@@ -30,6 +30,8 @@ const API_PAGE_MAX: usize = 64;
 /// A member the provider does not identify by digest is fetched whole and hashed; the
 /// class is HuggingFace non-LFS files (configs, tokenizers), which git itself keeps small.
 const UNPINNED_MEMBER_MAX_BYTES: u64 = 64 << 20;
+/// An explicit ordinary-file selection is a bounded working set, not a weight download.
+const FILE_SELECTION_MAX_BYTES: u64 = 64 << 20;
 const MEMBER_MAX: usize = 4096;
 /// A `*.safetensors.index.json` is a map from tensor name to shard file. It is JSON that
 /// git itself keeps small, and the Go resolver bounded it at the same 32 MiB.
@@ -1342,6 +1344,144 @@ pub fn resolve(
     })
 }
 
+/// Resolve only explicitly named ordinary files at one immutable HF revision.
+/// No suffix has special meaning here: selecting Python bytes never executes them,
+/// and selecting an index does not expand it into tensor shards. Tensor carriers
+/// continue to use `resolve` and reviewed profile/carrier selection.
+pub fn resolve_files(
+    uri: &SourceUri,
+    files: &[String],
+    endpoints: &Endpoints,
+    credentials: &dyn CredentialProvider,
+    deadline: Deadline,
+) -> Result<Resolution> {
+    let SourceUri::HuggingFace {
+        org,
+        repo,
+        revision,
+    } = uri
+    else {
+        return refuse(
+            Code::SOURCE_NOT_ALLOWED,
+            "ordinary file selection requires HuggingFace",
+        );
+    };
+    if files.is_empty() || files.len() > MEMBER_MAX {
+        return refuse(
+            Code::COUNT_CAP,
+            "ordinary file selection count is outside the bound",
+        );
+    }
+    let mut names = files.to_vec();
+    names.sort();
+    if names.iter().any(|name| !member_path(name)) {
+        return refuse(
+            Code::PATH_ILLEGAL,
+            "ordinary file selection requires exact member paths",
+        );
+    }
+    if names.windows(2).any(|pair| pair[0] == pair[1]) {
+        return refuse(
+            Code::DUPLICATE_KEY,
+            "ordinary file selection names one member twice",
+        );
+    }
+    let ledger = Ledger::new();
+    let policy = endpoints.policy(uri);
+    let listed = list_observed(uri, endpoints, credentials, deadline, &ledger)?;
+    // Establish the whole roster before fetching any body. A missing later member
+    // must not turn a partial requested tree into a successful smaller selection.
+    let selected = names
+        .iter()
+        .map(|name| {
+            listed
+                .iter()
+                .find(|member| &member.member == name)
+                .ok_or_else(|| Refusal {
+                    code: Code::MISSING_FIELD,
+                    detail: format!("the source does not contain requested file {name:?}"),
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let listed_bytes = selected.iter().try_fold(0u64, |total, member| {
+        total.checked_add(member.length.unwrap_or(0))
+    });
+    if listed_bytes.is_none_or(|bytes| bytes > FILE_SELECTION_MAX_BYTES) {
+        return refuse(
+            Code::SIZE_CAP,
+            "ordinary file selection exceeds its byte bound",
+        );
+    }
+    let mut remaining = FILE_SELECTION_MAX_BYTES;
+    let mut resolved = Vec::with_capacity(selected.len());
+    for member in selected {
+        if member.length.is_some_and(|length| length > remaining) || remaining == 0 {
+            return refuse(
+                Code::SIZE_CAP,
+                "ordinary file selection exceeds its byte bound",
+            );
+        }
+        let (object, provenance) = if let Some(sha256) = &member.sha256 {
+            let length = match member.length {
+                Some(length) => length,
+                None => probe_length(&member.url, &policy, credentials, deadline, &ledger)?,
+            };
+            (
+                ObjectRef {
+                    sha256: sha256.clone(),
+                    length,
+                },
+                Provenance::Declared,
+            )
+        } else {
+            let (body, _) = api_get(
+                &member.url,
+                &policy,
+                credentials,
+                remaining,
+                deadline,
+                &ledger,
+            )?;
+            if member
+                .length
+                .is_some_and(|length| length != body.len() as u64)
+            {
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    "ordinary file body disagrees with listed length",
+                );
+            }
+            (ObjectRef::of(&body), Provenance::Computed)
+        };
+        if object.length == 0 {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                "ordinary source files must not be empty",
+            );
+        }
+        remaining = remaining
+            .checked_sub(object.length)
+            .ok_or_else(|| Refusal {
+                code: Code::SIZE_CAP,
+                detail: "ordinary file selection exceeds its byte bound".into(),
+            })?;
+        resolved.push(ResolvedMember {
+            member: member.member.clone(),
+            object,
+            url: member.url.clone(),
+            provenance,
+            carrier: false,
+            requires: Vec::new(),
+        });
+    }
+    let canonical = format!("hf://{org}/{repo}@{revision}");
+    Ok(Resolution {
+        selection_sha256: selection_digest(&canonical, &resolved),
+        canonical,
+        members: resolved,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2230,5 +2370,264 @@ mod tests {
         assert_eq!(warm[0].transferred, 0);
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_files_resolve_only_named_bytes_and_retain_across_restart() {
+        let config = b"{\"model_type\":\"test\"}".to_vec();
+        let tokenizer = b"these are tokenizer bytes".to_vec();
+        let expected = vec![ObjectRef::of(&config), ObjectRef::of(&tokenizer)];
+        let listing = format!(
+            r#"[
+            {{"type":"file","path":"model.safetensors","size":100000000000,"lfs":{{"oid":"{}","size":100000000000}}}},
+            {{"type":"file","path":"config.json","size":{}}},
+            {{"type":"file","path":"tokenizer.json","size":{}}},
+            {{"type":"file","path":"unused.py","size":99}}
+        ]"#,
+            "a".repeat(64),
+            config.len(),
+            tokenizer.len()
+        );
+        // Two order-independent resolutions each read list + two small bodies;
+        // materialization reads the bodies once, and restart/warm admission reads none.
+        let (base, seen, handle) = origin(8, move |request| {
+            if request.path.contains("/tree/") {
+                ok_body(listing.as_bytes(), "application/json")
+            } else if request.path.ends_with("/config.json") {
+                ok_body(&config, "application/json")
+            } else if request.path.ends_with("/tokenizer.json") {
+                ok_body(&tokenizer, "application/json")
+            } else {
+                panic!("unselected file requested: {}", request.path);
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{}", "ab".repeat(20))).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let mut names = vec!["config.json".into(), "tokenizer.json".into()];
+        let selected =
+            resolve_files(&uri, &names, &endpoints, &Anonymous, Deadline::none()).unwrap();
+        names.reverse();
+        assert_eq!(
+            selected,
+            resolve_files(&uri, &names, &endpoints, &Anonymous, Deadline::none()).unwrap()
+        );
+        assert_eq!(
+            selected
+                .members
+                .iter()
+                .map(|m| m.object.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(selected
+            .members
+            .iter()
+            .all(|m| m.provenance == Provenance::Computed && !m.carrier && m.requires.is_empty()));
+        let root = temporary("selected-files");
+        let store = Store::init(&root).unwrap();
+        let producer = ObjectRef::of(b"files-producer").id();
+        let recipient = ObjectRef::of(b"files-recipient").id();
+        let (cold, transfers) = materialize_selected(
+            &store,
+            &producer,
+            &selected,
+            &endpoints.policy(&uri),
+            &Anonymous,
+            Deadline::none(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            transfers.iter().map(|row| row.transferred).sum::<u64>(),
+            selected.member_bytes()
+        );
+        crate::source_artifact::retain(&store, &producer, &recipient).unwrap();
+        drop(store);
+        let store = Store::open(&root).unwrap();
+        let (warm, transfers) = materialize_selected(
+            &store,
+            &producer,
+            &selected,
+            &endpoints.policy(&uri),
+            &Anonymous,
+            Deadline::none(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(warm, cold);
+        assert!(transfers.iter().all(|row| row.held && row.transferred == 0));
+        crate::source_artifact::release(&store, &producer).unwrap();
+        crate::gc::collect(&root, false).unwrap();
+        let retained = crate::source_artifact::read(&store, &recipient)
+            .unwrap()
+            .unwrap();
+        assert!(retained.complete && !retained.released);
+        for object in &expected {
+            assert!(store.record_valid(&object.sha256).is_ok());
+        }
+        crate::source_artifact::release(&store, &recipient).unwrap();
+        crate::gc::collect(&root, false).unwrap();
+        for object in expected {
+            assert!(!store.contains(&object.sha256));
+        }
+        handle.join().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 8);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_files_refuse_missing_and_over_budget_before_fetching_bodies() {
+        for (names, listing, code) in [
+            (
+                vec!["absent.json".into(), "config.json".into()],
+                r#"[{"type":"file","path":"config.json","size":2}]"#.to_string(),
+                Code::MISSING_FIELD,
+            ),
+            (
+                vec!["config.json".into()],
+                format!(
+                    r#"[{{"type":"file","path":"config.json","size":{}}}]"#,
+                    FILE_SELECTION_MAX_BYTES + 1
+                ),
+                Code::SIZE_CAP,
+            ),
+        ] {
+            let (base, _, handle) =
+                origin(1, move |_| ok_body(listing.as_bytes(), "application/json"));
+            let uri = SourceUri::parse(&format!("hf://org/repo@{}", "ab".repeat(20))).unwrap();
+            let endpoints = Endpoints {
+                huggingface: base,
+                allow_local: true,
+                ..Endpoints::default()
+            };
+            assert_eq!(
+                resolve_files(&uri, &names, &endpoints, &Anonymous, Deadline::none())
+                    .unwrap_err()
+                    .code,
+                code
+            );
+            handle.join().unwrap();
+        }
+        let uri = SourceUri::parse(&format!("hf://org/repo@{}", "ab".repeat(20))).unwrap();
+        for names in [
+            vec!["../config.json".into()],
+            vec!["*.json".into()],
+            vec!["/config.json".into()],
+        ] {
+            assert_eq!(
+                resolve_files(
+                    &uri,
+                    &names,
+                    &Endpoints::default(),
+                    &Anonymous,
+                    Deadline::none()
+                )
+                .unwrap_err()
+                .code,
+                Code::PATH_ILLEGAL
+            );
+        }
+        assert_eq!(
+            resolve_files(
+                &uri,
+                &["config.json".into(), "config.json".into()],
+                &Endpoints::default(),
+                &Anonymous,
+                Deadline::none()
+            )
+            .unwrap_err()
+            .code,
+            Code::DUPLICATE_KEY
+        );
+    }
+
+    #[test]
+    fn explicit_files_refuse_a_changed_listing_length() {
+        let (base, _, handle) = origin(2, move |request| {
+            if request.path.contains("/tree/") {
+                ok_body(
+                    br#"[{"type":"file","path":"config.json","size":2}]"#,
+                    "application/json",
+                )
+            } else {
+                ok_body(b"changed", "application/json")
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{}", "ab".repeat(20))).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        assert_eq!(
+            resolve_files(
+                &uri,
+                &["config.json".into()],
+                &endpoints,
+                &Anonymous,
+                Deadline::none()
+            )
+            .unwrap_err()
+            .code,
+            Code::LENGTH_MISMATCH
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_files_changed_after_resolution_never_finish_a_native_root() {
+        let replies = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (base, _, handle) = origin(3, move |request| {
+            if request.path.contains("/tree/") {
+                ok_body(
+                    br#"[{"type":"file","path":"config.json","size":2}]"#,
+                    "application/json",
+                )
+            } else {
+                let attempt = replies.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ok_body(if attempt == 0 { b"AA" } else { b"BB" }, "application/json")
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{}", "ab".repeat(20))).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let selected = resolve_files(
+            &uri,
+            &["config.json".into()],
+            &endpoints,
+            &Anonymous,
+            Deadline::none(),
+        )
+        .unwrap();
+        let root = temporary("changed-files");
+        let store = Store::init(&root).unwrap();
+        let producer = ObjectRef::of(b"changed-files-producer").id();
+        let error = materialize_selected(
+            &store,
+            &producer,
+            &selected,
+            &endpoints.policy(&uri),
+            &Anonymous,
+            Deadline::none(),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.code, Code::OBJECT_ID_MISMATCH);
+        assert!(!store.contains(&selected.members[0].object.sha256));
+        assert!(
+            !crate::source_artifact::read(&store, &producer)
+                .unwrap()
+                .unwrap()
+                .complete
+        );
+        handle.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
