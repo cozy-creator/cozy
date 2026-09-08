@@ -105,7 +105,7 @@ class Request(msgspec.Struct):
 app=App()
 @app.job
 async def run(ctx:Context,payload:Request)->Result:
-    return await score(media=Input(payload.image))
+    return await score(media=Input(image=payload.image))
 `)
 	run := func(args ...string) {
 		t.Helper()
@@ -127,7 +127,13 @@ async def run(ctx:Context,payload:Request)->Result:
 	fatal(t, problem)
 	defer store.Close()
 	var original records.Request
-	for index := 0; index < 2; index++ {
+	for index := 0; index < 3; index++ {
+		if index == 2 {
+			pixels.Set(3, 3, color.RGBA{G: 255, A: 255})
+			buffer.Reset()
+			must(t, png.Encode(&buffer, pixels))
+			must(t, os.WriteFile(imagePath, buffer.Bytes(), 0600))
+		}
 		run("run", "local/private-media-parent/run", "--asset", "image="+imagePath, "--await", "--json")
 		parent, problem := store.RequestByReference(strconv.Itoa(index*2 + 1))
 		fatal(t, problem)
@@ -138,8 +144,11 @@ async def run(ctx:Context,payload:Request)->Result:
 		}
 		if index == 0 {
 			original = children[0]
-		} else if children[0].ReusedFrom != original.ID || children[0].Ordinal != 0 {
+		} else if index == 1 && (children[0].ReusedFrom != original.ID || children[0].Ordinal != 0) {
 			t.Fatalf("new parent rescored identical media: %+v", children[0])
+		}
+		if index == 2 && (children[0].ReusedFrom != "" || children[0].Ordinal != 1) {
+			t.Fatalf("changed media reused an old score: %+v", children[0])
 		}
 	}
 }
