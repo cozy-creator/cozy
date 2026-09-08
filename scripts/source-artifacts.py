@@ -10,6 +10,7 @@ import tempfile
 import threading
 
 import tensorfs
+from tensorfs.errors import Refusal
 
 
 def main() -> None:
@@ -106,7 +107,7 @@ def main() -> None:
                 try:
                     store.resolve_source(source_uri, files=["config.json"], **selection,
                                          huggingface=endpoint, allow_local=True)
-                except tensorfs.Refusal as error:
+                except Refusal as error:
                     assert error.code == "TRANSACTION_CONFLICT", error
                 else:
                     raise AssertionError("mixed selection accepted")
