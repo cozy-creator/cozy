@@ -104,3 +104,31 @@ func (s *Store) ArtifactSourceAllowed(parent Request, source ArtifactSource) (bo
 	}
 	return s.ArtifactHasCustody(source.Weights.RequestID, source.Weights.Attempt, source.Weights.OutputSlot, parent.ReuseScope)
 }
+
+func packageArtifactSource(q artifactQuery, artifact ModelArtifact) (*ArtifactSource, *exit.Error) {
+	var weights ModelTransferWeights
+	var worker string
+	err := q.QueryRow(`SELECT o.request_id,o.attempt,o.output_slot,o.transaction_id,o.manifest_id,o.manifest_length,r.worker
+        FROM request_model_transfer_outputs o JOIN requests r ON r.id=o.request_id
+        WHERE o.request_id=? AND o.output_slot=? AND o.manifest_id=? AND o.manifest_length=?
+        AND CASE WHEN json_valid(o.receipt) THEN json_extract(CAST(o.receipt AS TEXT),'$.tensorfs_receipt_digest') ELSE '' END=? ORDER BY o.attempt DESC LIMIT 1`, artifact.ProducerRequestID, artifact.OutputSlot, artifact.Manifest.Digest, artifact.Manifest.Length, artifact.TensorFSReceiptDigest).Scan(&weights.RequestID, &weights.Attempt, &weights.OutputSlot, &weights.TransactionID, &weights.ManifestID, &weights.ManifestLength, &worker)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, exit.Named(exit.Conflict, "child.artifact_unowned", "effect artifact has no observed package/native producer")
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot inspect effect artifact provenance: %s", err)
+	}
+	return &ArtifactSource{Artifact: artifact, OwnerRequestID: weights.RequestID, Worker: worker, TransactionID: weights.TransactionID, Weights: &weights}, nil
+}
+func packageArtifactAllowed(q artifactQuery, parent Request, source ArtifactSource) (bool, *exit.Error) {
+	if source.Worker != parent.Worker {
+		return false, nil
+	}
+	var allowed bool
+	err := q.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests p WHERE p.id=? AND p.reuse_scope=? AND p.retain_work=1 AND p.state NOT IN ('canceling','canceled','releasing'))
+        OR EXISTS(SELECT 1 FROM request_weights_retentions h JOIN requests r ON r.id=h.request_id WHERE h.producer_request_id=? AND h.producer_attempt=? AND h.producer_output_slot=? AND h.state='held' AND r.reuse_scope=? AND r.worker=? AND r.state NOT IN ('canceling','canceled','releasing'))`, source.Weights.RequestID, parent.ReuseScope, source.Weights.RequestID, source.Weights.Attempt, source.Weights.OutputSlot, parent.ReuseScope, parent.Worker).Scan(&allowed)
+	if err != nil {
+		return false, exit.Internalf("cannot authorize effect artifact custody: %s", err)
+	}
+	return allowed, nil
+}

@@ -52,10 +52,21 @@ func reserveNativeArtifactTx(tx *sql.Tx, consumerID, parentID, kind, slot string
 		return NativeArtifactRetention{}, exit.New(exit.Validation, "request retention uses its own request authority")
 	}
 	source, problem := nativeArtifactSource(tx, artifact)
-	if problem != nil || source == nil {
-		return NativeArtifactRetention{}, exit.Named(exit.Conflict, "child.artifact_unowned", "native artifact has no original service provenance")
+	if problem != nil {
+		return NativeArtifactRetention{}, problem
 	}
-	allowed, problem := nativeArtifactAllowed(tx, parent, artifact)
+	if source == nil && kind == "effect" {
+		source, problem = packageArtifactSource(tx, artifact)
+	}
+	if problem != nil || source == nil {
+		return NativeArtifactRetention{}, exit.Named(exit.Conflict, "child.artifact_unowned", "artifact has no original service or effect-authorized package provenance")
+	}
+	var allowed bool
+	if source.NativeServiceID != "" {
+		allowed, problem = nativeArtifactAllowed(tx, parent, artifact)
+	} else {
+		allowed, problem = packageArtifactAllowed(tx, parent, *source)
+	}
 	if problem != nil {
 		return NativeArtifactRetention{}, problem
 	}
@@ -154,4 +165,21 @@ func nativeArtifactInput(tx *sql.Tx, requestID, slot string, raw json.RawMessage
 	}
 	_, problem = reserveNativeArtifactTx(tx, requestID, requestID, "input", "result/"+slot, *artifact)
 	return true, problem
+}
+
+func (s *Store) NativeEffectCleanupIDs() ([]string, *exit.Error) {
+	rows, err := s.db.Query(`SELECT DISTINCT h.consumer_id FROM native_artifact_retentions h JOIN native_calls n ON n.id=h.consumer_id WHERE h.kind='effect' AND h.state!='released' AND n.state IN ('succeeded','failed','canceled') ORDER BY h.consumer_id`)
+	if err != nil {
+		return nil, exit.Internalf("cannot inspect native effect cleanup: %s", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, exit.Internalf("cannot read native effect cleanup: %s", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
