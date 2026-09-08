@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 use tensorfs_core::{
+    err::Code,
     gc,
     ids::{Doc, ObjectRef},
     manifest::Manifest,
@@ -32,6 +33,87 @@ fn tree(store: &Store) -> Manifest {
         .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
         .unwrap();
     Manifest::from_files(vec![("model.safetensors".into(), object)]).unwrap()
+}
+
+#[test]
+fn retained_tree_distinguishes_missing_corrupt_and_stale_verified_members() {
+    let dir = root("member-verification");
+    let store = Store::init(&dir).unwrap();
+    let manifest = tree(&store);
+    let member = manifest.entries()[0].1.blob();
+    let producer = owner("producer");
+    let recipient = owner("recipient");
+    source_artifact::create(&store, &producer, &manifest).unwrap();
+    source_artifact::retain(&store, &producer, &recipient).unwrap();
+    let blob = store.object_path(&member.sha256);
+    let saved = dir.join("temporarily-missing-member");
+    fs::rename(&blob, &saved).unwrap();
+    drop(store);
+
+    let store = Store::open(&dir).unwrap();
+    // Both a new recipient and a replayed recipient must expose the same missing object.
+    for target in [&recipient, &owner("new-recipient")] {
+        let error = source_artifact::retain(&store, &producer, target).unwrap_err();
+        assert_eq!(error.code, Code::OBJECT_ABSENT, "{error}");
+    }
+    assert!(source_artifact::read(&store, &owner("new-recipient"))
+        .unwrap()
+        .is_none());
+
+    // A restored byte-identical inode with no standing record must recover by verification.
+    fs::rename(&saved, &blob).unwrap();
+    let db = rusqlite::Connection::open(dir.join("tensorfs.sqlite")).unwrap();
+    db.execute(
+        "DELETE FROM tensorfs_verified_blobs WHERE sha256=?1",
+        [&member.sha256],
+    )
+    .unwrap();
+    assert!(store.record_valid(&member.sha256).is_err());
+    source_artifact::retain(&store, &producer, &recipient).unwrap();
+    assert!(store.record_valid(&member.sha256).is_ok());
+    assert!(!store.open_verified_reporting(&member.sha256).unwrap().1);
+
+    // Replacing the inode with the exact same content invalidates metadata, not identity.
+    fs::rename(&blob, &saved).unwrap();
+    fs::copy(&saved, &blob).unwrap();
+    assert!(store.record_valid(&member.sha256).is_err());
+    source_artifact::retain(&store, &producer, &recipient).unwrap();
+    assert!(store.record_valid(&member.sha256).is_ok());
+    fs::remove_file(saved).unwrap();
+
+    // A changed object is a corruption refusal, never the missing-byte cache result.
+    fs::remove_file(&blob).unwrap();
+    fs::write(&blob, vec![0u8; member.length as usize]).unwrap();
+    let error = source_artifact::retain(&store, &producer, &recipient).unwrap_err();
+    assert_eq!(error.code, Code::OBJECT_CORRUPT, "{error}");
+    assert!(!blob.exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn retained_tree_rejects_nonregular_members_and_false_lengths() {
+    let dir = root("member-shape");
+    let store = Store::init(&dir).unwrap();
+    let manifest = tree(&store);
+    let member = manifest.entries()[0].1.blob();
+    let producer = owner("producer");
+    source_artifact::create(&store, &producer, &manifest).unwrap();
+    let incorrect = Manifest::from_files(vec![(
+        "model.safetensors".into(),
+        ObjectRef {
+            sha256: member.sha256.clone(),
+            length: member.length + 1,
+        },
+    )])
+    .unwrap();
+    let error = source_artifact::create(&store, &owner("wrong-length"), &incorrect).unwrap_err();
+    assert_eq!(error.code, Code::DURABILITY_UNPROVEN, "{error}");
+    let blob = store.object_path(&member.sha256);
+    fs::remove_file(&blob).unwrap();
+    fs::create_dir(&blob).unwrap();
+    let error = source_artifact::retain(&store, &producer, &owner("nonregular")).unwrap_err();
+    assert_eq!(error.code, Code::NOT_REGULAR_FILE, "{error}");
+    fs::remove_dir_all(dir).unwrap();
 }
 fn resolution(base: &str, name: &str, bytes: &[u8]) -> Resolution {
     Resolution {
