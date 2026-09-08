@@ -32,7 +32,7 @@ func TestMain(m *testing.M) {
 	// The reaper is this same binary under another argv (see reap_test.go). It must be
 	// recognised before anything else happens: it builds nothing and runs no test.
 	if len(os.Args) == 2 && strings.HasPrefix(os.Args[1], reapMode) {
-		runDaemonReaper(strings.TrimPrefix(os.Args[1], reapMode), os.Stdin)
+		runDaemonReaper(strings.TrimPrefix(os.Args[1], reapMode), os.Stdin) //cozy:stdin-value owned reaper subprocess liveness pipe
 		os.Exit(0)
 	}
 	// Reap the roots the previous run abandoned before claiming disk of our own,

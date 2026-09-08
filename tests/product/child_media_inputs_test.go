@@ -43,7 +43,7 @@ func TestChildMediaBorrowsOnlyParentInputs(t *testing.T) {
 		t.Fatalf("unexpected inherited media: %+v", forwarded)
 	}
 	call := records.Request{ID: "req-media-child", IdemKey: "media-child", BodyDigest: childDigest("3"), Package: "local/score", Entrypoint: "score", Kind: "job", Payload: payload, ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5"), Assets: forwarded}
-	child, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	child, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	held, problem := store.RequestRow(child.ID)
 	fatal(t, problem)
@@ -70,7 +70,7 @@ func TestChildMediaBorrowsOnlyParentInputs(t *testing.T) {
 	forged.ParentCallIndex = 1
 	forged.Assets = append([]records.AssetBinding(nil), forwarded...)
 	forged.Assets[0].LocalPath = filepath.Join(t.TempDir(), "ungranted.png")
-	if _, _, problem := store.SubmitChild(forged, 1, childDigest("1"), "private-boot"); problem == nil {
+	if _, _, problem := store.SubmitChild(forged, 1, childDigest("1"), "private-boot", nil); problem == nil {
 		t.Fatal("forged input path accepted by atomic admission")
 	}
 	must(t, os.WriteFile(asset.LocalPath, bytes.Repeat([]byte("x"), encoded.Len()), 0600))

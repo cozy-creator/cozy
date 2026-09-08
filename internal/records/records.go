@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 34
+const schemaVersion = 35
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -115,7 +115,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 func init() {
-	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL)
+	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -263,7 +263,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < schemaVersion {
+	if sourceVersion < 34 {
 		if e := migrateRentals(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -273,12 +273,12 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 33 {
+	if sourceVersion < 35 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
 	}
-	if sourceVersion < 33 {
+	if sourceVersion < 35 {
 		if _, err := tx.Exec(childRequestIndex); err != nil {
 			return exit.Internalf("cannot restore child call admission index in %s: %s", path, err)
 		}
@@ -412,6 +412,25 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 		}
 	}
 
+	if sourceVersion < 35 {
+		if sourceVersion >= 32 {
+			for _, statement := range []string{`ALTER TABLE native_calls RENAME TO native_calls_prior35`, nativeCallsDDL,
+				`INSERT INTO native_calls(` + nativeCallColumns + `) SELECT ` + nativeCallColumns + ` FROM native_calls_prior35`,
+				`DROP TABLE native_calls_prior35`} {
+				if _, err := tx.Exec(statement); err != nil {
+					return exit.Internalf("cannot preserve native call indices: %s", err)
+				}
+			}
+		}
+		if _, err := tx.Exec(childArgumentsDDL); err != nil {
+			return exit.Internalf("cannot add serving child arguments: %s", err)
+		}
+		for _, statement := range []string{activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot add managed serving records: %s", err)
+			}
+		}
+	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
 	}
@@ -697,6 +716,10 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		destinationColumns += ",child_artifacts"
 		selectColumns += ",child_artifacts"
 	}
+	if sourceVersion >= 33 {
+		destinationColumns += ",capture"
+		selectColumns += ",capture"
+	}
 	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
 		` FROM requests_prior`); err != nil {
 		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)
@@ -764,6 +787,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 35 && (statement == childArgumentsDDL || statement == activeChildRequestIndex || statement == activeNativeCallIndex || statement == servingPlacementsDDL || statement == operationContextsDDL) {
+			continue
+		}
 		if version < 33 && statement == byteOutputsDDL {
 			continue
 		}
@@ -843,7 +869,7 @@ func priorStatements(version int) []string {
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
 		}
 		if requestStatement && version < 27 {
-			stmt = strings.Replace(stmt, ",\n  parent_request_id TEXT NOT NULL DEFAULT '',\n  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<32),\n  child_intent_digest TEXT NOT NULL DEFAULT '',\n  child_target_digest TEXT NOT NULL DEFAULT '',\n  child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),\n  reused_from TEXT NOT NULL DEFAULT '',\n  orchestration_directive BLOB NOT NULL DEFAULT x''", "", 1)
+			stmt = strings.Replace(stmt, ",\n  parent_request_id TEXT NOT NULL DEFAULT '',\n  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<4294967296),\n  child_intent_digest TEXT NOT NULL DEFAULT '',\n  child_target_digest TEXT NOT NULL DEFAULT '',\n  child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),\n  reused_from TEXT NOT NULL DEFAULT '',\n  orchestration_directive BLOB NOT NULL DEFAULT x''", "", 1)
 		}
 		if requestStatement && version < 28 {
 			stmt = strings.Replace(stmt, ",\n  child_artifacts INTEGER NOT NULL DEFAULT 0 CHECK(child_artifacts IN (0,1))", "", 1)
@@ -867,6 +893,9 @@ func priorStatements(version int) []string {
 		}
 		if requestStatement && version < 33 {
 			stmt = strings.Replace(stmt, "  capture      TEXT    NOT NULL DEFAULT '',\n", "", 1)
+		}
+		if version < 35 {
+			stmt = strings.ReplaceAll(stmt, "call_index<4294967296", "call_index<32")
 		}
 		statements[index] = stmt
 	}

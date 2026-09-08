@@ -18,7 +18,9 @@ func operationHistory(t *testing.T, store *records.Store, label string, parent r
 		request.ChildArtifacts = true
 		request.WeightsOutputs = `[{"output_id":"weights"}]`
 	}
-	child, _, problem := store.SubmitChild(request, 1, childDigest("1"), "private-boot")
+	child, _, problem := store.SubmitChild(request, 1, childDigest("1"), "private-boot", nil)
+	fatal(t, problem)
+	_, problem = store.BindOperationContext(child.ID, childDigest("f"))
 	fatal(t, problem)
 	return child
 }
@@ -41,18 +43,18 @@ func TestOperationArtifactScopeRequiresNativeCacheAdoption(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{"source": artifact})
 	must(t, err)
 	next := records.Request{ID: "req-model-consumer", IdemKey: "model-consumer", Kind: "job", Package: "local/next", Entrypoint: "compute", Worker: "workspace", Payload: payload, BodyDigest: childDigest("8"), ParentRequestID: second.ID, ParentCallIndex: 1, ChildIntentDigest: childDigest("9"), ChildTargetDigest: childDigest("a"), Models: []records.ModelRef{{Slot: "source", Manifest: artifact.Manifest.Digest, ManifestLength: 161}}}
-	if _, _, problem := store.SubmitChild(next, 1, childDigest("1"), "private-boot"); problem == nil {
+	if _, _, problem := store.SubmitChild(next, 1, childDigest("1"), "private-boot", nil); problem == nil {
 		t.Fatal("same worker allowed a forged cross-run artifact grant")
 	}
 	consumer := operationHistory(t, store, "cached-native", second, true)
-	key, problem := records.OperationKey(consumer)
+	key, problem := records.QualifiedOperationKey(consumer, childDigest("f"))
 	fatal(t, problem)
 	fatal(t, store.BeginOperationLookup(consumer.ID, key))
 	last, problem := store.AttemptRow(source.ID, 1)
 	fatal(t, problem)
 	hold := records.WeightsRetention{RequestID: consumer.ID, Kind: "result", Slot: "weights/weights", ProducerRequestID: source.ID, ProducerAttempt: 1, ProducerOutputSlot: "weights", RetentionID: childDigest("d"), InstanceID: "private-worker", WorkerBootID: "private-boot", State: "held"}
 	fatal(t, store.AdoptCachedOperation(consumer.ID, records.CachedOperation{Key: key, SourceRequestID: source.ID, SourceAttempt: 1, InvocationDigest: last.InvocationDigest, OutcomeID: last.TerminalID, OutcomeDigest: last.TerminalDigest, OutcomeBody: last.TerminalBody, Retentions: []records.WeightsRetention{hold}}))
-	_, _, problem = store.SubmitChild(next, 1, childDigest("1"), "private-boot")
+	_, _, problem = store.SubmitChild(next, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	owned, problem := store.ArtifactHasCustody(source.ID, 1, "weights", second.ReuseScope)
 	fatal(t, problem)
@@ -125,7 +127,7 @@ func proveOperationLookupAcrossFreshRunHistory(t *testing.T, workspace string) {
 	if consumer.ReuseScope == source.ReuseScope || second.RetryOf != "" {
 		t.Fatal("fixture did not create an unrelated run")
 	}
-	key, problem := records.OperationKey(consumer)
+	key, problem := records.QualifiedOperationKey(consumer, childDigest("f"))
 	fatal(t, problem)
 	last, problem := store.AttemptRow(source.ID, 1)
 	fatal(t, problem)
@@ -186,7 +188,7 @@ func TestOperationLookupBlocksPauseAndCancelUntilReconciled(t *testing.T) {
 			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 			parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "parent", "workspace"))
 			child := operationHistory(t, store, "pending-op", parent)
-			key, problem := records.OperationKey(child)
+			key, problem := records.QualifiedOperationKey(child, childDigest("f"))
 			fatal(t, problem)
 			fatal(t, store.BeginOperationLookup(child.ID, key))
 			if action == "pause" {
@@ -240,7 +242,8 @@ func TestOperationLookupSchemaUpgradePreservesRequests(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	for _, table := range []string{"byte_outputs", "native_artifact_retentions", "native_calls", "request_operation_lookups"} {
+	restorePriorCallIndexBounds(t, db)
+	for _, table := range []string{"attempt_serving_placements", "request_child_arguments", "byte_outputs", "native_artifact_retentions", "native_calls", "request_operation_lookups"} {
 		_, err = db.Exec(`DROP TABLE ` + table)
 		must(t, err)
 	}

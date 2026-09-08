@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/config"
 )
 
 // ------------------------------------------------------------------ never leave a daemon
@@ -108,7 +110,8 @@ func reapDaemonRoot(root string) {
 		// what guarantees the daemon is gone, whatever `down` did or did not manage.
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		down := exec.CommandContext(ctx, cozyBin, "down", "--all")
-		down.Env = append(envWithout("COZY_HOME", "TENSORFS_HOME"), "COZY_HOME="+root,
+		cfg, _ := config.Load() // A configuration refusal cannot prevent the guaranteed reap below.
+		down.Env = cfg.Child("COZY_HOME="+root,
 			"TENSORFS_HOME="+filepath.Join(root, "tensorfs"))
 		down.Stdout, down.Stderr = io.Discard, io.Discard
 		_ = down.Run()
@@ -137,23 +140,6 @@ func anyAlive(pids []int) bool {
 		}
 	}
 	return false
-}
-
-// envWithout drops names before they are re-set. A duplicate in an exec environment is
-// not an override: the FIRST mention is the one the child reads, so appending a second
-// COZY_HOME to os.Environ() would point `down` at whichever root ran last.
-func envWithout(names ...string) []string {
-	kept := []string{}
-	for _, entry := range os.Environ() {
-		drop := false
-		for _, name := range names {
-			drop = drop || strings.HasPrefix(entry, name+"=")
-		}
-		if !drop {
-			kept = append(kept, entry)
-		}
-	}
-	return kept
 }
 
 // daemonOnRoot answers with one live daemon's pid for root, or 0.
@@ -242,7 +228,7 @@ func startDaemonReaper() {
 	cmd := exec.Command(self, reapMode+cozyBin)
 	// stdin is the control pipe and nothing else; stdout is discarded by the kernel
 	// rather than by a copier goroutine in a process that is expected to die first.
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = read, nil, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = read, nil, os.Stderr //cozy:stdin-value controlled reaper liveness pipe
 	detachSession(cmd)
 	if err := cmd.Start(); err != nil {
 		read.Close()

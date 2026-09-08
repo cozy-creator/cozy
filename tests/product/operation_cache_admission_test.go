@@ -26,12 +26,23 @@ func (p *fakePod) RecordOperationResult(_ context.Context, call *pb.RecordOperat
 	return p.recordOperation(call)
 }
 
+func (p *fakePod) NumericalEnvironment(_ context.Context, call *pb.NumericalEnvironmentCall) (*pb.NumericalEnvironmentResult, error) {
+	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
+		return nil, err
+	}
+	if len(p.numericalDigest) != 32 {
+		return nil, status.Error(codes.Unimplemented, "no numerical environment configured")
+	}
+	return &pb.NumericalEnvironmentResult{Digest: p.numericalDigest}, nil
+}
+
 // Optional cache admission is distinct from durably accepting the result. A
 // transport failure retries; a conclusive uncached answer permits the original ACK.
 func TestOperationCacheDeclineAcknowledgesSuccessfulResult(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
-	pod := &fakePod{controlKey: public}
+	numerical, _ := canonical.Raw(childDigest("4"))
+	pod := &fakePod{controlKey: public, numericalDigest: numerical}
 	var calls, acknowledgements atomic.Int64
 	replay := make(chan func() error, 1)
 	const id = "req-cache-admission-declined"
@@ -82,6 +93,8 @@ func TestOperationCacheDeclineAcknowledgesSuccessfulResult(t *testing.T) {
 	request, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: childDigest("2"),
 		Package: "local/operation", Entrypoint: "compute", Kind: "job", RetainWork: true, Payload: []byte(`{}`),
 		Worker: podRental, ParentRequestID: "retained-parent", ParentCallIndex: 0, ChildReusable: true, ChildTargetDigest: childDigest("3")})
+	fatal(t, problem)
+	_, problem = o.store.BindOperationContext(id, childDigest("4"))
 	fatal(t, problem)
 	_, problem = o.store.Dispatch(records.Attempt{RequestID: id, InstanceID: instance, SessionID: podBootID,
 		InvocationDigest: childDigest("1"), InvocationCanonical: []byte(`{}`)})
