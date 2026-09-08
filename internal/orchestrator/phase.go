@@ -342,7 +342,7 @@ func (c *Orchestrator) QueuePhase(requestID string) (PhaseObservation, bool) {
 	if facts.cause == "" {
 		return PhaseObservation{}, false
 	}
-	return PhaseObservation{Name: facts.cause, Machine: facts.on}, true
+	return c.phaseRental(requestID, PhaseObservation{Name: facts.cause, Machine: facts.on}), true
 }
 
 // PreparationPhase is one subject's observation read directly — the worker instance a
@@ -478,6 +478,9 @@ func (c *Orchestrator) phaseRental(requestID string, phase PhaseObservation) Pha
 	rental, problem := c.opt.Store.RentalByMachine(request.Worker)
 	if problem != nil || rental == nil {
 		return phase
+	}
+	if phase.Machine == "" {
+		phase.Machine = rental.MachineName
 	}
 	phase.Rental = &RentalProgress{AcceleratorModel: rental.AcceleratorModel,
 		AcceleratorCount: rental.AcceleratorCount, HourlyRateUSDMicros: rental.HourlyRateUSDMicros}

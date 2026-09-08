@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -110,5 +111,25 @@ func TestPreparationSnapshotCarriesRentalAndSeparateModelProgress(t *testing.T) 
 	reset, _ := o.c.PreparationPhase("model-stage")
 	if reset.Models[0].Rate != 0 || reset.Models[0].RemainingMS != nil {
 		t.Fatalf("counter reset retained rate: %+v", reset.Models[0])
+	}
+}
+
+// Reattaching after daemon recovery has durable rental facts but may have no live
+// preparation sample yet. The queue fallback must preserve that existing quote.
+func TestQueuePhaseFallbackRetainsRecordedRental(t *testing.T) {
+	o := hostOwner(t, "queue-rental-progress")
+	fatal(t, o.store.RecordRental(records.Rental{ID: "rental-progress", MachineName: "aldra",
+		SKU: "h100-nvl", AcceleratorModel: "H100 NVL", AcceleratorCount: 1,
+		HourlyRateUSDMicros: 3236009, State: "ready"}))
+	_, _, e := o.store.Submit(records.Request{ID: "queue-progress", IdemKey: "queue-progress",
+		BodyDigest: "queue-progress", Package: "paul/minimax-h3", Entrypoint: "ref2va",
+		State: "queued", Payload: []byte("{}"), Outputs: "[]", Worker: "rental-progress", Rental: true})
+	fatal(t, e)
+	phase, ok := o.c.QueuePhase("queue-progress")
+	if !ok || phase.Name != orchestrator.WaitWorkerStart || phase.Machine != "aldra" || phase.Rental == nil || phase.Rental.AcceleratorModel != "H100 NVL" || phase.Rental.HourlyRateUSDMicros != 3236009 {
+		t.Fatalf("fallback lost durable rental details: %+v", phase)
+	}
+	if !phase.Since.IsZero() || phase.HasBytes {
+		t.Fatalf("fallback invented measurements: %+v", phase)
 	}
 }
