@@ -56,7 +56,10 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		return
 	case "queued", "parked":
 		// A queue heartbeat has less detail than the live preparation phase.
-		if strings.HasPrefix(p.terminal.key, "phase:") || strings.HasPrefix(p.terminal.key, "stage:") {
+		cause, _ := e.Payload["wait"].(string)
+		capacity := cause == "slot_busy" || cause == "queue_ahead"
+		if strings.HasPrefix(p.terminal.key, "stage:") ||
+			(strings.HasPrefix(p.terminal.key, "phase:") && !capacity) {
 			return
 		}
 		key = "wait"

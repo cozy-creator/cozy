@@ -1631,6 +1631,17 @@ func HumanWaitLine(payload map[string]any) string {
 	pkg, _ := payload["package"].(string)
 	on, _ := payload["waiting_on"].(string)
 	cause, _ := payload["wait"].(string)
+	if cause == orchestrator.WaitSlotBusy || cause == orchestrator.WaitQueueAhead {
+		if waiting, ok := payload["waiting_for"].(map[string]any); ok {
+			if run, ok := number(waiting["number"]); ok && run > 0 {
+				line := fmt.Sprintf("  waiting for run %.0f", run)
+				if on != "" {
+					line += " on " + on
+				}
+				return line
+			}
+		}
+	}
 	switch cause {
 	case orchestrator.WaitWorkerStart:
 		if pkg != "" {
@@ -1673,6 +1684,10 @@ func HumanPhaseLine(value any) string {
 	if strings.TrimSpace(name) == "" {
 		return ""
 	}
+	if name == orchestrator.WaitSlotBusy || name == orchestrator.WaitQueueAhead {
+		return HumanWaitLine(map[string]any{"wait": name, "waiting_on": fields["machine"],
+			"waiting_for": fields["waiting_for"]})
+	}
 	line := "  " + strings.ReplaceAll(name, "_", " ")
 	if machine, _ := fields["machine"].(string); machine != "" {
 		line += " on " + machine
@@ -1701,6 +1716,9 @@ func HumanPhaseLine(value any) string {
 // diagnostic earns its place on the human line too. Callers hold p.mu.
 func (p *RunProgress) waitLine(e localapi.Event) string {
 	line := HumanWaitLine(e.Payload)
+	if cause, _ := e.Payload["wait"].(string); cause != "" {
+		return line
+	}
 	if p.waitedSince.IsZero() || time.Since(p.waitedSince) < WaitPatience {
 		return line
 	}
