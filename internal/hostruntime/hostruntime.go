@@ -20,11 +20,11 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the oldest cozy-runtime release whose `describe` is a static reading of
-// package source: it parses and imports nothing, so package code — untrusted — never runs on
-// this host to be analysed (cl-175). Older releases described a package by importing it. A
-// release at the floor also vendors this daemon's wire minor, so one remedy serves both fences.
-const Floor = "0.5.2"
+// Floor is the first release that statically describes plain scripts, managed operations,
+// and model types from their captured environment. The environment is a source location,
+// never an interpreter to start for description. This cohort also vendors the required
+// wire minor, so one remedy serves both admission checks.
+const Floor = "0.6.0"
 
 var floor = pep440.MustParse(Floor)
 
@@ -48,8 +48,8 @@ var hostRuntimeVerdicts = struct {
 // wire package at this daemon's minor or newer — the minor is additive, so a newer tool serves
 // an older daemon and an older tool cannot (cl-086's live run: a 0.0.29 tool (minor 16) under
 // a minor-22 daemon launched, never came READY, and the request sat `queued` with nothing
-// said) — and it must be at least Floor, the release whose `describe` stopped
-// importing the package it describes. The tool's own `version` verb is the fact, asked here.
+// said). Floor also requires the static script and managed-operation metadata contract.
+// The tool's own `version` verb is the fact, asked here.
 func Path(env []string) (string, *exit.Error) {
 	path, err := exec.LookPath("cozy-runtime")
 	if err != nil {

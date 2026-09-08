@@ -59,11 +59,12 @@ func InstallToolEnv(inst records.PackageInstall, env []string) []string {
 // never imports it (cl-175). The install's own Runtime (Binary) is asked only for the
 // interface wheel its executor consumes.
 type RuntimeCLI struct {
-	Bin              string   // the binary selected for the question: hostruntime.Path for metadata, Binary(install) for interface-wheel
-	Dir              string   // the package project root
-	PackageInterface string   // exact published package interface; empty for editable/source installs
-	Home             string   // COZY_HOME the runtime reads its artifact index out of
-	Env              []string // the allowlisted child environment (config.Tool)
+	Bin               string   // the binary selected for the question: hostruntime.Path for metadata, Binary(install) for interface-wheel
+	Dir               string   // the package project root
+	EnvironmentPython string   // captured environment location for static source reads only
+	PackageInterface  string   // exact published package interface; empty for editable/source installs
+	Home              string   // COZY_HOME the runtime reads its artifact index out of
+	Env               []string // the allowlisted child environment (config.Tool)
 }
 
 // Binary is the runtime an install carries. The install transaction already refused a
@@ -91,6 +92,9 @@ func (r RuntimeCLI) callInputContext(ctx context.Context, input []byte, out any,
 		args = append(args, "--package-interface", r.PackageInterface)
 	}
 	args = append(args, verb...)
+	if len(verb) > 0 && verb[0] == "describe" && r.PackageInterface == "" && r.EnvironmentPython != "" {
+		args = append(args, "--environment-python", r.EnvironmentPython)
+	}
 	cmd := exec.CommandContext(ctx, r.Bin, args...)
 	if input != nil {
 		cmd.Stdin = bytes.NewReader(input) //cozy:stdin-value exact owner-supplied metadata for a noninteractive Runtime capability

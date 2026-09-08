@@ -41,6 +41,7 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 		PackageInterface: d,
 		RuntimeCLI: RuntimeCLI{
 			Dir: source, PackageInterface: packageInterface, Home: cozyHome, Env: env,
+			EnvironmentPython: home.VenvPython(filepath.Join(inst.Dir, "venv")),
 		},
 	}, nil
 }
