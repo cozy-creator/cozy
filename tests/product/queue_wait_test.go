@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -46,12 +47,27 @@ func TestQueueWaitCauses(t *testing.T) {
 		map[string]any{"n": 1}))
 	fatal(t, e)
 	fatal(t, o.c.AwaitAccepted(requestA, attemptA, 15*time.Second))
+	// Preparation may leave an old warming observation. Once an existing placement
+	// is busy, current capacity is the wait, even for a newly attached watcher.
+	o.c.ObservePhase(instance, orchestrator.PhaseSample{Name: orchestrator.PhaseWarming})
 	requestB, _, e := o.c.Submit(submission(planID, "fake/wait-lanes", "wait-lanes-b",
 		map[string]any{"n": 2}))
 	fatal(t, e)
 	queuedB := awaitDurable(t, o, requestB, "request.queued")
 	if queuedB.Payload["wait"] != "slot_busy" {
 		t.Errorf("B's queued wait = %v, want slot_busy while A holds the only seat", queuedB.Payload["wait"])
+	}
+	blockingA, problem := o.store.RequestByReference(requestA)
+	fatal(t, problem)
+	waitingFor, _ := queuedB.Payload["waiting_for"].(map[string]any)
+	if waitingFor["request_id"] != requestA || waitingFor["number"] != float64(blockingA.Number) {
+		t.Fatalf("B did not name the existing run occupying its lane: %v", queuedB.Payload)
+	}
+	o.c.ObservePhase(requestB, orchestrator.PhaseSample{Name: orchestrator.PhaseWarming})
+	phase, observed := o.c.QueuePhase(requestB)
+	if !observed || phase.Name != orchestrator.WaitSlotBusy || phase.WaitingFor == nil ||
+		phase.WaitingFor.RequestID != requestA || phase.WaitingFor.Number != blockingA.Number {
+		t.Fatalf("stale warming hid B's real queue wait: %+v", phase)
 	}
 	requestC, _, e := o.c.Submit(submission(planID, "fake/wait-lanes", "wait-lanes-c",
 		map[string]any{"n": 3}))

@@ -230,6 +230,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	} else {
 		fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down\n")
 	}
+	fmt.Fprintf(ctx.Out, "  claim: %s; this daemon stops if that record stops naming it\n", l.Daemon)
 
 	go func() { _ = http.Serve(v4, handler) }()
 	if v6 != nil {
@@ -253,6 +254,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	if ctx.Cfg.DaemonIdleShutdown > 0 {
 		go idle.run(quit)
 	}
+	// Unconditional, and deliberately not behind `daemon.idle_shutdown_s`: a root that
+	// stops carrying this daemon's claim has taken away every way to reach it or stop it.
+	go claimWatch{held: held, root: l.Root, managed: idle.managed, log: ctx.Out,
+		stop: func() { stop <- syscall.SIGTERM }}.run(quit)
 	if sweep, ok := newGCCron(ctx.Cfg, l, idle, ctx.Out); ok {
 		go sweep.run(quit)
 	}

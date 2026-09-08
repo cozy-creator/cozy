@@ -39,7 +39,6 @@ const (
 func TestSharedConstructionEntrypointsSwitchWithoutAPrepare(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
-	digest := func(name string) []byte { return sha256Of([]byte("entrypoint:" + name)) }
 	pod := &fakePod{controlKey: public, serve: true, slots: 2,
 		// The Runtime's own rule (package_prepare._entrypoints): an entrypoint is bound
 		// when every slot it declares is selected, so one binding per selected slot.
@@ -57,7 +56,7 @@ func TestSharedConstructionEntrypointsSwitchWithoutAPrepare(t *testing.T) {
 					Manifest: &pb.Ref{Digest: manifest, Length: 164}})
 				name := strings.TrimSuffix(row.Str("slot"), ".models.model")
 				placement.Entrypoints = append(placement.Entrypoints,
-					&pb.Entrypoint{Name: name, EntrypointBindingDigest: digest(name),
+					&pb.Entrypoint{Name: name,
 						Slots: []*pb.Slot{{Slot: "model", ReferenceModelId: id,
 							Components: []*pb.Component{{Component: "dit", ModelId: id}}}}})
 			}
@@ -98,9 +97,18 @@ func TestSharedConstructionEntrypointsSwitchWithoutAPrepare(t *testing.T) {
 		return spec.Sub("serving").Str("entrypoint_binding_digest")
 	}
 	spelled := func(name string) string {
-		out, err := canonical.Spell(digest(name))
+		pod.mu.Lock()
+		raw := append([]byte(nil), pod.preparedSet...)
+		pod.mu.Unlock()
+		set, err := canonical.Read(raw, &pb.PlacementSet{})
 		must(t, err)
-		return out
+		for _, entry := range set.List("placements")[0].List("entrypoints") {
+			if entry.Str("name") == name {
+				return entry.Str("entrypoint_binding_digest")
+			}
+		}
+		t.Fatalf("prepared set omitted %s", name)
+		return ""
 	}
 
 	submit(sharedFirst, sharedSecond)

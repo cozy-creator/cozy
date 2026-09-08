@@ -790,7 +790,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 	if reconcile {
 		count, burn, e = fleet.totals()
 	} else {
-		count, burn, e = st.RentalFleetTotals()
+		count, burn, e = fleet.cachedTotals()
 	}
 	if e != nil {
 		return output.List{}, e
@@ -858,6 +858,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"image": r.Failure.BaseWorkerImageDigest, "provider": r.Failure.Provider,
 			"provider resource": r.Failure.ProviderResourceID, "provider host": r.Failure.ProviderHostID,
 			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
+			"recorded": "yes",
 		})
 		typed := map[string]any{
 			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
@@ -890,11 +891,83 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		list.TypedFields = []string{"machine", "sku", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at", "failure_code"}
 	}
+	// THE HUB'S HALF (cl-199, on th-199). Everything above is what this host FILED, and
+	// the incident of 2026-09-07 is the gap between that and what the account is
+	// actually paying for: six H100 NVLs booting at $3.19/hour, none of them filed
+	// here, so this board — the one command a person types to ask what they are
+	// spending — showed an empty fleet. The hub is asked what it bills this account
+	// for, and any live rental with no local row is a row here, marked as such.
+	unrecorded, listed, listingProblem := fleet.unrecordedSnapshot()
+	hubNamed := map[string]bool{}
+	for _, seen := range unrecorded {
+		hubNamed[seen.ID], hubNamed[seen.Name] = true, true
+		list.Rows = append(list.Rows, map[string]string{
+			// The hub publishes no Cozy SKU NAME for a rental, only the accelerator it
+			// bought. The card is what the SKU column exists to tell a reader — the
+			// difference between an H100 and a 4090 is the difference between $3.19 and
+			// $0.74 an hour — so the cell carries the card rather than a dash.
+			"machine": seen.Name,
+			"sku":     orNone(acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount)),
+			"state":   seen.State,
+			"failure": "—", "uptime": rentalUptime(seen.CreatedAt),
+			"running": "0", "queued": "0", "idle": "—",
+			"rental": seen.ID, "bought for": "—",
+			"accelerator": acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount),
+			"address":     seen.Address, "media": seen.MediaAddress, "hub": ctx.Cfg.HubURL,
+			"rented": orNone(seen.CreatedAt), "ready": "—", "idle_since": "", "release_due": "",
+			"image": "", "provider": "", "provider resource": "", "provider host": "",
+			"provider state": seen.ProviderState, "container state": seen.ContainerState,
+			"recorded": "no",
+		})
+		typed := map[string]any{
+			"machine": seen.Name, "state": seen.State, "rental_id": seen.ID,
+			"running": 0, "queued": 0, "hourly_rate_usd_micros": seen.HourlyRateUSDMicros,
+			"accelerator_count": seen.AcceleratorCount, "recorded": false,
+		}
+		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,
+			"address": seen.Address, "media_address": seen.MediaAddress,
+			"hub": ctx.Cfg.HubURL, "rented_at": seen.CreatedAt} {
+			if value != "" {
+				typed[key] = value
+			}
+		}
+		list.TypedRows = append(list.TypedRows, typed)
+	}
+	if len(unrecorded) > 0 {
+		var unrecordedBurn int64
+		for _, seen := range unrecorded {
+			unrecordedBurn += seen.HourlyRateUSDMicros
+		}
+		// The column appears only when it separates two kinds of row, the way the
+		// FAILURE column does: a board of rentals this host filed says nothing by
+		// carrying a whole column of `yes`.
+		list.Fields = append(list.Fields, "recorded")
+		list.AllFields = append(list.AllFields, "recorded")
+		list.TypedFields = append(list.TypedFields, "recorded")
+		list.TypedAllFields = append(list.TypedAllFields, "recorded")
+		list.Lead = append(list.Lead, fmt.Sprintf(
+			"Machines this account is billed for that this host has no record of: %d (%s)",
+			len(unrecorded), usdPerHourBare(unrecordedBurn)))
+		list.Aggregates = append(list.Aggregates,
+			output.Field{K: "unrecorded_rentals", V: jsonFact{len(unrecorded)}},
+			output.Field{K: "unrecorded_hourly_spend_usd_micros", V: jsonFact{unrecordedBurn}})
+		list.Trail = append(list.Trail,
+			"an unrecorded machine cannot be attached here, but `cozy rental end <machine>` releases it")
+	}
+	switch {
+	case listingProblem != nil:
+		list.Trail = append(list.Trail, "the hub could not be asked what this account owns ("+
+			listingProblem.Message+"); this board shows only what this host recorded")
+	case !listed:
+		list.Trail = append(list.Trail, "this hub publishes no rental listing (th-199), so a machine "+
+			"this host never recorded cannot appear here at all")
+	}
+
 	// UNSETTLED PAID ASKS ARE PART OF THE FLEET (cl-193). A board built only from attached
 	// rows shows zero machines while an accepted ask provisions a pod that is billing, and
 	// that is not a display detail — it is the difference between noticing a runaway charge
-	// and finding it in the invoice. Creator cannot enumerate the hub's side, so it shows
-	// the asks it made and has not seen settled, which is the half it does own.
+	// and finding it in the invoice. An ask the hub has now NAMED is already a row above;
+	// what stays here is the half the hub could not or would not answer for.
 	open, e := st.ActiveRentalOperations()
 	if e != nil {
 		return output.List{}, e
@@ -911,10 +984,13 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 				continue
 			}
 		}
-		unattached++
 		var request hub.RentalRequest
 		_ = json.Unmarshal(op.RequestBody, &request)
 		machine := either(request.Name, op.Key)
+		if hubNamed[op.RentalID] || hubNamed[request.Name] {
+			continue
+		}
+		unattached++
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": machine, "sku": orNone(request.SKU), "state": op.State,
 			"failure": "—", "uptime": rentalUptime(op.CreatedAt), "running": "0", "queued": "0",
@@ -922,7 +998,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"accelerator": "—", "address": "", "media": "", "hub": op.Hub,
 			"rented": stamp(op.CreatedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": "", "provider": "", "provider resource": "", "provider host": "",
-			"provider state": "", "container state": "",
+			"provider state": "", "container state": "", "recorded": "yes",
 		})
 		typed := map[string]any{
 			"machine": machine, "state": op.State, "rental_id": op.RentalID,
@@ -944,8 +1020,6 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"Paid asks with no attached machine: %d (a pod may be provisioning and billing under each)", unattached))
 		list.Aggregates = append(list.Aggregates,
 			output.Field{K: "unattached_rental_operations", V: jsonFact{unattached}})
-		list.Trail = append(list.Trail,
-			"this host can only name the rentals it recorded; the hub publishes no list of the pods this account owns")
 	}
 	if len(list.Rows) > 0 {
 		list.Next = []string{"cozy rental end " + list.Rows[0]["machine"]}
@@ -1017,7 +1091,12 @@ func roughDuration(d time.Duration) string {
 // idleShutdownNote is the one sentence the rental list owes: what ends an idle machine.
 func idleShutdownNote(grace time.Duration) string {
 	if grace <= 0 {
-		return "Idle machines are never shut down automatically; end them with `cozy rental end`."
+		// The sentence used to read as a product stance. It is a CONFIG READOUT: the
+		// shipped default is 300 s, and this host has switched the policy off. Naming
+		// the setting is the difference between "that is how it works" and "that is how
+		// you set it up", and the reader is the person paying for the difference.
+		return "Idle machines are never shut down automatically (rentals.idle_release_s is 0); " +
+			"end them with `cozy rental end`."
 	}
 	return "Idle machines shut down after " + plainDuration(grace) + "."
 }
@@ -1111,6 +1190,35 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		}
 		known.RentalID = id
 	}
+	// THE HUB CAN NOW BE ASKED WHO OWNS WHAT (cl-199, on th-199). A machine word is
+	// Creator's own alias, so before this route existed an unrecorded name could not be
+	// looked up at all and the command could only refuse. The account listing turns the
+	// word back into the id the hub minted, which is what a DELETE takes — and it is the
+	// ONLY path to a pod whose local record was never written, was lost, or belongs to
+	// another host.
+	listed, listing := false, 0
+	if known.RentalID == "" {
+		hctx, cancel := hub.Context()
+		remote, published, problem := c.Rentals(hctx)
+		cancel()
+		if problem != nil {
+			return problem.WithRemedy("the hub could not be asked which rentals this account owns; " +
+				"a pod may still be billing under this name and nothing here has been changed")
+		}
+		listed, listing = published, len(remote)
+		for _, seen := range remote {
+			if seen.ID != subject && seen.Name != subject {
+				continue
+			}
+			known.RentalID = seen.ID
+			if known.Machine == "" {
+				known.Machine = seen.Name
+			}
+			fmt.Fprintf(ctx.Err, "  the hub bills this account for %s (%s); this host holds no record of it\n",
+				seen.Name, seen.ID)
+			break
+		}
+	}
 	id := known.RentalID
 	if id == "" {
 		// Nothing local matches. The caller may still be naming a hub id this host never
@@ -1130,11 +1238,23 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	if verdict == rentalAbsent && !known.Recorded() {
+		// A listing CHANGES what this refusal is entitled to say. Without one the 404 is
+		// a failed lookup and the honest answer is "I cannot tell"; with one the hub has
+		// enumerated every rental this account owns and none of them is this name, which
+		// is the proof of absence the whole verb was missing.
+		if listed {
+			return exit.Named(exit.NotFound, "rental.unknown",
+				"%s bills this account for %d rental(s) and none of them is %q",
+				c.Base(), listing, subject).
+				WithRemedy("`cozy rental list` names every machine this account is billed for; "+
+					"nothing is billing under this name").
+				WithNext("cozy rental list")
+		}
 		return exit.Named(exit.NotFound, "rental.unknown",
 			"this host holds no record of %q and %s answered 404 for that exact key", subject, c.Base()).
 			WithRemedy("that 404 is not proof the machine is gone: the hub identifies a rental by the opaque id it "+
 				"minted, which a machine word is not, so an unrecorded name cannot be looked up at all. "+
-				"Name the rental id, or have the hub list the rentals this account owns").
+				"This hub publishes no rental listing (th-199), so name the rental id instead").
 			WithNext("cozy rental", "cozy rental end <rental-id>")
 	}
 	if problem := st.RequestRetainedRentalAbandonment(id, "cozy rental end"); problem != nil {

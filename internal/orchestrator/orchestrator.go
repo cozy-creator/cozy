@@ -826,7 +826,11 @@ func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, 
 	lanes := r.lanes
 	sort.Slice(lanes, func(i, j int) bool { return lanes[i].String() < lanes[j].String() })
 	p.lanes = lanes
-	state := fmt.Sprintf("%s|%s|%s|%s|%t", reason, facts.cause, facts.on, laneStrings(lanes), p.claims())
+	blocking := ""
+	if facts.waitingFor != nil {
+		blocking = facts.waitingFor.RequestID
+	}
+	state := fmt.Sprintf("%s|%s|%s|%s|%t|%s", reason, facts.cause, facts.on, laneStrings(lanes), p.claims(), blocking)
 	changed := state != p.logged
 	p.logged = state
 	overtaken, budget, claims := p.overtaken, p.budget, p.claims()
