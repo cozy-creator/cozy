@@ -56,7 +56,7 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		return
 	case "queued", "parked":
 		// A queue heartbeat has less detail than the live preparation phase.
-		if strings.HasPrefix(p.terminal.key, "phase:") {
+		if strings.HasPrefix(p.terminal.key, "phase:") || strings.HasPrefix(p.terminal.key, "stage:") {
 			return
 		}
 		key = "wait"
@@ -239,6 +239,9 @@ func (p *RunProgress) eraseLive() {
 			physical += max(1, (cells+columns-1)/columns)
 		}
 	}
+	if height := terminalHeight(p.ctx.Err); height > 0 {
+		physical = min(physical, height)
+	}
 	if physical > 1 {
 		fmt.Fprintf(p.ctx.Err, "\033[%dA", physical-1)
 	}
@@ -248,6 +251,10 @@ func (p *RunProgress) eraseLive() {
 
 func (p *RunProgress) drawLive() {
 	rows := p.visibleRows()
+	if height := terminalHeight(p.ctx.Err); height > 1 && len(rows) >= height {
+		visible := max(1, height-2)
+		rows = append(rows[:visible], fmt.Sprintf("    … %d more rows", len(rows)-visible))
+	}
 	if len(rows) == 0 {
 		return
 	}

@@ -63,7 +63,7 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 	p.On(frame(0.50, 0.10, 50))
 	if got := buf.String(); !strings.Contains(got, "overall") ||
 		!strings.Contains(got, "tile_steps 50/100") || !strings.Contains(got, "50% stage") ||
-		strings.Contains(got, "ETA") {
+		strings.Contains(got, "overall 10% · ETA") {
 		t.Fatalf("first progress sample conflated stage and overall facts: %q", got)
 	}
 	p.On(frame(0.60, 0.20, 60))
