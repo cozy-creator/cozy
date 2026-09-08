@@ -53,10 +53,10 @@ func ValidateSubmission(spec orchestrator.Submission) *exit.Error {
 		// identities to the Hub's closure union measurement, for jobs as well
 		// as serving. Private operation-local manifests have no such authority.
 		for _, model := range spec.Models {
-			if !model.Published() {
+			if !model.Downloadable() {
 				return exit.Named(exit.Validation, "model_transfer.prepared_rental_required",
-					"unpublished model inputs require an explicitly selected prepared rental").
-					WithRemedy("use published model references so Tensorhub can measure their closures before renting")
+					"operation-local model inputs require an explicitly selected prepared rental").
+					WithRemedy("use Hub-resolved checkpoints so Tensorhub can measure their closures before renting")
 			}
 		}
 	}

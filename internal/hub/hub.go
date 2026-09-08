@@ -202,12 +202,13 @@ type ModelCard struct {
 func (r Resource) Ref() string { return r.Org + "/" + r.Name }
 
 type call struct {
-	method    string
-	path      string
-	body      any
-	bodyBytes []byte // exact caller-persisted JSON; never re-marshaled on replay
-	auth      bool   // carries the configured operator token or a short user token
-	reason    string // X-Tensorhub-Reason; the hub refuses a mutation without one
+	method       string
+	path         string
+	body         any
+	bodyBytes    []byte // exact caller-persisted JSON; never re-marshaled on replay
+	auth         bool   // carries the configured operator token or a short user token
+	optionalAuth bool   // checkpoint reads use available credentials without requiring login
+	reason       string // X-Tensorhub-Reason; the hub refuses a mutation without one
 	// idempotency is the caller-owned operation identity for a paid mutation. It is
 	// distinct from Tensorhub's provider operation id and survives a lost HTTP answer.
 	idempotency string
@@ -350,11 +351,14 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 
 func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error) {
 	token := c.token
-	if cl.auth && c.tokens != nil {
+	if (cl.auth || cl.optionalAuth) && c.tokens != nil {
 		userToken, problem := c.tokens.AccessToken(ctx)
 		switch {
 		case problem == nil:
 			token = userToken
+		case cl.optionalAuth && problem.ErrName() == "auth.machine_key_missing":
+			// A signed-out checkpoint reader needs no credential. An explicitly
+			// configured operator token, if present, still takes its existing path.
 		case !token.Present() || problem.ErrName() != "auth.machine_key_missing":
 			return 0, problem
 		}
@@ -395,7 +399,7 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 	if cl.idempotency != "" {
 		req.Header.Set("Idempotency-Key", cl.idempotency)
 	}
-	if cl.auth {
+	if (cl.auth || cl.optionalAuth) && token.Present() {
 		// The ONE raw read of the credential in this binary. It goes into a header on
 		// a request and nowhere else: not a log line, not a record, not a rendering.
 		req.Header.Set("Authorization", "Bearer "+token.Reveal())

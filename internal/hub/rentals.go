@@ -275,9 +275,9 @@ func RentalRequestBytes(name, sku, mediaTokenSHA256, creatorPublicKey string,
 			"a rental declares at most %d serving models", maxServingModels)
 	}
 	for _, model := range req.ServingModels {
-		if model.Model == "" || model.Release == "" || model.Manifest == "" {
+		if model.Model == "" || model.Manifest == "" || model.Release == "" && model.Lane != "" {
 			return nil, exit.Named(exit.Validation, "rental.serving_model_incomplete",
-				"a declared serving model pins a model, a release and a manifest")
+				"a declared serving model pins a model and an exact manifest; a lane requires a release")
 		}
 	}
 	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)

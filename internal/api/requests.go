@@ -254,6 +254,22 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 // submissionDigest is the canonical identity of one submission. It uses the SAME writer
 // the protocol documents use, so the digest a client can reproduce is the digest the
 // authority recorded.
+func assetIdentity(bindings []records.AssetBinding) []canonical.Value {
+	bindings = append([]records.AssetBinding(nil), bindings...)
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].FieldPath < bindings[j].FieldPath })
+	assets := make([]canonical.Value, 0, len(bindings))
+	for _, asset := range bindings {
+		assets = append(assets, map[string]canonical.Value{
+			"field_path": asset.FieldPath,
+			"digest":     asset.Digest,
+			"length":     asset.Length,
+			"media_type": asset.MediaType,
+			"order":      int64(asset.Order),
+		})
+	}
+	return assets
+}
+
 func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	doc := map[string]canonical.Value{
 		"kind":       "serve",
@@ -264,16 +280,7 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"input":      base64.StdEncoding.EncodeToString(spec.Payload),
 		"outputs":    strings.Join(spec.Outputs, ","),
 	}
-	assets := make([]canonical.Value, 0, len(spec.Assets))
-	for _, asset := range spec.Assets {
-		assets = append(assets, map[string]canonical.Value{
-			"field_path": asset.FieldPath,
-			"digest":     asset.Digest,
-			"length":     asset.Length,
-			"media_type": asset.MediaType,
-			"order":      int64(asset.Order),
-		})
-	}
+	assets := assetIdentity(spec.Assets)
 	if len(assets) > 0 {
 		doc["assets"] = assets
 	}
@@ -564,7 +571,7 @@ func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission)
 	}
 	for index := range out.Assets {
 		asset := &out.Assets[index]
-		assetSpec, ok := launch.AssetSpec(entrypoint, asset.FieldPath)
+		assetSpec, ok := launch.AssetSpecForMedia(entrypoint, asset.FieldPath, asset.MediaType)
 		if !ok || assetSpec.MaxBytes <= 0 || asset.Length > assetSpec.MaxBytes {
 			return exit.Named(exit.Validation, "input_asset_bound",
 				"input asset %s is %d B and its pinned field admits %d B",
@@ -577,7 +584,7 @@ func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission)
 		}
 		asset.MaxBytes = assetSpec.MaxBytes
 	}
-	return nil
+	return launch.ValidateAssetCounts(entrypoint, out.Assets)
 }
 
 func placementPlan(placement orchestrator.DesiredPlacement, function string) (string, []string, *exit.Error) {

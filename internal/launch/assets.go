@@ -2,6 +2,8 @@ package launch
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -12,30 +14,55 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// ParseAssets turns repeated `--asset <field-path>=<file>` flags into one payload plus
-// exact byte bindings. The payload carries only an opaque content reference; paths and
+// ParseAssets resolves files and label=file occurrences in a declared Assets slot,
+// or explicit field-path=file bindings, into one payload plus exact byte bindings.
+// The payload carries only an opaque content reference; paths and
 // bytes travel out-of-band through DeliveryGrant. A nested path is resolved against the
 // package's recorded schema, so `references.0.image` cannot accidentally grant a file
 // to a scalar or to a misspelled field.
-func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.RawMessage, []records.AssetBinding, *exit.Error) {
-	if len(specs) == 0 {
+func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []string) (json.RawMessage, []records.AssetBinding, *exit.Error) {
+	if len(specs) == 0 && len(fidelities) == 0 && ep.Assets == nil {
 		return payload, nil, nil
 	}
 	var document map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(payload)))
 	decoder.UseNumber()
-	if err := decoder.Decode(&document); err != nil {
+	if err := decoder.Decode(&document); err != nil || document == nil {
 		return nil, nil, exit.Internalf("cannot add input assets to the payload: %s", err)
 	}
+	if ep.Assets != nil {
+		if _, present := document[ep.Assets.Parameter]; !present {
+			document[ep.Assets.Parameter] = []any{}
+		}
+	}
 
+	if problem := preflightAssetCount(ep, document, specs); problem != nil {
+		return nil, nil, problem
+	}
 	seen := map[string]bool{}
-	assets := make([]records.AssetBinding, 0, len(specs))
+	type pendingAsset struct {
+		fieldPath, source string
+		parts             []string
+	}
+	pending := make([]pendingAsset, 0, len(specs))
 	for _, spec := range specs {
-		fieldPath, source, ok := strings.Cut(spec, "=")
+		fieldPath, source, label, explicit := splitAssetArgument(ep, spec)
+		if !explicit {
+			if ep.Assets == nil {
+				return nil, nil, exit.Usagef("%s declares no Assets input for --asset %q", ep.Name, spec).
+					WithRemedy("use --asset <field-path>=<file> for a named payload asset")
+			}
+			values, _ := document[ep.Assets.Parameter].([]any)
+			fieldPath = fmt.Sprintf("%s.%d.asset", ep.Assets.Parameter, len(values))
+			entry := map[string]any{}
+			if label != "" {
+				entry["label"] = label
+			}
+			document[ep.Assets.Parameter] = append(values, entry)
+		}
 		fieldPath, source = strings.TrimSpace(fieldPath), strings.TrimSpace(source)
-		if !ok || fieldPath == "" || source == "" {
-			return nil, nil, exit.Usagef("--asset %q is not <field-path>=<file>", spec).
-				WithRemedy("examples: `--asset first_frame=frame.png` or `--asset references.0.image=ref.jpg`")
+		if fieldPath == "" || source == "" {
+			return nil, nil, exit.Usagef("--asset %q needs a file", spec)
 		}
 		parts, e := assetPath(fieldPath)
 		if e != nil {
@@ -64,12 +91,42 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 				"%s.%s is not an asset field in this release's request schema", ep.Name, fieldPath).
 				WithRemedy("the installed package.package-interface.json declares %s's request schema", ep.Name)
 		}
+		if ep.Assets.contains(parts) {
+			values := document[ep.Assets.Parameter].([]any)
+			index, _ := strconv.Atoi(parts[1])
+			for len(values) <= index {
+				values = append(values, nil)
+			}
+			if values[index] == nil {
+				values[index] = map[string]any{}
+			}
+			document[ep.Assets.Parameter] = values
+		}
+		pending = append(pending, pendingAsset{fieldPath, source, parts})
+	}
+	if problem := applyAssetFidelity(ep, document, fidelities); problem != nil {
+		return nil, nil, problem
+	}
+	assets := make([]records.AssetBinding, 0, len(pending))
+	for _, item := range pending {
+		fieldPath, source, parts := item.fieldPath, item.source, item.parts
 		assetSpec, _ := AssetSpec(ep, fieldPath)
 		maxBytes := assetSpec.MaxBytes
 		if maxBytes <= 0 {
 			maxBytes = inputasset.MaxBytes
 		}
 
+		if source == "~" || strings.HasPrefix(source, "~/") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset home: %s", err)
+			}
+			if source == "~" {
+				source = home
+			} else {
+				source = filepath.Join(home, strings.TrimPrefix(source, "~/"))
+			}
+		}
 		absolute, err := filepath.Abs(source)
 		if err != nil {
 			return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset %s: %s", source, err)
@@ -78,10 +135,15 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 		if e != nil {
 			return nil, nil, e
 		}
-		if !assetSpec.AcceptsMediaType(mediaType) {
+		selected, admitted := AssetSpecForMedia(ep, fieldPath, mediaType)
+		if !admitted || !selected.AcceptsMediaType(mediaType) {
 			return nil, nil, exit.New(exit.Validation,
 				"%s.%s accepts media types [%s], not %q",
 				ep.Name, fieldPath, strings.Join(assetSpec.MediaTypes, ", "), mediaType)
+		}
+		maxBytes = effectiveAssetMax(selected.MaxBytes)
+		if length > maxBytes {
+			return nil, nil, exit.Named(exit.Validation, "input_asset_bound", "input asset %s is %d B; its media policy permits %d B", fieldPath, length, maxBytes)
 		}
 		if e := setAssetRef(document, parts, digest); e != nil {
 			return nil, nil, e
@@ -91,12 +153,32 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 			Length: length, MediaType: mediaType, Order: pathOrder(parts), MaxBytes: maxBytes,
 		})
 	}
+	if problem := ValidateAssetCounts(ep, assets); problem != nil {
+		return nil, nil, problem
+	}
 	sort.Slice(assets, func(i, j int) bool { return assets[i].FieldPath < assets[j].FieldPath })
 	rendered, err := json.Marshal(document)
 	if err != nil {
 		return nil, nil, exit.Internalf("cannot render the payload with input assets: %s", err)
 	}
 	return rendered, assets, nil
+}
+
+// Explicit path syntax wins over label/field assignment, so a=b.png stays a
+// filename in /refs/a=b.png, ~/refs/a=b.png or ./refs/a=b.png.
+func splitAssetArgument(ep *Entrypoint, spec string) (field, source, label string, named bool) {
+	if filepath.IsAbs(spec) || spec == "~" || strings.HasPrefix(spec, "~/") ||
+		strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") {
+		return "", spec, "", false
+	}
+	field, source, named = strings.Cut(spec, "=")
+	if !named {
+		return "", spec, "", false
+	}
+	if ep.Assets == nil || namedAssetSpec(ep, field) {
+		return field, source, "", true
+	}
+	return "", source, field, false
 }
 
 // LegacyFileTerm returns the first `key=@file` payload term. That spelling embeds bytes
@@ -154,6 +236,9 @@ func AssetSpec(ep *Entrypoint, path string) (AssetField, bool) {
 	parts, problem := assetPath(path)
 	if problem != nil {
 		return AssetField{}, false
+	}
+	if ep.Assets.contains(parts) {
+		return AssetField{Kind: "file", MaxBytes: ep.Assets.maxBytes()}, true
 	}
 	return assetSpecAt(ep.Request, parts, AssetField{})
 }

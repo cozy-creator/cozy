@@ -30,6 +30,8 @@ const (
 	fp8Manifest  = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	mxfpManifest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	bf16Manifest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	// fp8LaterManifest is the fp8 lane of the sized 1.0.0-rc.2 release (cl-174).
+	fp8LaterManifest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	// textEncoderNeed is the largest group any H3 method holds resident: the text
 	// conditioning's 51.5 GiB encoder. Every DiT sample holds one ~20 GiB DiT.
 	textEncoderNeed    = 103 * gib / 2

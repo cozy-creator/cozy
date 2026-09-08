@@ -55,10 +55,6 @@ func InheritChildAssets(ep *Entrypoint, payload []byte, parent []records.AssetBi
 		if _, err := canonical.Raw(digest); !ok || err != nil {
 			return nil, exit.Named(exit.Conflict, "child.asset_ungranted", "child media needs a verified immutable input reference")
 		}
-		spec, ok := AssetSpec(ep, path)
-		if !ok {
-			return nil, exit.New(exit.Validation, "child media field has no declared asset contract")
-		}
 		var owned *records.AssetBinding
 		for i := range parent {
 			if parent[i].Digest == digest {
@@ -68,6 +64,10 @@ func InheritChildAssets(ep *Entrypoint, payload []byte, parent []records.AssetBi
 		}
 		if owned == nil {
 			return nil, exit.Named(exit.Conflict, "child.asset_ungranted", "child media was not granted to the parent")
+		}
+		spec, ok := AssetSpecForMedia(ep, path, owned.MediaType)
+		if !ok {
+			return nil, exit.New(exit.Validation, "child media field has no matching media contract")
 		}
 		maximum := spec.MaxBytes
 		if maximum <= 0 {
@@ -82,6 +82,9 @@ func InheritChildAssets(ep *Entrypoint, payload []byte, parent []records.AssetBi
 		bound := *owned
 		bound.FieldPath, bound.Order, bound.MaxBytes = path, pathOrder(parts), maximum
 		result = append(result, bound)
+	}
+	if problem := ValidateAssetCounts(ep, result); problem != nil {
+		return nil, problem
 	}
 	return result, nil
 }
