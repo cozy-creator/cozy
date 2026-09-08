@@ -1,0 +1,94 @@
+[
+  {
+    "name": "qwen2b",
+    "source": "Qwen/Qwen3-VL-2B-Instruct@89644892e4d85e24eaac8bacfd4f463576704203",
+    "component": "judge",
+    "profile": "hf/qwen/qwen3-vl-2b-instruct/bf16/1",
+    "carrier": "model.safetensors",
+    "logical_keys": 625,
+    "construction_order_sha256": "3a85ce792ffdfa43fcdc6bd1c89ddcc5c40c8570f9c2a2922b81d68987cb0110",
+    "constructor_provenance": "cozy-eval 0.4.0 instrument factory; transformers 5.16.1; torch 2.13.0; meta state_dict order filtered to observed source keys",
+    "members": [
+      {
+        "member": "model.safetensors",
+        "header_file": "qwen2b/model.safetensors.header",
+        "header_sha256": "4eb2d23447e8d842b0543252b4a2493798d40020c8e140334f57dd162626ca9a",
+        "header_bytes": 76248,
+        "full_length": 4255140312,
+        "declared_source_sha256": "7de1838c87a5349b016c26a1c3f7d2bc400a3d485f95ef39a7059ffd734977a0"
+      }
+    ]
+  },
+  {
+    "name": "qwen8b",
+    "source": "Qwen/Qwen3-VL-8B-Instruct@0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+    "component": "judge",
+    "profile": "hf/qwen/qwen3-vl-8b-instruct/bf16/1",
+    "carrier": "model.safetensors.index.json",
+    "logical_keys": 750,
+    "construction_order_sha256": "9291df06726e5e88c59c582d7f7f83095a9c421235f4bed4ce3ecf0c9c5e3800",
+    "constructor_provenance": "cozy-eval 0.4.0 instrument factory; transformers 5.16.1; torch 2.13.0; meta state_dict order filtered to observed source keys",
+    "members": [
+      {
+        "member": "model-00001-of-00004.safetensors",
+        "header_file": "qwen8b/model-00001-of-00004.safetensors.header",
+        "header_sha256": "b9b83a003ea2d2484cfe2374eacec42fcc20d891b4977be0b53d48fc848b8911",
+        "header_bytes": 14184,
+        "full_length": 4902275944,
+        "declared_source_sha256": "d5d0aef0eb170fc7453a296c43c0849a56f510555d3588e4fd662bb35490aefa"
+      },
+      {
+        "member": "model-00002-of-00004.safetensors",
+        "header_file": "qwen8b/model-00002-of-00004.safetensors.header",
+        "header_sha256": "6a40ab3b0c83ac0ce78e72e995196963a61b0d7627866444f17f3fcfde73bcba",
+        "header_bytes": 18560,
+        "full_length": 4915962496,
+        "declared_source_sha256": "8be88fb5501e4d5719a6d4cc212e6a13480330e74f3e8c77daa1a68f199106b5"
+      },
+      {
+        "member": "model-00003-of-00004.safetensors",
+        "header_file": "qwen8b/model-00003-of-00004.safetensors.header",
+        "header_sha256": "171500ab310ca09e09ed1b533d5e9375ff194462db4a4f1c72155c0cc769b4b4",
+        "header_bytes": 17928,
+        "full_length": 4999831048,
+        "declared_source_sha256": "83de00eafe6e0d57ccd009dbcf71c9974d74df2f016c27afb7e95aafd16b2192"
+      },
+      {
+        "member": "model-00004-of-00004.safetensors",
+        "header_file": "qwen8b/model-00004-of-00004.safetensors.header",
+        "header_sha256": "19830de02eafb80d0862c5e882c3fc4fe4846174bba5f4b670684eed918738f6",
+        "header_bytes": 41448,
+        "full_length": 2716270024,
+        "declared_source_sha256": "0a88b98e9f96270973f567e6a2c103ede6ccdf915ca3075e21c755604d0377a5"
+      },
+      {
+        "member": "model.safetensors.index.json",
+        "header_file": "qwen8b/model.safetensors.index.json",
+        "header_sha256": "520b2e05079402e9468a8701d03d1154d14b2599593afb6effa7fb60c1bff070",
+        "header_bytes": 67759,
+        "full_length": 67759,
+        "declared_source_sha256": "520b2e05079402e9468a8701d03d1154d14b2599593afb6effa7fb60c1bff070"
+      }
+    ]
+  },
+  {
+    "name": "whisper",
+    "source": "openai/whisper-small@973afd24965f72e36ca33b3055d56a652f456b4d",
+    "component": "asr",
+    "profile": "hf/openai/whisper-small/f32/1",
+    "carrier": "model.safetensors",
+    "logical_keys": 479,
+    "construction_order_sha256": "da89b46ba706282037e27fa83c7c5e1aecdbde770872265c27726e8efd67d1c4",
+    "constructor_provenance": "cozy-eval 0.4.0 instrument factory; transformers 5.16.1; torch 2.13.0; meta state_dict order filtered to observed source keys",
+    "members": [
+      {
+        "member": "model.safetensors",
+        "header_file": "whisper/model.safetensors.header",
+        "header_sha256": "918322850d76fa8260924036aca82f00f308d56e63c542a5150ee0b98f45a534",
+        "header_bytes": 55432,
+        "full_length": 966995080,
+        "declared_source_sha256": "1d7734884874f1a1513ed9aa760a4f8e97aaa02fd6d93a3a85d27b2ae9ca596b"
+      }
+    ]
+  }
+]
