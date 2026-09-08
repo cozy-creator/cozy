@@ -27,14 +27,15 @@ func (c *Orchestrator) nativeServingModels(request records.Request) ([]*pb.Nativ
 	}
 	bindings := make([]*pb.NativeModelBinding, 0, len(request.Models))
 	for _, model := range request.Models {
+		inputSlot := "result/" + model.Slot // childArtifacts uses one rooted JSON path for its custody rows.
 		var source *pb.DerivedRetentionRequest
 		for _, held := range native {
-			if held.Kind == "input" && held.Slot == model.Slot && held.State == "held" && held.ArtifactKind == "derived" && held.ManifestID == model.Manifest && held.ManifestLength == model.ManifestLength {
+			if held.Kind == "input" && held.Slot == inputSlot && held.State == "held" && held.ArtifactKind == "derived" && held.ManifestID == model.Manifest && held.ManifestLength == model.ManifestLength {
 				source = nativeTransferSource(held)
 			}
 		}
 		for _, held := range weights {
-			if held.Kind != "input" || held.Slot != model.Slot || held.State != "held" {
+			if held.Kind != "input" || held.Slot != inputSlot || held.State != "held" {
 				continue
 			}
 			output, problem := c.opt.Store.ModelTransferWeights(held.ProducerRequestID, held.ProducerAttempt, held.ProducerOutputSlot)
