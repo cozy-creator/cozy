@@ -100,8 +100,13 @@ func (s *Store) AdoptCachedOperation(id string, cached CachedOperation) *exit.Er
 		}
 	}
 
+	seenBytes := map[string]bool{}
 	for _, h := range cached.ByteRetentions {
-		if h.ConsumerID != request.ID || h.ParentRequestID != request.ParentRequestID || h.Kind != "result" || h.ArtifactKind != "tree" || h.ProducerID != source.ID || h.ProducerAttempt != cached.SourceAttempt || h.Slot != h.ProducerOutputID || h.InstanceID == "" || h.WorkerBootID == "" || h.State != "held" {
+		if seenBytes[h.ProducerOutputID] {
+			return exit.New(exit.Validation, "cached byte output was repeated")
+		}
+		seenBytes[h.ProducerOutputID] = true
+		if h.ConsumerID != request.ID || h.ParentRequestID != request.ParentRequestID || h.Kind != "result" || h.ArtifactKind != "tree" || h.ProducerID != source.ID || h.ProducerAttempt != cached.SourceAttempt || h.Slot != h.ProducerOutputID || h.OwnerRequestID != source.ID || h.OwnerWorker != request.Worker || h.InstanceID == "" || h.WorkerBootID == "" || h.State != "held" {
 			return exit.New(exit.Validation, "cached byte recipient differs from exact request and producer")
 		}
 		b, err := scanByteOutput(tx.QueryRow(`SELECT `+byteOutputCols+` FROM byte_outputs WHERE request_id=? AND attempt=? AND output_id=?`, h.ProducerID, h.ProducerAttempt, h.ProducerOutputID))
