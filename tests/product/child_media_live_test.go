@@ -14,15 +14,30 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/pelletier/go-toml/v2"
 )
 
 var privateChildEvalWheel = flag.String("child-eval-wheel", "", "exact Cozy Eval wheel for managed scoring transport")
 
+var privateChildEvalSource = flag.String("child-eval-source", "", "actual editable Cozy Eval project for selected managed-extra capture")
+
+func TestPrivateChildEvalManagedExtraUsesDirectEditableLibrary(t *testing.T) {
+	if *privateChildEvalSource == "" {
+		t.Skip("requires actual editable Cozy Eval project")
+	}
+	privateChildMediaProof(t, *privateChildEvalSource)
+}
+
 // Real Creator, independent executors, generated interface wheel, staged input
 // custody and completed memo lookup; no synthetic control peer.
 func TestPrivateChildMediaUsesExistingInputGrantsAndMemo(t *testing.T) {
-	if *privateChildRuntimeWheel == "" || *privateChildEvalWheel == "" {
+	privateChildMediaProof(t, "")
+}
+
+func privateChildMediaProof(t *testing.T, directSource string) {
+	if *privateChildRuntimeWheel == "" || (directSource == "" && *privateChildEvalWheel == "") {
 		t.Skip("requires candidate Runtime and Cozy Eval wheels")
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
@@ -80,13 +95,42 @@ build-backend="hatchling.build"
 only-include=[%q]
 `, name, version, extra, wheel, sources, module+":app", module+".py")
 	}
-	evalWheel, err := filepath.Abs(*privateChildEvalWheel)
-	must(t, err)
-	evalVersion := strings.Split(filepath.Base(evalWheel), "-")[1]
-	write(child, "pyproject.toml", metadata("private-media-scorer", "scorer", `,"cozy-eval==`+evalVersion+`"`, "cozy-eval={path="+strconv.Quote(evalWheel)+"}"))
-	write(child, "package.toml", "[application]\nobject=\"scorer:app\"\n")
-	write(child, "scorer.py", "from cozy_eval.operations import app\n")
-	write(project, "pyproject.toml", metadata("private-media-parent", "parent", `,"private-media-scorer==0.1.0"`, "private-media-scorer={path=\"./child\"}"))
+	var sourceMetadata []byte
+	if directSource != "" {
+		_, files, problem := packagepublish.LibrarySourceTree(directSource)
+		fatal(t, problem)
+		for name, source := range files {
+			destination := filepath.Join(child, filepath.FromSlash(name))
+			must(t, os.MkdirAll(filepath.Dir(destination), 0700))
+			raw, err := os.ReadFile(source)
+			must(t, err)
+			must(t, os.WriteFile(destination, raw, 0600))
+		}
+		sourceMetadata, err = os.ReadFile(filepath.Join(child, "pyproject.toml"))
+		must(t, err)
+		var parsed struct {
+			Project struct {
+				Version string `toml:"version"`
+			} `toml:"project"`
+		}
+		must(t, toml.Unmarshal(sourceMetadata, &parsed))
+		write(project, "pyproject.toml", metadata("private-media-parent", "parent", `,"cozy-eval[managed]==`+parsed.Project.Version+`"`, `cozy-eval={path="./child"}`))
+		base := filepath.Join(t.TempDir(), "base")
+		uv("venv", base, "--python", "3.12")
+		uv("pip", "install", "--python", filepath.Join(base, "bin", "python"), child)
+		check := exec.Command(filepath.Join(base, "bin", "python"), "-I", "-c", `import sys;from importlib.metadata import distributions;import cozy_eval;assert 'cozy_runtime' not in sys.modules;assert not any(d.metadata['Name']=='cozy-runtime' for d in distributions())`)
+		if out, err := check.CombinedOutput(); err != nil {
+			t.Fatalf("base library imported Runtime: %v %s", err, out)
+		}
+	} else {
+		evalWheel, err := filepath.Abs(*privateChildEvalWheel)
+		must(t, err)
+		evalVersion := strings.Split(filepath.Base(evalWheel), "-")[1]
+		write(child, "pyproject.toml", metadata("private-media-scorer", "scorer", `,"cozy-eval==`+evalVersion+`"`, "cozy-eval={path="+strconv.Quote(evalWheel)+"}"))
+		write(child, "package.toml", "[application]\nobject=\"scorer:app\"\n")
+		write(child, "scorer.py", "from cozy_eval.operations import app\n")
+		write(project, "pyproject.toml", metadata("private-media-parent", "parent", `,"private-media-scorer==0.1.0"`, "private-media-scorer={path=\"./child\"}"))
+	}
 	write(project, "package.toml", "[application]\nobject=\"parent:app\"\n")
 	write(project, "parent.py", `import msgspec
 from typing import Annotated
@@ -106,7 +150,9 @@ async def run(ctx:Context,payload:Request)->ScoreResult:
 			t.Fatalf("cozy %s [%d]: %s", strings.Join(args, " "), code, out)
 		}
 	}
-	uv("lock", "--project", child)
+	if directSource == "" {
+		uv("lock", "--project", child)
+	}
 	uv("lock", "--project", project)
 	run("package", "install", project, "--editable", "--json")
 	imagePath := filepath.Join(t.TempDir(), "input.png")
@@ -143,4 +189,12 @@ async def run(ctx:Context,payload:Request)->ScoreResult:
 			t.Fatalf("changed media reused an old score: %+v", children[0])
 		}
 	}
+	if directSource != "" {
+		actual, err := os.ReadFile(filepath.Join(child, "pyproject.toml"))
+		must(t, err)
+		if !bytes.Equal(actual, sourceMetadata) {
+			t.Fatal("managed capture mutated original editable pyproject")
+		}
+	}
+
 }

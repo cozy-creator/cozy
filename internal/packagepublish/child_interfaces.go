@@ -26,12 +26,16 @@ func WithChildInterfaces(ctx context.Context, parent *Package, replacements map[
 
 // Both ordinary private dependency resolution and interface substitution use
 // the same bounded source capture, path rebasing and uv resolver.
-func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[string]string) (*Package, *exit.Error) {
-	dependencies, problem := LocalDependencyPaths(parent.Tree)
+func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[string]string, extras ...string) (*Package, *exit.Error) {
+	extras, problem := normalizedExtras(extras)
 	if problem != nil {
 		return nil, problem
 	}
-	before, _, _, problem := parent.SourceIdentity()
+	dependencies, problem := LocalDependencySelections(parent.Tree, extras...)
+	if problem != nil {
+		return nil, problem
+	}
+	before, _, _, problem := parent.SourceIdentity(extras...)
 	if problem != nil {
 		return nil, problem
 	}
@@ -65,7 +69,7 @@ func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[s
 	}
 	// Read the copied bytes with the original dependency base before rebasing.
 	// An edit that is reverted during copying still cannot produce a mixed copy.
-	copied, _, _, problem := captured.SourceIdentity()
+	copied, _, _, problem := captured.SourceIdentity(extras...)
 	if problem != nil || copied != before {
 		return fail(exit.New(exit.Conflict, "parent source or dependency changed during interface capture"))
 	}
@@ -86,10 +90,51 @@ func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[s
 		}
 		return value
 	}
+	if len(extras) > 0 {
+		source, problem := readProjectDocument(filepath.Join(parent.Tree, "pyproject.toml"))
+		if problem != nil {
+			return fail(problem)
+		}
+		requirements := append([]string(nil), source.Project.Dependencies...)
+		optional, problem := selectedExtraRequirements(source, extras)
+		if problem != nil {
+			return fail(problem)
+		}
+		requirements = append(requirements, optional...)
+		nested(document, "project")["dependencies"] = requirements
+	}
 	uv := nested(nested(document, "tool"), "uv")
 	sources := nested(uv, "sources")
+	// uv lock resolves every optional group, including inactive ones. Preserve
+	// those declared source locations when the root project moves into its copy.
+	metadata, problem := readProjectDocument(filepath.Join(parent.Tree, "pyproject.toml"))
+	if problem != nil {
+		return fail(problem)
+	}
+	declared, problem := localSources(metadata)
+	if problem != nil {
+		return fail(problem)
+	}
+	for name, source := range declared {
+		path := source.path
+		if source.workspace {
+			path, problem = workspaceMember(parent.Tree, name)
+			if problem != nil {
+				return fail(problem)
+			}
+		} else if path != "" && !filepath.IsAbs(path) {
+			path = filepath.Join(parent.Tree, path)
+		}
+		if path != "" {
+			canonical, problem := canonicalLocalPath(path)
+			if problem != nil {
+				return fail(problem)
+			}
+			sources[name] = map[string]any{"path": canonical}
+		}
+	}
 	for name, path := range dependencies {
-		sources[name] = map[string]any{"path": path}
+		sources[name] = map[string]any{"path": path.Path}
 	}
 	for name, path := range replacements {
 		sources[name] = map[string]any{"path": path}
@@ -119,7 +164,7 @@ func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[s
 	if problem != nil {
 		return fail(problem)
 	}
-	after, _, _, problem := (&Package{Tree: tree, Files: files}).SourceIdentity()
+	after, _, _, problem := (&Package{Tree: tree, Files: files}).SourceIdentity(extras...)
 	if problem != nil || after != before {
 		return fail(exit.New(exit.Conflict, "private source or dependency changed while resolving dependencies"))
 	}
