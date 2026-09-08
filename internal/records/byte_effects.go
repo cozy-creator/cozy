@@ -82,7 +82,12 @@ func (s *Store) ReserveAssessmentBytes(callID, parentID, report, workloads strin
 		}
 		rows, err := tx.Query(`SELECT b.`+`request_id,b.attempt,b.output_id,b.digest,b.length,b.mime_type,b.producer_root_id,b.receipt_digest,b.manifest_id,b.manifest_length,b.content_bytes
    FROM native_artifact_retentions h JOIN byte_outputs b ON b.request_id=h.producer_id AND b.attempt=h.producer_attempt AND b.output_id=h.producer_output_id
-   JOIN requests c ON c.id=h.consumer_id WHERE h.parent_request_id=? AND h.kind='result' AND h.artifact_kind='tree' AND h.state='held' AND b.digest=? AND c.worker=? AND c.state='succeeded' ORDER BY b.request_id,b.attempt,b.output_id`, parentID, input.digest, parent.Worker)
+   JOIN requests c ON c.id=h.consumer_id
+   LEFT JOIN native_calls n ON n.id=b.native_service_id
+   WHERE h.parent_request_id=? AND h.kind='result' AND h.artifact_kind='tree' AND h.state='held' AND b.digest=? AND c.worker=?
+   AND h.transaction_id=b.producer_root_id AND h.receipt_digest=b.receipt_digest AND h.manifest_id=b.manifest_id AND h.manifest_length=b.manifest_length AND h.content_bytes=b.content_bytes
+   AND (c.state='succeeded' OR (c.id=? AND b.request_id=c.id AND c.state='dispatching' AND n.parent_request_id=c.id AND n.kind='source' AND n.operation='commit_file' AND n.state='succeeded' AND n.cancel_requested=0))
+   ORDER BY b.request_id,b.attempt,b.output_id`, parentID, input.digest, parent.Worker, parentID)
 		if err != nil {
 			return nil, "", exit.Internalf("cannot resolve assessment file grant: %s", err)
 		}
