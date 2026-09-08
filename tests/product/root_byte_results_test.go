@@ -33,14 +33,38 @@ func TestRootByteResultRetainsFinalCustodyWithoutInventingPublication(t *testing
 	if _, problem := store.ReserveByteResult(request.ID, output); problem == nil {
 		t.Fatal("uncompleted parent invented final custody")
 	}
-	_, problem = store.AcceptTerminal(records.Terminal{RequestID: request.ID, Attempt: 1, SessionID: "private-boot", InvocationDigest: childDigest("1"), TerminalID: "native-done", TerminalDigest: childDigest("a"), Status: "SUCCEEDED", RequestState: "succeeded", Body: []byte(`{}`), ByteOutputs: []records.ByteOutput{output}})
+	_, problem = store.AcceptTerminal(records.Terminal{RequestID: request.ID, Attempt: 1, SessionID: "private-boot", InvocationDigest: childDigest("1"), TerminalID: "native-done", TerminalDigest: childDigest("a"), Status: "SUCCEEDED", RequestState: "finalizing", EventType: "request.finalizing", EventPayload: map[string]any{"status": "FINALIZING", "execution_status": "SUCCEEDED"}, Body: []byte(`{}`), ByteOutputs: []records.ByteOutput{output}})
 	fatal(t, problem)
+	if store.CompleteNativeRootResult(request.ID, 1) == nil {
+		t.Fatal("result completed before its independent hold")
+	}
+	fatal(t, store.NoteNativeResultWait(request.ID, 1, "native.unavailable", "workspace disconnected"))
+	code, detail, problem := store.NativeResultWait(request.ID, 1)
+	fatal(t, problem)
+	if code != "native.unavailable" || detail != "workspace disconnected" {
+		t.Fatal("retention failure was not observable")
+	}
+	computation, problem := store.AttemptRow(request.ID, 1)
+	fatal(t, problem)
+	if computation.TerminalStatus != "SUCCEEDED" {
+		t.Fatal("retention failure erased successful computation")
+	}
 	hold, problem := store.ReserveByteResult(request.ID, output)
 	fatal(t, problem)
 	if hold.ParentRequestID != request.ID || hold.ConsumerID != request.ID || hold.State != "pending" {
 		t.Fatal("root result has no independent native recipient")
 	}
+	if store.CompleteNativeRootResult(request.ID, 1) == nil {
+		t.Fatal("pending retention was exposed as completed")
+	}
+	assets, problem := store.ReceivedByteAssets(request.ID)
+	fatal(t, problem)
+	if len(assets) != 0 {
+		t.Fatal("pending root result was grantable to another invocation")
+	}
 	fatal(t, store.ConfirmNativeArtifact(hold.RetentionID, "private-worker", "private-boot"))
+	fatal(t, store.CompleteNativeRootResult(request.ID, 1))
+	fatal(t, store.CompleteNativeRootResult(request.ID, 1))
 	fatal(t, store.Closed(request.ID, 1))
 	fatal(t, store.ReleaseCompletedNativeBytes(request.ID))
 	kept, problem := store.NativeArtifactRetentions(request.ID)

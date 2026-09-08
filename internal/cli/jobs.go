@@ -341,27 +341,6 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	if e != nil {
 		return e
 	}
-	if pendingNativeResults(state) {
-		// A successful executor terminal precedes the final native recipient ACK.
-		// Observe that real obligation; elapsed time never declares it complete.
-		tick := time.NewTicker(100 * time.Millisecond)
-		defer tick.Stop()
-		for pendingNativeResults(state) {
-			select {
-			case <-watchCtx.Done():
-				state.Status = "finalizing"
-				return renderSubmittedJob(ctx, state, false)
-			case <-tick.C:
-				state, e = c.Job(jobID)
-				if e != nil {
-					return e
-				}
-			}
-		}
-		if state.Status != "completed" {
-			terminal = nil
-		}
-	}
 	select {
 	case <-detached:
 		if !settled(state.Status) {
@@ -370,18 +349,6 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	default:
 	}
 	return renderJobTerminal(ctx, state, terminal, began)
-}
-
-func pendingNativeResults(state api.JobState) bool {
-	if state.Status != "completed" {
-		return false
-	}
-	for _, output := range state.NativeOutputs {
-		if output.State == "pending" {
-			return true
-		}
-	}
-	return false
 }
 
 func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event,
