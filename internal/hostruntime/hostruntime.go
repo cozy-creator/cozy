@@ -24,7 +24,7 @@ import (
 // and model types from their captured environment. The environment is a source location,
 // never an interpreter to start for description. This cohort also vendors the required
 // wire minor, so one remedy serves both admission checks.
-const Floor = "0.6.0"
+const Floor = "0.7.0"
 
 var floor = pep440.MustParse(Floor)
 
