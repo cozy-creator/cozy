@@ -7,7 +7,7 @@ import (
 )
 
 // Old-schema fixtures start with the released uint32-lifetime predecessor bound.
-// Preserve every row and historical index while removing only schema34 additions.
+// Preserve every row and historical index while removing only schema35 additions.
 func restorePriorCallIndexBounds(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.Exec(`PRAGMA legacy_alter_table=ON`)

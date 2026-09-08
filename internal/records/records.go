@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 34
+const schemaVersion = 35
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -263,7 +263,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 33 {
+	if sourceVersion < 34 {
 		if e := migrateRentals(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -273,12 +273,12 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 34 {
+	if sourceVersion < 35 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
 	}
-	if sourceVersion < 34 {
+	if sourceVersion < 35 {
 		if _, err := tx.Exec(childRequestIndex); err != nil {
 			return exit.Internalf("cannot restore child call admission index in %s: %s", path, err)
 		}
@@ -412,11 +412,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 		}
 	}
 
-	if sourceVersion < 34 {
+	if sourceVersion < 35 {
 		if sourceVersion >= 32 {
-			for _, statement := range []string{`ALTER TABLE native_calls RENAME TO native_calls_prior34`, nativeCallsDDL,
-				`INSERT INTO native_calls(` + nativeCallColumns + `) SELECT ` + nativeCallColumns + ` FROM native_calls_prior34`,
-				`DROP TABLE native_calls_prior34`} {
+			for _, statement := range []string{`ALTER TABLE native_calls RENAME TO native_calls_prior35`, nativeCallsDDL,
+				`INSERT INTO native_calls(` + nativeCallColumns + `) SELECT ` + nativeCallColumns + ` FROM native_calls_prior35`,
+				`DROP TABLE native_calls_prior35`} {
 				if _, err := tx.Exec(statement); err != nil {
 					return exit.Internalf("cannot preserve native call indices: %s", err)
 				}
@@ -787,7 +787,7 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
-		if version < 34 && (statement == childArgumentsDDL || statement == activeChildRequestIndex || statement == activeNativeCallIndex || statement == servingPlacementsDDL) {
+		if version < 35 && (statement == childArgumentsDDL || statement == activeChildRequestIndex || statement == activeNativeCallIndex || statement == servingPlacementsDDL) {
 			continue
 		}
 		if version < 33 && statement == byteOutputsDDL {
@@ -894,7 +894,7 @@ func priorStatements(version int) []string {
 		if requestStatement && version < 33 {
 			stmt = strings.Replace(stmt, "  capture      TEXT    NOT NULL DEFAULT '',\n", "", 1)
 		}
-		if version < 34 {
+		if version < 35 {
 			stmt = strings.ReplaceAll(stmt, "call_index<4294967296", "call_index<32")
 		}
 		statements[index] = stmt
