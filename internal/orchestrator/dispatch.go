@@ -758,6 +758,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		spec, planID, e := c.resolveFor(req)
 		if e != nil {
 			done()
+			if e.ErrName() == "device_envelope_held" {
+				c.logf("%s remains QUEUED while serving preparation awaits the local device envelope", req.ID)
+				return
+			}
 			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				return
 			}

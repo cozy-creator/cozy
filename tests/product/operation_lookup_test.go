@@ -241,7 +241,7 @@ func TestOperationLookupSchemaUpgradePreservesRequests(t *testing.T) {
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
 	restorePriorCallIndexBounds(t, db)
-	for _, table := range []string{"request_child_arguments", "byte_outputs", "native_artifact_retentions", "native_calls", "request_operation_lookups"} {
+	for _, table := range []string{"attempt_serving_placements", "request_child_arguments", "byte_outputs", "native_artifact_retentions", "native_calls", "request_operation_lookups"} {
 		_, err = db.Exec(`DROP TABLE ` + table)
 		must(t, err)
 	}

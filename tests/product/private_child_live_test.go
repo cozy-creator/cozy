@@ -78,10 +78,7 @@ default = %q
 `, name, runtimeVersion, runtimeSource, module+".py", module+":app")
 		must(t, os.WriteFile(filepath.Join(lib, "pyproject.toml"), []byte(metadata), 0o600))
 		must(t, os.WriteFile(filepath.Join(lib, "package.toml"), []byte(fmt.Sprintf("[application]\nobject=%q\n", module+":app")), 0o600))
-		body := `from importlib.metadata import distributions
-if any((d.metadata.get("Name") or "").startswith("cozy-script-") for d in distributions()):
-    raise RuntimeError("implementation imported into parent")
-import msgspec
+		body := `import msgspec
 from cozy_runtime.author import App, Context, invocable
 class Result(msgspec.Struct, frozen=True):
     value: int

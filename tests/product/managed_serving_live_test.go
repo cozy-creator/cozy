@@ -11,11 +11,11 @@ import (
 	"testing"
 )
 
-// Ordinary scripts receive large native files/trees and forward them without
-// inlining bytes, publishing code, or requiring a prior run identifier.
+// A plain script produces a retained native model, then calls the original GPU
+// serving function twice, observing capture without memoizing inference.
 func TestOrdinaryScriptNativeModelServing(t *testing.T) {
 	if *privateChildRuntimeWheel == "" {
-		t.Skip("requires the exact wire43 Runtime candidate wheel")
+		t.Skip("requires the exact wire44 Runtime candidate wheel")
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
@@ -39,7 +39,7 @@ func TestOrdinaryScriptNativeModelServing(t *testing.T) {
 	t.Cleanup(func() {
 		compositionDown(t, root, path)
 		if t.Failed() {
-			t.Log("byte artifact evidence retained", root)
+			t.Log("native serving evidence retained", root)
 		} else {
 			_ = os.RemoveAll(root)
 		}
@@ -55,7 +55,7 @@ func TestOrdinaryScriptNativeModelServing(t *testing.T) {
 name="model-tools"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s", "torch>=2.13,<3"]
+dependencies=["cozy-runtime==%s", "torch>=2.13,<3", "numpy>=1.26"]
 [project.entry-points."cozy.application"]
 default="model_tools:app"
 [tool.uv.sources]
@@ -79,7 +79,7 @@ only-include=["model_tools.py"]
 		}
 		code, out := runCozyPath(t, root, path, "run", script, "--await", "--json")
 		if code != 0 {
-			t.Fatalf("plain byte script %d [exit %d]\n%s\n%s", run, code, out, productWorkerLogs(root))
+			t.Fatalf("native serving script %d [exit %d]\n%s\n%s", run, code, out, productWorkerLogs(root))
 		}
 	}
 	db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))

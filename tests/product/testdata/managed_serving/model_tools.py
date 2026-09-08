@@ -96,6 +96,7 @@ async def produce(ctx: Context, *, artifacts: WeightsSink) -> ModelArtifact:
     ) as writer:
         for name, scale in (("alpha", 2.0), ("spare", 7.0), ("zeta", 1.0)):
             writer.add_part(name, "weight", "value", struct.pack("<4f", scale, 0, 0, scale))
+        writer.add_config("pipeline", b"{}")
         return writer.commit().artifact
 
 app.job(produce, weights=(WeightsOutput("weights", max_new_bytes=4096),))

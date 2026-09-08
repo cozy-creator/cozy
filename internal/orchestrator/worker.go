@@ -892,7 +892,7 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 
 // evictLRUIdleDeviceHolder releases one local device envelope under launch pressure.
 // Every holder conflicting with the requested envelope must be an idle local serving
-// worker; an active, remote, job, unknown, offered, reserved, or unacked holder makes the
+// worker or an acknowledged completed job; an active, remote, unknown, offered, reserved, or unacked holder makes the
 // conflict ineligible and preserves all workers. A changed holder set is concurrent/new
 // evidence and is never folded into the original pressure decision. The selected holder
 // is claimed under the orchestrator lock before teardown, so dispatch cannot race into it.
@@ -919,7 +919,7 @@ func (c *Orchestrator) evictLRUIdleDeviceHolder(devices []string,
 	eligible := make([]*worker, 0, len(holders))
 	for _, instanceID := range holders {
 		w := c.workers[instanceID]
-		if !c.idleLocalServingWorkerLocked(w, active) {
+		if !c.idleLocalDeviceHolderLocked(w, active) {
 			c.mu.Unlock()
 			return false, nil
 		}
@@ -2188,8 +2188,12 @@ func (c *Orchestrator) unloadIdleLocalWorkers(pkg, keepInstallID string) ([]Work
 }
 
 func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request) bool {
+	return c.idleLocalProcessLocked(w, active, false)
+}
+
+func (c *Orchestrator) idleLocalProcessLocked(w *worker, active []records.Request, allowJob bool) bool {
 	if w == nil || c.workers[w.instanceID] != w || w.exited || w.stopping ||
-		w.spec.Connection != nil || w.spec.IsJob() || w.seats.reserved != 0 || w.unacked != 0 {
+		w.spec.Connection != nil || (!allowJob && w.spec.IsJob()) || w.seats.reserved != 0 || w.unacked != 0 {
 		return false
 	}
 	for _, reservation := range c.offers {
@@ -2215,6 +2219,19 @@ func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request
 		}
 	}
 	return true
+}
+
+// An acknowledged completed GPU job retains its native workspace, not its device process.
+// The observed zero-flight capacity and shared offer/owner fence allow the next operation.
+func (c *Orchestrator) idleLocalDeviceHolderLocked(w *worker, active []records.Request) bool {
+	if !c.idleLocalProcessLocked(w, active, true) {
+		return false
+	}
+	if w.spec.IsJob() {
+		return !w.spec.Placement.Jobs[0].Orchestration && !w.lastReport.IsZero() &&
+			w.held == 0 && w.reservedJobs == 0 && w.snapshotAcknowledged
+	}
+	return c.idleLocalServingWorkerLocked(w, active)
 }
 
 func (c *Orchestrator) idleLocalServingWorkerLocked(w *worker, active []records.Request) bool {

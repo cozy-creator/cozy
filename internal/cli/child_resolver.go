@@ -135,9 +135,9 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	}
 	out.ChildReusable = job.Invocable.Memoize
 	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0 || len(out.Outputs) > len(out.WeightsOutputs)
+	out.LocalPackageDigest = binding.LocalRevisionDigest
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
-		out.LocalPackageDigest = binding.LocalRevisionDigest
 	}
 	identity, _ := json.Marshal(map[string]any{"local_revision_digest": binding.LocalRevisionDigest, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
 	identity, err := canonical.NormalizeJCS(identity)
