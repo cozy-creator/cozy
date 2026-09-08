@@ -2310,6 +2310,9 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	if problem := c.ResumeOutputExports(); problem != nil {
 		return killed, forgotten, problem
 	}
+	if problem := c.ResumeNativeEffects(); problem != nil {
+		c.logf("native effect recovery pending: %s", problem.ErrName())
+	}
 	if problem := c.ResumeModelTransfers(); problem != nil {
 		return killed, forgotten, problem
 	}

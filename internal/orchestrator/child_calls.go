@@ -73,6 +73,9 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Named(exit.Conflict, "child.intent_changed", "child intent digest does not match its exact target and input"))
 		return
 	}
+	if c.onNativeEffect(s, *parent, call) {
+		return
+	}
 	priorCalls, problem := c.opt.Store.Children(parent.ID)
 	if problem != nil {
 		refuse(problem)
