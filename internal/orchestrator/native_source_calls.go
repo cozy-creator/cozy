@@ -47,10 +47,10 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 	}
 	c.mu.Lock()
 	worker := c.workers[s.instanceID]
-	supported := worker != nil && worker.wireMinor >= 45
+	supported := worker != nil && worker.wireMinor >= 46
 	c.mu.Unlock()
 	if !supported {
-		refuse(exit.Named(exit.Conflict, "native.source_wire_unsupported", "native source operations require worker protocol 45"))
+		refuse(exit.Named(exit.Conflict, "native.source_wire_unsupported", "native source operations require worker protocol 46"))
 		return true
 	}
 	if !bytes.Equal(call.InterfaceDigest, nativeinterface.SourceDigest()) || nativeSourceOperation(call.Export) == 0 {

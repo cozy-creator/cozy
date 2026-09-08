@@ -20,7 +20,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the first release with bounded source-file views and the wire45 native source interface.
+// Floor is the first release with bounded source-file views and the wire46 native source interface.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
 const Floor = "0.12.0"
