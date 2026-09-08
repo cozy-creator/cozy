@@ -142,8 +142,8 @@ func TestRunListRetainsTerminalOverallProgress(t *testing.T) {
 			if test.name == "recovered_open" {
 				row, problem := o.store.AttemptRow(id, int64(call.offer.AttemptOrdinal))
 				fatal(t, problem)
-				if row.State != "recovered_open" || live.Attempt != call.offer.AttemptOrdinal {
-					t.Fatalf("recovery changed state/ordinal before readback: %+v %+v", row, live)
+				if row.State != "recovered_open" || row.Attempt != int64(call.offer.AttemptOrdinal) {
+					t.Fatalf("recovery changed state/ordinal before readback: %s #%d", row.State, row.Attempt)
 				}
 			}
 			wantLive := .42
