@@ -80,6 +80,9 @@ func UploadCheckpoint(ctx context.Context, client *hub.Client, operation string,
 		if len(granted.Grants) != 1 || granted.Grants[0].Length != lengths[id] {
 			return CheckpointRef{}, exit.New(exit.Conflict, "upload grant changed its exact inventory")
 		}
+		if problem := beforeWrite(); problem != nil {
+			return CheckpointRef{}, problem
+		}
 		if problem := upload(ctx, granted.Grants[0], granted.ServerTimeUnix); problem != nil {
 			return CheckpointRef{}, problem
 		}

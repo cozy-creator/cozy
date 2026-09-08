@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 31
+const schemaVersion = 32
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -378,6 +378,19 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if sourceVersion < 31 {
 		if _, err := tx.Exec(nativeArtifactRetentionsDDL); err != nil {
 			return exit.Internalf("cannot create native artifact custody in %s: %s", path, err)
+		}
+	}
+
+	if sourceVersion >= 30 && sourceVersion < 32 {
+		columns := strings.Replace(nativeCallColumns, ",cancel_requested", "", 1)
+		for _, statement := range []string{
+			`ALTER TABLE native_calls RENAME TO native_calls_prior`, nativeCallsDDL,
+			`INSERT INTO native_calls(` + columns + `) SELECT ` + columns + ` FROM native_calls_prior`,
+			`DROP TABLE native_calls_prior`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot preserve effect cancellation in %s: %s", path, err)
+			}
 		}
 	}
 
@@ -722,6 +735,9 @@ func priorStatements(version int) []string {
 			version < 16 && containsStatement(packageEventSchema, statement) ||
 			version < 23 && (statement == modelCheckpointSchema || statement == modelCheckpointPublicationSchema) {
 			continue
+		}
+		if version < 32 && statement == nativeCallsDDL {
+			statement = strings.Replace(statement, " cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),\n", "", 1)
 		}
 		statements = append(statements, statement)
 	}
