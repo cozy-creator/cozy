@@ -228,6 +228,34 @@ fn credential_of(
 /// unbound Store is a pull with no cache, and a cache that is missing, cold, corrupt,
 /// read-only or unmounted degrades to exactly that pull.
 pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
+    pull_with_budget(root, refspec, flags, None)
+}
+
+/// A distinct verb makes an older CLI refuse instead of ignoring new quota flags.
+pub fn cmd_bounded_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
+    let bound = |name: &str| {
+        let values = crate::flag_all(flags, name);
+        if values.len() != 1 {
+            return None;
+        }
+        values[0].parse::<u64>().ok()
+    };
+    let (Some(bytes), Some(objects)) = (bound("max-download-bytes"), bound("max-download-objects"))
+    else {
+        eprintln!(
+            "bounded fetch requires one unsigned --max-download-bytes and --max-download-objects"
+        );
+        return ExitCode::from(2);
+    };
+    pull_with_budget(root, refspec, flags, Some((bytes, objects)))
+}
+
+fn pull_with_budget(
+    root: &Path,
+    refspec: &str,
+    flags: &Flags,
+    budget: Option<(u64, u64)>,
+) -> ExitCode {
     let store = ok!(Store::open(root));
     let Some(base) = flag(flags, "hub") else {
         eprintln!("--hub <base-url> is required");
@@ -247,6 +275,7 @@ pub fn cmd_pull(root: &Path, refspec: &str, flags: &Flags) -> ExitCode {
     request.session = flag(flags, "session").unwrap_or("");
     request.streams = crate::flag_num(flags, "streams", transport::STREAMS);
     request.deadline = deadline_of(flags);
+    request.download_budget = budget;
     // THE WALK REPORTS WHILE IT WALKS.
     //
     // Until now `tfs fetch` printed one report at the end, the pod's supervisor buffered

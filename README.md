@@ -641,3 +641,11 @@ before acquire. The original transaction can be disposed independently. Native G
 these manifest roots directly from the filesystem, without relying on request or transaction
 metadata. Eligibility and authorization belong to the caller; this API provides storage
 retention and never schedules computation or publishes a model repository.
+
+For a host enforcing filesystem headroom, `tfs fetch bounded <root> <ref>`
+requires `--max-download-bytes N --max-download-objects N` alongside the normal
+fetch arguments. It uses the ordinary native plan and pull, refusing before body
+transfers when missing content exceeds either allowance. Already-held objects
+consume neither allowance. These limits do not rewrite the Store's saved quota
+and count objects, not filesystem inodes; the host reserves directory/temporary
+overhead separately. Older CLIs reject the distinct bounded verb.
