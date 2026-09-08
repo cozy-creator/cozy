@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -210,9 +211,39 @@ async def main(ctx):
 	if len(stopped.Parts) != 2 {
 		t.Fatalf("fault boundary is not one completed data/scale group: %+v", stopped.Parts)
 	}
+	stopped.Request, _, _ = strings.Cut(stopped.Request, "#")
+	controlDB, err := sql.Open("sqlite", "file:"+filepath.Join(root, "creator.sqlite")+"?mode=ro")
+	must(t, err)
+	defer controlDB.Close()
+	pause := exec.Command(cozyBin, "run", "pause", stopped.Request, "--json")
+	pause.Env = command.Env
+	var pauseOutput bytes.Buffer
+	pause.Stdout = &pauseOutput
+	pause.Stderr = &pauseOutput
+	must(t, pause.Start())
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- pause.Wait() }()
+	for {
+		var state string
+		must(t, controlDB.QueryRow(`SELECT state FROM requests WHERE id=?`, stopped.Request).Scan(&state))
+		if state == "pausing" || state == "paused" {
+			break
+		}
+		select {
+		case err := <-pauseDone:
+			t.Fatalf("pause returned without fencing the quantizer: %v %s", err, pauseOutput.String())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
 	process, err := os.FindProcess(stopped.PID)
 	must(t, err)
-	must(t, process.Kill())
+	if err = process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatal(err)
+	}
+	if err := <-pauseDone; err != nil {
+		t.Fatalf("pause failed: %v %s", err, pauseOutput.String())
+	}
+
 	if err := <-done; err == nil {
 		t.Fatal("interrupted/rejected first script unexpectedly succeeded")
 	}
@@ -236,6 +267,17 @@ async def main(ctx):
 	defer journal.Close()
 	var interruptedTransaction string
 	must(t, journal.QueryRow(`SELECT id FROM weights WHERE request=? AND length(checkpoint)>0 ORDER BY ordinal LIMIT 1`, stopped.Request).Scan(&interruptedTransaction))
+	var memoize, schemaBytes int
+	must(t, journal.QueryRow(`SELECT memoize,length(result_schema) FROM attempts WHERE request=? AND ordinal=1`, stopped.Request).Scan(&memoize, &schemaBytes))
+	if memoize != 1 || schemaBytes == 0 {
+		t.Fatalf("actual local invocable lost its memo declaration: memoize=%d schema_bytes=%d", memoize, schemaBytes)
+	}
+	originalQuant, problem := store.RequestRow(stopped.Request)
+	fatal(t, problem)
+	if originalQuant.Ordinal != 1 || originalQuant.State != "paused" {
+		t.Fatalf("fault was automatically retried instead of retaining a paused partial: %+v", originalQuant)
+	}
+
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "creator.sqlite")+"?mode=ro")
 	must(t, err)
 	defer db.Close()
