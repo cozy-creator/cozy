@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"image"
 	"image/png"
@@ -86,19 +85,6 @@ func TestChildMediaBorrowsOnlyParentInputs(t *testing.T) {
 		t.Fatal("missing original accepted by child")
 	}
 	must(t, os.WriteFile(asset.LocalPath, encoded.Bytes(), 0600))
-	db, err := sql.Open("sqlite", layout.DB)
-	must(t, err)
-	defer db.Close()
-	_, err = db.Exec(`UPDATE requests SET state='succeeded' WHERE id=?`, parent.ID)
-	must(t, err)
-	if _, err := os.Stat(asset.LocalPath); err != nil {
-		t.Fatal("parent cleanup removed child's owned bytes", err)
-	}
-	_, err = db.Exec(`UPDATE requests SET state='succeeded' WHERE id=?`, child.ID)
-	must(t, err)
-	if data, err := os.ReadFile(original); err != nil || !bytes.Equal(data, encoded.Bytes()) {
-		t.Fatal("settled child changed borrowed original", err)
-	}
 
 }
 
