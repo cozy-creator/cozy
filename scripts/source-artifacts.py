@@ -15,7 +15,7 @@ import tensorfs
 def main() -> None:
     body = b"selected raw checkpoint bytes"
     digest = hashlib.sha256(body).hexdigest()
-    ordinary = {"config.json": b'{"model_type":"test"}', "tokenizer.json": b'{"tokens":["a"]}'}
+    ordinary = {"config.json": b'{"model_type":"test"}', "tokenizer.json": b'{"tokens":["a"]}', "empty.py": b""}
     requests: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):

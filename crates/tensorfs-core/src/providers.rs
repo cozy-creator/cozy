@@ -361,7 +361,10 @@ fn list_selected_observed(
                         member: path.to_string(),
                         length,
                         sha256,
-                        url: format!("{base}/{org}/{repo}/resolve/{revision}/{path}"),
+                        url: format!(
+                            "{base}/{org}/{repo}/resolve/{revision}/{}",
+                            path.replace(' ', "%20")
+                        ),
                         primary: false,
                     });
                 }
@@ -1388,7 +1391,10 @@ pub fn resolve_files(
     }
     let mut names = files.to_vec();
     names.sort();
-    if names.iter().any(|name| !member_path(name)) {
+    if names
+        .iter()
+        .any(|name| !member_path(name) || crate::manifest::check_path(name).is_err())
+    {
         return refuse(
             Code::PATH_ILLEGAL,
             "ordinary file selection requires exact member paths",
@@ -1430,7 +1436,10 @@ pub fn resolve_files(
     let mut remaining = FILE_SELECTION_MAX_BYTES;
     let mut resolved = Vec::with_capacity(selected.len());
     for member in selected {
-        if member.length.is_some_and(|length| length > remaining) || remaining == 0 {
+        if member
+            .length
+            .map_or(remaining == 0, |length| length > remaining)
+        {
             return refuse(
                 Code::SIZE_CAP,
                 "ordinary file selection exceeds its byte bound",
@@ -1468,12 +1477,6 @@ pub fn resolve_files(
             }
             (ObjectRef::of(&body), Provenance::Computed)
         };
-        if object.length == 0 {
-            return refuse(
-                Code::LENGTH_MISMATCH,
-                "ordinary source files must not be empty",
-            );
-        }
         remaining = remaining
             .checked_sub(object.length)
             .ok_or_else(|| Refusal {
@@ -2396,7 +2399,7 @@ mod tests {
             r#"[
             {{"type":"file","path":"model.safetensors","size":100000000000,"lfs":{{"oid":"{}","size":100000000000}}}},
             {{"type":"file","path":"config.json","size":{}}},
-            {{"type":"file","path":"tokenizer.json","size":{}}},
+            {{"type":"file","path":"tokenizer files/tokenizer.json","size":{}}},
             {{"type":"file","path":"unused.py","size":99}}
         ]"#,
             "*".repeat(64),
@@ -2422,7 +2425,10 @@ mod tests {
             allow_local: true,
             ..Endpoints::default()
         };
-        let mut names = vec!["config.json".into(), "tokenizer.json".into()];
+        let mut names = vec![
+            "config.json".into(),
+            "tokenizer files/tokenizer.json".into(),
+        ];
         let selected =
             resolve_files(&uri, &names, &endpoints, &Anonymous, Deadline::none()).unwrap();
         names.reverse();
@@ -2491,6 +2497,11 @@ mod tests {
         }
         handle.join().unwrap();
         assert_eq!(seen.lock().unwrap().len(), 8);
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.contains("tokenizer%20files/")));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2642,6 +2653,55 @@ mod tests {
                 .unwrap()
                 .complete
         );
+        handle.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_files_can_retain_an_empty_file() {
+        let (base, _, handle) = origin(2, move |request| {
+            if request.path.contains("/tree/") {
+                ok_body(
+                    br#"[{"type":"file","path":"empty.py","size":0}]"#,
+                    "application/json",
+                )
+            } else {
+                ok_body(b"", "text/plain")
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{}", "ab".repeat(20))).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let selected = resolve_files(
+            &uri,
+            &["empty.py".into()],
+            &endpoints,
+            &Anonymous,
+            Deadline::none(),
+        )
+        .unwrap();
+        assert_eq!(selected.members[0].object, ObjectRef::of(b""));
+        let root = temporary("empty-files");
+        let store = Store::init(&root).unwrap();
+        let producer = ObjectRef::of(b"empty-files-producer").id();
+        let (retained, transfers) = materialize_selected(
+            &store,
+            &producer,
+            &selected,
+            &endpoints.policy(&uri),
+            &Anonymous,
+            Deadline::none(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert!(retained.complete && !retained.released);
+        assert_eq!(transfers[0].transferred, 0);
+        assert!(store
+            .record_valid(&selected.members[0].object.sha256)
+            .is_ok());
         handle.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
