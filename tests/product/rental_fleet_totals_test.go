@@ -20,7 +20,7 @@ func TestFailedRentalLeavesTheFleetTotals(t *testing.T) {
 	defer store.Close()
 	record := func(id, state string, rate int64) {
 		t.Helper()
-		fatal(t, store.RecordRental(records.Rental{
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 			ID: id, MachineName: id, SKU: "rtx-pro-4500",
 			AcceleratorModel:    "NVIDIA RTX PRO 4500 Blackwell",
 			HourlyRateUSDMicros: rate, State: state, Hub: "http://127.0.0.1:1",

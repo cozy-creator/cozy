@@ -15,7 +15,7 @@ for arm in ['readonly','release','wrong-boot','initial-absent','released-absent'
             assert self.headers.get('Authorization')=='Bearer fixture-token'
             if events:polls.append(self.path)
             if arm=='initial-absent' or arm=='released-absent' and events or arm=='pending-empty-absent' and len(polls)>1:self.answer(404,{'error':{'code':'rental.not_found','message':'fixture absent'}});return
-            value={'rental_id':'pr-22222222222222222222','name':'proof','state':'released' if events else 'ready','hourly_rate_usd_micros':1,'worker_id':'fixture-worker','worker_boot_id':'fixture-boot','provider_state':'gone' if events else 'running','container_state':'gone' if events else 'running'}
+            value={'rental_id':'pr-22222222222222222222','name':'proof','state':'released' if events else 'ready','accelerator_count':1,'hourly_rate_usd_micros':1,'worker_id':'fixture-worker','worker_boot_id':'fixture-boot','provider_state':'gone' if events else 'running','container_state':'gone' if events else 'running'}
             if arm.startswith('pending-empty') and events:
                 value['worker_id']='';value['worker_boot_id']='';value['state']='release_requested' if len(polls)==1 else 'released'
             if arm=='wrong-boot':value['worker_boot_id']='foreign-boot'

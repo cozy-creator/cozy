@@ -3,6 +3,7 @@ package rental
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -12,12 +13,18 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Constraints is the published release's own Requirements/RequiresPython. It narrows the
-// catalog ADVISORILY: a product whose base profile the release already contradicts is not
-// worth an hour's rent, because the pod would refuse it typed on arrival.
+// Constraints is the published release's own Requirements/RequiresPython and the degrees
+// its package declares it can shard at. It narrows the catalog ADVISORILY: a product whose
+// base profile the release already contradicts, or whose WIDTH the package cannot shard
+// across, is not worth an hour's rent, because the pod would refuse it typed on arrival.
 type Constraints struct {
 	Requirements   []string
 	RequiresPython string
+	// Degrees is the intersection of every model slot's `sequence_parallel.degrees` in the
+	// package interface — the author's statement of which group degrees the whole
+	// construction can be built at. Empty means the package declares none, which is most
+	// packages and is why a wide product is excluded rather than chosen by default.
+	Degrees []int
 }
 
 // Purchases is every product of the request's class as a placement candidate (cl-165),
@@ -36,6 +43,9 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		c := orchestrator.PlacementCandidate{SKU: sku.Name,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
 		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job)
+		if c.Verdict == "" {
+			c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
+		}
 		if c.Verdict == "" {
 			c.Verdict = baseMismatch(sku, constraints)
 		}
@@ -88,6 +98,13 @@ func Pin(models []records.ModelRef, accelerator string) ([]records.ModelRef, int
 // (cl-168): a device is short only when what the selection measurably needs outweighs it.
 // A rung-asserted slot needs no figure — the owner's word stands. VRAMGB is read as GiB,
 // the unit GPU memory is built in (an "80 GB" H100 carries 81920 MiB).
+//
+// ONE CARD, AT EVERY WIDTH, DELIBERATELY (cl-179). VRAMGB is the per-card figure for a
+// wide product as much as a narrow one, and that is the correct test: nothing here is
+// tensor- or pipeline-parallel, so under a sequence-parallel group every rank holds the
+// WHOLE weights and a four-card pod fits exactly what one of its cards fits. Reading a
+// width as capacity — summing it, or dividing the need by it — would buy a pod that
+// cannot hold the model and only discover it after the hour was billed.
 func Fit(need records.Residency, vramGB int64, name string) string {
 	if need.Bytes <= vramGB<<30 {
 		return ""
@@ -103,6 +120,51 @@ func FitNote(need records.Residency, vramGB int64) string {
 		return need.Fit
 	}
 	return fmt.Sprintf("%s %.1f GiB of %d GB", need.Fit, float64(need.Bytes)/(1<<30), vramGB)
+}
+
+// WidthUnusable keeps a machine WIDER than one card out of the decision unless this request
+// can actually use every card it would be billed for (cl-179). It holds a BUY and a REUSE
+// to the same rule: a wide pod already up is as unusable to a package that cannot shard as
+// one that has not been bought yet, and choosing it would fail the request typed at the
+// worker instead of placing it on a machine that works.
+//
+// A wide machine is not more capacity: every rank of a sequence-parallel group holds the
+// FULL weights, so width buys latency and never fit. The only thing that uses the extra
+// cards is a group placement of exactly that degree, which needs two things this side
+// knows before spending: the package's author must have declared the degree, and the
+// request must be a serving one — a job is a single bounded attempt and shards nothing,
+// so a wide pod given one idles every card but the first for the whole hour.
+//
+// Constraints are advisory — a hub that will not answer yields none — so this narrows the
+// decision and never widens it: with no declared degrees only one-card machines remain,
+// which is exactly the behaviour before wide products existed.
+func WidthUnusable(width int, job bool, constraints Constraints) string {
+	if width < 2 {
+		return ""
+	}
+	if job {
+		return orchestrator.VerdictExcluded + orchestrator.ExcludedWidthUndeclared +
+			fmt.Sprintf(": %d cards, and a job shards none of them", width)
+	}
+	for _, degree := range constraints.Degrees {
+		if degree == width {
+			return ""
+		}
+	}
+	return orchestrator.VerdictExcluded + orchestrator.ExcludedWidthUndeclared +
+		fmt.Sprintf(": %d cards, and the package declares %s", width,
+			declaredDegrees(constraints.Degrees))
+}
+
+func declaredDegrees(degrees []int) string {
+	if len(degrees) == 0 {
+		return "no sequence-parallel degree"
+	}
+	parts := make([]string, 0, len(degrees))
+	for _, degree := range degrees {
+		parts = append(parts, strconv.Itoa(degree))
+	}
+	return "degrees " + strings.Join(parts, ", ")
 }
 
 func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
@@ -187,6 +249,7 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 // the request settled FAILED on a fleet that was simply still booting.
 func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	row records.Rental, vramGB int64, needsAccelerator, offered, job bool,
+	constraints Constraints,
 ) bool {
 	if needsAccelerator && row.AcceleratorModel == "CPU" {
 		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
@@ -194,8 +257,13 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	}
 	// A machine the user already has up is held to the same floor as a buy; the catalog's
 	// memory figure for its product is the fact (a product gone from the catalog this
-	// minute decides nothing).
+	// minute decides nothing). Its WIDTH is held to the same rule too, and read from the
+	// machine's own row rather than its product's: an attached rental is the authority on
+	// how many cards it has, and its SKU may have left the catalog (cl-179).
 	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job)
+	if c.Verdict == "" {
+		c.Verdict = WidthUnusable(row.AcceleratorCount, job, constraints)
+	}
 	switch {
 	case c.Verdict != "":
 		return false

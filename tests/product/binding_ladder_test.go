@@ -198,11 +198,11 @@ func newLadderHub(t *testing.T) *ladderHub {
 		}
 		id := "pr-ladder-" + request.SKU
 		row := map[string]any{"rental_id": id, "name": request.Name, "state": "failed",
-			"requested_accelerator_model": "NVIDIA H200", "hourly_rate_usd_micros": 3_590_000,
+			"requested_accelerator_model": "NVIDIA H200", "accelerator_count": 1, "hourly_rate_usd_micros": 3_590_000,
 			"failure": map[string]any{"code": "fixture_finished"}}
 		if h.provisions {
 			row = map[string]any{"rental_id": id, "name": request.Name, "state": "ready",
-				"requested_accelerator_model": "NVIDIA H100 NVL", "hourly_rate_usd_micros": 2_790_000,
+				"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1, "hourly_rate_usd_micros": 2_790_000,
 				"worker_address": "127.0.0.1:1", "media_address": "127.0.0.1:2", "cert_pem": "fixture",
 				"worker_id": "fixture-worker", "worker_boot_id": "fixture-boot",
 				"creator_public_key": request.CreatorPublicKey, "media_token_sha256": []string{request.MediaTokenSHA256}}
@@ -256,14 +256,15 @@ func (h *ladderHub) addState(id, machine, accelerator, state string, rate int64)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.rentals[id] = map[string]any{"rental_id": id, "name": machine, "state": state,
-		"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate}
+		"requested_accelerator_model": accelerator, "accelerator_count": 1,
+		"hourly_rate_usd_micros": rate}
 }
 
 func (h *ladderHub) addReady(id, machine, accelerator string, rate int64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.rentals[id] = map[string]any{"rental_id": id, "name": machine, "state": "ready",
-		"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
+		"requested_accelerator_model": accelerator, "accelerator_count": 1, "hourly_rate_usd_micros": rate,
 		"worker_address": "127.0.0.1:1", "media_address": "127.0.0.1:2"}
 }
 
@@ -464,11 +465,11 @@ func TestAutoRentReusesTheFittingRentalBeforeBuying(t *testing.T) {
 	// on the bf16 rung fits too; the 5090 fits a rung but not that text encoder, so it is
 	// passed over with the need recorded (the 2026-09-07 production case, cl-168).
 	for _, seed := range []records.Rental{
-		{ID: "pr-zack", MachineName: "zack", SKU: "h200", AcceleratorModel: "NVIDIA H200",
+		{AcceleratorCount: 1, ID: "pr-zack", MachineName: "zack", SKU: "h200", AcceleratorModel: "NVIDIA H200",
 			HourlyRateUSDMicros: 3_590_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
-		{ID: "pr-cheap", MachineName: "cheap", SKU: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090",
+		{AcceleratorCount: 1, ID: "pr-cheap", MachineName: "cheap", SKU: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090",
 			HourlyRateUSDMicros: 990_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
-		{ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
+		{AcceleratorCount: 1, ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
 			HourlyRateUSDMicros: 2_490_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL},
 	} {
 		fatal(t, store.RecordRental(seed))

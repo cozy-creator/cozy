@@ -147,7 +147,7 @@ func TestPrivateTransactionsShareRentalRetention(t *testing.T) {
 	plant := func(id, machine, buyer string) {
 		t.Helper()
 		hub.add(id, machine)
-		fatal(t, store.RecordRental(records.Rental{
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 			ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
 			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hub.server.URL,
 			Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem"),
@@ -210,7 +210,7 @@ func TestPrivateCancellationReleasesManagedRentalWithIdleCleanupDisabled(t *test
 			machine = "heron"
 		}
 		hub.add(id, machine)
-		fatal(t, store.RecordRental(records.Rental{ID: id, MachineName: machine,
+		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: id, MachineName: machine,
 			State: "ready", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 			Hub: hub.server.URL, Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem"),
 			ManagedRequestID: buyer}))

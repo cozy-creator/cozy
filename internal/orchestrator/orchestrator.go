@@ -406,6 +406,12 @@ const (
 	// ExcludedBaseMismatch is spelled with the pod's own reason appended: the release's
 	// requirements contradict the product's base image.
 	ExcludedBaseMismatch = "base_mismatch"
+	// ExcludedWidthUndeclared is spelled with the product's width and the degrees the
+	// package declares: a machine wider than one card serves a placement as ONE group of
+	// that degree, and a package whose author declared no such degree cannot be sharded
+	// across it. The worker would refuse `device_group_unsupported` on arrival, so the
+	// exclusion belongs here, before the pod is paid for (cl-179).
+	ExcludedWidthUndeclared = "width_undeclared"
 )
 
 // RentalStanding is what this owner knows live about one ready rental a placement could

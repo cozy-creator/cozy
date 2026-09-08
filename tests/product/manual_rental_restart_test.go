@@ -176,7 +176,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 				_ = json.NewEncoder(w).Encode(skus)
 				return
 			case "/v1/rentals/" + podRental:
-				_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": podRental, "name": "manual-empty", "state": "ready", "hourly_rate_usd_micros": 1})
+				_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": podRental, "name": "manual-empty", "state": "ready", "accelerator_count": 1, "hourly_rate_usd_micros": 1})
 				return
 			}
 		}
@@ -189,7 +189,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	must(t, err)
 	token, problem := rental.PendingMediaToken(layout, "manual-restart")
 	fatal(t, problem)
-	row := records.Rental{ID: podRental, State: "ready", Hub: hub.URL, MachineName: "manual-empty",
+	row := records.Rental{AcceleratorCount: 1, ID: podRental, State: "ready", Hub: hub.URL, MachineName: "manual-empty",
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: listener.Addr().String(), MediaAddress: strings.TrimPrefix(media.URL, "https://"),
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
 	if mode == "attached" {

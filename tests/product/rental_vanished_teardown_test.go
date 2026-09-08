@@ -154,7 +154,7 @@ func TestDownAllIsNotRefusable(t *testing.T) {
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(rentals, "rental-down-all.creator.pem"),
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
-	fatal(t, store.RecordRental(records.Rental{
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
 		ID: "rental-down-all", MachineName: "vanished", SKU: "cpu", AcceleratorModel: "CPU",
 		HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
 		Address: "127.0.0.1:1", CertPath: filepath.Join(rentals, "rental-down-all.pem"),

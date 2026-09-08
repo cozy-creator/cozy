@@ -661,8 +661,13 @@ type Residency struct {
 	Need string
 }
 
-// Resident sizes the pinned selection against one accelerator the way cozy-runtime loads
-// it: per slot, the largest sum over the slot's component_use groups (a method stages only
+// Resident sizes the pinned selection against ONE accelerator, at every rental width
+// (cl-179): nothing here is tensor- or pipeline-parallel, so under a sequence-parallel
+// group every rank holds the whole selection and a K-card pod holds exactly what one of
+// its cards holds. A width is latency and activation headroom, never capacity.
+//
+// It sizes that one accelerator the way cozy-runtime loads it: per slot, the largest sum
+// over the slot's component_use groups (a method stages only
 // the components it names), or the largest single component when the slot declares none;
 // with no component bytes, the owner's rung for this accelerator and lane asserts the fit
 // with no figure, and failing that the lane's whole bytes stand in. Summed over slots,

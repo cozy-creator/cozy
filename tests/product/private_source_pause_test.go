@@ -45,7 +45,7 @@ func TestSourcePauseRecoversOrphanedMaterializationOnlyAfterHostDrain(t *testing
 	var options orchestrator.Options
 	o := hostOwner(t, "source-pause-recovery", rentalWiring(connection, private), func(opt *orchestrator.Options) { options = *opt })
 	t.Cleanup(finish)
-	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "otter", State: "ready", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
+	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "otter", State: "ready", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	request, _, problem := o.store.Submit(records.Request{ID: "req-paused-source", IdemKey: "paused-source", BodyDigest: "sha256:" + strings.Repeat("a", 64), Package: "local/source", Entrypoint: "prepare", Kind: "job", RetainWork: true, Worker: podRental, Rental: true, RentalRequired: true, Payload: []byte("{}"),
 		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Source: "hf://proof/source@" + strings.Repeat("4", 40), SourceSelection: "sha256:" + strings.Repeat("2", 64), SourceProfiles: map[string]string{"model": "hf/minimax-h3/shared-bf16/1"}, SourceFiles: []records.ModelTransferSourceFile{{Member: "model.safetensors.index.json", SHA256: strings.Repeat("1", 64), Length: 2, Header: []byte("{}")}}, Outputs: []records.ModelTransferOutput{{Name: "model"}}}})
 	fatal(t, problem)

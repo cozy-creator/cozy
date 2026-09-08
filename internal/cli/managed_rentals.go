@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -300,11 +301,14 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	}
 	decision := orchestrator.PlacementDecision{Tier: m.ctx.Cfg.PlacementPrefer,
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
-	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator)
+	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
+	// a machine that would be bought are held to the same declared degrees (cl-179).
+	constraints := releaseConstraints(m.ctx, req)
+	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
 	}
-	purchases := rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), releaseConstraints(m.ctx, req))
+	purchases := rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), constraints)
 	var capped *exit.Error
 	for i := range purchases {
 		c := &purchases[i]
@@ -384,7 +388,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 // is silently dropped (cl-132): a decision reporting no attached candidate while the
 // fleet holds two is the shape that read as waste live.
 func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hub.RentalSKU,
-	needsAccelerator bool) ([]orchestrator.PlacementCandidate, *exit.Error) {
+	needsAccelerator bool, constraints rental.Constraints) ([]orchestrator.PlacementCandidate, *exit.Error) {
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		return nil, problem
@@ -406,7 +410,7 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 		// Everything decidable from the rental ROW is settled by the chooser, in the one
 		// order that keeps a transient state out of a permanent verdict (cl-185). What
 		// is left are the questions only this host can answer.
-		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob()) {
+		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints) {
 			reason, problem := m.standingLocked(row)
 			if problem != nil {
 				return nil, problem
@@ -991,5 +995,14 @@ func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
 	if problem != nil {
 		return rental.Constraints{}
 	}
-	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython}
+	// The committed interface is what says which group degrees this package can be built
+	// at, so a WIDE product is only a candidate when its author declared that width
+	// (cl-179). It rides the same advisory read as the base-image check: unreadable means
+	// nothing is declared, which excludes wide products rather than admitting them.
+	var degrees []int
+	if declared, e := launch.DecodePackageInterface(detail.PackageInterface); e == nil {
+		degrees = declared.SequenceParallelDegrees()
+	}
+	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython,
+		Degrees: degrees}
 }
