@@ -149,3 +149,87 @@ func (s *Store) ReleaseCompletedNativeBytes(parent string) *exit.Error {
 	}
 	return nil
 }
+
+// CompleteNativeRootResult completes the existing finalizing lifecycle only after
+// every explicit final output has independent, confirmed native custody.
+func (s *Store) CompleteNativeRootResult(request string, attempt int64) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin native result completion: %s", err)
+	}
+	defer tx.Rollback()
+	row, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, request))
+	if err != nil || row.ParentRequestID != "" || !row.RetainsLocalOutputs() || row.Ordinal != attempt {
+		return exit.New(exit.Conflict, "native result changed its owner")
+	}
+	if row.State == "succeeded" {
+		return nil
+	}
+	if row.State != "finalizing" {
+		return exit.New(exit.Conflict, "native result owner stopped")
+	}
+	var completed, total, missing int
+	if err := tx.QueryRow(`SELECT count(*) FROM attempts WHERE request_id=? AND attempt=? AND terminal_status='SUCCEEDED' AND state IN ('terminal','closed')`, request, attempt).Scan(&completed); err != nil || completed != 1 {
+		return exit.New(exit.Conflict, "native result has no successful computation")
+	}
+	if err := tx.QueryRow(`SELECT count(*) FROM byte_outputs WHERE request_id=? AND attempt=? AND native_service_id IS NULL`, request, attempt).Scan(&total); err != nil || total == 0 {
+		return exit.New(exit.Conflict, "native result has no recorded final outputs")
+	}
+	if err := tx.QueryRow(`SELECT count(*) FROM byte_outputs b WHERE b.request_id=? AND b.attempt=? AND b.native_service_id IS NULL AND NOT EXISTS(
+ SELECT 1 FROM native_artifact_retentions h WHERE h.consumer_id=b.request_id AND h.parent_request_id=b.request_id AND h.kind='result' AND h.artifact_kind='tree' AND h.state='held'
+ AND h.producer_id=b.request_id AND h.producer_attempt=b.attempt AND h.producer_output_id=b.output_id AND h.transaction_id=b.producer_root_id AND h.receipt_digest=b.receipt_digest AND h.manifest_id=b.manifest_id AND h.manifest_length=b.manifest_length AND h.content_bytes=b.content_bytes)`, request, attempt).Scan(&missing); err != nil || missing != 0 {
+		return exit.Unavailablef("native result still awaits independent custody")
+	}
+	var raw string
+	if err := tx.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND attempt=? AND type='request.finalizing' ORDER BY seq DESC LIMIT 1`, request, attempt).Scan(&raw); err != nil {
+		return exit.New(exit.Conflict, "native result has no finalizing event")
+	}
+	var payload map[string]any
+	if json.Unmarshal([]byte(raw), &payload) != nil {
+		return exit.New(exit.Conflict, "native finalizing event is invalid")
+	}
+	payload["status"] = "SUCCEEDED"
+	delete(payload, "execution_status")
+	if _, err := tx.Exec(`UPDATE requests SET state='succeeded' WHERE id=? AND state='finalizing'`, request); err != nil {
+		return exit.Internalf("cannot complete native result: %s", err)
+	}
+	if err := appendEventTx(tx, request, "request.completed", attempt, payload); err != nil {
+		return exit.Internalf("cannot record native result completion: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit native result completion: %s", err)
+	}
+	return nil
+}
+
+func (s *Store) NoteNativeResultWait(request string, attempt int64, code, detail string) *exit.Error {
+	if len(code) > 128 || len(detail) > 1024 {
+		return exit.New(exit.Validation, "native retention diagnostic exceeds its bound")
+	}
+	raw, err := json.Marshal(map[string]string{"error_type": code, "error": detail})
+	if err != nil {
+		return exit.Internalf("cannot encode native retention diagnostic: %s", err)
+	}
+	_, err = s.db.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) SELECT ?,'native.result_wait',?,?,? WHERE EXISTS(SELECT 1 FROM requests WHERE id=? AND state='finalizing')
+ AND COALESCE((SELECT payload FROM request_events WHERE request_id=? AND attempt=? AND type='native.result_wait' ORDER BY seq DESC LIMIT 1),'')<>?`, request, attempt, string(raw), now(), request, request, attempt, string(raw))
+	if err != nil {
+		return exit.Internalf("cannot record native retention wait: %s", err)
+	}
+	return nil
+}
+
+func (s *Store) NativeResultWait(request string, attempt int64) (string, string, *exit.Error) {
+	var raw string
+	err := s.db.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND attempt=? AND type='native.result_wait' ORDER BY seq DESC LIMIT 1`, request, attempt).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", exit.Internalf("cannot read native retention wait: %s", err)
+	}
+	var value map[string]string
+	if json.Unmarshal([]byte(raw), &value) != nil {
+		return "", "", exit.New(exit.Internal, "native retention diagnostic is invalid")
+	}
+	return value["error_type"], value["error"], nil
+}

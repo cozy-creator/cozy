@@ -1009,6 +1009,12 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		kept.Payload = map[string]any{"status": "FINALIZING", "execution_status": status,
 			"outputs": []any{}, "requeuing": false}
 	}
+	if req.ParentRequestID == "" && req.RetainsLocalOutputs() && len(byteOutputs) > 0 && status == "SUCCEEDED" && req.State != "canceling" {
+		requestState = "finalizing"
+		kept.Type = "request.finalizing"
+		kept.Payload["status"] = "FINALIZING"
+		kept.Payload["execution_status"] = "SUCCEEDED"
+	}
 	weightsFinalizations, e := weightsFinalizationIntents(
 		*req, *attemptRow, status, requeuing || retaining, receiptsBySlot)
 	if req.State == "canceling" {
@@ -1113,6 +1119,10 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 // recovery. It is intentionally idempotent: cleanup and BeginRequeue both have durable
 // guards, so a replay cannot spend twice or delete a still-owned asset.
 func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, holder *worker) {
+	if req.State == "finalizing" && req.ModelTransfer == nil && req.RetainsLocalOutputs() {
+		go c.finishClosedNativeRootResult(req.ID, attempt.Attempt)
+		return
+	}
 	if req.State == "succeeded" && attempt.TerminalStatus == "SUCCEEDED" {
 		go c.finishNativeByteRecipients(req.ID)
 	}

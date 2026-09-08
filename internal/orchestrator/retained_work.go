@@ -367,6 +367,9 @@ func (c *Orchestrator) restoreRetainedWork() *exit.Error {
 		return problem
 	}
 	for _, request := range rows {
+		if request.State == "finalizing" && request.ModelTransfer == nil && request.RetainsLocalOutputs() {
+			go c.finishClosedNativeRootResult(request.ID, request.Ordinal)
+		}
 		if request.State == "pausing" {
 			if problem := c.stopRetainedAttempt(request.ID, pb.CancelReason_CANCEL_REASON_DRAIN); problem != nil {
 				c.logf("request %s pause recovery: %s", request.ID, problem.Message)

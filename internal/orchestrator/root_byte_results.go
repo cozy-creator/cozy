@@ -1,7 +1,9 @@
 package orchestrator
 
 import (
+	"context"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -53,7 +55,7 @@ func (c *Orchestrator) privateRootOutputs(req records.Request, attempt records.A
 	return native, outputs, problem
 }
 
-func (c *Orchestrator) retainRootByteResults(s *session, req records.Request, attempt records.Attempt) *exit.Error {
+func (c *Orchestrator) retainRootByteResults(ctx context.Context, req records.Request, attempt records.Attempt) *exit.Error {
 	outputs, problem := c.opt.Store.ByteOutputs(req.ID, attempt.Attempt)
 	if problem != nil {
 		return problem
@@ -64,10 +66,41 @@ func (c *Orchestrator) retainRootByteResults(s *session, req records.Request, at
 			return problem
 		}
 		if hold.State != "held" {
-			if problem := c.changeByteRetention(s.ctx, hold, false); problem != nil {
+			if problem := c.changeByteRetention(ctx, hold, false); problem != nil {
 				return problem
 			}
 		}
 	}
 	return nil
+}
+
+// A proven-dead local worker can leave a closed successful computation whose
+// native recipient still needs reconciling through the retained workspace.
+func (c *Orchestrator) finishClosedNativeRootResult(id string, ordinal int64) {
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+	req, problem := c.opt.Store.RequestRow(id)
+	if problem != nil || req == nil || req.State != "finalizing" || req.ModelTransfer != nil {
+		return
+	}
+	attempt, problem := c.opt.Store.AttemptRow(id, ordinal)
+	if problem != nil || attempt == nil || attempt.State != "closed" {
+		return
+	}
+	problem = c.retainRootByteResults(context.Background(), *req, *attempt)
+	if problem == nil {
+		problem = c.opt.Store.CompleteNativeRootResult(id, ordinal)
+	}
+	if problem != nil {
+		_ = c.opt.Store.NoteNativeResultWait(id, ordinal, problem.ErrName(), problem.Message)
+		time.AfterFunc(ReportCadence, func() { c.finishClosedNativeRootResult(id, ordinal) })
+		return
+	}
+	req, problem = c.opt.Store.RequestRow(id)
+	if problem == nil && req != nil {
+		c.afterAck(*req, *attempt, nil)
+	}
 }

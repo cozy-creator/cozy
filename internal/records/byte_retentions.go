@@ -24,7 +24,7 @@ func reserveByteRetentionTx(tx *sql.Tx, consumer Request, kind, slot string, b B
 	if rootResult {
 		expectedState = "succeeded"
 	}
-	if err != nil || parent.State != expectedState || !parent.RetainWork {
+	if err != nil || (parent.State != expectedState && !(rootResult && parent.State == "finalizing")) || !parent.RetainWork {
 		return fail("byte recipient parent is not executing")
 	}
 	if consumer.State == "canceling" || consumer.State == "canceled" || consumer.State == "releasing" {
@@ -45,7 +45,7 @@ func reserveByteRetentionTx(tx *sql.Tx, consumer Request, kind, slot string, b B
 		}
 	} else if consumer.ID != b.RequestID && consumer.ReusedFrom != b.RequestID {
 		return fail("byte result does not belong to this child")
-	} else if consumer.ReusedFrom != b.RequestID && sourceState != "succeeded" {
+	} else if consumer.ReusedFrom != b.RequestID && sourceState != "succeeded" && !(rootResult && sourceState == "finalizing") {
 		return fail("byte result producer was released")
 	}
 	id := ByteRetentionID(consumer.ID, kind, slot, b)

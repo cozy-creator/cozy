@@ -928,6 +928,11 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		state.ErrorType, state.Error = last.TerminalCause, last.SafeMessage
 	}
 	state.Result = inlineJobResult(doc)
+	if row.State == "finalizing" && len(state.NativeOutputs) > 0 {
+		state.Result = nil
+		state.Stage = "retaining native results"
+		state.ErrorType, state.Error, _ = s.store.NativeResultWait(row.ID, row.Ordinal)
+	}
 	return state
 }
 
