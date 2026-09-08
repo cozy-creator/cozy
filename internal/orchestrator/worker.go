@@ -1632,7 +1632,20 @@ func (w *worker) jobExecutorRefusal(r *pb.ObservedWorkerState) *exit.Error {
 // had gone wrong. Every way this can actually fail is already visible: the worker EXITS,
 // reports a FAILED axis, or its process/stream exits. A worker that is materializing is none
 // of those, however long it takes.
-func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Error {
+//
+// `requestID` is the request this wait exists FOR, and the wait ends when it does (cl-186).
+// That is not a timeout — it is the observation that the only reason to keep waiting has
+// gone. Without it a wedged preparation held `starting[slot]` forever: the request could be
+// cancelled and the loop went on spinning, every later request for the slot returned early
+// from selectOrStart and parked on "no attached rental has a DISPATCHABLE placement", and
+// the only recovery anyone found was `cozy rental end`. Two H100s were surrendered that way
+// on 2026-09-08. The guard two paragraphs down already refuses one particular version of
+// this wedge (`plan_not_staged`) and says so in those words; this is the general case.
+//
+// An empty `requestID` is a wait no request owns — `cozy install --sync`'s foreground
+// relaunch, which the operator interrupts directly.
+func (c *Orchestrator) EnsurePlacementReady(instanceID, planID, requestID string) *exit.Error {
+	settledCheck := time.Time{}
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
@@ -1667,6 +1680,20 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		}
 		if desiredRefusal != nil {
 			return desiredRefusal
+		}
+		// THE WAIT ENDS WHEN ITS REQUEST DOES (cl-186), and it is asked here — after
+		// readiness and after this owner's own verdicts, so a placement that became
+		// dispatchable still wins and a real refusal is still the answer. The durable row
+		// is read on entry and then no oftener than the fact can usefully change; the
+		// loop's 20 ms cadence is for in-memory observations, not for SQLite.
+		if requestID != "" && time.Since(settledCheck) >= time.Second {
+			settledCheck = time.Now()
+			if row, problem := c.opt.Store.RequestRow(requestID); problem == nil &&
+				(row == nil || records.Settled(row.State)) {
+				return exit.Named(exit.Canceled, "request.settled_while_preparing",
+					"request %s settled while worker %s was still preparing %s; the wait it "+
+						"started is over", requestID, instanceID, planID)
+			}
 		}
 		// A PLAN THE LAUNCHER NEVER STAGED CAN NEVER BECOME DISPATCHABLE (cl-022's
 		// corollary guard). The live case: submit, then an install --force moves the

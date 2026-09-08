@@ -29,7 +29,7 @@ func TestDispatchReadsLanes(t *testing.T) {
 	instance, _, e := o.c.EnsureWorker(spec)
 	fatal(t, e)
 	planID := planIDOf(t, spec)
-	fatal(t, o.c.EnsurePlacementReady(instance, planID))
+	fatal(t, o.c.EnsurePlacementReady(instance, planID, ""))
 
 	// THE LANES ARE READ, and spelled back as the devices this daemon granted.
 	facts := o.c.Worker(instance)

@@ -24,7 +24,7 @@ func TestServingRequestDeclaresNoModelInput(t *testing.T) {
 	instance, _, e := o.c.EnsureWorker(spec)
 	fatal(t, e)
 	planID := planIDOf(t, spec)
-	fatal(t, o.c.EnsurePlacementReady(instance, planID))
+	fatal(t, o.c.EnsurePlacementReady(instance, planID, ""))
 
 	sub := submission(planID, "fake/model-inputs", "model-inputs-1", map[string]any{"prompt": "fox"})
 	sub.Models = []orchestrator.ModelRef{{
