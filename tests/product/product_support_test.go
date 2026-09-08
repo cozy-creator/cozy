@@ -35,10 +35,22 @@ func TestMain(m *testing.M) {
 		runDaemonReaper(strings.TrimPrefix(os.Args[1], reapMode), os.Stdin)
 		os.Exit(0)
 	}
+	// Reap the roots the previous run abandoned before claiming disk of our own,
+	// and refuse to start at all on a box that has no fork headroom left — a
+	// suite that dies partway through leaks a scratch root per killed test.
+	if reaped, failed := reapAbandonedScratch(os.TempDir(), scratchReapMinAge); reaped+failed > 0 {
+		fmt.Fprintf(os.Stderr, "reaped %d abandoned scratch roots (%d could not be removed)\n", reaped, failed)
+	}
+	if ok, detail := forkHeadroom(); !ok {
+		fmt.Fprintf(os.Stderr, "refusing to start: the box is out of fork headroom (%s).\n"+
+			"Reap orphaned daemons and scratch roots before running the suite.\n", detail)
+		os.Exit(1)
+	}
 	dir, err := os.MkdirTemp("", "cozy-product-test-bin")
 	if err != nil {
 		panic(err)
 	}
+	claimScratch(dir)
 	// The suite must never reach the user's ~/.tensorfs: config freezes on its first
 	// in-process Load, so the isolated TensorFS home is pinned before any test runs.
 	if err := os.Setenv("TENSORFS_HOME", filepath.Join(dir, "tensorfs")); err != nil {
@@ -86,8 +98,9 @@ type owner struct {
 func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *owner {
 	t.Helper()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
-	must(t, os.RemoveAll(root))
+	must(t, removeAllForce(root))
 	must(t, os.MkdirAll(root, 0o755))
+	claimScratch(root)
 	must(t, os.Setenv("COZY_HOME", root))
 
 	cfg, e := config.Load()
