@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -222,7 +223,20 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 				if t.Failed() {
 					t.Log("local serving preparation evidence retained", root)
 				} else {
-					_ = os.RemoveAll(root)
+					// Immutable Runtime generations are read-only. Only this test's
+					// verified-stopped home is made removable, without following links.
+					err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+						if err == nil && entry.IsDir() {
+							return os.Chmod(path, 0700)
+						}
+						return err
+					})
+					if err == nil {
+						err = os.RemoveAll(root)
+					}
+					if err != nil {
+						t.Errorf("remove stopped fixture home: %v", err)
+					}
 				}
 			})
 			project := t.TempDir()
