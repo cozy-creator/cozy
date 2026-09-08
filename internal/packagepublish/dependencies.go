@@ -118,13 +118,11 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 	if includeBase {
 		requirements = append(requirements, document.Project.Dependencies...)
 	}
-	for _, extra := range extras {
-		optional, problem := optionalDependencyGroup(document, extra)
-		if problem != nil {
-			return problem
-		}
-		requirements = append(requirements, optional...)
+	optional, problem := selectedExtraRequirements(document, extras)
+	if problem != nil {
+		return problem
 	}
+	requirements = append(requirements, optional...)
 	for _, raw := range requirements {
 		req, problem := parseRequirement(raw)
 		if problem != nil {
@@ -300,7 +298,29 @@ func (c *dependencyCollector) collectWheel(req requirement, source string) *exit
 
 // LocalDependencyPaths uses the same resolver/closure validation as wheel building,
 // without executing a build backend. Watchers and immutable source capture use it.
+// LocalDependencySelection retains standard Python extras beside one local source.
+type LocalDependencySelection struct {
+	Path   string
+	Extras []string
+}
+
 func LocalDependencyPaths(root string) (map[string]string, *exit.Error) {
+	selected, problem := LocalDependencySelections(root)
+	if problem != nil {
+		return nil, problem
+	}
+	paths := map[string]string{}
+	for name, source := range selected {
+		paths[name] = source.Path
+	}
+	return paths, nil
+}
+
+func LocalDependencySelections(root string, extras ...string) (map[string]LocalDependencySelection, *exit.Error) {
+	extras, problem := normalizedExtras(extras)
+	if problem != nil {
+		return nil, problem
+	}
 	canonical, problem := canonicalLocalPath(root)
 	if problem != nil {
 		return nil, problem
@@ -312,13 +332,18 @@ func LocalDependencyPaths(root string) (map[string]string, *exit.Error) {
 	c := &dependencyCollector{byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
 		stack: map[string]bool{canonical: true}, scanOnly: true}
 	c.byName[normalizedProjectName(document.Project.Name)] = dependencyRecord{source: canonical, version: document.Project.Version}
-	if problem := c.collectProject(canonical, document, nil, true); problem != nil {
+	if problem := c.collectProject(canonical, document, extras, true); problem != nil {
 		return nil, problem
 	}
-	out := map[string]string{}
+	out := map[string]LocalDependencySelection{}
 	for name, row := range c.byName {
 		if row.source != canonical {
-			out[name] = row.source
+			selected := make([]string, 0, len(c.extras[row.source]))
+			for extra := range c.extras[row.source] {
+				selected = append(selected, extra)
+			}
+			sort.Strings(selected)
+			out[name] = LocalDependencySelection{Path: row.source, Extras: selected}
 		}
 	}
 	return out, nil
@@ -372,6 +397,60 @@ func (c *dependencyCollector) activateExtras(source string, requested []string) 
 	return added
 }
 
+func normalizedExtras(extras []string) ([]string, *exit.Error) {
+	seen := map[string]bool{}
+	for _, extra := range extras {
+		if extra == "" || requirementName.FindString(extra) != extra {
+			return nil, invalidRequirement(extra)
+		}
+		seen[normalizedProjectName(extra)] = true
+	}
+	names := make([]string, 0, len(seen))
+	for extra := range seen {
+		names = append(names, extra)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// A standard extra may include this project's other extras (for example all).
+// Expand only declared self-extra groups; ordinary requirements still go to uv.
+func selectedExtraRequirements(document projectMetadata, extras []string) ([]string, *exit.Error) {
+	queue, problem := normalizedExtras(extras)
+	if problem != nil {
+		return nil, problem
+	}
+	seen := map[string]bool{}
+	var requirements []string
+	for len(queue) > 0 {
+		extra := queue[0]
+		queue = queue[1:]
+		if seen[extra] {
+			continue
+		}
+		seen[extra] = true
+		optional, problem := optionalDependencyGroup(document, extra)
+		if problem != nil {
+			return nil, problem
+		}
+		for _, raw := range optional {
+			req, problem := parseRequirement(raw)
+			if problem != nil {
+				return nil, problem
+			}
+			if req.name == normalizedProjectName(document.Project.Name) && len(req.extras) > 0 && !req.direct {
+				if problem := req.accepts(document.Project.Version); problem != nil {
+					return nil, problem
+				}
+				queue = append(queue, req.extras...)
+			} else {
+				requirements = append(requirements, raw)
+			}
+		}
+	}
+	return requirements, nil
+}
+
 func optionalDependencyGroup(document projectMetadata, wanted string) ([]string, *exit.Error) {
 	var matched []string
 	found := false
@@ -385,6 +464,10 @@ func optionalDependencyGroup(document projectMetadata, wanted string) ([]string,
 		}
 		found = true
 		matched = requirements
+	}
+	if !found {
+		return nil, exit.Named(exit.Validation, "local_dependency_extra_unknown",
+			"local project declares no optional dependency group %s", wanted)
 	}
 	return matched, nil
 }
