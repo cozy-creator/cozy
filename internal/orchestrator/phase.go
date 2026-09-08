@@ -31,6 +31,7 @@ package orchestrator
 // authority over anything. Nothing here can settle, route, bill or cancel a request.
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -78,6 +79,8 @@ type PhaseObservation struct {
 	At      time.Time
 	Machine string
 	Detail  string
+	Rental  *RentalProgress
+	Models  []ModelDownloadProgress
 	// HasBytes is false for a phase whose producer declared no counters. Moved and Total
 	// are then meaningless and must not be rendered.
 	HasBytes bool
@@ -87,6 +90,14 @@ type PhaseObservation struct {
 	Total   uint64
 	Rate    float64
 	Average float64
+}
+
+// RentalProgress is the observed rental product and its whole-pod hourly rate.
+// It is display information only; billing and admission keep their own authority.
+type RentalProgress struct {
+	AcceleratorModel    string `json:"accelerator_model"`
+	AcceleratorCount    int    `json:"accelerator_count"`
+	HourlyRateUSDMicros int64  `json:"hourly_rate_usd_micros"`
 }
 
 // Elapsed is how long this phase has been the current one.
@@ -119,6 +130,8 @@ type phaseState struct {
 	at       time.Time
 	machine  string
 	detail   string
+	rental   *RentalProgress
+	models   map[string]modelDownloadState
 	hasBytes bool
 	moved    uint64
 	total    uint64
@@ -143,6 +156,8 @@ type PhaseSample struct {
 	Name     string
 	Machine  string
 	Detail   string
+	Rental   *RentalProgress
+	Models   []ModelDownloadProgress
 	HasBytes bool
 	Moved    uint64
 	Total    uint64
@@ -173,6 +188,10 @@ func (p *phases) observe(subject string, sample PhaseSample) {
 		state.machine = sample.Machine
 	}
 	state.detail = sample.Detail
+	if sample.Rental != nil {
+		rental := *sample.Rental
+		state.rental = &rental
+	}
 	if sample.HasBytes {
 		moved := sample.Moved
 		if moved < state.moved {
@@ -190,6 +209,7 @@ func (p *phases) observe(subject string, sample PhaseSample) {
 		state.prevAt, state.prevMove = now, moved
 		state.hasBytes, state.moved, state.total = true, moved, sample.Total
 	}
+	state.observeModels(sample.Models, now)
 	state.at = now
 }
 
@@ -205,6 +225,11 @@ func (p *phases) snapshot(subject string) (PhaseObservation, bool) {
 		Detail: state.detail, HasBytes: state.hasBytes, Moved: state.moved,
 		Total: state.total, Rate: state.rate,
 	}
+	if state.rental != nil {
+		rental := *state.rental
+		out.Rental = &rental
+	}
+	out.Models = state.modelSnapshots()
 	if state.hasBytes {
 		if elapsed := state.at.Sub(state.since).Seconds(); elapsed > 0 {
 			out.Average = float64(state.moved) / elapsed
@@ -240,7 +265,7 @@ func (c *Orchestrator) ObservePhase(subject string, sample PhaseSample) {
 		return
 	}
 	for _, requestID := range c.phaseAudience(subject) {
-		c.frames.publish(Frame{RequestID: requestID, Type: "phase", Value: observed.wire()})
+		c.frames.publish(observed.Frame(requestID))
 	}
 }
 
@@ -260,12 +285,26 @@ func (c *Orchestrator) phaseAudience(subject string) []string {
 	return audience
 }
 
+// Frame uses the same phase document for live updates and initial SSE snapshots.
+func (p PhaseObservation) Frame(requestID string) Frame {
+	return Frame{RequestID: requestID, Type: "phase", Value: p.wire()}
+}
+
 // wire is the live frame's payload. Absent keys mean "not measured": a consumer must not
 // read a missing rate as zero, so a phase with no counters carries no counter keys at all.
 func (p PhaseObservation) wire() map[string]any {
 	out := map[string]any{"phase": p.Name}
 	if p.Machine != "" {
 		out["machine"] = p.Machine
+	}
+	if p.Detail != "" {
+		out["detail"] = p.Detail
+	}
+	if p.Rental != nil {
+		out["rental"] = p.Rental
+	}
+	if len(p.Models) > 0 {
+		out["models"] = p.Models
 	}
 	if elapsed := p.Elapsed(); elapsed > 0 {
 		out["elapsed_ms"] = elapsed.Milliseconds()
@@ -293,7 +332,7 @@ func (p PhaseObservation) wire() map[string]any {
 // refuses everywhere else.
 func (c *Orchestrator) QueuePhase(requestID string) (PhaseObservation, bool) {
 	if observed, ok := c.PhaseOf(requestID); ok {
-		return observed, true
+		return c.phaseRental(requestID, observed), true
 	}
 	row, problem := c.opt.Store.RequestRow(requestID)
 	if problem != nil || row == nil {
@@ -424,4 +463,95 @@ func providerRunning(providerState, containerState string) bool {
 		return running(containerState)
 	}
 	return running(providerState)
+}
+
+// phaseRental fills the display from the existing rental row when preparation has
+// moved from the request to its worker. It introduces no second persisted quote.
+func (c *Orchestrator) phaseRental(requestID string, phase PhaseObservation) PhaseObservation {
+	if phase.Rental != nil {
+		return phase
+	}
+	request, problem := c.opt.Store.RequestRow(requestID)
+	if problem != nil || request == nil || request.Worker == "" {
+		return phase
+	}
+	rental, problem := c.opt.Store.RentalByMachine(request.Worker)
+	if problem != nil || rental == nil {
+		return phase
+	}
+	phase.Rental = &RentalProgress{AcceleratorModel: rental.AcceleratorModel,
+		AcceleratorCount: rental.AcceleratorCount, HourlyRateUSDMicros: rental.HourlyRateUSDMicros}
+	return phase
+}
+
+// ModelDownloadProgress names one checkpoint and measures its available bytes.
+// Rate excludes bytes already present at the start of the fetch. A cache copy is
+// transferred work, but is distinct from network origin bytes.
+type ModelDownloadProgress struct {
+	Model       string  `json:"model"`
+	Release     string  `json:"release"`
+	Lane        string  `json:"lane"`
+	Slot        string  `json:"slot,omitempty"`
+	Manifest    string  `json:"manifest"`
+	Moved       uint64  `json:"moved_bytes"`
+	Total       uint64  `json:"total_bytes,omitempty"`
+	OriginBytes uint64  `json:"origin_bytes,omitempty"`
+	CachedBytes uint64  `json:"cached_bytes,omitempty"`
+	Rate        float64 `json:"rate_bytes_per_second,omitempty"`
+	RemainingMS *int64  `json:"remaining_ms,omitempty"`
+}
+
+type modelDownloadState struct {
+	value             ModelDownloadProgress
+	since, previousAt time.Time
+	initial, previous uint64
+}
+
+func (p *phaseState) observeModels(samples []ModelDownloadProgress, now time.Time) {
+	if len(samples) == 0 {
+		return
+	}
+	if p.models == nil {
+		p.models = map[string]modelDownloadState{}
+	}
+	for _, sample := range samples {
+		if sample.Model == "" || sample.Manifest == "" {
+			continue
+		}
+		key := sample.Model + "\x00" + sample.Release + "\x00" + sample.Lane + "\x00" + sample.Manifest
+		moved := sample.OriginBytes + sample.CachedBytes
+		old, exists := p.models[key]
+		if !exists || moved < old.previous || sample.Moved < old.value.Moved {
+			old = modelDownloadState{since: now, previousAt: now, initial: moved, previous: moved}
+		}
+		if now.After(old.previousAt) && moved > old.previous {
+			sample.Rate = float64(moved-old.previous) / now.Sub(old.previousAt).Seconds()
+			old.previousAt, old.previous = now, moved
+		} else {
+			sample.Rate = old.value.Rate
+		}
+		if elapsed := now.Sub(old.since).Seconds(); elapsed > 0 && moved > old.initial && sample.Total > sample.Moved {
+			average := float64(moved-old.initial) / elapsed
+			seconds := float64(sample.Total-sample.Moved) / average
+			if seconds > 0 && seconds < float64(time.Duration(1<<62)/time.Second) {
+				remaining := int64(seconds * 1000)
+				sample.RemainingMS = &remaining
+			}
+		}
+		old.value = sample
+		p.models[key] = old
+	}
+}
+
+func (p *phaseState) modelSnapshots() []ModelDownloadProgress {
+	keys := make([]string, 0, len(p.models))
+	for key := range p.models {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]ModelDownloadProgress, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, p.models[key].value)
+	}
+	return out
 }
