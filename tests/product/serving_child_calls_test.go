@@ -26,6 +26,21 @@ func TestServingChildRetainsOriginalCallWithoutMemoizingInference(t *testing.T) 
 	if fresh || replay.ID != first.ID {
 		t.Fatal("accepted call-index replay duplicated inference")
 	}
+	state, problem := store.RequestPause(first.ID, "parent interrupted")
+	fatal(t, problem)
+	if state != "pausing" {
+		t.Fatal("serving child did not retain its pause intent")
+	}
+	paused, problem := store.CompleteRequestPause(first.ID)
+	fatal(t, problem)
+	if !paused {
+		t.Fatal("undispatched serving child did not become paused")
+	}
+	resumed, problem := store.ResumeRequest(first.ID, "parent resumed")
+	fatal(t, problem)
+	if !resumed {
+		t.Fatal("serving child was not queued for fresh inference")
+	}
 	call.ID, call.IdemKey, call.ParentCallIndex = "req-serving-repeat", "serving-repeat", 1
 	repeat, fresh, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", arguments)
 	fatal(t, problem)

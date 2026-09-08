@@ -140,16 +140,16 @@ func (s *Store) RequestPause(id, actor string) (string, *exit.Error) {
 		return "", exit.Internalf("cannot begin pause: %s", err)
 	}
 	defer tx.Rollback()
-	var state, kind string
+	var state, kind, parent string
 	var retain bool
-	if err := tx.QueryRow(`SELECT state,kind,retain_work FROM requests WHERE id=?`, id).
-		Scan(&state, &kind, &retain); err != nil {
+	if err := tx.QueryRow(`SELECT state,kind,parent_request_id,retain_work FROM requests WHERE id=?`, id).
+		Scan(&state, &kind, &parent, &retain); err != nil {
 		if err == sql.ErrNoRows {
 			return "", exit.New(exit.NotFound, "request %s is absent", id)
 		}
 		return "", exit.Internalf("cannot read pause ownership: %s", err)
 	}
-	if kind != "job" || !retain {
+	if (kind != "job" && parent == "") || !retain {
 		return "", exit.Named(exit.Conflict, "request.not_resumable", "request %s was not submitted with retained work", id)
 	}
 	if state == "paused" || state == "pausing" {

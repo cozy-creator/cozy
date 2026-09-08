@@ -991,7 +991,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	id := row.ID
 	actor := requestActor(r)
-	if row.RetainWork && row.IsJob() && row.State != "finalizing" && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) {
+	if row.RetainWork && (row.IsJob() || row.ParentRequestID != "") && row.State != "finalizing" && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) {
 		if e := s.orchestrator.CancelRetainedRequest(id, actor); e != nil {
 			s.refuseTyped(w, r, e)
 			return
