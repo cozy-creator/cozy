@@ -115,7 +115,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 func init() {
-	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, childArgumentsDDL)
+	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, childArgumentsDDL, servingPlacementsDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -414,6 +414,9 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if sourceVersion < 34 {
 		if _, err := tx.Exec(childArgumentsDDL); err != nil {
 			return exit.Internalf("cannot add serving child arguments: %s", err)
+		}
+		if _, err := tx.Exec(servingPlacementsDDL); err != nil {
+			return exit.Internalf("cannot retain exact serving placements: %s", err)
 		}
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
@@ -754,7 +757,7 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
-		if version < 34 && statement == childArgumentsDDL {
+		if version < 34 && (statement == childArgumentsDDL || statement == servingPlacementsDDL) {
 			continue
 		}
 		if version < 33 && statement == byteOutputsDDL {
