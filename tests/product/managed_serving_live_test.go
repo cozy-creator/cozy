@@ -142,7 +142,7 @@ only-include=["model_tools.py"]
 		if state == "blocked" || state == "canceled" || state == "succeeded" {
 			t.Fatalf("cancellable script settled before its serving call: %s", state)
 		}
-		err := db.QueryRow(`SELECT r.id FROM requests r JOIN attempts a ON a.request_id=r.id AND a.ordinal=r.ordinal WHERE r.parent_request_id=? AND r.entrypoint='generate' AND a.state='accepted'`, parent).Scan(&child)
+		err := db.QueryRow(`SELECT r.id FROM requests r JOIN attempts a ON a.request_id=r.id AND a.attempt=r.ordinal WHERE r.parent_request_id=? AND r.entrypoint='generate' AND a.state='accepted'`, parent).Scan(&child)
 		if err == nil {
 			break
 		}
