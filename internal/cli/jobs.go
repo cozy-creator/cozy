@@ -45,6 +45,10 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
+	input, assets, e := launch.ParseAssets(job, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"])
+	if e != nil {
+		return e
+	}
 	if e := launch.ValidatePayload(target.Package, job, input); e != nil {
 		return e
 	}
@@ -53,7 +57,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 
-	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input,
+	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
 		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),

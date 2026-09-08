@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
@@ -101,6 +102,9 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Unavailablef("this package owner cannot resolve frozen child interfaces"))
 		return
 	}
+	// Share the existing staged-input ownership fence with terminal cleanup.
+	unlockAssets := inputasset.Guard()
+	defer unlockAssets()
 	spec, target, problem := resolver.ResolvePrivateChild(*parent, iface, call.Module, call.Export, payload)
 	if problem != nil {
 		refuse(problem)

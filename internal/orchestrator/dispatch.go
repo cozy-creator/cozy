@@ -2002,6 +2002,23 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 		Inputs: []*pb.InputAccess{{InputId: "payload", Url: payloadURL(req.Payload)}},
 	}
 	g.Inputs = append(g.Inputs, modelAccess(req)...)
+	assets, problem := localAssetAccess(req)
+	if problem != nil {
+		return nil, problem
+	}
+	g.Inputs = append(g.Inputs, assets...)
+
+	for _, id := range splitList(req.Outputs) {
+		if e := FenceOutputID(id); e != nil {
+			return nil, e
+		}
+		g.Outputs = append(g.Outputs, &pb.OutputAccess{OutputId: id, Url: "file://" + dir + "/"})
+	}
+	return g, nil
+}
+
+func localAssetAccess(req records.Request) ([]*pb.InputAccess, *exit.Error) {
+	var inputs []*pb.InputAccess
 	for _, asset := range req.Assets {
 		limit := asset.MaxBytes
 		if limit <= 0 {
@@ -2010,17 +2027,11 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 		if e := inputasset.Verify(asset, limit); e != nil {
 			return nil, e
 		}
-		g.Inputs = append(g.Inputs, &pb.InputAccess{
+		inputs = append(inputs, &pb.InputAccess{
 			InputId: asset.FieldPath, Url: "file://" + asset.LocalPath,
 		})
 	}
-	for _, id := range splitList(req.Outputs) {
-		if e := FenceOutputID(id); e != nil {
-			return nil, e
-		}
-		g.Outputs = append(g.Outputs, &pb.OutputAccess{OutputId: id, Url: "file://" + dir + "/"})
-	}
-	return g, nil
+	return inputs, nil
 }
 
 // payloadURL is the request document as a `data:` URL: the grant IS the bytes, so a

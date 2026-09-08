@@ -80,8 +80,41 @@ identities. Runtime observes the actual worker environment and refuses protected
 conflicts before offline installation. Tensorhub's immutable release detail supplies the verified
 request/result PackageInterface.
 
-`local_assets` is the CLI-only local extension for `--asset
-<field-path>=<file>`. Each row names the exact request-schema field path plus a source
+For a callable with an explicit `assets` descriptor, repeated `--asset <file>`
+flags append files in attachment order. `--asset 'alice=~/Pictures/alice.png'`
+adds an optional, exact label; nonempty labels must be unique. Repeating the same
+file keeps separate occurrences while reusing its content identity. Explicit
+paths such as `~/Pictures/a=b.png` remain filenames. Labels and files do not
+rewrite the prompt or infer model-specific roles. The package decides how to use
+them. For example:
+
+```sh
+cozy run paul/minimax-h3/ref2va --await --rental-only \
+  prompt='<Picture1> and <Picture2> walk through a garden' \
+  --asset='alice=~/Pictures/alice.png' --asset='bob=~/Pictures/bob.png'
+```
+
+The descriptor names one request field containing `{asset, label?, fidelity?}` records.
+Bindings use `<parameter>.<index>.asset`, with labels carried in the ordinary
+request payload and memo identity. Missing declared collections default to `[]`;
+the authored minimum/maximum count decides whether that is valid. Each media
+kind's encoded byte limit applies per file; Runtime owns decoded byte limits.
+Optional kind counts are compiled from the author's argument-level `AssetLimits`
+annotation. The CLI, API admission and inherited child inputs use the same count
+check over observed MIME metadata.
+An exact named payload asset still uses `--asset <field-path>=<file>`, including
+on jobs, and takes precedence over a same-spelled label. Named fields and the
+declared collection can coexist.
+
+`--asset-fidelity alice=high` or `--asset-fidelity 0=low` records an optional
+per-occurrence hint: `auto` (default), `low`, `medium`, or `high`. Exact labels
+take precedence over canonical nonnegative indexes. Duplicate selectors for the
+same occurrence and unknown selectors refuse before file reads. Fidelity is part
+of the payload and memo identity; model adapters interpret it. The shared media
+loader preserves the input's resolution.
+
+`local_assets` is the CLI-only local extension carrying those attachments.
+Each row names the exact request-schema field path plus a source
 path, digest, length, and detected media type. The daemon verifies those claims and
 copies the bytes into its private content-addressed input store before recording the
 request. Only an opaque digest reference enters `input`; only the field-path identity,
@@ -267,7 +300,7 @@ URLs but remain local-scope rows in the same guarded route table.
 | `POST /v1/local/cache/prune` | local | yes | prune unused operation cache roots in this machine's Runtime workspace; report `removed_entries`, `reclaimed_bytes`, and `store_busy` |
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
-| `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
+| `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
 | `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
