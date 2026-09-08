@@ -7,12 +7,13 @@
 # score-tools={path="./score_tools"}
 # ///
 from cozy_runtime.author.sources import download_huggingface,convert_cozytensors
-from quantize_tools import quantize
+from quantize_tools import graft,quantize
 from score_tools import score
 
 async def main(ctx):
     source=await download_huggingface("example/model",revision="__REVISION__")
     original=await convert_cozytensors(source,profile="fixture/quantize/1")
+    original=await graft(source=original)
     candidate=await quantize(source=original,encoding="fp8-rowwise/1")
     report=await score(model=candidate)
     ctx.log(f"Supplied fixture media SSIM={report.ssim}; checkpoint={report.checkpoint}")

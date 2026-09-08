@@ -280,9 +280,9 @@ func normalizeWeightsOutputs(s Submission) ([]WeightsOutput, []byte, *exit.Error
 			return nil, nil, exit.Named(exit.Validation, "weights_output_identity",
 				"weights output slots are non-empty and unique; %q is repeated or empty", row.OutputID)
 		}
-		if row.MimeType != WeightsManifestMime || row.MaxBytes == 0 || row.MaxBytes > (uint64(1)<<53)-1 {
+		if row.MimeType != WeightsManifestMime || row.MaxBytes > (uint64(1)<<53)-1 {
 			return nil, nil, exit.Named(exit.Validation, "weights_output_contract",
-				"weights output %s must declare MIME %s and a new-byte cap in 1..2^53-1",
+				"weights output %s must declare MIME %s and a new-byte cap in 0..2^53-1",
 				row.OutputID, WeightsManifestMime)
 		}
 		ids[row.OutputID] = true
