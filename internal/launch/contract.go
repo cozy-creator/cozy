@@ -134,10 +134,19 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 		}
 	}
 	if len(ep.Result.Fields) > 0 {
-		b.WriteString("  result:\n")
+		b.WriteString("  output:\n")
 		writeFields(&b, ep.Result.Fields, "    ")
 	}
 	b.WriteString("\nusage: " + UsageLine(target, ep) + "\n")
+	return b.String()
+}
+
+// DescribeArguments uses the same schema printer as --describe without resolving
+// model defaults, so an invalid invocation can show its arguments immediately.
+func DescribeArguments(ep *Entrypoint) string {
+	var b strings.Builder
+	b.WriteString("Arguments:\n")
+	writeFields(&b, ep.Request.Fields, "  ")
 	return b.String()
 }
 

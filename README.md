@@ -234,6 +234,18 @@ weights-read return plane; local-only sources under `--rental` remain local.
 
 ## Run packages and jobs
 
+Inspect a function with `cozy run org/package/function --describe`; its request,
+models and output have separate sections. A call missing required arguments
+prints their names and the argument list before resolving or downloading a model.
+Functions whose arguments all have defaults may be invoked without values.
+Payload arguments and flags may be interleaved, including repeated `--asset` flags.
+
+For local execution, a matching GPU ladder rung selects the preferred lane. If
+the local GPU is not listed, Cozy uses the first declared lane instead. The ladder
+does not prohibit local execution; actual encoding support, model compatibility
+and memory capacity are still checked by Runtime. An explicit model/lane override
+takes precedence. Rental placement retains its existing capacity rules.
+
 Private scripts define ordinary `main()` or `main(ctx)`, synchronous or asynchronous.
 They need no App, request/result class, published package, or separate install command.
 Dependencies may be declared with PEP 723 inline metadata:

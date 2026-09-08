@@ -303,8 +303,11 @@ build-backend="hatchling.build"
 	resumed := latest()
 	children, problem := store.Children(resumed.ID)
 	fatal(t, problem)
-	if len(children) != 2 || children[0].ParentCallIndex != 2 || children[1].ParentCallIndex != 3 || children[0].State != "succeeded" || children[1].State != "succeeded" {
+	if len(children) != 3 || children[0].ParentCallIndex != 2 || children[1].ParentCallIndex != 3 || children[2].ParentCallIndex != 4 || children[0].State != "succeeded" || children[1].State != "succeeded" || children[2].State != "succeeded" {
 		t.Fatalf("resumed composition children incomplete: %+v", children)
+	}
+	if children[0].Ordinal != 0 || children[0].ReusedFrom == "" {
+		t.Fatalf("graft-only preparation should survive interruption: %+v", children[0])
 	}
 	for index, original := range []*records.NativeCall{originalSource, originalModel} {
 		reused, problem := store.NativeCall(resumed.ID, int64(index))
@@ -326,11 +329,15 @@ build-backend="hatchling.build"
 	complete := latest()
 	children, problem = store.Children(complete.ID)
 	fatal(t, problem)
-	if len(children) != 2 {
+	if len(children) != 3 {
 		t.Fatal("completed replay lost managed calls", children)
 	}
 	for index, child := range children {
-		if child.Ordinal != 0 || child.ReusedFrom != previous[index].ID {
+		producer := previous[index].ID
+		if previous[index].ReusedFrom != "" {
+			producer = previous[index].ReusedFrom
+		}
+		if child.Ordinal != 0 || child.ReusedFrom != producer {
 			t.Fatalf("completed operation ran again: %+v", child)
 		}
 	}
@@ -343,7 +350,7 @@ build-backend="hatchling.build"
 	changed := latest()
 	children, problem = store.Children(changed.ID)
 	fatal(t, problem)
-	if len(children) != 2 || children[0].Ordinal != 1 || children[0].ReusedFrom != "" {
+	if len(children) != 3 || children[0].Ordinal != 0 || children[1].Ordinal != 1 || children[1].ReusedFrom != "" {
 		t.Fatalf("changed encoding reused incompatible quantization: %+v", children)
 	}
 	if bodyRequests.Load() != 1 {

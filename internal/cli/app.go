@@ -117,7 +117,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return output.ShellCode(problem)
 	}
 
-	args = runModelFlagArgs(args, parser.Model.Node)
+	args = normalizeRunArgs(args, parser.Model.Node)
 	parsed, err := parser.Parse(args)
 	mode = presentationMode(stdout, wantsJSON || grammar.JSON)
 	mode.Full, mode.Fields = grammar.Full, grammar.Fields
@@ -172,9 +172,10 @@ func jsonRequested(args []string) bool {
 	return false
 }
 
-// runModelFlagArgs gives dashed model overrides the existing payload spelling.
-// Kong's own flag metadata protects option values; the resolver still owns slots/refs.
-func runModelFlagArgs(args []string, application *kong.Node) []string {
+// normalizeRunArgs keeps the variadic payload contiguous for Kong while allowing
+// options between its terms. Kong metadata protects option values; the existing
+// payload parser still owns values and model overrides.
+func normalizeRunArgs(args []string, application *kong.Node) []string {
 	var execute *kong.Node
 	for _, command := range application.Children {
 		if command.Name == "run" {
@@ -194,22 +195,32 @@ func runModelFlagArgs(args []string, application *kong.Node) []string {
 			}
 		}
 	}
-	var overrides []string
+	var payload []string
 	remove := map[int]bool{}
 	inRun, target := false, -1
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
+			if target < 0 {
+				return args
+			}
+			for j := i; j < len(args); j++ {
+				remove[j] = true
+			}
+			payload = append(payload, args[i+1:]...)
 			break
 		}
 		name, _, inline := strings.Cut(arg, "=")
 		if inRun && inline && strings.HasPrefix(name, "--model.") {
-			overrides = append(overrides, strings.TrimPrefix(arg, "--"))
+			payload = append(payload, strings.TrimPrefix(arg, "--"))
 			remove[i] = true
 			continue
 		}
 		if strings.HasPrefix(arg, "-") {
 			if !inline && valueFlags[name] {
+				if i+1 == len(args) {
+					return args // Leave the missing option value for Kong to report.
+				}
 				i++
 			}
 			continue
@@ -226,9 +237,12 @@ func runModelFlagArgs(args []string, application *kong.Node) []string {
 				}
 			}
 			target = i
+		} else {
+			payload = append(payload, arg)
+			remove[i] = true
 		}
 	}
-	if target < 0 || len(overrides) == 0 {
+	if target < 0 || len(payload) == 0 {
 		return args
 	}
 	out := make([]string, 0, len(args))
@@ -236,11 +250,9 @@ func runModelFlagArgs(args []string, application *kong.Node) []string {
 		if !remove[i] {
 			out = append(out, arg)
 		}
-		if i == target {
-			out = append(out, overrides...)
-		}
 	}
-	return out
+	// A single literal tail also preserves dash-prefixed values supplied after --.
+	return append(append(out, "--"), payload...)
 }
 
 func helpArgs(args []string) []string {

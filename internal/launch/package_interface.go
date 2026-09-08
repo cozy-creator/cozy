@@ -342,9 +342,13 @@ func validateClosedPackageInterface(data []byte) error {
 					return err
 				}
 				for _, output := range rows {
-					if _, err := exactKeys(output,
-						[]string{"max_bytes", "mime_type", "output_id"}, nil); err != nil {
+					fields, err := exactKeys(output,
+						[]string{"max_bytes", "mime_type", "output_id"}, nil)
+					if err != nil {
 						return err
+					}
+					if bytes.Equal(fields["max_bytes"], []byte("null")) {
+						return fmt.Errorf("weights output max_bytes must be an explicit integer")
 					}
 				}
 			}
@@ -538,10 +542,10 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	}
 	seenWeights := map[string]bool{}
 	for _, output := range ep.WeightsOutputs {
-		if output.OutputID == "" || seenWeights[output.OutputID] || output.MaxBytes == 0 ||
+		if output.OutputID == "" || seenWeights[output.OutputID] ||
 			output.MaxBytes > (uint64(1)<<53)-1 || output.MimeType != orchestrator.WeightsManifestMime {
 			return exit.New(exit.Validation,
-				"%s has an invalid weights output %q: slots are unique snapshot MIME rows with a 1..2^53-1 byte cap",
+				"%s has an invalid weights output %q: slots are unique snapshot MIME rows with a 0..2^53-1 new-byte cap",
 				ep.Name, output.OutputID)
 		}
 		seenWeights[output.OutputID] = true

@@ -189,7 +189,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		Publishes:        declared.Publishes,
 		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")) && !(f.CPUOrchestration && len(declared.Models) == 0 && len(declared.WeightsOutputs) == 0),
 	}
-	facts.RetainsArtifacts = len(ModelArtifactPaths(declared.Result)) > 0
+	facts.RetainsArtifacts = len(ModelArtifactPaths(declared.Result)) > 0 || len(RetainedAssetPaths(declared)) > 0
 	for _, model := range declared.Models {
 		facts.ModelParams = append(facts.ModelParams, model.Param)
 	}

@@ -21,7 +21,7 @@ func (r *Resolver) NativeSourceCredential(operation string) string {
 
 // NativeSourceEligible reads the captured descriptor, never source code or a mutable package pin.
 func (r *Resolver) NativeSourceEligible(parent records.Request, operation string) *exit.Error {
-	if operation == "convert_cozytensors" {
+	if operation == "convert_cozytensors" || operation == "source_files" || operation == "commit_file" {
 		return nil
 	}
 	install, problem := r.store.Install(parent.InstallID)

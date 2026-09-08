@@ -50,7 +50,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
-	if e := launch.ValidatePayload(target.Package, job, input); e != nil {
+	if e := validateInvocationPayload(ctx, target.Package, job, input); e != nil {
 		return e
 	}
 	trees, e := parseTrees(ctx.Inv.Values["--input"])
@@ -232,6 +232,9 @@ func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 		}
 		fields = append(fields, output.Field{K: "checkpoints_declared", V: rows})
 	}
+	if len(state.NativeOutputs) > 0 {
+		fields = append(fields, output.Field{K: "native_outputs", V: state.NativeOutputs})
+	}
 	if len(state.ModelOutputs) > 0 {
 		fields = append(fields, output.Field{K: "model_outputs", V: state.ModelOutputs})
 	}
@@ -375,6 +378,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if state.Publication != nil {
 		defaults = append(defaults, "publication")
 	}
+	if len(state.NativeOutputs) > 0 {
+		defaults = append(defaults, "native_outputs")
+	}
 	if len(state.ModelOutputs) > 0 {
 		defaults = append(defaults, "model_outputs")
 	}
@@ -389,6 +395,8 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if code == exit.OK {
 		if hint := modelPublishHint(state); hint != "" {
 			rec.Next = []string{hint}
+		} else if len(state.NativeOutputs) > 0 {
+			rec.Next = []string{"cozy run watch " + runReference(state.Number, state.JobID) + " --full"}
 		} else if state.Publication != nil {
 			rec.Next = []string{"cozy run list --full"}
 		}
