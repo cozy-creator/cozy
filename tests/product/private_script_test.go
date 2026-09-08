@@ -140,3 +140,43 @@ def second():
 		t.Fatalf("script without main created work: %+v", rows)
 	}
 }
+
+// Real private installation, generated descriptor, Worker attempt and output spool.
+// No App, request/result DTO or service shim is supplied by the client script.
+func TestPrivateScriptTypedOutputsUseNormalAttempt(t *testing.T) {
+	if *privateScriptRuntimeWheel == "" {
+		t.Skip("requires the exact candidate Runtime wheel")
+	}
+	root, err := os.MkdirTemp("", "cozy-typed-")
+	must(t, err)
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
+	script := filepath.Join(t.TempDir(), "image.py")
+	code := fmt.Sprintf(`# /// script
+# requires-python = ">=3.12,<3.13"
+# dependencies = ["cozy-runtime[media]"]
+# [tool.uv.sources]
+# cozy-runtime = {path = %q}
+# ///
+from cozy_runtime.author import ImageFrame, ImageAsset, Outputs, Telemetry
+
+def main(*, out: Outputs, tel: Telemetry) -> ImageAsset:
+    tel.log("typed main saved a real image")
+    return out.save_image(ImageFrame(2, 2, b"\xff\x00\x00" * 4), format="png")
+`, *privateScriptRuntimeWheel)
+	must(t, os.WriteFile(script, []byte(code), 0o600))
+	status, stdout, stderr := runCozyStreams(t, root, "run", script, "--await", "--json")
+	if status != 0 {
+		t.Fatalf("typed main failed [%d]: %s %s", status, stdout, stderr)
+	}
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	row, problem := store.RequestByReference("1")
+	fatal(t, problem)
+	if row == nil || row.State != "succeeded" {
+		t.Fatalf("missing completed typed script: %+v", row)
+	}
+	if !strings.Contains(stdout, "image/png") {
+		t.Fatalf("typed image result missing: %s", stdout)
+	}
+}
