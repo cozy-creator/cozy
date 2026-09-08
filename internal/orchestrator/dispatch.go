@@ -1434,6 +1434,18 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	}
 	payloadDigest := spellOf(canonical.Digest(req.Payload))
 	outputLimit := c.maxOutputBytes()
+	var servingPlacement DesiredPlacement
+	if !req.IsJob() {
+		c.mu.Lock()
+		servingPlacement = w.spec.Placement
+		if selected, ok := w.remotePlacements[remotePlanKey(pinnedPackage(req.Package, req.Worker), req.PlanID)]; ok {
+			servingPlacement = selected
+		}
+		c.mu.Unlock()
+		if servingPlacement.BindingsDigest == "" || len(servingPlacement.PlacementSetBytes) == 0 {
+			return 0, exit.Named(exit.Conflict, "serving.placement_evidence_absent", "serving dispatch needs the exact prepared model bindings")
+		}
+	}
 	spec := &pb.InvocationSpec{
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
@@ -1444,7 +1456,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		Outputs:           invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingDigest: req.PlanID,
-			BindingsDigest:          w.spec.Placement.BindingsDigest,
+			BindingsDigest:          servingPlacement.BindingsDigest,
 			// With no adapters the binding IS the plan, so the two ids are equal by
 			// construction rather than by copying a value around.
 			AttemptBindingId: req.PlanID,
@@ -1487,7 +1499,8 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	ordinal, e := c.opt.Store.Dispatch(records.Attempt{
 		RequestID: req.ID, InstanceID: w.instanceID,
 		SessionID: w.bootID, InvocationDigest: spelled, InvocationCanonical: canonicalBytes,
-		WeightsOutputs: req.WeightsOutputs,
+		WeightsOutputs:      req.WeightsOutputs,
+		ServingPlacementSet: servingPlacement.PlacementSetBytes,
 	})
 	if e != nil {
 		return 0, e
