@@ -97,7 +97,7 @@ func fp8Exact() records.ModelRef {
 // the hub publishes for each product.
 func market20260907() []hub.RentalSKU {
 	gpu := func(name, model string, vram int64, price int64) hub.RentalSKU {
-		return hub.RentalSKU{Name: name, AcceleratorModel: model, VRAMGB: vram,
+		return hub.RentalSKU{Name: name, AcceleratorModel: model, AcceleratorCount: 1, VRAMGB: vram,
 			ComputeCapability: "9.0", MinimumRAMPerGPUGB: 64,
 			PriceUSDMicrosPerHour: price, StorageUSDMicrosPerHour: 213_504,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"}
@@ -109,7 +109,7 @@ func market20260907() []hub.RentalSKU {
 		gpu("h100-nvl", "NVIDIA H100 NVL", 94, 2_790_000),
 		gpu("h200", "NVIDIA H200", 141, 3_590_000),
 		gpu("b200", "NVIDIA B200", 180, 5_990_000),
-		{Name: "cpu", AcceleratorModel: "CPU", PriceUSDMicrosPerHour: 70_000,
+		{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 70_000,
 			BaseWorkerProfile: "python3.12-cpu-linux-x86"},
 	}
 }

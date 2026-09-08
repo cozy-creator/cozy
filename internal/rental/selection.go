@@ -43,7 +43,7 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
 		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job)
 		if c.Verdict == "" {
-			c.Verdict = widthUnusable(sku, job, constraints)
+			c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
 		}
 		if c.Verdict == "" {
 			c.Verdict = baseMismatch(sku, constraints)
@@ -121,36 +121,37 @@ func FitNote(need records.Residency, vramGB int64) string {
 	return fmt.Sprintf("%s %.1f GiB of %d GB", need.Fit, float64(need.Bytes)/(1<<30), vramGB)
 }
 
-// widthUnusable keeps a product WIDER than one card out of the ladder unless this request
-// can actually use every card it would pay for (cl-179).
+// WidthUnusable keeps a machine WIDER than one card out of the decision unless this request
+// can actually use every card it would be billed for (cl-179). It holds a BUY and a REUSE
+// to the same rule: a wide pod already up is as unusable to a package that cannot shard as
+// one that has not been bought yet, and choosing it would fail the request typed at the
+// worker instead of placing it on a machine that works.
 //
 // A wide machine is not more capacity: every rank of a sequence-parallel group holds the
 // FULL weights, so width buys latency and never fit. The only thing that uses the extra
 // cards is a group placement of exactly that degree, which needs two things this side
 // knows before spending: the package's author must have declared the degree, and the
 // request must be a serving one — a job is a single bounded attempt and shards nothing,
-// so a wide pod bought for one idles every card but the first for the whole hour.
+// so a wide pod given one idles every card but the first for the whole hour.
 //
-// The check is CHEAP INSURANCE, not the fence. The worker refuses
-// `device_group_unsupported` on arrival either way; the difference is whether that refusal
-// costs an hour's rent. Constraints are advisory — a hub that will not answer yields none
-// — so this narrows the ladder and never widens it: with no declared degrees, only
-// one-card products remain, which is exactly the behaviour before wide products existed.
-func widthUnusable(sku hub.RentalSKU, job bool, constraints Constraints) string {
-	if sku.AcceleratorCount < 2 {
+// Constraints are advisory — a hub that will not answer yields none — so this narrows the
+// decision and never widens it: with no declared degrees only one-card machines remain,
+// which is exactly the behaviour before wide products existed.
+func WidthUnusable(width int, job bool, constraints Constraints) string {
+	if width < 2 {
 		return ""
 	}
 	if job {
 		return orchestrator.VerdictExcluded + orchestrator.ExcludedWidthUndeclared +
-			fmt.Sprintf(": %d cards, and a job shards none of them", sku.AcceleratorCount)
+			fmt.Sprintf(": %d cards, and a job shards none of them", width)
 	}
 	for _, degree := range constraints.Degrees {
-		if degree == sku.AcceleratorCount {
+		if degree == width {
 			return ""
 		}
 	}
 	return orchestrator.VerdictExcluded + orchestrator.ExcludedWidthUndeclared +
-		fmt.Sprintf(": %d cards, and the package declares %s", sku.AcceleratorCount,
+		fmt.Sprintf(": %d cards, and the package declares %s", width,
 			declaredDegrees(constraints.Degrees))
 }
 

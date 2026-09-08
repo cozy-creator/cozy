@@ -18,9 +18,9 @@ import (
 // code had substituted a dearer card. It had not.
 func refusalCatalog() []hub.RentalSKU {
 	return []hub.RentalSKU{
-		{Name: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090",
+		{Name: "rtx-4090", AcceleratorModel: "NVIDIA GeForce RTX 4090", AcceleratorCount: 1,
 			PriceUSDMicrosPerHour: 740_000, StorageUSDMicrosPerHour: 213_504},
-		{Name: "cpu", AcceleratorModel: "CPU", PriceUSDMicrosPerHour: 70_000},
+		{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 70_000},
 	}
 }
 

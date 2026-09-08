@@ -301,11 +301,14 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	}
 	decision := orchestrator.PlacementDecision{Tier: m.ctx.Cfg.PlacementPrefer,
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
-	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator)
+	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
+	// a machine that would be bought are held to the same declared degrees (cl-179).
+	constraints := releaseConstraints(m.ctx, req)
+	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
 	}
-	purchases := rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), releaseConstraints(m.ctx, req))
+	purchases := rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), constraints)
 	var capped *exit.Error
 	for i := range purchases {
 		c := &purchases[i]
@@ -376,7 +379,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 // is silently dropped (cl-132): a decision reporting no attached candidate while the
 // fleet holds two is the shape that read as waste live.
 func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hub.RentalSKU,
-	needsAccelerator bool) ([]orchestrator.PlacementCandidate, *exit.Error) {
+	needsAccelerator bool, constraints rental.Constraints) ([]orchestrator.PlacementCandidate, *exit.Error) {
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		return nil, problem
@@ -407,6 +410,11 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 			// catalog's memory figure for its product is the fact (a product gone from
 			// the catalog this minute decides nothing).
 			rental.Size(&c, req.Models, row.AcceleratorModel, sku.VRAMGB, needsAccelerator && offered, req.IsJob())
+			if c.Verdict == "" {
+				// The machine's OWN width, not its product's: an attached rental is the
+				// authority on how many cards it has, and its SKU may have left the catalog.
+				c.Verdict = rental.WidthUnusable(row.AcceleratorCount, req.IsJob(), constraints)
+			}
 			if c.Verdict != "" {
 				break
 			}

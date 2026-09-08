@@ -109,21 +109,26 @@ func submitToWideRental(t *testing.T, o *owner, idem string) {
 	fatal(t, problem)
 }
 
-// awaitPlacementSet returns the last serving desired state the pod received.
-func awaitPlacementSet(t *testing.T, o *owner, pod *fakePod) *pb.DesiredPlacementSet {
+// awaitPlacementSet returns the last desired state the pod received that actually names a
+// placement, and that placement's id. An empty set is a drain, not the convergence the pin
+// rides on.
+func awaitPlacementSet(t *testing.T, o *owner, pod *fakePod) (*pb.DesiredPlacementSet, string) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		pod.mu.Lock()
-		var last *pb.DesiredPlacementSet
-		for _, desired := range pod.desired {
-			if set := desired.GetPlacementSet(); set != nil && len(set.PlacementSetCanonicalBytes) > 2 {
-				last = set
-			}
-		}
+		states := append([]*pb.DesiredWorkerState(nil), pod.desired...)
 		pod.mu.Unlock()
-		if last != nil {
-			return last
+		for i := len(states) - 1; i >= 0; i-- {
+			set := states[i].GetPlacementSet()
+			if set == nil {
+				continue
+			}
+			doc, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+			if err != nil || len(doc.List("placements")) != 1 {
+				continue
+			}
+			return set, doc.List("placements")[0].Str("placement_id")
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("no serving desired state reached the pod: %v", o.c.Events())
@@ -156,11 +161,7 @@ func TestRentalWidthPinsThePlacementToEveryPaidCard(t *testing.T) {
 			o := hostOwner(t, "rental-width-"+arm.name,
 				rentalWidthWiring(t, pod, connection, certPath, arm.width))
 			submitToWideRental(t, o, "width-"+arm.name)
-			set := awaitPlacementSet(t, o, pod)
-
-			doc, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
-			must(t, err)
-			placementID := doc.List("placements")[0].Str("placement_id")
+			set, placementID := awaitPlacementSet(t, o, pod)
 			if len(arm.pin) == 0 {
 				if len(set.DevicePins) != 0 {
 					t.Fatalf("a %d-card rental pinned %v; one device is one lane",
@@ -200,7 +201,7 @@ func TestWeightlessPlacementIsNeverPinnedToAGroup(t *testing.T) {
 	o := hostOwner(t, "rental-width-weightless",
 		rentalWidthWiring(t, pod, connection, certPath, 4))
 	submitToWideRental(t, o, "width-weightless")
-	set := awaitPlacementSet(t, o, pod)
+	set, _ := awaitPlacementSet(t, o, pod)
 	if len(set.DevicePins) != 0 {
 		t.Fatalf("a weightless placement was pinned to %v", set.DevicePins)
 	}
@@ -236,7 +237,9 @@ func TestPodDeliveringFewerCardsThanPaidForIsRefused(t *testing.T) {
 // that uses a second card is a group of that degree, and only the package's author can say
 // the construction can be built at one. A wide product is therefore excluded from the
 // ladder unless the degree is declared, which keeps a typed worker refusal from costing an
-// hour's rent.
+// hour's rent. The same rule holds a REUSE: `attachedLocked` puts every attached rental's
+// own width through `WidthUnusable`, because a wide pod already up is as unusable to a
+// package that cannot shard as one that has not been bought.
 func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T) {
 	skus := []hub.RentalSKU{
 		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 1,
