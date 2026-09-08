@@ -256,7 +256,8 @@ func (h *ladderHub) addState(id, machine, accelerator, state string, rate int64)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.rentals[id] = map[string]any{"rental_id": id, "name": machine, "state": state,
-		"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate}
+		"requested_accelerator_model": accelerator, "accelerator_count": 1,
+		"hourly_rate_usd_micros": rate}
 }
 
 func (h *ladderHub) addReady(id, machine, accelerator string, rate int64) {

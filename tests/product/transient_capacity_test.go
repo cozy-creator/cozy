@@ -49,7 +49,7 @@ func plantRental(t *testing.T, root string, h *ladderHub, store *records.Store,
 	must(t, os.WriteFile(filepath.Join(rentals, id+".creator.pem"),
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
 	row := records.Rental{ID: id, MachineName: machine, SKU: "h100-80", AcceleratorModel: h100SXM,
-		HourlyRateUSDMicros: 2_490_000, State: state, Hub: h.server.URL}
+		AcceleratorCount: 1, HourlyRateUSDMicros: 2_490_000, State: state, Hub: h.server.URL}
 	if attached {
 		row.Address, row.CertPath = "127.0.0.1:1", filepath.Join(rentals, id+".pem")
 		h.addReady(id, machine, h100SXM, row.HourlyRateUSDMicros)
