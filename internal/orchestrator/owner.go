@@ -357,6 +357,10 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			if e := c.onClaimAck(w, s, ack); e != nil {
 				return fmt.Errorf("%s", e.Message)
 			}
+		case *pb.WorkerFrame_NativeSourceStatus:
+			c.onNativeSourceStatus(s, m.NativeSourceStatus)
+		case *pb.WorkerFrame_NativeArtifactTransferStatus:
+			c.onNativeArtifactTransfer(s, m.NativeArtifactTransferStatus)
 		case *pb.WorkerFrame_ChildCallRequest:
 			c.onChildCall(s, m.ChildCallRequest)
 		case *pb.WorkerFrame_ChildCallCancel:

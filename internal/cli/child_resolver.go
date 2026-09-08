@@ -96,26 +96,27 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 		if artifact == nil {
 			return out, "", exit.Named(exit.Conflict, "child.model_unbound", "child model %s needs an exact retained ModelArtifact", slot.Param)
 		}
-		weights, problem := r.store.ArtifactOutput(*artifact)
+		source, problem := r.store.ResolveArtifactSource(*artifact)
 		if problem != nil {
 			return out, "", problem
 		}
-		producer, problem := r.store.RequestRow(artifact.ProducerRequestID)
-		if problem != nil || producer == nil || producer.Worker != parent.Worker {
-			return out, "", exit.Named(exit.Conflict, "child.artifact_scope", "model artifact does not belong to the parent's retained scope and store")
-		}
-		held, problem := r.store.ArtifactHasCustody(producer.ID, weights.Attempt, weights.OutputSlot, parent.ReuseScope)
+		held, problem := r.store.ArtifactSourceAllowed(parent, *source)
 		if problem != nil {
 			return out, "", problem
 		}
 		if !held {
-			return out, "", exit.Named(exit.Conflict, "child.artifact_released", "model artifact no longer has retained native custody")
+			return out, "", exit.Named(exit.Conflict, "child.artifact_scope", "model artifact was not received with retained custody in this private store")
 		}
-		models = append(models, orchestrator.ModelRef{Package: install.Package, Slot: slot.Param, BindingPath: slot.Path, Model: producer.ID + "/" + artifact.OutputSlot, Manifest: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length})
+
+		models = append(models, orchestrator.ModelRef{Package: install.Package, Slot: slot.Param, BindingPath: slot.Path, Model: artifact.ProducerRequestID + "/" + artifact.OutputSlot, Manifest: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length})
 	}
 	out = orchestrator.Submission{Kind: "job", RetainWork: true, Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
 		PlanID: facts.DescriptorID, Payload: append([]byte(nil), payload...), Outputs: facts.Outputs, WeightsOutputs: facts.WeightsOutputs, NeedsAccelerator: facts.NeedsAccelerator, Org: parent.Org}
 	out.Models = models
+	out.Assets, problem = launch.InheritChildAssets(job, payload, parent.Assets)
+	if problem != nil {
+		return out, "", problem
+	}
 	out.ChildReusable = job.Invocable.Memoize
 	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0
 	if parent.Worker != "" {

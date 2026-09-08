@@ -267,7 +267,7 @@ URLs but remain local-scope rows in the same guarded route table.
 | `POST /v1/local/cache/prune` | local | yes | prune unused operation cache roots in this machine's Runtime workspace; report `removed_entries`, `reclaimed_bytes`, and `store_busy` |
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
-| `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
+| `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
 | `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
@@ -437,3 +437,12 @@ cannot drift:
 **A FAILED or CANCELED terminal never comes back through this table.** It is answered
 `200` on purpose—a terminal is an answer, not a transport failure. The CLI preserves the
 terminal's detailed symbolic status and returns shell exit 1 for any non-successful outcome.
+
+
+Private invocable dependencies preserve standard Python extra selection. For example,
+a local dependency declared as `cozy-eval[managed]` activates that library's declared
+managed requirements in the immutable child capture. The original editable pyproject
+and lock remain unchanged. The captured pyproject, resolved uv lock, wheel and execution
+environment identify the selected closure; equivalent normalized extra sets capture
+identically. Unknown or ambiguous local extra groups refuse. This uses the existing
+private installation and invocation flow, without a wrapper package or another command.

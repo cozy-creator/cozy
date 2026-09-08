@@ -341,18 +341,19 @@ func Paths(files map[string]string) []string {
 // SourceIdentity binds an editable install to the exact publishable source tree.
 // It neither builds nor claims a wheel: editable execution uses this live tree,
 // while published execution remains the separate wheel-backed path.
-func (p *Package) SourceIdentity() (string, int, int64, *exit.Error) {
+func (p *Package) SourceIdentity(extras ...string) (string, int, int64, *exit.Error) {
 	document := sourceIdentityDocument{}
 	var sourceBytes int64
 	files := make(map[string]string, len(p.Files))
 	for name, path := range p.Files {
 		files[name] = path
 	}
-	dependencies, problem := LocalDependencyPaths(p.Tree)
+	dependencies, problem := LocalDependencySelections(p.Tree, extras...)
 	if problem != nil {
 		return "", 0, 0, problem
 	}
-	for name, source := range dependencies {
+	for name, selection := range dependencies {
+		source := selection.Path
 		info, err := os.Stat(source)
 		if err != nil {
 			return "", 0, 0, exit.Internalf("cannot inspect local dependency: %s", err)

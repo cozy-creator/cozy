@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -435,7 +436,9 @@ func (c *Orchestrator) RentalStanding(id string, job bool) (reason string, held 
 
 // Orchestrator is the Cozy daemon's scheduling role.
 type Orchestrator struct {
-	opt Options
+	artifactSequence atomic.Uint64
+	artifactPending  sync.Map
+	opt              Options
 
 	// done closes when the daemon is closing; Serve blocks on it (the owner DIALS
 	// workers, so there is no server here to run, #436). closeOnce makes Close

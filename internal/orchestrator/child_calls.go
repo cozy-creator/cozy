@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
@@ -73,6 +74,12 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Named(exit.Conflict, "child.intent_changed", "child intent digest does not match its exact target and input"))
 		return
 	}
+	if c.onNativeSourceCall(s, parent, call) {
+		return
+	}
+	if c.onNativeEffect(s, *parent, call) {
+		return
+	}
 	priorCalls, problem := c.opt.Store.Children(parent.ID)
 	if problem != nil {
 		refuse(problem)
@@ -101,6 +108,9 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Unavailablef("this package owner cannot resolve frozen child interfaces"))
 		return
 	}
+	// Share the existing staged-input ownership fence with terminal cleanup.
+	unlockAssets := inputasset.Guard()
+	defer unlockAssets()
 	spec, target, problem := resolver.ResolvePrivateChild(*parent, iface, call.Module, call.Export, payload)
 	if problem != nil {
 		refuse(problem)
@@ -296,6 +306,9 @@ func (c *Orchestrator) onChildCancel(s *session, call *pb.ChildCallCancel) {
 	}
 	parent, problem := c.childParent(s, call.ParentRequestId, call.ParentAttemptOrdinal, call.ParentInvocationSpecDigest)
 	if problem != nil {
+		return
+	}
+	if c.cancelNativeSource(s, call) {
 		return
 	}
 	children, problem := c.opt.Store.Children(call.ParentRequestId)

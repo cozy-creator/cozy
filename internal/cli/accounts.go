@@ -4,6 +4,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/publication"
 )
 
 // publicationAccount binds a publication to the logged-in user's one Tensorhub account.
@@ -23,17 +24,9 @@ func ownedPublication(ctx *Context, ref hub.Ref) (*hub.Client, *exit.Error) {
 	if auth == nil {
 		auth = accountauth.New(ctx.Cfg)
 	}
-	if ctx.Cfg.HubToken.Present() && !auth.CredentialPresent() {
-		return client(ctx), nil
-	}
-	c, account, problem := publicationAccount(ctx)
-	if problem != nil {
-		return nil, problem
-	}
-	if ref.Org != account.Name {
-		return nil, exit.Usagef("cannot publish %s while logged in as Tensorhub account %s",
-			ref.String(), account.Name).
-			WithRemedy("publish as %s/%s", account.Name, ref.Name)
-	}
-	return c, nil
+	c := client(ctx)
+	hctx, cancel := hub.Context()
+	defer cancel()
+	_, problem := publication.Authorize(hctx, c, ref, ctx.Cfg.HubToken.Present() && !auth.CredentialPresent())
+	return c, problem
 }

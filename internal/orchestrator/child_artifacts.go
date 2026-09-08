@@ -129,6 +129,22 @@ func (c *Orchestrator) retainChildArtifacts(ctx context.Context, consumer record
 	sort.Strings(slots)
 	for _, slot := range slots {
 		artifact := artifacts[slot]
+		source, problem := c.opt.Store.ResolveArtifactSource(artifact)
+		if problem != nil {
+			return problem
+		}
+		if source.NativeServiceID != "" {
+			retention, problem := c.opt.Store.ReserveNativeArtifact(consumer.ID, consumer.ID, kind, slot, artifact)
+			if problem != nil {
+				return problem
+			}
+			if retention.State != "held" {
+				if problem := c.changeNativeArtifactRetention(ctx, retention, false); problem != nil {
+					return problem
+				}
+			}
+			continue
+		}
 		weights, problem := c.opt.Store.ArtifactOutput(artifact)
 		if problem != nil {
 			return problem
@@ -293,5 +309,20 @@ func (c *Orchestrator) releaseChildRetentions(id string, inputsOnly bool) *exit.
 			}
 		}
 	}
+	if problem := c.opt.Store.BeginNativeArtifactRelease(id, inputsOnly); problem != nil {
+		return problem
+	}
+	native, problem := c.opt.Store.NativeArtifactRetentions(id)
+	if problem != nil {
+		return problem
+	}
+	for _, retention := range native {
+		if retention.State == "releasing" {
+			if problem := c.changeNativeArtifactRetention(context.Background(), retention, true); problem != nil {
+				return problem
+			}
+		}
+	}
+
 	return nil
 }
