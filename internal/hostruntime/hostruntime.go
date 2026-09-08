@@ -20,10 +20,10 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the first release that validates exact private dependency closure.
+// Floor supports exact private dependency closure with ordinary prebuilt wheels.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-const Floor = "0.10.1"
+const Floor = "0.10.3"
 
 var floor = pep440.MustParse(Floor)
 
