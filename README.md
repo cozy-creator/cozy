@@ -356,6 +356,11 @@ the package reports `overall_fraction`; stage-local fractions are labeled as sta
 Human progress is automatic with `--await`; no separate progress flag is needed.
 Model overrides accept `--model.<param>=org/model@release/lane` after the target;
 the existing `model.<param>=...` payload spelling has the same meaning.
+Without an override, Cozy uses the owner's Tensorhub binding, then the selected function's
+published model default ladder. Authors can declare that ladder with
+`@invocable(defaults={"model": [{"gpu": "H100", "lane": "org/model@release/fp8"}]})`.
+Each slot's rungs must use the same model and release; the GPU patterns select its lanes.
+These authored defaults stay in the package interface and are never copied into Hub bindings.
 `cozy run watch <run-id>` attaches to that same progress stream later; interrupting a watcher
 detaches without canceling the durable run.
 
