@@ -641,6 +641,11 @@ const (
 	// accelerator — an explicit override off the ladder, or bound to none — so the whole
 	// lane's bytes are the need, conservatively.
 	FitLaneBytes = "lane_bytes"
+	// FitDeriveOnly: the request is a JOB, whose Model inputs cozy-runtime never
+	// constructs — they are derive-only Manifest capabilities with no load, no component
+	// scope and no residency (cozy-runtime `internal/worker/plan.py` JobBinding) — so no
+	// component of one is ever on the device and no figure is compared.
+	FitDeriveOnly = "derive_only"
 )
 
 // Residency is what a pinned selection must hold on one device at once, and the rule that
@@ -659,11 +664,17 @@ type Residency struct {
 // with no component bytes, the owner's rung for this accelerator and lane asserts the fit
 // with no figure, and failing that the lane's whole bytes stand in. Summed over slots,
 // because a placement holds every slot at once.
-func Resident(models []ModelRef, accelerator string) Residency {
+//
+// `job` sizes the SAME selection as a job's inputs instead, and there the answer is
+// nothing: cozy-runtime hands a job a derive-only view of the Manifest and refuses load
+// and component access on it, so a job's model never reaches the device however large its
+// closure is. Sizing one by the components a SERVING construction would stage is a figure
+// about a different run (cl-180).
+func Resident(models []ModelRef, accelerator string, job bool) Residency {
 	var out Residency
 	var fits, needs []string
 	for _, model := range models {
-		bytes, need, fit := model.resident(accelerator)
+		bytes, need, fit := model.resident(accelerator, job)
 		out.Bytes += bytes
 		if need != "" {
 			needs = append(needs, need)
@@ -676,7 +687,10 @@ func Resident(models []ModelRef, accelerator string) Residency {
 	return out
 }
 
-func (m ModelRef) resident(accelerator string) (int64, string, string) {
+func (m ModelRef) resident(accelerator string, job bool) (int64, string, string) {
+	if job {
+		return 0, "", FitDeriveOnly
+	}
 	if len(m.ComponentBytes) > 0 {
 		bytes, need := m.largestGroup()
 		return bytes, need, FitComponents

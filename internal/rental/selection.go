@@ -23,8 +23,9 @@ type Constraints struct {
 // pinned to the rung its accelerator fits and carrying the verdict that keeps it out —
 // no rung, a device the selection outweighs (cl-168, cl-170), a base image the release
 // contradicts — or none, when it may be bought. The rate is what the renter pays: price
-// plus storage. A CPU-class request skips the device check: there is no device.
-func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator bool,
+// plus storage. A CPU-class request skips the device check: there is no device, and a
+// `job` request skips the memory figure: its models are never resident (cl-180).
+func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator, job bool,
 	constraints Constraints) []orchestrator.PlacementCandidate {
 	var out []orchestrator.PlacementCandidate
 	for _, sku := range skus {
@@ -33,7 +34,7 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		}
 		c := orchestrator.PlacementCandidate{SKU: sku.Name,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
-		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator)
+		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job)
 		if c.Verdict == "" {
 			c.Verdict = baseMismatch(sku, constraints)
 		}
@@ -45,9 +46,11 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 // Size pins the selection onto one machine and holds its device to what the pinned lanes
 // need (cl-168, cl-170): Models, Rung and Lane, then Fit — the rule that sized it — and
 // the verdict that keeps it out, no_rung or vram_short. `device` is false for a CPU-class
-// request, or a machine the catalog no longer sizes: nothing is compared.
+// request, or a machine the catalog no longer sizes: nothing is compared. `job` says the
+// selection is a job's inputs, which are derive-only and never resident (cl-180); the
+// rung still selects the lane, and nothing is compared against memory.
 func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
-	vramGB int64, device bool) {
+	vramGB int64, device, job bool) {
 	var ok bool
 	if c.Models, c.Rung, ok = Pin(models, accelerator); !ok {
 		c.Verdict = orchestrator.VerdictNoRung
@@ -57,7 +60,7 @@ func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, acceler
 	if !device {
 		return
 	}
-	need := records.Resident(c.Models, accelerator)
+	need := records.Resident(c.Models, accelerator, job)
 	c.Fit, c.Verdict = FitNote(need, vramGB), Fit(need, vramGB, c.SKU)
 }
 

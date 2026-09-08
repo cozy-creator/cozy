@@ -304,7 +304,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if problem != nil {
 		return none, "", problem
 	}
-	purchases := rental.Purchases(skus, req.Models, needsAccelerator, releaseConstraints(m.ctx, req))
+	purchases := rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), releaseConstraints(m.ctx, req))
 	var capped *exit.Error
 	for i := range purchases {
 		c := &purchases[i]
@@ -405,7 +405,7 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 			// A machine the user already has up is held to the same floor as a buy; the
 			// catalog's memory figure for its product is the fact (a product gone from
 			// the catalog this minute decides nothing).
-			rental.Size(&c, req.Models, row.AcceleratorModel, sku.VRAMGB, needsAccelerator && offered)
+			rental.Size(&c, req.Models, row.AcceleratorModel, sku.VRAMGB, needsAccelerator && offered, req.IsJob())
 			if c.Verdict != "" {
 				break
 			}

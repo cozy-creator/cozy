@@ -52,11 +52,17 @@ const (
 	ladderPackage = "proof/h3"
 	ladderSlot    = "generate.models.model"
 	ladderModel   = "proof/minimax"
+	ladderRelease = "1.0.0-rc.1"
+	ladderLane    = "fp8-adaln-pruned"
 )
 
 func newLadderHub(t *testing.T) *ladderHub {
 	t.Helper()
-	iface := []byte(`{"application":"h3:app","entrypoints":[{"name":"generate","models":[{"class":"H3","component_use":{"condition_fl2va_media":["video_vae"],"condition_ref2va_media":["audio_vae","video_vae"],"condition_text":["text_encoder"],"decode_audio":["audio_vae"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"],"sample_ref2va":["ref2va_dit"]},"path":"generate.models.model"}],"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
+	// `generate` is the serving entrypoint whose methods stage components. `lane` is the
+	// se-037 shape: a JOB whose model input is a derive-only source it reads the header of
+	// and inherits by reference — its class declares no component_use, and it writes one
+	// 64 KiB config per output.
+	iface := []byte(`{"application":"h3:app","entrypoints":[{"name":"generate","models":[{"class":"H3","component_use":{"condition_fl2va_media":["video_vae"],"condition_ref2va_media":["audio_vae","video_vae"],"condition_text":["text_encoder"],"decode_audio":["audio_vae"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"],"sample_ref2va":["ref2va_dit"]},"path":"generate.models.model"}],"request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[{"name":"lane","models":[{"class":"Source","component_use":{},"path":"lane.models.pruned"}],"publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":65536,"mime_type":"application/vnd.cozy.model-manifest","output_id":"attn8"}]}]}`)
 	contract, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
 	var detail hub.PackageReleaseDetail
@@ -138,6 +144,14 @@ func newLadderHub(t *testing.T) *ladderHub {
 		}
 		_ = json.NewEncoder(w).Encode(card)
 	})
+	mux.HandleFunc("GET /v1/models/proof/minimax/releases/{release}/lanes/{lane}/manifest",
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.PathValue("release") != ladderRelease || r.PathValue("lane") != ladderLane {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(fp8ManifestBody)
+		})
 	mux.HandleFunc("GET /v1/models/proof/minimax/throughput", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -507,4 +521,53 @@ func candidateVerdicts(placement map[string]any) map[string]string {
 		out[name], _ = c["verdict"].(string)
 	}
 	return out
+}
+
+// cl-180. On 2026-09-08 `cozy run paul/minimax-h3-tools/attention-lane
+// --model.pruned=paul/minimax-h3@1.0.0-rc.2/fp8-adaln-pruned --rental-only` was sized
+// "fit components 48.0 GiB of 48 GB": the job reads the source HEADER, inherits 3,858
+// tensors by reference and writes 550 bytes, but the sizer held the card to the
+// components a SERVING construction of that lane would stage. The 24 GB card was
+// excluded, two rtx-6000-ada pods sat in `acquiring` for 22 and 24 minutes, and ~32 s of
+// work cost 849 s of wall. cozy-runtime gives a job a derive-only view of the Manifest
+// and refuses load and component access on it, so a job's model is never on the device:
+// the cheap card is admissible and the record says `derive_only` rather than a figure.
+func TestAJobIsNotSizedByTheComponentsItNeverStages(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	// The cheapest card is refused for stock, so the walk itself is the evidence: the
+	// 24 GB product is asked for FIRST, which the component figure made impossible.
+	h.soldOut["rtx-4090"] = true
+	root := ladderRoot(t, h)
+	startDaemonProcess(t, root)
+	_, out := runCozy(t, root, "run", ladderPackage+"/lane",
+		"--model.pruned="+ladderModel+"@"+ladderRelease+"/"+ladderLane,
+		"--rental-only", "--json", "--idempotency-key", "job-derive-fit")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	queued, problem := store.RequestByIdempotencyKey("job-derive-fit")
+	fatal(t, problem)
+	if queued == nil || queued.Kind != "job" {
+		t.Fatalf("the by-reference job was not submitted: %s", out)
+	}
+	if len(queued.Models) != 1 || queued.Models[0].Manifest != fp8Manifest ||
+		queued.Models[0].ComponentBytes["text_encoder"] != textEncoderNeed {
+		t.Fatalf("the job did not carry the sized lane it reads: %+v", queued.Models)
+	}
+	waitFor(t, root, "the walk passing the cheapest card", func() bool { return len(h.postedSKUs()) >= 2 })
+	posted := h.postedSKUs()
+	if !strings.HasPrefix(posted[0], "rtx-4090/") || !strings.HasPrefix(posted[1], "rtx-5090/") {
+		t.Fatalf("paid asks %v; want the cheapest cards first for a job that stages nothing", posted)
+	}
+	log := tail(filepath.Join(root, "daemon.log"))
+	for _, want := range []string{"renting rtx-4090", "(lane fp8-adaln-pruned, fit derive_only)",
+		"rtx-4090 has no inventory; choosing again without it", "renting rtx-5090"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("daemon.log does not say %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "vram_short") {
+		t.Fatalf("a job's derive-only model excluded a card for memory:\n%s", log)
+	}
 }

@@ -67,7 +67,7 @@ func exampleCandidates(t *testing.T, ahead int) []orchestrator.PlacementCandidat
 	attached := orchestrator.PlacementCandidate{Rental: "pr-morgiana", Machine: "morgiana", SKU: "h100-sxm5-80gb",
 		Rung: rung, Lane: fp8Lane, Ahead: ahead, RateUSDMicrosPerHour: 3_520_000, Models: pinned}
 	candidates := append([]orchestrator.PlacementCandidate{attached},
-		rental.Purchases(exampleMarket(), exampleLadder(), true, rental.Constraints{})...)
+		rental.Purchases(exampleMarket(), exampleLadder(), true, false, rental.Constraints{})...)
 	if used := rental.Measure(candidates, exampleRows(), exampleLadder()); len(used) != 2 {
 		t.Fatalf("the two rows were not both used: %+v", used)
 	}
