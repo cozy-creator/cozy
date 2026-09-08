@@ -271,12 +271,12 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 28 {
+	if sourceVersion < 33 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
 	}
-	if sourceVersion < 28 {
+	if sourceVersion < 33 {
 		if _, err := tx.Exec(childRequestIndex); err != nil {
 			return exit.Internalf("cannot restore child call admission index in %s: %s", path, err)
 		}
@@ -395,23 +395,16 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	}
 
 	if sourceVersion < 33 {
-		if sourceVersion >= 28 {
-			if _, err := tx.Exec("ALTER TABLE requests ADD COLUMN capture TEXT NOT NULL DEFAULT ''"); err != nil {
-				return exit.Internalf("cannot add capture request identity: %s", err)
-			}
-		}
+
 		if _, err := tx.Exec(byteOutputsDDL); err != nil {
 			return exit.Internalf("cannot add byte output custody: %s", err)
 		}
+
 		if sourceVersion >= 31 {
-			for _, statement := range []string{
-				"ALTER TABLE native_artifact_retentions ADD COLUMN artifact_kind TEXT NOT NULL DEFAULT 'derived' CHECK(artifact_kind IN ('derived','tree'))",
-				"ALTER TABLE native_artifact_retentions ADD COLUMN producer_attempt INTEGER NOT NULL DEFAULT 0",
-				"ALTER TABLE native_artifact_retentions ADD COLUMN producer_output_id TEXT NOT NULL DEFAULT ''",
-				"ALTER TABLE native_artifact_retentions ADD COLUMN content_bytes INTEGER NOT NULL DEFAULT 0",
-			} {
+			columns := strings.TrimPrefix(nativeArtifactCols, "artifact_kind,producer_attempt,producer_output_id,content_bytes,")
+			for _, statement := range []string{`ALTER TABLE native_artifact_retentions RENAME TO native_artifact_retentions_prior`, nativeArtifactRetentionsDDL, `INSERT INTO native_artifact_retentions(` + columns + `) SELECT ` + columns + ` FROM native_artifact_retentions_prior`, `DROP TABLE native_artifact_retentions_prior`} {
 				if _, err := tx.Exec(statement); err != nil {
-					return exit.Internalf("cannot extend native byte retention: %s", err)
+					return exit.Internalf("cannot preserve native custody migration: %s", err)
 				}
 			}
 		}
@@ -674,6 +667,10 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		child := ",parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive"
 		destinationColumns += child
 		selectColumns += child
+	}
+	if sourceVersion >= 28 {
+		destinationColumns += ",child_artifacts"
+		selectColumns += ",child_artifacts"
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
 		` FROM requests_prior`); err != nil {
