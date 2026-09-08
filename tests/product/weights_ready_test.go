@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,6 +16,15 @@ import (
 // An independent claimed Host status drives the real Creator Ready consumer.
 // No model publication exists for this job, so Ready must explicitly choose no restore.
 func TestWeightsIntentStatusTriggersExactReadyWithoutAPublication(t *testing.T) {
+	for _, maximum := range []uint64{0, 8 << 20} {
+		t.Run(strconv.FormatUint(maximum, 10), func(t *testing.T) {
+			weightsIntentReady(t, maximum)
+		})
+	}
+}
+
+func weightsIntentReady(t *testing.T, maximum uint64) {
+	t.Helper()
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	ready := make(chan *pb.WeightsIntentReadyRequest, 1)
@@ -41,9 +51,9 @@ func TestWeightsIntentStatusTriggersExactReadyWithoutAPublication(t *testing.T) 
 			TensorfsDeclarationDigest: subject.TensorfsDeclarationDigest, Stage: pb.WeightsHostStage_WEIGHTS_HOST_STAGE_INTENT, Outcome: pb.WeightsHostOutcome_WEIGHTS_HOST_OUTCOME_RECORDED}, nil
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
-	owner := hostOwner(t, "weights-ready-consumer", rentalWiring(connection, private))
+	owner := hostOwner(t, "weights-ready-consumer-"+strconv.FormatUint(maximum, 10), rentalWiring(connection, private))
 	id, _, problem := owner.c.Submit(orchestrator.Submission{IdemKey: "weights-ready", Package: "cozy/h3-package", Entrypoint: "four-lane", PlanID: "sha256:" + strings.Repeat("35", 32), Release: "1.0.7", Kind: "job", Org: "paul", Payload: []byte(`{}`), Outputs: []string{"model"},
-		WeightsOutputs: []orchestrator.WeightsOutput{{OutputID: "model", MimeType: orchestrator.WeightsManifestMime, MaxBytes: 8 << 20}}, Worker: podRental, Rental: true, RentalRequired: true})
+		WeightsOutputs: []orchestrator.WeightsOutput{{OutputID: "model", MimeType: orchestrator.WeightsManifestMime, MaxBytes: maximum}}, Worker: podRental, Rental: true, RentalRequired: true})
 	fatal(t, problem)
 	waitUntil(t, "actual Creator Ready call", func() bool { return len(ready) > 0 })
 	request := <-ready
