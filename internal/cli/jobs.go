@@ -97,7 +97,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if ctx.Inv.Bool("--follow") {
 		return followJob(ctx, c, handle.JobID, began)
 	}
-	terminal, problem := observe(ctx, c, handle.JobID, false, optimisticObservation, began)
+	terminal, problem := observe(ctx, c, handle.JobID, optimisticObservation, began)
 	if problem != nil {
 		return problem
 	}
@@ -296,16 +296,18 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 			// A SIGNAL NEVER CANCELS THE JOB (cl-108): a dying follower is not a person
 			// asking for cancellation. The daemon owns the accepted job; this client
 			// merely detaches, and only an explicit `cozy job cancel` cancels.
-			fmt.Fprintf(ctx.Err,
-				"\ndetached — the job keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
-				jobID, jobID)
+			if !ctx.Mode().JSON {
+				fmt.Fprintf(ctx.Err,
+					"\ndetached — the job keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
+					jobID, jobID)
+			}
 			detached <- struct{}{}
 			stopWatch()
 		case <-done:
 		}
 	}()
 
-	lines := NewProgress(ctx, false, began)
+	lines := NewProgress(ctx, ctx.Mode().JSON, began)
 	var stopped *localapi.Event
 	terminal, e := c.WatchContext(watchCtx, jobID, 0, func(event localapi.Event) bool {
 		keep := lines.On(event)

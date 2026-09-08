@@ -348,6 +348,17 @@ func (s *daemonProcess) callBytes(t *testing.T, method, path string, body []byte
 // inventing a second child-env mechanism, and the env fence says there is one reader.
 func runCozy(t *testing.T, root string, args ...string) (int, string) {
 	t.Helper()
+	// Machine results are one stdout document; awaited JSONL progress is stderr.
+	// Dedicated stream proofs validate that channel independently.
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if arg == "--json" {
+			code, stdout, _ := runCozyStreams(t, root, args...)
+			return code, stdout
+		}
+	}
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 	cmd.Env = childEnv(t, root)
 	data, _ := cmd.CombinedOutput()

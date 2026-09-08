@@ -69,10 +69,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
-	if ctx.Inv.Bool("--stream") && !ctx.Inv.Bool("--await") {
-		return exit.Usagef("--stream requires --await").
-			WithRemedy("use --await for a terminal progress stream, or omit --stream for a short optimistic observation")
-	}
 	if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
 		return exit.Usagef("--timeout requires --await").
 			WithRemedy("a detached run has no client waiting to enforce a caller deadline")
@@ -120,7 +116,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if ctx.Inv.Bool("--stream") || len(ctx.Inv.Values["--asset"]) > 0 ||
+	if len(ctx.Inv.Values["--asset"]) > 0 ||
 		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
 			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --await, and --rental")
@@ -210,8 +206,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return e
 	}
 	submitted := time.Since(began)
-	stream := ctx.Inv.Bool("--stream")
-	if !stream && !ctx.Mode().JSON {
+	if !ctx.Mode().JSON {
 		if ctx.Mode().Full {
 			fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
 				handle.RequestID, handle.Attempt, handle.Status)
@@ -230,9 +225,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	var terminal *localapi.Event
 	stopped := ""
 	if ctx.Inv.Bool("--await") {
-		terminal, stopped, e = watch(ctx, c, handle.RequestID, stream, deadline, began)
+		terminal, stopped, e = watch(ctx, c, handle.RequestID, deadline, began)
 	} else {
-		terminal, e = observe(ctx, c, handle.RequestID, stream, optimisticObservation, began)
+		terminal, e = observe(ctx, c, handle.RequestID, optimisticObservation, began)
 	}
 	if e != nil {
 		return e
@@ -902,12 +897,12 @@ const optimisticObservation = 3 * time.Second
 // expiry merely detaches this client; it does not enter the cancellation path used by an
 // explicit --await. A terminal that arrives inside the window is still rendered through
 // the ordinary result/error path, including a fast refusal.
-func observe(ctx *Context, c *localapi.Client, requestID string, stream bool,
+func observe(ctx *Context, c *localapi.Client, requestID string,
 	window time.Duration, began time.Time,
 ) (*localapi.Event, *exit.Error) {
 	watchCtx, stop := context.WithTimeout(context.Background(), window)
 	defer stop()
-	lines := NewProgress(ctx, stream, began)
+	lines := NewProgress(ctx, false, began)
 	terminal, problem := c.WatchContext(watchCtx, requestID, 0, lines.On)
 	lines.Done()
 	return terminal, problem
@@ -1073,7 +1068,7 @@ func runStatus(status string) string {
 // same question as what the terminal says: a canceled terminal caused by `--timeout` is
 // exit 10, because a caller that set a deadline wants to know the deadline is what
 // happened.
-func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
+func watch(ctx *Context, c *localapi.Client, requestID string,
 	deadline time.Duration, began time.Time) (*localapi.Event, string, *exit.Error) {
 	interrupt := make(chan os.Signal, 2)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
@@ -1092,9 +1087,11 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 				return
 			}
 			stopped <- "detached"
-			fmt.Fprintf(ctx.Err,
-				"\ndetached — the run keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
-				requestID, requestID)
+			if !ctx.Mode().JSON {
+				fmt.Fprintf(ctx.Err,
+					"\ndetached — the run keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
+					requestID, requestID)
+			}
 			stopWatch()
 			return
 		case <-deadlineC(deadline):
@@ -1103,9 +1100,11 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 			// supervisor's watchdog deadline (that one is on the attempt, and this host
 			// has no wire field for it) — walking away instead would leave the card held.
 			stopped <- "deadline"
-			fmt.Fprintf(ctx.Err,
-				"\n--timeout %s expired; cancel requested — the attempt's own terminal still settles it\n",
-				deadline)
+			if !ctx.Mode().JSON {
+				fmt.Fprintf(ctx.Err,
+					"\n--timeout %s expired; cancel requested — the attempt's own terminal still settles it\n",
+					deadline)
+			}
 		case <-done:
 			return
 		}
@@ -1113,11 +1112,15 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 		go func() { cancelResult <- c.Cancel(requestID, fmt.Sprintf("cozy run --timeout %s", deadline)) }()
 		select {
 		case <-interrupt:
-			fmt.Fprintln(ctx.Err, "detached — the canceled terminal still lands in `cozy run list`")
+			if !ctx.Mode().JSON {
+				fmt.Fprintln(ctx.Err, "detached — the canceled terminal still lands in `cozy run list`")
+			}
 			stopWatch()
 		case problem := <-cancelResult:
 			if problem != nil {
-				fmt.Fprintf(ctx.Err, "cancel: %s\n", problem.Message)
+				if !ctx.Mode().JSON {
+					fmt.Fprintf(ctx.Err, "cancel: %s\n", problem.Message)
+				}
 				cancelFailed <- problem
 				stopWatch()
 				return
@@ -1127,13 +1130,15 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 		}
 		select {
 		case <-interrupt:
-			fmt.Fprintln(ctx.Err, "detached — the canceled terminal still lands in `cozy run list`")
+			if !ctx.Mode().JSON {
+				fmt.Fprintln(ctx.Err, "detached — the canceled terminal still lands in `cozy run list`")
+			}
 			stopWatch()
 		case <-done:
 		}
 	}()
 
-	lines := NewProgress(ctx, stream, began)
+	lines := NewProgress(ctx, ctx.Mode().JSON, began)
 	terminal, e := c.WatchContext(watchCtx, requestID, 0, lines.On)
 	lines.Done()
 	select {
@@ -1172,15 +1177,15 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 }
 
 // progress renders the live lane. Three shapes, and they are not the same surface:
-// `--stream` is NDJSON of the typed envelope for a machine, a terminal gets ONE
+// Awaited `--json` writes NDJSON of the typed envelope on stderr, a terminal gets ONE
 // carriage-return-rewritten line, and a redirected human command gets sparse
 // append-only lines — a stage change, each new tenth of the work, one line per five
-// quiet seconds — never the full lossy tick stream. --json stays untouched. Exported —
+// quiet seconds — never the full lossy tick stream. JSON results stay on stdout. Exported —
 // with HumanWaitLine and WaitPatience — so the product suite (#661: verification's one
 // home) drives this exact render path.
 type RunProgress struct {
 	ctx             *Context
-	stream          bool
+	rawJSON         bool
 	mu              sync.Mutex
 	last            string
 	dirty           bool
@@ -1208,15 +1213,15 @@ type RunProgress struct {
 	width func() int
 }
 
-func NewProgress(ctx *Context, stream bool, began time.Time) *RunProgress {
+func NewProgress(ctx *Context, rawJSON bool, began time.Time) *RunProgress {
 	return &RunProgress{
-		ctx: ctx, stream: stream, began: began, sparseDecile: -1,
+		ctx: ctx, rawJSON: rawJSON, began: began, sparseDecile: -1,
 		now: time.Now, width: func() int { return terminalWidth(ctx.Err) },
 	}
 }
 
 func (p *RunProgress) On(e localapi.Event) bool {
-	if p.stream {
+	if p.rawJSON {
 		data, err := json.Marshal(e)
 		if err == nil {
 			fmt.Fprintln(p.ctx.Err, string(data))
@@ -1284,7 +1289,7 @@ func (p *RunProgress) observeWait(e localapi.Event) {
 // armPatience schedules the one time-driven render: a wait that outlives WaitPatience
 // re-renders with the diagnostic even when no new event arrives — the stuck case emits
 // exactly one parked event and then silence. Only the human status line needs it; the
-// diagnostic surfaces (--full, --stream, --json) carry the detail from the start.
+// diagnostic surfaces (--full and --json) carry the detail from the start.
 // Callers hold p.mu.
 func (p *RunProgress) armPatience() {
 	if !p.ctx.Mode().Color || p.ctx.Mode().Full {
@@ -1543,7 +1548,7 @@ func (p *RunProgress) Done() {
 }
 
 // progressLine is the human projection of one event. Runtime's exact typed envelope stays
-// available through --stream and --full; the ordinary status line shows only Runtime's named
+// available through --json and --full; the ordinary status line shows only Runtime's named
 // stage and explicit progress coordinates. Timing samples and metrics are diagnostics.
 func progressLine(e localapi.Event, full bool) string {
 	if full {
@@ -1616,7 +1621,7 @@ func humanProgress(value any) string {
 // WaitPatience is how long a wait stays a calm one-liner (cl-103). Past it, the
 // dispatcher's own diagnostic joins the line: a long wait is the abnormal case, and the
 // detail is how a person sees exactly what the queue is stuck on. The full diagnostic is
-// always in --full and --stream/--json regardless.
+// always in --full and --json regardless.
 const WaitPatience = 90 * time.Second
 
 // HumanWaitLine says what the queue is DOING, never how it thinks: the event's stable
@@ -1738,7 +1743,7 @@ func number(value any) (float64, bool) {
 }
 
 // diagnosticProgressLine preserves the old lossless human spelling for --full. The
-// machine surface remains --stream, which emits the complete JSON envelope unchanged.
+// machine surface is awaited --json, which emits the complete JSON envelope unchanged.
 func diagnosticProgressLine(e localapi.Event) string {
 	kind := strings.TrimPrefix(e.Type, "request.")
 	switch kind {
