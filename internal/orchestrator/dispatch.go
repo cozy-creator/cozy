@@ -1119,12 +1119,19 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 				"local_package_revision_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
+		var parent *pb.JobDirective
 		if req.ParentRequestID != "" {
-			_, e = c.retainedOrchestrationParent(req)
-			if e != nil {
-				return WorkerLaunchSpec{}, "", e
+			plan, problem := c.retainedOrchestrationParent(req)
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
 			}
+			parent = c.jobDirective(plan)
 		}
+		c.mu.Lock()
+		if worker := c.workers[instance]; worker != nil {
+			worker.orchestrationParent = parent
+		}
+		c.mu.Unlock()
 		if req.IsJob() {
 			jobPrepared, problem = c.prepareLocalJob(instance, req, revision)
 			if problem != nil {
@@ -1136,7 +1143,15 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			}); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		if !req.IsJob() && len(logical.Models) > 0 {
+		if !req.IsJob() && len(logical.Models) > 0 && req.ParentRequestID != "" {
+			native, problem := c.nativeServingModels(req)
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+			if problem := c.convergePrivateModels(instance, req.ID, req.LocalPackageDigest, nil, native); problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+		} else if !req.IsJob() && len(logical.Models) > 0 {
 			models := downloadModelRefs(logical.Models)
 			if len(models) != len(logical.Models) {
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
@@ -1429,6 +1444,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		Outputs:           invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingDigest: req.PlanID,
+			BindingsDigest:          w.spec.Placement.BindingsDigest,
 			// With no adapters the binding IS the plan, so the two ids are equal by
 			// construction rather than by copying a value around.
 			AttemptBindingId: req.PlanID,

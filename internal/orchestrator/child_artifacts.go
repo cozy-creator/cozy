@@ -302,7 +302,19 @@ func (c *Orchestrator) retainChildInputs(request records.Request) *exit.Error {
 	for _, model := range request.Models {
 		paths = append(paths, []string{model.Slot})
 	}
-	artifacts, problem := childArtifacts(request.Payload, paths)
+	payload := request.Payload
+	if !request.IsJob() && request.ParentRequestID != "" {
+		arguments, problem := c.opt.Store.ChildArguments(request)
+		if problem != nil {
+			return problem
+		}
+		_, models, problem := records.ServingCallArguments(arguments)
+		if problem != nil {
+			return problem
+		}
+		payload, _ = json.Marshal(models)
+	}
+	artifacts, problem := childArtifacts(payload, paths)
 	if problem != nil {
 		return problem
 	}
