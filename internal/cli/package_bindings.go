@@ -13,8 +13,8 @@ import (
 )
 
 // A package's default bindings are MUTABLE HUB ROWS — one per (package, slot path) — and
-// `cozy package bind` is their ONE writer (th-116, cl-166): package.toml carries no
-// bindings and publish seeds none. A row names a model release and its ladder, the fit
+// `cozy package bind` sets them; Tensorhub removes defaults whose slots disappear.
+// package.toml carries no bindings and publish seeds none. A row names a model release and its ladder, the fit
 // map from GPU class to lane. Bind verifies both against the hub before writing — the
 // slot against the package's latest published interface, the release and every lane
 // against the model card — so a binding can never name what the card does not offer.

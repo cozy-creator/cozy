@@ -252,8 +252,8 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) 
 // PackageBindingRow is one mutable hub default: which model release a package slot loads
 // when no `model.<param>=` run key speaks, and — as a FIT MAP, not a ranking of machines
 // (cl-166) — which of that release's lanes belongs on which GPU class. The hub row is
-// the ONE source: `cozy package bind` is its only writer and nothing reads a package.toml
-// binding at install or run time.
+// the ONE source: `cozy package bind` sets defaults, Tensorhub removes obsolete slots,
+// and nothing reads a package.toml binding at install or run time.
 type PackageBindingRow struct {
 	Slot      string        `json:"slot"`
 	Model     string        `json:"model"`
