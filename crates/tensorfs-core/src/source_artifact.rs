@@ -158,14 +158,16 @@ fn verify(store: &Store, manifest: &ObjectRef) -> Result<Manifest> {
         );
     }
     for (_, entry) in tree.entries() {
-        match store.record_valid(&entry.blob().sha256) {
-            Ok(record) if record.length == entry.blob().length => {}
-            _ => {
-                return refuse(
-                    Code::DURABILITY_UNPROVEN,
-                    "tree member has no standing verification record",
-                )
-            }
+        // Retention asks the same question as reading: are these exact bytes present and
+        // verified? Keep the native distinction between an absent member (a cache miss)
+        // and corrupt or unreadable bytes. The pinned reader also repairs a stale record
+        // by hashing only when its fast metadata check can no longer establish identity.
+        let file = store.open_verified(&entry.blob().sha256)?;
+        if file.len() != entry.blob().length {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                "tree member length differs from its manifest",
+            );
         }
     }
     Ok(tree)
