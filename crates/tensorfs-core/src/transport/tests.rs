@@ -1255,10 +1255,53 @@ fn hub_envelope_crosses_verbatim_as_typed_refusals() {
     assert!(refusal.detail.contains("models.unknown_ref"));
     assert!(refusal.detail.contains("check the ref"));
 
-    let denied: Dispatch = Arc::new(|_: &Request| status(401, b"{}"));
+    let denied: Dispatch = Arc::new(|_: &Request| {
+        status(
+            401,
+            br#"{"error":{"code":"auth.credential_required","message":"no credential"}}"#,
+        )
+    });
     let origin = self::origin(denied);
     let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
     assert_eq!(refusal.code, Code::CREDENTIAL_REQUIRED);
+    let _ = std::fs::remove_dir_all(store_root);
+}
+
+// tfs-101. A status is evidence about the CATALOG only when the hub wrote it. On
+// 2026-09-08 the public origin's tunnel agent was seconds out of a reconnect loop and its
+// edge answered `POST /v1/tensorfs/presign` with its own 404 page; the status alone was
+// read as REF_NOT_FOUND, which the pod supervisor treats as poisoned, and a paid H100
+// journaled a permanent refusal for a placement set the hub was holding in full.
+#[test]
+fn a_status_with_no_hub_envelope_is_the_edge_and_stays_resumable() {
+    let store_root = temporary("unenveloped");
+    let store = Store::init(&store_root).unwrap();
+    let policy = SourcePolicy::default();
+    // Exactly what an ngrok endpoint answers while its agent session is down.
+    let edge_page: Dispatch = Arc::new(|_: &Request| {
+        status(
+            404,
+            b"<!DOCTYPE html><html><body>ERR_NGROK_3200 endpoint offline</body></html>",
+        )
+    });
+    let origin = origin(edge_page);
+    let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    assert_eq!(refusal.code, Code::HUB_UNREACHABLE);
+    assert!(refusal.detail.contains("no hub envelope"));
+    assert!(refusal.detail.contains("404"));
+
+    // A 401 page from a gateway is not this hub asking for a credential it does not take.
+    let gateway: Dispatch = Arc::new(|_: &Request| status(401, b"<html>Unauthorized</html>"));
+    let origin = self::origin(gateway);
+    let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    assert_eq!(refusal.code, Code::HUB_UNREACHABLE);
+
+    // And a well-formed JSON body that is simply not the envelope stays weather too: the
+    // test is the hub's own code, not the content type.
+    let shaped: Dispatch = Arc::new(|_: &Request| status(404, br#"{"detail":"not found"}"#));
+    let origin = self::origin(shaped);
+    let refusal = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    assert_eq!(refusal.code, Code::HUB_UNREACHABLE);
     let _ = std::fs::remove_dir_all(store_root);
 }
 

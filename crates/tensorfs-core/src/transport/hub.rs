@@ -593,7 +593,29 @@ fn call_once(
             })
         });
     }
-    let refusal = envelope(status, &raw, path);
+    let Some(refusal) = envelope(status, &raw, path) else {
+        // NOT THE HUB. Every refusal the hub can write carries its typed envelope, so a
+        // status that carries none was written by something in front of it — a tunnel
+        // whose agent is reconnecting, a load balancer with no backend, a captive
+        // gateway. That is weather over an immutable request, exactly like a connection
+        // that was never answered, and it is classified as such.
+        //
+        // Reading it as a verdict cost a paid H100 on 2026-09-08 (tfs-101): the public
+        // origin's tunnel agent was seventeen seconds out of a reconnect loop, its edge
+        // answered `POST /v1/tensorfs/presign` with its own 404 page, this function
+        // called that REF_NOT_FOUND, the pod supervisor's poisoned set made it terminal,
+        // and the pod journaled a permanent refusal for a placement set whose every
+        // object the hub was holding and would have signed.
+        return Err(Retryable {
+            wait: ledger.patience(),
+            refusal: Refusal {
+                code: Code::HUB_UNREACHABLE,
+                detail: format!(
+                    "{base}{path} answered HTTP {status} with no hub envelope, so the hub                      did not write it; artifacts already in the local store are usable offline"
+                ),
+            },
+        });
+    };
     if !crate::transport::pull::RETRYABLE_STATUS.contains(&status) {
         return Err(Retryable::from(refusal));
     }
@@ -626,7 +648,14 @@ fn stated_wait(raw: &[u8]) -> Option<std::time::Duration> {
 
 /// The hub's own typed envelope, crossed verbatim: its code and remedy are BETTER than
 /// anything invented here — the hub knows why it refused.
-fn envelope(status: u16, raw: &[u8], path: &str) -> Refusal {
+///
+/// `None` when the answer carried no envelope, and that is the point of the return type.
+/// The STATUS ALONE is not evidence about the catalog: a 404 means "the published catalog
+/// does not name this" only when the hub said so, and the presence of `error.code` is the
+/// only thing that distinguishes the hub's verdict from a proxy's opinion. Mapping status
+/// without that test is how a tunnel's error page came to mean a model does not exist —
+/// permanently, on a pod that had already paid to boot.
+fn envelope(status: u16, raw: &[u8], path: &str) -> Option<Refusal> {
     let mut code = String::new();
     let mut message = String::new();
     let mut remedy = String::new();
@@ -645,7 +674,7 @@ fn envelope(status: u16, raw: &[u8], path: &str) -> Refusal {
         }
     }
     if code.is_empty() {
-        code = format!("http.{status}");
+        return None;
     }
     if message.is_empty() {
         message = format!("the hub answered HTTP {status} to {path}");
@@ -655,7 +684,7 @@ fn envelope(status: u16, raw: &[u8], path: &str) -> Refusal {
     } else {
         format!("{code}: {message} — {remedy}")
     };
-    match status {
+    Some(match status {
         404 => Refusal {
             code: Code::REF_NOT_FOUND,
             detail,
@@ -672,5 +701,5 @@ fn envelope(status: u16, raw: &[u8], path: &str) -> Refusal {
             code: Code::HUB_REFUSED,
             detail,
         },
-    }
+    })
 }
