@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 
 import msgspec
 
@@ -14,6 +15,7 @@ app = App()
 class Request(msgspec.Struct, forbid_unknown_fields=True):
     seed: int = 1234
     steps: int = 3
+    wait_for_cancel: bool = False
 
 
 class Result(msgspec.Struct):
@@ -72,6 +74,9 @@ class OrderedModel(Model[OrderedPipeline]):
 @app.entrypoint
 def generate(ctx: Context, payload: Request, model: OrderedModel, tel: Telemetry) -> Result:
     ctx.raise_if_cancelled()
+    while payload.wait_for_cancel:
+        ctx.raise_if_cancelled()
+        time.sleep(0.02)
     return model.measure(payload.seed, payload.steps, tel)
 
 

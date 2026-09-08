@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A plain script produces a retained native model, then calls the original GPU
@@ -91,10 +92,18 @@ only-include=["model_tools.py"]
 	if produced != 2 || reused != 1 || verified != 4 {
 		t.Fatalf("independent scripts did not reuse production and execute both recipient reads: produce=%d reused=%d verify=%d", produced, reused, verified)
 	}
-	var install string
-	must(t, db.QueryRow(`SELECT dir FROM installs WHERE package='local/model-tools' LIMIT 1`).Scan(&install))
-	staged, err := filepath.Glob(filepath.Join(install, "worker-environments", ".stage", "*", "wheels"))
+	installs, err := db.Query(`SELECT dir FROM installs WHERE package='local/model-tools'`)
 	must(t, err)
+	var staged []string
+	for installs.Next() {
+		var install string
+		must(t, installs.Scan(&install))
+		paths, err := filepath.Glob(filepath.Join(install, "worker-environments", ".stage", "*", "wheels"))
+		must(t, err)
+		staged = append(staged, paths...)
+	}
+	must(t, installs.Err())
+	must(t, installs.Close())
 	if len(staged) != 2 {
 		t.Fatalf("unchanged code was prepared more than once per worker: stages=%v", staged)
 	}
@@ -113,5 +122,46 @@ only-include=["model_tools.py"]
 	must(t, db.QueryRow(`SELECT count(DISTINCT h.request_id) FROM request_weights_retentions h JOIN requests r ON r.id=h.request_id WHERE r.entrypoint='generate' AND h.kind='input' AND h.slot='result/model'`).Scan(&inputs))
 	if inputs != 4 {
 		t.Fatal("prepared code reuse bypassed per-call model custody")
+	}
+
+	// Cancel an accepted serving call through the same CLI. Its already completed
+	// native producer remains reusable, while this recipient's input hold closes.
+	waiting := string(body[:strings.Index(string(body), "async def main(ctx):")]) + `async def main(ctx):
+    model = await produce()
+    await generate(model=model, wait_for_cancel=True)
+`
+	must(t, os.WriteFile(script, []byte(waiting), 0600))
+	if code, out := runCozyPath(t, root, path, "run", script, "--json"); code != 0 {
+		t.Fatalf("submit cancellable serving script [%d]: %s", code, out)
+	}
+	var parent, child string
+	must(t, db.QueryRow(`SELECT id FROM requests WHERE parent_request_id='' AND state<>'succeeded'`).Scan(&parent))
+	for {
+		var state string
+		must(t, db.QueryRow(`SELECT state FROM requests WHERE id=?`, parent).Scan(&state))
+		if state == "blocked" || state == "canceled" || state == "succeeded" {
+			t.Fatalf("cancellable script settled before its serving call: %s", state)
+		}
+		err := db.QueryRow(`SELECT r.id FROM requests r JOIN attempts a ON a.request_id=r.id AND a.ordinal=r.ordinal WHERE r.parent_request_id=? AND r.entrypoint='generate' AND a.state='accepted'`, parent).Scan(&child)
+		if err == nil {
+			break
+		}
+		if err != sql.ErrNoRows {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if code, out := runCozyPath(t, root, path, "run", "cancel", parent, "--json"); code != 0 {
+		t.Fatalf("cancel accepted serving script [%d]: %s", code, out)
+	}
+	waitUntil(t, "accepted serving cancellation releases recipient custody", func() bool {
+		var remaining int
+		must(t, db.QueryRow(`SELECT (SELECT count(*) FROM requests WHERE id IN (?,?) AND state<>'canceled') + (SELECT count(*) FROM request_weights_retentions WHERE request_id=? AND state<>'released')`, parent, child, child).Scan(&remaining))
+		return remaining == 0
+	})
+	var memoized int
+	must(t, db.QueryRow(`SELECT count(*) FROM requests WHERE parent_request_id=? AND entrypoint='produce' AND reused_from<>'' AND ordinal=0`, parent).Scan(&memoized))
+	if memoized != 1 {
+		t.Fatal("canceled serving script repeated its completed model production")
 	}
 }
