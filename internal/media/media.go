@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -306,6 +307,11 @@ func (c *Client) Health() *exit.Error {
 		return c.skew("speaks media contract rev %d and this host speaks rev %d",
 			*said.ContractRev, mediawire.ContractRev)
 	}
+	if !said.AttemptScopedInputs {
+		return exit.Named(exit.Conflict, "media_input_scope_unsupported",
+			"the pod's media plane at %s does not support attempt-scoped inputs", c.spec.Addr).
+			WithRemedy("update the pod supervisor before attaching this rental; inputs require an existing attempt reservation")
+	}
 	return nil
 }
 
@@ -326,28 +332,13 @@ func (c *Client) skew(format string, args ...any) *exit.Error {
 // PutInput uploads one attempt input and answers the POD-LOCAL PATH it landed at. That
 // path is what the owner mints into `InputAccess.Url`: the owner never guesses where the
 // pod's disk is, and the pod never learns where the owner's is.
-func (c *Client) PutInput(blob string, data []byte) (string, *exit.Error) {
-	doc, _, e := c.call(http.MethodPut, "/v1/inputs/"+blob, data)
-	if e != nil {
-		return "", e
-	}
-	if doc.Path == "" {
-		return "", exit.Internalf("the pod accepted %d B and named no path for them", len(data))
-	}
-	// The pod's own digest, checked against ours. It is cheap and it closes the one gap a
-	// path answer leaves: an upload that landed truncated would otherwise be discovered by
-	// the worker as a digest refusal on the input, one whole dispatch later.
-	if want := digestOf(data); doc.Digest != "" && doc.Digest != want {
-		return "", exit.New(exit.Failed,
-			"the pod says the %d B it landed hash to %s and they hash to %s here",
-			len(data), shortDigest(doc.Digest), shortDigest(want))
-	}
-	return doc.Path, nil
+func (c *Client) PutInput(slot, inputID string, data []byte) (string, *exit.Error) {
+	return c.putInput(slot, inputID, bytes.NewReader(data), digestOf(data), int64(len(data)))
 }
 
-// PutInputFile streams one exact verified file to the pod. The digest and length are the
-// request record's facts; neither side needs a whole-file byte slice.
-func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (string, *exit.Error) {
+// PutInputFile streams one exact verified file to the pod. It borrows the original
+// path; neither this client nor attempt cleanup moves or removes that file.
+func (c *Client) PutInputFile(slot, inputID, path, wantDigest string, wantLength int64) (string, *exit.Error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", exit.New(exit.NotFound, "input asset %s: %s", filepath.Base(path), err)
@@ -358,22 +349,35 @@ func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (
 		return "", exit.Named(exit.Conflict, "input_asset_changed",
 			"input asset %s no longer has its recorded %d-byte length", filepath.Base(path), wantLength)
 	}
+	return c.putInput(slot, inputID, file, wantDigest, wantLength)
+}
+
+// putInput is shared by payload bytes and borrowed files. The receiver records
+// this exact input against the reserved attempt before returning its cache path.
+func (c *Client) putInput(slot, inputID string, body io.Reader, wantDigest string, wantLength int64) (string, *exit.Error) {
+	if slot == "" || inputID == "" {
+		return "", exit.New(exit.Validation, "media input requires an attempt slot and input ID")
+	}
 	hash := sha256.New()
-	request, err := http.NewRequest(http.MethodPut, c.url("/v1/inputs/"+blob),
-		io.TeeReader(file, hash))
+	request, err := http.NewRequest(http.MethodPut,
+		c.url("/v1/attempts/"+url.PathEscape(slot)+"/inputs/"+url.PathEscape(inputID)),
+		io.TeeReader(body, hash))
 	if err != nil {
 		return "", exit.Internalf("cannot build the media upload: %s", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
 	request.Header.Set("Content-Type", "application/octet-stream")
 	request.ContentLength = wantLength
+	if wantLength == 0 {
+		request.Body = http.NoBody
+	}
 	request, guard := c.stall(request)
 	defer guard.cancel()
 	response, err := c.http.Do(request)
 	if err != nil {
 		return "", exit.Named(exit.Unavailable, "media_unreachable",
-			"the pod's media server at %s did not accept %s: %s",
-			c.spec.Addr, filepath.Base(path), guard.why(err))
+			"the pod's media server at %s did not accept input %s: %s",
+			c.spec.Addr, inputID, guard.why(err))
 	}
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(guard.reader(response.Body), 1<<20+1))
@@ -388,10 +392,9 @@ func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (
 		return "", exit.Internalf("the pod accepted an input and returned no readable path")
 	}
 	gotDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
-	if gotDigest != wantDigest || doc.Length != wantLength ||
-		(doc.Digest != "" && doc.Digest != wantDigest) {
+	if gotDigest != wantDigest || doc.Length != wantLength || doc.Digest != wantDigest {
 		return "", exit.Named(exit.Conflict, "input_asset_changed",
-			"input asset %s did not retain its recorded digest/length during upload", filepath.Base(path))
+			"input %s did not retain its recorded digest/length during upload", inputID)
 	}
 	return doc.Path, nil
 }
@@ -424,7 +427,8 @@ func (c *Client) ReserveOutputs(slot string, maxBytes int64) (string, *exit.Erro
 	return doc.Dir, nil
 }
 
-// DropAttempt removes the pod-side inputs and outputs owned by one attempt. It is
+// DropAttempt releases one attempt through the receiver's existing lifecycle.
+// Shared cached input bytes remain available to other attempts. The call is
 // idempotent, serving both failed-grant rollback and post-ack terminal cleanup.
 func (c *Client) DropAttempt(slot string) *exit.Error {
 	_, _, e := c.call(http.MethodDelete, "/v1/attempts/"+slot, nil)
