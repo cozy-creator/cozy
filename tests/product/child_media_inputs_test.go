@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"image"
 	"image/png"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -97,4 +98,19 @@ func TestChildMediaInheritsOnlyParentInputsAndKeepsIndependentCustody(t *testing
 		t.Fatal("settled input bytes stayed pinned", err)
 	}
 
+}
+
+func TestJobMediaRequiresLocalCredentialBeforePathRead(t *testing.T) {
+	root := t.TempDir()
+	daemon := startDaemonProcess(t, root)
+	response := daemon.call(t, http.MethodPost, "/v1/local/jobs", map[string]any{
+		"package": "local/proof", "function": "score", "input": map[string]any{},
+		"local_assets": []map[string]any{{"field_path": "image", "local_path": "/not-a-granted-file", "digest": childDigest("8"), "length": 1}},
+	}, "Authorization", "")
+	if response.Status != http.StatusUnauthorized {
+		t.Fatalf("untrusted job media reached file resolution: %s", response.brief())
+	}
+	if requests := listInvocations(t, root); len(requests) != 0 {
+		t.Fatalf("unauthorized media created requests: %+v", requests)
+	}
 }

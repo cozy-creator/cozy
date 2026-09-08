@@ -123,7 +123,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--stream") ||
 		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --await, and --rental")
+			WithRemedy("jobs accept payload values, --in, --asset, --input-tree, --org, --await, and --rental")
 	}
 	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
