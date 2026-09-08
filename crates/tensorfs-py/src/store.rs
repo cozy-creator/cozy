@@ -673,9 +673,9 @@ impl PyStore {
             .or_refuse(py)
     }
 
-    /// Resolve only immutable provider URIs and narrow to the reviewed carriers.
+    /// Resolve immutable provider URIs to reviewed carriers or exact ordinary files.
     /// Deployment adapters own credentials and optional loopback origins.
-    #[pyo3(signature = (source_uri, carriers=Vec::new(), *, profiles=Vec::new(), credential=String::new(), huggingface=None, civitai=None, allow_local=false))]
+    #[pyo3(signature = (source_uri, carriers=Vec::new(), *, profiles=Vec::new(), files=Vec::new(), credential=String::new(), huggingface=None, civitai=None, allow_local=false))]
     #[allow(clippy::too_many_arguments)]
     fn resolve_source<'p>(
         &self,
@@ -683,12 +683,31 @@ impl PyStore {
         source_uri: &str,
         carriers: Vec<String>,
         profiles: Vec<String>,
+        files: Vec<String>,
         credential: String,
         huggingface: Option<String>,
         civitai: Option<String>,
         allow_local: bool,
     ) -> PyResult<Bound<'p, PyDict>> {
         use tensorfs_core::{providers, transport};
+        if [
+            !carriers.is_empty(),
+            !profiles.is_empty(),
+            !files.is_empty(),
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count()
+            > 1
+        {
+            return Err(to_py(
+                py,
+                &Refusal {
+                    code: Code::TRANSACTION_CONFLICT,
+                    detail: "choose carriers, reviewed profiles or exact ordinary files".into(),
+                },
+            ));
+        }
         let uri = providers::SourceUri::parse(source_uri).or_refuse(py)?;
         let mut endpoints = providers::Endpoints::default();
         if let Some(value) = huggingface {
@@ -708,6 +727,9 @@ impl PyStore {
             transport::credential_from_spec(&credential, vec![host.clone()]).or_refuse(py)?;
         let selected = py
             .detach(|| {
+                if !files.is_empty() {
+                    return providers::resolve_files(&uri, &files, &endpoints, &credentials, transport::Deadline::none());
+                }
                 let resolution = providers::resolve(
                     &uri,
                     &endpoints,
@@ -715,7 +737,6 @@ impl PyStore {
                     transport::Deadline::none(),
                 )?;
                 let selected = if !carriers.is_empty() {
-                    if !profiles.is_empty() { return refuse(Code::TRANSACTION_CONFLICT, "choose carriers or reviewed profiles"); }
                     carriers.clone()
                 } else if !profiles.is_empty() {
                     let heads = providers::read_heads(&resolution, &uri, &endpoints, &credentials, transport::Deadline::none())?;
