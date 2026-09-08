@@ -47,6 +47,8 @@
 //! and the origin. It is bound by `tfs store ensure --repo-cache` and never by a flag here.
 //!
 //!   tfs fetch <root> <ref>       closure -> plan -> N-way walk (presign at use) -> proof
+//!   tfs fetch bounded <root> <ref> --max-download-bytes N --max-download-objects N
+//!                               same pull, refused before body transfer if new objects exceed bounds
 //!   tfs fetch plan-objects <root> <session> --refs <jsonl>   HELD/WANTED, no manifest
 //!   tfs fetch url <root> <sha256> <length> <url|-> [--progress] [--streams N]
 //!                                                    one granted object, in parallel ranges
@@ -351,6 +353,7 @@ fn main() -> ExitCode {
         ["fetch", "plan-objects", r, s] => fetch::cmd_plan_objects(Path::new(r), s, &flags),
         ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
         ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
+        ["fetch", "bounded", r, refspec] => fetch::cmd_bounded_pull(Path::new(r), refspec, &flags),
         ["fetch", "url", r, i, l, u] => fetch::cmd_url(Path::new(r), i, l, u, &flags),
         ["staging", "fetch", r, i, l, u] => fetch::cmd_staging_fetch(Path::new(r), i, l, u, &flags),
         ["staging", "drop", r, i] => fetch::cmd_staging_drop(Path::new(r), i),
@@ -361,7 +364,15 @@ fn main() -> ExitCode {
         ["source", "plan", u] => fetch::cmd_source_plan(u, &flags),
         ["source", "pull", r, u] => fetch::cmd_source_pull(Path::new(r), u, &flags),
         ["fetch", sub, _t]
-            if ["plan", "plan-objects", "admit", "complete", "url"].contains(sub) =>
+            if [
+                "plan",
+                "plan-objects",
+                "admit",
+                "complete",
+                "url",
+                "bounded",
+            ]
+            .contains(sub) =>
         {
             eprintln!("usage: see the header of {}", file!());
             ExitCode::from(2)

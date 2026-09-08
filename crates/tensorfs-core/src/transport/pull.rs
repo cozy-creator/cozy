@@ -936,6 +936,9 @@ pub struct PullRequest<'a> {
     pub streams: usize,
     pub session: &'a str,
     pub sample_seconds: f64,
+    /// Remaining admission allowance supplied by the host: new bytes and objects,
+    /// excluding content already held. Does not change the Store's durable quota.
+    pub download_budget: Option<(u64, u64)>,
     /// The native plan, once, before body transfers. Observability only; consumers can
     /// report the exact declared and already-held bytes without resolving a second plan.
     pub on_plan: Option<&'a (dyn Fn(&FetchPlan) + Sync)>,
@@ -961,6 +964,7 @@ impl<'a> PullRequest<'a> {
             streams: STREAMS,
             session: "",
             sample_seconds: crate::transport::ledger::SAMPLE_SECONDS,
+            download_budget: None,
             on_plan: None,
             on_object: None,
         }
@@ -1034,6 +1038,19 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         request.session.to_string()
     };
     let (plan, why) = FetchPlan::of(request.store, &session, &closure.manifest, &closure.objects)?;
+    if let Some((bytes, objects)) = request.download_budget {
+        let wanted_bytes = plan.wanted_bytes();
+        let wanted_objects = plan.wanted.len() as u64;
+        if wanted_bytes > bytes || wanted_objects > objects {
+            return Err(Refusal {
+                code: Code::CAPACITY_EXHAUSTED,
+                detail: format!(
+                    "download needs {wanted_bytes} new bytes and {wanted_objects} new objects; \
+                     host allowance is {bytes} bytes and {objects} objects"
+                ),
+            });
+        }
+    }
     if let Some(observer) = request.on_plan {
         observer(&plan);
     }
