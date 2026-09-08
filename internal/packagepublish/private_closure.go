@@ -82,8 +82,16 @@ func PrivateRegistryRows(raw []byte, closure, project, version string, existing 
 		return nil, nil, exit.Named(exit.Validation, "private_dependency_lock_invalid", "private revision requires its captured uv.lock")
 	}
 	selected := registryLock{LockVersion: "1.0"}
+	matched := map[string]bool{}
 	for _, entry := range lock.Packages {
 		name := normalizedProjectName(entry.Name)
+		if pins[name] != entry.Version {
+			continue
+		}
+		if matched[name] {
+			return nil, nil, exit.Named(exit.Conflict, "private_dependency_lock_ambiguous", "captured uv.lock has multiple sources for installed dependency %s", name)
+		}
+		matched[name] = true
 		if expected[name] != entry.Version {
 			continue
 		}
@@ -100,6 +108,11 @@ func PrivateRegistryRows(raw []byte, closure, project, version string, existing 
 		}
 		selected.Packages = append(selected.Packages, row)
 		delete(expected, name)
+	}
+	for name := range pins {
+		if !matched[name] {
+			return nil, nil, exit.Named(exit.Conflict, "private_dependency_lock_drift", "captured uv.lock does not match installed dependency %s", name)
+		}
 	}
 	if len(expected) != 0 {
 		names := make([]string, 0, len(expected))
