@@ -91,18 +91,21 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 		if existing.ID != call.ID || existing.IntentDigest != call.IntentDigest || existing.Kind != call.Kind || existing.Operation != call.Operation || !bytes.Equal(existing.Request, call.Request) {
 			return NativeCall{}, false, exit.Named(exit.Conflict, "child.intent_changed", "parent index already names another native call")
 		}
-		if existing.Kind == "source" && parentAttempt > existing.ParentAttempt && (existing.State == "failed" || existing.State == "stopped") {
-			state := "accepted"
-			if len(existing.Frozen) > 0 {
-				state = "frozen"
+		if existing.Kind == "source" && parentAttempt > existing.ParentAttempt && existing.State != "succeeded" && existing.State != "canceled" {
+			state := existing.State
+			if state == "failed" || state == "stopped" {
+				state = "accepted"
+				if len(existing.Frozen) > 0 {
+					state = "frozen"
+				}
 			}
-			if _, err := tx.Exec(`UPDATE native_calls SET state=?,parent_attempt=?,safe_code='' WHERE id=?`, state, parentAttempt, existing.ID); err != nil {
+			if _, err := tx.Exec(`UPDATE native_calls SET state=?,parent_attempt=?,worker=?,safe_code='' WHERE id=?`, state, parentAttempt, parent.Worker, existing.ID); err != nil {
 				return NativeCall{}, false, exit.Internalf("cannot reattach stopped native call: %s", err)
 			}
 			if err := tx.Commit(); err != nil {
 				return NativeCall{}, false, exit.Internalf("cannot commit native reattachment: %s", err)
 			}
-			existing.State, existing.ParentAttempt, existing.SafeCode = state, parentAttempt, ""
+			existing.State, existing.ParentAttempt, existing.Worker, existing.SafeCode = state, parentAttempt, parent.Worker, ""
 		}
 		return existing, false, nil
 	}
