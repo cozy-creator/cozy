@@ -809,6 +809,9 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		return true
 	}
 	placements := []DesiredPlacement(nil)
+	if w.spec.Preparation != nil && w.spec.Placement.PlacementSetDigest == "" {
+		return true // the owner activates only the worker's completed preparation
+	}
 	if w.spec.Placement.Package == "" && w.spec.Placement.PlacementSetDigest == "" {
 		return true // empty local Runtime serves workspace RPCs without an executor
 	}

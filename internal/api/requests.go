@@ -428,13 +428,16 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 	if refreshProblem != nil {
 		return out, refreshProblem
 	}
-	if editable {
+	if editable || sub.InstallID == "" {
 		sub.InstallID = refreshed
 	}
 	var e *exit.Error
 	if sub.InstallID != "" {
 		var spec orchestrator.WorkerLaunchSpec
 		spec, e = s.packages.ResolveInstall(sub.InstallID, sub.Models)
+		if e == nil && spec.Preparation != nil {
+			return s.resolvePendingServing(ctx, sub, out, spec)
+		}
 		placement = spec.Placement
 	} else {
 		placement, e = s.packages.ResolvePlacement(sub.Package)
@@ -525,6 +528,9 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 	if problem != nil {
 		return out, problem
 	}
+	if spec.Preparation != nil {
+		return s.resolvePendingServing(ctx, sub, out, spec)
+	}
 	placement := spec.Placement
 	if placement.Package != sub.Package {
 		return out, exit.Named(exit.Conflict, "install_package_mismatch",
@@ -556,6 +562,42 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 	out.LocalPackageDigest = revision.Digest
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
+	}
+	if problem := s.deriveOutputExport(entrypoint, &out); problem != nil {
+		return out, problem
+	}
+	return out, nil
+}
+
+// resolvePendingServing retains only code and model selections. The worker's
+// completed preparation supplies the binding digest before ordinary dispatch.
+func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out orchestrator.Submission,
+	spec orchestrator.WorkerLaunchSpec) (orchestrator.Submission, *exit.Error) {
+	placement := spec.Placement
+	if placement.Package != sub.Package || spec.Preparation == nil {
+		return out, exit.Named(exit.Conflict, "install_package_mismatch", "unprepared install names another package")
+	}
+	entrypoint, needsAccelerator, problem := s.packages.Entrypoint(placement.InstallID, sub.Function)
+	if problem != nil {
+		return out, problem
+	}
+	if len(entrypoint.Models) > 0 && len(out.Models) == 0 {
+		return out, exit.Named(exit.Validation, "package_model_binding_required", "%s/%s requires exact model selections", sub.Package, sub.Function)
+	}
+	if problem := validateInputs(entrypoint, &out); problem != nil {
+		return out, problem
+	}
+	out.InstallID, out.Release = placement.InstallID, placement.Release
+	out.NeedsAccelerator = needsAccelerator
+	if !spec.Preparation.Published {
+		revision, problem := s.packages.PrepareLocal(ctx, placement.InstallID)
+		if problem != nil {
+			return out, problem
+		}
+		out.LocalPackageDigest = revision.Digest
+	}
+	if len(out.Outputs) == 0 {
+		out.Outputs = launch.AssetPaths(entrypoint.Result)
 	}
 	if problem := s.deriveOutputExport(entrypoint, &out); problem != nil {
 		return out, problem

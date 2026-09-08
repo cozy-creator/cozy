@@ -88,26 +88,15 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 // host Runtime owns worker control; the install venv supplies the selected executor.
 // A connected worker never calls this method.
 func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	if f.Install.SourceKind == "local" || f.Install.PlacementSetDigest == "" {
+		return f.PreparationSpec(devices)
+	}
 	placement, e := f.Placement()
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
-	if f.Install.SourceKind == "local" {
-		// The install's own artifact cache is where the checkout's derived package interface
-		// and model headers live for the worker to read — never under COZY_HOME.
-		return orchestrator.WorkerLaunchSpec{
-			Placement: placement,
-			Python:    Binary(f.Install), Args: []string{"serve",
-				"--development-project", f.Source,
-				"--development-package", placement.Package,
-				"--development-release", placement.Release,
-				"--development-source-digest", placement.SourceDigest},
-			Dir: f.Source, Devices: devices, GraceSec: 3,
-			ArtifactCache: cache,
-			TensorFSRoot:  config.Frozen().TensorFSRoot,
-		}, nil
-	}
+
 	runtimeBin, e := hostruntime.Path(f.RuntimeCLI.Env)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
