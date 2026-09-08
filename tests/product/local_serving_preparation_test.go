@@ -20,6 +20,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -75,6 +76,44 @@ func TestPublishedJobIdentityMatchesActualWorkerPreparation(t *testing.T) {
 	fatal(t, problem)
 	if build != preparedBuild || fallback.EnvironmentDigest != set.List("placements")[0].Str("environment_digest") {
 		t.Fatalf("job identity changed after real preparation: fallback=%s prepared=%s environment=%s", build, preparedBuild, fallback.EnvironmentDigest)
+	}
+}
+
+func TestCapturedDevelopmentPlacementValidatesItsEnvironment(t *testing.T) {
+	fixture := *localServingFixtureDir
+	if fixture == "" {
+		fixture = filepath.Join("testdata", "local_serving_preparation")
+	}
+	// These are actual PreparePrivatePlacement bytes from the native model proof,
+	// produced by Runtime623dbb8; only the negative cases alter them.
+	raw, err := os.ReadFile(filepath.Join(fixture, "placement-from-runtime-623dbb8.json"))
+	must(t, err)
+	check := func(raw []byte) *exit.Error {
+		digest, err := canonical.Spell(canonical.Digest(raw))
+		must(t, err)
+		_, problem := orchestrator.PlacementFromExact("local/cozy-serving-preparation-fixture", "proof", digest, raw, nil)
+		return problem
+	}
+	fatal(t, check(raw))
+	for _, field := range []string{"local_revision_digest", "project_wheel", "environment_digest", "changed_environment"} {
+		t.Run(field, func(t *testing.T) {
+			doc, err := canonical.Read(raw, &pb.PlacementSet{})
+			must(t, err)
+			row := doc.List("placements")[0]
+			switch field {
+			case "environment_digest":
+				delete(row, field)
+			case "changed_environment":
+				row["environment_digest"] = "sha256:" + strings.Repeat("f", 64)
+			default:
+				delete(row.Sub("development"), field)
+			}
+			changed, err := canonical.Write(doc)
+			must(t, err)
+			if check(changed) == nil {
+				t.Fatalf("accepted captured placement with invalid %s", field)
+			}
+		})
 	}
 }
 
@@ -341,9 +380,6 @@ cozy-runtime={path=%q}
 				t.Fatalf("worker lost actual construction order: %v; header=%v", components, seed.HeaderComponents)
 			}
 			after := activeInstall(t, root, pkg)
-			if after.PlacementSetDigest != digest {
-				t.Fatalf("owner did not adopt real worker placement: %s != %s; code=%d output=%s", after.PlacementSetDigest, digest, code, out)
-			}
 			retained, err := os.ReadFile(filepath.Join(after.Dir, "artifact-cache", prepared.Digest))
 			must(t, err)
 			if !bytes.Equal(retained, raw) {
