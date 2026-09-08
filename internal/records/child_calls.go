@@ -42,6 +42,13 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	if !owned || !parent.IsJob() || !parent.RetainWork || parent.State != "dispatching" || parent.Ordinal != parentAttempt {
 		return Request{}, false, exit.Named(exit.Conflict, "child.parent_stopped", "the parent attempt is not authorized to create child work")
 	}
+	var nativeIndex bool
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM native_calls WHERE parent_request_id=? AND call_index=?)`, parent.ID, r.ParentCallIndex).Scan(&nativeIndex); err != nil {
+		return Request{}, false, exit.Internalf("cannot inspect native parent index: %s", err)
+	}
+	if nativeIndex {
+		return Request{}, false, exit.Named(exit.Conflict, "child.intent_changed", "parent index already names a native call")
+	}
 	existing, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE parent_request_id=? AND parent_call_index=?`, parent.ID, r.ParentCallIndex))
 	if err == nil {
 		if existing.ChildIntentDigest != r.ChildIntentDigest || existing.ChildTargetDigest != r.ChildTargetDigest || existing.ChildReusable != r.ChildReusable || existing.ChildArtifacts != r.ChildArtifacts {
