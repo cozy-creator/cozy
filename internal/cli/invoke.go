@@ -167,8 +167,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	prepareImage, releasePrepared := imagePreparer(ctx)
-	defer releasePrepared()
+	prepareImage := imagePreparer(ctx)
 	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"], prepareImage)
 	if e != nil {
 		return e
@@ -203,7 +202,6 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Models:          models,
 		OutputDirectory: outputDirectory,
 	}, key)
-	releasePrepared()
 	if e != nil {
 		return e
 	}
@@ -251,7 +249,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 
 // invocationModelSpec is one slot's selection before the card is read: an explicit
 // `model.<param>=` run key pins Ref (and possibly Lane); a bare run takes Ref from the
-// hub binding and its ladder decides the lane (cl-166). Beside a run key the binding is
+// owner binding or authored default; its ladder decides the lane. Beside a run key the binding is
 // only the owner's word on where that lane fits (cl-170): evidence, never a choice.
 type invocationModelSpec struct {
 	Slot     string
@@ -262,11 +260,11 @@ type invocationModelSpec struct {
 }
 
 // resolveInvocationModels applies the one selection order for both local and rented
-// execution: an explicit `model.<param>=` run key, then the hub default binding. Local
+// execution: an explicit `model.<param>=` run key, then a Hub owner override, then the
+// selected callable's authored default ladder. Local
 // acquisition freezes the exact Manifest and length before submission — the lane is the
 // host GPU's rung; remote acquisition carries the whole ladder and the winning machine
-// pins its rung. An editable `local/` package has no hub binding and takes its model per
-// run only.
+// pins its rung. Editable packages use authored defaults without a Hub override.
 func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
 	overrides map[string]string, remote bool,
 ) ([]orchestrator.ModelRef, *exit.Error) {
@@ -376,7 +374,7 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 			selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: source, Explicit: true}
 			continue
 		}
-		model, release, lane, manifest, problem := parseModelRef(raw)
+		model, release, lane, manifest, problem := hub.ParseModelRef(raw)
 		if problem != nil {
 			return nil, problem
 		}
@@ -389,13 +387,13 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 		}
 		selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: ref, Lane: lane, Explicit: true}
 	}
-	// An editable `local/` package has no hub row to ask and nothing in its repo is a
-	// binding: every slot takes its model per run, or the run refuses here.
+	// Editable packages have no Hub override; their selected source still declares
+	// the same immutable default metadata as a published package.
 	editable := strings.HasPrefix(target.Package, "local/")
 	defaults := map[string]hub.PackageBindingRow{}
 	if !editable {
 		var problem *exit.Error
-		if defaults, problem = invocationDefaultBindings(ctx, target); problem != nil {
+		if defaults, problem = invocationDefaultBindings(ctx, target, ep.Models); problem != nil {
 			// A slot a run key covers needs no binding: beside it the read is only the
 			// owner's word on the lane's fit (cl-170), and a hub that cannot give it
 			// leaves the lane held to its own bytes rather than refusing the run.
@@ -404,6 +402,8 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 			}
 			defaults = map[string]hub.PackageBindingRow{}
 		}
+	} else {
+		defaults = effectiveModelBindings(ep.Models, nil)
 	}
 	out := make([]invocationModelSpec, 0, len(ep.Models))
 	for _, slot := range ep.Models {
@@ -414,15 +414,15 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 			out = append(out, spec)
 			continue
 		}
-		if editable {
-			return nil, exit.Named(exit.Usage, "package_model_override_required",
-				"%s is an editable package and model slot %s takes its model per run", target.Package, slot.Path).
-				WithRemedy("model.%s=org/model@release[/lane]", slot.Param)
-		}
 		binding, ok := defaults[slot.Path]
 		if !ok {
+			if editable {
+				return nil, exit.Named(exit.Usage, "package_model_override_required",
+					"%s has no authored default for model slot %s", target.Package, slot.Path).
+					WithRemedy("model.%s=org/model@release[/lane]", slot.Param)
+			}
 			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
-				"%s has no hub binding for model slot %s", target.Package, slot.Path).
+				"%s has no owner binding or authored default for model slot %s", target.Package, slot.Path).
 				WithRemedy("bind it: %s — or override this run: model.%s=org/model@release[/lane]",
 					bindRemedy(target.Package, slot.Path), slot.Param)
 		}
@@ -434,9 +434,9 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 
 // invocationDefaultBindings reads the package's CURRENT default bindings from the hub
 // (th-116, cl-166): mutable owner-written rows, each a model release and its ladder.
-// Nothing in the release itself is consulted, so an owner's rebind takes effect on the
-// very next bare run. A `model.<param>=` run key still overrides per invocation.
-func invocationDefaultBindings(ctx *Context, target Target) (
+// Owner rows take precedence; only absent rows use the selected callable metadata.
+// A failed Hub read cannot establish absence and therefore cannot silently fall back.
+func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot) (
 	map[string]hub.PackageBindingRow, *exit.Error,
 ) {
 	ref, problem := hub.ParseRef(target.Package)
@@ -451,11 +451,7 @@ func invocationDefaultBindings(ctx *Context, target Target) (
 			"%s default bindings are not readable: %s", target.Package, problem.Message).
 			WithRemedy("supply model.<param>=org/model@release to bypass the hub default")
 	}
-	out := make(map[string]hub.PackageBindingRow, len(rows))
-	for _, row := range rows {
-		out[row.Slot] = row
-	}
-	return out, nil
+	return effectiveModelBindings(slots, rows), nil
 }
 
 func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstall, *exit.Error) {
@@ -483,7 +479,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	// Exact checkpoint inputs use Hub-owned facts; named selections use the release
 	// card. Both freeze a verified repository/manifest identity before preparation.
 	var empty orchestrator.ModelRef
-	modelName, release, refLane, manifest, problem := parseModelRef(raw)
+	modelName, release, refLane, manifest, problem := hub.ParseModelRef(raw)
 	if problem != nil {
 		return empty, problem
 	}
@@ -2259,7 +2255,7 @@ func describeBindings(ctx *Context, target Target, ep *launch.Entrypoint) map[st
 	if len(ep.Models) == 0 || strings.HasPrefix(target.Package, "local/") {
 		return nil
 	}
-	rows, problem := invocationDefaultBindings(ctx, target)
+	rows, problem := invocationDefaultBindings(ctx, target, ep.Models)
 	if problem != nil {
 		return nil
 	}

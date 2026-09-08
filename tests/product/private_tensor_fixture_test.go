@@ -19,6 +19,7 @@ func copyPrivateTensorProject(t *testing.T, root, source string) string {
 		source = filepath.Join("testdata", "private_tensor_operations")
 	}
 	project := filepath.Join(root, "client-project")
+	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	var sources, scriptSources strings.Builder
 	for _, dependency := range []struct{ name, wheel string }{
 		{"cozy-runtime", *privateChildRuntimeWheel}, {"tensorfs", *privateChildTensorFSWheel}, //cozy:allow distribution source metadata, not executable invocation
@@ -38,7 +39,7 @@ func copyPrivateTensorProject(t *testing.T, root, source string) string {
 			continue // private intake resolves into its owned copy
 		}
 		must(t, err)
-		text := string(body)
+		text := strings.ReplaceAll(string(body), "__RUNTIME_VERSION__", version)
 		if relative == "recipe.py" {
 			text = strings.Replace(text, "factor=2", "factor=0", 1)
 			text = strings.Replace(text, "# [tool.uv.sources]\n", "# [tool.uv.sources]\n"+scriptSources.String(), 1)

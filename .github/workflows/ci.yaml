@@ -76,11 +76,11 @@ jobs:
         if: env.COZY_RUNTIME_TOKEN != ''
         with:
           go-version: stable
-      - name: Compare the vendored roster against cozy-runtime
+      - name: Compare the vendored roster and authored defaults against cozy-runtime
         if: env.COZY_RUNTIME_TOKEN != ''
         working-directory: cozy
         run: |
-          nice -n 19 go test ./tests/product/ -run TestVendoredBaseDistributions -v -timeout 5m \
+          nice -n 19 go test ./tests/product/ -run 'TestVendoredBaseDistributions|TestAuthoredDefaultsMatchRuntimeCorpus' -v -timeout 5m \
             -cozy-runtime-repo="$GITHUB_WORKSPACE/cozy-runtime" \
             -require-cozy-runtime-peer
       - name: Report unarmed roster comparison

@@ -13,7 +13,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -1302,9 +1301,8 @@ func (c *Orchestrator) settleRefusedOutcome(s *session, requestID string, ordina
 // cleanupAttempt runs only after the outcome's bytes were mirrored, its terminal commit
 // succeeded, and OutcomeAck was sent. A local attempt leaves nothing behind — its result
 // files were written where they live and its inputs were never staged. A remote attempt
-// releases its reservation on the pod. Request assets and the request's `tmp/<id>/` are
-// dropped only after the final attempt (assets only when no other live request owns the
-// same content digest).
+// releases its reservation on the pod. Request scratch is dropped only after the final
+// attempt; borrowed input files are never deleted.
 func (c *Orchestrator) cleanupAttempt(req records.Request, attempt uint64, holder *worker, final bool) {
 	if holder != nil && holder.media != nil {
 		c.cleanupRemote(req.ID, attempt, holder)
@@ -1323,11 +1321,6 @@ func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
 			c.logf("request %s snapshot cleanup deferred: %s", req.ID, problem.Message)
 		}
 	}
-	unlock := inputasset.Guard()
-	if e := inputasset.DropUnowned(c.opt.Layout, c.opt.Store, req.Assets); e != nil {
-		c.logf("request %s input asset cleanup deferred: %s", req.ID, e.Message)
-	}
-	unlock()
 	if req.LocalPackageDigest == "" {
 		return
 	}

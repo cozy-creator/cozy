@@ -39,16 +39,15 @@ func (r RuntimeCLI) ImagePreparationProfile(ctx context.Context) (ImagePreparati
 	return result, problem
 }
 
-func (r RuntimeCLI) PrepareImage(ctx context.Context, source, directory string, kind AssetsKind) (PreparedImage, *exit.Error) {
+func (r RuntimeCLI) PrepareImage(ctx context.Context, source string, kind AssetsKind) (PreparedImage, *exit.Error) {
 	var result PreparedImage
 	body, err := json.Marshal(struct {
 		Source          string            `json:"source_path"`
-		Directory       string            `json:"output_directory"`
 		Prepare         *ImagePreparation `json:"prepare"`
 		MediaTypes      []string          `json:"media_types"`
 		MaxBytes        int64             `json:"max_bytes"`
 		MaxDecodedBytes int64             `json:"max_decoded_bytes"`
-	}{source, directory, kind.Preparation, kind.MediaTypes, effectiveAssetMax(kind.MaxBytes), kind.MaxDecodedBytes})
+	}{source, kind.Preparation, kind.MediaTypes, effectiveAssetMax(kind.MaxBytes), kind.MaxDecodedBytes})
 	if err != nil {
 		return result, exit.Internalf("cannot encode image preparation: %s", err)
 	}
