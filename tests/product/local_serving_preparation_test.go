@@ -38,6 +38,7 @@ type servingSeed struct {
 type servingPreparationEvent struct {
 	Method      string `json:"method"`
 	WorkerPID   int    `json:"worker_pid"`
+	Birth       string `json:"birth"`
 	WorkerBoot  string `json:"worker_boot_id"`
 	OperationID string `json:"operation_id"`
 	Placement   string `json:"placement"`
@@ -150,7 +151,29 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 				}
 			}
 			t.Cleanup(func() {
-				compositionDown(t, root, path)
+				if _, err := os.Stat(filepath.Join(root, "creator.sqlite")); err == nil {
+					compositionDown(t, root, path)
+				} else if !os.IsNotExist(err) {
+					t.Errorf("read fixture home before teardown: %v", err)
+				} else {
+					for _, event := range preparationEvents(t, audit) {
+						if event.Method != "WorkerProcess" {
+							continue
+						}
+						raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(event.WorkerPID), "stat"))
+						if os.IsNotExist(err) {
+							continue
+						}
+						if err != nil {
+							t.Errorf("read owned worker after early refusal: %v", err)
+							continue
+						}
+						fields := strings.Fields(string(raw)[strings.LastIndex(string(raw), ")")+1:])
+						if len(fields) < 20 || fields[19] == event.Birth {
+							t.Errorf("metadata refusal left owned worker %d alive before database creation", event.WorkerPID)
+						}
+					}
+				}
 				if t.Failed() {
 					t.Log("local serving preparation evidence retained", root)
 				} else {
@@ -184,6 +207,7 @@ only-include=["serving_fixture.py"]
 cozy-runtime={path=%q}
 `, version, wheel)
 			must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0600))
+			uv("lock", "--project", project, "--no-progress")
 			pkg := "local/cozy-serving-preparation-fixture"
 			if code, out := runCozyPath(t, root, path, "package", "install", project, "--editable", "--json"); code != 0 {
 				t.Fatalf("metadata install initialized the model or refused: %d %s", code, out)
@@ -191,8 +215,10 @@ cozy-runtime={path=%q}
 			if code, out := runCozyPath(t, root, path, "run", pkg+"/generate", "--describe", "--json"); code != 0 {
 				t.Fatalf("static description initialized the model or refused: %d %s", code, out)
 			}
-			if events := preparationEvents(t, audit); len(events) != 0 {
-				t.Fatalf("metadata intake triggered worker preparation: %+v", events)
+			for _, event := range preparationEvents(t, audit) {
+				if event.Method != "WorkerProcess" {
+					t.Fatalf("metadata intake triggered worker preparation: %+v", event)
+				}
 			}
 			before := activeInstall(t, root, pkg)
 			if before.PlacementSetDigest != "" {

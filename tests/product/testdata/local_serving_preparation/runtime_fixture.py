@@ -17,9 +17,10 @@ def record(method, worker, request, result=None, error=None):
     row = {
         "method": method,
         "worker_pid": os.getpid(),
-        "worker_boot_id": worker.fence.worker_boot_id,
-        "owner": worker.fence.record_owner_id,
-        "operation_id": request.operation_id,
+        "worker_boot_id": worker.fence.worker_boot_id if worker is not None else "",
+        "owner": worker.fence.record_owner_id if worker is not None else "",
+        "operation_id": request.operation_id if request is not None else "",
+        "birth": Path("/proc/self/stat").read_text().rsplit(") ", 1)[1].split()[19],
     }
     if result is not None:
         row["placement"] = base64.b64encode(
@@ -30,6 +31,10 @@ def record(method, worker, request, result=None, error=None):
         row["error"] = str(error)
     with AUDIT.open("a") as output:
         output.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+if "serve" in sys.argv[1:]:
+    record("WorkerProcess", None, None)
 
 
 class FixtureWorker(session.Worker):
