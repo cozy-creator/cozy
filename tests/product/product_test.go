@@ -17,7 +17,6 @@ import (
 )
 
 const localWeightlessRef = "local/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "4732ba992dbeea819a3d21e2e3d53862c69ad8dd"
 
 var tensorfsFixtureWheel = flag.String("tensorfs-fixture-wheel", "", "exact native candidate wheel for an unpublished paired Runtime proof; omitted uses public resolution")
 
@@ -513,9 +512,12 @@ func weightlessProject(t *testing.T) string {
 	}
 	dir := t.TempDir()
 	project := filepath.Join(dir, "source")
+	runtimeSHA, err := qualifiedRuntimeFixtureSHA(repo, childEnv(t, dir))
+	must(t, err)
+	t.Logf("editable Runtime fixture uses qualified source %s", runtimeSHA)
 	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
 		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project,
-		"--runtime-sha", editableRuntimeFixtureSHA)
+		"--runtime-sha", runtimeSHA)
 	if *tensorfsFixtureWheel != "" {
 		build.Args = append(build.Args, "--tensorfs-wheel", *tensorfsFixtureWheel)
 	}

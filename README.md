@@ -134,7 +134,8 @@ See [package publication](docs/package-publication.md) for the release contract.
 ## Models
 
 Search lists `MODEL`, `FAMILY`, `RELEASE`, and `LANES`, with one row per available
-release. Lane names belong to that release; `--full` and JSON retain complete lists.
+release. Long columns are shortened in the compact human table; `--full` and JSON
+retain complete values and lane lists.
 `cozy model info org/name` shows all available releases, while `@release` selects
 one exact tag. Info shows full lanes and immutable checkpoint refs. Unavailable
 Hub timestamps remain unavailable; model creation is distinct from release creation.
@@ -169,13 +170,13 @@ conversion. The destination owner must match the account shown by `cozy auth`:
 cozy model upload local/model org/model
 
 cozy run paul/minimax-h3-tools/four-lane \
-  model.dits=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
-  model.shared=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
+  --model.dits=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
+  --model.shared=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
   --source-profile dits=hf/minimax-h3/native-dual-bf16/1 \
   --source-profile shared=hf/minimax-h3/shared-bf16/1 \
   --publish-to paul/minimax-h3 --rental-only --await
 
-cozy run org/quantize/convert model.source=org/model@release/bf16 \
+cozy run org/quantize/convert --model.source=org/model@release/bf16 \
   --in quantize.json --publish-to org/quantized --rental-only
 ```
 
@@ -340,7 +341,10 @@ return its result directly; otherwise it prints the run id, live status, and aut
 position, then returns while the daemon continues. `--await` stays attached through the terminal and
 shows named pipeline stages, measured step speed, elapsed time, and a whole-run estimate only when
 the package reports `overall_fraction`; stage-local fractions are labeled as stage progress.
-`--stream` is the corresponding typed event stream and requires `--await`.
+`--await --json` writes typed JSONL progress events to stderr and one final JSON result to stdout.
+Human progress is automatic with `--await`; no separate progress flag is needed.
+Model overrides accept `--model.<param>=org/model@release/lane` after the target;
+the existing `model.<param>=...` payload spelling has the same meaning.
 `cozy run watch <run-id>` attaches to that same progress stream later; interrupting a watcher
 detaches without canceling the durable run.
 

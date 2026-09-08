@@ -315,10 +315,9 @@ type RunCmd struct {
 
 type RunExecuteCmd struct {
 	Target         string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
-	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
+	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and --model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
-	Stream         bool     `help:"Emit typed progress deltas."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
 	Assets         []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	Rental         bool     `help:"Run on a Creator-managed rental."`
@@ -330,14 +329,14 @@ type RunExecuteCmd struct {
 	PublishTo      string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
 	SourceProfiles []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
 	DryRun         bool     `help:"Resolve exact job inputs and conversion headers without queueing or renting."`
-	Await          bool     `help:"Wait for the terminal result instead of returning after the short optimistic observation."`
+	Await          bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
 	Describe       bool     `help:"Print the callable's request contract instead of running it."`
 }
 
 func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
-		"--stream", c.Stream, "--await", c.Await, "--rental", c.Rental,
+		"--await", c.Await, "--rental", c.Rental,
 		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,

@@ -147,14 +147,31 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("terminal run never showed elapsed time\n%q", tty)
 	}
 
-	// --json: the machine surface is untouched — the renderer contributes nothing.
+	// --await --json: stdout remains one final result; stderr carries typed JSONL events.
 	code, stdout, stderr := runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
 		"size=32", "seed=5", "delay_ms=1000", "--await")
 	if code != 0 || !strings.Contains(stdout, `"status":"completed"`) {
 		t.Fatalf("--json run failed [exit %d]\n%s", code, stdout)
 	}
-	if strings.ContainsAny(stderr, "\r\033") || strings.Contains(stderr, "tile_steps") {
-		t.Fatalf("--json stderr shows renderer output\n%q", stderr)
+	if strings.ContainsAny(stderr, "\r\033") {
+		t.Fatalf("--json stderr shows terminal control bytes\n%q", stderr)
+	}
+	var final map[string]any
+	if err := json.Unmarshal([]byte(stdout), &final); err != nil {
+		t.Fatalf("stdout is not one final JSON document: %v", err)
+	}
+	progressEvents := 0
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil || event["type"] == nil {
+			t.Fatalf("stderr is not a typed JSONL event: %q (%v)", line, err)
+		}
+		if event["type"] == "request.progress" {
+			progressEvents++
+		}
+	}
+	if progressEvents == 0 {
+		t.Fatal("awaited JSON omitted available progress")
 	}
 
 	// The list reuses the same lossy Runtime progress lane. Whole-job percentage and ETA

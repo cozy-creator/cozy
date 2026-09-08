@@ -11,7 +11,7 @@ import (
 // TestQueueWaitCauses is cl-103 as behaviour: a waiting request's durable queued/parked
 // events name WHAT the queue is doing in a stable `wait` cause beside the verbatim
 // dispatcher diagnostic. The human client renders the cause as a calm stage line; the
-// machine surfaces (--json/--stream, this payload) keep the raw `reason` unchanged.
+// machine surfaces (--json, this payload) keep the raw `reason` unchanged.
 func TestQueueWaitCauses(t *testing.T) {
 	o := hostOwner(t, "queue-wait")
 

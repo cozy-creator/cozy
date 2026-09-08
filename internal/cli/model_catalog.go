@@ -24,6 +24,7 @@ func (view modelSearchView) Emit(w io.Writer, mode output.Mode) error {
 	list := output.List{Name: "models", Fields: fields, AllFields: fields,
 		TypedFields: fields, TypedAllFields: fields,
 		TypedRows: []map[string]any{}, Notes: append([]string(nil), view.Notes...)}
+	truncated := false
 	for _, card := range view.Cards {
 		count := 0
 		for _, release := range card.Releases {
@@ -33,10 +34,14 @@ func (view modelSearchView) Emit(w io.Writer, mode output.Mode) error {
 			lanes := modelLaneNames(release.Lanes)
 			cell := "[" + strings.Join(lanes, ", ") + "]"
 			if mode.Human && !mode.JSON && !mode.Full {
-				cell = shortModelLanes(lanes)
+				short := shortModelLanes(lanes)
+				truncated = truncated || short != cell
+				cell = short
 			}
-			list.Rows = append(list.Rows, map[string]string{"model": card.Model.Ref(), "family": card.Model.Family,
-				"release": release.Release, "lanes": cell})
+			row := map[string]string{"model": card.Model.Ref(), "family": card.Model.Family,
+				"release": release.Release, "lanes": cell}
+
+			list.Rows = append(list.Rows, row)
 			list.TypedRows = append(list.TypedRows, map[string]any{"model": card.Model.Ref(), "family": card.Model.Family,
 				"release": release.Release, "lanes": lanes})
 			if len(list.Next) == 0 || strings.Contains(cell, "…") {
@@ -52,6 +57,18 @@ func (view modelSearchView) Emit(w io.Writer, mode output.Mode) error {
 				list.Next = []string{"cozy model info " + card.Model.Ref()}
 			}
 		}
+	}
+	if mode.Human && !mode.JSON && !mode.Full {
+		for _, row := range list.Rows {
+			for column, width := range map[string]int{"model": 28, "family": 14, "release": 24} {
+				short := compactModelCell(row[column], width)
+				truncated = truncated || short != row[column]
+				row[column] = short
+			}
+		}
+	}
+	if truncated {
+		list.Notes = append(list.Notes, "Use --full for complete values, or cozy model info <model> for details.")
 	}
 	list.Total = len(list.Rows)
 	if len(list.Rows) == 0 {
@@ -75,8 +92,17 @@ func modelLaneNames(lanes []hub.ModelLaneSummary) []string {
 	return names
 }
 
+// compactModelCell keeps listing cells bounded; --full and model info carry the detail.
+func compactModelCell(value string, width int) string {
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	return string(runes[:width-1]) + "…"
+}
+
 func shortModelLanes(lanes []string) string {
-	const width = 72
+	const width = 40
 	full := "[" + strings.Join(lanes, ", ") + "]"
 	if utf8.RuneCountInString(full) <= width {
 		return full
@@ -96,7 +122,7 @@ func shortModelLanes(lanes []string) string {
 	if len(lanes) > 1 {
 		suffix = fmt.Sprintf(", … +%d]", len(lanes)-1)
 	}
-	return "[" + output.Elide(lanes[0], width-1-utf8.RuneCountInString(suffix), false) + suffix
+	return "[" + compactModelCell(lanes[0], width-1-utf8.RuneCountInString(suffix)) + suffix
 }
 
 func handleModelInfo(ctx *Context) *exit.Error {
