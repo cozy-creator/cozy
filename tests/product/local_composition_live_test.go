@@ -88,7 +88,7 @@ func TestOrdinaryScriptNativePreparationQuantizationAndScore(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(control, "bin", "source_fixture.json"), configuration, 0600))
 	launcher, err := os.ReadFile(filepath.Join(fixture, "runtime_fixture.py"))
 	must(t, err)
-	must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), append([]byte("#!"+filepath.Join(control, "bin", "python")+"\n"), launcher...), 0700))
+	must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), append([]byte("#!"+filepath.Join(control, "bin", "python")+"\n"), launcher...), 0700)) //cozy:allow product fixture starts the actual Runtime with a local source provider
 	path := filepath.Join(control, "bin")
 	for _, item := range childEnv(t, root) {
 		if strings.HasPrefix(item, "PATH=") {
@@ -159,7 +159,8 @@ build-backend="hatchling.build"
 		must(t, os.WriteFile(filepath.Join(to, "package.toml"), []byte("[application]\nobject="+strconv.Quote(name+":app")+"\n"), 0600))
 	}
 	script := filepath.Join(project, "prepare.py")
-	code := `# /// script
+	code := `# //cozy:allow product fixture calls public Runtime source operations
+# /// script
 # requires-python=">=3.12,<3.13"
 # dependencies=["cozy-runtime==` + runtimeVersion + `","quantize-tools==0.0.1","score-tools==0.0.1"]
 # [tool.uv.sources]
