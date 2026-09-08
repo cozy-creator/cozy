@@ -392,12 +392,18 @@ fn list_observed(
                         format!("member name {name:?} is outside the grammar"),
                     );
                 }
+                let file_id = json_u64(file, "id")
+                    .filter(|id| *id > 0 && *id < (1u64 << 53))
+                    .ok_or_else(|| Refusal {
+                        code: Code::KEY_GRAMMAR,
+                        detail: "a Civitai file requires a positive exact integer id".into(),
+                    })?;
                 let sha256 = json_get(file, "hashes")
                     .and_then(|hashes| json_str(hashes, "SHA256"))
                     .and_then(digest64);
                 let url = match json_str(file, "downloadUrl") {
                     Some(explicit) => explicit.to_string(),
-                    None => format!("{base}/api/download/models/{version}"),
+                    None => format!("{base}/api/download/models/{version}?fileId={file_id}"),
                 };
                 // A Civitai version is a bag of files (weights, a VAE, a config); the
                 // one to take is the `primary` SafeTensors file, exactly as the Go
@@ -413,7 +419,9 @@ fn list_observed(
                 // sizeKB is kilobytes as a float — an approximation, not a length.
                 // The exact length is probed from the origin at pull time.
                 members.push(SourceMember {
-                    member: name.to_string(),
+                    // Display filenames may change; the provider file ID is the reviewed
+                    // profile member identity, shared with Creator and retained source trees.
+                    member: format!("civitai/files/{file_id}"),
                     length: None,
                     sha256,
                     url,
@@ -1038,6 +1046,14 @@ fn is_index(member: &str) -> bool {
 
 fn is_safetensors(member: &str) -> bool {
     lower_ends_with(member, ".safetensors")
+}
+
+/// Civitai carrier members have provider IDs rather than filename extensions.
+pub(crate) fn is_civitai_member(member: &str) -> bool {
+    member.strip_prefix("civitai/files/").is_some_and(|id| {
+        id.parse::<u64>()
+            .is_ok_and(|value| value > 0 && value < (1u64 << 53) && value.to_string() == id)
+    })
 }
 
 /// Resolve `relative` against the directory of `member`, the way the Go resolver's
@@ -1970,12 +1986,16 @@ mod tests {
     /// so the exact length comes from a ranged probe through the same fence.
     #[test]
     fn resolve_takes_the_one_primary_civitai_safetensors() {
-        let body: Vec<u8> = (0u32..9_000).flat_map(|i| i.to_le_bytes()).collect();
+        let header =
+            br#"{"model.diffusion_model.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut body = (header.len() as u64).to_le_bytes().to_vec();
+        body.extend_from_slice(header);
+        body.extend_from_slice(&1f32.to_le_bytes());
         let object = ObjectRef::of(&body);
         let listing = format!(
             r#"{{"id":777,"files":[
-               {{"name":"model.safetensors","primary":true,"sizeKB":35.15,"hashes":{{"SHA256":"{}"}},"metadata":{{"format":"SafeTensor"}}}},
-               {{"name":"extra.safetensors","primary":false,"sizeKB":1.0,"hashes":{{"SHA256":"{}"}}}}
+               {{"id":92696,"name":"model.safetensors","primary":true,"sizeKB":35.15,"hashes":{{"SHA256":"{}"}},"metadata":{{"format":"SafeTensor"}}}},
+               {{"id":92697,"name":"extra.safetensors","primary":false,"sizeKB":1.0,"hashes":{{"SHA256":"{}"}}}}
             ]}}"#,
             object.sha256.to_ascii_uppercase(),
             "11".repeat(32)
@@ -1999,12 +2019,101 @@ mod tests {
         };
         let resolved = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap();
         assert_eq!(resolved.members.len(), 1);
-        assert_eq!(resolved.members[0].member, "model.safetensors");
+        assert_eq!(resolved.members[0].member, "civitai/files/92696");
         assert_eq!(resolved.members[0].object, object);
         assert_eq!(resolved.members[0].provenance, Provenance::Declared);
         assert!(resolved.members[0].carrier);
         assert_eq!(resolved.canonical, "civitai://777");
         handle.join().unwrap();
+
+        // The real source tree must keep the carrier visible to conversion despite its
+        // lack of a filename extension, under the member the reviewed profile selects.
+        let root = temporary("civitai-member");
+        let store = Store::init(&root).unwrap();
+        store
+            .put_stream(&mut body.as_slice(), Some(&object), &Fault::default())
+            .unwrap();
+        let tree = content_manifest(&resolved).unwrap();
+        let owner = ObjectRef::of(b"civitai-member-owner").id();
+        crate::source_artifact::create(&store, &owner, &tree).unwrap();
+        let (_, roster, landed) =
+            crate::source_artifact::conversion_roster(&store, &owner).unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].member, "civitai/files/92696");
+        assert_eq!(roster[0].header, body[..8 + header.len()]);
+        assert_eq!(landed, vec!["civitai/files/92696"]);
+        let registry = crate::ingest::fingerprint::FingerprintRegistry::parse(
+            crate::ingest::source::BUILTIN_REGISTRY_BYTES,
+        )
+        .unwrap();
+        let profile = registry
+            .source_profiles
+            .iter()
+            .find(|profile| profile.name == "civitai/101055/128078/single-file-fp16")
+            .unwrap();
+        assert!(
+            profile
+                .components
+                .iter()
+                .all(|component| component.source_member.as_deref()
+                    == Some(roster[0].member.as_str()))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn civitai_refuses_missing_invalid_and_duplicate_file_ids() {
+        for id in ["null", "0", "-1", "1.5", "9007199254740992", "\"92696\""] {
+            let listing = format!(r#"{{"files":[{{"id":{id},"name":"model.safetensors"}}]}}"#);
+            let (base, _, handle) =
+                origin(1, move |_| ok_body(listing.as_bytes(), "application/json"));
+            let endpoints = Endpoints {
+                civitai: base,
+                allow_local: true,
+                ..Endpoints::default()
+            };
+            let refusal = list(
+                &SourceUri::Civitai { version: 777 },
+                &endpoints,
+                &Anonymous,
+                Deadline::none(),
+            )
+            .unwrap_err();
+            let expected = if id == "9007199254740992" {
+                Code::NUMBER_RANGE // The shared JSON decoder refuses before provider parsing.
+            } else {
+                Code::KEY_GRAMMAR
+            };
+            assert_eq!(refusal.code, expected, "{id}");
+            handle.join().unwrap();
+        }
+        for (listing, code) in [
+            (
+                r#"{"files":[{"name":"missing-id.safetensors"}]}"#,
+                Code::KEY_GRAMMAR,
+            ),
+            (
+                r#"{"files":[{"id":92696,"name":"a.safetensors"},{"id":92696,"name":"b.safetensors"}]}"#,
+                Code::DUPLICATE_KEY,
+            ),
+        ] {
+            let (base, _, handle) =
+                origin(1, move |_| ok_body(listing.as_bytes(), "application/json"));
+            let endpoints = Endpoints {
+                civitai: base,
+                allow_local: true,
+                ..Endpoints::default()
+            };
+            let refusal = list(
+                &SourceUri::Civitai { version: 777 },
+                &endpoints,
+                &Anonymous,
+                Deadline::none(),
+            )
+            .unwrap_err();
+            assert_eq!(refusal.code, code);
+            handle.join().unwrap();
+        }
     }
 
     /// The credential is scoped to the host that holds it. A relative redirect stays on
@@ -2065,7 +2174,7 @@ mod tests {
         // No downloadUrl in the fixture: the handler must fall back to the provider's
         // canonical download route under the configured base.
         let listing = format!(
-            r#"{{"id":777,"files":[{{"name":"model.safetensors","sizeKB":273.4,"hashes":{{"SHA256":"{}"}}}}]}}"#,
+            r#"{{"id":777,"files":[{{"id":92696,"name":"model.safetensors","sizeKB":273.4,"hashes":{{"SHA256":"{}"}}}}]}}"#,
             object.sha256.to_ascii_uppercase()
         );
         let payload = body.clone();
@@ -2074,7 +2183,7 @@ mod tests {
         let (base, _, handle) = origin(5, move |request| {
             if request.path == "/api/v1/model-versions/777" {
                 ok_body(listing.as_bytes(), "application/json")
-            } else if request.path == "/api/download/models/777" {
+            } else if request.path == "/api/download/models/777?fileId=92696" {
                 if request.range.as_deref() == Some("bytes=0-0") {
                     format!(
                         "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/{length}\r\nETag: \"tag\"\r\nConnection: close\r\n\r\n\0"

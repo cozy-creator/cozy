@@ -31,7 +31,7 @@ def main() -> None:
                 ]).encode()
             elif self.path == "/api/v1/model-versions/42":
                 data = json.dumps({"files": [{
-                    "name": "chosen.safetensors", "primary": True,
+                    "id": 92696, "name": "chosen.safetensors", "primary": True,
                     "metadata": {"format": "SafeTensor"}, "sizeKB": 123456.789,
                     "hashes": {"SHA256": digest},
                     "downloadUrl": f"http://127.0.0.1:{self.server.server_port}/chosen.safetensors",
@@ -62,11 +62,13 @@ def main() -> None:
             store = tensorfs.Store.init(Path(temporary) / "store")
             owner = tensorfs.object_id(b"producer")
             recipient = tensorfs.object_id(b"recipient")
+            civitai_owner = tensorfs.object_id(b"civitai-producer")
             hf = store.resolve_source("hf://org/repo@" + "a" * 40,
                                       ["chosen.safetensors"], huggingface=endpoint, allow_local=True)
-            civitai = store.resolve_source("civitai://42", ["chosen.safetensors"],
+            civitai = store.resolve_source("civitai://42", ["civitai/files/92696"],
                                            civitai=endpoint, allow_local=True)
-            assert hf["content_manifest_digest"] == civitai["content_manifest_digest"]
+            assert hf["content_manifest_digest"] != civitai["content_manifest_digest"]
+            assert civitai["members"][0][0] == "civitai/files/92696"
             assert hf["selection_sha256"] != civitai["selection_sha256"]
             assert civitai["members"][0][2] == len(body), "rounded Civitai size was used"
             assert all("unselected" not in path for path in requests)
@@ -75,9 +77,11 @@ def main() -> None:
             assert result["transferred_bytes"] == len(body)
             assert result["artifact"]["manifest_digest"] == hf["content_manifest_digest"]
             before = len(requests)
-            again = store.materialize_source(owner, civitai["members"], allowed_hosts=civitai["allowed_hosts"],
+            again = store.materialize_source(civitai_owner, civitai["members"], allowed_hosts=civitai["allowed_hosts"],
                                              allow_local=True)
             assert again["transferred_bytes"] == 0 and len(requests) == before
+            assert again["artifact"]["manifest_digest"] == civitai["content_manifest_digest"]
+            store.release_tree_root(civitai_owner)
             root = store.tree_root(owner)
             assert root is not None
             assert "http" not in root["receipt"].decode()
@@ -92,7 +96,7 @@ def main() -> None:
             tensorfs.gc(store.root)
             assert not store.contains(digest)
             assert len(store.implementation_sha256) == 64
-        print("source facade green: native HF/Civitai selection, exact lengths, shared content identity, zero-network replay, custody and GC")
+        print("source facade green: native HF/Civitai selection, exact lengths, distinct member identity, shared raw bytes, zero-network reuse, custody and GC")
     finally:
         server.shutdown()
         server.server_close()

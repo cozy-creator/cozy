@@ -459,7 +459,7 @@ pub fn conversion_roster(
                 .read_to_end(&mut bytes)
                 .map_err(io)?;
             bytes
-        } else if member.ends_with(".safetensors") {
+        } else if member.ends_with(".safetensors") || crate::providers::is_civitai_member(member) {
             let mut prefix = [0u8; 8];
             file.read_exact(&mut prefix).map_err(io)?;
             let length = u64::from_le_bytes(prefix);
