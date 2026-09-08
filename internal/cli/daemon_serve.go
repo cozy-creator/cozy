@@ -131,6 +131,11 @@ func serveDaemon(ctx *Context) *exit.Error {
 		ReleaseRetainedRental: fleet.releaseRetained,
 		ModelTransfers:        transfers,
 		ReclaimInstall: func(id string) *exit.Error {
+			// Background cleanup and editable refresh are mutations by this same daemon.
+			// Serialize them before the cross-process writer claim so cleanup cannot
+			// make an otherwise valid submission fail with a writer conflict.
+			resolver.refreshMu.Lock()
+			defer resolver.refreshMu.Unlock()
 			writer, problem := install.Lock(l)
 			if problem != nil {
 				return problem

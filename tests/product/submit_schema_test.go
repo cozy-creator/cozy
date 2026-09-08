@@ -152,22 +152,20 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		t.Fatalf("down before the red arm [exit %d]\n%s", code, out)
 	}
 	o := ownerAtRoot(t, root)
-	resolver := cli.NewResolver(o.store, o.cfg, orchestrator.LocalDeviceEnvelope())
-	spec, problem := resolver.Resolve(localWeightlessRef)
+	// The prior successful request holds the binding returned by its worker. An
+	// install now carries static metadata until preparation, so it has no plan to
+	// inject here. Reuse the real retained binding while bypassing only validation.
+	prepared, problem := o.store.RequestRow(handle.RequestID)
 	fatal(t, problem)
-	planID, outputs := "", []string(nil)
-	for _, entrypoint := range spec.Placement.Entrypoints {
-		if entrypoint.Name == "tile" {
-			planID, outputs = entrypoint.Digest, entrypoint.Outputs
-		}
-	}
-	if planID == "" {
-		t.Fatal("the placement names no tile entrypoint")
+	if prepared.PlanID == "" || prepared.LocalPackageDigest == "" {
+		t.Fatal("the completed request retained no worker-prepared local binding")
 	}
 	requestID, _, problem := o.c.Submit(orchestrator.Submission{
 		IdemKey: "schema-past-client", Package: localWeightlessRef, Entrypoint: "tile",
-		PlanID: planID, Payload: []byte(`{"bogus":1}`), Outputs: outputs,
-		InstallID: spec.Placement.InstallID,
+		PlanID: prepared.PlanID, Payload: []byte(`{"bogus":1}`),
+		Outputs:   strings.FieldsFunc(prepared.Outputs, func(r rune) bool { return r == ',' }),
+		InstallID: prepared.InstallID, Release: prepared.Release,
+		LocalPackageDigest: prepared.LocalPackageDigest,
 	})
 	fatal(t, problem)
 	deadline := time.Now().Add(180 * time.Second)
