@@ -225,49 +225,11 @@ func parseLadder(raw []string) ([]hub.BindingRung, *exit.Error) {
 	return ladder, nil
 }
 
-// parseModelRef reads the ONE model-ref grammar (cl-109):
-//
-//	org/model[@release[/lane]][#sha256:<hex>]
-//
-// It serves the `model.<param>=` run key and `package bind` alike; a lane narrows to
-// one encoding and a manifest to one exact release artifact.
-func parseModelRef(raw string) (model, release, lane, manifest string, problem *exit.Error) {
-	spec := strings.TrimSpace(raw)
-	if strings.Count(spec, "#") > 1 {
-		return "", "", "", "", exit.Usagef("%q carries more than one manifest", raw)
-	}
-	rest, digest, hasManifest := strings.Cut(spec, "#")
-	if hasManifest {
-		if digest == "" {
-			return "", "", "", "", exit.Usagef("%q carries an empty manifest", raw)
-		}
-		if _, err := canonical.Raw(digest); err != nil {
-			return "", "", "", "", exit.Usagef("%q is not a sha256 model manifest", digest)
-		}
-		manifest = digest
-	}
-	if strings.Count(rest, "@") > 1 {
-		return "", "", "", "", exit.Usagef("%q carries more than one release", rest)
-	}
-	model, versioned, pinned := strings.Cut(rest, "@")
-	if _, e := hub.ParseRef(model); e != nil {
-		return "", "", "", "", e
-	}
-	if pinned {
-		var sliced bool
-		release, lane, sliced = strings.Cut(versioned, "/")
-		if release == "" || sliced && lane == "" || strings.ContainsAny(lane, " \t") {
-			return "", "", "", "", exit.Usagef("%q is not org/model[@release[/lane]][#sha256:<hex>]", raw)
-		}
-	}
-	return model, release, lane, manifest, nil
-}
-
 // parseBindingTarget reads the verb's slice of the one ref grammar: a binding row pins
 // org/model@release, its lanes ride the ladder, and an exact manifest is per-run
 // narrowing on the `model.<param>=` run key.
 func parseBindingTarget(raw string) (model, release string, problem *exit.Error) {
-	model, release, lane, manifest, problem := parseModelRef(raw)
+	model, release, lane, manifest, problem := hub.ParseModelRef(raw)
 	if problem != nil {
 		return "", "", problem
 	}

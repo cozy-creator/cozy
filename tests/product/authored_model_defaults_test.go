@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -116,9 +117,7 @@ func TestUnbindPreservesConcurrentOwnerChoice(t *testing.T) {
 
 func TestAuthoredModelDefaultDescriptorIsClosed(t *testing.T) {
 	for _, raw := range []string{`null`, `[]`, `[{"gpu":"H100","lane":"proof/m@1.0.0/fp8","extra":true}]`, `[{"gpu":1,"lane":"proof/m@1.0.0/fp8"}]`} {
-		doc := map[string]any{"format": "cozy.package.interface/1", "application": "proof:app", "entrypoints": []any{map[string]any{"name": "generate", "request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}}, "models": []any{map[string]any{"class": "M", "path": "generate.models.model", "component_use": map[string]any{}, "default_ladder": json.RawMessage(raw)}}}}, "jobs": []any{}}
-		body, err := json.Marshal(doc)
-		must(t, err)
+		body := authoredInterfaceDocument(t, json.RawMessage(raw))
 		if _, problem := launch.DecodePackageInterface(body); problem == nil {
 			t.Fatalf("invalid authored ladder admitted: %s", raw)
 		}
@@ -129,10 +128,11 @@ func TestAuthoredDefaultRefusesMixedOrUnpinnedTargetsBeforeRental(t *testing.T) 
 	for _, wrong := range []string{"proof/other@1.0.0-rc.1/fp8", "proof/minimax@2.0.0/fp8", "proof/minimax/fp8", "proof/minimax@1.0.0-rc.1", "proof/minimax@" + strings.Repeat("a", 64) + "/fp8", "proof/minimax@1.0.0-rc.1/bad lane"} {
 		defaults := append(authoredH3(ladderLane), launch.ModelDefaultRung{GPU: "B200", Lane: wrong})
 		h := newLadderHub(t, defaults)
+		h.bind(goodLadder()) // Even a valid owner override cannot hide invalid source metadata.
 		root := ladderRoot(t, h)
 		t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 		code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental-only", "--json")
-		if code == 0 || !strings.Contains(out, "package_model_default_invalid") {
+		if code == 0 || !strings.Contains(out, "rental.package_interface_invalid") {
 			t.Fatalf("invalid authored target reached resolution: %q %d %s", wrong, code, out)
 		}
 		h.mu.Lock()
@@ -155,4 +155,62 @@ func TestGPUFitPatternsAllowMultipleTokens(t *testing.T) {
 			t.Fatalf("invalid GPU pattern admitted: %q", gpu)
 		}
 	}
+}
+
+func TestAuthoredDefaultsMatchRuntimeCorpus(t *testing.T) {
+	path := os.Getenv("COZY_MODEL_DEFAULTS_CORPUS")
+	if path == "" {
+		t.Skip("set COZY_MODEL_DEFAULTS_CORPUS to Runtime's shared model-default-ladders.json")
+	}
+	body, err := os.ReadFile(path)
+	must(t, err)
+	var groups map[string][]struct {
+		Name   string          `json:"name"`
+		Ladder json.RawMessage `json:"ladder"`
+	}
+	must(t, json.Unmarshal(body, &groups))
+	for group, cases := range groups {
+		for _, entry := range cases {
+			t.Run(group+"/"+entry.Name, func(t *testing.T) {
+				iface, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t, entry.Ladder))
+				valid := group == "valid"
+				if (problem == nil) != valid {
+					t.Fatalf("Creator/Runtime admission differs: %v", problem)
+				}
+				if !valid {
+					return
+				}
+				slot := iface.Entrypoints[0].Models[0]
+				if slot.DefaultBinding == nil || len(slot.DefaultBinding.Ladder) != len(slot.DefaultLadder) {
+					t.Fatal("admission did not retain the lowered default")
+				}
+				for index, rung := range slot.DefaultLadder {
+					lowered := slot.DefaultBinding.Ladder[index]
+					if lowered.GPU != rung.GPU || slot.DefaultBinding.Ref()+"/"+lowered.Lane != rung.Lane {
+						t.Fatal("lowering changed authored reference or order")
+					}
+				}
+			})
+		}
+	}
+	iface, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t, nil))
+	fatal(t, problem)
+	if iface.Entrypoints[0].Models[0].DefaultBinding != nil {
+		t.Fatal("absent default became a binding")
+	}
+	if _, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t, json.RawMessage(`null`))); problem == nil {
+		t.Fatal("explicit null default was accepted")
+	}
+}
+
+func authoredInterfaceDocument(t *testing.T, ladder json.RawMessage) []byte {
+	t.Helper()
+	slot := map[string]any{"class": "M", "path": "generate.models.model", "component_use": map[string]any{}}
+	if ladder != nil {
+		slot["default_ladder"] = ladder
+	}
+	doc := map[string]any{"format": "cozy.package.interface/1", "application": "proof:app", "entrypoints": []any{map[string]any{"name": "generate", "request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}}, "models": []any{slot}}}, "jobs": []any{}}
+	body, err := json.Marshal(doc)
+	must(t, err)
+	return body
 }

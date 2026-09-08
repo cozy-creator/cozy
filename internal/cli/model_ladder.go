@@ -119,7 +119,7 @@ func bindRemedy(packageName, slot string) string {
 func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 	spec invocationModelSpec) (orchestrator.ModelRef, *exit.Error) {
 	var empty orchestrator.ModelRef
-	modelName, release, _, _, problem := parseModelRef(spec.Ref)
+	modelName, release, _, _, problem := hub.ParseModelRef(spec.Ref)
 	if problem != nil {
 		return empty, problem
 	}

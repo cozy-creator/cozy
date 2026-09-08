@@ -33,6 +33,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
@@ -93,14 +94,15 @@ type WeightsOutput struct {
 // optional `sequence_parallel` document. `stamps` is a RETIRED member: every release published before the cut ships an
 // empty map, which reads as nothing declared, and a value in it refuses by name below.
 type Slot struct {
-	Class            string              `json:"class"`
-	Path             string              `json:"path"`
-	Param            string              `json:"-"`
-	ComponentUse     map[string][]string `json:"component_use"`
-	EncodedLeaves    string              `json:"encoded_leaves,omitempty"`
-	Fusion           string              `json:"fusion,omitempty"`
-	SequenceParallel json.RawMessage     `json:"sequence_parallel,omitempty"`
-	DefaultLadder    []ModelDefaultRung  `json:"default_ladder,omitempty"`
+	Class            string                 `json:"class"`
+	Path             string                 `json:"path"`
+	Param            string                 `json:"-"`
+	ComponentUse     map[string][]string    `json:"component_use"`
+	EncodedLeaves    string                 `json:"encoded_leaves,omitempty"`
+	Fusion           string                 `json:"fusion,omitempty"`
+	SequenceParallel json.RawMessage        `json:"sequence_parallel,omitempty"`
+	DefaultLadder    []ModelDefaultRung     `json:"default_ladder,omitempty"`
+	DefaultBinding   *hub.PackageBindingRow `json:"-"`
 }
 
 // ModelDefaultRung binds a GPU pattern to a full org/model@release/lane reference.
@@ -510,6 +512,11 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 				"%s has invalid model path %q; it must be %s<parameter>", ep.Name, slot.Path, prefix)
 		}
 		slot.Param = param
+		var problem *exit.Error
+		slot.DefaultBinding, problem = defaultModelBinding(*slot)
+		if problem != nil {
+			return problem
+		}
 	}
 	for _, pair := range []struct {
 		name string

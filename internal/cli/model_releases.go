@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"regexp"
 	"sort"
 	"strings"
 
@@ -11,10 +10,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
-var modelReleaseLabelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+!-]{0,63}$`)
-
 func modelLabel(flag, value string) (string, *exit.Error) {
-	if !modelReleaseLabelPattern.MatchString(value) {
+	if !hub.ValidModelLabel(value) {
 		return "", exit.Usagef("%s must start alphanumeric and use at most 64 bytes of letters, digits, ., _, +, !, or -", flag)
 	}
 	return value, nil

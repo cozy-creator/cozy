@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -85,12 +86,14 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 		iface, err = json.Marshal(doc)
 		must(t, err)
 	}
-	contract, problem := launch.DecodePackageInterface(iface)
-	fatal(t, problem)
+	normalized, err := canonical.NormalizeJCS(iface)
+	must(t, err)
+	digest, err := canonical.Spell(canonical.Digest(normalized))
+	must(t, err)
 	var detail hub.PackageReleaseDetail
 	detail.PackageInterface = iface
 	detail.Release.Release = "1.0.0"
-	detail.Release.PackageInterfaceDigest = contract.Digest
+	detail.Release.PackageInterfaceDigest = digest
 	detail.Release.PackageInterfaceLength = int64(len(iface))
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25", "torch<3,>=2.13"}
 	h := &ladderHub{soldOut: map[string]bool{}, rentals: map[string]map[string]any{},

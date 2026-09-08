@@ -374,7 +374,7 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 			selected[slotPath] = invocationModelSpec{Slot: slotPath, Ref: source, Explicit: true}
 			continue
 		}
-		model, release, lane, manifest, problem := parseModelRef(raw)
+		model, release, lane, manifest, problem := hub.ParseModelRef(raw)
 		if problem != nil {
 			return nil, problem
 		}
@@ -403,11 +403,7 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 			defaults = map[string]hub.PackageBindingRow{}
 		}
 	} else {
-		var problem *exit.Error
-		defaults, problem = effectiveModelBindings(ep.Models, nil)
-		if problem != nil {
-			return nil, problem
-		}
+		defaults = effectiveModelBindings(ep.Models, nil)
 	}
 	out := make([]invocationModelSpec, 0, len(ep.Models))
 	for _, slot := range ep.Models {
@@ -455,7 +451,7 @@ func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot)
 			"%s default bindings are not readable: %s", target.Package, problem.Message).
 			WithRemedy("supply model.<param>=org/model@release to bypass the hub default")
 	}
-	return effectiveModelBindings(slots, rows)
+	return effectiveModelBindings(slots, rows), nil
 }
 
 func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstall, *exit.Error) {
@@ -483,7 +479,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	// Exact checkpoint inputs use Hub-owned facts; named selections use the release
 	// card. Both freeze a verified repository/manifest identity before preparation.
 	var empty orchestrator.ModelRef
-	modelName, release, refLane, manifest, problem := parseModelRef(raw)
+	modelName, release, refLane, manifest, problem := hub.ParseModelRef(raw)
 	if problem != nil {
 		return empty, problem
 	}

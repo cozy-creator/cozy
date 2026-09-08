@@ -250,10 +250,7 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root stri
 	if problem != nil {
 		return problem
 	}
-	effective, problem := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints, packageInterface.Jobs), rows)
-	if problem != nil {
-		return problem
-	}
+	effective := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints, packageInterface.Jobs), rows)
 	bindings := make([]hub.PackageBindingRow, 0, len(effective))
 	for _, row := range effective {
 		bindings = append(bindings, row)
@@ -307,7 +304,7 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	if problem != nil {
 		return empty, problem
 	}
-	modelName, release, selectedLane, manifestPin, problem := parseModelRef(spec)
+	modelName, release, selectedLane, manifestPin, problem := hub.ParseModelRef(spec)
 	if problem != nil {
 		return empty, problem
 	}

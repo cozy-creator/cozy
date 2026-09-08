@@ -458,10 +458,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 		if problem != nil {
 			return empty, nil, problem
 		}
-		defaults, problem := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows)
-		if problem != nil {
-			return empty, nil, problem
-		}
+		defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows)
 		for i := range models {
 			models[i].SharedSlots = sharedSlots(models[i], entrypoint, packageInterface.Entrypoints, defaults)
 		}
