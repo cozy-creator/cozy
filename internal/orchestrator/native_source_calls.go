@@ -208,7 +208,9 @@ func (c *Orchestrator) onNativeSourceStatus(s *session, status *pb.NativeSourceS
 		_ = c.opt.Store.StopNativeCall(row.ID, "failed", code)
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_FAILED, nil, exit.Named(exit.Failed, "native.source_failed", "native source operation failed (%s); retained bytes remain available", code))
 	case pb.NativeSourceState_NATIVE_SOURCE_STATE_CANCELED:
-		_ = c.opt.Store.StopNativeCall(row.ID, "stopped", "native_source_stopped")
+		// Explicit logical cancellation already wrote canceled. A worker interrupted
+		// with its parent keeps the accepted intent available to a later attempt.
+		_ = c.opt.Store.StopNativeCall(row.ID, "failed", "native_source_interrupted")
 		c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_CANCELED, nil, nil)
 	}
 }
@@ -225,7 +227,7 @@ func (c *Orchestrator) cancelNativeSource(s *session, call *pb.ChildCallCancel) 
 	if row.State == "succeeded" {
 		return true
 	}
-	_ = c.opt.Store.StopNativeCall(row.ID, "stopped", "native_source_stopped")
+	_ = c.opt.Store.StopNativeCall(row.ID, "canceled", "native_source_stopped")
 	parent := &pb.ChildCallRequest{ParentRequestId: call.ParentRequestId, ParentAttemptOrdinal: call.ParentAttemptOrdinal, ParentInvocationSpecDigest: call.ParentInvocationSpecDigest,
 		CallIndex: call.CallIndex, InterfaceDigest: nativeinterface.SourceDigest(), Module: nativeinterface.SourceModule, Export: row.Operation, RequestCanonicalBytes: row.Request, IntentDigest: call.IntentDigest}
 	c.sendNativeSource(s, parent, row.ID, pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_CANCEL, nil)
