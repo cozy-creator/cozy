@@ -36,7 +36,7 @@ type servingSeed struct {
 	ManifestJSON     string           `json:"manifest_json"`
 	HeaderComponents []string         `json:"header_components"`
 	ComponentBytes   map[string]int64 `json:"component_bytes"`
-	WeightBytes      int64            `json:"weight_bytes"`
+	Bytes            int64            `json:"weight_bytes"`
 }
 
 func TestPublishedJobIdentityMatchesActualWorkerPreparation(t *testing.T) {
@@ -141,7 +141,7 @@ func servingModelCatalog(t *testing.T, seed servingSeed) *httptest.Server {
 			Model: hub.Resource{Org: "proof", Name: "ordered"},
 			Releases: []hub.ModelReleaseSummary{{
 				ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0"},
-				Lanes:          []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: seed.Manifest, Bytes: seed.WeightBytes}},
+				Lanes:          []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: seed.Manifest, Bytes: seed.Bytes}},
 			}},
 		})
 	})
@@ -157,7 +157,7 @@ func servingModelCatalog(t *testing.T, seed servingSeed) *httptest.Server {
 		_ = json.NewEncoder(w).Encode(hub.ModelResolution{
 			Model: "proof/ordered", Release: "1.0.0", Lane: "bf16",
 			ManifestID: seed.Manifest, ManifestLength: seed.Length,
-			Bytes: seed.WeightBytes, Components: seed.HeaderComponents, ComponentBytes: seed.ComponentBytes,
+			Bytes: seed.Bytes, Components: seed.HeaderComponents, ComponentBytes: seed.ComponentBytes,
 		})
 	})
 	return httptest.NewServer(mux)
@@ -218,7 +218,7 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 			}
 			var seed servingSeed
 			must(t, json.Unmarshal(seedBytes, &seed))
-			if !slices.Equal(seed.HeaderComponents, []string{"alpha", "spare", "zeta"}) || seed.WeightBytes != 48 {
+			if !slices.Equal(seed.HeaderComponents, []string{"alpha", "spare", "zeta"}) || seed.Bytes != 48 {
 				t.Fatalf("unexpected native fixture: %+v", seed)
 			}
 			catalog := servingModelCatalog(t, seed)
@@ -227,7 +227,7 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 				"tensorhub_url: "+catalog.URL+"\ntensorhub_token: local-serving-fixture\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 			launcher, err := os.ReadFile(filepath.Join(fixture, "runtime_fixture.py"))
 			must(t, err)
-			must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), append([]byte("#!"+python+"\n"), launcher...), 0700))
+			must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), append([]byte("#!"+python+"\n"), launcher...), 0700)) //cozy:allow records real Runtime worker preparation in the owned fixture launcher
 			audit := filepath.Join(root, "serving_fixture_audit.jsonl")
 			must(t, os.Symlink(audit, filepath.Join(control, "bin", "serving_fixture_audit.jsonl")))
 			path := filepath.Join(control, "bin")

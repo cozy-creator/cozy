@@ -32,9 +32,9 @@ func TestSlowRuntimeMetadataIsAnswered(t *testing.T) {
 	slowRuntime := filepath.Join(root, "cozy-runtime") //cozy:allow a stand-in runtime, not this host's
 	version := strings.TrimPrefix(stubRuntime(t, hostruntime.Floor, pb.WireMinor), "#!/bin/sh\n")
 	must(t, os.WriteFile(slowRuntime, []byte("#!/bin/sh\nfor arg in \"$@\"; do\n"+
-		"if [ \"$arg\" = version ]; then\n"+version+"exit 0\nfi\ndone\nsleep 6\n"+
+		"if [ \"$arg\" = version ]; then\n"+version+"exit 0\nfi\ndone\n/bin/sleep 6\n"+
 		`printf '{"job_descriptor_id":"jd-slow"}\n'`+"\n"), 0o700))
-	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PATH", root)
 
 	facts := &launch.Facts{
 		Install:          records.PackageInstall{Package: "acme/slow"},
