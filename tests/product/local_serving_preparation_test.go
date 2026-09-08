@@ -409,7 +409,7 @@ cozy-runtime={path=%q}
 			if request.State != "succeeded" {
 				t.Fatalf("successful CLI result has request state %s", request.State)
 			}
-			if !strings.Contains(out, `"value":12`) {
+			if !regexp.MustCompile(`"value":12(?:\.0)?[,}]`).MatchString(out) {
 				t.Fatalf("normal inference did not read the actual filled tensors: %s", out)
 			}
 			t.Logf("actual worker %d retained components %v and immutable environment %s; inference returned 12", prepared.WorkerPID, components, acquired.Receipt)
