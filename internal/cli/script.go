@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -30,6 +31,27 @@ func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) 
 			WithRemedy("define main() or main(ctx); ordinary helper functions are allowed")
 	}
 	target.Function = callables[0].Name
+	// Defaults enter the existing model.<parameter>=<ref> admission path. The
+	// user's explicit term wins; neither metadata nor scripts resolve credentials.
+	names := make([]string, 0, len(pack.ScriptModels))
+	for name := range pack.ScriptModels {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		prefix := "model." + name + "="
+		fullPrefix := "model." + target.Function + ".models." + name + "="
+		overridden := false
+		for _, arg := range ctx.Inv.Args[1:] {
+			if strings.HasPrefix(arg, prefix) || strings.HasPrefix(arg, fullPrefix) {
+				overridden = true
+				break
+			}
+		}
+		if !overridden {
+			ctx.Inv.Args = append(ctx.Inv.Args, prefix+pack.ScriptModels[name])
+		}
+	}
 	return target, surface, nil
 }
 

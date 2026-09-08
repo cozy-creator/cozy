@@ -46,7 +46,8 @@ type Package struct {
 	Root             string // disposable wheel output, empty until Build
 	Name             string
 	Release          string
-	temporarySource  string // generated single-file project, copied into a retained install
+	ScriptModels     map[string]string // plain-main default model refs; ordinary CLI overrides win
+	temporarySource  string            // generated single-file project, copied into a retained install
 }
 
 type sourceIdentityFile struct {
