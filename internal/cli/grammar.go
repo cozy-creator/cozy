@@ -320,6 +320,7 @@ type RunExecuteCmd struct {
 	Timeout        string   `help:"Request deadline."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
 	Assets         []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
+	AssetFidelity  []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
 	Rental         bool     `help:"Run on a Creator-managed rental."`
 	RentalOnly     bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
@@ -339,7 +340,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--await", c.Await, "--rental", c.Rental,
 		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
 		"--out", c.Out, "--timeout", c.Timeout,
-		"--in", c.PayloadFile, "--asset", c.Assets,
+		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
 }

@@ -83,5 +83,8 @@ func InheritChildAssets(ep *Entrypoint, payload []byte, parent []records.AssetBi
 		bound.FieldPath, bound.Order, bound.MaxBytes = path, pathOrder(parts), maximum
 		result = append(result, bound)
 	}
+	if problem := ValidateAssetCounts(ep, result); problem != nil {
+		return nil, problem
+	}
 	return result, nil
 }

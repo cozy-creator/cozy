@@ -94,14 +94,24 @@ cozy run paul/minimax-h3/ref2va --await --rental-only \
   --asset='alice=~/Pictures/alice.png' --asset='bob=~/Pictures/bob.png'
 ```
 
-The descriptor names one request field containing `{asset, label?}` records.
+The descriptor names one request field containing `{asset, label?, fidelity?}` records.
 Bindings use `<parameter>.<index>.asset`, with labels carried in the ordinary
 request payload and memo identity. Missing declared collections default to `[]`;
 the authored minimum/maximum count decides whether that is valid. Each media
 kind's encoded byte limit applies per file; Runtime owns decoded byte limits.
+Optional kind counts are compiled from the author's argument-level `AssetLimits`
+annotation. The CLI, API admission and inherited child inputs use the same count
+check over observed MIME metadata.
 An exact named payload asset still uses `--asset <field-path>=<file>`, including
 on jobs, and takes precedence over a same-spelled label. Named fields and the
 declared collection can coexist.
+
+`--asset-fidelity alice=high` or `--asset-fidelity 0=low` records an optional
+per-occurrence hint: `auto` (default), `low`, `medium`, or `high`. Exact labels
+take precedence over canonical nonnegative indexes. Duplicate selectors for the
+same occurrence and unknown selectors refuse before file reads. Fidelity is part
+of the payload and memo identity; model adapters interpret it. The shared media
+loader preserves the input's resolution.
 
 `local_assets` is the CLI-only local extension carrying those attachments.
 Each row names the exact request-schema field path plus a source

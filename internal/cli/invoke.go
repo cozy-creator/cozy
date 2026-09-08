@@ -167,7 +167,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"])
+	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"])
 	if e != nil {
 		return e
 	}

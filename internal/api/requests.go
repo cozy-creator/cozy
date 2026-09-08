@@ -584,7 +584,7 @@ func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission)
 		}
 		asset.MaxBytes = assetSpec.MaxBytes
 	}
-	return nil
+	return launch.ValidateAssetCounts(entrypoint, out.Assets)
 }
 
 func placementPlan(placement orchestrator.DesiredPlacement, function string) (string, []string, *exit.Error) {

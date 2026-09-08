@@ -28,7 +28,7 @@ func TestDeclaredAssetsUseExistingRemoteInputBindings(t *testing.T) {
 	must(t, png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2))))
 	photo := filepath.Join(t.TempDir(), "photo.png")
 	must(t, os.WriteFile(photo, encoded.Bytes(), 0600))
-	payload, assets, problem := launch.ParseAssets(ep, []byte(`{"prompt":"unchanged"}`), []string{"alice=" + photo, photo})
+	payload, assets, problem := launch.ParseAssets(ep, []byte(`{"prompt":"unchanged"}`), []string{"alice=" + photo, photo}, nil)
 	fatal(t, problem)
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)

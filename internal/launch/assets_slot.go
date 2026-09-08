@@ -9,6 +9,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // AssetsSlot is the explicit callable input contract authored by Runtime.
@@ -23,6 +24,7 @@ type AssetsKind struct {
 	Kind            string   `json:"kind"`
 	MediaTypes      []string `json:"media_types"`
 	MaxBytes        int64    `json:"max_bytes,omitempty"`
+	MaxCount        *int64   `json:"max_count,omitempty"`
 	MaxDecodedBytes int64    `json:"max_decoded_bytes,omitempty"`
 }
 
@@ -48,7 +50,7 @@ func validateAssetsSlot(raw, request json.RawMessage) error {
 			continue
 		}
 		var expected, actual any
-		_ = json.Unmarshal([]byte(`{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"}]}}`), &expected)
+		_ = json.Unmarshal([]byte(`{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"},{"name":"fidelity","type":{"literal":["auto","high","low","medium"]},"wire":"optional"}]}}`), &expected)
 		if json.Unmarshal(field.Type, &actual) != nil || !reflect.DeepEqual(actual, expected) {
 			return fmt.Errorf("assets parameter must name a list of asset/label records")
 		}
@@ -63,13 +65,16 @@ func validateAssetsSlot(raw, request json.RawMessage) error {
 	}
 	seen, media := map[string]bool{}, map[string]bool{}
 	for i, row := range rows {
-		fields, err := exactKeys(row, []string{"kind", "media_types"}, []string{"max_bytes", "max_decoded_bytes"})
+		fields, err := exactKeys(row, []string{"kind", "media_types"}, []string{"max_bytes", "max_decoded_bytes", "max_count"})
 		if err != nil {
 			return err
 		}
 		kind := slot.Kinds[i]
 		if seen[kind.Kind] || (kind.Kind != "image" && kind.Kind != "video" && kind.Kind != "audio" && kind.Kind != "file") || (len(kind.MediaTypes) == 0 && kind.Kind != "file") {
 			return fmt.Errorf("assets kinds must be unique media contracts")
+		}
+		if fields["max_count"] != nil && (kind.MaxCount == nil || *kind.MaxCount < 0) {
+			return fmt.Errorf("assets kind max_count must be a nonnegative integer")
 		}
 		seen[kind.Kind] = true
 		for _, mime := range kind.MediaTypes {
@@ -206,4 +211,80 @@ func namedAssetSpec(ep *Entrypoint, path string) bool {
 	parts[0] = folded
 	_, ok := AssetSpec(ep, strings.Join(parts, "."))
 	return ok
+}
+
+// ValidateAssetCounts applies the compiled kind limits to ordinary input
+// bindings. Named payload fields are outside the separate Assets collection.
+func ValidateAssetCounts(ep *Entrypoint, bindings []records.AssetBinding) *exit.Error {
+	if ep.Assets == nil {
+		return nil
+	}
+	counts := map[string]int64{}
+	for _, binding := range bindings {
+		if !ep.Assets.contains(strings.Split(binding.FieldPath, ".")) {
+			continue
+		}
+		spec, ok := AssetSpecForMedia(ep, binding.FieldPath, binding.MediaType)
+		if !ok {
+			return exit.New(exit.Validation, "Assets input has no matching media kind")
+		}
+		counts[spec.Kind]++
+	}
+	for _, kind := range ep.Assets.Kinds {
+		if kind.MaxCount != nil && counts[kind.Kind] > *kind.MaxCount {
+			return exit.Named(exit.Validation, "input_asset_count", "Assets input %s has %d %s items; maximum is %d", ep.Assets.Parameter, counts[kind.Kind], kind.Kind, *kind.MaxCount)
+		}
+	}
+	return nil
+}
+
+// Fidelity stays in the request's ordinary occurrence record. The SDK owns
+// its interpretation; neither this binding nor the shared loader resizes media.
+func applyAssetFidelity(ep *Entrypoint, document map[string]any, mappings []string) *exit.Error {
+	if len(mappings) == 0 {
+		return nil
+	}
+	if ep.Assets == nil {
+		return exit.Usagef("%s declares no Assets input for --asset-fidelity", ep.Name)
+	}
+	values, _ := document[ep.Assets.Parameter].([]any)
+	labels := map[string]int{}
+	for i, value := range values {
+		if entry, ok := value.(map[string]any); ok {
+			if label, ok := entry["label"].(string); ok && label != "" {
+				labels[label] = i
+			}
+		}
+	}
+	seen := map[int]bool{}
+	for _, mapping := range mappings {
+		split := strings.LastIndex(mapping, "=")
+		if split < 1 {
+			return exit.Usagef("--asset-fidelity needs label-or-index=auto|low|medium|high")
+		}
+		key, fidelity := mapping[:split], mapping[split+1:]
+		switch fidelity {
+		case "auto", "low", "medium", "high":
+		default:
+			return exit.Usagef("unknown asset fidelity %q; choose auto, low, medium or high", fidelity)
+		}
+		index, found := labels[key]
+		if !found {
+			number, err := strconv.ParseUint(key, 10, 31)
+			if err != nil || strconv.FormatUint(number, 10) != key || number >= uint64(len(values)) {
+				return exit.Usagef("asset fidelity selector %q names no attached occurrence", key)
+			}
+			index = int(number)
+		}
+		if seen[index] {
+			return exit.Usagef("asset fidelity for occurrence %d was supplied more than once", index)
+		}
+		seen[index] = true
+		entry, ok := values[index].(map[string]any)
+		if !ok {
+			return exit.Usagef("asset fidelity selector %q names no attached occurrence", key)
+		}
+		entry["fidelity"] = fidelity
+	}
+	return nil
 }

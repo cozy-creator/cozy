@@ -30,19 +30,20 @@ func TestDeclaredAssetsActualCallable(t *testing.T) {
 	code := `
 from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, Assets, AssetBound, Image, Context, invocable
-Pictures = Annotated[Assets[Annotated[Image, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], msgspec.Meta(min_length=1,max_length=3)]
-OptionalPictures = Annotated[Assets[Annotated[Image, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], msgspec.Meta(max_length=3)]
+from cozy_runtime.author import App, Assets, AssetBound, AssetLimits, Image, Context, invocable
+Pictures = Annotated[Assets[Annotated[Image, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], AssetLimits(images=2,total=3), msgspec.Meta(min_length=1)]
+OptionalPictures = Annotated[Assets[Annotated[Image, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], AssetLimits(images=2,total=3)]
 class Result(msgspec.Struct):
     labels: list[str]
     ids: list[str]
     positions: list[int]
     sizes: list[int]
+    fidelities: list[str]
 app = App()
 def result(assets: Pictures) -> Result:
     assert assets.info("艾丽丝").position == 0
     assert assets["艾丽丝"].size == (2, 2)
-    return Result([assets.info(i).label for i in range(len(assets))],[assets.info(i).id for i in range(len(assets))],[assets.info(i).position for i in range(len(assets))],[assets.info(i).size_bytes for i in range(len(assets))])
+    return Result([assets.info(i).label for i in range(len(assets))],[assets.info(i).id for i in range(len(assets))],[assets.info(i).position for i in range(len(assets))],[assets.info(i).size_bytes for i in range(len(assets))],[assets.info(i).fidelity for i in range(len(assets))])
 @invocable(memoize=False)
 async def main(ctx: Context, *, assets: Pictures, fail: bool = False) -> Result:
     ctx.raise_if_cancelled()
@@ -61,7 +62,7 @@ async def collect(payload: Request, assets: Pictures) -> Result:
 async def empty(payload: Request, assets: OptionalPictures) -> Result:
     assert payload.prompt == "text only"
     assert len(assets) == 0
-    return Result([], [], [], [])
+    return Result([], [], [], [], [])
 `
 	must(t, os.WriteFile(script, []byte(code), 0600))
 	metadata := `[project]
@@ -95,32 +96,48 @@ object = "assets_app:app"
 	must(t, err)
 	must(t, png.Encode(file, image.NewRGBA(image.Rect(0, 0, 2, 2))))
 	must(t, file.Close())
+
 	for _, function := range []string{"collect", "main"} {
 		t.Run(function, func(t *testing.T) {
 			args := []string{"--json", "run", "local/cozy-assets-proof/" + function}
 			if function == "collect" {
 				args = append(args, "prompt=unchanged")
 			}
-			args = append(args, "--asset", "艾丽丝="+photo, "--asset", photo, "--await")
+			args = append(args, "--asset", "艾丽丝="+photo, "--asset", photo, "--asset-fidelity", "艾丽丝=high", "--asset-fidelity", "1=low", "--await")
 			status, stdout, stderr := runCozyStreams(t, root, args...)
 			var result struct {
 				Status string `json:"status"`
 				Result struct {
-					Labels    []string `json:"labels"`
-					IDs       []string `json:"ids"`
-					Positions []int    `json:"positions"`
-					Sizes     []int    `json:"sizes"`
+					Labels     []string `json:"labels"`
+					IDs        []string `json:"ids"`
+					Positions  []int    `json:"positions"`
+					Sizes      []int    `json:"sizes"`
+					Fidelities []string `json:"fidelities"`
 				} `json:"result"`
 			}
 			if status != 0 || json.Unmarshal([]byte(stdout), &result) != nil || result.Status != "completed" {
 				t.Fatalf("actual Assets job failed: code=%d stdout=%s stderr=%s", status, stdout, stderr)
 			}
 			got := result.Result
-			if len(got.Labels) != 2 || got.Labels[0] != "艾丽丝" || got.Labels[1] != "" || got.IDs[0] != "assets.0.asset" || got.IDs[1] != "assets.1.asset" || got.Positions[0] != 0 || got.Positions[1] != 1 || got.Sizes[0] <= 0 || got.Sizes[0] != got.Sizes[1] {
+			if len(got.Labels) != 2 || got.Labels[0] != "艾丽丝" || got.Labels[1] != "" || got.IDs[0] != "assets.0.asset" || got.IDs[1] != "assets.1.asset" || got.Positions[0] != 0 || got.Positions[1] != 1 || got.Sizes[0] <= 0 || got.Sizes[0] != got.Sizes[1] || len(got.Fidelities) != 2 || got.Fidelities[0] != "high" || got.Fidelities[1] != "low" {
 				t.Fatalf("actual author received changed assets: %+v", got)
 			}
 		})
 	}
+	t.Run("kind-count", func(t *testing.T) {
+		code, out, stderr := runCozyStreams(t, root, "--json", "run", "local/cozy-assets-proof/main", "--asset", photo, "--asset", photo, "--asset", photo)
+		if code == 0 || !strings.Contains(out+stderr, "maximum") {
+			t.Fatalf("authored image limit was ignored: %d %s %s", code, out, stderr)
+		}
+		st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+		fatal(t, problem)
+		defer st.Close()
+		row, problem := st.RequestByReference("3")
+		fatal(t, problem)
+		if row != nil {
+			t.Fatal("over-limit Assets invocation queued a request")
+		}
+	})
 	t.Run("retry", func(t *testing.T) {
 		code, out, _ := runCozyStreams(t, root, "--json", "run", "local/cozy-assets-proof/main", "fail=true", "--asset", "艾丽丝="+photo, "--asset", photo, "--await")
 		if code == 0 || !strings.Contains(out, "deliberate asset retry") {

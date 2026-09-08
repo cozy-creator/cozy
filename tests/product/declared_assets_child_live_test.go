@@ -64,16 +64,17 @@ only-include=[%q]
 	write(child, "package.toml", "[application]\nobject=\"label_child:app\"\n")
 	write(child, "label_child.py", `from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, Assets, AssetBound, Image, Context, invocable
-Pictures=Annotated[Assets[Annotated[Image,AssetBound(max_bytes=1024,max_decoded_bytes=4096)]],msgspec.Meta(min_length=1,max_length=3)]
+from cozy_runtime.author import App, Assets, AssetBound, AssetLimits, Image, Context, invocable
+Pictures=Annotated[Assets[Annotated[Image,AssetBound(max_bytes=1024,max_decoded_bytes=4096)]],AssetLimits(images=2,total=3),msgspec.Meta(min_length=1)]
 class Result(msgspec.Struct):
     labels: list[str]
     ids: list[str]
     rgb: list[str]
+    fidelities: list[str]
 @invocable(memoize=True)
 async def inspect_assets(ctx: Context, *, assets: Pictures) -> Result:
     ctx.raise_if_cancelled()
-    return Result([assets.info(i).label for i in range(len(assets))],[assets.info(i).id for i in range(len(assets))],[image.tobytes().hex() for image in assets])
+    return Result([assets.info(i).label for i in range(len(assets))],[assets.info(i).id for i in range(len(assets))],[image.tobytes().hex() for image in assets],[assets.info(i).fidelity for i in range(len(assets))])
 app=App()
 app.job(inspect_assets)
 `)
@@ -81,9 +82,9 @@ app.job(inspect_assets)
 	write(project, "package.toml", "[application]\nobject=\"label_parent:app\"\n")
 	write(project, "label_parent.py", `from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, Assets, AssetBound, Image, Context, invocable
+from cozy_runtime.author import App, Assets, AssetBound, AssetLimits, Image, Context, invocable
 from label_child import Result, inspect_assets
-Pictures=Annotated[Assets[Annotated[Image,AssetBound(max_bytes=1024,max_decoded_bytes=4096)]],msgspec.Meta(min_length=1,max_length=3)]
+Pictures=Annotated[Assets[Annotated[Image,AssetBound(max_bytes=1024,max_decoded_bytes=4096)]],AssetLimits(images=2,total=3),msgspec.Meta(min_length=1)]
 app=App()
 @invocable(memoize=False)
 async def run(ctx: Context, *, assets: Pictures) -> Result:
@@ -112,21 +113,23 @@ app.job(run)
 	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer st.Close()
-	var original records.Request
-	for index, label := range []string{"alice", "alice", "carol"} {
-		code, out, stderr := runCozyStreams(t, root, "--json", "run", "local/labelled-assets-parent/run", "--asset", label+"="+photo, "--asset", "bob="+photo, "--await")
+	var original, labelChanged records.Request
+	for index, item := range []struct{ label, fidelity string }{{"alice", "high"}, {"alice", "high"}, {"carol", "high"}, {"carol", "low"}} {
+		label := item.label
+		code, out, stderr := runCozyStreams(t, root, "--json", "run", "local/labelled-assets-parent/run", "--asset", label+"="+photo, "--asset", "bob="+photo, "--asset-fidelity", label+"="+item.fidelity, "--asset-fidelity", "bob=medium", "--await")
 		var answer struct {
 			Status string `json:"status"`
 			Result struct {
-				Labels []string `json:"labels"`
-				IDs    []string `json:"ids"`
-				RGB    []string `json:"rgb"`
+				Labels     []string `json:"labels"`
+				IDs        []string `json:"ids"`
+				RGB        []string `json:"rgb"`
+				Fidelities []string `json:"fidelities"`
 			} `json:"result"`
 		}
 		if code != 0 || json.Unmarshal([]byte(out), &answer) != nil || answer.Status != "completed" {
 			t.Fatalf("parent invocation: %d %s %s", code, out, stderr)
 		}
-		if len(answer.Result.Labels) != 2 || answer.Result.Labels[0] != "bob" || answer.Result.Labels[1] != label || answer.Result.IDs[0] != "assets.0.asset" || answer.Result.IDs[1] != "assets.1.asset" || answer.Result.RGB[0] != strings.Repeat("ff0000", 4) || answer.Result.RGB[1] != answer.Result.RGB[0] {
+		if len(answer.Result.Labels) != 2 || answer.Result.Labels[0] != "bob" || answer.Result.Labels[1] != label || answer.Result.IDs[0] != "assets.0.asset" || answer.Result.IDs[1] != "assets.1.asset" || answer.Result.RGB[0] != strings.Repeat("ff0000", 4) || answer.Result.RGB[1] != answer.Result.RGB[0] || len(answer.Result.Fidelities) != 2 || answer.Result.Fidelities[0] != "medium" || answer.Result.Fidelities[1] != item.fidelity {
 			t.Fatalf("child lost labels/order/decode: %+v", answer.Result)
 		}
 		parent, problem := st.RequestByReference(strconv.Itoa(index*2 + 1))
@@ -145,6 +148,12 @@ app.job(run)
 		}
 		if index == 2 && (current.ReusedFrom != "" || current.Ordinal != 1 || current.BodyDigest == original.BodyDigest) {
 			t.Fatalf("changed label reused prior child: %+v", current)
+		}
+		if index == 2 {
+			labelChanged = current
+		}
+		if index == 3 && (current.ReusedFrom != "" || current.Ordinal != 1 || current.BodyDigest == labelChanged.BodyDigest) {
+			t.Fatalf("changed fidelity reused prior child: %+v", current)
 		}
 		if current.Assets[0].Digest != current.Assets[1].Digest || current.Assets[0].Order != 0 || current.Assets[1].Order != 1 {
 			t.Fatalf("duplicate content lost occurrence identity: %+v", current.Assets)

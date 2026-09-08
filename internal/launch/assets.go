@@ -14,13 +14,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// ParseAssets turns repeated `--asset <field-path>=<file>` flags into one payload plus
-// exact byte bindings. The payload carries only an opaque content reference; paths and
+// ParseAssets resolves files and label=file occurrences in a declared Assets slot,
+// or explicit field-path=file bindings, into one payload plus exact byte bindings.
+// The payload carries only an opaque content reference; paths and
 // bytes travel out-of-band through DeliveryGrant. A nested path is resolved against the
 // package's recorded schema, so `references.0.image` cannot accidentally grant a file
 // to a scalar or to a misspelled field.
-func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.RawMessage, []records.AssetBinding, *exit.Error) {
-	if len(specs) == 0 && ep.Assets == nil {
+func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []string) (json.RawMessage, []records.AssetBinding, *exit.Error) {
+	if len(specs) == 0 && len(fidelities) == 0 && ep.Assets == nil {
 		return payload, nil, nil
 	}
 	var document map[string]any
@@ -39,7 +40,11 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 		return nil, nil, problem
 	}
 	seen := map[string]bool{}
-	assets := make([]records.AssetBinding, 0, len(specs))
+	type pendingAsset struct {
+		fieldPath, source string
+		parts             []string
+	}
+	pending := make([]pendingAsset, 0, len(specs))
 	for _, spec := range specs {
 		fieldPath, source, label, explicit := splitAssetArgument(ep, spec)
 		if !explicit {
@@ -86,6 +91,25 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 				"%s.%s is not an asset field in this release's request schema", ep.Name, fieldPath).
 				WithRemedy("the installed package.package-interface.json declares %s's request schema", ep.Name)
 		}
+		if ep.Assets.contains(parts) {
+			values := document[ep.Assets.Parameter].([]any)
+			index, _ := strconv.Atoi(parts[1])
+			for len(values) <= index {
+				values = append(values, nil)
+			}
+			if values[index] == nil {
+				values[index] = map[string]any{}
+			}
+			document[ep.Assets.Parameter] = values
+		}
+		pending = append(pending, pendingAsset{fieldPath, source, parts})
+	}
+	if problem := applyAssetFidelity(ep, document, fidelities); problem != nil {
+		return nil, nil, problem
+	}
+	assets := make([]records.AssetBinding, 0, len(pending))
+	for _, item := range pending {
+		fieldPath, source, parts := item.fieldPath, item.source, item.parts
 		assetSpec, _ := AssetSpec(ep, fieldPath)
 		maxBytes := assetSpec.MaxBytes
 		if maxBytes <= 0 {
@@ -128,6 +152,9 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 			FieldPath: fieldPath, LocalPath: absolute, Digest: digest,
 			Length: length, MediaType: mediaType, Order: pathOrder(parts), MaxBytes: maxBytes,
 		})
+	}
+	if problem := ValidateAssetCounts(ep, assets); problem != nil {
+		return nil, nil, problem
 	}
 	sort.Slice(assets, func(i, j int) bool { return assets[i].FieldPath < assets[j].FieldPath })
 	rendered, err := json.Marshal(document)
