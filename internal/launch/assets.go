@@ -20,7 +20,7 @@ import (
 // package's recorded schema, so `references.0.image` cannot accidentally grant a file
 // to a scalar or to a misspelled field.
 func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.RawMessage, []records.AssetBinding, *exit.Error) {
-	if len(specs) == 0 {
+	if len(specs) == 0 && ep.Assets == nil {
 		return payload, nil, nil
 	}
 	var document map[string]any
@@ -28,6 +28,11 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 	decoder.UseNumber()
 	if err := decoder.Decode(&document); err != nil || document == nil {
 		return nil, nil, exit.Internalf("cannot add input assets to the payload: %s", err)
+	}
+	if ep.Assets != nil {
+		if _, present := document[ep.Assets.Parameter]; !present {
+			document[ep.Assets.Parameter] = []any{}
+		}
 	}
 
 	if problem := preflightAssetCount(ep, document, specs); problem != nil {

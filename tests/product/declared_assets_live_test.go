@@ -25,12 +25,14 @@ func TestDeclaredAssetsActualCallable(t *testing.T) {
 	must(t, err)
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
 	project := t.TempDir()
+	version := strings.Split(filepath.Base(*assetsRuntimeWheel), "-")[1]
 	script := filepath.Join(project, "assets_app.py")
 	code := `
 from typing import Annotated
 import msgspec
 from cozy_runtime.author import App, Assets, AssetBound, ImageAsset, Context, invocable
 Pictures = Annotated[Assets[Annotated[ImageAsset, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], msgspec.Meta(min_length=1,max_length=3)]
+OptionalPictures = Annotated[Assets[Annotated[ImageAsset, AssetBound(max_bytes=1024, max_decoded_bytes=4096)]], msgspec.Meta(max_length=3)]
 class Result(msgspec.Struct):
     labels: list[str]
     ids: list[str]
@@ -54,13 +56,18 @@ class Request(msgspec.Struct):
 async def collect(payload: Request, assets: Pictures) -> Result:
     assert payload.prompt == "unchanged"
     return result(assets)
+@app.entrypoint
+async def empty(payload: Request, assets: OptionalPictures) -> Result:
+    assert payload.prompt == "text only"
+    assert len(assets) == 0
+    return Result([], [], [], [])
 `
 	must(t, os.WriteFile(script, []byte(code), 0600))
 	metadata := `[project]
 name = "cozy-assets-proof"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime"]
+dependencies = ["cozy-runtime==` + version + `"]
 [project.entry-points."cozy.application"]
 default = "assets_app:app"
 [build-system]
@@ -148,6 +155,18 @@ object = "assets_app:app"
 			if asset.Digest != prior.Assets[i].Digest || asset.FieldPath != prior.Assets[i].FieldPath || asset.Order != prior.Assets[i].Order || asset.MediaType != prior.Assets[i].MediaType {
 				t.Fatalf("retry changed retained asset identity: %+v", fresh.Assets)
 			}
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		code, out, stderr := runCozyStreams(t, root, "--json", "run", "local/cozy-assets-proof/empty", "prompt=text only", "--await")
+		var answer struct {
+			Status string `json:"status"`
+			Result struct {
+				Labels []string `json:"labels"`
+			} `json:"result"`
+		}
+		if code != 0 || json.Unmarshal([]byte(out), &answer) != nil || answer.Status != "completed" || answer.Result.Labels == nil || len(answer.Result.Labels) != 0 {
+			t.Fatalf("zero-reference Assets invocation failed: %d %s %s", code, out, stderr)
 		}
 	})
 

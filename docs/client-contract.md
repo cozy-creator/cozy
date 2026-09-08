@@ -80,8 +80,31 @@ identities. Runtime observes the actual worker environment and refuses protected
 conflicts before offline installation. Tensorhub's immutable release detail supplies the verified
 request/result PackageInterface.
 
-`local_assets` is the CLI-only local extension for `--asset
-<field-path>=<file>`. Each row names the exact request-schema field path plus a source
+For a callable with an explicit `assets` descriptor, repeated `--asset <file>`
+flags append files in attachment order. `--asset 'alice=~/Pictures/alice.png'`
+adds an optional, exact label; nonempty labels must be unique. Repeating the same
+file keeps separate occurrences while reusing its content identity. Explicit
+paths such as `~/Pictures/a=b.png` remain filenames. Labels and files do not
+rewrite the prompt or infer model-specific roles. The package decides how to use
+them. For example:
+
+```sh
+cozy run paul/minimax-h3/ref2va --await --rental-only \
+  prompt='<Picture1> and <Picture2> walk through a garden' \
+  --asset='alice=~/Pictures/alice.png' --asset='bob=~/Pictures/bob.png'
+```
+
+The descriptor names one request field containing `{asset, label?}` records.
+Bindings use `<parameter>.<index>.asset`, with labels carried in the ordinary
+request payload and memo identity. Missing declared collections default to `[]`;
+the authored minimum/maximum count decides whether that is valid. Each media
+kind's encoded byte limit applies per file; Runtime owns decoded byte limits.
+An exact named payload asset still uses `--asset <field-path>=<file>`, including
+on jobs, and takes precedence over a same-spelled label. Named fields and the
+declared collection can coexist.
+
+`local_assets` is the CLI-only local extension carrying those attachments.
+Each row names the exact request-schema field path plus a source
 path, digest, length, and detected media type. The daemon verifies those claims and
 copies the bytes into its private content-addressed input store before recording the
 request. Only an opaque digest reference enters `input`; only the field-path identity,

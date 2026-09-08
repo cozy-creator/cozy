@@ -89,3 +89,27 @@ func TestDeclaredAssetsPreserveOccurrencesLabelsAndNamedFields(t *testing.T) {
 		t.Fatal("bare asset guessed a payload destination without a declared Assets slot")
 	}
 }
+
+func TestDeclaredAssetsDefaultEmptyCollection(t *testing.T) {
+	ep := assetsCallable(t)
+	payload, bindings, problem := launch.ParseAssets(ep, []byte(`{"prompt":"text only"}`), nil)
+	fatal(t, problem)
+	if len(bindings) != 0 || !strings.Contains(string(payload), `"assets":[]`) {
+		t.Fatalf("missing declared Assets did not become an empty collection: %s %+v", payload, bindings)
+	}
+	if problem := launch.ValidatePayload("proof/assets", ep, payload); problem == nil {
+		t.Fatal("empty required image collection ignored the authored minimum count")
+	}
+	// A zero-reference callable uses the same payload builder and schema owner.
+	ep.Request.Fields[1].Constraints.MinLength = nil
+	fatal(t, launch.ValidatePayload("proof/assets", ep, payload))
+	explicit := []byte(`{"prompt":"text only","assets":[{"asset":"retained","label":"last"}]}`)
+	payload, bindings, problem = launch.ParseAssets(ep, explicit, nil)
+	fatal(t, problem)
+	if len(bindings) != 0 || !strings.Contains(string(payload), `"asset":"retained","label":"last"`) {
+		t.Fatalf("explicit collection was replaced: %s %+v", payload, bindings)
+	}
+	if _, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"text only","assets":null}`), nil); problem == nil {
+		t.Fatal("explicit null collection became an empty list")
+	}
+}
