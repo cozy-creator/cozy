@@ -15,7 +15,9 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strconv"
 	"strings"
@@ -132,6 +134,33 @@ func (h *Held) Release() {
 	_ = flock.Release(h.f)
 	_ = h.f.Close()
 	h.f = nil
+}
+
+// Claimed reports whether the path this daemon published its claim at still names the
+// file it holds. The lock file IS the claim (see the package comment): a client reaches
+// this daemon only by opening `<home>/daemon.lock` and failing to take the lock. If the
+// root was deleted, moved, or wiped out from under the running daemon, that path no
+// longer resolves to this file — nothing can find this process, nothing can stop it, and
+// nothing it writes will ever be read again.
+//
+// The comparison is by identity, not existence: a root that was removed and recreated is
+// the same absence as one that was removed, and a second daemon that took the recreated
+// lock must not be mistaken for this one. Any answer other than "the path is not there"
+// — an unreadable directory, a filesystem in trouble — reads as still claimed: this is a
+// reason to leave, so it must never fire on an answer the kernel could not give.
+func (h *Held) Claimed() bool {
+	if h == nil || h.f == nil {
+		return false
+	}
+	mine, err := h.f.Stat()
+	if err != nil {
+		return true
+	}
+	published, err := os.Stat(h.f.Name())
+	if err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
+	}
+	return os.SameFile(mine, published)
 }
 
 // Unavailable is the typed refusal every server-dependent verb shares.
