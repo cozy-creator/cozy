@@ -26,7 +26,7 @@ func CommittedFileOutput(owner string, row NativeCall, status *pb.NativeSourceSt
 		return fail()
 	}
 	var request struct {
-		Handle    string `json:"handle"`
+		Slot      string `json:"slot"`
 		Digest    string `json:"digest"`
 		Size      int64  `json:"size_bytes"`
 		MediaType string `json:"media_type"`
@@ -44,8 +44,7 @@ func CommittedFileOutput(owner string, row NativeCall, status *pb.NativeSourceSt
 			return fail()
 		}
 	}
-	prefix := fmt.Sprintf("attempt:%s#%d/file/", row.ParentRequestID, status.ByteOutputAttemptOrdinal)
-	tail, ok := strings.CutPrefix(request.Handle, prefix)
+	tail, ok := strings.CutPrefix(request.Slot, "file/")
 	index, err := strconv.ParseUint(tail, 10, 64)
 	if !ok || err != nil || index == 0 || len(tail) > 16 || fmt.Sprintf("%04d", index) != tail {
 		return fail()

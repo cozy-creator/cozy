@@ -26,7 +26,7 @@ func TestCommittedFileKeepsOriginalProducerAndExactOwnedBytes(t *testing.T) {
 			}
 			digest := "sha256:" + strings.Repeat("ab", 32)
 			spec := []byte(strings.Repeat("s", 32))
-			request := map[string]any{"handle": "attempt:parent#1/file/0001", "digest": digest, "size_bytes": 80000, "media_type": "application/json"}
+			request := map[string]any{"slot": "file/0001", "digest": digest, "size_bytes": 80000, "media_type": "application/json"}
 			result := map[string]any{"file": map[string]any{"asset_ref": digest, "kind": "file", "digest": digest, "size_bytes": 80000, "media_type": "application/json"}}
 			manifest := encode(map[string]any{"entries": []any{map[string]any{"path": "payload", "kind": "file", "blob": map[string]any{"sha256": strings.TrimPrefix(digest, "sha256:"), "length": 80000}}}})
 			row := records.NativeCall{ParentRequestID: "parent", CallIndex: 80, Operation: "commit_file"}
@@ -36,7 +36,7 @@ func TestCommittedFileKeepsOriginalProducerAndExactOwnedBytes(t *testing.T) {
 			}}
 			switch fault {
 			case "foreign_handle":
-				request["handle"] = "attempt:other#1/file/0001"
+				request["slot"] = "attempt:other#1/file/0001"
 			case "changed_size":
 				request["size_bytes"] = 80001
 			case "changed_mime":
