@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 29
+const schemaVersion = 30
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS pins (
 var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orchestratorSchema,
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
-func init() { schema = append(schema, weightsRetentionsDDL, operationLookupsDDL) }
+func init() { schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL) }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -366,6 +366,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if sourceVersion < 29 {
 		if _, err := tx.Exec(operationLookupsDDL); err != nil {
 			return exit.Internalf("cannot create pending operation lookups in %s: %s", path, err)
+		}
+	}
+	if sourceVersion < 30 {
+		if _, err := tx.Exec(nativeCallsDDL); err != nil {
+			return exit.Internalf("cannot create native call admission in %s: %s", path, err)
 		}
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
@@ -691,6 +696,9 @@ func priorStatements(version int) []string {
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
 		if version < 29 && statement == operationLookupsDDL {
+			continue
+		}
+		if version < 30 && statement == nativeCallsDDL {
 			continue
 		}
 		if version < 28 && statement == weightsRetentionsDDL {
