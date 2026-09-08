@@ -891,7 +891,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		list.TypedFields = []string{"machine", "sku", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at", "failure_code"}
 	}
-	// THE HUB'S HALF (cl-196, on th-199). Everything above is what this host FILED, and
+	// THE HUB'S HALF (cl-199, on th-199). Everything above is what this host FILED, and
 	// the incident of 2026-09-07 is the gap between that and what the account is
 	// actually paying for: six H100 NVLs booting at $3.19/hour, none of them filed
 	// here, so this board — the one command a person types to ask what they are
@@ -1190,7 +1190,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		}
 		known.RentalID = id
 	}
-	// THE HUB CAN NOW BE ASKED WHO OWNS WHAT (cl-196, on th-199). A machine word is
+	// THE HUB CAN NOW BE ASKED WHO OWNS WHAT (cl-199, on th-199). A machine word is
 	// Creator's own alias, so before this route existed an unrecorded name could not be
 	// looked up at all and the command could only refuse. The account listing turns the
 	// word back into the id the hub minted, which is what a DELETE takes — and it is the

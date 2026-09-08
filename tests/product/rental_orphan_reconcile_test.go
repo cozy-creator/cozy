@@ -13,7 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// THE MONEY-LEAK HALF (cl-196, on hub th-199).
+// THE MONEY-LEAK HALF (cl-199, on hub th-199).
 //
 // 2026-09-07: six H100 NVLs at $3.19/hour were created hub-side and reached
 // `booting`. Creator's width fence refused the create answer, so this host recorded

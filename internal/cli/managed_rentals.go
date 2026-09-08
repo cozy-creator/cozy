@@ -47,7 +47,7 @@ type managedRentals struct {
 	retryAt map[string]time.Time
 	said    map[string]string
 	closed  bool
-	// unrecorded is the OTHER HALF OF THE FLEET (cl-196): the rentals the hub says
+	// unrecorded is the OTHER HALF OF THE FLEET (cl-199): the rentals the hub says
 	// this account owns that this host holds no live record of. It is refreshed by
 	// every reconcile from `GET /v1/rentals` (th-199) and is the only place a pod
 	// this host never recorded can be counted, named, or ended.
