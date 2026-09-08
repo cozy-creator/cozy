@@ -155,6 +155,9 @@ func TestSourceCustodyCannotRunBesideTheDaemon(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, cozyBin, "up", "--json", "--full")
+	// This `up` is expected to refuse, but the root is registered for reaping anyway:
+	// the suite's guarantee is about what a child COULD start, not what it should.
+	trackDaemonRoot(t, root)
 	command.Env = cfg.Child("COZY_HOME="+root, "TENSORFS_HOME="+filepath.Join(root, "tensorfs"), "TENSORHUB_URL=http://127.0.0.1:1")
 	output, err := command.CombinedOutput()
 	if ctx.Err() != nil || err == nil || !bytes.Contains(output, []byte("daemon.operator_owned")) {

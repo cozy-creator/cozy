@@ -146,6 +146,7 @@ func (p *parking) competes(k laneKey) bool {
 type routing struct {
 	candidates []candidate
 	parked     []string
+	blocked    []laneKey
 	lanes      []laneKey
 	claimed    []string
 	// pinned is the rental this decision pinned the request to (dispatch), or "".
@@ -207,6 +208,7 @@ func (c *Orchestrator) route(req records.Request) routing {
 		out.lanes = append(out.lanes, lane)
 		if room <= 0 {
 			out.parked = append(out.parked, w.instanceID+": "+why)
+			out.blocked = append(out.blocked, lane)
 			continue
 		}
 		if by, claimed := claims[lane]; claimed && room < 2 {
@@ -239,6 +241,7 @@ func (c *Orchestrator) route(req records.Request) routing {
 		return a.laneID < b.laneID
 	})
 	sort.Strings(out.parked)
+	sort.Slice(out.blocked, func(i, j int) bool { return out.blocked[i].String() < out.blocked[j].String() })
 	sort.Strings(out.claimed)
 	return out
 }

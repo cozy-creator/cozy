@@ -326,6 +326,28 @@ func (s *Store) ActiveRentalOperations() ([]RentalOperation, *exit.Error) {
 	return out, nil
 }
 
+// RentalOperations is every paid acquisition this host has ever recorded, oldest first.
+// SETTLED rows are included on purpose: "this host released that rental" and "this host
+// never heard of it" are opposite answers about a machine that may still be billing, and
+// only the history separates them.
+func (s *Store) RentalOperations() ([]RentalOperation, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + rentalOperationCols +
+		` FROM rental_operations ORDER BY created_at,operation_key`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list rental operations: %s", err)
+	}
+	defer rows.Close()
+	var out []RentalOperation
+	for rows.Next() {
+		op, err := scanRentalOperation(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read a rental operation: %s", err)
+		}
+		out = append(out, op)
+	}
+	return out, nil
+}
+
 // AdvanceRentalOperation records facts learned from the hub. Empty rentalID preserves a
 // previously learned id, which keeps a later polling update from erasing the join. The
 // compare-and-swap keeps a delayed poll from moving an operation behind a fact another

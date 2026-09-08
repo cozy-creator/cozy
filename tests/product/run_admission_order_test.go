@@ -126,6 +126,18 @@ func runAdmissionCLI(t *testing.T, root, path string, args ...string) (int, stri
 	return cmd.ProcessState.ExitCode(), string(out)
 }
 
+// daemonFleetHousekeeping is the traffic the DAEMON generates for its own reasons,
+// which these arms are not about. `cozy run` dials the daemon, and a daemon asks the
+// hub what rentals this account owns whether or not it holds any records of its own
+// (cl-199) — that reverse reconcile is the only way a pod nobody recorded is ever
+// noticed, so it cannot be conditioned on the local fleet being non-empty. It is the
+// same class as the per-rental reconcile the daemon already runs, which this fixture
+// simply never saw because it holds no rentals.
+//
+// What these arms assert is unchanged: nothing the INVALID INPUT touches reaches the
+// hub, the store, or the GPU.
+func daemonFleetHousekeeping(request string) bool { return request == "GET /v1/rentals" }
+
 func (p *admissionProbe) snapshot() (requests, lanes []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -172,7 +184,8 @@ func TestRunValidatesArgumentsBeforeModelResolution(t *testing.T) {
 			}
 			requests, _ := probe.snapshot()
 			for _, request := range requests {
-				if request != "GET /v1/packages/proof/h3" && request != "GET /v1/packages/proof/h3/releases/1.0.0" {
+				if request != "GET /v1/packages/proof/h3" && request != "GET /v1/packages/proof/h3/releases/1.0.0" &&
+					!daemonFleetHousekeeping(request) {
 					t.Errorf("invalid input reached %s", request)
 				}
 			}
@@ -193,8 +206,11 @@ func TestBareRunReportsRequiredArgumentsAndFullInterface(t *testing.T) {
 		}
 	}
 	requests, _ := probe.snapshot()
-	if len(requests) != 0 {
-		t.Errorf("rendering argument help dialed Hub: %v", requests)
+	for _, request := range requests {
+		if !daemonFleetHousekeeping(request) {
+			t.Errorf("rendering argument help dialed Hub: %v", requests)
+			break
+		}
 	}
 	if _, err := os.Stat(activity); !os.IsNotExist(err) {
 		t.Errorf("rendering argument help opened tools: %s", tail(activity))

@@ -435,7 +435,8 @@ type worker struct {
 	desiredEpoch uint64
 	// localMu serializes ConvergeLocalPackage on this worker. It is never held by the
 	// control stream's receive loop, whose reports the holder waits on.
-	localMu sync.Mutex
+	localMu   sync.Mutex
+	localCode *localPreparedCode // guarded by localMu; valid only for this live worker/base
 	// hostPrepareSeq numbers the logical desires issued through PodHost (proto-025); a
 	// prepare that completes for an older number sends nothing.
 	hostPrepareSeq uint64
@@ -647,13 +648,14 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 		}
 		placement := DesiredPlacement{Package: pkg, Release: release,
 			PlacementIDValue: row.Str("placement_id"), PlacementSetDigest: digest,
+			BindingsDigest:    row.Str("bindings_digest"),
 			PlacementSetBytes: append([]byte(nil), w.setBytes...),
 			EnvironmentDigest: row.Str("environment_digest")}
 		if development.Str("package") != "" {
 			placement.SourceDigest = development.Str("source_digest")
 			placement.LocalRevisionDigest = development.Str("local_revision_digest")
 		}
-		if placement.PlacementIDValue == "" ||
+		if placement.PlacementIDValue == "" || !validDigest(placement.BindingsDigest) ||
 			(placement.SourceDigest == "" && placement.EnvironmentDigest == "") {
 			return DesiredPlacement{}, false, exit.Named(exit.Structural,
 				"rental.placement_incomplete", "prepared placement for %s@%s is incomplete", pkg, release)

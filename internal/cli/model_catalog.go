@@ -12,8 +12,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
-// Releases are opaque labels. Search gives each available label its own row,
-// and info lists them all unless the caller explicitly selects one.
+// Releases are opaque labels. Search shows the first available release in the
+// hub's catalog order; info lists them all unless the caller selects one.
 type modelSearchView struct {
 	Cards []hub.ModelCard
 	Notes []string
@@ -28,7 +28,7 @@ func (view modelSearchView) Emit(w io.Writer, mode output.Mode) error {
 	for _, card := range view.Cards {
 		count := 0
 		for _, release := range card.Releases {
-			if release.Yanked || release.Release == "" {
+			if release.Yanked || release.YankedAt != "" || release.Release == "" {
 				continue
 			}
 			lanes := modelLaneNames(release.Lanes)
@@ -45,9 +45,10 @@ func (view modelSearchView) Emit(w io.Writer, mode output.Mode) error {
 			list.TypedRows = append(list.TypedRows, map[string]any{"model": card.Model.Ref(), "family": card.Model.Family,
 				"release": release.Release, "lanes": lanes})
 			if len(list.Next) == 0 || strings.Contains(cell, "…") {
-				list.Next = []string{"cozy model info " + card.Model.Ref() + "@" + release.Release}
+				list.Next = []string{"cozy model info " + card.Model.Ref()}
 			}
 			count++
+			break
 		}
 		if count == 0 {
 			list.Rows = append(list.Rows, map[string]string{"model": card.Model.Ref(), "family": card.Model.Family, "lanes": "[]"})

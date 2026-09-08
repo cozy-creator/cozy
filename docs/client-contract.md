@@ -163,11 +163,17 @@ Answers:
 
 `status`: `queued` · `in_progress` · `completed` · `failed` · `canceled`.
 
+Status and list responses expose `overall_fraction` when whole-run progress is
+known. Completed runs report `1`; failed and canceled runs retain the last
+measured fraction of their current attempt across daemon restarts. The field is
+omitted when no overall measurement was recorded. Stage coordinates and ETA
+remain live-only, and stage progress has its own denominator.
+
 ### Status
 
 ```json
 {"request_id": "req-…", "status": "completed", "package": "org/name",
- "function": "denoise", "attempt": 1, "attempts": 1,
+ "function": "denoise", "attempt": 1, "attempts": 1, "overall_fraction": 1,
  "metrics": {"runtime_ms": 401, "handler_ms": 398, "peak_vram_bytes": 6…},
  "result": {…the package's typed result…},
  "outputs": [{"output_id": "image", "media_id": "med-…", "url": "/v1/media/med-…",
@@ -209,9 +215,9 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 | `request.dispatch_aborted` | pre-offer preparation failed; `cause`, `error`; no worker saw this ordinal |
 | `request.dispatched` | `instance_id`, `invocation_digest` |
 | `request.accepted` | `plan_digest`, `construction_digest`, `plan` |
-| `request.attempt_failed` | one ATTEMPT ended and the request did NOT — `status`, `cause`, `requeuing: true` |
+| `request.attempt_failed` | one ATTEMPT ended and the request did NOT — `status`, `cause`, `requeuing: true`, optional last measured `overall_fraction` |
 | `request.requeued` | `cause`, `requeues`, `budget` |
-| `request.completed` | `status`, `cause`, `outputs[]` (media ids), `triage_subject` |
+| `request.completed` | `status`, `cause`, `outputs[]` (media ids), `triage_subject`, optional last measured `overall_fraction` |
 | `request.failed` | the above plus `error_type`, `error` |
 | `request.canceled` | the above |
 
@@ -219,7 +225,8 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 never replayed from a cursor. The LATEST tick is replayed immediately on connect so a
 mid-run subscriber renders current state. `request.progress` carries `value` (a fraction)
 and `seq`; when Runtime reports measured production coordinates, `value` is an object with
-`name`, `fraction`, `position`, and `step_ms`. `request.log`, `request.stage` and
+`stage`, `stage_fraction`, `overall_fraction`, `position`, `total`, and `step_ms`
+(with unmeasured coordinates omitted). `request.log`, `request.stage` and
 `request.metric` carry the worker's own.
 
 Three rules a client may rely on:

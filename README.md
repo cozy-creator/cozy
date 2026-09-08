@@ -144,11 +144,14 @@ See [package publication](docs/package-publication.md) for the release contract.
 
 ## Models
 
-Search lists `MODEL`, `FAMILY`, `RELEASE`, and `LANES`, with one row per available
-release. Long columns are shortened in the compact human table; `--full` and JSON
-retain complete values and lane lists.
+Search lists `MODEL`, `FAMILY`, `RELEASE`, and `LANES`, with one row per model at its
+latest available release in Tensorhub's catalog order. Long columns are shortened
+in the compact human table; `--full` and JSON retain complete values and lane lists
+for that release.
 `cozy model info org/name` shows all available releases, while `@release` selects
-one exact tag. Info shows full lanes and immutable checkpoint refs. Unavailable
+one exact tag. Info shows every lane's full stored byte size and immutable checkpoint
+ref; JSON also includes components and their sizes when available. Stored size is
+not a VRAM requirement or a measurement of bytes missing from the local cache. Unavailable
 Hub timestamps remain unavailable; model creation is distinct from release creation.
 
 Model releases live in the local TensorFS store:
@@ -296,10 +299,14 @@ An unchanged deterministic failure is not automatically retried. `--await` retur
 transaction blocks or pauses, and the ordinary run view explains the stopped state.
 
 An invocable dependency exposes an ordinary typed Python call. Its implementation is
-captured separately; the parent imports a generated interface containing signatures and
-result types. Calling it creates an ordinary managed child job. A reusable computation
+captured separately; the parent keeps its ordinary helpers and resources, with generated
+callable interfaces for managed exports. Calling one creates an ordinary managed child job. A reusable computation
 opts in with `@invocable(memoize=True)` and registers through `app.job(function)`.
 Arbitrary helper functions and external effects do not become cached operations.
+An invocable library declares its App in `package.toml` (`[application] object =
+"my_algorithm:app"`) and the matching `pyproject.toml` entry point
+(`[project.entry-points."cozy.application"] default = "my_algorithm:app"`).
+The calling single-file script needs neither declaration.
 
 On either a local or rented worker, a memoized child can acquire an earlier successful result when its
 exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,
@@ -308,6 +315,14 @@ ID. Run IDs, the parent's script digest and call position are not computation ca
 Native model results travel as `ModelArtifact`
 references; reuse acquires independent native custody before the new result is visible.
 The reference names its original producer and receipt without copying tensor bytes.
+
+The script starts at `main()` on every run; Python lines and call stacks are not replayed.
+Completed operations return their retained results. An interrupted operation can also
+adopt compatible progress that its implementation checkpointed: download prefixes,
+conversion groups, or complete quantized tensor data/scale groups. Only completed,
+verified units can be reused; an unfinished group runs again. Changed operation code,
+inputs or encoding starts new work while independently retained preparation remains
+available. Ordinary inference starts again after interruption.
 
 The implementation boundary is a package and its dependencies, not an individual Python
 function body. Editing B inside a package that also implements A invalidates that package's

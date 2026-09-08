@@ -16,6 +16,9 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/cozy-creator/cozy/internal/cli"
+	"github.com/cozy-creator/cozy/internal/output"
 )
 
 const ptyColumns = 80
@@ -113,8 +116,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("piped lane leaked a diagnostic spelling\n%s", stderr)
 	}
 
-	// TTY: ONE in-place line — every step write is a \r + erase rewrite carrying the bar,
-	// steps, percentage and elapsed, each clamped under the terminal's 80 columns.
+	// TTY: the active stage block refreshes in place; completed stages remain above it.
+	// Each row is clamped under the terminal's 80 columns.
 	code, tty := ptyRun(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=4", "delay_ms=2500", "--await")
 	if code != 0 {
@@ -126,7 +129,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	}
 	// The 80-column pty clamps the tail (that IS the resize safety); the bar, steps
 	// and percentage must always survive the clamp.
-	barred := regexp.MustCompile(`overall \[[=.]{18}\] \d+% · tile_steps \d+/100 · \d+% stage`)
+	barred := regexp.MustCompile(`tile_steps \d+/100 \[[=.]{10}\] \d+% stage`)
 	seen := 0
 	for _, chunk := range rewrites[1:] {
 		line := chunk
@@ -143,8 +146,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 	if seen < 2 {
 		t.Fatalf("terminal rewrites never showed the step bar\n%q", tty)
 	}
-	if !strings.Contains(tty, "elapsed") {
-		t.Fatalf("terminal run never showed elapsed time\n%q", tty)
+	if !strings.Contains(tty, "elapsed") || !strings.Contains(tty, "s/step avg") || !strings.Contains(tty, "ETA ~") {
+		t.Fatalf("terminal run never showed elapsed, measured speed and stage ETA\n%q", tty)
 	}
 
 	// --await --json: stdout remains one final result; stderr carries typed JSONL events.
@@ -176,7 +179,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 
 	// The list reuses the same lossy Runtime progress lane. Whole-job percentage and ETA
 	// come only from overall_fraction; the current stage remains explicitly stage-local.
-	// Terminal rows return to a dash because progress beside "completed" adds no information.
+	// Completed rows preserve the successful 100% coordinate after live telemetry is gone.
 	code, output := runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=6", "delay_ms=5000")
 	if code != 0 {
@@ -255,9 +258,9 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("progress proof run did not settle [exit %d]\n%s", code, out)
 	}
 	if terminal := list(true); terminal.Status != "completed" || terminal.ProgressStage != "" ||
-		terminal.StageFraction != nil || terminal.OverallFraction != nil ||
+		terminal.StageFraction != nil || terminal.OverallFraction == nil || *terminal.OverallFraction != 1 ||
 		terminal.Position != nil || terminal.Total != nil || terminal.RemainingMS != nil {
-		t.Fatalf("terminal run retained redundant progress: %+v", terminal)
+		t.Fatalf("terminal run did not preserve completed progress: %+v", terminal)
 	}
 
 	// The live inventory is a real terminal viewport: a wheel event moves the bounded page,
@@ -286,3 +289,57 @@ func TestRunProgressSurfaces(t *testing.T) {
 // humanProgressCell is the shape a person reads off a row: the stage, then one
 // percent for the whole job.
 var humanProgressCell = regexp.MustCompile(`[a-z_]+ [0-9]+%`)
+
+// The renderer is also driven on a small real terminal without a model/daemon.
+// A resize may reflow old rows; redraw must stay inside the current screen and
+// retain the stage/count at the front of each bounded row.
+func TestLiveProgressFitsResizedTerminal(t *testing.T) {
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	must(t, err)
+	defer master.Close()
+	must(t, unix.IoctlSetPointerInt(int(master.Fd()), unix.TIOCSPTLCK, 0))
+	number, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
+	must(t, err)
+	resize := func(columns uint16) {
+		must(t, unix.IoctlSetWinsize(int(master.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 6, Col: columns}))
+	}
+	resize(80)
+	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR, 0)
+	must(t, err)
+	defer slave.Close()
+	buf := &renderBuffer{}
+	readDone := make(chan struct{})
+	go func() { _, _ = io.Copy(buf, master); close(readDone) }()
+	p := cli.NewProgress(&cli.Context{Inv: &cli.Invocation{Mode: output.Mode{Human: true, Color: true}}, Err: slave}, false, time.Now())
+	t.Cleanup(p.Done)
+	models := make([]any, 12)
+	for i := range models {
+		models[i] = map[string]any{"model": fmt.Sprintf("paul/model-%d", i), "moved_bytes": 5 << 30, "total_bytes": 50 << 30, "rate_bytes_per_second": 400 << 20}
+	}
+	p.On(liveEvent("phase", map[string]any{"phase": "downloading", "models": models}))
+	waitUntil(t, "bounded model viewport", func() bool { return strings.Contains(buf.String(), "more rows") })
+	before := len(buf.String())
+	resize(32)
+	p.On(liveEvent("phase", map[string]any{"phase": "downloading", "models": models}))
+	p.On(liveEvent("progress", map[string]any{"stage": "denoise", "position": 5, "total": 30, "step_ms": 15000}))
+	p.Done()
+	must(t, slave.Close())
+	<-readDone
+	narrow := buf.String()[before:]
+	for _, control := range regexp.MustCompile(`\x1b\[(\d+)A`).FindAllStringSubmatch(narrow, -1) {
+		up, _ := strconv.Atoi(control[1])
+		if up > 5 {
+			t.Fatalf("redraw moved above the 6-row terminal: %q", narrow)
+		}
+	}
+	for _, chunk := range strings.Split(narrow, "\r\033[K")[1:] {
+		line := strings.SplitN(chunk, "\r", 2)[0]
+		line = strings.SplitN(line, "\n", 2)[0]
+		if len([]rune(line)) >= 32 {
+			t.Fatalf("redraw wrapped a 32-column terminal: %q", line)
+		}
+	}
+	if !strings.Contains(narrow, "denoising 5/30") {
+		t.Fatalf("resize lost the stage and count: %q", narrow)
+	}
+}

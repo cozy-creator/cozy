@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -110,6 +111,62 @@ func (w idleWatch) run(quit <-chan struct{}) {
 		}
 		fmt.Fprintf(w.log, "nothing to manage for %s; stopping (daemon.idle_shutdown_s=%d)\n",
 			w.debounce, int64(w.debounce/time.Second))
+		return
+	}
+}
+
+// The daemon's OTHER reason to leave, and the one no configuration turns off: it no
+// longer owns the root it published itself under. `daemon.idle_shutdown_s` is the knob
+// for "nothing to manage"; there is deliberately no knob for this, because a daemon whose
+// claim is gone cannot be found by a client, cannot be told to stop, and cannot write a
+// record anyone will read. Staying alive is not a safety property there — it is a process
+// nobody can reach and nobody can kill by any documented means, which is exactly how 143
+// unreachable daemons once accumulated over three days on one development host.
+//
+// The signal is an observed fact about the filesystem, never elapsed time: `Claimed`
+// compares the file this process holds against the path it published it at. Samples are
+// required to agree `claimLostSamples` times running only so that a single unlucky read
+// cannot end a daemon.
+const claimLostSamples = 3
+
+type claimWatch struct {
+	held    *daemon.Held
+	root    string
+	managed func() ([]string, *exit.Error)
+	stop    func()
+	log     io.Writer
+}
+
+func (w claimWatch) run(quit <-chan struct{}) {
+	tick := time.NewTicker(idleSampleCadence)
+	defer tick.Stop()
+	lost := 0
+	for {
+		select {
+		case <-quit:
+			return
+		case <-tick.C:
+		}
+		if w.held.Claimed() {
+			lost = 0
+			continue
+		}
+		if lost++; lost < claimLostSamples {
+			continue
+		}
+		// SAY WHAT IS BEING ABANDONED. The log lives under the root that just went, so
+		// these words may reach no one — which is the honest shape of the situation and
+		// not a reason to stay: the records naming this work went with the root.
+		if held, problem := w.managed(); problem != nil {
+			fmt.Fprintf(w.log, "%s no longer carries this daemon's claim; stopping (what it manages is unreadable: %s)\n",
+				w.root, problem.Message)
+		} else if len(held) > 0 {
+			fmt.Fprintf(w.log, "%s no longer carries this daemon's claim; stopping and ABANDONING: %s\n",
+				w.root, strings.Join(held, ", "))
+		} else {
+			fmt.Fprintf(w.log, "%s no longer carries this daemon's claim; stopping\n", w.root)
+		}
+		w.stop()
 		return
 	}
 }
