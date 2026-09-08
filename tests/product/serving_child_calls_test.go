@@ -32,9 +32,9 @@ func TestServingChildRetainsOriginalCallWithoutMemoizingInference(t *testing.T) 
 	if !fresh || repeat.ID == first.ID || repeat.ReusedFrom != "" {
 		t.Fatal("repeat reused reference inference")
 	}
-	call.ID, call.IdemKey, call.ParentCallIndex, call.ChildReusable = "req-serving-bad", "serving-bad", 2, true
+	call.ID, call.IdemKey, call.ParentCallIndex, call.ChildReusable = "req-serving-bad", "serving-bad", 1, true
 	if _, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", arguments); problem == nil {
-		t.Fatal("memoized serving admission was accepted")
+		t.Fatal("accepted inference was changed into a memoized measurement")
 	}
 	store.Close()
 	store, problem = records.Open(path)
@@ -65,6 +65,7 @@ func TestServingArgumentsSchemaUpgradePreservesPrivateParent(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
+	restorePriorCallIndexBounds(t, db)
 	_, err = db.Exec(`DROP TABLE request_child_arguments`)
 	must(t, err)
 	_, err = db.Exec(`PRAGMA user_version=33`)

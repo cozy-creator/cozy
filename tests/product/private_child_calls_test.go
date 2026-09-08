@@ -68,6 +68,7 @@ func TestPrivateChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
+	restorePriorCallIndexBounds(t, db)
 	var ddl string
 	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='requests'`).Scan(&ddl))
 	_, err = db.Exec(`PRAGMA foreign_keys=OFF`)

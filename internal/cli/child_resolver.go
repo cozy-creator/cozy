@@ -39,9 +39,6 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if (job.Kind != "job" && job.Kind != "entrypoint") || job.Invocable == nil || job.Invocable.Module != module || job.Invocable.Export != export {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured implementation does not expose the exact managed callable")
 	}
-	if job.Kind == "entrypoint" && job.Invocable.Memoize {
-		return out, "", exit.Named(exit.Conflict, "child.memoized_inference", "serving inference cannot be memoized")
-	}
 	if job.Invocable.Memoize {
 		for _, capability := range job.Invocable.Capabilities {
 			if capability == "egress" || capability == "secrets" {
@@ -136,7 +133,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if problem != nil {
 		return out, "", problem
 	}
-	out.ChildReusable = job.Kind == "job" && job.Invocable.Memoize
+	out.ChildReusable = job.Invocable.Memoize
 	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0 || len(out.Outputs) > len(out.WeightsOutputs)
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
