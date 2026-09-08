@@ -76,7 +76,35 @@ func TestNativeByteServiceUsesOriginalAttemptAndIndependentReceivedHold(t *testi
 	if downstream.Assets[0].Native.RetentionID == held.RetentionID {
 		t.Fatal("child borrowed source hold")
 	}
-	fatal(t, store.BeginNativeArtifactRelease(parent.ID, false))
+	fatal(t, store.ReleaseCompletedNativeBytes(parent.ID))
+	before, problem := store.NativeArtifactRetentions(parent.ID)
+	fatal(t, problem)
+	if len(before) != 1 || before[0].State != "held" {
+		t.Fatal("running parent lost its early recipient")
+	}
+	returned := output
+	returned.OutputID = "returned"
+	returned.ProducerRootID = childDigest("7")
+	_, problem = store.AcceptTerminal(records.Terminal{RequestID: parent.ID, Attempt: 1, SessionID: "private-boot", InvocationDigest: childDigest("1"), TerminalID: "native-parent-done", TerminalDigest: childDigest("a"), Status: "SUCCEEDED", RequestState: "succeeded", Body: []byte(`{}`), ByteOutputs: []records.ByteOutput{returned}})
+	fatal(t, problem)
+	fatal(t, store.ReleaseCompletedNativeBytes(parent.ID))
+	before, problem = store.NativeArtifactRetentions(parent.ID)
+	fatal(t, problem)
+	if before[0].State != "held" {
+		t.Fatal("unacknowledged terminal lost its recipient")
+	}
+	fatal(t, store.Closed(parent.ID, 1))
+	owed, problem := store.CompletedNativeByteRecipients()
+	fatal(t, problem)
+	if len(owed) != 1 || owed[0] != parent.ID {
+		t.Fatal("closed native recipient cleanup was not recoverable")
+	}
+	fatal(t, store.ReleaseCompletedNativeBytes(parent.ID))
+	visible, problem = store.ByteOutputs(parent.ID, 1)
+	fatal(t, problem)
+	if len(visible) != 1 || visible[0] != returned {
+		t.Fatal("native recipient cleanup removed explicit return custody")
+	}
 	if store.ConfirmNativeArtifact(held.RetentionID, "private-worker", "private-boot") == nil {
 		t.Fatal("late ACK resurrected hold")
 	}

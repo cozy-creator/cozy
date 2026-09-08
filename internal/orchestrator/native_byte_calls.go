@@ -2,8 +2,10 @@ package orchestrator
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -92,4 +94,30 @@ func (c *Orchestrator) replayNativeByteResult(s *session, call *pb.ChildCallRequ
 		return
 	}
 	c.sendNativeByteResult(s, call, row, *output, attempt.InvocationDigest, row.Result, row.NativeReceipt)
+}
+
+// Ordinary terminal closure already recorded final outputs and cache custody.
+// Only now may parent-only early service recipients be released.
+func (c *Orchestrator) finishNativeByteRecipients(parent string) {
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+	problem := c.opt.Store.ReleaseCompletedNativeBytes(parent)
+	if problem == nil {
+		var holds []records.NativeArtifactRetention
+		holds, problem = c.opt.Store.NativeArtifactRetentions(parent)
+		for _, hold := range holds {
+			if problem != nil {
+				break
+			}
+			if hold.State == "releasing" && hold.ArtifactKind == "tree" {
+				problem = c.changeByteRetention(context.Background(), hold, true)
+			}
+		}
+	}
+	if problem != nil {
+		time.AfterFunc(ReportCadence, func() { c.finishNativeByteRecipients(parent) })
+	}
 }

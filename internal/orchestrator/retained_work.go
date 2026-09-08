@@ -355,6 +355,13 @@ func (c *Orchestrator) ResumeRequest(id, actor string) *exit.Error {
 
 // restoreRetainedWork reconstructs control ownership without queueing paused work.
 func (c *Orchestrator) restoreRetainedWork() *exit.Error {
+	completed, problem := c.opt.Store.CompletedNativeByteRecipients()
+	if problem != nil {
+		return problem
+	}
+	for _, id := range completed {
+		go c.finishNativeByteRecipients(id)
+	}
 	rows, problem := c.opt.Store.ActiveRequests()
 	if problem != nil {
 		return problem

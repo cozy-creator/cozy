@@ -112,3 +112,40 @@ func (s *Store) CompleteNativeByteCall(service string, currentAttempt int64, cur
 	}
 	return h, nil
 }
+
+// CompletedNativeByteRecipients are disposal obligations from closed successful
+// parents. Intermediate service views are not returned-output or cache owners.
+func (s *Store) CompletedNativeByteRecipients() ([]string, *exit.Error) {
+	rows, err := s.db.Query(`SELECT DISTINCT h.consumer_id FROM native_artifact_retentions h
+ JOIN byte_outputs b ON b.request_id=h.producer_id AND b.attempt=h.producer_attempt AND b.output_id=h.producer_output_id
+ JOIN requests r ON r.id=h.consumer_id JOIN attempts a ON a.request_id=r.id AND a.attempt=r.ordinal
+ WHERE h.consumer_id=h.parent_request_id AND h.kind='result' AND h.artifact_kind='tree' AND h.state<>'released'
+ AND b.native_service_id IS NOT NULL AND r.state='succeeded' AND a.state='closed' AND a.terminal_status='SUCCEEDED'`)
+	if err != nil {
+		return nil, exit.Internalf("cannot read completed native byte recipients: %s", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, exit.Internalf("cannot read native byte cleanup owner: %s", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish native byte cleanup census: %s", err)
+	}
+	return ids, nil
+}
+
+func (s *Store) ReleaseCompletedNativeBytes(parent string) *exit.Error {
+	_, err := s.db.Exec(`UPDATE native_artifact_retentions SET state='releasing'
+ WHERE consumer_id=? AND consumer_id=parent_request_id AND kind='result' AND artifact_kind='tree' AND state IN ('pending','held')
+ AND EXISTS(SELECT 1 FROM requests r JOIN attempts a ON a.request_id=r.id AND a.attempt=r.ordinal WHERE r.id=? AND r.state='succeeded' AND a.state='closed' AND a.terminal_status='SUCCEEDED')
+ AND EXISTS(SELECT 1 FROM byte_outputs b WHERE b.request_id=producer_id AND b.attempt=producer_attempt AND b.output_id=producer_output_id AND b.native_service_id IS NOT NULL)`, parent, parent)
+	if err != nil {
+		return exit.Internalf("cannot release completed native byte recipients: %s", err)
+	}
+	return nil
+}
