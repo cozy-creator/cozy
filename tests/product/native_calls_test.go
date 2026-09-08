@@ -30,11 +30,11 @@ func TestNativeAndPackageCallsShareOneParentIndexAndFreezeBeforeEffects(t *testi
 		t.Fatal("source index accepted effect reinterpretation")
 	}
 	child := records.Request{ID: "req-collision", IdemKey: "collision", BodyDigest: childDigest("3"), Package: "local/operation", Entrypoint: "run", Kind: "job", Payload: []byte(`{}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5")}
-	if _, _, problem = store.SubmitChild(child, 1, childDigest("1"), "private-boot"); problem == nil {
+	if _, _, problem = store.SubmitChild(child, 1, childDigest("1"), "private-boot", nil); problem == nil {
 		t.Fatal("package call stole native index")
 	}
 	child.ParentCallIndex = 1
-	_, _, problem = store.SubmitChild(child, 1, childDigest("1"), "private-boot")
+	_, _, problem = store.SubmitChild(child, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	call.ID = "source-collision"
 	call.CallIndex = 1

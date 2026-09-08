@@ -13,7 +13,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
 )
+
+type localPreparedCode struct {
+	operation, revision, base string
+	result                    *pb.PreparePackageSetResult
+}
 
 // LocalServingPreparation names package metadata retained by the install. It is
 // launch configuration, not a guessed PlacementSet or an invocation binding.
@@ -51,7 +57,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		(req.LocalPackageDigest == "" || req.LocalPackageDigest == w.spec.Placement.LocalRevisionDigest) && w.desiredRefusal == nil
 	preparedSpec := w.spec
 	c.mu.Unlock()
-	if already {
+	if already && req.ParentRequestID == "" {
 		plan, problem := preparedSpec.Placement.EntrypointDigest(req.Entrypoint)
 		if problem != nil {
 			return WorkerLaunchSpec{}, "", problem
@@ -61,6 +67,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	prep := spec.Preparation
 	var result *pb.PreparePackageSetResult
 	var rpcError error
+	var preparedCode *localPreparedCode
 	c.ObservePhase(instance, PhaseSample{Name: PhasePreparing, Detail: req.Package})
 	if prep.Published {
 		locked, err := os.ReadFile(prep.LockedRequirements)
@@ -87,25 +94,39 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		if revision.Package != req.Package || revision.Release != logical.Release || revision.PackageInterfaceDigest != prep.PackageInterfaceDigest {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "local_package_revision_changed", "local serving revision differs from its install")
 		}
-		files, problem := stageLocalPreparationWheels(spec.InstallRoot, req.ID, revision)
-		if problem != nil {
-			return WorkerLaunchSpec{}, "", problem
-		}
-		source, _ := canonical.Raw(revision.SourceDigest)
 		digest, _ := canonical.Raw(revision.Digest)
-		result, rpcError = s.preparation.PrepareLocalPackage(s.ctx, &pb.PrepareLocalPackageRequest{
-			InstallRoot: spec.InstallRoot, OperationId: req.ID,
-			Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, SourceDigest: source, LocalRevisionDigest: digest},
-			Wheels:  files,
-		})
-		if rpcError == nil && len(req.Models) > 0 {
-			selected, problem := localDownloadSelection(req.Models, nil)
+		operation := req.ID
+		base, baseProblem := numericalEnvironment(s)
+		if prior := w.localCode; baseProblem == nil && prior != nil && prior.base == base && prior.revision == revision.Digest {
+			operation = prior.operation
+			result = proto.Clone(prior.result).(*pb.PreparePackageSetResult)
+			c.logf("%s reuses prepared code operation %s", req.ID, operation)
+		} else {
+			files, problem := stageLocalPreparationWheels(spec.InstallRoot, operation, revision)
 			if problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
-			result, rpcError = s.preparation.PreparePrivatePlacement(s.ctx, &pb.PreparePrivatePlacementRequest{
-				OperationId: req.ID, LocalRevisionDigest: digest, DownloadDelegation: selected,
+			source, _ := canonical.Raw(revision.SourceDigest)
+			result, rpcError = s.preparation.PrepareLocalPackage(s.ctx, &pb.PrepareLocalPackageRequest{
+				InstallRoot: spec.InstallRoot, OperationId: operation,
+				Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, SourceDigest: source, LocalRevisionDigest: digest},
+				Wheels:  files,
 			})
+			if rpcError == nil && result != nil && baseProblem == nil {
+				preparedCode = &localPreparedCode{operation: operation, revision: revision.Digest, base: base, result: proto.Clone(result).(*pb.PreparePackageSetResult)}
+			}
+		}
+		if rpcError == nil && len(req.Models) > 0 {
+			call := &pb.PreparePrivatePlacementRequest{OperationId: operation, LocalRevisionDigest: digest, Claim: s.claim}
+			if req.ParentRequestID != "" {
+				call.NativeModels, problem = c.nativeServingModels(req)
+			} else {
+				call.DownloadDelegation, problem = localDownloadSelection(req.Models, nil)
+			}
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+			result, rpcError = s.preparation.PreparePrivatePlacement(s.ctx, call)
 		}
 	}
 	if rpcError != nil {
@@ -157,6 +178,11 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	}
 	if current == nil || (current.State != "queued" && current.State != "submitted") {
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "request.execution_stopped", "request stopped during local model preparation")
+	}
+	if preparedCode != nil {
+		if base, problem := numericalEnvironment(s); problem == nil && base == preparedCode.base {
+			w.localCode = preparedCode
+		}
 	}
 	revision := c.nextRevision()
 	c.mu.Lock()

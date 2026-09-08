@@ -45,6 +45,10 @@ func (s *Store) BeginOperationLookup(id, key string) *exit.Error {
 	if !allowed {
 		return exit.Named(exit.Conflict, "operation.consumer_stopped", "stopped or offered request cannot start a cache lookup")
 	}
+	var qualified string
+	if err := tx.QueryRow(`SELECT computation_digest FROM request_operation_contexts WHERE request_id=?`, id).Scan(&qualified); err != nil || qualified != key {
+		return exit.Named(exit.Conflict, "operation.context_absent", "lookup requires the callee's bound numerical context")
+	}
 	if _, err := tx.Exec(`INSERT INTO request_operation_lookups(request_id,computation_digest,state) VALUES(?,?,'pending') ON CONFLICT(request_id) DO NOTHING`, id, key); err != nil {
 		return exit.Internalf("cannot persist operation lookup intent: %s", err)
 	}

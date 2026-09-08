@@ -37,10 +37,12 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 	if !request.ChildReusable || request.ParentRequestID == "" || request.ReusedFrom != "" || attempt.TerminalStatus != "SUCCEEDED" || request.State == "canceling" || request.State == "canceled" || request.State == "releasing" {
 		return nil
 	}
-	key, problem := records.OperationKey(request)
+	context, problem := c.qualifyOperation(s, request)
 	if problem != nil {
-		return problem
+		c.logf("%s completed without memoization: its numerical environment could not be revalidated", request.ID)
+		return nil
 	}
+	key := context.Key
 	doc, err := canonical.Read(attempt.TerminalBody, &pb.AttemptOutcomeBody{})
 	if err != nil {
 		return exit.Internalf("operation terminal is not canonical")
@@ -86,11 +88,21 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 	return nil
 }
 
-func (c *Orchestrator) lookupOperation(request records.Request) (bool, *exit.Error) {
-	return c.lookupOperationPending(request, false)
+func (c *Orchestrator) lookupOperationOn(request records.Request, selected *session) (bool, *exit.Error) {
+	if !request.ChildReusable || request.ParentRequestID == "" {
+		return false, nil
+	}
+	if _, problem := c.qualifyOperation(selected, request); problem != nil {
+		return false, problem
+	}
+	return c.lookupOperationWithSession(request, false, selected)
 }
 
 func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOnly bool) (bool, *exit.Error) {
+	return c.lookupOperationWithSession(request, pendingOnly, nil)
+}
+
+func (c *Orchestrator) lookupOperationWithSession(request records.Request, pendingOnly bool, selected *session) (bool, *exit.Error) {
 	if !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
 		return false, nil
 	}
@@ -125,10 +137,14 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 	if lookup != nil {
 		key = lookup.Key
 	} else {
-		key, problem = records.OperationKey(request)
+		context, problem := c.opt.Store.OperationContext(request.ID)
 		if problem != nil {
 			return false, problem
 		}
+		if context == nil {
+			return false, exit.Named(exit.Conflict, "operation.context_absent", "operation lookup has no selected callee environment")
+		}
+		key = context.Key
 	}
 	if !pendingOnly {
 		if problem := c.opt.Store.BeginOperationLookup(request.ID, key); problem != nil {
@@ -144,9 +160,14 @@ func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOn
 			return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
 		}
 	}
-	s, problem := c.workspaceControl(request.Worker)
-	if problem != nil {
-		return false, problem
+	s := selected
+	if s == nil {
+		// Pause/cancellation reconciles its already-pinned lookup obligation.
+		// It does not select a new computation or execute the observed result.
+		s, problem = c.workspaceControl(request.Worker)
+		if problem != nil {
+			return false, problem
+		}
 	}
 	keyBytes, _ := canonical.Raw(key)
 	workspace, problem := s.operationWorkspace()
