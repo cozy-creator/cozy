@@ -102,11 +102,18 @@ func TestHostRuntimeWireFence(t *testing.T) {
 // stubRuntime answers `cozy-runtime --json version` the way the real tool does.
 func stubRuntime(t *testing.T, release string, minor uint32) string {
 	t.Helper()
+	return "#!/bin/sh\nprintf '%s\\n' '" + stubIdentity(t, release, minor) + "'\n"
+}
+
+// stubIdentity is what `cozy-runtime --json version` prints: the document hostruntime.Path
+// admits a tool by.
+func stubIdentity(t *testing.T, release string, minor uint32) string {
+	t.Helper()
 	answer, err := json.Marshal(map[string]string{
 		"distribution": release, "wire_protocol": fmt.Sprintf("cozy.worker.v1+minor.%d", minor),
 	})
 	must(t, err)
-	return "#!/bin/sh\nprintf '%s\\n' '" + string(answer) + "'\n"
+	return string(answer)
 }
 
 // hostRuntimeRoot is a fresh daemon root and a PATH holding only the stand-in tool (none

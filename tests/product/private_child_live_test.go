@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -22,7 +23,7 @@ var privateChildRuntimeWheel = flag.String("child-runtime-wheel", "", "exact Run
 // This uses the actual Creator binary, installed interface wheels, independent
 // package executors and typed broker. No control peer or executor is simulated.
 func TestPrivateChildCompositionReusesLocalWorkspace(t *testing.T) {
-	runtimeVersion := "0.4.0"
+	runtimeVersion := hostruntime.Floor
 	runtimeInstall := "cozy-runtime==" + runtimeVersion
 	runtimeSource := ""
 	if *privateChildRuntimeWheel != "" {
