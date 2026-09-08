@@ -104,6 +104,8 @@ func TestPrivateChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
 	must(t, err)
 	_, err = db.Exec(`DROP TABLE byte_outputs`)
 	must(t, err)
+	_, err = db.Exec(`DROP TABLE request_child_arguments`)
+	must(t, err)
 	_, err = db.Exec(`DROP TABLE native_calls`)
 	must(t, err)
 	_, err = db.Exec(`PRAGMA user_version=27`)
@@ -214,7 +216,7 @@ func TestPrivateChildrenDoNotReuseEffectsByDefault(t *testing.T) {
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "effects-original", ""))
 	call := records.Request{ID: "req-effect-original", IdemKey: "effect-original", BodyDigest: childDigest("3"), Package: "local/effect", Entrypoint: "perform", Kind: "job", Payload: []byte(`{}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5")}
-	child, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	child, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	closeChild(t, store, child, "SUCCEEDED", "succeeded")
 	closeChild(t, store, parent, "FAILED", "blocked")
@@ -223,7 +225,7 @@ func TestPrivateChildrenDoNotReuseEffectsByDefault(t *testing.T) {
 	fatal(t, problem)
 	parent = offerChildParent(t, store, parent)
 	call.ID, call.IdemKey, call.ParentRequestID = "req-effect-new", "effect-new", parent.ID
-	child, _, problem = store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	child, _, problem = store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	if child.State != "submitted" || child.ReusedFrom != "" {
 		t.Fatal("an undeclared reusable effect was cached across parent revisions")
@@ -236,7 +238,7 @@ func TestPrivateParentPauseWaitsForChildExecutionBarrier(t *testing.T) {
 	defer store.Close()
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "pause-parent", ""))
-	child, _, problem := store.SubmitChild(records.Request{ID: "req-child-pause", IdemKey: "child-pause", BodyDigest: childDigest("3"), Package: "local/operation", Entrypoint: "run", Kind: "job", Payload: []byte(`{}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5")}, 1, childDigest("1"), "private-boot")
+	child, _, problem := store.SubmitChild(records.Request{ID: "req-child-pause", IdemKey: "child-pause", BodyDigest: childDigest("3"), Package: "local/operation", Entrypoint: "run", Kind: "job", Payload: []byte(`{}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5")}, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	child = offerChildParent(t, store, child)
 	_, problem = store.RequestPause(parent.ID, "test")
@@ -272,7 +274,7 @@ func TestPrivateChildHistoryDoesNotActAsOperationCache(t *testing.T) {
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "parent-original", ""))
 	call := records.Request{ID: "req-child-original-a", IdemKey: "child-original-a", BodyDigest: childDigest("3"), Package: "local/operation-a", Entrypoint: "compute", Kind: "job", Payload: []byte(`{"size":100}`), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("4"), ChildTargetDigest: childDigest("5"), ChildReusable: true}
-	child, fresh, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	child, fresh, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	if !fresh || child.ParentRequestID != parent.ID || child.ReuseScope != parent.ReuseScope {
 		t.Fatalf("child lost owner scope: %+v", child)
@@ -287,7 +289,7 @@ func TestPrivateChildHistoryDoesNotActAsOperationCache(t *testing.T) {
 	fatal(t, problem)
 	next = offerChildParent(t, store, next)
 	call.ID, call.IdemKey, call.ParentRequestID = "req-child-edited-a", "child-edited-a", next.ID
-	reused, fresh, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	reused, fresh, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	if !fresh || reused.ID == child.ID || reused.State != "submitted" || reused.Ordinal != 0 || reused.ReusedFrom != "" {
 		t.Fatalf("run history invented a cache hit without its workspace owner: %+v", reused)
@@ -303,29 +305,29 @@ func TestPrivateChildHistoryDoesNotActAsOperationCache(t *testing.T) {
 		t.Fatal("reused child invented an execution attempt")
 	}
 	call.ChildTargetDigest = childDigest("8")
-	if _, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot"); problem == nil {
+	if _, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil); problem == nil {
 		t.Fatal("same parent/index accepted changed implementation")
 	}
 	call.ParentCallIndex = 1
 	call.ID, call.IdemKey = "req-child-edited-b", "child-edited-b"
-	changed, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	changed, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	if changed.State != "submitted" || changed.ReusedFrom != "" {
 		t.Fatal("changed operation inherited stale result")
 	}
 	call.ID, call.IdemKey, call.ParentCallIndex, call.ChildTargetDigest = "req-child-reordered", "child-reordered", 2, childDigest("5")
-	reordered, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot")
+	reordered, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	if reordered.ReusedFrom != "" {
 		t.Fatal("matching call inputs bypassed the workspace cache authority")
 	}
 	call.ID, call.IdemKey, call.ParentCallIndex = "req-child-forged", "child-forged", 3
-	if _, _, problem := store.SubmitChild(call, 1, childDigest("9"), "private-boot"); problem == nil {
+	if _, _, problem := store.SubmitChild(call, 1, childDigest("9"), "private-boot", nil); problem == nil {
 		t.Fatal("forged parent invocation admitted child")
 	}
 	_, problem = store.RequestPause(next.ID, "test")
 	fatal(t, problem)
-	if _, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot"); problem == nil {
+	if _, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", nil); problem == nil {
 		t.Fatal("paused parent admitted new child")
 	}
 }

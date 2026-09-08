@@ -18,7 +18,7 @@ func operationHistory(t *testing.T, store *records.Store, label string, parent r
 		request.ChildArtifacts = true
 		request.WeightsOutputs = `[{"output_id":"weights"}]`
 	}
-	child, _, problem := store.SubmitChild(request, 1, childDigest("1"), "private-boot")
+	child, _, problem := store.SubmitChild(request, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	return child
 }
@@ -41,7 +41,7 @@ func TestOperationArtifactScopeRequiresNativeCacheAdoption(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{"source": artifact})
 	must(t, err)
 	next := records.Request{ID: "req-model-consumer", IdemKey: "model-consumer", Kind: "job", Package: "local/next", Entrypoint: "compute", Worker: "workspace", Payload: payload, BodyDigest: childDigest("8"), ParentRequestID: second.ID, ParentCallIndex: 1, ChildIntentDigest: childDigest("9"), ChildTargetDigest: childDigest("a"), Models: []records.ModelRef{{Slot: "source", Manifest: artifact.Manifest.Digest, ManifestLength: 161}}}
-	if _, _, problem := store.SubmitChild(next, 1, childDigest("1"), "private-boot"); problem == nil {
+	if _, _, problem := store.SubmitChild(next, 1, childDigest("1"), "private-boot", nil); problem == nil {
 		t.Fatal("same worker allowed a forged cross-run artifact grant")
 	}
 	consumer := operationHistory(t, store, "cached-native", second, true)
@@ -52,7 +52,7 @@ func TestOperationArtifactScopeRequiresNativeCacheAdoption(t *testing.T) {
 	fatal(t, problem)
 	hold := records.WeightsRetention{RequestID: consumer.ID, Kind: "result", Slot: "weights/weights", ProducerRequestID: source.ID, ProducerAttempt: 1, ProducerOutputSlot: "weights", RetentionID: childDigest("d"), InstanceID: "private-worker", WorkerBootID: "private-boot", State: "held"}
 	fatal(t, store.AdoptCachedOperation(consumer.ID, records.CachedOperation{Key: key, SourceRequestID: source.ID, SourceAttempt: 1, InvocationDigest: last.InvocationDigest, OutcomeID: last.TerminalID, OutcomeDigest: last.TerminalDigest, OutcomeBody: last.TerminalBody, Retentions: []records.WeightsRetention{hold}}))
-	_, _, problem = store.SubmitChild(next, 1, childDigest("1"), "private-boot")
+	_, _, problem = store.SubmitChild(next, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	owned, problem := store.ArtifactHasCustody(source.ID, 1, "weights", second.ReuseScope)
 	fatal(t, problem)

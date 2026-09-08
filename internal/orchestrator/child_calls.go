@@ -156,7 +156,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		request.Outputs += "runtime.capture"
 	}
 	parentDigest, _ := canonical.Spell(call.ParentInvocationSpecDigest)
-	child, fresh, problem := c.opt.Store.SubmitChild(request, int64(call.ParentAttemptOrdinal), parentDigest, s.bootID)
+	child, fresh, problem := c.opt.Store.SubmitChild(request, int64(call.ParentAttemptOrdinal), parentDigest, s.bootID, call.RequestCanonicalBytes)
 	if problem != nil {
 		refuse(problem)
 		return
