@@ -320,6 +320,11 @@ func (c *Orchestrator) jobGrant(req records.Request, attempt uint64) (*pb.Delive
 		Inputs: []*pb.InputAccess{{InputId: "payload", Url: payloadURL(req.Payload)}},
 	}
 	g.Inputs = append(g.Inputs, modelAccess(req)...)
+	assets, problem := localAssetAccess(req)
+	if problem != nil {
+		return nil, "", problem
+	}
+	g.Inputs = append(g.Inputs, assets...)
 	// THE INPUT TREES. A tree's bytes are not re-hashed at the grant: a tree is a
 	// materialized TensorFS snapshot and its verification is the store's own verified
 	// read path (law 18, tfs-007). What this side owns is that the grant NAMES it — a
