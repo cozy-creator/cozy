@@ -58,6 +58,8 @@ func TestLiveProgressKeepsFinishedStagesAndMeasuredRates(t *testing.T) {
 	before = len(buf.String())
 	// A heartbeat/old stage end cannot replace the newer work with generic running.
 	p.On(liveEvent("accepted", nil))
+	p.On(liveEvent("queued", nil))
+	p.On(liveEvent("parked", nil))
 	p.On(liveEvent("stage", map[string]any{"name": "condition_text", "ms": 1234}))
 	p.On(liveEvent("phase", map[string]any{"phase": "warming"}))
 	if len(buf.String()) != before {
