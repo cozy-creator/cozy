@@ -42,6 +42,19 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	if !owned || !parent.IsJob() || !parent.RetainWork || parent.State != "dispatching" || parent.Ordinal != parentAttempt {
 		return Request{}, false, exit.Named(exit.Conflict, "child.parent_stopped", "the parent attempt is not authorized to create child work")
 	}
+	for _, asset := range r.Assets {
+		held := false
+		for _, original := range parent.Assets {
+			if asset.Digest == original.Digest && asset.Length == original.Length &&
+				asset.MediaType == original.MediaType && asset.LocalPath == original.LocalPath {
+				held = true
+				break
+			}
+		}
+		if !held {
+			return Request{}, false, exit.Named(exit.Conflict, "child.asset_ungranted", "child input bytes are not owned by the current parent")
+		}
+	}
 	existing, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE parent_request_id=? AND parent_call_index=?`, parent.ID, r.ParentCallIndex))
 	if err == nil {
 		if existing.ChildIntentDigest != r.ChildIntentDigest || existing.ChildTargetDigest != r.ChildTargetDigest || existing.ChildReusable != r.ChildReusable || existing.ChildArtifacts != r.ChildArtifacts {
