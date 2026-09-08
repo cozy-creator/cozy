@@ -15,15 +15,17 @@ const nativeCallsDDL = `CREATE TABLE IF NOT EXISTS native_calls (
  call_index INTEGER NOT NULL CHECK(call_index>=0 AND call_index<32),
  kind TEXT NOT NULL CHECK(kind IN ('source','effect')), operation TEXT NOT NULL,
  intent_digest TEXT NOT NULL, request BLOB NOT NULL, frozen BLOB NOT NULL DEFAULT x'',
- state TEXT NOT NULL CHECK(state IN ('accepted','frozen','executing','succeeded','failed','canceled')),
+ state TEXT NOT NULL CHECK(state IN ('accepted','frozen','executing','succeeded','failed','canceled','stopped')),
  result BLOB NOT NULL DEFAULT x'', native_receipt BLOB NOT NULL DEFAULT x'',
  safe_code TEXT NOT NULL DEFAULT '', worker TEXT NOT NULL DEFAULT '',
  instance_id TEXT NOT NULL DEFAULT '', worker_boot_id TEXT NOT NULL DEFAULT '',
+ parent_attempt INTEGER NOT NULL DEFAULT 0,
  UNIQUE(parent_request_id,call_index)
 )`
 
 type NativeCall struct {
 	ID, ParentRequestID              string
+	ParentAttempt                    int64
 	CallIndex                        int64
 	Kind, Operation, IntentDigest    string
 	Request, Frozen                  []byte
@@ -33,11 +35,11 @@ type NativeCall struct {
 	Worker, InstanceID, WorkerBootID string
 }
 
-const nativeCallColumns = `id,parent_request_id,call_index,kind,operation,intent_digest,request,frozen,state,result,native_receipt,safe_code,worker,instance_id,worker_boot_id`
+const nativeCallColumns = `id,parent_request_id,call_index,kind,operation,intent_digest,request,frozen,state,result,native_receipt,safe_code,worker,instance_id,worker_boot_id,parent_attempt`
 
 func scanNativeCall(row interface{ Scan(...any) error }) (NativeCall, error) {
 	var call NativeCall
-	err := row.Scan(&call.ID, &call.ParentRequestID, &call.CallIndex, &call.Kind, &call.Operation, &call.IntentDigest, &call.Request, &call.Frozen, &call.State, &call.Result, &call.NativeReceipt, &call.SafeCode, &call.Worker, &call.InstanceID, &call.WorkerBootID)
+	err := row.Scan(&call.ID, &call.ParentRequestID, &call.CallIndex, &call.Kind, &call.Operation, &call.IntentDigest, &call.Request, &call.Frozen, &call.State, &call.Result, &call.NativeReceipt, &call.SafeCode, &call.Worker, &call.InstanceID, &call.WorkerBootID, &call.ParentAttempt)
 	return call, err
 }
 func (s *Store) NativeCall(parent string, index int64) (*NativeCall, *exit.Error) {
@@ -89,12 +91,25 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 		if existing.ID != call.ID || existing.IntentDigest != call.IntentDigest || existing.Kind != call.Kind || existing.Operation != call.Operation || !bytes.Equal(existing.Request, call.Request) {
 			return NativeCall{}, false, exit.Named(exit.Conflict, "child.intent_changed", "parent index already names another native call")
 		}
+		if existing.Kind == "source" && parentAttempt > existing.ParentAttempt && (existing.State == "failed" || existing.State == "stopped") {
+			state := "accepted"
+			if len(existing.Frozen) > 0 {
+				state = "frozen"
+			}
+			if _, err := tx.Exec(`UPDATE native_calls SET state=?,parent_attempt=?,safe_code='' WHERE id=?`, state, parentAttempt, existing.ID); err != nil {
+				return NativeCall{}, false, exit.Internalf("cannot reattach stopped native call: %s", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return NativeCall{}, false, exit.Internalf("cannot commit native reattachment: %s", err)
+			}
+			existing.State, existing.ParentAttempt, existing.SafeCode = state, parentAttempt, ""
+		}
 		return existing, false, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return NativeCall{}, false, exit.Internalf("cannot read native replay: %s", err)
 	}
-	_, err = tx.Exec(`INSERT INTO native_calls(id,parent_request_id,call_index,kind,operation,intent_digest,request,state,worker) VALUES(?,?,?,?,?,?,?,'accepted',?)`, call.ID, parent.ID, call.CallIndex, call.Kind, call.Operation, call.IntentDigest, call.Request, parent.Worker)
+	_, err = tx.Exec(`INSERT INTO native_calls(id,parent_request_id,call_index,kind,operation,intent_digest,request,state,worker,parent_attempt) VALUES(?,?,?,?,?,?,?,'accepted',?,?)`, call.ID, parent.ID, call.CallIndex, call.Kind, call.Operation, call.IntentDigest, call.Request, parent.Worker, parentAttempt)
 	if err != nil {
 		return NativeCall{}, false, exit.Internalf("cannot record native call: %s", err)
 	}
@@ -106,6 +121,7 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 	}
 	call.State = "accepted"
 	call.Worker = parent.Worker
+	call.ParentAttempt = parentAttempt
 	return call, true, nil
 }
 func (s *Store) FreezeNativeCall(id string, frozen []byte) *exit.Error {
@@ -177,7 +193,7 @@ func (s *Store) CompleteNativeCallAt(id string, result, receipt []byte, instance
 	return nil
 }
 func (s *Store) StopNativeCall(id, state, code string) *exit.Error {
-	if (state != "failed" && state != "canceled") || len(code) > 128 {
+	if (state != "failed" && state != "canceled" && state != "stopped") || len(code) > 128 {
 		return exit.New(exit.Validation, "native stop is not a bounded terminal")
 	}
 	_, err := s.db.Exec(`UPDATE native_calls SET state=?,safe_code=? WHERE id=? AND state IN ('accepted','frozen','executing')`, state, code, id)

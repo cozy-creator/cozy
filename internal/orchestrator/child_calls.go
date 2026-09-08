@@ -308,6 +308,9 @@ func (c *Orchestrator) onChildCancel(s *session, call *pb.ChildCallCancel) {
 	if problem != nil {
 		return
 	}
+	if c.cancelNativeSource(s, call) {
+		return
+	}
 	children, problem := c.opt.Store.Children(call.ParentRequestId)
 	if problem != nil {
 		return
