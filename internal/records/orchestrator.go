@@ -1394,6 +1394,10 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 			return Request{}, false, exit.Named(exit.Conflict, "request.rental_unavailable", "the selected rental is being released or has ended")
 		}
 	}
+	machineRental := r.Worker
+	if machineRental == "" {
+		machineRental = r.RequestedRental
+	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,
@@ -1405,7 +1409,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.Release, r.LocalPackageDigest,
 		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker,
-		r.Worker, r.Rental,
+		machineRental, r.Rental,
 		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision,

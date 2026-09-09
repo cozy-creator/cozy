@@ -53,6 +53,22 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	if code == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "0.13.0") {
 		t.Fatalf("wrong runtime admitted: %d %s", code, out)
 	}
+	// Replaying an accepted request preserves its selected identity after the rental
+	// ends; it does not need a fresh inventory read merely to retrieve history.
+	st, problem = records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	_, _, problem = st.Submit(records.Request{ID: "prior", IdemKey: "prior", BodyDigest: childDigest("f"), Package: "proof/quantize", Entrypoint: "quantize", Payload: []byte("{}"), Rental: true, RequestedRental: current})
+	fatal(t, problem)
+	_, problem = st.FailQueuedRequest("prior", map[string]any{"error_type": "proof", "error": "stopped"})
+	fatal(t, problem)
+	_, problem = st.ForgetRental(current)
+	fatal(t, problem)
+	st.Close()
+	replayReads := inventoryReads.Load()
+	code, out = runCozy(t, root, append(append([]string{}, args...), "--rental=isao", "--idempotency-key=prior")...)
+	if code != 0 || !strings.Contains(out, current) || inventoryReads.Load() != replayReads {
+		t.Fatalf("replay required a released rental: %d %s", code, out)
+	}
 	before := inventoryReads.Load()
 	code, out = runCozy(t, root, append(append([]string{}, args...), "--rental=unknown")...)
 	if code == 0 || !strings.Contains(out, "rental.selection_unavailable") || inventoryReads.Load() != before {

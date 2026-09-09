@@ -18,6 +18,15 @@ func requestedRental(ctx *Context, target Target, function string) (string, *exi
 		return "", problem
 	}
 	defer store.Close()
+	if key := ctx.Inv.Value("--idempotency-key"); key != "" {
+		prior, problem := store.RequestByIdempotencyKey(key)
+		if problem != nil {
+			return "", problem
+		}
+		if prior != nil && prior.RequestedRental != "" && (name == prior.RequestedRental || name == prior.Machine) {
+			return prior.RequestedRental, nil
+		}
+	}
 	selected, problem := rental.Resolve(store, name)
 	if problem != nil {
 		return "", problem
