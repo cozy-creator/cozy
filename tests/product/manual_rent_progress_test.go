@@ -3,6 +3,7 @@
 package producttest
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -11,8 +12,8 @@ import (
 // Drive the ordinary CLI through real polling against a Hub fixture. The fixture
 // fails after boot so the proof rents no hardware and needs no worker substitute.
 func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
-	for _, terminal := range []bool{false, true} {
-		t.Run(map[bool]string{false: "redirected", true: "terminal"}[terminal], func(t *testing.T) {
+	for _, mode := range []string{"redirected", "terminal", "json"} {
+		t.Run(mode, func(t *testing.T) {
 			root, _, stand := rentalEndRoot(t, "manual-rent-progress")
 			stand.publishListing()
 			stand.setSKUs(map[string]any{
@@ -45,15 +46,26 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 				stand.setState(id, "failed", "fixture boot completed without a worker")
 			}()
 			var code int
-			var log string
-			if terminal {
+			var log, stdout string
+			if mode == "terminal" {
 				code, log = ptyRun(t, root, "rent", "h100-nvl", "--timeout=8s")
 			} else {
-				code, _, log = runCozyStreams(t, root, "rent", "h100-nvl", "--timeout=8s")
+				args := []string{"rent", "h100-nvl", "--timeout=8s"}
+				if mode == "json" {
+					args = append(args, "--json")
+				}
+				code, stdout, log = runCozyStreams(t, root, args...)
 			}
 			<-finished
 			if code == 0 {
 				t.Fatal("the terminal fixture failure unexpectedly succeeded")
+			}
+			if mode == "json" {
+				var result map[string]any
+				if err := json.Unmarshal([]byte(stdout), &result); err != nil || result["error"] == nil || log != "" {
+					t.Fatalf("manual rental JSON is not one clean error document: stdout=%q stderr=%q", stdout, log)
+				}
+				return
 			}
 			for _, want := range []string{"acquiring", "NVIDIA H100 NVL · $3.19/hour", "image: sha256:0123456789abcdef", "pulling image on", "booting on"} {
 				if !strings.Contains(log, want) {
@@ -63,7 +75,7 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 			if strings.Contains(log, "ETA") || strings.Contains(log, "%") {
 				t.Fatalf("boot acquired a fabricated estimate or percentage: %q", log)
 			}
-			if terminal {
+			if mode == "terminal" {
 				if !strings.Contains(log, "\r\033[K") || !strings.Contains(log, " · done") || !strings.Contains(log, " · failed") {
 					t.Fatalf("manual rent did not retain completed stages and final failure: %q", log)
 				}

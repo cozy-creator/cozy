@@ -115,7 +115,9 @@ func handleRent(ctx *Context) *exit.Error {
 			return problem
 		}
 		sku = admitted
-		fmt.Fprintln(ctx.Err, line)
+		if !ctx.Mode().JSON {
+			fmt.Fprintln(ctx.Err, line)
+		}
 	}
 
 	state, _, problem := ensureDaemon(ctx)
@@ -628,7 +630,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 			return hub.Rental{}, e
 		}
 		if e != nil {
-			if e.Message != said {
+			if e.Message != said && !ctx.Mode().JSON {
 				said = e.Message
 				fmt.Fprintf(ctx.Err, "  hub: %s; retrying\n", e.Message)
 			}
@@ -673,7 +675,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		}
 		// The hub's own words about what is happening, printed when they CHANGE. A line
 		// per poll would be a progress bar for someone else's work.
-		if ctx.Mode().Full && r.Detail != "" && r.Detail != said {
+		if ctx.Mode().Full && !ctx.Mode().JSON && r.Detail != "" && r.Detail != said {
 			said = r.Detail
 			fmt.Fprintf(ctx.Err, "  %s: %s\n", r.State, r.Detail)
 		}
