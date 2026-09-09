@@ -81,12 +81,12 @@ source = { registry = "https://pypi.org/simple" }
 `)
 }
 
-func TestPrivateRegistryClosureIncludesSelectedExtrasAndPinsBase(t *testing.T) {
+func TestPrivateRegistryClosureIncludesSelectedExtrasAndLeavesImageBaseToWorker(t *testing.T) {
 	closure := "fixture==1.0\nnumpy==2.5.3\nscipy==1.18.1"
 	rows, pins, problem := packagepublish.PrivateRegistryRows(privateClosureLock(), closure, "fixture", "1.0", nil)
 	fatal(t, problem)
-	if len(rows) != 1 || rows[0].Name != "scipy" || rows[0].SHA256 != strings.Repeat("a", 64) || !reflect.DeepEqual(pins, []string{"numpy==2.5.3", "scipy==1.18.1"}) {
-		t.Fatalf("selected extra omitted or base silently substituted: rows=%+v pins=%v", rows, pins)
+	if len(rows) != 1 || rows[0].Name != "scipy" || rows[0].SHA256 != strings.Repeat("a", 64) || !reflect.DeepEqual(pins, []string{"scipy==1.18.1"}) {
+		t.Fatalf("selected extra omitted or image-owned base was repinned: rows=%+v pins=%v", rows, pins)
 	}
 	for _, candidate := range []struct {
 		label, closure string
@@ -181,4 +181,47 @@ func TestPrivateWheelPinsPreserveImplementationAndVerifyRecord(t *testing.T) {
 	if !bytes.Equal(a, b) {
 		t.Fatal("private metadata pinning is not deterministic")
 	}
+}
+
+func TestPrivateWheelPreservesImageOwnedRequirement(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "fixture-1.0-py3-none-any.whl")
+	file, err := os.Create(source)
+	must(t, err)
+	writer := zip.NewWriter(file)
+	for name, body := range map[string]string{
+		"fixture.py":                     "VALUE = 123\n",
+		"fixture-1.0.dist-info/METADATA": "Metadata-Version: 2.3\nName: fixture\nVersion: 1.0\nProvides-Extra: gpu\nRequires-Dist: torch>=2.13,<3; extra == 'gpu'\nRequires-Dist: scipy>=1.0\n\n",
+		"fixture-1.0.dist-info/RECORD":   "",
+	} {
+		out, err := writer.Create(name)
+		must(t, err)
+		_, err = io.WriteString(out, body)
+		must(t, err)
+	}
+	must(t, writer.Close())
+	must(t, file.Close())
+	target := filepath.Join(root, "sealed", "fixture-1.0-py3-none-any.whl")
+	fatal(t, wheel.PinDependenciesPreserving(source, target, []string{"scipy==1.18.1"}, func(raw string) bool {
+		return strings.HasPrefix(raw, "torch")
+	}))
+	archive, err := zip.OpenReader(target)
+	must(t, err)
+	defer archive.Close()
+	for _, member := range archive.File {
+		if !strings.HasSuffix(member.Name, ".dist-info/METADATA") {
+			continue
+		}
+		in, err := member.Open()
+		must(t, err)
+		body, err := io.ReadAll(in)
+		must(t, err)
+		must(t, in.Close())
+		metadata := string(body)
+		if !strings.Contains(metadata, "Requires-Dist: torch>=2.13,<3; extra == 'gpu'\n") || !strings.Contains(metadata, "Requires-Dist: scipy==1.18.1\n") || strings.Contains(metadata, "scipy>=1.0") || strings.Contains(metadata, "Provides-Extra:") {
+			t.Fatalf("private wheel did not preserve only the image-owned compatibility range: %s", metadata)
+		}
+		return
+	}
+	t.Fatal("sealed wheel metadata missing")
 }

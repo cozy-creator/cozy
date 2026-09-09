@@ -20,10 +20,10 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the first release with the wire47 private package capacity contract.
+// Floor is the Runtime release that carries this Creator's current wire contract.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-const Floor = "0.14.1"
+const Floor = "0.16.5"
 
 var floor = pep440.MustParse(Floor)
 
