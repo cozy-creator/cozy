@@ -764,6 +764,11 @@ func (c *Orchestrator) drain() {
 	c.mu.Lock()
 	queued := append([]string(nil), c.pending...)
 	c.mu.Unlock()
+	// A named rental is an explicit serial queue. If its head cannot dispatch yet
+	// (for example because its selected lane is still warming), later requests on
+	// that same rental must not overtake it merely because they select a different
+	// already-ready lane. Automatic requests remain work-conserving across rentals.
+	blockedRentals := map[string]bool{}
 	for position, id := range queued {
 		req, e := c.opt.Store.RequestRow(id)
 		if e != nil || req == nil {
@@ -772,6 +777,10 @@ func (c *Orchestrator) drain() {
 		}
 		if req.State != "submitted" && req.State != "queued" {
 			c.forget(id)
+			continue
+		}
+		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] {
+			c.park(*req, position, waitFacts{}, "an earlier request is waiting on this rental")
 			continue
 		}
 		if req.ModelTransfer != nil {
@@ -804,6 +813,9 @@ func (c *Orchestrator) drain() {
 			// `dispatch` refuses AFTER `pick` succeeded and the only branch here was
 			// `continue`.
 			if e.Code == exit.Unavailable || e.Code == exit.Conflict {
+				if req.RequestedRental != "" {
+					blockedRentals[req.RequestedRental] = true
+				}
 				c.park(*req, position, waitFacts{}, e.Message)
 				continue
 			}
