@@ -114,11 +114,7 @@ func (p *RunProgress) stepRows(f stepFacts) []string {
 	if f.hasStageFraction {
 		line += fmt.Sprintf(" %s %.0f%% stage", progressBar(f.stageFraction, 10), f.stageFraction*100)
 	}
-	if f.counted && f.perStep > 0 {
-		line += fmt.Sprintf(" · %.2fs/step avg", f.perStep)
-		remaining := time.Duration(float64(f.total-f.current) * f.perStep * float64(time.Second))
-		line += " · ETA ~" + shortDuration(remaining)
-	}
+	line += f.timing()
 	rows := []string{line}
 	if f.hasOverall {
 		overall := fmt.Sprintf("    overall %.0f%%", f.overallFraction*100)
@@ -128,6 +124,14 @@ func (p *RunProgress) stepRows(f stepFacts) []string {
 		rows = append(rows, overall)
 	}
 	return rows
+}
+
+func (f stepFacts) timing() string {
+	if !f.counted || f.perStep <= 0 {
+		return ""
+	}
+	remaining := time.Duration(float64(f.total-f.current) * f.perStep * float64(time.Second))
+	return fmt.Sprintf(" · %.2fs/step avg · ETA ~%s", f.perStep, shortDuration(remaining))
 }
 
 func phaseRows(fields map[string]any) []string {

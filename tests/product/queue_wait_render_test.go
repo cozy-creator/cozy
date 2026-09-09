@@ -72,6 +72,20 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 	}
 	p.Done()
 
+	// Redirecting the same progress retains the measured stage timing, without
+	// terminal control bytes or a separate estimate from the human formatter.
+	p, buf = progressSink(output.Mode{Human: true}, false)
+	p.On(frame(0.50, 0.10, 50))
+	if got := buf.String(); !strings.Contains(got, "tile_steps 50/100 · 50% stage · 0.02s/step avg · ETA ~1s · 10% overall") ||
+		strings.ContainsAny(got, "\r\033") {
+		t.Fatalf("redirected progress dropped measured timing: %q", got)
+	}
+	p.On(frame(0.60, 0.20, 60))
+	if got := buf.String(); !strings.Contains(got, "tile_steps 60/100 · 60% stage · 0.02s/step avg · ETA ~0.8s · 20% overall") {
+		t.Fatalf("redirected progress did not advance its stage ETA: %q", got)
+	}
+	p.Done()
+
 	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
 	p.On(localapi.Event{Type: "request.progress", RequestID: "req-stage", Attempt: 1,
 		Payload: map[string]any{"value": map[string]any{
