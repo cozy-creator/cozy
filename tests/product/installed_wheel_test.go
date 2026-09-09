@@ -1,9 +1,11 @@
-package install
+package producttest
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/install"
 )
 
 func TestInstalledAppFilterDoesNotPromoteCallerOrAmbientLibraries(t *testing.T) {
@@ -28,7 +30,7 @@ func TestInstalledAppFilterDoesNotPromoteCallerOrAmbientLibraries(t *testing.T) 
 		{"caller==1\nsource-lib==1", map[string]string{"source-lib": "already-bound"}, false},
 		{"caller==1\nwheel-lib==1", nil, true},
 	} {
-		found, problem := HasInstalledApplications(python, test.installed, "caller", test.ignored)
+		found, problem := install.HasInstalledApplications(python, test.installed, "caller", test.ignored)
 		if problem != nil || found != test.want {
 			t.Fatalf("filter(%q) = %v, %v", test.installed, found, problem)
 		}
