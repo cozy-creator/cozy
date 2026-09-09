@@ -480,9 +480,19 @@ terminal's detailed symbolic status and returns shell exit 1 for any non-success
 
 
 Private invocable dependencies preserve standard Python extra selection. For example,
-a local dependency declared as `cozy-eval[managed]` activates that library's declared
-managed requirements in the immutable child capture. The original editable pyproject
+a dependency declared as `cozy-eval[jobs]` activates that library's declared
+job requirements in the immutable child capture. The original editable pyproject
 and lock remain unchanged. The captured pyproject, resolved uv lock, wheel and execution
 environment identify the selected closure; equivalent normalized extra sets capture
 identically. Unknown or ambiguous local extra groups refuse. This uses the existing
 private installation and invocation flow, without a wrapper package or another command.
+
+Installed App wheels use the selected environment's exact dependency graph, including
+active extras. A callee's identity excludes its caller, unrelated dependencies and the
+wheel's local-file versus registry origin. Creator retains the original wheel and its
+digest, then uses the same private requirement sealing as source packages: only METADATA
+and RECORD change in the executable derivative. The derivative and selected closure bind
+the caller interface and computation key. The worker does not execute a byte-identical
+copy of the downloaded archive, and mismatched protected base versions must refuse.
+Wheel discovery reads metadata and source without importing the package; ordinary
+non-App dependencies and Runtime's native facade keep their existing behavior.
