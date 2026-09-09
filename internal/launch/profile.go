@@ -131,7 +131,7 @@ func requirementSpecifiers(requirement string) (pep440.Specifiers, bool) {
 
 // InventoryMismatch checks only protected base distributions. Incidental image
 // libraries may be replaced by captured wheels. Marked requirements stay undecided here.
-func InventoryMismatch(inventory *pb.ImageInventory, requirements []string, requiresPython string) string {
+func InventoryMismatch(inventory *pb.ImageInventory, requirements []string, requiresPython string, development ...bool) string {
 	if inventory == nil {
 		return "the rental image inventory is absent"
 	}
@@ -151,6 +151,11 @@ func InventoryMismatch(inventory *pb.ImageInventory, requirements []string, requ
 	}
 	for _, requirement := range requirements {
 		name, tail := requirementParts(requirement)
+		// Development inventories omit the updatable Runtime pair. The worker's
+		// package preparation checks their actual installed versions.
+		if len(development) == 1 && development[0] && (name == "cozy-runtime" || name == "tensorfs") {
+			continue
+		}
 		if !packagepublish.ImageOwnedDistribution(name) {
 			continue
 		}

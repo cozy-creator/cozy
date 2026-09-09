@@ -1171,8 +1171,8 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 
 func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints) *exit.Error {
 	call, cancel := hub.Context()
+	defer cancel()
 	raw, problem := client(ctx).RentalImageInventory(call, id)
-	cancel()
 	if problem != nil {
 		return problem
 	}
@@ -1180,7 +1180,11 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	if err != nil {
 		return exit.Named(exit.Structural, "rental.image_inventory_invalid", "%s", err)
 	}
-	if reason := launch.InventoryMismatch(inventory, constraints.Requirements, constraints.RequiresPython); reason != "" {
+	view, problem := client(ctx).Rental(call, id)
+	if problem != nil {
+		return problem
+	}
+	if reason := launch.InventoryMismatch(inventory, constraints.Requirements, constraints.RequiresPython, view.Development); reason != "" {
 		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
 	}
 	return nil

@@ -264,6 +264,25 @@ func TestRentalInventoryAllowsPackageOwnedVersions(t *testing.T) {
 	}
 }
 
+func TestDevelopmentRentalInventoryLeavesMutablePairToWorker(t *testing.T) {
+	inventory := &pb.ImageInventory{Python: "3.12.12", Distributions: []*pb.ImageDistribution{
+		{Distribution: "torch", Version: "2.13.0+cu130"},
+	}}
+	requirements := []string{"cozy-runtime[media]>=0.13.0", "tensorfs>=0.3.33", "torch>=2.13"}
+	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13", true); why != "" {
+		t.Fatal(why)
+	}
+	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); !strings.Contains(why, "cozy-runtime") {
+		t.Fatalf("production image incorrectly exempted its Runtime: %s", why)
+	}
+	if why := launch.InventoryMismatch(inventory, []string{"torch>=3"}, "", true); !strings.Contains(why, "torch") {
+		t.Fatalf("development image ignored immutable Torch: %s", why)
+	}
+	if why := launch.InventoryMismatch(inventory, nil, ">=3.13", true); !strings.Contains(why, "Python") {
+		t.Fatalf("development image ignored Python: %s", why)
+	}
+}
+
 func TestRequestedRentalFlowsToChildAndRetainedRetry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	st, problem := records.Open(path)
