@@ -421,9 +421,9 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // weightless placement is never pinned to a group either — a group shards a model's
 // attention and there is no model — so it stays on the worker's own least-loaded lane.
 //
-// Weight is read from the SET, never from a projection beside it: `models` in the exact
-// document the worker is about to accept is the same fact the worker's own
-// `model_bearing` is folded from, and Creator supports exactly one placement per set.
+// Serving weight is read from entrypoint model slots in the exact set, matching
+// Runtime's executable bindings. A job can retain model input metadata without
+// constructing any serving model; a model inventory alone cannot justify a group.
 func devicePins(setBytes []byte, envelope []string) ([]*pb.PlacementDevicePin, *exit.Error) {
 	if len(envelope) < 2 {
 		return nil, nil
@@ -438,7 +438,14 @@ func devicePins(setBytes []byte, envelope []string) ([]*pb.PlacementDevicePin, *
 			"a %d-device rental needs one readable placement to pin: %v", len(envelope), err)
 	}
 	placement := doc.List("placements")[0]
-	if len(placement.List("models")) == 0 {
+	modelBearing := false
+	for _, entrypoint := range placement.List("entrypoints") {
+		if len(entrypoint.List("slots")) > 0 {
+			modelBearing = true
+			break
+		}
+	}
+	if !modelBearing {
 		return nil, nil
 	}
 	ordinals := make([]uint32, 0, len(envelope))

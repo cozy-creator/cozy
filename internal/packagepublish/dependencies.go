@@ -50,7 +50,6 @@ func VendoredNote(org string, dependency VendoredDependency) string {
 type requirement struct {
 	raw       string
 	name      string
-	spec      string
 	extras    []string
 	specifier pep440.Specifiers
 	hasSpec   bool
@@ -127,11 +126,6 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 		req, problem := parseRequirement(raw)
 		if problem != nil {
 			return problem
-		}
-		if c.publish {
-			if problem := refuseImageOwnedPin(req); problem != nil {
-				return problem
-			}
 		}
 		if req.direct {
 			return exit.Named(exit.Validation, "project_dependency_direct_url_unsupported",
@@ -228,7 +222,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 			return duplicateDependency(name, prior, canonical, version)
 		}
 		newExtras := c.activateExtras(canonical, req.extras)
-		if remoteBaseRoots[name] {
+		if ImageOwnedDistribution(name) {
 			return nil
 		}
 		if len(newExtras) == 0 {
@@ -245,7 +239,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	c.count++
 	c.byName[name] = dependencyRecord{source: canonical, version: version}
 	newExtras := c.activateExtras(canonical, req.extras)
-	if !remoteBaseRoots[name] {
+	if !ImageOwnedDistribution(name) {
 		c.stack[canonical] = true
 		if problem := c.collectProject(canonical, document, newExtras, true); problem != nil {
 			return problem
@@ -364,7 +358,7 @@ func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Er
 	// Base-owned distributions are requirements checked against the selected base inventory,
 	// never package overlays. Their exact author-side wheels remain in source custody so
 	// Creator can materialize its independent local environment.
-	if remoteBaseRoots[identity.Distribution] {
+	if ImageOwnedDistribution(identity.Distribution) {
 		return nil
 	}
 	if len(c.wheels) >= MaxDependencyWheels {
@@ -526,7 +520,7 @@ func parseRequirement(raw string) (requirement, *exit.Error) {
 	if err != nil {
 		return requirement{}, invalidRequirement(raw)
 	}
-	req.specifier, req.spec, req.hasSpec = specifier, rest, true
+	req.specifier, req.hasSpec = specifier, true
 	return req, nil
 }
 

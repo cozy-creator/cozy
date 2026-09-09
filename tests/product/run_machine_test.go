@@ -199,7 +199,8 @@ func TestRunListMachineColumn(t *testing.T) {
 		HourlyRateUSDMicros: 100_000, ManagedRequestID: "req-machine-acquiring",
 	}, 10_000_000, 0, func(machineName string) ([]byte, string, *exit.Error) {
 		return []byte(`{"name":"` + machineName + `"}`), "sha256:" + strings.Repeat("cd", 32), nil
-	})
+	}, nil)
+
 	fatal(t, problem)
 	if replay {
 		t.Fatal("a fresh rental operation replayed")

@@ -169,7 +169,7 @@ func (view modelInfoView) Emit(w io.Writer, mode output.Mode) error {
 		lanes := make([]map[string]any, 0, len(release.Lanes))
 		for _, lane := range release.Lanes {
 			row := map[string]any{"lane": lane.Lane, "bytes": lane.Bytes, "components": lane.Components,
-				"checkpoint_id": lane.ManifestID, "checkpoint_ref": card.Model.Ref() + "@" + lane.ManifestID}
+				"checkpoint_id": lane.ManifestID, "checkpoint_ref": card.Model.Ref() + "#" + lane.ManifestID}
 			if lane.ComponentBytes != nil {
 				row["component_bytes"] = lane.ComponentBytes
 			}
@@ -219,7 +219,7 @@ func (view modelInfoView) Emit(w io.Writer, mode output.Mode) error {
 		list := output.List{Name: "lanes", Fields: columns, AllFields: columns, Bytes: []string{"bytes"}}
 		for _, lane := range release.Lanes {
 			list.Rows = append(list.Rows, map[string]string{"lane": lane.Lane, "bytes": output.Int(lane.Bytes),
-				"checkpoint_ref": card.Model.Ref() + "@" + lane.ManifestID})
+				"checkpoint_ref": card.Model.Ref() + "#" + lane.ManifestID})
 		}
 		list.Total = len(list.Rows)
 		if err := list.Emit(w, mode); err != nil {

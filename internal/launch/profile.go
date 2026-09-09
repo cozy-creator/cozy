@@ -153,7 +153,7 @@ func InventoryMismatch(inventory *pb.ImageInventory, requirements []string, requ
 		name, tail := requirementParts(requirement)
 		// Development inventories omit the updatable Runtime pair. The worker's
 		// package preparation checks their actual installed versions.
-		if len(development) == 1 && development[0] && (name == "cozy-runtime" || name == "tensorfs") {
+		if len(development) == 1 && development[0] && (name == "cozy-runtime" || name == "tensorfs") { //cozy:allow inventory distribution metadata, never a binary invocation
 			continue
 		}
 		if !packagepublish.ImageOwnedDistribution(name) {

@@ -456,7 +456,8 @@ func TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung(t *testing.T) {
 	first, problem := store.ManagedRentalOperationKey(walker)
 	fatal(t, problem)
 	op, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: first, Hub: "http://hub.example",
-		HourlyRateUSDMicros: 2_490_000, ManagedRequestID: walker}, 20_000_000, 0, replacementAuthor)
+		HourlyRateUSDMicros: 2_490_000, ManagedRequestID: walker}, 20_000_000, 0, replacementAuthor, nil)
+
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(op.Key, "", "rejected"))
 	next, problem := store.ManagedRentalOperationKey(walker)

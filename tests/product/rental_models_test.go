@@ -28,6 +28,9 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	catalogLookups := 0
 	first, second := "sha256:"+strings.Repeat("1", 64), "sha256:"+strings.Repeat("2", 64)
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"rentals":[]}`))
+	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()

@@ -80,7 +80,8 @@ func TestRentalMachineNames(t *testing.T) {
 			body, problem := hub.RentalRequestBytes(machineName, "cpu", strings.Repeat("ab", 32),
 				"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil)
 			return body, "sha256:" + strings.Repeat("cd", 32), problem
-		})
+		}, nil)
+
 		fatal(t, problem)
 		if replay {
 			t.Fatalf("operation %s replayed on first use", key)
@@ -150,7 +151,8 @@ func TestRentalMachineNames(t *testing.T) {
 	}, fleetCap, 0, func(string) ([]byte, string, *exit.Error) {
 		t.Fatal("a request was authored with no free word")
 		return nil, "", nil
-	})
+	}, nil)
+
 	if problem == nil || problem.Name != "rental.machine_names_exhausted" {
 		t.Fatalf("an exhausted vocabulary did not refuse: %v", problem)
 	}

@@ -70,6 +70,12 @@ func databaseRows(t *testing.T, path string) map[string]string {
 			// pre-existing cell and require safe defaults for ordinary requests.
 			preserved := make([]any, 0, len(values))
 			for i, column := range columns {
+				if name == "rental_operations" && column == "estimated_hourly_rate_usd_micros" {
+					if values[i] != nil {
+						t.Fatal("migration invented a historical rental estimate")
+					}
+					continue
+				}
 				if name == "requests" && (column == "retain_work" || column == "child_reusable" || column == "child_artifacts") {
 					if values[i] != int64(0) {
 						t.Fatal("migration changed a legacy request's retention policy")

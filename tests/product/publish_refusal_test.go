@@ -1,6 +1,6 @@
 package producttest
 
-// cl-084: publish refuses author-local uv.lock rows and image-owned pins, and
+// cl-084: publish refuses author-local uv.lock rows and
 // nudges toward publishing when it auto-vendors an in-tree local dependency.
 // Every arm drives the real publication staging path (PrepareFrom +
 // BuildForPublish) over a real project tree; the frozen editable lock below is
@@ -148,64 +148,6 @@ func TestPublishRefusesAuthorLocalLockRows(t *testing.T) {
 	problem = editable.Build(t.Context())
 	if problem != nil && strings.HasPrefix(problem.Name, "package_publish.") {
 		t.Fatalf("non-publish build fired a publish refusal: %v", problem)
-	}
-}
-
-func TestPublishRefusesImageOwnedPins(t *testing.T) {
-	banned := []string{
-		"torch==2.13.0",
-		"torch==2.13.*",
-		"torch~=2.13.0",
-		"torch>=2.13,<2.14",
-		"nvidia-cublas-cu12==12.9.1.4",
-		"cozy-runtime~=0.0.37",
-	}
-	for _, dependency := range banned {
-		tree := fixtureTree(t, fixturePyproject(dependency), minimalFixtureLock)
-		pack, problem := packagepublish.PrepareFrom(tree)
-		fatal(t, problem)
-		problem = pack.BuildForPublish(t.Context())
-		pack.Close()
-		if problem == nil || problem.Name != "package_publish.image_owned_pin" {
-			t.Fatalf("%s answered %v", dependency, problem)
-		}
-	}
-
-	tree := fixtureTree(t, fixturePyproject("torch==2.13.0"), minimalFixtureLock)
-	pack, problem := packagepublish.PrepareFrom(tree)
-	fatal(t, problem)
-	defer pack.Close()
-	problem = pack.BuildForPublish(t.Context())
-	if problem == nil {
-		t.Fatal("torch==2.13.0 published")
-	}
-	wantMessage := `project dependency "torch==2.13.0" confines image-owned distribution torch to fewer than two minor releases`
-	wantRemedy := "declare a range admitting at least two minor releases, such as torch>=2.13,<3, so the fleet can move between image builds"
-	if problem.Message != wantMessage || problem.Remedy != wantRemedy {
-		t.Fatalf("refusal = %q / %q, want %q / %q",
-			problem.Message, problem.Remedy, wantMessage, wantRemedy)
-	}
-
-	// Ranges spanning minors, unbounded floors, bare names, and pins on
-	// non-image-owned distributions all pass the gate; these trees then fail
-	// later in the real pipeline (their frozen lock does not resolve the
-	// declared dependency), which proves the gate itself let them through.
-	allowed := []string{
-		"torch>=2.13,<3",
-		"torch>=2.13",
-		"torch",
-		"torch>=2.13,!=2.14.*,<2.16",
-		"requests==2.32.3",
-	}
-	for _, dependency := range allowed {
-		tree := fixtureTree(t, fixturePyproject(dependency), minimalFixtureLock)
-		pack, problem := packagepublish.PrepareFrom(tree)
-		fatal(t, problem)
-		problem = pack.BuildForPublish(t.Context())
-		pack.Close()
-		if problem == nil || strings.HasPrefix(problem.Name, "package_publish.") {
-			t.Fatalf("%s answered %v", dependency, problem)
-		}
 	}
 }
 

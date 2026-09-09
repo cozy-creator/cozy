@@ -25,6 +25,19 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	var inventoryReads atomic.Int32
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, detail *hub.PackageReleaseDetail) {
 		detail.ExecutionRequirements = []string{"cozy-runtime[media]>=0.15.0,<1"}
+		mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
+			id := r.PathValue("id")
+			name, ok := map[string]string{current: "isao", old: "giriko"}[id]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"rental_id": id, "name": name, "state": "ready", "development": false,
+				"requested_accelerator_model": "CPU", "accelerator_count": 1,
+				"hourly_rate_usd_micros": 100000,
+			})
+		})
 		mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, r *http.Request) {
 			inventoryReads.Add(1)
 			version := "0.15.0"
@@ -182,7 +195,7 @@ func TestSchema36MigrationKeepsAutomaticAssignments(t *testing.T) {
 	var create string
 	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='requests'`).Scan(&create))
 	create = strings.Replace(create, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)
-	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN requested_rental; PRAGMA user_version=36`)
+	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN requested_rental; ALTER TABLE rental_operations DROP COLUMN estimated_hourly_rate_usd_micros; PRAGMA user_version=36`)
 	must(t, err)
 	_, err = db.Exec(`PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=? WHERE name='requests'; PRAGMA writable_schema=OFF`, create)
 	must(t, err)
@@ -272,7 +285,7 @@ func TestDevelopmentRentalInventoryLeavesMutablePairToWorker(t *testing.T) {
 	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13", true); why != "" {
 		t.Fatal(why)
 	}
-	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); !strings.Contains(why, "cozy-runtime") {
+	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); !strings.Contains(why, runtimeDistribution) {
 		t.Fatalf("production image incorrectly exempted its Runtime: %s", why)
 	}
 	if why := launch.InventoryMismatch(inventory, []string{"torch>=3"}, "", true); !strings.Contains(why, "torch") {
