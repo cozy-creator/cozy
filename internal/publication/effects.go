@@ -76,6 +76,16 @@ func EffectDestination(operation string, raw []byte) (hub.Ref, *exit.Error) {
 			return hub.Ref{}, problem
 		}
 		destination = request.Destination
+
+	case "attach_assessment":
+		var request AssessmentRequest
+		if problem := DecodeEffect(raw, &request); problem != nil {
+			return hub.Ref{}, problem
+		}
+		if problem := ValidateAssessmentRequest(request); problem != nil {
+			return hub.Ref{}, problem
+		}
+		destination = request.Checkpoint.Destination
 	case "upload_checkpoint":
 		var request UploadRequest
 		if problem := DecodeEffect(raw, &request); problem != nil {

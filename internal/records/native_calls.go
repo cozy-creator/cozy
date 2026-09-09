@@ -254,7 +254,7 @@ func (s *Store) OwedNativeCalls(kind string) ([]NativeCall, *exit.Error) {
 // RequestNativeEffectCancel records cancellation of one awaited effect while
 // retaining its executing marker for authoritative late-commit reconciliation.
 func (s *Store) RequestNativeEffectCancel(parentID string, index, parentAttempt int64, parentSpec, parentSession, intent string) (*NativeCall, *exit.Error) {
-	if parentID == "" || index < 0 || index >= 32 || parentAttempt <= 0 {
+	if parentID == "" || index < 0 || index > maxChildCallIndex || parentAttempt <= 0 {
 		return nil, exit.New(exit.Validation, "effect cancellation has invalid parent identity")
 	}
 	for _, value := range []string{parentSpec, intent} {

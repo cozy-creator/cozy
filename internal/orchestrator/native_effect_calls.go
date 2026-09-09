@@ -28,7 +28,7 @@ func (c *Orchestrator) onNativeEffect(s *session, parent records.Request, call *
 		c.sendChildResult(s, call, "", pb.ChildCallState_CHILD_CALL_STATE_REFUSED, nil, problem)
 	}
 	iface, _ := canonical.Spell(call.InterfaceDigest)
-	if iface != publication.InterfaceDigest() || (call.Export != "upload_checkpoint" && call.Export != "publish_release") {
+	if iface != publication.InterfaceDigest() || (call.Export != "upload_checkpoint" && call.Export != "publish_release" && call.Export != "attach_assessment") {
 		refuse(exit.New(exit.Validation, "publication effect differs from its fixed interface"))
 		return true
 	}
@@ -131,8 +131,14 @@ func (c *Orchestrator) runNativeEffect(row records.NativeCall) {
 			}
 			continue
 		}
-		if row.Operation == "upload_checkpoint" {
-			result, problem := c.runNativeUpload(context.Background(), row)
+		if row.Operation == "upload_checkpoint" || row.Operation == "attach_assessment" {
+			var result []byte
+			var problem *exit.Error
+			if row.Operation == "attach_assessment" {
+				result, problem = c.runNativeAssessment(context.Background(), row)
+			} else {
+				result, problem = c.runNativeUpload(context.Background(), row)
+			}
 			if problem == nil {
 				problem = c.opt.Store.CompleteNativeCall(row.ID, result, nil)
 			}
