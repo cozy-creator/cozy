@@ -128,11 +128,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if problem != nil {
 		return fail(problem)
 	}
-	names := make([]string, 0, len(dependencies))
-	for name := range dependencies {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := privateWheelClosureNames(dependencies)
 	var requirements []string
 	type identity struct{ Name, Version, Wheel, OriginalWheel, BaseRequirement string }
 	var identities []identity
@@ -215,6 +211,17 @@ func exactPrivateWheelRequirements(project string, dependencies map[string]packa
 	}
 	sort.Strings(exact)
 	return exact
+}
+
+func privateWheelClosureNames(dependencies map[string]packagepublish.CapturedDependency) []string {
+	names := make([]string, 0, len(dependencies))
+	for name := range dependencies {
+		if !packagepublish.ImageOwnedDistribution(name) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func retainOriginalWheel(dir string, dependency packagepublish.CapturedDependency) (string, *exit.Error) {

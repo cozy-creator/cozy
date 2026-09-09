@@ -16,4 +16,7 @@ func TestExactPrivateWheelRequirementsExcludeImageOwnedClosure(t *testing.T) {
 	if got := exactPrivateWheelRequirements("fixture", dependencies); !reflect.DeepEqual(got, []string{"scipy==1.18.1"}) {
 		t.Fatalf("image-owned framework was repinned in callable wheel metadata: %v", got)
 	}
+	if got := privateWheelClosureNames(dependencies); !reflect.DeepEqual(got, []string{"fixture", "scipy"}) {
+		t.Fatalf("image-owned framework entered the private wheel closure: %v", got)
+	}
 }
