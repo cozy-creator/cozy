@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS rental_operations (
   hub              TEXT NOT NULL,
   reason           TEXT NOT NULL,
   hourly_rate_usd_micros INTEGER NOT NULL,
+  estimated_hourly_rate_usd_micros INTEGER CHECK(estimated_hourly_rate_usd_micros >= hourly_rate_usd_micros),
   managed_request_id TEXT NOT NULL DEFAULT '',
   rental_id        TEXT NOT NULL DEFAULT '',
   state            TEXT NOT NULL,
@@ -98,19 +99,21 @@ type RentalOperation struct {
 	Hub                 string
 	Reason              string
 	HourlyRateUSDMicros int64
-	ManagedRequestID    string
-	RentalID            string
-	State               string
-	CreatedAt           string
-	UpdatedAt           string
+	// Nil for legacy intents whose storage estimate was never recorded.
+	EstimatedHourlyRateUSDMicros *int64
+	ManagedRequestID             string
+	RentalID                     string
+	State                        string
+	CreatedAt                    string
+	UpdatedAt                    string
 }
 
-const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,hourly_rate_usd_micros,managed_request_id,rental_id,state,created_at,updated_at`
+const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,hourly_rate_usd_micros,estimated_hourly_rate_usd_micros,managed_request_id,rental_id,state,created_at,updated_at`
 
 func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, error) {
 	var op RentalOperation
 	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.Hub, &op.Reason,
-		&op.HourlyRateUSDMicros, &op.ManagedRequestID,
+		&op.HourlyRateUSDMicros, &op.EstimatedHourlyRateUSDMicros, &op.ManagedRequestID,
 		&op.RentalID, &op.State, &op.CreatedAt, &op.UpdatedAt)
 	return op, err
 }
@@ -160,7 +163,7 @@ type RentalRequestAuthor func(machineName string) (body []byte, digest string, p
 // storageUSDMicros is the SKU's estimated storage adder (th-126): the spend
 // admission totals it with the locked GPU rate — burn is billed-truth money
 // (th-120), so the figure admitted is what the pod will actually bill — while
-// the operation row keeps the GPU quote alone.
+// the operation preserves both the GPU quote and the total reservation.
 func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros, storageUSDMicros int64,
 	author RentalRequestAuthor, observed map[string]int64) (RentalOperation, bool, *exit.Error) {
 	stamp := now()
@@ -230,8 +233,8 @@ func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros, stor
 		}
 	}
 	if _, err := tx.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
-		op.HourlyRateUSDMicros, op.ManagedRequestID, op.RentalID, "pending_acquisition", stamp, stamp); err != nil {
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
+		op.HourlyRateUSDMicros, estimatedTotal, op.ManagedRequestID, op.RentalID, "pending_acquisition", stamp, stamp); err != nil {
 		return RentalOperation{}, false, exit.Internalf("cannot record rental operation: %s", err)
 	}
 	stored, err = scanRentalOperation(tx.QueryRow(
@@ -910,7 +913,7 @@ func rentalFleetTotals(q interface {
 	rows, err := q.Query(`SELECT hub,id,hourly_rate_usd_micros FROM rentals
 		WHERE state NOT IN (` + absentRentalStates + `)
 		UNION ALL
-		SELECT o.hub,o.rental_id,o.hourly_rate_usd_micros FROM rental_operations o
+		SELECT o.hub,o.rental_id,o.estimated_hourly_rate_usd_micros FROM rental_operations o
 		LEFT JOIN rentals r ON r.id=o.rental_id AND RTRIM(r.hub,'/')=RTRIM(o.hub,'/')
 		WHERE o.state NOT IN (` + finalRentalOperationStates + `)
 		  AND o.state NOT IN (` + absentRentalStates + `) AND r.id IS NULL`)
@@ -918,18 +921,21 @@ func rentalFleetTotals(q interface {
 		return 0, 0, exit.Internalf("cannot read rental fleet obligations: %s", err)
 	}
 	defer rows.Close()
-	rates := make(map[[2]string]int64)
+	rates := make(map[[2]string]sql.NullInt64)
 	count, burn := 0, int64(0)
 	for rows.Next() {
 		var origin, id string
-		var rate int64
+		var rate sql.NullInt64
 		if err := rows.Scan(&origin, &id, &rate); err != nil {
 			return 0, 0, exit.Internalf("cannot read rental fleet rate: %s", err)
 		}
 		if id == "" {
+			if !rate.Valid {
+				return 0, 0, unknownRentalEstimate()
+			}
 			count++
 			var problem *exit.Error
-			burn, problem = addRentalSpend(burn, rate)
+			burn, problem = addRentalSpend(burn, rate.Int64)
 			if problem != nil {
 				return 0, 0, problem
 			}
@@ -943,21 +949,30 @@ func rentalFleetTotals(q interface {
 	for id, rate := range observed {
 		identity := [2]string{strings.TrimRight(hub, "/"), id}
 		if rate > 0 {
-			rates[identity] = rate
-		} else if rates[identity] <= 0 {
+			rates[identity] = sql.NullInt64{Int64: rate, Valid: true}
+		} else if !rates[identity].Valid || rates[identity].Int64 <= 0 {
 			return 0, 0, exit.Named(exit.Unavailable, "rental.rate_unknown",
-				"rental %s has no observed rate or retained quote; account spend is unknown", id)
+				"rental %s has no observed rate or known total reservation; account spend is unknown", id)
 		}
 	}
 	for _, rate := range rates {
+		if !rate.Valid {
+			return 0, 0, unknownRentalEstimate()
+		}
 		count++
 		var problem *exit.Error
-		burn, problem = addRentalSpend(burn, rate)
+		burn, problem = addRentalSpend(burn, rate.Int64)
 		if problem != nil {
 			return 0, 0, problem
 		}
 	}
 	return count, burn, nil
+}
+
+func unknownRentalEstimate() *exit.Error {
+	return exit.Named(exit.Unavailable, "rental.reservation_unknown",
+		"a pending rental has no recorded total estimate; account spend is unknown").
+		WithRemedy("resolve or release the retained rental intent before acquiring another rental")
 }
 
 func addRentalSpend(total, rate int64) (int64, *exit.Error) {
