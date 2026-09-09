@@ -53,10 +53,21 @@ func (c *Orchestrator) RetryOutputExport(requestID string) {
 		}
 		return
 	}
+	if request.ParentRequestID != "" {
+		_ = c.opt.Store.SkipOutputExport(requestID, "child results remain internal to their parent")
+		return
+	}
 	outputs, problem := c.opt.Store.VisibleOutputs(requestID)
 	if problem != nil {
 		c.failOutputExport(requestID, problem)
 		return
+	}
+	if request.IsJob() {
+		outputs, problem = materializeJobMedia(*export, outputs)
+		if problem != nil {
+			c.failOutputExport(requestID, problem)
+			return
+		}
 	}
 	paths, problem := outputExportPaths(*export, outputs)
 	if problem != nil {
@@ -69,6 +80,28 @@ func (c *Orchestrator) RetryOutputExport(requestID string) {
 	}
 	c.logf("output export %s published %d file(s) under %s", requestID, len(paths), export.Directory)
 	c.reclaimTmp(requestID)
+}
+
+func materializeJobMedia(export records.OutputExport, outputs []records.Output) ([]records.Output, *exit.Error) {
+	accepted := make(map[string]records.Output, len(outputs))
+	for _, output := range outputs {
+		accepted[output.OutputID] = output
+	}
+	media := make([]records.Output, 0, len(export.Outputs))
+	for _, intended := range export.Outputs {
+		output, ok := accepted[intended.OutputID]
+		if !ok || output.MimeType != intended.MediaType {
+			return nil, exit.Named(exit.Validation, "output_export_contract_mismatch",
+				"accepted output %s does not match its pre-execution media contract", intended.OutputID)
+		}
+		path, problem := resultfiles.Materialize(output.Path, export.Directory, output.Digest, output.MimeType, output.Length)
+		if problem != nil {
+			return nil, problem
+		}
+		output.Path = path
+		media = append(media, output)
+	}
+	return media, nil
 }
 
 // reclaimTmp removes one settled request's `tmp/<id>/` if its writer did not — the

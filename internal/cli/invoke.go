@@ -116,9 +116,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
+	if ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --asset, --input-tree, --org, --await, and --rental")
+			WithRemedy("jobs accept payload values, --in, --asset, --input-tree, --org, --out, --await, and --rental")
 	}
 	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
@@ -183,13 +183,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	outputDirectory := ""
-	if requested := ctx.Inv.Value("--out"); requested != "" {
-		absolute, err := filepath.Abs(requested)
-		if err != nil {
-			return exit.Usagef("cannot resolve --out %q: %s", requested, err)
-		}
-		outputDirectory = filepath.Clean(absolute)
+	outputDirectory, e := requestedOutputDirectory(ctx)
+	if e != nil {
+		return e
 	}
 
 	c, e := dial(ctx)

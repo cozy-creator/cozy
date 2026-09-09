@@ -57,12 +57,16 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
+	outputDirectory, e := requestedOutputDirectory(ctx)
+	if e != nil {
+		return e
+	}
 
 	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
 		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
-		RentalRequired: ctx.Inv.Bool("--rental-only")}
+		RentalRequired: ctx.Inv.Bool("--rental-only"), OutputDirectory: outputDirectory}
 	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides)
 	if e != nil {
 		return e
@@ -202,6 +206,18 @@ func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 	}
 	if state.Progress != nil {
 		fields = append(fields, output.Field{K: "progress", V: compactValue(state.Progress)})
+	}
+	if export := state.OutputExport; export != nil {
+		fields = append(fields,
+			output.Field{K: "output_directory", V: export.Directory},
+			output.Field{K: "output_export", V: outputExportHint(mode, export)})
+		if saved := exportedOutputs(api.Lifecycle{OutputExport: export, Outputs: state.Outputs}); len(saved) > 0 {
+			if mode.JSON {
+				fields = append(fields, output.Field{K: "saved", V: saved})
+			} else {
+				fields = append(fields, output.Field{K: "saved", V: outputExportHint(mode, export)})
+			}
+		}
 	}
 	// A MEMBER THAT DID NOT VERIFY IS SAID OUT LOUD, not folded into a percentage. This is
 	// the surface run 205 did not have: 44 of 48 verified for 2h55m, four members
@@ -354,6 +370,19 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event,
 	began time.Time,
 ) *exit.Error {
+	if state.Status == "completed" && state.OutputExport != nil {
+		client, problem := dial(ctx)
+		if problem != nil {
+			return problem
+		}
+		life, problem := waitOutputExport(client, api.Lifecycle{
+			RequestID: state.JobID, Status: state.Status, OutputExport: state.OutputExport,
+		})
+		if problem != nil {
+			return problem
+		}
+		state.OutputExport = life.OutputExport
+	}
 	status := localapi.StreamStatus(terminal)
 	if status == "" {
 		status = state.Status
@@ -372,6 +401,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	fields := append(jobFields(ctx.Mode(), state, true),
 		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
 	defaults := []string{"job", "status"}
+	if state.OutputExport != nil {
+		defaults = append(defaults, "saved", "output_export")
+	}
 	if state.Result != nil {
 		defaults = append(defaults, "result")
 	}
