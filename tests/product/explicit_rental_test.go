@@ -272,7 +272,7 @@ func TestDevelopmentRentalInventoryLeavesMutablePairToWorker(t *testing.T) {
 	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13", true); why != "" {
 		t.Fatal(why)
 	}
-	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); !strings.Contains(why, "cozy-runtime") {
+	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); !strings.Contains(why, runtimeDistribution) {
 		t.Fatalf("production image incorrectly exempted its Runtime: %s", why)
 	}
 	if why := launch.InventoryMismatch(inventory, []string{"torch>=3"}, "", true); !strings.Contains(why, "torch") {
