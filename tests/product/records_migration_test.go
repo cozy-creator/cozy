@@ -181,6 +181,90 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 }
 
+// TestRecordsMigrationFromThirtySeven proves the additive attention-pin column is
+// defaulted when a schema-37 daemon database is upgraded. It also protects the
+// operator-facing refusal older binaries must give when they see this newer shape:
+// upgrade in place, never move the records database aside as if it were corrupt.
+func TestRecordsMigrationFromThirtySeven(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "records.db")
+	store, problem := records.OpenForDaemon(path, "")
+	if problem != nil {
+		t.Fatalf("initialize records: %v", problem)
+	}
+	store.Close()
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,plan_id,payload,state,created_at)
+		VALUES('request-schema37','idem-schema37','sha256:body','cozy/example','generate','sha256:plan',x'00','queued','2026-01-01T00:00:00Z')`); err != nil {
+		db.Close()
+		t.Fatalf("plant schema-37 request: %v", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE requests DROP COLUMN attention_kernel`); err != nil {
+		db.Close()
+		t.Fatalf("make schema-37 requests shape: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version=37`); err != nil {
+		db.Close()
+		t.Fatalf("stamp schema-37 database: %v", err)
+	}
+	db.Close()
+
+	if store, problem := records.Open(path); problem == nil || problem.ErrName() != "records_schema_upgrade_required" {
+		if store != nil {
+			store.Close()
+		}
+		t.Fatalf("ordinary Open = %v, want records_schema_upgrade_required", problem)
+	}
+	store, problem = records.OpenForDaemon(path, "")
+	if problem != nil {
+		t.Fatalf("schema-37 database did not migrate: %v", problem)
+	}
+	defer store.Close()
+
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 38 {
+		t.Fatalf("user_version = %d, %v", version, err)
+	}
+	var pin string
+	if err := db.QueryRow(`SELECT attention_kernel FROM requests WHERE id='request-schema37'`).Scan(&pin); err != nil || pin != "" {
+		t.Fatalf("migrated attention pin = %q, %v", pin, err)
+	}
+}
+
+func TestRecordsRejectsNewerSchemaWithoutResetHint(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "records.db")
+	store, problem := records.OpenForDaemon(path, "")
+	if problem != nil {
+		t.Fatalf("initialize records: %v", problem)
+	}
+	store.Close()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA user_version=39`); err != nil {
+		db.Close()
+		t.Fatalf("stamp future schema: %v", err)
+	}
+	db.Close()
+	if store, problem := records.Open(path); problem == nil || problem.ErrName() != "records_schema_newer" {
+		if store != nil {
+			store.Close()
+		}
+		t.Fatalf("future-schema Open = %v, want records_schema_newer", problem)
+	}
+}
+
 // writeSchemaElevenAttempt plants one closed, triage-bearing attempt in the released
 // shape: the bundle bytes live in a FILE the row names, which is exactly what schema 22
 // retires.
