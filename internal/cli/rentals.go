@@ -63,6 +63,10 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 
 func handleRent(ctx *Context) *exit.Error {
 	skuName := strings.TrimSpace(ctx.Inv.Args[0])
+	skuName, gpuProblem := rentalGPUSKU(skuName, ctx.Inv.Value("--gpus"))
+	if gpuProblem != nil {
+		return gpuProblem
+	}
 	if skuName == "" {
 		if ctx.Inv.Value("--idempotency-key") != "" ||
 			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || ctx.Inv.Bool("--development") || ctx.Inv.Value("--ssh-public-key") != "" {

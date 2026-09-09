@@ -424,6 +424,7 @@ type RentalCmd struct {
 }
 
 type RentalNewCmd struct {
+	GPUs           string   `name:"gpus" help:"Physical GPU count; defaults to one unless the SKU already includes a width."`
 	Development    bool     `help:"Rent an explicit developer worker for SSH/SFTP wheel updates."`
 	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
 	SKU            string   `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
@@ -442,7 +443,7 @@ func (c *RentalPruneCmd) Run(r *Runtime) error {
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
 	return r.call(handleRent, []string{c.SKU}, bools("--development", c.Development), values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey, "--gpus", c.GPUs), false)
 }
 
 type RentalEndCmd struct {
