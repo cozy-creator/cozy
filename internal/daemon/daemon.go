@@ -95,7 +95,11 @@ func (h *Held) PublishSchema(version int) *exit.Error {
 	if h == nil || h.f == nil || version <= 0 {
 		return exit.Internalf("cannot publish daemon schema version")
 	}
-	if _, err := h.f.WriteString(fmt.Sprintf("schema=%d\n", version)); err != nil {
+	info, err := h.f.Stat()
+	if err != nil {
+		return exit.Internalf("cannot inspect daemon record: %s", err)
+	}
+	if _, err := h.f.WriteAt([]byte(fmt.Sprintf("schema=%d\n", version)), info.Size()); err != nil {
 		return exit.Internalf("cannot publish daemon schema version: %s", err)
 	}
 	return nil
