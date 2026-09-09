@@ -687,10 +687,10 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
 			"progress", "phase", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "queued", "execution", "attempts", "created"},
-		TypedFields: []string{"number", "target", "machine", "rental_id", "status",
+		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
 			"remaining_ms", "execution_ms"},
-		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id",
+		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "progress_stage", "stage_fraction", "overall_fraction",
@@ -703,6 +703,11 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	}
 	states := map[string]int{}
 	for _, life := range rows {
+		// An assignment still in this daemon's queue is not execution on that pod.
+		// Also correct older daemon projections that expose the provisional venue.
+		if life.Status == "queued" && life.Attempts == 0 && life.Attempt == 0 {
+			life.Machine = ""
+		}
 		kind := life.Kind
 		if kind == "" {
 			kind = "invocation"
@@ -713,9 +718,13 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		if life.Status == "canceled" && life.CanceledBy != "" {
 			status = "canceled by " + life.CanceledBy
 		}
+		machine := life.Machine
+		if machine == "" {
+			machine = "—"
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			"number": strconv.FormatInt(life.Number, 10), "id": life.RequestID, "kind": kind,
-			"target": life.Package + "/" + life.Function, "machine": life.Machine,
+			"target": life.Package + "/" + life.Function, "machine": machine,
 			"rental_id": life.RentalID,
 			"status":    status, "progress": progressValue(life), "phase": life.Phase,
 			"progress_stage":   life.ProgressStage,
@@ -735,6 +744,10 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		}
 		if life.RentalID != "" {
 			typed["rental_id"] = life.RentalID
+		}
+		if life.RequestedRental != "" {
+			typed["requested_rental"] = life.RequestedRental
+			typed["requested_machine"] = life.RequestedMachine
 		}
 		// The preparation facts are machine-readable as NUMBERS and absence, never as the
 		// human cell: a reader must be able to tell "no rate was measured" from "the rate
@@ -873,6 +886,11 @@ func PhaseCell(life api.Lifecycle) string {
 
 func progressValue(life api.Lifecycle) string {
 	if life.Status == "queued" {
+		if life.RequestedRental != "" && (life.Phase == "" || life.Phase == orchestrator.WaitRental ||
+			life.Phase == orchestrator.WaitSlotBusy || life.Phase == orchestrator.WaitQueueAhead) {
+			name := either(life.RequestedMachine, life.RequestedRental)
+			return "waiting for rental " + name
+		}
 		if cell := phaseValue(life); cell != "" {
 			return cell
 		}
