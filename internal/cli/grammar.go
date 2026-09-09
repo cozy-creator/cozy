@@ -7,18 +7,17 @@ type CLI struct {
 	Full   bool     `help:"Include complete values and all available fields."`
 	Fields []string `help:"Select result fields." sep:","`
 
-	Package PackageCmd   `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
-	Model   ModelCmd     `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
-	Auth    AuthCmd      `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
-	Run     RunCmd       `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
-	Rent    RentalNewCmd `cmd:"" group:"Rentals" help:"Start a private rental of the requested GPU SKU."`
-	Rental  RentalCmd    `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
-	Cache   CacheCmd     `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
-	Volume  VolumeCmd    `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
-	Up      UpCmd        `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
-	Down    DownCmd      `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
-	Unload  UnloadCmd    `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
-	Daemon  DaemonCmd    `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
+	Package PackageCmd `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
+	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
+	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
+	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
+	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
+	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
+	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
+	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
+	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
+	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
+	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
 }
 
 type DaemonCmd struct {
@@ -418,7 +417,7 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 type RentalCmd struct {
 	SSHInfo RentalSSHInfoCmd `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List    RentalListCmd    `cmd:"" help:"List rented machines, live on a terminal."`
-	New     RentalNewCmd     `cmd:"" hidden:"" help:"Start a private rental."`
+	New     RentalNewCmd     `cmd:"" help:"Start a private rental, or list available machine types."`
 	End     RentalEndCmd     `cmd:"" help:"End a private rental and stop billing."`
 	Prune   RentalPruneCmd   `cmd:"" help:"Free unused cached operation results on a private rental."`
 }
@@ -426,7 +425,7 @@ type RentalCmd struct {
 type RentalNewCmd struct {
 	Development    bool     `help:"Rent an explicit developer worker for SSH/SFTP wheel updates."`
 	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
-	SKU            string   `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
+	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
 	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
