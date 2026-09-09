@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -85,11 +84,9 @@ func TestRentalIdleRelease(t *testing.T) {
 	if hub.releases("rental-idle-busy") != 0 {
 		t.Fatalf("the hub saw a release of a busy rental\n%s", tail(logPath))
 	}
-	code, out := runCozy(t, root, "rental", "list")
-	busyRow := regexp.MustCompile(`otter\s+cpu\s+ready\s+\S+\s+0\s+1\s+-`)
-	if code != 0 || !busyRow.MatchString(out) ||
-		!strings.Contains(out, "Idle machines shut down after 2 seconds.") {
-		t.Fatalf("the listing does not show the queued work holding the rental [exit %d]\n%s", code, out)
+	busy := listedRental(t, root, "rental-idle-busy")
+	if busy.Machine != "otter" || busy.State != "ready" || busy.Running == nil || *busy.Running != 0 || busy.Queued == nil || *busy.Queued != 1 || busy.IdleSeconds != nil || busy.ReleaseDue != "" {
+		t.Fatalf("the listing does not show queued work holding the rental: %+v", busy)
 	}
 	if r := daemon.call(t, "POST", "/v1/requests/req-rental-idle/cancel", nil); r.Status != http.StatusOK {
 		t.Fatalf("cancel of the queued request: %s", r.brief())
@@ -123,10 +120,9 @@ func TestRentalIdleRelease(t *testing.T) {
 	if hub.releases("rental-idle-owed") != 0 {
 		t.Fatalf("the hub saw a release of an owed rental\n%s", tail(logPath))
 	}
-	code, out = runCozy(t, root, "rental", "list")
-	owedRow := regexp.MustCompile(`curlew\s+cpu\s+ready\s+\S+\s+0\s+0\s+-`)
-	if code != 0 || !owedRow.MatchString(out) {
-		t.Fatalf("the listing shows an idle countdown on an owed rental [exit %d]\n%s", code, out)
+	owed := listedRental(t, root, "rental-idle-owed")
+	if owed.State != "ready" || owed.Running == nil || *owed.Running != 0 || owed.Queued == nil || *owed.Queued != 0 || owed.IdleSeconds != nil || owed.ReleaseDue != "" {
+		t.Fatalf("the listing shows an idle countdown on an owed rental: %+v", owed)
 	}
 	if r := daemon.call(t, "POST", "/v1/requests/req-rental-owed/cancel", nil); r.Status != http.StatusOK {
 		t.Fatalf("cancel of the owing request: %s", r.brief())
@@ -164,11 +160,9 @@ func TestRentalIdleRelease(t *testing.T) {
 	}
 	// The listing has to agree with the mechanism: no work of its OWN (0 queued, 0 running)
 	// and no countdown, because the fleet is not idle even though this machine is.
-	code, out = runCozy(t, root, "rental", "list")
-	unpinnedRow := regexp.MustCompile(`kestrel\s+cpu\s+ready\s+\S+\s+0\s+0\s+-`)
-	if code != 0 || !unpinnedRow.MatchString(out) {
-		t.Fatalf("the listing shows an idle countdown while unpinned work is queued [exit %d]\n%s",
-			code, out)
+	unpinned := listedRental(t, root, "rental-idle-unpinned")
+	if unpinned.State != "ready" || unpinned.Running == nil || *unpinned.Running != 0 || unpinned.Queued == nil || *unpinned.Queued != 0 || unpinned.IdleSeconds != nil || unpinned.ReleaseDue != "" {
+		t.Fatalf("the listing shows an idle countdown while unpinned work is queued: %+v", unpinned)
 	}
 	// And settling the unpinned request is what lets it go: the hold is the WORK, never a
 	// permanent exemption.
@@ -397,4 +391,35 @@ func (h *fakeRentalHub) close() {
 	if server != nil {
 		server.Close()
 	}
+}
+
+// Listing assertions use the public JSON fields; adding a display column must not
+// make lifecycle proofs depend on its position or the machine's elapsed uptime.
+type rentalListingRow struct {
+	ID          string `json:"rental_id"`
+	Machine     string `json:"machine"`
+	State       string `json:"state"`
+	Failure     string `json:"failure_code"`
+	Running     *int   `json:"running"`
+	Queued      *int   `json:"queued"`
+	IdleSeconds *int   `json:"idle_s"`
+	ReleaseDue  string `json:"release_due_at"`
+}
+
+func listedRental(t *testing.T, root, id string) rentalListingRow {
+	t.Helper()
+	code, out := runCozy(t, root, "rental", "list", "--json", "--full")
+	var document struct {
+		Rentals []rentalListingRow `json:"rentals"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &document) != nil {
+		t.Fatalf("rental list failed [exit %d]: %s", code, out)
+	}
+	for _, row := range document.Rentals {
+		if row.ID == id {
+			return row
+		}
+	}
+	t.Fatalf("rental %s absent from listing: %s", id, out)
+	return rentalListingRow{}
 }
