@@ -32,6 +32,7 @@ import (
 // carried VERBATIM: the orchestrator digests exactly the bytes the client sent, so a
 // re-submit under one key compares the same request identity.
 type Submission struct {
+	RequestedGPUs   int             `json:"requested_gpus,omitempty"`
 	RequestedRental string          `json:"requested_rental,omitempty"`
 	Package         string          `json:"package"`
 	Function        string          `json:"function"`
@@ -278,6 +279,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if spec.RentalRequired {
 		doc["rental_required"] = true
 	}
+	if spec.RequestedGPUs != 0 {
+		doc["requested_gpus"] = int64(spec.RequestedGPUs)
+	}
 	if spec.RequestedRental != "" {
 		doc["requested_rental"] = spec.RequestedRental
 	}
@@ -362,7 +366,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
 		Release: sub.Release,
 		Rental:  sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
-		RequestedRental: sub.RequestedRental,
+		RequestedRental: sub.RequestedRental, RequestedGPUs: sub.RequestedGPUs,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
 		OutputDirectory: sub.OutputDirectory,
 	}
@@ -616,6 +620,9 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 // validateInputs checks the payload and every local asset against the entrypoint that
 // will run it — the same law for a local install and a rental's frozen PackageInterface.
 func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
+	if problem := entrypoint.ValidateGPUCount(out.RequestedGPUs); problem != nil {
+		return problem
+	}
 	if e := launch.ValidatePayload(out.Package, entrypoint, out.Payload); e != nil {
 		return e
 	}

@@ -325,6 +325,7 @@ type RunCmd struct {
 }
 
 type RunExecuteCmd struct {
+	GPUs           string   `name:"gpus" help:"Exact execution GPU count, independent of rental width; accelerator calls default to one."`
 	Target         string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and --model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
 	Out            string   `help:"Output directory." type:"path"`
@@ -354,7 +355,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 	return r.call(handleRunExecute, args, bools(
 		"--await", c.Await,
 		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
-		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
+		"--gpus", c.GPUs, "--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)

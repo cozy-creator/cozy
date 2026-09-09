@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS requests (
   reused_from TEXT NOT NULL DEFAULT '',
   orchestration_directive BLOB NOT NULL DEFAULT x'',
   child_artifacts INTEGER NOT NULL DEFAULT 0 CHECK(child_artifacts IN (0,1)),
-  requested_rental TEXT NOT NULL DEFAULT ''
+  requested_rental TEXT NOT NULL DEFAULT '',
+  requested_gpus INTEGER NOT NULL DEFAULT 0 CHECK(requested_gpus>=0 AND requested_gpus<=4294967295)
 )`
 
 const workerProcessesDDL = `
@@ -447,6 +448,7 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 type Request struct {
 	// RequestedRental is immutable caller affinity; Worker is the current assignment.
 	RequestedRental string
+	RequestedGPUs   int
 	Capture         string
 	// Number is this host's short user-facing request reference. The globally unique ID
 	// remains the durable internal/Hub identity; Number is derived from the retained local
@@ -758,7 +760,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	environment_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,capture,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
-	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental`
+	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,requested_gpus`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -767,7 +769,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, &r.Capture, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
-		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental}
+		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RequestedGPUs}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -1402,9 +1404,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		plan_id,package_release,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,
-		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental)
+		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,requested_gpus)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
-		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalPackageDigest,
 		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
@@ -1413,7 +1415,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision,
-		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental); err != nil {
+		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RequestedGPUs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {

@@ -64,6 +64,10 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	if r.RequestedRental != "" && r.RequestedRental != parent.RequestedRental {
 		return Request{}, false, exit.Named(exit.Conflict, "child.rental_changed", "child cannot change its parent's requested rental")
 	}
+	if r.RequestedGPUs != 0 && r.RequestedGPUs != parent.RequestedGPUs {
+		return Request{}, false, exit.Named(exit.Conflict, "child.gpus_changed", "child cannot change its parent requested GPU count")
+	}
+	r.RequestedGPUs = parent.RequestedGPUs
 	r.RequestedRental = parent.RequestedRental
 	if parent.RequestedRental != "" {
 		if r.Worker != "" && r.Worker != parent.Worker {

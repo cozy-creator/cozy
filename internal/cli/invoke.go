@@ -66,6 +66,9 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 // ----------------------------------------------------------------------------- run
 
 func handleRunExecute(ctx *Context) *exit.Error {
+	if _, problem := requestedGPUCount(ctx.Inv.Value("--gpus")); problem != nil {
+		return problem
+	}
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
@@ -100,6 +103,10 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	}
 	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--await") {
 		return exit.Usagef("--dry-run and --await conflict")
+	}
+	gpus, _ := requestedGPUCount(ctx.Inv.Value("--gpus"))
+	if problem := callable.ValidateGPUCount(gpus); problem != nil {
+		return problem
 	}
 	if callable.Kind != "job" {
 		if ctx.Inv.Value("--retry") != "" {
@@ -199,13 +206,14 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	gpus, _ := requestedGPUCount(ctx.Inv.Value("--gpus"))
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, Rental: managedRental,
 		RentalRequired:  ctx.Inv.Bool("--rental-only") || selectedRental != "",
-		RequestedRental: selectedRental,
+		RequestedRental: selectedRental, RequestedGPUs: gpus,
 		Models:          models,
 		OutputDirectory: outputDirectory,
 	}, key)

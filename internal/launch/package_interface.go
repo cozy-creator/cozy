@@ -141,6 +141,24 @@ func (entrypoint *Entrypoint) SequenceParallelDegrees() []int {
 	return out
 }
 
+// ValidateGPUCount checks construction capability independently of physical
+// rental width. A one-device construction needs no sequence-parallel declaration.
+func (entrypoint *Entrypoint) ValidateGPUCount(count int) *exit.Error {
+	if count < 0 || uint64(count) > uint64(^uint32(0)) {
+		return exit.Usagef("requested_gpus must be a non-negative integer GPU count")
+	}
+	if count <= 1 || entrypoint.Kind == "job" {
+		return nil
+	}
+	for _, degree := range entrypoint.SequenceParallelDegrees() {
+		if degree == count {
+			return nil
+		}
+	}
+	return exit.Named(exit.Validation, "request.gpu_degree_unsupported",
+		"%s does not declare a %d-GPU construction for all of its model slots", entrypoint.Name, count)
+}
+
 // sequenceParallelDegrees reads one slot's `{"degrees": [K, ...]}`. An absent, unreadable
 // or empty document declares nothing, which is the same answer as a slot that cannot be
 // sharded — this side never infers a degree an author did not write.

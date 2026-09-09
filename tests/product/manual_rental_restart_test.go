@@ -230,7 +230,8 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		}, 2_000_000, 0, func(name string) ([]byte, string, *exit.Error) {
 			body, problem := hubapi.RentalRequestBytes(name, "cpu", secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil)
 			return body, fmt.Sprintf("sha256:%x", sha256.Sum256(body)), problem
-		})
+		}, nil)
+
 		fatal(t, problem)
 		request, problem := hubapi.ParseRentalRequestBytes(op.RequestBody)
 		fatal(t, problem)

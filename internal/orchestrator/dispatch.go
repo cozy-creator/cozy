@@ -80,6 +80,7 @@ type Submission struct {
 	// through Options.Rentals). Empty = any local worker.
 	Worker          string
 	RequestedRental string
+	RequestedGPUs   int
 	// InstallID pins a durable request to one immutable local install resolution.
 	// Remote requests instead carry their immutable Release.
 	InstallID string
@@ -176,6 +177,9 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 }
 
 func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
+	if s.RequestedGPUs < 0 || uint64(s.RequestedGPUs) > uint64(^uint32(0)) {
+		return records.Request{}, nil, exit.Usagef("requested_gpus must be a non-negative GPU count")
+	}
 	if s.RequestedRental != "" {
 		if s.Worker != "" && s.Worker != s.RequestedRental {
 			return records.Request{}, nil, exit.New(exit.Conflict, "assigned rental differs from requested rental")
@@ -197,10 +201,13 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		identity := s.Payload
-		if s.Rental {
+		if s.Rental || s.RequestedGPUs != 0 {
 			document := map[string]canonical.Value{
 				"payload": base64.StdEncoding.EncodeToString(s.Payload),
-				"rental":  true, "rental_required": s.RentalRequired,
+				"rental":  s.Rental, "rental_required": s.RentalRequired,
+			}
+			if s.RequestedGPUs != 0 {
+				document["requested_gpus"] = int64(s.RequestedGPUs)
 			}
 			if s.RequestedRental != "" {
 				document["requested_rental"] = s.RequestedRental
@@ -249,8 +256,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Outputs:            strings.Join(s.Outputs, ","),
 		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
 		Kind: s.Kind, RetainWork: s.RetainWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		RequestedRental: s.RequestedRental,
-		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
+		RequestedRental: s.RequestedRental, RequestedGPUs: s.RequestedGPUs,
+		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
 	}

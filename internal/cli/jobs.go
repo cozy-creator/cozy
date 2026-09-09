@@ -66,7 +66,8 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
-	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
+	gpus, _ := requestedGPUCount(ctx.Inv.Value("--gpus"))
+	sub := api.JobSubmission{RequestedGPUs: gpus, Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
 		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),

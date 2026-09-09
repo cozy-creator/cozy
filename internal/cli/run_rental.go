@@ -34,6 +34,11 @@ func requestedRental(ctx *Context, target Target, function string) (string, *exi
 	if selected.Row == nil || records.RentalTerminalState(selected.Row.State) {
 		return "", exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
 	}
+	gpus, _ := requestedGPUCount(ctx.Inv.Value("--gpus"))
+	if gpus > selected.Row.AcceleratorCount {
+		return "", exit.Named(exit.Capacity, "rental.gpu_count_insufficient",
+			"--gpus=%d exceeds rental %s's %d physical GPUs", gpus, name, selected.Row.AcceleratorCount)
+	}
 	constraints, problem := releaseConstraints(ctx, records.Request{Package: target.Package, Release: target.Release, InstallID: target.InstallID, Entrypoint: function})
 	if problem != nil {
 		return "", problem

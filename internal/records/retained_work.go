@@ -74,6 +74,10 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 	if request.RequestedRental != "" && request.RequestedRental != prior.RequestedRental {
 		return exit.Named(exit.Conflict, "request.retry_rental_changed", "retry cannot change requested rental")
 	}
+	if request.RequestedGPUs != 0 && request.RequestedGPUs != prior.RequestedGPUs {
+		return exit.Named(exit.Conflict, "request.retry_gpus_changed", "retry cannot change requested GPU count")
+	}
+	request.RequestedGPUs = prior.RequestedGPUs
 	request.RequestedRental = prior.RequestedRental
 	request.Worker, request.Rental, request.RentalRequired = prior.Worker, prior.Rental, prior.RentalRequired
 	request.ReuseScope = prior.ReuseScope
