@@ -1126,13 +1126,15 @@ func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
 	if problem != nil {
 		return rental.Constraints{}
 	}
-	// The committed interface is what says which group degrees this package can be built
+	// The committed interface says which group degrees this requested function can be built
 	// at, so a WIDE product is only a candidate when its author declared that width
 	// (cl-179). It rides the same advisory read as the base-image check: unreadable means
 	// nothing is declared, which excludes wide products rather than admitting them.
 	var degrees []int
 	if declared, e := launch.DecodePackageInterface(detail.PackageInterface); e == nil {
-		degrees = declared.SequenceParallelDegrees()
+		if entrypoint, e := declared.Function(req.Entrypoint); e == nil && entrypoint.Kind != "job" {
+			degrees = entrypoint.SequenceParallelDegrees()
+		}
 	}
 	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython,
 		Degrees: degrees}

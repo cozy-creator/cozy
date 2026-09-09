@@ -116,9 +116,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
+	if ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --asset, --input-tree, --org, --await, and --rental")
+			WithRemedy("jobs accept payload values, --in, --asset, --input-tree, --org, --out, --await, and --rental")
 	}
 	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
@@ -183,13 +183,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	outputDirectory := ""
-	if requested := ctx.Inv.Value("--out"); requested != "" {
-		absolute, err := filepath.Abs(requested)
-		if err != nil {
-			return exit.Usagef("cannot resolve --out %q: %s", requested, err)
-		}
-		outputDirectory = filepath.Clean(absolute)
+	outputDirectory, e := requestedOutputDirectory(ctx)
+	if e != nil {
+		return e
 	}
 
 	c, e := dial(ctx)
@@ -425,8 +421,11 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 					"%s has no authored default for model slot %s", target.Package, slot.Path).
 					WithRemedy("model.%s=org/model@release[/lane]", slot.Param)
 			}
-			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
-				"%s has no owner binding or authored default for model slot %s", target.Package, slot.Path).
+			message := fmt.Sprintf("%s has no owner binding or authored default for model slot %s", target.Package, slot.Path)
+			if ep.Kind != "job" {
+				message = fmt.Sprintf("%s/%s is disabled in this deployment: no default model binding for %s", target.Package, ep.Name, slot.Param)
+			}
+			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable", "%s", message).
 				WithRemedy("bind it: %s — or override this run: model.%s=org/model@release[/lane]",
 					bindRemedy(target.Package, slot.Path), slot.Param)
 		}
@@ -2235,10 +2234,21 @@ func describeBindings(ctx *Context, target Target, ep *launch.Entrypoint) map[st
 }
 
 func emitFunctions(ctx *Context, target Target, packageInterface *launch.PackageInterface) *exit.Error {
-	list := output.List{Name: "functions", Fields: []string{"function"}, AllFields: []string{"function"}}
+	slots := declaredModelSlots(packageInterface.Entrypoints)
+	defaults := effectiveModelBindings(slots, nil)
+	var bindingProblem *exit.Error
+	if len(slots) > 0 && !strings.HasPrefix(target.Package, "local/") {
+		defaults, bindingProblem = invocationDefaultBindings(ctx, target, slots)
+	}
+	list := output.List{Name: "functions", Fields: []string{"function", "availability"}, AllFields: []string{"function", "availability"}}
 	for _, name := range packageInterface.Names() {
-		list.Rows = append(list.Rows, map[string]string{"function": name})
-		if len(list.Next) < 2 {
+		callable, _ := packageInterface.Function(name)
+		availability := modelDefaultAvailability(callable, defaults)
+		if bindingProblem != nil && callable.Kind != "job" && len(callable.Models) > 0 {
+			availability = "unknown: defaults unavailable"
+		}
+		list.Rows = append(list.Rows, map[string]string{"function": name, "availability": availability})
+		if availability == "available" && len(list.Next) < 2 {
 			list.Next = append(list.Next, "cozy run "+target.Package+"/"+name)
 		}
 	}

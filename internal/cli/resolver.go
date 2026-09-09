@@ -459,9 +459,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 			return empty, nil, problem
 		}
 		defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows)
-		for i := range models {
-			models[i].SharedSlots = sharedSlots(models[i], entrypoint, packageInterface.Entrypoints, defaults)
-		}
+		shareModelSlots(models, entrypoint, packageInterface.Entrypoints, defaults)
 	}
 	planID := ""
 	if len(models) == 0 {
@@ -818,38 +816,50 @@ func dedupe(in []string) []string {
 	return out
 }
 
-// sharedSlots names the sibling entrypoints' slots one selection also binds (h3a-018): a
-// slot of another entrypoint declaring the selected slot's model class, whose hub default
-// names the same model release and offers the selected lane — the same ladder for an
-// unpinned selection, a rung carrying the pinned lane for an explicit one. Those slots
-// construct the same object from the same bytes on every machine class, so the pod serves
-// them from one placement. Anything else — another class, another release, another
-// ladder — is its own construction and stays out.
-func sharedSlots(model orchestrator.ModelRef, own *launch.Entrypoint, all []launch.Entrypoint,
-	defaults map[string]hub.PackageBindingRow) []string {
-	class := ""
+// shareModelSlots binds only complete sibling constructions (h3a-018). Every slot
+// must have a default satisfied by an already-selected model; a partial sibling
+// would leave stranded selections that Runtime correctly refuses at preparation.
+func shareModelSlots(models []orchestrator.ModelRef, own *launch.Entrypoint, all []launch.Entrypoint,
+	defaults map[string]hub.PackageBindingRow) {
+	classes := make(map[string]string, len(own.Models))
 	for _, slot := range own.Models {
-		if slot.Path == model.Slot {
-			class = slot.Class
-		}
+		classes[slot.Path] = slot.Class
 	}
-	var out []string
+	for i := range models {
+		models[i].SharedSlots = nil
+	}
+siblingLoop:
 	for i := range all {
 		sibling := &all[i]
 		if sibling.Name == own.Name {
 			continue
 		}
+		selected := make(map[int][]string)
 		for _, slot := range sibling.Models {
 			row, bound := defaults[slot.Path]
-			if slot.Class != class || !bound || row.Model != model.Model || row.Release != model.Release ||
-				!ladderOffers(row.Ladder, model) {
-				continue
+			if !bound {
+				continue siblingLoop
 			}
-			out = append(out, slot.Path)
+			matched := false
+			for j, model := range models {
+				if slot.Class == classes[model.Slot] && row.Model == model.Model &&
+					row.Release == model.Release && ladderOffers(row.Ladder, model) {
+					selected[j] = append(selected[j], slot.Path)
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue siblingLoop
+			}
+		}
+		for j, slots := range selected {
+			models[j].SharedSlots = append(models[j].SharedSlots, slots...)
 		}
 	}
-	sort.Strings(out)
-	return out
+	for i := range models {
+		sort.Strings(models[i].SharedSlots)
+	}
 }
 
 // ladderOffers answers whether a sibling's ladder serves the selection: rung for rung the

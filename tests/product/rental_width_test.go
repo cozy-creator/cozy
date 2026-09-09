@@ -298,12 +298,8 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 	}
 }
 
-// TestDeclaredDegreesAreTheIntersectionOverEveryModelSlot reads the degrees out of a real
-// committed package interface — the published H3 document, with `sequence_parallel` added
-// to its slots exactly as packages-v2 #148 writes it — through the same closed-grammar
-// decoder an install uses. A group shards the WHOLE construction, so an entrypoint whose
-// slot declares nothing makes the package unshardable however loudly its sibling declares:
-// the answer is the intersection, and the empty intersection excludes every wide product.
+// A group shards the selected construction. Intersect all its model slots, while
+// keeping a separate sibling's unsupported slots out of that decision.
 func TestDeclaredDegreesAreTheIntersectionOverEveryModelSlot(t *testing.T) {
 	raw, err := os.ReadFile("testdata/h3/package-interface-1.1.2.json")
 	must(t, err)
@@ -341,14 +337,26 @@ func TestDeclaredDegreesAreTheIntersectionOverEveryModelSlot(t *testing.T) {
 		{"the published interface declares none", []string{"", ""}, nil},
 		{"both slots declare 2 and 4", []string{"[2,4]", "[2,4]"}, []int{2, 4}},
 		{"only the overlap survives", []string{"[2,4]", "[4,8]"}, []int{4}},
-		{"one silent slot makes the package unshardable", []string{"[2,4]", ""}, nil},
+		{"one silent slot makes the construction unshardable", []string{"[2,4]", ""}, nil},
 		{"no overlap declares nothing", []string{"[2]", "[4]"}, nil},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
-			got := declare(arm.declared...).SequenceParallelDegrees()
+			iface := declare(arm.declared...)
+			selected := launch.Entrypoint{}
+			for _, endpoint := range iface.Entrypoints {
+				selected.Models = append(selected.Models, endpoint.Models...)
+			}
+			got := selected.SequenceParallelDegrees()
 			if spell(got) != spell(arm.want) {
 				t.Fatalf("degrees = %v, want %v", got, arm.want)
 			}
 		})
+	}
+	iface := declare("[2,4]", "")
+	if got := spell(iface.Entrypoints[0].SequenceParallelDegrees()); got != "2,4" {
+		t.Fatalf("an unselected unshardable sibling restricted the normal function: %s", got)
+	}
+	if got := iface.Entrypoints[1].SequenceParallelDegrees(); len(got) != 0 {
+		t.Fatalf("the unshardable function inherited its sibling's degrees: %v", got)
 	}
 }

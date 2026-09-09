@@ -31,6 +31,7 @@ type JobFacts struct {
 	// Request is the exact callable schema used by the admission authority before
 	// the request enters the ordinary queue.
 	Request          Struct
+	Result           Struct
 	Assets           *AssetsSlot
 	RetainsArtifacts bool
 	// DescriptorID is `job_descriptor_id`: sha256 over the canonical bytes of
@@ -184,7 +185,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		outputs = append(outputs, output.OutputID)
 	}
 	facts := &JobFacts{
-		Name: function, Request: declared.Request, Assets: declared.Assets, DescriptorID: said.DescriptorID, Outputs: outputs,
+		Name: function, Request: declared.Request, Result: declared.Result, Assets: declared.Assets, DescriptorID: said.DescriptorID, Outputs: outputs,
 		WeightsOutputs:   weightsOutputs,
 		Publishes:        declared.Publishes,
 		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")) && !(f.CPUOrchestration && !f.SelfCallable[function] && len(declared.Models) == 0 && len(declared.WeightsOutputs) == 0),
