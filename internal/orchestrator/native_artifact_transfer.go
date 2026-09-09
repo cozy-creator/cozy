@@ -46,12 +46,8 @@ func (c *Orchestrator) artifactRoundtrip(ctx context.Context, worker string, com
 	}
 	select {
 	case result := <-pending.result:
-		if result.SafeCode != "" {
-			code := exit.Unavailable
-			if result.SafeCode == "native_artifact_refused" {
-				code = exit.Conflict
-			}
-			return nil, exit.Named(code, result.SafeCode, "%s", result.SafeDetail)
+		if problem := publication.ArtifactTransferRefusal(result.SafeCode, result.SafeDetail); problem != nil {
+			return nil, problem
 		}
 		return result, nil
 	case <-ctx.Done():
