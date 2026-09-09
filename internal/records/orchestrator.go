@@ -1780,9 +1780,10 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 	defer tx.Rollback()
 
 	var state, digest, assignedSession, assignedSpec string
-	err = tx.QueryRow(`SELECT state, terminal_digest, session_id, invocation_digest FROM attempts
+	var knownBody []byte
+	err = tx.QueryRow(`SELECT state, terminal_digest, session_id, invocation_digest, COALESCE(terminal_body,x'') FROM attempts
 		WHERE request_id=? AND attempt=?`, t.RequestID, t.Attempt).
-		Scan(&state, &digest, &assignedSession, &assignedSpec)
+		Scan(&state, &digest, &assignedSession, &assignedSpec, &knownBody)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, exit.New(exit.NotFound,
 			"terminal for %s#%d refused: no such assigned attempt", t.RequestID, t.Attempt).
@@ -1796,19 +1797,21 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 			"terminal for %s#%d refused: it closes %s, the assignment is %s",
 			t.RequestID, t.Attempt, short(t.InvocationDigest), short(assignedSpec))
 	}
+	if state == "terminal" || state == "closed" {
+		if digest != t.TerminalDigest || !bytes.Equal(knownBody, t.Body) {
+			return false, exit.New(exit.Conflict,
+				"%s#%d already closed with terminal %s; %s is a different body",
+				t.RequestID, t.Attempt, short(digest), short(t.TerminalDigest))
+		}
+		// A claimed peer can carry this already committed outcome after recovery.
+		// ACK its exact bytes without rewriting who actually executed it.
+		return false, nil
+	}
 	if assignedSession != t.SessionID {
 		return false, exit.New(exit.Conflict,
 			"terminal for %s#%d refused: session %s does not own that attempt row (%s does)",
 			t.RequestID, t.Attempt, t.SessionID, assignedSession).
 			WithRemedy("one writer per attempt row")
-	}
-	if state == "terminal" || state == "closed" {
-		if digest != t.TerminalDigest {
-			return false, exit.New(exit.Conflict,
-				"%s#%d already closed with terminal %s; %s is a different body",
-				t.RequestID, t.Attempt, short(digest), short(t.TerminalDigest))
-		}
-		return false, nil // exact replay: ack again, apply nothing
 	}
 	if t.ExpectedRequestState != "" {
 		var current string
@@ -1951,28 +1954,6 @@ func (s *Store) Closed(requestID string, attempt int64) *exit.Error {
 			requestID, attempt).Scan(&state); err != nil || state != "closed" {
 			return exit.New(exit.Conflict, "cannot close %s#%d from state %q", requestID, attempt, state)
 		}
-	}
-	return nil
-}
-
-// Recover marks an attempt the worker reported on Register as an OPEN OBLIGATION. While
-// it is open, NextOrdinal refuses for that request id — the whole point of the
-// recovered-journal handshake.
-// An already-acknowledged terminal stays closed: retained custody or a lost ACK
-// may require another reply, but cannot erase the owner's completed ACK decision.
-func (s *Store) Recover(requestID string, attempt int64, sessionID string) *exit.Error {
-	res, err := s.db.Exec(`UPDATE attempts SET
-		state=CASE WHEN state='closed' THEN 'closed' WHEN terminal_digest<>'' THEN 'terminal' ELSE 'recovered_open' END,
-		session_id=? WHERE request_id=? AND attempt=?
-		AND state IN ('preparing','offered','accepted','recovered_open','terminal','closed')`,
-		sessionID, requestID, attempt)
-	if err != nil {
-		return exit.Internalf("cannot record the recovered attempt %s#%d: %s", requestID, attempt, err)
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return exit.New(exit.NotFound,
-			"the worker reported a recovered attempt %s#%d this orchestrator never assigned",
-			requestID, attempt)
 	}
 	return nil
 }

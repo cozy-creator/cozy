@@ -23,7 +23,7 @@ import (
 func TestAssessmentPublicationReconcilesExactBytesAndFencesCanceledWrites(t *testing.T) {
 	report, err := os.ReadFile("testdata/assessment-v4.json")
 	must(t, err)
-	for _, mode := range []string{"normal", "lost-reply", "canceled", "wrong-readback", "changed-account"} {
+	for _, mode := range []string{"normal", "lost-reply", "canceled", "wrong-readback", "changed-account", "wrong-ack-verdict"} {
 		t.Run(mode, func(t *testing.T) {
 			digest := assessmentDigest(report)
 			checkpoint := childDigest("a")
@@ -58,7 +58,11 @@ func TestAssessmentPublicationReconcilesExactBytesAndFencesCanceledWrites(t *tes
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(map[string]any{"assessment": map[string]any{"checkpoint_id": checkpoint, "scope": "publisher_assessment", "report": map[string]any{"digest": digest, "length": len(report)}, "actor": "alice", "created_at": "fixture"}, "publisher_reported_verdict": "pass"})
+				verdict := "pass"
+				if mode == "wrong-ack-verdict" {
+					verdict = "fail"
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"assessment": map[string]any{"checkpoint_id": checkpoint, "scope": "publisher_assessment", "report": map[string]any{"digest": digest, "length": len(report)}, "actor": "alice", "created_at": "fixture", "verdict": verdict}, "publisher_reported_verdict": "pass"})
 			}))
 			defer server.Close()
 			client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "")
@@ -96,6 +100,10 @@ func TestAssessmentPublicationReconcilesExactBytesAndFencesCanceledWrites(t *tes
 				fatal(t, problem)
 				if result.Observation != "observed_convergence" || writes != 1 || calls != 1 {
 					t.Fatal("canceled retry issued another write instead of exact readback")
+				}
+			case "wrong-ack-verdict":
+				if problem == nil || writes != 1 {
+					t.Fatal("a conflicting stored verdict was accepted as an acknowledgement")
 				}
 			default:
 				if problem == nil || writes != 0 {

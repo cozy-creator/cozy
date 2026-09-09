@@ -22,13 +22,14 @@ func (c *Client) AttachAssessment(ctx context.Context, ref Ref, checkpoint, dige
 			} `json:"report"`
 			Actor   string `json:"actor"`
 			Created string `json:"created_at"`
+			Verdict string `json:"verdict"`
 		} `json:"assessment"`
 		Verdict string `json:"publisher_reported_verdict"`
 	}
 	if problem := c.do(ctx, call{method: http.MethodPut, path: path, auth: true, reason: "attach verified assessment", bodyBytes: raw, strict: true}, &out); problem != nil {
 		return problem
 	}
-	if out.Assessment.Checkpoint != checkpoint || out.Assessment.Scope != "publisher_assessment" || out.Assessment.Report.Digest != digest || out.Assessment.Report.Length != int64(len(raw)) || out.Verdict != expectedVerdict {
+	if out.Assessment.Checkpoint != checkpoint || out.Assessment.Scope != "publisher_assessment" || out.Assessment.Report.Digest != digest || out.Assessment.Report.Length != int64(len(raw)) || out.Assessment.Verdict != expectedVerdict || out.Verdict != expectedVerdict {
 		return exit.Internalf("checkpoint assessment readback changed its identity or scope")
 	}
 	var received []byte
