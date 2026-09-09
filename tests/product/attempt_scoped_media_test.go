@@ -23,8 +23,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-var scopedInputMediaAddress = flag.String("pod-media-address", "", "disposable Tensorhub scoped media receiver")
-var legacyInputMediaAddress = flag.String("legacy-pod-media-address", "", "disposable Tensorhub legacy media receiver")
+var podMediaProofAddress = flag.String("pod-media-proof-addr", "", "disposable Tensorhub media receiver for cross-repository proof")
+var legacyPodMediaProofAddress = flag.String("legacy-pod-media-proof-addr", "", "disposable legacy Tensorhub media receiver for cross-repository proof")
+
+func inputMediaHealth(w io.Writer, scoped *bool) {
+	revision := mediawire.ContractRev
+	_ = json.NewEncoder(w).Encode(struct {
+		mediawire.Health
+		Scoped *bool `json:"attempt_scoped_inputs,omitempty"`
+	}{Health: mediawire.Health{Service: mediawire.Service, ContractRev: &revision}, Scoped: scoped})
+}
 
 func inputMediaClient(t *testing.T, address string, budget time.Duration) *media.Client {
 	t.Helper()
@@ -33,38 +41,32 @@ func inputMediaClient(t *testing.T, address string, budget time.Duration) *media
 	return client
 }
 
-func writeInputMediaHealth(w http.ResponseWriter, scoped, declared bool) {
-	revision := mediawire.ContractRev
-	var capability *bool
-	if declared {
-		capability = &scoped
-	}
-	_ = json.NewEncoder(w).Encode(struct {
-		mediawire.Health
-		AttemptScopedInputs *bool `json:"attempt_scoped_inputs,omitempty"`
-	}{mediawire.Health{Service: mediawire.Service, ContractRev: &revision}, capability})
-}
-
 func TestMediaNegotiatesExistingAndScopedPeersBeforeBytes(t *testing.T) {
-	for _, capability := range []string{"", `,"attempt_scoped_inputs":false`, `,"attempt_scoped_inputs":true`} {
-		t.Run(fmt.Sprint(capability), func(t *testing.T) {
+	no, yes := false, true
+	for _, capability := range []*bool{nil, &no, &yes} {
+		name := "absent"
+		if capability != nil {
+			name = fmt.Sprint(*capability)
+		}
+		t.Run(name, func(t *testing.T) {
+			scoped := capability != nil && *capability
 			var writes atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet && r.URL.Path == "/v1/health" {
-					writeInputMediaHealth(w, strings.HasSuffix(capability, "true"), capability != "")
+					inputMediaHealth(w, capability)
 					return
 				}
 				writes.Add(1)
 				if r.Method == http.MethodPost {
 					_, countPresent := r.URL.Query()["output_count"]
-					if countPresent != strings.HasSuffix(capability, "true") || r.URL.Query().Get("max_bytes") != "1024" {
+					if countPresent != scoped || r.URL.Query().Get("max_bytes") != "1024" {
 						t.Errorf("wrong negotiated reservation: %s", r.URL)
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/outputs/attempt-7"})
 					return
 				}
 				wantPath := "/v1/inputs/attempt-7-payload"
-				if strings.HasSuffix(capability, "true") {
+				if scoped {
 					wantPath = "/v1/attempts/attempt-7/inputs/payload"
 				}
 				if r.Method != http.MethodPut || r.URL.Path != wantPath {
@@ -101,7 +103,8 @@ func TestScopedMediaFailureNeverFallsBackToUnscopedUpload(t *testing.T) {
 	var scoped, legacy atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/health" {
-			writeInputMediaHealth(w, true, true)
+			scoped := true
+			inputMediaHealth(w, &scoped)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/inputs/") {
@@ -211,7 +214,8 @@ func TestMediaInputRequiresExactReceipt(t *testing.T) {
 			t.Run(fmt.Sprintf("legacy=%t/%s", legacy, response), func(t *testing.T) {
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					if r.URL.Path == "/v1/health" {
-						writeInputMediaHealth(w, !legacy, true)
+						scoped := !legacy
+						inputMediaHealth(w, &scoped)
 						return
 					}
 					_, _ = io.Copy(io.Discard, r.Body)
@@ -231,9 +235,9 @@ func TestMediaInputRequiresExactReceipt(t *testing.T) {
 // This optional cross-repository proof dials an actual Tensorhub podmedia server
 // with a disposable ledger/cache. The address never points at a paid rental.
 func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
-	address := *scopedInputMediaAddress
+	address := *podMediaProofAddress
 	if address == "" {
-		t.Skip("requires disposable Tensorhub podmedia receiver at -pod-media-address")
+		t.Skip("requires disposable Tensorhub podmedia receiver at -pod-media-proof-addr")
 	}
 	client := inputMediaClient(t, address, 2*time.Second)
 	fatal(t, client.Health())
@@ -343,9 +347,9 @@ func inputDigest(data []byte) string { return fmt.Sprintf("sha256:%x", sha256.Su
 // retained rentals. The fixed test credential and disposable loopback receiver
 // keep this proof separate from live pods and their files.
 func TestLegacyInputsAgainstPodMedia(t *testing.T) {
-	address := *legacyInputMediaAddress
+	address := *legacyPodMediaProofAddress
 	if address == "" {
-		t.Skip("requires disposable old Tensorhub receiver at -legacy-pod-media-address")
+		t.Skip("requires disposable old Tensorhub receiver at -legacy-pod-media-proof-addr")
 	}
 	client := inputMediaClient(t, address, 2*time.Second)
 	fatal(t, client.Health())
