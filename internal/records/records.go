@@ -179,6 +179,12 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 			db.Close()
 			return nil, e
 		}
+	} else if version > schemaVersion {
+		db.Close()
+		return nil, exit.Named(exit.Conflict, "records_schema_newer",
+			"records database has schema %d; this Creator supports schema %d",
+			version, schemaVersion).
+			WithRemedy("upgrade Cozy Creator to a version that supports schema %d; keep %s in place", version, path)
 	} else if version != schemaVersion {
 		db.Close()
 		return nil, schemaReset(path,
