@@ -105,7 +105,7 @@ func TestReattachedProgressUsesRecordedStageBoundaries(t *testing.T) {
 	before := len(buf.String())
 	p.On(replay("accepted", 12*time.Second, 2, nil))
 	accepted := buf.String()[before:]
-	for _, want := range []string{"waiting for a rental machine · elapsed 12s · done", "running · waiting for stage updates"} {
+	for _, want := range []string{"waiting for a rental machine · elapsed 12s · done", "running · preparing request"} {
 		if !strings.Contains(accepted, want) {
 			t.Fatalf("replayed acceptance lacks %q: %q", want, accepted)
 		}
