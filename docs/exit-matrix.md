@@ -22,7 +22,7 @@ structured error document, but deliberately projects shell exits onto three outc
 | 9 | unavailable | socket / local server / hub unreachable |
 | 10 | deadline | `--timeout` or request deadline exceeded |
 | 11 | failed | attempt/job failure terminal (remedy verbatim) |
-| 12 | canceled | canceled terminal |
+| 12 | cancelled | cancelled terminal |
 | 13 | conflict | target exists / concurrent writer / failed replacement kept the working state |
 | 14 | capacity | no proven plan fits BELOW the physical floor — quantified shortfall (needed N, had M, short by N−M for X); fires only after the ladder's deepest authorized rung, never exit 6, never a silent 0 |
 

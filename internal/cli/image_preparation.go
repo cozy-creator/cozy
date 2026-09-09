@@ -27,7 +27,7 @@ func imagePreparer(ctx *Context) launch.ImagePreparer {
 			var problem *exit.Error
 			tool, problem = launch.ImagePreparationTool(ctx.Cfg.Home, ctx.Cfg.Tool())
 			if callCtx.Err() != nil {
-				return "", exit.New(exit.Canceled, "image preparation was canceled")
+				return "", exit.New(exit.Canceled, "image preparation was cancelled")
 			}
 			if problem != nil {
 				unavailable = true
@@ -35,7 +35,7 @@ func imagePreparer(ctx *Context) launch.ImagePreparer {
 			}
 			profile, problem = tool.ImagePreparationProfile(callCtx)
 			if callCtx.Err() != nil {
-				return "", exit.New(exit.Canceled, "image preparation was canceled")
+				return "", exit.New(exit.Canceled, "image preparation was cancelled")
 			}
 			if problem != nil || !profile.Qualified {
 				unavailable = true

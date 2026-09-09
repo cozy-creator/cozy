@@ -651,7 +651,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 	for {
 		if lifecycle.Err() != nil {
 			return hub.Rental{}, exit.New(exit.Canceled,
-				"rental %s acquisition was canceled", id)
+				"rental %s acquisition was cancelled", id)
 		}
 		hctx, cancel := rentalCallContext(deadline)
 		r, e := c.Rental(hctx, id)
@@ -670,7 +670,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 			select {
 			case <-lifecycle.Done():
 				return hub.Rental{}, exit.New(exit.Canceled,
-					"rental %s acquisition was canceled", id)
+					"rental %s acquisition was cancelled", id)
 			case <-time.After(pollCadence):
 			}
 			continue
@@ -715,7 +715,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		select {
 		case <-lifecycle.Done():
 			return hub.Rental{}, exit.New(exit.Canceled,
-				"rental %s acquisition was canceled", id)
+				"rental %s acquisition was cancelled", id)
 		case <-time.After(pollCadence):
 		}
 	}
@@ -916,7 +916,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU),
-			"state": r.State, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
+			"state": humanRentalState(r.State), "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(idle.Running), "queued": strconv.Itoa(idle.Queued),
 			"idle":   idleCell(idle, grace),
 			"rental": r.ID, "bought for": orNone(boughtFor[r.ID]),
