@@ -21,6 +21,7 @@ jobs:
       - run: python3 scripts/rebank-h3.py --tfs target/debug/tfs
       - run: python3 scripts/rebank-h3-pdd.py --tfs target/debug/tfs
       - run: python3 scripts/rebank-sdxl.py --tfs target/debug/tfs
+      - run: python3 scripts/rebank-civitai-sdxl.py --tfs target/debug/tfs
       - run: python3 scripts/rebank-instruments.py --tfs target/debug/tfs
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
