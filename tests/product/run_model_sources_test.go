@@ -67,7 +67,7 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, PriceUSDMicrosPerHour: 100_000, BaseWorkerProfile: "python3.12-cpu-linux-x86"}})
 	})
-	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`[]`)) })
+	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"rentals":[]}`)) })
 	mux.HandleFunc("POST /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -286,5 +286,28 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 	fatal(t, problem)
 	if replayed.ID != row.ID || replayed.BodyDigest != row.BodyDigest {
 		t.Fatal("replay changed request identity")
+	}
+}
+
+func TestCatalogCheckpointReferenceRoundTripsThroughRun(t *testing.T) {
+	root, _, _, digest, _ := runModelCatalog(t)
+	code, out := runCozy(t, root, "model", "info", "proof/source", "--json")
+	var document struct {
+		Releases []struct {
+			Lanes []struct {
+				Ref string `json:"checkpoint_ref"`
+			} `json:"lanes"`
+		} `json:"releases"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Releases) != 1 || len(document.Releases[0].Lanes) != 1 {
+		t.Fatalf("catalog info unavailable: %d %s", code, out)
+	}
+	ref := document.Releases[0].Lanes[0].Ref
+	if ref != "proof/source#"+digest {
+		t.Fatalf("catalog emitted unsupported checkpoint syntax: %s", ref)
+	}
+	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "steps=7", "--model.dits="+ref, "--model.shared="+ref, "--rental-only", "--dry-run", "--json")
+	if code != 0 || !strings.Contains(out, `"hub_checkpoint":true`) {
+		t.Fatalf("copied catalog ref did not resolve checkpoint: %d %s", code, out)
 	}
 }

@@ -360,3 +360,42 @@ func TestDeclaredDegreesAreTheIntersectionOverEveryModelSlot(t *testing.T) {
 		t.Fatalf("the unshardable function inherited its sibling's degrees: %v", got)
 	}
 }
+
+func TestJobInputModelsNeverPinWeightlessPreparationToAGroup(t *testing.T) {
+	pod := &fakePod{serve: true, jobReady: true, deviceCount: 4, preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
+		placement := podPlacement(download, pkg, release, "")
+		placement.Entrypoints = nil
+		placement.Models = []*pb.Model{{Id: "job-source", Repo: "source/h3", Version: "1.0.0", Lane: "bf16", Manifest: &pb.Ref{Digest: sha256Of([]byte("job-source")), Length: 164}}}
+		return placement
+	}}
+	root := t.TempDir()
+	connection, certPath := startFakePod(t, root, pod)
+	o := hostOwner(t, "job-input-wide-prepare", rentalWidthWiring(t, pod, connection, certPath, 4))
+	submitPublishedRentalJob(t, o, "cozy/h3-package", "1.0.7", "sha256:"+strings.Repeat("35", 32), "job-input-wide-prepare")
+	waitUntil(t, "weightless package preparation followed by ordinary job directive", func() bool { pod.mu.Lock(); defer pod.mu.Unlock(); return len(pod.jobDirectives) > 0 })
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	prepared := false
+	for _, desired := range pod.desired {
+		set := desired.GetPlacementSet()
+		if set == nil {
+			continue
+		}
+		document, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+		must(t, err)
+		if len(document.List("placements")) == 0 {
+			continue
+		}
+		placement := document.List("placements")[0]
+		if len(placement.List("models")) != 1 || len(placement.List("entrypoints")) != 0 {
+			t.Fatal("fixture omitted the actual job-only model metadata shape")
+		}
+		if len(set.DevicePins) > 0 {
+			t.Fatalf("job input inventory became a CP serving group: %+v", set.DevicePins)
+		}
+		prepared = true
+	}
+	if !prepared || pod.jobDirectives[0].DeviceCount > 1 {
+		t.Fatal("ordinary job did not follow ungrouped package preparation")
+	}
+}

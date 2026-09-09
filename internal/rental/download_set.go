@@ -68,13 +68,13 @@ func DownloadSet(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRe
 			}
 		}
 		if row == nil || strings.TrimSpace(row.Model) != row.Model || row.Model == "" ||
-			strings.TrimSpace(row.Release) != row.Release || row.Release == "" ||
+			strings.TrimSpace(row.Release) != row.Release ||
 			strings.TrimSpace(row.Package) != row.Package || !packageSelected ||
 			strings.TrimSpace(row.Slot) != row.Slot || row.Slot == "" ||
-			strings.TrimSpace(row.Lane) != row.Lane || row.Lane == "" ||
+			strings.TrimSpace(row.Lane) != row.Lane || (row.Release == "") != (row.Lane == "") ||
 			digestErr != nil || key <= prior {
 			return nil, exit.Named(exit.Validation, "rental.download_set_model_invalid",
-				"download models must be complete, unique logical refs with exact lanes and manifests")
+				"download models need unique exact manifests and a release/lane pair or neither")
 		}
 		prior = key
 	}
