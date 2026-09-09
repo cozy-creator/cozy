@@ -1492,6 +1492,12 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			return 0, exit.Named(exit.Conflict, "serving.placement_evidence_absent", "serving dispatch needs the exact prepared model bindings")
 		}
 	}
+	if req.AttentionKernel != "" && w.wireMinor < pb.AttentionKernelWireMinor {
+		return 0, exit.Named(exit.Unavailable, "attention_kernel_protocol_unsupported",
+			"worker protocol minor %d cannot carry attention-kernel requests; need minor %d",
+			w.wireMinor, pb.AttentionKernelWireMinor).
+			WithRemedy("select a worker image with protocol minor %d or newer", pb.AttentionKernelWireMinor)
+	}
 	spec := &pb.InvocationSpec{
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
