@@ -64,17 +64,20 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 	}
 	defer store.Close()
 	defer writer.Unlock()
-	intake, problem := prepareChildIntake(ctx, pack, layout, store)
-	if problem != nil {
-		return Target{}, nil, problem
-	}
-	defer intake.Close()
+	var intake *childIntake
 	var result *install.Result
 	problem = packagePublishStage(ctx, "Preparing private script environment", func() *exit.Error {
 		var problem *exit.Error
+		intake, problem = prepareChildIntake(ctx, pack, layout, store)
+		if problem != nil {
+			return problem
+		}
 		result, problem = intake.Install()
 		return problem
 	})
+	if intake != nil {
+		defer intake.Close()
+	}
 	if problem != nil {
 		return Target{}, nil, problem
 	}
