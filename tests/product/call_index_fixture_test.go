@@ -41,6 +41,7 @@ func restorePriorCallIndexBounds(t *testing.T, db *sql.DB) {
 		must(t, rows.Close())
 		_, err = db.Exec(`ALTER TABLE ` + table + ` RENAME TO prior_call_bound`)
 		must(t, err)
+		ddl = strings.Replace(ddl, ",\n  requested_gpus INTEGER NOT NULL DEFAULT 0 CHECK(requested_gpus>=0 AND requested_gpus<=4294967295)", "", 1)
 		ddl = strings.Replace(ddl, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)
 		_, err = db.Exec(strings.ReplaceAll(ddl, "call_index<4294967296", "call_index<32"))
 		must(t, err)
