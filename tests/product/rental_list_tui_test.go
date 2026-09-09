@@ -186,7 +186,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 		}
 	}
 	if row["machine"] != "sparrow" || row["state"] != "ready" || row["rental_id"] != "rental-tui" ||
-		row["queued"] != float64(0) || row["hourly_rate_usd_micros"] != float64(100_000) ||
+		row["running"] != float64(0) || row["queued"] != float64(0) || row["hourly_rate_usd_micros"] != float64(100_000) ||
 		row["accelerator_count"] != float64(1) ||
 		row["idle_s"] == nil || row["release_due_at"] == "" {
 		t.Fatalf("JSON row is not the live idle truth: %s", out)

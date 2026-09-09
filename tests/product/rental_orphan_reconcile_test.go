@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -69,9 +70,12 @@ func TestRentalListNamesMachinesThisHostNeverRecorded(t *testing.T) {
 	if !strings.Contains(out, "Machines this account is billed for that this host has no record of: 1") {
 		t.Fatalf("the board does not distinguish an unrecorded machine from a recorded one\n%s", out)
 	}
-	// SEEING A RENTAL YOU CANNOT END IS BARELY BETTER THAN NOT SEEING IT.
-	if !strings.Contains(out, "cozy rental end") {
-		t.Fatalf("the board names an unrecorded machine without saying how to end it\n%s", out)
+	// This controller cannot infer inactivity from its missing local history.
+	if !strings.Contains(out, "activity on those machines is unknown") || strings.Contains(out, "cozy rental end") {
+		t.Fatalf("the board treats missing local activity as a reason to end a machine\n%s", out)
+	}
+	if code, selected := runCozy(t, root, "rental", "list", "--fields=machine,running,queued"); code != 0 || !regexp.MustCompile(`(?m)^stiyl\s+—\s+—\s*$`).MatchString(selected) {
+		t.Fatalf("unknown activity became zero in the table [exit %d]\n%s", code, selected)
 	}
 	// And the row itself says which kind it is, in the table a person reads: a lead
 	// line saying "1 of them" over rows that all look alike names a count, not a machine.
@@ -104,6 +108,14 @@ func TestRentalListNamesMachinesThisHostNeverRecorded(t *testing.T) {
 		row["state"] != "booting" || row["recorded"] != false ||
 		row["hourly_rate_usd_micros"] != float64(3_190_000) {
 		t.Fatalf("the unrecorded row is not the hub's truth: %s", out)
+	}
+	for _, field := range []string{"running", "queued", "idle_s", "idle_since_at", "release_due_at"} {
+		if _, present := row[field]; present {
+			t.Fatalf("unobserved %s was reported as a fact: %s", field, out)
+		}
+	}
+	if stand.releases("pr-1111111111111111stiy") != 0 {
+		t.Fatal("listing released a rental owned outside this controller")
 	}
 	// Uptime for a pod with no local `rented_at` can only come from the hub's own
 	// clock; without it nobody can say how long the machine has been costing money.
@@ -215,7 +227,7 @@ func TestAHubWithNoListingIsNotAnEmptyFleet(t *testing.T) {
 // that evidence is worse than the leak.
 //
 // So the daemon's answer is an ALARM, not a reaper: it says the machine, its rate and
-// the word that ends it, once, and leaves the decision to the person paying.
+// its unknown activity, once, and leaves control with the person paying.
 func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-orphan-daemon")
 	must(t, os.RemoveAll(root))
@@ -248,7 +260,7 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 
 	startDaemonProcess(t, root)
 	awaitRentalGone(t, store, "rental-orphan-owned", 20*time.Second, logPath)
-	awaitLog(t, logPath, "this host holds no record of it; end it with `cozy rental end takemikazuchi`",
+	awaitLog(t, logPath, "this host holds no record of it; activity is unknown to this controller",
 		20*time.Second)
 
 	// The reaper ran, took the machine it owns, and left the one it cannot account for.
@@ -260,7 +272,7 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 	}
 	// Said ONCE, however many sweeps pass over it.
 	log, _ := os.ReadFile(logPath)
-	if strings.Count(string(log), "end it with `cozy rental end takemikazuchi`") != 1 {
+	if strings.Count(string(log), "this host holds no record of it; activity is unknown to this controller") != 1 {
 		t.Fatalf("the unrecorded-spend alarm repeats on every sweep\n%s", tail(logPath))
 	}
 }
