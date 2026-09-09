@@ -95,7 +95,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 	}
 
 	// PIPED HUMAN: sparse append-only lines — plain bytes, one line per tenth, each line
-	// a stable spelling of steps + percentage + elapsed. Never the full tick stream.
+	// a stable spelling of steps + percentage + measured speed/ETA + elapsed.
+	// Never the full tick stream.
 	code, _, stderr := runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=3", "delay_ms=2500", "--await")
 	if code != 0 {
@@ -104,7 +105,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	if strings.ContainsAny(stderr, "\r\033") {
 		t.Fatalf("piped progress carries terminal control bytes\n%q", stderr)
 	}
-	stepLine := regexp.MustCompile(`^  tile_steps (\d+)/100 · (\d+)% stage · (\d+)% overall · elapsed [0-9ms.]+$`)
+	stepLine := regexp.MustCompile(`^  tile_steps (\d+)/100 · (\d+)% stage · [0-9.]+s/step avg · ETA ~[0-9hms.]+ · (\d+)% overall · elapsed [0-9ms.]+$`)
 	previous, matched := -1, 0
 	for _, line := range strings.Split(stderr, "\n") {
 		if !strings.Contains(line, "tile_steps") {

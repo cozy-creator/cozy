@@ -1358,6 +1358,7 @@ func (p *RunProgress) sparse(e localapi.Event) {
 	if facts.hasStageFraction {
 		line += fmt.Sprintf(" · %.0f%% stage", facts.stageFraction*100)
 	}
+	line += facts.timing()
 	if facts.hasOverall {
 		line += fmt.Sprintf(" · %.0f%% overall", facts.overallFraction*100)
 	}
