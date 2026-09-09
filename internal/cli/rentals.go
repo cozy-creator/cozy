@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -93,27 +94,52 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
-	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	line, sku, e := fleet.admit(skuName)
+	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
+	if len(operationKey) > 200 {
+		return exit.Usagef("--idempotency-key is %d bytes; the hub admits at most 200", len(operationKey))
+	}
+	operationKey = requestKey(operationKey)
+	existing, e := st.RentalOperation(operationKey)
 	if e != nil {
 		return e
 	}
-	fmt.Fprintln(ctx.Err, line)
+	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
+	var sku hub.RentalSKU
+	if existing != nil {
+		// An accepted operation already owns its quote and provider obligation.
+		// Resuming it neither needs current stock nor admits a second purchase.
+		sku.PriceUSDMicrosPerHour = existing.HourlyRateUSDMicros
+	} else {
+		line, admitted, problem := fleet.admit(skuName)
+		if problem != nil {
+			return problem
+		}
+		sku = admitted
+		if !ctx.Mode().JSON {
+			fmt.Fprintln(ctx.Err, line)
+		}
+	}
 
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return problem
 	}
 	ctx.Daemon = state
-	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
-	if len(operationKey) > 200 {
-		return exit.Usagef("--idempotency-key is %d bytes; the hub admits at most 200", len(operationKey))
-	}
-	operationKey = requestKey(operationKey)
+	progress := NewProgress(ctx, false, time.Now())
+	completed := false
+	defer func() {
+		if !completed {
+			progress.On(localapi.Event{Type: "request.failed"})
+		}
+		progress.Done()
+	}()
+	progress.rentalAcquisition(hub.Rental{State: "pending_acquisition",
+		AcceleratorModel: sku.AcceleratorModel, AcceleratorCount: sku.AcceleratorCount,
+		HourlyRateUSDMicros: sku.PriceUSDMicrosPerHour})
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
-		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", nil, rentalRates(fleet.unrecorded))
+		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", progress.rentalAcquisition, rentalRates(fleet.unrecorded))
 	if e != nil {
 		return e
 	}
@@ -132,6 +158,9 @@ func handleRent(ctx *Context) *exit.Error {
 	if _, e := local.EnsureRental(attachable.ID); e != nil {
 		return e.WithRemedy("the paid rental is attached on this host; keep `cozy run list` running and resume with the same --idempotency-key")
 	}
+	progress.On(localapi.Event{Type: "request.completed"})
+	progress.Done()
+	completed = true
 	ready := attachable
 	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release",
 		idleReleaseNote(ctx.Cfg.RentalsIdleRelease)}
@@ -149,6 +178,7 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "media", V: ready.MediaAddress},
 		{K: "gpu", V: skuName},
 		{K: "accelerator", V: ready.AcceleratorModel},
+		{K: "base_worker_image_digest", V: ready.BaseWorkerImageDigest},
 		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
 	}
 	if ready.Development {
@@ -210,6 +240,16 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			"rental operation %s is %s and still names rental %s", operationKey, existing.State, existing.RentalID).
 			WithRemedy("release the existing rental before starting another operation").
 			WithNext("cozy rental end " + existing.RentalID)
+	}
+	if existing != nil {
+		request, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
+		if problem != nil {
+			return records.Rental{}, hub.Rental{}, false, problem
+		}
+		if request.SKU != skuName {
+			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
+				"rental operation %s names SKU %s, not %s", operationKey, request.SKU, skuName)
+		}
 	}
 	var workload hub.DeclaredWorkload
 	var development *hub.RentalDevelopment
@@ -590,7 +630,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 			return hub.Rental{}, e
 		}
 		if e != nil {
-			if e.Message != said {
+			if e.Message != said && !ctx.Mode().JSON {
 				said = e.Message
 				fmt.Fprintf(ctx.Err, "  hub: %s; retrying\n", e.Message)
 			}
@@ -635,7 +675,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		}
 		// The hub's own words about what is happening, printed when they CHANGE. A line
 		// per poll would be a progress bar for someone else's work.
-		if r.Detail != "" && r.Detail != said {
+		if ctx.Mode().Full && !ctx.Mode().JSON && r.Detail != "" && r.Detail != said {
 			said = r.Detail
 			fmt.Fprintf(ctx.Err, "  %s: %s\n", r.State, r.Detail)
 		}

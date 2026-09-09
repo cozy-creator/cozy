@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +63,60 @@ func TestProgressWatchReconnectsWithoutRestartingControl(t *testing.T) {
 	pod.mu.Unlock()
 	if snapshots != 1 {
 		t.Fatalf("progress-only disconnect restarted control: %d snapshots", snapshots)
+	}
+}
+
+func TestRoundedCountedProgressSurvivesLossyTransport(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	frames := make(chan map[string]any, 1)
+	pod := &fakePod{controlKey: public}
+	pod.watchProgress = func(open *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
+		for seq := uint64(1); ; seq++ {
+			select {
+			case fields := <-frames:
+				data, err := json.Marshal(map[string]any{"type": "progress", "payload": fields})
+				if err != nil {
+					return err
+				}
+				if err := stream.Send(&pb.AttemptProgress{
+					RecordOwnerEpoch: open.RecordOwnerEpoch, ControlStreamEpoch: open.ControlStreamEpoch,
+					WorkerBootId: open.WorkerBootId, RequestId: "rounded-progress", AttemptOrdinal: 1,
+					Seq: seq, Data: data,
+				}); err != nil {
+					return err
+				}
+			case <-stream.Context().Done():
+				return nil
+			}
+		}
+	}
+	connection, _ := startFakePod(t, t.TempDir(), pod)
+	o := hostOwner(t, "rounded-progress", rentalWiring(connection, private))
+	_, _, _, e := o.c.EnsureRental(podRental)
+	fatal(t, e)
+
+	// These are Runtime's six-decimal fractions. The 2 -> 5 jump drops two
+	// frames: its 42s interval represents one step, while three steps advanced.
+	for _, position := range []int64{0, 1, 2, 5, 18} {
+		fraction := math.Round(float64(position)/30*1e6) / 1e6
+		frames <- map[string]any{"stage": "denoise", "position": position, "total": 30,
+			"stage_fraction": fraction, "overall_fraction": fraction, "step_ms": 42000}
+		waitUntil(t, "rounded work coordinate", func() bool {
+			progress, ok := o.c.LatestProgress("rounded-progress", 1)
+			return ok && progress.Position != nil && *progress.Position == position
+		})
+		progress, _ := o.c.LatestProgress("rounded-progress", 1)
+		if progress.StageFraction == nil || *progress.StageFraction != float64(position)/30 {
+			t.Fatalf("counted fraction was not derived from its exact coordinates: %+v", progress)
+		}
+		if position > 0 {
+			want := (30 - position) * 42000
+			if !progress.Estimated || math.Abs(float64(progress.RemainingMS-want)) > 20 {
+				t.Fatalf("ETA priced coalesced steps as one interval: position=%d got=%d want=%d",
+					position, progress.RemainingMS, want)
+			}
+		}
 	}
 }
 

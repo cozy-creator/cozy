@@ -92,8 +92,9 @@ type Rental struct {
 	// the same class of fact the hub already publishes inside RentalFailure — a provider
 	// lifecycle fact the hub observed — and carry no acquisition identity of their own.
 	// Blank whenever the hub has not observed the pod yet, or is older than the field.
-	ProviderState  string
-	ContainerState string
+	ProviderState         string
+	ContainerState        string
+	BaseWorkerImageDigest string
 	// CreatedAt is when the hub opened the rental, which is when it began billing.
 	// It is how long a pod this host holds no record of has been costing money —
 	// there is no local `rented_at` for a rental the records never saw. RFC 3339 as
@@ -145,26 +146,27 @@ func (r Rental) HoldsMediaHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	Development         bool           `json:"development,omitempty"`
-	SSHAddress          string         `json:"ssh_address,omitempty"`
-	ID                  string         `json:"rental_id"`
-	Name                string         `json:"name"`
-	State               string         `json:"state"`
-	AcceleratorModel    string         `json:"requested_accelerator_model"`
-	AcceleratorCount    int            `json:"accelerator_count"`
-	WorkerAddress       string         `json:"worker_address"`
-	CertPEM             string         `json:"cert_pem"`
-	Detail              string         `json:"detail"`
-	Failure             *RentalFailure `json:"failure"`
-	MediaAddress        string         `json:"media_address"`
-	WorkerID            string         `json:"worker_id"`
-	WorkerBootID        string         `json:"worker_boot_id"`
-	CreatorPublicKey    string         `json:"creator_public_key"`
-	MediaTokenSHA256    []string       `json:"media_token_sha256"`
-	HourlyRateUSDMicros int64          `json:"hourly_rate_usd_micros"`
-	ProviderState       string         `json:"provider_state,omitempty"`
-	ContainerState      string         `json:"container_state,omitempty"`
-	CreatedAt           string         `json:"created_at,omitempty"`
+	Development           bool           `json:"development,omitempty"`
+	SSHAddress            string         `json:"ssh_address,omitempty"`
+	ID                    string         `json:"rental_id"`
+	Name                  string         `json:"name"`
+	State                 string         `json:"state"`
+	AcceleratorModel      string         `json:"requested_accelerator_model"`
+	AcceleratorCount      int            `json:"accelerator_count"`
+	WorkerAddress         string         `json:"worker_address"`
+	CertPEM               string         `json:"cert_pem"`
+	Detail                string         `json:"detail"`
+	Failure               *RentalFailure `json:"failure"`
+	MediaAddress          string         `json:"media_address"`
+	WorkerID              string         `json:"worker_id"`
+	WorkerBootID          string         `json:"worker_boot_id"`
+	CreatorPublicKey      string         `json:"creator_public_key"`
+	MediaTokenSHA256      []string       `json:"media_token_sha256"`
+	HourlyRateUSDMicros   int64          `json:"hourly_rate_usd_micros"`
+	ProviderState         string         `json:"provider_state,omitempty"`
+	ContainerState        string         `json:"container_state,omitempty"`
+	BaseWorkerImageDigest string         `json:"base_worker_image_digest,omitempty"`
+	CreatedAt             string         `json:"created_at,omitempty"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -193,12 +195,13 @@ func (w wireRental) rental() Rental {
 		Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, Failure: w.Failure, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
-		CreatorPublicKey:    w.CreatorPublicKey,
-		MediaTokenSHA256:    w.MediaTokenSHA256,
-		HourlyRateUSDMicros: w.HourlyRateUSDMicros,
-		ProviderState:       w.ProviderState,
-		ContainerState:      w.ContainerState,
-		CreatedAt:           w.CreatedAt,
+		CreatorPublicKey:      w.CreatorPublicKey,
+		MediaTokenSHA256:      w.MediaTokenSHA256,
+		HourlyRateUSDMicros:   w.HourlyRateUSDMicros,
+		ProviderState:         w.ProviderState,
+		ContainerState:        w.ContainerState,
+		BaseWorkerImageDigest: w.BaseWorkerImageDigest,
+		CreatedAt:             w.CreatedAt,
 	}
 }
 

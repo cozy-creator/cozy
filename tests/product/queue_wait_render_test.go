@@ -72,6 +72,20 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 	}
 	p.Done()
 
+	// Redirecting the same progress retains the measured stage timing, without
+	// terminal control bytes or a separate estimate from the human formatter.
+	p, buf = progressSink(output.Mode{Human: true}, false)
+	p.On(frame(0.50, 0.10, 50))
+	if got := buf.String(); !strings.Contains(got, "tile_steps 50/100 · 50% stage · 0.02s/step avg · ETA ~1s · 10% overall") ||
+		strings.ContainsAny(got, "\r\033") {
+		t.Fatalf("redirected progress dropped measured timing: %q", got)
+	}
+	p.On(frame(0.60, 0.20, 60))
+	if got := buf.String(); !strings.Contains(got, "tile_steps 60/100 · 60% stage · 0.02s/step avg · ETA ~0.8s · 20% overall") {
+		t.Fatalf("redirected progress did not advance its stage ETA: %q", got)
+	}
+	p.Done()
+
 	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
 	p.On(localapi.Event{Type: "request.progress", RequestID: "req-stage", Attempt: 1,
 		Payload: map[string]any{"value": map[string]any{
@@ -82,6 +96,22 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 		t.Fatalf("stage-only progress was presented as whole-job progress: %q", got)
 	}
 	p.Done()
+}
+
+func TestProgressOverallETAAccountsForCoalescedSteps(t *testing.T) {
+	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	t.Cleanup(p.Done)
+	for _, position := range []float64{3, 6} {
+		p.On(localapi.Event{Type: "request.progress", RequestID: "coalesced-progress", Attempt: 1,
+			Payload: map[string]any{"value": map[string]any{
+				"stage": "denoise", "position": position, "total": float64(30),
+				"stage_fraction": position / 30, "overall_fraction": position / 30,
+				"step_ms": float64(42000),
+			}}})
+	}
+	if got := buf.String(); !strings.Contains(got, "overall 20% · ETA ~16m48s") {
+		t.Fatalf("whole-job ETA charged one interval to three completed steps: %q", got)
+	}
 }
 
 func TestWaitLinesAreStageHonest(t *testing.T) {

@@ -1241,6 +1241,8 @@ type RunProgress struct {
 	rawJSON         bool
 	mu              sync.Mutex
 	last            string
+	rentalLine      string
+	placementLine   string
 	closed          bool
 	began           time.Time
 	stepStage       string
@@ -1255,9 +1257,10 @@ type RunProgress struct {
 	overallSeconds  float64
 
 	// The sparse lane's memory: which tenth of which stage was last appended, and when.
-	sparseStage  string
-	sparseDecile int
-	sparseAt     time.Time
+	sparseStage   string
+	sparseDecile  int
+	sparseAt      time.Time
+	sparseStarted time.Time
 
 	// Injected clock and measure, so tests drive the REAL renderer deterministically.
 	now   func() time.Time
@@ -1284,6 +1287,17 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	kind := strings.TrimPrefix(e.Type, "request.")
+	if !p.ctx.Mode().Full && (kind == "rentals" || kind == "placement") {
+		p.rentalNotice(e)
+		if kind != "placement" || !waitingPlacement(e.Payload) {
+			return true
+		}
+		// The placement record remains unchanged on the wire. Its attaching verdict
+		// is an ordinary rental wait on the human progress surface.
+		e.Type = "request.parked"
+		e.Payload = map[string]any{"wait": orchestrator.WaitRental}
+	}
 	if strings.TrimPrefix(e.Type, "request.") == "progress" && p.progressAttempt != e.Attempt {
 		if p.progressAttempt != 0 && p.ctx.Mode().Color && !p.ctx.Mode().Full {
 			p.finishLive("retrying", eventTime(e))
@@ -1327,6 +1341,22 @@ func eventTime(e localapi.Event) time.Time {
 // non-progress status line once, and pass step telemetry only on a stage change, on
 // each new tenth of the work, or after five quiet seconds.
 func (p *RunProgress) sparse(e localapi.Event) {
+	kind := strings.TrimPrefix(e.Type, "request.")
+	if kind == "phase" {
+		p.sparsePhase(e)
+		return
+	}
+	if kind == "queued" || kind == "parked" {
+		line := HumanWaitLine(e.Payload)
+		if line != p.sparseStage {
+			p.sparseStarted = eventTime(e)
+		} else if p.now().Sub(p.sparseAt) < 5*time.Second {
+			return
+		}
+		p.sparseStage, p.sparseAt = line, p.now()
+		p.appendOnce(line + " · elapsed " + shortDuration(max(p.now().Sub(p.sparseStarted), 0)))
+		return
+	}
 	if strings.TrimPrefix(e.Type, "request.") != "progress" {
 		p.appendOnce(progressLine(e, false))
 		return
@@ -1358,6 +1388,7 @@ func (p *RunProgress) sparse(e localapi.Event) {
 	if facts.hasStageFraction {
 		line += fmt.Sprintf(" · %.0f%% stage", facts.stageFraction*100)
 	}
+	line += facts.timing()
 	if facts.hasOverall {
 		line += fmt.Sprintf(" · %.0f%% overall", facts.overallFraction*100)
 	}
@@ -1399,8 +1430,10 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	position, positionOK := number(fields["position"])
 	total, totalOK := number(fields["total"])
 	stepMS, stepOK := number(fields["step_ms"])
+	previousPosition := p.stepPosition
 	if name != "" && name != p.stepStage {
 		p.stepStage, p.stepSeconds, p.stepSamples, p.stepPosition = name, 0, 0, -1
+		previousPosition = -1
 	}
 	if stepOK && stepMS >= 0 {
 		if stepMS > 0 && (!positionOK || position > p.stepPosition) {
@@ -1434,8 +1467,15 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 			return facts, false
 		}
 		if p.overallSeen && overallFraction > p.overallFraction && stepOK && stepMS > 0 {
+			elapsed := stepMS / 1000
+			if positionOK {
+				// A coalesced frame carries the last step's interval, not the
+				// elapsed time for every step since the previous coordinate.
+				advanced := position - math.Max(0, previousPosition)
+				elapsed *= math.Max(0, advanced)
+			}
 			p.overallDelta += overallFraction - p.overallFraction
-			p.overallSeconds += stepMS / 1000
+			p.overallSeconds += elapsed
 		}
 		p.overallSeen, p.overallFraction = true, overallFraction
 	}

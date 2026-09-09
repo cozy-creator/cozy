@@ -9,6 +9,8 @@ import (
 	"golang.org/x/text/width"
 
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
@@ -59,7 +61,8 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		cause, _ := e.Payload["wait"].(string)
 		capacity := cause == "slot_busy" || cause == "queue_ahead"
 		if strings.HasPrefix(p.terminal.key, "stage:") ||
-			(strings.HasPrefix(p.terminal.key, "phase:") && !capacity) {
+			(strings.HasPrefix(p.terminal.key, "phase:") && !capacity &&
+				!(cause == orchestrator.WaitRental && p.terminal.key == "phase:rental")) {
 			return
 		}
 		key = "wait"
@@ -71,15 +74,6 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		}
 		rows = []string{"  running · waiting for stage updates"}
 	case "dispatched", "submitted", "metric", "log":
-		return
-	case "rentals", "placement":
-		line, _ := e.Payload["line"].(string)
-		if line != "" && line != p.last {
-			p.eraseLive()
-			fmt.Fprintln(p.ctx.Err, line)
-			p.last = line
-			p.drawLive(p.displayTime(e))
-		}
 		return
 	case "completed", "succeeded":
 		p.finishLive("done", eventTime(e))
@@ -106,6 +100,93 @@ func (p *RunProgress) interactive(e localapi.Event) {
 	p.armLiveClock()
 }
 
+// Spend and placement arrive interleaved. Each has its own last observation;
+// neither an unchanged heartbeat nor an unrelated stage makes it new again.
+func (p *RunProgress) rentalNotice(e localapi.Event) {
+	previous := &p.rentalLine
+	if strings.TrimPrefix(e.Type, "request.") == "placement" {
+		previous = &p.placementLine
+	}
+	line, _ := e.Payload["line"].(string)
+	if line == "" || line == *previous {
+		return
+	}
+	*previous = line
+	if p.ctx.Mode().Color {
+		p.eraseLive()
+	}
+	fmt.Fprintln(p.ctx.Err, line)
+	if p.ctx.Mode().Color {
+		p.drawLive(p.displayTime(e))
+	}
+}
+
+func waitingPlacement(payload map[string]any) bool {
+	waiting := false
+	candidates, _ := payload["candidates"].([]any)
+	for _, value := range candidates {
+		candidate, _ := value.(map[string]any)
+		switch candidate["verdict"] {
+		case orchestrator.VerdictChosen:
+			return false
+		case orchestrator.VerdictAttaching:
+			waiting = true
+		}
+	}
+	return waiting
+}
+
+// Manual rentals observe the same Hub lifecycle facts as a run's acquisition.
+// The shared renderer owns elapsed clocks and terminal history for both commands.
+func (p *RunProgress) rentalAcquisition(r hub.Rental) {
+	name := orchestrator.PhaseOfHubRental(r.State, r.ProviderState, r.ContainerState, r.Failure != nil)
+	if name == "" {
+		if !r.Attachable() {
+			return
+		}
+		name = "connecting"
+	}
+	p.On(localapi.Event{Type: "request.phase", Payload: map[string]any{
+		"value": map[string]any{"phase": name, "machine": r.Name,
+			"rental": map[string]any{"accelerator_model": r.AcceleratorModel,
+				"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros,
+				"base_worker_image_digest": r.BaseWorkerImageDigest},
+		},
+	}})
+}
+
+func (p *RunProgress) sparsePhase(e localapi.Event) {
+	fields, _ := e.Payload["value"].(map[string]any)
+	name, _ := fields["phase"].(string)
+	if name == "" {
+		return
+	}
+	key := "phase:" + name
+	if key != p.sparseStage {
+		p.sparseStarted = eventTime(e)
+	} else if p.now().Sub(p.sparseAt) < 5*time.Second {
+		return
+	}
+	p.sparseStage, p.sparseAt = key, p.now()
+	for _, row := range phaseRows(phaseFieldsAt(e, p.sparseStarted, p.now())) {
+		fmt.Fprintln(p.ctx.Err, row)
+	}
+}
+
+func phaseFieldsAt(e localapi.Event, started, at time.Time) map[string]any {
+	original, _ := e.Payload["value"].(map[string]any)
+	fields := make(map[string]any, len(original)+1)
+	for k, v := range original {
+		fields[k] = v
+	}
+	if prior, measured := number(fields["elapsed_ms"]); measured {
+		fields["elapsed_ms"] = prior + float64(max(at.Sub(eventTime(e)), 0).Milliseconds())
+	} else {
+		fields["elapsed_ms"] = float64(max(at.Sub(started), 0).Milliseconds())
+	}
+	return fields
+}
+
 func (p *RunProgress) stepRows(f stepFacts) []string {
 	line := "  " + f.label
 	if f.counted {
@@ -114,11 +195,7 @@ func (p *RunProgress) stepRows(f stepFacts) []string {
 	if f.hasStageFraction {
 		line += fmt.Sprintf(" %s %.0f%% stage", progressBar(f.stageFraction, 10), f.stageFraction*100)
 	}
-	if f.counted && f.perStep > 0 {
-		line += fmt.Sprintf(" · %.2fs/step avg", f.perStep)
-		remaining := time.Duration(float64(f.total-f.current) * f.perStep * float64(time.Second))
-		line += " · ETA ~" + shortDuration(remaining)
-	}
+	line += f.timing()
 	rows := []string{line}
 	if f.hasOverall {
 		overall := fmt.Sprintf("    overall %.0f%%", f.overallFraction*100)
@@ -128,6 +205,14 @@ func (p *RunProgress) stepRows(f stepFacts) []string {
 		rows = append(rows, overall)
 	}
 	return rows
+}
+
+func (f stepFacts) timing() string {
+	if !f.counted || f.perStep <= 0 {
+		return ""
+	}
+	remaining := time.Duration(float64(f.total-f.current) * f.perStep * float64(time.Second))
+	return fmt.Sprintf(" · %.2fs/step avg · ETA ~%s", f.perStep, shortDuration(remaining))
 }
 
 func phaseRows(fields map[string]any) []string {
@@ -147,6 +232,9 @@ func phaseRows(fields map[string]any) []string {
 				row += fmt.Sprintf(" · $%.2f/hour", price/1_000_000)
 			}
 			rows = append(rows, row)
+		}
+		if digest, _ := rental["base_worker_image_digest"].(string); digest != "" {
+			rows = append(rows, "    image: "+digest)
 		}
 	}
 	// Older workers report one aggregate transfer. Preserve that honest fallback;
@@ -220,14 +308,7 @@ func (p *RunProgress) visibleRows(at time.Time) []string {
 	}
 	elapsed := max(at.Sub(p.terminal.started), 0)
 	if strings.HasPrefix(p.terminal.key, "phase:") {
-		original, _ := p.terminal.event.Payload["value"].(map[string]any)
-		fields := make(map[string]any, len(original)+1)
-		for k, v := range original {
-			fields[k] = v
-		}
-		prior, _ := number(fields["elapsed_ms"])
-		fields["elapsed_ms"] = prior + float64(max(at.Sub(eventTime(p.terminal.event)), 0).Milliseconds())
-		return phaseRows(fields)
+		return phaseRows(phaseFieldsAt(p.terminal.event, p.terminal.started, at))
 	}
 	if p.terminal.key == "wait" {
 		rows[0] = HumanWaitLine(p.terminal.event.Payload)
