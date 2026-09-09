@@ -24,9 +24,18 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	var posts [][]byte
 	lookups := 0
 	changed := false
+	stockOut := false
+	catalogLookups := 0
 	first, second := "sha256:"+strings.Repeat("1", 64), "sha256:"+strings.Repeat("2", 64)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		catalogLookups++
+		if stockOut {
+			_ = json.NewEncoder(w).Encode([]any{})
+			return
+		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{{"name": "h200", "accelerator_model": "NVIDIA H200",
 			"accelerator_count": 1, "compute_capability": "9.0", "vram_gb": 141, "minimum_ram_per_gpu_gb": 128, "price_usd_micros_per_hour": 1_000_000,
 			"storage_usd_micros_per_hour": 100_000, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86"}})
@@ -124,6 +133,8 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	}
 	mu.Lock()
 	changed = true // later lane retarget must not change a paid replay
+	stockOut = true
+	initialCatalogLookups := catalogLookups
 	mu.Unlock()
 	for _, replayArgs := range [][]string{args, {"rent", "h200", "--idempotency-key", "manual-models-proof"}} {
 		code, output = runRental(replayArgs...)
@@ -132,10 +143,15 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 		}
 	}
 	mu.Lock()
-	if lookups != initialLookups || len(posts) != 3 || !bytes.Equal(posts[1], body) || !bytes.Equal(posts[2], body) {
+	if catalogLookups != initialCatalogLookups || lookups != initialLookups || len(posts) != 3 || !bytes.Equal(posts[1], body) || !bytes.Equal(posts[2], body) {
 		t.Fatalf("retry re-resolved or changed paid bytes: lookups=%d/%d posts=%d", lookups, initialLookups, len(posts))
 	}
+	stockOut = false
 	mu.Unlock()
+	code, output = runRental("rent", "another-gpu", "--idempotency-key", "manual-models-proof")
+	if code == 0 || !strings.Contains(output, "rental.idempotency_conflict") {
+		t.Fatalf("changed SKU not refused before replay [exit %d]: %s", code, output)
+	}
 	code, output = runRental("rent", "h200", "--idempotency-key", "manual-models-proof",
 		"--model", "proof/h3@1.2.0/changed")
 	if code == 0 || !strings.Contains(output, "rental.idempotency_conflict") {
