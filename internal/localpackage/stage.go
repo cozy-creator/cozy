@@ -101,6 +101,9 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 // StageWheels uses the same immutable revision writer for source builds and
 // already-built library wheels. It preserves every supplied original byte.
 func StageWheels(layout home.Layout, install records.PackageInstall, packageInterfaceBytes []byte, paths []string) (Revision, *exit.Error) {
+	if len(paths) == 0 || len(paths) > maxFiles {
+		return Revision{}, exit.Named(exit.Structural, "local_package_revision_invalid", "local package revision requires 1..%d wheels", maxFiles)
+	}
 	if len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
 		return Revision{}, exit.New(exit.Validation, "private wheel interface exceeds its document bound")
 	}
@@ -208,7 +211,7 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 	wheels, err := os.ReadDir(wheelDir)
 	if err != nil || len(wheels) == 0 || len(wheels) > maxFiles {
 		return Revision{}, exit.Named(exit.Structural, "local_package_revision_invalid",
-			"local package revision has an invalid wheel count")
+			"local package revision requires 1..%d wheels", maxFiles)
 	}
 	files := make([]File, 0, len(wheels))
 	projects := 0
@@ -321,7 +324,7 @@ func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Digest < rows[j].Digest })
 	if len(rows) == 0 || len(rows) > maxFiles {
 		return Revision{}, nil, exit.Named(exit.Structural, "local_package_revision_invalid",
-			"local package revision has an invalid wheel count")
+			"local package revision requires 1..%d wheels", maxFiles)
 	}
 	refs := make([]*pb.LocalPackageFileRef, 0, len(rows))
 	for index, file := range rows {

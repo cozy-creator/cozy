@@ -26,7 +26,10 @@ const MaxModelSourceProfileBytes = 1024
 const MaxModelSourceURIBytes = 4096
 const MaxModelSourceLicenseBytes = 4096
 const MaxModelSourceURLBytes = 16 << 10
-const MaxLocalPackageFiles = 33
+// Wire47 expands private revisions to one project plus128 dependencies.
+const ExpandedLocalPackageFilesWireMinor = 47
+const LegacyMaxLocalPackageFiles = 33
+const MaxLocalPackageFiles = 129
 const MaxLocalPackageFilenameBytes = 255
 const MaxLocalPackageGrantURLBytes = 16 << 10
 const MaxModelSlotPaths = 256

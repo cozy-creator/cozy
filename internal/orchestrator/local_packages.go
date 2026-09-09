@@ -71,6 +71,9 @@ func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
 	if problem != nil {
 		return problem
 	}
+	if problem := requireLocalPackageCapacity(s, len(revision.Files)); problem != nil {
+		return problem
+	}
 	// One local preparation at a time per pod: a run and the editable refresh converging
 	// the same revision must not each ask the pod to prepare over the other's placement.
 	w.localMu.Lock()
@@ -114,6 +117,8 @@ func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
 			delete(c.localTransfers, operationID)
 			c.mu.Unlock()
 			return nil
+		} else if problem.ErrName() == "local_package_worker_capacity_unsupported" {
+			return problem
 		}
 		w, s, problem = c.localControl(instanceID)
 		if problem != nil {
@@ -270,6 +275,9 @@ func (c *Orchestrator) transferLocalPackage(instanceID, operationID string,
 ) *exit.Error {
 	_, current, problem := c.localControl(instanceID)
 	if problem != nil {
+		return problem
+	}
+	if problem := requireLocalPackageCapacity(current, len(transfer.files)); problem != nil {
 		return problem
 	}
 	held, problem := c.bindLocalTransfer(instanceID, operationID, transfer, current)
@@ -673,6 +681,9 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 	if selected == nil {
 		return exit.Internalf("cannot issue an empty local package set")
 	}
+	if problem := requireLocalPackageCapacity(s, len(selected.Files)); problem != nil {
+		return problem
+	}
 	revision, err := canonical.Spell(selected.Package.GetLocalRevisionDigest())
 	if err != nil {
 		return exit.Internalf("cannot spell the local revision digest: %s", err)
@@ -796,4 +807,27 @@ func clonePrivatePlacementSet(in *pb.DesiredPrivatePlacementSet) *pb.DesiredPriv
 		return nil
 	}
 	return proto.Clone(in).(*pb.DesiredPrivatePlacementSet)
+}
+
+// The Host advertises the intersection with its installed Runtime. ClaimAck alone
+// can describe a newer Runtime behind an older Host, so probe before sending bytes.
+func requireLocalPackageCapacity(s *session, files int) *exit.Error {
+	if files <= pb.LegacyMaxLocalPackageFiles {
+		return nil
+	}
+	if s == nil || s.host == nil {
+		return exit.Unavailablef("private package capacity awaits the claimed Host")
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer cancel()
+	info, err := s.host.ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
+	if err != nil {
+		return exit.Unavailablef("private package capacity probe is unavailable")
+	}
+	if info == nil || info.WireMinor < pb.ExpandedLocalPackageFilesWireMinor {
+		return exit.Named(exit.Conflict, "local_package_worker_capacity_unsupported",
+			"private revision has %d wheels; this worker supports at most %d", files, pb.LegacyMaxLocalPackageFiles).
+			WithRemedy("select a worker with protocol minor %d or newer", pb.ExpandedLocalPackageFilesWireMinor)
+	}
+	return nil
 }
