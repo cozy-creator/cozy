@@ -180,9 +180,12 @@ func TestUnrecordedSpendRefusesTheNextPurchase(t *testing.T) {
 	if !strings.Contains(out, "rental.fleet_spend_cap") {
 		t.Fatalf("the refusal is not the spend ceiling: %s", out)
 	}
-	// WHICH machines to end is the whole question when the burn is invisible locally.
-	if !strings.Contains(out, "this host holds no record of") {
-		t.Fatalf("the ceiling refusal does not name the unrecorded burn: %s", out)
+	if !strings.Contains(out, "$5.00/hour account limit; current spend is $6.38/hour") ||
+		!strings.Contains(out, "cozy rental list") {
+		t.Fatalf("the ceiling refusal does not explain account spend and its limit: %s", out)
+	}
+	if strings.Contains(out, "holds no record") || strings.Contains(out, "recorded only at the hub") {
+		t.Fatalf("the ceiling refusal exposes controller bookkeeping: %s", out)
 	}
 	if stand.releases("pr-3333333333333333sem") != 0 {
 		t.Fatalf("a spend refusal ended a machine on its own")

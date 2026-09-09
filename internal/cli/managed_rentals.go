@@ -592,17 +592,10 @@ func (m *managedRentals) admitLocked(sku hub.RentalSKU) *exit.Error {
 	// figure admitted is the estimated TOTAL the pod will bill — the GPU rate
 	// plus the SKU's storage adder — never the GPU rate alone (th-126).
 	if burn > cap || sku.PriceUSDMicrosPerHour+sku.StorageUSDMicrosPerHour > cap-burn {
-		remedy := "raise rentals.max_hourly_spend_usd or end another rental"
-		// Account-wide burn includes other controllers' rentals. Explain that scope
-		// without treating an absent local record as permission to end their work.
-		if unrecorded, unrecordedBurn := m.unrecordedTotalsLocked(); unrecorded > 0 {
-			remedy = fmt.Sprintf("%s of the burn is %d machine(s) the hub bills this account for that this "+
-				"host holds no record of; inspect them with `cozy rental list` or raise rentals.max_hourly_spend_usd",
-				usdPerHour(unrecordedBurn), unrecorded)
-		}
 		return exit.Named(exit.Capacity, "rental.fleet_spend_cap",
-			"rental %s at %s would exceed %s",
-			sku.Name, skuRate(sku), usdPerHour(cap)).WithRemedy("%s", remedy)
+			"rental %s at %s would exceed the %s account limit; current spend is %s",
+			sku.Name, skuRate(sku), usdPerHour(cap), usdPerHour(burn)).WithRemedy(
+			"inspect `cozy rental list` to manage existing rentals, or raise rentals.max_hourly_spend_usd")
 	}
 	return nil
 }
@@ -1026,9 +1019,6 @@ func (m *managedRentals) lineLocked() (string, *exit.Error) {
 	}
 	line := fmt.Sprintf("rentals: %d remote %s running · %s of %s",
 		count, machine, usdPerHour(burn), usdPerHour(m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros))
-	if unrecorded, _ := m.unrecordedTotalsLocked(); unrecorded > 0 {
-		line += fmt.Sprintf(" · %d of them recorded only at the hub", unrecorded)
-	}
 	if m.listingProblem != nil {
 		line += " · the hub could not be asked what this account owns (" + m.listingProblem.Message + ")"
 	} else if !m.listed {
