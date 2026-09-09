@@ -77,7 +77,7 @@ type rentalIdleness struct {
 	// queued is busy, not idle.
 	Owed bool
 	// Since is the newest fact this host holds about the pod doing anything: the close of
-	// its last settled attempt, or, for a rental that has never run, the moment this host
+	// its last settled request (including preparation), or, before any work, the moment this host
 	// recorded the hub's `ready`. Zero while the pod is still booting — RentedAt is when it
 	// was asked for, not when it began to exist — so a rental is never reaped mid-boot.
 	Since time.Time
@@ -118,8 +118,8 @@ func observeRentalIdle(st *records.Store, row records.Rental) (rentalIdleness, *
 	if problem != nil {
 		return idle, problem
 	}
-	if found && last.ClosedAt.After(idle.Since) {
-		idle.Since = last.ClosedAt
+	if found && last.SettledAt.After(idle.Since) {
+		idle.Since = last.SettledAt
 	}
 	if idle.Spent, problem = orchestrator.RentalSpent(st, row); problem != nil {
 		return idle, problem
