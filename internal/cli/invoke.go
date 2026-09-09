@@ -2126,13 +2126,22 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 		hctx, cancel := hub.Context()
 		defer cancel()
 		catalog := client(ctx)
-		card, problem := catalog.PackageCard(hctx, ref)
-		if problem != nil {
+		installed, problem := installedPackage(ctx, target.Package)
+		if problem != nil && problem.Code != exit.NotFound {
 			return Target{}, nil, problem
 		}
-		release, problem := newestPackageRelease(card.Releases)
-		if problem != nil {
-			return Target{}, nil, problem
+		release := ""
+		if installed != nil {
+			release = installed.Version
+		} else {
+			card, problem := catalog.PackageCard(hctx, ref)
+			if problem != nil {
+				return Target{}, nil, problem
+			}
+			release, problem = newestPackageRelease(card.Releases)
+			if problem != nil {
+				return Target{}, nil, problem
+			}
 		}
 		detail, problem := catalog.PackageRelease(hctx, ref, release)
 		if problem != nil {
