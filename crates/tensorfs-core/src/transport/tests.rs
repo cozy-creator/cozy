@@ -593,14 +593,16 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
     // Cold acquisition may retry a delayed response under concurrent CI load.
     // Warm reuse must add exactly the closure request, regardless of those retries.
     let calls_after_cold = origin.total_hits();
+    let closures_after_cold = origin.hits("/v1/tensorfs/closure");
+    let presigns_after_cold = origin.hits("/v1/tensorfs/presign");
 
     // Warm: one closure question, no presign, no GET, nothing moved — and still PROVEN.
     let warm = pull(&request_for(&store, &origin.base, &policy)).unwrap();
     assert_eq!(warm.held, 8);
     assert_eq!(warm.fetched, 0);
     assert_eq!(warm.bytes_moved, 0);
-    assert_eq!(origin.hits("/v1/tensorfs/closure"), 2);
-    assert_eq!(origin.hits("/v1/tensorfs/presign"), 1);
+    assert_eq!(origin.hits("/v1/tensorfs/closure") - closures_after_cold, 1);
+    assert_eq!(origin.hits("/v1/tensorfs/presign") - presigns_after_cold, 0);
     assert_eq!(origin.total_hits(), calls_after_cold + 1);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -650,6 +652,8 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
     // published exact cache bytes before asking a different Store to reuse them.
     wait_for_cache(&store_a, &checkpoint);
     let calls_after_a = origin.total_hits();
+    let closures_after_a = origin.hits("/v1/tensorfs/closure");
+    let presigns_after_a = origin.hits("/v1/tensorfs/presign");
 
     // POD B — a DIFFERENT empty Store on the same mounted cache: the re-rental.
     let b = temporary("repo-cache-pod-b");
@@ -684,11 +688,11 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
         1,
         "pod B should have cost the origin exactly one call — the closure question"
     );
-    assert_eq!(origin.hits("/v1/tensorfs/closure"), 2);
+    assert_eq!(origin.hits("/v1/tensorfs/closure") - closures_after_a, 1);
     assert_eq!(
-        origin.hits("/v1/tensorfs/presign"),
-        1,
-        "an object that never crosses the network is never minted a URL"
+        origin.hits("/v1/tensorfs/presign") - presigns_after_a,
+        0,
+        "warm cache reuse must not mint another object URL"
     );
 
     // And pod B is genuinely servable: `pull` refuses rather than returns if the closure is
