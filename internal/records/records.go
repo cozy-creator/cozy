@@ -1277,7 +1277,7 @@ func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
 		FROM installs i WHERE i.id NOT IN (SELECT install_id FROM pins)
 		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND (state IN (` + activeRequestStates + `) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
-		AND NOT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=i.id)
+		AND NOT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=i.id AND parent_install_id!=i.id)
 		ORDER BY i.created_at`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list unreferenced installs: %s", err)
@@ -1336,7 +1336,7 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	var held bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM pins WHERE install_id=?)
 		OR EXISTS(SELECT 1 FROM requests WHERE install_id=? AND (state IN (`+activeRequestStates+`) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
-		OR EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=?)
+		OR EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=? AND parent_install_id!=child_install_id)
 		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`, id, id, id, id).Scan(&held); err != nil {
 		return false, exit.New(exit.Conflict, "cannot inspect install %s gc ownership: %s", id, err)
 	}
@@ -1356,7 +1356,7 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 		AND NOT EXISTS (SELECT 1 FROM pins WHERE install_id=?)
 		AND NOT EXISTS (SELECT 1 FROM requests WHERE install_id=?
 		  AND state IN (`+activeRequestStates+`))
-		AND NOT EXISTS (SELECT 1 FROM private_child_bindings WHERE child_install_id=?)
+		AND NOT EXISTS (SELECT 1 FROM private_child_bindings WHERE child_install_id=? AND parent_install_id!=child_install_id)
 		AND NOT EXISTS (SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`,
 		id, id, id, id, id)
 	if err != nil {

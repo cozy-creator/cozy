@@ -16,6 +16,10 @@ import (
 // Facts is everything one package install needs to be served, gathered once.
 type Facts struct {
 	CPUOrchestration bool // exact captured child bindings give model-free composition its CPU role
+	// SelfCallable names the install's own exports it captured as its own children.
+	// They are the CALLEES of a composition, never its parent, so the CPU role above
+	// is not read onto them — one install holds both halves of a self call.
+	SelfCallable     map[string]bool
 	Install          records.PackageInstall
 	Source           string
 	PackageInterface *PackageInterface

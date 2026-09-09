@@ -1543,11 +1543,32 @@ func progressLine(e localapi.Event, full bool) string {
 	case "requeued":
 		return "  retrying"
 	case "attempt_failed":
-		return "  attempt failed; retrying"
+		return attemptFailedLine(e.Payload)
 	default:
 		return ""
 	}
 	return ""
+}
+
+// attemptFailedLine names WHY the attempt failed, not merely that it did. Every one of
+// these causes is deterministic, so an operator who is shown only "retrying" watches a
+// budget burn on a fact that was on the wire the whole time (cl-206).
+func attemptFailedLine(payload map[string]any) string {
+	kind, _ := payload["error_type"].(string)
+	detail, _ := payload["error"].(string)
+	kind, detail = strings.TrimSpace(kind), strings.TrimSpace(detail)
+	if len(detail) > 240 {
+		detail = strings.ToValidUTF8(detail[:240], "") + "…"
+	}
+	switch {
+	case kind != "" && detail != "":
+		return "  attempt failed (" + kind + "): " + detail + "; retrying"
+	case kind != "":
+		return "  attempt failed (" + kind + "); retrying"
+	case detail != "":
+		return "  attempt failed: " + detail + "; retrying"
+	}
+	return "  attempt failed; retrying"
 }
 
 func humanProgress(value any) string {

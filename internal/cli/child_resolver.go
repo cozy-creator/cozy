@@ -28,6 +28,13 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if problem != nil || install == nil {
 		return out, "", exit.Named(exit.Conflict, "child.install_absent", "the captured child implementation is unavailable")
 	}
+	// A self binding names the parent's own install and therefore captures no separate
+	// carrier revision: the calling request's own frozen revision IS the child's, which
+	// is what keeps a replayed self call byte-identical to the first one.
+	revision := binding.LocalRevisionDigest
+	if revision == "" && binding.ChildInstallID == parent.InstallID {
+		revision = parent.LocalPackageDigest
+	}
 	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), iface)
 	if problem != nil {
 		return out, "", problem
@@ -76,8 +83,10 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	if problem := launch.ValidatePayload(install.Package, job, payload); problem != nil {
 		return out, "", problem
 	}
-	if _, problem := r.LocalRevision(install.ID, binding.LocalRevisionDigest); problem != nil {
-		return out, "", problem
+	if revision != "" {
+		if _, problem := r.LocalRevision(install.ID, revision); problem != nil {
+			return out, "", problem
+		}
 	}
 	out = orchestrator.Submission{Kind: "serving", Package: install.Package, Entrypoint: binding.Entrypoint, Release: install.Version, InstallID: install.ID,
 		Payload: append([]byte(nil), payload...), Outputs: launch.AssetPaths(job.Result),
@@ -135,11 +144,11 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	}
 	out.ChildReusable = job.Invocable.Memoize
 	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0 || len(out.Outputs) > len(out.WeightsOutputs)
-	out.LocalPackageDigest = binding.LocalRevisionDigest
+	out.LocalPackageDigest = revision
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
 	}
-	identity, _ := json.Marshal(map[string]any{"local_revision_digest": binding.LocalRevisionDigest, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
+	identity, _ := json.Marshal(map[string]any{"local_revision_digest": revision, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
 	identity, err := canonical.NormalizeJCS(identity)
 	if err != nil {
 		return out, "", exit.Internalf("cannot encode frozen child identity: %s", err)

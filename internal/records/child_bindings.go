@@ -65,6 +65,44 @@ func (s *Store) ChildBindings(parentInstall string) ([]ChildBinding, *exit.Error
 
 const childBindingCols = `parent_install_id,interface_digest,module,export,child_install_id,local_revision_digest,entrypoint`
 
+// SelfCallableEntrypoints names the install's own exports it captured as its own
+// children. Those entrypoints are the CALLEES of a composition, never its parent, so
+// the CPU orchestration role and its resource fence must not be read onto them.
+func (s *Store) SelfCallableEntrypoints(installID string) (map[string]bool, *exit.Error) {
+	rows, err := s.db.Query(`SELECT entrypoint FROM private_child_bindings WHERE parent_install_id=? AND child_install_id=?`, installID, installID)
+	if err != nil {
+		return nil, exit.Internalf("cannot read self-callable exports: %s", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, exit.Internalf("cannot read a self-callable export: %s", err)
+		}
+		out[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish the self-callable export census: %s", err)
+	}
+	return out, nil
+}
+
+// CompositionParent answers whether one request's entrypoint is the CPU orchestration
+// parent of a captured composition: the install captured children, and this entrypoint
+// is not itself one of them.
+func (s *Store) CompositionParent(installID, entrypoint string) (bool, *exit.Error) {
+	bound, problem := s.HasChildBindings(installID)
+	if problem != nil || !bound {
+		return false, problem
+	}
+	callees, problem := s.SelfCallableEntrypoints(installID)
+	if problem != nil {
+		return false, problem
+	}
+	return !callees[entrypoint], nil
+}
+
 func scanChildBinding(row interface{ Scan(...any) error }) (ChildBinding, error) {
 	var binding ChildBinding
 	err := row.Scan(&binding.ParentInstallID, &binding.InterfaceDigest, &binding.Module, &binding.Export, &binding.ChildInstallID, &binding.LocalRevisionDigest, &binding.Entrypoint)
@@ -90,7 +128,12 @@ func (s *Store) RecordChildBindings(bindings []ChildBinding) *exit.Error {
 	defer tx.Rollback()
 	for _, binding := range bindings {
 		_, interfaceError := canonical.Raw(binding.InterfaceDigest)
-		_, revisionError := canonical.Raw(binding.LocalRevisionDigest)
+		revisionError := error(nil)
+		// A self binding names the parent's own install, so it carries no separate
+		// frozen revision: the calling request's own carrier set IS the child's.
+		if binding.LocalRevisionDigest != "" || binding.ChildInstallID != binding.ParentInstallID {
+			_, revisionError = canonical.Raw(binding.LocalRevisionDigest)
+		}
 		if binding.ParentInstallID == "" || binding.ChildInstallID == "" || binding.Module == "" || binding.Export == "" || binding.Entrypoint == "" || interfaceError != nil || revisionError != nil {
 			return exit.New(exit.Validation, "child binding requires exact parent, interface, export, child revision and entrypoint")
 		}

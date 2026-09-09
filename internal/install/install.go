@@ -300,6 +300,11 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		res.Idempotent = true
 		res.Install = *priorInstall
 		_ = os.RemoveAll(installDir)
+		// The same source is the same self-callable surface. Capture is idempotent, so
+		// this also gives an install made before self bindings existed its rows back.
+		if e := CaptureSelfBindings(st, *priorInstall, nil); e != nil {
+			return nil, e
+		}
 		return res, nil
 	}
 	if !req.Snapshot && prior != nil && !req.Force {
@@ -417,6 +422,11 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	if e != nil {
 		return guard(e)
+	}
+	// The install row is committed, so its directory stays: reporting the failure
+	// without deleting a pinned environment is the safer half of an impossible path.
+	if e := CaptureSelfBindings(st, inst, packageInterface); e != nil {
+		return nil, e
 	}
 	res.Install, res.Superseded = inst, superseded
 	mark("activate")

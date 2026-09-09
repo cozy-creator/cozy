@@ -594,11 +594,11 @@ func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool,
 	}
 	accelerator := launch.AcceleratorRequired(strings.Split(install.Closure, "\n"))
 	if entrypoint.Kind == "job" && len(entrypoint.Models) == 0 && len(entrypoint.WeightsOutputs) == 0 {
-		bound, problem := r.store.HasChildBindings(installID)
+		parent, problem := r.store.CompositionParent(installID, name)
 		if problem != nil {
 			return nil, false, problem
 		}
-		accelerator = accelerator && !bound
+		accelerator = accelerator && !parent
 	}
 	return entrypoint, accelerator, nil
 }
@@ -639,6 +639,10 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 		return nil, problem
 	}
 	facts.CPUOrchestration, problem = r.store.HasChildBindings(installID)
+	if problem != nil {
+		return nil, problem
+	}
+	facts.SelfCallable, problem = r.store.SelfCallableEntrypoints(installID)
 	return facts, problem
 }
 

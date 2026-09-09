@@ -8,7 +8,9 @@ import (
 )
 
 func (c *Orchestrator) requiredPrivateWire(req records.Request) (uint32, *exit.Error) {
-	bound, problem := c.opt.Store.HasChildBindings(req.InstallID)
+	// A composition parent speaks the child-call minor because it makes the calls; a
+	// captured callee needs it only when it IS one, which the second term already says.
+	bound, problem := c.opt.Store.CompositionParent(req.InstallID, req.Entrypoint)
 	if problem != nil {
 		return 0, problem
 	}
@@ -28,7 +30,9 @@ func (c *Orchestrator) jobExecutionRole(req records.Request, spec WorkerLaunchSp
 	plan := *plans[0]
 	plans[0] = &plan
 	spec.Placement.Jobs = plans
-	bound, problem := c.opt.Store.HasChildBindings(req.InstallID)
+	// The composition PARENT takes the CPU slot; a captured callee of the same install
+	// is an ordinary job, which is what a package awaiting its own sibling requires.
+	bound, problem := c.opt.Store.CompositionParent(req.InstallID, req.Entrypoint)
 	if problem != nil {
 		return spec, problem
 	}
