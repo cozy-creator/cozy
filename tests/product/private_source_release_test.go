@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,32 +18,45 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func (p *fakePod) ModelSourceRelease(_ context.Context, call *pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error) {
+func (p *fakePod) ModelSourceRelease(ctx context.Context, call *pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error) {
 	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
 		return nil, err
 	}
 	if p.sourceRelease == nil {
 		return nil, status.Error(codes.Unimplemented, "source release not provided")
 	}
-	return p.sourceRelease(call)
+	return p.sourceRelease(ctx, call)
 }
 
 func TestPrivateSourceCancellationWaitsForOriginalHostRelease(t *testing.T) {
+	for _, cancelDrain := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel_drain=%t", cancelDrain), func(t *testing.T) { privateSourceCancellationDrain(t, cancelDrain) })
+	}
+}
+
+func privateSourceCancellationDrain(t *testing.T, cancelDrain bool) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public}
 	entered, finish := make(chan struct{}), make(chan struct{})
+	peerCanceled := make(chan struct{})
+	var peerCanceledOnce sync.Once
 	var finishOnce sync.Once
 	release := func() { finishOnce.Do(func() { close(finish) }) }
 	var calls atomic.Int64
-	pod.sourceRelease = func(call *pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error) {
+	pod.sourceRelease = func(ctx context.Context, call *pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error) {
 		if call.OperationId != "req-source-release" || !bytes.Equal(call.SourceSelectionDigest, bytes.Repeat([]byte{0x22}, 32)) {
 			t.Error("release changed the captured operation or source selection")
 		}
 		if calls.Add(1) == 1 {
 			close(entered)
 		}
-		<-finish
+		select {
+		case <-finish:
+		case <-ctx.Done():
+			peerCanceledOnce.Do(func() { close(peerCanceled) })
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
 		return &pb.ReleaseModelSourceResult{OperationId: call.OperationId, Released: true}, nil
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
@@ -84,7 +98,43 @@ func TestPrivateSourceCancellationWaitsForOriginalHostRelease(t *testing.T) {
 	if row.State != "canceling" || !retained {
 		t.Fatalf("source cleanup acknowledged while native work was live: state=%s retained=%t", row.State, retained)
 	}
+
+	drain, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	drained := make(chan struct{})
+	go func() { o.c.WaitRetainedCancellations(drain); close(drained) }()
+	// This deliberately outlasts down's 100ms poll. No second cancellation was
+	// requested, but the accepted native disposal is still in flight.
+	select {
+	case <-drained:
+		t.Fatal("shutdown called an active cleanup pass a fixed point")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if cancelDrain {
+		cancel()
+		select {
+		case <-drained:
+		case <-time.After(5 * time.Second):
+			t.Fatal("canceled shutdown drain did not return")
+		}
+		select {
+		case <-peerCanceled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("shutdown context did not reach native disposal RPC")
+		}
+		row, problem := o.store.RequestRow(request.ID)
+		fatal(t, problem)
+		if row.State != "canceling" {
+			t.Fatalf("unconfirmed native disposal was erased: %s", row.State)
+		}
+		return
+	}
 	release()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("completed cleanup did not wake shutdown")
+	}
 	waitUntil(t, "cancellation settles after native source release", func() bool {
 		row, problem := o.store.RequestRow(request.ID)
 		fatal(t, problem)

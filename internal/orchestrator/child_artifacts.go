@@ -189,7 +189,7 @@ func (c *Orchestrator) changeDerivedRetention(ctx context.Context, retention rec
 	if problem != nil || producer == nil {
 		return exit.Unavailablef("native artifact producer is unavailable")
 	}
-	session, problem := c.workspaceControl(producer.Worker)
+	session, problem := c.workspaceControlContext(ctx, producer.Worker)
 	if problem != nil {
 		return problem
 	}
@@ -234,7 +234,7 @@ func (c *Orchestrator) changeDerivedRetention(ctx context.Context, retention rec
 	return c.opt.Store.ConfirmWeightsRetention(retention.RetentionID, session.instanceID, session.bootID)
 }
 
-func (c *Orchestrator) releaseOriginalDerivedResults(id string) *exit.Error {
+func (c *Orchestrator) releaseOriginalDerivedResults(ctx context.Context, id string) *exit.Error {
 	request, problem := c.opt.Store.RequestRow(id)
 	if problem != nil || request == nil {
 		return problem
@@ -249,7 +249,7 @@ func (c *Orchestrator) releaseOriginalDerivedResults(id string) *exit.Error {
 	if len(outputs) == 0 {
 		return nil
 	}
-	session, problem := c.workspaceControl(request.Worker)
+	session, problem := c.workspaceControlContext(ctx, request.Worker)
 	if problem != nil {
 		return problem
 	}
@@ -268,9 +268,9 @@ func (c *Orchestrator) releaseOriginalDerivedResults(id string) *exit.Error {
 		call := &pb.DerivedResultReleaseCall{Claim: session.claim, Request: &pb.DerivedResultReleaseRequest{WeightsTransactionId: output.TransactionID, TensorfsReceiptDigest: digest}}
 		var result *pb.DerivedResultReleaseResult
 		if session.host != nil {
-			result, err = session.host.ReleaseDerivedResult(context.Background(), call)
+			result, err = session.host.ReleaseDerivedResult(ctx, call)
 		} else {
-			result, err = session.preparation.WorkspaceReleaseDerivedResult(context.Background(), call)
+			result, err = session.preparation.WorkspaceReleaseDerivedResult(ctx, call)
 		}
 		if err != nil {
 			return exit.Unavailablef("original artifact release awaits native disposal")
@@ -321,7 +321,7 @@ func (c *Orchestrator) retainChildInputs(request records.Request) *exit.Error {
 	return c.retainChildArtifacts(context.Background(), request, "input", artifacts)
 }
 
-func (c *Orchestrator) releaseChildRetentions(id string, inputsOnly bool) *exit.Error {
+func (c *Orchestrator) releaseChildRetentions(ctx context.Context, id string, inputsOnly bool) *exit.Error {
 	if problem := c.opt.Store.BeginWeightsRetentionRelease(id, inputsOnly); problem != nil {
 		return problem
 	}
@@ -331,7 +331,7 @@ func (c *Orchestrator) releaseChildRetentions(id string, inputsOnly bool) *exit.
 	}
 	for _, retention := range retentions {
 		if retention.State == "releasing" {
-			if problem := c.changeDerivedRetention(context.Background(), retention, true); problem != nil {
+			if problem := c.changeDerivedRetention(ctx, retention, true); problem != nil {
 				return problem
 			}
 		}
@@ -345,7 +345,7 @@ func (c *Orchestrator) releaseChildRetentions(id string, inputsOnly bool) *exit.
 	}
 	for _, retention := range native {
 		if retention.State == "releasing" {
-			if problem := c.changeNativeArtifactRetention(context.Background(), retention, true); problem != nil {
+			if problem := c.changeNativeArtifactRetention(ctx, retention, true); problem != nil {
 				return problem
 			}
 		}

@@ -1144,7 +1144,7 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 		return
 	}
 	if req.RetainWork && req.State == "canceling" {
-		go c.finishRetainedCancellation(req.ID)
+		c.finishRetainedCancellation(req.ID)
 		return
 	}
 	if req.ModelTransfer != nil && req.State == "finalizing" {

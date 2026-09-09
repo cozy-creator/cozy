@@ -470,7 +470,8 @@ type Orchestrator struct {
 	offers map[string]*dispatchReservation
 	// mediaCleaning prevents overlapping retries of one durable cleanup obligation. It
 	// contains only calls in flight; success is recorded on the attempt row.
-	mediaCleaning map[string]bool
+	mediaCleaning    map[string]bool
+	retainedCleaning map[string]*retainedCleanup
 	// outputExporting serializes retries of one durable local --out obligation.
 	outputExporting map[string]bool
 	// pending is the dispatch queue: requests that have no ready worker YET. A requeue
@@ -585,6 +586,9 @@ func (c *Orchestrator) Serve() error {
 func (c *Orchestrator) Close(grace time.Duration) {
 	c.mu.Lock()
 	c.closing = true
+	for _, cleanup := range c.retainedCleaning {
+		cleanup.cancel()
+	}
 	starting := make([]chan struct{}, 0, len(c.ensuring))
 	for _, done := range c.ensuring {
 		starting = append(starting, done)
