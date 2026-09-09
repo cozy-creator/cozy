@@ -250,6 +250,146 @@ fn export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct MeasuredIO {
+        moved: AtomicU64,
+        admitted: AtomicU64,
+    }
+
+    impl crate::store::Progress for MeasuredIO {
+        fn moved(&self, bytes: u64) {
+            self.moved.fetch_add(bytes, Ordering::Relaxed);
+        }
+        fn admitted(&self) {
+            self.admitted.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl MeasuredIO {
+        fn take(&self) -> (u64, u64) {
+            (
+                self.moved.swap(0, Ordering::Relaxed),
+                self.admitted.swap(0, Ordering::Relaxed),
+            )
+        }
+    }
+
+    #[test]
+    fn multiple_checkpoint_groups_separate_rehash_from_adoption_metadata_io() {
+        let (store, meta, mut declaration, source, target) = fixture();
+        let mut third = declaration.components[0].add[0].clone();
+        third.key = "third".into();
+        declaration.components[0].add.push(third);
+        declaration.order.push(("model".into(), "third".into()));
+        declaration.max_new_bytes += 2048;
+        let raw = declaration.canonical_work_bytes().unwrap();
+        let writer = begin(&store, &meta, &source, 1, declaration.clone(), None).unwrap();
+        let first = write(&store, &meta, &source, "weight", 3);
+        checkpoint_progress(&store, &meta, &source, 1, "source", "model", None).unwrap();
+        let second = write(&store, &meta, &source, "next", 4);
+        let (_, checkpoint) =
+            checkpoint_progress(&store, &meta, &source, 1, "source", "model", None).unwrap();
+        fence(&meta, &source, 1).unwrap();
+        release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
+
+        let progress = Arc::new(MeasuredIO::default());
+        let store = store.observed(progress.clone());
+        eprintln!("CR108_IO_ROOT {}", store.root().display());
+        eprintln!("CR108_IO_PAYLOAD {} {}", first.sha256, second.sha256);
+        // Lose only the verification receipts in this fixture, not the actual
+        // bytes. The real verifier must rehash them before the warm adoption arm.
+        let catalog = crate::catalog::Catalog::open(store.root()).unwrap();
+        catalog.drop_verification(&first.sha256);
+        catalog.drop_verification(&second.sha256);
+        drop(catalog);
+        eprintln!("CR108_IO_PHASE verification");
+        assert!(matches!(
+            store.verify(&first.sha256).unwrap(),
+            crate::store::Verdict::Invalidated { .. }
+        ));
+        assert!(matches!(
+            store.verify(&second.sha256).unwrap(),
+            crate::store::Verdict::Invalidated { .. }
+        ));
+        let verification = progress.take();
+        assert_eq!(verification, (4096, 0));
+
+        eprintln!("CR108_IO_PHASE inspect_before");
+        let before: BTreeSet<_> = store.objects().unwrap().into_iter().collect();
+        let before_payloads: Vec<_> = [&first, &second]
+            .iter()
+            .map(|object| {
+                let path = store.blob_path(&object.sha256);
+                (
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        eprintln!("CR108_IO_PHASE adoption");
+        let (_, adopted) = adopt_checkpoint(
+            &store,
+            &meta,
+            &target,
+            &source,
+            &raw,
+            checkpoint.head.as_ref().unwrap(),
+            "target",
+            "model",
+        )
+        .unwrap();
+        let adoption = progress.take();
+        eprintln!("CR108_IO_PHASE inspect_after");
+        let fresh: Vec<_> = store
+            .objects()
+            .unwrap()
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        let metadata_bytes: u64 = fresh
+            .iter()
+            .map(|id| std::fs::metadata(store.blob_path(id)).unwrap().len())
+            .sum();
+        assert!(metadata_bytes > 0);
+        assert_eq!(adoption, (metadata_bytes, fresh.len() as u64));
+        for (object, prior) in [&first, &second].iter().zip(before_payloads) {
+            let path = store.blob_path(&object.sha256);
+            assert_eq!(std::fs::read(&path).unwrap(), prior.0);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+                prior.1
+            );
+        }
+        eprintln!("CR108_IO_PHASE restore");
+        let next = begin(
+            &store,
+            &meta,
+            &target,
+            1,
+            declaration,
+            adopted.head.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            completed(&meta, &target, 1).unwrap().0,
+            vec![
+                ("model".into(), "next".into(), "value".into()),
+                ("model".into(), "weight".into(), "value".into())
+            ]
+        );
+        let restore = progress.take();
+        assert_eq!(restore, (0, 0));
+        eprintln!("CR108_IO_PHASE finish");
+        write(&store, &meta, &target, "third", 5);
+        commit(&store, &meta, &target, 1).unwrap();
+        release_guards(&meta, Some(next.writer_hold), next.source_leases);
+        eprintln!("CR108_IO_PHASE done");
+        eprintln!("CR108_IO_COUNTS verification={verification:?} adoption={adoption:?} restore={restore:?} adoption_metadata_bytes={metadata_bytes}");
+    }
 
     fn fixture() -> (Store, Meta, Declaration, String, String) {
         let path = std::env::temp_dir().join(format!(
