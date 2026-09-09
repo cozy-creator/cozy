@@ -293,7 +293,7 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	hubClient *hub.Client, spec, lane, packageName string, slot launch.Slot, work string,
 ) (install.PublishedModel, *exit.Error) {
 	var empty install.PublishedModel
-	if local, ok, problem := exactLocalModel(tool, spec, lane, work); problem != nil {
+	if local, ok, problem := exactLocalModel(tool, spec, lane, work, cli.Inv.Bool("--dry-run")); problem != nil {
 		return empty, problem
 	} else if ok {
 		return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: local.Model,
@@ -334,6 +334,22 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	if manifestPin != "" && resolved.ManifestID != manifestPin {
 		return empty, exit.Named(exit.Conflict, "model_resolution_changed", "resolved model differs from its checkpoint pin")
 	}
+	if cli.Inv.Bool("--dry-run") {
+		var root []byte
+		if resolved.Release == "" {
+			root, problem = hubClient.CheckpointManifest(ctx, fetch.Ref, resolved.ManifestID)
+		} else {
+			root, problem = hubClient.ReleaseManifest(ctx, fetch.Ref, resolved.Release, resolved.Lane)
+		}
+		if problem != nil {
+			return empty, problem
+		}
+		digest, err := canonical.Spell(canonical.Digest(root))
+		if err != nil || len(root) == 0 || digest != resolved.ManifestID {
+			return empty, exit.Named(exit.Conflict, "job.model_manifest_changed", "published model root differs from its selected checkpoint")
+		}
+		return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: fetch.Ref.String(), Release: resolved.Release, Lane: resolved.Lane, Manifest: resolved.ManifestID, ManifestLength: int64(len(root))}, nil
+	}
 	fetched, problem := fetch.Acquire(ctx, resolved)
 	if problem != nil {
 		return empty, problem
@@ -365,7 +381,7 @@ type localModelSelection struct {
 	ManifestLength                 int64
 }
 
-func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
+func exactLocalModel(tool *tfs.Tool, spec, lane, work string, metadataOnly bool) (
 	localModelSelection, bool, *exit.Error,
 ) {
 	var empty localModelSelection
@@ -386,8 +402,10 @@ func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
 		if problem != nil || length == 0 {
 			return empty, false, problem
 		}
-		if problem := tool.VerifyManifest(manifest); problem != nil {
-			return empty, false, problem
+		if !metadataOnly {
+			if problem := tool.VerifyManifest(manifest); problem != nil {
+				return empty, false, problem
+			}
 		}
 		return localModelSelection{Model: ref.String(), Manifest: manifest, ManifestLength: length}, true, nil
 	}
