@@ -92,7 +92,7 @@ func (c *Orchestrator) LatestFrame(requestID string) (Frame, bool) {
 }
 
 // ProgressSnapshot is the latest real work coordinate Runtime reported and an optional
-// whole-job estimate from measured elapsed time per overall-fraction advance. It is
+// whole-job estimate from sampled step intervals per overall-fraction advance. It is
 // observational; the final overall fraction is copied into the attempt-end event.
 type ProgressSnapshot struct {
 	Stage           string
@@ -236,12 +236,13 @@ func progressCoordinates(value any) (progressCoordinate, bool) {
 		}
 		out.position, out.total, out.hasPosition = int64(position), int64(total), true
 		derived := position / total
-		if out.hasStageFraction && math.Abs(out.stageFraction-derived) > 1e-9 {
+		// Runtime rounds fractions to six decimal places. Counted progress has
+		// exact integer coordinates; keep those authoritative after checking that
+		// the approximate fraction agrees to its reported precision.
+		if out.hasStageFraction && math.Abs(out.stageFraction-derived) > 1e-6 {
 			return out, false
 		}
-		if !out.hasStageFraction {
-			out.stageFraction, out.hasStageFraction = derived, true
-		}
+		out.stageFraction, out.hasStageFraction = derived, true
 	}
 	return out, true
 }
@@ -261,8 +262,19 @@ func (f *fanout) observeProgress(frame Frame) {
 	}
 	if coordinate.hasOverall && progress.hasOverall &&
 		coordinate.overallFraction > progress.overallFraction && coordinate.stepMS > 0 {
+		elapsed := coordinate.stepMS
+		if coordinate.hasPosition {
+			advanced := coordinate.position
+			if progress.stage == coordinate.stage && progress.hasPosition && progress.total == coordinate.total {
+				advanced -= progress.position
+			}
+			// The stream is lossy: the last interval samples one step, while the
+			// coordinate can advance by several. Estimate the missing intervals at
+			// that sampled rate; do not price all of their work as a single step.
+			elapsed *= float64(max(0, advanced))
+		}
 		progress.overallDelta += coordinate.overallFraction - progress.overallFraction
-		progress.overallMSSum += coordinate.stepMS
+		progress.overallMSSum += elapsed
 	}
 	if coordinate.hasOverall {
 		progress.overallFraction, progress.hasOverall = coordinate.overallFraction, true
