@@ -21,7 +21,7 @@ import (
 )
 
 func TestAssessmentPublicationReconcilesExactBytesAndFencesCanceledWrites(t *testing.T) {
-	report, err := os.ReadFile("testdata/assessment-v4.json")
+	report, err := os.ReadFile("testdata/assessment-v5.json")
 	must(t, err)
 	for _, mode := range []string{"normal", "lost-reply", "canceled", "wrong-readback", "changed-account", "wrong-ack-verdict"} {
 		t.Run(mode, func(t *testing.T) {

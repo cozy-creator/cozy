@@ -41,6 +41,9 @@ func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Reques
 	if s.host == nil || s.claim == nil {
 		return nil, exit.Unavailablef("private job preparation awaits the claimed Host")
 	}
+	if problem := requireLocalPackageCapacity(s, len(selected.Files)); problem != nil {
+		return nil, problem
+	}
 	call := &pb.PrepareLocalPackageCall{Claim: s.claim, LocalPackageSet: selected}
 	result := c.runHostPrepare(s, w, 0, hostLabel("local_job", request.ID),
 		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
