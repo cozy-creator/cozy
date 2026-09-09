@@ -440,7 +440,7 @@ func TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung(t *testing.T) {
 	pinned, _, _ := rental.Pin(h3Ladder(), "NVIDIA H100 80GB HBM3")
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "pr-ladder-h100", MachineName: "ladder-h100",
 		SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3", HourlyRateUSDMicros: 2_490_000,
-		State: "ready", Hub: "http://hub.example"}))
+		HourlyRateSource: "observed", State: "ready", Hub: "http://hub.example"}))
 	assigned, problem := store.PinRental(request, "pr-ladder-h100", pinned)
 	fatal(t, problem)
 	row, problem = store.RequestRow(request)
