@@ -137,6 +137,8 @@ pub struct Ledger {
     sample: Duration,
     worst_gap: Mutex<Duration>,
     progress: Mutex<Progress>,
+    #[cfg(test)]
+    clock: Option<Box<dyn Fn() -> Instant + Send + Sync>>,
 }
 
 impl Ledger {
@@ -155,7 +157,28 @@ impl Ledger {
                 advanced: Instant::now(),
                 worst_still: Duration::ZERO,
             }),
+            #[cfg(test)]
+            clock: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_clock(
+        sample: Duration,
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Self {
+        let mut ledger = Self::with_resolution(sample);
+        ledger.progress.lock().unwrap().advanced = clock();
+        ledger.clock = Some(Box::new(clock));
+        ledger
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock();
+        }
+        Instant::now()
     }
 
     pub fn sample(&self) -> Duration {
@@ -215,7 +238,7 @@ impl Ledger {
     /// stream cannot raise the bar the next stream is judged by.
     fn advance(&self, bytes: u64) {
         let mut progress = self.progress.lock().unwrap();
-        let now = Instant::now();
+        let now = self.now();
         let gap = now.saturating_duration_since(progress.advanced);
         if gap > progress.worst_still {
             progress.worst_still = gap;
@@ -238,7 +261,7 @@ impl Ledger {
         let progress = self.progress.lock().unwrap();
         Still {
             moved: progress.moved,
-            silent: progress.advanced.elapsed(),
+            silent: self.now().saturating_duration_since(progress.advanced),
         }
     }
 }
