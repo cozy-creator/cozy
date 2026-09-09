@@ -47,7 +47,7 @@ func SyncStoredSourceCustody(ctx context.Context, cfg config.Config, requestID, 
 	if problem != nil {
 		return nil, problem
 	}
-	connection, problem := orchestrator.DialIdleControl(ctx, target.Connection, rental.ClaimProof(layout))
+	connection, problem := orchestrator.DialIdleControl(ctx, target.Connection, rental.ClaimProof(layout), nil)
 	if problem != nil {
 		return nil, problem
 	}

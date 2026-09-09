@@ -6,6 +6,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -24,7 +25,7 @@ type IdleControl struct {
 
 func (s *IdleControl) Close() error { s.cancel(); return s.connection.Close() }
 
-func DialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource) (*IdleControl, *exit.Error) {
+func DialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
 	if remote == nil || remote.CACert == "" || remote.WorkerBootID == "" || sign == nil {
 		return nil, exit.New(exit.Credential, "operator control requires a pinned rental and Claim signer")
 	}
@@ -76,7 +77,7 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 			if epoch == 0 || snap.RecordOwnerEpoch != recordOwnerEpoch || snap.ControlStreamEpoch != epoch || snap.WorkerBootId != remote.WorkerBootID {
 				return nil, exit.New(exit.Conflict, "operator control snapshot changed its claimed envelope")
 			}
-			if problem := validateIdleSnapshot(snap); problem != nil {
+			if problem := validateIdleSnapshot(snap, remote.RentalID, retained); problem != nil {
 				return nil, problem
 			}
 			control.ControlStreamEpoch = epoch
@@ -109,7 +110,7 @@ func idleControlEnd(err error) *exit.Error {
 	return exit.New(exit.Conflict, "operator control refused the fixed rental Claim")
 }
 
-func validateIdleSnapshot(snap *pb.WorkerSnapshot) *exit.Error {
+func validateIdleSnapshot(snap *pb.WorkerSnapshot, rentalID string, retained *records.Store) *exit.Error {
 	if snap.SnapshotId == "" || !bytes.Equal(canonical.Digest(snap.SnapshotCanonicalBytes), snap.SnapshotDigest) {
 		return exit.New(exit.Structural, "operator control snapshot digest mismatch")
 	}
@@ -121,9 +122,6 @@ func validateIdleSnapshot(snap *pb.WorkerSnapshot) *exit.Error {
 	if declared := doc.Str("accepted_placement_set_digest"); declared != "" && declared != set {
 		return exit.New(exit.Structural, "operator control accepted placement bytes changed")
 	}
-	if len(doc.List("held_attempts")) != 0 {
-		return exit.New(exit.Conflict, "operator control cannot take over a worker holding attempts")
-	}
 	if len(snap.HostSnapshotCanonicalBytes) == 0 || !bytes.Equal(canonical.Digest(snap.HostSnapshotCanonicalBytes), snap.HostSnapshotDigest) {
 		return exit.New(exit.Structural, "operator control Host snapshot digest mismatch")
 	}
@@ -131,8 +129,66 @@ func validateIdleSnapshot(snap *pb.WorkerSnapshot) *exit.Error {
 	if err != nil {
 		return exit.New(exit.Structural, "operator control Host snapshot is not canonical")
 	}
-	if len(host.List("held_outcomes")) != 0 {
-		return exit.New(exit.Conflict, "operator control cannot ignore held producer outcomes")
+	seen := map[string]map[int64]bool{}
+	for _, held := range append(doc.List("held_attempts"), host.List("held_outcomes")...) {
+		request, ordinal := held.Str("request_id"), held.Int("attempt_ordinal")
+		if seen[request] == nil {
+			seen[request] = map[int64]bool{}
+		}
+		if seen[request][ordinal] {
+			return exit.New(exit.Conflict, "operator control snapshot repeats a held attempt")
+		}
+		seen[request][ordinal] = true
+		if problem := verifySettledRetainedAttempt(retained, rentalID, held); problem != nil {
+			return problem
+		}
+	}
+	return nil
+}
+
+// Only the development holder supplies its locked local authority. Generic idle
+// and source-custody lanes still require an empty held-attempt census. Retention
+// keeps completed outcomes in the workspace; accepting their exact settled
+// identity neither releases bytes nor opens the snapshot dispatch barrier.
+// Both snapshot censuses carry HeldAttempt outcome ID/digest; those must match
+// the closed local terminal whose canonical body is independently verified here.
+func verifySettledRetainedAttempt(store *records.Store, rentalID string, held canonical.Doc) *exit.Error {
+	refuse := func() *exit.Error {
+		return exit.New(exit.Conflict, "operator control cannot take over an unverified held attempt")
+	}
+	if store == nil || rentalID == "" || held.Int("state") != int64(pb.AttemptState_ATTEMPT_STATE_OUTCOME_PENDING_ACK) || held.Int("attempt_ordinal") <= 0 {
+		return refuse()
+	}
+	request, problem := store.RequestRow(held.Str("request_id"))
+	if problem != nil {
+		return problem
+	}
+	if request == nil || request.Worker != rentalID || !request.RetainWork {
+		return refuse()
+	}
+	switch request.State {
+	case "paused", "blocked", "succeeded", "failed", "canceled", "refused", "abandoned":
+	default:
+		return refuse()
+	}
+	attempt, problem := store.AttemptRow(request.ID, held.Int("attempt_ordinal"))
+	if problem != nil {
+		return problem
+	}
+	if attempt == nil {
+		return refuse()
+	}
+	terminalDigest, _ := canonical.Spell(canonical.Digest(attempt.TerminalBody))
+	instance := (WorkerLaunchSpec{Connection: &WorkerConnection{RentalID: rentalID}}).InstanceID()
+	if attempt.State != "closed" || attempt.InstanceID != instance || attempt.TerminalID == "" ||
+		attempt.InvocationDigest != held.Str("invocation_spec_digest") || terminalDigest != attempt.TerminalDigest ||
+		held.Str("outcome_id") != attempt.TerminalID || held.Str("outcome_digest") != attempt.TerminalDigest {
+		return refuse()
+	}
+	body, err := canonical.Read(attempt.TerminalBody, &pb.AttemptOutcomeBody{})
+	if err != nil || body.Str("request_id") != request.ID || body.Int("attempt_ordinal") != attempt.Attempt ||
+		body.Str("invocation_spec_digest") != attempt.InvocationDigest {
+		return refuse()
 	}
 	return nil
 }

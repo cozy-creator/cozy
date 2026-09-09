@@ -62,7 +62,7 @@ func TestIdleControlAcceptsCompatibleMinorSkew(t *testing.T) {
 		var options orchestrator.Options
 		rentalWiring(connection, private)(&options)
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		control, problem := orchestrator.DialIdleControl(ctx, connection, options.RentalClaimProof)
+		control, problem := orchestrator.DialIdleControl(ctx, connection, options.RentalClaimProof, nil)
 		if control != nil {
 			must(t, control.Close())
 		}

@@ -41,6 +41,8 @@ type idleHoldPeer struct {
 	epoch                uint64
 	workerID, bootID     string
 	workerBusy, hostBusy bool
+	settled              []*pb.HeldAttempt
+	settledAtHost        bool
 	deny                 codes.Code
 	claims               atomic.Int64
 	otherFrames          atomic.Int64
@@ -86,6 +88,11 @@ func (p *idleHoldPeer) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFra
 	}
 	if p.hostBusy {
 		host.HeldOutcomes = []*pb.HeldAttempt{{RequestId: "unacknowledged", AttemptOrdinal: 1}}
+	}
+	if p.settledAtHost {
+		host.HeldOutcomes = append(host.HeldOutcomes, p.settled...)
+	} else {
+		worker.HeldAttempts = append(worker.HeldAttempts, p.settled...)
 	}
 	workerBody, workerDigest, err := canonical.Identity(worker)
 	if err != nil {
