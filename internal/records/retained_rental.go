@@ -39,12 +39,18 @@ func (s *Store) RequestRetainedRentalAbandonment(rental, actor string) *exit.Err
 	if _, err := tx.Exec(`UPDATE rentals SET state='release_requested' WHERE id=? AND state NOT IN ('failed','released')`, rental); err != nil {
 		return exit.Internalf("cannot fence released rental admission: %s", err)
 	}
+	// Refuse new reads while this machine is being removed. These are custody
+	// states, independent of whether the producing execution already succeeded.
+	if _, err := tx.Exec(`UPDATE native_artifact_retentions SET state='releasing'
+		WHERE owner_worker=? AND state IN ('pending','held')`, rental); err != nil {
+		return exit.Internalf("cannot fence released rental artifact custody: %s", err)
+	}
 	ids, problem := retainedRentalIDs(tx, rental)
 	if problem != nil {
 		return problem
 	}
 	for _, id := range ids {
-		changed, err := tx.Exec(`UPDATE requests SET state='canceling',control_revision=control_revision+1 WHERE id=? AND state NOT IN ('canceling','releasing')`, id)
+		changed, err := tx.Exec(`UPDATE requests SET state='canceling',control_revision=control_revision+1 WHERE id=? AND state NOT IN ('succeeded','canceling','releasing')`, id)
 		if err != nil {
 			return exit.Internalf("cannot abandon retained rental request: %s", err)
 		}
@@ -70,6 +76,12 @@ func (s *Store) CompleteRetainedRentalAbandonment(rental, actor string) *exit.Er
 		return exit.Internalf("cannot begin retained rental settlement: %s", err)
 	}
 	defer tx.Rollback()
+	// Provider absence is proof these particular holds no longer retain bytes.
+	// Keep the original receipts/outcomes; do not invent a native finalization ACK.
+	if _, err := tx.Exec(`UPDATE native_artifact_retentions SET state='released'
+		WHERE owner_worker=? AND state!='released'`, rental); err != nil {
+		return exit.Internalf("cannot settle released rental artifact custody: %s", err)
+	}
 	ids, problem := retainedRentalIDs(tx, rental)
 	if problem != nil {
 		return problem
@@ -78,6 +90,17 @@ func (s *Store) CompleteRetainedRentalAbandonment(rental, actor string) *exit.Er
 		var state string
 		if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, id).Scan(&state); err != nil {
 			return exit.Internalf("cannot inspect retained rental cancellation: %s", err)
+		}
+		if state == "succeeded" {
+			if _, err := tx.Exec(`UPDATE requests SET retain_work=0 WHERE id=? AND state='succeeded'`, id); err != nil {
+				return exit.Internalf("cannot release completed rental retention: %s", err)
+			}
+			if err := appendEventTx(tx, id, "request.retention_released", 0, map[string]any{
+				"actor": actor, "rental": rental, "reason": "the retained rental was explicitly released",
+			}); err != nil {
+				return exit.Internalf("cannot journal completed rental retention release: %s", err)
+			}
+			continue
 		}
 		if state != "canceling" && state != "releasing" {
 			return exit.Named(exit.Conflict, "request.rental_abandonment_missing", "retained request %s has no explicit rental abandonment intent", id)
