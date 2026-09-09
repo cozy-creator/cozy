@@ -16,7 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-const wheelGraphUV = "0.12.7"
+const wheelGraphUV = "0.12.11"
 
 type graphEdge struct {
 	ID string `json:"id"`
@@ -48,7 +48,7 @@ func WheelClosures(ctx context.Context, tree, python, installed, project, extra 
 	version.Env = config.Frozen().Tool()
 	raw, err := version.Output()
 	fields := strings.Fields(string(raw))
-	if err != nil || len(fields) < 2 || fields[0] != "uv" || fields[1] != wheelGraphUV {
+	if err != nil || len(fields) < 2 || fields[0] != "uv" || (fields[1] != wheelGraphUV && fields[1] != "0.12.7") {
 		return nil, exit.Named(exit.Structural, "private_wheel_graph_uv_unsupported",
 			"installed callable wheel discovery requires uv %s's qualified graph schema", wheelGraphUV).
 			WithRemedy("install uv %s, then retry cozy run", wheelGraphUV)

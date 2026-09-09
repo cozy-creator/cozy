@@ -9,6 +9,8 @@ jobs:
         with:
           go-version: stable
       - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.12.11'
       - run: uv python install 3.12
       - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
       - name: Install the public worker for private script execution
