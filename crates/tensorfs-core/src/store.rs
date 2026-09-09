@@ -947,8 +947,47 @@ impl Store {
         mutation: &crate::repository::Mutation,
         fault: &Fault,
     ) -> Result<Option<crate::repository::Repository>> {
-        let catalog = crate::catalog::Catalog::open(&self.root)?;
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        self.apply_repository_locked(observed, mutation, fault, false)
+    }
+
+    /// Only the verified Hub transport may extend disposable cache ownership.
+    pub(crate) fn apply_cached_repository(
+        &self,
+        observed: Option<&[u8]>,
+        mutation: &crate::repository::Mutation,
+        fault: &Fault,
+    ) -> Result<Option<crate::repository::Repository>> {
+        let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        self.apply_repository_locked(observed, mutation, fault, true)
+    }
+
+    pub(crate) fn remove_cached_repository(
+        &self,
+        observed: &[u8],
+        repo: &crate::repository::RepositoryName,
+        _exclusive: &crate::catalog::RebuildGuard,
+    ) -> Result<()> {
+        if !crate::cache_roots::matches(self, repo, observed)? {
+            return refuse(Code::REPOSITORY_CONFLICT, "cache root ownership changed");
+        }
+        self.apply_repository_locked(
+            Some(observed),
+            &crate::repository::Mutation::DeleteRepository { repo: repo.clone() },
+            &Fault::default(),
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn apply_repository_locked(
+        &self,
+        observed: Option<&[u8]>,
+        mutation: &crate::repository::Mutation,
+        fault: &Fault,
+        cache: bool,
+    ) -> Result<Option<crate::repository::Repository>> {
+        let catalog = crate::catalog::Catalog::open(&self.root)?;
         let path = self.repository_path(mutation.repo());
         let current = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
@@ -1026,6 +1065,14 @@ impl Store {
                     "repository changed while acquiring SQLite coordination",
                 );
             }
+            // Unknown/preexisting ownership cannot be promoted by a later download.
+            // Clear first: any crash before the matching replacement receipt preserves it.
+            let cache_owned = cache
+                && match actual.as_deref() {
+                    None => true,
+                    Some(bytes) => crate::cache_roots::matches(self, mutation.repo(), bytes)?,
+                };
+            crate::cache_roots::clear(self, mutation.repo())?;
             fault.hit("repo-before-replace");
             match &replacement_for_write {
                 Some(repository) => {
@@ -1065,6 +1112,15 @@ impl Store {
                 }
             }
             fault.hit("repo-after-replace");
+            if cache_owned {
+                if let Some(repository) = &replacement_for_write {
+                    crate::cache_roots::record(
+                        self,
+                        mutation.repo(),
+                        &repository.canonical_bytes(),
+                    )?;
+                }
+            }
             crate::storage::Census::open_metadata(&self.root)?.projection_for(&org, &name)
         })?;
         Ok(replacement)

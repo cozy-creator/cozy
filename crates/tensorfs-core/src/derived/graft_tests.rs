@@ -210,3 +210,50 @@ fn source_projection_inherits_only_selected_tensors_without_new_bytes() {
     release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
     std::fs::remove_dir_all(store.root()).unwrap();
 }
+
+#[test]
+fn pressure_keeps_cached_inputs_of_a_paused_derive_until_explicit_abandon() {
+    use crate::ids::Doc;
+    use crate::repository::{Mutation, RepositoryName};
+    let (store, meta, body, bank, declaration) = fixture();
+    let mut repos = Vec::new();
+    for (name, receipt) in [("body", &body), ("bank", &bank)] {
+        let repo = RepositoryName::new("downloaded", name).unwrap();
+        let recorded = store
+            .apply_cached_repository(
+                None,
+                &Mutation::PutCheckpoint {
+                    repo: repo.clone(),
+                    manifest: receipt.manifest.clone(),
+                },
+                &Default::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(crate::cache_roots::matches(&store, &repo, &recorded.canonical_bytes()).unwrap());
+        repos.push(repo);
+    }
+    let id = format!("sha256:{}", "a4".repeat(32));
+    let writer = begin(&store, &meta, &id, 1, declaration, None).unwrap();
+    fence(&meta, &id, 1).unwrap();
+    release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
+    // The producer's original obligations end; only the paused derive still needs inputs.
+    dispose(&store, &meta, &body.transaction).unwrap();
+    dispose(&store, &meta, &bank.transaction).unwrap();
+    let held = crate::gc::collect_cached(store.root(), &[]).unwrap();
+    assert_eq!(held.reclaimed_bytes, 0);
+    assert!(repos
+        .iter()
+        .all(|repo| store.repository_path(repo).exists()));
+    abandon(&store, &meta, &id).unwrap();
+    assert!(
+        crate::gc::collect_cached(store.root(), &[])
+            .unwrap()
+            .reclaimed_bytes
+            > 0
+    );
+    assert!(repos
+        .iter()
+        .any(|repo| !store.repository_path(repo).exists()));
+    std::fs::remove_dir_all(store.root()).unwrap();
+}

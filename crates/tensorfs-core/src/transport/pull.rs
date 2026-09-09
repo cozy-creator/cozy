@@ -1209,7 +1209,7 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
         return Ok(());
     }
     if !holds_checkpoint(latest.as_ref()) {
-        latest = store.apply_repository(
+        latest = store.apply_cached_repository(
             observed.as_deref(),
             &Mutation::PutCheckpoint {
                 repo: repo.clone(),
@@ -1233,7 +1233,7 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
                 .find(|release| release.version == closure.release)
         })
         .map_or(0, |release| release.revision);
-    store.apply_repository(
+    store.apply_cached_repository(
         observed.as_deref(),
         &Mutation::UpdateRelease {
             expected_revision,
