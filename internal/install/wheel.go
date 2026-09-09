@@ -128,7 +128,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if problem != nil {
 		return fail(problem)
 	}
-	names := privateWheelClosureNames(dependencies)
+	names := privateWheelAllNames(dependencies)
 	var requirements []string
 	type identity struct{ Name, Version, Wheel, OriginalWheel, BaseRequirement string }
 	var identities []identity
@@ -180,6 +180,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if installed != packagepublish.PinnedClosure(pins) {
 		return fail(exit.New(exit.Conflict, "installed callable wheel environment differs from its exact selected closure"))
 	}
+	portable := portablePrivateWheelClosure(installed)
 	path := launch.PackageInterfacePath(dir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fail(exit.Internalf("cannot retain private wheel interface"))
@@ -194,7 +195,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	inst := records.PackageInstall{ID: id, Package: "local/" + project, Version: root.Version, Major: major,
 		SourceKind: "wheel", SourceRef: dir, SourceDigest: digest, ProjectDir: dir, Dir: dir,
 		Python: pythonVersion(venv), UV: toolVersion("uv", "--version"), LockDigest: digest,
-		Platform: "linux/amd64", Packages: count, Closure: installed, PackageInterface: surface.Digest}
+		Platform: "linux/amd64", Packages: count, Closure: portable, PackageInterface: surface.Digest}
 	inst.BytesExcl, inst.BytesShared = Disk(dir)
 	if problem := store.RecordInstall(inst); problem != nil {
 		return fail(problem)
@@ -213,15 +214,24 @@ func exactPrivateWheelRequirements(project string, dependencies map[string]packa
 	return exact
 }
 
-func privateWheelClosureNames(dependencies map[string]packagepublish.CapturedDependency) []string {
+func privateWheelAllNames(dependencies map[string]packagepublish.CapturedDependency) []string {
 	names := make([]string, 0, len(dependencies))
 	for name := range dependencies {
-		if !packagepublish.ImageOwnedDistribution(name) {
-			names = append(names, name)
-		}
+		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
+}
+
+func portablePrivateWheelClosure(installed string) string {
+	rows := make([]string, 0)
+	for _, row := range strings.Split(strings.TrimSpace(installed), "\n") {
+		name, _, _ := strings.Cut(row, "==")
+		if !packagepublish.ImageOwnedDistribution(normalizedRequirementName(name)) {
+			rows = append(rows, row)
+		}
+	}
+	return strings.Join(rows, "\n")
 }
 
 func retainOriginalWheel(dir string, dependency packagepublish.CapturedDependency) (string, *exit.Error) {
