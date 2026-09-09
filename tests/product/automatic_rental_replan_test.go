@@ -138,6 +138,7 @@ func TestRentalReassignmentPreservesExecutionAndPurchaseCustody(t *testing.T) {
 				fatal(t, st.AdvanceRentalOperation(op.Key, row.ID, "ready"))
 			}
 			if mode == "attempted" {
+				fatal(t, st.SpawnWorker(records.WorkerProcess{InstanceID: "instance", Package: request.Package, WorkerID: "worker", Devices: []string{"cpu"}}))
 				_, problem := st.Dispatch(records.Attempt{RequestID: request.ID, InstanceID: "instance", SessionID: "session", InvocationCanonical: []byte(`{}`), WeightsOutputs: `[]`})
 				fatal(t, problem)
 			}
