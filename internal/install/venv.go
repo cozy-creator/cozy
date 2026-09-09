@@ -65,7 +65,7 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 	}
 	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
 
-	args := []string{"sync", "--locked", "--no-progress"}
+	args := []string{"sync", "--locked", "--no-dev", "--no-default-groups", "--no-progress"}
 	if !editable {
 		args = append(args, "--no-editable")
 	}
@@ -132,7 +132,7 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	defer os.Remove(exported)
 	// Export the committed registry closure without the rows the release's own wheels
 	// supply; those rows are re-added below as exact org-index pins.
-	args := []string{"export", "--frozen", "--no-dev", "--no-emit-project",
+	args := []string{"export", "--frozen", "--no-dev", "--no-default-groups", "--no-emit-project",
 		"--format", "requirements.txt", "--output-file", exported, "--no-progress"}
 	seen := map[string]bool{}
 	for _, wheel := range appended {
