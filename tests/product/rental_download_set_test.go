@@ -151,6 +151,7 @@ func delegatedPackages() []*pb.DownloadPackageRef {
 // presentedDownloadSet is what the pod was handed: whether it prepared, and the two
 // facts the deletion is about — any surviving credential field, and any signature.
 type presentedDownloadSet struct {
+	document         []byte
 	accepted         bool
 	credentialFields string
 	signature        bool
@@ -396,7 +397,7 @@ func (p *standInPod) applyPackageSet(desired, signature []byte) error {
 			surviving = append(surviving, field)
 		}
 	}
-	presented := presentedDownloadSet{credentialFields: strings.Join(surviving, ","),
+	presented := presentedDownloadSet{document: append([]byte(nil), desired...), credentialFields: strings.Join(surviving, ","),
 		signature: len(signature) != 0}
 
 	p.mu.Lock()
@@ -588,4 +589,26 @@ func standInCertificate(t *testing.T, root string) string {
 	must(t, os.WriteFile(certPath+".key",
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600))
 	return certPath
+}
+
+func TestUnversionedCheckpointReachesRentalDownloadSet(t *testing.T) {
+	pod := &standInPod{}
+	o, instance := attachStandInRental(t, "checkpoint-no-release", pod)
+	packages := delegatedPackages()
+	digest := "sha256:" + strings.Repeat("4", 64)
+	models := []*pb.DownloadModelRef{{Package: packages[0].Package, Slot: "prepare.models.source", Model: "proof/checkpoint", Manifest: digest}}
+	fatal(t, o.c.ConvergePackageSet(instance, packages, models))
+	seen := pod.await(t, 1, 10*time.Second)
+	document, err := canonical.Read(seen[0].document, &pb.DownloadDelegation{})
+	must(t, err)
+	rows := document.List("models")
+	if !seen[0].accepted || len(rows) != 1 || rows[0].Str("manifest") != digest || rows[0].Str("release") != "" || rows[0].Str("lane") != "" {
+		t.Fatalf("checkpoint gained a synthetic release or was lost: %s", seen[0].document)
+	}
+	for _, pair := range [][2]string{{"release", ""}, {"", "lane"}} {
+		models[0].Release, models[0].Lane = pair[0], pair[1]
+		if _, problem := rental.DownloadSet(packages, models); problem == nil {
+			t.Fatalf("partial provenance accepted: %v", pair)
+		}
+	}
 }

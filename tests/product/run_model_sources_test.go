@@ -288,3 +288,26 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 		t.Fatal("replay changed request identity")
 	}
 }
+
+func TestCatalogCheckpointReferenceRoundTripsThroughRun(t *testing.T) {
+	root, _, _, digest, _ := runModelCatalog(t)
+	code, out := runCozy(t, root, "model", "info", "proof/source", "--json")
+	var document struct {
+		Releases []struct {
+			Lanes []struct {
+				Ref string `json:"checkpoint_ref"`
+			} `json:"lanes"`
+		} `json:"releases"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Releases) != 1 || len(document.Releases[0].Lanes) != 1 {
+		t.Fatalf("catalog info unavailable: %d %s", code, out)
+	}
+	ref := document.Releases[0].Lanes[0].Ref
+	if ref != "proof/source#"+digest {
+		t.Fatalf("catalog emitted unsupported checkpoint syntax: %s", ref)
+	}
+	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "steps=7", "--model.dits="+ref, "--model.shared="+ref, "--rental-only", "--dry-run", "--json")
+	if code != 0 || !strings.Contains(out, `"hub_checkpoint":true`) {
+		t.Fatalf("copied catalog ref did not resolve checkpoint: %d %s", code, out)
+	}
+}
