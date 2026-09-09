@@ -809,7 +809,9 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 			// READ ONCE, WHATEVER THE STATE. The rows used to be read only while
 			// `materializing`, which is to say only while there was nothing to explain: a
 			// transfer that has already failed is exactly when the reason is wanted.
-			if statuses, statusProblem := s.store.ModelTransferSourceStatuses(row.ID); statusProblem == nil {
+			// Completed transfer publication proves the accepted source preparation finished.
+			// Raw transfer counters may be absent when conversion ran through native calls.
+			if statuses, statusProblem := s.store.ModelTransferSourceStatuses(row.ID); statusProblem == nil && transfer.State != "completed" {
 				var transferred, total int64
 				verified, converted := 0, 0
 				for _, status := range statuses {
