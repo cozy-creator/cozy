@@ -460,6 +460,11 @@ its own once nothing has been queued, running, or owed on it for `rentals.idle_r
 (default 300). Running work on it is what keeps it: the clock restarts at each settled attempt,
 and a rental that never ran anything counts from the moment Tensorhub first reported it `ready`,
 so a pod still booting is never ended. A managed rental whose job is done goes at once.
+
+Running and queued counts describe work recorded by this controller. For rentals
+missing from its local history, activity is unknown: the table shows `—`, and JSON
+omits those counts. Another controller may be using those machines.
+
 `cozy rental list` shows each machine's idle time and when it will be released; `cozy rental end`
 ends one now. A release Tensorhub does not confirm is retried until it does. Set
 `idle_release_s: 0` to leave every rental to `cozy rental end`.

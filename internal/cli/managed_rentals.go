@@ -576,12 +576,11 @@ func (m *managedRentals) admitLocked(sku hub.RentalSKU) *exit.Error {
 	// plus the SKU's storage adder — never the GPU rate alone (th-126).
 	if burn > cap || sku.PriceUSDMicrosPerHour+sku.StorageUSDMicrosPerHour > cap-burn {
 		remedy := "raise rentals.max_hourly_spend_usd or end another rental"
-		// WHICH rental to end is the whole question when part of the burn is a pod
-		// this host never filed: without this line the reader ends a machine they can
-		// see and the ceiling stays breached by the ones they cannot.
+		// Account-wide burn includes other controllers' rentals. Explain that scope
+		// without treating an absent local record as permission to end their work.
 		if unrecorded, unrecordedBurn := m.unrecordedTotalsLocked(); unrecorded > 0 {
 			remedy = fmt.Sprintf("%s of the burn is %d machine(s) the hub bills this account for that this "+
-				"host holds no record of; `cozy rental list` names them and `cozy rental end` releases them",
+				"host holds no record of; inspect them with `cozy rental list` or raise rentals.max_hourly_spend_usd",
 				usdPerHour(unrecordedBurn), unrecorded)
 		}
 		return exit.Named(exit.Capacity, "rental.fleet_spend_cap",
@@ -910,12 +909,12 @@ func (m *managedRentals) reconcileListingLocked() {
 // to the reconcile because the reconcile also runs under a CLI verb, whose stdout is
 // a machine document that a log line would corrupt. The daemon has no reader watching
 // a board, so a machine billing outside its records has to reach the log by itself —
-// once per machine, at the sweep's own cadence, saying the word that ends it.
+// once per machine, at the sweep's own cadence, stating the missing local activity.
 func (m *managedRentals) sayUnrecordedLocked() {
 	for _, seen := range m.unrecorded {
 		m.sayLocked("hub:"+seen.ID, fmt.Sprintf(
-			"rental %s (%s) is %s at %s and this host holds no record of it; end it with `cozy rental end %s`",
-			seen.ID, seen.Name, seen.State, usdPerHour(seen.HourlyRateUSDMicros), seen.Name))
+			"rental %s (%s) is %s at %s and this host holds no record of it; activity is unknown to this controller",
+			seen.ID, seen.Name, seen.State, usdPerHour(seen.HourlyRateUSDMicros)))
 	}
 }
 

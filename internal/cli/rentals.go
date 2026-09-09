@@ -831,7 +831,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		Aggregates: []output.Field{{K: "machines_running", V: jsonFact{count}},
 			{K: "hourly_spend_usd_micros", V: jsonFact{burn}}},
 		Trail: []string{idleShutdownNote(grace)},
-		Next:  []string{"cozy help rental new"},
+		Next:  []string{"cozy help rental"},
 	}
 	haveFailure := false
 	for _, r := range rows {
@@ -910,7 +910,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"sku":     orNone(acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount)),
 			"state":   seen.State,
 			"failure": "—", "uptime": rentalUptime(seen.CreatedAt),
-			"running": "0", "queued": "0", "idle": "—",
+			"running": "—", "queued": "—", "idle": "—",
 			"rental": seen.ID, "bought for": "—",
 			"accelerator": acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount),
 			"address":     seen.Address, "media": seen.MediaAddress, "hub": ctx.Cfg.HubURL,
@@ -921,8 +921,8 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		})
 		typed := map[string]any{
 			"machine": seen.Name, "state": seen.State, "rental_id": seen.ID,
-			"running": 0, "queued": 0, "hourly_rate_usd_micros": seen.HourlyRateUSDMicros,
-			"accelerator_count": seen.AcceleratorCount, "recorded": false,
+			"hourly_rate_usd_micros": seen.HourlyRateUSDMicros,
+			"accelerator_count":      seen.AcceleratorCount, "recorded": false,
 		}
 		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,
 			"address": seen.Address, "media_address": seen.MediaAddress,
@@ -952,7 +952,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			output.Field{K: "unrecorded_rentals", V: jsonFact{len(unrecorded)}},
 			output.Field{K: "unrecorded_hourly_spend_usd_micros", V: jsonFact{unrecordedBurn}})
 		list.Trail = append(list.Trail,
-			"an unrecorded machine cannot be attached here, but `cozy rental end <machine>` releases it")
+			"Unrecorded means this controller has no local history; running and queued activity on those machines is unknown.")
 	}
 	switch {
 	case listingProblem != nil:
@@ -1020,9 +1020,6 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"Paid asks with no attached machine: %d (a pod may be provisioning and billing under each)", unattached))
 		list.Aggregates = append(list.Aggregates,
 			output.Field{K: "unattached_rental_operations", V: jsonFact{unattached}})
-	}
-	if len(list.Rows) > 0 {
-		list.Next = []string{"cozy rental end " + list.Rows[0]["machine"]}
 	}
 	return list, nil
 }
@@ -1095,8 +1092,7 @@ func idleShutdownNote(grace time.Duration) string {
 		// shipped default is 300 s, and this host has switched the policy off. Naming
 		// the setting is the difference between "that is how it works" and "that is how
 		// you set it up", and the reader is the person paying for the difference.
-		return "Idle machines are never shut down automatically (rentals.idle_release_s is 0); " +
-			"end them with `cozy rental end`."
+		return "Idle machines are never shut down automatically (rentals.idle_release_s is 0)."
 	}
 	return "Idle machines shut down after " + plainDuration(grace) + "."
 }
@@ -1246,7 +1242,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 			return exit.Named(exit.NotFound, "rental.unknown",
 				"%s bills this account for %d rental(s) and none of them is %q",
 				c.Base(), listing, subject).
-				WithRemedy("`cozy rental list` names every machine this account is billed for; "+
+				WithRemedy("`cozy rental list` names every machine this account is billed for; " +
 					"nothing is billing under this name").
 				WithNext("cozy rental list")
 		}
