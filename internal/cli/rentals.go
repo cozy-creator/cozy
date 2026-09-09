@@ -113,7 +113,7 @@ func handleRent(ctx *Context) *exit.Error {
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
-		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", nil)
+		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", nil, rentalRates(fleet.unrecorded))
 	if e != nil {
 		return e
 	}
@@ -168,11 +168,11 @@ func handleRent(ctx *Context) *exit.Error {
 // worker's authenticated attach projection are durable locally.
 func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName,
 	operationKey, reason string, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
-	deadline time.Time, managedRequestID string, phase acquisitionPhase,
+	deadline time.Time, managedRequestID string, phase acquisitionPhase, observed map[string]int64,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	return acquireRentalContext(context.Background(), ctx, l, st, skuName, operationKey,
 		reason, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros, deadline,
-		managedRequestID, phase)
+		managedRequestID, phase, observed)
 }
 
 // acquisitionPhase reports one readiness observation to whoever is waiting on this
@@ -189,7 +189,7 @@ type acquisitionPhase func(hub.Rental)
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
 	st *records.Store, skuName, operationKey, reason string,
 	hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
-	deadline time.Time, managedRequestID string, phase acquisitionPhase,
+	deadline time.Time, managedRequestID string, phase acquisitionPhase, observed map[string]int64,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	c := client(ctx)
 	existing, e := st.RentalOperation(operationKey)
@@ -286,7 +286,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
 		Key: operationKey, Hub: c.Base(), Reason: reason, HourlyRateUSDMicros: hourlyRateUSDMicros,
 		ManagedRequestID: managedRequestID,
-	}, fleetCapUSDMicros, storageUSDMicros, author)
+	}, fleetCapUSDMicros, storageUSDMicros, author, observed)
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
@@ -1140,11 +1140,6 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
-	line, e := (&managedRentals{ctx: ctx, layout: l, store: st}).status()
-	if e != nil {
-		return e
-	}
-	fmt.Fprintln(ctx.Err, line)
 	known, e := rental.Resolve(st, subject)
 	if e != nil {
 		return e

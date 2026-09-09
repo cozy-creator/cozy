@@ -159,6 +159,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	media.StartTLS()
 	defer media.Close()
 	var mutations atomic.Int64
+	rentalView := map[string]any{"rental_id": podRental, "name": "manual-empty", "state": "ready", "accelerator_count": 1, "hourly_rate_usd_micros": 1}
 	// Control reattachment needs the retained identity, not a successful cloud poll.
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -166,6 +167,9 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		}
 		if classProof && r.Method == http.MethodGet {
 			switch r.URL.Path {
+			case "/v1/rentals":
+				_ = json.NewEncoder(w).Encode(map[string]any{"rentals": []map[string]any{rentalView}})
+				return
 			case "/v1/rental-skus":
 				skus := offeredSKUs()
 				for i := range skus {
@@ -176,7 +180,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 				_ = json.NewEncoder(w).Encode(skus)
 				return
 			case "/v1/rentals/" + podRental:
-				_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": podRental, "name": "manual-empty", "state": "ready", "accelerator_count": 1, "hourly_rate_usd_micros": 1})
+				_ = json.NewEncoder(w).Encode(rentalView)
 				return
 			}
 		}

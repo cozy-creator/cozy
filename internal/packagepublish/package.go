@@ -106,10 +106,8 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 	return p.build(ctx, false)
 }
 
-// BuildForPublish is Build plus the publish-only refusals (cl-084): a uv.lock
-// row that lives only on the author's machine and an image-owned pin cannot
-// enter a published release, while an editable or local install of the same
-// tree stays legal.
+// BuildForPublish also rejects lock rows available only on the author's machine.
+// Declared compatibility bounds are preserved; worker admission checks the image.
 func (p *Package) BuildForPublish(ctx context.Context) *exit.Error {
 	return p.build(ctx, true)
 }

@@ -246,11 +246,10 @@ type fakeRentalHub struct {
 
 func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	t.Helper()
-	h := &fakeRentalHub{rentals: map[string]map[string]any{}, released: map[string]int{}}
+	h := &fakeRentalHub{rentals: map[string]map[string]any{}, released: map[string]int{}, publishes: true}
 	mux := http.NewServeMux()
-	// th-199's enumeration door, the half a pre-th-199 hub does not have: `publishes`
-	// off leaves `POST /v1/rentals` to answer a GET with net/http's own 405, exactly as
-	// an un-upgraded Tensorhub does.
+	// Ordinary fixtures provide the real account census. Tests of an unavailable
+	// route must opt into that refusal explicitly.
 	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -327,8 +326,7 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	return h
 }
 
-// publishListing turns th-199's account listing on. It is off by default so every
-// proof written before the route still runs against the hub it was written for.
+// publishListing enables the account listing for tests that control availability.
 func (h *fakeRentalHub) publishListing() {
 	h.mu.Lock()
 	defer h.mu.Unlock()

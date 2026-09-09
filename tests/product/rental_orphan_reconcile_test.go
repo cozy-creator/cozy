@@ -197,11 +197,14 @@ func TestUnrecordedSpendRefusesTheNextPurchase(t *testing.T) {
 // nothing" would rebuild the exact silence this work exists to remove.
 func TestAHubWithNoListingIsNotAnEmptyFleet(t *testing.T) {
 	root, _, stand := rentalEndRoot(t, "rental-orphan-unpublished")
+	stand.mu.Lock()
+	stand.publishes = false
+	stand.mu.Unlock()
 	orphan(stand, "pr-5555555555555555punp", "punpun", 3_190_000)
 
 	code, out := runCozy(t, root, "rental", "list")
-	if code != 0 {
-		t.Fatalf("rental list failed against a hub with no listing [exit %d]\n%s", code, out)
+	if code == 0 || !strings.Contains(out, "account rental census unavailable") || strings.Contains(out, "Current spend") {
+		t.Fatalf("unavailable census claimed account totals [exit %d]\n%s", code, out)
 	}
 	if strings.Contains(out, "punpun") {
 		t.Fatalf("a hub that publishes no listing somehow named a machine\n%s", out)
@@ -216,6 +219,10 @@ func TestAHubWithNoListingIsNotAnEmptyFleet(t *testing.T) {
 	}
 	if stand.releases("pr-5555555555555555punp") != 0 {
 		t.Fatalf("a refusal still sent a DELETE")
+	}
+	code, out = runCozy(t, root, "rental", "end", "pr-5555555555555555punp", "--json")
+	if code != 0 || !strings.Contains(out, `"changed":true`) || stand.releases("pr-5555555555555555punp") != 1 {
+		t.Fatalf("unavailable census blocked release by exact rental ID [exit %d]\n%s", code, out)
 	}
 }
 

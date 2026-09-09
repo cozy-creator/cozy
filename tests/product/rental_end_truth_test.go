@@ -56,17 +56,15 @@ func rentalEndRoot(t *testing.T, name string) (string, string, *fakeRentalHub) {
 	return root, hubURL, newFakeRentalHub(t, port)
 }
 
-// TestEndingAnUnrecordedMachineDoesNotClaimItEnded is the exact live shape: the hub holds
-// a live pod, this host has never recorded it, and the person types the machine word.
-//
-// The only outcome that must not survive is silence dressed as success.
-func TestEndingAnUnrecordedMachineDoesNotClaimItEnded(t *testing.T) {
+// A complete account listing proves that a mistyped machine name is absent; it
+// must not release a different live rental or claim that a deletion occurred.
+func TestEndingAnUnknownMachineDoesNotClaimItEnded(t *testing.T) {
 	root, _, stand := rentalEndRoot(t, "rental-end-unrecorded")
 	stand.add("pr-0badc0de0badc0de0bad", "koharu")
 
-	code, out := runCozy(t, root, "rental", "end", "koharu", "--json")
+	code, out := runCozy(t, root, "rental", "end", "unknown-name", "--json")
 	if code == 0 {
-		t.Fatalf("ending a machine this host never recorded exited 0\n%s", out)
+		t.Fatalf("ending a machine absent from the account exited 0\n%s", out)
 	}
 	if strings.Contains(out, `"state":"ended"`) {
 		t.Fatalf("the CLI reported an end it did not perform\n%s", out)
@@ -74,9 +72,9 @@ func TestEndingAnUnrecordedMachineDoesNotClaimItEnded(t *testing.T) {
 	if !strings.Contains(out, "rental.unknown") {
 		t.Fatalf("the refusal is not the typed one that names what happened\n%s", out)
 	}
-	// The refusal must say WHY the 404 proved nothing, not merely that it got one.
-	if !strings.Contains(out, "opaque id") {
-		t.Fatalf("the refusal does not explain that a machine word is not a hub key\n%s", out)
+	// The refusal must distinguish an unknown name from a successful deletion.
+	if !strings.Contains(out, "none of them") {
+		t.Fatalf("the refusal does not report the account lookup\n%s", out)
 	}
 	if n := stand.releases("pr-0badc0de0badc0de0bad"); n != 0 {
 		t.Fatalf("the hub saw %d release(s) from a command that refused", n)
@@ -111,7 +109,8 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 		body, problem := hub.RentalRequestBytes(name, "cpu", strings.Repeat("ab", 32),
 			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil)
 		return body, "digest-" + name, problem
-	})
+	}, nil)
+
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(op.Key, id, "attached"))
 	stand.add(id, machine)
@@ -155,6 +154,7 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 // deleted its pending credential, and left nothing on this host that named the pod.
 func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 	root, _, stand := rentalEndRoot(t, "rental-end-unusable-answer")
+	stand.publishListing()
 	stand.setSKUs(map[string]any{
 		"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1,
 		"price_usd_micros_per_hour": 100_000, "storage_usd_micros_per_hour": 10_000,
@@ -213,12 +213,15 @@ func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 	var listed struct {
 		Rentals                    []map[string]any `json:"rentals"`
 		UnattachedRentalOperations int              `json:"unattached_rental_operations"`
+		MachinesRunning            int              `json:"machines_running"`
+		HourlySpendUSDMicros       int64            `json:"hourly_spend_usd_micros"`
 	}
 	if err := json.Unmarshal([]byte(board), &listed); err != nil {
 		t.Fatalf("rental list is not JSON: %v\n%s", err, board)
 	}
-	if listed.UnattachedRentalOperations != 1 || len(listed.Rentals) != 1 ||
-		listed.Rentals[0]["machine"] != machine {
+	if listed.UnattachedRentalOperations != 0 || len(listed.Rentals) != 1 ||
+		listed.Rentals[0]["machine"] != machine || listed.MachinesRunning != 1 ||
+		listed.HourlySpendUSDMicros != 100_000 {
 		t.Fatalf("a paid pod with no local record is invisible on the board\n%s", board)
 	}
 

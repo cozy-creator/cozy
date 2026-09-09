@@ -50,7 +50,6 @@ func VendoredNote(org string, dependency VendoredDependency) string {
 type requirement struct {
 	raw       string
 	name      string
-	spec      string
 	extras    []string
 	specifier pep440.Specifiers
 	hasSpec   bool
@@ -127,11 +126,6 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 		req, problem := parseRequirement(raw)
 		if problem != nil {
 			return problem
-		}
-		if c.publish {
-			if problem := refuseImageOwnedPin(req); problem != nil {
-				return problem
-			}
 		}
 		if req.direct {
 			return exit.Named(exit.Validation, "project_dependency_direct_url_unsupported",
@@ -526,7 +520,7 @@ func parseRequirement(raw string) (requirement, *exit.Error) {
 	if err != nil {
 		return requirement{}, invalidRequirement(raw)
 	}
-	req.specifier, req.spec, req.hasSpec = specifier, rest, true
+	req.specifier, req.hasSpec = specifier, true
 	return req, nil
 }
 
