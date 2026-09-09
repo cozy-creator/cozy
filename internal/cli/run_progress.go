@@ -147,9 +147,10 @@ func (p *RunProgress) rentalAcquisition(r hub.Rental) {
 		name = "connecting"
 	}
 	p.On(localapi.Event{Type: "request.phase", Payload: map[string]any{
-		"value": map[string]any{"phase": name, "machine": r.Name, "base_worker_image_digest": r.BaseWorkerImageDigest,
+		"value": map[string]any{"phase": name, "machine": r.Name,
 			"rental": map[string]any{"accelerator_model": r.AcceleratorModel,
-				"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros},
+				"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros,
+				"base_worker_image_digest": r.BaseWorkerImageDigest},
 		},
 	}})
 }
@@ -220,9 +221,6 @@ func phaseRows(fields map[string]any) []string {
 		return nil
 	}
 	rows := []string{line}
-	if digest, _ := fields["base_worker_image_digest"].(string); digest != "" {
-		rows = append(rows, "    image: "+digest)
-	}
 	if rental, ok := fields["rental"].(map[string]any); ok {
 		model, _ := rental["accelerator_model"].(string)
 		if model != "" {
@@ -234,6 +232,9 @@ func phaseRows(fields map[string]any) []string {
 				row += fmt.Sprintf(" · $%.2f/hour", price/1_000_000)
 			}
 			rows = append(rows, row)
+		}
+		if digest, _ := rental["base_worker_image_digest"].(string); digest != "" {
+			rows = append(rows, "    image: "+digest)
 		}
 	}
 	// Older workers report one aggregate transfer. Preserve that honest fallback;

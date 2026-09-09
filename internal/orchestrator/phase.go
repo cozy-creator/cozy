@@ -98,9 +98,10 @@ type PhaseObservation struct {
 // RentalProgress is the observed rental product and its whole-pod hourly rate.
 // It is display information only; billing and admission keep their own authority.
 type RentalProgress struct {
-	AcceleratorModel    string `json:"accelerator_model"`
-	AcceleratorCount    int    `json:"accelerator_count"`
-	HourlyRateUSDMicros int64  `json:"hourly_rate_usd_micros"`
+	AcceleratorModel      string `json:"accelerator_model"`
+	AcceleratorCount      int    `json:"accelerator_count"`
+	HourlyRateUSDMicros   int64  `json:"hourly_rate_usd_micros"`
+	BaseWorkerImageDigest string `json:"base_worker_image_digest,omitempty"`
 }
 
 // Elapsed is how long this phase has been the current one.
