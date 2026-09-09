@@ -51,7 +51,7 @@ func TestVolumeUXDescribesAnOptionalDisposableCache(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Optional cache storage per hour:",
-		"CACHED",
+		"Cache usage is not measured.",
 		"model and dataset snapshot objects",
 		"disposable copies",
 		"never authoritative",
@@ -62,7 +62,7 @@ func TestVolumeUXDescribesAnOptionalDisposableCache(t *testing.T) {
 	}
 
 	code, machine := runCozy(t, root, "--json", "volume")
-	if code != 0 || !strings.Contains(machine, `"cached":"5.0GB"`) ||
+	if code != 0 || strings.Contains(machine, `"cached":`) || strings.Contains(machine, `"cached_objects":`) ||
 		strings.Contains(machine, `"warm":`) || strings.Contains(machine, `"warm_objects":`) {
 		t.Fatalf("machine volume list did not hardcut cached fields [exit %d]:\n%s", code, machine)
 	}
@@ -136,7 +136,7 @@ func TestVolumeVerbsSpeakTheHubContract(t *testing.T) {
 		t.Fatalf("list: %v %+v", e, volumes)
 	}
 	if v := volumes[0]; v.ID != "pvl-a" || v.Datacenter != "EU-RO-1" || v.SizeGB != 500 ||
-		v.USDMicrosPerHour != 48000 || v.WarmBytes != 5<<30 || v.WarmObjects != 12 {
+		v.USDMicrosPerHour != 48000 {
 		t.Fatalf("volume row: %+v", v)
 	}
 

@@ -30,8 +30,6 @@ type Volume struct {
 	CreatedAt        string `json:"created_at"`
 	LiveAt           string `json:"live_at,omitempty"`
 	LastBoundAt      string `json:"last_bound_at,omitempty"`
-	WarmBytes        int64  `json:"warm_bytes"`
-	WarmObjects      int64  `json:"warm_objects"`
 }
 
 func (v Volume) valid() bool {

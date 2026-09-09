@@ -27,19 +27,17 @@ func handleVolumeLs(ctx *Context) *exit.Error {
 	}
 	list := output.List{
 		Name:      "volumes",
-		Fields:    []string{"datacenter", "provider", "state", "size", "rate", "cached", "volume"},
-		AllFields: []string{"datacenter", "provider", "state", "size", "rate", "cached", "cached_objects", "volume", "created", "live", "last_bound"},
+		Fields:    []string{"datacenter", "provider", "state", "size", "rate", "volume"},
+		AllFields: []string{"datacenter", "provider", "state", "size", "rate", "volume", "created", "live", "last_bound"},
 		Lead:      []string{"Optional cache storage per hour: " + usdPerHourBare(burn)},
-		Trail:     []string{"Cache volumes hold disposable copies of immutable model and dataset snapshot objects; they are never authoritative."},
+		Trail:     []string{"Cache volumes hold disposable copies of immutable model and dataset snapshot objects; they are never authoritative.", "Cache usage is not measured."},
 		Next:      []string{"cozy help volume warm"},
 	}
 	for _, v := range volumes {
 		list.Rows = append(list.Rows, map[string]string{
 			"datacenter": v.Datacenter, "provider": v.Provider, "state": v.State,
 			"size": fmt.Sprintf("%dGB", v.SizeGB), "rate": usdPerHourBare(v.USDMicrosPerHour),
-			"cached":         gigabytes(v.WarmBytes),
-			"cached_objects": fmt.Sprintf("%d", v.WarmObjects),
-			"volume":         v.ID, "created": stamp(v.CreatedAt), "live": orNone(stamp(v.LiveAt)),
+			"volume": v.ID, "created": stamp(v.CreatedAt), "live": orNone(stamp(v.LiveAt)),
 			"last_bound": orNone(stamp(v.LastBoundAt)),
 		})
 	}
