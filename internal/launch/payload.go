@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,43 +31,80 @@ import (
 // An undeclared key refuses HERE, before a request is recorded and long before a model
 // loads, because a typo should cost a millisecond.
 
-// ParsePayload builds one request document from the argv terms, and collects the
-// reserved `model.<param>=<ref>` run keys beside it (cl-109). The exact-case dotted
-// `model.` prefix is matched BEFORE field case-folding and can never reach a payload
-// field — wire names carry no dot — so it routes to the returned override map, keyed
-// by the declared slot path. A bare `model=` term stays an ordinary payload field.
+// KernelAxes is the execution-path override's vocabulary of AXES (cr-125), and it is one:
+// attention. A GEMM or fusion pin is not here because no measurement has asked for one. The
+// KERNEL names are the runtime's own (`attention.BY_NAME`) and are deliberately NOT restated
+// here — a second copy of that vocabulary would drift from the image that ships the kernels,
+// so an unknown NAME refuses at the worker, which knows what it can actually run.
+var KernelAxes = []string{"attention"}
+
+// RunKeys are the RESERVED dotted namespaces a run term may claim before the payload grammar
+// sees it. `model.<param>=<ref>` picks the WEIGHTS off the owner's ladder (cl-109);
+// `kernel.<axis>=<name>` picks the EXECUTION PATH off the runtime's own selection (cr-125).
+// Neither can reach a payload field, because a wire name carries no dot.
+type RunKeys struct {
+	// Models is the declared slot path -> ref the caller pinned.
+	Models map[string]string
+	// AttentionKernel rides the InvocationSpec to the worker; empty leaves the runtime's own
+	// selection alone, which is what every ordinary run does.
+	AttentionKernel string
+}
+
+// ParsePayload builds one request document from the argv terms, and collects the reserved
+// run keys beside it. The exact-case dotted prefixes are matched BEFORE field case-folding
+// and can never reach a payload field — wire names carry no dot — so they route to the
+// returned RunKeys. A bare `model=` or `kernel=` term stays an ordinary payload field.
 func ParsePayload(ep *Entrypoint, terms []string, infile string) (
-	json.RawMessage, map[string]string, *exit.Error,
+	json.RawMessage, RunKeys, *exit.Error,
 ) {
 	document := map[string]json.RawMessage{}
 
 	if infile != "" {
 		data, err := os.ReadFile(infile)
 		if err != nil {
-			return nil, nil, exit.New(exit.NotFound, "--in %s: %s", infile, err).
+			return nil, RunKeys{}, exit.New(exit.NotFound, "--in %s: %s", infile, err).
 				WithRemedy("--in takes one JSON file holding the whole payload")
 		}
 		var loaded map[string]json.RawMessage
 		if err := json.Unmarshal(data, &loaded); err != nil {
-			return nil, nil, exit.New(exit.Validation, "--in %s does not hold one JSON object: %s", infile, err)
+			return nil, RunKeys{}, exit.New(exit.Validation, "--in %s does not hold one JSON object: %s", infile, err)
 		}
 		for k, v := range loaded {
 			document[k] = v
 		}
 	}
 
-	overrides := map[string]string{}
+	keys := RunKeys{Models: map[string]string{}}
 	var positional []string
 	for _, term := range terms {
 		if strings.HasPrefix(term, "model.") && strings.Contains(term, "=") {
 			slotPath, ref, e := modelOverrideTerm(ep, term)
 			if e != nil {
-				return nil, nil, e
+				return nil, RunKeys{}, e
 			}
-			if _, dup := overrides[slotPath]; dup {
-				return nil, nil, exit.Usagef("model slot %s was bound more than once", slotPath)
+			if _, dup := keys.Models[slotPath]; dup {
+				return nil, RunKeys{}, exit.Usagef("model slot %s was bound more than once", slotPath)
 			}
-			overrides[slotPath] = ref
+			keys.Models[slotPath] = ref
+			continue
+		}
+		if strings.HasPrefix(term, "kernel.") {
+			axis, name, e := kernelOverrideTerm(term)
+			if e != nil {
+				return nil, RunKeys{}, e
+			}
+			switch axis {
+			case "attention":
+				if keys.AttentionKernel != "" {
+					return nil, RunKeys{}, exit.Usagef("kernel.attention was pinned more than once")
+				}
+				keys.AttentionKernel = name
+			default:
+				// A NAMED AXIS WITH NOWHERE TO PUT IT. Reachable only by adding a name to
+				// KernelAxes without a field beside it, and silently dropping the pin there
+				// would be the exact failure the whole namespace exists to prevent.
+				return nil, RunKeys{}, exit.Internalf("kernel.%s is declared but carries nowhere", axis)
+			}
 			continue
 		}
 		colon := strings.Index(term, ":=")
@@ -74,15 +112,15 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		if colon >= 0 && strings.Index(term, "=") == colon+1 {
 			key, raw := term[:colon], term[colon+2:]
 			if !json.Valid([]byte(raw)) {
-				return nil, nil, exit.Usagef("%s:=… is not JSON: %s", key, raw).
+				return nil, RunKeys{}, exit.Usagef("%s:=… is not JSON: %s", key, raw).
 					WithRemedy("`key:=<json>` carries a nested value verbatim; `key=value` is the scalar form")
 			}
 			key, e := canonicalFieldKey(ep, key)
 			if e != nil {
-				return nil, nil, e
+				return nil, RunKeys{}, e
 			}
 			if e := declared(ep, key); e != nil {
-				return nil, nil, e
+				return nil, RunKeys{}, e
 			}
 			document[key] = json.RawMessage(raw)
 			continue
@@ -90,33 +128,33 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		if key, raw, ok := strings.Cut(term, "="); ok {
 			key, e := canonicalFieldKey(ep, key)
 			if e != nil {
-				return nil, nil, e
+				return nil, RunKeys{}, e
 			}
 			if e := declared(ep, key); e != nil {
-				return nil, nil, e
+				return nil, RunKeys{}, e
 			}
 			if after, isFile := strings.CutPrefix(raw, "@"); isFile {
 				rendered, _ := ep.TypeOfField(key)
 				kind, _ := typeOf(rendered)
 				if kind == "asset" {
-					return nil, nil, exit.New(exit.Validation,
+					return nil, RunKeys{}, exit.New(exit.Validation,
 						"%s.%s is an input asset and key=@file has no grant identity", ep.Name, key).
 						WithRemedy("use `--asset %s=%s`; the schema field path becomes the input identity", key, after)
 				}
 				data, err := os.ReadFile(after)
 				if err != nil {
-					return nil, nil, exit.New(exit.NotFound, "%s=@%s: %s", key, after, err)
+					return nil, RunKeys{}, exit.New(exit.NotFound, "%s=@%s: %s", key, after, err)
 				}
 				encoded, err := json.Marshal(string(data))
 				if err != nil {
-					return nil, nil, exit.Internalf("cannot carry %s: %s", after, err)
+					return nil, RunKeys{}, exit.Internalf("cannot carry %s: %s", after, err)
 				}
 				document[key] = encoded
 				continue
 			}
 			value, e := typed(ep, key, raw)
 			if e != nil {
-				return nil, nil, e
+				return nil, RunKeys{}, e
 			}
 			document[key] = value
 			continue
@@ -132,25 +170,52 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 			primary = ep.Request.Fields[0].Name
 		}
 		if primary == "" {
-			return nil, nil, exit.Usagef("%s takes no positional value: it declares no request field", ep.Name)
+			return nil, RunKeys{}, exit.Usagef("%s takes no positional value: it declares no request field", ep.Name)
 		}
 		if len(positional) > 1 {
-			return nil, nil, exit.Usagef("%s takes ONE positional value (%s); got %d",
+			return nil, RunKeys{}, exit.Usagef("%s takes ONE positional value (%s); got %d",
 				ep.Name, primary, len(positional)).
 				WithRemedy("every other field is `key=value`, `key=@file` or `key:=<json>`")
 		}
 		value, e := typed(ep, primary, positional[0])
 		if e != nil {
-			return nil, nil, e
+			return nil, RunKeys{}, e
 		}
 		document[primary] = value
 	}
 
 	data, err := json.Marshal(document)
 	if err != nil {
-		return nil, nil, exit.Internalf("cannot render the payload: %s", err)
+		return nil, RunKeys{}, exit.Internalf("cannot render the payload: %s", err)
 	}
-	return data, overrides, nil
+	return data, keys, nil
+}
+
+// kernelOverrideTerm claims one `kernel.`-prefixed argv term for the execution-path override
+// (cr-125). The namespace is claimed WHOLE: a term that is not a legal override refuses here
+// rather than falling through to become a payload field named `kernel.gemm`, which is exactly
+// the mistyped-pin failure the reservation exists to prevent. The `:=` form is refused with
+// the rest — a kernel name is one word, so a structured spelling would be a second grammar
+// for the same fact.
+func kernelOverrideTerm(term string) (axis, name string, problem *exit.Error) {
+	refuse := func() *exit.Error {
+		spellings := make([]string, 0, len(KernelAxes))
+		for _, a := range KernelAxes {
+			spellings = append(spellings, "kernel."+a+"=<name>")
+		}
+		return exit.Named(exit.Usage, "kernel_override_unknown",
+			"%s is not an execution-path override", term).
+			WithRemedy("the reserved namespace is %s", strings.Join(spellings, ", "))
+	}
+	key, raw, ok := strings.Cut(term, "=")
+	if !ok || raw == "" || strings.HasSuffix(key, ":") {
+		return "", "", refuse()
+	}
+	asked := strings.TrimPrefix(key, "kernel.")
+	if !slices.Contains(KernelAxes, asked) {
+		return "", "", refuse()
+	}
+	return asked, strings.TrimSpace(raw), nil
 }
 
 // modelOverrideTerm claims one `model.`-prefixed argv term for the reserved run-key

@@ -71,7 +71,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentalRequired: ctx.Inv.Bool("--rental-only") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory}
-	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides)
+	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides.Models)
 	if e != nil {
 		return e
 	}
