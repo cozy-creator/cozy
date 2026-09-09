@@ -1430,8 +1430,10 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	position, positionOK := number(fields["position"])
 	total, totalOK := number(fields["total"])
 	stepMS, stepOK := number(fields["step_ms"])
+	previousPosition := p.stepPosition
 	if name != "" && name != p.stepStage {
 		p.stepStage, p.stepSeconds, p.stepSamples, p.stepPosition = name, 0, 0, -1
+		previousPosition = -1
 	}
 	if stepOK && stepMS >= 0 {
 		if stepMS > 0 && (!positionOK || position > p.stepPosition) {
@@ -1465,8 +1467,15 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 			return facts, false
 		}
 		if p.overallSeen && overallFraction > p.overallFraction && stepOK && stepMS > 0 {
+			elapsed := stepMS / 1000
+			if positionOK {
+				// A coalesced frame carries the last step's interval, not the
+				// elapsed time for every step since the previous coordinate.
+				advanced := position - math.Max(0, previousPosition)
+				elapsed *= math.Max(0, advanced)
+			}
 			p.overallDelta += overallFraction - p.overallFraction
-			p.overallSeconds += stepMS / 1000
+			p.overallSeconds += elapsed
 		}
 		p.overallSeen, p.overallFraction = true, overallFraction
 	}

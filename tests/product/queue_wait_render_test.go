@@ -98,6 +98,22 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 	p.Done()
 }
 
+func TestProgressOverallETAAccountsForCoalescedSteps(t *testing.T) {
+	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	t.Cleanup(p.Done)
+	for _, position := range []float64{3, 6} {
+		p.On(localapi.Event{Type: "request.progress", RequestID: "coalesced-progress", Attempt: 1,
+			Payload: map[string]any{"value": map[string]any{
+				"stage": "denoise", "position": position, "total": float64(30),
+				"stage_fraction": position / 30, "overall_fraction": position / 30,
+				"step_ms": float64(42000),
+			}}})
+	}
+	if got := buf.String(); !strings.Contains(got, "overall 20% · ETA ~16m48s") {
+		t.Fatalf("whole-job ETA charged one interval to three completed steps: %q", got)
+	}
+}
+
 func TestWaitLinesAreStageHonest(t *testing.T) {
 	cases := []struct {
 		name    string
