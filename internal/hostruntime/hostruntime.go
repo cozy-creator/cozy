@@ -23,7 +23,7 @@ import (
 // Floor is the first release with the wire47 private package capacity contract.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-const Floor = "0.14.0"
+const Floor = "0.14.1"
 
 var floor = pep440.MustParse(Floor)
 
