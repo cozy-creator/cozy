@@ -110,13 +110,29 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 		out.Outputs, out.WeightsOutputs, out.NeedsAccelerator = facts.Outputs, facts.WeightsOutputs, facts.NeedsAccelerator
 	}
 	models := make([]orchestrator.ModelRef, 0, len(job.Models))
+	accelerator, machineRead := "", false
 	for _, slot := range job.Models {
 		artifact, problem := records.DecodeModelArtifact(arguments[slot.Param])
 		if problem != nil {
 			return out, "", problem
 		}
 		if artifact == nil {
-			return out, "", exit.Named(exit.Conflict, "child.model_unbound", "child model %s needs an exact retained ModelArtifact", slot.Param)
+			// No retained artifact: the granting host selects the slot itself, from the
+			// owner's binding or the callee's authored default (cl-210). The caller named
+			// its own callable, never a model.
+			if !machineRead {
+				accelerator, problem = r.childAccelerator(parent)
+				if problem != nil {
+					return out, "", problem
+				}
+				machineRead = true
+			}
+			selected, problem := r.childModelSelection(install.Package, binding.Entrypoint, slot, accelerator)
+			if problem != nil {
+				return out, "", problem
+			}
+			models = append(models, selected)
+			continue
 		}
 		source, problem := r.store.ResolveArtifactSource(*artifact)
 		if problem != nil {

@@ -297,10 +297,20 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if !req.Rental || req.Worker != "" {
 		return none, "", exit.Internalf("request %s is not an unassigned --rental request", req.ID)
 	}
-	needsAccelerator, problem := NewResolver(m.store, m.ctx.Cfg, nil).PrivateRentalNeedsAccelerator(req)
+	resolver := NewResolver(m.store, m.ctx.Cfg, nil)
+	needsAccelerator, problem := resolver.PrivateRentalNeedsAccelerator(req)
 	if problem != nil {
 		return none, "", problem
 	}
+	// A composition parent holds no model of its own, so without its captured shots'
+	// selections this decision would rank cards against nothing and could buy one no shot
+	// declares a lane for (cl-210). `req` is this call's own copy; the record keeps the
+	// parent's own model set, which is empty and stays empty.
+	childModels, problem := resolver.PrivateChildModels(req)
+	if problem != nil {
+		return none, "", problem
+	}
+	req.Models = append(append([]records.ModelRef(nil), req.Models...), childModels...)
 	if problem := m.reconcileLocked(); problem != nil {
 		return none, "", problem
 	}
