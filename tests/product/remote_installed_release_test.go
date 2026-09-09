@@ -42,7 +42,7 @@ func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 				detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
 				_ = json.NewEncoder(w).Encode(detail)
 			})
-			mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`[]`)) })
+			mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"rentals":[]}`)) })
 			mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`[]`)) })
 			server := httptest.NewServer(mux)
 			t.Cleanup(server.Close)
