@@ -221,14 +221,27 @@ func assessmentDigest(raw []byte) string {
 
 // The canonical reader remains the numerical/schema authority; Creator consumes
 // its exact association projection and binds the original artifact identity.
-var assessmentEvaluatorPath = flag.String("assessment-v4-evaluator", "", "installed canonical @4 report reader for association proof")
+var assessmentEvaluatorPath = flag.String("assessment-v5-evaluator", "", "installed canonical @5 report reader for association proof")
 
-func TestAssessmentV4InspectorIdentityBoundary(t *testing.T) {
+func TestAssessmentV5ProjectionSchemaBoundary(t *testing.T) {
+	report, err := os.ReadFile("testdata/assessment-v5.json")
+	must(t, err)
+	inspected, err := os.ReadFile("testdata/assessment-v5-inspection.json")
+	must(t, err)
+	info, problem := assessment.ReadRenderInspection(report, inspected)
+	assessmentRecord(t, problem)
+	info.Report.Schema = "cozy-eval/checkpoint-validation@4"
+	if _, problem := assessment.ReadRenderInspection(report, assessmentJSON(t, info)); problem == nil {
+		t.Fatal("retired report schema was accepted through the current inspection envelope")
+	}
+}
+
+func TestAssessmentV5InspectorIdentityBoundary(t *testing.T) {
 	evaluator := *assessmentEvaluatorPath
 	if evaluator == "" {
-		t.Skip("requires the installed cozy-eval @4 reader")
+		t.Skip("requires the installed cozy-eval @5 reader")
 	}
-	report, err := os.ReadFile("testdata/assessment-v4.json")
+	report, err := os.ReadFile("testdata/assessment-v5.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,12 +264,29 @@ func TestAssessmentV4InspectorIdentityBoundary(t *testing.T) {
 	}
 }
 
-func TestAssessmentV4PreservesUnobservedExecutionMode(t *testing.T) {
+func TestAssessmentV5PreservesUnobservedSaturationVerdict(t *testing.T) {
 	evaluator := *assessmentEvaluatorPath
 	if evaluator == "" {
-		t.Skip("requires the installed cozy-eval @4 reader")
+		t.Skip("requires the installed cozy-eval @5 reader")
 	}
-	report, err := os.ReadFile("testdata/assessment-v4.json")
+	report, err := os.ReadFile("testdata/assessment-v5-unobserved-saturation.json")
+	must(t, err)
+	t.Setenv("PATH", filepath.Dir(evaluator))
+	inspected, problem := assessment.Inspect(t.Context(), report, []string{"PYTHONNOUSERSITE=1"})
+	assessmentRecord(t, problem)
+	info, problem := assessment.ReadRenderInspection(report, inspected)
+	assessmentRecord(t, problem)
+	if info.Verdict != "indeterminate" {
+		t.Fatal("an unavailable required saturation measurement was promoted to a pass")
+	}
+}
+
+func TestAssessmentV5PreservesUnobservedExecutionMode(t *testing.T) {
+	evaluator := *assessmentEvaluatorPath
+	if evaluator == "" {
+		t.Skip("requires the installed cozy-eval @5 reader")
+	}
+	report, err := os.ReadFile("testdata/assessment-v5.json")
 	must(t, err)
 	var body any
 	must(t, json.Unmarshal(report, &body))
