@@ -62,6 +62,10 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("conflicting rental selection accepted: %s", out)
 	}
+	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "--rental=")
+	if code == 0 || !strings.Contains(out, "--rental-only") {
+		t.Fatalf("empty rental silently became local: %d %s", code, out)
+	}
 	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "--rental")
 	if code == 0 || !strings.Contains(out, "--rental-only") {
 		t.Fatalf("bare old flag lacks guidance: %d %s", code, out)

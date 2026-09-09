@@ -326,7 +326,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
 	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
 	// a machine that would be bought are held to the same declared degrees (cl-179).
-	constraints := releaseConstraints(m.ctx, req)
+	constraints, _ := releaseConstraints(m.ctx, req)
 	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
@@ -1125,35 +1125,35 @@ func settledRequest(state string) bool {
 // above can decline a base that already contradicts them. It is ADVISORY: a package this
 // host cannot name, or a hub that will not answer, yields no constraints and therefore no
 // refusal — the pod remains the authority on whether the package runs (th-075).
-func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
+func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
 	if req.InstallID != "" && strings.HasPrefix(req.Package, "local/") {
 		_, store, problem := rentalStores(ctx)
 		if problem != nil {
-			return rental.Constraints{}
+			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
 		defer store.Close()
 		install, problem := store.Install(req.InstallID)
 		if problem != nil || install == nil {
-			return rental.Constraints{}
+			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
-		return rental.Constraints{Requirements: strings.Split(install.Closure, "\n"), RequiresPython: ">=3.12,<3.13"}
+		return rental.Constraints{Requirements: strings.Split(install.Closure, "\n"), RequiresPython: ">=3.12,<3.13"}, nil
 	}
 	if req.Package == "" || req.Release == "" {
-		return rental.Constraints{}
+		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 	}
 	ref, problem := hub.ParseRef(req.Package)
 	if problem != nil {
-		return rental.Constraints{}
+		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
 	detail, problem := client(ctx).PackageRelease(hctx, ref, req.Release)
 	if problem != nil {
-		return rental.Constraints{}
+		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 	}
 	requirements, requiresPython, problem := detail.Constraints()
 	if problem != nil {
-		return rental.Constraints{}
+		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 	}
 	// The committed interface says which group degrees this requested function can be built
 	// at, so a WIDE product is only a candidate when its author declared that width
@@ -1166,7 +1166,7 @@ func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
 		}
 	}
 	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython,
-		Degrees: degrees}
+		Degrees: degrees}, nil
 }
 
 func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints) *exit.Error {

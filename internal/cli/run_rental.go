@@ -25,9 +25,23 @@ func requestedRental(ctx *Context, target Target, function string) (string, *exi
 	if selected.Row == nil || records.RentalTerminalState(selected.Row.State) {
 		return "", exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
 	}
-	constraints := releaseConstraints(ctx, records.Request{Package: target.Package, Release: target.Release, InstallID: target.InstallID, Entrypoint: function})
+	constraints, problem := releaseConstraints(ctx, records.Request{Package: target.Package, Release: target.Release, InstallID: target.InstallID, Entrypoint: function})
+	if problem != nil {
+		return "", problem
+	}
 	if problem := rentalCompatibility(ctx, selected.RentalID, constraints); problem != nil {
 		return "", problem
 	}
 	return selected.RentalID, nil
+}
+
+func rentalArgument(value *string) (string, *exit.Error) {
+	if value == nil {
+		return "", nil
+	}
+	name := strings.TrimSpace(*value)
+	if name == "" {
+		return "", exit.Usagef("--rental requires an existing rental name or id; use --rental-only for automatic allocation")
+	}
+	return name, nil
 }
