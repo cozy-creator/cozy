@@ -38,7 +38,7 @@ func TestPrivateInterfaceRefusesOlderDependencyRuntimeBeforeGeneration(t *testin
 	}
 }
 
-func TestLocalApplicationDeclarationFailsBeforeCapture(t *testing.T) {
+func TestLocalApplicationEntryPointUsesOrdinaryDependencyCapture(t *testing.T) {
 	root := t.TempDir()
 	library := filepath.Join(root, "library")
 	must(t, os.MkdirAll(library, 0o700))
@@ -59,9 +59,7 @@ tools={path="./library",editable=true}
 	}
 	must(t, os.WriteFile(path, []byte(metadata+"[project.entry-points.'cozy.application']\ndefault='tools:app'\n"), 0o600))
 	_, problem = packagepublish.LocalDependencySelections(root)
-	if problem == nil || problem.ErrName() != "local_application_declaration_missing" || !strings.Contains(problem.Remedy, "[application]") {
-		t.Fatalf("declared local application was silently treated as an ordinary library: %v", problem)
-	}
+	fatal(t, problem) // The installed wheel entry point supplies its application metadata.
 	must(t, os.WriteFile(filepath.Join(library, "package.toml"), []byte("[application]\nobject='tools:app'\n"), 0o600))
 	_, problem = packagepublish.LocalDependencySelections(root)
 	fatal(t, problem)
