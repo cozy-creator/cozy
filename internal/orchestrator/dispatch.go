@@ -1926,6 +1926,30 @@ func localGrantSupport(goos string) *exit.Error {
 		WithRemedy("use --rental; local file URL authorization is currently POSIX-only")
 }
 
+// MediaReservationBytes prices only file outputs. Native Weights are written to
+// TensorFS under Runtime admission, so their slot cannot reserve the media byte
+// ceiling as well. File-count/OutputAccess identities remain unchanged.
+func MediaReservationBytes(req records.Request, perOutput uint64) (int64, *exit.Error) {
+	weights, problem := decodeWeightsOutputs(req.WeightsOutputs)
+	if problem != nil {
+		return 0, problem
+	}
+	native := make(map[string]bool, len(weights))
+	for _, row := range weights {
+		native[row.OutputID] = true
+	}
+	count := uint64(0)
+	for _, id := range splitList(req.Outputs) {
+		if !native[id] {
+			count++
+		}
+	}
+	if count > 0 && perOutput > uint64(math.MaxInt64)/count {
+		return 0, exit.New(exit.Validation, "the output grant for %s exceeds the media plane's byte range", req.ID)
+	}
+	return int64(perOutput * count), nil
+}
+
 // remoteGrant builds the grant for an attempt that will run on a POD (cl-014/#506b).
 //
 // It is the same grant the local lane mints and every address in it is on the other
@@ -1941,12 +1965,10 @@ func localGrantSupport(goos string) *exit.Error {
 func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
 	slot := media.Slot(req.ID, attempt)
 	outputIDs := splitList(req.Outputs)
-	perOutput := c.maxOutputBytes()
-	if len(outputIDs) > 0 && perOutput > uint64(math.MaxInt64)/uint64(len(outputIDs)) {
-		return nil, exit.New(exit.Validation,
-			"the output grant for %s#%d exceeds the media plane's byte range", req.ID, attempt)
+	reservedOutputBytes, problem := MediaReservationBytes(req, c.maxOutputBytes())
+	if problem != nil {
+		return nil, problem
 	}
-	reservedOutputBytes := int64(perOutput * uint64(len(outputIDs)))
 	complete := false
 	defer func() {
 		if !complete {
