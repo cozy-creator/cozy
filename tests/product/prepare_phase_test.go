@@ -127,10 +127,13 @@ func TestAPhaseWithNoDenominatorRendersBytesAndRate(t *testing.T) {
 		Status: "queued", Phase: orchestrator.PhaseDownloading, PhaseMachine: "uzume",
 		PhaseMovedBytes: &moved, PhaseRate: &rate,
 	})
-	for _, want := range []string{"downloading", "uzume", "/s"} {
+	for _, want := range []string{"waiting: downloading models", "/s"} {
 		if !strings.Contains(cell, want) {
 			t.Fatalf("the cell %q does not carry %q", cell, want)
 		}
+	}
+	if strings.Contains(cell, "uzume") {
+		t.Fatalf("progress repeats the machine column: %q", cell)
 	}
 	if strings.Contains(cell, "%") || strings.Contains(cell, " of ") {
 		t.Fatalf("the cell invented a fraction with no declared total: %q", cell)
@@ -148,18 +151,22 @@ func TestAPhaseWithNoDenominatorRendersBytesAndRate(t *testing.T) {
 }
 
 // TestAPhaseWithNoCountersStillNamesItself is the other honesty arm, and the one that
-// splits an otherwise silent wait: acquiring a machine has no byte counter and is still
-// worth saying, with the one quantity that was actually measured.
+// splits an otherwise silent wait without repeating the machine or elapsed fields.
 func TestAPhaseWithNoCountersStillNamesItself(t *testing.T) {
 	elapsed := int64(41_000)
 	cell := cli.PhaseCell(api.Lifecycle{
-		Status: "queued", Phase: orchestrator.PhaseProvisioning, PhaseElapsedMS: &elapsed,
+		Status: "queued", Phase: orchestrator.PhaseProvisioning, PhaseMachine: "fumiya", PhaseElapsedMS: &elapsed,
 	})
-	if !strings.Contains(cell, "provisioning") || !strings.Contains(cell, "41s") {
-		t.Fatalf("a counterless phase must still name itself and its elapsed: %q", cell)
+	if cell != "waiting: provisioning machine" {
+		t.Fatalf("a counterless phase should name only the activity: %q", cell)
 	}
 	if strings.Contains(cell, "0 B") {
 		t.Fatalf("a counterless phase rendered a zero byte count: %q", cell)
+	}
+	cell = cli.PhaseCell(api.Lifecycle{Status: "queued", Phase: orchestrator.PhaseResolving,
+		PhaseMachine: "fumiya", PhaseElapsedMS: &elapsed})
+	if cell != "waiting: preparing downloads" {
+		t.Fatalf("resolution should not claim model bytes are downloading: %q", cell)
 	}
 }
 

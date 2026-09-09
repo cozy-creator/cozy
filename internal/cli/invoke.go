@@ -809,15 +809,8 @@ func integerValue(value *int64) string {
 	return strconv.FormatInt(*value, 10)
 }
 
-// phaseValue is the PROGRESS cell of a request that has not dispatched yet (cl-121).
-//
-// The order is deliberate and the owner's: RATE FIRST where there is one, then the bytes,
-// then a fraction only when the producer declared a real denominator. A percentage bar
-// reads identically at 70 MB/s and at 6 MB/s; a rate shows the second one degrading the
-// moment it degrades, which is the question an operator staring at a long download is
-// actually asking. A phase with nothing measured shows its name and how long it has been
-// that phase — which is still an answer, and is the answer that splits a silent wait into
-// named pieces.
+// phaseValue describes the activity holding a queued request. Machine and elapsed
+// time have their own fields; only measured transfer progress belongs beside it.
 func phaseValue(life api.Lifecycle) string { return PhaseCell(life) }
 
 // PhaseCell is exported so the product suite drives this exact renderer rather than a
@@ -827,17 +820,34 @@ func PhaseCell(life api.Lifecycle) string {
 		return ""
 	}
 	if life.Phase == orchestrator.WaitSlotBusy || life.Phase == orchestrator.WaitQueueAhead {
-		fields := map[string]any{"wait": life.Phase, "waiting_on": life.PhaseMachine}
 		if life.WaitingFor != nil {
-			fields["waiting_for"] = map[string]any{"number": life.WaitingFor.Number}
+			return fmt.Sprintf("waiting: run %d", life.WaitingFor.Number)
 		}
-		return strings.TrimSpace(HumanWaitLine(fields))
+		if life.Phase == orchestrator.WaitQueueAhead {
+			return "waiting: earlier runs"
+		}
+		return "waiting: free worker slot"
 	}
-	head := strings.ReplaceAll(life.Phase, "_", " ")
-	if life.PhaseMachine != "" {
-		head += " on " + life.PhaseMachine
+	activity := strings.ReplaceAll(life.Phase, "_", " ")
+	switch life.Phase {
+	case orchestrator.PhaseAcquiring:
+		activity = "acquiring rental"
+	case orchestrator.PhaseReplanning:
+		activity = "finding another rental"
+	case orchestrator.PhaseProvisioning:
+		activity = "provisioning machine"
+	case orchestrator.PhaseBooting:
+		activity = "starting machine"
+	case orchestrator.PhaseResolving:
+		activity = "preparing downloads"
+	case orchestrator.PhaseDownloading:
+		activity = "downloading models"
+	case orchestrator.PhasePreparing:
+		activity = "preparing models"
+	case orchestrator.PhaseWarming:
+		activity = "loading models"
 	}
-	parts := []string{head}
+	parts := []string{"waiting: " + activity}
 	if life.PhaseMovedBytes != nil {
 		moved := output.Bytes(*life.PhaseMovedBytes)
 		if life.PhaseTotalBytes != nil && *life.PhaseTotalBytes > 0 {
@@ -848,12 +858,8 @@ func PhaseCell(life api.Lifecycle) string {
 	if life.PhaseRate != nil {
 		parts = append(parts, output.Bytes(int64(*life.PhaseRate))+"/s")
 	}
-	switch {
-	case life.PhaseRemainingMS != nil:
+	if life.PhaseRemainingMS != nil {
 		parts = append(parts, "~"+shortDuration(time.Duration(*life.PhaseRemainingMS)*time.Millisecond))
-	case life.PhaseMovedBytes == nil && life.PhaseElapsedMS != nil:
-		// No counters at all: the one measured fact is how long this phase has lasted.
-		parts = append(parts, shortDuration(time.Duration(*life.PhaseElapsedMS)*time.Millisecond))
 	}
 	return strings.Join(parts, " · ")
 }
