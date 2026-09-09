@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -34,16 +35,17 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
-	LocalAssets    []records.AssetBinding `json:"local_assets,omitempty"`
-	Package        string                 `json:"package"`
-	Function       string                 `json:"function"`
-	Input          json.RawMessage        `json:"input"`
-	InstallID      string                 `json:"install_id,omitempty"`
-	Release        string                 `json:"release,omitempty"`
-	Rental         bool                   `json:"rental,omitempty"`
-	RentalRequired bool                   `json:"rental_required,omitempty"`
-	RetainWork     bool                   `json:"retain_work,omitempty"`
-	RetryOf        string                 `json:"retry_of,omitempty"`
+	LocalAssets     []records.AssetBinding `json:"local_assets,omitempty"`
+	Package         string                 `json:"package"`
+	Function        string                 `json:"function"`
+	Input           json.RawMessage        `json:"input"`
+	InstallID       string                 `json:"install_id,omitempty"`
+	Release         string                 `json:"release,omitempty"`
+	Rental          bool                   `json:"rental,omitempty"`
+	RentalRequired  bool                   `json:"rental_required,omitempty"`
+	RetainWork      bool                   `json:"retain_work,omitempty"`
+	RetryOf         string                 `json:"retry_of,omitempty"`
+	OutputDirectory string                 `json:"output_directory,omitempty"`
 	// Worker pins an internal production step to the already-attached rental that
 	// prepared its source Manifests. It is admitted only with the CLI credential.
 	Worker string `json:"worker,omitempty"`
@@ -118,7 +120,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
 	if (len(sub.LocalAssets) > 0 || len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 ||
-		sub.ModelTransfer != nil || sub.RetryOf != "") &&
+		sub.ModelTransfer != nil || sub.RetryOf != "" || sub.OutputDirectory != "") &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
@@ -166,12 +168,27 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		spec, e = replayJobSubmission(sub, *existing)
+		if e == nil {
+			export, problem := s.store.OutputExportOf(existing.ID)
+			if problem != nil {
+				e = problem
+			} else if export != nil {
+				directory := sub.OutputDirectory
+				if directory == "" {
+					directory = s.layout.PackageOutputs(spec.Package)
+				}
+				spec.OutputExport = &records.OutputExportIntent{Directory: directory, Outputs: export.Outputs}
+			}
+		}
 	} else {
 		if sub.Rental || sub.RentalRequired {
 			unlock := localpackage.Guard()
 			defer unlock()
 		}
 		spec, e = s.resolveJob(r.Context(), sub)
+		if e == nil && spec.OutputExport != nil {
+			e = resultfiles.Preflight(spec.OutputExport.Directory)
+		}
 		if e == nil {
 			spec.Assets, e = bindAssets(spec.Assets)
 		}
@@ -221,6 +238,9 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		CancelURL: "/v1/local/jobs/" + jobID + "/cancel",
 		EventsURL: "/v1/requests/" + jobID + "/events",
 		Replay:    !fresh,
+	}
+	if handle.Replay && settledRequestState(recorded.State) {
+		s.orchestrator.RetryOutputExport(recorded.ID)
 	}
 	if handle.Status == "queued" {
 		if position, depth := s.orchestrator.QueueState(recorded.ID); position > 0 {
@@ -280,8 +300,8 @@ func replayJobSubmission(sub JobSubmission,
 		sort.Strings(params)
 	}
 	return orchestrator.Submission{Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: packageName,
-		ChildArtifacts: recorded.ChildArtifacts,
-		Entrypoint:     function, Payload: payload, Org: org, Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
+		ChildArtifacts: recorded.ChildArtifacts, OutputDirectory: sub.OutputDirectory,
+		Entrypoint: function, Payload: payload, Org: org, Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
 		InstallID: recorded.InstallID, Release: recorded.Release,
 		LocalPackageDigest: recorded.LocalPackageDigest,
 		PlanID:             recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
@@ -307,8 +327,8 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	out := orchestrator.Submission{
 		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org), Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
-		Release: sub.Release,
-		Rental:  sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
+		Release: sub.Release, OutputDirectory: sub.OutputDirectory,
+		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 		ModelTransfer: sub.ModelTransfer,
 	}
@@ -360,6 +380,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.WeightsOutputs, out.NeedsAccelerator = logical.WeightsOutputs, logical.NeedsAccelerator
 		out.ProducerParams = logical.ProducerParams
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
+		if problem := s.deriveOutputExport(job, &out); problem != nil {
+			return out, problem
+		}
 		return out, nil
 	}
 	if sub.InstallID == "" {
@@ -403,6 +426,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.NeedsAccelerator = job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
 		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request, Assets: job.Assets}, &out); problem != nil {
+			return out, problem
+		}
+		if problem := s.deriveOutputExport(&launch.Entrypoint{Result: job.Result}, &out); problem != nil {
 			return out, problem
 		}
 	}
@@ -453,6 +479,9 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
 		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request, Assets: job.Assets}, &out); problem != nil {
+			return out, problem
+		}
+		if problem := s.deriveOutputExport(&launch.Entrypoint{Result: job.Result}, &out); problem != nil {
 			return out, problem
 		}
 	}
@@ -542,6 +571,9 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if spec.RentalRequired {
 		doc["rental_required"] = true
 	}
+	if spec.OutputDirectory != "" {
+		doc["output_directory"] = spec.OutputDirectory
+	}
 	if spec.ModelTransfer != nil {
 		encoded, err := json.Marshal(spec.ModelTransfer)
 		if err != nil {
@@ -598,6 +630,7 @@ type JobState struct {
 	CanceledBy       string            `json:"canceled_by,omitempty"`
 	Result           any               `json:"result,omitempty"`
 	Outputs          []MediaRef        `json:"outputs"`
+	OutputExport     *OutputExportRef  `json:"output_export,omitempty"`
 	Weights          []WeightsRef      `json:"weights,omitempty"`
 	Checkpoints      []JobCheckpoint   `json:"checkpoints,omitempty"`
 	ModelOutputs     map[string]string `json:"model_outputs,omitempty"`
@@ -730,7 +763,8 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		Requeues: row.Requeues, RetryBudget: orchestrator.MaxRequeues,
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
-		EventsURL: "/v1/requests/" + row.ID + "/events",
+		EventsURL:    "/v1/requests/" + row.ID + "/events",
+		OutputExport: s.outputExportOf(row.ID),
 	}
 	if row.State == "blocked" {
 		state.ErrorType, state.Error, _ = s.store.RetainedFailure(row.ID)

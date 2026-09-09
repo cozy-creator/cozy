@@ -468,6 +468,19 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 // files exports nothing and records no obligation.
 func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
 	paths := launch.AssetPaths(entrypoint.Result)
+	if out.Kind == "job" {
+		media := paths[:0]
+		for _, path := range paths {
+			if spec, ok := launch.ResultAssetSpec(entrypoint, path); ok &&
+				(spec.Kind == "image" || spec.Kind == "video" || spec.Kind == "audio") {
+				media = append(media, path)
+			}
+		}
+		paths = media
+		if len(paths) == 0 {
+			return nil
+		}
+	}
 	if len(paths) == 0 && len(out.Outputs) == 0 {
 		return nil
 	}
@@ -480,7 +493,7 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 		return exit.Named(exit.Validation, "output_export_directory_malformed",
 			"output directory must be one canonical absolute path")
 	}
-	if len(paths) != len(out.Outputs) {
+	if out.Kind != "job" && len(paths) != len(out.Outputs) {
 		return exit.Named(exit.Validation, "output_export_set_mismatch",
 			"package result declares %d asset paths for %d granted outputs", len(paths), len(out.Outputs))
 	}
@@ -826,13 +839,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	} else if life.Status == "failed" || life.Status == "canceled" {
 		life.OverallFraction, _ = s.store.TerminalOverallFraction(row.ID, row.Ordinal)
 	}
-	if export, problem := s.store.OutputExportOf(row.ID); problem == nil && export != nil {
-		life.OutputExport = &OutputExportRef{
-			Directory: export.Directory, State: export.State,
-			ErrorCode: export.ErrorCode, Error: export.SafeError,
-			Paths: append([]string{}, export.PublishedPaths...),
-		}
-	}
+	life.OutputExport = s.outputExportOf(row.ID)
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
 	life.Machine = s.machineOf(row, len(attempts) > 0)
