@@ -62,6 +62,38 @@ type List struct {
 	Next  []string
 }
 
+// Table separates the fixed parts of a live list from its scrollable data rows.
+// Unlike a snapshot, a live table keeps its heading even when it has no rows.
+type Table struct {
+	Lead   []string
+	Header string
+	Rows   []string
+	Footer []string
+}
+
+func (l List) Table(mode Mode) (Table, error) {
+	columns, err := l.Columns(mode)
+	if err != nil {
+		return Table{}, err
+	}
+	var footer strings.Builder
+	lines := humanTableLines(columns, humanBytes(l.Bytes, l.Rows), mode.Full)
+	document := make(map[string]any, len(l.Aggregates))
+	for _, aggregate := range l.Aggregates {
+		document[aggregate.K] = aggregate.V
+	}
+	writeHumanListFooter(&footer, l, len(l.Rows), len(l.Rows), document, mode.Full)
+	table := Table{Header: lines[0], Rows: lines[1:]}
+	if len(l.Lead) > 0 {
+		table.Lead = strings.Split(strings.Join(l.Lead, "\n"), "\n")
+		table.Lead = append(table.Lead, "")
+	}
+	if text := strings.TrimSuffix(footer.String(), "\n"); text != "" {
+		table.Footer = append([]string{""}, strings.Split(text, "\n")...)
+	}
+	return table, nil
+}
+
 // Human is a value with its own terminal sentence; JSON carries the value itself. An
 // empty sentence keeps an aggregate out of the terminal and shows a record field as `-`.
 type Human interface {
@@ -276,8 +308,16 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 	} else {
 		writeHumanTable(&rendered, columns, humanBytes(list.Bytes, shown), full)
 	}
-	if omitted := total - len(shown); omitted > 0 {
-		fmt.Fprintf(&rendered, "%d more not shown. Use --full to show all.\n", omitted)
+	writeHumanListFooter(&rendered, list, len(shown), total, document, full)
+	_, err := io.WriteString(w, rendered.String())
+	return err
+}
+
+func writeHumanListFooter(rendered *strings.Builder, list List, shown, total int,
+	document map[string]any, full bool,
+) {
+	if omitted := total - shown; omitted > 0 {
+		fmt.Fprintf(rendered, "%d more not shown. Use --full to show all.\n", omitted)
 	}
 	wroteAggregate := false
 	for _, aggregate := range list.Aggregates {
@@ -297,7 +337,7 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 			if !wroteAggregate && rendered.Len() > 0 {
 				rendered.WriteByte('\n')
 			}
-			fmt.Fprintf(&rendered, "%s: %s\n", aggregate.K, text)
+			fmt.Fprintf(rendered, "%s: %s\n", aggregate.K, text)
 			wroteAggregate = true
 		}
 	}
@@ -310,12 +350,10 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 	}
 	if len(list.Trail) > 0 {
 		// The trail already sits apart from the table; the guidance follows it directly.
-		writeGuidanceLines(&rendered, list.Notes, list.Next)
+		writeGuidanceLines(rendered, list.Notes, list.Next)
 	} else {
-		writeHumanGuidance(&rendered, list.Notes, list.Next)
+		writeHumanGuidance(rendered, list.Notes, list.Next)
 	}
-	_, err := io.WriteString(w, rendered.String())
-	return err
 }
 
 // humanBytes renders every byte column of every row in binary units; other cells pass.
@@ -340,6 +378,13 @@ func humanBytes(byteColumns []string, rows []map[string]string) []map[string]str
 }
 
 func writeHumanTable(rendered *strings.Builder, columns []string, rows []map[string]string, full bool) {
+	for _, line := range humanTableLines(columns, rows, full) {
+		rendered.WriteString(line)
+		rendered.WriteByte('\n')
+	}
+}
+
+func humanTableLines(columns []string, rows []map[string]string, full bool) []string {
 	widths := make([]int, len(columns))
 	for i, column := range columns {
 		widths[i] = utf8.RuneCountInString(strings.ToUpper(column))
@@ -357,20 +402,22 @@ func writeHumanTable(rendered *strings.Builder, columns []string, rows []map[str
 	for i, column := range columns {
 		headings[i] = strings.ToUpper(column)
 	}
-	writeHumanRow(rendered, headings, widths)
+	lines := []string{humanTableRow(headings, widths)}
 	for _, row := range values {
-		writeHumanRow(rendered, row, widths)
+		lines = append(lines, humanTableRow(row, widths))
 	}
+	return lines
 }
 
-func writeHumanRow(rendered *strings.Builder, values []string, widths []int) {
+func humanTableRow(values []string, widths []int) string {
+	var rendered strings.Builder
 	for i, value := range values {
 		rendered.WriteString(value)
 		if i < len(values)-1 {
 			rendered.WriteString(strings.Repeat(" ", widths[i]-utf8.RuneCountInString(value)+2))
 		}
 	}
-	rendered.WriteByte('\n')
+	return rendered.String()
 }
 
 func writeHumanGuidance(rendered *strings.Builder, notes, next []string) {
