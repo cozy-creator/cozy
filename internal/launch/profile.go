@@ -138,7 +138,10 @@ func InventoryMismatch(inventory *pb.ImageInventory, requirements []string, requ
 	if requiresPython != "" {
 		current, err := pep440.Parse(inventory.Python)
 		bounds, boundsErr := pep440.NewSpecifiers(requiresPython)
-		if err == nil && boundsErr == nil && !bounds.Check(current) {
+		if err != nil {
+			return "the rental image reports an invalid Python version"
+		}
+		if boundsErr == nil && !bounds.Check(current) {
 			return "Python " + inventory.Python + " does not satisfy " + requiresPython
 		}
 	}
@@ -166,7 +169,10 @@ func InventoryMismatch(inventory *pb.ImageInventory, requirements []string, requ
 		}
 		bounds, err := pep440.NewSpecifiers(tail)
 		version, versionErr := pep440.Parse(carried)
-		if err == nil && versionErr == nil && !bounds.Check(version) {
+		if versionErr != nil {
+			return "the rental image reports an invalid version for " + name
+		}
+		if err == nil && !bounds.Check(version) {
 			return name + " " + carried + " does not satisfy " + strings.TrimSpace(requirement)
 		}
 	}

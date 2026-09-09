@@ -353,3 +353,69 @@ func TestExplicitWideJobKeepsOrdinarySingleExecutorDirective(t *testing.T) {
 		t.Fatal("explicit wide job bought extra capacity")
 	}
 }
+
+func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
+	for _, kind := range []string{"serving", "job"} {
+		t.Run(kind, func(t *testing.T) {
+			h := newLadderHub(t)
+			h.bind(goodLadder())
+			root, _ := placementRoot(t, h, "balanced")
+			cert := filepath.Join(root, "fixture.pem")
+			must(t, os.WriteFile(cert, []byte("fixture"), 0600))
+			st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+			fatal(t, problem)
+			id := "pr-replayrental"
+			fatal(t, st.RecordRental(records.Rental{ID: id, MachineName: "isao", SKU: "h100-80", AcceleratorModel: h100SXM, AcceleratorCount: 1, HourlyRateUSDMicros: 2490000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL}))
+			h.addReady(id, "isao", h100SXM, 2490000)
+			st.Close()
+			startDaemonProcess(t, root)
+			args := []string{"run", ladderPackage + "/generate", "steps=1", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
+			if kind == "job" {
+				args = []string{"run", ladderPackage + "/lane", "--model.pruned=proof/minimax@1.0.0-rc.1/fp8-adaln-pruned", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
+			}
+			_, firstOut := runCozy(t, root, args...)
+			st, problem = records.Open(filepath.Join(root, "creator.sqlite"))
+			fatal(t, problem)
+			defer st.Close()
+			first, problem := st.RequestByIdempotencyKey("ended-replay")
+			fatal(t, problem)
+			if first == nil {
+				t.Fatalf("initial named request absent: %s", firstOut)
+			}
+			_, _ = runCozy(t, root, "run", "cancel", first.ID, "--json")
+			before, problem := st.RequestRow(first.ID)
+			fatal(t, problem)
+			if before.State != "canceled" && before.State != "failed" {
+				t.Fatalf("request has not settled: %s", before.State)
+			}
+			h.mu.Lock()
+			delete(h.rentals, id)
+			h.mu.Unlock()
+			_, problem = st.ForgetRental(id)
+			fatal(t, problem)
+			_, replayOut := runCozy(t, root, args...)
+			after, problem := st.RequestByIdempotencyKey("ended-replay")
+			fatal(t, problem)
+			if after == nil || after.ID != before.ID || after.State != before.State || after.Ordinal != before.Ordinal {
+				t.Fatalf("replay reactivated or replaced request: before=%+v after=%+v output=%s", before, after, replayOut)
+			}
+			if strings.Contains(replayOut, "rental.selection_unavailable") || strings.Contains(replayOut, "rental.dependency_mismatch") {
+				t.Fatalf("replay consulted ended rental: %s", replayOut)
+			}
+			if asks := h.postedSKUs(); len(asks) != 0 {
+				t.Fatalf("replay purchased capacity: %v", asks)
+			}
+		})
+	}
+}
+
+func TestRentalInventoryRefusesMalformedProtectedVersions(t *testing.T) {
+	inventory := &pb.ImageInventory{Python: "broken", Distributions: []*pb.ImageDistribution{{Distribution: runtimeDistribution, Version: "broken"}}}
+	if why := launch.InventoryMismatch(inventory, nil, ">=3.12"); !strings.Contains(why, "invalid Python version") {
+		t.Fatal(why)
+	}
+	inventory.Python = "3.12.12"
+	if why := launch.InventoryMismatch(inventory, []string{"cozy-runtime>=0.15"}, ""); !strings.Contains(why, "invalid version for cozy-runtime") {
+		t.Fatal(why)
+	}
+}
