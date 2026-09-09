@@ -186,12 +186,16 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 // ---------------------------------------------------------------------- job status
 
 func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
+	status := state.Status
+	if export := state.OutputExport; export != nil && export.State == "failed" && status == "completed" {
+		status += " (export pending: " + export.ErrorCode + ")"
+	}
 	fields := []output.Field{
 		{K: "job", V: runReference(state.Number, state.JobID)},
 		{K: "id", V: state.JobID},
 		{K: "package", V: state.Package},
 		{K: "function", V: state.Function},
-		{K: "status", V: state.Status},
+		{K: "status", V: status},
 		{K: "queued", V: seconds(state.QueuedMS)},
 		{K: "execution", V: seconds(state.ExecutionMS)},
 	}
@@ -423,6 +427,10 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	}
 	defaults = append(defaults, "wall_ms")
 	rec := compactRecord(fields, defaults...)
+	if export := state.OutputExport; export != nil && export.State == "failed" {
+		rec.Notes = append(rec.Notes, fmt.Sprintf("output export to %s failed (%s): %s; accepted output bytes remain in internal custody",
+			export.Directory, export.ErrorCode, export.Error))
+	}
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
 		if hint := modelPublishHint(state); hint != "" {

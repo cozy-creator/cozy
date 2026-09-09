@@ -33,7 +33,12 @@ func TestTopLevelJobMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
 	}
 	uv("venv", control, "--python", "3.12")
 	uv("pip", "install", "--python", filepath.Join(control, "bin", "python"), wheel)
-	path := filepath.Join(control, "bin") + string(os.PathListSeparator) + os.Getenv("PATH")
+	path := filepath.Join(control, "bin")
+	for _, item := range childEnv(t, root) {
+		if strings.HasPrefix(item, "PATH=") {
+			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
+		}
+	}
 	t.Cleanup(func() {
 		_, _ = runCozyPath(t, root, path, "down", "--all")
 		if !t.Failed() {

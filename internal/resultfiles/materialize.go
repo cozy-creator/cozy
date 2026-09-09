@@ -36,13 +36,13 @@ func Materialize(source, directory, digest, mediaType string, length int64) (str
 	}
 	root, err := os.OpenRoot(directory)
 	if err != nil {
-		return "", unwritable(directory, err)
+		return "", exportWriteFailure(directory, err)
 	}
 	defer root.Close()
 	temporary := ".cozy-export-" + randomSuffix()
 	output, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
-		return "", unwritable(directory, err)
+		return "", exportWriteFailure(directory, err)
 	}
 	defer func() { output.Close(); _ = root.Remove(temporary) }()
 	hash := sha256.New()
@@ -54,21 +54,26 @@ func Materialize(source, directory, digest, mediaType string, length int64) (str
 		return "", exit.Named(exit.Conflict, "output_export_source_changed", "accepted output changed before export")
 	}
 	if err := output.Sync(); err != nil {
-		return "", unwritable(directory, err)
+		return "", exportWriteFailure(directory, err)
 	}
 	if err := output.Close(); err != nil {
-		return "", unwritable(directory, err)
+		return "", exportWriteFailure(directory, err)
 	}
 	if err := root.Rename(temporary, name); err != nil {
-		return "", unwritable(directory, err)
+		return "", exportWriteFailure(directory, err)
 	}
 	parent, err := root.Open(".")
 	if err != nil {
-		return "", unwritable(directory, err)
+		return "", exportWriteFailure(directory, err)
 	}
 	defer parent.Close()
 	if err := parent.Sync(); err != nil {
-		return "", unwritable(directory, err)
+		return "", exportWriteFailure(directory, err)
 	}
 	return filepath.Join(directory, name), nil
+}
+
+func exportWriteFailure(directory string, err error) *exit.Error {
+	return exit.Named(exit.Failed, "output_export_write_failed",
+		"cannot export accepted output under %s: %s", directory, ioCause(err))
 }

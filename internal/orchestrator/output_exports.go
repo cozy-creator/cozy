@@ -11,10 +11,10 @@ import (
 )
 
 // RetryOutputExport settles one daemon-owned publication obligation — the package's
-// store under outputs/ or the caller's --out. The files are already there: the grant
-// named that directory, the worker wrote each result under its digest name, and the
-// terminal was verified against exactly those paths. Settling is proving the accepted
-// set matches the pre-execution contract and recording the paths; nothing is copied.
+// store under outputs/ or the caller's --out. Serving files are already at that
+// destination. Top-level jobs retain internal publication custody and materialize
+// independent user copies of their declared media. Both settle the same export row
+// after proving the accepted set matches its pre-execution contract.
 // It never changes the execution terminal and never trusts a terminal path.
 func (c *Orchestrator) RetryOutputExport(requestID string) {
 	c.mu.Lock()
