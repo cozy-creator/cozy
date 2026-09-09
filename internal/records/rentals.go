@@ -948,44 +948,60 @@ type RentalLastSettlement struct {
 }
 
 func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *exit.Error) {
-	var out RentalLastSettlement
-	var closedAt, settledAt string
-	err := s.db.QueryRow(`SELECT r.id,r.kind,COALESCE(MAX(a.closed_at),''),
-		MAX(COALESCE(MAX(a.closed_at),''), COALESCE((
-		  SELECT e.at FROM request_events e WHERE e.request_id=r.id
-		    AND e.type IN ('request.completed','request.failed','request.canceled')
-		  ORDER BY e.seq DESC LIMIT 1),'')) AS settled_at
-		FROM requests r
-		LEFT JOIN attempts a ON a.request_id=r.id AND a.state IN ('terminal','closed')
-		WHERE r.worker=? AND r.rental=1
-		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')
-		GROUP BY r.id,r.kind,r.created_at
-		ORDER BY COALESCE(NULLIF(settled_at,''),r.created_at) DESC,r.id DESC LIMIT 1`, id).
-		Scan(&out.RequestID, &out.Kind, &closedAt, &settledAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return RentalLastSettlement{}, false, nil
-	}
+	rows, err := s.db.Query(`SELECT r.id,r.kind,r.created_at,
+		COALESCE((SELECT a.closed_at FROM attempts a WHERE a.request_id=r.id
+		  AND a.state IN ('terminal','closed') AND a.closed_at<>''
+		  ORDER BY a.attempt DESC LIMIT 1),''),
+		COALESCE((SELECT e.at FROM request_events e WHERE e.request_id=r.id
+		  AND e.type IN ('request.completed','request.failed','request.canceled')
+		  ORDER BY e.seq DESC LIMIT 1),'')
+		FROM requests r WHERE r.worker=? AND r.rental=1
+		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')`, id)
 	if err != nil {
 		return RentalLastSettlement{}, false, exit.Internalf(
-			"cannot read the last settled request for rental %s: %s", id, err)
+			"cannot read settlements for rental %s: %s", id, err)
 	}
-	if closedAt != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, closedAt)
-		if err != nil {
-			return RentalLastSettlement{}, false, exit.Internalf(
-				"rental %s has an invalid terminal timestamp: %s", id, err)
+	defer rows.Close()
+	var out RentalLastSettlement
+	var latest time.Time
+	found := false
+	for rows.Next() {
+		var candidate RentalLastSettlement
+		var created, closed, settled string
+		if err := rows.Scan(&candidate.RequestID, &candidate.Kind, &created, &closed, &settled); err != nil {
+			return RentalLastSettlement{}, false, exit.Internalf("cannot read rental settlement: %s", err)
 		}
-		out.ClosedAt = parsed
-	}
-	if settledAt != "" {
-		parsed, err := time.Parse(time.RFC3339Nano, settledAt)
-		if err != nil {
-			return RentalLastSettlement{}, false, exit.Internalf(
-				"rental %s has an invalid settlement timestamp: %s", id, err)
+		var createdAt time.Time
+		// RFC3339Nano is not lexically ordered: 32Z sorts after 32.456Z.
+		for _, stamp := range []struct {
+			raw string
+			dst *time.Time
+		}{{created, &createdAt}, {closed, &candidate.ClosedAt}, {settled, &candidate.SettledAt}} {
+			if stamp.raw == "" {
+				continue
+			}
+			parsed, err := time.Parse(time.RFC3339Nano, stamp.raw)
+			if err != nil {
+				return RentalLastSettlement{}, false, exit.Internalf(
+					"rental %s has an invalid settlement timestamp: %s", id, err)
+			}
+			*stamp.dst = parsed
 		}
-		out.SettledAt = parsed
+		if candidate.ClosedAt.After(candidate.SettledAt) {
+			candidate.SettledAt = candidate.ClosedAt
+		}
+		at := candidate.SettledAt
+		if at.IsZero() {
+			at = createdAt
+		}
+		if !found || at.After(latest) || (at.Equal(latest) && candidate.RequestID > out.RequestID) {
+			out, latest, found = candidate, at, true
+		}
 	}
-	return out, true, nil
+	if err := rows.Err(); err != nil {
+		return RentalLastSettlement{}, false, exit.Internalf("cannot finish rental settlements: %s", err)
+	}
+	return out, found, nil
 }
 
 // ForgetRental removes the row once the hub reports the pod gone and closes whatever

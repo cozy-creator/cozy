@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,65 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "creator.sqlite")
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	defer store.Close()
+	const rentalID, first, second = "rental-clock", "job-first", "job-second"
+	submit := func(id string) {
+		t.Helper()
+		_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, Kind: "job",
+			Package: "proof/clock", Entrypoint: "run", Payload: []byte("{}"),
+			BodyDigest: "sha256:" + strings.Repeat("a", 64), Rental: true, Worker: rentalID})
+		fatal(t, problem)
+	}
+	submit(first)
+	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "ins-clock", Package: "proof/clock", WorkerID: rentalID, Devices: []string{"cpu"}}))
+	digest := "sha256:" + strings.Repeat("b", 64)
+	ordinal, problem := store.Dispatch(records.Attempt{RequestID: first, SessionID: "boot-clock",
+		InstanceID: "ins-clock", InvocationDigest: digest, InvocationCanonical: []byte("{}")})
+	fatal(t, problem)
+	fatal(t, store.OfferDispatch(first, ordinal, "boot-clock"))
+	fatal(t, store.Accepted(first, ordinal, "boot-clock"))
+	_, problem = store.AcceptTerminal(records.Terminal{RequestID: first, Attempt: ordinal,
+		SessionID: "boot-clock", InvocationDigest: digest, TerminalID: "out-clock",
+		TerminalDigest: "sha256:" + strings.Repeat("c", 64), Status: "FAILED", Cause: "EXCEPTION",
+		EventType: "request.failed"})
+	fatal(t, problem)
+	fatal(t, store.Closed(first, ordinal))
+	// Replay controlled historical timestamps through real records. The producer's
+	// RFC3339Nano formatter emits both spellings; SQL string MAX reverses them.
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	whole := "2026-09-09T05:24:32Z"
+	fraction := "2026-09-09T05:24:32.456Z"
+	_, err = db.Exec(`UPDATE attempts SET closed_at=? WHERE request_id=?`, whole, first)
+	must(t, err)
+	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='request.failed'`, fraction, first)
+	must(t, err)
+	check := func(id, at string, attempted bool) {
+		t.Helper()
+		last, found, problem := store.RentalLastSettlement(rentalID)
+		fatal(t, problem)
+		if !found || last.RequestID != id || last.SettledAt.Format(time.RFC3339Nano) != at || last.ClosedAt.IsZero() == attempted {
+			t.Fatalf("wrong chronological settlement or attempt classification: %+v", last)
+		}
+	}
+	check(first, fraction, true)
+	submit(second)
+	_, problem = store.FailQueuedRequest(second, nil)
+	fatal(t, problem)
+	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='request.failed'`, whole, second)
+	must(t, err)
+	check(first, fraction, true)
+	later := "2026-09-09T05:24:32.789Z"
+	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='request.failed'`, later, second)
+	must(t, err)
+	check(second, later, false)
+}
 
 // Preparation can spend minutes on a paid pod before an attempt exists. The
 // terminal request event ends that work even when the controller was restarted
