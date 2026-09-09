@@ -393,6 +393,13 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		}
 		rental.Conclude(decision.Candidates, i)
 		decision.RentalID, decision.Models = rentalID, c.Models
+		if !decision.Bought && c.Ahead > 0 && req.RequestedRental == "" && !req.RetainWork {
+			// Preparation may use this candidate, but its occupied seat is not an
+			// assignment. The local queue can still take another ready rental;
+			// dispatch records the chosen worker when it reserves a free seat.
+			line, problem := m.lineLocked()
+			return decision, line, problem
+		}
 		pinned, problem := m.store.PinRental(req.ID, rentalID, c.Models)
 		if problem != nil {
 			return none, "", problem
