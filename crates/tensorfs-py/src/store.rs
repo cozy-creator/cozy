@@ -2955,10 +2955,27 @@ impl PyBatch {
 /// repository or open ingest session names, from the filesystem census alone, under the
 /// store's exclusive lock. `dry_run` plans without deleting.
 #[pyfunction]
-#[pyo3(signature = (root, dry_run = false))]
-pub fn gc<'p>(py: Python<'p>, root: PathBuf, dry_run: bool) -> PyResult<Bound<'p, PyDict>> {
+#[pyo3(signature = (root, dry_run = false, *, evict_cached = false, keep_manifests = Vec::new()))]
+pub fn gc<'p>(
+    py: Python<'p>,
+    root: PathBuf,
+    dry_run: bool,
+    evict_cached: bool,
+    keep_manifests: Vec<String>,
+) -> PyResult<Bound<'p, PyDict>> {
     let report = py
-        .detach(|| tensorfs_core::gc::collect(&root, dry_run))
+        .detach(|| {
+            if !evict_cached {
+                return tensorfs_core::gc::collect(&root, dry_run);
+            }
+            if dry_run {
+                return tensorfs_core::err::refuse(
+                    tensorfs_core::err::Code::KEY_GRAMMAR,
+                    "cached-root eviction does not support dry_run",
+                );
+            }
+            tensorfs_core::gc::collect_cached(&root, &keep_manifests)
+        })
         .or_refuse(py)?;
     let result = PyDict::new(py);
     result.set_item("dry_run", report.dry_run)?;

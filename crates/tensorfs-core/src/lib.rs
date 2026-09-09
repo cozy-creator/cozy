@@ -9,6 +9,7 @@
 #![deny(unsafe_code)]
 
 pub mod b64;
+mod cache_roots;
 pub mod canon;
 pub mod capability;
 pub mod catalog;

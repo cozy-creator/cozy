@@ -4064,3 +4064,33 @@ fn blocked_optional_backfill_does_not_delay_process_exit() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn downloaded_cache_root_is_protected_then_evicted_and_refetched() {
+    let checkpoint = Arc::new(checkpoint(2, 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let root = temporary("pressure-cached-root");
+    let store = Store::init(&root).unwrap();
+    let request = PullRequest::new(&store, &origin.base, "acme/model", &Anonymous, &policy);
+    let cold = pull(&request).unwrap();
+    assert!(cold.bytes_moved > 0);
+    let repository = crate::repository::RepositoryName::new("acme", "model").unwrap();
+    let body = std::fs::read(store.repository_path(&repository)).unwrap();
+    assert!(crate::cache_roots::matches(&store, &repository, &body).unwrap());
+    let parsed = crate::repository::Repository::parse(&body).unwrap();
+    let keep = vec![parsed.checkpoints[0].manifest.sha256.clone()];
+    assert_eq!(
+        crate::gc::collect_cached(&root, &keep)
+            .unwrap()
+            .reclaimed_bytes,
+        0
+    );
+    let report = crate::gc::collect_cached(&root, &[]).unwrap();
+    assert!(report.reclaimed_bytes > 0);
+    assert!(!store.repository_path(&repository).exists());
+    let again = pull(&request).unwrap();
+    assert_eq!(again.bytes_moved, cold.bytes_moved);
+    assert!(store.repository_path(&repository).exists());
+    let _ = std::fs::remove_dir_all(root);
+}

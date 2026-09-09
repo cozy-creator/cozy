@@ -177,7 +177,16 @@ pub(crate) fn retained_manifests(store: &Store) -> Result<Vec<crate::ids::Object
 /// One complete pass: exclusivity, orphan temps, census, plan, delete, catalog repair.
 pub fn collect(root: &Path, dry_run: bool) -> Result<Report> {
     let store = Store::open(root)?;
-    let _exclusive = WriterGuard::lock_rebuild(root)?;
+    let exclusive = WriterGuard::lock_rebuild(root)?;
+    collect_locked(&store, dry_run, &exclusive)
+}
+
+pub(crate) fn collect_locked(
+    store: &Store,
+    dry_run: bool,
+    _exclusive: &crate::catalog::RebuildGuard,
+) -> Result<Report> {
+    let root = store.root();
     let mut report = Report {
         dry_run,
         ..Report::default()
@@ -186,11 +195,12 @@ pub fn collect(root: &Path, dry_run: bool) -> Result<Report> {
         // Under exclusivity every remaining put- temp and lease marker belongs to a dead
         // process: the kernel released its lock with it.
         report.scratch_reaped = store.reap()?.0 as u64;
-        if let Ok(meta) = crate::meta::Meta::open(&store) {
+        report.scratch_reaped += crate::cache_roots::reap(store, 128)?;
+        if let Ok(meta) = crate::meta::Meta::open(store) {
             report.scratch_reaped += meta.reap_holds()?.len() as u64;
         }
     }
-    let (holds, sessions) = session_holds(&store)?;
+    let (holds, sessions) = session_holds(store)?;
     report.sessions = sessions;
     let census = Census::open(root)?;
     let plan = census.gc_plan(&holds)?;
@@ -257,4 +267,66 @@ fn remove(root: &Path, row: &GcDelete) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io(format!("remove {}", row.key), error)),
     }
+}
+
+/// One pressure pass on an explicitly managed store: first ordinary garbage, then the
+/// smallest useful cache-root drop chosen by the existing dedup-aware planner. The owner
+/// keeps its placement generation stable through this call. The native lock covers the
+/// entire selection/removal/collection transition, including new readers and downloads.
+/// Old roots without transport provenance are deliberately not migrated or inferred.
+pub fn collect_cached(root: &Path, protected_manifests: &[String]) -> Result<Report> {
+    let protected_manifests = protected_manifests
+        .iter()
+        .map(|digest| {
+            crate::ids::hex64(
+                "protected manifest",
+                digest.strip_prefix("sha256:").unwrap_or(digest),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let store = Store::open(root)?;
+    let exclusive = WriterGuard::lock_rebuild(root)?;
+    let collected = collect_locked(&store, false, &exclusive)?;
+    if collected.reclaimed_bytes > 0 {
+        return Ok(collected);
+    }
+    let (holds, _) = session_holds(&store)?;
+    let mut protected: BTreeSet<&str> = protected_manifests.iter().map(String::as_str).collect();
+    protected.extend(
+        holds
+            .iter()
+            .filter(|hold| hold.kind == "manifest")
+            .map(|hold| hold.sha256.as_str()),
+    );
+    let repositories = storage::read_repositories(root)?;
+    let mut keep = Vec::new();
+    for (repository, body) in &repositories {
+        if repository
+            .checkpoints
+            .iter()
+            .any(|checkpoint| protected.contains(checkpoint.manifest.sha256.as_str()))
+            || !crate::cache_roots::matches(&store, &repository.repo, body)?
+        {
+            keep.push(repository.repo.clone());
+        }
+    }
+    let plan = match crate::reclaim::plan_managed(&store, 1, &keep, &holds) {
+        Ok(plan) => plan,
+        Err(error) if error.code == Code::RECLAIM_INSUFFICIENT => return Ok(collected),
+        Err(error) => return Err(error),
+    };
+    // A bounded pass never removes an arbitrarily large jointly-deduplicated set.
+    if plan.victims.len() > 16 {
+        return Ok(collected);
+    }
+    for victim in plan.victims {
+        let (repository, body) = repositories
+            .iter()
+            .find(|(repository, _)| {
+                repository.repo.org == victim.org && repository.repo.name == victim.name
+            })
+            .expect("planner only names census repositories");
+        store.remove_cached_repository(body, &repository.repo, &exclusive)?;
+    }
+    collect_locked(&store, false, &exclusive)
 }

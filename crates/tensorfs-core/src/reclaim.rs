@@ -339,6 +339,16 @@ pub fn usage(
 /// rather than returning a plan that empties the Store and still cannot admit the fetch.
 pub fn plan(store: &Store, need: u64, keep: &[RepositoryName], holds: &[HeldKey]) -> Result<Plan> {
     permitted(store)?;
+    plan_managed(store, need, keep, holds)
+}
+
+// Managed pressure already has an explicit owner opt-in; it shares the same planner.
+pub(crate) fn plan_managed(
+    store: &Store,
+    need: u64,
+    keep: &[RepositoryName],
+    holds: &[HeldKey],
+) -> Result<Plan> {
     let census = Census::open(store.root())?;
     let index = census.holder_index(holds)?;
 
