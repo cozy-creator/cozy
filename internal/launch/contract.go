@@ -121,7 +121,7 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 		b.WriteString("  request: none\n")
 	} else {
 		b.WriteString("  request:\n")
-		writeFields(&b, ep.Request.Fields, "    ")
+		writeFields(&b, ep.Request.Fields, "    ", "request", ep.Invocable)
 	}
 	if len(ep.Models) > 0 {
 		b.WriteString("  models:\n")
@@ -135,7 +135,7 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 	}
 	if len(ep.Result.Fields) > 0 {
 		b.WriteString("  output:\n")
-		writeFields(&b, ep.Result.Fields, "    ")
+		writeFields(&b, ep.Result.Fields, "    ", "result", ep.Invocable)
 	}
 	b.WriteString("\nusage: " + UsageLine(target, ep) + "\n")
 	return b.String()
@@ -146,18 +146,19 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 func DescribeArguments(ep *Entrypoint) string {
 	var b strings.Builder
 	b.WriteString("Arguments:\n")
-	writeFields(&b, ep.Request.Fields, "  ")
+	writeFields(&b, ep.Request.Fields, "  ", "request", ep.Invocable)
 	return b.String()
 }
 
-func writeFields(b *strings.Builder, fields []Field, indent string) {
+func writeFields(b *strings.Builder, fields []Field, indent, path string, invocable *Invocable) {
 	for i := range fields {
 		field := &fields[i]
+		fieldPath := path + "/" + field.Name
 		b.WriteString(indent + field.Name + ": " + describePhrase(field))
-		b.WriteString(fieldNotes(field))
+		b.WriteString(fieldNotes(field, fieldPath, invocable))
 		b.WriteString("\n")
 		if kind, nested := typeOf(field.Type); kind == "struct" && len(indent) < 12 {
-			writeFields(b, nested.Fields, indent+"  ")
+			writeFields(b, nested.Fields, indent+"  ", fieldPath, invocable)
 		}
 	}
 }
@@ -179,10 +180,15 @@ func describePhrase(f *Field) string {
 	return typePhrase(f.Type)
 }
 
-func fieldNotes(f *Field) string {
+func fieldNotes(f *Field, path string, invocable *Invocable) string {
 	notes := ""
 	if c := constraintPhrase(f.Constraints); c != "" {
 		notes += " " + c
+	}
+	if invocable != nil {
+		if value, ok := invocable.Defaults[path]; ok {
+			return notes + " (default = " + string(value) + ")"
+		}
 	}
 	switch f.Wire {
 	case "optional":

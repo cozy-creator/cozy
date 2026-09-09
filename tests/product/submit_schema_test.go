@@ -48,7 +48,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		}
 	}
 	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "--describe")
-	for _, expected := range []string{"(job)", "size: int (>=8, <=256) (optional)"} {
+	for _, expected := range []string{"(job)", "size: int (>=8, <=256) (default = 64)"} {
 		if code != 0 || !strings.Contains(out, expected) {
 			t.Fatalf("a job's --describe omitted %q [exit %d]\n%s", expected, code, out)
 		}
