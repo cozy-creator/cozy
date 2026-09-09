@@ -75,7 +75,7 @@ func TestRentalMachineNames(t *testing.T) {
 	begin := func(key string) string {
 		t.Helper()
 		op, replay, problem := store.BeginRentalOperation(records.RentalOperation{
-			Key: key, Hub: hubURL, Reason: "cozy rent cpu", HourlyRateUSDMicros: 100_000,
+			Key: key, Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100_000,
 		}, fleetCap, 0, func(machineName string) ([]byte, string, *exit.Error) {
 			body, problem := hub.RentalRequestBytes(machineName, "cpu", strings.Repeat("ab", 32),
 				"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil)
@@ -147,7 +147,7 @@ func TestRentalMachineNames(t *testing.T) {
 		t.Fatalf("the released word %s was not reused; got %s", first, reused)
 	}
 	_, _, problem = store.BeginRentalOperation(records.RentalOperation{
-		Key: "op-exhausted", Hub: hubURL, Reason: "cozy rent cpu", HourlyRateUSDMicros: 100_000,
+		Key: "op-exhausted", Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100_000,
 	}, fleetCap, 0, func(string) ([]byte, string, *exit.Error) {
 		t.Fatal("a request was authored with no free word")
 		return nil, "", nil

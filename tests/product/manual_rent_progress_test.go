@@ -48,9 +48,9 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 			var code int
 			var log, stdout string
 			if mode == "terminal" {
-				code, log = ptyRun(t, root, "rent", "h100-nvl", "--timeout=8s")
+				code, log = ptyRun(t, root, "rental", "new", "h100-nvl", "--timeout=8s")
 			} else {
-				args := []string{"rent", "h100-nvl", "--timeout=8s"}
+				args := []string{"rental", "new", "h100-nvl", "--timeout=8s"}
 				if mode == "json" {
 					args = append(args, "--json")
 				}

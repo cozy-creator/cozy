@@ -543,6 +543,16 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		return
 	}
 	req = *current
+	previousRental := req.Worker
+	req, problem = c.reconsiderAutomaticRental(req)
+	if problem != nil {
+		c.logf("%s cannot reconsider its automatic rental: %s", req.ID, problem.Message)
+		return
+	}
+	if previousRental != req.Worker {
+		go c.drain()
+		return
+	}
 	// A queued pin can predate a client upgrade or the peer's first ClaimAck.
 	// Replan only work which has never been offered; keep old attempts/data intact.
 	if req.Rental && req.Worker != "" {
@@ -1393,6 +1403,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request %s is not queued for execution", req.ID)
 	}
 	req = *current
+
 	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission epoch it OBSERVED, which is what

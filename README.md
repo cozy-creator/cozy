@@ -429,10 +429,10 @@ reuse; job workers are reclaimed at terminal.
 With Tensorhub configured, rent generic private capacity:
 
 ```sh
-cozy rent                    # Cozy GPUs, VRAM, and retail hourly prices
-cozy rent h200                # prints e.g. otter
-cozy rent h200 --model paul/minimax-h3@1.0.0/bf16
-cozy rent h200 \
+cozy rental new                   # Cozy GPUs, VRAM, and retail hourly prices
+cozy rental new h100-sxm5-80gb     # prints e.g. otter
+cozy rental new h100-sxm5-80gb --model paul/minimax-h3@1.0.0/bf16
+cozy rental new h100-sxm5-80gb \
   --idempotency-key <unique-key>
 
 cozy rental list                   # current rented machines, live on a terminal
@@ -455,7 +455,7 @@ their shared object closure and required disk headroom. This declares capacity n
 and models are prepared when requests run. Retrying the same idempotency key reuses the pinned
 set, including when `--model` is omitted on the retry.
 
-Every rental the daemon owns — bought for a request or started with `cozy rent` — ends on
+Every rental the daemon owns — bought for a request or started with `cozy rental new` — ends on
 its own once nothing has been queued, running, or owed on it for `rentals.idle_release_s`
 (default 300). Running work on it is what keeps it: the clock restarts at each settled attempt,
 and a rental that never ran anything counts from the moment Tensorhub first reported it `ready`,
@@ -629,5 +629,5 @@ Choose existing capacity explicitly with `cozy run org/package/function --rental
 (or its rental ID). This constraint survives retries and daemon restarts. If that
 rental becomes unavailable, the run fails or retains its work; it never buys a
 replacement or moves onto another machine. `--rental-only` retains automatic remote
-allocation. Create capacity with `cozy rent <sku>`, such as `cozy rent h100-sxm5-80gb-x2`;
-`cozy rent` alone lists the current catalog.
+allocation. Create capacity with `cozy rental new <machine-slug>`, such as `cozy rental new h100-sxm5-80gb-x2`;
+`cozy rental new` alone lists the current catalog.

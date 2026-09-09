@@ -201,7 +201,7 @@ func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
 func TestManualRentalAcceptsRetainedCheckpointIdentity(t *testing.T) {
 	root, mu, posts, digest, _ := runModelCatalog(t)
 	startDaemonProcess(t, root)
-	args := []string{"rent", "cpu", "--idempotency-key", "retained-manual-rental",
+	args := []string{"rental", "new", "cpu", "--idempotency-key", "retained-manual-rental",
 		"--model", "proof/source#" + digest, "--model", "proof/source#" + digest, "--json"}
 	code, out := runCozy(t, root, args...)
 	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
@@ -219,7 +219,7 @@ func TestManualRentalAcceptsRetainedCheckpointIdentity(t *testing.T) {
 	if len(request.ServingModels) != 1 || request.ServingModels[0] != (hub.ServingModel{Model: "proof/source", Manifest: digest}) {
 		t.Fatal("manual rental invented release metadata or duplicated checkpoint")
 	}
-	code, out = runCozy(t, root, "rent", "cpu", "--idempotency-key", "retained-manual-rental", "--json")
+	code, out = runCozy(t, root, "rental", "new", "cpu", "--idempotency-key", "retained-manual-rental", "--json")
 	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
 		t.Fatalf("pinned retry failed: %d %s", code, out)
 	}

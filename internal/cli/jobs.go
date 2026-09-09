@@ -192,6 +192,9 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 
 func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 	status := state.Status
+	if state.Status == "canceled" {
+		status = humanCancellationStatus(state.CanceledBy)
+	}
 	if export := state.OutputExport; export != nil && export.State == "failed" && status == "completed" {
 		status += " (export pending: " + export.ErrorCode + ")"
 	}
@@ -447,17 +450,21 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		}
 		return emit(ctx, rec)
 	}
-	err := exit.Named(code, status, "job %s ended %s", state.JobID, status)
+	humanStatus := status
+	if status == "canceled" {
+		humanStatus = humanCancellationStatus(state.CanceledBy)
+	}
+	err := exit.Named(code, humanStatus, "job %s ended %s", state.JobID, humanStatus)
 	if status == "blocked" {
 		err.WithNext("cozy run <updated-script-or-package> --retry " + runReference(state.Number, state.JobID))
 	}
 	if state.Error != "" {
 		err.Message = fmt.Sprintf("job %s ended %s: %s — %s",
-			state.JobID, status, state.ErrorType, state.Error)
+			state.JobID, humanStatus, state.ErrorType, state.Error)
 	}
 	// A canceled job is LOUD about WHO ended it (cl-108).
 	if mapTerminal(status) == "canceled" && state.CanceledBy != "" {
-		err.Message = fmt.Sprintf("job %s was canceled by %s", state.JobID, state.CanceledBy)
+		err.Message = fmt.Sprintf("job %s was %s", state.JobID, humanCancellationStatus(state.CanceledBy))
 		if state.Error != "" {
 			err.Message += ": " + state.Error
 		}

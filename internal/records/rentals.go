@@ -1207,6 +1207,27 @@ func (s *Store) PinnedRentalWork(rentalID string) ([]Request, *exit.Error) {
 	return out, nil
 }
 
+// ReleaseUnattemptedRentalAssignment releases only an automatic, unoffered
+// routing choice. A purchase still owed to this request, uploaded private code,
+// retained work, and even a refused historical offer preserve their custody.
+func (s *Store) ReleaseUnattemptedRentalAssignment(requestID, rentalID string) (bool, *exit.Error) {
+	result, err := s.db.Exec(`UPDATE requests SET worker=''
+		WHERE id=? AND worker=? AND requested_rental='' AND rental=1
+		  AND state IN ('submitted','queued') AND ordinal=0 AND retain_work=0
+		  AND local_package_uploaded_boot_id=''
+		  AND NOT EXISTS (SELECT 1 FROM attempts WHERE request_id=requests.id)
+		  AND NOT EXISTS (SELECT 1 FROM rental_operations WHERE managed_request_id=requests.id
+		    AND rental_id=? AND state NOT IN ('released','rejected'))`, requestID, rentalID, rentalID)
+	if err != nil {
+		return false, exit.Internalf("cannot reconsider rental assignment: %s", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, exit.Internalf("cannot read rental reassignment: %s", err)
+	}
+	return changed == 1, nil
+}
+
 // UnpinRentalWork releases a still-QUEUED request from a rental that can no longer serve
 // it, so routing may replan it onto another machine. It is the exact inverse of PinRental
 // and refuses the same rows PinRental would not have written: a request that has reached

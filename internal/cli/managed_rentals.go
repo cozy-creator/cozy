@@ -19,7 +19,7 @@ import (
 // The fleet, and its one reason to end a rental on its own. The owner's ruling: the main
 // guard against over-spend is Creator reaping unused pods, so a controller that dies must
 // not leave pods billing with no work being done. Every rental this daemon owns is under
-// that rule — one bought for a request and one asked for with `cozy rent` alike —
+// that rule — one bought for a request and one asked for with `cozy rental new` alike —
 // because how a pod was acquired says nothing about whether it is doing anything.
 //
 // The observation is the decision: nothing queued for the pod, nothing running or owed on
@@ -203,7 +203,7 @@ func (m *managedRentals) admit(skuName string) (string, hub.RentalSKU, *exit.Err
 //	"Tensorhub sells no such machine"      -> you typed something wrong; stop
 //	"that machine has no inventory now"    -> wait a couple of minutes; retry
 //
-// They used to share one sentence. On 2026-09-04 an explicit `cozy rent
+// They used to share one sentence. On 2026-09-04 an explicit `cozy rental new
 // rtx-a4000` was refused during a 32-minute stock-out, the message read as the
 // first, and the conclusion drawn was that the rental code had substituted a
 // dearer card — it had not, and two issues were filed against a defect that does
@@ -235,14 +235,14 @@ func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatu
 		return exit.Named(exit.Validation, "rental.sku_unavailable",
 			"no rental SKU %q is on offer right now — %s", skuName, said).
 			WithRemedy("the catalog is live provider inventory, so a name absent now may "+
-				"return within minutes; `cozy rent` alone lists what is offered "+
+				"return within minutes; `cozy rental new` alone lists what is offered "+
 				"this minute (currently %s)", offeredNames(skus)).
-			WithNext("cozy rent")
+			WithNext("cozy rental new")
 	case !status.Known:
 		return exit.Named(exit.Validation, "rental.sku_unknown",
 			"Tensorhub sells no rental SKU named %q — %s", skuName, said).
 			WithRemedy("choose one of the names it does sell: %s", offeredNames(skus)).
-			WithNext("cozy rent")
+			WithNext("cozy rental new")
 	}
 	// Known but not buyable: a real product in a stock-out. The timestamp is the
 	// actionable half — it separates "gone for ten seconds" from "gone all night".
@@ -257,7 +257,7 @@ func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatu
 		skuName, seen, said).
 		WithRemedy("this is a stock-out, not a bad name: retry in a minute or two, or "+
 			"see what is buyable this minute (currently %s)", offeredNames(skus)).
-		WithNext("cozy rent "+skuName, "cozy rent")
+		WithNext("cozy rental new "+skuName, "cozy rental new")
 }
 
 // offeredNames is the live catalog as a reader can scan it, so a refusal shows the shape
@@ -394,6 +394,13 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		}
 		rental.Conclude(decision.Candidates, i)
 		decision.RentalID, decision.Models = rentalID, c.Models
+		if !decision.Bought && c.Ahead > 0 && req.RequestedRental == "" && !req.RetainWork {
+			// Preparation may use this candidate, but its occupied seat is not an
+			// assignment. The local queue can still take another ready rental;
+			// dispatch records the chosen worker when it reserves a free seat.
+			line, problem := m.lineLocked()
+			return decision, line, problem
+		}
 		pinned, problem := m.store.PinRental(req.ID, rentalID, c.Models)
 		if problem != nil {
 			return none, "", problem

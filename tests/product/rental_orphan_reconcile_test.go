@@ -182,7 +182,7 @@ func TestUnrecordedSpendRefusesTheNextPurchase(t *testing.T) {
 	})
 
 	// The root's ceiling is $5.00/hour and the account is already burning $6.38 of it.
-	code, out := runCozy(t, root, "rent", "h100-nvl", "--json")
+	code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--json")
 	if code == 0 {
 		t.Fatalf("a purchase was admitted over a ceiling the account has already breached\n%s", out)
 	}

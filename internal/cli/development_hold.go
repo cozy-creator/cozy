@@ -142,7 +142,7 @@ func HoldStoredDevelopmentWorker(ctx context.Context, cfg config.Config, rentalI
 		if !frozen.same(target) {
 			return exit.Named(exit.Conflict, "development_hold_identity_changed", "development hold cannot adopt a changed worker, certificate or owner")
 		}
-		control, problem := orchestrator.DialIdleControl(ctx, target.connection, sign)
+		control, problem := orchestrator.DialIdleControl(ctx, target.connection, sign, store)
 		if ctx.Err() != nil {
 			if control != nil {
 				_ = control.Close()

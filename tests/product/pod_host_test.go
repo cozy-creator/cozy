@@ -58,6 +58,8 @@ const (
 // does. It verifies the owner's Ed25519 ClaimProof on both services against the control key
 // the rental's auth document would carry, records what crossed, and answers minimally.
 type fakePod struct {
+	identity         string
+	noSeats          bool
 	mediaReservation func(int64, int) error
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime   pb.RuntimePreparationClient
@@ -149,6 +151,25 @@ func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequ
 
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
 // the one placement staged and dispatchable under every binding it names.
+func (p *fakePod) workerID() string {
+	if p.identity == "" {
+		return podWorkerID
+	}
+	return "wrk-" + p.identity
+}
+func (p *fakePod) bootID() string {
+	if p.identity == "" {
+		return podBootID
+	}
+	return "boot-" + p.identity
+}
+func (p *fakePod) rentalID() string {
+	if p.identity == "" {
+		return podRental
+	}
+	return "pr-" + p.identity
+}
+
 func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame {
 	set := d.GetPlacementSet()
 	doc, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
@@ -171,12 +192,17 @@ func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame
 		}
 		placements = append(placements, row)
 	}
+	p.mu.Lock()
 	seats := uint32(1)
 	if p.slots > 1 {
 		seats = p.slots
 	}
+	if p.noSeats {
+		seats = 0
+	}
+	p.mu.Unlock()
 	return &pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
-		RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: epoch, WorkerBootId: podBootID,
+		RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: epoch, WorkerBootId: p.bootID(),
 		AcceptedDesiredStateRevision: d.Revision, ConvergedRevision: d.Revision,
 		AcceptedPlacementSetDigest: set.PlacementSetDigest,
 		WorkerPhase:                pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
@@ -226,7 +252,7 @@ func (p *fakePod) report(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame
 		})
 	}
 	return &pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
-		RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: epoch, WorkerBootId: podBootID,
+		RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: epoch, WorkerBootId: p.bootID(),
 		AcceptedDesiredStateRevision: d.Revision, AcceptedPlacementSetDigest: set.PlacementSetDigest,
 		WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
 		AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AdmissionEpoch: 4,
@@ -243,7 +269,7 @@ func (p *fakePod) verifyClaim(claim *pb.Claim, stream bool) error {
 		return status.Error(codes.FailedPrecondition, "a host call is not stream-scoped")
 	}
 	proof, err := canonical.Bytes(&pb.ClaimProof{RecordOwnerEpoch: claim.RecordOwnerEpoch,
-		WorkerId: podWorkerID, WorkerBootId: podBootID, WorkerTlsCertificateDigest: p.leafDigest})
+		WorkerId: p.workerID(), WorkerBootId: p.bootID(), WorkerTlsCertificateDigest: p.leafDigest})
 	if err != nil {
 		return err
 	}
@@ -287,8 +313,8 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 				minor = pb.WireMinor
 			}
 			if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
-				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
-				Accepted: true, WireMinor: minor, WorkerId: podWorkerID, WorkerInstanceId: "inst-pod-1",
+				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: p.bootID(),
+				Accepted: true, WireMinor: minor, WorkerId: p.workerID(), WorkerInstanceId: "inst-pod-1",
 				Resources: &pb.WorkerResources{Backend: "cuda", DeviceName: "fake-4090",
 					DeviceCount: max(p.deviceCount, 1), DeviceMemoryTotalBytes: 24 << 30},
 			}}}); err != nil {
@@ -322,7 +348,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.hostDigest = hostDigest
 			p.mu.Unlock()
 			if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: &pb.WorkerSnapshot{
-				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
+				RecordOwnerEpoch: m.Claim.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: p.bootID(),
 				SnapshotId: "snp-pod-1", SnapshotDigest: digest, SnapshotCanonicalBytes: body,
 				HostSnapshotDigest: hostDigest, HostSnapshotCanonicalBytes: hostBody,
 			}}}); err != nil {
@@ -344,7 +370,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			if p.jobReady && m.DesiredState.GetJob() != nil {
 				d := m.DesiredState
 				ready := &pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
-					RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: podBootID,
+					RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: p.bootID(),
 					AcceptedDesiredStateRevision: d.Revision, ConvergedRevision: d.Revision,
 					WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
 					AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionEpoch: 7,
@@ -791,8 +817,8 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 	mediaPlane.StartTLS()
 	t.Cleanup(mediaPlane.Close)
 	return &orchestrator.WorkerConnection{
-		RentalID: podRental, Addr: listener.Addr().String(), CACert: pemPath,
-		WorkerID: podWorkerID, WorkerBootID: podBootID,
+		RentalID: pod.rentalID(), Addr: listener.Addr().String(), CACert: pemPath,
+		WorkerID: pod.workerID(), WorkerBootID: pod.bootID(),
 		// ONE PROVISIONED IDENTITY, TWO LISTENERS: the byte plane presents the SAME pinned
 		// leaf as the control leg, which is the shape `rental.Resolver` resolves in
 		// production — it hands the media client the rental's pinned certificate, so a
@@ -808,7 +834,7 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.PrivateKey) func(*orchestrator.Options) {
 	return func(o *orchestrator.Options) {
 		o.Rentals = func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
-			if id != podRental {
+			if id != connection.RentalID {
 				return nil, exit.New(exit.NotFound, "no rental %s", id)
 			}
 			return &orchestrator.RemoteTarget{Connection: connection}, nil
