@@ -2,7 +2,7 @@
 name = "tensor-candidate"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime==__RUNTIME_VERSION__", "tensorfs>=0.3.26,<0.3.27"]
+dependencies = ["cozy-runtime==__RUNTIME_VERSION__", "tensorfs"]
 
 [tool.uv.sources]
 

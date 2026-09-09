@@ -27,6 +27,7 @@ type childIntake struct {
 	created      []string
 	staging      string
 	ownedPackage bool
+	prepared     *install.Result
 }
 
 func (i *childIntake) Finish(parentInstall string) *exit.Error {
@@ -34,10 +35,19 @@ func (i *childIntake) Finish(parentInstall string) *exit.Error {
 	for n := range bindings {
 		bindings[n].ParentInstallID = parentInstall
 	}
-	return i.store.RecordChildBindings(bindings)
+	if problem := i.store.RecordChildBindings(bindings); problem != nil {
+		return problem
+	}
+	if i.prepared != nil && i.prepared.Install.ID == parentInstall {
+		i.prepared = nil
+	}
+	return nil
 }
 
 func (i *childIntake) Close() {
+	if i.prepared != nil {
+		_, _ = install.Reclaim(i.layout, i.store, i.prepared.Install.ID)
+	}
 	if i.ownedPackage {
 		i.Package.Close()
 	}
@@ -45,6 +55,22 @@ func (i *childIntake) Close() {
 	for _, id := range i.created {
 		_, _ = install.Reclaim(i.layout, i.store, id)
 	}
+}
+
+func (i *childIntake) Install() (*install.Result, *exit.Error) {
+	if i.prepared != nil {
+		return i.prepared, nil
+	}
+	source, files, size, problem := i.Package.SourceIdentity()
+	if problem != nil {
+		return nil, problem
+	}
+	result, problem := install.Run(i.layout, i.store, install.Request{Ref: install.Ref{Package: "local/" + i.Package.Name}, Snapshot: true,
+		Local: &install.LocalSource{SourceDigest: source, Bytes: size, Files: files, Package: "local/" + i.Package.Name, Release: i.Package.Release, Tree: i.Package.Tree}})
+	if problem == nil {
+		i.prepared = result
+	}
+	return result, problem
 }
 
 func prepareChildIntake(ctx *Context, pack *packagepublish.Package, layout home.Layout, store *records.Store) (*childIntake, *exit.Error) {
@@ -91,14 +117,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 			dependency.Close()
 			return fail(problem)
 		}
-		source, files, size, problem := nested.Package.SourceIdentity()
-		if problem != nil {
-			nested.Close()
-			dependency.Close()
-			return fail(problem)
-		}
-		result, problem := install.Run(layout, store, install.Request{Ref: install.Ref{Package: "local/" + nested.Package.Name}, Snapshot: true,
-			Local: &install.LocalSource{SourceDigest: source, Bytes: size, Files: files, Package: "local/" + nested.Package.Name, Release: nested.Package.Release, Tree: nested.Package.Tree}})
+		result, problem := nested.Install()
 		if problem != nil {
 			nested.Close()
 			dependency.Close()
@@ -172,6 +191,9 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 			return fail(problem)
 		}
 		intake.Package, intake.ownedPackage = overlay, true
+	}
+	if problem := intake.prepareWheelIntake(context.Background(), replacements); problem != nil {
+		return fail(problem)
 	}
 	return intake, nil
 }

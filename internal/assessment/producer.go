@@ -11,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -79,7 +78,7 @@ func VerifyProducer(st *records.Store, requestID string, report []byte, inspecte
 	source := false
 	for _, input := range invocation.List("inputs") {
 		source = source || (strings.HasPrefix(input.Str("input_id"), "model:") &&
-			input.Str("kind_mime") == orchestrator.WeightsManifestMime && input.Str("digest") == info.Subject.Reference)
+			input.Str("kind_mime") == "application/vnd.cozy.model-manifest" && input.Str("digest") == info.Subject.Reference)
 	}
 	if !source {
 		return refuse()

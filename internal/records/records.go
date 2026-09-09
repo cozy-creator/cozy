@@ -40,7 +40,7 @@ type PackageInstall struct {
 	Package            string // org/name
 	Major              int
 	Version            string
-	SourceKind         string // "tensorhub" | "local"
+	SourceKind         string // "tensorhub" | "local" | "wheel" (private immutable dependency)
 	SourceRef          string
 	SourceDigest       string
 	Verified           bool // false = an explicit local/development install, not published custody
@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 35
+const schemaVersion = 36
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -115,7 +115,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 func init() {
-	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
+	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -430,6 +430,18 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 				return exit.Internalf("cannot add managed serving records: %s", err)
 			}
 		}
+	}
+	if sourceVersion >= 33 && sourceVersion < 36 {
+		for _, statement := range []string{`ALTER TABLE byte_outputs RENAME TO byte_outputs_prior36`, byteOutputsDDL,
+			`INSERT INTO byte_outputs(` + byteOutputCols + `) SELECT ` + byteOutputCols + ` FROM byte_outputs_prior36`,
+			`DROP TABLE byte_outputs_prior36`} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot preserve native byte producer authority: %s", err)
+			}
+		}
+	}
+	if _, err := tx.Exec(nativeByteOutputIndex); err != nil {
+		return exit.Internalf("cannot index native byte producer authority: %s", err)
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
@@ -787,11 +799,17 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 36 && statement == nativeByteOutputIndex {
+			continue
+		}
 		if version < 35 && (statement == childArgumentsDDL || statement == activeChildRequestIndex || statement == activeNativeCallIndex || statement == servingPlacementsDDL || statement == operationContextsDDL) {
 			continue
 		}
 		if version < 33 && statement == byteOutputsDDL {
 			continue
+		}
+		if version < 36 && statement == byteOutputsDDL {
+			statement = strings.Replace(statement, " native_service_id TEXT REFERENCES native_calls(id),\n", "", 1)
 		}
 
 		if version < 29 && statement == operationLookupsDDL {

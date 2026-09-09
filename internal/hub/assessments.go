@@ -25,7 +25,7 @@ func (c *Client) AttachAssessment(ctx context.Context, ref Ref, checkpoint, dige
 		} `json:"assessment"`
 		Verdict string `json:"publisher_reported_verdict"`
 	}
-	if problem := c.do(ctx, call{method: http.MethodPut, path: path, auth: true, reason: "attach verified producer evidence", bodyBytes: raw, strict: true}, &out); problem != nil {
+	if problem := c.do(ctx, call{method: http.MethodPut, path: path, auth: true, reason: "attach verified assessment", bodyBytes: raw, strict: true}, &out); problem != nil {
 		return problem
 	}
 	if out.Assessment.Checkpoint != checkpoint || out.Assessment.Scope != "publisher_assessment" || out.Assessment.Report.Digest != digest || out.Assessment.Report.Length != int64(len(raw)) || out.Verdict != expectedVerdict {
@@ -39,4 +39,11 @@ func (c *Client) AttachAssessment(ctx context.Context, ref Ref, checkpoint, dige
 		return exit.Internalf("checkpoint assessment bytes differ after attachment")
 	}
 	return nil
+}
+
+func (c *Client) AssessmentReport(ctx context.Context, ref Ref, checkpoint, digest string) ([]byte, *exit.Error) {
+	path := resourcePath("models", ref) + "/checkpoints/" + url.PathEscape(checkpoint) + "/assessments/" + url.PathEscape(digest)
+	var raw []byte
+	problem := c.do(ctx, call{method: http.MethodGet, path: path, auth: true, raw: &raw, responseBytes: 8 << 20}, nil)
+	return raw, problem
 }

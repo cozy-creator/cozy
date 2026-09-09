@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -120,6 +121,14 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 				requested = append(requested, identity)
 			}
 		}
+		if len(requested) == 0 {
+			// No new request does not mean its asynchronous native cleanup has
+			// finished. Give accepted cleanup the existing shutdown grace, then
+			// sample its durable result. Unreachable peers still cannot veto --all.
+			drain, cancel := context.WithTimeout(r.Context(), orchestrator.StopGrace)
+			s.orchestrator.WaitRetainedCancellations(drain)
+			cancel()
+		}
 		// Re-read rather than trusting the pre-pass sample: what a client is told is still
 		// holding the daemon has to be what IS.
 		remaining, remainingRentals, problem := s.downBlockers()
@@ -137,11 +146,9 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		// NOTHING MOVED. Asking again would produce this same answer forever, and `--all`
-		// does not get to leave an operator with a daemon they cannot stop — that is the
-		// whole reason they typed it. Anything still here is reported, including a paid pod
-		// the CLI could not end: rental rows are durable and the next boot reconciles them,
-		// so a pod that outlives the daemon is a fact to state, not a reason to stay up.
+		// No new cancellation remains, and accepted cleanup has finished or used
+		// its shutdown grace. Report any still-unsettled rows; they remain durable
+		// for the next boot. An unreachable peer cannot prevent explicit teardown.
 		if s.shutdown != nil && (len(remaining) > 0 || len(remainingRentals) > 0) {
 			s.shuttingDown = true
 			s.ok(w, r, http.StatusAccepted, DownResult{

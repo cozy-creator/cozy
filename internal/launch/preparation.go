@@ -64,7 +64,7 @@ func (f *Facts) JobCodeIdentity() (orchestrator.DesiredPlacement, string, *exit.
 		return placement, build, problem
 	}
 	placement := orchestrator.DesiredPlacement{Package: f.Install.Package, InstallID: f.Install.ID, Release: f.Install.Version}
-	if f.Install.SourceKind == "local" {
+	if f.Install.SourceKind == "local" || f.Install.SourceKind == "wheel" {
 		placement.SourceDigest = f.Install.SourceDigest
 		return placement, placement.SourceDigest, nil
 	}

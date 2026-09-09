@@ -9,11 +9,13 @@ jobs:
         with:
           go-version: stable
       - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.12.11'
       - run: uv python install 3.12
       - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
       - name: Install the public worker for private script execution
         run: |
-          uv tool install --python 3.12 'cozy-runtime[model-execution]==0.11.0'
+          uv tool install --refresh-package cozy-runtime --python 3.12 'cozy-runtime[model-execution]==0.12.0'
           uv tool dir --bin >> "$GITHUB_PATH"
       # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
       # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
