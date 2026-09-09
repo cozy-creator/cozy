@@ -237,3 +237,19 @@ func (r *Resolver) PrivateByteOutputBound(request records.Request, path, mediaTy
 	}
 	return maximum, nil
 }
+
+func (r *Resolver) PrivateRetainedResultFields(request records.Request) (map[string]bool, *exit.Error) {
+	install, problem := r.store.Install(request.InstallID)
+	if problem != nil || install == nil {
+		return nil, exit.Unavailablef("native result schema install is absent")
+	}
+	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
+	if problem != nil {
+		return nil, problem
+	}
+	entry, problem := surface.Function(request.Entrypoint)
+	if problem != nil {
+		return nil, problem
+	}
+	return launch.RetainedAssetPaths(entry), nil
+}

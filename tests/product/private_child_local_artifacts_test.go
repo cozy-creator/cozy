@@ -191,6 +191,24 @@ func TestPrivateChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	}
 	checkTensor(originalA, 7)
 	checkTensor(latestB, 15)
+	var down struct {
+		NotClosed int `json:"not_closed_cleanly"`
+	}
+	must(t, json.Unmarshal([]byte(run("down", "--all")), &down))
+	if down.NotClosed != 0 {
+		t.Fatalf("shutdown abandoned ordinary native cleanup: %+v", down)
+	}
+	// Canceling the old producers releases their own custody, independently of
+	// the workspace cache. A fresh caller after shutdown still acquires both.
+	run("run", script, "--await")
+	resumed, problem := store.RequestByReference("13")
+	fatal(t, problem)
+	children, problem := store.Children(resumed.ID)
+	fatal(t, problem)
+	if len(children) != 2 || children[0].Ordinal != 0 || children[1].Ordinal != 0 ||
+		children[0].ReusedFrom != originalA.ID || children[1].ReusedFrom != latestB.ID {
+		t.Fatalf("shutdown discarded independently retained memo results: %+v", children)
+	}
 	for _, name := range []string{"source", "candidate"} {
 		if _, err := os.Stat(filepath.Join(project, name, "uv.lock")); !os.IsNotExist(err) {
 			t.Fatal("private intake modified the author's lock files")

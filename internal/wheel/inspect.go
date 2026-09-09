@@ -81,7 +81,7 @@ func InspectIdentity(file string) (Identity, *exit.Error) {
 	if metadata == nil {
 		return out, wheelStructure("one .dist-info/METADATA is required")
 	}
-	metadataName, metadataVersion, problem := metadataIdentity(metadata)
+	metadataName, metadataVersion, problem := MetadataIdentity(metadata)
 	if problem != nil {
 		return out, problem
 	}
@@ -150,7 +150,8 @@ func wheelStructure(message string) *exit.Error {
 	return exit.Named(exit.Validation, "wheel_structure_invalid", "%s", message)
 }
 
-func metadataIdentity(body []byte) (string, string, *exit.Error) {
+// MetadataIdentity reads one distribution's declared name/version without importing it.
+func MetadataIdentity(body []byte) (string, string, *exit.Error) {
 	header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(body))).ReadMIMEHeader()
 	if err != nil && err != io.EOF {
 		return "", "", wheelStructure("METADATA header block is malformed")

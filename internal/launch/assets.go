@@ -425,3 +425,15 @@ func pathOrder(parts []string) uint32 {
 	}
 	return uint32(order)
 }
+
+// RetainedAssetPaths names native file/tree results; ordinary rendered media
+// keeps its publication path even when returned beside a retained artifact.
+func RetainedAssetPaths(ep *Entrypoint) map[string]bool {
+	result := map[string]bool{}
+	for _, path := range AssetPaths(ep.Result) {
+		if spec, ok := ResultAssetSpec(ep, path); ok && (spec.Kind == "file" || spec.Kind == "tree") {
+			result[path] = true
+		}
+	}
+	return result
+}

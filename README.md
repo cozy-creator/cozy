@@ -303,10 +303,19 @@ captured separately; the parent keeps its ordinary helpers and resources, with g
 callable interfaces for managed exports. Calling one creates an ordinary managed child job. A reusable computation
 opts in with `@invocable(memoize=True)` and registers through `app.job(function)`.
 Arbitrary helper functions and external effects do not become cached operations.
-An invocable library declares its App in `package.toml` (`[application] object =
+An editable source library declares its App in `package.toml` (`[application] object =
 "my_algorithm:app"`) and the matching `pyproject.toml` entry point
 (`[project.entry-points."cozy.application"] default = "my_algorithm:app"`).
-The calling single-file script needs neither declaration.
+A local or PyPI wheel needs the single `cozy.application` entry point in its wheel
+metadata; no `package.toml` is required inside the wheel. Declare it in the script's
+ordinary Python dependencies, using `[tool.uv.sources]` for a local wheel path.
+The calling single-file script needs neither App declaration.
+
+Installed callable wheels require Runtime 0.12 or newer and a qualified uv dependency
+graph version (0.12.7 or 0.12.11). Creator retains the downloaded original and creates
+an executable with the exact selected dependencies pinned in its metadata; implementation
+and resource bytes stay unchanged. An incompatible private worker base refuses before
+execution. This uses the same `cozy run` command and private transfer path as source libraries.
 
 On either a local or rented worker, a memoized child can acquire an earlier successful result when its
 exact implementation closure, entrypoint, canonical inputs, resolved model checkpoints,

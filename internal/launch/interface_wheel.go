@@ -10,6 +10,7 @@ import (
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -17,8 +18,35 @@ const interfaceGeneratorABI = "cozy.interface-generator/5"
 const interfaceGeneratorRuntimeFloor = "0.11.0"
 
 func GenerateInterfaceWheel(ctx context.Context, install records.PackageInstall, home string, env []string, implementation, source, sourceDigest, output string) (InterfaceWheel, *exit.Error) {
-	runtime := RuntimeCLI{Bin: Binary(install), Dir: install.ProjectDir, Home: home, Env: env}
+	// A selected dependency venv may contain arbitrary .pth startup hooks.
+	// Source/interface tooling belongs to the trusted host Runtime, never that
+	// interpreter. The child's SDK version is already observed distribution metadata.
+	version := ""
+	for _, pin := range strings.Split(install.Closure, "\n") {
+		if value, found := strings.CutPrefix(pin, "cozy-runtime=="); found {
+			version = value
+		}
+	}
+	if problem := interfaceRuntimeFloor(strings.TrimPrefix(install.Package, "local/"), version); problem != nil {
+		return InterfaceWheel{}, problem
+	}
+	bin, problem := hostruntime.Path(env)
+	if problem != nil {
+		return InterfaceWheel{}, problem
+	}
+	runtime := RuntimeCLI{Bin: bin, Dir: install.ProjectDir, Home: home, Env: env}
 	return runtime.InterfaceWheel(ctx, PackageInterfacePath(install.Dir), strings.TrimPrefix(install.Package, "local/"), install.Version, implementation, source, sourceDigest, output)
+}
+
+func interfaceRuntimeFloor(distribution, version string) *exit.Error {
+	release, err := pep440.Parse(version)
+	if err != nil || release.LessThan(pep440.MustParse(interfaceGeneratorRuntimeFloor)) {
+		return exit.Named(exit.Structural, "interface_runtime_below_floor",
+			"interface generation for %s uses cozy-runtime %q; %s requires Runtime %s or newer",
+			distribution, version, interfaceGeneratorABI, interfaceGeneratorRuntimeFloor).
+			WithRemedy("upgrade this dependency project's cozy-runtime requirement and uv.lock to >=%s (uv lock --upgrade-package cozy-runtime), then retry cozy run", interfaceGeneratorRuntimeFloor)
+	}
+	return nil
 }
 
 type InterfaceWheel struct {
@@ -37,15 +65,11 @@ func (r RuntimeCLI) InterfaceWheel(ctx context.Context, interfacePath, distribut
 	if problem := r.callContext(ctx, &identity, "version"); problem != nil {
 		return wheel, problem
 	}
-	release, err := pep440.Parse(identity.Distribution)
-	if err != nil || release.LessThan(pep440.MustParse(interfaceGeneratorRuntimeFloor)) {
-		return wheel, exit.Named(exit.Structural, "interface_runtime_below_floor",
-			"editable dependency %s uses cozy-runtime %q; %s requires Runtime %s or newer",
-			distribution, identity.Distribution, interfaceGeneratorABI, interfaceGeneratorRuntimeFloor).
-			WithRemedy("upgrade this dependency project's cozy-runtime requirement and uv.lock to >=%s (uv lock --upgrade-package cozy-runtime), then retry cozy run", interfaceGeneratorRuntimeFloor)
+	if problem := interfaceRuntimeFloor(distribution, identity.Distribution); problem != nil {
+		return wheel, problem
 	}
 	raw, _ := json.Marshal(map[string]string{"interface_path": interfacePath, "distribution": distribution, "version": version, "implementation_digest": implementation, "output_directory": output, "implementation_wheel": source, "implementation_wheel_digest": sourceDigest})
-	raw, err = canonical.NormalizeJCS(raw)
+	raw, err := canonical.NormalizeJCS(raw)
 	if err != nil {
 		return wheel, exit.Internalf("cannot encode interface generation request: %s", err)
 	}

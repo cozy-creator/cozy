@@ -93,9 +93,9 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 		if existing.ID != call.ID || existing.IntentDigest != call.IntentDigest || existing.Kind != call.Kind || existing.Operation != call.Operation || !bytes.Equal(existing.Request, call.Request) {
 			return NativeCall{}, false, exit.Named(exit.Conflict, "child.intent_changed", "parent index already names another native call")
 		}
-		if existing.Kind == "source" && parentAttempt > existing.ParentAttempt && existing.State != "succeeded" && existing.State != "canceled" {
+		if existing.Kind == "source" && parentAttempt > existing.ParentAttempt && existing.State != "succeeded" && existing.State != "canceled" && existing.State != "stopped" {
 			state := existing.State
-			if state == "failed" || state == "stopped" {
+			if state == "failed" {
 				if problem := requireActiveChildSlot(tx, parent.ID); problem != nil {
 					return NativeCall{}, false, problem
 				}
@@ -254,7 +254,7 @@ func (s *Store) OwedNativeCalls(kind string) ([]NativeCall, *exit.Error) {
 // RequestNativeEffectCancel records cancellation of one awaited effect while
 // retaining its executing marker for authoritative late-commit reconciliation.
 func (s *Store) RequestNativeEffectCancel(parentID string, index, parentAttempt int64, parentSpec, parentSession, intent string) (*NativeCall, *exit.Error) {
-	if parentID == "" || index < 0 || index >= 32 || parentAttempt <= 0 {
+	if parentID == "" || index < 0 || index > maxChildCallIndex || parentAttempt <= 0 {
 		return nil, exit.New(exit.Validation, "effect cancellation has invalid parent identity")
 	}
 	for _, value := range []string{parentSpec, intent} {

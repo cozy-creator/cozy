@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"math"
 	"time"
@@ -95,14 +96,14 @@ func (c *Orchestrator) lookupOperationOn(request records.Request, selected *sess
 	if _, problem := c.qualifyOperation(selected, request); problem != nil {
 		return false, problem
 	}
-	return c.lookupOperationWithSession(request, false, selected)
+	return c.lookupOperationWithSession(selected.ctx, request, false, selected)
 }
 
-func (c *Orchestrator) lookupOperationPending(request records.Request, pendingOnly bool) (bool, *exit.Error) {
-	return c.lookupOperationWithSession(request, pendingOnly, nil)
+func (c *Orchestrator) lookupOperationPending(ctx context.Context, request records.Request, pendingOnly bool) (bool, *exit.Error) {
+	return c.lookupOperationWithSession(ctx, request, pendingOnly, nil)
 }
 
-func (c *Orchestrator) lookupOperationWithSession(request records.Request, pendingOnly bool, selected *session) (bool, *exit.Error) {
+func (c *Orchestrator) lookupOperationWithSession(ctx context.Context, request records.Request, pendingOnly bool, selected *session) (bool, *exit.Error) {
 	if !request.ChildReusable || request.ParentRequestID == "" || request.Ordinal != 0 {
 		return false, nil
 	}
@@ -164,7 +165,7 @@ func (c *Orchestrator) lookupOperationWithSession(request records.Request, pendi
 	if s == nil {
 		// Pause/cancellation reconciles its already-pinned lookup obligation.
 		// It does not select a new computation or execute the observed result.
-		s, problem = c.workspaceControl(request.Worker)
+		s, problem = c.workspaceControlContext(ctx, request.Worker)
 		if problem != nil {
 			return false, problem
 		}
@@ -174,7 +175,10 @@ func (c *Orchestrator) lookupOperationWithSession(request records.Request, pendi
 	if problem != nil {
 		return false, problem
 	}
-	answer, err := workspace.LookupOperation(s.ctx, &pb.LookupOperationCall{Claim: s.claim, ComputationDigest: keyBytes, ConsumerRequestId: request.ID})
+	if ctx == nil {
+		ctx = s.ctx
+	}
+	answer, err := workspace.LookupOperation(ctx, &pb.LookupOperationCall{Claim: s.claim, ComputationDigest: keyBytes, ConsumerRequestId: request.ID})
 	if err != nil {
 		return false, operationCacheProblem(err)
 	}

@@ -189,11 +189,16 @@ func (s *editableSync) rescanLoop() {
 // single-writer lock, and the database event that woke this arrives while the writer is
 // still inside its transaction, so the set is read only once that writer has let go.
 func (s *editableSync) reconcile() {
+	// This read barrier briefly owns the same writer claim as a refresh. Join the
+	// daemon's mutation lock so a foreground refresh waits for the barrier instead
+	// of reporting our own watcher as a competing install process.
+	s.resolver.refreshMu.Lock()
 	if file, err := os.OpenFile(s.layout.Lock, os.O_CREATE|os.O_RDWR, 0o644); err == nil {
 		_ = flock.Block(file)
 		_ = flock.Release(file)
 		file.Close()
 	}
+	s.resolver.refreshMu.Unlock()
 	rows, problem := s.store.Installed()
 	if problem != nil {
 		fmt.Fprintf(s.log, "editable watch: cannot read installs: %s\n", problem.Message)

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -247,7 +248,7 @@ func (c *Orchestrator) watchChildCall(s *session, call *pb.ChildCallRequest, id 
 					}
 				}
 				if problem == nil {
-					problem = c.releaseChildRetentions(row.ID, true)
+					problem = c.releaseChildRetentions(context.Background(), row.ID, true)
 				}
 				if problem == nil && row.State == "finalizing" {
 					problem = c.opt.Store.CompleteReusedChild(row.ID)
