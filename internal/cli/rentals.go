@@ -50,6 +50,12 @@ import (
 const pollCadence = 2 * time.Second
 
 func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
+	// The daemon is the migration owner. Ensure its generation is current before a
+	// client-side reader opens the lifecycle store; otherwise an older daemon can hold
+	// the root while this process reports a raw schema mismatch.
+	if _, _, problem := ensureDaemon(ctx); problem != nil {
+		return home.Layout{}, nil, problem
+	}
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return home.Layout{}, nil, e

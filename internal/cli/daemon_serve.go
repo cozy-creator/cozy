@@ -104,6 +104,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
+	if e := held.PublishSchema(records.CurrentSchemaVersion()); e != nil {
+		closeListeners()
+		return e
+	}
 	retired, retiredNote := reclaimNote(reclaim.Retired(l))
 
 	// The resolver is built BEFORE the orchestrator, because the orchestrator holds it:

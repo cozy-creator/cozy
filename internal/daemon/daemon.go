@@ -30,13 +30,14 @@ import (
 )
 
 type State struct {
-	Addr    string // the local client API address the live owner published
-	Socket  string // the worker-protocol unix socket the live owner published
-	PID     int
-	Since   string
-	Up      bool
-	Path    string
-	Details string // why the probe answered as it did, for status output
+	Addr          string // the local client API address the live owner published
+	Socket        string // the worker-protocol unix socket the live owner published
+	PID           int
+	Since         string
+	Up            bool
+	Path          string
+	Details       string // why the probe answered as it did, for status output
+	SchemaVersion int    // local lifecycle-store generation published by the daemon
 }
 
 // Probe answers from the lock, never from a file's existence.
@@ -76,6 +77,8 @@ func Probe(cfg config.Config) State {
 			st.PID, _ = strconv.Atoi(value)
 		case "since":
 			st.Since = value
+		case "schema":
+			st.SchemaVersion, _ = strconv.Atoi(value)
 		}
 	}
 	st.Details = "the daemon lock is held by pid " + strconv.Itoa(st.PID)
@@ -85,6 +88,18 @@ func Probe(cfg config.Config) State {
 // Held is the live Cozy daemon's own claim on this root. It exists only inside the
 // daemon process; nothing reads it, and nothing outlives it.
 type Held struct{ f *os.File }
+
+// PublishSchema records the store generation only after the daemon has opened and
+// migrated the database. A missing value identifies an older daemon to a newer CLI.
+func (h *Held) PublishSchema(version int) *exit.Error {
+	if h == nil || h.f == nil || version <= 0 {
+		return exit.Internalf("cannot publish daemon schema version")
+	}
+	if _, err := h.f.WriteString(fmt.Sprintf("schema=%d\n", version)); err != nil {
+		return exit.Internalf("cannot publish daemon schema version: %s", err)
+	}
+	return nil
+}
 
 // Hold takes the root's exclusive claim and publishes the live addresses under it. A
 // second `cozy run list` on one root gets exit 13 here, before it can bind anything.

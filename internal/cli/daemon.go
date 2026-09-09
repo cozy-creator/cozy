@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
@@ -21,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 const daemonProcessName = "cozy-daemon"
@@ -133,6 +135,7 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 	var child *daemonChild
 	var childResult *daemonExit
 	started := false
+	upgradeRequested := false
 	defer func() {
 		if child != nil {
 			child.closeDiagnostics()
@@ -143,6 +146,41 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 	defer tick.Stop()
 	for {
 		if state := daemon.Probe(ctx.Cfg); state.Up {
+			// A daemon with no schema fact predates the ownership record contract. A
+			// daemon advertising an older schema cannot safely serve this CLI because
+			// direct store readers would otherwise discover the mismatch later and
+			// report a misleading database error. Replace it before accepting work;
+			// the durable queue and rental rows remain in the same SQLite file.
+			if state.SchemaVersion == 0 || state.SchemaVersion < records.CurrentSchemaVersion() {
+				if !upgradeRequested {
+					if state.PID <= 0 {
+						return daemon.State{}, false, exit.Named(exit.Conflict, "daemon_upgrade_required",
+							"an older Cozy daemon owns this root but did not publish its process id").
+							WithRemedy("stop the old Cozy daemon, then retry")
+					}
+					process, err := os.FindProcess(state.PID)
+					if err != nil || process.Signal(syscall.SIGTERM) != nil {
+						return daemon.State{}, false, exit.Named(exit.Conflict, "daemon_upgrade_required",
+							"an older Cozy daemon (pid %d) owns this root and could not be replaced", state.PID).
+							WithRemedy("stop the old Cozy daemon, then retry")
+					}
+					upgradeRequested = true
+				}
+				select {
+				case <-tick.C:
+					continue
+				case <-time.After(10 * time.Second):
+					return daemon.State{}, false, exit.Named(exit.Conflict, "daemon_upgrade_timeout",
+						"the older Cozy daemon did not stop for schema migration").
+						WithRemedy("stop the old Cozy daemon, then retry")
+				}
+			}
+			if state.SchemaVersion > records.CurrentSchemaVersion() {
+				return daemon.State{}, false, exit.Named(exit.Conflict, "daemon_newer_than_client",
+					"the running Cozy daemon uses schema %d; this client understands through schema %d",
+					state.SchemaVersion, records.CurrentSchemaVersion()).
+					WithRemedy("update the Cozy client before using this local root")
+			}
 			if state.Addr == "" {
 				return daemon.State{}, false, exit.Named(exit.Conflict, "daemon.operator_owned",
 					"an operator process holds this Cozy root without starting a daemon").

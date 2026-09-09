@@ -74,6 +74,11 @@ type Store struct{ db *sql.DB }
 
 const schemaVersion = 38
 
+// CurrentSchemaVersion is the local lifecycle-store generation understood by this
+// Creator build. The daemon publishes it in its ownership record so a newer CLI can
+// replace an older daemon before touching the store; clients never guess from a file.
+func CurrentSchemaVersion() int { return schemaVersion }
+
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
   id            TEXT PRIMARY KEY,
