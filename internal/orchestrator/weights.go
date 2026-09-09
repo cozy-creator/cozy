@@ -363,6 +363,24 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		c.retryOperationAck(s, requestID, ordinal)
 		return
 	}
+	if req.ParentRequestID == "" && req.RetainsLocalOutputs() && attempt.TerminalStatus == "SUCCEEDED" && (req.State == "finalizing" || req.State == "succeeded") {
+		if problem := c.retainRootByteResults(s.ctx, *req, *attempt); problem != nil {
+			c.logf("OutcomeAck %s#%d awaits native result custody: %s", requestID, ordinal, problem.Message)
+			_ = c.opt.Store.NoteNativeResultWait(requestID, int64(ordinal), problem.ErrName(), problem.Message)
+			c.retryOperationAck(s, requestID, ordinal)
+			return
+		}
+		if req.State == "finalizing" && req.ModelTransfer == nil {
+			if problem := c.opt.Store.CompleteNativeRootResult(requestID, int64(ordinal)); problem != nil {
+				c.retryOperationAck(s, requestID, ordinal)
+				return
+			}
+			req, e = c.opt.Store.RequestRow(requestID)
+			if e != nil || req == nil {
+				return
+			}
+		}
+	}
 	ack := &pb.AttemptOutcomeAck{
 		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: specDigest,
 		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,

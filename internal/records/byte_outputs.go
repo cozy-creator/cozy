@@ -15,9 +15,12 @@ const byteOutputsDDL = `CREATE TABLE IF NOT EXISTS byte_outputs (
  digest TEXT NOT NULL,length INTEGER NOT NULL,mime_type TEXT NOT NULL,
  producer_root_id TEXT NOT NULL,receipt_digest TEXT NOT NULL,manifest_id TEXT NOT NULL,
  manifest_length INTEGER NOT NULL,content_bytes INTEGER NOT NULL,
+ native_service_id TEXT REFERENCES native_calls(id),
  PRIMARY KEY(request_id,attempt,output_id),
  FOREIGN KEY(request_id,attempt) REFERENCES attempts(request_id,attempt)
 )`
+
+const nativeByteOutputIndex = `CREATE UNIQUE INDEX IF NOT EXISTS byte_outputs_native_service ON byte_outputs(native_service_id) WHERE native_service_id IS NOT NULL`
 
 // ByteOutput is a terminal-owned native byte tree, never a local pathname or weights receipt.
 type ByteOutput struct {
@@ -51,7 +54,7 @@ func ValidateByteRef(ref *pb.NativeByteTreeRef) *exit.Error {
 	return nil
 }
 func (s *Store) ByteOutputs(request string, attempt int64) ([]ByteOutput, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+byteOutputCols+` FROM byte_outputs WHERE request_id=? AND attempt=? ORDER BY output_id`, request, attempt)
+	rows, err := s.db.Query(`SELECT `+byteOutputCols+` FROM byte_outputs WHERE request_id=? AND attempt=? AND native_service_id IS NULL ORDER BY output_id`, request, attempt)
 	if err != nil {
 		return nil, exit.Internalf("cannot read native byte outputs: %s", err)
 	}

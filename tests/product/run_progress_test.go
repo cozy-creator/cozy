@@ -33,25 +33,8 @@ func ptyRun(t *testing.T, root string, args ...string) (int, string) {
 // a short observation window. This drives terminal interaction itself, not parser helpers.
 func ptyRunInput(t *testing.T, root string, rows uint16, input [][]byte, args ...string) (int, string) {
 	t.Helper()
-	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
-	must(t, err)
+	master, cmd := startPTY(t, root, rows, ptyColumns, args...)
 	defer master.Close()
-	must(t, unix.IoctlSetPointerInt(int(master.Fd()), unix.TIOCSPTLCK, 0))
-	number, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
-	must(t, err)
-	must(t, unix.IoctlSetWinsize(int(master.Fd()), unix.TIOCSWINSZ,
-		&unix.Winsize{Row: rows, Col: ptyColumns}))
-	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR, 0)
-	must(t, err)
-	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-	cmd.Env = childEnv(t, root)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave //cozy:stdin-value test pty navigation
-	must(t, cmd.Start())
-	must(t, slave.Close()) // the child holds the slave now; EOF/EIO on master ends the read
-	// The kill is a stuck-terminal stop for a child that never answers its inputs; the
-	// proofs' own bounds are their input cadences, so the stop stays far behind them.
-	timedOut := time.AfterFunc(20*time.Second, func() { _ = cmd.Process.Kill() })
-	defer timedOut.Stop()
 	go func() {
 		for _, keys := range input {
 			time.Sleep(500 * time.Millisecond)
@@ -66,6 +49,34 @@ func ptyRunInput(t *testing.T, root string, rows uint16, input [][]byte, args ..
 		code = cmd.ProcessState.ExitCode()
 	}
 	return code, out.String()
+}
+
+func startPTY(t *testing.T, root string, rows, columns uint16, args ...string) (*os.File, *exec.Cmd) {
+	t.Helper()
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	must(t, err)
+	t.Cleanup(func() { _ = master.Close() })
+	must(t, unix.IoctlSetPointerInt(int(master.Fd()), unix.TIOCSPTLCK, 0))
+	number, err := unix.IoctlGetInt(int(master.Fd()), unix.TIOCGPTN)
+	must(t, err)
+	must(t, unix.IoctlSetWinsize(int(master.Fd()), unix.TIOCSWINSZ,
+		&unix.Winsize{Row: rows, Col: columns}))
+	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR, 0)
+	must(t, err)
+	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
+	cmd.Env = childEnv(t, root)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave //cozy:stdin-value test pty navigation
+	must(t, cmd.Start())
+	must(t, slave.Close()) // the child holds the slave now; EOF/EIO on master ends the read
+	// The kill is a stuck-terminal stop for a child that never answers its inputs; the
+	// proofs' own bounds are their input cadences, so the stop stays far behind them.
+	timedOut := time.AfterFunc(20*time.Second, func() { _ = cmd.Process.Kill() })
+	t.Cleanup(func() {
+		timedOut.Stop()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return master, cmd
 }
 
 // TestRunProgressSurfaces (cl-104) proves the three progress surfaces of one live run

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -963,6 +964,10 @@ func lessRecentlyUsed(a, b *worker) bool {
 // EnsureRental attaches one generic empty worker without selecting a package. Later
 // desired state is Creator-owned and travels directly on this control stream.
 func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *exit.Error) {
+	return c.ensureRentalContext(context.Background(), id)
+}
+
+func (c *Orchestrator) ensureRentalContext(ctx context.Context, id string) (string, string, WorkerChange, *exit.Error) {
 	if c.opt.Rentals == nil {
 		return "", "", ChangeNone, exit.Unavailablef("this Cozy daemon attaches no rented workers")
 	}
@@ -980,17 +985,21 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 		live.spec.Connection.RentalID == id
 	c.mu.Unlock()
 	if already {
-		return instance, "", ChangeNone, c.ensureWorkerClaimed(instance)
+		return instance, "", ChangeNone, c.ensureWorkerClaimedContext(ctx, instance)
 	}
 	spec := WorkerLaunchSpec{Connection: target.Connection, Devices: target.Devices}
 	instance, change, problem := c.EnsureWorker(spec)
 	if problem == nil {
-		problem = c.ensureWorkerClaimed(instance)
+		problem = c.ensureWorkerClaimedContext(ctx, instance)
 	}
 	return instance, "", change, problem
 }
 
 func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
+	return c.ensureWorkerClaimedContext(context.Background(), instanceID)
+}
+
+func (c *Orchestrator) ensureWorkerClaimedContext(ctx context.Context, instanceID string) *exit.Error {
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
@@ -1010,7 +1019,13 @@ func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
 		case gone:
 			return exit.New(exit.Failed, "the rented worker exited before accepting this Creator claim")
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return exit.Unavailablef("worker claim wait canceled")
+		case <-c.done:
+			return exit.Unavailablef("worker owner closed")
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }
 
