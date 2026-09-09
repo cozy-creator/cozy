@@ -554,9 +554,10 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 				m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
 					Name: name, Machine: seen.Name, Detail: detail,
 					Rental: &orchestrator.RentalProgress{
-						AcceleratorModel:    seen.AcceleratorModel,
-						AcceleratorCount:    seen.AcceleratorCount,
-						HourlyRateUSDMicros: seen.HourlyRateUSDMicros,
+						AcceleratorModel:      seen.AcceleratorModel,
+						AcceleratorCount:      seen.AcceleratorCount,
+						HourlyRateUSDMicros:   seen.HourlyRateUSDMicros,
+						BaseWorkerImageDigest: seen.BaseWorkerImageDigest,
 					}})
 			}
 		}, rentalRates(m.unrecorded))
@@ -933,6 +934,18 @@ func (m *managedRentals) reconcileRowsLocked() *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	operations, problem := m.store.ActiveRentalOperations()
+	if problem != nil {
+		return problem
+	}
+	pending := map[string]records.RentalOperation{}
+	for _, operation := range operations {
+		if operation.ManagedRequestID == "" && operation.RentalID != "" &&
+			operation.Hub == client(m.ctx).Base() && operation.State != "attached" &&
+			operation.State != hub.RentalFailed && operation.State != hub.RentalReleaseRequested {
+			pending[operation.RentalID] = operation
+		}
+	}
 	for _, row := range rows {
 		if row.State == hub.RentalReleased {
 			m.forgetIdleLocked(row.ID)
@@ -970,6 +983,31 @@ func (m *managedRentals) reconcileRowsLocked() *exit.Error {
 			}
 			if _, problem := rental.Forget(m.layout, m.store, row.ID); problem != nil {
 				return problem
+			}
+			continue
+		}
+		if operation, unfinished := pending[row.ID]; unfinished && remote.Attachable() {
+			// A foreground acquisition may have completed or released this operation
+			// while the GET was in flight. Its newer durable state wins.
+			current, problem := m.store.RentalOperation(operation.Key)
+			if problem != nil {
+				return problem
+			}
+			if current == nil || current.State == "attached" || current.State == hub.RentalReleased ||
+				current.State == hub.RentalFailed || current.State == hub.RentalReleaseRequested {
+				continue
+			}
+			token, creator, problem := rental.RetainedAcquisitionCredentials(m.layout, *current)
+			if problem != nil {
+				return problem
+			}
+			if _, problem := finishRentalAttachment(m.layout, m.store, row, remote, operation.Key, token, creator); problem != nil {
+				return problem
+			}
+			if m.owner != nil {
+				// This method starts the existing reconnect loop asynchronously. No
+				// owner/queue work runs while this goroutine holds the fleet lock.
+				m.owner.ResumeRentalControl(row.ID)
 			}
 			continue
 		}

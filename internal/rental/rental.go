@@ -40,6 +40,18 @@ func validID(id string) *exit.Error {
 // a pod or publishing a row whose credential is absent.
 func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value,
 	creator CreatorIdentity) *exit.Error {
+	return attach(l, st, row, cert, token, creator, "")
+}
+
+// AttachAcquisition publishes the same authenticated target while holding the
+// existing operation transaction against concurrent release or completion.
+func AttachAcquisition(l home.Layout, st *records.Store, row records.Rental, cert string,
+	token secret.Value, creator CreatorIdentity, operationKey string) *exit.Error {
+	return attach(l, st, row, cert, token, creator, operationKey)
+}
+
+func attach(l home.Layout, st *records.Store, row records.Rental, cert string,
+	token secret.Value, creator CreatorIdentity, operationKey string) *exit.Error {
 	if e := validID(row.ID); e != nil {
 		return e
 	}
@@ -68,22 +80,31 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 			}
 		}
 	}
-	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
-		return exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
-	}
-	if err := os.WriteFile(l.RentalCert(row.ID), []byte(cert), 0o644); err != nil {
-		return exit.Internalf("cannot pin the rental's certificate: %s", err)
-	}
-	if e := write0600(l.RentalMediaToken(row.ID), secret.FileBody(token)); e != nil {
-		return e
-	}
-	if len(creator.pem) == 0 {
-		return exit.Internalf("rental %s has no pending Creator identity", row.ID)
-	}
-	if e := write0600(l.RentalCreatorIdentity(row.ID), creator.pem); e != nil {
-		return e
-	}
 	row.CertPath = l.RentalCert(row.ID)
+	stage := func() *exit.Error {
+		if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
+			return exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
+		}
+		if err := os.WriteFile(l.RentalCert(row.ID), []byte(cert), 0o644); err != nil {
+			return exit.Internalf("cannot pin the rental's certificate: %s", err)
+		}
+		if e := write0600(l.RentalMediaToken(row.ID), secret.FileBody(token)); e != nil {
+			return e
+		}
+		if len(creator.pem) == 0 {
+			return exit.Internalf("rental %s has no pending Creator identity", row.ID)
+		}
+		if e := write0600(l.RentalCreatorIdentity(row.ID), creator.pem); e != nil {
+			return e
+		}
+		return nil
+	}
+	if operationKey != "" {
+		return st.CompleteRentalAttachment(operationKey, row, stage)
+	}
+	if problem := stage(); problem != nil {
+		return problem
+	}
 	return st.RecordRental(row)
 }
 
@@ -132,6 +153,28 @@ func PendingMediaToken(l home.Layout, operationKey string) (secret.Value, *exit.
 	}
 	ok = true
 	return token, nil
+}
+
+// RetainedAcquisitionCredentials reads the credentials minted before the paid
+// operation. It never replaces missing keys. Foreground completion may already
+// have moved them to their final names while a daemon observation was in flight.
+func RetainedAcquisitionCredentials(l home.Layout, operation records.RentalOperation) (secret.Value, CreatorIdentity, *exit.Error) {
+	token, problem := tokenAt(l.PendingRentalMediaToken(operation.Key), "pending rental operation "+operation.Key)
+	if problem == nil {
+		identity, identityProblem := loadCreatorIdentity(l.PendingRentalCreatorIdentity(operation.Key))
+		if identityProblem == nil {
+			return token, identity, nil
+		}
+		problem = identityProblem
+	}
+	if operation.RentalID != "" {
+		token, attachedProblem := MediaToken(l, operation.RentalID)
+		if attachedProblem == nil {
+			identity, identityProblem := CreatorIdentityFor(l, operation.RentalID)
+			return token, identity, identityProblem
+		}
+	}
+	return secret.Value{}, CreatorIdentity{}, problem
 }
 
 // ForgetPending removes the pre-id token only after the operation is attached or proved

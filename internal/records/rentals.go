@@ -550,6 +550,17 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		return exit.Internalf("cannot begin recording rental %s: %s", r.ID, err)
 	}
 	defer tx.Rollback()
+	if problem := recordRental(tx, r); problem != nil {
+		return problem
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit rental %s: %s", r.ID, err)
+	}
+	return nil
+}
+
+func recordRental(tx *sql.Tx, r Rental) *exit.Error {
+	var err error
 	if r.MachineName == "" || r.SKU == "" || r.HourlyRateUSDMicros == 0 || r.AcceleratorCount == 0 {
 		var existingName, existingSKU string
 		var existingRate int64
@@ -667,8 +678,39 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
 			"rental %s already carries another width, address, media address, certificate pin, or worker identity", r.ID)
 	}
+	return nil
+}
+
+// CompleteRentalAttachment serializes the local credential handoff with release.
+// The existing immediate SQLite transaction covers staging and both authoritative
+// rows, so a released operation cannot recreate a ready target after deletion.
+func (s *Store) CompleteRentalAttachment(key string, row Rental, stage func() *exit.Error) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin rental attachment: %s", err)
+	}
+	defer tx.Rollback()
+	op, err := scanRentalOperation(tx.QueryRow(`SELECT `+rentalOperationCols+` FROM rental_operations WHERE operation_key=?`, key))
+	if err != nil {
+		return exit.Internalf("cannot read rental attachment operation: %s", err)
+	}
+	if op.RentalID != row.ID || RentalTerminalState(op.State) {
+		return exit.Named(exit.Conflict, "rental.operation_moved", "rental operation is no longer awaiting this attachment")
+	}
+	if op.State == "attached" {
+		return nil
+	}
+	if problem := recordRental(tx, row); problem != nil {
+		return problem
+	}
+	if problem := stage(); problem != nil {
+		return problem
+	}
+	if _, err := tx.Exec(`UPDATE rental_operations SET state='attached',updated_at=? WHERE operation_key=?`, now(), key); err != nil {
+		return exit.Internalf("cannot finish rental attachment: %s", err)
+	}
 	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit rental %s: %s", r.ID, err)
+		return exit.Internalf("cannot commit rental attachment: %s", err)
 	}
 	return nil
 }
