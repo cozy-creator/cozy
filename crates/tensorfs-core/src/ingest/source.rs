@@ -809,6 +809,8 @@ pub struct PreparedModelSources {
     pub deferred_ops: usize,
     pub converted_bytes: u64,
     pub largest_op_bytes: u64,
+    /// Minimum body admission for the next atomic op, without writing that op.
+    pub required_write_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1113,6 +1115,24 @@ pub fn prepare_model_source_with_registry(
     registry_locator: &str,
     registry_bytes: &[u8],
 ) -> Result<PreparedModelSources> {
+    prepare_model_source_with_registry_budget(
+        store,
+        request,
+        registry_locator,
+        registry_bytes,
+        None,
+    )
+}
+
+/// An explicit body budget never admits an oversized op. Zero advances only metadata
+/// and replay, reporting the next atomic body's native byte count for host admission.
+pub fn prepare_model_source_with_registry_budget(
+    store: &Store,
+    request: &PrepareModelSource,
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    write_budget_bytes: Option<u64>,
+) -> Result<PreparedModelSources> {
     // The guard bridges local snapshot publication and recipient root adoption. A
     // predecessor can be released between them, but GC cannot remove the saved bytes.
     let _guard = crate::catalog::WriterGuard::acquire(store.root())?;
@@ -1171,7 +1191,10 @@ pub fn prepare_model_source_with_registry(
         request,
         registry_locator,
         registry_bytes,
-        &mut transaction::Budget::new(durability::INTERVAL_BYTES),
+        &mut match write_budget_bytes {
+            Some(limit) => transaction::Budget::bounded(limit),
+            None => transaction::Budget::new(durability::INTERVAL_BYTES),
+        },
     )
 }
 
@@ -1365,6 +1388,7 @@ fn prepare_model_source_with_budget(
                 deferred_ops: 0,
                 converted_bytes: 0,
                 largest_op_bytes: 0,
+                required_write_bytes: 0,
             });
         }
         crate::catalog::SourcePreparation::Open(writer) => writer,
@@ -1381,6 +1405,7 @@ fn prepare_model_source_with_budget(
         deferred_ops: 0,
         converted_bytes: 0,
         largest_op_bytes: 0,
+        required_write_bytes: 0,
     };
     let mut needed = std::collections::BTreeSet::new();
     for (requested, (plan_hex, prepared)) in request.profiles.iter().zip(plans) {
@@ -1470,6 +1495,7 @@ fn prepare_model_source_with_budget(
         result.converted_roles += progress.converted_roles;
         result.converted_bytes += progress.written;
         result.largest_op_bytes = budget.largest_op;
+        result.required_write_bytes = budget.required_write_bytes;
         result.resumed_roles += progress.resumed_roles;
         result.deferred_ops += progress.deferred_ops;
         if let Some(outcome) = outcome {
@@ -2523,6 +2549,58 @@ mod tests {
         assert!(replay.replayed && replay.complete);
         assert_eq!(replay.converted_bytes, 0);
         release_model_source(&store, &request.operation_id).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_source_pass_reports_body_admission_then_resumes_without_reconversion() {
+        let root = temporary("strict-source-admission");
+        let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let advance = |limit| {
+            prepare_model_source_with_registry_budget(
+                &store,
+                &request,
+                "fixture:registry",
+                &registry,
+                Some(limit),
+            )
+            .unwrap()
+        };
+        for limit in [0, 4095] {
+            let held = advance(limit);
+            assert!(!held.complete);
+            assert_eq!(held.converted_roles, 0);
+            assert_eq!(held.converted_bytes, 0);
+            assert_eq!(held.largest_op_bytes, 0);
+            assert_eq!(held.required_write_bytes, 4096);
+            assert_eq!(held.deferred_ops, 2);
+        }
+        let first = advance(4096);
+        assert!(!first.complete);
+        assert_eq!(first.converted_bytes, 4096);
+        assert_eq!(first.converted_roles, 1);
+        assert_eq!(first.required_write_bytes, 0);
+        let held = advance(0);
+        assert_eq!(held.converted_bytes, 0);
+        assert_eq!(held.resumed_roles, 1);
+        assert_eq!(held.required_write_bytes, 4096);
+        assert_eq!(held.checkpoints, first.checkpoints);
+        let completed = advance(4096);
+        assert!(completed.complete);
+        assert_eq!(completed.converted_bytes, 4096);
+        assert_eq!(completed.resumed_roles, 1);
+        let replay = advance(0);
+        assert!(replay.replayed && replay.complete);
+        assert_eq!(replay.sources, completed.sources);
+        assert_eq!(replay.converted_bytes, 0);
+        assert_eq!(replay.required_write_bytes, 0);
+        let clean = Store::init(&root.join("clean")).unwrap();
+        let expected =
+            prepare_model_source_with_registry(&clean, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert_eq!(completed.sources, expected.sources);
+        release_model_source(&store, &request.operation_id).unwrap();
+        release_model_source(&clean, &request.operation_id).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -108,6 +108,8 @@ class PreparedModelSource(TypedDict):
     deferred_ops: int
     converted_bytes: int
     largest_op_bytes: int
+    required_write_bytes: int
+    write_interval_bytes: int
 
 class ManifestRow(TypedDict):
     manifest_id: str
@@ -519,6 +521,7 @@ class Store:
         checkpoints: Sequence[tuple[str, str, int]] = ...,
         adopt_from_operation_id: str | None = ...,
         registry: bytes | None = None,
+        write_budget_bytes: int | None = None,
     ) -> PreparedModelSource: ...
     def checkpoint_page(
         self, head_id: str, head_length: int, *, operation_id: str, slot: str,

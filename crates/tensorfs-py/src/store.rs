@@ -1073,7 +1073,7 @@ impl PyStore {
 
     /// Advance the exact source plan over verified physical carriers. Checkpoint heads are
     /// local progress until the RecordOwner acknowledges their complete upload.
-    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new(), adopt_from_operation_id=None, registry=None))]
+    #[pyo3(signature = (operation_id, source_selection_digest, profiles, roster, landed, *, checkpoints=Vec::new(), adopt_from_operation_id=None, registry=None, write_budget_bytes=None))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn prepare_model_source<'p>(
         &self,
@@ -1086,6 +1086,7 @@ impl PyStore {
         checkpoints: Vec<(String, String, u64)>,
         adopt_from_operation_id: Option<String>,
         registry: Option<Vec<u8>>,
+        write_budget_bytes: Option<u64>,
     ) -> PyResult<Bound<'p, PyDict>> {
         let checkpoints = checkpoints
             .into_iter()
@@ -1126,14 +1127,21 @@ impl PyStore {
             adopt_from_operation_id,
         };
         let prepared = py
-            .detach(|| match &registry {
-                Some(bytes) => model_source::prepare_model_source_with_registry(
+            .detach(|| {
+                let (locator, bytes) = match &registry {
+                    Some(bytes) => ("supplied:native-registry", bytes.as_slice()),
+                    None => (
+                        model_source::BUILTIN_REGISTRY,
+                        model_source::BUILTIN_REGISTRY_BYTES,
+                    ),
+                };
+                model_source::prepare_model_source_with_registry_budget(
                     &self.store,
                     &request,
-                    "supplied:native-registry",
+                    locator,
                     bytes,
-                ),
-                None => model_source::prepare_model_source(&self.store, &request),
+                    write_budget_bytes,
+                )
             })
             .or_refuse(py)?;
         let out = PyDict::new(py);
@@ -1145,6 +1153,11 @@ impl PyStore {
         out.set_item("deferred_ops", prepared.deferred_ops)?;
         out.set_item("converted_bytes", prepared.converted_bytes)?;
         out.set_item("largest_op_bytes", prepared.largest_op_bytes)?;
+        out.set_item("required_write_bytes", prepared.required_write_bytes)?;
+        out.set_item(
+            "write_interval_bytes",
+            tensorfs_core::durability::INTERVAL_BYTES,
+        )?;
         let rows = PyList::empty(py);
         for source in prepared.sources {
             let row = PyDict::new(py);
@@ -1208,6 +1221,7 @@ impl PyStore {
             checkpoints,
             adopt_from_operation_id,
             registry,
+            None,
         )
     }
 

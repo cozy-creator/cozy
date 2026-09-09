@@ -444,6 +444,8 @@ pub struct Budget {
     used: u64,
     stopped: bool,
     pub largest_op: u64,
+    strict: bool,
+    pub required_write_bytes: u64,
 }
 
 impl Budget {
@@ -453,10 +455,23 @@ impl Budget {
             used: 0,
             stopped: false,
             largest_op: 0,
+            strict: false,
+            required_write_bytes: 0,
+        }
+    }
+    pub fn bounded(limit: u64) -> Self {
+        Self {
+            strict: true,
+            ..Self::new(limit)
         }
     }
     fn take(&mut self, bytes: u64) -> bool {
         if self.stopped {
+            return false;
+        }
+        if self.strict && self.used == 0 && bytes > self.limit {
+            self.required_write_bytes = bytes;
+            self.stopped = true;
             return false;
         }
         if self.used > 0 && bytes > self.limit.saturating_sub(self.used) {
