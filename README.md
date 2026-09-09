@@ -173,7 +173,7 @@ verbs — and every one of them refuses on a Store with no recorded disk budget.
 ```text
 tfs reclaim usage <root> --rows <rows.jsonl> [--keep <keep.jsonl>] [--candidates <cand.jsonl>]
 tfs reclaim plan  <root> --need <bytes> [--keep <org>/<name>]... [--out <plan.json>]
-tfs reclaim run   <root> --plan <plan.json> [--demote] [--assume-upstream]
+tfs reclaim run   <root> --plan <plan.json> --assume-upstream [--demote]
 ```
 
 **Reclaimable bytes are a property of the candidate SET, never of a model.** On a
@@ -201,23 +201,15 @@ free nothing never survives into a plan. If the whole droppable set frees less t
 `--need` the plan refuses `RECLAIM_INSUFFICIENT` naming the shortfall, rather than emptying
 the Store and failing anyway.
 
-`reclaim run` is demote, tombstone, collect, in that order:
+`reclaim run` requires `--assume-upstream`: the caller must first confirm that the
+selected roots have durable upstream custody. A valid cache entry cannot supply that
+promise because a cache owner may delete it at any time. Without the declaration, all
+named local roots and bytes are preserved, even when `--demote` was requested.
 
-1. **Demote** (`--demote`) publishes each condemned object to the bound repo cache while it
-   is still live. The cache is on a network volume, which survives the container-disk reset
-   that destroys the Store, so an eviction becomes a demotion and the refetch is a local
-   read. It comes back through `RepoObjectCache::admit`, the ordinary verified door the
-   fetch already uses — the promote half needed no new code.
-2. **Tombstone** removes the repository documents. This is the explicit act: bytes become
-   collectable because somebody removed the thing that named them, never because a sweep
-   inferred they were garbage.
-3. **Collect** is `tfs gc`, unchanged. **This is why a wrong plan cannot corrupt a Store**:
-   the plan chooses which ROOTS stop being named, the census decides which OBJECTS that
-   frees, so an object a retained manifest or a live hold still needs is never touched.
-
-An object that could not be got back if it went is **kept and the run refuses**, naming
-what it could not prove. A failed demote is weather for a fetch — R2 is still the authority
-— and is not weather for an eviction, where this pod may hold the last copy.
+With that declaration, `--demote` optionally warms the repo cache from verified local
+bytes before repository roots are removed and ordinary GC runs. Failed cache writes do
+not prevent reclaiming bytes whose upstream copy the caller has already confirmed.
+Objects still named by a retained repository or hold remain protected by GC.
 
 `reclaim run` takes the same store-wide exclusivity `gc` does and refuses `STORE_BUSY`
 naming the live holder, so it cannot run beside a reader that holds a lease.

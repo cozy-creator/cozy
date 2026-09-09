@@ -3844,228 +3844,98 @@ fn wait_for_cache(store: &Store, checkpoint: &Checkpoint) {
 }
 
 #[test]
-fn blocked_optional_backfill_does_not_hold_origin_slots_completion_or_gc() {
+fn nonregular_cache_entries_fall_back_to_origin_without_blocking() {
     use crate::repo_cache::{CacheKind, RepoObjectCache};
-    use std::os::unix::fs::OpenOptionsExt;
-    let _serial = OPTIONAL_CACHE_PROOFS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let exit_root = std::env::var_os("TFS_TEST_BACKFILL_EXIT_ROOT").map(PathBuf::from);
-    let cache_root = exit_root.as_ref().map_or_else(
-        || temporary("blocked-backfill-cache"),
-        |root| root.join("cache"),
-    );
+
+    let root = temporary("nonregular-cache");
+    let cache_root = root.join("cache");
     let cache = RepoObjectCache::new(&cache_root);
-    let checkpoint = Arc::new(checkpoint(24, 32 * 1024));
-    let blocked = checkpoint
-        .objects
-        .iter()
-        .take(4)
-        .map(|o| o.sha256.clone())
-        .collect::<Vec<_>>();
-    let fifo_paths = blocked
-        .iter()
-        .map(|id| cache.path(CacheKind::Blob, id).unwrap())
-        .collect::<Vec<_>>();
-    let planted = Arc::new(AtomicUsize::new(0));
-    let planted_for = planted.clone();
-    let cache_for = cache.clone();
-    // Plant the stall AFTER the cache miss, as HTTP serves the real object. Opening
-    // this non-regular cache entry blocks in the actual backfill verifier, just as
-    // the measured FUSE backfill did. It can never become a valid cache object.
-    let origin = hub_origin(checkpoint.clone(), move |id, _| {
-        if blocked.iter().any(|blocked| blocked == id) {
-            let path = cache_for.path(CacheKind::Blob, id).unwrap();
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            assert!(std::process::Command::new("mkfifo")
-                .arg(&path)
-                .status()
-                .unwrap()
-                .success());
-            planted_for.fetch_add(1, Ordering::SeqCst);
-        }
-        None
-    });
-    struct Release(Vec<PathBuf>);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            for path in &self.0 {
-                // Linux O_RDWR|O_NONBLOCK opens a FIFO without a reader. This unblocks
-                // the worker's open; the existing regular-file check then refuses it.
-                let _file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .custom_flags(0x800)
-                    .open(path);
-                let _ = std::fs::remove_file(path);
-            }
+    let checkpoint = Arc::new(checkpoint(6, 1024));
+    let blocked = &checkpoint.objects[0];
+    let fifo = cache.path(CacheKind::Blob, &blocked.sha256).unwrap();
+    std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+
+    let source = Store::init(&root.join("source")).unwrap();
+    for object in &checkpoint.objects {
+        source
+            .put_stream(
+                &mut checkpoint.bodies[&object.sha256].as_slice(),
+                Some(object),
+                &Default::default(),
+            )
+            .unwrap();
+        if object != blocked {
+            assert_eq!(
+                cache
+                    .backfill_store(&source, CacheKind::Blob, object)
+                    .unwrap(),
+                crate::repo_cache::CacheWrite::Stored
+            );
         }
     }
-    let release = Release(fifo_paths.clone());
-    let a = exit_root.as_ref().map_or_else(
-        || temporary("blocked-backfill-a"),
-        |root| root.join("store"),
-    );
-    let store = Store::init(&a)
+    source
+        .put_manifest(
+            &crate::manifest::Manifest::parse(&checkpoint.bodies[&checkpoint.manifest.sha256])
+                .unwrap(),
+        )
+        .unwrap();
+    cache
+        .backfill_store(&source, CacheKind::Manifest, &checkpoint.manifest)
+        .unwrap();
+    let origin = hub_origin(checkpoint.clone(), |_, _| None);
+    let store = Store::init(&root.join("destination"))
         .unwrap()
         .bind_repo_cache(Some(&cache_root))
         .unwrap();
-    let policy = SourcePolicy::default();
-    let base = origin.base.clone();
-    let task_store = store.clone();
+    // Use a thread only to put a finite test bound around the old blocking FIFO open.
+    // Opening the peer in the failure cleanup releases that syscall before joining.
+    let worker_store = store.clone();
+    let worker_origin = origin.base.clone();
     let (send, receive) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         send.send(pull(&PullRequest::new(
-            &task_store,
-            &base,
+            &worker_store,
+            &worker_origin,
             "acme/model",
             &Anonymous,
             &SourcePolicy::default(),
         )))
-        .unwrap()
+        .unwrap();
     });
-    let result = receive.recv_timeout(std::time::Duration::from_secs(10));
+    let result = receive.recv_timeout(Duration::from_secs(5));
     if result.is_err() {
-        drop(release);
+        use std::os::unix::fs::OpenOptionsExt;
+        let _peer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(if cfg!(target_os = "linux") { 0o4000 } else { 4 })
+            .open(&fifo)
+            .unwrap();
         worker.join().unwrap();
-        panic!("origin completion waited for optional backfill")
+        panic!("cache FIFO prevented origin fallback");
     }
     let result = result.unwrap().unwrap();
     worker.join().unwrap();
-    assert_eq!(result.fetched, 26);
-    assert_eq!(planted.load(Ordering::SeqCst), 4);
-    // Every object is local and verified despite the blocked writes. Local replay
-    // must consult no cache, spend no URL and launch no extra worker pool.
-    let calls_before_warm = origin.total_hits();
+    assert_eq!(result.fetched, 1);
+    assert_eq!(result.cached, 7);
+    assert_eq!(result.bytes_moved, blocked.length);
+    assert_eq!(origin.hits(&format!("/obj/{}", blocked.sha256)), 1);
+    assert!(crate::repo_cache::finish_optional_backfills());
     let warm = pull(&PullRequest::new(
         &store,
         &origin.base,
         "acme/model",
         &Anonymous,
-        &policy,
+        &SourcePolicy::default(),
     ))
     .unwrap();
-    assert_eq!(warm.held, 26);
+    assert_eq!(warm.held, 8);
     assert_eq!(warm.bytes_moved, 0);
-    assert_eq!(origin.total_hits() - calls_before_warm, 1); // closure only
-    for id in checkpoint.bodies.keys() {
-        assert_eq!(origin.hits(&format!("/obj/{id}")), 1);
-    }
-    crate::gc::collect(&a, false).unwrap();
-    for object in &checkpoint.objects {
-        assert!(store.record_valid(&object.sha256).is_ok());
-    }
-    let pool_threads = std::fs::read_dir("/proc/self/task")
-        .unwrap()
-        .flatten()
-        .filter(|entry| {
-            std::fs::read_to_string(entry.path().join("comm"))
-                .is_ok_and(|name| name.trim() == "tfs-cache-write")
-        })
-        .count();
-    assert_eq!(pool_threads, 4);
-    if exit_root.is_some() {
-        // The subprocess proof returns normally with all four workers still waiting
-        // on their FIFO opens. It must not depend on the test's unblock cleanup.
-        std::mem::forget(release);
-        return;
-    }
-
-    // Another Store/cache pair still acquires its exact objects while the process
-    // pool is full. Repeated reference offers fill/drop the bounded queue, never
-    // multiply threads, hold GC, or mix source/destination Store identities.
-    let b = temporary("blocked-backfill-b");
-    let second_cache = temporary("blocked-backfill-cache-b");
-    let second = Store::init(&b)
-        .unwrap()
-        .bind_repo_cache(Some(&second_cache))
-        .unwrap();
-    let other = Arc::new(self::checkpoint(8, 16 * 1024));
-    let second_origin = hub_origin(other.clone(), |_, _| None);
-    let result = pull(&PullRequest::new(
-        &second,
-        &second_origin.base,
-        "acme/model",
-        &Anonymous,
-        &policy,
-    ))
-    .unwrap();
-    assert_eq!(result.fetched, 10);
-    let unrooted = second
-        .put_stream(
-            &mut b"cache may miss reclaimed source".as_slice(),
-            None,
-            &Default::default(),
-        )
-        .unwrap()
-        .obj;
-    let mut queued = 0;
-    for _ in 0..512 {
-        queued += usize::from(second.repo_cache().unwrap().offer_backfill(
-            &second,
-            CacheKind::Blob,
-            &unrooted,
-        ));
-    }
-    assert!(
-        queued <= 128,
-        "blocked pool grew beyond its reference queue"
-    );
-    crate::gc::collect(&b, false).unwrap();
-    assert!(!second.contains(&unrooted.sha256));
-    drop(release);
-    wait_for_cache(&second, &other);
-    for path in fifo_paths {
-        assert!(!path.exists());
-    }
-    // No queued cache job may resurrect the reclaimed local source or claim it
-    // was cached; it carries only a reference and performs ordinary verified reads.
-    assert!(!second.contains(&unrooted.sha256));
-    for root in [a, b, cache_root, second_cache] {
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
-
-#[test]
-fn blocked_optional_backfill_does_not_delay_process_exit() {
-    let root = temporary("backfill-process-exit");
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "transport::tests::blocked_optional_backfill_does_not_hold_origin_slots_completion_or_gc",
-            "--nocapture",
-        ])
-        .env("TFS_TEST_BACKFILL_EXIT_ROOT", &root)
-        .spawn()
-        .unwrap();
-    let until = std::time::Instant::now() + Duration::from_secs(15);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() >= until {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            std::fs::remove_dir_all(&root).unwrap();
-            panic!("process exit waited for optional backfill");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert!(status.success());
-    // A new process sees the completed local checkpoint. The unfinished cache offers
-    // conferred no custody and their loss did not remove or corrupt local bytes.
-    let store = Store::open(&root.join("store")).unwrap();
-    let checkpoint = checkpoint(24, 32 * 1024);
-    for object in &checkpoint.objects {
-        assert!(store.record_valid(&object.sha256).is_ok());
-    }
-    assert_eq!(
-        store
-            .read_manifest(&checkpoint.manifest)
-            .unwrap()
-            .canonical_bytes(),
-        checkpoint.bodies[&checkpoint.manifest.sha256]
-    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

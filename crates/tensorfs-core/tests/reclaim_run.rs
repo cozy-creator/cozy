@@ -1,10 +1,5 @@
-//! The act: demote, tombstone, collect. Real store, real repo cache directory, real
-//! `gc::collect`, real `RepoObjectCache::admit` for the way back.
-//!
-//! The end-to-end arm is the one that matters: a predicted number, a reported number, and
-//! `du` over `blobs/` must agree EXACTLY, on a store built with deliberate sharing — the
-//! proof obligation tensorfs.md §2 has carried unbuilt since it was written
-//! (*"deleting a release/repository must reclaim exactly the bytes `exclusive` promised"*).
+//! Upstream-authorized reclaim and optional cache warming through real Stores and GC.
+//! Cache contents never provide custody; shared roots and active readers remain protected.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -157,7 +152,7 @@ fn the_prediction_the_report_and_the_disk_agree_exactly_and_the_shared_object_su
         &victim(),
         RunOptions {
             demote: true,
-            assume_upstream: false,
+            assume_upstream: true,
         },
     )
     .unwrap();
@@ -189,8 +184,8 @@ fn the_prediction_the_report_and_the_disk_agree_exactly_and_the_shared_object_su
     );
     assert_eq!(report.roots_dropped, vec!["acme/victim".to_string()]);
 
-    // DEMOTED, NOT DESTROYED: the bytes are on the volume-side cache, and they come back
-    // through the ordinary verified admission door — the same call `pull` makes.
+    // Optional warming kept a verified cache copy. Upstream custody, declared above,
+    // authorized reclamation; the cache only accelerates this subsequent read.
     assert!(report.demoted_bytes >= f.victim_only.length);
     assert!(!f.store.contains(&f.victim_only.sha256));
     let cache = RepoObjectCache::new(&f.cache);
@@ -241,14 +236,57 @@ fn bytes_that_cannot_be_got_back_are_kept_and_the_run_refuses() {
 }
 
 #[test]
-fn a_cache_that_cannot_take_the_bytes_keeps_them_rather_than_dropping_them_anyway() {
-    // A failed demote is weather for a FETCH — R2 is still the authority — and is not
-    // weather for an EVICTION, where this pod may hold the last copy.
-    let f = fixture("cache-unwritable", true);
-    let mut mode = std::fs::metadata(&f.cache).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o500);
-    std::fs::set_permissions(&f.cache, mode).unwrap();
+fn disposable_cache_never_authorizes_local_reclaim() {
+    use std::os::unix::fs::symlink;
 
+    for state in ["corrupt", "symlink", "valid", "removed"] {
+        let f = fixture(state, true);
+        let cache = RepoObjectCache::new(&f.cache);
+        let rows = Census::open(&f.root)
+            .unwrap()
+            .reclaim_plan(&victim(), &[])
+            .unwrap();
+        for row in rows {
+            let kind = if row.kind == "manifest" {
+                CacheKind::Manifest
+            } else {
+                CacheKind::Blob
+            };
+            let path = cache.path(kind, &row.sha256).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let source = f.root.join(&row.key);
+            match state {
+                "corrupt" => std::fs::write(path, vec![0; row.length as usize]).unwrap(),
+                "symlink" => symlink(source, path).unwrap(),
+                _ => {
+                    std::fs::copy(source, &path).unwrap();
+                }
+            }
+        }
+        if state == "removed" {
+            // Another cache owner may drop the whole disposable copy at any time.
+            std::fs::remove_dir_all(&f.cache).unwrap();
+        }
+        let before = on_disk(&f.root);
+        let outcome = reclaim::run(&f.store, &victim(), RunOptions::default());
+        assert!(
+            outcome.is_err(),
+            "{state} cache authorized deleting the local copy: {outcome:?}"
+        );
+        assert_eq!(outcome.unwrap_err().code, Code::DURABILITY_UNPROVEN);
+        assert_eq!(on_disk(&f.root), before);
+        assert!(f.store.repository_path(&victim()[0]).exists());
+        assert!(f.store.open_verified(&f.victim_only.sha256).is_ok());
+        std::fs::remove_dir_all(f.root).unwrap();
+        let _ = std::fs::remove_dir_all(f.cache);
+    }
+}
+
+#[test]
+fn cache_warming_failure_does_not_block_explicit_upstream_reclaim() {
+    let f = fixture("cache-unavailable", true);
+    std::fs::remove_dir_all(&f.cache).unwrap();
+    std::fs::write(&f.cache, b"not a directory").unwrap();
     let before = on_disk(&f.root);
     let refusal = reclaim::run(
         &f.store,
@@ -259,23 +297,22 @@ fn a_cache_that_cannot_take_the_bytes_keeps_them_rather_than_dropping_them_anywa
         },
     )
     .unwrap_err();
-    assert_eq!(refusal.code, Code::DURABILITY_UNPROVEN, "{refusal}");
+    assert_eq!(refusal.code, Code::DURABILITY_UNPROVEN);
     assert_eq!(on_disk(&f.root), before);
-
-    let mut mode = std::fs::metadata(&f.cache).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
-    std::fs::set_permissions(&f.cache, mode).unwrap();
-    reclaim::run(
+    let report = reclaim::run(
         &f.store,
         &victim(),
         RunOptions {
             demote: true,
-            assume_upstream: false,
+            assume_upstream: true,
         },
     )
-    .expect("a writable cache must let the same run through");
-    let _ = std::fs::remove_dir_all(f.root);
-    let _ = std::fs::remove_dir_all(f.cache);
+    .unwrap();
+    assert!(report.reclaimed_bytes > 0);
+    assert_eq!(report.demoted_objects, 0);
+    assert!(!f.store.contains(&f.victim_only.sha256));
+    std::fs::remove_dir_all(f.root).unwrap();
+    std::fs::remove_file(f.cache).unwrap();
 }
 
 #[test]
@@ -418,7 +455,7 @@ fn one_orphan_blob_does_not_refuse_the_whole_run_and_is_never_pushed_to_the_cach
         &victim(),
         RunOptions {
             demote: true,
-            assume_upstream: false,
+            assume_upstream: true,
         },
     )
     .expect("an orphan blob must not refuse the run");

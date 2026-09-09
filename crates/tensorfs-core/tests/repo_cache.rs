@@ -234,6 +234,73 @@ fn missing_and_corrupt_cache_objects_fall_through_without_local_admission() {
 }
 
 #[test]
+fn fifo_symlink_and_directory_entries_are_unavailable() {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary("nonregular");
+    let cache = RepoObjectCache::new(root.join("cache"));
+    let destination = Store::init(&root.join("destination")).unwrap();
+    let object = ObjectRef::of(b"verified");
+    let path = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let correct = root.join("correct");
+    fs::write(&correct, b"verified").unwrap();
+    symlink(&correct, &path).unwrap();
+    assert_eq!(
+        cache.admit(&destination, CacheKind::Blob, &object).unwrap(),
+        CacheRead::Unavailable
+    );
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert_eq!(
+        cache.admit(&destination, CacheKind::Blob, &object).unwrap(),
+        CacheRead::Unavailable
+    );
+    fs::remove_dir(&path).unwrap();
+    assert!(Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "repo-cache",
+            "admit",
+            cache.root().to_str().unwrap(),
+            destination.root().to_str().unwrap(),
+            "blob",
+            &object.id(),
+            &object.length.to_string(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= until {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("cache FIFO waited for a writer before rejecting the nonregular entry");
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        r#"{"status":"unavailable"}"#
+    );
+    assert!(!destination.blob_path(&object.sha256).exists());
+    fs::remove_file(&path).unwrap();
+    fs::copy(&correct, &path).unwrap();
+    assert_eq!(
+        cache.admit(&destination, CacheKind::Blob, &object).unwrap(),
+        CacheRead::Hit
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn concurrent_backfills_converge_without_clobbering() {
     let root = temporary("concurrent");
     let source = Arc::new(Store::init(&root.join("source-store")).unwrap());
