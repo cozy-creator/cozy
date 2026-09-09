@@ -425,8 +425,11 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 					"%s has no authored default for model slot %s", target.Package, slot.Path).
 					WithRemedy("model.%s=org/model@release[/lane]", slot.Param)
 			}
-			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
-				"%s/%s is disabled in this deployment: no default model binding for %s", target.Package, ep.Name, slot.Param).
+			message := fmt.Sprintf("%s has no owner binding or authored default for model slot %s", target.Package, slot.Path)
+			if ep.Kind != "job" {
+				message = fmt.Sprintf("%s/%s is disabled in this deployment: no default model binding for %s", target.Package, ep.Name, slot.Param)
+			}
+			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable", "%s", message).
 				WithRemedy("bind it: %s — or override this run: model.%s=org/model@release[/lane]",
 					bindRemedy(target.Package, slot.Path), slot.Param)
 		}
