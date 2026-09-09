@@ -87,6 +87,23 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			ModelSlotPaths: prep.ModelSlotPaths, LockedRequirements: locked,
 		})
 	} else {
+		// The local path seals too, and defers to no image: this host IS the machine,
+		// and its worker environment is not an inventoried base (cl-212). A nil
+		// inventory therefore carries the whole closure, which is what a local run has
+		// always carried.
+		if !validDigest(req.LocalPackageDigest) {
+			unlock := localpackage.Guard()
+			sealed, problem := c.opt.Packages.SealLocal(s.ctx, req.InstallID, nil)
+			unlock()
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+			pinned, problem := c.opt.Store.PinRequestLocalRevision(req.ID, sealed.Digest)
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+			req.LocalPackageDigest = pinned
+		}
 		revision, problem := c.opt.Packages.LocalRevision(req.InstallID, req.LocalPackageDigest)
 		if problem != nil {
 			return WorkerLaunchSpec{}, "", problem

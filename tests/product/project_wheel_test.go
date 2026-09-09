@@ -105,7 +105,7 @@ func TestProjectWheelImportRoots(t *testing.T) {
 	}
 	layout, problem := home.Open(root)
 	fatal(t, problem)
-	revision, problem := localpackage.Stage(t.Context(), layout, activePackageInstall(t, root))
+	revision, problem := localpackage.Stage(t.Context(), layout, activePackageInstall(t, root), nil)
 	fatal(t, problem)
 	var transferred []string
 	for _, file := range revision.Files {

@@ -460,13 +460,15 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		return out, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function)
 	}
-	revision, problem := s.packages.PrepareLocal(ctx, installID)
+	// NO SEAL HERE. The carrier set is what the chosen machine's image does not already
+	// provide, and no machine is chosen yet; sealing now computed a set against a
+	// decision not yet made and carried a package's whole closure (cl-212). Dispatch
+	// seals it once the worker is known and pins the digest on this request.
+	release, problem := s.packages.InstallRelease(installID)
 	if problem != nil {
 		return out, problem
 	}
-	out.InstallID = installID
-	out.Release = revision.Release
-	out.LocalPackageDigest = revision.Digest
+	out.InstallID, out.Release = installID, release
 	return out, nil
 }
 

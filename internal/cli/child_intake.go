@@ -146,7 +146,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 			dependency.Close()
 			continue
 		}
-		revision, problem := localpackage.Stage(context.Background(), layout, result.Install)
+		revision, problem := localpackage.Stage(context.Background(), layout, result.Install, nil)
 		if problem != nil {
 			nested.Close()
 			dependency.Close()

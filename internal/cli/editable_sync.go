@@ -414,18 +414,28 @@ func (s *editableSync) reprepare(pkg string, snapshot *EditableSnapshot, install
 }
 
 func (s *editableSync) reprepareRentals(pkg, installID string, rentals []orchestrator.RentalHolder) []string {
-	unlock := localpackage.Guard()
-	revision, problem := s.resolver.PrepareLocal(s.ctx, installID)
-	unlock()
-	if problem != nil {
-		fmt.Fprintf(s.log, "editable %s: cannot seal install %s for its rentals: %s\n",
-			pkg, short12(installID), problem.Message)
-		return nil
-	}
-	fmt.Fprintf(s.log, "editable %s: sealed revision %s (%d wheel(s)) for %d rental(s)\n",
-		pkg, digest12(revision.Digest), len(revision.Files), len(rentals))
 	var workers []string
 	for _, rental := range rentals {
+		// ONE SEAL PER MACHINE. The carrier set is what THIS pod's image does not
+		// already provide, so two rentals on different images do not share a revision
+		// (cl-212). Sealing once for the whole fleet was only ever right while the set
+		// ignored the image entirely.
+		provided, problem := s.resolver.RentalProvided(s.ctx, rental.RentalID)
+		if problem != nil {
+			fmt.Fprintf(s.log, "editable %s: rental %s image inventory unreadable (%s); the next run seals it\n",
+				pkg, rental.RentalID, problem.Message)
+			continue
+		}
+		unlock := localpackage.Guard()
+		revision, problem := s.resolver.PrepareLocal(s.ctx, installID, provided)
+		unlock()
+		if problem != nil {
+			fmt.Fprintf(s.log, "editable %s: cannot seal install %s for rental %s: %s\n",
+				pkg, short12(installID), rental.RentalID, problem.Message)
+			continue
+		}
+		fmt.Fprintf(s.log, "editable %s: sealed revision %s (%d wheel(s)) for rental %s\n",
+			pkg, digest12(revision.Digest), len(revision.Files), rental.RentalID)
 		for _, held := range rental.Placements {
 			function := held.Entrypoints[0].Name
 			spec, problem := s.resolver.ResolveInstall(installID, held.Models)

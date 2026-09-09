@@ -39,7 +39,7 @@ func TestPrivateRecordedRegistryStage(t *testing.T) {
 	if directory == "" {
 		directory = t.TempDir()
 	}
-	revision, problem := localpackage.Stage(t.Context(), home.Layout{LocalPackages: directory}, install)
+	revision, problem := localpackage.Stage(t.Context(), home.Layout{LocalPackages: directory}, install, nil)
 	fatal(t, problem)
 	versions := map[string]string{}
 	for _, file := range revision.Files {
@@ -57,6 +57,44 @@ func TestPrivateRecordedRegistryStage(t *testing.T) {
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(directory, "qualification.json"), encoded, 0o600))
 	t.Logf("captured %s with %d exact wheels", revision.Digest, len(revision.Files))
+
+	// cl-212: the carrier set is what ONE machine's image does not already provide. A
+	// dependency the image ships is not carried; the project wheel never is, because it
+	// IS the package and no image has it.
+	var project, deferred string
+	for _, file := range revision.Files {
+		if file.Kind == "project" {
+			project = file.Filename
+			continue
+		}
+		identity, problem := wheel.InspectIdentity(file.Path)
+		fatal(t, problem)
+		if deferred == "" {
+			deferred = localpackage.NormalizeDistribution(identity.Distribution)
+		}
+	}
+	if project == "" || deferred == "" {
+		t.Fatalf("the fixture carries no project wheel and dependency to defer: %d file(s)", len(revision.Files))
+	}
+	pruned, problem := localpackage.Stage(t.Context(), home.Layout{LocalPackages: t.TempDir()}, install,
+		map[string]bool{deferred: true})
+	fatal(t, problem)
+	if len(pruned.Files) != len(revision.Files)-1 {
+		t.Fatalf("deferring %s carried %d wheel(s), want %d", deferred, len(pruned.Files), len(revision.Files)-1)
+	}
+	held := map[string]bool{}
+	for _, file := range pruned.Files {
+		identity, problem := wheel.InspectIdentity(file.Path)
+		fatal(t, problem)
+		held[localpackage.NormalizeDistribution(identity.Distribution)] = true
+	}
+	if held[deferred] {
+		t.Fatalf("%s was carried even though the image provides it", deferred)
+	}
+	if pruned.Digest == revision.Digest {
+		t.Fatal("a different carrier set kept the same revision identity")
+	}
+	t.Logf("deferring %s to the image sealed %s with %d wheels", deferred, pruned.Digest, len(pruned.Files))
 }
 
 func privateClosureLock() []byte {

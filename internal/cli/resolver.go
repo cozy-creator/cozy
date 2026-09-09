@@ -52,9 +52,12 @@ type Resolver struct {
 	Devices []string
 }
 
-// PrepareLocal freezes one editable install into exact wheels before rental attachment.
-// Tensorhub selects the base; the worker validates the package against that exact base.
-func (r *Resolver) PrepareLocal(ctx context.Context, installID string) (
+// PrepareLocal seals one editable install into the exact wheels ONE machine needs.
+//
+// `provided` is that machine's registered image inventory by normalized distribution name,
+// or nil for local execution, which defers to no image. It cannot be known before a machine
+// is chosen, which is why sealing belongs after placement and not at submission (cl-212).
+func (r *Resolver) PrepareLocal(ctx context.Context, installID string, provided map[string]bool) (
 	localpackage.Revision, *exit.Error,
 ) {
 	install, problem := r.store.Install(installID)
@@ -71,11 +74,33 @@ func (r *Resolver) PrepareLocal(ctx context.Context, installID string) (
 	if problem := localpackage.Sweep(layout, r.store); problem != nil {
 		return localpackage.Revision{}, problem
 	}
-	revision, problem := localpackage.Stage(ctx, layout, *install)
+	revision, problem := localpackage.Stage(ctx, layout, *install, provided)
 	if problem != nil {
 		return localpackage.Revision{}, problem
 	}
 	return revision, nil
+}
+
+// SealLocal is PrepareLocal under the orchestrator's name for it: the sealing step the
+// dispatch path performs once it knows which machine will run the work.
+func (r *Resolver) SealLocal(ctx context.Context, installID string, provided map[string]bool) (
+	localpackage.Revision, *exit.Error,
+) {
+	return r.PrepareLocal(ctx, installID, provided)
+}
+
+// InstallRelease is the version one install proved. Submission records it without
+// sealing a wheel revision, which cannot happen until a machine is chosen (cl-212);
+// `localpackage.Stage` refuses if the editable source ever names a different one.
+func (r *Resolver) InstallRelease(installID string) (string, *exit.Error) {
+	install, problem := r.store.Install(installID)
+	if problem != nil {
+		return "", problem
+	}
+	if install == nil {
+		return "", exit.New(exit.NotFound, "install %s does not exist", installID)
+	}
+	return install.Version, nil
 }
 
 // LocalRevision reopens the exact staged wheel set a durable request already names.

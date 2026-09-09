@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"math"
@@ -17,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -1109,10 +1111,22 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 	}
 	var jobPrepared *pb.DesiredPlacementSet
 	if req.InstallID != "" {
-		if c.opt.Packages == nil || !validDigest(req.LocalPackageDigest) {
+		if c.opt.Packages == nil {
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
 				"local_package_request_incomplete",
-				"editable rental request %s names no sealed local package revision", req.ID)
+				"editable rental request %s has no package resolver", req.ID)
+		}
+		// THIS is where the carrier set can first be computed honestly: the machine is
+		// chosen, so its image inventory is knowable, and a wheel the image already
+		// provides is not carried (cl-212). Sealing at submission had to answer "what
+		// does the image have?" before there was an image, and answered it from a
+		// static roster instead — 46 wheels for minimax-h3 where 7 were needed.
+		if !validDigest(req.LocalPackageDigest) {
+			sealed, problem := c.sealLocalFor(req)
+			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+			req.LocalPackageDigest = sealed
 		}
 		revision, problem := c.opt.Packages.LocalRevision(req.InstallID, req.LocalPackageDigest)
 		if problem != nil {
@@ -2285,4 +2299,27 @@ func (c *Orchestrator) Cancel(requestID string, attempt uint64, reason pb.Cancel
 	c.logf("CancelAttempt %s#%d reason=%s", requestID, attempt,
 		pb.CancelReason_name[int32(reason)])
 	return nil
+}
+
+// sealLocalFor seals one editable request's wheel set for the machine that will run it and
+// pins the digest on the request, once. The pin is the arbiter: a caller that loses the
+// race to a concurrent dispatch takes the digest already recorded rather than its own, so
+// one request never has two execution identities.
+func (c *Orchestrator) sealLocalFor(req records.Request) (string, *exit.Error) {
+	provided, problem := c.opt.Packages.RentalProvided(context.Background(), req.Worker)
+	if problem != nil {
+		return "", problem
+	}
+	unlock := localpackage.Guard()
+	revision, problem := c.opt.Packages.SealLocal(context.Background(), req.InstallID, provided)
+	unlock()
+	if problem != nil {
+		return "", problem
+	}
+	if revision.Release != req.Release {
+		return "", exit.Named(exit.Conflict, "local_package_revision_changed",
+			"request %s was accepted at %s and its editable source now names %s",
+			req.ID, req.Release, revision.Release)
+	}
+	return c.opt.Store.PinRequestLocalRevision(req.ID, revision.Digest)
 }

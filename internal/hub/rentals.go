@@ -594,6 +594,33 @@ func (c *Client) PrepareFacts(ctx context.Context, id, pkg, release string) (Pre
 	return out, nil
 }
 
+// RentalImageInventory is the placed image's registered
+// `tensorhub.image_inventory/1` document, asked MACHINE-scoped (th-205).
+//
+// `PrepareFacts` cannot answer it for an editable package: that door needs a
+// published org/name@release, and an editable install has neither. Without this
+// route Creator had no image knowledge at all on the editable path and pruned
+// what it uploads against a static ABI-protection roster instead — the wrong
+// list for the question (cl-212).
+//
+// Absence is refused by the hub, never answered as an empty document: a caller
+// that prunes its upload against this would otherwise ship nothing.
+func (c *Client) RentalImageInventory(ctx context.Context, id string) (json.RawMessage, *exit.Error) {
+	if e := validateRentalID(id); e != nil {
+		return nil, e
+	}
+	var out struct {
+		Inventory json.RawMessage `json:"image_inventory"`
+	}
+	e := c.do(ctx, call{method: http.MethodGet,
+		path: "/v1/rentals/" + url.PathEscape(id) + "/image-inventory",
+		auth: true, responseBytes: maxPrepareFactsResponseBytes}, &out)
+	if e != nil {
+		return nil, e
+	}
+	return out.Inventory, nil
+}
+
 // canonicalServingModels sorts and de-duplicates the declared set so the authored
 // bytes are a pure function of the selection: the same models in any order
 // author the same request, and a replay re-authors byte-identically. An empty

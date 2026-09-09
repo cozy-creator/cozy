@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -39,7 +40,19 @@ type Revision struct {
 	Files                                                          []File
 }
 
-func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Revision, *exit.Error) {
+// Stage seals one editable install into the exact wheel set ONE machine needs.
+//
+// `provided` is that machine's registered image inventory, by normalized distribution
+// name — the answer to "what does the image already have?", which is a property of the
+// placed image and therefore not knowable until a machine is chosen. A dependency the
+// image provides is not carried: the package venv is built `--system-site-packages` over
+// the immutable base, so the image's copy is what resolves either way, and sending a
+// second one uploads bytes that are installed only to shadow it.
+//
+// A nil `provided` seals the whole closure, which is the right answer for local execution
+// — there is no image to defer to — and the old behaviour for every caller that has no
+// machine in hand.
+func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall, provided map[string]bool) (Revision, *exit.Error) {
 	if install.SourceKind == "wheel" {
 		raw, err := os.ReadFile(filepath.Join(install.Dir, "private-revision"))
 		if err != nil {
@@ -95,12 +108,12 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	for _, dependency := range pack.DependencyWheels {
 		paths = append(paths, dependency.Path)
 	}
-	return StageWheels(layout, install, packageInterfaceBytes, paths)
+	return StageWheels(layout, install, packageInterfaceBytes, paths, provided)
 }
 
 // StageWheels uses the same immutable revision writer for source builds and
 // already-built library wheels. It preserves every supplied original byte.
-func StageWheels(layout home.Layout, install records.PackageInstall, packageInterfaceBytes []byte, paths []string) (Revision, *exit.Error) {
+func StageWheels(layout home.Layout, install records.PackageInstall, packageInterfaceBytes []byte, paths []string, provided map[string]bool) (Revision, *exit.Error) {
 	if len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
 		return Revision{}, exit.New(exit.Validation, "private wheel interface exceeds its document bound")
 	}
@@ -136,6 +149,16 @@ func StageWheels(layout home.Layout, install records.PackageInstall, packageInte
 		kind := "dependency"
 		if index == 0 {
 			kind = "project"
+		}
+		// The project wheel is never deferred to the image: it IS the package.
+		if kind == "dependency" && len(provided) > 0 {
+			fact, problem := wheel.InspectIdentity(source)
+			if problem != nil {
+				return Revision{}, problem
+			}
+			if provided[NormalizeDistribution(fact.Distribution)] {
+				continue
+			}
 		}
 		file, problem := copyWheel(source, wheelDir, kind)
 		if problem != nil {
@@ -369,3 +392,11 @@ func syncDirectory(path string) error {
 	defer directory.Close()
 	return directory.Sync()
 }
+
+// NormalizeDistribution is PEP 503 name normalization, the one spelling a wheel
+// identity, an image inventory and a lock row can be compared in.
+func NormalizeDistribution(name string) string {
+	return distributionRuns.ReplaceAllString(strings.ToLower(strings.TrimSpace(name)), "-")
+}
+
+var distributionRuns = regexp.MustCompile(`[-_.]+`)

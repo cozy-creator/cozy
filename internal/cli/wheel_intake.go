@@ -153,7 +153,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 				paths = append(paths, closure[dependency].Path)
 			}
 		}
-		revision, problem := localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths)
+		revision, problem := localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths, nil)
 		if problem != nil {
 			return problem
 		}

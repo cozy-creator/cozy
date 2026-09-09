@@ -180,6 +180,13 @@ type Launcher interface {
 	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
 	ResolveJobInstall(installID, function string) (WorkerLaunchSpec, *exit.Error)
 	LocalRevision(installID, digest string) (localpackage.Revision, *exit.Error)
+	// SealLocal seals an editable install into the exact wheels ONE machine needs, and
+	// RentalProvided is that machine's registered image inventory by normalized
+	// distribution name (th-205). Both belong here rather than at submission because the
+	// carrier set is a function of the chosen image, which submission does not know
+	// (cl-212). A nil inventory seals the whole closure, which is right locally.
+	SealLocal(ctx context.Context, installID string, provided map[string]bool) (localpackage.Revision, *exit.Error)
+	RentalProvided(ctx context.Context, rentalID string) (map[string]bool, *exit.Error)
 }
 
 type LogicalPackage struct {

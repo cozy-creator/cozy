@@ -539,13 +539,14 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 		return out, problem
 	}
 	out.NeedsAccelerator = needsAccelerator
-	revision, problem := s.packages.PrepareLocal(ctx, installID)
+	// No seal at submission: the carrier set belongs to the machine that has not been
+	// chosen yet (cl-212). Dispatch seals and pins it.
+	release, problem := s.packages.InstallRelease(installID)
 	if problem != nil {
 		return out, problem
 	}
 	out.InstallID, out.PlanID = installID, planID
-	out.Release = revision.Release
-	out.LocalPackageDigest = revision.Digest
+	out.Release = release
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
 	}
@@ -575,13 +576,8 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 	}
 	out.InstallID, out.Release = placement.InstallID, placement.Release
 	out.NeedsAccelerator = needsAccelerator
-	if !spec.Preparation.Published {
-		revision, problem := s.packages.PrepareLocal(ctx, placement.InstallID)
-		if problem != nil {
-			return out, problem
-		}
-		out.LocalPackageDigest = revision.Digest
-	}
+	// An unprepared editable install seals nothing here either: the worker this
+	// pending request will reach decides its carrier set (cl-212).
 	if len(out.Outputs) == 0 {
 		out.Outputs = launch.AssetPaths(entrypoint.Result)
 	}

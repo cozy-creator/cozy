@@ -103,7 +103,13 @@ type Server struct {
 // start may require the target environment through Resolve.
 type Resolver interface {
 	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
-	PrepareLocal(context.Context, string) (localpackage.Revision, *exit.Error)
+	// PrepareLocal seals an editable install into the wheels ONE machine needs; the
+	// map is that machine's image inventory. Submission does not call it — the machine
+	// is not chosen yet — so a request leaves here with no sealed revision (cl-212).
+	PrepareLocal(context.Context, string, map[string]bool) (localpackage.Revision, *exit.Error)
+	// InstallRelease is the version the install proved, which submission records without
+	// sealing anything. `localpackage.Stage` holds the two equal.
+	InstallRelease(installID string) (string, *exit.Error)
 	LocalRevision(string, string) (localpackage.Revision, *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)

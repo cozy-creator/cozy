@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -1007,6 +1008,31 @@ func (s *Store) PinRequestModels(id string, models []ModelRef) *exit.Error {
 		return exit.Internalf("cannot record request %s models: %s", id, err)
 	}
 	return nil
+}
+
+// PinRequestLocalRevision records the wheel revision one machine sealed for an editable
+// request. It is written ONCE and only over an empty value: the digest is part of the
+// request's execution identity from the moment it exists, so a second machine may not
+// quietly reseal work already dispatched under the first (cl-212). A caller that loses
+// the race reads the pinned row back and uses it.
+func (s *Store) PinRequestLocalRevision(id, digest string) (string, *exit.Error) {
+	if _, err := canonical.Raw(digest); err != nil {
+		return "", exit.New(exit.Validation, "a sealed local package revision must be one canonical digest")
+	}
+	if _, err := s.db.Exec(`UPDATE requests SET local_package_digest=?
+		WHERE id=? AND local_package_digest='' AND state NOT IN ('succeeded','failed','canceled','refused','abandoned')`,
+		digest, id); err != nil {
+		return "", exit.Internalf("cannot record request %s local package revision: %s", id, err)
+	}
+	var held string
+	if err := s.db.QueryRow(`SELECT local_package_digest FROM requests WHERE id=?`, id).Scan(&held); err != nil {
+		return "", exit.Internalf("cannot read back request %s local package revision: %s", id, err)
+	}
+	if held == "" {
+		return "", exit.Named(exit.Conflict, "local_package_seal_refused",
+			"request %s is no longer open for a sealed local package revision", id)
+	}
+	return held, nil
 }
 
 func settledRequestState(state string) bool {
