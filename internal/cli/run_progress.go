@@ -9,6 +9,7 @@ import (
 	"golang.org/x/text/width"
 
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
@@ -59,7 +60,8 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		cause, _ := e.Payload["wait"].(string)
 		capacity := cause == "slot_busy" || cause == "queue_ahead"
 		if strings.HasPrefix(p.terminal.key, "stage:") ||
-			(strings.HasPrefix(p.terminal.key, "phase:") && !capacity) {
+			(strings.HasPrefix(p.terminal.key, "phase:") && !capacity &&
+				!(cause == orchestrator.WaitRental && p.terminal.key == "phase:rental")) {
 			return
 		}
 		key = "wait"
@@ -71,15 +73,6 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		}
 		rows = []string{"  running · waiting for stage updates"}
 	case "dispatched", "submitted", "metric", "log":
-		return
-	case "rentals", "placement":
-		line, _ := e.Payload["line"].(string)
-		if line != "" && line != p.last {
-			p.eraseLive()
-			fmt.Fprintln(p.ctx.Err, line)
-			p.last = line
-			p.drawLive(p.displayTime(e))
-		}
 		return
 	case "completed", "succeeded":
 		p.finishLive("done", eventTime(e))
@@ -104,6 +97,42 @@ func (p *RunProgress) interactive(e localapi.Event) {
 	p.terminal.event, p.terminal.counted = e, counted
 	p.drawLive(p.displayTime(e))
 	p.armLiveClock()
+}
+
+// Spend and placement arrive interleaved. Each has its own last observation;
+// neither an unchanged heartbeat nor an unrelated stage makes it new again.
+func (p *RunProgress) rentalNotice(e localapi.Event) {
+	previous := &p.rentalLine
+	if strings.TrimPrefix(e.Type, "request.") == "placement" {
+		previous = &p.placementLine
+	}
+	line, _ := e.Payload["line"].(string)
+	if line == "" || line == *previous {
+		return
+	}
+	*previous = line
+	if p.ctx.Mode().Color {
+		p.eraseLive()
+	}
+	fmt.Fprintln(p.ctx.Err, line)
+	if p.ctx.Mode().Color {
+		p.drawLive(p.displayTime(e))
+	}
+}
+
+func waitingPlacement(payload map[string]any) bool {
+	waiting := false
+	candidates, _ := payload["candidates"].([]any)
+	for _, value := range candidates {
+		candidate, _ := value.(map[string]any)
+		switch candidate["verdict"] {
+		case orchestrator.VerdictChosen:
+			return false
+		case orchestrator.VerdictAttaching:
+			waiting = true
+		}
+	}
+	return waiting
 }
 
 func (p *RunProgress) stepRows(f stepFacts) []string {
