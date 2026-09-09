@@ -779,7 +779,12 @@ func (c *Orchestrator) drain() {
 			c.forget(id)
 			continue
 		}
-		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] {
+		// Serving requests have their own physical-group allocator. A named rental
+		// may run a later request on an independent ready GPU while an earlier
+		// request's group is still warming; the allocator's queue/fairness fence
+		// prevents overlap and starvation. Keep the serial named-rental fence for
+		// CPU/ordinary work, which has no disjoint physical group to exploit.
+		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] && requestGPUWidth(*req) == 0 {
 			c.park(*req, position, waitFacts{}, "an earlier request is waiting on this rental")
 			continue
 		}
