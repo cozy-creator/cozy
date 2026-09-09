@@ -22,7 +22,7 @@ func byteRetentionRequest(h records.NativeArtifactRetention) *pb.NativeByteReten
 	return &pb.NativeByteRetentionRequest{RetentionId: h.RetentionID, Source: &pb.NativeByteTreeRef{ProducerRootId: h.TransactionID, ReceiptDigest: receipt, Manifest: &pb.Ref{Digest: manifest, Length: uint64(h.ManifestLength)}, ContentBytes: uint64(h.ContentBytes)}}
 }
 func (c *Orchestrator) changeByteRetention(ctx context.Context, h records.NativeArtifactRetention, release bool) *exit.Error {
-	session, problem := c.workspaceControl(h.OwnerWorker)
+	session, problem := c.workspaceControlContext(ctx, h.OwnerWorker)
 	if problem != nil {
 		return problem
 	}

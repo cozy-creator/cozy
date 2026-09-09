@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"path/filepath"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -9,8 +10,18 @@ import (
 // Workspace effects belong to the configured TensorFS store, not a package
 // worker's disposable home. An empty worker can service cleanup after all jobs exit.
 func (c *Orchestrator) workspaceControl(rental string) (*session, *exit.Error) {
+	return c.workspaceControlContext(context.Background(), rental)
+}
+
+func (c *Orchestrator) workspaceControlContext(ctx context.Context, rental string) (*session, *exit.Error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return nil, exit.Unavailablef("workspace cleanup canceled")
+	}
 	if rental != "" {
-		if _, _, _, problem := c.EnsureRental(rental); problem != nil {
+		if _, _, _, problem := c.ensureRentalContext(ctx, rental); problem != nil {
 			return nil, problem
 		}
 		return c.rentalControl(rental)
@@ -53,7 +64,7 @@ func (c *Orchestrator) workspaceControl(rental string) (*session, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	if problem := c.ensureWorkerClaimed(instance); problem != nil {
+	if problem := c.ensureWorkerClaimedContext(ctx, instance); problem != nil {
 		return nil, exit.Named(exit.Unavailable, "workspace.control_unavailable", "the local Runtime workspace service could not accept its claim: %s", problem.Message)
 	}
 	if current := find(); current != nil {

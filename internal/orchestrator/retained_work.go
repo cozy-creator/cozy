@@ -24,11 +24,11 @@ func (c *Orchestrator) CancelRetainedRequest(id, actor string) *exit.Error {
 	if problem := c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_CLIENT); problem != nil {
 		return problem
 	}
-	go c.finishRetainedCancellation(id)
+	c.finishRetainedCancellation(id)
 	return nil
 }
 
-func (c *Orchestrator) finishRetainedCancellation(id string) {
+func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 	request, problem := c.opt.Store.RequestRow(id)
 	if problem != nil || request == nil || (request.State != "canceling" && request.State != "releasing") {
 		return
@@ -37,7 +37,7 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 		c.finishRetainedRelease(*request)
 		return
 	}
-	if _, problem := c.lookupOperationPending(*request, true); problem != nil {
+	if _, problem := c.lookupOperationPending(ctx, *request, true); problem != nil {
 		c.retryRetainedCancellation(id)
 		return
 	}
@@ -56,7 +56,7 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			return
 		}
 	}
-	if problem := c.releaseChildRetentions(id, false); problem != nil {
+	if problem := c.releaseChildRetentions(ctx, id, false); problem != nil {
 		c.retryRetainedCancellation(id)
 		return
 	}
@@ -109,7 +109,7 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			return
 		}
 	}
-	if problem := c.releaseOriginalDerivedResults(id); problem != nil {
+	if problem := c.releaseOriginalDerivedResults(ctx, id); problem != nil {
 		c.retryRetainedCancellation(id)
 		return
 	}
@@ -119,23 +119,23 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			c.retryRetainedCancellation(id)
 			return
 		}
-		if problem := c.releaseRetainedSource(*request); problem != nil {
+		if problem := c.releaseRetainedSource(ctx, *request); problem != nil {
 			c.logf("request %s retained source release: %s", id, problem.Message)
 			c.retryRetainedCancellation(id)
 			return
 		}
 	}
 	if request.ModelTransfer != nil && c.opt.ModelTransfers != nil {
-		if problem := c.opt.ModelTransfers.AbandonModelTransferPublications(context.Background(), id); problem != nil {
+		if problem := c.opt.ModelTransfers.AbandonModelTransferPublications(ctx, id); problem != nil {
 			c.retryRetainedCancellation(id)
 			return
 		}
-		if problem := c.opt.ModelTransfers.ReleaseCheckpoints(context.Background(), id); problem != nil {
+		if problem := c.opt.ModelTransfers.ReleaseCheckpoints(ctx, id); problem != nil {
 			c.retryRetainedCancellation(id)
 			return
 		}
 	}
-	if problem := c.ackReleasedRetainedAttempts(*request, attempts); problem != nil {
+	if problem := c.ackReleasedRetainedAttempts(ctx, *request, attempts); problem != nil {
 		c.retryRetainedCancellation(id)
 		return
 	}
@@ -151,7 +151,7 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 // A retained terminal remains a Host obligation after the attempt first closes.
 // Release that same terminal only after its native/source ownership is settled.
 // Reconnect replays this ordinary ACK if the connection dies before delivery.
-func (c *Orchestrator) ackReleasedRetainedAttempts(request records.Request, attempts []records.Attempt) *exit.Error {
+func (c *Orchestrator) ackReleasedRetainedAttempts(ctx context.Context, request records.Request, attempts []records.Attempt) *exit.Error {
 	if len(attempts) == 0 {
 		return nil
 	}
@@ -164,7 +164,7 @@ func (c *Orchestrator) ackReleasedRetainedAttempts(request records.Request, atte
 			return nil
 		}
 	}
-	s, problem := c.workspaceControl(request.Worker)
+	s, problem := c.workspaceControlContext(ctx, request.Worker)
 	if problem != nil {
 		return problem
 	}
@@ -291,8 +291,10 @@ func (c *Orchestrator) stopRetainedAttempt(id string, reason pb.CancelReason) *e
 	if problem != nil {
 		return problem
 	}
-	if request != nil {
-		if _, problem := c.lookupOperationPending(*request, true); problem != nil {
+	// Cancellation reconciles a pending memo lookup in its tracked cleanup pass,
+	// where the shutdown context can stop a disconnected native peer.
+	if request != nil && request.State == "pausing" {
+		if _, problem := c.lookupOperationPending(nil, *request, true); problem != nil {
 			return problem
 		}
 	}
@@ -377,7 +379,7 @@ func (c *Orchestrator) restoreRetainedWork() *exit.Error {
 			c.retryRetainedPause(request.ID)
 		}
 		if request.RetainWork && (request.State == "canceling" || request.State == "releasing") {
-			go c.finishRetainedCancellation(request.ID)
+			c.finishRetainedCancellation(request.ID)
 		}
 	}
 	return nil
