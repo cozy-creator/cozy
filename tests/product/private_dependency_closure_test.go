@@ -81,12 +81,12 @@ source = { registry = "https://pypi.org/simple" }
 `)
 }
 
-func TestPrivateRegistryClosureIncludesSelectedExtrasAndPinsBase(t *testing.T) {
+func TestPrivateRegistryClosureIncludesSelectedExtrasAndLeavesImageBaseToWorker(t *testing.T) {
 	closure := "fixture==1.0\nnumpy==2.5.3\nscipy==1.18.1"
 	rows, pins, problem := packagepublish.PrivateRegistryRows(privateClosureLock(), closure, "fixture", "1.0", nil)
 	fatal(t, problem)
-	if len(rows) != 1 || rows[0].Name != "scipy" || rows[0].SHA256 != strings.Repeat("a", 64) || !reflect.DeepEqual(pins, []string{"numpy==2.5.3", "scipy==1.18.1"}) {
-		t.Fatalf("selected extra omitted or base silently substituted: rows=%+v pins=%v", rows, pins)
+	if len(rows) != 1 || rows[0].Name != "scipy" || rows[0].SHA256 != strings.Repeat("a", 64) || !reflect.DeepEqual(pins, []string{"scipy==1.18.1"}) {
+		t.Fatalf("selected extra omitted or image-owned base was repinned: rows=%+v pins=%v", rows, pins)
 	}
 	for _, candidate := range []struct {
 		label, closure string
