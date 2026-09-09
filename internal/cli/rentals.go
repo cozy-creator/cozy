@@ -421,6 +421,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		ID: remote.ID, MachineName: machineName, SKU: skuName,
 		AcceleratorModel: remote.AcceleratorModel, AcceleratorCount: remote.AcceleratorCount,
 		HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
+		HourlyRateSource:    remote.HourlyRateSource,
 		ManagedRequestID:    managedRequestID, State: remote.State, Hub: c.Base(),
 	}
 	copyRentalFailure(&row, remote)
@@ -460,7 +461,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		// The hub's rate is the provider's reconciled billed total once the
 		// pod is read back (th-120); the row and burn line adopt it.
 		if seen.HourlyRateUSDMicros > 0 {
-			row.HourlyRateUSDMicros = seen.HourlyRateUSDMicros
+			row.HourlyRateUSDMicros, row.HourlyRateSource = seen.HourlyRateUSDMicros, seen.HourlyRateSource
 		}
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
@@ -850,7 +851,7 @@ func watchRentalList(ctx *Context, st *records.Store, fleet *managedRentals) *ex
 
 // rentalList is one snapshot of the fleet. reconcile says whether to converge local rows
 // with the hub first — every `cozy rental list` invocation does; the live board does at
-// pollCadence. The spend lead is th-120's reconciled BILLED burn, never the quote.
+// pollCadence. Totals combine observed ready rates and pending reservations.
 func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 	reconcile bool,
 ) (output.List, *exit.Error) {
@@ -905,6 +906,13 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 	}
 	haveFailure := false
 	for _, r := range rows {
+		if !records.RentalRateIsTotal(r.HourlyRateSource) && r.State != hub.RentalFailed && r.State != hub.RentalReleased {
+			rate, problem := st.RentalReservedRate(r.Hub, r.ID)
+			if problem != nil {
+				return output.List{}, problem
+			}
+			r.HourlyRateUSDMicros = rate
+		}
 		idle, problem := observeRentalIdle(st, r)
 		if problem != nil {
 			return output.List{}, problem
@@ -969,7 +977,16 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 	// for, and any live rental with no local row is a row here, marked as such.
 	unrecorded, listed, listingProblem := fleet.unrecordedSnapshot()
 	hubNamed := map[string]bool{}
+	var unrecordedBurn int64
 	for _, seen := range unrecorded {
+		if !records.RentalRateIsTotal(seen.HourlyRateSource) {
+			rate, problem := st.RentalReservedRate(client(ctx).Base(), seen.ID)
+			if problem != nil {
+				return output.List{}, problem
+			}
+			seen.HourlyRateUSDMicros = rate
+		}
+		unrecordedBurn += seen.HourlyRateUSDMicros
 		hubNamed[seen.ID], hubNamed[seen.Name] = true, true
 		list.Rows = append(list.Rows, map[string]string{
 			// The hub publishes no Cozy SKU NAME for a rental, only the accelerator it
@@ -1004,10 +1021,6 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		list.TypedRows = append(list.TypedRows, typed)
 	}
 	if len(unrecorded) > 0 {
-		var unrecordedBurn int64
-		for _, seen := range unrecorded {
-			unrecordedBurn += seen.HourlyRateUSDMicros
-		}
 		list.TypedFields = append(list.TypedFields, "recorded")
 		list.TypedAllFields = append(list.TypedAllFields, "recorded")
 		list.Aggregates = append(list.Aggregates,

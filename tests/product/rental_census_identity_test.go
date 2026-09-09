@@ -23,7 +23,7 @@ func TestRentalCensusDoesNotHideSameIDFromAnotherHub(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	fatal(t, store.RecordRental(records.Rental{ID: "rental-collision", MachineName: "elsewhere",
+	fatal(t, store.RecordRental(records.Rental{HourlyRateSource: "observed", ID: "rental-collision", MachineName: "elsewhere",
 		Hub: "http://127.0.0.1:1", State: "ready", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
 	code, out := runCozy(t, root, "rental", "list", "--json", "--full")
 	var listed struct {
@@ -125,7 +125,7 @@ func TestRentalCensusIdentityScopeAndUnknownRates(t *testing.T) {
 	if problem == nil || problem.ErrName() != "rental.rate_unknown" {
 		t.Fatalf("an unpriced orphan was reported as zero spend: %v", problem)
 	}
-	row := records.Rental{ID: "rental-known", MachineName: "known", Hub: origin, State: "ready",
+	row := records.Rental{HourlyRateSource: "observed", ID: "rental-known", MachineName: "known", Hub: origin, State: "ready",
 		AcceleratorCount: 1, HourlyRateUSDMicros: 40_000}
 	fatal(t, store.RecordRental(row))
 	check(origin, map[string]int64{"rental-known": 40_000}, 2, 70_000)
@@ -146,7 +146,7 @@ func TestRentalFleetRateOverflowRefusesAdmission(t *testing.T) {
 				return []byte(fmt.Sprintf(`{"name":%q}`, name)), "sha256:" + strings.Repeat("a", 64), nil
 			}
 			if source == "recorded" {
-				fatal(t, store.RecordRental(records.Rental{ID: "rental-large", MachineName: "large",
+				fatal(t, store.RecordRental(records.Rental{HourlyRateSource: "observed", ID: "rental-large", MachineName: "large",
 					Hub: origin, State: "ready", AcceleratorCount: 1, HourlyRateUSDMicros: math.MaxInt64}))
 			} else {
 				storage := int64(0)

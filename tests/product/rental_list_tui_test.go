@@ -49,8 +49,16 @@ func TestRentalListLiveBoard(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
+	op, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "tui", Hub: hubURL,
+		HourlyRateUSDMicros: 100000}, 1000000, 0, storageReservationBody, nil)
+	fatal(t, problem)
+	var request struct{ Name string }
+	must(t, json.Unmarshal(op.RequestBody, &request))
+	machine := request.Name
+	hub.set("rental-tui", "name", machine)
+	fatal(t, store.AdvanceRentalOperation(op.Key, "rental-tui", "acquiring"))
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
-		ID: "rental-tui", MachineName: "sparrow", SKU: "cpu", AcceleratorModel: "CPU",
+		ID: "rental-tui", MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
 		HourlyRateUSDMicros: 100_000, State: "acquiring", Hub: hubURL,
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-tui.pem"),
 	}))
@@ -93,12 +101,12 @@ func TestRentalListLiveBoard(t *testing.T) {
 		!strings.Contains(tty, "Current spend per hour: $0.1") {
 		t.Fatalf("the board lost the fleet spend header\n%q", tty)
 	}
-	acquiring := regexp.MustCompile(`sparrow\s+cpu\s+acquiring`).FindStringIndex(tty)
-	ready := regexp.MustCompile(`sparrow\s+cpu\s+ready`).FindStringIndex(tty)
+	acquiring := regexp.MustCompile(regexp.QuoteMeta(machine) + `\s+cpu\s+acquiring`).FindStringIndex(tty)
+	ready := regexp.MustCompile(regexp.QuoteMeta(machine) + `\s+cpu\s+ready`).FindStringIndex(tty)
 	if acquiring == nil || ready == nil || acquiring[0] >= ready[0] {
 		t.Fatalf("the board did not redraw acquiring→ready in order\n%q", tty)
 	}
-	busy := regexp.MustCompile(`sparrow\s+cpu\s+ready\s+\$0\.10\s+\S+\s+0\s+1\s+-`).FindStringIndex(tty)
+	busy := regexp.MustCompile(regexp.QuoteMeta(machine) + `\s+cpu\s+ready\s+\$0\.10\s+\S+\s+0\s+1\s+-`).FindStringIndex(tty)
 	if busy == nil {
 		t.Fatalf("queued work did not blank the idle countdown\n%q", tty)
 	}
@@ -185,7 +193,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 			t.Fatalf("JSON row lost field %q: %s", field, out)
 		}
 	}
-	if row["machine"] != "sparrow" || row["state"] != "ready" || row["rental_id"] != "rental-tui" ||
+	if row["machine"] != machine || row["state"] != "ready" || row["rental_id"] != "rental-tui" ||
 		row["running"] != float64(0) || row["queued"] != float64(0) || row["hourly_rate_usd_micros"] != float64(100_000) ||
 		row["accelerator_count"] != float64(1) ||
 		row["idle_s"] == nil || row["release_due_at"] == "" {
