@@ -1,8 +1,8 @@
 package cli
 
 import (
+	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -232,9 +232,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	fmt.Fprintf(ctx.Out, "  claim: %s; this daemon stops if that record stops naming it\n", l.Daemon)
 
-	go func() { _ = http.Serve(v4, handler) }()
+	httpServer := daemon.NewHTTPServer(handler)
+	go func() { _ = httpServer.Serve(v4) }()
 	if v6 != nil {
-		go func() { _ = http.Serve(v6, handler) }()
+		go func() { _ = httpServer.Serve(v6) }()
 	}
 	go func() { _ = c.Serve() }()
 
@@ -263,10 +264,15 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
 	<-stop
 	close(quit)
 	fmt.Fprintln(ctx.Out, "draining package processes…")
-	closeListeners()
+	drain, cancelDrain := context.WithTimeout(context.Background(), orchestrator.StopGrace)
+	if err := httpServer.Shutdown(drain); err != nil {
+		fmt.Fprintf(ctx.Out, "HTTP response drain incomplete: %s\n", err)
+	}
+	cancelDrain()
 	fleet.close()
 	c.Close(orchestrator.StopGrace)
 	return nil
