@@ -222,7 +222,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 			return duplicateDependency(name, prior, canonical, version)
 		}
 		newExtras := c.activateExtras(canonical, req.extras)
-		if remoteBaseRoots[name] {
+		if ImageOwnedDistribution(name) {
 			return nil
 		}
 		if len(newExtras) == 0 {
@@ -239,7 +239,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	c.count++
 	c.byName[name] = dependencyRecord{source: canonical, version: version}
 	newExtras := c.activateExtras(canonical, req.extras)
-	if !remoteBaseRoots[name] {
+	if !ImageOwnedDistribution(name) {
 		c.stack[canonical] = true
 		if problem := c.collectProject(canonical, document, newExtras, true); problem != nil {
 			return problem
@@ -358,7 +358,7 @@ func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Er
 	// Base-owned distributions are requirements checked against the selected base inventory,
 	// never package overlays. Their exact author-side wheels remain in source custody so
 	// Creator can materialize its independent local environment.
-	if remoteBaseRoots[identity.Distribution] {
+	if ImageOwnedDistribution(identity.Distribution) {
 		return nil
 	}
 	if len(c.wheels) >= MaxDependencyWheels {

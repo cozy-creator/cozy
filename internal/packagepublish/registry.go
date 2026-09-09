@@ -87,7 +87,7 @@ func collectRegistryRows(ctx context.Context, project, stage, organization strin
 		return nil, exit.Named(exit.Structural, "registry_dependency_export_invalid",
 			"uv export did not produce a non-empty pylock.toml at or below %d B", maxLockBytes)
 	}
-	return RegistryRowsFromLock(raw, existing, organization)
+	return registryRowsFromLock(raw, existing, organization, true)
 }
 
 // orgIndexNamespace answers the org namespace when raw is one hub org index —
@@ -107,6 +107,14 @@ func orgIndexNamespace(raw string) string {
 }
 
 func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization string) ([]RegistryRow, *exit.Error) {
+	return registryRowsFromLock(raw, existing, organization, false)
+}
+
+// A locally exported lock may retain image-owned prefix families as direct
+// dependencies of captured interface wheels even after `uv --prune torch`.
+// Omit every canonical image family before selecting/counting its wheel. External
+// declarations must already be pruned and still refuse such rows.
+func registryRowsFromLock(raw []byte, existing []DependencyWheel, organization string, pruneBase bool) ([]RegistryRow, *exit.Error) {
 	var lock registryLock
 	if err := toml.Unmarshal(raw, &lock); err != nil || lock.LockVersion != "1.0" {
 		return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
@@ -134,7 +142,10 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 			return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
 				"pylock.toml contains a package without an exact name and version")
 		}
-		if remoteBaseRoots[name] {
+		if ImageOwnedDistribution(name) {
+			if pruneBase {
+				continue
+			}
 			return nil, exit.Named(exit.Validation, "registry_dependency_platform_root_present",
 				"uv export retained platform-owned root %s", name)
 		}
