@@ -1043,6 +1043,9 @@ func (m *managedRentals) lineLocked() (string, *exit.Error) {
 // that admitted every one of them, because the ceiling was computed from local rows
 // and none of the six had one. A cap that cannot see half the spend is not a cap.
 func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
+	if m.listingProblem != nil {
+		return 0, 0, m.listingProblem
+	}
 	count, burn, problem := m.store.RentalFleetTotals()
 	if problem != nil || burn < 0 {
 		return 0, 0, problem
