@@ -957,6 +957,8 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	if !knownReplay {
 		if req.ParentRequestID != "" && len(declaredWeightsOutputs) == 0 {
 			byteOutputs, e = c.privateByteOutputs(*req, *attemptRow, doc)
+		} else if req.RetainsLocalOutputs() && len(declaredWeightsOutputs) == 0 {
+			byteOutputs, outputs, e = c.privateRootOutputs(*req, *attemptRow, doc, holder)
 		} else {
 			outputs, e = c.mirrorOutputs(*req, ordinal, doc, holder)
 		}
@@ -1007,6 +1009,12 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		kept.Payload = map[string]any{"status": "FINALIZING", "execution_status": status,
 			"outputs": []any{}, "requeuing": false}
 	}
+	if req.ParentRequestID == "" && req.RetainsLocalOutputs() && len(byteOutputs) > 0 && status == "SUCCEEDED" && req.State != "canceling" {
+		requestState = "finalizing"
+		kept.Type = "request.finalizing"
+		kept.Payload["status"] = "FINALIZING"
+		kept.Payload["execution_status"] = "SUCCEEDED"
+	}
 	weightsFinalizations, e := weightsFinalizationIntents(
 		*req, *attemptRow, status, requeuing || retaining, receiptsBySlot)
 	if req.State == "canceling" {
@@ -1029,7 +1037,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// goes on to succeed. Observed live: attempt 1 of a killed job committed an empty
 	// `local/_job-…` publication seconds before attempt 2 published the real one.
 	var publication *records.Publication
-	if req.IsJob() && req.ParentRequestID == "" && len(declaredWeightsOutputs) == 0 && !requeuing && !retaining && req.State != "canceling" && !knownReplay {
+	if req.IsJob() && req.ParentRequestID == "" && len(declaredWeightsOutputs) == 0 && !requeuing && !retaining && req.State != "canceling" && !knownReplay && (len(byteOutputs) == 0 || len(outputs) > 0) {
 		if e := c.promote(*req, ordinal, outputs); e != nil {
 			refuse("%s", e.Message)
 			return
@@ -1111,6 +1119,13 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 // recovery. It is intentionally idempotent: cleanup and BeginRequeue both have durable
 // guards, so a replay cannot spend twice or delete a still-owned asset.
 func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, holder *worker) {
+	if req.State == "finalizing" && req.ModelTransfer == nil && req.RetainsLocalOutputs() {
+		go c.finishClosedNativeRootResult(req.ID, attempt.Attempt)
+		return
+	}
+	if req.State == "succeeded" && attempt.TerminalStatus == "SUCCEEDED" {
+		go c.finishNativeByteRecipients(req.ID)
+	}
 	if req.State == "succeeded" && req.RetainsLocalOutputs() {
 		c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
 		c.signalClosed(key(req.ID, uint64(attempt.Attempt)), nil)
