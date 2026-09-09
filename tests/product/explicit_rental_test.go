@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -313,5 +314,42 @@ func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
 		if _, _, problem := o.c.RecordSubmission(sub); problem == nil {
 			t.Fatal("idempotency key changed rental affinity")
 		}
+	}
+}
+
+func TestExplicitWideJobKeepsOrdinarySingleExecutorDirective(t *testing.T) {
+	row := records.Rental{ID: "chosen", State: "ready", Address: "fixture", CertPath: "fixture", AcceleratorModel: h100SXM, AcceleratorCount: 4}
+	for _, explicit := range []bool{false, true} {
+		candidate := orchestrator.PlacementCandidate{Rental: row.ID}
+		accepted := rental.Standing(&candidate, nil, row, 80, true, true, true, rental.Constraints{}, explicit)
+		if accepted != explicit {
+			t.Fatalf("explicit=%v: accepted=%v verdict=%s", explicit, accepted, candidate.Verdict)
+		}
+	}
+	pod := &fakePod{serve: true, deviceCount: 4}
+	root := t.TempDir()
+	connection, certPath := startFakePod(t, root, pod)
+	var purchases atomic.Int32
+	o := hostOwner(t, "explicit-wide-job", rentalWidthWiring(t, pod, connection, certPath, 4), func(opt *orchestrator.Options) {
+		opt.AcquireManagedRental = func(records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
+			purchases.Add(1)
+			return orchestrator.PlacementDecision{}, "", nil
+		}
+	})
+	_, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "wide-job", Package: "cozy/h3-package", Entrypoint: "four-lane", PlanID: childDigest("3"), Release: "1.0.7", Kind: "job", Payload: []byte(`{"steps":4}`), Outputs: []string{"model"}, Worker: podRental, RequestedRental: podRental, Rental: true, RentalRequired: true, NeedsAccelerator: true})
+	fatal(t, problem)
+	waitUntil(t, "ordinary JobDirective on four-card rental", func() bool { pod.mu.Lock(); defer pod.mu.Unlock(); return len(pod.jobDirectives) > 0 })
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	if directive := pod.jobDirectives[0]; directive.DeviceCount != 1 || directive.Orchestration || !directive.ResourceCaps.DeviceRequired {
+		t.Fatalf("job became a group: %+v", directive)
+	}
+	for _, desired := range pod.desired {
+		if set := desired.GetPlacementSet(); set != nil && len(set.DevicePins) > 0 {
+			t.Fatalf("job acquired CP pins: %+v", set.DevicePins)
+		}
+	}
+	if purchases.Load() != 0 {
+		t.Fatal("explicit wide job bought extra capacity")
 	}
 }

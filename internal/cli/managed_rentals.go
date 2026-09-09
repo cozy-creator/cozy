@@ -442,7 +442,7 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 		// Everything decidable from the rental ROW is settled by the chooser, in the one
 		// order that keeps a transient state out of a permanent verdict (cl-185). What
 		// is left are the questions only this host can answer.
-		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints) {
+		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints, req.RequestedRental == row.ID) {
 			if len(constraints.Requirements) > 0 || constraints.RequiresPython != "" {
 				if problem := rentalCompatibility(m.ctx, row.ID, constraints); problem != nil {
 					c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + problem.Message
