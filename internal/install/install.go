@@ -192,13 +192,16 @@ type Timing struct {
 }
 
 type Result struct {
-	Install    records.PackageInstall
-	Superseded string
-	Idempotent bool
-	Timings    []Timing
-	Warnings   []string
-	Files      int
-	Bytes      int64
+	Install records.PackageInstall
+	// PrivateProjectWheel is the metadata-sealed executable of a captured App
+	// wheel. Its original archive remains under this install's original/ directory.
+	PrivateProjectWheel string
+	Superseded          string
+	Idempotent          bool
+	Timings             []Timing
+	Warnings            []string
+	Files               int
+	Bytes               int64
 	// ModelStatus is post-commit Creator UX, not part of the install transaction.
 	// A failed optional prefetch therefore cannot roll this successful result back.
 	ModelStatus string

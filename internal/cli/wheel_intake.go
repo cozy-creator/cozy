@@ -26,7 +26,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		return problem
 	}
 	python := home.VenvPython(filepath.Join(parent.Install.Dir, "venv"))
-	possible, problem := install.HasInstalledApplications(python, parent.Install.Closure, sourceOverlays)
+	possible, problem := install.HasInstalledApplications(python, parent.Install.Closure, i.Package.Name, sourceOverlays)
 	if problem != nil || !possible {
 		return problem
 	}
@@ -129,7 +129,8 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			}
 		}
 		if len(exports) == 0 {
-			return exit.Named(exit.Validation, "private_wheel_no_invocable_exports", "App dependency %s declares no invocable exports", name)
+			overlays[name] = captured[name]
+			return nil
 		}
 		result, problem := install.CaptureWheel(ctx, i.layout, i.store, python, name, closure, surface)
 		if problem != nil {
@@ -142,7 +143,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		if problem := i.store.RecordChildBindings(childBindings); problem != nil {
 			return problem
 		}
-		paths := []string{captured[name].Path}
+		paths := []string{result.PrivateProjectWheel}
 		for _, dependency := range dependencyNames {
 			if dependency != name && !packagepublish.ImageOwnedDistribution(dependency) {
 				paths = append(paths, closure[dependency].Path)
@@ -159,7 +160,11 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		if err != nil {
 			return exit.Internalf("cannot stage callable wheel interface")
 		}
-		generated, problem := launch.GenerateInterfaceWheel(ctx, result.Install, i.layout.Root, config.Frozen().Tool(), revision.Digest, captured[name].Path, captured[name].Digest, output)
+		executable, problem := packagepublish.CaptureDependency(result.PrivateProjectWheel)
+		if problem != nil {
+			return problem
+		}
+		generated, problem := launch.GenerateInterfaceWheel(ctx, result.Install, i.layout.Root, config.Frozen().Tool(), revision.Digest, executable.Path, executable.Digest, output)
 		if problem != nil {
 			return problem
 		}
@@ -184,11 +189,17 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		if problem := prepare(name, 0); problem != nil {
 			return problem
 		}
+		if len(bindings[name]) == 0 {
+			continue
+		}
 		i.Bindings = append(i.Bindings, bindings[name]...)
 		if len(i.Bindings) > 32 {
 			return exit.New(exit.Validation, "private parent exceeds 32 invocable dependency exports")
 		}
 		replacements[name] = overlays[name].Path
+	}
+	if len(replacements) == 0 {
+		return nil
 	}
 	overlay, problem := packagepublish.WithChildInterfaces(ctx, i.Package, replacements)
 	if problem != nil {
