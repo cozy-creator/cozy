@@ -1122,9 +1122,9 @@ func settledRequest(state string) bool {
 }
 
 // releaseConstraints reads the release's own immutable requirements so the SKU choice
-// above can decline a base that already contradicts them. It is ADVISORY: a package this
-// host cannot name, or a hub that will not answer, yields no constraints and therefore no
-// refusal — the pod remains the authority on whether the package runs (th-075).
+// above can decline a base that contradicts them. Automatic selection preserves its
+// advisory fallback on an unavailable release; explicit rental selection requires
+// these facts before submitting work.
 func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
 	if req.InstallID != "" && strings.HasPrefix(req.Package, "local/") {
 		_, store, problem := rentalStores(ctx)

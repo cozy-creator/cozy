@@ -278,3 +278,24 @@ func TestRequestedRentalFlowsToChildAndRetainedRetry(t *testing.T) {
 		t.Fatal("child replaced parent affinity")
 	}
 }
+
+func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
+	o := hostOwner(t, "requested-rental-identity")
+	for _, kind := range []string{"serving", "job"} {
+		sub := orchestrator.Submission{Kind: kind, Package: "proof/model", Entrypoint: "run", Payload: []byte("{}"), IdemKey: kind, Rental: true, RentalRequired: true, RequestedRental: "wanted"}
+		first, fresh, problem := o.c.RecordSubmission(sub)
+		fatal(t, problem)
+		if !fresh {
+			t.Fatal("first affinity submission replayed")
+		}
+		replay, fresh, problem := o.c.RecordSubmission(sub)
+		fatal(t, problem)
+		if fresh || replay.ID != first.ID {
+			t.Fatal("same affinity did not replay")
+		}
+		sub.RequestedRental = "other"
+		if _, _, problem := o.c.RecordSubmission(sub); problem == nil {
+			t.Fatal("idempotency key changed rental affinity")
+		}
+	}
+}

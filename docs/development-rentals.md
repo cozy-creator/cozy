@@ -1,6 +1,6 @@
 # Explicit development rentals
 
-`cozy rental new` will accept an explicit development mode and a caller-selected
+`cozy rent` will accept an explicit development mode and a caller-selected
 SSH public-key file. The exact key and mode become part of the existing durable
 paid request before the Hub is called. Normal invocations omit development intent.
 No caller chooses an arbitrary OCI image or provider port.

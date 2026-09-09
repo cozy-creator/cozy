@@ -227,7 +227,7 @@ cozy model yank org/model --release 1.0.0
 Checkpoint IDs are immutable. Release labels and their lane maps are mutable owner pointers. Ordinary
 consumers follow a release lane so fixes take effect; accepted runs freeze the checkpoint they resolved.
 
-With `--rental`, job packages resolve directly to their latest non-yanked immutable
+With `--rental-only` or a named `--rental`, job packages resolve directly to their latest non-yanked immutable
 Tensorhub releases. The transfer intent pins `(package, release)`; downloaded execution files carry
 their own exact refs, including `metadata/package-interface.json`.
 They do not need to be installable in the laptop's local Python environment. Local production still
@@ -429,22 +429,22 @@ reuse; job workers are reclaimed at terminal.
 With Tensorhub configured, rent generic private capacity:
 
 ```sh
-cozy rental new                    # Cozy GPUs, VRAM, and retail hourly prices
-cozy rental new h200                # prints e.g. otter
-cozy rental new h200 --model paul/minimax-h3@1.0.0/bf16
-cozy rental new h200 \
+cozy rent                    # Cozy GPUs, VRAM, and retail hourly prices
+cozy rent h200                # prints e.g. otter
+cozy rent h200 --model paul/minimax-h3@1.0.0/bf16
+cozy rent h200 \
   --idempotency-key <unique-key>
 
 cozy rental list                   # current rented machines, live on a terminal
-cozy run org/package/generate --rental prompt="moonlit lake"
+cozy run org/package/generate --rental=otter prompt="moonlit lake"
 cozy rental end otter
 ```
 
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
 reads RunPod SKU names or provider prices. `cozy run` is local-only by default, while
-`--rental` permits Creator to reuse or acquire remote capacity only when ready local capacity cannot
-run the request. `--rental-only` deliberately bypasses local capacity and requires an external
-rental. Both modes remain under the configured fleet ceiling. Creator names every private rental
+`--rental=<name-or-id>` uses only the selected existing rental. It does not permit a
+purchase or fallback onto another machine. `--rental-only` automatically reuses or acquires
+remote capacity under the configured fleet ceiling. Creator names every private rental
 with one memorable word, unique among this host's live rentals (a released word is drawn again);
 Tensorhub's identity for it is its `pr-…` id, which is what the provider-side pod is named after.
 The name carries no workload facts.
@@ -455,7 +455,7 @@ their shared object closure and required disk headroom. This declares capacity n
 and models are prepared when requests run. Retrying the same idempotency key reuses the pinned
 set, including when `--model` is omitted on the retry.
 
-Every rental the daemon owns — bought for a request or started with `cozy rental new` — ends on
+Every rental the daemon owns — bought for a request or started with `cozy rent` — ends on
 its own once nothing has been queued, running, or owed on it for `rentals.idle_release_s`
 (default 300). Running work on it is what keeps it: the clock restarts at each settled attempt,
 and a rental that never ran anything counts from the moment Tensorhub first reported it `ready`,
