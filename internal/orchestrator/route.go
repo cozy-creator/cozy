@@ -322,6 +322,9 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 	if w.exited || w.stopping || !w.supportsCurrentProtocol() || c.sessions[w.bootID] == nil {
 		return "", false
 	}
+	if req.RequestedRental != "" && (w.spec.Connection == nil || w.spec.Connection.RentalID != req.RequestedRental) {
+		return "", false
+	}
 	if w.spec.Connection == nil {
 		if req.RentalRequired || req.Worker != "" || w.spec.Placement.Package != req.Package {
 			return "", false

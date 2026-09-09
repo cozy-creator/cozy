@@ -1041,7 +1041,7 @@ func (s *Store) PinnedRentalWork(rentalID string) ([]Request, *exit.Error) {
 // that waited on a pod which died should still be able to say which pod that was.
 func (s *Store) UnpinRentalWork(requestID, rentalID string) (bool, *exit.Error) {
 	result, err := s.db.Exec(`UPDATE requests SET worker=''
-		WHERE id=? AND worker=? AND rental=1
+		WHERE id=? AND worker=? AND requested_rental=''  AND rental=1
 		  AND state IN ('submitted','queued','requeue_pending')`, requestID, rentalID)
 	if err != nil {
 		return false, exit.Internalf("cannot release request %s from rental %s: %s",
@@ -1067,6 +1067,7 @@ const (
 	// for everything to stop, and requeueing into a daemon that is shutting down would be
 	// answering a different question than the one they asked.
 	CancelAfterLoss
+	FailAfterLoss
 )
 
 // AbandonLostAttempt closes one open attempt whose EXECUTION CONTEXT IS PROVABLY GONE, and
@@ -1109,6 +1110,15 @@ func (s *Store) AbandonLostAttempt(requestID string, attempt int64, reason strin
 		return false, nil
 	}
 	switch outcome {
+	case FailAfterLoss:
+		if _, err := tx.Exec(`UPDATE requests SET state='failed' WHERE id=? AND state NOT IN (`+settledRequestStates+`)`, requestID); err != nil {
+			return false, exit.Internalf("cannot fail lost fixed-rental request: %s", err)
+		}
+		if err := appendEventTx(tx, requestID, "request.failed", attempt, map[string]any{
+			"status": "FAILED", "cause": "RENTAL_LOST", "error_type": "rental.selected_lost", "error": reason, "outputs": []any{}, "requeuing": false,
+		}); err != nil {
+			return false, exit.Internalf("cannot record selected rental loss: %s", err)
+		}
 	case CancelAfterLoss:
 		// The operator asked for everything to stop. The attempt's closure above is what
 		// makes this reachable at all: `CancelQueuedRequest` refuses a request that holds

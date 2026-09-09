@@ -71,6 +71,10 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 			return exit.Named(exit.Conflict, "request.state_lost", "retry predecessor %s's retained rental is %s", prior.ID, state)
 		}
 	}
+	if request.RequestedRental != "" && request.RequestedRental != prior.RequestedRental {
+		return exit.Named(exit.Conflict, "request.retry_rental_changed", "retry cannot change requested rental")
+	}
+	request.RequestedRental = prior.RequestedRental
 	request.Worker, request.Rental, request.RentalRequired = prior.Worker, prior.Rental, prior.RentalRequired
 	request.ReuseScope = prior.ReuseScope
 	if request.ReuseScope == "" {

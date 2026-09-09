@@ -78,9 +78,9 @@ func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
 
 	// The ladder itself states ONE price per rung and it is the whole one — the figure
 	// that surprised Paul is the figure on the table.
-	code, out := runCozy(t, root, "rental", "new")
+	code, out := runCozy(t, root, "rent")
 	if code != 0 {
-		t.Fatalf("cozy rental new [exit %d]:\n%s", code, out)
+		t.Fatalf("cozy rent [exit %d]:\n%s", code, out)
 	}
 	for _, want := range []string{"$0.70/hr", "$2.17/hr", "PRICE"} {
 		if !strings.Contains(out, want) {
@@ -95,9 +95,9 @@ func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
 	}
 	// The decomposition is retained, one flag away: both widths of the card carry their
 	// own GPU rate beside the one pod-disk adder.
-	code, full := runCozy(t, root, "rental", "new", "--full")
+	code, full := runCozy(t, root, "rent", "--full")
 	if code != 0 {
-		t.Fatalf("cozy rental new --full [exit %d]:\n%s", code, full)
+		t.Fatalf("cozy rent --full [exit %d]:\n%s", code, full)
 	}
 	for _, want := range []string{
 		"$0.49/hr", "$0.21/hr", "$0.70/hr", // the L4 rung, decomposed
@@ -210,7 +210,7 @@ func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 		}
 	}
 	hubServer.mu.Unlock()
-	code, raw, _ = runCozyStreams(t, root, "rental", "new", "l4", "--json")
+	code, raw, _ = runCozyStreams(t, root, "rent", "l4", "--json")
 	var failed struct {
 		Error struct {
 			Code string `json:"code"`

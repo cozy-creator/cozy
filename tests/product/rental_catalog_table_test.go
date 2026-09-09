@@ -83,9 +83,9 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		gpu("rtx-pro-6000-maxq", "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "12.0", 96, 1_590_000),
 	)
 
-	code, out := runCozy(t, root, "rental", "new")
+	code, out := runCozy(t, root, "rent")
 	if code != 0 {
-		t.Fatalf("cozy rental new [exit %d]:\n%s", code, out)
+		t.Fatalf("cozy rent [exit %d]:\n%s", code, out)
 	}
 	header, rows, order := catalogTable(t, out)
 	want := []string{"NAME", "GPU", "COMPUTE", "VRAM", "PRICE"}
@@ -152,9 +152,9 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 
 	// --full still carries th-126's decomposition AND the verbatim provider id: the id
 	// Tensorhub matches live offers against is shortened for reading, never rewritten.
-	code, full := runCozy(t, root, "rental", "new", "--full")
+	code, full := runCozy(t, root, "rent", "--full")
 	if code != 0 {
-		t.Fatalf("cozy rental new --full [exit %d]:\n%s", code, full)
+		t.Fatalf("cozy rent --full [exit %d]:\n%s", code, full)
 	}
 	for _, kept := range []string{
 		"ACCELERATOR MODEL", "GPU PRICE", "STORAGE PRICE",

@@ -28,7 +28,7 @@ const (
 )
 
 // marketWithA4000 is what RunPod published at 03:00:11 on 2026-09-04, when an explicit
-// `cozy rental new rtx-a4000` succeeded and acquired `cisqua`.
+// `cozy rent rtx-a4000` succeeded and acquired `cisqua`.
 func marketWithA4000() []hub.RentalSKU {
 	return append(marketWithoutA4000(), hub.RentalSKU{
 		Name: "rtx-a4000", AcceleratorModel: "NVIDIA RTX A4000", AcceleratorCount: 1,
@@ -194,7 +194,7 @@ func TestRentalProvenanceSurvivesToTheRecord(t *testing.T) {
 	}
 	defer store.Close()
 
-	explicit := "cozy rental new rtx-a4000"
+	explicit := "cozy rent rtx-a4000"
 	managed := rental.AcquisitionReason(records.Request{
 		ID: "req-59119a5207ab58898ac5d626", Package: "paul/sdxl"})
 	job := rental.AcquisitionReason(records.Request{

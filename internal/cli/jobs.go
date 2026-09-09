@@ -62,11 +62,15 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 
+	selectedRental, e := requestedRental(ctx, target, job.Name)
+	if e != nil {
+		return e
+	}
 	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
 		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
-		RentalRequired: ctx.Inv.Bool("--rental-only"), OutputDirectory: outputDirectory}
+		RentalRequired: ctx.Inv.Bool("--rental-only") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory}
 	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides)
 	if e != nil {
 		return e
@@ -87,7 +91,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 			{K: "target", V: target.Package + "/" + target.Function}, {K: "release", V: target.Release},
 			{K: "input", V: input}, {K: "models", V: models},
 			{K: "publish_to", V: ctx.Inv.Value("--publish-to")},
-			{K: "status", V: "planned"}, {K: "changed", V: false},
+			{K: "status", V: "planned"}, {K: "changed", V: false}, {K: "requested_rental", V: selectedRental},
 		}, "target", "release", "models", "publish_to", "status", "changed"))
 	}
 	c, e := dial(ctx)

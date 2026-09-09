@@ -134,7 +134,10 @@ func validateRunPlacement(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--rental") && ctx.Inv.Bool("--rental-only") {
 		return exit.Usagef("--rental and --rental-only are mutually exclusive")
 	}
-	managedRental := rentalRequested(ctx)
+	if ctx.Inv.Value("--rental") != "" && (ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only")) {
+		return exit.Usagef("a named --rental cannot be combined with --rental-only")
+	}
+	managedRental := ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only")
 	if managedRental && ctx.Cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
 		return exit.Named(exit.Usage, "rental.spend_cap_required",
 			"rented execution requires a positive rentals.max_hourly_spend_usd in %s", filepath.Join(ctx.Cfg.Home, "config.yaml")).
@@ -144,11 +147,15 @@ func validateRunPlacement(ctx *Context) *exit.Error {
 }
 
 func rentalRequested(ctx *Context) bool {
-	return ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only")
+	return ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != ""
 }
 
 func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	deadline, e := runDeadline(ctx)
+	if e != nil {
+		return e
+	}
+	selectedRental, e := requestedRental(ctx, target, ep.Name)
 	if e != nil {
 		return e
 	}
@@ -197,7 +204,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, Rental: managedRental,
-		RentalRequired:  ctx.Inv.Bool("--rental-only"),
+		RentalRequired:  ctx.Inv.Bool("--rental-only") || selectedRental != "",
+		RequestedRental: selectedRental,
 		Models:          models,
 		OutputDirectory: outputDirectory,
 	}, key)

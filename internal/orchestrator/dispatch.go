@@ -78,7 +78,8 @@ type Submission struct {
 
 	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
 	// through Options.Rentals). Empty = any local worker.
-	Worker string
+	Worker          string
+	RequestedRental string
 	// InstallID pins a durable request to one immutable local install resolution.
 	// Remote requests instead carry their immutable Release.
 	InstallID string
@@ -175,6 +176,12 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 }
 
 func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
+	if s.RequestedRental != "" {
+		if s.Worker != "" && s.Worker != s.RequestedRental {
+			return records.Request{}, nil, exit.New(exit.Conflict, "assigned rental differs from requested rental")
+		}
+		s.RentalRequired = true
+	}
 	if s.RentalRequired {
 		s.Rental = true
 	}
@@ -191,11 +198,14 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	if bodyDigest == "" {
 		identity := s.Payload
 		if s.Rental {
-			encoded, err := canonical.Write(map[string]canonical.Value{
-				"payload":         base64.StdEncoding.EncodeToString(s.Payload),
-				"rental":          true,
-				"rental_required": s.RentalRequired,
-			})
+			document := map[string]canonical.Value{
+				"payload": base64.StdEncoding.EncodeToString(s.Payload),
+				"rental":  true, "rental_required": s.RentalRequired,
+			}
+			if s.RequestedRental != "" {
+				document["requested_rental"] = s.RequestedRental
+			}
+			encoded, err := canonical.Write(document)
 			if err != nil {
 				return records.Request{}, nil, exit.Internalf("cannot encode request budget identity: %s", err)
 			}
@@ -239,7 +249,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Outputs:            strings.Join(s.Outputs, ","),
 		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
 		Kind: s.Kind, RetainWork: s.RetainWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
+		RequestedRental: s.RequestedRental,
+		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
 	}
@@ -553,7 +564,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			}
 		}
 		if reason != "" {
-			if req.RetainWork {
+			if req.RetainWork || req.RequestedRental != "" {
 				c.failQueued(req.ID, exit.Named(exit.Conflict, "request.retained_rental_unavailable", "the retained rental cannot execute this transaction (%s)", reason), "")
 				return
 			}

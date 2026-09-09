@@ -19,6 +19,11 @@ func AcceleratorRequired(requirements []string) bool {
 }
 
 func requirementName(requirement string) string {
+	name, _ := requirementParts(requirement)
+	return name
+}
+
+func requirementParts(requirement string) (string, string) {
 	requirement = strings.TrimSpace(requirement)
 	end := 0
 	for end < len(requirement) {
@@ -30,5 +35,5 @@ func requirementName(requirement string) string {
 		end++
 	}
 	name := strings.ToLower(requirement[:end])
-	return strings.NewReplacer("_", "-", ".", "-").Replace(name)
+	return strings.Join(strings.FieldsFunc(name, func(r rune) bool { return r == '-' || r == '_' || r == '.' }), "-"), strings.TrimSpace(requirement[end:])
 }

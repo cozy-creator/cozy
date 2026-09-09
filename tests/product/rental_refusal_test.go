@@ -13,7 +13,7 @@ import (
 // th-150 arm 2. The catalog is live provider inventory, so a name it does not
 // carry means one of two opposite things, and both used to be spelled
 // "Tensorhub currently offers no rental SKU". On 2026-09-04 an explicit
-// `cozy rental new rtx-a4000` was refused during a 32-minute stock-out; the
+// `cozy rent rtx-a4000` was refused during a 32-minute stock-out; the
 // message read as "no such machine"; the conclusion drawn was that the rental
 // code had substituted a dearer card. It had not.
 func refusalCatalog() []hub.RentalSKU {

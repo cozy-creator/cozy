@@ -623,3 +623,11 @@ error, and `1` operational failure.
 
 Billing management, datasets, passkey recovery, and the full web UI are planned later; Cozy does
 not advertise placeholder commands for features that do not exist yet.
+
+
+Choose existing capacity explicitly with `cozy run org/package/function --rental=name`
+(or its rental ID). This constraint survives retries and daemon restarts. If that
+rental becomes unavailable, the run fails or retains its work; it never buys a
+replacement or moves onto another machine. `--rental-only` retains automatic remote
+allocation. Create capacity with `cozy rent <sku>`, such as `cozy rent h100-sxm5-80gb-x2`;
+`cozy rent` alone lists the current catalog.

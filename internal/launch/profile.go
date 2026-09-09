@@ -4,6 +4,9 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/packagepublish"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+
 	pep440 "github.com/aquasecurity/go-pep440-version"
 )
 
@@ -115,8 +118,7 @@ func pythonMismatch(profile BaseProfile, requiresPython string) string {
 // requirement carrying extras, an environment marker, or a direct URL is reported
 // undecidable rather than guessed at.
 func requirementSpecifiers(requirement string) (pep440.Specifiers, bool) {
-	rest := strings.TrimSpace(requirement)
-	rest = strings.TrimSpace(rest[len(requirementName(requirement)):])
+	_, rest := requirementParts(requirement)
 	if rest == "" || strings.ContainsAny(rest, "[;@") {
 		return pep440.Specifiers{}, false
 	}
@@ -125,4 +127,48 @@ func requirementSpecifiers(requirement string) (pep440.Specifiers, bool) {
 		return pep440.Specifiers{}, false
 	}
 	return specifiers, true
+}
+
+// InventoryMismatch checks only protected base distributions. Incidental image
+// libraries may be replaced by captured wheels. Marked requirements stay undecided here.
+func InventoryMismatch(inventory *pb.ImageInventory, requirements []string, requiresPython string) string {
+	if inventory == nil {
+		return "the rental image inventory is absent"
+	}
+	if requiresPython != "" {
+		current, err := pep440.Parse(inventory.Python)
+		bounds, boundsErr := pep440.NewSpecifiers(requiresPython)
+		if err == nil && boundsErr == nil && !bounds.Check(current) {
+			return "Python " + inventory.Python + " does not satisfy " + requiresPython
+		}
+	}
+	installed := map[string]string{}
+	for _, row := range inventory.Distributions {
+		installed[requirementName(row.Distribution)] = row.Version
+	}
+	for _, requirement := range requirements {
+		name, tail := requirementParts(requirement)
+		if !packagepublish.ImageOwnedDistribution(name) {
+			continue
+		}
+		if strings.HasPrefix(tail, "[") {
+			if end := strings.Index(tail, "]"); end >= 0 {
+				tail = strings.TrimSpace(tail[end+1:])
+			}
+		}
+		// Markers and direct references remain the worker's exact resolver's decision.
+		if strings.ContainsAny(tail, ";@") {
+			continue
+		}
+		carried, present := installed[name]
+		if !present {
+			return "the rental image does not provide required base distribution " + name
+		}
+		bounds, err := pep440.NewSpecifiers(tail)
+		version, versionErr := pep440.Parse(carried)
+		if err == nil && versionErr == nil && !bounds.Check(version) {
+			return name + " " + carried + " does not satisfy " + strings.TrimSpace(requirement)
+		}
+	}
+	return ""
 }
