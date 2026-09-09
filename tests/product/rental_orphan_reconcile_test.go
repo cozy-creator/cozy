@@ -67,20 +67,14 @@ func TestRentalListNamesMachinesThisHostNeverRecorded(t *testing.T) {
 	if !strings.Contains(out, "Current spend per hour: $3.19") {
 		t.Fatalf("the burn does not carry the unrecorded machine's rate\n%s", out)
 	}
-	if !strings.Contains(out, "Machines this account is billed for that this host has no record of: 1") {
-		t.Fatalf("the board does not distinguish an unrecorded machine from a recorded one\n%s", out)
-	}
-	// This controller cannot infer inactivity from its missing local history.
-	if !strings.Contains(out, "activity on those machines is unknown") || strings.Contains(out, "cozy rental end") {
-		t.Fatalf("the board treats missing local activity as a reason to end a machine\n%s", out)
+	if strings.Contains(out, "RECORDED") || strings.Contains(out, "this host has no record") || strings.Contains(out, "cozy rental end") {
+		t.Fatalf("ordinary fleet display exposes controller bookkeeping or suggests ending unseen work\n%s", out)
 	}
 	if code, selected := runCozy(t, root, "rental", "list", "--fields=machine,running,queued"); code != 0 || !regexp.MustCompile(`(?m)^stiyl\s+—\s+—\s*$`).MatchString(selected) {
 		t.Fatalf("unknown activity became zero in the table [exit %d]\n%s", code, selected)
 	}
-	// And the row itself says which kind it is, in the table a person reads: a lead
-	// line saying "1 of them" over rows that all look alike names a count, not a machine.
-	if !strings.Contains(out, "RECORDED") || !strings.Contains(out, "no") {
-		t.Fatalf("the board does not mark WHICH row the account is billed for blind\n%s", out)
+	if code, selected := runCozy(t, root, "rental", "list", "--fields=machine,$/hour"); code != 0 || !regexp.MustCompile(`(?m)^stiyl\s+\$3\.19\s*$`).MatchString(selected) {
+		t.Fatalf("hub rental lost its hourly rate [exit %d]\n%s", code, selected)
 	}
 
 	// The machine document carries it as a fact a program can branch on, not a spelling.
@@ -122,6 +116,11 @@ func TestRentalListNamesMachinesThisHostNeverRecorded(t *testing.T) {
 	if row["rented_at"] != "2026-09-07T21:18:49Z" {
 		t.Fatalf("the unrecorded row lost the moment its billing began: %s", out)
 	}
+	stand.setRate("pr-1111111111111111stiy", 0)
+	if code, selected := runCozy(t, root, "rental", "list", "--fields=machine,$/hour"); code != 0 || !regexp.MustCompile(`(?m)^stiyl\s+unknown\s*$`).MatchString(selected) {
+		t.Fatalf("a missing hourly rate was displayed as free [exit %d]\n%s", code, selected)
+	}
+
 }
 
 // TestEndingAnUnrecordedMachineByItsHubNameReleasesIt is the actionable half: the

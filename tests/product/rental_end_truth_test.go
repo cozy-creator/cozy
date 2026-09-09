@@ -222,6 +222,10 @@ func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 		t.Fatalf("a paid pod with no local record is invisible on the board\n%s", board)
 	}
 
+	if code, rates := runCozy(t, root, "rental", "list", "--fields=machine,$/hour"); code != 0 || !strings.Contains(rates, fmt.Sprintf("$%.2f", float64(operations[0].HourlyRateUSDMicros)/1_000_000)) {
+		t.Fatalf("unattached paid ask has no hourly rate [exit %d]\n%s", code, rates)
+	}
+
 	// And the machine word ends the machine, which is the whole ask.
 	code, out = runCozy(t, root, "rental", "end", machine, "--json")
 	if code != 0 || !strings.Contains(out, `"state":"ended"`) || !strings.Contains(out, `"changed":true`) {

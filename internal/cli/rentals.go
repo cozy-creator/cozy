@@ -858,7 +858,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"image": r.Failure.BaseWorkerImageDigest, "provider": r.Failure.Provider,
 			"provider resource": r.Failure.ProviderResourceID, "provider host": r.Failure.ProviderHostID,
 			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
-			"recorded": "yes", "$/hour": rentalHourlyRate(r.HourlyRateUSDMicros),
+			"$/hour": rentalHourlyRate(r.HourlyRateUSDMicros),
 		})
 		typed := map[string]any{
 			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
@@ -917,7 +917,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"rented": orNone(seen.CreatedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": "", "provider": "", "provider resource": "", "provider host": "",
 			"provider state": seen.ProviderState, "container state": seen.ContainerState,
-			"recorded": "no", "$/hour": rentalHourlyRate(seen.HourlyRateUSDMicros),
+			"$/hour": rentalHourlyRate(seen.HourlyRateUSDMicros),
 		})
 		typed := map[string]any{
 			"machine": seen.Name, "state": seen.State, "rental_id": seen.ID,
@@ -938,21 +938,11 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		for _, seen := range unrecorded {
 			unrecordedBurn += seen.HourlyRateUSDMicros
 		}
-		// The column appears only when it separates two kinds of row, the way the
-		// FAILURE column does: a board of rentals this host filed says nothing by
-		// carrying a whole column of `yes`.
-		list.Fields = append(list.Fields, "recorded")
-		list.AllFields = append(list.AllFields, "recorded")
 		list.TypedFields = append(list.TypedFields, "recorded")
 		list.TypedAllFields = append(list.TypedAllFields, "recorded")
-		list.Lead = append(list.Lead, fmt.Sprintf(
-			"Machines this account is billed for that this host has no record of: %d (%s)",
-			len(unrecorded), usdPerHourBare(unrecordedBurn)))
 		list.Aggregates = append(list.Aggregates,
 			output.Field{K: "unrecorded_rentals", V: jsonFact{len(unrecorded)}},
 			output.Field{K: "unrecorded_hourly_spend_usd_micros", V: jsonFact{unrecordedBurn}})
-		list.Trail = append(list.Trail,
-			"Unrecorded means this controller has no local history; running and queued activity on those machines is unknown.")
 	}
 	switch {
 	case listingProblem != nil:
@@ -998,7 +988,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"accelerator": "—", "address": "", "media": "", "hub": op.Hub,
 			"rented": stamp(op.CreatedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": "", "provider": "", "provider resource": "", "provider host": "",
-			"provider state": "", "container state": "", "recorded": "yes",
+			"provider state": "", "container state": "",
 			"$/hour": rentalHourlyRate(op.HourlyRateUSDMicros),
 		})
 		typed := map[string]any{

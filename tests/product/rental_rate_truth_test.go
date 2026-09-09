@@ -45,6 +45,15 @@ func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "Current spend per hour: $0.72") {
 		t.Fatalf("the burn line still says the quote [exit %d]:\n%s", code, out)
 	}
+	for _, args := range [][]string{
+		{"rental", "list", "--fields=machine,$/hour"},
+		{"rental", "list", "--full", "--fields=machine,$/hour"},
+	} {
+		code, listed := runCozy(t, root, args...)
+		if code != 0 || !strings.Contains(listed, "$/HOUR") || !strings.Contains(listed, "$0.72") || strings.Contains(listed, "$0.50") {
+			t.Fatalf("rental row does not show the reconciled billed rate [exit %d]:\n%s", code, listed)
+		}
+	}
 	row, problem := store.RentalRow("pr-redarm")
 	fatal(t, problem)
 	if row == nil || row.HourlyRateUSDMicros != 720_000 {
