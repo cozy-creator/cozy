@@ -51,6 +51,11 @@ type Submission struct {
 	// OutputDirectory is the caller's --out. Empty means the package's own store under
 	// outputs/, which every run exports to.
 	OutputDirectory string `json:"output_directory,omitempty"`
+	// AttentionKernel is the execution-path override (cr-125): the attention kernel this
+	// request pins, by the runtime's own vocabulary. Empty on every ordinary run, and it
+	// reaches exactly one place — the InvocationSpec. It is not a placement fact, so it never
+	// enters the ladder, the rental or the plan.
+	AttentionKernel string `json:"attention_kernel,omitempty"`
 	AttemptKey      string `json:"-"`
 }
 
@@ -234,6 +239,9 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		RentalRequired:     sub.RentalRequired,
 		Models:             models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
+		// A REPLAY RUNS WHAT WAS RECORDED. The pin is inside the invocation digest, so a key
+		// re-sent with a different kernel must conflict rather than quietly re-pin.
+		AttentionKernel: recorded.AttentionKernel,
 	}
 }
 
@@ -359,6 +367,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		Rental:  sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
 		OutputDirectory: sub.OutputDirectory,
+		AttentionKernel: sub.AttentionKernel,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")

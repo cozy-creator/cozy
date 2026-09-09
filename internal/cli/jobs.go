@@ -53,6 +53,15 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e := validateInvocationPayload(ctx, target.Package, job, input); e != nil {
 		return e
 	}
+	if overrides.AttentionKernel != "" {
+		// THE OVERRIDE IS A SERVING INSTRUMENT (cr-125). A job's product is bytes somebody
+		// keeps, and a kernel that changes the numbers has no business deciding what those
+		// bytes are; the A/B it exists for is two serving attempts on one prepared pod.
+		return exit.Named(exit.Usage, "kernel_override_not_serving",
+			"kernel.attention pins the execution path of a SERVING attempt; %s is a job",
+			target.Function).
+			WithRemedy("measure a kernel with `cozy run <package>/<function> kernel.attention=<name>`")
+	}
 	trees, e := parseTrees(ctx.Inv.Values["--input"])
 	if e != nil {
 		return e
@@ -63,7 +72,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentalRequired: ctx.Inv.Bool("--rental-only")}
-	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides)
+	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides.Models)
 	if e != nil {
 		return e
 	}

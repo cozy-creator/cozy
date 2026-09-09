@@ -179,7 +179,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e := validateInvocationPayload(ctx, target.Package, ep, input); e != nil {
 		return e
 	}
-	models, e := resolveInvocationModels(ctx, target, ep, overrides, managedRental)
+	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models, managedRental)
 	if e != nil {
 		return e
 	}
@@ -204,6 +204,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		RentalRequired:  ctx.Inv.Bool("--rental-only"),
 		Models:          models,
 		OutputDirectory: outputDirectory,
+		// THE EXECUTION-PATH OVERRIDE (cr-125). It rides the request to the InvocationSpec and
+		// nowhere else: it is not part of the placement decision, the ladder, or the rental.
+		AttentionKernel: overrides.AttentionKernel,
 	}, key)
 	if e != nil {
 		return e

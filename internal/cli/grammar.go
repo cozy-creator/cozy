@@ -325,7 +325,7 @@ type RunCmd struct {
 
 type RunExecuteCmd struct {
 	Target         string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
-	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and --model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
+	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=<name> to pin one attention kernel for this request (DEV)."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`

@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 36
+const schemaVersion = 37
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -676,7 +676,8 @@ func migrateModelTransferOutputs(tx *sql.Tx, path string) *exit.Error {
 	return nil
 }
 
-// migrateRequests rebuilds the requests table on every migration: before schema 11 to derive
+// migrateRequests rebuilds the requests table on every migration: at schema 37 to carry the
+// execution-path override (cr-125), before schema 11 to derive
 // the accelerator-class fact from the retired GPU count, at schema 12 because the row's own
 // DDL text names the install table it references, at schema 15 because the editable
 // revision columns are spelled `local_package_*`, and at schema 17 to record the rental's
@@ -731,6 +732,10 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	if sourceVersion >= 33 {
 		destinationColumns += ",capture"
 		selectColumns += ",capture"
+	}
+	if sourceVersion >= 37 {
+		destinationColumns += ",attention_kernel"
+		selectColumns += ",attention_kernel"
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
 		` FROM requests_prior`); err != nil {
@@ -911,6 +916,9 @@ func priorStatements(version int) []string {
 		}
 		if requestStatement && version < 33 {
 			stmt = strings.Replace(stmt, "  capture      TEXT    NOT NULL DEFAULT '',\n", "", 1)
+		}
+		if requestStatement && version < 37 {
+			stmt = strings.Replace(stmt, "  attention_kernel TEXT NOT NULL DEFAULT '',\n", "", 1)
 		}
 		if version < 35 {
 			stmt = strings.ReplaceAll(stmt, "call_index<4294967296", "call_index<32")

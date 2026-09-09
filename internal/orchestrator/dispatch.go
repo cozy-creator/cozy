@@ -90,6 +90,11 @@ type Submission struct {
 	// OutputDirectory is the caller's explicit --out; empty means the package's store.
 	// It is part of the submission's identity, where the derived intent below is not.
 	OutputDirectory string
+	// AttentionKernel is the execution-path override (cr-125), and it decides HOW rather than
+	// WHAT: it rides the InvocationSpec to the worker and reaches no other record. Placement,
+	// the ladder, the rental and the checkpoint never see it, because attention is weightless
+	// and a kernel is not a fact about capacity.
+	AttentionKernel string
 	// OutputExport is the derived publication obligation: the directory (explicit or
 	// default) and the result-file contract. It changes no execution fact and is settled
 	// independently after the terminal mirror.
@@ -207,6 +212,24 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 		bodyDigest = spelled
 	}
+	if s.AttentionKernel != "" {
+		// THE PIN IS PART OF THE SUBMISSION'S IDENTITY. One idempotency key re-sent with a
+		// different kernel is a different question and must CONFLICT, never replay the first
+		// answer under the second name.
+		identity, err := canonical.Write(map[string]canonical.Value{
+			"body_digest":      bodyDigest,
+			"attention_kernel": s.AttentionKernel,
+		})
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf(
+				"cannot encode the pinned request identity: %s", err)
+		}
+		bodyDigest, err = canonical.Spell(canonical.Digest(identity))
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf(
+				"cannot digest the pinned request identity: %s", err)
+		}
+	}
 	if s.LocalPackageDigest != "" {
 		if s.InstallID == "" || !validDigest(s.LocalPackageDigest) {
 			return records.Request{}, nil, exit.Named(exit.Structural,
@@ -241,12 +264,16 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Kind: s.Kind, RetainWork: s.RetainWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
-		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
+		AttentionKernel: s.AttentionKernel,
+		OutputExport:    s.OutputExport, ModelTransfer: s.ModelTransfer,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"weights_outputs": weightsOutputs,
+	}
+	if s.AttentionKernel != "" {
+		event["attention_kernel"] = s.AttentionKernel
 	}
 	if s.Rental {
 		event["rental"] = true
@@ -1484,6 +1511,13 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			},
 		}}
 	}
+	if req.AttentionKernel != "" {
+		// THE EXECUTION-PATH OVERRIDE, INSIDE THE DIGEST (cr-125). Two attempts on one
+		// prepared pod that differ only by their pin are two different invocations, which is
+		// the property the A/B rests on. The worker refuses typed if it cannot honour it, so
+		// a SUCCEEDED attempt carrying this field served this kernel.
+		spec.AttentionKernel = req.AttentionKernel
+	}
 	if req.Capture != "" {
 		var capture pb.ActivationCapture
 		if err := json.Unmarshal([]byte(req.Capture), &capture); err != nil {
@@ -1572,6 +1606,11 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		len(canonicalBytes), placementID, orNone(laneID), strings.Join(laneDevices, ","),
 		admissionEpoch, req.Outputs, w.instanceID)
 	event := map[string]any{"instance_id": w.instanceID, "invocation_digest": spelled}
+	// THE KERNEL THIS ATTEMPT PINNED rides the durable event beside the lane it drew from
+	// (proto-024's rule): what an attempt ran on is a fact a user reads back, not a log line.
+	if req.AttentionKernel != "" {
+		event["attention_kernel"] = req.AttentionKernel
+	}
 	if placementID != "" {
 		event["placement_id"] = placementID
 	}
