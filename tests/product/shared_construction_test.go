@@ -217,6 +217,46 @@ func TestRemoteReleaseSharesSlotsOfOneConstruction(t *testing.T) {
 	if got := shared(sharedFirst, foreign); len(got) != 0 {
 		t.Fatalf("a lane the sibling's ladder never offered shares %v, want nothing", got)
 	}
+	// A sibling may share the base class yet require an additional model. Neither
+	// an absent default nor a default for bytes this request did not select may
+	// leave its base slot in the preparation's selected set.
+	var document map[string]any
+	must(t, json.Unmarshal(iface, &document))
+	sibling := document["entrypoints"].([]any)[1].(map[string]any)
+	sibling["models"] = append(sibling["models"].([]any), map[string]any{
+		"class": "Adapter", "component_use": map[string]any{}, "path": sharedSecond + ".models.adapter",
+	})
+	setInterface := func() {
+		t.Helper()
+		changed, err := json.Marshal(document)
+		must(t, err)
+		parsed, problem := launch.DecodePackageInterface(changed)
+		fatal(t, problem)
+		detail.PackageInterface = changed
+		detail.Release.PackageInterfaceDigest = parsed.Digest
+		detail.Release.PackageInterfaceLength = int64(len(changed))
+	}
+	setInterface()
+	if got := shared(sharedFirst, unpinned); len(got) != 0 {
+		t.Fatalf("an unbound sibling leaked partial shared slots: %v", got)
+	}
+	bindings = append(bindings, hub.PackageBindingRow{Slot: sharedSecond + ".models.adapter", Model: "proof/adapter", Release: "1.0.0", Ladder: ladder, Revision: 1})
+	if got := shared(sharedFirst, unpinned); len(got) != 0 {
+		t.Fatalf("an unselected sibling adapter leaked partial shared slots: %v", got)
+	}
+	// When one already-selected construction supplies every sibling slot, retain
+	// the original sharing optimization for all of those slots together.
+	adapter := sibling["models"].([]any)[1].(map[string]any)
+	adapter["class"] = "H3Model"
+	bindings[len(bindings)-1].Model = "proof/minimax"
+	setInterface()
+	if got := shared(sharedFirst, unpinned); !slices.Equal(got, []string{sharedSecond + ".models.adapter", sharedSecond + ".models.model"}) {
+		t.Fatalf("a fully covered sibling was not shared as a complete set: %v", got)
+	}
+	// Restore the original interface for the ladder/release mismatch arms.
+	detail.PackageInterface = iface
+	detail.Release.PackageInterfaceDigest = contract.Digest
+	detail.Release.PackageInterfaceLength = int64(len(iface))
 	bindings[1].Ladder = []hub.BindingRung{{GPU: "*", Lane: "bf16-full"}}
 	if got := shared(sharedFirst, unpinned); len(got) != 0 {
 		t.Fatalf("a sibling bound under another ladder shares %v, want nothing", got)

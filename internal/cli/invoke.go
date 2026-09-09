@@ -425,8 +425,11 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 					"%s has no authored default for model slot %s", target.Package, slot.Path).
 					WithRemedy("model.%s=org/model@release[/lane]", slot.Param)
 			}
-			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
-				"%s has no owner binding or authored default for model slot %s", target.Package, slot.Path).
+			message := fmt.Sprintf("%s has no owner binding or authored default for model slot %s", target.Package, slot.Path)
+			if ep.Kind != "job" {
+				message = fmt.Sprintf("%s/%s is disabled in this deployment: no default model binding for %s", target.Package, ep.Name, slot.Param)
+			}
+			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable", "%s", message).
 				WithRemedy("bind it: %s — or override this run: model.%s=org/model@release[/lane]",
 					bindRemedy(target.Package, slot.Path), slot.Param)
 		}
@@ -2235,10 +2238,21 @@ func describeBindings(ctx *Context, target Target, ep *launch.Entrypoint) map[st
 }
 
 func emitFunctions(ctx *Context, target Target, packageInterface *launch.PackageInterface) *exit.Error {
-	list := output.List{Name: "functions", Fields: []string{"function"}, AllFields: []string{"function"}}
+	slots := declaredModelSlots(packageInterface.Entrypoints)
+	defaults := effectiveModelBindings(slots, nil)
+	var bindingProblem *exit.Error
+	if len(slots) > 0 && !strings.HasPrefix(target.Package, "local/") {
+		defaults, bindingProblem = invocationDefaultBindings(ctx, target, slots)
+	}
+	list := output.List{Name: "functions", Fields: []string{"function", "availability"}, AllFields: []string{"function", "availability"}}
 	for _, name := range packageInterface.Names() {
-		list.Rows = append(list.Rows, map[string]string{"function": name})
-		if len(list.Next) < 2 {
+		callable, _ := packageInterface.Function(name)
+		availability := modelDefaultAvailability(callable, defaults)
+		if bindingProblem != nil && callable.Kind != "job" && len(callable.Models) > 0 {
+			availability = "unknown: defaults unavailable"
+		}
+		list.Rows = append(list.Rows, map[string]string{"function": name, "availability": availability})
+		if availability == "available" && len(list.Next) < 2 {
 			list.Next = append(list.Next, "cozy run "+target.Package+"/"+name)
 		}
 	}
