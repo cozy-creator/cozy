@@ -91,6 +91,9 @@ type Submission struct {
 	// OutputDirectory is the caller's explicit --out; empty means the package's store.
 	// It is part of the submission's identity, where the derived intent below is not.
 	OutputDirectory string
+	// AttentionKernel is an optional developer execution-path pin. It affects only the
+	// InvocationSpec and is intentionally excluded from placement and model resolution.
+	AttentionKernel string
 	// OutputExport is the derived publication obligation: the directory (explicit or
 	// default) and the result-file contract. It changes no execution fact and is settled
 	// independently after the terminal mirror.
@@ -217,6 +220,19 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 		bodyDigest = spelled
 	}
+	if s.AttentionKernel != "" {
+		identity, err := canonical.Write(map[string]canonical.Value{
+			"body_digest":      bodyDigest,
+			"attention_kernel": s.AttentionKernel,
+		})
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf("cannot encode pinned request identity: %s", err)
+		}
+		bodyDigest, err = canonical.Spell(canonical.Digest(identity))
+		if err != nil {
+			return records.Request{}, nil, exit.Internalf("cannot digest pinned request identity: %s", err)
+		}
+	}
 	if s.LocalPackageDigest != "" {
 		if s.InstallID == "" || !validDigest(s.LocalPackageDigest) {
 			return records.Request{}, nil, exit.Named(exit.Structural,
@@ -258,6 +274,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"weights_outputs": weightsOutputs,
+	}
+	if s.AttentionKernel != "" {
+		event["attention_kernel"] = s.AttentionKernel
 	}
 	if s.Rental {
 		event["rental"] = true
@@ -1481,6 +1500,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		PayloadDigest:     payloadDigest,
 		Inputs:            inputBindings(req, payloadDigest),
 		Outputs:           invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
+		AttentionKernel:   req.AttentionKernel,
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingDigest: req.PlanID,
 			BindingsDigest:          servingPlacement.BindingsDigest,

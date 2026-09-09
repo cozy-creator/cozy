@@ -17769,10 +17769,16 @@ type InvocationSpec struct {
 	//
 	//	*InvocationSpec_Serving
 	//	*InvocationSpec_Job
-	Spec          isInvocationSpec_Spec `protobuf_oneof:"spec"`
-	Capture       *ActivationCapture    `protobuf:"bytes,10,opt,name=capture,proto3" json:"capture,omitempty"` // MINOR43; immutable requested capture semantics
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Spec    isInvocationSpec_Spec `protobuf_oneof:"spec"`
+	Capture *ActivationCapture    `protobuf:"bytes,10,opt,name=capture,proto3" json:"capture,omitempty"` // MINOR43; immutable requested capture semantics
+	// MINOR48, the execution-path override (cr-125). The attention kernel this attempt
+	// pins, by `attention.BY_NAME`; empty leaves the runtime's own selection alone. INSIDE
+	// the digest: it changes what the attempt computes. A pin the worker cannot honour is a
+	// typed refusal, never a quiet fallback, so a non-empty value here is a fact about what
+	// ran. Developer instrument only: nothing on the hub-driven production path sets it.
+	AttentionKernel string `protobuf:"bytes,11,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *InvocationSpec) Reset() {
@@ -17870,6 +17876,13 @@ func (x *InvocationSpec) GetCapture() *ActivationCapture {
 		return x.Capture
 	}
 	return nil
+}
+
+func (x *InvocationSpec) GetAttentionKernel() string {
+	if x != nil {
+		return x.AttentionKernel
+	}
+	return ""
 }
 
 type isInvocationSpec_Spec interface {
@@ -21761,7 +21774,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fcontent_type\x18\b \x01(\tR\vcontentType\x12\x12\n" +
 	"\x04data\x18\t \x01(\fR\x04data\x12!\n" +
 	"\fplacement_id\x18\n" +
-	" \x01(\tR\vplacementIdJ\x04\b\x04\x10\x05\"\x86\x04\n" +
+	" \x01(\tR\vplacementIdJ\x04\b\x04\x10\x05\"\xb1\x04\n" +
 	"\x0eInvocationSpec\x12-\n" +
 	"\x12environment_digest\x18\x02 \x01(\tR\x11environmentDigest\x12%\n" +
 	"\x0epayload_digest\x18\x04 \x01(\tR\rpayloadDigest\x124\n" +
@@ -21771,7 +21784,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\aserving\x18\b \x01(\v2%.cozy.worker.v1.ServingInvocationSpecH\x00R\aserving\x125\n" +
 	"\x03job\x18\t \x01(\v2!.cozy.worker.v1.JobInvocationSpecH\x00R\x03job\x12;\n" +
 	"\acapture\x18\n" +
-	" \x01(\v2!.cozy.worker.v1.ActivationCaptureR\acaptureB\x06\n" +
+	" \x01(\v2!.cozy.worker.v1.ActivationCaptureR\acapture\x12)\n" +
+	"\x10attention_kernel\x18\v \x01(\tR\x0fattentionKernelB\x06\n" +
 	"\x04specJ\x04\b\x01\x10\x02J\x04\b\x03\x10\x04R\x17package_revision_digestR\x12package_release_idR\rconfig_digest\"\x8c\x01\n" +
 	"\fInputBinding\x12\x19\n" +
 	"\binput_id\x18\x01 \x01(\tR\ainputId\x12\x16\n" +

@@ -324,24 +324,25 @@ type RunCmd struct {
 }
 
 type RunExecuteCmd struct {
-	Target         string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
-	Input          []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, and --model.<param>=reference overrides (Tensorhub, hf://, or civitai://)."`
-	Out            string   `help:"Output directory." type:"path"`
-	Timeout        string   `help:"Request deadline."`
-	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
-	Assets         []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
-	AssetFidelity  []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
-	Rental         *string  `help:"Run only on this existing rental name or id; never buy a replacement."`
-	RentalOnly     bool     `help:"Require a remote rental even when local capacity is ready."`
-	IdempotencyKey string   `help:"Stable request identity for safe retries."`
-	Retry          string   `help:"Retry with current code while retaining compatible work from this prior run."`
-	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
-	Org            string   `help:"Job publication organization (defaults to local)."`
-	PublishTo      string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
-	SourceProfiles []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
-	DryRun         bool     `help:"Resolve exact job inputs and conversion headers without queueing or renting."`
-	Await          bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
-	Describe       bool     `help:"Print the callable's request contract instead of running it."`
+	Target          string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
+	Input           []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=<name> to pin one attention kernel for this request (DEV)."`
+	Out             string   `help:"Output directory." type:"path"`
+	Timeout         string   `help:"Request deadline."`
+	PayloadFile     string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
+	Assets          []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
+	AssetFidelity   []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
+	AttentionKernel string   `name:"attention-kernel" help:"DEV: pin one runtime attention kernel for this request (for example flash-attn3-fp8)."`
+	Rental          *string  `help:"Run only on this existing rental name or id; never buy a replacement."`
+	RentalOnly      bool     `help:"Require a remote rental even when local capacity is ready."`
+	IdempotencyKey  string   `help:"Stable request identity for safe retries."`
+	Retry           string   `help:"Retry with current code while retaining compatible work from this prior run."`
+	Trees           []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
+	Org             string   `help:"Job publication organization (defaults to local)."`
+	PublishTo       string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
+	SourceProfiles  []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
+	DryRun          bool     `help:"Resolve exact job inputs and conversion headers without queueing or renting."`
+	Await           bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
+	Describe        bool     `help:"Print the callable's request contract instead of running it."`
 }
 
 func (c *RunExecuteCmd) Run(r *Runtime) error {
@@ -354,6 +355,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--await", c.Await,
 		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
 		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
+		"--attention-kernel", c.AttentionKernel,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
