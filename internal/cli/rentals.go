@@ -505,13 +505,10 @@ func finishRentalAttachment(l home.Layout, st *records.Store, row records.Rental
 			"rental %s did not retain the Creator key sent at create", attachable.ID).
 			WithRemedy("release it; this host will not sign for a rental bound to another key")
 	}
-	if e := rental.Attach(l, st, row, attachable.CertPEM, token, creator); e != nil {
+	if e := rental.AttachAcquisition(l, st, row, attachable.CertPEM, token, creator, operationKey); e != nil {
 		return records.Rental{}, e
 	}
 	row.CertPath = l.RentalCert(attachable.ID)
-	if e := st.AdvanceRentalOperation(operationKey, attachable.ID, "attached"); e != nil {
-		return records.Rental{}, e
-	}
 	rental.ForgetPending(l, operationKey)
 	return row, nil
 }
