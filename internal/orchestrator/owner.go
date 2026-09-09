@@ -653,6 +653,10 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	// never a re-serialization, and its digest lives INSIDE the body. Checking one against
 	// the other is what makes "the set it is serving" a fact rather than a claim.
 	setDigest, _ := canonical.Spell(canonical.Digest(snap.AcceptedPlacementSetCanonicalBytes))
+	if (len(snap.AcceptedPlacementSetCanonicalBytes) > 0) != (doc.Str("accepted_placement_set_digest") != "") {
+		refuse("accepted placement bytes and their snapshot digest must both be present or absent")
+		return false
+	}
 	if declared := doc.Str("accepted_placement_set_digest"); declared != "" && declared != setDigest {
 		refuse("the body names accepted set %s and the %d bytes beside it hash to %s",
 			shortDigest(declared), len(snap.AcceptedPlacementSetCanonicalBytes),

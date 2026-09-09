@@ -69,6 +69,7 @@ func (w *worker) cacheGPUTemplates(data []byte) (bool, *exit.Error) {
 	return true, nil
 }
 
+// templateMatches binds a cached construction to the exact callable and model selection.
 func templateMatches(row *pb.Placement, logical LogicalPackage) bool {
 	pkg, release := row.GetPackage().GetPackage(), row.GetPackage().GetRelease()
 	if development := row.GetDevelopment(); development != nil {
@@ -82,19 +83,53 @@ func templateMatches(row *pb.Placement, logical LogicalPackage) bool {
 	if pkg != logical.Package || release != logical.Release {
 		return false
 	}
-	manifests := map[string]string{}
+	models := map[string]*pb.Model{}
 	for _, model := range row.Models {
-		manifests[model.Id] = spellOf(model.Manifest.Digest)
+		if model == nil || model.Id == "" || model.Manifest == nil {
+			return false
+		}
+		// Placement model IDs are local names. Duplicate IDs would make the
+		// lookup below ambiguous and must never turn into a warm-cache hit.
+		if _, exists := models[model.Id]; exists {
+			return false
+		}
+		models[model.Id] = model
 	}
 	for _, entrypoint := range row.Entrypoints {
 		if entrypoint.Name != logical.Function || len(entrypoint.Slots) != len(logical.Models) {
 			continue
 		}
+		if logical.PlanID != "" && spellOf(entrypoint.EntrypointBindingDigest) != logical.PlanID {
+			continue
+		}
+		used := make(map[int]bool, len(entrypoint.Slots))
 		for _, slot := range entrypoint.Slots {
+			if slot == nil || slot.ReferenceModelId == "" {
+				return false
+			}
+			bound, ok := models[slot.ReferenceModelId]
+			if !ok {
+				return false
+			}
 			matched := false
-			for _, model := range logical.Models {
-				if model.Slot == logical.Function+".models."+slot.Slot && model.Manifest == manifests[slot.ReferenceModelId] {
+			for i, model := range logical.Models {
+				if used[i] {
+					continue
+				}
+				// Match every immutable model-selection fact. A manifest digest alone
+				// is insufficient: two lanes/releases can legitimately share a tree,
+				// and accepting one would route a request to the wrong execution plan.
+				expectedSlot := model.BindingPath
+				if expectedSlot == "" {
+					expectedSlot = logical.Function + ".models." + slot.Slot
+				}
+				if model.Slot == expectedSlot &&
+					model.Model == bound.Repo &&
+					model.Release == bound.Version && model.Lane == bound.Lane &&
+					model.Manifest == spellOf(bound.Manifest.Digest) &&
+					model.ManifestLength > 0 && uint64(model.ManifestLength) == bound.Manifest.Length {
 					matched = true
+					used[i] = true
 					break
 				}
 			}
@@ -179,9 +214,16 @@ func (c *Orchestrator) ensureRequestGPUs(req records.Request) *exit.Error {
 		}
 		if w != nil {
 			req.Worker = w.spec.Connection.RentalID
+			pinned, problem := c.opt.Store.PinRental(req.ID, req.Worker, nil)
+			if problem != nil {
+				return problem
+			}
+			if !pinned {
+				return exit.Unavailablef("request settled while selecting its GPU worker")
+			}
 		}
 	}
-	if w == nil || w.exited || w.spec.IsJob() {
+	if w == nil || w.exited || w.spec.IsJob() || !w.snapshotAcknowledged {
 		return exit.Unavailablef("waiting for the selected GPU worker")
 	}
 	if width > len(w.spec.Devices) {
@@ -189,6 +231,9 @@ func (c *Orchestrator) ensureRequestGPUs(req records.Request) *exit.Error {
 	}
 	knownHeld := 0
 	for _, lane := range w.lanes.lanes {
+		if (lane.held > 0 || lane.seats.reserved > 0) && (len(lane.ordinals) == 0 || lane.outsideEnvelope) {
+			return exit.Unavailablef("waiting for valid physical GPU occupancy of recovered work")
+		}
 		knownHeld += lane.held
 	}
 	if knownHeld < w.held {
@@ -210,7 +255,11 @@ func (c *Orchestrator) ensureRequestGPUs(req records.Request) *exit.Error {
 			}
 		}
 	}
-	for _, instance := range w.gpuInstances {
+	for id, instance := range w.gpuInstances {
+		if len(instance.ordinals) == 0 && !w.gpuBusy(id) {
+			delete(w.gpuInstances, id)
+			continue
+		}
 		if instance.claim != "" && !c.queued(instance.claim) {
 			instance.claim = ""
 		}
@@ -231,7 +280,8 @@ func (c *Orchestrator) ensureRequestGPUs(req records.Request) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		if prior != nil && (prior.Worker == req.Worker || prior.Worker == "" && prior.Rental) && !prior.IsJob() && requestGPUWidth(*prior) > 0 {
+		if prior != nil && prior.Worker == req.Worker && !prior.IsJob() &&
+			requestGPUWidth(*prior) > 0 && requestGPUWidth(*prior) <= len(w.spec.Devices) {
 			reserved := false
 			for _, instance := range w.gpuInstances {
 				reserved = reserved || instance.claim == prior.ID
@@ -330,18 +380,19 @@ func (w *worker) restoreGPUInstances(data []byte) *exit.Error {
 	instances := map[string]*gpuInstance{}
 	for _, row := range set.Placements {
 		lane := w.lanes.of(row.PlacementId)
-		if lane == nil || len(lane.ordinals) == 0 || lane.outsideEnvelope {
-			continue // no dispatchable physical assignment was observed
+		instance := &gpuInstance{row: row}
+		if lane != nil && len(lane.ordinals) > 0 && !lane.outsideEnvelope {
+			instance.ordinals = append([]uint32(nil), lane.ordinals...)
 		}
-		instances[row.PlacementId] = &gpuInstance{row: row, ordinals: append([]uint32(nil), lane.ordinals...)}
+		instances[row.PlacementId] = instance
 	}
 	w.gpuInstances = instances
 	w.setBytes, w.setDigest = append([]byte(nil), data...), canonical.Digest(data)
 	return nil
 }
 
-func (c *Orchestrator) routeGPUInstances(w *worker, req records.Request, claims map[laneKey]string, out *routing) {
-	if w.exited || w.stopping || !w.supportsCurrentProtocol() || c.sessions[w.bootID] == nil ||
+func (c *Orchestrator) routeGPUInstances(w *worker, req records.Request, out *routing) {
+	if w.exited || w.stopping || !w.snapshotAcknowledged || !w.supportsCurrentProtocol() || c.sessions[w.bootID] == nil ||
 		!req.Rental || (req.Worker != "" && req.Worker != w.spec.Connection.RentalID) ||
 		(req.RequestedRental != "" && req.RequestedRental != w.spec.Connection.RentalID) {
 		return
@@ -361,11 +412,8 @@ func (c *Orchestrator) routeGPUInstances(w *worker, req records.Request, claims 
 			out.parked = append(out.parked, why)
 			continue
 		}
-		lane := laneKey{w.instanceID, laneID}
-		if by, blocked := claims[lane]; blocked {
-			out.claimed = append(out.claimed, lane.String()+" by "+by)
-			continue
-		}
+		// ensureRequestGPUs already reserved disjoint physical groups in queue
+		// order. A warming group cannot claim another group's independent lane.
 		candidate := candidate{worker: w, laneID: laneID, placementID: id, held: held}
 		candidate.cost, candidate.resident = w.costOn(laneID, id)
 		candidate.score = held + candidate.cost

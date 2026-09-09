@@ -911,7 +911,7 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 			retirementGround(w) != "" || w.spec.Connection == nil {
 			continue
 		}
-		if requestGPUWidth(req) > 0 && w.gpuTemplate(requestLogical(req)) != nil {
+		if requestGPUWidth(req) > 0 && requestGPUWidth(req) <= len(w.spec.Devices) && w.gpuTemplate(requestLogical(req)) != nil {
 			return true
 		}
 

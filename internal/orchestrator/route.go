@@ -202,7 +202,7 @@ func (c *Orchestrator) route(req records.Request) routing {
 	var out routing
 	for _, w := range c.workers {
 		if w.spec.Connection != nil && !req.IsJob() && requestGPUWidth(req) > 0 {
-			c.routeGPUInstances(w, req, claims, &out)
+			c.routeGPUInstances(w, req, &out)
 			continue
 		}
 		slot, ok := c.eligible(w, req, planID)

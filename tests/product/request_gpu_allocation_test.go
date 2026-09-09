@@ -18,13 +18,15 @@ import (
 // This independent TLS peer enforces the physical contract rather than trusting
 // Creator's lane arithmetic: changed busy pins or any overlap refuse the stream.
 type gpuPeer struct {
-	mu      sync.Mutex
-	pod     *fakePod
-	desired *pb.DesiredWorkerState
-	pins    map[string][]uint32
-	active  map[string]*pb.AttemptOffer
-	started map[string][]uint32
-	send    func(*pb.WorkerFrame) error
+	mu            sync.Mutex
+	pod           *fakePod
+	desired       *pb.DesiredWorkerState
+	pins          map[string][]uint32
+	active        map[string]*pb.AttemptOffer
+	started       map[string][]uint32
+	send          func(*pb.WorkerFrame) error
+	coldFirst     bool
+	snapshotFault string
 }
 
 func newGPUPeer(t *testing.T, width int) *gpuPeer {
@@ -56,12 +58,16 @@ func (p *gpuPeer) frame(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) e
 			return true, err
 		}
 		observed := p.observed().GetObservedState()
-		body, digest, err := canonical.Identity(&pb.WorkerSnapshotBody{
+		snapshot := &pb.WorkerSnapshotBody{
 			WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AdmissionEpoch: 7,
 			AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED, AvailableAttemptSlots: observed.AvailableAttemptSlots,
 			AcceptedDesiredStateRevision: p.desired.Revision, ConvergedRevision: p.desired.Revision,
 			AcceptedPlacementSetDigest: p.desired.GetPlacementSet().PlacementSetDigest,
-			Placements:                 observed.Placements, Lanes: observed.Lanes, HeldAttempts: observed.HeldAttempts})
+			Placements:                 observed.Placements, Lanes: observed.Lanes, HeldAttempts: observed.HeldAttempts}
+		if p.snapshotFault == "unpaired" {
+			snapshot.AcceptedPlacementSetDigest = nil
+		}
+		body, digest, err := canonical.Identity(snapshot)
 		if err != nil {
 			return true, err
 		}
@@ -124,6 +130,12 @@ func (p *gpuPeer) frame(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) e
 }
 
 func TestGPUAllocationRecoversActivePinsFromWorkerSnapshot(t *testing.T) {
+	for _, fault := range []string{"valid", "empty", "outside", "unpaired"} {
+		t.Run(fault, func(t *testing.T) { proveGPUAllocationRecovery(t, fault) })
+	}
+}
+
+func proveGPUAllocationRecovery(t *testing.T, fault string) {
 	peer := newGPUPeer(t, 2)
 	connection, cert := startFakePod(t, t.TempDir(), peer.pod)
 	wiring := rentalWidthWiring(t, peer.pod, connection, cert, 2)
@@ -141,6 +153,9 @@ func TestGPUAllocationRecoversActivePinsFromWorkerSnapshot(t *testing.T) {
 		return peer.active[first] != nil
 	})
 	o.c.Close(0)
+	peer.mu.Lock()
+	peer.snapshotFault = fault
+	peer.mu.Unlock()
 	options := orchestrator.Options{Cfg: o.cfg, Layout: o.l, Store: o.store, Yield: "smart", MaxOutputMiB: 8}
 	wiring(&options)
 	next, problem := orchestrator.Open(options)
@@ -150,6 +165,27 @@ func TestGPUAllocationRecoversActivePinsFromWorkerSnapshot(t *testing.T) {
 	submission.IdemKey = "second"
 	second, _, problem := next.Submit(submission)
 	fatal(t, problem)
+	if fault != "valid" {
+		waitUntil(t, "invalid recovery occupancy refuses allocation", func() bool {
+			for _, line := range next.Events() {
+				if strings.Contains(line, "valid physical GPU occupancy") || strings.Contains(line, "NOT acknowledged") {
+					return true
+				}
+			}
+			return false
+		})
+		peer.mu.Lock()
+		if peer.started[second] != nil {
+			t.Error("invalid snapshot allocated another request")
+		}
+		if fault == "unpaired" {
+			peer.mu.Unlock()
+			return
+		}
+		peer.snapshotFault = "valid"
+		must(t, peer.send(peer.observed()))
+		peer.mu.Unlock()
+	}
 	waitUntil(t, "second request uses free GPU after recovery", func() bool {
 		peer.mu.Lock()
 		defer peer.mu.Unlock()
@@ -176,11 +212,22 @@ func (p *gpuPeer) observed() *pb.WorkerFrame {
 	for _, placement := range state.Placements {
 		id := placement.PlacementId
 		placement.DeviceLaneId = "lane-" + id
+		if p.coldFirst && len(p.pins[id]) > 0 && p.pins[id][0] == 0 {
+			placement.Serving = pb.ServingState_SERVING_STATE_OFFLINE
+			placement.MaterializableBindingDigests = placement.DispatchableBindingDigests
+			placement.DispatchableBindingDigests = nil
+		}
 		lane := &pb.DeviceLane{LaneId: placement.DeviceLaneId, DeviceOrdinals: p.pins[id],
 			PlacementIds: []string{id}, ResidentPlacementIds: []string{id}, AvailableAttemptSlots: 1}
 		for _, offer := range p.active {
 			if offer.PlacementId == id {
 				lane.AvailableAttemptSlots = 0
+				if p.snapshotFault == "empty" {
+					lane.DeviceOrdinals = nil
+				}
+				if p.snapshotFault == "outside" {
+					lane.DeviceOrdinals = []uint32{p.pod.deviceCount}
+				}
 				state.HeldAttempts = append(state.HeldAttempts, &pb.HeldAttempt{RequestId: offer.RequestId,
 					AttemptOrdinal: offer.AttemptOrdinal, PlacementId: id, LaneId: lane.LaneId,
 					InvocationSpecDigest: offer.InvocationSpecDigest, Kind: pb.AttemptKind_ATTEMPT_KIND_SERVING,
@@ -191,6 +238,33 @@ func (p *gpuPeer) observed() *pb.WorkerFrame {
 		state.Lanes = append(state.Lanes, lane)
 	}
 	return frame
+}
+
+func TestWarmingGPUDoesNotBlockAnIndependentReadyGPU(t *testing.T) {
+	peer := newGPUPeer(t, 2)
+	peer.coldFirst = true
+	connection, cert := startFakePod(t, t.TempDir(), peer.pod)
+	o := hostOwner(t, "gpu-independent-warmup", rentalWidthWiring(t, peer.pod, connection, cert, 2))
+	sub := orchestrator.Submission{IdemKey: "cold", Package: "cozy/h3-package", Entrypoint: "tile", Release: "1.1.2",
+		Payload: []byte(`{}`), Worker: podRental, RequestedRental: podRental, Rental: true, RentalRequired: true, NeedsAccelerator: true,
+		Models: []records.ModelRef{{Package: "cozy/h3-package", Slot: "tile.models.model", Model: "source/h3",
+			Release: "1.0.0", Lane: "bf16", Manifest: "sha256:" + strings.Repeat("1", 64), ManifestLength: 164}}}
+	first, _, problem := o.c.Submit(sub)
+	fatal(t, problem)
+	sub.IdemKey = "ready"
+	second, _, problem := o.c.Submit(sub)
+	fatal(t, problem)
+	waitUntil(t, "independent ready GPU runs while first warms", func() bool { peer.mu.Lock(); defer peer.mu.Unlock(); return peer.active[second] != nil })
+	peer.mu.Lock()
+	if peer.active[first] != nil {
+		t.Error("cold placement was dispatched before it became ready")
+	}
+	peer.coldFirst = false
+	must(t, peer.send(peer.observed()))
+	peer.mu.Unlock()
+	waitUntil(t, "first GPU finishes warming", func() bool { peer.mu.Lock(); defer peer.mu.Unlock(); return len(peer.active) == 2 })
+	peer.finish(t, first)
+	peer.finish(t, second)
 }
 
 func (p *gpuPeer) finish(t *testing.T, id string) {

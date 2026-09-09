@@ -466,6 +466,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 		w.observeHeld(heldPlacements(r.HeldAttempts))
+		for id, instance := range w.gpuInstances {
+			if lane := w.lanes.of(id); lane != nil && len(lane.ordinals) > 0 && !lane.outsideEnvelope {
+				instance.ordinals = append([]uint32(nil), lane.ordinals...)
+			}
+		}
 		w.heldManifests = setOf(r.HeldManifests)
 		heldVerdicts = c.observeHeldOutcomes(w, r.HeldAttempts)
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
