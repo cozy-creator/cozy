@@ -19,7 +19,7 @@ import (
 // The fleet, and its one reason to end a rental on its own. The owner's ruling: the main
 // guard against over-spend is Creator reaping unused pods, so a controller that dies must
 // not leave pods billing with no work being done. Every rental this daemon owns is under
-// that rule — one bought for a request and one asked for with `cozy rental new` alike —
+// that rule — one bought for a request and one asked for with `cozy rent` alike —
 // because how a pod was acquired says nothing about whether it is doing anything.
 //
 // The observation is the decision: nothing queued for the pod, nothing running or owed on
@@ -203,7 +203,7 @@ func (m *managedRentals) admit(skuName string) (string, hub.RentalSKU, *exit.Err
 //	"Tensorhub sells no such machine"      -> you typed something wrong; stop
 //	"that machine has no inventory now"    -> wait a couple of minutes; retry
 //
-// They used to share one sentence. On 2026-09-04 an explicit `cozy rental new
+// They used to share one sentence. On 2026-09-04 an explicit `cozy rent
 // rtx-a4000` was refused during a 32-minute stock-out, the message read as the
 // first, and the conclusion drawn was that the rental code had substituted a
 // dearer card — it had not, and two issues were filed against a defect that does
@@ -235,14 +235,14 @@ func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatu
 		return exit.Named(exit.Validation, "rental.sku_unavailable",
 			"no rental SKU %q is on offer right now — %s", skuName, said).
 			WithRemedy("the catalog is live provider inventory, so a name absent now may "+
-				"return within minutes; `cozy rental new` alone lists what is offered "+
+				"return within minutes; `cozy rent` alone lists what is offered "+
 				"this minute (currently %s)", offeredNames(skus)).
-			WithNext("cozy rental new")
+			WithNext("cozy rent")
 	case !status.Known:
 		return exit.Named(exit.Validation, "rental.sku_unknown",
 			"Tensorhub sells no rental SKU named %q — %s", skuName, said).
 			WithRemedy("choose one of the names it does sell: %s", offeredNames(skus)).
-			WithNext("cozy rental new")
+			WithNext("cozy rent")
 	}
 	// Known but not buyable: a real product in a stock-out. The timestamp is the
 	// actionable half — it separates "gone for ten seconds" from "gone all night".
@@ -257,7 +257,7 @@ func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatu
 		skuName, seen, said).
 		WithRemedy("this is a stock-out, not a bad name: retry in a minute or two, or "+
 			"see what is buyable this minute (currently %s)", offeredNames(skus)).
-		WithNext("cozy rental new "+skuName, "cozy rental new")
+		WithNext("cozy rent "+skuName, "cozy rent")
 }
 
 // offeredNames is the live catalog as a reader can scan it, so a refusal shows the shape
@@ -326,12 +326,15 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
 	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
 	// a machine that would be bought are held to the same declared degrees (cl-179).
-	constraints := releaseConstraints(m.ctx, req)
+	constraints, _ := releaseConstraints(m.ctx, req)
 	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
 	}
-	purchases := rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), constraints)
+	var purchases []orchestrator.PlacementCandidate
+	if req.RequestedRental == "" {
+		purchases = rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), constraints)
+	}
 	var capped *exit.Error
 	for i := range purchases {
 		c := &purchases[i]
@@ -369,6 +372,9 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 			i = idle
 		}
 		if i < 0 {
+			if req.RequestedRental != "" {
+				return decision, "", exit.Named(exit.Conflict, "rental.selection_unavailable", "selected rental %s cannot accept this request: %s", req.RequestedRental, decision.Line())
+			}
 			return decision, "", rental.Refusal(req, decision, needsAccelerator, capped)
 		}
 		c := &decision.Candidates[i]
@@ -424,6 +430,9 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 	})
 	out := make([]orchestrator.PlacementCandidate, 0, len(rows))
 	for _, row := range rows {
+		if req.RequestedRental != "" && row.ID != req.RequestedRental {
+			continue
+		}
 		c := orchestrator.PlacementCandidate{Rental: row.ID, Machine: row.MachineName, SKU: row.SKU,
 			RateUSDMicrosPerHour: row.HourlyRateUSDMicros}
 		sku, offered := bySKU[row.SKU]
@@ -433,7 +442,15 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 		// Everything decidable from the rental ROW is settled by the chooser, in the one
 		// order that keeps a transient state out of a permanent verdict (cl-185). What
 		// is left are the questions only this host can answer.
-		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints) {
+		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints, req.RequestedRental == row.ID) {
+			if len(constraints.Requirements) > 0 || constraints.RequiresPython != "" {
+				if problem := rentalCompatibility(m.ctx, row.ID, constraints); problem != nil {
+					c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + problem.Message
+					out = append(out, c)
+					continue
+				}
+			}
+
 			reason, problem := m.standingLocked(row)
 			if problem != nil {
 				return nil, problem
@@ -1105,26 +1122,38 @@ func settledRequest(state string) bool {
 }
 
 // releaseConstraints reads the release's own immutable requirements so the SKU choice
-// above can decline a base that already contradicts them. It is ADVISORY: a package this
-// host cannot name, or a hub that will not answer, yields no constraints and therefore no
-// refusal — the pod remains the authority on whether the package runs (th-075).
-func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
+// above can decline a base that contradicts them. Automatic selection preserves its
+// advisory fallback on an unavailable release; explicit rental selection requires
+// these facts before submitting work.
+func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
+	if req.InstallID != "" && strings.HasPrefix(req.Package, "local/") {
+		_, store, problem := rentalStores(ctx)
+		if problem != nil {
+			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
+		}
+		defer store.Close()
+		install, problem := store.Install(req.InstallID)
+		if problem != nil || install == nil {
+			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
+		}
+		return rental.Constraints{Requirements: strings.Split(install.Closure, "\n"), RequiresPython: ">=3.12,<3.13"}, nil
+	}
 	if req.Package == "" || req.Release == "" {
-		return rental.Constraints{}
+		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 	}
 	ref, problem := hub.ParseRef(req.Package)
 	if problem != nil {
-		return rental.Constraints{}
+		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
 	detail, problem := client(ctx).PackageRelease(hctx, ref, req.Release)
 	if problem != nil {
-		return rental.Constraints{}
+		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 	}
 	requirements, requiresPython, problem := detail.Constraints()
 	if problem != nil {
-		return rental.Constraints{}
+		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 	}
 	// The committed interface says which group degrees this requested function can be built
 	// at, so a WIDE product is only a candidate when its author declared that width
@@ -1137,5 +1166,22 @@ func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
 		}
 	}
 	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython,
-		Degrees: degrees}
+		Degrees: degrees}, nil
+}
+
+func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints) *exit.Error {
+	call, cancel := hub.Context()
+	raw, problem := client(ctx).RentalImageInventory(call, id)
+	cancel()
+	if problem != nil {
+		return problem
+	}
+	inventory, err := rental.ImageInventory(raw)
+	if err != nil {
+		return exit.Named(exit.Structural, "rental.image_inventory_invalid", "%s", err)
+	}
+	if reason := launch.InventoryMismatch(inventory, constraints.Requirements, constraints.RequiresPython); reason != "" {
+		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
+	}
+	return nil
 }

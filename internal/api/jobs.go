@@ -35,6 +35,7 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
+	RequestedRental string                 `json:"requested_rental,omitempty"`
 	LocalAssets     []records.AssetBinding `json:"local_assets,omitempty"`
 	Package         string                 `json:"package"`
 	Function        string                 `json:"function"`
@@ -119,7 +120,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// A job's trees name HOST DIRECTORIES that become read/write worker grants — the same
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
-	if (len(sub.LocalAssets) > 0 || len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 ||
+	if (len(sub.LocalAssets) > 0 || len(sub.Trees) > 0 || sub.Worker != "" || sub.RequestedRental != "" || len(sub.Models) > 0 ||
 		sub.ModelTransfer != nil || sub.RetryOf != "" || sub.OutputDirectory != "") &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
@@ -141,6 +142,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			s.refuse(w, r, http.StatusConflict, "request.retry_worker_changed", "retry must retain the predecessor's machine", "")
 			return
 		}
+		if sub.RequestedRental != "" && sub.RequestedRental != prior.RequestedRental {
+			s.refuseTyped(w, r, exit.New(exit.Conflict, "retry cannot change the requested rental"))
+			return
+		}
+		sub.RequestedRental = prior.RequestedRental
 		sub.RetryOf, sub.Worker = prior.ID, prior.Worker
 		sub.RetainWork = true
 		sub.Rental, sub.RentalRequired = prior.Rental, prior.RentalRequired
@@ -151,7 +157,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if existing != nil && !existing.RetainWork && (existing.State == "canceled" || existing.State == "failed" || existing.State == "refused") {
+	if existing != nil && !existing.RetainWork && existing.RequestedRental == "" && (existing.State == "canceled" || existing.State == "failed" || existing.State == "refused") {
 		released, e := s.store.ReleaseCanceledIdempotencyKey(key)
 		if e != nil {
 			s.refuseTyped(w, r, e)
@@ -306,8 +312,9 @@ func replayJobSubmission(sub JobSubmission,
 		LocalPackageDigest: recorded.LocalPackageDigest,
 		PlanID:             recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
-		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
-		Models: models, ModelTransfer: transfer, ProducerParams: params}, nil
+		Rental: sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
+		RequestedRental: sub.RequestedRental,
+		Models:          models, ModelTransfer: transfer, ProducerParams: params}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
@@ -328,9 +335,13 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org), Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
 		Release: sub.Release, OutputDirectory: sub.OutputDirectory,
-		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
-		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
+		Rental: sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
+		RequestedRental: sub.RequestedRental,
+		Worker:          sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 		ModelTransfer: sub.ModelTransfer,
+	}
+	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
+		return out, problem
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -573,6 +584,9 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.OutputDirectory != "" {
 		doc["output_directory"] = spec.OutputDirectory
+	}
+	if spec.RequestedRental != "" {
+		doc["requested_rental"] = spec.RequestedRental
 	}
 	if spec.ModelTransfer != nil {
 		encoded, err := json.Marshal(spec.ModelTransfer)

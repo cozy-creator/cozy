@@ -60,7 +60,7 @@ func PrepareFactsFromView(view hub.PrepareFactsView, pkg, release string,
 		return refuse("locked requirements are absent or exceed the %d-byte wire bound",
 			pb.MaxLockedRequirementsBytes)
 	}
-	inventory, err := imageInventory(view.ImageInventory)
+	inventory, err := ImageInventory(view.ImageInventory)
 	if err != nil {
 		return refuse("%s", err)
 	}
@@ -76,7 +76,7 @@ func PrepareFactsFromView(view hub.PrepareFactsView, pkg, release string,
 // into the wire message the Runtime range-checks its base against. The Runtime
 // refuses a preparation without one, so an image registered without an
 // inventory is refused HERE, with the fact named, not on the pod.
-func imageInventory(raw json.RawMessage) (*pb.ImageInventory, error) {
+func ImageInventory(raw json.RawMessage) (*pb.ImageInventory, error) {
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil, fmt.Errorf("the rental's image has no registered inventory")
 	}

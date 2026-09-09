@@ -559,7 +559,7 @@ def check_manifest():
         bad.append("[grammar] package publish identity must come only from project metadata")
     derived_audits = {
         "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',
-        "internal/cli/rentals.go": '"cozy rental new " + skuName',
+        "internal/cli/rentals.go": '"cozy rent " + skuName',
     }
     for path, spelling in derived_audits.items():
         if spelling not in pathlib.Path(path).read_text():

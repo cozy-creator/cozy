@@ -23,7 +23,7 @@ import (
 
 // This catalog supplies declared metadata only. It refuses paid creation; no
 // successful source conversion, worker receipt, or byte custody is simulated.
-func runModelCatalog(t *testing.T) (string, *sync.Mutex, *[][]byte, string, []byte) {
+func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.PackageReleaseDetail)) (string, *sync.Mutex, *[][]byte, string, []byte) {
 	t.Helper()
 	manifest := []byte(`{"fixture":"small root, not model closure bytes"}`)
 	digest, err := canonical.Spell(canonical.Digest(manifest))
@@ -79,6 +79,9 @@ func runModelCatalog(t *testing.T) (string, *sync.Mutex, *[][]byte, string, []by
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"error":{"code":"proof.no_paid_create","message":"captured without renting"}}`))
 	})
+	for _, apply := range configure {
+		apply(mux, &detail)
+	}
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	root := t.TempDir()
@@ -198,7 +201,7 @@ func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
 func TestManualRentalAcceptsRetainedCheckpointIdentity(t *testing.T) {
 	root, mu, posts, digest, _ := runModelCatalog(t)
 	startDaemonProcess(t, root)
-	args := []string{"rental", "new", "cpu", "--idempotency-key", "retained-manual-rental",
+	args := []string{"rent", "cpu", "--idempotency-key", "retained-manual-rental",
 		"--model", "proof/source#" + digest, "--model", "proof/source#" + digest, "--json"}
 	code, out := runCozy(t, root, args...)
 	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
@@ -216,7 +219,7 @@ func TestManualRentalAcceptsRetainedCheckpointIdentity(t *testing.T) {
 	if len(request.ServingModels) != 1 || request.ServingModels[0] != (hub.ServingModel{Model: "proof/source", Manifest: digest}) {
 		t.Fatal("manual rental invented release metadata or duplicated checkpoint")
 	}
-	code, out = runCozy(t, root, "rental", "new", "cpu", "--idempotency-key", "retained-manual-rental", "--json")
+	code, out = runCozy(t, root, "rent", "cpu", "--idempotency-key", "retained-manual-rental", "--json")
 	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
 		t.Fatalf("pinned retry failed: %d %s", code, out)
 	}

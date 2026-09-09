@@ -249,7 +249,7 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 // the request settled FAILED on a fleet that was simply still booting.
 func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	row records.Rental, vramGB int64, needsAccelerator, offered, job bool,
-	constraints Constraints,
+	constraints Constraints, explicit bool,
 ) bool {
 	if needsAccelerator && row.AcceleratorModel == "CPU" {
 		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
@@ -261,7 +261,7 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	// machine's own row rather than its product's: an attached rental is the authority on
 	// how many cards it has, and its SKU may have left the catalog (cl-179).
 	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job)
-	if c.Verdict == "" {
+	if c.Verdict == "" && !(explicit && job) {
 		c.Verdict = WidthUnusable(row.AcceleratorCount, job, constraints)
 	}
 	switch {

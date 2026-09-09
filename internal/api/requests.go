@@ -32,9 +32,10 @@ import (
 // carried VERBATIM: the orchestrator digests exactly the bytes the client sent, so a
 // re-submit under one key compares the same request identity.
 type Submission struct {
-	Package  string          `json:"package"`
-	Function string          `json:"function"`
-	Input    json.RawMessage `json:"input"`
+	RequestedRental string          `json:"requested_rental,omitempty"`
+	Package         string          `json:"package"`
+	Function        string          `json:"function"`
+	Input           json.RawMessage `json:"input"`
 	// InstallID is the immutable local install selected by the CLI. It is opaque to users;
 	// omitting it asks the daemon to resolve the active package pointer.
 	InstallID string   `json:"install_id,omitempty"`
@@ -109,7 +110,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			`{"package":"org/name","function":"denoise","input":{…}}`)
 		return
 	}
-	if (len(sub.LocalAssets) > 0 || sub.OutputDirectory != "") && !s.cliAuthenticated(r) {
+	if (len(sub.LocalAssets) > 0 || sub.OutputDirectory != "" || sub.RequestedRental != "") && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"local assets and output directories require the OS-protected CLI credential",
 			"use `cozy run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
@@ -230,8 +231,9 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: sub.InstallID, Release: sub.Release,
 		LocalPackageDigest: recorded.LocalPackageDigest,
-		Rental:             sub.Rental || sub.RentalRequired,
-		RentalRequired:     sub.RentalRequired,
+		Rental:             sub.Rental || sub.RentalRequired || sub.RequestedRental != "",
+		RentalRequired:     sub.RentalRequired || sub.RequestedRental != "",
+		RequestedRental:    sub.RequestedRental,
 		Models:             models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
 	}
@@ -275,6 +277,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.RentalRequired {
 		doc["rental_required"] = true
+	}
+	if spec.RequestedRental != "" {
+		doc["requested_rental"] = spec.RequestedRental
 	}
 	if len(spec.Models) > 0 {
 		refs := append([]orchestrator.ModelRef(nil), spec.Models...)
@@ -356,9 +361,13 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
 		Release: sub.Release,
-		Rental:  sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
+		Rental:  sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
+		RequestedRental: sub.RequestedRental,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
 		OutputDirectory: sub.OutputDirectory,
+	}
+	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
+		return out, problem
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")

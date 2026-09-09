@@ -53,7 +53,8 @@ type ladderHub struct {
 	// market is what GET /v1/rental-skus answers. It is MUTABLE because a catalog that
 	// momentarily offers no product of the request's class is a real hub state and one
 	// half of what killed run 412 (cl-185); a fixed market cannot express it.
-	market []hub.RentalSKU
+	market          []hub.RentalSKU
+	runtimeVersions map[string]string
 }
 
 const (
@@ -99,6 +100,18 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 	h := &ladderHub{soldOut: map[string]bool{}, rentals: map[string]map[string]any{},
 		market: market20260907()}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		version := h.runtimeVersions[r.PathValue("id")]
+		h.mu.Unlock()
+		if version == "" {
+			version = "0.15.0"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"image_inventory": map[string]any{
+			"format": "tensorhub.image_inventory/1", "profile": "torch2.13.0-cu130-cp312-linux-x86", "python": "3.12.12",
+			"distributions": []map[string]string{{"name": runtimeDistribution, "version": version}, {"name": "torch", "version": "2.13.0"}},
+		}})
+	})
 	mux.HandleFunc("GET /v1/packages/proof/h3", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "h3"},
 			Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})

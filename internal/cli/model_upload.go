@@ -137,7 +137,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
 		Producer: callable, Placement: placement, SourceProfiles: suppliedProfiles}
 	localOnly := localOnlyModelSource(instructionSource)
-	if localOnly && ctx.Inv.Bool("--rental-only") {
+	if localOnly && (ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != "") {
 		return exit.Usagef("a local model source cannot run under --rental-only").
 			WithRemedy("omit --rental-only or use an addressable provider/Tensorhub source")
 	}
@@ -279,7 +279,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 		return problem
 	}
 	submission.ModelTransfer = &intent
-	submission.Rental, submission.RentalRequired = effectiveRental, placement == "rental-only"
+	submission.Rental, submission.RentalRequired = effectiveRental, placement == "rental-only" || submission.RequestedRental != ""
 	if invocation != nil && kind == "model-upload" && !privateOutputs {
 		org := strings.Split(destination, "/")[0]
 		if submission.Org != "" && submission.Org != org {

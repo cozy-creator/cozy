@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -191,11 +190,11 @@ func TestRentalFailureRecovery(t *testing.T) {
 
 	// (c) THE DISPLAY. An operator reading `RUNNING 1` on a failed machine is being told
 	// something that cannot be true, and that is how this bug was found at all.
-	code, out := runCozy(t, root, "rental", "list")
-	holding := regexp.MustCompile(`nitian\s+cpu\s+failed\s+readiness\.receipt_conflict\s+\S+\s+0\s+0\b`)
-	if code != 0 || !holding.MatchString(out) {
-		t.Fatalf("a failed rental still renders as holding work [exit %d]\n%s", code, out)
+	listed := listedRental(t, root, "rental-lost")
+	if listed.Machine != "nitian" || listed.State != "failed" || listed.Failure != "readiness.receipt_conflict" || listed.Running == nil || *listed.Running != 0 || listed.Queued == nil || *listed.Queued != 0 {
+		t.Fatalf("failed rental listing does not reflect reclaimed work: %+v", listed)
 	}
+
 }
 
 // TestRentalFailureKeepsARecordedTerminal is the arm that must NOT fire. An attempt whose

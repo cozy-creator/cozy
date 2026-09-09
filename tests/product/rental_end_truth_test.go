@@ -104,7 +104,7 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 	// machine word and the ask is recorded BEFORE the pod exists.
 	machine := ""
 	op, _, problem := store.BeginRentalOperation(records.RentalOperation{
-		Key: "idempotent-proof", Hub: hubURL, Reason: "cozy rental new cpu",
+		Key: "idempotent-proof", Hub: hubURL, Reason: "cozy rent cpu",
 		HourlyRateUSDMicros: 100_000,
 	}, 5_000_000, 10_000, func(name string) ([]byte, string, *exit.Error) {
 		machine = name
@@ -175,7 +175,7 @@ func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 	}
 	startDaemonProcess(t, root)
 
-	code, out := runCozy(t, root, "rental", "new", "cpu", "--json")
+	code, out := runCozy(t, root, "rent", "cpu", "--json")
 	if code == 0 {
 		t.Fatalf("Creator attached a pod whose width the hub never stated\n%s", out)
 	}

@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 36
+const schemaVersion = 37
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -273,7 +273,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 35 {
+	if sourceVersion < 37 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -438,6 +438,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			if _, err := tx.Exec(statement); err != nil {
 				return exit.Internalf("cannot preserve native byte producer authority: %s", err)
 			}
+		}
+	}
+	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
+		if _, err := tx.Exec(statement); err != nil {
+			return exit.Internalf("cannot restore request indexes in %s: %s", path, err)
 		}
 	}
 	if _, err := tx.Exec(nativeByteOutputIndex); err != nil {
@@ -728,6 +733,10 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		destinationColumns += ",child_artifacts"
 		selectColumns += ",child_artifacts"
 	}
+	if sourceVersion >= 37 {
+		destinationColumns += ",requested_rental"
+		selectColumns += ",requested_rental"
+	}
 	if sourceVersion >= 33 {
 		destinationColumns += ",capture"
 		selectColumns += ",capture"
@@ -885,6 +894,9 @@ func priorStatements(version int) []string {
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
+		}
+		if requestStatement && version < 37 {
+			stmt = strings.Replace(stmt, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)
 		}
 		if requestStatement && version < 27 {
 			stmt = strings.Replace(stmt, ",\n  parent_request_id TEXT NOT NULL DEFAULT '',\n  parent_call_index INTEGER NOT NULL DEFAULT -1 CHECK(parent_call_index>=-1 AND parent_call_index<4294967296),\n  child_intent_digest TEXT NOT NULL DEFAULT '',\n  child_target_digest TEXT NOT NULL DEFAULT '',\n  child_reusable INTEGER NOT NULL DEFAULT 0 CHECK(child_reusable IN (0,1)),\n  reused_from TEXT NOT NULL DEFAULT '',\n  orchestration_directive BLOB NOT NULL DEFAULT x''", "", 1)

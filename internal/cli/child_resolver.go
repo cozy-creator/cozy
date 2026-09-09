@@ -163,6 +163,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	out.LocalPackageDigest = revision
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
+		out.RequestedRental = parent.RequestedRental
 	}
 	identity, _ := json.Marshal(map[string]any{"local_revision_digest": revision, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
 	identity, err := canonical.NormalizeJCS(identity)
