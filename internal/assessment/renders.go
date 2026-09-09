@@ -64,7 +64,7 @@ func renderRefusal() *exit.Error {
 func ReadRenderInspection(report, inspected []byte) (RenderInspection, *exit.Error) {
 	var out RenderInspection
 	if len(report) == 0 || len(report) > MaxBytes || len(inspected) > MaxBytes || json.Unmarshal(inspected, &out) != nil ||
-		out.Schema != "cozy-eval/report-inspection@3" || out.Report.Schema != "cozy-eval/checkpoint-validation@3" ||
+		out.Schema != "cozy-eval/report-inspection@4" || out.Report.Schema != "cozy-eval/checkpoint-validation@4" ||
 		out.Report.Digest != spell(report) || out.Report.Length != int64(len(report)) ||
 		len(out.Subject.Arms) != 3 || len(out.Environment) != 3 {
 		return out, renderRefusal()

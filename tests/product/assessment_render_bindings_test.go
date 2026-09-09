@@ -221,14 +221,14 @@ func assessmentDigest(raw []byte) string {
 
 // The canonical reader remains the numerical/schema authority; Creator consumes
 // its exact association projection and binds the original artifact identity.
-var assessmentEvaluatorPath = flag.String("assessment-v3-evaluator", "", "installed canonical @3 report reader for association proof")
+var assessmentEvaluatorPath = flag.String("assessment-v4-evaluator", "", "installed canonical @4 report reader for association proof")
 
-func TestAssessmentV3InspectorIdentityBoundary(t *testing.T) {
+func TestAssessmentV4InspectorIdentityBoundary(t *testing.T) {
 	evaluator := *assessmentEvaluatorPath
 	if evaluator == "" {
-		t.Skip("requires the installed cozy-eval @3 reader")
+		t.Skip("requires the installed cozy-eval @4 reader")
 	}
-	report, err := os.ReadFile("testdata/assessment-v3.json")
+	report, err := os.ReadFile("testdata/assessment-v4.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,8 +245,48 @@ func TestAssessmentV3InspectorIdentityBoundary(t *testing.T) {
 			t.Fatal("changed report bytes accepted")
 		}
 	}
-	info.Schema = "cozy-eval/report-inspection@2"
+	info.Schema = "cozy-eval/report-inspection@3"
 	if _, problem := assessment.ReadRenderInspection(report, assessmentJSON(t, info)); problem == nil {
 		t.Fatal("retired inspector accepted")
+	}
+}
+
+func TestAssessmentV4PreservesUnobservedExecutionMode(t *testing.T) {
+	evaluator := *assessmentEvaluatorPath
+	if evaluator == "" {
+		t.Skip("requires the installed cozy-eval @4 reader")
+	}
+	report, err := os.ReadFile("testdata/assessment-v4.json")
+	must(t, err)
+	var body any
+	must(t, json.Unmarshal(report, &body))
+	var eraseMode func(any)
+	eraseMode = func(value any) {
+		switch row := value.(type) {
+		case map[string]any:
+			for key, child := range row {
+				if key == "execution_lane" {
+					row[key] = ""
+				} else {
+					eraseMode(child)
+				}
+			}
+		case []any:
+			for _, child := range row {
+				eraseMode(child)
+			}
+		}
+	}
+	eraseMode(body)
+	report = assessmentJSON(t, body)
+	t.Setenv("PATH", filepath.Dir(evaluator))
+	inspected, problem := assessment.Inspect(t.Context(), report, []string{"PYTHONNOUSERSITE=1"})
+	assessmentRecord(t, problem)
+	info, problem := assessment.ReadRenderInspection(report, inspected)
+	assessmentRecord(t, problem)
+	for _, environment := range info.Environment {
+		if environment.ExecutionLane != "" {
+			t.Fatal("reader manufactured an observed execution mode")
+		}
 	}
 }

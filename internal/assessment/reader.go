@@ -18,7 +18,7 @@ func Inspect(ctx context.Context, report []byte, env []string) ([]byte, *exit.Er
 	}
 	bin, err := exec.LookPath("cozy-eval")
 	if err != nil {
-		return nil, exit.Named(exit.Structural, "assessment.reader_missing", "cozy-eval report inspector is not installed on the client").WithRemedy("install cozy-eval 0.4.0 or newer with uv tool install")
+		return nil, exit.Named(exit.Structural, "assessment.reader_missing", "cozy-eval report inspector is not installed on the client").WithRemedy("install cozy-eval 0.6.0 or newer with uv tool install")
 	}
 	command := exec.CommandContext(ctx, bin, "report", "inspect")
 	command.Env = append([]string{}, env...)
