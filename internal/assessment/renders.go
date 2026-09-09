@@ -11,7 +11,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// RenderInspection is the installed cozy-eval reader's @3 association projection.
+// RenderInspection is the installed cozy-eval reader's association projection.
 // It contains no metric parser or implementation of the evaluator's gate rules.
 type RenderInspection struct {
 	Schema string `json:"schema"`
@@ -64,7 +64,7 @@ func renderRefusal() *exit.Error {
 func ReadRenderInspection(report, inspected []byte) (RenderInspection, *exit.Error) {
 	var out RenderInspection
 	if len(report) == 0 || len(report) > MaxBytes || len(inspected) > MaxBytes || json.Unmarshal(inspected, &out) != nil ||
-		out.Schema != "cozy-eval/report-inspection@4" || out.Report.Schema != "cozy-eval/checkpoint-validation@4" ||
+		out.Schema != "cozy-eval/report-inspection@4" || out.Report.Schema != "cozy-eval/checkpoint-validation@5" ||
 		out.Report.Digest != spell(report) || out.Report.Length != int64(len(report)) ||
 		len(out.Subject.Arms) != 3 || len(out.Environment) != 3 {
 		return out, renderRefusal()
