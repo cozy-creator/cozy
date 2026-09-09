@@ -419,3 +419,15 @@ func TestRentalInventoryRefusesMalformedProtectedVersions(t *testing.T) {
 		t.Fatal(why)
 	}
 }
+
+func TestDevelopmentInventoryDefersOnlyUnreportedVersions(t *testing.T) {
+	inventory := &pb.ImageInventory{Python: "3.12.12", Profile: "torch2.13.0-cu130-cp312-linux-x86", Distributions: []*pb.ImageDistribution{{Distribution: "torch", Version: "2.13.0"}}}
+	requirements := []string{"cozy-runtime[media]>=0.15.0,<1", "tensorfs>=0.3.35,<0.4", "torch>=2.13,<3"}
+	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); why != "" {
+		t.Fatalf("projected mutable versions treated as absent packages: %s", why)
+	}
+	inventory.Distributions = append(inventory.Distributions, &pb.ImageDistribution{Distribution: runtimeDistribution, Version: "0.13.0"})
+	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); !strings.Contains(why, "cozy-runtime 0.13.0") {
+		t.Fatalf("known mismatch was waived: %s", why)
+	}
+}

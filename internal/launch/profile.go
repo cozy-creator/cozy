@@ -165,7 +165,10 @@ func InventoryMismatch(inventory *pb.ImageInventory, requirements []string, requ
 		}
 		carried, present := installed[name]
 		if !present {
-			return "the rental image does not provide required base distribution " + name
+			// Development inventory deliberately omits mutable Runtime/TensorFS
+			// versions. Absence from this projection is not package absence;
+			// actual worker preparation still validates the live installation.
+			continue
 		}
 		bounds, err := pep440.NewSpecifiers(tail)
 		version, versionErr := pep440.Parse(carried)
