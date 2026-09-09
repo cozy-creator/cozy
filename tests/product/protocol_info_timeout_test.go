@@ -44,7 +44,7 @@ func TestProtocolProbeNeverAnswerHasDeadline(t *testing.T) {
 	defer cancel()
 	result := make(chan *exit.Error, 1)
 	go func() {
-		control, problem := orchestrator.DialIdleControl(ctx, connection, options.RentalClaimProof)
+		control, problem := orchestrator.DialIdleControl(ctx, connection, options.RentalClaimProof, nil)
 		if control != nil {
 			_ = control.Close()
 		}
