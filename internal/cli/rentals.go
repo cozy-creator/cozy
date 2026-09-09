@@ -93,23 +93,35 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
-	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	line, sku, e := fleet.admit(skuName)
+	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
+	if len(operationKey) > 200 {
+		return exit.Usagef("--idempotency-key is %d bytes; the hub admits at most 200", len(operationKey))
+	}
+	operationKey = requestKey(operationKey)
+	existing, e := st.RentalOperation(operationKey)
 	if e != nil {
 		return e
 	}
-	fmt.Fprintln(ctx.Err, line)
+	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
+	var sku hub.RentalSKU
+	if existing != nil {
+		// An accepted operation already owns its quote and provider obligation.
+		// Resuming it neither needs current stock nor admits a second purchase.
+		sku.PriceUSDMicrosPerHour = existing.HourlyRateUSDMicros
+	} else {
+		line, admitted, problem := fleet.admit(skuName)
+		if problem != nil {
+			return problem
+		}
+		sku = admitted
+		fmt.Fprintln(ctx.Err, line)
+	}
 
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return problem
 	}
 	ctx.Daemon = state
-	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
-	if len(operationKey) > 200 {
-		return exit.Usagef("--idempotency-key is %d bytes; the hub admits at most 200", len(operationKey))
-	}
-	operationKey = requestKey(operationKey)
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
@@ -210,6 +222,16 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			"rental operation %s is %s and still names rental %s", operationKey, existing.State, existing.RentalID).
 			WithRemedy("release the existing rental before starting another operation").
 			WithNext("cozy rental end " + existing.RentalID)
+	}
+	if existing != nil {
+		request, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
+		if problem != nil {
+			return records.Rental{}, hub.Rental{}, false, problem
+		}
+		if request.SKU != skuName {
+			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
+				"rental operation %s names SKU %s, not %s", operationKey, request.SKU, skuName)
+		}
 	}
 	var workload hub.DeclaredWorkload
 	var development *hub.RentalDevelopment
