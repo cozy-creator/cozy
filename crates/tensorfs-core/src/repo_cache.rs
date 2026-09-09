@@ -1085,6 +1085,8 @@ mod backfill_tests {
 #[cfg(test)]
 mod exit_wait_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1093,9 +1095,22 @@ mod exit_wait_tests {
         struct Paced<'a>(&'a [u8]);
         impl Read for Paced<'_> {
             fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-                std::thread::sleep(Duration::from_millis(5));
                 let take = out.len().min(4096);
                 self.0.read(&mut out[..take])
+            }
+        }
+        struct Progress {
+            activity: Arc<BackfillActivity>,
+            elapsed_ms: Arc<AtomicU64>,
+        }
+        impl store::Progress for Progress {
+            fn admitted(&self) {}
+            fn moved(&self, bytes: u64) {
+                // Advance time only after real bytes were copied and hashed. Thread
+                // startup, filesystem scheduling and final fsync are not a stalled
+                // transfer injected by this test.
+                self.elapsed_ms.fetch_add(5, Ordering::SeqCst);
+                self.activity.moved(bytes);
             }
         }
         let root = std::env::temp_dir().join(format!(
@@ -1110,22 +1125,51 @@ mod exit_wait_tests {
             Duration::from_millis(10),
         )));
         activity.offered();
-        let observed = activity.clone();
+        let elapsed_ms = Arc::new(AtomicU64::new(0));
+        let clock = elapsed_ms.clone();
+        let started = Instant::now();
+        let (sampled, observation) = mpsc::channel();
+        activity.pending.lock().unwrap().1 =
+            Ledger::with_clock(Duration::from_millis(10), move || {
+                let elapsed = clock.load(Ordering::SeqCst);
+                if elapsed >= 320 && std::thread::current().name() == Some("copy-wait") {
+                    let _ = sampled.send(());
+                }
+                started + Duration::from_millis(elapsed)
+            });
+        let observed = Progress {
+            activity: activity.clone(),
+            elapsed_ms: elapsed_ms.clone(),
+        };
         let target = destination.clone();
         let wanted = object.clone();
-        let started = Instant::now();
+        let (finish, finishing) = mpsc::channel();
         let copy = std::thread::spawn(move || {
-            let result =
-                publish_stream(&mut Paced(&data), &target, &wanted, Some(observed.as_ref()));
-            observed.finished();
+            let result = publish_stream(&mut Paced(&data), &target, &wanted, Some(&observed));
+            finishing.recv().unwrap();
+            observed.activity.finished();
             result
         });
-        assert!(activity.wait(), "a moving copy was abandoned");
-        assert_eq!(copy.join().unwrap(), Ok(true));
+        let waiting = activity.clone();
+        let waiter = std::thread::Builder::new()
+            .name("copy-wait".into())
+            .spawn(move || waiting.wait())
+            .unwrap();
+        // The wait must actually sample a pending copy after more than the initial
+        // 60 ms floor, before finished() can make it return trivially. This timeout
+        // is only a deadlock guard; it is not the liveness clock being qualified.
+        let sampled_pending = observation.recv_timeout(Duration::from_secs(5));
+        finish.send(()).unwrap();
         assert!(
-            started.elapsed() > Duration::from_millis(60),
-            "copy never outlived the initial silence floor"
+            sampled_pending.is_ok(),
+            "wait never observed the moving copy"
         );
+        assert!(waiter.join().unwrap(), "a moving copy was abandoned");
+        assert_eq!(copy.join().unwrap(), Ok(true));
+        let state = activity.pending.lock().unwrap();
+        assert!(Duration::from_millis(elapsed_ms.load(Ordering::SeqCst)) > state.1.floor());
+        assert_eq!(state.1.still().moved, object.length);
+        drop(state);
         assert_eq!(
             verify_path(&destination, CacheKind::Blob, &object, None),
             Ok(())
