@@ -191,7 +191,7 @@ func TestPrivateWheelPreservesImageOwnedRequirement(t *testing.T) {
 	writer := zip.NewWriter(file)
 	for name, body := range map[string]string{
 		"fixture.py":                     "VALUE = 123\n",
-		"fixture-1.0.dist-info/METADATA": "Metadata-Version: 2.3\nName: fixture\nVersion: 1.0\nRequires-Dist: torch>=2.13,<3\nRequires-Dist: scipy>=1.0\n\n",
+		"fixture-1.0.dist-info/METADATA": "Metadata-Version: 2.3\nName: fixture\nVersion: 1.0\nProvides-Extra: gpu\nRequires-Dist: torch>=2.13,<3; extra == 'gpu'\nRequires-Dist: scipy>=1.0\n\n",
 		"fixture-1.0.dist-info/RECORD":   "",
 	} {
 		out, err := writer.Create(name)
@@ -218,7 +218,7 @@ func TestPrivateWheelPreservesImageOwnedRequirement(t *testing.T) {
 		must(t, err)
 		must(t, in.Close())
 		metadata := string(body)
-		if !strings.Contains(metadata, "Requires-Dist: torch>=2.13,<3\n") || !strings.Contains(metadata, "Requires-Dist: scipy==1.18.1\n") || strings.Contains(metadata, "scipy>=1.0") {
+		if !strings.Contains(metadata, "Requires-Dist: torch>=2.13,<3; extra == 'gpu'\n") || !strings.Contains(metadata, "Requires-Dist: scipy==1.18.1\n") || strings.Contains(metadata, "scipy>=1.0") || strings.Contains(metadata, "Provides-Extra:") {
 			t.Fatalf("private wheel did not preserve only the image-owned compatibility range: %s", metadata)
 		}
 		return

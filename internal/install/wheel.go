@@ -119,7 +119,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	}
 	var exact []string
 	for name, dependency := range dependencies {
-		if name != project {
+		if name != project && !packagepublish.ImageOwnedDistribution(name) {
 			exact = append(exact, name+"=="+dependency.Version)
 		}
 	}
