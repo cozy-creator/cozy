@@ -5,10 +5,14 @@
 //! the caller's exact digest and length while bytes move into an ordinary local Store.
 //! Cache failure is weather, never authority.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{self as unix, AtFlags, Mode, OFlags};
 
 use crate::err::{Code, Result};
 use crate::ids::{hex64, Doc, ObjectRef};
@@ -241,27 +245,49 @@ impl RepoObjectCache {
         progress: Option<&dyn store::Progress>,
     ) -> Result<CacheWrite> {
         let destination = self.path(kind, &want.sha256)?;
-        if destination.exists() {
-            return Ok(match verify_path(&destination, kind, want, progress) {
-                Ok(()) => CacheWrite::Present,
-                Err(_) => CacheWrite::Unavailable,
-            });
-        }
+        let directory = match cache_parent(&self.root, &destination) {
+            Ok(directory) => directory,
+            Err(_) => return Ok(CacheWrite::Unavailable),
+        };
+        let name = destination.file_name().expect("digest path has a filename");
+        let repair = match open_at(&directory, name) {
+            Ok(file) => {
+                let metadata = match file.metadata() {
+                    Ok(metadata) if metadata.is_file() => metadata,
+                    _ => return Ok(CacheWrite::Unavailable),
+                };
+                match verify_file(file, kind, want, progress) {
+                    Ok(()) => return Ok(CacheWrite::Present),
+                    Err(SoftFailure::Corrupt) => Some(metadata),
+                    Err(_) => return Ok(CacheWrite::Unavailable),
+                }
+            }
+            Err(SoftFailure::Missing) => None,
+            Err(_) => return Ok(CacheWrite::Unavailable),
+        };
         let result = match kind {
             CacheKind::Blob => match source.open_verified(&want.sha256) {
                 Ok(mut file) if file.len() == want.length => {
-                    publish_stream(&mut file, &destination, want, progress)
+                    publish_stream(&mut file, &directory, name, want, progress, repair.as_ref())
                 }
                 Ok(_) | Err(_) => Err(SoftFailure::Unavailable),
             },
             CacheKind::Manifest => match source.read_manifest(want) {
-                Ok(manifest) => publish_bytes(&manifest.canonical_bytes(), &destination, progress),
+                Ok(manifest) => publish_bytes(
+                    &manifest.canonical_bytes(),
+                    &directory,
+                    name,
+                    progress,
+                    repair.as_ref(),
+                ),
                 Err(_) => Err(SoftFailure::Unavailable),
             },
         };
         Ok(match result {
             Ok(true) => CacheWrite::Stored,
-            Ok(false) => match verify_path(&destination, kind, want, progress) {
+            Ok(false) => match open_at(&directory, name)
+                .and_then(|file| verify_file(file, kind, want, progress))
+            {
                 Ok(()) => CacheWrite::Present,
                 Err(_) => CacheWrite::Unavailable,
             },
@@ -451,80 +477,181 @@ fn read_manifest(path: &Path, want: &ObjectRef) -> std::result::Result<Manifest,
     Manifest::parse(&bytes).map_err(|_| SoftFailure::Corrupt)
 }
 
+#[cfg(test)]
 fn verify_path(
     path: &Path,
     kind: CacheKind,
     want: &ObjectRef,
     progress: Option<&dyn store::Progress>,
 ) -> std::result::Result<(), SoftFailure> {
-    match kind {
-        CacheKind::Blob => {
-            let mut file = open_exact(path, want.length)?;
-            let mut sink = std::io::sink();
-            stream_exact(&mut file, &mut sink, want, progress)
-        }
-        CacheKind::Manifest => read_manifest(path, want).map(|_| ()),
+    verify_file(open_exact(path, want.length)?, kind, want, progress)
+}
+
+fn verify_file(
+    mut file: File,
+    kind: CacheKind,
+    want: &ObjectRef,
+    progress: Option<&dyn store::Progress>,
+) -> std::result::Result<(), SoftFailure> {
+    let metadata = file.metadata().map_err(|_| SoftFailure::Unavailable)?;
+    if !metadata.is_file() {
+        return Err(SoftFailure::Unavailable);
     }
+    if metadata.len() != want.length {
+        return Err(SoftFailure::Corrupt);
+    }
+    match kind {
+        CacheKind::Blob => stream_exact(&mut file, &mut std::io::sink(), want, progress),
+        CacheKind::Manifest => {
+            if want.length > Manifest::MAX_BYTES as u64 {
+                return Err(SoftFailure::Corrupt);
+            }
+            let mut bytes = Vec::with_capacity(want.length as usize);
+            file.take(want.length + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| SoftFailure::Unavailable)?;
+            if bytes.len() as u64 != want.length || sha256::hex_digest(&bytes) != want.sha256 {
+                return Err(SoftFailure::Corrupt);
+            }
+            Manifest::parse(&bytes)
+                .map(|_| ())
+                .map_err(|_| SoftFailure::Corrupt)
+        }
+    }
+}
+
+// The configured root is the caller's location authority. Pin it once, then refuse
+// symlinks in every cache-owned fanout directory and publish relative to the pinned fd.
+fn cache_parent(root: &Path, destination: &Path) -> std::result::Result<File, SoftFailure> {
+    fs::create_dir_all(root).map_err(|_| SoftFailure::Unavailable)?;
+    let mut directory = File::from(
+        unix::open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| SoftFailure::Unavailable)?,
+    );
+    let relative = destination
+        .parent()
+        .and_then(|parent| parent.strip_prefix(root).ok())
+        .ok_or(SoftFailure::Unavailable)?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(SoftFailure::Unavailable);
+        };
+        match unix::mkdirat(&directory, name, Mode::from_raw_mode(0o755)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(_) => return Err(SoftFailure::Unavailable),
+        }
+        directory = File::from(
+            unix::openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| SoftFailure::Unavailable)?,
+        );
+    }
+    Ok(directory)
+}
+
+fn open_at(directory: &File, name: &OsStr) -> std::result::Result<File, SoftFailure> {
+    unix::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        if error == rustix::io::Errno::NOENT {
+            SoftFailure::Missing
+        } else {
+            SoftFailure::Unavailable
+        }
+    })
 }
 
 fn publish_bytes(
     bytes: &[u8],
-    destination: &Path,
+    directory: &File,
+    name: &OsStr,
     progress: Option<&dyn store::Progress>,
+    repair: Option<&fs::Metadata>,
 ) -> std::result::Result<bool, SoftFailure> {
-    let mut source = bytes;
-    let want = ObjectRef::of(bytes);
-    publish_stream(&mut source, destination, &want, progress)
+    publish_stream(
+        &mut &bytes[..],
+        directory,
+        name,
+        &ObjectRef::of(bytes),
+        progress,
+        repair,
+    )
 }
 
 fn publish_stream(
     source: &mut impl Read,
-    destination: &Path,
+    directory: &File,
+    name: &OsStr,
     want: &ObjectRef,
     progress: Option<&dyn store::Progress>,
+    repair: Option<&fs::Metadata>,
 ) -> std::result::Result<bool, SoftFailure> {
-    let Some(directory) = destination.parent() else {
-        return Err(SoftFailure::Unavailable);
-    };
-    fs::create_dir_all(directory).map_err(|_| SoftFailure::Unavailable)?;
-    let name = destination
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("object");
-    let temporary = directory.join(format!(
-        ".{name}.{}.{}.tmp",
+    let temporary = format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
         std::process::id(),
         store::now_nanos_unique()
-    ));
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|_| SoftFailure::Unavailable)?;
-    if let Err(error) = stream_exact(source, &mut output, want, progress) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if output.sync_all().is_err()
-        || fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444)).is_err()
-    {
-        let _ = fs::remove_file(&temporary);
-        return Err(SoftFailure::Unavailable);
-    }
-    let admitted = match fs::hard_link(&temporary, destination) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(_) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(SoftFailure::Unavailable);
+    );
+    let mut output = File::from(
+        unix::openat(
+            directory,
+            temporary.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|_| SoftFailure::Unavailable)?,
+    );
+    let publish = (|| {
+        stream_exact(source, &mut output, want, progress)?;
+        output.sync_all().map_err(|_| SoftFailure::Unavailable)?;
+        output
+            .set_permissions(fs::Permissions::from_mode(0o444))
+            .map_err(|_| SoftFailure::Unavailable)?;
+        let admitted = if let Some(previous) = repair {
+            let current = unix::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|_| SoftFailure::Unavailable)?;
+            if current.st_dev != previous.dev() || current.st_ino != previous.ino() {
+                false
+            } else {
+                // Both racing successful repairs publish exactly the same verified object.
+                // renameat replaces the directory entry, never follows a changed symlink.
+                unix::renameat(directory, temporary.as_str(), directory, name)
+                    .map_err(|_| SoftFailure::Unavailable)?;
+                true
+            }
+        } else {
+            match unix::linkat(
+                directory,
+                temporary.as_str(),
+                directory,
+                name,
+                AtFlags::empty(),
+            ) {
+                Ok(()) => true,
+                Err(rustix::io::Errno::EXIST) => false,
+                Err(_) => return Err(SoftFailure::Unavailable),
+            }
+        };
+        if admitted {
+            directory.sync_all().map_err(|_| SoftFailure::Unavailable)?;
         }
-    };
-    let _ = fs::remove_file(&temporary);
-    if admitted && store::fsync_dir(directory).is_err() {
-        return Err(SoftFailure::Unavailable);
-    }
-    Ok(admitted)
+        Ok(admitted)
+    })();
+    let _ = unix::unlinkat(directory, temporary.as_str(), AtFlags::empty());
+    publish
 }
 
 fn stream_exact(
@@ -1040,7 +1167,14 @@ mod backfill_tests {
             length: object.length,
         };
         assert_eq!(
-            publish_stream(&mut input, &destination, &object, None),
+            publish_stream(
+                &mut input,
+                &cache_parent(&root, &destination).unwrap(),
+                destination.file_name().unwrap(),
+                &object,
+                None,
+                None
+            ),
             Ok(true)
         );
         assert!(!source.contains(&object.sha256));
@@ -1077,7 +1211,14 @@ mod backfill_tests {
             }
         }
         assert_eq!(
-            publish_stream(&mut Fails(false), &destination, &object, None),
+            publish_stream(
+                &mut Fails(false),
+                &cache_parent(&root, &destination).unwrap(),
+                destination.file_name().unwrap(),
+                &object,
+                None,
+                None
+            ),
             Err(SoftFailure::Unavailable)
         );
         assert!(!destination.exists());
@@ -1153,7 +1294,14 @@ mod exit_wait_tests {
         let wanted = object.clone();
         let (finish, finishing) = mpsc::channel();
         let copy = std::thread::spawn(move || {
-            let result = publish_stream(&mut Paced(&data), &target, &wanted, Some(&observed));
+            let result = publish_stream(
+                &mut Paced(&data),
+                &cache_parent(target.parent().unwrap(), &target).unwrap(),
+                target.file_name().unwrap(),
+                &wanted,
+                Some(&observed),
+                None,
+            );
             finishing.recv().unwrap();
             observed.activity.finished();
             result
@@ -1182,6 +1330,143 @@ mod exit_wait_tests {
             verify_path(&destination, CacheKind::Blob, &object, None),
             Ok(())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Swap {
+        once: AtomicBool,
+        path: PathBuf,
+        replacement: PathBuf,
+        outside: Option<PathBuf>,
+    }
+    impl store::Progress for Swap {
+        fn admitted(&self) {}
+        fn moved(&self, _: u64) {
+            if self.once.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            if let Some(outside) = &self.outside {
+                fs::rename(&self.path, &self.replacement).unwrap();
+                std::os::unix::fs::symlink(outside, &self.path).unwrap();
+            } else {
+                fs::rename(&self.replacement, &self.path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn publication_stays_in_its_open_directory_after_a_fanout_swap() {
+        let root = std::env::temp_dir().join(format!(
+            "tfs-parent-swap-{}-{}",
+            std::process::id(),
+            store::now_nanos_unique()
+        ));
+        let source = Store::init(&root.join("source")).unwrap();
+        let data = vec![9; 4096];
+        let object = source
+            .put_stream(&mut data.as_slice(), None, &Fault::default())
+            .unwrap()
+            .obj;
+        let cache = RepoObjectCache::new(root.join("cache"));
+        let path = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let parked = root.join("parked");
+        let swap = Swap {
+            once: AtomicBool::new(false),
+            path: path.parent().unwrap().to_path_buf(),
+            replacement: parked.clone(),
+            outside: Some(outside.clone()),
+        };
+        assert_eq!(
+            cache
+                .backfill_observed(&source, CacheKind::Blob, &object, Some(&swap))
+                .unwrap(),
+            CacheWrite::Stored
+        );
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(parked.join(path.file_name().unwrap())).unwrap(),
+            data
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repair_adopts_a_competing_verified_final_instead_of_replacing_it() {
+        let root = std::env::temp_dir().join(format!(
+            "tfs-repair-winner-{}-{}",
+            std::process::id(),
+            store::now_nanos_unique()
+        ));
+        let source = Store::init(&root.join("source")).unwrap();
+        let data = vec![17; 4096];
+        let object = source
+            .put_stream(&mut data.as_slice(), None, &Fault::default())
+            .unwrap()
+            .obj;
+        let cache = RepoObjectCache::new(root.join("cache"));
+        let path = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"bad").unwrap();
+        let winner = root.join("winner");
+        fs::write(&winner, &data).unwrap();
+        let winner_inode = fs::metadata(&winner).unwrap().ino();
+        let swap = Swap {
+            once: AtomicBool::new(false),
+            path: path.clone(),
+            replacement: winner,
+            outside: None,
+        };
+        assert_eq!(
+            cache
+                .backfill_observed(&source, CacheKind::Blob, &object, Some(&swap))
+                .unwrap(),
+            CacheWrite::Present
+        );
+        assert_eq!(fs::metadata(&path).unwrap().ino(), winner_inode);
+        assert_eq!(fs::read(path).unwrap(), data);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_repair_keeps_the_previous_final_and_removes_its_temporary() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("copy interrupted"))
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "tfs-repair-interrupted-{}-{}",
+            std::process::id(),
+            store::now_nanos_unique()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let object = ObjectRef::of(b"right");
+        let path = root.join(&object.sha256);
+        fs::write(&path, b"wrong").unwrap();
+        let previous = fs::metadata(&path).unwrap();
+        let directory = cache_parent(&root, &path).unwrap();
+        assert_eq!(
+            publish_stream(
+                &mut Broken,
+                &directory,
+                path.file_name().unwrap(),
+                &object,
+                None,
+                Some(&previous)
+            ),
+            Err(SoftFailure::Unavailable)
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"wrong");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -57,9 +57,11 @@ directly into the ordinary local Store. Missing, corrupt,
 read-only, full, and unavailable cache states are soft misses; the authenticated cloud source
 remains authoritative. Cloud-success backfill uses a hidden unique sibling, fsync, and an atomic
 no-clobber link, so concurrent writers converge and an interrupted write never has a final name.
-An existing corrupt final entry is never overwritten: it remains a soft miss until an operator
-deletes that exact cache object, after which the next successful backfill repairs it. This explicit
-drop is intentional; the cache has no independent repair authority or garbage collector.
+Backfill repairs a corrupt regular entry by fully verifying and syncing its replacement before
+an atomic rename. A competing correct final is verified and retained. Publication pins the
+configured cache root and opens each fanout directory without following symlinks; all temporary,
+link and rename operations stay relative to those directory descriptors. Symlink and nonregular
+entries remain unavailable. Repair grants no custody and adds no cache garbage collector.
 
 Cache calls perform synchronous filesystem I/O and must run on a worker data path or subprocess,
 never its control loop. A mounted filesystem which stops responding cannot provide a timely soft

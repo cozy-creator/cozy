@@ -5,7 +5,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tensorfs_core::ids::ObjectRef;
+use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::Manifest;
 use tensorfs_core::repo_cache::{CacheKind, CacheRead, CacheWrite, RepoObjectCache};
 use tensorfs_core::store::{Fault, Store};
@@ -105,6 +105,27 @@ fn blobs_and_manifests_round_trip_through_normal_store_admission() {
     );
     assert_eq!(destination.read_manifest(&manifest_ref).unwrap(), manifest);
 
+    // Manifest repairs obey the same complete-object publication rule as blobs.
+    let manifest_path = cache
+        .path(CacheKind::Manifest, &manifest_ref.sha256)
+        .unwrap();
+    fs::set_permissions(
+        &manifest_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    fs::write(&manifest_path, b"damaged manifest").unwrap();
+    assert_eq!(
+        cache
+            .backfill_store(&source, CacheKind::Manifest, &manifest_ref)
+            .unwrap(),
+        CacheWrite::Stored
+    );
+    assert_eq!(
+        fs::read(&manifest_path).unwrap(),
+        manifest.canonical_bytes()
+    );
+
     let cache_root = cache.root();
     assert!(!cache_root.join("tensorfs.sqlite").exists());
     assert!(!cache_root.join("repos").exists());
@@ -203,10 +224,10 @@ fn missing_and_corrupt_cache_objects_fall_through_without_local_admission() {
         cache
             .backfill_store(&source, CacheKind::Blob, &wanted)
             .unwrap(),
-        CacheWrite::Unavailable,
-        "no-clobber leaves repair of a corrupt final entry explicit"
+        CacheWrite::Stored,
+        "verified local bytes atomically repair a corrupt regular cache entry"
     );
-    assert_eq!(fs::read(&cache_path).unwrap(), b"wrong");
+    assert_eq!(fs::read(&cache_path).unwrap(), b"right");
     fs::remove_file(&cache_path).unwrap();
     assert_eq!(
         cache
@@ -567,4 +588,67 @@ fn concurrent_offers_keep_the_offer_list_and_the_sequence_in_step() {
     }
     assert_eq!(mirror.report().durable.objects, objects.len() as u64);
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_symlinked_fanout_never_redirects_cache_publication() {
+    use std::os::unix::fs::symlink;
+    let root = temporary("fanout-symlink");
+    let source = Store::init(&root.join("source")).unwrap();
+    let object = put_blob(&source, b"verified");
+    let cache = RepoObjectCache::new(root.join("cache"));
+    let outside = root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(cache.root()).unwrap();
+    symlink(&outside, cache.root().join("blobs")).unwrap();
+    assert_eq!(
+        cache
+            .backfill_store(&source, CacheKind::Blob, &object)
+            .unwrap(),
+        CacheWrite::Unavailable
+    );
+    assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn concurrent_repairs_publish_only_verified_complete_bytes() {
+    let root = temporary("repairs");
+    let source = Arc::new(Store::init(&root.join("source")).unwrap());
+    let data = vec![73; 2 << 20];
+    let object = put_blob(&source, &data);
+    let cache = Arc::new(RepoObjectCache::new(root.join("cache")));
+    let path = cache.path(CacheKind::Blob, &object.sha256).unwrap();
+    write(&path, &vec![0; data.len()]);
+    let barrier = Arc::new(Barrier::new(4));
+    let workers = (0..4)
+        .map(|_| {
+            let (source, cache, object, barrier) = (
+                source.clone(),
+                cache.clone(),
+                object.clone(),
+                barrier.clone(),
+            );
+            thread::spawn(move || {
+                barrier.wait();
+                cache
+                    .backfill_store(&source, CacheKind::Blob, &object)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        assert!(matches!(
+            worker.join().unwrap(),
+            CacheWrite::Stored | CacheWrite::Present
+        ));
+    }
+    assert_eq!(fs::read(path).unwrap(), data);
+    assert_eq!(
+        cache
+            .backfill_store(&source, CacheKind::Blob, &object)
+            .unwrap(),
+        CacheWrite::Present
+    );
+    fs::remove_dir_all(root).unwrap();
 }
