@@ -180,7 +180,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if installed != packagepublish.PinnedClosure(pins) {
 		return fail(exit.New(exit.Conflict, "installed callable wheel environment differs from its exact selected closure"))
 	}
-	portable := portablePrivateWheelClosure(installed)
+	portable := portableClosure(installed)
 	path := launch.PackageInterfacePath(dir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fail(exit.Internalf("cannot retain private wheel interface"))
@@ -221,17 +221,6 @@ func privateWheelAllNames(dependencies map[string]packagepublish.CapturedDepende
 	}
 	sort.Strings(names)
 	return names
-}
-
-func portablePrivateWheelClosure(installed string) string {
-	rows := make([]string, 0)
-	for _, row := range strings.Split(strings.TrimSpace(installed), "\n") {
-		name, _, _ := strings.Cut(row, "==")
-		if !packagepublish.ImageOwnedDistribution(normalizedRequirementName(name)) {
-			rows = append(rows, row)
-		}
-	}
-	return strings.Join(rows, "\n")
 }
 
 func retainOriginalWheel(dir string, dependency packagepublish.CapturedDependency) (string, *exit.Error) {
