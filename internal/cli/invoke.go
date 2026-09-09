@@ -1342,6 +1342,10 @@ func eventTime(e localapi.Event) time.Time {
 // each new tenth of the work, or after five quiet seconds.
 func (p *RunProgress) sparse(e localapi.Event) {
 	kind := strings.TrimPrefix(e.Type, "request.")
+	if kind == "phase" {
+		p.sparsePhase(e)
+		return
+	}
 	if kind == "queued" || kind == "parked" {
 		line := HumanWaitLine(e.Payload)
 		if line != p.sparseStage {

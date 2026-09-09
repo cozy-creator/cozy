@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -122,10 +123,21 @@ func handleRent(ctx *Context) *exit.Error {
 		return problem
 	}
 	ctx.Daemon = state
+	progress := NewProgress(ctx, false, time.Now())
+	completed := false
+	defer func() {
+		if !completed {
+			progress.On(localapi.Event{Type: "request.failed"})
+		}
+		progress.Done()
+	}()
+	progress.rentalAcquisition(hub.Rental{State: "pending_acquisition",
+		AcceleratorModel: sku.AcceleratorModel, AcceleratorCount: sku.AcceleratorCount,
+		HourlyRateUSDMicros: sku.PriceUSDMicrosPerHour})
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
-		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", nil)
+		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", progress.rentalAcquisition)
 	if e != nil {
 		return e
 	}
@@ -144,6 +156,9 @@ func handleRent(ctx *Context) *exit.Error {
 	if _, e := local.EnsureRental(attachable.ID); e != nil {
 		return e.WithRemedy("the paid rental is attached on this host; keep `cozy run list` running and resume with the same --idempotency-key")
 	}
+	progress.On(localapi.Event{Type: "request.completed"})
+	progress.Done()
+	completed = true
 	ready := attachable
 	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release",
 		idleReleaseNote(ctx.Cfg.RentalsIdleRelease)}
@@ -161,6 +176,7 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "media", V: ready.MediaAddress},
 		{K: "gpu", V: skuName},
 		{K: "accelerator", V: ready.AcceleratorModel},
+		{K: "base_worker_image_digest", V: ready.BaseWorkerImageDigest},
 		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
 	}
 	if ready.Development {
@@ -657,7 +673,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		}
 		// The hub's own words about what is happening, printed when they CHANGE. A line
 		// per poll would be a progress bar for someone else's work.
-		if r.Detail != "" && r.Detail != said {
+		if ctx.Mode().Full && r.Detail != "" && r.Detail != said {
 			said = r.Detail
 			fmt.Fprintf(ctx.Err, "  %s: %s\n", r.State, r.Detail)
 		}

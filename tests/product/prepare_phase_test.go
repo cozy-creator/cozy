@@ -186,7 +186,7 @@ func TestTheProviderDrawsTheProvisioningBoundary(t *testing.T) {
 	}{
 		{"pending_acquisition", "", "", false, orchestrator.PhaseAcquiring},
 		{"pending_acquisition", "CREATED", "", false, orchestrator.PhaseProvisioning},
-		{"pending_acquisition", "RUNNING", "PULLING", false, orchestrator.PhaseProvisioning},
+		{"pending_acquisition", "RUNNING", "PULLING", false, orchestrator.PhasePullingImage},
 		{"pending_acquisition", "RUNNING", "RUNNING", false, orchestrator.PhaseBooting},
 		{"pending_acquisition", "RUNNING", "", false, orchestrator.PhaseBooting},
 		// A rental back in pending_acquisition carrying a failure is buying AGAIN. It
