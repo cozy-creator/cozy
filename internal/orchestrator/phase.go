@@ -54,6 +54,8 @@ const (
 	// PhaseProvisioning: the provider holds the request and has not reported the
 	// container running. This is the provider's queue, and it is not ours to shorten.
 	PhaseProvisioning = "provisioning"
+	// PhasePullingImage: the provider explicitly reports a container image pull.
+	PhasePullingImage = "pulling_image"
 	// PhaseBooting: the paid pod exists and has not yet reported itself attachable.
 	PhaseBooting = "booting"
 	// PhaseResolving: the pod host verified the request and journaled the intent.
@@ -96,9 +98,10 @@ type PhaseObservation struct {
 // RentalProgress is the observed rental product and its whole-pod hourly rate.
 // It is display information only; billing and admission keep their own authority.
 type RentalProgress struct {
-	AcceleratorModel    string `json:"accelerator_model"`
-	AcceleratorCount    int    `json:"accelerator_count"`
-	HourlyRateUSDMicros int64  `json:"hourly_rate_usd_micros"`
+	AcceleratorModel      string `json:"accelerator_model"`
+	AcceleratorCount      int    `json:"accelerator_count"`
+	HourlyRateUSDMicros   int64  `json:"hourly_rate_usd_micros"`
+	BaseWorkerImageDigest string `json:"base_worker_image_digest,omitempty"`
 }
 
 // Elapsed is how long this phase has been the current one.
@@ -448,6 +451,10 @@ func PhaseOfHubRental(state, providerState, containerState string, retrying bool
 		// 25.3s here, before the provider was asked at all. Naming it is the only way
 		// anyone learns it exists.
 		return PhaseAcquiring
+	}
+	switch strings.ToUpper(strings.TrimSpace(containerState)) {
+	case "PULLING", "PULLING_IMAGE", "IMAGE_PULLING":
+		return PhasePullingImage
 	}
 	if providerRunning(providerState, containerState) {
 		return PhaseBooting

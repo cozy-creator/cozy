@@ -9,6 +9,7 @@ import (
 	"golang.org/x/text/width"
 
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 )
@@ -135,6 +136,57 @@ func waitingPlacement(payload map[string]any) bool {
 	return waiting
 }
 
+// Manual rentals observe the same Hub lifecycle facts as a run's acquisition.
+// The shared renderer owns elapsed clocks and terminal history for both commands.
+func (p *RunProgress) rentalAcquisition(r hub.Rental) {
+	name := orchestrator.PhaseOfHubRental(r.State, r.ProviderState, r.ContainerState, r.Failure != nil)
+	if name == "" {
+		if !r.Attachable() {
+			return
+		}
+		name = "connecting"
+	}
+	p.On(localapi.Event{Type: "request.phase", Payload: map[string]any{
+		"value": map[string]any{"phase": name, "machine": r.Name,
+			"rental": map[string]any{"accelerator_model": r.AcceleratorModel,
+				"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros,
+				"base_worker_image_digest": r.BaseWorkerImageDigest},
+		},
+	}})
+}
+
+func (p *RunProgress) sparsePhase(e localapi.Event) {
+	fields, _ := e.Payload["value"].(map[string]any)
+	name, _ := fields["phase"].(string)
+	if name == "" {
+		return
+	}
+	key := "phase:" + name
+	if key != p.sparseStage {
+		p.sparseStarted = eventTime(e)
+	} else if p.now().Sub(p.sparseAt) < 5*time.Second {
+		return
+	}
+	p.sparseStage, p.sparseAt = key, p.now()
+	for _, row := range phaseRows(phaseFieldsAt(e, p.sparseStarted, p.now())) {
+		fmt.Fprintln(p.ctx.Err, row)
+	}
+}
+
+func phaseFieldsAt(e localapi.Event, started, at time.Time) map[string]any {
+	original, _ := e.Payload["value"].(map[string]any)
+	fields := make(map[string]any, len(original)+1)
+	for k, v := range original {
+		fields[k] = v
+	}
+	if prior, measured := number(fields["elapsed_ms"]); measured {
+		fields["elapsed_ms"] = prior + float64(max(at.Sub(eventTime(e)), 0).Milliseconds())
+	} else {
+		fields["elapsed_ms"] = float64(max(at.Sub(started), 0).Milliseconds())
+	}
+	return fields
+}
+
 func (p *RunProgress) stepRows(f stepFacts) []string {
 	line := "  " + f.label
 	if f.counted {
@@ -180,6 +232,9 @@ func phaseRows(fields map[string]any) []string {
 				row += fmt.Sprintf(" · $%.2f/hour", price/1_000_000)
 			}
 			rows = append(rows, row)
+		}
+		if digest, _ := rental["base_worker_image_digest"].(string); digest != "" {
+			rows = append(rows, "    image: "+digest)
 		}
 	}
 	// Older workers report one aggregate transfer. Preserve that honest fallback;
@@ -253,14 +308,7 @@ func (p *RunProgress) visibleRows(at time.Time) []string {
 	}
 	elapsed := max(at.Sub(p.terminal.started), 0)
 	if strings.HasPrefix(p.terminal.key, "phase:") {
-		original, _ := p.terminal.event.Payload["value"].(map[string]any)
-		fields := make(map[string]any, len(original)+1)
-		for k, v := range original {
-			fields[k] = v
-		}
-		prior, _ := number(fields["elapsed_ms"])
-		fields["elapsed_ms"] = prior + float64(max(at.Sub(eventTime(p.terminal.event)), 0).Milliseconds())
-		return phaseRows(fields)
+		return phaseRows(phaseFieldsAt(p.terminal.event, p.terminal.started, at))
 	}
 	if p.terminal.key == "wait" {
 		rows[0] = HumanWaitLine(p.terminal.event.Payload)

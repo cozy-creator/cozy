@@ -554,9 +554,10 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 				m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
 					Name: name, Machine: seen.Name, Detail: detail,
 					Rental: &orchestrator.RentalProgress{
-						AcceleratorModel:    seen.AcceleratorModel,
-						AcceleratorCount:    seen.AcceleratorCount,
-						HourlyRateUSDMicros: seen.HourlyRateUSDMicros,
+						AcceleratorModel:      seen.AcceleratorModel,
+						AcceleratorCount:      seen.AcceleratorCount,
+						HourlyRateUSDMicros:   seen.HourlyRateUSDMicros,
+						BaseWorkerImageDigest: seen.BaseWorkerImageDigest,
 					}})
 			}
 		})
