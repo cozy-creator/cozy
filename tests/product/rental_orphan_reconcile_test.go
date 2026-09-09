@@ -116,6 +116,14 @@ func TestRentalListNamesMachinesThisHostNeverRecorded(t *testing.T) {
 	if row["rented_at"] != "2026-09-07T21:18:49Z" {
 		t.Fatalf("the unrecorded row lost the moment its billing began: %s", out)
 	}
+	// A pre-ready quote without a local total reservation cannot establish spend.
+	stand.set("pr-1111111111111111stiy", "state", "ready")
+	stand.set("pr-1111111111111111stiy", "hourly_rate_source", "quote")
+	code, out = runCozy(t, root, "rental", "list", "--json")
+	if code == 0 || !strings.Contains(out, `"code":"rental.rate_unknown"`) {
+		t.Fatalf("pending quote became an all-in account rate: %d %s", code, out)
+	}
+	stand.set("pr-1111111111111111stiy", "hourly_rate_source", "observed")
 	stand.setRate("pr-1111111111111111stiy", 0)
 	code, out = runCozy(t, root, "rental", "list", "--json")
 	if code == 0 || !strings.Contains(out, `"code":"rental.rate_unknown"`) ||

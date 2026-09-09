@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS rentals (
   accelerator_model TEXT NOT NULL,
   accelerator_count INTEGER NOT NULL DEFAULT 0,
   hourly_rate_usd_micros INTEGER NOT NULL,
+  hourly_rate_source TEXT NOT NULL DEFAULT 'unknown' CHECK(hourly_rate_source IN ('unknown','quote','estimate','observed')),
   managed_request_id TEXT NOT NULL DEFAULT '',
   address           TEXT NOT NULL,
   cert_path         TEXT NOT NULL,
@@ -161,9 +162,8 @@ type RentalRequestAuthor func(machineName string) (body []byte, digest string, p
 // transaction that records it — so two acquisitions can never share a word, and
 // `cozy rental end <word>` is never ambiguous.
 // storageUSDMicros is the SKU's estimated storage adder (th-126): the spend
-// admission totals it with the locked GPU rate — burn is billed-truth money
-// (th-120), so the figure admitted is what the pod will actually bill — while
-// the operation preserves both the GPU quote and the total reservation.
+// admission adds it to the locked GPU quote and preserves that total estimate.
+// A ready rental's observed total replaces the estimate without rewriting the quote.
 func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros, storageUSDMicros int64,
 	author RentalRequestAuthor, observed map[string]int64) (RentalOperation, bool, *exit.Error) {
 	stamp := now()
@@ -462,6 +462,7 @@ type Rental struct {
 	// there is nothing to notice it against.
 	AcceleratorCount    int
 	HourlyRateUSDMicros int64
+	HourlyRateSource    string
 	ManagedRequestID    string
 	Address             string
 	CertPath            string
@@ -493,11 +494,13 @@ type RentalFailure struct {
 	ContainerState        string
 }
 
-const rentalCols = `id,machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider,failure_provider_resource_id,failure_provider_host_id,failure_provider_state,failure_container_state`
+const rentalCols = `id,machine_name,sku,accelerator_model,accelerator_count,hourly_rate_usd_micros,hourly_rate_source,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at,failure_code,failure_image_digest,failure_provider,failure_provider_resource_id,failure_provider_host_id,failure_provider_state,failure_container_state`
 
 // rentalColsPriorThirtyThree is the released column list every schema before 33 carried:
 // the current one without the rental's width.
-var rentalColsPriorThirtyThree = strings.Replace(rentalCols, ",accelerator_count", "", 1)
+var rentalColsPriorThirtyEight = strings.Replace(rentalCols, ",hourly_rate_source", "", 1)
+
+var rentalColsPriorThirtyThree = strings.Replace(rentalColsPriorThirtyEight, ",accelerator_count", "", 1)
 
 const rentalColsPriorTwentyOne = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,ready_at`
 
@@ -507,7 +510,7 @@ var rentalColsPriorThirteen = strings.TrimSuffix(rentalColsPriorTwentyOne, ",rea
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.AcceleratorModel, &r.AcceleratorCount,
-		&r.HourlyRateUSDMicros, &r.ManagedRequestID, &r.Address, &r.CertPath,
+		&r.HourlyRateUSDMicros, &r.HourlyRateSource, &r.ManagedRequestID, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
 		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID, &r.ReadyAt,
 		&r.Failure.Code, &r.Failure.BaseWorkerImageDigest, &r.Failure.Provider,
@@ -560,6 +563,12 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 }
 
 func recordRental(tx *sql.Tx, r Rental) *exit.Error {
+	if r.HourlyRateSource == "" {
+		r.HourlyRateSource = "unknown"
+	}
+	if r.HourlyRateSource != "unknown" && r.HourlyRateSource != "quote" && !RentalRateIsTotal(r.HourlyRateSource) {
+		return exit.Named(exit.Validation, "rental.rate_source_invalid", "unknown rental rate source %q", r.HourlyRateSource)
+	}
 	var err error
 	if r.MachineName == "" || r.SKU == "" || r.HourlyRateUSDMicros == 0 || r.AcceleratorCount == 0 {
 		var existingName, existingSKU string
@@ -616,19 +625,24 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 	if r.RentedAt == "" {
 		r.RentedAt = now()
 	}
-	var current string
-	switch err := tx.QueryRow(`SELECT state FROM rentals WHERE id=?`, r.ID).Scan(&current); {
+	var current, priorRateSource string
+	var currentRate int64
+	switch err := tx.QueryRow(`SELECT state,hourly_rate_source,hourly_rate_usd_micros FROM rentals WHERE id=?`, r.ID).Scan(&current, &priorRateSource, &currentRate); {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
 		return exit.Internalf("cannot read rental %s state: %s", r.ID, err)
 	default:
+		if RentalRateIsTotal(priorRateSource) && !RentalRateIsTotal(r.HourlyRateSource) {
+			// A quote cannot replace a previously qualified total.
+			r.HourlyRateUSDMicros, r.HourlyRateSource = currentRate, priorRateSource
+		}
 		r.State = rentalStateForward(current, r.State)
 	}
 	if r.ReadyAt == "" && RentalReadyState(r.State) {
 		r.ReadyAt = now()
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
@@ -636,6 +650,7 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 		    THEN rentals.accelerator_count ELSE excluded.accelerator_count END,
 		  hourly_rate_usd_micros=CASE WHEN excluded.hourly_rate_usd_micros>0
 		    THEN excluded.hourly_rate_usd_micros ELSE rentals.hourly_rate_usd_micros END,
+		  hourly_rate_source=excluded.hourly_rate_source,
 		  managed_request_id=rentals.managed_request_id,
 		  address=CASE WHEN rentals.address<>'' THEN rentals.address ELSE excluded.address END,
 		  cert_path=CASE WHEN rentals.cert_path<>'' THEN rentals.cert_path ELSE excluded.cert_path END,
@@ -653,7 +668,7 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 		  failure_provider_host_id=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_host_id ELSE excluded.failure_provider_host_id END,
 		  failure_provider_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_provider_state ELSE excluded.failure_provider_state END,
 		  failure_container_state=CASE WHEN rentals.failure_code<>'' THEN rentals.failure_container_state ELSE excluded.failure_container_state END`,
-		r.ID, r.MachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.ManagedRequestID,
+		r.ID, r.MachineName, r.SKU, r.AcceleratorModel, r.AcceleratorCount, r.HourlyRateUSDMicros, r.HourlyRateSource, r.ManagedRequestID,
 		r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID, r.ReadyAt,
 		r.Failure.Code, r.Failure.BaseWorkerImageDigest, r.Failure.Provider,
@@ -898,9 +913,39 @@ func (s *Store) HeldRentalIDs() (map[string]bool, *exit.Error) {
 	return held, nil
 }
 
-// RentalFleetTotals overlays this Hub's census on local billing obligations.
-// An accepted operation and its observed rental are one identity; operations
-// whose rental IDs are still unknown continue reserving their original quotes.
+// RentalRateIsTotal distinguishes qualified total rates from quotes and legacy unknowns.
+func RentalRateIsTotal(source string) bool { return source == "estimate" || source == "observed" }
+
+// rentalObligationsSQL keeps the reservation until the Hub supplies an explicit total.
+// Lifecycle readiness and a positive quote alone do not prove the price.
+const rentalObligationsSQL = `SELECT r.hub,r.id,
+ CASE WHEN r.hourly_rate_source IN ('estimate','observed') THEN r.hourly_rate_usd_micros
+      ELSE o.estimated_hourly_rate_usd_micros END AS rate
+ FROM rentals r LEFT JOIN rental_operations o
+   ON o.rental_id=r.id AND RTRIM(o.hub,'/')=RTRIM(r.hub,'/')
+ WHERE r.state NOT IN (` + absentRentalStates + `)
+ UNION ALL
+ SELECT o.hub,o.rental_id,o.estimated_hourly_rate_usd_micros FROM rental_operations o
+ LEFT JOIN rentals r ON r.id=o.rental_id AND RTRIM(r.hub,'/')=RTRIM(o.hub,'/')
+ WHERE o.state NOT IN (` + finalRentalOperationStates + `)
+   AND o.state NOT IN (` + absentRentalStates + `) AND r.id IS NULL`
+
+// RentalReservedRate is the same per-identity obligation used in fleet admission.
+func (s *Store) RentalReservedRate(hub, id string) (int64, *exit.Error) {
+	var rate sql.NullInt64
+	err := s.db.QueryRow(`SELECT rate FROM (`+rentalObligationsSQL+`)
+		WHERE RTRIM(hub,'/')=? AND id=?`, strings.TrimRight(hub, "/"), id).Scan(&rate)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !rate.Valid) {
+		return 0, unknownRentalEstimate()
+	}
+	if err != nil {
+		return 0, exit.Internalf("cannot read rental reservation: %s", err)
+	}
+	return rate.Int64, nil
+}
+
+// RentalFleetTotals combines ready rental rates with pending total reservations.
+// observed contains this Hub's ready rates, or zero for a still-unpriced identity.
 func (s *Store) RentalFleetTotals(hub string, observed map[string]int64) (int, int64, *exit.Error) {
 	return rentalFleetTotals(s.db, hub, observed)
 }
@@ -910,13 +955,7 @@ func rentalFleetTotals(q interface {
 },
 	hub string, observed map[string]int64,
 ) (int, int64, *exit.Error) {
-	rows, err := q.Query(`SELECT hub,id,hourly_rate_usd_micros FROM rentals
-		WHERE state NOT IN (` + absentRentalStates + `)
-		UNION ALL
-		SELECT o.hub,o.rental_id,o.estimated_hourly_rate_usd_micros FROM rental_operations o
-		LEFT JOIN rentals r ON r.id=o.rental_id AND RTRIM(r.hub,'/')=RTRIM(o.hub,'/')
-		WHERE o.state NOT IN (` + finalRentalOperationStates + `)
-		  AND o.state NOT IN (` + absentRentalStates + `) AND r.id IS NULL`)
+	rows, err := q.Query(rentalObligationsSQL)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot read rental fleet obligations: %s", err)
 	}

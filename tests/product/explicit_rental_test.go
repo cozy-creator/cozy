@@ -196,7 +196,7 @@ func TestSchema36MigrationKeepsAutomaticAssignments(t *testing.T) {
 	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='requests'`).Scan(&create))
 	create = strings.Replace(create, ",\n  requested_gpus INTEGER NOT NULL DEFAULT 0 CHECK(requested_gpus>=0 AND requested_gpus<=4294967295)", "", 1)
 	create = strings.Replace(create, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)
-	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN requested_gpus; ALTER TABLE requests DROP COLUMN requested_rental; ALTER TABLE rental_operations DROP COLUMN estimated_hourly_rate_usd_micros; PRAGMA user_version=36`)
+	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN requested_gpus; ALTER TABLE requests DROP COLUMN requested_rental; ALTER TABLE rental_operations DROP COLUMN estimated_hourly_rate_usd_micros; ALTER TABLE rentals DROP COLUMN hourly_rate_source; PRAGMA user_version=36`)
 	must(t, err)
 	_, err = db.Exec(`PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=? WHERE name='requests'; PRAGMA writable_schema=OFF`, create)
 	must(t, err)

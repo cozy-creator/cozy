@@ -85,6 +85,7 @@ type Rental struct {
 	// a comparison neither end can make by saying the token.
 	MediaTokenSHA256    []string
 	HourlyRateUSDMicros int64
+	HourlyRateSource    string
 	// ProviderState and ContainerState are the provider's own lifecycle words for this
 	// pod, as the hub last observed them. They are here for one reason: without them the
 	// whole interval between "renting" and "attachable" is a single edge, and a person
@@ -163,6 +164,7 @@ type wireRental struct {
 	CreatorPublicKey      string         `json:"creator_public_key"`
 	MediaTokenSHA256      []string       `json:"media_token_sha256"`
 	HourlyRateUSDMicros   int64          `json:"hourly_rate_usd_micros"`
+	HourlyRateSource      string         `json:"hourly_rate_source"`
 	ProviderState         string         `json:"provider_state,omitempty"`
 	ContainerState        string         `json:"container_state,omitempty"`
 	BaseWorkerImageDigest string         `json:"base_worker_image_digest,omitempty"`
@@ -198,6 +200,7 @@ func (w wireRental) rental() Rental {
 		CreatorPublicKey:      w.CreatorPublicKey,
 		MediaTokenSHA256:      w.MediaTokenSHA256,
 		HourlyRateUSDMicros:   w.HourlyRateUSDMicros,
+		HourlyRateSource:      w.HourlyRateSource,
 		ProviderState:         w.ProviderState,
 		ContainerState:        w.ContainerState,
 		BaseWorkerImageDigest: w.BaseWorkerImageDigest,

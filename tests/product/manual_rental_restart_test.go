@@ -176,7 +176,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	fatal(t, problem)
 	machineName := "manual-empty"
 	var mutations atomic.Int64
-	rentalView := map[string]any{"rental_id": podRental, "name": "manual-empty", "state": "ready", "accelerator_count": 1, "hourly_rate_usd_micros": 1}
+	rentalView := map[string]any{"rental_id": podRental, "name": "manual-empty", "state": "ready", "accelerator_count": 1, "hourly_rate_usd_micros": 1, "hourly_rate_source": "observed"}
 	// Control reattachment needs the retained identity, not a successful cloud poll.
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -231,7 +231,6 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 			body, problem := hubapi.RentalRequestBytes(name, "cpu", secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil)
 			return body, fmt.Sprintf("sha256:%x", sha256.Sum256(body)), problem
 		}, nil)
-
 		fatal(t, problem)
 		request, problem := hubapi.ParseRentalRequestBytes(op.RequestBody)
 		fatal(t, problem)

@@ -22,6 +22,52 @@ func storageReservationBody(name string) ([]byte, string, *exit.Error) {
 	return body, fmt.Sprintf("sha256:%x", sha256.Sum256(body)), nil
 }
 
+func TestPendingRentalIdentityKeepsStorageUntilTotalRate(t *testing.T) {
+	for _, pending := range []string{"pending_acquisition", "acquiring", "materializing", "converging", "release_requested"} {
+		t.Run(pending, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "creator.sqlite")
+			store, problem := records.Open(path)
+			fatal(t, problem)
+			const origin = "http://example.invalid"
+			_, _, problem = store.BeginRentalOperation(records.RentalOperation{Key: "first", Hub: origin,
+				HourlyRateUSDMicros: 100000}, 300000, 100000, storageReservationBody, nil)
+			fatal(t, problem)
+			fatal(t, store.AdvanceRentalOperation("first", "rental-pending", pending))
+			row := records.Rental{ID: "rental-pending", MachineName: "pending", Hub: origin,
+				State: pending, AcceleratorCount: 1, HourlyRateUSDMicros: 100000, HourlyRateSource: "quote"}
+			fatal(t, store.RecordRental(row))
+			store.Close()
+			store, problem = records.Open(path)
+			fatal(t, problem)
+			defer store.Close()
+			count, total, problem := store.RentalFleetTotals(origin, map[string]int64{row.ID: 0})
+			fatal(t, problem)
+			if count != 1 || total != 200000 {
+				t.Fatalf("pending ID replaced storage reservation: %d/%d", count, total)
+			}
+			_, _, problem = store.BeginRentalOperation(records.RentalOperation{Key: "second", Hub: origin,
+				HourlyRateUSDMicros: 100000}, 300000, 100000, storageReservationBody, map[string]int64{row.ID: 0})
+			if problem == nil || problem.ErrName() != "rental.fleet_spend_cap" {
+				t.Fatalf("pending ID let the next intent exceed its cap: %v", problem)
+			}
+			if pending == "release_requested" {
+				return
+			}
+			row.State, row.HourlyRateUSDMicros, row.HourlyRateSource = "ready", 40000, "observed"
+			fatal(t, store.RecordRental(row))
+			row.State, row.HourlyRateUSDMicros, row.HourlyRateSource = "pending_acquisition", 100000, "quote"
+			fatal(t, store.RecordRental(row))
+			row.State = "release_requested"
+			fatal(t, store.RecordRental(row))
+			count, total, problem = store.RentalFleetTotals(origin, map[string]int64{row.ID: 0})
+			fatal(t, problem)
+			if count != 1 || total != 40000 {
+				t.Fatal("a late quote or release request replaced the witnessed ready rate")
+			}
+		})
+	}
+}
+
 func TestConcurrentRentalStorageReservationsSurviveRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	first, problem := records.Open(path)
@@ -91,7 +137,14 @@ func TestConcurrentRentalStorageReservationsSurviveRestart(t *testing.T) {
 	}
 }
 
-func TestRentalCLIRetainsStorageReservationBeforeIdentityArrives(t *testing.T) {
+func TestRentalCLIRetainsStorageReservationUntilTotalRate(t *testing.T) {
+	for _, identity := range []string{"absent", "unrecorded", "recorded"} {
+		t.Run(identity, func(t *testing.T) { provePendingRentalStorage(t, identity) })
+	}
+}
+
+func provePendingRentalStorage(t *testing.T, identity string) {
+	t.Helper()
 	root, origin, peer := rentalEndRoot(t, "pending-storage")
 	peer.publishListing()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
@@ -104,11 +157,23 @@ func TestRentalCLIRetainsStorageReservationBeforeIdentityArrives(t *testing.T) {
 	var asks atomic.Int32
 	peer.rent = func(request map[string]any) map[string]any {
 		asks.Add(1)
-		// Accepted response with no identity: the durable intent must survive it.
-		return map[string]any{"name": request["name"], "state": "pending_acquisition"}
+		row := map[string]any{"name": request["name"], "state": "pending_acquisition", "hourly_rate_source": "quote"}
+		if identity != "absent" {
+			row["rental_id"], row["hourly_rate_usd_micros"] = "rental-pending", 100000
+		}
+		if identity == "recorded" {
+			row["accelerator_count"], row["requested_accelerator_model"] = 1, "CPU"
+		}
+		return row
 	}
-	code, out := runCozy(t, root, "rent", "cpu", "--idempotency-key=first", "--json")
-	if code == 0 || !strings.Contains(out, "hub.rental_unnamed") || asks.Load() != 1 {
+	code, out := runCozy(t, root, "rent", "cpu", "--idempotency-key=first", "--timeout=1s", "--json")
+	want := "hub.rental_unnamed"
+	if identity == "unrecorded" {
+		want = "hub.rental_accelerator_count_missing"
+	} else if identity == "recorded" {
+		want = `"code":"deadline"`
+	}
+	if code == 0 || !strings.Contains(out, want) || asks.Load() != 1 {
 		t.Fatalf("first accepted intent did not retain its unknown identity: %d %s", code, out)
 	}
 	code, out = runCozy(t, root, "rental", "list", "--json", "--full")
@@ -125,6 +190,19 @@ func TestRentalCLIRetainsStorageReservationBeforeIdentityArrives(t *testing.T) {
 	code, out = runCozy(t, root, "rent", "cpu", "--idempotency-key=second", "--json")
 	if code == 0 || !strings.Contains(out, "rental.fleet_spend_cap") || asks.Load() != 1 {
 		t.Fatalf("second intent reached POST despite 400000 estimated under 300000 cap: %d %s, asks=%d", code, out, asks.Load())
+	}
+	if identity != "absent" {
+		peer.setState("rental-pending", "ready", "")
+		peer.setRate("rental-pending", 40000)
+		code, out = runCozy(t, root, "rental", "list", "--json", "--full")
+		if code != 0 || json.Unmarshal([]byte(out), &board) != nil || board.Rate != 200000 {
+			t.Fatalf("readiness without rate provenance dropped the reservation: %d %s", code, out)
+		}
+		peer.set("rental-pending", "hourly_rate_source", "observed")
+		code, out = runCozy(t, root, "rental", "list", "--json", "--full")
+		if code != 0 || json.Unmarshal([]byte(out), &board) != nil || board.Rate != 40000 || len(board.Rows) != 1 || board.Rows[0].Rate != 40000 {
+			t.Fatalf("ready billed rate did not replace the reservation: %d %s", code, out)
+		}
 	}
 }
 
@@ -172,6 +250,10 @@ func TestSchema37RentalReservationMigrationPreservesUnknownEstimates(t *testing.
 			"2026-09-08T01:02:03Z", "2026-09-08T02:03:04Z")
 		must(t, err)
 	}
+	_, err = db.Exec(`INSERT INTO rentals(id,machine_name,accelerator_model,accelerator_count,hourly_rate_usd_micros,address,cert_path,state,hub,rented_at,ready_at)
+		VALUES('rental-known','known','CPU',1,100000,'','', 'ready','http://example.invalid','2026-09-08T01:02:03Z','2026-09-08T02:03:04Z')`)
+	must(t, err)
+	priorRentals := tableRows(t, db, "rentals")
 	before := tableRows(t, db, "rental_operations")
 	if reader, problem := records.Open(path); problem == nil || problem.ErrName() != "records_schema_upgrade_required" {
 		if reader != nil {
@@ -190,6 +272,11 @@ func TestSchema37RentalReservationMigrationPreservesUnknownEstimates(t *testing.
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	if version != 39 || tableRows(t, db, "rental_operations") != before {
 		t.Fatal("migration changed retained quote, identity, state or timestamps")
+	}
+	legacy, problem := store.RentalRow("rental-known")
+	fatal(t, problem)
+	if legacy.HourlyRateSource != "unknown" || legacy.HourlyRateUSDMicros != 100000 || tableRows(t, db, "rentals") != priorRentals {
+		t.Fatal("migration invented rate provenance or changed historical numbers")
 	}
 	ops, problem := store.RentalOperations()
 	fatal(t, problem)
