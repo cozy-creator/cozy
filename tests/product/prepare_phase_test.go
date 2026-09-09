@@ -127,27 +127,30 @@ func TestAPhaseWithNoDenominatorRendersBytesAndRate(t *testing.T) {
 		Status: "queued", Phase: orchestrator.PhaseDownloading, PhaseMachine: "uzume",
 		PhaseMovedBytes: &moved, PhaseRate: &rate,
 	})
-	for _, want := range []string{"waiting: downloading models", "/s"} {
+	for _, want := range []string{"downloading models", "/s"} {
 		if !strings.Contains(cell, want) {
 			t.Fatalf("the cell %q does not carry %q", cell, want)
 		}
 	}
-	if strings.Contains(cell, "uzume") {
-		t.Fatalf("progress repeats the machine column: %q", cell)
+	if strings.Contains(cell, "uzume") || strings.Contains(cell, "waiting:") {
+		t.Fatalf("progress contains redundant context: %q", cell)
 	}
-	if strings.Contains(cell, "%") || strings.Contains(cell, " of ") {
+	if strings.Contains(cell, "%") || strings.Contains(cell, " / ") {
 		t.Fatalf("the cell invented a fraction with no declared total: %q", cell)
 	}
 
 	// With a total the fraction becomes real, and only then.
-	total := int64(226_000_000_000)
+	moved, total := int64(50<<30), int64(100<<30)
 	cell = cli.PhaseCell(api.Lifecycle{
 		Status: "queued", Phase: orchestrator.PhaseDownloading,
 		PhaseMovedBytes: &moved, PhaseTotalBytes: &total, PhaseRate: &rate,
 	})
-	if !strings.Contains(cell, " of ") {
-		t.Fatalf("the cell does not name the declared total: %q", cell)
+	for _, want := range []string{"50", " / ", "100"} {
+		if !strings.Contains(cell, want) {
+			t.Fatalf("the cell does not show finished / total bytes: %q", cell)
+		}
 	}
+	t.Log(cell)
 }
 
 // TestAPhaseWithNoCountersStillNamesItself is the other honesty arm, and the one that
@@ -157,7 +160,7 @@ func TestAPhaseWithNoCountersStillNamesItself(t *testing.T) {
 	cell := cli.PhaseCell(api.Lifecycle{
 		Status: "queued", Phase: orchestrator.PhaseProvisioning, PhaseMachine: "fumiya", PhaseElapsedMS: &elapsed,
 	})
-	if cell != "waiting: provisioning machine" {
+	if cell != "provisioning machine" {
 		t.Fatalf("a counterless phase should name only the activity: %q", cell)
 	}
 	if strings.Contains(cell, "0 B") {
@@ -165,7 +168,7 @@ func TestAPhaseWithNoCountersStillNamesItself(t *testing.T) {
 	}
 	cell = cli.PhaseCell(api.Lifecycle{Status: "queued", Phase: orchestrator.PhaseResolving,
 		PhaseMachine: "fumiya", PhaseElapsedMS: &elapsed})
-	if cell != "waiting: preparing downloads" {
+	if cell != "preparing downloads" {
 		t.Fatalf("resolution should not claim model bytes are downloading: %q", cell)
 	}
 }

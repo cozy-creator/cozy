@@ -847,11 +847,11 @@ func PhaseCell(life api.Lifecycle) string {
 	case orchestrator.PhaseWarming:
 		activity = "loading models"
 	}
-	parts := []string{"waiting: " + activity}
+	parts := []string{activity}
 	if life.PhaseMovedBytes != nil {
 		moved := output.Bytes(*life.PhaseMovedBytes)
 		if life.PhaseTotalBytes != nil && *life.PhaseTotalBytes > 0 {
-			moved += " of " + output.Bytes(*life.PhaseTotalBytes)
+			moved += " / " + output.Bytes(*life.PhaseTotalBytes)
 		}
 		parts = append(parts, moved)
 	}
