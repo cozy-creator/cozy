@@ -1,0 +1,384 @@
+package producttest
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/media"
+	"github.com/cozy-creator/cozy/internal/mediawire"
+	"github.com/cozy-creator/cozy/internal/secret"
+)
+
+func inputMediaClient(t *testing.T, address string, budget time.Duration) *media.Client {
+	t.Helper()
+	client, problem := media.Dial(media.Spec{Addr: address, Token: secret.New("media-input-test")}, budget, 1024)
+	fatal(t, problem)
+	return client
+}
+
+func TestMediaNegotiatesExistingAndScopedPeersBeforeBytes(t *testing.T) {
+	for _, capability := range []string{"", `,"attempt_scoped_inputs":false`, `,"attempt_scoped_inputs":true`} {
+		t.Run(fmt.Sprint(capability), func(t *testing.T) {
+			var writes atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == "/v1/health" {
+					fmt.Fprintf(w, `{"service":"cozy-media","contract_rev":%d%s}`, mediawire.ContractRev, capability)
+					return
+				}
+				writes.Add(1)
+				if r.Method == http.MethodPost {
+					_, countPresent := r.URL.Query()["output_count"]
+					if countPresent != strings.HasSuffix(capability, "true") || r.URL.Query().Get("max_bytes") != "1024" {
+						t.Errorf("wrong negotiated reservation: %s", r.URL)
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/outputs/attempt-7"})
+					return
+				}
+				wantPath := "/v1/inputs/attempt-7-payload"
+				if strings.HasSuffix(capability, "true") {
+					wantPath = "/v1/attempts/attempt-7/inputs/payload"
+				}
+				if r.Method != http.MethodPut || r.URL.Path != wantPath {
+					t.Errorf("wrong negotiated upload: %s %s", r.Method, r.URL.Path)
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"path": "/tmp/cozy/input", "digest": inputDigest(body), "length": len(body)})
+			}))
+			defer server.Close()
+			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+			fatal(t, client.Health())
+			if writes.Load() != 0 {
+				t.Fatal("health moved bytes before negotiation")
+			}
+			_, problem := client.ReserveOutputs("attempt-7", 1024, 3)
+			fatal(t, problem)
+			_, problem = client.PutInput("attempt-7", "payload", []byte("payload"))
+			fatal(t, problem)
+			original := filepath.Join(t.TempDir(), "original")
+			must(t, os.WriteFile(original, []byte("payload"), 0600))
+			_, problem = client.PutInputFile("attempt-7", "payload", original, inputDigest([]byte("payload")), 7)
+			fatal(t, problem)
+			if writes.Load() != 3 {
+				t.Fatalf("unexpected transport replay count: %d", writes.Load())
+			}
+		})
+	}
+}
+
+func TestScopedMediaFailureNeverFallsBackToUnscopedUpload(t *testing.T) {
+	var scoped, legacy atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/health" {
+			fmt.Fprintf(w, `{"service":"cozy-media","contract_rev":%d,"attempt_scoped_inputs":true}`, mediawire.ContractRev)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/inputs/") {
+			legacy.Add(1)
+		} else {
+			scoped.Add(1)
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"media.input_conflict","message":"changed input"}}`)
+	}))
+	defer server.Close()
+	client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+	fatal(t, client.Health())
+	if path, problem := client.PutInput("attempt-7", "payload", []byte("payload")); problem == nil || path != "" || problem.ErrName() != "media.input_conflict" {
+		t.Fatalf("scoped refusal changed: %s %v", path, problem)
+	}
+	if scoped.Load() != 1 || legacy.Load() != 0 {
+		t.Fatalf("scoped failure retried legacy route: scoped=%d legacy=%d", scoped.Load(), legacy.Load())
+	}
+}
+
+// A zero-output attempt still reserves an explicit count; the receiver must
+// distinguish zero from an old client which omitted inode obligations entirely.
+func TestMediaOutputReservationCarriesExactCount(t *testing.T) {
+	for _, count := range []int{0, 3} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			bound := int64(count) * 512
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/outputs/attempt-7" ||
+					r.URL.Query().Get("output_count") != fmt.Sprint(count) ||
+					r.URL.Query().Get("max_bytes") != fmt.Sprint(bound) {
+					t.Errorf("output byte/count reservation changed: %s %s", r.Method, r.URL)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/outputs/attempt-7"})
+			}))
+			defer server.Close()
+			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+			dir, problem := client.ReserveOutputs("attempt-7", bound, count)
+			fatal(t, problem)
+			if dir != "/outputs/attempt-7" {
+				t.Fatalf("reservation lost its directory: %q", dir)
+			}
+		})
+	}
+}
+
+// Exercise the common bytes/file transport with a response lost after the peer
+// consumes the body. Retrying preserves both path components and the original file.
+func TestMediaInputRetryKeepsAttemptAndOriginalFile(t *testing.T) {
+	body := []byte("shared input")
+	original := filepath.Join(t.TempDir(), "original")
+	must(t, os.WriteFile(original, body, 0600))
+	before, err := os.Stat(original)
+	must(t, err)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.EscapedPath() != "/v1/attempts/attempt-7/inputs/input-2" {
+			t.Errorf("wrong scoped upload: %s %s", r.Method, r.URL.EscapedPath())
+		}
+		if r.Header.Get("Authorization") != "Bearer media-input-test" || r.ContentLength != int64(len(body)) {
+			t.Error("upload omitted credential or exact length")
+		}
+		got, err := io.ReadAll(r.Body)
+		if err != nil || !bytes.Equal(got, body) {
+			t.Errorf("upload body changed: %q, %v", got, err)
+		}
+		if requests.Add(1) == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"path": "/tmp/cozy/shared.bin", "digest": inputDigest(got), "length": len(got)})
+	}))
+	defer server.Close()
+	client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+	if _, problem := client.PutInput("attempt-7", "input-2", body); problem == nil {
+		t.Fatal("lost response incorrectly produced a usable path")
+	}
+	path, problem := client.PutInputFile("attempt-7", "input-2", original, inputDigest(body), int64(len(body)))
+	fatal(t, problem)
+	if path != "/tmp/cozy/shared.bin" || requests.Load() != 2 {
+		t.Fatalf("retry changed destination or replayed unexpectedly: %q, %d", path, requests.Load())
+	}
+	after, err := os.Stat(original)
+	must(t, err)
+	if !os.SameFile(before, after) {
+		t.Fatal("upload replaced the borrowed original")
+	}
+	got, err := os.ReadFile(original)
+	must(t, err)
+	if !bytes.Equal(got, body) {
+		t.Fatal("upload modified the borrowed original")
+	}
+}
+
+func TestMediaInputRequiresExactReceipt(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		for _, response := range []string{
+			`{"path":"/tmp/cozy/input","length":3}`,
+			`{"path":"/tmp/cozy/input","length":2,"digest":"sha256:incorrect"}`,
+		} {
+			t.Run(fmt.Sprintf("legacy=%t/%s", legacy, response), func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/v1/health" {
+						fmt.Fprintf(w, `{"service":"cozy-media","contract_rev":%d,"attempt_scoped_inputs":%t}`, mediawire.ContractRev, !legacy)
+						return
+					}
+					_, _ = io.Copy(io.Discard, r.Body)
+					_, _ = io.WriteString(w, response)
+				}))
+				defer server.Close()
+				client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+				fatal(t, client.Health())
+				if path, problem := client.PutInput("attempt-1", "payload", []byte("abc")); problem == nil || path != "" {
+					t.Fatalf("inexact receipt became input grant: %q, %v", path, problem)
+				}
+			})
+		}
+	}
+}
+
+// This optional cross-repository proof dials an actual Tensorhub podmedia server
+// with a disposable ledger/cache. The address never points at a paid rental.
+func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
+	address := os.Getenv("COZY_TEST_POD_MEDIA_ADDR")
+	if address == "" {
+		t.Skip("requires disposable Tensorhub podmedia receiver at COZY_TEST_POD_MEDIA_ADDR")
+	}
+	client := inputMediaClient(t, address, 2*time.Second)
+	fatal(t, client.Health())
+	outputSlot := media.Slot("output-count-proof", 1)
+	defer client.DropAttempt(outputSlot)
+	_, problem := client.ReserveOutputs(outputSlot, 4096, 3)
+	fatal(t, problem)
+	_, problem = client.ReserveOutputs(outputSlot, 4096, 3)
+	fatal(t, problem)
+	if _, problem = client.ReserveOutputs(outputSlot, 4096, 2); problem == nil {
+		t.Fatal("receiver allowed an existing output count to change")
+	}
+	body := []byte("same cached bytes across attempts")
+	slotA := media.Slot("input-proof-a", 1)
+	slotB := media.Slot("input-proof-b", 1)
+	defer client.DropAttempt(slotA)
+	defer client.DropAttempt(slotB)
+	if _, problem := client.PutInput(slotA, "payload", body); problem == nil {
+		t.Fatal("receiver accepted bytes before reservation")
+	}
+	_, problem = client.ReserveOutputs(slotA, 0, 0)
+	fatal(t, problem)
+	// Let the actual receiver commit the input, then drop its response before
+	// Creator can obtain a path. The next upload retries the same binding.
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: address})
+	var committed atomic.Bool
+	proxy.ModifyResponse = func(response *http.Response) error {
+		if response.StatusCode >= 400 {
+			return nil
+		}
+		_, err := io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			return err
+		}
+		committed.Store(true)
+		return fmt.Errorf("discard committed upload response")
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+		connection, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = connection.Close()
+		}
+	}
+	lostReply := httptest.NewServer(proxy)
+	defer lostReply.Close()
+	interrupted := inputMediaClient(t, strings.TrimPrefix(lostReply.URL, "http://"), time.Second)
+	if path, problem := interrupted.PutInput(slotA, "payload", body); problem == nil || path != "" || !committed.Load() {
+		t.Fatalf("lost committed response yielded a grant: %q, %v, committed=%t", path, problem, committed.Load())
+	}
+	path, problem := client.PutInput(slotA, "payload", body)
+	fatal(t, problem)
+	if _, problem := client.PutInput(slotA, "payload", []byte("changed binding")); problem == nil {
+		t.Fatal("receiver rebound an existing input to changed bytes")
+	}
+	_, problem = client.ReserveOutputs(slotB, 0, 0)
+	fatal(t, problem)
+	original := filepath.Join(t.TempDir(), "original")
+	must(t, os.WriteFile(original, body, 0600))
+	shared, problem := client.PutInputFile(slotB, "input-0", original, inputDigest(body), int64(len(body)))
+	fatal(t, problem)
+	if shared != path {
+		t.Fatalf("same bytes copied into per-attempt paths: %q != %q", shared, path)
+	}
+	fatal(t, client.DropAttempt(slotA))
+	fatal(t, client.DropAttempt(slotA))
+	got, err := os.ReadFile(shared)
+	must(t, err)
+	if !bytes.Equal(got, body) {
+		t.Fatal("pre-accept cancellation removed another attempt's input")
+	}
+	got, err = os.ReadFile(original)
+	must(t, err)
+	if !bytes.Equal(got, body) {
+		t.Fatal("attempt cleanup changed the borrowed original")
+	}
+	for _, boundary := range []string{"reserved", "payload", "file"} {
+		t.Run("cancel_"+boundary, func(t *testing.T) {
+			slot := media.Slot("cancel-"+boundary, 1)
+			_, problem := client.ReserveOutputs(slot, 0, 0)
+			fatal(t, problem)
+			if boundary != "reserved" {
+				_, problem = client.PutInput(slot, "payload", body)
+				fatal(t, problem)
+			}
+			if boundary == "file" {
+				_, problem = client.PutInputFile(slot, "input-0", original, inputDigest(body), int64(len(body)))
+				fatal(t, problem)
+			}
+			fatal(t, client.DropAttempt(slot))
+			fatal(t, client.DropAttempt(slot))
+			if _, problem = client.PutInput(slot, "payload", body); problem == nil {
+				t.Fatal("released reservation still accepted an input")
+			}
+			got, err := os.ReadFile(shared)
+			must(t, err)
+			if !bytes.Equal(got, body) {
+				t.Fatal("cancellation removed another attempt's input")
+			}
+		})
+	}
+}
+
+func inputDigest(data []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(data)) }
+
+// Exercise the same client against the actual pre-scoped receiver used by
+// retained rentals. The fixed test credential and disposable loopback receiver
+// keep this proof separate from live pods and their files.
+func TestLegacyInputsAgainstPodMedia(t *testing.T) {
+	address := os.Getenv("COZY_TEST_LEGACY_POD_MEDIA_ADDR")
+	if address == "" {
+		t.Skip("requires disposable old Tensorhub receiver at COZY_TEST_LEGACY_POD_MEDIA_ADDR")
+	}
+	client := inputMediaClient(t, address, 2*time.Second)
+	fatal(t, client.Health())
+	body := []byte("existing rental shared image")
+	original := filepath.Join(t.TempDir(), "original")
+	must(t, os.WriteFile(original, body, 0600))
+	before, err := os.Stat(original)
+	must(t, err)
+	slotA, slotB := media.Slot("legacy-a", 1), media.Slot("legacy-b", 1)
+	defer client.DropAttempt(slotA)
+	defer client.DropAttempt(slotB)
+	_, problem := client.ReserveOutputs(slotA, 4096, 3)
+	fatal(t, problem)
+	_, problem = client.ReserveOutputs(slotA, 4096, 3)
+	fatal(t, problem)
+	path, problem := client.PutInput(slotA, "payload", body)
+	fatal(t, problem)
+	_, problem = client.ReserveOutputs(slotB, 0, 0)
+	fatal(t, problem)
+	shared, problem := client.PutInputFile(slotB, "input-0", original, inputDigest(body), int64(len(body)))
+	fatal(t, problem)
+	if path != shared {
+		t.Fatalf("legacy receiver duplicated shared input: %q != %q", path, shared)
+	}
+	inode, err := os.Stat(path)
+	must(t, err)
+	retry, problem := client.PutInput(slotA, "payload", body)
+	fatal(t, problem)
+	reused, err := os.Stat(retry)
+	must(t, err)
+	if !os.SameFile(inode, reused) {
+		t.Fatal("legacy retry replaced cached inode")
+	}
+	fatal(t, client.DropAttempt(slotA))
+	fatal(t, client.DropAttempt(slotA))
+	got, err := os.ReadFile(shared)
+	must(t, err)
+	if !bytes.Equal(got, body) {
+		t.Fatal("legacy cleanup damaged another job's shared bytes")
+	}
+	fatal(t, client.DropAttempt(slotB))
+	got, err = os.ReadFile(shared)
+	must(t, err)
+	if !bytes.Equal(got, body) {
+		t.Fatal("legacy receiver unexpectedly reclaimed shared cache")
+	}
+	after, err := os.Stat(original)
+	must(t, err)
+	if !os.SameFile(before, after) {
+		t.Fatal("legacy upload changed borrowed original inode")
+	}
+}

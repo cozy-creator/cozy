@@ -110,6 +110,7 @@ type fakePod struct {
 	// more is what one that reports while the bytes are moving sends. It exists so the
 	// phase lane is proven on a stream that ADVANCES, not only on one that is wired.
 	downloadSamples int
+	prepareEvent    func(*pb.PrepareEvent)
 
 	mu                 sync.Mutex
 	acks               []*pb.SnapshotAck
@@ -630,6 +631,9 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, TotalBytes: total, TransferredBytes: total,
 			PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: setDigest, PlacementSetCanonicalBytes: setBytes}})
 	for i, event := range events {
+		if p.prepareEvent != nil {
+			p.prepareEvent(event)
+		}
 		if err := stream.Send(event); err != nil {
 			return err
 		}
@@ -728,23 +732,42 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 	t.Cleanup(server.Stop)
 	rev := mediawire.ContractRev
 	mediaRoot := filepath.Join(root, "pod-media")
+	var mediaWrites sync.Mutex
+	reserved := map[string]bool{}
 	mediaPlane := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mediaWrites.Lock()
+		defer mediaWrites.Unlock()
 		switch {
 		case r.URL.Path == "/v1/health":
-			_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &rev})
-		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/inputs/"):
+			_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &rev, AttemptScopedInputs: true})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/attempts/") && strings.Contains(r.URL.Path, "/inputs/"):
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/attempts/"), "/inputs/")
+			if len(parts) != 2 || !reserved[parts[0]] {
+				t.Errorf("input upload arrived without its attempt reservation: %s", r.URL.Path)
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
 			body, _ := io.ReadAll(r.Body)
-			path := filepath.Join(mediaRoot, "inputs", strings.TrimPrefix(r.URL.Path, "/v1/inputs/"))
+			path := filepath.Join(mediaRoot, "inputs", strings.TrimPrefix(r.URL.Path, "/v1/attempts/"))
 			_ = os.MkdirAll(filepath.Dir(path), 0o755)
 			_ = os.WriteFile(path, body, 0o644)
 			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]any{"path": path, "length": len(body)})
+			_ = json.NewEncoder(w).Encode(map[string]any{"path": path, "length": len(body), "digest": "sha256:" + hex.EncodeToString(sha256Of(body))})
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/outputs/"):
-			dir := filepath.Join(mediaRoot, "outputs", strings.TrimPrefix(r.URL.Path, "/v1/outputs/"))
+			count, err := strconv.Atoi(r.URL.Query().Get("output_count"))
+			if err != nil || count < 0 {
+				t.Errorf("output reservation omitted its exact file count: %s", r.URL)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			slot := strings.TrimPrefix(r.URL.Path, "/v1/outputs/")
+			reserved[slot] = true
+			dir := filepath.Join(mediaRoot, "outputs", slot)
 			_ = os.MkdirAll(dir, 0o755)
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"dir": dir})
 		case r.Method == http.MethodDelete:
+			delete(reserved, strings.TrimPrefix(r.URL.Path, "/v1/attempts/"))
 			_ = json.NewEncoder(w).Encode(map[string]any{})
 		default:
 			w.WriteHeader(http.StatusNotFound)
