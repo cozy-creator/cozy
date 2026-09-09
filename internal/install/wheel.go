@@ -125,7 +125,9 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	}
 	sort.Strings(exact)
 	executablePath := filepath.Join(dir, "wheels", filepath.Base(original))
-	if problem := wheel.PinDependencies(original, executablePath, exact); problem != nil {
+	if problem := wheel.PinDependenciesPreserving(original, executablePath, exact, func(raw string) bool {
+		return packagepublish.ImageOwnedDistribution(normalizedRequirementName(raw))
+	}); problem != nil {
 		return fail(problem)
 	}
 	executable, problem := packagepublish.CaptureDependency(executablePath)
