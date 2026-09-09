@@ -937,26 +937,31 @@ func (s *Store) QueuedUnpinnedRentalRequests() (int, *exit.Error) {
 	return count, nil
 }
 
-// RentalLastSettlement returns the newest settled request assigned to one rental and
-// the time its final attempt became durable. A zero ClosedAt means the request settled
-// before an attempt crossed the terminal boundary.
+// RentalLastSettlement includes preparation that settled before an attempt
+// existed. ClosedAt stays zero in that case; SettledAt comes from the atomic
+// terminal request event, so idle grace survives missed sweeps and restarts.
 type RentalLastSettlement struct {
 	RequestID string
 	Kind      string
 	ClosedAt  time.Time
+	SettledAt time.Time
 }
 
 func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *exit.Error) {
 	var out RentalLastSettlement
-	var closedAt string
-	err := s.db.QueryRow(`SELECT r.id,r.kind,COALESCE(MAX(a.closed_at),'')
+	var closedAt, settledAt string
+	err := s.db.QueryRow(`SELECT r.id,r.kind,COALESCE(MAX(a.closed_at),''),
+		MAX(COALESCE(MAX(a.closed_at),''), COALESCE((
+		  SELECT e.at FROM request_events e WHERE e.request_id=r.id
+		    AND e.type IN ('request.completed','request.failed','request.canceled')
+		  ORDER BY e.seq DESC LIMIT 1),'')) AS settled_at
 		FROM requests r
 		LEFT JOIN attempts a ON a.request_id=r.id AND a.state IN ('terminal','closed')
 		WHERE r.worker=? AND r.rental=1
 		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')
 		GROUP BY r.id,r.kind,r.created_at
-		ORDER BY COALESCE(NULLIF(MAX(a.closed_at),''),r.created_at) DESC,r.id DESC LIMIT 1`, id).
-		Scan(&out.RequestID, &out.Kind, &closedAt)
+		ORDER BY COALESCE(NULLIF(settled_at,''),r.created_at) DESC,r.id DESC LIMIT 1`, id).
+		Scan(&out.RequestID, &out.Kind, &closedAt, &settledAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RentalLastSettlement{}, false, nil
 	}
@@ -971,6 +976,14 @@ func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *ex
 				"rental %s has an invalid terminal timestamp: %s", id, err)
 		}
 		out.ClosedAt = parsed
+	}
+	if settledAt != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, settledAt)
+		if err != nil {
+			return RentalLastSettlement{}, false, exit.Internalf(
+				"rental %s has an invalid settlement timestamp: %s", id, err)
+		}
+		out.SettledAt = parsed
 	}
 	return out, true, nil
 }
