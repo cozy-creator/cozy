@@ -13,7 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-func TestPrivateModelPreflightDefersOnlyUnboundJobInputs(t *testing.T) {
+func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 	for _, mode := range []string{"job-unbound", "entrypoint-unbound", "job-default", "job-owner-unreadable"} {
 		t.Run(mode, func(t *testing.T) {
 			catalog := newLadderHub(t)
@@ -58,7 +58,7 @@ func TestPrivateModelPreflightDefersOnlyUnboundJobInputs(t *testing.T) {
 			resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.server.URL, HubToken: secret.New("ladder-test")}, nil)
 			models, problem := resolver.PrivateChildModels(records.Request{InstallID: parent.ID, Kind: "job"})
 			switch mode {
-			case "job-unbound":
+			case "job-unbound", "entrypoint-unbound":
 				fatal(t, problem)
 				if len(models) != 0 {
 					t.Fatal("future retained artifact acquired a fabricated static selection")
@@ -68,15 +68,50 @@ func TestPrivateModelPreflightDefersOnlyUnboundJobInputs(t *testing.T) {
 				if len(models) != 1 || models[0].Model != ladderModel || len(models[0].Ladder) != 1 || models[0].Ladder[0].Lane != ladderLane {
 					t.Fatal("deferral discarded an authored model ladder")
 				}
-			case "entrypoint-unbound":
-				if problem == nil || problem.ErrName() != "child.model_unbound" {
-					t.Fatal("unbound serving model was deferred", problem)
-				}
 			case "job-owner-unreadable":
 				if problem == nil || problem.ErrName() != "child.model_binding_unreadable" {
 					t.Fatal("unreadable owner binding silently fell back or was deferred", problem)
 				}
 			}
 		})
+	}
+}
+
+func TestInvokedCapturedEntrypointStillRequiresItsActualModel(t *testing.T) {
+	layout, problem := home.Open(t.TempDir())
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	installed := cleanupTestInstall(layout, "3333333333333333", "1.0.0")
+	installed.Package = "local/captured"
+	raw := assessmentJSON(t, map[string]any{
+		"format": "cozy.package.interface/1", "application": "captured:app",
+		"entrypoints": []any{map[string]any{
+			"name": "judge", "models": []any{map[string]any{"class": "Judge", "path": "judge.models.model", "component_use": map[string]any{}}},
+			"request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}},
+			"invocable": map[string]any{"context": "ctx", "module": "captured", "export": "judge", "parameters": []any{},
+				"defaults": map[string]any{}, "type_names": map[string]any{}, "enum_members": map[string]any{}, "memoize": false, "capabilities": []any{}},
+		}},
+		"jobs": []any{map[string]any{"name": "parent", "publishes": false, "models": []any{},
+			"request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}}, "weights_outputs": []any{}}},
+	})
+	installed.PackageInterface = assessmentDigest(raw)
+	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0o700))
+	must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), raw, 0o444))
+	fatal(t, store.RecordInstall(installed))
+	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID, ChildInstallID: installed.ID,
+		InterfaceDigest: installed.PackageInterface, Module: "captured", Export: "judge", Entrypoint: "judge"}}))
+	resolver := cli.NewResolver(store, config.Config{Home: layout.Root}, nil)
+	parent := records.Request{ID: "parent", InstallID: installed.ID, Entrypoint: "parent", Kind: "job"}
+	models, problem := resolver.PrivateChildModels(parent)
+	fatal(t, problem)
+	if len(models) != 0 {
+		t.Fatal("preflight invented a model")
+	}
+	_, _, problem = resolver.ResolvePrivateChild(parent, installed.PackageInterface, "captured", "judge",
+		assessmentJSON(t, map[string]any{"payload": map[string]any{}, "models": map[string]any{"model": nil}}))
+	if problem == nil || problem.ErrName() != "child.model_unbound" {
+		t.Fatal("invoking an unbound entrypoint bypassed actual model admission", problem)
 	}
 }

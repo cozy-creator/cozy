@@ -172,9 +172,9 @@ func (r *Resolver) childAccelerator(parent records.Request) (string, *exit.Error
 
 // PrivateChildModels is every captured callee's declared model selection, with its rung
 // still open. Two consumers, one reading: the machine decision uses it so a composition
-// whose parent holds no model of its own is still bought a card its SHOTS declare a lane
-// for and sized for their bytes, and asking it before the buy means a slot that cannot be
-// bound at all refuses on the queue instead of on a paid pod.
+// whose parent holds no model of its own can still use available authored/default
+// ladders for placement. Capturing a callable does not invoke it or establish its
+// future model arguments; absent selections are checked when the child is called.
 func (r *Resolver) PrivateChildModels(request records.Request) ([]records.ModelRef, *exit.Error) {
 	if request.InstallID == "" {
 		return nil, nil
@@ -212,10 +212,10 @@ func (r *Resolver) PrivateChildModels(request records.Request) ([]records.ModelR
 			for _, slot := range job.Models {
 				selected, problem := r.childModelLadder(child.Package, binding.Entrypoint, slot)
 				if problem != nil {
-					// A job can receive a retained artifact produced later by its
-					// parent. Its actual child call must prove that input's custody;
+					// A callable can receive an artifact produced later by its
+					// parent, or remain uninvoked. Its actual call proves custody;
 					// absence of a static default is not a preflight failure.
-					if job.Kind == "job" && problem.ErrName() == "child.model_unbound" {
+					if problem.ErrName() == "child.model_unbound" {
 						continue
 					}
 					return nil, problem
