@@ -2131,10 +2131,14 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 			return Target{}, nil, problem
 		}
 		packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
-		if problem != nil || packageInterface.Digest != detail.Release.PackageInterfaceDigest ||
+		if problem != nil {
+			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
+				"Tensorhub returned an invalid package interface: %s", problem.Message)
+		}
+		if packageInterface.Digest != detail.Release.PackageInterfaceDigest ||
 			detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
 			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
-				"Tensorhub returned an invalid package interface")
+				"Tensorhub package interface does not match its committed digest or length")
 		}
 		if detail.Release.Release != release {
 			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_release_invalid",
