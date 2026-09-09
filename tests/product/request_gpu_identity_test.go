@@ -14,7 +14,7 @@ func TestRequestedGPUsPersistAndDefineSubmissionIdentity(t *testing.T) {
 	o := hostOwner(t, "gpu-request-identity")
 	for _, kind := range []string{"serving", "job"} {
 		sub := orchestrator.Submission{Kind: kind, Package: "proof/model", Entrypoint: "run",
-			Payload: []byte("{}"), IdemKey: kind, RequestedGPUs: 2}
+			Payload: []byte("{}"), IdemKey: kind, RequestedGPUs: 2, Rental: true}
 		first, fresh, problem := o.c.RecordSubmission(sub)
 		fatal(t, problem)
 		if !fresh || first.RequestedGPUs != 2 {

@@ -324,6 +324,24 @@ func (c *Orchestrator) setDesiredUnavailable(w *worker, seq uint64, e *exit.Erro
 func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, label string, prepared *pb.DesiredPlacementSet) {
 	setBytes := append([]byte(nil), prepared.PlacementSetCanonicalBytes...)
 	digest := append([]byte(nil), prepared.PlacementSetDigest...)
+	if w.spec.Connection != nil && len(w.spec.Devices) > 0 {
+		c.mu.Lock()
+		if w.hostPrepareSeq != seq {
+			c.mu.Unlock()
+			return
+		}
+		cached, problem := w.cacheGPUTemplates(setBytes)
+		c.mu.Unlock()
+		if problem != nil {
+			c.setDesiredRefusal(w, seq, problem)
+			return
+		}
+		if cached {
+			go c.reviveQueue()
+			go c.drain()
+			return
+		}
+	}
 	// THE WIDTH IS AUTHORED HERE TOO. This is the rental's own convergence path — the pod
 	// prepared its own bytes and this owner relays them — so the device pin has to be
 	// authored over the SAME rule as a locally prepared set, or a wide pod would take a

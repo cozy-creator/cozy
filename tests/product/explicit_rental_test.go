@@ -194,8 +194,9 @@ func TestSchema36MigrationKeepsAutomaticAssignments(t *testing.T) {
 	must(t, err)
 	var create string
 	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='requests'`).Scan(&create))
+	create = strings.Replace(create, ",\n  requested_gpus INTEGER NOT NULL DEFAULT 0 CHECK(requested_gpus>=0 AND requested_gpus<=4294967295)", "", 1)
 	create = strings.Replace(create, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)
-	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN requested_rental; ALTER TABLE rental_operations DROP COLUMN estimated_hourly_rate_usd_micros; PRAGMA user_version=36`)
+	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN requested_gpus; ALTER TABLE requests DROP COLUMN requested_rental; ALTER TABLE rental_operations DROP COLUMN estimated_hourly_rate_usd_micros; PRAGMA user_version=36`)
 	must(t, err)
 	_, err = db.Exec(`PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=? WHERE name='requests'; PRAGMA writable_schema=OFF`, create)
 	must(t, err)
@@ -354,7 +355,7 @@ func TestExplicitWideJobKeepsOrdinarySingleExecutorDirective(t *testing.T) {
 	for _, explicit := range []bool{false, true} {
 		candidate := orchestrator.PlacementCandidate{Rental: row.ID}
 		accepted := rental.Standing(&candidate, nil, row, 80, true, true, true, rental.Constraints{}, explicit)
-		if accepted != explicit {
+		if !accepted {
 			t.Fatalf("explicit=%v: accepted=%v verdict=%s", explicit, accepted, candidate.Verdict)
 		}
 	}
@@ -402,6 +403,9 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 			st.Close()
 			startDaemonProcess(t, root)
 			args := []string{"run", ladderPackage + "/generate", "steps=1", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
+			if kind == "serving" {
+				args = append(args, "--gpus=1")
+			}
 			if kind == "job" {
 				args = []string{"run", ladderPackage + "/lane", "--model.pruned=proof/minimax@1.0.0-rc.1/fp8-adaln-pruned", "--rental=isao", "--json", "--idempotency-key=ended-replay"}
 			}
@@ -433,6 +437,9 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 			}
 			if strings.Contains(replayOut, "rental.selection_unavailable") || strings.Contains(replayOut, "rental.dependency_mismatch") {
 				t.Fatalf("replay consulted ended rental: %s", replayOut)
+			}
+			if strings.Contains(replayOut, "different body") || (kind == "serving" && after.RequestedGPUs != 1) {
+				t.Fatalf("GPU count was lost from CLI replay identity: %+v %s", after, replayOut)
 			}
 			if asks := h.postedSKUs(); len(asks) != 0 {
 				t.Fatalf("replay purchased capacity: %v", asks)

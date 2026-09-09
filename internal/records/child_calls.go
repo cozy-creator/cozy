@@ -68,6 +68,9 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 		return Request{}, false, exit.Named(exit.Conflict, "child.gpus_changed", "child cannot change its parent requested GPU count")
 	}
 	r.RequestedGPUs = parent.RequestedGPUs
+	if r.RequestedGPUs > 0 && r.IsJob() && r.NeedsAccelerator {
+		return Request{}, false, exit.Named(exit.Validation, "request.gpu_job_slots_unsupported", "explicit GPU assignment for ordinary child jobs requires the GPU job-slot protocol")
+	}
 	r.RequestedRental = parent.RequestedRental
 	if parent.RequestedRental != "" {
 		if r.Worker != "" && r.Worker != parent.Worker {

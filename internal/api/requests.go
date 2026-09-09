@@ -235,6 +235,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Rental:             sub.Rental || sub.RentalRequired || sub.RequestedRental != "",
 		RentalRequired:     sub.RentalRequired || sub.RequestedRental != "",
 		RequestedRental:    sub.RequestedRental,
+		RequestedGPUs:      sub.RequestedGPUs,
 		Models:             models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
 	}
@@ -738,6 +739,7 @@ type Lifecycle struct {
 	// keeps after the rental is released. It never changes request identity or numbering.
 	Machine string `json:"machine"`
 	// Caller affinity names a requested venue, not a remotely queued attempt.
+	RequestedGPUs    int    `json:"requested_gpus,omitempty"`
 	RequestedRental  string `json:"requested_rental,omitempty"`
 	RequestedMachine string `json:"requested_machine,omitempty"`
 	// RentalID is the raw immutable rental id (`pr-…`) behind Machine, for machines and
@@ -809,6 +811,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{}, Rental: row.Rental, RentalID: row.Worker,
 	}
+	life.RequestedGPUs = row.RequestedGPUs
 	if row.RequestedRental != "" {
 		life.RequestedRental, life.RequestedMachine = row.RequestedRental, row.Machine
 	}

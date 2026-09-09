@@ -18,6 +18,7 @@ import (
 // base profile the release already contradicts, or whose WIDTH the package cannot shard
 // across, is not worth an hour's rent, because the pod would refuse it typed on arrival.
 type Constraints struct {
+	GPUs           int // exact requested execution width; zero uses the one-GPU default
 	Requirements   []string
 	RequiresPython string
 	// Degrees is the intersection of every model slot's `sequence_parallel.degrees` in the
@@ -44,7 +45,11 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
 		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job)
 		if c.Verdict == "" {
-			c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
+			if sku.AcceleratorCount != max(1, constraints.GPUs) {
+				c.Verdict = orchestrator.VerdictExcluded + "gpu_count_mismatch"
+			} else {
+				c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
+			}
 		}
 		if c.Verdict == "" {
 			c.Verdict = baseMismatch(sku, constraints)
@@ -122,38 +127,26 @@ func FitNote(need records.Residency, vramGB int64) string {
 	return fmt.Sprintf("%s %.1f GiB of %d GB", need.Fit, float64(need.Bytes)/(1<<30), vramGB)
 }
 
-// WidthUnusable keeps a machine WIDER than one card out of the decision unless this request
-// can actually use every card it would be billed for (cl-179). It holds a BUY and a REUSE
-// to the same rule: a wide pod already up is as unusable to a package that cannot shard as
-// one that has not been bought yet, and choosing it would fail the request typed at the
-// worker instead of placing it on a machine that works.
-//
-// A wide machine is not more capacity: every rank of a sequence-parallel group holds the
-// FULL weights, so width buys latency and never fit. The only thing that uses the extra
-// cards is a group placement of exactly that degree, which needs two things this side
-// knows before spending: the package's author must have declared the degree, and the
-// request must be a serving one — a job is a single bounded attempt and shards nothing,
-// so a wide pod given one idles every card but the first for the whole hour.
-//
-// Constraints are advisory — a hub that will not answer yields none — so this narrows the
-// decision and never widens it: with no declared degrees only one-card machines remain,
-// which is exactly the behaviour before wide products existed.
+// WidthUnusable validates requested execution width against physical capacity
+// and author-declared group support. Spare cards remain available to other work.
 func WidthUnusable(width int, job bool, constraints Constraints) string {
-	if width < 2 {
+	requested := max(1, constraints.GPUs)
+	if width < requested {
+		return orchestrator.VerdictExcluded + "gpu_count_insufficient" +
+			fmt.Sprintf(": needs %d GPUs, rental has %d", requested, width)
+	}
+	if requested == 1 {
 		return ""
 	}
-	if job {
-		return orchestrator.VerdictExcluded + orchestrator.ExcludedWidthUndeclared +
-			fmt.Sprintf(": %d cards, and a job shards none of them", width)
-	}
-	for _, degree := range constraints.Degrees {
-		if degree == width {
-			return ""
+	if !job {
+		for _, degree := range constraints.Degrees {
+			if degree == requested {
+				return ""
+			}
 		}
 	}
 	return orchestrator.VerdictExcluded + orchestrator.ExcludedWidthUndeclared +
-		fmt.Sprintf(": %d cards, and the package declares %s", width,
-			declaredDegrees(constraints.Degrees))
+		fmt.Sprintf(": %d GPUs requested; package declares %s", requested, declaredDegrees(constraints.Degrees))
 }
 
 func declaredDegrees(degrees []int) string {
@@ -249,7 +242,7 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 // the request settled FAILED on a fleet that was simply still booting.
 func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	row records.Rental, vramGB int64, needsAccelerator, offered, job bool,
-	constraints Constraints, explicit bool,
+	constraints Constraints, _ bool,
 ) bool {
 	if needsAccelerator && row.AcceleratorModel == "CPU" {
 		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
@@ -261,7 +254,7 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	// machine's own row rather than its product's: an attached rental is the authority on
 	// how many cards it has, and its SKU may have left the catalog (cl-179).
 	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job)
-	if c.Verdict == "" && !(explicit && job) {
+	if c.Verdict == "" {
 		c.Verdict = WidthUnusable(row.AcceleratorCount, job, constraints)
 	}
 	switch {

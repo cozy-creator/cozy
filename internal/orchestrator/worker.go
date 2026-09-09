@@ -423,6 +423,8 @@ type worker struct {
 	// package B joins the same desired set.
 	remotePlacements map[string]DesiredPlacement
 	observedRemote   map[string]remotePlacementObservation
+	gpuTemplates     map[string]*pb.Placement
+	gpuInstances     map[string]*gpuInstance
 	// desiredLocal is the exact command-scoped local wheel inventory. It survives
 	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
 	desiredLocal *pb.DesiredLocalPackageSet
@@ -577,6 +579,11 @@ func (w *worker) dispatchableFor(planID string) bool {
 		return w.acceptedRevision >= w.revision && w.dispatchable[planID]
 	}
 	if w.spec.Connection != nil {
+		for _, instance := range w.gpuInstances {
+			if observed := w.observedRemote[instance.row.PlacementId]; observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE && observed.dispatchablePlanIDs[planID] {
+				return true
+			}
+		}
 		for key, placement := range w.remotePlacements {
 			if strings.HasSuffix(key, "\x00"+planID) && w.remoteDispatchable(placement, planID) {
 				return true
@@ -684,6 +691,9 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 // costs the pod a full materialization (28 s measured, for zero new bytes) — and reaches
 // dispatch through the ordinary ready wait. A refused or failed desire is never "held".
 func preparedPlacementServes(w *worker, logical LogicalPackage) bool {
+	if w != nil && w.gpuTemplate(logical) != nil {
+		return true
+	}
 	if w == nil || w.refusal != nil || w.desiredRefusal != nil || len(logical.Models) == 0 {
 		return false
 	}
@@ -1038,6 +1048,18 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 		var refused, desiredRefusal *exit.Error
 		placementFailed := false
 		if w != nil {
+			if row := w.gpuTemplate(logical); row != nil {
+				placement, problem := gpuProjection(row, logical, rentalID)
+				if problem != nil {
+					c.mu.Unlock()
+					return WorkerLaunchSpec{}, "", problem
+				}
+				w.remotePlacements[remotePlanKey(placement.Package, placement.Entrypoints[0].Digest)] = placement
+				spec := w.spec
+				spec.Placement = placement
+				c.mu.Unlock()
+				return spec, placement.Entrypoints[0].Digest, nil
+			}
 			refused, desiredRefusal = w.refusal, w.desiredRefusal
 			desired, found, placementProblem := preparedRemotePlacement(w, logical.Package, logical.Release)
 			if placementProblem != nil {

@@ -70,6 +70,9 @@ func (k candidate) event() map[string]any {
 		"held": k.held, "cost": k.cost, "score": k.score, "age_ms": k.ageMS,
 		"resident": k.resident, "manifests_missing": k.manifestsMissing,
 	}
+	if lane := k.worker.lanes.get(k.laneID); lane != nil {
+		out["gpu_ordinals"] = append([]uint32(nil), lane.ordinals...)
+	}
 	if !k.local() {
 		out["rental"] = k.worker.spec.Connection.RentalID
 	}
@@ -198,6 +201,10 @@ func (c *Orchestrator) route(req records.Request) routing {
 	claims := c.claimsAhead(req.ID)
 	var out routing
 	for _, w := range c.workers {
+		if w.spec.Connection != nil && !req.IsJob() && requestGPUWidth(req) > 0 {
+			c.routeGPUInstances(w, req, claims, &out)
+			continue
+		}
 		slot, ok := c.eligible(w, req, planID)
 		if !ok {
 			continue

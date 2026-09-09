@@ -733,6 +733,13 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		heldPlacements = append(heldPlacements, ha.Str("placement_id"))
 	}
 	w.observeHeld(heldPlacements)
+	if w.spec.Connection != nil && len(snap.AcceptedPlacementSetCanonicalBytes) > 0 {
+		if problem := w.restoreGPUInstances(snap.AcceptedPlacementSetCanonicalBytes); problem != nil {
+			c.mu.Unlock()
+			refuse("cannot restore GPU placement occupancy: %s", problem.Message)
+			return false
+		}
+	}
 	w.heldManifests = setOf(doc.Strs("held_manifests"))
 	w.phase = pb.WorkerPhase(doc.Int("worker_phase"))
 	c.mu.Unlock()
@@ -770,6 +777,14 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	}
 	if w.spec.Connection != nil {
 		c.signalAllTransfers()
+		c.mu.Lock()
+		restoredGPUs := len(w.gpuInstances) > 0
+		c.mu.Unlock()
+		if restoredGPUs {
+			go c.reviveQueue()
+			go c.drain()
+			return true
+		}
 		c.replayLocalAborts(s, w.spec.Connection.RentalID)
 		c.mu.Lock()
 		private := cloneLocalPackageSet(w.desiredLocal)

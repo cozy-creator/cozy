@@ -177,6 +177,14 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 }
 
 func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
+	if s.RequestedGPUs > 0 && s.Kind == "job" && s.NeedsAccelerator {
+		return records.Request{}, nil, exit.Named(exit.Validation, "request.gpu_job_slots_unsupported",
+			"explicit GPU assignment for ordinary jobs requires the GPU job-slot protocol; serving calls support --gpus")
+	}
+	if s.RequestedGPUs > 1 && !s.Rental && !s.RentalRequired && s.RequestedRental == "" {
+		return records.Request{}, nil, exit.Named(exit.Validation, "request.local_gpu_count_unsupported",
+			"multi-GPU execution currently requires --rental=<name> or --rental-only")
+	}
 	if s.RequestedGPUs < 0 || uint64(s.RequestedGPUs) > uint64(^uint32(0)) {
 		return records.Request{}, nil, exit.Usagef("requested_gpus must be a non-negative GPU count")
 	}
@@ -819,6 +827,15 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			return
 		}
 		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
+		if problem := c.ensureRequestGPUs(req); problem != nil {
+			done()
+			if problem.Code == exit.Unavailable {
+				c.parkFor(req, problem.Message)
+			} else {
+				c.failQueued(req.ID, problem, "")
+			}
+			return
+		}
 		if e := c.EnsurePlacementReady(instance, req.PlanID, req.ID); e != nil {
 			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				done()
@@ -894,6 +911,10 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 			retirementGround(w) != "" || w.spec.Connection == nil {
 			continue
 		}
+		if requestGPUWidth(req) > 0 && w.gpuTemplate(requestLogical(req)) != nil {
+			return true
+		}
+
 		slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
 		if req.IsJob() {
 			if w.spec.Placement.Package == slot &&
@@ -921,6 +942,13 @@ func (c *Orchestrator) logPlacement(req records.Request, decision PlacementDecis
 // It reads what the LAUNCHER wrote, not what the worker has got around to advertising: a
 // worker still filling is capacity, a worker holding a different digest is not.
 func staged(w *worker, planID string) bool {
+	for _, template := range w.gpuTemplates {
+		for _, entrypoint := range template.Entrypoints {
+			if spellOf(entrypoint.EntrypointBindingDigest) == planID {
+				return true
+			}
+		}
+	}
 	for _, id := range w.planIDs {
 		if id == planID {
 			return true
@@ -1098,7 +1126,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
 			"remote package preparation requires one exact package revision")
 	}
-	logical := LogicalPackage{Package: req.Package, Release: req.Release,
+	logical := LogicalPackage{Package: req.Package, Release: req.Release, LocalRevision: req.LocalPackageDigest,
 		Function: req.Entrypoint,
 		Outputs:  strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
 		PlanID:   req.PlanID, Models: append([]ModelRef(nil), req.Models...),
@@ -1447,7 +1475,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// the payload digest, the ORDERED input identities, the output contracts, the
 	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
 	// service class, no local extension has a slot.
-	environmentDigest, e := c.invocationIdentity(w, req)
+	environmentDigest, e := c.invocationIdentity(w, req, target.routed.pick().placementID)
 	if e != nil {
 		return 0, e
 	}
@@ -1461,7 +1489,14 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	if !req.IsJob() {
 		c.mu.Lock()
 		servingPlacement = w.spec.Placement
-		if selected, ok := w.remotePlacements[remotePlanKey(pinnedPackage(req.Package, req.Worker), req.PlanID)]; ok {
+		if instance := w.gpuInstances[target.routed.pick().placementID]; instance != nil {
+			var problem *exit.Error
+			servingPlacement, problem = gpuProjection(instance.row, requestLogical(req), req.Worker)
+			if problem != nil {
+				c.mu.Unlock()
+				return 0, problem
+			}
+		} else if selected, ok := w.remotePlacements[remotePlanKey(pinnedPackage(req.Package, req.Worker), req.PlanID)]; ok {
 			servingPlacement = selected
 		}
 		c.mu.Unlock()
@@ -1545,7 +1580,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	grant.InvocationSpecDigest = digest
 
 	c.mu.Lock()
-	placementID := w.placementFor(pinnedPackage(req.Package, req.Worker), req.PlanID)
+	placementID := target.routed.pick().placementID
 	laneID := reservation.laneID
 	var laneDevices []string
 	if l := w.lanes.get(laneID); l != nil {
@@ -1654,10 +1689,17 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 // therefore have one writer: neither package preparation nor rental selection needs a
 // second identity path.
 func (c *Orchestrator) invocationIdentity(w *worker,
-	req records.Request) (environment string, e *exit.Error) {
+	req records.Request, placementID string) (environment string, e *exit.Error) {
 	c.mu.Lock()
 	placement, remote, instanceID := w.spec.Placement, w.spec.Connection != nil, w.instanceID
-	if selected, ok := w.remotePlacements[remotePlanKey(
+	if instance := w.gpuInstances[placementID]; instance != nil {
+		var problem *exit.Error
+		placement, problem = gpuProjection(instance.row, requestLogical(req), req.Worker)
+		if problem != nil {
+			c.mu.Unlock()
+			return "", problem
+		}
+	} else if selected, ok := w.remotePlacements[remotePlanKey(
 		pinnedPackage(req.Package, req.Worker), req.PlanID)]; remote && ok {
 		placement = selected
 	}

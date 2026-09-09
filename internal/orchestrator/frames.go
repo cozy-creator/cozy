@@ -405,56 +405,27 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	return nil
 }
 
-// devicePins authors proto-024's `device_pins`: WHERE this owner puts each placement on
-// this worker's devices. It is the whole of Creator's authorship of width.
-//
-// The rule is one line because the width is a property of the machine, not of a request: a
-// model-bearing placement on a K-device envelope is pinned to ALL K ordinals, which fuses
-// one group lane of degree K advertising ONE seat. There is nothing to choose. The renter
-// bought K cards; the package declares which degrees it can shard at; the worker joins the
-// two and refuses `device_group_unsupported` when they disagree, which is a typed refusal
-// against a machine that is already paid for rather than a silent success that idles K-1
-// cards (group-lanes ruling 3). A degree is never a request parameter and never a fallback.
-//
-// Width 1 pins nothing: one envelope device is one lane and the worker assigns it by
-// measured fit, which is the behaviour every worker had before there was a wider one. A
-// weightless placement is never pinned to a group either — a group shards a model's
-// attention and there is no model — so it stays on the worker's own least-loaded lane.
-//
-// Serving weight is read from entrypoint model slots in the exact set, matching
-// Runtime's executable bindings. A job can retain model input metadata without
-// constructing any serving model; a model inventory alone cannot justify a group.
+// devicePins is the unpartitioned preparation default. Serving GPU requests use
+// explicit disjoint placement instances; a bare preparation uses one card only.
 func devicePins(setBytes []byte, envelope []string) ([]*pb.PlacementDevicePin, *exit.Error) {
 	if len(envelope) < 2 {
 		return nil, nil
 	}
-	doc, err := canonical.Read(setBytes, &pb.PlacementSet{})
-	if err != nil || len(doc.List("placements")) != 1 {
-		// REFUSE, never send an unpinned wide set. A placement the owner cannot read is a
-		// placement it cannot pin, and an unpinned model-bearing placement on a wide
-		// envelope is either K-1 idle paid cards or a typed worker refusal — never the
-		// group the renter bought.
-		return nil, exit.Named(exit.Conflict, "placement_set_unpinnable",
-			"a %d-device rental needs one readable placement to pin: %v", len(envelope), err)
+	var set pb.PlacementSet
+	if err := canonical.Unmarshal(setBytes, &set); err != nil {
+		return nil, exit.Named(exit.Conflict, "placement_set_unpinnable", "cannot read placement pins: %s", err)
 	}
-	placement := doc.List("placements")[0]
-	modelBearing := false
-	for _, entrypoint := range placement.List("entrypoints") {
-		if len(entrypoint.List("slots")) > 0 {
-			modelBearing = true
-			break
+	var pins []*pb.PlacementDevicePin
+	for _, placement := range set.Placements {
+		if !modelPlacement(placement) {
+			continue
 		}
+		if len(pins) >= len(envelope) {
+			return nil, exit.Named(exit.Capacity, "placement_set_unpinnable", "not enough GPUs for the prepared placements")
+		}
+		pins = append(pins, &pb.PlacementDevicePin{PlacementId: placement.PlacementId, DeviceOrdinals: []uint32{uint32(len(pins))}})
 	}
-	if !modelBearing {
-		return nil, nil
-	}
-	ordinals := make([]uint32, 0, len(envelope))
-	for ordinal := range envelope {
-		ordinals = append(ordinals, uint32(ordinal))
-	}
-	return []*pb.PlacementDevicePin{{
-		PlacementId: placement.Str("placement_id"), DeviceOrdinals: ordinals,
-	}}, nil
+	return pins, nil
 }
 
 // ------------------------------------------------------------------- observed state

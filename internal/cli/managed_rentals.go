@@ -327,6 +327,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
 	// a machine that would be bought are held to the same declared degrees (cl-179).
 	constraints, _ := releaseConstraints(m.ctx, req)
+	constraints.GPUs = req.RequestedGPUs
 	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem

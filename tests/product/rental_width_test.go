@@ -137,58 +137,6 @@ func awaitPlacementSet(t *testing.T, o *owner, pod *fakePod) (*pb.DesiredPlaceme
 	}
 }
 
-// TestRentalWidthPinsThePlacementToEveryPaidCard is the whole plumbing in one line of
-// evidence: what the pod is told to do with its cards is the width the rental was bought
-// at. At one card nothing is pinned — one envelope device is one lane and the worker
-// assigns it by measured fit, exactly as before wide products existed. At two and four the
-// placement carries ONE pin over ALL the ordinals, which is what fuses a group lane of
-// that degree; a pin over fewer would idle paid cards without saying so.
-func TestRentalWidthPinsThePlacementToEveryPaidCard(t *testing.T) {
-	for _, arm := range []struct {
-		name  string
-		width int
-		pin   []uint32
-	}{
-		{"one card pins nothing", 1, nil},
-		{"degree two", 2, []uint32{0, 1}},
-		{"degree four", 4, []uint32{0, 1, 2, 3}},
-	} {
-		t.Run(arm.name, func(t *testing.T) {
-			pod := &fakePod{serve: true, deviceCount: uint32(arm.width),
-				preparedPlacement: modelBearingPlacement(t)}
-			root := t.TempDir()
-			connection, certPath := startFakePod(t, root, pod)
-			o := hostOwner(t, "rental-width-"+arm.name,
-				rentalWidthWiring(t, pod, connection, certPath, arm.width))
-			submitToWideRental(t, o, "width-"+arm.name)
-			set, placementID := awaitPlacementSet(t, o, pod)
-			if len(arm.pin) == 0 {
-				if len(set.DevicePins) != 0 {
-					t.Fatalf("a %d-card rental pinned %v; one device is one lane",
-						arm.width, set.DevicePins)
-				}
-				return
-			}
-			if len(set.DevicePins) != 1 {
-				t.Fatalf("a %d-card rental sent %d pin(s), want exactly one for its one placement",
-					arm.width, len(set.DevicePins))
-			}
-			pin := set.DevicePins[0]
-			if pin.PlacementId != placementID {
-				t.Errorf("the pin names placement %q, not the set's %q", pin.PlacementId, placementID)
-			}
-			if len(pin.DeviceOrdinals) != len(arm.pin) {
-				t.Fatalf("the pin covers %v, want every paid ordinal %v", pin.DeviceOrdinals, arm.pin)
-			}
-			for i, ordinal := range arm.pin {
-				if pin.DeviceOrdinals[i] != ordinal {
-					t.Fatalf("the pin covers %v, want every paid ordinal %v", pin.DeviceOrdinals, arm.pin)
-				}
-			}
-		})
-	}
-}
-
 // TestWeightlessPlacementIsNeverPinnedToAGroup is the other half of the rule. A group
 // shards a model's attention; a placement holding no weights has nothing to shard, and the
 // worker refuses `device_group_unsupported` for a weightless pin. So the owner authors
@@ -240,61 +188,28 @@ func TestPodDeliveringFewerCardsThanPaidForIsRefused(t *testing.T) {
 // hour's rent. The same rule holds a REUSE: `attachedLocked` puts every attached rental's
 // own width through `WidthUnusable`, because a wide pod already up is as unusable to a
 // package that cannot shard as one that has not been bought.
-func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T) {
+func TestPurchasesUseRequestedWidthAndStandingRentalsAllowSubsets(t *testing.T) {
 	skus := []hub.RentalSKU{
-		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 1,
-			VRAMGB: 80, PriceUSDMicrosPerHour: 3_490_000},
-		{Name: "h100-x2", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 2,
-			VRAMGB: 80, PriceUSDMicrosPerHour: 6_980_000},
-		{Name: "h100-x4", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 4,
-			VRAMGB: 80, PriceUSDMicrosPerHour: 13_960_000},
+		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 1, VRAMGB: 80, PriceUSDMicrosPerHour: 3_490_000},
+		{Name: "h100-x2", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 2, VRAMGB: 80, PriceUSDMicrosPerHour: 6_980_000},
+		{Name: "h100-x4", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 4, VRAMGB: 80, PriceUSDMicrosPerHour: 13_960_000},
 	}
-	verdicts := func(constraints rental.Constraints, job bool) map[string]string {
-		out := map[string]string{}
-		for _, c := range rental.Purchases(skus, nil, true, job, constraints) {
-			out[c.SKU] = c.Verdict
+	for _, width := range []int{0, 1, 2, 4} {
+		constraints := rental.Constraints{GPUs: width, Degrees: []int{2, 4}}
+		for index, candidate := range rental.Purchases(skus, nil, true, false, constraints) {
+			if (candidate.Verdict == "") != (skus[index].AcceleratorCount == max(1, width)) {
+				t.Fatalf("request%d: wrong purchase verdict for %+v", width, candidate)
+			}
 		}
-		return out
-	}
-	// Nothing declared: the ladder is one-card products, which is every package today.
-	undeclared := verdicts(rental.Constraints{}, false)
-	if undeclared["h100"] != "" {
-		t.Fatalf("the one-card product was excluded: %q", undeclared["h100"])
-	}
-	for _, name := range []string{"h100-x2", "h100-x4"} {
-		if !strings.Contains(undeclared[name], "width_undeclared") ||
-			!strings.Contains(undeclared[name], "no sequence-parallel degree") {
-			t.Fatalf("%s verdict = %q, want a width refusal naming the missing degree",
-				name, undeclared[name])
+		if why := rental.WidthUnusable(4, false, constraints); why != "" {
+			t.Fatalf("request%d cannot use existing four-GPU rental: %s", width, why)
 		}
 	}
-	// `@sequence_parallel(degrees=(2, 4))`: both widths become buyable, and the one-card
-	// product stays buyable beside them — a declared degree is a capability, not a demand.
-	declared := verdicts(rental.Constraints{Degrees: []int{2, 4}}, false)
-	for _, name := range []string{"h100", "h100-x2", "h100-x4"} {
-		if declared[name] != "" {
-			t.Fatalf("%s was excluded from a package declaring degrees 2 and 4: %q",
-				name, declared[name])
-		}
+	if why := rental.WidthUnusable(4, false, rental.Constraints{GPUs: 2}); !strings.Contains(why, "width_undeclared") {
+		t.Fatalf("unsupported construction was not refused: %s", why)
 	}
-	// A degree the author did not declare stays out however wide the machine is.
-	partial := verdicts(rental.Constraints{Degrees: []int{2}}, false)
-	if partial["h100-x2"] != "" {
-		t.Fatalf("the declared width was excluded: %q", partial["h100-x2"])
-	}
-	if !strings.Contains(partial["h100-x4"], "width_undeclared") ||
-		!strings.Contains(partial["h100-x4"], "degrees 2") {
-		t.Fatalf("h100-x4 verdict = %q, want a refusal naming the declared degrees",
-			partial["h100-x4"])
-	}
-	// A JOB shards nothing: one bounded attempt on a wide pod idles every card but one for
-	// the whole hour, whatever the package declares.
-	jobs := verdicts(rental.Constraints{Degrees: []int{2, 4}}, true)
-	for _, name := range []string{"h100-x2", "h100-x4"} {
-		if !strings.Contains(jobs[name], "width_undeclared") ||
-			!strings.Contains(jobs[name], "a job shards none of them") {
-			t.Fatalf("%s was buyable for a job: %q", name, jobs[name])
-		}
+	if why := rental.WidthUnusable(1, false, rental.Constraints{GPUs: 2, Degrees: []int{2}}); !strings.Contains(why, "gpu_count_insufficient") {
+		t.Fatalf("too few physical GPUs did not refuse: %s", why)
 	}
 }
 

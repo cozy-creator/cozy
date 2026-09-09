@@ -188,7 +188,7 @@ func TestSchema37RentalReservationMigrationPreservesUnknownEstimates(t *testing.
 	fatal(t, problem)
 	defer store.Close()
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 38 || tableRows(t, db, "rental_operations") != before {
+	if version != 39 || tableRows(t, db, "rental_operations") != before {
 		t.Fatal("migration changed retained quote, identity, state or timestamps")
 	}
 	ops, problem := store.RentalOperations()

@@ -183,6 +183,7 @@ type Launcher interface {
 }
 
 type LogicalPackage struct {
+	LocalRevision    string
 	Package          string
 	Release          string
 	Function         string
@@ -784,6 +785,14 @@ func (c *Orchestrator) drain() {
 					"model transfer "+transfer.State+" on the selected worker")
 				continue
 			}
+		}
+		if problem := c.ensureRequestGPUs(*req); problem != nil {
+			if problem.Code == exit.Unavailable {
+				c.park(*req, position, waitFacts{}, problem.Message)
+			} else {
+				c.failQueued(id, problem, "")
+			}
+			continue
 		}
 		attempt, e := c.dispatch(*req)
 		if e != nil {

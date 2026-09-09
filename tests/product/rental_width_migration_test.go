@@ -56,7 +56,7 @@ func tableRows(t *testing.T, db *sql.DB, table string) string {
 		must(t, rows.Scan(pointers...))
 		record := map[string]any{}
 		for i, name := range columns {
-			if name != "accelerator_count" && name != "native_service_id" && name != "requested_rental" && name != "estimated_hourly_rate_usd_micros" {
+			if name != "accelerator_count" && name != "native_service_id" && name != "requested_rental" && name != "requested_gpus" && name != "estimated_hourly_rate_usd_micros" {
 				record[name] = values[i]
 			}
 		}
@@ -113,7 +113,7 @@ func TestBothReleasedSchema33RentalShapesMigrateWithoutLosingWork(t *testing.T) 
 				}
 			}
 			must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-			if version != 38 {
+			if version != 39 {
 				t.Fatalf("migration version=%d", version)
 			}
 			violations, err := db.Query(`PRAGMA foreign_key_check`)
