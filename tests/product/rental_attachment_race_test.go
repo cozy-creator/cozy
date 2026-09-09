@@ -26,7 +26,7 @@ func TestRentalAttachmentSerializesWithRelease(t *testing.T) {
 			fatal(t, problem)
 			defer second.Close()
 			operation, _, problem := first.BeginRentalOperation(records.RentalOperation{Key: "attachment-race", Hub: "proof", Reason: "manual", HourlyRateUSDMicros: 1}, 100, 0,
-				func(name string) ([]byte, string, *exit.Error) { return []byte(`{}`), "proof", nil })
+				func(name string) ([]byte, string, *exit.Error) { return []byte(`{}`), "proof", nil }, nil)
 			fatal(t, problem)
 			row := records.Rental{ID: "pr-attachment-race", MachineName: "attachment-race", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, State: "acquiring", Hub: "proof"}
 			fatal(t, first.RecordRental(row))
