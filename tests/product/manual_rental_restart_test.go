@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -20,11 +21,14 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	hubapi "github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/mediawire"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -36,6 +40,14 @@ import (
 // replacement without any request, package, or explicit second claim call.
 func TestIdleManualRentalReclaimsAfterDaemonRestart(t *testing.T) {
 	for _, mode := range []string{"healthy", "attached", "weather", "released", "closed", "permanent", "released_health", "closing_health", "concurrent", "retained"} {
+		t.Run(mode, func(t *testing.T) { proveIdleManualRentalRestart(t, mode) })
+	}
+}
+
+// The manual CLI disappeared after its accepted ID was durable. Recovery performs
+// only Hub reads and completes the same authenticated local attachment.
+func TestInterruptedManualAcquisitionCompletesOnDaemonRestart(t *testing.T) {
+	for _, mode := range []string{"interrupted", "interrupted-released", "interrupted-wrong-key"} {
 		t.Run(mode, func(t *testing.T) { proveIdleManualRentalRestart(t, mode) })
 	}
 }
@@ -158,11 +170,35 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	media.TLS = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
 	media.StartTLS()
 	defer media.Close()
+	cert, err := os.ReadFile(certPath)
+	must(t, err)
+	token, problem := rental.PendingMediaToken(layout, "manual-restart")
+	fatal(t, problem)
+	machineName := "manual-empty"
 	var mutations atomic.Int64
 	// Control reattachment needs the retained identity, not a successful cloud poll.
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			mutations.Add(1)
+		}
+		if strings.HasPrefix(mode, "interrupted") && r.Method == http.MethodGet {
+			if r.URL.Path == "/v1/rentals/"+podRental {
+				publicKey := identity.PublicKey()
+				if mode == "interrupted-wrong-key" {
+					publicKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": podRental, "name": machineName,
+					"state": "ready", "requested_accelerator_model": "CPU", "accelerator_count": 1,
+					"hourly_rate_usd_micros": 1, "worker_address": listener.Addr().String(),
+					"media_address": strings.TrimPrefix(media.URL, "https://"), "cert_pem": string(cert),
+					"worker_id": podWorkerID, "worker_boot_id": podBootID,
+					"creator_public_key": publicKey, "media_token_sha256": []string{secret.HashHex(token)}})
+				return
+			}
+			if r.URL.Path == "/v1/rentals" {
+				_ = json.NewEncoder(w).Encode([]any{})
+				return
+			}
 		}
 		if classProof && r.Method == http.MethodGet {
 			switch r.URL.Path {
@@ -184,12 +220,20 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		_, _ = w.Write([]byte(`{"error":{"code":"proof.hub_unavailable","message":"controlled cloud outage"}}`))
 	}))
 	defer hub.Close()
+	if strings.HasPrefix(mode, "interrupted") {
+		op, _, problem := store.BeginRentalOperation(records.RentalOperation{
+			Key: "manual-restart", Hub: hub.URL, Reason: "cozy rent cpu", HourlyRateUSDMicros: 1,
+		}, 2_000_000, 0, func(name string) ([]byte, string, *exit.Error) {
+			body, problem := hubapi.RentalRequestBytes(name, "cpu", secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil)
+			return body, fmt.Sprintf("sha256:%x", sha256.Sum256(body)), problem
+		})
+		fatal(t, problem)
+		request, problem := hubapi.ParseRentalRequestBytes(op.RequestBody)
+		fatal(t, problem)
+		machineName = request.Name
+	}
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: manual-restart-proof\nrentals:\n  max_hourly_spend_usd: 2\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	cert, err := os.ReadFile(certPath)
-	must(t, err)
-	token, problem := rental.PendingMediaToken(layout, "manual-restart")
-	fatal(t, problem)
-	row := records.Rental{AcceleratorCount: 1, ID: podRental, State: "ready", Hub: hub.URL, MachineName: "manual-empty",
+	row := records.Rental{AcceleratorCount: 1, ID: podRental, State: "ready", Hub: hub.URL, MachineName: machineName,
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: listener.Addr().String(), MediaAddress: strings.TrimPrefix(media.URL, "https://"),
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
 	if mode == "attached" {
@@ -200,6 +244,54 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	}
 	if mode == "cpu_job_on_gpu" {
 		row.SKU, row.AcceleratorModel = "rtx-4090", "RTX 4090"
+	}
+	if strings.HasPrefix(mode, "interrupted") {
+		pending := row
+		pending.State, pending.Address, pending.MediaAddress = "acquiring", "", ""
+		pending.ExpectedWorkerID, pending.ExpectedWorkerBootID = "", ""
+		fatal(t, store.RecordRental(pending))
+		fatal(t, store.AdvanceRentalOperation("manual-restart", podRental, "acquiring"))
+		if mode == "interrupted-released" {
+			fatal(t, store.AdvanceRentalOperation("manual-restart", podRental, "released"))
+			pending.State = "released"
+			fatal(t, store.RecordRental(pending))
+		}
+		startDaemonProcess(t, root)
+		if mode == "interrupted-released" || mode == "interrupted-wrong-key" {
+			waitUntil(t, "recovery refuses changed ownership", func() bool {
+				if mode == "interrupted-released" {
+					row, problem := store.RentalRow(podRental)
+					fatal(t, problem)
+					return row == nil
+				}
+				return strings.Contains(tail(filepath.Join(root, "daemon.log")), "did not retain the Creator key")
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if len(claims) != 0 || mutations.Load() != 0 {
+				t.Fatal("refused acquisition claimed a worker or made a paid mutation")
+			}
+			if _, err := os.Stat(layout.RentalCert(podRental)); !os.IsNotExist(err) {
+				t.Fatal("refused acquisition installed worker credentials")
+			}
+			return
+		}
+		waitUntil(t, "interrupted acquisition attaches and acknowledges its snapshot", func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(acknowledged) == 1
+		})
+		attached, problem := store.RentalRow(podRental)
+		fatal(t, problem)
+		op, problem := store.RentalOperation("manual-restart")
+		fatal(t, problem)
+		if mutations.Load() != 0 || op.State != "attached" || attached.Address != row.Address || attached.ExpectedWorkerBootID != podBootID {
+			t.Fatalf("manual acquisition not recovered from its original operation: state=%s mutations=%d row=%+v", op.State, mutations.Load(), attached)
+		}
+		if _, err := os.Stat(layout.PendingRentalMediaToken("manual-restart")); !os.IsNotExist(err) {
+			t.Fatal("pending credential was not retired after authenticated attachment")
+		}
+		return
 	}
 	fatal(t, rental.Attach(layout, store, row, string(cert), token, identity))
 	before, problem := store.RentalRow(podRental)

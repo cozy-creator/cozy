@@ -284,9 +284,15 @@ func (c *Orchestrator) resumeManualRentals() *exit.Error {
 		if (row.ManagedRequestID != "" && !retained) || !records.RentalReadyState(row.State) {
 			continue
 		}
-		go c.resumeManualRental(row.ID)
+		c.ResumeRentalControl(row.ID)
 	}
 	return nil
+}
+
+// ResumeRentalControl reconnects an already-owned ready rental after its local
+// authenticated target becomes durable. It shares restart recovery and never buys.
+func (c *Orchestrator) ResumeRentalControl(id string) {
+	go c.resumeManualRental(id)
 }
 
 func (c *Orchestrator) resumeManualRental(id string) {
