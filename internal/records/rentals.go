@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 	"unicode"
@@ -161,7 +162,7 @@ type RentalRequestAuthor func(machineName string) (body []byte, digest string, p
 // (th-120), so the figure admitted is what the pod will actually bill — while
 // the operation row keeps the GPU quote alone.
 func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros, storageUSDMicros int64,
-	author RentalRequestAuthor) (RentalOperation, bool, *exit.Error) {
+	author RentalRequestAuthor, observed map[string]int64) (RentalOperation, bool, *exit.Error) {
 	stamp := now()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -193,11 +194,14 @@ func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros, stor
 		return RentalOperation{}, false, exit.Named(exit.Usage, "rental.spend_cap_required",
 			"a positive locked hourly rate, a non-negative storage adder, and rentals.max_hourly_spend_usd are required")
 	}
-	count, burn, problem := rentalFleetTotals(tx)
+	count, burn, problem := rentalFleetTotals(tx, op.Hub, observed)
 	if problem != nil {
 		return RentalOperation{}, false, problem
 	}
-	estimatedTotal := op.HourlyRateUSDMicros + storageUSDMicros
+	estimatedTotal, problem := addRentalSpend(op.HourlyRateUSDMicros, storageUSDMicros)
+	if problem != nil {
+		return RentalOperation{}, false, problem
+	}
 	if burn > fleetCapUSDMicros || estimatedTotal > fleetCapUSDMicros-burn {
 		return RentalOperation{}, false, exit.Named(exit.Capacity, "rental.fleet_spend_cap",
 			"%d potentially billing rental(s) already reserve %d USD micros/hour; the next %d (%d gpu + %d storage) would exceed %d",
@@ -849,30 +853,77 @@ func (s *Store) HeldRentalIDs() (map[string]bool, *exit.Error) {
 	return held, nil
 }
 
-// RentalFleetTotals counts each potentially billing obligation once. A rental
-// operation with no local rental row covers the response-loss window; once its
-// row exists, the immutable row rate replaces that reservation in the sum.
-// Rentals in a proven-absent terminal state are out of both numbers.
-func (s *Store) RentalFleetTotals() (count int, hourlyRateUSDMicros int64, problem *exit.Error) {
-	return rentalFleetTotals(s.db)
+// RentalFleetTotals overlays this Hub's census on local billing obligations.
+// An accepted operation and its observed rental are one identity; operations
+// whose rental IDs are still unknown continue reserving their original quotes.
+func (s *Store) RentalFleetTotals(hub string, observed map[string]int64) (int, int64, *exit.Error) {
+	return rentalFleetTotals(s.db, hub, observed)
 }
 
-func rentalFleetTotals(q interface{ QueryRow(string, ...any) *sql.Row }) (int, int64, *exit.Error) {
-	var count int
-	var burn int64
-	err := q.QueryRow(`SELECT COUNT(*),COALESCE(SUM(hourly_rate_usd_micros),0) FROM (
-		SELECT id AS identity,hourly_rate_usd_micros FROM rentals
-		WHERE state NOT IN (`+absentRentalStates+`)
+func rentalFleetTotals(q interface {
+	Query(string, ...any) (*sql.Rows, error)
+},
+	hub string, observed map[string]int64,
+) (int, int64, *exit.Error) {
+	rows, err := q.Query(`SELECT hub,id,hourly_rate_usd_micros FROM rentals
+		WHERE state NOT IN (` + absentRentalStates + `)
 		UNION ALL
-		SELECT o.operation_key,o.hourly_rate_usd_micros FROM rental_operations o
-		LEFT JOIN rentals r ON r.id=o.rental_id
-		WHERE o.state NOT IN (`+finalRentalOperationStates+`)
-		  AND o.state NOT IN (`+absentRentalStates+`) AND r.id IS NULL
-	)`).Scan(&count, &burn)
+		SELECT o.hub,o.rental_id,o.hourly_rate_usd_micros FROM rental_operations o
+		LEFT JOIN rentals r ON r.id=o.rental_id AND RTRIM(r.hub,'/')=RTRIM(o.hub,'/')
+		WHERE o.state NOT IN (` + finalRentalOperationStates + `)
+		  AND o.state NOT IN (` + absentRentalStates + `) AND r.id IS NULL`)
 	if err != nil {
-		return 0, 0, exit.Internalf("cannot total the rental fleet: %s", err)
+		return 0, 0, exit.Internalf("cannot read rental fleet obligations: %s", err)
+	}
+	defer rows.Close()
+	rates := make(map[[2]string]int64)
+	count, burn := 0, int64(0)
+	for rows.Next() {
+		var origin, id string
+		var rate int64
+		if err := rows.Scan(&origin, &id, &rate); err != nil {
+			return 0, 0, exit.Internalf("cannot read rental fleet rate: %s", err)
+		}
+		if id == "" {
+			count++
+			var problem *exit.Error
+			burn, problem = addRentalSpend(burn, rate)
+			if problem != nil {
+				return 0, 0, problem
+			}
+		} else {
+			rates[[2]string{strings.TrimRight(origin, "/"), id}] = rate
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, exit.Internalf("cannot finish rental fleet obligations: %s", err)
+	}
+	for id, rate := range observed {
+		identity := [2]string{strings.TrimRight(hub, "/"), id}
+		if rate > 0 {
+			rates[identity] = rate
+		} else if rates[identity] <= 0 {
+			return 0, 0, exit.Named(exit.Unavailable, "rental.rate_unknown",
+				"rental %s has no observed rate or retained quote; account spend is unknown", id)
+		}
+	}
+	for _, rate := range rates {
+		count++
+		var problem *exit.Error
+		burn, problem = addRentalSpend(burn, rate)
+		if problem != nil {
+			return 0, 0, problem
+		}
 	}
 	return count, burn, nil
+}
+
+func addRentalSpend(total, rate int64) (int64, *exit.Error) {
+	if rate < 0 || total > math.MaxInt64-rate {
+		return 0, exit.Named(exit.Structural, "rental.spend_overflow",
+			"rental spend cannot be represented as non-negative USD micros/hour")
+	}
+	return total + rate, nil
 }
 
 // RentalRunCounts is the work still pinned to one machine, in the ONE spelling of "still

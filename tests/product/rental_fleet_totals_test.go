@@ -30,7 +30,7 @@ func TestFailedRentalLeavesTheFleetTotals(t *testing.T) {
 	record("rental-failed", "failed", 720_000)
 	record("rental-released", "released", 70_000)
 
-	count, burn, problem := store.RentalFleetTotals()
+	count, burn, problem := store.RentalFleetTotals("", nil)
 	fatal(t, problem)
 	if count != 1 || burn != 720_000 {
 		t.Fatalf("fleet totals = %d machines at %d micros/hour, want the one ready "+
@@ -53,7 +53,8 @@ func TestFleetCapAdmitsTheEstimatedTotalNotTheGPURate(t *testing.T) {
 	_, _, problem = store.BeginRentalOperation(records.RentalOperation{
 		Key: "op-l4", Hub: "http://127.0.0.1:1", Reason: "cozy rent l4",
 		HourlyRateUSDMicros: 490_000,
-	}, 700_000, 213_504, author)
+	}, 700_000, 213_504, author, nil)
+
 	if problem == nil || problem.ErrName() != "rental.fleet_spend_cap" ||
 		!strings.Contains(problem.Error(), "703504 (490000 gpu + 213504 storage)") {
 		t.Fatalf("a total above the cap was admitted on its GPU rate alone: %v", problem)
@@ -62,7 +63,8 @@ func TestFleetCapAdmitsTheEstimatedTotalNotTheGPURate(t *testing.T) {
 	_, replay, problem := store.BeginRentalOperation(records.RentalOperation{
 		Key: "op-l4-fits", Hub: "http://127.0.0.1:1", Reason: "cozy rent l4",
 		HourlyRateUSDMicros: 490_000,
-	}, 710_000, 213_504, author)
+	}, 710_000, 213_504, author, nil)
+
 	fatal(t, problem)
 	if replay {
 		t.Fatal("a fresh operation replayed")

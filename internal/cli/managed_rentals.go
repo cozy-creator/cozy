@@ -559,7 +559,7 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 						HourlyRateUSDMicros: seen.HourlyRateUSDMicros,
 					}})
 			}
-		})
+		}, rentalRates(m.unrecorded))
 	return row, problem
 }
 
@@ -908,7 +908,7 @@ func (m *managedRentals) reconcileListingLocked() {
 			m.unrecorded = nil
 			return
 		}
-		if row != nil {
+		if row != nil && strings.TrimRight(row.Hub, "/") == client(m.ctx).Base() {
 			continue
 		}
 		m.unrecorded = append(m.unrecorded, seen)
@@ -1019,11 +1019,6 @@ func (m *managedRentals) lineLocked() (string, *exit.Error) {
 	}
 	line := fmt.Sprintf("rentals: %d remote %s running · %s of %s",
 		count, machine, usdPerHour(burn), usdPerHour(m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros))
-	if m.listingProblem != nil {
-		line += " · the hub could not be asked what this account owns (" + m.listingProblem.Message + ")"
-	} else if !m.listed {
-		line += " · this hub publishes no rental listing, so only recorded machines are counted"
-	}
 	return line, nil
 }
 
@@ -1041,12 +1036,15 @@ func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 			"account rental census unavailable: this hub publishes no rental listing").
 			WithRemedy("restore the Hub account-listing route before reading totals or acquiring a rental")
 	}
-	count, burn, problem := m.store.RentalFleetTotals()
-	if problem != nil || burn < 0 {
-		return 0, 0, problem
+	return m.store.RentalFleetTotals(client(m.ctx).Base(), rentalRates(m.unrecorded))
+}
+
+func rentalRates(rows []hub.Rental) map[string]int64 {
+	rates := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		rates[row.ID] = row.HourlyRateUSDMicros
 	}
-	unrecordedCount, unrecordedBurn := m.unrecordedTotalsLocked()
-	return count + unrecordedCount, burn + unrecordedBurn, nil
+	return rates
 }
 
 func (m *managedRentals) unrecordedTotalsLocked() (int, int64) {

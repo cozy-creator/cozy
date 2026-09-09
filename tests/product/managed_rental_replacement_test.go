@@ -44,7 +44,7 @@ func TestReleasedManagedRentalGetsOneConcurrentReplacement(t *testing.T) {
 	replacementRequest(t, store, request, "")
 	key, problem := store.ManagedRentalOperationKey(request)
 	fatal(t, problem)
-	first, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: key, Hub: "http://hub.example", HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 100000, 0, replacementAuthor)
+	first, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: key, Hub: "http://hub.example", HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 100000, 0, replacementAuthor, nil)
 	fatal(t, problem)
 	for _, state := range []string{"acquiring", "attached", "release_requested"} {
 		fatal(t, store.AdvanceRentalOperation(first.Key, "pr-old", state))
@@ -55,7 +55,7 @@ func TestReleasedManagedRentalGetsOneConcurrentReplacement(t *testing.T) {
 		}
 	}
 	fatal(t, store.AdvanceRentalOperation(first.Key, "pr-old", "released"))
-	raced, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: first.Key, Hub: "http://hub.example", HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 100000, 0, replacementAuthor)
+	raced, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: first.Key, Hub: "http://hub.example", HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 100000, 0, replacementAuthor, nil)
 	if problem == nil || problem.Code != exit.Unavailable || raced.Key != "" {
 		t.Fatal("a selector raced by release replayed the settled key before the paid call")
 	}
@@ -83,7 +83,7 @@ func TestReleasedManagedRentalGetsOneConcurrentReplacement(t *testing.T) {
 				errors <- p.Message
 				return
 			}
-			op, _, p := other.BeginRentalOperation(records.RentalOperation{Key: chosen, Hub: "http://hub.example", HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 100000, 0, func(machine string) ([]byte, string, *exit.Error) { authors.Add(1); return replacementAuthor(machine) })
+			op, _, p := other.BeginRentalOperation(records.RentalOperation{Key: chosen, Hub: "http://hub.example", HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 100000, 0, func(machine string) ([]byte, string, *exit.Error) { authors.Add(1); return replacementAuthor(machine) }, nil)
 			if p != nil {
 				errors <- p.Message
 			} else if op.Key != next {
@@ -99,7 +99,7 @@ func TestReleasedManagedRentalGetsOneConcurrentReplacement(t *testing.T) {
 	if authors.Load() != 1 {
 		t.Fatalf("replacement body was authored %d times, want one durable operation", authors.Load())
 	}
-	stale, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: next + "-other", Hub: "http://hub.example", HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 1000000, 0, replacementAuthor)
+	stale, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: next + "-other", Hub: "http://hub.example", HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 1000000, 0, replacementAuthor, nil)
 	if problem == nil || problem.Code != exit.Unavailable || stale.Key != "" {
 		t.Fatal("stale selector created another managed acquisition")
 	}
@@ -124,7 +124,7 @@ func TestLostOnlyRentalReacquiresForTheSameSourceJob(t *testing.T) {
 	replacementRequest(t, store, request, "rental-lost-only")
 	before, problem := store.RequestRow(request)
 	fatal(t, problem)
-	original, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "managed-rental-" + request, Hub: origin, HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 1000000, 0, replacementAuthor)
+	original, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "managed-rental-" + request, Hub: origin, HourlyRateUSDMicros: 100000, ManagedRequestID: request}, 1000000, 0, replacementAuthor, nil)
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(original.Key, "rental-lost-only", "attached"))
 	var oldBody struct{ Name string }
