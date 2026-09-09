@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestWriteLockedRequirementsOmitsWorkerImageTransitives(t *testing.T) {
+func TestWriteLockedRequirementsKeepsLocalImageWheels(t *testing.T) {
 	root := t.TempDir()
 	exported := filepath.Join(root, "exported.txt")
 	target := filepath.Join(root, "locked.txt")
@@ -21,7 +21,7 @@ func TestWriteLockedRequirementsOmitsWorkerImageTransitives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "cuda-bindings") || !strings.Contains(string(data), "scipy==1.18.1") {
-		t.Fatalf("worker-image transitive survived locked export: %s", data)
+	if !strings.Contains(string(data), "cuda-bindings==13.3.1") || !strings.Contains(string(data), "scipy==1.18.1") {
+		t.Fatalf("local environment lost an image wheel needed for pip check: %s", data)
 	}
 }

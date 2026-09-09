@@ -19,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
 // EnvironmentReceipt is the environment record: exactly what produced this install's venv.
@@ -210,12 +209,6 @@ func writeLockedRequirements(exported, target, indexURL string,
 		name := normalizedRequirementName(row)
 		if name == "" || rows[name] != "" {
 			return exit.Internalf("the exported registry closure row %q is not one exact pin", row)
-		}
-		if packagepublish.ImageOwnedDistribution(name) {
-			// The worker image owns this distribution. Its selected version is an
-			// image fact, not a package release fact; retaining the publisher's
-			// transitive pin makes otherwise compatible images refuse the package.
-			continue
 		}
 		rows[name] = strings.Join(strings.Fields(row), " ")
 	}
