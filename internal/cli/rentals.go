@@ -1470,6 +1470,11 @@ func (w *releaseWatch) request() *exit.Error {
 }
 
 func (w *releaseWatch) say(state, detail string) {
+	// The hub keeps the durable protocol spelling `release_requested`; human output
+	// uses the lifecycle term operators act on.  A rental in this state is no longer
+	// admitting work and is waiting for provider teardown, so "draining" is the
+	// useful status to show while `cozy rental end` watches it.
+	state = humanRentalState(state)
 	line := state + ": " + detail
 	if detail == "" || line == w.said {
 		return
