@@ -117,10 +117,11 @@ func TestRentalListNamesMachinesThisHostNeverRecorded(t *testing.T) {
 		t.Fatalf("the unrecorded row lost the moment its billing began: %s", out)
 	}
 	stand.setRate("pr-1111111111111111stiy", 0)
-	if code, selected := runCozy(t, root, "rental", "list", "--fields=machine,$/hour"); code != 0 || !regexp.MustCompile(`(?m)^stiyl\s+unknown\s*$`).MatchString(selected) {
-		t.Fatalf("a missing hourly rate was displayed as free [exit %d]\n%s", code, selected)
+	code, out = runCozy(t, root, "rental", "list", "--json")
+	if code == 0 || !strings.Contains(out, `"code":"rental.rate_unknown"`) ||
+		strings.Contains(out, `"hourly_spend_usd_micros"`) {
+		t.Fatalf("an unknown rate produced an account total [exit %d]\n%s", code, out)
 	}
-
 }
 
 // TestEndingAnUnrecordedMachineByItsHubNameReleasesIt is the actionable half: the

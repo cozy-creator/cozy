@@ -26,6 +26,9 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	changed := false
 	first, second := "sha256:"+strings.Repeat("1", 64), "sha256:"+strings.Repeat("2", 64)
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"rentals":[]}`))
+	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]map[string]any{{"name": "h200", "accelerator_model": "NVIDIA H200",
 			"accelerator_count": 1, "compute_capability": "9.0", "vram_gb": 141, "minimum_ram_per_gpu_gb": 128, "price_usd_micros_per_hour": 1_000_000,
