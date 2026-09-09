@@ -212,6 +212,12 @@ func (r *Resolver) PrivateChildModels(request records.Request) ([]records.ModelR
 			for _, slot := range job.Models {
 				selected, problem := r.childModelLadder(child.Package, binding.Entrypoint, slot)
 				if problem != nil {
+					// A job can receive a retained artifact produced later by its
+					// parent. Its actual child call must prove that input's custody;
+					// absence of a static default is not a preflight failure.
+					if job.Kind == "job" && problem.ErrName() == "child.model_unbound" {
+						continue
+					}
 					return nil, problem
 				}
 				// Qualified so a shot's slot cannot collide with the parent's own.
