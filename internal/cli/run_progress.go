@@ -72,7 +72,11 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		if strings.HasPrefix(p.terminal.key, "stage:") {
 			return
 		}
-		rows = []string{"  running · waiting for stage updates"}
+		// Acceptance means the worker owns the attempt; silence after that point is
+		// preparation/dispatch work, not a condition the user can act on. Calling it
+		// "waiting for stage updates" made a healthy request look stalled and obscured
+		// the next stage when a worker emits no intermediate frame.
+		rows = []string{"  running · preparing request"}
 	case "dispatched", "submitted", "metric", "log":
 		return
 	case "completed", "succeeded":
