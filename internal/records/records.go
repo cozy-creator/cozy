@@ -263,7 +263,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 34 {
+	if sourceVersion < 38 {
 		if e := migrateRentals(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -549,7 +549,7 @@ func migrateRentals(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	columns := rentalColsPriorThirtyThree
 	switch {
 	case hasWidth == 1:
-		columns = rentalCols
+		columns = rentalColsPriorThirtyEight
 	case sourceVersion < 13:
 		columns = rentalColsPriorThirteen
 	case sourceVersion < 21:
@@ -879,6 +879,7 @@ func priorStatements(version int) []string {
 	for index, stmt := range statements {
 		transferStatement := stmt == modelTransferSchema[0]
 		requestStatement := stmt == requestsDDL
+		rentalStatement := stmt == rentalsDDL
 		switch {
 		case stmt == rentalOperationsDDL && version < 38:
 			stmt = strings.Replace(stmt, "  estimated_hourly_rate_usd_micros INTEGER CHECK(estimated_hourly_rate_usd_micros >= hourly_rate_usd_micros),\n", "", 1)
@@ -920,6 +921,9 @@ func priorStatements(version int) []string {
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
+		}
+		if rentalStatement && version < 38 {
+			stmt = strings.Replace(stmt, "  hourly_rate_source TEXT NOT NULL DEFAULT 'unknown' CHECK(hourly_rate_source IN ('unknown','quote','estimate','observed')),\n", "", 1)
 		}
 		if requestStatement && version < 37 {
 			stmt = strings.Replace(stmt, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)

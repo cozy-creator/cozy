@@ -10,7 +10,7 @@ import (
 // Preserve every row and historical index while removing schema35 and later additions.
 func restorePriorCallIndexBounds(t *testing.T, db *sql.DB) {
 	t.Helper()
-	_, err := db.Exec(`ALTER TABLE rental_operations DROP COLUMN estimated_hourly_rate_usd_micros`)
+	_, err := db.Exec(`ALTER TABLE rental_operations DROP COLUMN estimated_hourly_rate_usd_micros; ALTER TABLE rentals DROP COLUMN hourly_rate_source`)
 	must(t, err)
 	_, err = db.Exec(`DROP INDEX IF EXISTS byte_outputs_native_service`)
 	must(t, err)

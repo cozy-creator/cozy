@@ -981,7 +981,7 @@ func (m *managedRentals) reconcileRowsLocked() *exit.Error {
 		// Adopt the hub's reconciled billed rate (th-120): the burn this host
 		// reports and caps on must be what the provider actually charges.
 		if remote.HourlyRateUSDMicros > 0 {
-			row.HourlyRateUSDMicros = remote.HourlyRateUSDMicros
+			row.HourlyRateUSDMicros, row.HourlyRateSource = remote.HourlyRateUSDMicros, remote.HourlyRateSource
 		}
 		if remote.State == hub.RentalReleased {
 			m.forgetIdleLocked(row.ID)
@@ -1087,7 +1087,10 @@ func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 func rentalRates(rows []hub.Rental) map[string]int64 {
 	rates := make(map[string]int64, len(rows))
 	for _, row := range rows {
-		rates[row.ID] = row.HourlyRateUSDMicros
+		rates[row.ID] = 0
+		if records.RentalRateIsTotal(row.HourlyRateSource) {
+			rates[row.ID] = row.HourlyRateUSDMicros
+		}
 	}
 	return rates
 }

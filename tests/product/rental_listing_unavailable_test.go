@@ -44,7 +44,7 @@ func proveUnavailableRentalListing(t *testing.T, unavailableStatus int) {
 		if released.Load() {
 			state = "released"
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": r.PathValue("id"), "name": "isao", "state": state, "requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100000})
+		_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": r.PathValue("id"), "name": "isao", "state": state, "requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100000, "hourly_rate_source": "observed"})
 	})
 	mux.HandleFunc("DELETE /v1/rentals/pr-existing", func(w http.ResponseWriter, r *http.Request) {
 		releases.Add(1)

@@ -221,11 +221,11 @@ func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 	}
 	if listed.UnattachedRentalOperations != 0 || len(listed.Rentals) != 1 ||
 		listed.Rentals[0]["machine"] != machine || listed.MachinesRunning != 1 ||
-		listed.HourlySpendUSDMicros != 100_000 {
+		listed.HourlySpendUSDMicros != 110_000 {
 		t.Fatalf("a paid pod with no local record is invisible on the board\n%s", board)
 	}
 
-	if code, rates := runCozy(t, root, "rental", "list", "--fields=machine,$/hour"); code != 0 || !strings.Contains(rates, fmt.Sprintf("$%.2f", float64(operations[0].HourlyRateUSDMicros)/1_000_000)) {
+	if code, rates := runCozy(t, root, "rental", "list", "--fields=machine,$/hour"); code != 0 || !strings.Contains(rates, fmt.Sprintf("$%.2f", float64(*operations[0].EstimatedHourlyRateUSDMicros)/1_000_000)) {
 		t.Fatalf("unattached paid ask has no hourly rate [exit %d]\n%s", code, rates)
 	}
 

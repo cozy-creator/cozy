@@ -56,7 +56,7 @@ func tableRows(t *testing.T, db *sql.DB, table string) string {
 		must(t, rows.Scan(pointers...))
 		record := map[string]any{}
 		for i, name := range columns {
-			if name != "accelerator_count" && name != "native_service_id" && name != "requested_rental" && name != "estimated_hourly_rate_usd_micros" {
+			if name != "accelerator_count" && name != "native_service_id" && name != "requested_rental" && name != "estimated_hourly_rate_usd_micros" && name != "hourly_rate_source" {
 				record[name] = values[i]
 			}
 		}

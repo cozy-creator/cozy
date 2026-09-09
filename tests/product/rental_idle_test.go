@@ -346,7 +346,7 @@ func (h *fakeRentalHub) add(id, machine string) {
 	defer h.mu.Unlock()
 	h.rentals[id] = map[string]any{
 		"rental_id": id, "name": machine, "state": "ready",
-		"requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100_000,
+		"requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100_000, "hourly_rate_source": "observed",
 	}
 }
 
