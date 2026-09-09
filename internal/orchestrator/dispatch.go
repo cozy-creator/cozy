@@ -1953,11 +1953,11 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 			c.cleanupRemote(req.ID, attempt, w)
 		}
 	}()
-	dir, e := w.media.ReserveOutputs(slot, reservedOutputBytes)
+	dir, e := w.media.ReserveOutputs(slot, reservedOutputBytes, len(outputIDs))
 	if e != nil {
 		return nil, e
 	}
-	path, e := w.media.PutInput(slot+"-payload", req.Payload)
+	path, e := w.media.PutInput(slot, "payload", req.Payload)
 	if e != nil {
 		return nil, e
 	}
@@ -1974,7 +1974,7 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 			g.Inputs = append(g.Inputs, &pb.InputAccess{InputId: asset.FieldPath, NativeTree: &pb.NativeByteRetentionRequest{Source: asset.Native.Output.NativeRef(), RetentionId: asset.Native.RetentionID}})
 			continue
 		}
-		path, e := w.media.PutInputFile(slot+"-input-"+strconv.Itoa(index),
+		path, e := w.media.PutInputFile(slot, "input-"+strconv.Itoa(index),
 			asset.LocalPath, asset.Digest, asset.Length)
 		if e != nil {
 			return nil, e

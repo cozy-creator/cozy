@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -55,6 +56,9 @@ type Client struct {
 	http   *http.Client
 	scheme string
 	budget time.Duration
+	// Health runs before rental attachment. Only an explicit successful legacy
+	// health response selects the old routes; unprobed harness clients stay scoped.
+	legacyInputs atomic.Bool
 	// maxObject is the largest body this host will pull from the pod. A pod is a machine
 	// somebody else is running; without a bound here, one that streams forever streams
 	// into this process's memory. It is the OWNER's own per-output ceiling, passed in —
@@ -306,6 +310,9 @@ func (c *Client) Health() *exit.Error {
 		return c.skew("speaks media contract rev %d and this host speaks rev %d",
 			*said.ContractRev, mediawire.ContractRev)
 	}
+	// Existing rented pods keep their pinned supervisor. Its original media
+	// routes remain usable, and that old receiver never activates input GC.
+	c.legacyInputs.Store(!said.AttemptScopedInputs)
 	return nil
 }
 
@@ -326,28 +333,13 @@ func (c *Client) skew(format string, args ...any) *exit.Error {
 // PutInput uploads one attempt input and answers the POD-LOCAL PATH it landed at. That
 // path is what the owner mints into `InputAccess.Url`: the owner never guesses where the
 // pod's disk is, and the pod never learns where the owner's is.
-func (c *Client) PutInput(blob string, data []byte) (string, *exit.Error) {
-	doc, _, e := c.call(http.MethodPut, "/v1/inputs/"+blob, data)
-	if e != nil {
-		return "", e
-	}
-	if doc.Path == "" {
-		return "", exit.Internalf("the pod accepted %d B and named no path for them", len(data))
-	}
-	// The pod's own digest, checked against ours. It is cheap and it closes the one gap a
-	// path answer leaves: an upload that landed truncated would otherwise be discovered by
-	// the worker as a digest refusal on the input, one whole dispatch later.
-	if want := digestOf(data); doc.Digest != "" && doc.Digest != want {
-		return "", exit.New(exit.Failed,
-			"the pod says the %d B it landed hash to %s and they hash to %s here",
-			len(data), shortDigest(doc.Digest), shortDigest(want))
-	}
-	return doc.Path, nil
+func (c *Client) PutInput(slot, inputID string, data []byte) (string, *exit.Error) {
+	return c.putInput(slot, inputID, bytes.NewReader(data), digestOf(data), int64(len(data)))
 }
 
-// PutInputFile streams one exact verified file to the pod. The digest and length are the
-// request record's facts; neither side needs a whole-file byte slice.
-func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (string, *exit.Error) {
+// PutInputFile streams one exact verified file to the pod. It borrows the original
+// path; neither this client nor attempt cleanup moves or removes that file.
+func (c *Client) PutInputFile(slot, inputID, path, wantDigest string, wantLength int64) (string, *exit.Error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", exit.New(exit.NotFound, "input asset %s: %s", filepath.Base(path), err)
@@ -358,22 +350,40 @@ func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (
 		return "", exit.Named(exit.Conflict, "input_asset_changed",
 			"input asset %s no longer has its recorded %d-byte length", filepath.Base(path), wantLength)
 	}
+	return c.putInput(slot, inputID, file, wantDigest, wantLength)
+}
+
+// putInput is shared by payload bytes and borrowed files. Scoped receivers record
+// the reserved attempt before returning a path; negotiated old peers use their
+// original opaque upload names. Neither transport retries through the other route.
+func (c *Client) putInput(slot, inputID string, body io.Reader, wantDigest string, wantLength int64) (string, *exit.Error) {
+	if slot == "" || inputID == "" {
+		return "", exit.New(exit.Validation, "media input requires an attempt slot and input ID")
+	}
+	path := "/v1/attempts/" + url.PathEscape(slot) + "/inputs/" + url.PathEscape(inputID)
+	if c.legacyInputs.Load() {
+		path = "/v1/inputs/" + url.PathEscape(slot+"-"+inputID)
+	}
 	hash := sha256.New()
-	request, err := http.NewRequest(http.MethodPut, c.url("/v1/inputs/"+blob),
-		io.TeeReader(file, hash))
+	request, err := http.NewRequest(http.MethodPut,
+		c.url(path),
+		io.TeeReader(body, hash))
 	if err != nil {
 		return "", exit.Internalf("cannot build the media upload: %s", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
 	request.Header.Set("Content-Type", "application/octet-stream")
 	request.ContentLength = wantLength
+	if wantLength == 0 {
+		request.Body = http.NoBody
+	}
 	request, guard := c.stall(request)
 	defer guard.cancel()
 	response, err := c.http.Do(request)
 	if err != nil {
 		return "", exit.Named(exit.Unavailable, "media_unreachable",
-			"the pod's media server at %s did not accept %s: %s",
-			c.spec.Addr, filepath.Base(path), guard.why(err))
+			"the pod's media server at %s did not accept input %s: %s",
+			c.spec.Addr, inputID, guard.why(err))
 	}
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(guard.reader(response.Body), 1<<20+1))
@@ -388,10 +398,9 @@ func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (
 		return "", exit.Internalf("the pod accepted an input and returned no readable path")
 	}
 	gotDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
-	if gotDigest != wantDigest || doc.Length != wantLength ||
-		(doc.Digest != "" && doc.Digest != wantDigest) {
+	if gotDigest != wantDigest || doc.Length != wantLength || doc.Digest != wantDigest {
 		return "", exit.Named(exit.Conflict, "input_asset_changed",
-			"input asset %s did not retain its recorded digest/length during upload", filepath.Base(path))
+			"input %s did not retain its recorded digest/length during upload", inputID)
 	}
 	return doc.Path, nil
 }
@@ -409,12 +418,18 @@ func mediaRefusal(status int, data []byte) *exit.Error {
 	return problem
 }
 
-// ReserveOutputs charges the exact sum of the attempt's OutputBinding max_bytes values,
-// then creates its output directory and answers the pod-local destination. Charging first
-// is what lets direct worker filesystem writes and owner HTTP uploads share one quota.
-func (c *Client) ReserveOutputs(slot string, maxBytes int64) (string, *exit.Error) {
-	doc, _, e := c.call(http.MethodPost,
-		"/v1/outputs/"+slot+"?max_bytes="+strconv.FormatInt(maxBytes, 10), nil)
+// ReserveOutputs reserves the total output byte bound and exact output count
+// before the worker can write. The receiver uses the count to protect the inodes
+// still owed by this attempt, including when the declared count is zero.
+func (c *Client) ReserveOutputs(slot string, maxBytes int64, outputCount int) (string, *exit.Error) {
+	if maxBytes < 0 || outputCount < 0 {
+		return "", exit.New(exit.Validation, "output reservation requires non-negative bytes and file count")
+	}
+	path := "/v1/outputs/" + url.PathEscape(slot) + "?max_bytes=" + strconv.FormatInt(maxBytes, 10)
+	if !c.legacyInputs.Load() {
+		path += "&output_count=" + strconv.Itoa(outputCount)
+	}
+	doc, _, e := c.call(http.MethodPost, path, nil)
 	if e != nil {
 		return "", e
 	}
@@ -424,7 +439,8 @@ func (c *Client) ReserveOutputs(slot string, maxBytes int64) (string, *exit.Erro
 	return doc.Dir, nil
 }
 
-// DropAttempt removes the pod-side inputs and outputs owned by one attempt. It is
+// DropAttempt releases one attempt through the receiver's existing lifecycle.
+// Shared cached input bytes remain available to other attempts. The call is
 // idempotent, serving both failed-grant rollback and post-ack terminal cleanup.
 func (c *Client) DropAttempt(slot string) *exit.Error {
 	_, _, e := c.call(http.MethodDelete, "/v1/attempts/"+slot, nil)
@@ -562,14 +578,6 @@ func (c *Client) GetTriage(subject, wantDigest string, wantLength int64) ([]byte
 func digestOf(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-func shortDigest(d string) string {
-	bare := strings.TrimPrefix(d, "sha256:")
-	if len(bare) > 12 {
-		return "sha256:" + bare[:12]
-	}
-	return d
 }
 
 func brief(s string) string {
