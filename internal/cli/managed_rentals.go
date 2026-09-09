@@ -559,7 +559,7 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 						HourlyRateUSDMicros: seen.HourlyRateUSDMicros,
 					}})
 			}
-		})
+		}, rentalRates(m.unrecorded))
 	return row, problem
 }
 
@@ -915,7 +915,7 @@ func (m *managedRentals) reconcileListingLocked() {
 			m.unrecorded = nil
 			return
 		}
-		if row != nil {
+		if row != nil && strings.TrimRight(row.Hub, "/") == client(m.ctx).Base() {
 			continue
 		}
 		m.unrecorded = append(m.unrecorded, seen)
@@ -1043,12 +1043,15 @@ func (m *managedRentals) lineLocked() (string, *exit.Error) {
 // that admitted every one of them, because the ceiling was computed from local rows
 // and none of the six had one. A cap that cannot see half the spend is not a cap.
 func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
-	count, burn, problem := m.store.RentalFleetTotals()
-	if problem != nil || burn < 0 {
-		return 0, 0, problem
+	return m.store.RentalFleetTotals(client(m.ctx).Base(), rentalRates(m.unrecorded))
+}
+
+func rentalRates(rows []hub.Rental) map[string]int64 {
+	rates := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		rates[row.ID] = row.HourlyRateUSDMicros
 	}
-	unrecordedCount, unrecordedBurn := m.unrecordedTotalsLocked()
-	return count + unrecordedCount, burn + unrecordedBurn, nil
+	return rates
 }
 
 func (m *managedRentals) unrecordedTotalsLocked() (int, int64) {

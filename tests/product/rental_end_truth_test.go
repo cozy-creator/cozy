@@ -111,7 +111,8 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 		body, problem := hub.RentalRequestBytes(name, "cpu", strings.Repeat("ab", 32),
 			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil)
 		return body, "digest-" + name, problem
-	})
+	}, nil)
+
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(op.Key, id, "attached"))
 	stand.add(id, machine)
@@ -155,6 +156,7 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 // deleted its pending credential, and left nothing on this host that named the pod.
 func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 	root, _, stand := rentalEndRoot(t, "rental-end-unusable-answer")
+	stand.publishListing()
 	stand.setSKUs(map[string]any{
 		"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1,
 		"price_usd_micros_per_hour": 100_000, "storage_usd_micros_per_hour": 10_000,
@@ -213,12 +215,15 @@ func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 	var listed struct {
 		Rentals                    []map[string]any `json:"rentals"`
 		UnattachedRentalOperations int              `json:"unattached_rental_operations"`
+		MachinesRunning            int              `json:"machines_running"`
+		HourlySpendUSDMicros       int64            `json:"hourly_spend_usd_micros"`
 	}
 	if err := json.Unmarshal([]byte(board), &listed); err != nil {
 		t.Fatalf("rental list is not JSON: %v\n%s", err, board)
 	}
-	if listed.UnattachedRentalOperations != 1 || len(listed.Rentals) != 1 ||
-		listed.Rentals[0]["machine"] != machine {
+	if listed.UnattachedRentalOperations != 0 || len(listed.Rentals) != 1 ||
+		listed.Rentals[0]["machine"] != machine || listed.MachinesRunning != 1 ||
+		listed.HourlySpendUSDMicros != 100_000 {
 		t.Fatalf("a paid pod with no local record is invisible on the board\n%s", board)
 	}
 
