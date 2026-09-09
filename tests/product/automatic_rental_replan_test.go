@@ -119,7 +119,7 @@ func TestRentalReassignmentPreservesExecutionAndPurchaseCustody(t *testing.T) {
 			st, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 			fatal(t, problem)
 			defer st.Close()
-			row := records.Rental{ID: "pr-busy", MachineName: "busy", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, State: "ready", Hub: "proof"}
+			row := records.Rental{ID: "pr-busy", MachineName: "busy", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, HourlyRateSource: "estimate", State: "ready", Hub: "proof"}
 			fatal(t, st.RecordRental(row))
 			request := records.Request{ID: "job-replan", IdemKey: "replan", BodyDigest: "sha256:" + strings.Repeat("a", 64), Package: "proof/video", Entrypoint: "generate", PlanID: "plan", Payload: []byte(`{}`), Outputs: "[]", Kind: "job", Worker: row.ID, Rental: true, RentalRequired: true}
 			switch mode {
