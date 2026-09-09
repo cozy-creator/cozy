@@ -7,17 +7,18 @@ type CLI struct {
 	Full   bool     `help:"Include complete values and all available fields."`
 	Fields []string `help:"Select result fields." sep:","`
 
-	Package PackageCmd `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
-	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
-	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
-	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
-	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
-	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
-	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
-	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
-	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
-	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
-	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
+	Package PackageCmd   `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
+	Model   ModelCmd     `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
+	Auth    AuthCmd      `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
+	Run     RunCmd       `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
+	Rent    RentalNewCmd `cmd:"" group:"Rentals" help:"Start a private rental of the requested GPU SKU."`
+	Rental  RentalCmd    `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
+	Cache   CacheCmd     `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
+	Volume  VolumeCmd    `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
+	Up      UpCmd        `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
+	Down    DownCmd      `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
+	Unload  UnloadCmd    `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
+	Daemon  DaemonCmd    `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
 }
 
 type DaemonCmd struct {
@@ -331,7 +332,7 @@ type RunExecuteCmd struct {
 	PayloadFile    string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
 	Assets         []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	AssetFidelity  []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
-	Rental         bool     `help:"Run on a Creator-managed rental."`
+	Rental         *string  `help:"Run only on this existing rental name or id; never buy a replacement."`
 	RentalOnly     bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
 	Retry          string   `help:"Retry with current code while retaining compatible work from this prior run."`
@@ -345,11 +346,15 @@ type RunExecuteCmd struct {
 }
 
 func (c *RunExecuteCmd) Run(r *Runtime) error {
+	rentalName, problem := rentalArgument(c.Rental)
+	if problem != nil {
+		return problem
+	}
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
-		"--await", c.Await, "--rental", c.Rental,
+		"--await", c.Await,
 		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
-		"--out", c.Out, "--timeout", c.Timeout,
+		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
@@ -413,7 +418,7 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 type RentalCmd struct {
 	SSHInfo RentalSSHInfoCmd `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List    RentalListCmd    `cmd:"" help:"List rented machines, live on a terminal."`
-	New     RentalNewCmd     `cmd:"" help:"Start a private rental."`
+	New     RentalNewCmd     `cmd:"" hidden:"" help:"Start a private rental."`
 	End     RentalEndCmd     `cmd:"" help:"End a private rental and stop billing."`
 	Prune   RentalPruneCmd   `cmd:"" help:"Free unused cached operation results on a private rental."`
 }

@@ -84,7 +84,7 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	runRental := func(args ...string) (int, string) {
 		return runCozy(t, root, append(args, "--json")...)
 	}
-	args := []string{"rental", "new", "h200", "--idempotency-key", "manual-models-proof",
+	args := []string{"rent", "h200", "--idempotency-key", "manual-models-proof",
 		"--development", "--ssh-public-key", keyPath,
 		"--model", "proof/shared@1.0.0/bf16", "--model", "proof/h3@1.2.0/full",
 		"--model", "proof/shared@1.0.0/bf16"}
@@ -125,7 +125,7 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	mu.Lock()
 	changed = true // later lane retarget must not change a paid replay
 	mu.Unlock()
-	for _, replayArgs := range [][]string{args, {"rental", "new", "h200", "--idempotency-key", "manual-models-proof"}} {
+	for _, replayArgs := range [][]string{args, {"rent", "h200", "--idempotency-key", "manual-models-proof"}} {
 		code, output = runRental(replayArgs...)
 		if code == 0 || !strings.Contains(output, "proof.no_paid_create") {
 			t.Fatalf("exact replay refused before the captured boundary [exit %d]: %s", code, output)
@@ -136,14 +136,14 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 		t.Fatalf("retry re-resolved or changed paid bytes: lookups=%d/%d posts=%d", lookups, initialLookups, len(posts))
 	}
 	mu.Unlock()
-	code, output = runRental("rental", "new", "h200", "--idempotency-key", "manual-models-proof",
+	code, output = runRental("rent", "h200", "--idempotency-key", "manual-models-proof",
 		"--model", "proof/h3@1.2.0/changed")
 	if code == 0 || !strings.Contains(output, "rental.idempotency_conflict") {
 		t.Fatalf("changed serving set not refused [exit %d]: %s", code, output)
 	}
 	for _, ref := range []string{"proof/h3", "proof/h3@1.2.0", "local/h3@1.2.0/full",
 		"proof/absent@1.0.0/full", "proof/wrong@1.0.0/full", "proof/h3@1.2.0/full#" + first} {
-		code, output = runRental("rental", "new", "h200", "--model", ref)
+		code, output = runRental("rent", "h200", "--model", ref)
 		if code == 0 {
 			t.Fatalf("invalid/mismatched --model %s admitted: %s", ref, output)
 		}
@@ -163,11 +163,11 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 		t.Fatalf("changed key reached paid create: %d", len(posts))
 	}
 	mu.Unlock()
-	code, output = runRental("rental", "new", "--model", "proof/h3@1.2.0/full")
+	code, output = runRental("rent", "--model", "proof/h3@1.2.0/full")
 	if code == 0 || !strings.Contains(output, "require a GPU SKU") {
 		t.Fatalf("--model without GPU was not refused [exit %d]: %s", code, output)
 	}
-	code, output = runRental("rental", "new", "h200", "--idempotency-key", "manual-undeclared")
+	code, output = runRental("rent", "h200", "--idempotency-key", "manual-undeclared")
 	if code == 0 || !strings.Contains(output, "proof.no_paid_create") {
 		t.Fatalf("undeclared rental did not reach isolated paid boundary [exit %d]: %s", code, output)
 	}

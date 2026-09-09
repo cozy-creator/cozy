@@ -644,3 +644,15 @@ func (c *Client) RentalSKUStatus(ctx context.Context, name string) (RentalSKUSta
 	}
 	return out, nil
 }
+
+// RentalImageInventory reads the image actually assigned to this rental.
+func (c *Client) RentalImageInventory(ctx context.Context, id string) (json.RawMessage, *exit.Error) {
+	if problem := validateRentalID(id); problem != nil {
+		return nil, problem
+	}
+	var out struct {
+		ImageInventory json.RawMessage `json:"image_inventory"`
+	}
+	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals/" + url.PathEscape(id) + "/image-inventory", auth: true, responseBytes: maxPrepareFactsResponseBytes}, &out)
+	return out.ImageInventory, problem
+}

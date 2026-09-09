@@ -125,6 +125,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return helpExit
 	}
 	if err != nil {
+		if strings.Contains(err.Error(), "--rental") && strings.Contains(err.Error(), "value") {
+			err = fmt.Errorf("--rental requires an existing rental name or id; use --rental-only for automatic allocation: %w", err)
+		}
 		problem := output.NewError(output.Usage, "cli.usage", err.Error()).
 			WithNext(helpFor(parsed, args))
 		_ = output.EmitError(stdout, problem, mode)

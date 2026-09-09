@@ -135,7 +135,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("bare `cozy rental` did not print its verbs [exit %d]\n%s", code, bare)
 	}
-	for _, verb := range []string{"rental list", "rental new", "rental end"} {
+	for _, verb := range []string{"rental list", "rental end"} {
 		if !strings.Contains(bare, verb) {
 			t.Fatalf("bare `cozy rental` does not offer `cozy %s`\n%s", verb, bare)
 		}

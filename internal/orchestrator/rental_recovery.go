@@ -149,7 +149,7 @@ func (c *Orchestrator) recoverPinned(req records.Request, rentalID, cause string
 			// re-offer under the budget.
 			abandoned, problem := c.opt.Store.AbandonLostAttempt(req.ID, attempt.Attempt,
 				"the rented machine was lost before this attempt reported a terminal ("+cause+")",
-				records.RequeueAfterLoss)
+				lostOutcome(req))
 			if problem != nil {
 				c.logf("%s#%d could not be abandoned: %s", req.ID, attempt.Attempt, problem.Message)
 				return
@@ -158,6 +158,10 @@ func (c *Orchestrator) recoverPinned(req records.Request, rentalID, cause string
 				return
 			}
 			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
+			if req.RequestedRental != "" {
+				c.forget(req.ID)
+				return
+			}
 			c.emit(req.ID, "request.attempt_failed", uint64(attempt.Attempt), map[string]any{
 				"status": "FAILED", "cause": "RENTAL_LOST", "error_type": "rental.lost",
 				"error":     "the rented machine " + rentalID + " was lost while this attempt was running (" + cause + ")",
@@ -180,6 +184,10 @@ func (c *Orchestrator) recoverPinned(req records.Request, rentalID, cause string
 			c.Requeue(req.ID, "the rented machine it was running on was lost")
 			return
 		}
+	}
+	if req.RequestedRental != "" {
+		c.failQueued(req.ID, exit.Named(exit.NotFound, "rental.selected_lost", "selected rental %s was lost: %s", req.RequestedRental, cause), "")
+		return
 	}
 	// THE QUEUED CASE. No attempt is executing, so there is nothing to replay and nothing
 	// to charge. Release the pin and let routing choose again.
@@ -323,4 +331,11 @@ func (c *Orchestrator) resumeManualRental(id string) {
 		case <-timer.C:
 		}
 	}
+}
+
+func lostOutcome(req records.Request) records.LostAttemptOutcome {
+	if req.RequestedRental != "" {
+		return records.FailAfterLoss
+	}
+	return records.RequeueAfterLoss
 }

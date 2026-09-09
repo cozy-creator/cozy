@@ -61,6 +61,16 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 	if !owned || !parent.IsJob() || !parent.RetainWork || parent.State != "dispatching" || parent.Ordinal != parentAttempt {
 		return Request{}, false, exit.Named(exit.Conflict, "child.parent_stopped", "the parent attempt is not authorized to create child work")
 	}
+	if r.RequestedRental != "" && r.RequestedRental != parent.RequestedRental {
+		return Request{}, false, exit.Named(exit.Conflict, "child.rental_changed", "child cannot change its parent's requested rental")
+	}
+	r.RequestedRental = parent.RequestedRental
+	if parent.RequestedRental != "" {
+		if r.Worker != "" && r.Worker != parent.Worker {
+			return Request{}, false, exit.Named(exit.Conflict, "child.rental_changed", "child cannot change its parent's assigned rental")
+		}
+		r.Worker, r.Rental, r.RentalRequired = parent.Worker, true, true
+	}
 	var nativeIndex bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM native_calls WHERE parent_request_id=? AND call_index=?)`, parent.ID, r.ParentCallIndex).Scan(&nativeIndex); err != nil {
 		return Request{}, false, exit.Internalf("cannot inspect native parent index: %s", err)
