@@ -67,7 +67,7 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 		switch message := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
 			ack := message.ClaimAck
-			if !ack.Accepted || ack.RecordOwnerEpoch != recordOwnerEpoch || ack.WorkerId != remote.WorkerID || ack.WorkerBootId != remote.WorkerBootID || ack.ControlStreamEpoch == 0 || ack.WireMinor < pb.WireMinor {
+			if !ack.Accepted || ack.RecordOwnerEpoch != recordOwnerEpoch || ack.WorkerId != remote.WorkerID || ack.WorkerBootId != remote.WorkerBootID || ack.ControlStreamEpoch == 0 || ack.WireMinor < pb.MinCompatibleWireMinor {
 				return nil, exit.New(exit.Conflict, "operator control claim was refused or changed the pinned worker")
 			}
 			epoch = ack.ControlStreamEpoch

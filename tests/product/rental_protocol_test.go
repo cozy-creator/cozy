@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -8,19 +9,24 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // An incompatible older pod is excluded before any Claim mutates ownership.
 func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
-	for _, older := range []bool{false, true} {
-		name := "current"
-		minor := uint32(pb.WireMinor)
-		if older {
-			name = "older"
-			minor = pb.MinCompatibleWireMinor - 1
-		}
+	for _, test := range []struct {
+		name  string
+		minor uint32
+		older bool
+	}{
+		{"minimum compatible", pb.MinCompatibleWireMinor, false},
+		{"current", pb.WireMinor, false},
+		{"newer compatible", pb.WireMinor + 1, false},
+		{"below minimum", pb.MinCompatibleWireMinor - 1, true},
+	} {
+		name, minor, older := test.name, test.minor, test.older
 		t.Run(name, func(t *testing.T) {
 			public, private, err := ed25519.GenerateKey(rand.Reader)
 			must(t, err)
@@ -44,6 +50,39 @@ func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestIdleControlAcceptsCompatibleMinorSkew(t *testing.T) {
+	for _, minor := range []uint32{pb.MinCompatibleWireMinor, pb.WireMinor, pb.WireMinor + 1, pb.MinCompatibleWireMinor - 1} {
+		public, private, err := ed25519.GenerateKey(rand.Reader)
+		must(t, err)
+		pod := &fakePod{controlKey: public, wireMinor: minor}
+		connection, _ := startFakePod(t, t.TempDir(), pod)
+		var options orchestrator.Options
+		rentalWiring(connection, private)(&options)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		control, problem := orchestrator.DialIdleControl(ctx, connection, options.RentalClaimProof)
+		if control != nil {
+			must(t, control.Close())
+		}
+		cancel()
+		if minor < pb.MinCompatibleWireMinor {
+			if problem == nil || problem.ErrName() != "worker.protocol_incompatible" {
+				t.Fatalf("minor %d should refuse before Claim: %v", minor, problem)
+			}
+		} else {
+			fatal(t, problem)
+			if control == nil {
+				t.Fatalf("compatible minor %d did not open idle control", minor)
+			}
+		}
+		pod.mu.Lock()
+		mutated := len(pod.offers) + len(pod.prepares) + len(pod.desired)
+		pod.mu.Unlock()
+		if mutated != 0 {
+			t.Fatalf("idle control prepared or dispatched work for minor %d", minor)
+		}
 	}
 }
 
