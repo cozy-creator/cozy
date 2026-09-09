@@ -67,10 +67,11 @@ def main():
                 row["keyset_digest"], row["component"], row["tensor_schema_digest"]))
             registry_path.write_text(json.dumps(registry, sort_keys=True, separators=(",", ":")))
 
-        def plan(path, member=observed["member"]):
+        def plan(path, member=observed["member"], compiled=False):
+            registry = [] if compiled else ["--registry", str(registry_path)]
             return subprocess.run(
                 [binary, "ingest", "source-plan", "--carrier", f"{member}={path}",
-                 "--registry", str(registry_path), "--source-profile", observed["profile"]],
+                 *registry, "--source-profile", observed["profile"]],
                 capture_output=True, text=True,
             )
 
@@ -84,6 +85,12 @@ def main():
         assert all(row["projected"] and row["source_member"] == observed["member"]
                    for row in planned["sources"])
         assert json.loads(plan(carrier).stdout) == planned
+        native = plan(carrier, compiled=True)
+        assert native.returncode == 0, native.stderr
+        native_plan = json.loads(native.stdout)
+        assert native_plan["construction_order"] == planned["construction_order"]
+        assert native_plan["sources"] == planned["sources"]
+        assert native_plan["target"] == planned["target"]
 
         header = json.loads(raw[8:])
         for arm in ("same-width-dtype", "missing-key", "provider-namespace"):
@@ -106,7 +113,7 @@ def main():
                           if key != "__metadata__")
             altered = area / (arm + ".safetensors")
             sparse(altered, struct.pack("<Q", len(body)) + body, 8 + len(body) + maximum)
-            result = plan(altered, member)
+            result = plan(altered, member, compiled=True)
             assert result.returncode != 0 and "UNREGISTERED_FINGERPRINT" in result.stderr, (
                 arm, result.stdout, result.stderr)
     print(json.dumps({"checked": 4, "changes": changes,
