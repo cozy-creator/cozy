@@ -134,6 +134,28 @@ func PendingMediaToken(l home.Layout, operationKey string) (secret.Value, *exit.
 	return token, nil
 }
 
+// RetainedAcquisitionCredentials reads the credentials minted before the paid
+// operation. It never replaces missing keys. Foreground completion may already
+// have moved them to their final names while a daemon observation was in flight.
+func RetainedAcquisitionCredentials(l home.Layout, operation records.RentalOperation) (secret.Value, CreatorIdentity, *exit.Error) {
+	token, problem := tokenAt(l.PendingRentalMediaToken(operation.Key), "pending rental operation "+operation.Key)
+	if problem == nil {
+		identity, identityProblem := loadCreatorIdentity(l.PendingRentalCreatorIdentity(operation.Key))
+		if identityProblem == nil {
+			return token, identity, nil
+		}
+		problem = identityProblem
+	}
+	if operation.RentalID != "" {
+		token, attachedProblem := MediaToken(l, operation.RentalID)
+		if attachedProblem == nil {
+			identity, identityProblem := CreatorIdentityFor(l, operation.RentalID)
+			return token, identity, identityProblem
+		}
+	}
+	return secret.Value{}, CreatorIdentity{}, problem
+}
+
 // ForgetPending removes the pre-id token only after the operation is attached or proved
 // terminal. An interrupted poll deliberately leaves it for the exact-key retry.
 func ForgetPending(l home.Layout, operationKey string) {

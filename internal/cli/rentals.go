@@ -458,29 +458,62 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
+	row, e = finishRentalAttachment(l, st, row, attachable, operationKey, token, creator)
+	return row, attachable, replay, e
+}
+
+// finishRentalAttachment is the shared durable handoff for foreground acquisition
+// and daemon recovery. It validates the same retained credentials before the row
+// advertises an authenticated worker target.
+func finishRentalAttachment(l home.Layout, st *records.Store, row records.Rental,
+	attachable hub.Rental, operationKey string, token secret.Value, creator rental.CreatorIdentity,
+) (records.Rental, *exit.Error) {
+	if row.ID != attachable.ID || row.MachineName != attachable.Name || !attachable.Attachable() {
+		return records.Rental{}, exit.Named(exit.Conflict, "rental.attach_projection_conflict",
+			"rental attachment does not match the recorded ready machine")
+	}
+	current, problem := st.RentalOperation(operationKey)
+	if problem != nil {
+		return records.Rental{}, problem
+	}
+	if current == nil || current.RentalID != row.ID || current.State == hub.RentalReleased ||
+		current.State == hub.RentalFailed || current.State == hub.RentalReleaseRequested {
+		return records.Rental{}, exit.Named(exit.Conflict, "rental.operation_moved",
+			"rental operation is no longer awaiting this attachment")
+	}
+	if current.State == "attached" {
+		stored, problem := st.RentalRow(row.ID)
+		if problem != nil {
+			return records.Rental{}, problem
+		}
+		if stored == nil {
+			return records.Rental{}, exit.Named(exit.Conflict, "rental.attached_record_missing", "attached rental has no local row")
+		}
+		return *stored, nil
+	}
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
 	row.ExpectedWorkerID, row.ExpectedWorkerBootID = attachable.WorkerID, attachable.WorkerBootID
 	if !attachable.HoldsMediaHash(secret.HashHex(token)) {
-		return records.Rental{}, hub.Rental{}, false, exit.New(exit.Failed,
+		return records.Rental{}, exit.New(exit.Failed,
 			"rental %s is attachable and its live credential set does not carry the token this host minted", attachable.ID).
 			WithRemedy("release it and rent again; a pod nobody can authenticate to still costs money").
 			WithNext("cozy rental end " + attachable.ID)
 	}
 	if attachable.CreatorPublicKey != creator.PublicKey() {
-		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.creator_key_changed",
+		return records.Rental{}, exit.Named(exit.Conflict, "rental.creator_key_changed",
 			"rental %s did not retain the Creator key sent at create", attachable.ID).
 			WithRemedy("release it; this host will not sign for a rental bound to another key")
 	}
 	if e := rental.Attach(l, st, row, attachable.CertPEM, token, creator); e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+		return records.Rental{}, e
 	}
 	row.CertPath = l.RentalCert(attachable.ID)
 	if e := st.AdvanceRentalOperation(operationKey, attachable.ID, "attached"); e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+		return records.Rental{}, e
 	}
 	rental.ForgetPending(l, operationKey)
-	return row, attachable, replay, nil
+	return row, nil
 }
 
 func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
