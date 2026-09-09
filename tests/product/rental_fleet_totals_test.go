@@ -51,7 +51,7 @@ func TestFleetCapAdmitsTheEstimatedTotalNotTheGPURate(t *testing.T) {
 	}
 	// Cap $0.70/h; the L4 quote is $0.49 GPU + $0.213504 storage = $0.703504.
 	_, _, problem = store.BeginRentalOperation(records.RentalOperation{
-		Key: "op-l4", Hub: "http://127.0.0.1:1", Reason: "cozy rent l4",
+		Key: "op-l4", Hub: "http://127.0.0.1:1", Reason: "cozy rental new l4",
 		HourlyRateUSDMicros: 490_000,
 	}, 700_000, 213_504, author, nil)
 
@@ -61,7 +61,7 @@ func TestFleetCapAdmitsTheEstimatedTotalNotTheGPURate(t *testing.T) {
 	}
 	// The same SKU under a cap that covers the total is admitted.
 	_, replay, problem := store.BeginRentalOperation(records.RentalOperation{
-		Key: "op-l4-fits", Hub: "http://127.0.0.1:1", Reason: "cozy rent l4",
+		Key: "op-l4-fits", Hub: "http://127.0.0.1:1", Reason: "cozy rental new l4",
 		HourlyRateUSDMicros: 490_000,
 	}, 710_000, 213_504, author, nil)
 

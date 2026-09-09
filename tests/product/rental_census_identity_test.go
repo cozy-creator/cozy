@@ -55,7 +55,7 @@ func TestRentalCensusRateControlsTransactionalAdmission(t *testing.T) {
 			fatal(t, problem)
 			defer store.Close()
 			_, _, problem = store.BeginRentalOperation(records.RentalOperation{Key: "old", Hub: origin,
-				Reason: "cozy rent cpu", HourlyRateUSDMicros: 100_000}, 1_000_000, 0,
+				Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100_000}, 1_000_000, 0,
 				func(name string) ([]byte, string, *exit.Error) {
 					return []byte(fmt.Sprintf(`{"name":%q,"sku":"cpu"}`, name)), "sha256:" + strings.Repeat("a", 64), nil
 				}, nil)
@@ -71,7 +71,7 @@ func TestRentalCensusRateControlsTransactionalAdmission(t *testing.T) {
 					"state": "pending_acquisition", "requested_accelerator_model": "CPU",
 					"hourly_rate_usd_micros": 100_000}
 			}
-			code, out := runCozy(t, root, "rent", "cpu", "--idempotency-key=next", "--json")
+			code, out := runCozy(t, root, "rental", "new", "cpu", "--idempotency-key=next", "--json")
 			if actual == 40_000 {
 				if asks.Load() != 1 || code == 0 || !strings.Contains(out, "accelerator count") {
 					t.Fatalf("observed 0.04 + new 0.11 should reach the paid POST under 0.15 cap: asks=%d exit=%d %s", asks.Load(), code, out)

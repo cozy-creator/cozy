@@ -226,11 +226,11 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	defer hub.Close()
 	if strings.HasPrefix(mode, "interrupted") {
 		op, _, problem := store.BeginRentalOperation(records.RentalOperation{
-			Key: "manual-restart", Hub: hub.URL, Reason: "cozy rent cpu", HourlyRateUSDMicros: 1,
+			Key: "manual-restart", Hub: hub.URL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 1,
 		}, 2_000_000, 0, func(name string) ([]byte, string, *exit.Error) {
 			body, problem := hubapi.RentalRequestBytes(name, "cpu", secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil)
 			return body, fmt.Sprintf("sha256:%x", sha256.Sum256(body)), problem
-		})
+		}, nil)
 		fatal(t, problem)
 		request, problem := hubapi.ParseRentalRequestBytes(op.RequestBody)
 		fatal(t, problem)
