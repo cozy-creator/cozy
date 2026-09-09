@@ -7,17 +7,18 @@ type CLI struct {
 	Full   bool     `help:"Include complete values and all available fields."`
 	Fields []string `help:"Select result fields." sep:","`
 
-	Package PackageCmd `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
-	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
-	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
-	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
-	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
-	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
-	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
-	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
-	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
-	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
-	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
+	Package PackageCmd   `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
+	Model   ModelCmd     `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
+	Auth    AuthCmd      `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
+	Run     RunCmd       `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
+	Rental  RentalCmd    `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
+	Rent    RentalNewCmd `cmd:"" group:"Rentals" name:"rent" help:"Rent a more powerful GPU in the cloud."`
+	Cache   CacheCmd     `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
+	Volume  VolumeCmd    `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
+	Up      UpCmd        `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
+	Down    DownCmd      `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
+	Unload  UnloadCmd    `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
+	Daemon  DaemonCmd    `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
 }
 
 type DaemonCmd struct {
