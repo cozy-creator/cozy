@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 37
+const schemaVersion = 38
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -275,6 +275,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	}
 	if sourceVersion < 37 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
+			return e
+		}
+	}
+	if sourceVersion < 38 {
+		if e := migrateRentalReservations(tx, path); e != nil {
 			return e
 		}
 	}
@@ -568,6 +573,25 @@ func migrateRentals(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	return nil
 }
 
+// Legacy rental intents did not record storage prices. Preserve their exact quote
+// and request identity, leaving the total unknown until an observed rate replaces it.
+func migrateRentalReservations(tx *sql.Tx, path string) *exit.Error {
+	priorColumns := strings.Replace(rentalOperationCols, ",estimated_hourly_rate_usd_micros", "", 1)
+	for _, statement := range []string{
+		`DROP INDEX rental_operation_remote`,
+		`ALTER TABLE rental_operations RENAME TO rental_operations_prior`,
+		rentalOperationsDDL,
+		`INSERT INTO rental_operations(` + priorColumns + `) SELECT ` + priorColumns + ` FROM rental_operations_prior`,
+		`DROP TABLE rental_operations_prior`,
+		rentalSchema[2],
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return exit.Internalf("cannot preserve rental reservations while migrating %s: %s", path, err)
+		}
+	}
+	return nil
+}
+
 // migrateOutputExports rebuilds the export table without its payload hash. Rows carry
 // over: a settled row keeps its published paths, an owed one is retried under the
 // content-digest naming and lands on the same bytes.
@@ -856,6 +880,8 @@ func priorStatements(version int) []string {
 		transferStatement := stmt == modelTransferSchema[0]
 		requestStatement := stmt == requestsDDL
 		switch {
+		case stmt == rentalOperationsDDL && version < 38:
+			stmt = strings.Replace(stmt, "  estimated_hourly_rate_usd_micros INTEGER CHECK(estimated_hourly_rate_usd_micros >= hourly_rate_usd_micros),\n", "", 1)
 		case stmt == requestsDDL && version == 6:
 			stmt = priorRequestsSix
 		case stmt == requestsDDL && version < 11:

@@ -981,6 +981,10 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			continue
 		}
 		unattached++
+		rate := op.HourlyRateUSDMicros
+		if op.EstimatedHourlyRateUSDMicros != nil {
+			rate = *op.EstimatedHourlyRateUSDMicros
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": machine, "sku": orNone(request.SKU), "state": op.State,
 			"failure": "—", "uptime": rentalUptime(op.CreatedAt), "running": "0", "queued": "0",
@@ -989,11 +993,11 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			"rented": stamp(op.CreatedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": "", "provider": "", "provider resource": "", "provider host": "",
 			"provider state": "", "container state": "",
-			"$/hour": rentalHourlyRate(op.HourlyRateUSDMicros),
+			"$/hour": rentalHourlyRate(rate),
 		})
 		typed := map[string]any{
 			"machine": machine, "state": op.State, "rental_id": op.RentalID,
-			"running": 0, "queued": 0, "hourly_rate_usd_micros": op.HourlyRateUSDMicros,
+			"running": 0, "queued": 0, "hourly_rate_usd_micros": rate,
 			"accelerator_count": 0, "operation": op.Key, "attached": false,
 		}
 		for key, value := range map[string]string{"sku": request.SKU, "hub": op.Hub,

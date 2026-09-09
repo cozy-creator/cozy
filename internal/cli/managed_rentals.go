@@ -1047,16 +1047,6 @@ func rentalRates(rows []hub.Rental) map[string]int64 {
 	return rates
 }
 
-func (m *managedRentals) unrecordedTotalsLocked() (int, int64) {
-	var burn int64
-	for _, seen := range m.unrecorded {
-		if seen.HourlyRateUSDMicros > 0 {
-			burn += seen.HourlyRateUSDMicros
-		}
-	}
-	return len(m.unrecorded), burn
-}
-
 // unrecorded is the cached set, for a caller rendering the fleet rather than
 // deciding on it. It never asks the hub: the reconcile owns that, at the cadence
 // every rental verb already samples at.
