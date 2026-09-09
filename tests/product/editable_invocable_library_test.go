@@ -30,14 +30,22 @@ func TestEditableInvocableLibraryTracksCodeWithoutPackageManifest(t *testing.T) 
 			t.Fatalf("uv: %v\n%s", err, out)
 		}
 	}
-	root := t.TempDir()
+	root, err := os.MkdirTemp("", "cozy-edit-lib-")
+	must(t, err)
 	path := filepath.Join(control, "bin")
 	for _, item := range childEnv(t, root) {
 		if strings.HasPrefix(item, "PATH=") {
 			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
 		}
 	}
-	t.Cleanup(func() { compositionDown(t, root, path) })
+	t.Cleanup(func() {
+		compositionDown(t, root, path)
+		if !t.Failed() {
+			must(t, os.RemoveAll(root))
+		} else {
+			t.Log("retained editable proof home", root)
+		}
+	})
 	library := filepath.Join(project, "library")
 	must(t, os.Mkdir(library, 0700))
 	metadata := fmt.Sprintf(`[project]
@@ -54,10 +62,13 @@ build-backend="hatchling.build"
 only-include=["editable_leaf.py"]
 `, version)
 	must(t, os.WriteFile(filepath.Join(library, "pyproject.toml"), []byte(metadata), 0600))
-	body := `from cozy_runtime.author import App, Context, invocable
+	body := `import msgspec
+from cozy_runtime.author import App, Context, invocable
+class Result(msgspec.Struct):
+    value: int
 @invocable(memoize=True)
-async def value(ctx: Context) -> int:
-    return 42
+async def value(ctx: Context) -> Result:
+    return Result(42)
 app = App()
 app.job(value)
 `
@@ -71,7 +82,7 @@ app.job(value)
 # ///
 from editable_leaf import value
 async def main(ctx):
-    assert await value() == 42
+    assert (await value()).value == 42
 `, version, runtimeSource, library)
 	firstScript := filepath.Join(project, "first.py")
 	must(t, os.WriteFile(firstScript, []byte(script), 0600))
@@ -107,7 +118,7 @@ async def main(ctx):
 	if second.Ordinal != 0 || second.ReusedFrom != first.ID || second.ChildTargetDigest != first.ChildTargetDigest {
 		t.Fatalf("caller edit invalidated helper: %+v", second)
 	}
-	must(t, os.WriteFile(module, []byte(strings.Replace(body, "return 42", "return 43", 1)), 0600))
+	must(t, os.WriteFile(module, []byte(strings.Replace(body, "Result(42)", "Result(43)", 1)), 0600))
 	must(t, os.WriteFile(edited, []byte(strings.Replace(script, "== 42", "== 43", 1)), 0600))
 	run(edited)
 	third := child("5")
