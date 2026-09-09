@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"strings"
+
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 )
@@ -33,4 +35,27 @@ func declaredModelSlots(callables ...[]launch.Entrypoint) []launch.Slot {
 		}
 	}
 	return slots
+}
+
+// missingModelDefaults describes deployment readiness, not permission to supply
+// explicit model inputs to a local or private invocation. Jobs have no default
+// serving deployment and may take unpublished model inputs from their caller.
+func missingModelDefaults(callable *launch.Entrypoint, defaults map[string]hub.PackageBindingRow) []string {
+	if callable.Kind == "job" {
+		return nil
+	}
+	var missing []string
+	for _, slot := range callable.Models {
+		if _, bound := defaults[slot.Path]; !bound {
+			missing = append(missing, slot.Param)
+		}
+	}
+	return missing
+}
+
+func modelDefaultAvailability(callable *launch.Entrypoint, defaults map[string]hub.PackageBindingRow) string {
+	if missing := missingModelDefaults(callable, defaults); len(missing) > 0 {
+		return "disabled: no default for " + strings.Join(missing, ", ")
+	}
+	return "available"
 }

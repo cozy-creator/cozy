@@ -1132,7 +1132,9 @@ func releaseConstraints(ctx *Context, req records.Request) rental.Constraints {
 	// nothing is declared, which excludes wide products rather than admitting them.
 	var degrees []int
 	if declared, e := launch.DecodePackageInterface(detail.PackageInterface); e == nil {
-		degrees = declared.SequenceParallelDegrees()
+		if entrypoint, e := declared.Function(req.Entrypoint); e == nil && entrypoint.Kind != "job" {
+			degrees = entrypoint.SequenceParallelDegrees()
+		}
 	}
 	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython,
 		Degrees: degrees}

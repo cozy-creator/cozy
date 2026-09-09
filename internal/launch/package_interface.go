@@ -112,29 +112,24 @@ type ModelDefaultRung struct {
 	Lane string `json:"lane"`
 }
 
-// SequenceParallelDegrees is the group degrees this package can be built at: the
-// INTERSECTION of `sequence_parallel.degrees` over every model slot of every model-bearing
-// entrypoint, which is the same fold cozy-runtime does over a placement's bindings before
-// it will honour a device pin of degree K. A slot that declares nothing makes the whole
-// construction unshardable, and an author who declared nothing anywhere declares none —
-// the answer is empty, not "any".
+// SequenceParallelDegrees intersects the selected entrypoint's model slots. Other
+// functions are separate constructions and cannot restrict this request's GPU group.
+// A slot that declares nothing makes the selected construction unshardable.
 //
 // This is CAPABILITY, never selection: it says a group of this degree can be built, not
 // that one will be. What decides the actual degree is the width of the machine the renter
 // bought (cl-179).
-func (d *PackageInterface) SequenceParallelDegrees() []int {
+func (entrypoint *Entrypoint) SequenceParallelDegrees() []int {
 	folded, first := map[int]bool{}, true
-	for _, entrypoint := range d.Entrypoints {
-		for _, slot := range entrypoint.Models {
-			declared := slot.sequenceParallelDegrees()
-			if first {
-				folded, first = declared, false
-				continue
-			}
-			for degree := range folded {
-				if !declared[degree] {
-					delete(folded, degree)
-				}
+	for _, slot := range entrypoint.Models {
+		declared := slot.sequenceParallelDegrees()
+		if first {
+			folded, first = declared, false
+			continue
+		}
+		for degree := range folded {
+			if !declared[degree] {
+				delete(folded, degree)
 			}
 		}
 	}
