@@ -25,6 +25,19 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	var inventoryReads atomic.Int32
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, detail *hub.PackageReleaseDetail) {
 		detail.ExecutionRequirements = []string{"cozy-runtime[media]>=0.15.0,<1"}
+		mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
+			id := r.PathValue("id")
+			name, ok := map[string]string{current: "isao", old: "giriko"}[id]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"rental_id": id, "name": name, "state": "ready", "development": false,
+				"requested_accelerator_model": "CPU", "accelerator_count": 1,
+				"hourly_rate_usd_micros": 100000,
+			})
+		})
 		mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, r *http.Request) {
 			inventoryReads.Add(1)
 			version := "0.15.0"
