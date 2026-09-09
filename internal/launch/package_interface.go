@@ -462,6 +462,21 @@ func validateTypeRaw(raw json.RawMessage) error {
 			return err
 		}
 		return validateTypeRaw(object["list"])
+	case object["map"] != nil:
+		if _, err := exactKeys(raw, []string{"map"}, nil); err != nil {
+			return err
+		}
+		entry, err := exactKeys(object["map"], []string{"key", "value"}, nil)
+		if err != nil {
+			return err
+		}
+		if err := validateTypeRaw(entry["key"]); err != nil {
+			return fmt.Errorf("map key: %w", err)
+		}
+		if err := validateTypeRaw(entry["value"]); err != nil {
+			return fmt.Errorf("map value: %w", err)
+		}
+		return nil
 	case object["union"] != nil:
 		union, err := exactKeys(raw, []string{"union"}, []string{"tag_field"})
 		if err != nil {
