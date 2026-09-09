@@ -107,3 +107,56 @@ func TestAFailedSourceMemberReachesTheClientAndTheCLI(t *testing.T) {
 		t.Fatalf("`cozy run watch` listed a member that verified:\n%s", said)
 	}
 }
+
+func TestCompletedSourcePublicationSuppressesStalePendingRows(t *testing.T) {
+	root := t.TempDir()
+	daemon := startDaemonProcess(t, root)
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	id := "job-native-source-complete"
+	intent := &records.ModelTransferIntent{Kind: "model-upload", Destination: "paul/minimax-h3", Source: "hf://proof/pdd@" + strings.Repeat("4", 40), SourceSelection: childDigest("2"), SourceFiles: []records.ModelTransferSourceFile{{Member: "pdd.safetensors", SHA256: strings.Repeat("a", 64), Length: 1372450680}}, Outputs: []records.ModelTransferOutput{{Name: "adapter"}}}
+	_, _, problem = store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: childDigest("c"), Package: "local/pdd", Entrypoint: "main", Kind: "job", Payload: []byte("{}"), ModelTransfer: intent})
+	fatal(t, problem)
+	read := func() api.JobState {
+		answer := daemon.call(t, "GET", "/v1/local/jobs/"+id, nil)
+		if answer.Status != 200 {
+			t.Fatal(answer.brief())
+		}
+		var state api.JobState
+		must(t, json.Unmarshal(answer.Body, &state))
+		return state
+	}
+	if sources := read().ModelSources; len(sources) != 1 || sources[0].State != "pending" || sources[0].Transferred != 0 {
+		t.Fatalf("pending source was hidden: %+v", sources)
+	}
+	fatal(t, store.CompleteModelTransferMaterialization(id, []records.ModelRef{{Slot: "adapter", Manifest: childDigest("d"), ManifestLength: 163}}, ""))
+	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "source-worker", Package: "local/pdd", WorkerID: "source-worker", Devices: []string{"cpu"}}))
+	ordinal, problem := store.Dispatch(records.Attempt{RequestID: id, InstanceID: "source-worker", SessionID: "source-session", InvocationDigest: childDigest("e"), InvocationCanonical: []byte("{}")})
+	fatal(t, problem)
+	fatal(t, store.RecordModelTransferWeights(records.ModelTransferWeights{RequestID: id, OutputSlot: "adapter", ManifestID: childDigest("d"), ManifestLength: 163, Attempt: ordinal, InvocationDigest: childDigest("e"), TransactionID: childDigest("f"), ReceiptDigest: childDigest("1")}))
+	fatal(t, store.CompleteModelTransferOutput(id, ordinal, "adapter", "published-adapter"))
+	fatal(t, store.BeginModelTransferFinalization(id))
+	if sources := read().ModelSources; len(sources) != 1 {
+		t.Fatal("publication still pending but source report disappeared")
+	}
+	fatal(t, store.CompleteModelTransfer(id, map[string]string{"adapter": childDigest("d")}))
+	state := read()
+	if len(state.ModelSources) != 0 || state.ModelOutputs["adapter"] != childDigest("d") {
+		t.Fatalf("completed source publication still pending: %+v", state)
+	}
+	statuses, problem := store.ModelTransferSourceStatuses(id)
+	fatal(t, problem)
+	if len(statuses) != 1 || statuses[0].State != "pending" || statuses[0].Transferred != 0 {
+		t.Fatal("readback fabricated raw transfer observations")
+	}
+	// The parent has not been marked successful: the source-publication authority,
+	// rather than an unrelated parent terminal, determines this projection.
+	row, problem := store.RequestRow(id)
+	fatal(t, problem)
+	if row.State == "succeeded" {
+		t.Fatal("fixture accidentally depended on parent success")
+	}
+}
