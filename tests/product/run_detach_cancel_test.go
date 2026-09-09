@@ -116,7 +116,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 	// A canceled run renders LOUDLY with its actor: in watch (the operational error exit)…
 	for _, ref := range []string{dref, parkedID} {
 		code, out := runCozy(t, root, "run", "watch", ref)
-		if code != 1 || !strings.Contains(out, "was canceled by cozy run cancel") {
+		if code != 1 || !strings.Contains(out, "was cancelled by user") {
 			t.Fatalf("watch of canceled run %s is not loud about its actor [exit %d]\n%s", ref, code, out)
 		}
 	}
@@ -127,7 +127,7 @@ func TestClientDeathNeverCancels(t *testing.T) {
 	}
 	// …and in list, where the incident read as a quiet no-output end.
 	if code, out := runCozy(t, root, "run", "list"); code != 0 ||
-		!strings.Contains(out, "canceled by cozy run cancel") {
+		!strings.Contains(out, "cancelled by user") {
 		t.Fatalf("run list does not carry the cancellation cause [exit %d]\n%s", code, out)
 	}
 

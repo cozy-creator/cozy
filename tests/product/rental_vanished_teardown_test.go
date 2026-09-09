@@ -199,7 +199,7 @@ func TestDownAllIsNotRefusable(t *testing.T) {
 			hub.releases("rental-down-all"), out)
 	}
 	// It cancelled the owner's in-flight work by design, so it has to SAY so.
-	if !strings.Contains(out, "canceled") {
+	if !strings.Contains(out, "cancelled") {
 		t.Fatalf("the teardown did not report what it destroyed\n%s", out)
 	}
 }
