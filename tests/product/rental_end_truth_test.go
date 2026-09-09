@@ -56,17 +56,15 @@ func rentalEndRoot(t *testing.T, name string) (string, string, *fakeRentalHub) {
 	return root, hubURL, newFakeRentalHub(t, port)
 }
 
-// TestEndingAnUnrecordedMachineDoesNotClaimItEnded is the exact live shape: the hub holds
-// a live pod, this host has never recorded it, and the person types the machine word.
-//
-// The only outcome that must not survive is silence dressed as success.
-func TestEndingAnUnrecordedMachineDoesNotClaimItEnded(t *testing.T) {
+// A complete account listing proves that a mistyped machine name is absent; it
+// must not release a different live rental or claim that a deletion occurred.
+func TestEndingAnUnknownMachineDoesNotClaimItEnded(t *testing.T) {
 	root, _, stand := rentalEndRoot(t, "rental-end-unrecorded")
 	stand.add("pr-0badc0de0badc0de0bad", "koharu")
 
-	code, out := runCozy(t, root, "rental", "end", "koharu", "--json")
+	code, out := runCozy(t, root, "rental", "end", "unknown-name", "--json")
 	if code == 0 {
-		t.Fatalf("ending a machine this host never recorded exited 0\n%s", out)
+		t.Fatalf("ending a machine absent from the account exited 0\n%s", out)
 	}
 	if strings.Contains(out, `"state":"ended"`) {
 		t.Fatalf("the CLI reported an end it did not perform\n%s", out)
@@ -74,9 +72,9 @@ func TestEndingAnUnrecordedMachineDoesNotClaimItEnded(t *testing.T) {
 	if !strings.Contains(out, "rental.unknown") {
 		t.Fatalf("the refusal is not the typed one that names what happened\n%s", out)
 	}
-	// The refusal must say WHY the 404 proved nothing, not merely that it got one.
-	if !strings.Contains(out, "opaque id") {
-		t.Fatalf("the refusal does not explain that a machine word is not a hub key\n%s", out)
+	// The refusal must distinguish an unknown name from a successful deletion.
+	if !strings.Contains(out, "none of them") {
+		t.Fatalf("the refusal does not report the account lookup\n%s", out)
 	}
 	if n := stand.releases("pr-0badc0de0badc0de0bad"); n != 0 {
 		t.Fatalf("the hub saw %d release(s) from a command that refused", n)

@@ -1046,6 +1046,11 @@ func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 	if m.listingProblem != nil {
 		return 0, 0, m.listingProblem
 	}
+	if !m.listed {
+		return 0, 0, exit.Named(exit.Unavailable, "rental.list_unavailable",
+			"account rental census unavailable: this hub publishes no rental listing").
+			WithRemedy("restore the Hub account-listing route before reading totals or acquiring a rental")
+	}
 	count, burn, problem := m.store.RentalFleetTotals()
 	if problem != nil || burn < 0 {
 		return 0, 0, problem

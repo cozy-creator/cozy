@@ -1140,11 +1140,6 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
-	line, e := (&managedRentals{ctx: ctx, layout: l, store: st}).status()
-	if e != nil {
-		return e
-	}
-	fmt.Fprintln(ctx.Err, line)
 	known, e := rental.Resolve(st, subject)
 	if e != nil {
 		return e
