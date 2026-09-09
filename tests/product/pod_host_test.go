@@ -58,6 +58,7 @@ const (
 // does. It verifies the owner's Ed25519 ClaimProof on both services against the control key
 // the rental's auth document would carry, records what crossed, and answers minimally.
 type fakePod struct {
+	mediaReservation func(int64, int) error
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime   pb.RuntimePreparationClient
 	sourceRelease   func(*pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
@@ -759,6 +760,18 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 				t.Errorf("output reservation omitted its exact file count: %s", r.URL)
 				w.WriteHeader(http.StatusBadRequest)
 				return
+			}
+			if pod.mediaReservation != nil {
+				bytes, err := strconv.ParseInt(r.URL.Query().Get("max_bytes"), 10, 64)
+				if err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if err := pod.mediaReservation(bytes, count); err != nil {
+					w.WriteHeader(http.StatusInsufficientStorage)
+					return
+				}
 			}
 			slot := strings.TrimPrefix(r.URL.Path, "/v1/outputs/")
 			reserved[slot] = true
