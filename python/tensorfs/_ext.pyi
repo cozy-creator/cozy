@@ -353,6 +353,9 @@ class ReadLease:
         self, object: str, object_length: int, off: int, length: int, into: object
     ) -> None: ...
     def read_asset(self, header: _Bytes, name: str, max_bytes: int = 67108864) -> _Bytes: ...
+    def read_part_into(
+        self, header: _Bytes, component: str, key: str, role: str, off: int, into: object
+    ) -> None: ...
     def stream(
         self,
         plan: ReadPlan,

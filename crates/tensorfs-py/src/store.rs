@@ -2812,6 +2812,56 @@ impl PyLease {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    /// Read a bounded semantic part from a header already covered by this read lease.
+    /// This is the same native range reader used by derived writers, without a writer.
+    #[allow(clippy::too_many_arguments)]
+    fn read_part_into(
+        &self,
+        py: Python<'_>,
+        header: &[u8],
+        component: &str,
+        key: &str,
+        role: &str,
+        off: u64,
+        into: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let header_ref = ObjectRef::of(header);
+        let header = Header::parse(header).or_refuse(py)?;
+        let name = format!("{component}/{key}/{role}");
+        let part = header
+            .components
+            .iter()
+            .find(|(candidate, _)| candidate == component)
+            .and_then(|(_, tensors)| tensors.iter().find(|(candidate, _)| candidate == key))
+            .and_then(|(_, tensor)| tensor.parts.iter().find(|(candidate, _)| candidate == role))
+            .map(|(_, part)| part)
+            .ok_or_else(|| missing(py, "model tensor part", &name))?;
+        let mut buffer = Writable::new(py, into)?;
+        let destination = buffer.slice();
+        let guard = self.lease.lock_py_attached(py).unwrap();
+        let lease = guard.as_ref().ok_or_else(|| released(py))?;
+        lease
+            .covers(&ObjectRange {
+                obj: header_ref,
+                off: 0,
+                len: 0,
+            })
+            .or_refuse(py)?;
+        py.detach(|| {
+            lease.recheck(&self.meta)?;
+            read::read_part_into(
+                lease,
+                &name,
+                part,
+                off,
+                destination.len() as u64,
+                destination,
+            )?;
+            lease.recheck(&self.meta)
+        })
+        .or_refuse(py)
+    }
+
     /// **The streaming shape.** One plan, a ring of CALLER-owned slots, and a reader pool
     /// that never stops at a batch boundary.
     ///

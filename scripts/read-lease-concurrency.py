@@ -4,6 +4,7 @@
 import concurrent.futures
 import hashlib
 import io
+import math
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from pathlib import Path
 import tensorfs
 
 ARMS = ("readers", "hold_id", "manifest", "bytes", "objects", "live", "recheck",
-        "read_into", "read_asset", "stream", "release", "exit", "callback_error")
+        "read_into", "read_asset", "read_part_into", "stream", "release", "exit", "callback_error")
 
 
 def readers():
@@ -52,6 +53,11 @@ def contention(arm, root, manifest):
     asset_name = next(iter(header["assets"]))
     asset = lease.read_asset(raw, asset_name)
     assert hashlib.sha256(asset).hexdigest() == header["assets"][asset_name]["logical_sha256"]
+    component, key = order[0]
+    role, part = next(iter(header["components"][component][key]["parts"].items()))
+    part_bytes = min(17, math.prod(part["shape"]) * tensorfs.dtypes()[part["dtype"]])
+    expected_part = bytearray(part_bytes)
+    lease.read_part_into(raw, component, key, role, 0, expected_part)
 
     def stream(block=False):
         slots = [bytearray(1 << 18) for _ in range(2)]
@@ -90,6 +96,10 @@ def contention(arm, root, manifest):
             assert target == expected
         elif arm == "read_asset":
             assert lease.read_asset(raw, asset_name) == asset
+        elif arm == "read_part_into":
+            target = bytearray(part_bytes)
+            lease.read_part_into(raw, component, key, role, 0, target)
+            assert target == expected_part
         elif arm == "stream":
             assert stream() == baseline
         elif arm == "release":
