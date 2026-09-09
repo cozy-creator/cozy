@@ -30,7 +30,11 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	if problem != nil || !possible {
 		return problem
 	}
-	graph, problem := packagepublish.WheelClosures(ctx, parent.Install.SourceRef, python, parent.Install.Closure, i.Package.Name, parent.Install.Extra)
+	basePython, problem := install.BasePython(filepath.Join(parent.Install.Dir, "venv"))
+	if problem != nil {
+		return problem
+	}
+	graph, problem := packagepublish.WheelClosures(ctx, parent.Install.SourceRef, basePython, parent.Install.Closure, i.Package.Name, parent.Install.Extra)
 	if problem != nil {
 		return problem
 	}
@@ -132,7 +136,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			overlays[name] = captured[name]
 			return nil
 		}
-		result, problem := install.CaptureWheel(ctx, i.layout, i.store, python, name, closure, surface)
+		result, problem := install.CaptureWheel(ctx, i.layout, i.store, basePython, name, closure, surface)
 		if problem != nil {
 			return problem
 		}

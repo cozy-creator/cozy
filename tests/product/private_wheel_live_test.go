@@ -178,4 +178,19 @@ async def main(ctx):
 	if !bytes.Equal(raw, original) {
 		t.Fatal("wheel edit changed original source custody")
 	}
+	// Describing a remote-capable script is not permission to execute a selected
+	// wheel's Python startup hooks on the client, in either parent or child venv.
+	marker := filepath.Join(project, "startup-hook-ran")
+	hook := fmt.Sprintf("import pathlib; pathlib.Path(%q).write_text('unexpected client startup')\n", marker)
+	must(t, os.WriteFile(filepath.Join(library, "startup_probe.pth"), []byte(hook), 0o600))
+	metadata = strings.Replace(metadata, `only-include = ["wheel_proof.py"]`, `only-include = ["wheel_proof.py", "startup_probe.pth"]`, 1)
+	must(t, os.WriteFile(filepath.Join(library, "pyproject.toml"), []byte(metadata), 0o600))
+	runUV("build", "--wheel", "--out-dir", wheels, library)
+	status, output = runCozyPath(t, root, path, "run", edited, "--describe", "--json")
+	if status != 0 {
+		t.Fatalf("static wheel description failed [%d]: %s", status, output)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("describing the wheel executed its Python startup hook on the client")
+	}
 }

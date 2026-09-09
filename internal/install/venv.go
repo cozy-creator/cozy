@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -90,6 +89,9 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 
 	env.Python = pythonVersion(venvDir)
 	env.Packages, env.Closure = closure(venvDir)
+	if env.Python == "" || env.Packages == 0 {
+		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
+	}
 	return env, nil
 }
 
@@ -163,6 +165,9 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	}
 	env.Python = pythonVersion(venvDir)
 	env.Packages, env.Closure = closure(venvDir)
+	if env.Python == "" || env.Packages == 0 {
+		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
+	}
 	return env, nil
 }
 
@@ -394,25 +399,6 @@ func hostCUDA() int {
 	major, _ := strconv.Atoi(string(m[1]))
 	minor, _ := strconv.Atoi(string(m[2]))
 	return major*10 + minor
-}
-
-func pythonVersion(venvDir string) string {
-	out := strings.TrimSpace(runOut(home.VenvPython(venvDir), "-V"))
-	return strings.TrimSpace(strings.TrimPrefix(out, "Python"))
-}
-
-func closure(venvDir string) (int, string) {
-	out := runOut("uv", "pip", "list", "--format=json", "--python", home.VenvPython(venvDir))
-	var pkgs []struct{ Name, Version string }
-	if json.Unmarshal([]byte(out), &pkgs) != nil {
-		return 0, ""
-	}
-	lines := make([]string, 0, len(pkgs))
-	for _, p := range pkgs {
-		lines = append(lines, p.Name+"=="+p.Version)
-	}
-	sort.Strings(lines)
-	return len(lines), strings.Join(lines, "\n")
 }
 
 func toolVersion(name string, args ...string) string {
