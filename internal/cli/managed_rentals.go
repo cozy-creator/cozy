@@ -305,10 +305,9 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if problem != nil {
 		return none, "", problem
 	}
-	// A composition parent holds no model of its own, so without its captured shots'
-	// selections this decision would rank cards against nothing and could buy one no shot
-	// declares a lane for (cl-210). `req` is this call's own copy; the record keeps the
-	// parent's own model set, which is empty and stays empty.
+	// CPU orchestration requests need their captured defaults to narrow the rental
+	// choice (cl-210). Accelerator-owning requests retain only their own model slots;
+	// unrelated captures must not inflate their residency or preparation selection.
 	childModels, problem := resolver.UnpublishedChildModels(req)
 	if problem != nil {
 		return none, "", problem
