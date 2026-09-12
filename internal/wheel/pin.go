@@ -17,26 +17,28 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
+// Metadata reads the verified top-level distribution metadata without imports.
+func Metadata(path string) ([]byte, *exit.Error) {
+	if _, problem := InspectIdentity(path); problem != nil {
+		return nil, problem
+	}
+	archive, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, wheelStructure("cannot read captured wheel metadata")
+	}
+	defer archive.Close()
+	for _, member := range archive.File {
+		if distInfoMember(member.Name, "METADATA") {
+			return wheelMember(member)
+		}
+	}
+	return nil, wheelStructure("captured wheel metadata is absent")
+}
+
 // PinDependencies derives a private project wheel with exact flattened requirements.
 // Every implementation/resource member keeps its original bytes. The new METADATA
 // and RECORD participate in the ordinary wheel hash; no extra runtime manifest exists.
 func PinDependencies(source, target string, requirements []string) *exit.Error {
-	return pinDependencies(source, target, requirements, nil)
-}
-
-// PinDependenciesPreserving seals private requirements while retaining the
-// project's original compatibility declarations for image-owned distributions.
-// Those distributions are supplied by the worker image and must not be replaced
-// by the versions selected on the publishing machine.
-func PinDependenciesPreserving(source, target string, requirements []string,
-	preserve func(string) bool,
-) *exit.Error {
-	return pinDependencies(source, target, requirements, preserve)
-}
-
-func pinDependencies(source, target string, requirements []string,
-	preserve func(string) bool,
-) *exit.Error {
 	if _, problem := InspectIdentity(source); problem != nil {
 		return problem
 	}
@@ -77,7 +79,7 @@ func pinDependencies(source, target string, requirements []string,
 			if problem != nil {
 				return problem
 			}
-			body, err = pinnedMetadata(body, requirements, preserve)
+			body, err = pinnedMetadata(body, requirements)
 			if err != nil {
 				return wheelStructure("cannot seal private project requirements")
 			}
@@ -138,7 +140,7 @@ func pinDependencies(source, target string, requirements []string,
 	return nil
 }
 
-func pinnedMetadata(raw []byte, requirements []string, preserve func(string) bool) ([]byte, error) {
+func pinnedMetadata(raw []byte, requirements []string) ([]byte, error) {
 	reader := bufio.NewReader(bytes.NewReader(raw))
 	headers, err := textproto.NewReader(reader).ReadMIMEHeader()
 	if err != nil && err != io.EOF {
@@ -148,16 +150,8 @@ func pinnedMetadata(raw []byte, requirements []string, preserve func(string) boo
 	if err != nil {
 		return nil, err
 	}
-	originalRequirements := headers.Values("Requires-Dist")
 	headers.Del("Requires-Dist")
 	headers.Del("Provides-Extra")
-	if preserve != nil {
-		for _, requirement := range originalRequirements {
-			if preserve(requirement) {
-				headers.Add("Requires-Dist", requirement)
-			}
-		}
-	}
 	for _, requirement := range requirements {
 		headers.Add("Requires-Dist", requirement)
 	}

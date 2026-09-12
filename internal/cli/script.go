@@ -66,7 +66,7 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 	defer writer.Unlock()
 	var intake *childIntake
 	var result *install.Result
-	problem = packagePublishStage(ctx, "Preparing private script environment", func() *exit.Error {
+	problem = packagePublishStage(ctx, "Preparing local script environment", func() *exit.Error {
 		var problem *exit.Error
 		intake, problem = prepareChildIntake(ctx, pack, layout, store)
 		if problem != nil {
@@ -88,7 +88,7 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 	raw, err := os.ReadFile(launch.PackageInterfacePath(result.Install.Dir))
 	if err != nil {
 		_, _ = install.Reclaim(layout, store, result.Install.ID)
-		return Target{}, nil, exit.Internalf("cannot read private invocation interface: %s", err)
+		return Target{}, nil, exit.Internalf("cannot read unpublished invocation interface: %s", err)
 	}
 	surface, problem := launch.DecodePackageInterface(raw)
 	if problem != nil {

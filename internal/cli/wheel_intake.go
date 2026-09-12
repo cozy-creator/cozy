@@ -30,6 +30,11 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	if problem != nil || !possible {
 		return problem
 	}
+	selection, problem := install.ExecutionRequirements(ctx, filepath.Join(parent.Install.Dir, "venv"),
+		i.Package.Name, strings.Fields(parent.Install.Extra))
+	if problem != nil {
+		return problem
+	}
 	basePython, problem := install.BasePython(filepath.Join(parent.Install.Dir, "venv"))
 	if problem != nil {
 		return problem
@@ -66,7 +71,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		return nil
 	}
 	if len(candidates) > 32 {
-		return exit.New(exit.Validation, "private parent exceeds 32 callable dependencies")
+		return exit.New(exit.Validation, "unpublished parent exceeds 32 callable dependencies")
 	}
 	sourceBindings := map[string][]records.ChildBinding{}
 	for _, binding := range i.Bindings {
@@ -89,7 +94,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			return nil
 		}
 		if visiting[name] || depth > 16 {
-			return exit.New(exit.Validation, "private callable wheel graph is cyclic or exceeds 16 levels")
+			return exit.New(exit.Validation, "unpublished callable wheel graph is cyclic or exceeds 16 levels")
 		}
 		visiting[name] = true
 		defer delete(visiting, name)
@@ -136,7 +141,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			overlays[name] = captured[name]
 			return nil
 		}
-		result, problem := install.CaptureWheel(ctx, i.layout, i.store, basePython, name, closure, surface)
+		result, problem := install.CaptureWheel(ctx, i.layout, i.store, basePython, name, selection.Extras[name], closure, surface)
 		if problem != nil {
 			return problem
 		}
@@ -147,7 +152,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		if problem := i.store.RecordChildBindings(childBindings); problem != nil {
 			return problem
 		}
-		paths := []string{result.PrivateProjectWheel}
+		paths := []string{result.CapturedProjectWheel}
 		for _, dependency := range dependencyNames {
 			if dependency != name && !packagepublish.ImageOwnedDistribution(dependency) {
 				paths = append(paths, closure[dependency].Path)
@@ -164,7 +169,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		if err != nil {
 			return exit.Internalf("cannot stage callable wheel interface")
 		}
-		executable, problem := packagepublish.CaptureDependency(result.PrivateProjectWheel)
+		executable, problem := packagepublish.CaptureDependency(result.CapturedProjectWheel)
 		if problem != nil {
 			return problem
 		}
@@ -198,7 +203,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		}
 		i.Bindings = append(i.Bindings, bindings[name]...)
 		if len(i.Bindings) > 32 {
-			return exit.New(exit.Validation, "private parent exceeds 32 invocable dependency exports")
+			return exit.New(exit.Validation, "unpublished parent exceeds 32 invocable dependency exports")
 		}
 		replacements[name] = overlays[name].Path
 	}

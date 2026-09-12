@@ -418,7 +418,11 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 	}
 	for _, slot := range entrypoint.Models {
 		model, selected := bySlot[slot.Path]
-		if model.Package != pkg || model.Slot != slot.Path || model.Release == "" {
+		// A retained Hub checkpoint has no release/lane yet. It is the same
+		// exact downloadable input already accepted by jobs; an unbound name or
+		// operation-local manifest is not a replacement for that resolved fact.
+		if model.Package != pkg || model.Slot != slot.Path ||
+			(model.Release == "" && (!model.Downloadable() || model.Lane != "" || model.ManifestLength <= 0)) {
 			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
 				"model selection does not bind exact slot %s", slot.Path)
 		}

@@ -16,7 +16,7 @@ import (
 
 // Every invocation uses the actual cozy CLI. A successful import alone does not
 // test worker dispatch, native custody, or independently edited caller reuse.
-func TestPrivateWheelCompositionTracksExecutableNotCaller(t *testing.T) {
+func TestUnpublishedWheelCompositionTracksExecutableNotCaller(t *testing.T) {
 	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	parsed, err := pep440.Parse(version)
 	must(t, err)
@@ -53,13 +53,13 @@ func TestPrivateWheelCompositionTracksExecutableNotCaller(t *testing.T) {
 		if !t.Failed() {
 			must(t, os.RemoveAll(root))
 		} else {
-			t.Log("private wheel evidence retained", root)
+			t.Log("captured wheel evidence retained", root)
 		}
 	})
 	library := filepath.Join(project, "library")
 	must(t, os.MkdirAll(library, 0o700))
 	metadata := fmt.Sprintf(`[project]
-name = "private-wheel-proof"
+name = "unpublished-wheel-proof"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = ["cozy-runtime[model-execution]==%s", "msgspec"]
@@ -94,15 +94,15 @@ app.job(second)
 	must(t, os.WriteFile(module, []byte(body), 0o600))
 	wheels := filepath.Join(project, "wheels")
 	runUV("build", "--wheel", "--out-dir", wheels, library)
-	wheel := filepath.Join(wheels, "private_wheel_proof-0.1.0-py3-none-any.whl")
+	wheel := filepath.Join(wheels, "unpublished_wheel_proof-0.1.0-py3-none-any.whl")
 	original, err := os.ReadFile(wheel)
 	must(t, err)
 	script := filepath.Join(project, "first.py")
 	code := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime[model-execution]==%s", "private-wheel-proof==0.1.0"]
+# dependencies = ["cozy-runtime[model-execution]==%s", "unpublished-wheel-proof==0.1.0"]
 # [tool.uv.sources]
-%s# private-wheel-proof = {path = %q}
+%s# unpublished-wheel-proof = {path = %q}
 # ///
 from wheel_proof import compose
 async def main(ctx):

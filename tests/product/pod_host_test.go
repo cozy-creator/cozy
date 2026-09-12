@@ -90,7 +90,8 @@ type fakePod struct {
 	snapshotHeld []*pb.HeldAttempt
 	hostHeld     func() []*pb.HeldAttempt
 	// localJobOnly supplies a prepared interface without any serving entrypoints.
-	localJobOnly bool
+	localJobOnly   bool
+	privatePrepare func(*pb.PreparePrivatePlacementCall, grpc.ServerStreamingServer[pb.PrepareEvent]) error
 	// onJobReady can delay and sequence the independent peer's readiness facts.
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// answerOffer supplies a protocol outcome when a test exercises settlement.
@@ -427,7 +428,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.finalizations = append(p.finalizations, m.WeightsFinalizeRequest)
 			p.mu.Unlock()
 		case *pb.RecordOwnerFrame_LocalPackageFetchRequest:
-			return status.Error(codes.PermissionDenied, "private wheels must use direct upload")
+			return status.Error(codes.PermissionDenied, "captured wheels must use direct upload")
 		}
 	}
 }

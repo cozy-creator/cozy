@@ -16,7 +16,7 @@ import (
 
 func childDigest(letter string) string { return "sha256:" + strings.Repeat(letter, 64) }
 
-func TestPrivateJobBuildIncludesChangedDependencyRevision(t *testing.T) {
+func TestUnpublishedJobBuildIncludesChangedDependencyRevision(t *testing.T) {
 	development := &pb.DevelopmentPackage{Package: "local/script", Release: "0.0.0", SourceDigest: bytes.Repeat([]byte{0x11}, 32), ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: bytes.Repeat([]byte{0x22}, 32), Length: 123}}}
 	set := &pb.PlacementSet{Placements: []*pb.Placement{{PackageMode: &pb.Placement_Development{Development: development}}}}
 	var before string
@@ -54,7 +54,7 @@ func offerChildParent(t *testing.T, store *records.Store, parent records.Request
 	return *current
 }
 
-func TestPrivateChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
+func TestUnpublishedChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -125,7 +125,7 @@ func TestPrivateChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
 	}
 }
 
-func TestPrivateParentRetainsExactOrchestrationContract(t *testing.T) {
+func TestUnpublishedParentRetainsExactOrchestrationContract(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -163,7 +163,7 @@ func TestPrivateParentRetainsExactOrchestrationContract(t *testing.T) {
 	}
 }
 
-func TestPrivateChildBindingsAreImmutableAndOwnTheirImplementation(t *testing.T) {
+func TestUnpublishedChildBindingsAreImmutableAndOwnTheirImplementation(t *testing.T) {
 	layout, problem := home.Open(t.TempDir())
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
@@ -213,7 +213,7 @@ func TestPrivateChildBindingsAreImmutableAndOwnTheirImplementation(t *testing.T)
 	}
 }
 
-func TestPrivateChildrenDoNotReuseEffectsByDefault(t *testing.T) {
+func TestUnpublishedChildrenDoNotReuseEffectsByDefault(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -236,7 +236,7 @@ func TestPrivateChildrenDoNotReuseEffectsByDefault(t *testing.T) {
 	}
 }
 
-func TestPrivateParentPauseWaitsForChildExecutionBarrier(t *testing.T) {
+func TestUnpublishedParentPauseWaitsForChildExecutionBarrier(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -271,7 +271,7 @@ func closeChild(t *testing.T, store *records.Store, request records.Request, sta
 	fatal(t, store.Closed(request.ID, 1))
 }
 
-func TestPrivateChildHistoryDoesNotActAsOperationCache(t *testing.T) {
+func TestUnpublishedChildHistoryDoesNotActAsOperationCache(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()

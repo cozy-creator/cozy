@@ -29,7 +29,7 @@ var childHostRuntimeBin = flag.String("child-host-runtime-bin", "", "installed m
 
 // Only the provider catalog/readback is a test peer. Both control planes, package
 // preparation, signed native effects and executors run in the actual Host image.
-func TestPrivateChildActualHostArtifacts(t *testing.T) {
+func TestUnpublishedChildActualHostArtifacts(t *testing.T) {
 	if *childHostLauncher == "" || *childHostHome == "" || *childHostRuntimeBin == "" {
 		t.Skip("requires an explicit task-owned actual Host image and artifact fixture")
 	}

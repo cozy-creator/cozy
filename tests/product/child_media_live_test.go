@@ -24,7 +24,7 @@ var privateChildEvalWheel = flag.String("child-eval-wheel", "", "exact Cozy Eval
 
 var privateChildEvalSource = flag.String("child-eval-source", "", "actual editable Cozy Eval project for selected managed-extra capture")
 
-func TestPrivateChildEvalManagedExtraUsesDirectEditableLibrary(t *testing.T) {
+func TestUnpublishedChildEvalManagedExtraUsesDirectEditableLibrary(t *testing.T) {
 	if *privateChildEvalSource == "" {
 		t.Skip("requires actual editable Cozy Eval project")
 	}
@@ -33,7 +33,7 @@ func TestPrivateChildEvalManagedExtraUsesDirectEditableLibrary(t *testing.T) {
 
 // Real Creator, independent executors, generated interface wheel, borrowed input
 // custody and completed memo lookup; no synthetic control peer.
-func TestPrivateChildMediaUsesExistingInputGrantsAndMemo(t *testing.T) {
+func TestUnpublishedChildMediaUsesExistingInputGrantsAndMemo(t *testing.T) {
 	privateChildMediaProof(t, "")
 }
 

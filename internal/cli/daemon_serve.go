@@ -190,6 +190,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 	server := api.New(api.Options{
 		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
+		RentalInventory: func(reconcile bool) (api.RentalInventory, *exit.Error) {
+			return readRentalInventory(st, fleet, reconcile)
+		},
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
 	handler, e := server.Handler()

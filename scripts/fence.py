@@ -402,6 +402,19 @@ def check_media_contract():
     return bad
 
 
+def check_unpublished_vocabulary():
+    """Publication state is not a privacy or access-control mode."""
+    bad = []
+    retired = re.compile(r"\bprivate[ -](?:package|job|script|wheel|revision|callable)\b", re.I)
+    for path in pathlib.Path("internal").rglob("*.go"):
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            # Existing on-disk markers and stable machine error codes are not prose.
+            prose = re.sub(r'"private[-_][A-Za-z0-9_-]+"', '""', line)
+            if retired.search(prose):
+                bad.append(f"{path}:{number}: [terminology] use unpublished package or local script")
+    return bad
+
+
 def check_sources():
     bad = []
     for p in files():
@@ -912,7 +925,8 @@ if sys.argv[1:]:
     sys.exit(2)
 os.chdir(pathlib.Path(__file__).resolve().parent.parent)
 
-violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
+violations = (check_unpublished_vocabulary() + check_sources() + check_matrix()
+              + check_manifest() + check_secret_flags()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams() + check_output_shape()
               + check_media_contract() + check_typed_resources() + check_web_boundary()

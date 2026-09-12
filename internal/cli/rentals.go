@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -55,6 +56,17 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 		return home.Layout{}, nil, e
 	}
 	st, e := records.Open(l.DB)
+	if e != nil && e.ErrName() == "records_schema_upgrade_required" {
+		// Only the daemon can migrate. Start it if this root is unowned, or wait
+		// for an existing startup to finish. A live older daemon stays in place;
+		// the reopened reader then reports its own schema requirement.
+		state, _, problem := ensureDaemon(ctx)
+		if problem != nil {
+			return home.Layout{}, nil, problem
+		}
+		ctx.Daemon = state
+		st, e = records.Open(l.DB)
+	}
 	if e != nil {
 		return home.Layout{}, nil, e
 	}
@@ -812,72 +824,64 @@ func handleRentalList(ctx *Context) *exit.Error {
 		return exit.Usagef("--watch requires interactive terminal output").
 			WithRemedy("omit --watch for one snapshot, or use --json for automation")
 	}
-	l, st, e := rentalStores(ctx)
-	if e != nil {
-		return e
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
 	}
-	defer st.Close()
-	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
+	var legacy *records.Store
+	var legacyFleet *managedRentals
+	defer func() {
+		if legacy != nil {
+			legacy.Close()
+		}
+	}()
+	var last time.Time
+	fetch := func(call context.Context) (output.List, *exit.Error) {
+		reconcile := last.IsZero() || time.Since(last) >= pollCadence
+		var inventory api.RentalInventory
+		if legacy == nil {
+			inventory, problem = client.RentalInventory(call, reconcile)
+			// Older daemons have no inventory route. Their compatible local store
+			// remains a migration bridge; a schema mismatch refuses without
+			// replacing the owner. All other API errors stay authoritative.
+			if problem != nil && problem.Code == exit.NotFound && problem.ErrName() == "unknown_route" {
+				var layout home.Layout
+				layout, legacy, problem = rentalStores(ctx)
+				if problem == nil {
+					legacyFleet = &managedRentals{ctx: ctx, layout: layout, store: legacy}
+				}
+			}
+		}
+		if legacy != nil {
+			inventory, problem = readRentalInventory(legacy, legacyFleet, reconcile)
+		}
+		if problem != nil {
+			return output.List{}, problem
+		}
+		if reconcile {
+			last = time.Now()
+		}
+		list := renderRentalList(inventory)
+		if watching {
+			list.Next = nil
+		}
+		return list, nil
+	}
 	if watching {
-		return watchRentalList(ctx, st, fleet)
+		return watchList(ctx, "machine", fetch)
 	}
-	list, e := rentalList(ctx, st, fleet, true)
-	if e != nil {
-		return e
+	list, problem := fetch(context.Background())
+	if problem != nil {
+		return problem
 	}
 	return emit(ctx, list)
 }
 
-// watchRentalList is the board: redrawn every second so UPTIME and the IDLE countdown
-// move, reconciled with the hub only at pollCadence — a redraw is a local read, and the
-// hub is asked at the same rate every other rental wait asks it.
-func watchRentalList(ctx *Context, st *records.Store, fleet *managedRentals) *exit.Error {
-	var reconciled time.Time
-	return watchList(ctx, "machine", func(context.Context) (output.List, *exit.Error) {
-		reconcile := time.Since(reconciled) >= pollCadence
-		if reconcile {
-			reconciled = time.Now()
-		}
-		list, problem := rentalList(ctx, st, fleet, reconcile)
-		if problem != nil {
-			return output.List{}, problem
-		}
-		// The board's guidance line is its own trail; per-row verbs stay in the snapshot.
-		list.Next = nil
-		return list, nil
-	})
-}
-
-// rentalList is one snapshot of the fleet. reconcile says whether to converge local rows
-// with the hub first — every `cozy rental list` invocation does; the live board does at
-// pollCadence. The spend lead is th-120's reconciled BILLED burn, never the quote.
-func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
-	reconcile bool,
-) (output.List, *exit.Error) {
-	var count int
-	var burn int64
-	var e *exit.Error
-	if reconcile {
-		count, burn, e = fleet.totals()
-	} else {
-		count, burn, e = fleet.cachedTotals()
-	}
-	if e != nil {
-		return output.List{}, e
-	}
-	rows, e := st.Rentals()
-	if e != nil {
-		return output.List{}, e
-	}
-	// Provenance: which command bought each pod (cl-132). Without it a `ready` machine
-	// beside another `ready` machine is two anonymous charges, and the reader supplies
-	// the attribution from memory — which is exactly how a refused explicit ask came to
-	// be credited with two pods that auto-placement had bought.
-	boughtFor, e := st.RentalProvenance()
-	if e != nil {
-		return output.List{}, e
-	}
-	grace := ctx.Cfg.RentalsIdleRelease
+// renderRentalList formats the daemon's public read model; it never opens SQLite.
+func renderRentalList(inventory api.RentalInventory) output.List {
+	count, burn := inventory.MachinesRunning, inventory.HourlySpendUSDMicros
+	rows, unrecorded := inventory.Rentals, inventory.Unrecorded
+	grace := time.Duration(inventory.IdleReleaseSeconds) * time.Second
 	list := output.List{
 		Name:   "rentals",
 		Fields: []string{"machine", "sku", "state", "$/hour", "uptime", "running", "queued", "idle"},
@@ -905,21 +909,24 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 	}
 	haveFailure := false
 	for _, r := range rows {
-		idle, problem := observeRentalIdle(st, r)
-		if problem != nil {
-			return output.List{}, problem
+		activity := api.RentalActivity{}
+		if r.Activity != nil {
+			activity = *r.Activity
 		}
-		due, eligible := idle.releaseAt(grace)
-		idleSince, releaseDue := "", ""
+		idleSince, releaseDue := activity.IdleSince, activity.ReleaseDue
+		since, sinceErr := time.Parse(time.RFC3339, idleSince)
+		due, dueErr := time.Parse(time.RFC3339, releaseDue)
+		eligible := sinceErr == nil && dueErr == nil
+		idleText := ""
 		if eligible {
-			idleSince, releaseDue = idle.Since.UTC().Format(time.RFC3339), due.UTC().Format(time.RFC3339)
+			idleText = idleClock(time.Since(since)) + " / " + idleClock(due.Sub(since))
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU),
 			"state": humanRentalState(r.State), "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
-			"running": strconv.Itoa(idle.Running), "queued": strconv.Itoa(idle.Queued),
-			"idle":   idleCell(idle, grace),
-			"rental": r.ID, "bought for": orNone(boughtFor[r.ID]),
+			"running": strconv.Itoa(activity.Running), "queued": strconv.Itoa(activity.Queued),
+			"idle":   idleText,
+			"rental": r.ID, "bought for": orNone(r.BoughtFor),
 			"accelerator": acceleratorLabel(r.AcceleratorModel, r.AcceleratorCount),
 			"address":     r.Address,
 			"media":       r.MediaAddress, "hub": r.Hub,
@@ -932,20 +939,20 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		})
 		typed := map[string]any{
 			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
-			"running": idle.Running, "queued": idle.Queued,
+			"running": activity.Running, "queued": activity.Queued,
 			"hourly_rate_usd_micros": r.HourlyRateUSDMicros,
 			"accelerator_count":      r.AcceleratorCount,
 		}
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
-			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": boughtFor[r.ID],
+			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
 			"idle_since_at": idleSince, "release_due_at": releaseDue} {
 			if value != "" {
 				typed[key] = value
 			}
 		}
 		if eligible {
-			typed["idle_s"] = int64(time.Since(idle.Since).Seconds())
+			typed["idle_s"] = int64(time.Since(since).Seconds())
 		}
 		if r.Failure.Code != "" {
 			haveFailure = true
@@ -967,36 +974,33 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 	// here, so this board — the one command a person types to ask what they are
 	// spending — showed an empty fleet. The hub is asked what it bills this account
 	// for, and any live rental with no local row is a row here, marked as such.
-	unrecorded, listed, listingProblem := fleet.unrecordedSnapshot()
-	hubNamed := map[string]bool{}
 	for _, seen := range unrecorded {
-		hubNamed[seen.ID], hubNamed[seen.Name] = true, true
 		list.Rows = append(list.Rows, map[string]string{
 			// The hub publishes no Cozy SKU NAME for a rental, only the accelerator it
 			// bought. The card is what the SKU column exists to tell a reader — the
 			// difference between an H100 and a 4090 is the difference between $3.19 and
 			// $0.74 an hour — so the cell carries the card rather than a dash.
-			"machine": seen.Name,
+			"machine": seen.MachineName,
 			"sku":     orNone(acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount)),
-			"state":   seen.State,
-			"failure": "—", "uptime": rentalUptime(seen.CreatedAt),
+			"state":   humanRentalState(seen.State),
+			"failure": "—", "uptime": rentalUptime(seen.RentedAt),
 			"running": "—", "queued": "—", "idle": "—",
 			"rental": seen.ID, "bought for": "—",
 			"accelerator": acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount),
-			"address":     seen.Address, "media": seen.MediaAddress, "hub": ctx.Cfg.HubURL,
-			"rented": orNone(seen.CreatedAt), "ready": "—", "idle_since": "", "release_due": "",
+			"address":     seen.Address, "media": seen.MediaAddress, "hub": seen.Hub,
+			"rented": orNone(seen.RentedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": "", "provider": "", "provider resource": "", "provider host": "",
 			"provider state": seen.ProviderState, "container state": seen.ContainerState,
 			"$/hour": rentalHourlyRate(seen.HourlyRateUSDMicros),
 		})
 		typed := map[string]any{
-			"machine": seen.Name, "state": seen.State, "rental_id": seen.ID,
+			"machine": seen.MachineName, "state": seen.State, "rental_id": seen.ID,
 			"hourly_rate_usd_micros": seen.HourlyRateUSDMicros,
 			"accelerator_count":      seen.AcceleratorCount, "recorded": false,
 		}
 		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,
 			"address": seen.Address, "media_address": seen.MediaAddress,
-			"hub": ctx.Cfg.HubURL, "rented_at": seen.CreatedAt} {
+			"hub": seen.Hub, "rented_at": seen.RentedAt} {
 			if value != "" {
 				typed[key] = value
 			}
@@ -1014,60 +1018,31 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 			output.Field{K: "unrecorded_rentals", V: jsonFact{len(unrecorded)}},
 			output.Field{K: "unrecorded_hourly_spend_usd_micros", V: jsonFact{unrecordedBurn}})
 	}
-	switch {
-	case listingProblem != nil:
-		list.Trail = append(list.Trail, "the hub could not be asked what this account owns ("+
-			listingProblem.Message+"); this board shows only what this host recorded")
-	case !listed:
-		list.Trail = append(list.Trail, "this hub publishes no rental listing (th-199), so a machine "+
-			"this host never recorded cannot appear here at all")
-	}
-
 	// UNSETTLED PAID ASKS ARE PART OF THE FLEET (cl-193). A board built only from attached
 	// rows shows zero machines while an accepted ask provisions a pod that is billing, and
 	// that is not a display detail — it is the difference between noticing a runaway charge
 	// and finding it in the invoice. An ask the hub has now NAMED is already a row above;
 	// what stays here is the half the hub could not or would not answer for.
-	open, e := st.ActiveRentalOperations()
-	if e != nil {
-		return output.List{}, e
-	}
-	unattached := 0
-	for index := range open {
-		op := open[index]
-		if op.RentalID != "" {
-			attached, problem := st.RentalRow(op.RentalID)
-			if problem != nil {
-				return output.List{}, problem
-			}
-			if attached != nil {
-				continue
-			}
-		}
-		var request hub.RentalRequest
-		_ = json.Unmarshal(op.RequestBody, &request)
-		machine := either(request.Name, op.Key)
-		if hubNamed[op.RentalID] || hubNamed[request.Name] {
-			continue
-		}
-		unattached++
+	unattached := len(inventory.Pending)
+	for _, op := range inventory.Pending {
+		machine := op.MachineName
 		list.Rows = append(list.Rows, map[string]string{
-			"machine": machine, "sku": orNone(request.SKU), "state": op.State,
-			"failure": "—", "uptime": rentalUptime(op.CreatedAt), "running": "0", "queued": "0",
-			"idle": "—", "rental": orNone(op.RentalID), "bought for": orNone(op.ManagedRequestID),
+			"machine": machine, "sku": orNone(op.SKU), "state": humanRentalState(op.State),
+			"failure": "—", "uptime": rentalUptime(op.RentedAt), "running": "0", "queued": "0",
+			"idle": "—", "rental": orNone(op.ID), "bought for": orNone(op.BoughtFor),
 			"accelerator": "—", "address": "", "media": "", "hub": op.Hub,
-			"rented": stamp(op.CreatedAt), "ready": "—", "idle_since": "", "release_due": "",
+			"rented": stamp(op.RentedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": "", "provider": "", "provider resource": "", "provider host": "",
 			"provider state": "", "container state": "",
 			"$/hour": rentalHourlyRate(op.HourlyRateUSDMicros),
 		})
 		typed := map[string]any{
-			"machine": machine, "state": op.State, "rental_id": op.RentalID,
+			"machine": machine, "state": op.State, "rental_id": op.ID,
 			"running": 0, "queued": 0, "hourly_rate_usd_micros": op.HourlyRateUSDMicros,
-			"accelerator_count": 0, "operation": op.Key, "attached": false,
+			"accelerator_count": 0, "operation": op.Operation, "attached": false,
 		}
-		for key, value := range map[string]string{"sku": request.SKU, "hub": op.Hub,
-			"rented_at": op.CreatedAt, "bought_for": op.ManagedRequestID} {
+		for key, value := range map[string]string{"sku": op.SKU, "hub": op.Hub,
+			"rented_at": op.RentedAt, "bought_for": op.BoughtFor} {
 			if value != "" {
 				typed[key] = value
 			}
@@ -1082,7 +1057,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		list.Aggregates = append(list.Aggregates,
 			output.Field{K: "unattached_rental_operations", V: jsonFact{unattached}})
 	}
-	return list, nil
+	return list
 }
 
 // rentalHourlyRate uses the known rental rate; a missing quote is not free.
@@ -1098,18 +1073,6 @@ type jsonFact struct{ V any }
 
 func (jsonFact) Human() string                  { return "" }
 func (f jsonFact) MarshalJSON() ([]byte, error) { return json.Marshal(f.V) }
-
-// idleCell is the IDLE column (cl-114): how long the machine has sat idle over the grace
-// that ends it — `41s / 30m` — from the actual rentals.idle_release_s policy. Blank when
-// no idle clock is running: the machine is busy, still booting, leaving, or the policy
-// is off.
-func idleCell(idle rentalIdleness, grace time.Duration) string {
-	due, eligible := idle.releaseAt(grace)
-	if !eligible {
-		return ""
-	}
-	return idleClock(time.Since(idle.Since)) + " / " + idleClock(due.Sub(idle.Since))
-}
 
 // idleClock spells a countdown duration the way a person reads a clock: `0s`, `41s`,
 // `1m30s`, `30m` — whole seconds, no zero units.
