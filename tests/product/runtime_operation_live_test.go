@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -26,7 +28,7 @@ func TestRuntimeBuiltinQuantizeSurvivesCallerEdit(t *testing.T) {
 	}
 	control := filepath.Join(t.TempDir(), "control")
 	for _, args := range [][]string{{"venv", control, "--python", "3.12"},
-		{"pip", "install", "--python", filepath.Join(control, "bin/python"), runtimeInstall, "numpy>=1.26"}} {
+		{"pip", "install", "--python", filepath.Join(control, "bin/python"), runtimeInstall}} {
 		if output, err := exec.Command("uv", args...).CombinedOutput(); err != nil {
 			t.Fatalf("uv: %v\n%s", err, output)
 		}
@@ -54,7 +56,7 @@ func TestRuntimeBuiltinQuantizeSurvivesCallerEdit(t *testing.T) {
 name="native-quantize-fixture"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s", "numpy>=1.26"]
+dependencies=["cozy-runtime==%s"]
 [project.entry-points."cozy.application"]
 default="runtime_quantize_source:app"
 [build-system]
@@ -85,6 +87,36 @@ async def main(ctx):
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
+	unrelated := filepath.Join(project, "unrelated.py")
+	coreScript := fmt.Sprintf(`# /// script
+# requires-python=">=3.12,<3.13"
+# dependencies=["cozy-runtime==%s"]
+# [tool.uv.sources]
+%s# ///
+async def main(ctx):
+    ctx.log("This script does not quantize")
+`, version, strings.ReplaceAll(runtimeSource, "cozy-runtime =", "# cozy-runtime ="))
+	must(t, os.WriteFile(unrelated, []byte(coreScript), 0600))
+	if status, output := runCozyPath(t, root, path, "run", unrelated, "--await", "--json"); status != 0 {
+		t.Fatalf("unrelated script requires a numerical dependency [%d]: %s", status, output)
+	}
+	plain, problem := store.RequestByReference("1")
+	fatal(t, problem)
+	if plain == nil || plain.State != "succeeded" {
+		t.Fatal("unrelated script did not complete")
+	}
+	bindings, problem := store.ChildBindings(plain.InstallID)
+	fatal(t, problem)
+	if len(bindings) != 0 {
+		t.Fatal("unrelated script eagerly prepared a numerical operation")
+	}
+	assertBaseUnchanged := func() {
+		t.Helper()
+		if _, err := os.Stat(filepath.Join(control, "lib", "python3.12", "site-packages", "numpy")); !os.IsNotExist(err) {
+			t.Fatal("operation preparation changed the NumPy-free base SDK")
+		}
+	}
+	assertBaseUnchanged()
 	var original records.Request
 	for i := range 2 {
 		script := filepath.Join(project, fmt.Sprintf("caller%d.py", i))
@@ -125,6 +157,28 @@ async def main(ctx):
 				t.Fatal("native readback was skipped")
 			}
 		}
+	}
+	assertBaseUnchanged()
+	prepared, problem := store.Install(original.InstallID)
+	fatal(t, problem)
+	if prepared == nil || !strings.Contains(prepared.Closure, "numpy==") {
+		t.Fatal("actual quantizer has no observed numerical dependency")
+	}
+	python, problem := launch.EnvironmentPython(*prepared)
+	fatal(t, problem)
+	requirements, _, problem := install.ImageRequirements(filepath.Dir(filepath.Dir(python)), "cozy-runtime-operations")
+	fatal(t, problem)
+	numpyRange := false
+	for _, requirement := range requirements {
+		if strings.HasPrefix(requirement, "numpy") {
+			numpyRange = requirement == "numpy>=1.26"
+			if !numpyRange {
+				t.Fatalf("observed local NumPy became a worker image pin: %s", requirement)
+			}
+		}
+	}
+	if !numpyRange {
+		t.Fatal("worker image requirement lost the authored NumPy range")
 	}
 	if original.ID == "" {
 		t.Fatal("no Runtime quantization child")

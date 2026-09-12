@@ -67,3 +67,10 @@ func (r RuntimeCLI) PrepareBuiltin(ctx context.Context, wheel, output string) (B
 	problem := r.callContext(ctx, &result, "builtin-prepare", "operations", "--wheel", wheel, "--out", output)
 	return result, problem
 }
+
+// CaptureBuiltin keeps a base snapshot without resolving optional numerical dependencies.
+func (r RuntimeCLI) CaptureBuiltin(ctx context.Context, wheel, output string) (BuiltinPreparation, *exit.Error) {
+	var result BuiltinPreparation
+	problem := r.callContext(ctx, &result, "builtin-capture", "operations", "--wheel", wheel, "--out", output)
+	return result, problem
+}

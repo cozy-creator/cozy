@@ -46,26 +46,35 @@ func ReadEnvironment(root, environmentDigest, interfaceDigest, sourceDigest stri
 			return "", exit.New(exit.Conflict, "Runtime operation environment has an invalid identity")
 		}
 	}
-	if !filepath.IsAbs(environment.Python) || filepath.Base(environment.Python) != "python" {
-		return "", exit.New(exit.Conflict, "Runtime operation interpreter is not an exact local path")
+	if problem := ValidateOwnedPython(root, environment.Python); problem != nil {
+		return "", problem
+	}
+	return environment.Python, nil
+}
+
+// ValidateOwnedPython checks the real containing directory without rejecting the
+// ordinary venv link to its external interpreter executable.
+func ValidateOwnedPython(root, python string) *exit.Error {
+	if !filepath.IsAbs(python) || filepath.Base(python) != "python" {
+		return exit.New(exit.Conflict, "Runtime operation interpreter is not an exact local path")
 	}
 	// A venv's python may link to its external base executable. Its containing
 	// directory, however, must be the real owned generation under this install.
-	directory, err := filepath.EvalSymlinks(filepath.Dir(environment.Python))
+	directory, err := filepath.EvalSymlinks(filepath.Dir(python))
 	if err != nil {
-		return "", exit.New(exit.Conflict, "Runtime operation generation is unavailable")
+		return exit.New(exit.Conflict, "Runtime operation generation is unavailable")
 	}
 	owned, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return "", exit.New(exit.Conflict, "Runtime operation install is unavailable")
+		return exit.New(exit.Conflict, "Runtime operation install is unavailable")
 	}
 	relative, err := filepath.Rel(owned, directory)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", exit.New(exit.Conflict, "Runtime operation interpreter escaped its owned install")
+		return exit.New(exit.Conflict, "Runtime operation interpreter escaped its owned install")
 	}
-	executable, err := os.Stat(environment.Python)
+	executable, err := os.Stat(python)
 	if err != nil || !executable.Mode().IsRegular() || executable.Mode()&0o111 == 0 {
-		return "", exit.New(exit.Conflict, "Runtime operation interpreter is unavailable")
+		return exit.New(exit.Conflict, "Runtime operation interpreter is unavailable")
 	}
-	return environment.Python, nil
+	return nil
 }

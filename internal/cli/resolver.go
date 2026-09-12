@@ -633,17 +633,23 @@ func (r *Resolver) installPackageInterface(installID string) (*records.PackageIn
 }
 
 func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
-	install, e := r.installRecord(installID)
+	installed, e := r.installRecord(installID)
 	if e != nil {
 		return nil, e
 	}
-	facts, problem := launch.Read(*install, r.cfg.Home, r.cfg.Tool())
+	facts, problem := launch.Read(*installed, r.cfg.Home, r.cfg.Tool())
 	if problem != nil {
 		return nil, problem
 	}
 	facts.CPUOrchestration, problem = r.store.HasChildBindings(installID)
 	if problem != nil {
 		return nil, problem
+	}
+	if !facts.CPUOrchestration && facts.PackageInterface.Application == packagepublish.ScriptApplication {
+		facts.CPUOrchestration, problem = install.HasRuntimeOperationsCapture(*installed)
+		if problem != nil {
+			return nil, problem
+		}
 	}
 	if facts.CPUOrchestration && facts.PackageInterface.Application != packagepublish.ScriptApplication {
 		bindings, problem := r.store.ChildBindings(installID)

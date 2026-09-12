@@ -6,7 +6,7 @@ from cozy_runtime.author import (
     App, Context, ModelArtifact, WeightsOutput, WeightsPart, WeightsReader,
     WeightsSink, WeightsTarget, WeightsTensor, invocable,
 )
-from cozy_runtime.derive.quantization import QuantizationSource
+from cozy_runtime.derive.operations import QuantizationSource
 
 app = App()
 PLAIN = dict(tensorfs.seed_digests())["plain/1"]

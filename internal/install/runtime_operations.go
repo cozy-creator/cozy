@@ -9,9 +9,7 @@ import (
 	"runtime"
 	"strings"
 
-	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -20,27 +18,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
-// RuntimeOperations captures a base-owned App without copying a caller's code or
-// promoting its observed dependency versions into the builtin's requirements.
-// Older SDKs simply have no builtin; their existing private functions still work.
-func RuntimeOperations(ctx context.Context, layout home.Layout, store *records.Store) (*records.ChildBinding, string, *exit.Error) {
-	env := config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
-	tool, problem := launch.BuiltinOperationsTool(layout.Root, runtimeScratchHome(), env)
-	if problem != nil {
-		return nil, "", problem
-	}
-	version, problem := tool.RuntimeVersion(ctx)
-	if problem != nil {
-		return nil, "", problem
-	}
-	parsed, err := pep440.Parse(version)
-	if err != nil {
-		return nil, "", exit.New(exit.Conflict, "Runtime returned an invalid builtin version")
-	}
-	if parsed.LessThan(pep440.MustParse(runtimeoperation.Floor)) {
-		return nil, "", nil
-	}
-	surface, problem := tool.BuiltinOperations(ctx)
+// prepareRuntimeOperations materializes only a previously captured builtin.
+// Neither the current host SDK nor the invoking family's closure participates.
+func prepareRuntimeOperations(ctx context.Context, layout home.Layout, store *records.Store, tool launch.RuntimeCLI, capture launch.BuiltinPreparation) (*records.ChildBinding, string, *exit.Error) {
+	version := capture.RuntimeVersion
+	surface, problem := launch.DecodePackageInterface(capture.PackageInterface)
 	if problem != nil {
 		return nil, "", problem
 	}
@@ -72,7 +54,7 @@ func RuntimeOperations(ctx context.Context, layout home.Layout, store *records.S
 	if problem != nil {
 		return fail(problem)
 	}
-	if actual.Digest != surface.Digest || !bytes.Equal(actual.Raw, surface.Raw) || prepared.RuntimeVersion != version {
+	if actual.Digest != surface.Digest || !bytes.Equal(actual.Raw, surface.Raw) || prepared.RuntimeVersion != version || prepared.ImplementationDigest != capture.ImplementationDigest {
 		return fail(exit.New(exit.Conflict, "Runtime changed its builtin while preparing it"))
 	}
 	for _, digest := range []string{prepared.EnvironmentDigest, prepared.ContentDigest, prepared.ReceiptDigest, prepared.ImplementationDigest} {
@@ -82,7 +64,7 @@ func RuntimeOperations(ctx context.Context, layout home.Layout, store *records.S
 	}
 	carrierDigest, _ := canonical.Spell(canonical.Digest(wheel))
 	identity, _ := json.Marshal(map[string]string{"carrier_digest": carrierDigest, "interface_digest": surface.Digest, "implementation_digest": prepared.ImplementationDigest})
-	identity, err = canonical.NormalizeJCS(identity)
+	identity, err := canonical.NormalizeJCS(identity)
 	if err != nil {
 		return fail(exit.Internalf("cannot identify Runtime builtin: %s", err))
 	}
@@ -109,7 +91,7 @@ func RuntimeOperations(ctx context.Context, layout home.Layout, store *records.S
 	if python == "" {
 		return fail(exit.New(exit.Conflict, "builtin interpreter identity is unobserved"))
 	}
-	inst := records.PackageInstall{ID: id, Package: "local/" + runtimeoperation.Name, Version: version, SourceKind: "wheel", SourceRef: dir, SourceDigest: sourceDigest, Dir: dir, ProjectDir: dir, Runtime: tool.Bin, Python: python, UV: toolVersion("uv", "--version"), LockDigest: prepared.EnvironmentDigest, Platform: runtime.GOOS + "/" + runtime.GOARCH, Closure: prepared.Closure, Packages: len(strings.Split(strings.TrimSpace(prepared.Closure), "\n")), PackageInterface: surface.Digest}
+	inst := records.PackageInstall{ID: id, Package: "local/" + runtimeoperation.Name, Version: version, SourceKind: "wheel", SourceRef: dir, SourceDigest: sourceDigest, Dir: dir, ProjectDir: dir, Runtime: launch.CapturedBuiltinTool(dir, prepared.EnvironmentPython, tool.Env).Bin, Python: python, UV: toolVersion("uv", "--version"), LockDigest: prepared.EnvironmentDigest, Platform: runtime.GOOS + "/" + runtime.GOARCH, Closure: prepared.Closure, Packages: len(strings.Split(strings.TrimSpace(prepared.Closure), "\n")), PackageInterface: surface.Digest}
 	inst.BytesExcl, inst.BytesShared = Disk(dir)
 	if problem := store.RecordInstall(inst); problem != nil {
 		return fail(problem)

@@ -35,26 +35,14 @@ type childIntake struct {
 
 func (i *childIntake) Finish(parentInstall string) *exit.Error {
 	bindings := append([]records.ChildBinding(nil), i.Bindings...)
-	builtin, created, problem := install.RuntimeOperations(context.Background(), i.layout, i.store)
-	if created != "" {
-		i.created = append(i.created, created)
-	}
-	if problem != nil {
-		return problem
-	}
-	if builtin != nil {
-		bindings = append(bindings, *builtin)
-	}
 	for n := range bindings {
 		bindings[n].ParentInstallID = parentInstall
 	}
 	if problem := i.store.RecordChildBindings(bindings); problem != nil {
 		return problem
 	}
-	if builtin != nil {
-		if problem := i.shareBuiltinWithChildren(parentInstall, *builtin); problem != nil {
-			return problem
-		}
+	if problem := i.captureBuiltinWithChildren(parentInstall); problem != nil {
+		return problem
 	}
 	if i.prepared != nil && i.prepared.Install.ID == parentInstall {
 		i.prepared = nil
@@ -62,11 +50,11 @@ func (i *childIntake) Finish(parentInstall string) *exit.Error {
 	return nil
 }
 
-// A wheel App may itself compose the same Runtime operation. Those callees use
-// the shared builtin target, without inheriting any other parent's dependency.
-func (i *childIntake) shareBuiltinWithChildren(parent string, builtin records.ChildBinding) *exit.Error {
+// Each caller owns an immutable base capture. Optional numerical preparation
+// occurs only when that caller actually asks for the shared Runtime operation.
+func (i *childIntake) captureBuiltinWithChildren(parent string) *exit.Error {
 	queue := []string{parent}
-	seen := map[string]bool{builtin.ChildInstallID: true}
+	seen := map[string]bool{}
 	for len(queue) > 0 {
 		id := queue[0]
 		queue = queue[1:]
@@ -82,10 +70,9 @@ func (i *childIntake) shareBuiltinWithChildren(parent string, builtin records.Ch
 			return problem
 		}
 		for _, binding := range bindings {
-			queue = append(queue, binding.ChildInstallID)
-		}
-		if id == parent {
-			continue
+			if binding.Module != runtimeoperation.Module {
+				queue = append(queue, binding.ChildInstallID)
+			}
 		}
 		installed, problem := i.store.Install(id)
 		if problem != nil {
@@ -104,16 +91,7 @@ func (i *childIntake) shareBuiltinWithChildren(parent string, builtin records.Ch
 		if !eligible {
 			continue
 		}
-		held, problem := i.store.ChildBinding(id, builtin.InterfaceDigest, builtin.Module, builtin.Export)
-		if problem != nil {
-			return problem
-		}
-		if held != nil {
-			continue
-		} // An immutable earlier intake owns its exact builtin capture.
-		copy := builtin
-		copy.ParentInstallID = id
-		if problem := i.store.RecordChildBindings([]records.ChildBinding{copy}); problem != nil {
+		if problem := install.CaptureRuntimeOperations(context.Background(), i.layout, *installed); problem != nil {
 			return problem
 		}
 	}
