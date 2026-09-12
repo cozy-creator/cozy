@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -14,6 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // childIntake is bounded installation staging under the caller's existing
@@ -48,8 +51,71 @@ func (i *childIntake) Finish(parentInstall string) *exit.Error {
 	if problem := i.store.RecordChildBindings(bindings); problem != nil {
 		return problem
 	}
+	if builtin != nil {
+		if problem := i.shareBuiltinWithChildren(parentInstall, *builtin); problem != nil {
+			return problem
+		}
+	}
 	if i.prepared != nil && i.prepared.Install.ID == parentInstall {
 		i.prepared = nil
+	}
+	return nil
+}
+
+// A wheel App may itself compose the same Runtime operation. Those callees use
+// the shared builtin target, without inheriting any other parent's dependency.
+func (i *childIntake) shareBuiltinWithChildren(parent string, builtin records.ChildBinding) *exit.Error {
+	queue := []string{parent}
+	seen := map[string]bool{builtin.ChildInstallID: true}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if len(seen) > 1024 {
+			return exit.New(exit.Validation, "private builtin dependency graph exceeds its bound")
+		}
+		bindings, problem := i.store.ChildBindings(id)
+		if problem != nil {
+			return problem
+		}
+		for _, binding := range bindings {
+			queue = append(queue, binding.ChildInstallID)
+		}
+		if id == parent {
+			continue
+		}
+		installed, problem := i.store.Install(id)
+		if problem != nil {
+			return problem
+		}
+		if installed == nil {
+			return exit.New(exit.Conflict, "captured builtin caller is unavailable")
+		}
+		eligible := false
+		for _, pin := range strings.Split(installed.Closure, "\n") {
+			if version, ok := strings.CutPrefix(pin, "cozy-runtime=="); ok {
+				parsed, err := pep440.Parse(version)
+				eligible = err == nil && !parsed.LessThan(pep440.MustParse(runtimeoperation.Floor))
+			}
+		}
+		if !eligible {
+			continue
+		}
+		held, problem := i.store.ChildBinding(id, builtin.InterfaceDigest, builtin.Module, builtin.Export)
+		if problem != nil {
+			return problem
+		}
+		if held != nil {
+			continue
+		} // An immutable earlier intake owns its exact builtin capture.
+		copy := builtin
+		copy.ParentInstallID = id
+		if problem := i.store.RecordChildBindings([]records.ChildBinding{copy}); problem != nil {
+			return problem
+		}
 	}
 	return nil
 }
