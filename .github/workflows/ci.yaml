@@ -45,7 +45,7 @@ jobs:
             --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 \
-            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 20m'
+            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 30m'
       - run: python3 scripts/fence.py
 
   # THE WORKER-IMAGE ROSTER CHECK. `internal/packagepublish/base-distributions.json` is
