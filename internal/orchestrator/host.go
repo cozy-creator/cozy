@@ -339,6 +339,24 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		c.logf("PodHost prepare %s#%d superseded by #%d before its bytes were sent", label, seq, w.hostPrepareSeq)
 		return
 	}
+	if w.spec.IsJob() {
+		retained, problem := c.opt.Store.RentalHasRetainedJob(w.spec.Connection.RentalID)
+		if problem != nil || retained || !c.idleRentalWorkerLocked(w) {
+			c.mu.Unlock()
+			c.setDesiredUnavailable(w, seq, exit.Unavailablef("rented worker is finishing its current job before changing mode"))
+			return
+		}
+		// The wire carries a full replacement. Match it locally before its first
+		// report arrives, otherwise serving capacity is interpreted as job capacity.
+		// Native checkpoint/workspace custody stays with the supervisor and TensorFS.
+		w.spec.Placement = DesiredPlacement{}
+		w.planIDs = nil
+		w.remotePlacements = map[string]DesiredPlacement{}
+		w.observedRemote = map[string]remotePlacementObservation{}
+		w.dispatchable, w.materializable = map[string]bool{}, map[string]bool{}
+		w.jobReady = nil
+		w.jobsAvail, w.reportedJobs = 0, 0
+	}
 	w.setDigest, w.setBytes = digest, setBytes
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{

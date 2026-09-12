@@ -436,13 +436,30 @@ func (c *Orchestrator) RentalStanding(id string, job bool) (reason string, held 
 	}
 	serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
 		w.desiredUnpublishedPlacement != nil || len(w.observedRemote) > 0
-	if job && serving || !job && w.spec.IsJob() {
+	if job && serving || !job && w.spec.IsJob() && !c.idleRentalWorkerLocked(w) {
 		return ExcludedModeConflict, 0
 	}
 	if c.sessions[w.bootID] == nil {
 		return "", 0
 	}
 	return "", w.held + w.seats.reserved
+}
+
+// A completed job does not consume the rental forever. This fence uses observed
+// custody plus every owner-side reservation, so a delayed idle report cannot hide
+// an offer that has already crossed the dispatch boundary. Callers hold c.mu.
+func (c *Orchestrator) idleRentalWorkerLocked(w *worker) bool {
+	if w == nil || w.spec.Connection == nil || w.exited || w.stopping ||
+		!w.snapshotAcknowledged || w.lastReport.IsZero() || w.held != 0 ||
+		w.unacked != 0 || w.seats.reserved != 0 || w.reservedJobs != 0 {
+		return false
+	}
+	for _, offer := range c.offers {
+		if offer.worker == w {
+			return false
+		}
+	}
+	return true
 }
 
 // Orchestrator is the Cozy daemon's scheduling role.
