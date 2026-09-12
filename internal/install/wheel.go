@@ -125,7 +125,8 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 		}
 		paths = append(paths, dependency.Path)
 	}
-	selection, problem := packagepublish.ActiveWheelRequirements(ctx, project, extras, paths)
+	python := strings.TrimSpace(strings.TrimPrefix(runOut(parentPython, "-I", "-S", "-V"), "Python "))
+	selection, problem := packagepublish.ActiveWheelRequirements(ctx, project, extras, paths, python)
 	if problem != nil {
 		return fail(problem)
 	}

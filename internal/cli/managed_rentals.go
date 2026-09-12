@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
@@ -1233,7 +1234,11 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	if problem != nil {
 		return problem
 	}
-	if reason := launch.InventoryMismatch(inventory, constraints.Requirements, constraints.RequiresPython, view.Development); reason != "" {
+	requirements, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, inventory.Python)
+	if problem != nil {
+		return problem
+	}
+	if reason := launch.InventoryMismatch(inventory, requirements, constraints.RequiresPython, view.Development); reason != "" {
 		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
 	}
 	return nil

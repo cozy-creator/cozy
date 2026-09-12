@@ -121,7 +121,7 @@ func ExecutionRequirements(ctx context.Context, venv, project string, extras []s
 		}
 		metadata[name] = string(distribution.metadata)
 	}
-	return packagepublish.ActiveRequirements(ctx, project, extras, metadata)
+	return packagepublish.ActiveRequirements(ctx, project, extras, metadata, pythonVersion(venv))
 }
 
 type installedDistribution struct {

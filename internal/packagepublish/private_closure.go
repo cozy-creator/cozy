@@ -141,7 +141,7 @@ func PrivateRegistryRows(raw []byte, closure, project, version string, existing 
 }
 
 // CapturePrivateClosure keeps wheel bytes entirely on the client-to-worker path.
-func (p *Package) CapturePrivateClosure(ctx context.Context, closure string, extras []string) *exit.Error {
+func (p *Package) CapturePrivateClosure(ctx context.Context, closure string, extras []string, python string) *exit.Error {
 	raw, err := os.ReadFile(p.Files["uv.lock"])
 	if err != nil {
 		return exit.Named(exit.Validation, "private_dependency_lock_invalid", "captured private uv.lock is unavailable")
@@ -173,7 +173,7 @@ func (p *Package) CapturePrivateClosure(ctx context.Context, closure string, ext
 	for _, dependency := range p.DependencyWheels {
 		paths = append(paths, dependency.Path)
 	}
-	selection, problem := ActiveWheelRequirements(ctx, p.Name, extras, paths)
+	selection, problem := ActiveWheelRequirements(ctx, p.Name, extras, paths, python)
 	if problem != nil {
 		return problem
 	}
