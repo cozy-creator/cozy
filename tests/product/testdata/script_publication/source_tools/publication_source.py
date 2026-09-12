@@ -6,7 +6,8 @@ from cozy_runtime.author import App, Context, ModelArtifact, WeightsOutput, Weig
 PLAIN = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
 
 @invocable(memoize=True)
-async def produce(ctx: Context, *, weights: WeightsSink, value: int) -> ModelArtifact:
+async def produce(ctx: Context, *, weights: WeightsSink, value: int, private_note: str = "") -> ModelArtifact:
+    assert isinstance(private_note, str)
     assert 1 <= value <= 32
     names = ("linear_a.weight", "linear_b.weight")
     tensors = {name: WeightsTensor(logical_dtype="bf16", shape=(16, 64), encoding=PLAIN,
