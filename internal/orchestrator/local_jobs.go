@@ -10,7 +10,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-// A private job needs its prepared environment and job records. Preparing it
+// A unpublished package job needs its prepared environment and job records. Preparing it
 // must not activate a serving placement or remove a running orchestration parent.
 func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Request, revision localpackage.Revision) (*pb.DesiredPlacementSet, *exit.Error) {
 	selected, transfer, problem := localSelection(request.ID, revision)
@@ -32,14 +32,14 @@ func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Reques
 			return nil, problem
 		}
 		if !c.localTransferVerified(request.ID, revision.Digest, s) {
-			return nil, exit.Unavailablef("private job files await verification on the current worker")
+			return nil, exit.Unavailablef("unpublished package job files await verification on the current worker")
 		}
 		if problem := c.opt.Store.MarkLocalPackageUploaded(request.ID, revision.Digest, s.bootID); problem != nil {
 			return nil, problem
 		}
 	}
 	if s.host == nil || s.claim == nil {
-		return nil, exit.Unavailablef("private job preparation awaits the claimed Host")
+		return nil, exit.Unavailablef("unpublished package job preparation awaits the claimed Host")
 	}
 	if problem := requireLocalPackageCapacity(s, len(selected.Files)); problem != nil {
 		return nil, problem
@@ -53,17 +53,17 @@ func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Reques
 		return nil, result.fault
 	}
 	if result.refusal != "" {
-		return nil, exit.Named(exit.Structural, "worker.prepare_refused", "private job preparation refused: %s", result.refusal)
+		return nil, exit.Named(exit.Structural, "worker.prepare_refused", "unpublished package job preparation refused: %s", result.refusal)
 	}
 	if result.err != nil || result.set == nil {
-		return nil, exit.Unavailablef("private job preparation ended before its exact result")
+		return nil, exit.Unavailablef("unpublished package job preparation ended before its exact result")
 	}
 	// Preparing code does not download a job's Model inputs. Reuse the private
 	// model preparation, but do not activate its result as a serving placement.
 	// Native operation inputs keep their existing custody and are not downloads.
 	if models := downloadModelRefs(request.Models); len(models) > 0 {
 		if c.opt.RentalPackageSet == nil {
-			return nil, exit.Unavailablef("private job models require a rental download set")
+			return nil, exit.Unavailablef("unpublished package job models require a rental download set")
 		}
 		downloads, problem := c.opt.RentalPackageSet(nil, models)
 		if problem != nil {
@@ -79,10 +79,10 @@ func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Reques
 			return nil, result.fault
 		}
 		if result.refusal != "" {
-			return nil, exit.Named(exit.Structural, "worker.prepare_refused", "private job model preparation refused: %s", result.refusal)
+			return nil, exit.Named(exit.Structural, "worker.prepare_refused", "unpublished package job model preparation refused: %s", result.refusal)
 		}
 		if result.err != nil || result.set == nil {
-			return nil, exit.Unavailablef("private job model preparation ended before its exact result")
+			return nil, exit.Unavailablef("unpublished package job model preparation ended before its exact result")
 		}
 	}
 	c.mu.Lock()
@@ -92,7 +92,7 @@ func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Reques
 	}
 	c.mu.Unlock()
 	if !current {
-		return nil, exit.Unavailablef("private job preparation belonged to a superseded worker session")
+		return nil, exit.Unavailablef("unpublished package job preparation belonged to a superseded worker session")
 	}
 	return result.set, nil
 }

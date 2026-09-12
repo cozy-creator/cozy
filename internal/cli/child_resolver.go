@@ -13,10 +13,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
-// ResolvePrivateChild resolves only the immutable interface binding captured by
+// ResolveUnpublishedChild resolves only the immutable interface binding captured by
 // the parent's intake. Current pins, mutable source trees and package-supplied
 // install identities never participate in this execution authority.
-func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, export string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
+func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module, export string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
 	var out orchestrator.Submission
 	binding, problem := r.store.ChildBinding(parent.InstallID, iface, module, export)
 	if problem != nil {
@@ -175,7 +175,7 @@ func (r *Resolver) ResolvePrivateChild(parent records.Request, iface, module, ex
 	return out, target, nil
 }
 
-func (r *Resolver) PrivateArtifactPaths(request records.Request) ([][]string, *exit.Error) {
+func (r *Resolver) CapturedArtifactPaths(request records.Request) ([][]string, *exit.Error) {
 	install, problem := r.store.Install(request.InstallID)
 	if problem != nil || install == nil {
 		return nil, exit.Named(exit.Conflict, "child.install_absent", "captured artifact result schema is unavailable")
@@ -241,9 +241,9 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 	return needed, nil
 }
 
-// PrivateByteOutputBound uses the captured result schema, with the same finite
+// CapturedByteOutputBound uses the captured result schema, with the same finite
 // asset bounds as ordinary inputs. A manifest entry cannot invent a result field.
-func (r *Resolver) PrivateByteOutputBound(request records.Request, path, mediaType string) (int64, *exit.Error) {
+func (r *Resolver) CapturedByteOutputBound(request records.Request, path, mediaType string) (int64, *exit.Error) {
 	install, problem := r.store.Install(request.InstallID)
 	if problem != nil || install == nil {
 		return 0, exit.Unavailablef("byte result schema install is absent")
@@ -267,7 +267,7 @@ func (r *Resolver) PrivateByteOutputBound(request records.Request, path, mediaTy
 	return maximum, nil
 }
 
-func (r *Resolver) PrivateRetainedResultFields(request records.Request) (map[string]bool, *exit.Error) {
+func (r *Resolver) CapturedRetainedResultFields(request records.Request) (map[string]bool, *exit.Error) {
 	install, problem := r.store.Install(request.InstallID)
 	if problem != nil || install == nil {
 		return nil, exit.Unavailablef("native result schema install is absent")

@@ -76,7 +76,7 @@ func WheelClosures(ctx context.Context, tree, python, installed, project, extra 
 }
 
 func readWheelClosures(raw []byte, installed, project, extra string) (map[string]map[string]string, *exit.Error) {
-	pins, problem := privatePins(installed)
+	pins, problem := capturedPins(installed)
 	if problem != nil {
 		return nil, problem
 	}

@@ -4,7 +4,7 @@
 //
 // Nothing here re-derives a fact its owner already produced:
 //
-//   - THE SURFACE is an install-private package interface read once at install by THIS host's
+//   - THE SURFACE is an install-scoped package interface read once at install by THIS host's
 //     Runtime — a static reading of the source that imports nothing (cl-175) — and compared
 //     with the committed release. Reading it back costs microseconds; the recorded semantic
 //     digest is checked on every read.
@@ -563,17 +563,17 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	return nil
 }
 
-// PackageInterfacePath is the one install-private location for Runtime-derived bytes.
+// PackageInterfacePath is the one install-scoped location for Runtime-derived bytes.
 func PackageInterfacePath(installDir string) string {
 	return filepath.Join(installDir, "documents", PackageInterfaceFile)
 }
 
-// ReadPackageInterface reads the private package interface and joins it to the install record.
+// ReadPackageInterface reads the stored package interface and joins it to the install record.
 func ReadPackageInterface(path, expectDigest string) (*PackageInterface, *exit.Error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "package_interface_absent",
-			"this install carries no private %s", PackageInterfaceFile).
+			"this install carries no stored %s", PackageInterfaceFile).
 			WithRemedy("reinstall from the original source so its Runtime can derive the package interface")
 	}
 	d, problem := DecodePackageInterface(data)
@@ -582,7 +582,7 @@ func ReadPackageInterface(path, expectDigest string) (*PackageInterface, *exit.E
 	}
 	if expectDigest != "" && d.Digest != expectDigest {
 		return nil, exit.Named(exit.Conflict, "package_interface_stale",
-			"the private package interface content digests to %s and this install recorded %s", d.Digest, expectDigest).
+			"the stored package interface content digests to %s and this install recorded %s", d.Digest, expectDigest).
 			WithRemedy("the immutable install is corrupt; reinstall it from its original source")
 	}
 	return d, nil

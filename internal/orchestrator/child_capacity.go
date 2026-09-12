@@ -7,7 +7,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-func (c *Orchestrator) requiredPrivateWire(req records.Request) (uint32, *exit.Error) {
+func (c *Orchestrator) requiredUnpublishedWire(req records.Request) (uint32, *exit.Error) {
 	// A composition parent speaks the child-call minor because it makes the calls; a
 	// captured callee needs it only when it IS one, which the second term already says.
 	bound, problem := c.opt.Store.CompositionParent(req.InstallID, req.Entrypoint)

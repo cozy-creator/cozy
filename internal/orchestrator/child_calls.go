@@ -19,8 +19,8 @@ import (
 
 const childCallMaxBytes = 48 * 1024
 
-type privateChildResolver interface {
-	ResolvePrivateChild(records.Request, string, string, string, []byte) (Submission, string, *exit.Error)
+type unpublishedChildResolver interface {
+	ResolveUnpublishedChild(records.Request, string, string, string, []byte) (Submission, string, *exit.Error)
 }
 
 func (c *Orchestrator) childParent(s *session, id string, ordinal uint64, digest []byte) (*records.Request, *exit.Error) {
@@ -37,7 +37,7 @@ func (c *Orchestrator) childParent(s *session, id string, ordinal uint64, digest
 		return nil, exit.Named(exit.Conflict, "child.parent_fenced", "child call does not belong to this worker's current parent attempt")
 	}
 	if !parent.IsJob() || !parent.RetainWork || parent.InstallID == "" {
-		return nil, exit.Named(exit.Conflict, "child.parent_not_private", "child calls require a captured private job")
+		return nil, exit.Named(exit.Conflict, "child.parent_not_private", "child calls require a captured unpublished package job")
 	}
 	return parent, nil
 }
@@ -124,12 +124,12 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 			return
 		}
 	}
-	resolver, ok := c.opt.Packages.(privateChildResolver)
+	resolver, ok := c.opt.Packages.(unpublishedChildResolver)
 	if !ok {
 		refuse(exit.Unavailablef("this package owner cannot resolve frozen child interfaces"))
 		return
 	}
-	spec, target, problem := resolver.ResolvePrivateChild(*parent, iface, call.Module, call.Export, payload)
+	spec, target, problem := resolver.ResolveUnpublishedChild(*parent, iface, call.Module, call.Export, payload)
 	if problem != nil {
 		refuse(problem)
 		return

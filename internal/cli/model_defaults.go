@@ -38,7 +38,7 @@ func declaredModelSlots(callables ...[]launch.Entrypoint) []launch.Slot {
 }
 
 // missingModelDefaults describes deployment readiness, not permission to supply
-// explicit model inputs to a local or private invocation. Jobs have no default
+// explicit model inputs to a local or rented invocation. Jobs have no default
 // serving deployment and may take unpublished model inputs from their caller.
 func missingModelDefaults(callable *launch.Entrypoint, defaults map[string]hub.PackageBindingRow) []string {
 	if callable.Kind == "job" {
