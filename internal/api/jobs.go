@@ -432,7 +432,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		}
 		out.PlanID = job.DescriptorID
 		out.ChildArtifacts = job.RetainsArtifacts
-		out.ReleaseImplicitWork = !job.RetainsArtifacts && len(job.Outputs) == 0 && len(job.WeightsOutputs) == 0
+		out.ReleaseImplicitWork = (job.Result.Fields != nil || job.Result.Input == "model") && len(job.WeightsOutputs) == 0 && (len(job.Outputs) == 0 || job.RetainsArtifacts)
 		out.Outputs = job.Outputs
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
@@ -488,7 +488,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		}
 		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
 		out.ChildArtifacts = job.RetainsArtifacts
-		out.ReleaseImplicitWork = !job.RetainsArtifacts && len(job.Outputs) == 0 && len(job.WeightsOutputs) == 0
+		out.ReleaseImplicitWork = (job.Result.Fields != nil || job.Result.Input == "model") && len(job.WeightsOutputs) == 0 && (len(job.Outputs) == 0 || job.RetainsArtifacts)
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
 		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request, Assets: job.Assets}, &out); problem != nil {

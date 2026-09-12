@@ -8,7 +8,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// Rows are armed only by new, verified no-artifact root submissions. Historical
+// Rows are armed only by new, verified root submissions. Historical
 // success is not evidence that its result schema or custody can be reconstructed.
 const successfulWorkDDL = `CREATE TABLE IF NOT EXISTS successful_work_releases (
  request_id TEXT PRIMARY KEY REFERENCES requests(id),
@@ -28,7 +28,7 @@ type SuccessfulWorkRelease struct {
 
 func armSuccessfulWorkTx(tx *sql.Tx, r Request) *exit.Error {
 	if !r.ReleaseImplicitWork || !r.RetainWork || r.ParentRequestID != "" || !r.IsJob() ||
-		r.ChildArtifacts || (r.WeightsOutputs != "" && r.WeightsOutputs != "[]") || r.Outputs != "" || r.ModelTransfer != nil {
+		(r.WeightsOutputs != "" && r.WeightsOutputs != "[]") || r.ModelTransfer != nil {
 		return nil
 	}
 	if _, err := tx.Exec(`INSERT INTO successful_work_releases(request_id,body_digest,plan_id) VALUES(?,?,?)`, r.ID, r.BodyDigest, r.PlanID); err != nil {
@@ -61,7 +61,7 @@ func (s *Store) BeginSuccessfulWorkRelease(r Request, a Attempt) (bool, *exit.Er
 		return false, nil
 	}
 	_, err := s.db.Exec(`UPDATE successful_work_releases SET state='draining',attempt=?,invocation_digest=?,terminal_id=?,terminal_digest=?,
-		members=(WITH RECURSIVE family(id) AS (SELECT successful_work_releases.request_id UNION ALL SELECT r.id FROM requests r JOIN family f ON r.parent_request_id=f.id) SELECT json_group_array(r.id) FROM requests r WHERE r.id IN (SELECT id FROM family) AND r.retain_work=1)
+		members=(WITH RECURSIVE family(id) AS (SELECT successful_work_releases.request_id UNION ALL SELECT r.id FROM requests r JOIN family f ON r.parent_request_id=f.id) SELECT json_group_array(r.id) FROM requests r WHERE r.id IN (SELECT id FROM family) AND r.retain_work=1 AND (r.id<>successful_work_releases.request_id OR (r.child_artifacts=0 AND r.weights_outputs IN ('','[]'))))
 		WHERE request_id=? AND state='armed' AND body_digest=? AND plan_id=?
 		AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state='succeeded' AND ordinal=?)`,
 		a.Attempt, a.InvocationDigest, a.TerminalID, a.TerminalDigest, r.ID, r.BodyDigest, r.PlanID, r.ID, a.Attempt)
@@ -143,17 +143,18 @@ func (s *Store) ReadySuccessfulWorkRelease(root string, members []Request) (bool
 		if state != "succeeded" || open != 0 {
 			return false, nil
 		}
+		keepResult := member.ID == root && member.RetainsLocalOutputs()
 		var owed bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_weights_retentions WHERE request_id=? AND state!='released')
-            OR EXISTS(SELECT 1 FROM native_artifact_retentions WHERE consumer_id=? AND state!='released')
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_weights_retentions WHERE request_id=? AND state!='released' AND (?=0 OR kind!='result'))
+            OR EXISTS(SELECT 1 FROM native_artifact_retentions WHERE consumer_id=? AND state!='released' AND (?=0 OR kind!='result'))
             OR EXISTS(SELECT 1 FROM weights_finalizations WHERE request_id=? AND completed_at='')
-            OR EXISTS(SELECT 1 FROM request_operation_lookups WHERE request_id=? AND state='pending')`, member.ID, member.ID, member.ID, member.ID).Scan(&owed); err != nil {
+            OR EXISTS(SELECT 1 FROM request_operation_lookups WHERE request_id=? AND state='pending')`, member.ID, keepResult, member.ID, keepResult, member.ID, member.ID).Scan(&owed); err != nil {
 			return false, exit.Internalf("cannot verify successful native drain: %s", err)
 		}
 		if owed {
 			return false, nil
 		}
-		if retained {
+		if retained && !keepResult {
 			if !expected[member.ID] {
 				return false, exit.Internalf("successful release changed its sealed members")
 			}

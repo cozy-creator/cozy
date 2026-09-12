@@ -23,7 +23,7 @@ func successReleaseRoot(t *testing.T, s *records.Store, id string, armed, output
 	return r
 }
 
-func TestSuccessfulReleaseRequiresNewNoArtifactRootAndExactSuccess(t *testing.T) {
+func TestSuccessfulReleaseRequiresNewVerifiedRootAndExactSuccess(t *testing.T) {
 	for _, mode := range []string{"new-none", "legacy-unknown", "returned-model", "failed", "paused", "active"} {
 		t.Run(mode, func(t *testing.T) {
 			s := successReleaseStore(t)
@@ -45,13 +45,13 @@ func TestSuccessfulReleaseRequiresNewNoArtifactRootAndExactSuccess(t *testing.T)
 			fatal(t, p)
 			started, p := s.BeginSuccessfulWorkRelease(*current, *a)
 			fatal(t, p)
-			if started != (mode == "new-none") {
+			if started != (mode == "new-none" || mode == "returned-model") {
 				t.Fatalf("%s started=%v", mode, started)
 			}
 			intent, p := s.SuccessfulWorkRelease(r.ID)
 			fatal(t, p)
-			if (mode == "legacy-unknown" || mode == "returned-model") && intent != nil {
-				t.Fatal("unverified or explicit-output root was armed")
+			if mode == "legacy-unknown" && intent != nil {
+				t.Fatal("unverified legacy root was armed")
 			}
 			if !current.RetainWork {
 				t.Fatal("eligibility changed retention before native drain")

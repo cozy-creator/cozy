@@ -9,8 +9,8 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// New no-artifact roots are armed at admission. An absent/old schema or an
-// explicitly returned artifact keeps the existing conservative retention path.
+// New verified roots are armed at admission. Unknown or legacy schemas keep
+// the existing conservative retention path. Returned artifacts need independent custody.
 func (c *Orchestrator) beginSuccessfulWorkRelease(req records.Request, ordinal int64) bool {
 	if req.ParentRequestID != "" || req.State != "succeeded" {
 		return false
@@ -24,7 +24,7 @@ func (c *Orchestrator) beginSuccessfulWorkRelease(req records.Request, ordinal i
 		return false
 	}
 	doc, err := canonical.Read(a.TerminalBody, &pb.AttemptOutcomeBody{})
-	if err != nil || req.RetainsLocalOutputs() || len(doc.Sub("output_manifest").List("outputs")) != 0 || len(doc.List("weights_receipts")) != 0 {
+	if err != nil || (!req.RetainsLocalOutputs() && (len(doc.Sub("output_manifest").List("outputs")) != 0 || len(doc.List("weights_receipts")) != 0)) {
 		_ = c.opt.Store.DeferSuccessfulWorkRelease(req.ID, "returned or unverified output custody")
 		return false
 	}
@@ -88,6 +88,28 @@ func (c *Orchestrator) runSuccessfulWorkRelease(ctx context.Context, id string) 
 		return
 	}
 	if intent.State == "draining" {
+		if root.RetainsLocalOutputs() {
+			// The root gets its own exact borrower before any producer/child hold
+			// is released. Captured paths and native receipt authority are reused.
+			raw, e := c.childInlineResult(*root)
+			if e != nil {
+				c.retrySuccessfulWorkRelease(id)
+				return
+			}
+			artifacts, e := c.childResultArtifacts(*root, raw)
+			if e != nil {
+				c.retrySuccessfulWorkRelease(id)
+				return
+			}
+			if e := c.retainChildArtifacts(ctx, *root, "result", artifacts); e != nil {
+				c.retrySuccessfulWorkRelease(id)
+				return
+			}
+			if e := c.retainRootByteResults(ctx, *root, *a); e != nil {
+				c.retrySuccessfulWorkRelease(id)
+				return
+			}
+		}
 		// A caught child failure does not make that child's unfinished work unused.
 		// Defer this first slice rather than abandoning a failed/paused descendant.
 		for _, member := range members {
@@ -121,7 +143,7 @@ func (c *Orchestrator) runSuccessfulWorkRelease(ctx context.Context, id string) 
 			if ctx.Err() != nil {
 				return
 			}
-			if e := c.releaseChildRetentions(ctx, member.ID, false); e != nil {
+			if e := c.releaseChildRetentions(ctx, member.ID, member.ID == id && root.RetainsLocalOutputs()); e != nil {
 				c.retrySuccessfulWorkRelease(id)
 				return
 			}

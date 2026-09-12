@@ -483,7 +483,7 @@ type Request struct {
 	// RetainWork preserves a unpublished package job's artifacts and capacity until the owner
 	// resumes or permanently cancels it, including after an attempt fails.
 	RetainWork bool
-	// ReleaseImplicitWork is derived from a new captured no-artifact root schema.
+	// ReleaseImplicitWork is derived from a new captured result schema.
 	// Its durable authority is successful_work_releases, not this admission-only field.
 	ReleaseImplicitWork bool `json:"-"`
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
