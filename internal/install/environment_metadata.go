@@ -1,10 +1,7 @@
 package install
 
 import (
-	"bufio"
-	"bytes"
-	"io"
-	"net/textproto"
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -112,30 +109,19 @@ func closure(venv string) (int, string) {
 // Image-owned distributions resolve their own dependency subtree on that image:
 // e.g. a locally installed Torch wheel's CUDA pins do not constrain remote Torch.
 // The full installed roster remains separate and exact for local graph/custody checks.
-func ExecutionRequirements(venv string) ([]string, *exit.Error) {
+func ExecutionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, *exit.Error) {
 	installed := installedMetadata(venv)
 	if len(installed) == 0 {
-		return nil, exit.New(exit.Structural, "captured environment metadata is unavailable")
+		return packagepublish.RequirementSelection{}, exit.New(exit.Structural, "captured environment metadata is unavailable")
 	}
-	seen := map[string]bool{}
+	metadata := map[string]string{}
 	for name, distribution := range installed {
 		if packagepublish.ImageOwnedDistribution(name) {
 			continue
 		}
-		header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(distribution.metadata))).ReadMIMEHeader()
-		if err != nil && err != io.EOF {
-			return nil, exit.New(exit.Structural, "captured dependency metadata is invalid")
-		}
-		for _, requirement := range header.Values("Requires-Dist") {
-			seen[requirement] = true
-		}
+		metadata[name] = string(distribution.metadata)
 	}
-	requirements := make([]string, 0, len(seen))
-	for requirement := range seen {
-		requirements = append(requirements, requirement)
-	}
-	sort.Strings(requirements)
-	return requirements, nil
+	return packagepublish.ActiveRequirements(ctx, project, extras, metadata)
 }
 
 type installedDistribution struct {
