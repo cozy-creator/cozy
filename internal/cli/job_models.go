@@ -151,7 +151,9 @@ func jobManifestInputs(ctx *Context, job *launch.Entrypoint, models []orchestrat
 		if !ok {
 			return nil, exit.Internalf("resolved model slot %s is absent from the job", model.Slot)
 		}
-		model.Slot = param
+		// Preparation names the interface's full binding path; invocation inputs
+		// name its parameter. Preserve both before replacing the serving slot key.
+		model.BindingPath, model.Slot = model.Slot, param
 	}
 	return models, nil
 }
