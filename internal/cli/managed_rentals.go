@@ -11,9 +11,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	packageinstall "github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
@@ -1159,16 +1160,17 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
 		defer store.Close()
-		install, problem := store.Install(req.InstallID)
-		if problem != nil || install == nil {
+		installed, problem := store.Install(req.InstallID)
+		if problem != nil || installed == nil {
 			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
-		python, problem := launch.EnvironmentPython(*install)
+		python, problem := launch.EnvironmentPython(*installed)
 		if problem != nil {
 			return rental.Constraints{}, problem
 		}
-		requirements, requiresPython, problem := packageinstall.ImageRequirements(
-			filepath.Dir(filepath.Dir(python)), strings.TrimPrefix(install.Package, "local/"))
+		requirements, requiresPython, problem := install.ImageRequirements(
+			filepath.Dir(filepath.Dir(python)), strings.TrimPrefix(installed.Package, "local/"), strings.Fields(installed.Extra)...)
+
 		if problem != nil {
 			return rental.Constraints{}, problem
 		}
@@ -1220,7 +1222,11 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	if problem != nil {
 		return problem
 	}
-	if reason := launch.InventoryMismatch(inventory, constraints.Requirements, constraints.RequiresPython, view.Development); reason != "" {
+	requirements, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, inventory.Python)
+	if problem != nil {
+		return problem
+	}
+	if reason := launch.InventoryMismatch(inventory, requirements, constraints.RequiresPython, view.Development); reason != "" {
 		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
 	}
 	return nil
