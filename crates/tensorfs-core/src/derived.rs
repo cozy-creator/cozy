@@ -7,6 +7,8 @@
 //! vocabulary, Torch, schedule, publication, or serving decision here.
 
 mod adoption;
+mod estimate;
+pub use estimate::{estimate_write, WriteEstimate};
 mod progress;
 mod retention;
 mod roots;
@@ -2040,6 +2042,72 @@ fn release_guards(meta: &Meta, writer_hold: Option<Hold>, source_leases: Vec<(St
     }
 }
 
+// One epoch/declaration decision for inspection and writer creation. The returned
+// row is an isolated candidate; only begin publishes it under the native CAS.
+fn planned_row(
+    initial: Option<&TransactionRow>,
+    transaction: &str,
+    writer_session: u64,
+    declaration_text: &str,
+    source_facts: &[SourceFact],
+) -> Result<TransactionRow> {
+    if let Some(previous) = initial {
+        match previous.state {
+            TransactionState::Committed(_) => {
+                return refuse(
+                    Code::TRANSACTION_CLOSED,
+                    format!("{transaction} is committed; recover it with derived_lookup"),
+                )
+            }
+            TransactionState::Abandoned => {
+                return refuse(
+                    Code::TRANSACTION_CLOSED,
+                    format!("{transaction} was durably abandoned and cannot reopen"),
+                )
+            }
+            TransactionState::Open => {}
+        }
+        if previous.declaration.as_deref() != Some(declaration_text)
+            || previous.source_facts.as_slice() != source_facts
+        {
+            return refuse(
+                Code::TRANSACTION_CONFLICT,
+                format!("{transaction} is already locked to a different declaration"),
+            );
+        }
+        if writer_session < previous.highest_session
+            || (writer_session == previous.highest_session
+                && previous.current_session != Some(writer_session))
+        {
+            return refuse(
+                Code::WRITER_FENCED,
+                format!(
+                    "WriterSessionId {writer_session} is behind the durable fence {}",
+                    previous.highest_session
+                ),
+            );
+        }
+        let mut row = previous.clone();
+        row.highest_session = row.highest_session.max(writer_session);
+        row.current_session = Some(writer_session);
+        return Ok(row);
+    }
+    Ok(TransactionRow {
+        id: transaction.to_string(),
+        declaration: Some(declaration_text.to_string()),
+        state: TransactionState::Open,
+        highest_session: writer_session,
+        current_session: Some(writer_session),
+        added_parts: Vec::new(),
+        added_configs: Vec::new(),
+        source_facts: source_facts.to_vec(),
+        inherited_payload_objects: 0,
+        inherited_payload_bytes: 0,
+        header: None,
+        manifest: None,
+    })
+}
+
 pub fn begin(
     store: &Store,
     meta: &Meta,
@@ -2124,69 +2192,20 @@ pub fn begin(
         .derived_rows()?
         .into_iter()
         .find(|row| row.id == transaction);
-    let mut rows: Vec<_> = initial.clone().into_iter().collect();
-    let result = match rows.iter_mut().find(|row| row.id == transaction) {
-        Some(row) => match row.state {
-            TransactionState::Committed(_) => refuse(
-                Code::TRANSACTION_CLOSED,
-                format!("{transaction} is committed; recover it with derived_lookup"),
-            ),
-            TransactionState::Abandoned => refuse(
-                Code::TRANSACTION_CLOSED,
-                format!("{transaction} was durably abandoned and cannot reopen"),
-            ),
-            TransactionState::Open => {
-                if row.declaration.as_deref() != Some(&declaration_text)
-                    || row.source_facts != source_facts
-                {
-                    refuse(
-                        Code::TRANSACTION_CONFLICT,
-                        format!("{transaction} is already locked to a different declaration"),
-                    )
-                } else if writer_session < row.highest_session
-                    || (writer_session == row.highest_session
-                        && row.current_session != Some(writer_session))
-                {
-                    refuse(
-                        Code::WRITER_FENCED,
-                        format!(
-                            "WriterSessionId {writer_session} is behind the durable fence {}",
-                            row.highest_session
-                        ),
-                    )
-                } else {
-                    if writer_session > row.highest_session {
-                        row.highest_session = writer_session;
-                    }
-                    row.current_session = Some(writer_session);
-                    Ok(())
-                }
-            }
-        },
-        None => {
-            rows.push(TransactionRow {
-                id: transaction.clone(),
-                declaration: Some(declaration_text),
-                state: TransactionState::Open,
-                highest_session: writer_session,
-                current_session: Some(writer_session),
-                added_parts: Vec::new(),
-                added_configs: Vec::new(),
-                source_facts: source_facts.clone(),
-                inherited_payload_objects: 0,
-                inherited_payload_bytes: 0,
-                header: None,
-                manifest: None,
-            });
-            Ok(())
+    let mut row = match planned_row(
+        initial.as_ref(),
+        &transaction,
+        writer_session,
+        &declaration_text,
+        &source_facts,
+    ) {
+        Ok(row) => row,
+        Err(error) => {
+            release_guards(meta, Some(writer_hold), source_leases);
+            return Err(error);
         }
     };
-    if let Err(error) = result {
-        release_guards(meta, Some(writer_hold), source_leases);
-        return Err(error);
-    }
-    let row = open_row(&mut rows, &transaction, writer_session)?;
-    let merged = merge_progress(store, row, incoming.as_ref()).and_then(|()| {
+    let merged = merge_progress(store, &mut row, incoming.as_ref()).and_then(|()| {
         build_header(
             &declaration,
             &sources,
@@ -2218,7 +2237,7 @@ pub fn begin(
                 "writer is behind the retained restore epoch",
             );
         }
-        retain_progress(store, row, checkpoint)?;
+        retain_progress(store, &row, checkpoint)?;
         match current {
             Some(current) => *current = row.clone(),
             None => txn.rows.push(row.clone()),

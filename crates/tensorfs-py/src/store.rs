@@ -2022,6 +2022,47 @@ impl PyStore {
         })
     }
 
+    /// Remaining native additions before opening a writer or reserving capacity.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes, *, work_fingerprint, checkpoint=None))]
+    fn derived_write_estimate<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+        writer_session_id: u64,
+        sources: &Bound<'_, PyDict>,
+        targets: &Bound<'_, PyDict>,
+        configs: &Bound<'_, PyDict>,
+        order: Vec<(String, String)>,
+        max_new_bytes: u64,
+        work_fingerprint: &str,
+        checkpoint: Option<(String, u64)>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let mut declaration =
+            parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+        declaration.work_fingerprint = Some(work_fingerprint.to_string());
+        let checkpoint = checkpoint
+            .map(|(id, length)| obj_ref(py, &id, length))
+            .transpose()?;
+        let estimate = py
+            .detach(|| {
+                derived::estimate_write(
+                    &self.store,
+                    &self.meta,
+                    transaction_id,
+                    writer_session_id,
+                    declaration,
+                    checkpoint.as_ref(),
+                )
+            })
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("payload_bytes", estimate.payload_bytes)?;
+        out.set_item("largest_part_bytes", estimate.largest_part_bytes)?;
+        out.set_item("parts", estimate.parts)?;
+        Ok(out)
+    }
+
     /// Durable recovery after the TensorFS-commit/Runtime-journal crash gap.
     fn derived_lookup<'p>(
         &self,
