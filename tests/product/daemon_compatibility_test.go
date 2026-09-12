@@ -176,3 +176,31 @@ func TestDaemonOperatorLockRefusesBeforeAPIReadiness(t *testing.T) {
 		t.Fatal("operator conflict opened a records database")
 	}
 }
+
+func TestConcurrentCLIStartsConvergeOnOneEphemeralDaemon(t *testing.T) {
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("port: 0\n"), 0600))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	commands := []*exec.Cmd{
+		exec.CommandContext(ctx, cozyBin, "run", "list", "--json"),
+		exec.CommandContext(ctx, cozyBin, "run", "list", "--json"),
+	}
+	for _, command := range commands {
+		command.Env = childEnv(t, root)
+		must(t, command.Start())
+	}
+	for _, command := range commands {
+		must(t, command.Wait())
+	}
+	state := daemon.Probe(config.Config{Home: root})
+	if !state.Up || state.PID <= 0 || state.Addr == "" || strings.HasSuffix(state.Addr, ":0") {
+		t.Fatalf("concurrent startup did not publish one bound daemon: %+v", state)
+	}
+	if output, err := compatibilityCLI(t, root, "run", "list", "--json"); err != nil {
+		t.Fatalf("winner did not remain ready: %v %s", err, output)
+	}
+	if next := daemon.Probe(config.Config{Home: root}); next.PID != state.PID {
+		t.Fatal("a subsequent client replaced the startup winner")
+	}
+}

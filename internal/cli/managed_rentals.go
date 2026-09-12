@@ -1102,22 +1102,6 @@ func (m *managedRentals) unrecordedTotalsLocked() (int, int64) {
 	return len(m.unrecorded), burn
 }
 
-// unrecorded is the cached set, for a caller rendering the fleet rather than
-// deciding on it. It never asks the hub: the reconcile owns that, at the cadence
-// every rental verb already samples at.
-func (m *managedRentals) unrecordedSnapshot() ([]hub.Rental, bool, *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]hub.Rental(nil), m.unrecorded...), m.listed, m.listingProblem
-}
-
-// cachedTotals is totalsLocked without a reconcile, for the live board's redraw.
-func (m *managedRentals) cachedTotals() (int, int64, *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.totalsLocked()
-}
-
 func usdPerHour(micros int64) string {
 	return usdPerHourBare(micros) + "/hour"
 }
