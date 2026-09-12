@@ -329,7 +329,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
 	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
 	// a machine that would be bought are held to the same declared degrees (cl-179).
-	constraints, _ := releaseConstraints(m.ctx, req)
+	constraints, _ := RentalConstraints(m.ctx, req)
 	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
@@ -1149,11 +1149,11 @@ func settledRequest(state string) bool {
 	return false
 }
 
-// releaseConstraints reads the release's own immutable requirements so the SKU choice
+// RentalConstraints reads the release's own immutable requirements so the SKU choice
 // above can decline a base that contradicts them. Automatic selection preserves its
 // advisory fallback on an unavailable release; explicit rental selection requires
 // these facts before submitting work.
-func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
+func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
 	if req.InstallID != "" && strings.HasPrefix(req.Package, "local/") {
 		_, store, problem := rentalStores(ctx)
 		if problem != nil {
