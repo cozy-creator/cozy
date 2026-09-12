@@ -5,8 +5,19 @@ import (
 	"encoding/json"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
+
+// BuiltinOperationsTool uses the admitted host Runtime for base-owned metadata
+// and environment preparation. All subprocess execution stays in launch.
+func BuiltinOperationsTool(root, scratch string, env []string) (RuntimeCLI, *exit.Error) {
+	bin, problem := hostruntime.Path(env)
+	if problem != nil {
+		return RuntimeCLI{}, problem
+	}
+	return RuntimeCLI{Bin: bin, Dir: root, Home: scratch, Env: env}, nil
+}
 
 type BuiltinPreparation struct {
 	EnvironmentPython    string          `json:"environment_python"`

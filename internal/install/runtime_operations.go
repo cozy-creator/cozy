@@ -14,7 +14,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -26,11 +25,10 @@ import (
 // Older SDKs simply have no builtin; their existing private functions still work.
 func RuntimeOperations(ctx context.Context, layout home.Layout, store *records.Store) (*records.ChildBinding, string, *exit.Error) {
 	env := config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
-	bin, problem := hostruntime.Path(env)
+	tool, problem := launch.BuiltinOperationsTool(layout.Root, runtimeScratchHome(), env)
 	if problem != nil {
 		return nil, "", problem
 	}
-	tool := launch.RuntimeCLI{Bin: bin, Dir: layout.Root, Home: runtimeScratchHome(), Env: env}
 	version, problem := tool.RuntimeVersion(ctx)
 	if problem != nil {
 		return nil, "", problem
@@ -111,7 +109,7 @@ func RuntimeOperations(ctx context.Context, layout home.Layout, store *records.S
 	if python == "" {
 		return fail(exit.New(exit.Conflict, "builtin interpreter identity is unobserved"))
 	}
-	inst := records.PackageInstall{ID: id, Package: "local/" + runtimeoperation.Name, Version: version, SourceKind: "wheel", SourceRef: dir, SourceDigest: sourceDigest, Dir: dir, ProjectDir: dir, Runtime: bin, Python: python, UV: toolVersion("uv", "--version"), LockDigest: prepared.EnvironmentDigest, Platform: runtime.GOOS + "/" + runtime.GOARCH, Closure: prepared.Closure, Packages: len(strings.Split(strings.TrimSpace(prepared.Closure), "\n")), PackageInterface: surface.Digest}
+	inst := records.PackageInstall{ID: id, Package: "local/" + runtimeoperation.Name, Version: version, SourceKind: "wheel", SourceRef: dir, SourceDigest: sourceDigest, Dir: dir, ProjectDir: dir, Runtime: tool.Bin, Python: python, UV: toolVersion("uv", "--version"), LockDigest: prepared.EnvironmentDigest, Platform: runtime.GOOS + "/" + runtime.GOARCH, Closure: prepared.Closure, Packages: len(strings.Split(strings.TrimSpace(prepared.Closure), "\n")), PackageInterface: surface.Digest}
 	inst.BytesExcl, inst.BytesShared = Disk(dir)
 	if problem := store.RecordInstall(inst); problem != nil {
 		return fail(problem)
