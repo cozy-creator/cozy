@@ -153,7 +153,7 @@ func ApplyRelease(ctx context.Context, client Releases, intent ReleaseIntent, se
 	if problem := beforeSend(); problem != nil {
 		return ReleaseReceipt{}, problem
 	}
-	updated, problem := client.UpdateModelRelease(ctx, ref, intent.Request.Release, intent.BaselineRevision, intent.Request.Lanes, nil, "private script release publication")
+	updated, problem := client.UpdateModelRelease(ctx, ref, intent.Request.Release, intent.BaselineRevision, intent.Request.Lanes, nil, "local script release publication")
 	if problem != nil {
 		return ReleaseReceipt{}, problem
 	}

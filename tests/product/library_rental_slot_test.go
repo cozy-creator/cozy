@@ -16,7 +16,7 @@ import (
 
 type libraryChildLauncher struct{ localLauncher }
 
-func (l libraryChildLauncher) ResolvePrivateChild(parent records.Request, _, _, _ string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
+func (l libraryChildLauncher) ResolveUnpublishedChild(parent records.Request, _, _, _ string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
 	return orchestrator.Submission{Kind: "job", Package: parent.Package, Entrypoint: "compute", Release: parent.Release,
 		InstallID: parent.InstallID, LocalPackageDigest: parent.LocalPackageDigest, PlanID: childDigest("5"), Payload: payload,
 		RetainWork: true, Worker: parent.Worker, Rental: true, RentalRequired: true}, childDigest("6"), nil

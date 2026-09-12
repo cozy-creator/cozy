@@ -435,7 +435,7 @@ func (c *Orchestrator) RentalStanding(id string, job bool) (reason string, held 
 		return "", 0
 	}
 	serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
-		w.desiredPrivatePlacement != nil || len(w.observedRemote) > 0
+		w.desiredUnpublishedPlacement != nil || len(w.observedRemote) > 0
 	if job && serving || !job && w.spec.IsJob() {
 		return ExcludedModeConflict, 0
 	}

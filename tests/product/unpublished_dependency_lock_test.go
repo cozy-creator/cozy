@@ -12,7 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
-func TestPrivateDependencyRefusesSourceMutationDuringResolution(t *testing.T) {
+func TestUnpublishedDependencyRefusesSourceMutationDuringResolution(t *testing.T) {
 	root := t.TempDir()
 	project, library := filepath.Join(root, "operation"), filepath.Join(root, "library")
 	must(t, os.MkdirAll(project, 0o700))
@@ -49,7 +49,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     return name
 `, marker)
 	must(t, os.WriteFile(filepath.Join(library, "backend.py"), []byte(backend), 0o600))
-	pack, problem := packagepublish.PreparePrivateFrom(context.Background(), project)
+	pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
 	if pack != nil {
 		pack.Close()
 	}
@@ -61,7 +61,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
 	}
 }
 
-func TestPrivateDependencyLocksOnlyCapturedSource(t *testing.T) {
+func TestUnpublishedDependencyLocksOnlyCapturedSource(t *testing.T) {
 	root := t.TempDir()
 	project, library := filepath.Join(root, "operation"), filepath.Join(root, "library")
 	must(t, os.MkdirAll(project, 0o700))
@@ -83,12 +83,12 @@ private-lock-library = {path = "../library", editable = true}
 	if _, problem := packagepublish.PrepareFrom(project); problem == nil || problem.ErrName() != "package_source_required_file_missing" {
 		t.Fatalf("publication no longer requires an authored lock: %v", problem)
 	}
-	first, problem := packagepublish.PreparePrivateFrom(context.Background(), project)
+	first, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
 	fatal(t, problem)
 	defer first.Close()
 	firstIdentity, _, _, problem := first.SourceIdentity()
 	fatal(t, problem)
-	second, problem := packagepublish.PreparePrivateFrom(context.Background(), project)
+	second, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
 	fatal(t, problem)
 	defer second.Close()
 	secondIdentity, _, _, problem := second.SourceIdentity()
@@ -115,7 +115,7 @@ private-lock-library = {path = "../library", editable = true}
 		t.Fatalf("captured package has no resolved lock: %v", err)
 	}
 	must(t, os.WriteFile(implementation, []byte("VALUE = 12\n"), 0o600))
-	edited, problem := packagepublish.PreparePrivateFrom(context.Background(), project)
+	edited, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
 	fatal(t, problem)
 	defer edited.Close()
 	editedIdentity, _, _, problem := edited.SourceIdentity()
@@ -125,7 +125,7 @@ private-lock-library = {path = "../library", editable = true}
 	}
 }
 
-func TestPrivateSelectedExtrasAreCanonicalCapturedAndValidated(t *testing.T) {
+func TestCapturedSelectedExtrasAreCanonicalCapturedAndValidated(t *testing.T) {
 	root := t.TempDir()
 	project, library, alternate := filepath.Join(root, "operation"), filepath.Join(root, "library"), filepath.Join(root, "alternate")
 	for _, dir := range []string{project, library, alternate} {
@@ -155,7 +155,7 @@ private-extra-alternate={path="../alternate"}
 	}
 	capture := func(extras ...string) (*packagepublish.Package, string) {
 		t.Helper()
-		pack, problem := packagepublish.PreparePrivateFrom(context.Background(), project, extras...)
+		pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, extras...)
 		fatal(t, problem)
 		t.Cleanup(pack.Close)
 		identity, _, _, problem := pack.SourceIdentity()
@@ -195,7 +195,7 @@ private-extra-alternate={path="../alternate"}
 		t.Fatalf("selected optional dependencies lost their original paths: %+v", selected)
 	}
 	for _, extra := range []string{"missing", "managed; injected"} {
-		pack, problem := packagepublish.PreparePrivateFrom(context.Background(), project, extra)
+		pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, extra)
 		if pack != nil {
 			pack.Close()
 		}
