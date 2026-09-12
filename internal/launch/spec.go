@@ -34,6 +34,18 @@ func (f *Facts) environmentPython() string {
 	return home.VenvPython(filepath.Join(f.Install.Dir, "venv"))
 }
 
+// EnvironmentPython preserves the ordinary venv layout and resolves only the
+// fixed builtin's independently prepared Runtime generation through bound metadata.
+func EnvironmentPython(inst records.PackageInstall) (string, *exit.Error) {
+	if inst.Package != "local/"+runtimeoperation.Name {
+		return home.VenvPython(filepath.Join(inst.Dir, "venv")), nil
+	}
+	if inst.SourceKind != "wheel" {
+		return "", exit.New(exit.Conflict, "Runtime builtin is not a captured metadata carrier")
+	}
+	return runtimeoperation.ReadEnvironment(inst.Dir, inst.LockDigest, inst.PackageInterface, inst.SourceDigest)
+}
+
 // Read gathers an install's facts: where its source is, the surface it proved at install,
 // and how this host's Runtime is asked about it — a published install by its exact retained
 // interface, an editable one by its source. The tool itself is resolved when a question is
@@ -48,14 +60,13 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 	if inst.SourceKind == "tensorhub" || inst.SourceKind == "wheel" {
 		packageInterface = PackageInterfacePath(inst.Dir)
 	}
-	environmentPython := home.VenvPython(filepath.Join(inst.Dir, "venv"))
+	environmentPython, e := EnvironmentPython(inst)
+	if e != nil {
+		return nil, e
+	}
 	if inst.Package == "local/"+runtimeoperation.Name {
 		if inst.SourceKind != "wheel" || d.Application != runtimeoperation.Application {
 			return nil, exit.New(exit.Conflict, "Runtime builtin install changed its fixed application")
-		}
-		environmentPython, e = runtimeoperation.ReadEnvironment(inst.Dir, inst.LockDigest, inst.PackageInterface, inst.SourceDigest)
-		if e != nil {
-			return nil, e
 		}
 	}
 	return &Facts{

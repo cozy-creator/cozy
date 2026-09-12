@@ -1163,8 +1163,12 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 		if problem != nil || install == nil {
 			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
+		python, problem := launch.EnvironmentPython(*install)
+		if problem != nil {
+			return rental.Constraints{}, problem
+		}
 		requirements, requiresPython, problem := packageinstall.ImageRequirements(
-			filepath.Join(install.Dir, "venv"), strings.TrimPrefix(install.Package, "local/"))
+			filepath.Dir(filepath.Dir(python)), strings.TrimPrefix(install.Package, "local/"))
 		if problem != nil {
 			return rental.Constraints{}, problem
 		}
