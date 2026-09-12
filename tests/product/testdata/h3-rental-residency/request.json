@@ -1,0 +1,56 @@
+{
+  "id": "req-b0a735ba113a2372771a44ee",
+  "package": "local/minimax-h3",
+  "entrypoint": "fl2va",
+  "models": [
+    {
+      "package": "local/minimax-h3",
+      "slot": "fl2va.models.model",
+      "model": "paul/minimax-h3",
+      "release": "",
+      "manifest": "sha256:d64f250c556b28889fb0c900643bf2028fa92cad619d8cc4b716d6145ca7d275",
+      "hub_checkpoint": true,
+      "manifest_length": 164,
+      "bytes": 104738993849,
+      "component_bytes": {
+        "audio_vae": 605306340,
+        "fl2va_dit": 21105747968,
+        "ref2va_dit": 21105747968,
+        "text_encoder": 51506191840,
+        "video_vae": 10415475936
+      },
+      "component_use": {
+        "condition_fl2va_media": [
+          "video_vae"
+        ],
+        "condition_ref2va_media": [
+          "audio_vae",
+          "video_vae"
+        ],
+        "condition_text": [
+          "text_encoder"
+        ],
+        "decode_audio": [
+          "audio_vae"
+        ],
+        "decode_video": [
+          "video_vae"
+        ],
+        "sample_fl2va": [
+          "fl2va_dit"
+        ],
+        "sample_ref2va": [
+          "ref2va_dit"
+        ],
+        "warm_fl2va": [
+          "fl2va_dit"
+        ],
+        "warm_ref2va": [
+          "ref2va_dit"
+        ]
+      }
+    }
+  ],
+  "local_package_digest": "sha256:172aafbffb424b5edac0ef619f0e7dab9d7960db8924b7f1a1b60efa28e49485",
+  "package_release": "1.14.2"
+}

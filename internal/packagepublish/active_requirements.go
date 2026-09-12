@@ -18,8 +18,9 @@ import (
 var activeRequirementsScript string
 
 type RequirementSelection struct {
-	Requirements []string            `json:"requirements"`
-	Extras       map[string][]string `json:"extras"`
+	RequiresPython string              `json:"requires_python"`
+	Requirements   []string            `json:"requirements"`
+	Extras         map[string][]string `json:"extras"`
 }
 
 func ActiveWheelRequirements(ctx context.Context, project string, extras []string, paths []string, python string) (RequirementSelection, *exit.Error) {

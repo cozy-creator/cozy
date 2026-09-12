@@ -453,7 +453,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if status == "canceled" {
 		humanStatus = humanCancellationStatus(state.CanceledBy)
 	}
-	err := exit.Named(code, humanStatus, "job %s ended %s", state.JobID, humanStatus)
+	err := exit.Named(code, status, "job %s ended %s", state.JobID, humanStatus)
 	if status == "blocked" {
 		err.WithNext("cozy run <updated-script-or-package> --retry " + runReference(state.Number, state.JobID))
 	}

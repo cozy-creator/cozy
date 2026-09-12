@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -305,10 +306,9 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if problem != nil {
 		return none, "", problem
 	}
-	// A composition parent holds no model of its own, so without its captured shots'
-	// selections this decision would rank cards against nothing and could buy one no shot
-	// declares a lane for (cl-210). `req` is this call's own copy; the record keeps the
-	// parent's own model set, which is empty and stays empty.
+	// CPU orchestration requests need their captured defaults to narrow the rental
+	// choice (cl-210). Accelerator-owning requests retain only their own model slots;
+	// unrelated captures must not inflate their residency or preparation selection.
 	childModels, problem := resolver.UnpublishedChildModels(req)
 	if problem != nil {
 		return none, "", problem
@@ -1164,12 +1164,12 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 		if problem != nil || installed == nil {
 			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
-		requirements, requiresPython, problem := install.ImageRequirements(
-			filepath.Join(installed.Dir, "venv"), strings.TrimPrefix(installed.Package, "local/"), strings.Fields(installed.Extra)...)
+		selection, problem := install.ExecutionRequirements(context.Background(), filepath.Join(installed.Dir, "venv"),
+			strings.TrimPrefix(installed.Package, "local/"), strings.Fields(installed.Extra))
 		if problem != nil {
 			return rental.Constraints{}, problem
 		}
-		return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython}, nil
+		return rental.Constraints{Requirements: selection.Requirements, RequiresPython: selection.RequiresPython}, nil
 	}
 	if req.Package == "" || req.Release == "" {
 		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
