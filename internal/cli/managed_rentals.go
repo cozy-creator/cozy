@@ -1106,22 +1106,6 @@ func (m *managedRentals) unrecordedTotalsLocked() (int, int64) {
 	return len(m.unrecorded), burn
 }
 
-// unrecorded is the cached set, for a caller rendering the fleet rather than
-// deciding on it. It never asks the hub: the reconcile owns that, at the cadence
-// every rental verb already samples at.
-func (m *managedRentals) unrecordedSnapshot() ([]hub.Rental, bool, *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]hub.Rental(nil), m.unrecorded...), m.listed, m.listingProblem
-}
-
-// cachedTotals is totalsLocked without a reconcile, for the live board's redraw.
-func (m *managedRentals) cachedTotals() (int, int64, *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.totalsLocked()
-}
-
 func usdPerHour(micros int64) string {
 	return usdPerHourBare(micros) + "/hour"
 }
@@ -1186,7 +1170,7 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 		if problem != nil {
 			return rental.Constraints{}, problem
 		}
-		return rental.Constraints{Requirements: selection.Requirements, RequiresPython: ">=3.12,<3.13"}, nil
+		return rental.Constraints{Requirements: selection.Requirements, RequiresPython: selection.RequiresPython}, nil
 	}
 	if req.Package == "" || req.Release == "" {
 		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)

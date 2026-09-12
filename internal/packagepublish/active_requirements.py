@@ -77,7 +77,8 @@ def bind_extra(node, extra):
     return " or ".join(alternatives) if alternatives else False
 
 
-pending = deque((request["project"], extra) for extra in ["", *request["extras"]])
+project = canonicalize_name(request["project"])
+pending = deque((project, extra) for extra in ["", *request["extras"]])
 seen = set()
 requirements = set()
 extras = {}
@@ -105,4 +106,5 @@ while pending:
             pending.extend((target, value) for value in ["", *sorted(requirement.extras)])
 
 json.dump({"requirements": sorted(requirements),
+           "requires_python": metadata[project].get("Requires-Python", ""),
            "extras": {name: sorted(values) for name, values in sorted(extras.items())}}, sys.stdout)
