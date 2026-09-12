@@ -58,6 +58,33 @@ func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Reques
 	if result.err != nil || result.set == nil {
 		return nil, exit.Unavailablef("private job preparation ended before its exact result")
 	}
+	// Preparing code does not download a job's Model inputs. Reuse the private
+	// model preparation, but do not activate its result as a serving placement.
+	// Native operation inputs keep their existing custody and are not downloads.
+	if models := downloadModelRefs(request.Models); len(models) > 0 {
+		if c.opt.RentalPackageSet == nil {
+			return nil, exit.Unavailablef("private job models require a rental download set")
+		}
+		downloads, problem := c.opt.RentalPackageSet(nil, models)
+		if problem != nil {
+			return nil, problem
+		}
+		call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: &pb.DesiredPrivatePlacementSet{
+			OperationId: selected.OperationId, LocalRevisionDigest: selected.Package.LocalRevisionDigest, DownloadDelegation: downloads}}
+		result = c.runHostPrepare(s, w, 0, hostLabel("local_job_models", request.ID),
+			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
+				return s.host.PreparePrivatePlacement(ctx, call)
+			})
+		if result.fault != nil {
+			return nil, result.fault
+		}
+		if result.refusal != "" {
+			return nil, exit.Named(exit.Structural, "worker.prepare_refused", "private job model preparation refused: %s", result.refusal)
+		}
+		if result.err != nil || result.set == nil {
+			return nil, exit.Unavailablef("private job model preparation ended before its exact result")
+		}
+	}
 	c.mu.Lock()
 	current := c.sessions[s.bootID] == s && c.workers[instanceID] == w
 	if current {
