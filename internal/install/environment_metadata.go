@@ -199,7 +199,7 @@ func executionRequirements(ctx context.Context, venv, project string, extras []s
 }
 
 // ImageRequirements preserves the authored Python bound and selected extras while
-// using the same requirement graph as private wheel sealing.
+// using the same requirement graph as unpublished wheel sealing.
 func ImageRequirements(venv, project string, extras ...string) ([]string, string, *exit.Error) {
 	selected, python, problem := executionRequirements(context.Background(), venv, project, extras)
 	return selected.ImageRequirements(), python, problem
