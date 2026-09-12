@@ -11,7 +11,7 @@ import (
 
 // A private retry reuses same-machine observed state. Its independent native
 // head and provenance release the ancestor's hold; no remote ACK is fabricated.
-func TestPrivateTransactionRetryRecordsIndependentLocalSource(t *testing.T) {
+func TestUnpublishedTransactionRetryRecordsIndependentLocalSource(t *testing.T) {
 	store, prior, retry, old := localSourceRetryRecords(t, "unchanged")
 	parent, available, problem := store.RetriedSourceCheckpoints(retry.ID)
 	fatal(t, problem)
@@ -84,7 +84,7 @@ func TestPrivateTransactionRetryRecordsIndependentLocalSource(t *testing.T) {
 	}
 }
 
-func TestPrivateTransactionRetryDoesNotOfferChangedSource(t *testing.T) {
+func TestUnpublishedTransactionRetryDoesNotOfferChangedSource(t *testing.T) {
 	for _, arm := range []string{"source", "profile", "selection"} {
 		t.Run(arm, func(t *testing.T) {
 			store, _, retry, _ := localSourceRetryRecords(t, arm)

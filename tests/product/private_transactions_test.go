@@ -18,7 +18,7 @@ import (
 // Lifecycle commands operate on an existing request. A miss must reach the
 // daemon's typed job lookup, without treating pause/resume as package names or
 // creating a replacement transaction.
-func TestPrivateTransactionCommandsResolveExistingRequest(t *testing.T) {
+func TestUnpublishedTransactionCommandsResolveExistingRequest(t *testing.T) {
 	root := t.TempDir()
 	daemon := startDaemonProcess(t, root)
 	for _, action := range []string{"pause", "resume"} {
@@ -51,7 +51,7 @@ func TestPrivateTransactionCommandsResolveExistingRequest(t *testing.T) {
 // A paused request remains an unfinished obligation after a hard daemon exit.
 // This arm starts before dispatch deliberately: pausing a queued transaction
 // must not require starting its Python program just to stop it again.
-func TestPrivateTransactionQueuedPauseSurvivesDaemonCrash(t *testing.T) {
+func TestUnpublishedTransactionQueuedPauseSurvivesDaemonCrash(t *testing.T) {
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName),
 		[]byte("daemon:\n  idle_shutdown_s: 0\n"), 0o600))
@@ -121,7 +121,7 @@ func TestPrivateTransactionQueuedPauseSurvivesDaemonCrash(t *testing.T) {
 // The rental holding transaction state is owned by every retained request, not
 // only by its original buyer. A separate idle rental proves the real sweep has
 // run; elapsed time alone is not evidence that the retained rental was examined.
-func TestPrivateTransactionsShareRentalRetention(t *testing.T) {
+func TestUnpublishedTransactionsShareRentalRetention(t *testing.T) {
 	root := t.TempDir()
 	hub := newFakeRentalHub(t, 0)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(

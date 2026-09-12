@@ -61,7 +61,7 @@ only-include = ["code.py"]
 				Files:            map[string]string{"uv.lock": filepath.Join(root, "uv.lock")},
 				DependencyWheels: []packagepublish.DependencyWheel{{Path: filepath.Join(wheels, "extra_proof-1.0-py3-none-any.whl")}},
 			}
-			fatal(t, pack.CapturePrivateClosure(context.Background(), environment.Closure, nil, environment.Python))
+			fatal(t, pack.CaptureUnpublishedClosure(context.Background(), environment.Closure, nil, environment.Python))
 			body, problem := wheel.Metadata(pack.Wheel)
 			fatal(t, problem)
 			text := string(body)

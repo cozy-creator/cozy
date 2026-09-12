@@ -128,7 +128,7 @@ func TestModelArtifactIsClosedAndDigestExact(t *testing.T) {
 	}
 }
 
-func TestPrivateCompletedScriptRetainsDelegatedArtifacts(t *testing.T) {
+func TestUnpublishedCompletedScriptRetainsDelegatedArtifacts(t *testing.T) {
 	for _, artifacts := range []bool{false, true} {
 		t.Run(map[bool]string{false: "scalar", true: "native_artifact"}[artifacts], func(t *testing.T) {
 			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))

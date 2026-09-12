@@ -388,7 +388,7 @@ spends a durable budget that the settlement names when it is exhausted.
 
 ### Private transactions and child calls
 
-`retain_work:true` makes an ordinary private job retain its exact inputs, implementation
+`retain_work:true` makes an ordinary unpublished package job retain its exact inputs, implementation
 and native intermediate work across failed or paused attempts. `pause` durably fences
 admission and reaches `paused` only after its writers and child writers stop. `resume`
 continues the same captured request. A deterministic `blocked` failure requires a

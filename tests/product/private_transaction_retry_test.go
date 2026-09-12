@@ -12,7 +12,7 @@ import (
 // An edited program is a new immutable request. Its explicit predecessor conveys
 // retained custody without replacing history or allowing a different machine to
 // claim bytes that only exist on the original rental.
-func TestPrivateTransactionEditedRetryPreservesHistoryAndCustody(t *testing.T) {
+func TestUnpublishedTransactionEditedRetryPreservesHistoryAndCustody(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -73,7 +73,7 @@ func TestPrivateTransactionEditedRetryPreservesHistoryAndCustody(t *testing.T) {
 	}
 }
 
-func TestPrivateTransactionRetryRefusesUnavailableCustody(t *testing.T) {
+func TestUnpublishedTransactionRetryRefusesUnavailableCustody(t *testing.T) {
 	for _, arm := range []string{"missing", "active", "canceled", "different-machine", "lost-machine", "not-retained"} {
 		t.Run(arm, func(t *testing.T) {
 			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))

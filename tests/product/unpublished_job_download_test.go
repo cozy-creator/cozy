@@ -24,7 +24,7 @@ func (p *fakePod) PreparePrivatePlacement(call *pb.PreparePrivatePlacementCall, 
 	return p.privatePrepare(call, stream)
 }
 
-func TestPrivateJobDownloadsInputsBeforeDispatchWithoutServing(t *testing.T) {
+func TestUnpublishedJobDownloadsInputsBeforeDispatchWithoutServing(t *testing.T) {
 	for _, versioned := range []bool{false, true} {
 		t.Run(map[bool]string{false: "checkpoint", true: "release_lane"}[versioned], func(t *testing.T) {
 			privateJobDownload(t, versioned)

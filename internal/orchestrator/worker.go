@@ -183,7 +183,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 
 // placementModels reads the exact model rows a PlacementSet binds and names each by the
 // descriptor slot path its entrypoint binds it to — the spelling every download
-// download set, private placement, and request selection is addressed by.
+// download set, unpublished package placement, and request selection is addressed by.
 func placementModels(pkg string, row canonical.Doc) []ModelRef {
 	byID := map[string]canonical.Doc{}
 	for _, model := range row.List("models") {
@@ -426,9 +426,9 @@ type worker struct {
 	// desiredLocal is the exact command-scoped local wheel inventory. It survives
 	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
 	desiredLocal *pb.DesiredLocalPackageSet
-	// desiredPrivatePlacement is the model-only join for the already-prepared private
+	// desiredUnpublishedPlacement is the model-only join for the already-prepared private
 	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
-	desiredPrivatePlacement *pb.DesiredPrivatePlacementSet
+	desiredUnpublishedPlacement *pb.DesiredPrivatePlacementSet
 	orchestrationParent     *pb.JobDirective
 	// desiredEpoch is the control-stream epoch the local desire above was issued on. A
 	// desire issued on the live session and not refused is in flight or done; the same one

@@ -27,7 +27,7 @@ import (
 var privateRecordedInstall = flag.String("private-recorded-install", "", "captured PackageInstall JSON for actual private closure qualification")
 var privateStageDirectory = flag.String("private-stage-directory", "", "owned output directory for private closure qualification")
 
-func TestPrivateRecordedRegistryStage(t *testing.T) {
+func TestCapturedRegistryStage(t *testing.T) {
 	if *privateRecordedInstall == "" {
 		t.Skip("requires an actual retained install fixture")
 	}
@@ -59,7 +59,7 @@ func TestPrivateRecordedRegistryStage(t *testing.T) {
 	t.Logf("captured %s with %d exact wheels", revision.Digest, len(revision.Files))
 }
 
-func privateClosureLock() []byte {
+func capturedClosureLock() []byte {
 	return []byte(`version = 1
 [[package]]
 name = "fixture"
@@ -81,9 +81,9 @@ source = { registry = "https://pypi.org/simple" }
 `)
 }
 
-func TestPrivateRegistryClosureIncludesSelectedExtrasAndLeavesImageBaseToWorker(t *testing.T) {
+func TestCapturedRegistryClosureIncludesSelectedExtrasAndLeavesImageBaseToWorker(t *testing.T) {
 	closure := "fixture==1.0\nnumpy==2.5.3\nscipy==1.18.1"
-	rows, pins, problem := packagepublish.PrivateRegistryRows(privateClosureLock(), closure, "fixture", "1.0", nil)
+	rows, pins, problem := packagepublish.CapturedRegistryRows(capturedClosureLock(), closure, "fixture", "1.0", nil)
 	fatal(t, problem)
 	if len(rows) != 1 || rows[0].Name != "scipy" || rows[0].SHA256 != strings.Repeat("a", 64) || !reflect.DeepEqual(pins, []string{"scipy==1.18.1"}) {
 		t.Fatalf("selected extra omitted or image-owned base was repinned: rows=%+v pins=%v", rows, pins)
@@ -92,22 +92,22 @@ func TestPrivateRegistryClosureIncludesSelectedExtrasAndLeavesImageBaseToWorker(
 		label, closure string
 		lock           []byte
 	}{
-		{"missing extra", closure, bytes.Replace(privateClosureLock(), []byte(`name = "scipy"`), []byte(`name = "other"`), 1)},
-		{"base version drift", "fixture==1.0\nnumpy==2.5.2\nscipy==1.18.1", privateClosureLock()},
-		{"incompatible wheel", closure, bytes.Replace(privateClosureLock(), []byte("py3-none-any"), []byte("cp311-cp311-win_amd64"), 1)},
-		{"unlocked installed package", closure + "\nmissing==1.0", privateClosureLock()},
-		{"changed index", closure, bytes.ReplaceAll(privateClosureLock(), []byte("https://pypi.org/simple"), []byte("https://another.invalid/simple"))},
-		{"duplicate source", closure, append(privateClosureLock(), []byte("\n[[package]]\nname=\"scipy\"\nversion=\"1.18.1\"\n")...)},
+		{"missing extra", closure, bytes.Replace(capturedClosureLock(), []byte(`name = "scipy"`), []byte(`name = "other"`), 1)},
+		{"base version drift", "fixture==1.0\nnumpy==2.5.2\nscipy==1.18.1", capturedClosureLock()},
+		{"incompatible wheel", closure, bytes.Replace(capturedClosureLock(), []byte("py3-none-any"), []byte("cp311-cp311-win_amd64"), 1)},
+		{"unlocked installed package", closure + "\nmissing==1.0", capturedClosureLock()},
+		{"changed index", closure, bytes.ReplaceAll(capturedClosureLock(), []byte("https://pypi.org/simple"), []byte("https://another.invalid/simple"))},
+		{"duplicate source", closure, append(capturedClosureLock(), []byte("\n[[package]]\nname=\"scipy\"\nversion=\"1.18.1\"\n")...)},
 	} {
 		t.Run(candidate.label, func(t *testing.T) {
-			if _, _, problem := packagepublish.PrivateRegistryRows(candidate.lock, candidate.closure, "fixture", "1.0", nil); problem == nil {
+			if _, _, problem := packagepublish.CapturedRegistryRows(candidate.lock, candidate.closure, "fixture", "1.0", nil); problem == nil {
 				t.Fatal("incomplete or ambiguous private closure accepted")
 			}
 		})
 	}
 }
 
-func TestPrivateWheelPinsPreserveImplementationAndVerifyRecord(t *testing.T) {
+func TestUnpublishedWheelPinsPreserveImplementationAndVerifyRecord(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "fixture-1.0-py3-none-any.whl")
 	file, err := os.Create(source)
@@ -156,7 +156,7 @@ func TestPrivateWheelPinsPreserveImplementationAndVerifyRecord(t *testing.T) {
 	}
 	metadata := string(actual["fixture-1.0.dist-info/METADATA"])
 	if !strings.Contains(metadata, "Requires-Dist: numpy==2.5.3\n") || !strings.Contains(metadata, "Requires-Dist: scipy==1.18.1\n") || strings.Contains(metadata, "Provides-Extra:") || strings.Contains(metadata, ">=") {
-		t.Fatal("private wheel did not freeze its selected closure")
+		t.Fatal("captured wheel did not freeze its selected closure")
 	}
 	record, err := csv.NewReader(bytes.NewReader(actual["fixture-1.0.dist-info/RECORD"])).ReadAll()
 	must(t, err)
