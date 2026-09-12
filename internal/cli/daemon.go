@@ -141,16 +141,22 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
+	// Bound this CLI's readiness wait, never the owner's lifetime. A daemon may
+	// still be migrating or starting after we return; retrying observes it again.
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
 	for {
 		if state := daemon.Probe(ctx.Cfg); state.Up {
-			if state.Addr == "" {
+			if state.OperatorOwned {
 				return daemon.State{}, false, exit.Named(exit.Conflict, "daemon.operator_owned",
 					"an operator process holds this Cozy root without starting a daemon").
 					WithRemedy("finish or stop the operator handoff before starting Cozy")
 			}
 			current, _ := os.ReadFile(layout.Daemon)
 			credentialReady := !started || !bytes.Equal(current, staleCredential)
-			if credentialReady {
+			// Schema generations belong to the records reader, not this API client.
+			// Missing/newer schema metadata never authorizes replacing a live owner.
+			if state.Addr != "" && credentialReady {
 				if _, problem := api.ClientCredential(layout); problem == nil && uiReady(state.Addr) {
 					changed := child != nil && state.PID == child.pid
 					if child != nil {
@@ -180,6 +186,10 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 			// shared lock/credential readiness until it appears or that process exits.
 			childResult, child = &result, nil
 		case <-tick.C:
+		case <-timeout.C:
+			return daemon.State{}, false, exit.Named(exit.Unavailable, "daemon_startup_timeout",
+				"the Cozy daemon has not published a ready local API after 10 seconds").
+				WithRemedy("retry the command if startup is still progressing; inspect `cozy daemon log` if it is not")
 		}
 	}
 }

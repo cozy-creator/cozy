@@ -66,6 +66,16 @@ func Open(cfg config.Config, st daemon.State) (*Client, *exit.Error) {
 // Addr is the daemon address this client talks to, for rendering.
 func (c *Client) Addr() string { return strings.TrimPrefix(c.base, "http://") }
 
+func (c *Client) RentalInventory(ctx context.Context, reconcile bool) (api.RentalInventory, *exit.Error) {
+	var inventory api.RentalInventory
+	path := "/v1/local/rentals"
+	if !reconcile {
+		path += "?reconcile=false"
+	}
+	problem := c.callContext(ctx, http.MethodGet, path, nil, &inventory)
+	return inventory, problem
+}
+
 func (c *Client) request(method, path string, body any, headers ...string) (*http.Request, *exit.Error) {
 	var reader io.Reader
 	if body != nil {
