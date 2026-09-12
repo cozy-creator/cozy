@@ -205,7 +205,7 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 	w.desiredModels = cloneModelRefs(models)
 	w.desiredDownloadSets = sets
 	w.desiredLocal = nil
-	w.desiredPrivatePlacement = nil
+	w.desiredUnpublishedPlacement = nil
 	c.mu.Unlock()
 	return c.issuePackagePrepares(s, w,
 		hostLabel("package_set", fmt.Sprintf("%d packages, %d models", len(packages), len(models))), prepares)
@@ -963,9 +963,9 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	var byteOutputs []records.ByteOutput
 	if !knownReplay {
 		if req.ParentRequestID != "" && len(declaredWeightsOutputs) == 0 {
-			byteOutputs, e = c.privateByteOutputs(*req, *attemptRow, doc)
+			byteOutputs, e = c.capturedByteOutputs(*req, *attemptRow, doc)
 		} else if req.RetainsLocalOutputs() && len(declaredWeightsOutputs) == 0 {
-			byteOutputs, outputs, e = c.privateRootOutputs(*req, *attemptRow, doc, holder)
+			byteOutputs, outputs, e = c.capturedRootOutputs(*req, *attemptRow, doc, holder)
 		} else {
 			outputs, e = c.mirrorOutputs(*req, ordinal, doc, holder)
 		}

@@ -94,11 +94,11 @@ func ReadInstalledInterface(ctx context.Context, python, distribution string) (*
 	return launch.DecodePackageInterface([]byte(stdout.String()))
 }
 
-// CaptureWheel installs an exact wheel closure into an independent private
+// CaptureWheel installs an exact wheel closure into an independent captured
 // environment. It runs no resolver and records no fake source project or pin.
 func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store, parentPython, project string, dependencies map[string]packagepublish.CapturedDependency, surface *launch.PackageInterface) (*Result, *exit.Error) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		return nil, exit.New(exit.Validation, "private callable wheels require Linux amd64")
+		return nil, exit.New(exit.Validation, "unpublished callable wheels require Linux amd64")
 	}
 	id, problem := newInstallID()
 	if problem != nil {
@@ -106,18 +106,18 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	}
 	dir := layout.InstallDir(id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, exit.Internalf("cannot create private wheel install")
+		return nil, exit.Internalf("cannot create captured wheel install")
 	}
 	fail := func(problem *exit.Error) (*Result, *exit.Error) { _ = os.RemoveAll(dir); return nil, problem }
 	root, ok := dependencies[project]
 	if !ok || root.Path == "" || root.Digest == "" || !root.Application {
-		return fail(exit.New(exit.Validation, "private wheel install requires its exact App wheel"))
+		return fail(exit.New(exit.Validation, "captured wheel install requires its exact App wheel"))
 	}
 	original, problem := retainOriginalWheel(dir, root)
 	if problem != nil {
 		return fail(problem)
 	}
-	exact := exactPrivateWheelRequirements(project, dependencies)
+	exact := exactCapturedWheelRequirements(project, dependencies)
 	executablePath := filepath.Join(dir, "wheels", filepath.Base(original))
 	if problem := wheel.PinDependenciesPreserving(original, executablePath, exact, func(raw string) bool {
 		return packagepublish.ImageOwnedDistribution(normalizedRequirementName(raw))
@@ -128,7 +128,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if problem != nil {
 		return fail(problem)
 	}
-	names := privateWheelAllNames(dependencies)
+	names := capturedWheelNames(dependencies)
 	var requirements []string
 	type identity struct{ Name, Version, Wheel, OriginalWheel, BaseRequirement string }
 	var identities []identity
@@ -139,7 +139,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 			dependency = executable
 		}
 		if dependency.Name != name || dependency.Version == "" || dependency.Requirement == "" {
-			return fail(exit.New(exit.Validation, "private wheel dependency is incomplete"))
+			return fail(exit.New(exit.Validation, "captured wheel dependency is incomplete"))
 		}
 		requirements = append(requirements, dependency.Requirement)
 		item := identity{Name: name, Version: dependency.Version, Wheel: dependency.Digest}
@@ -155,25 +155,25 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	raw, _ := json.Marshal(identities)
 	raw, err := canonical.NormalizeJCS(raw)
 	if err != nil {
-		return fail(exit.Internalf("cannot identify private wheel closure"))
+		return fail(exit.Internalf("cannot identify captured wheel closure"))
 	}
 	digest, _ := canonical.Spell(canonical.Digest(raw))
 	if err := os.WriteFile(filepath.Join(dir, "wheel-capture.json"), raw, 0o400); err != nil {
-		return fail(exit.Internalf("cannot retain private wheel capture identity"))
+		return fail(exit.Internalf("cannot retain captured wheel capture identity"))
 	}
 	lockPath := filepath.Join(dir, "requirements.txt")
 	if err := os.WriteFile(lockPath, []byte(strings.Join(requirements, "\n")+"\n"), 0o600); err != nil {
-		return fail(exit.Internalf("cannot retain private wheel requirements"))
+		return fail(exit.Internalf("cannot retain captured wheel requirements"))
 	}
 	venv := filepath.Join(dir, "venv")
 	env := config.Frozen().Tool()
-	if problem := runUV(dir, env, "private_wheel_python_refused", "cannot select private wheel Python", "venv", "--python", parentPython, "--no-project", venv); problem != nil {
+	if problem := runUV(dir, env, "private_wheel_python_refused", "cannot select captured wheel Python", "venv", "--python", parentPython, "--no-project", venv); problem != nil {
 		return fail(problem)
 	}
-	if problem := runUV(dir, env, "private_wheel_install_refused", "cannot install exact private wheel closure", "pip", "install", "--no-deps", "--require-hashes", "--python", home.VenvPython(venv), "--requirements", lockPath); problem != nil {
+	if problem := runUV(dir, env, "private_wheel_install_refused", "cannot install exact captured wheel closure", "pip", "install", "--no-deps", "--require-hashes", "--python", home.VenvPython(venv), "--requirements", lockPath); problem != nil {
 		return fail(problem)
 	}
-	if problem := runUV(dir, env, "private_wheel_requirements_refused", "private wheel requirements are not satisfied", "pip", "check", "--python", home.VenvPython(venv)); problem != nil {
+	if problem := runUV(dir, env, "private_wheel_requirements_refused", "captured wheel requirements are not satisfied", "pip", "check", "--python", home.VenvPython(venv)); problem != nil {
 		return fail(problem)
 	}
 	count, installed := closure(venv)
@@ -182,10 +182,10 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	}
 	path := launch.PackageInterfacePath(dir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fail(exit.Internalf("cannot retain private wheel interface"))
+		return fail(exit.Internalf("cannot retain captured wheel interface"))
 	}
 	if err := os.WriteFile(path, surface.Raw, 0o600); err != nil {
-		return fail(exit.Internalf("cannot retain private wheel interface"))
+		return fail(exit.Internalf("cannot retain captured wheel interface"))
 	}
 	major, problem := MajorOf(root.Version)
 	if problem != nil {
@@ -199,10 +199,10 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if problem := store.RecordInstall(inst); problem != nil {
 		return fail(problem)
 	}
-	return &Result{Install: inst, PrivateProjectWheel: executablePath}, nil
+	return &Result{Install: inst, CapturedProjectWheel: executablePath}, nil
 }
 
-func exactPrivateWheelRequirements(project string, dependencies map[string]packagepublish.CapturedDependency) []string {
+func exactCapturedWheelRequirements(project string, dependencies map[string]packagepublish.CapturedDependency) []string {
 	exact := make([]string, 0, len(dependencies)-1)
 	for name, dependency := range dependencies {
 		if name != project && !packagepublish.ImageOwnedDistribution(name) {
@@ -213,7 +213,7 @@ func exactPrivateWheelRequirements(project string, dependencies map[string]packa
 	return exact
 }
 
-func privateWheelAllNames(dependencies map[string]packagepublish.CapturedDependency) []string {
+func capturedWheelNames(dependencies map[string]packagepublish.CapturedDependency) []string {
 	names := make([]string, 0, len(dependencies))
 	for name := range dependencies {
 		names = append(names, name)
@@ -225,23 +225,23 @@ func privateWheelAllNames(dependencies map[string]packagepublish.CapturedDepende
 func retainOriginalWheel(dir string, dependency packagepublish.CapturedDependency) (string, *exit.Error) {
 	root := filepath.Join(dir, "original")
 	if err := os.Mkdir(root, 0o700); err != nil {
-		return "", exit.Internalf("cannot retain original private wheel")
+		return "", exit.Internalf("cannot retain original captured wheel")
 	}
 	target := filepath.Join(root, filepath.Base(dependency.Path))
 	input, err := os.Open(dependency.Path)
 	if err != nil {
-		return "", exit.New(exit.Conflict, "original private wheel disappeared")
+		return "", exit.New(exit.Conflict, "original captured wheel disappeared")
 	}
 	defer input.Close()
 	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o400)
 	if err != nil {
-		return "", exit.Internalf("cannot retain original private wheel")
+		return "", exit.Internalf("cannot retain original captured wheel")
 	}
 	hash := sha256.New()
 	n, copyErr := io.Copy(io.MultiWriter(output, hash), io.LimitReader(input, wheel.MaxWheelBytes+1))
 	syncErr, closeErr := output.Sync(), output.Close()
 	if copyErr != nil || syncErr != nil || closeErr != nil || n <= 0 || n > wheel.MaxWheelBytes || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != dependency.Digest {
-		return "", exit.New(exit.Conflict, "original private wheel changed during capture")
+		return "", exit.New(exit.Conflict, "original captured wheel changed during capture")
 	}
 	return target, nil
 }

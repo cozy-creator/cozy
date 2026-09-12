@@ -21,7 +21,7 @@ const CommittedInterfacePath = "metadata/package-interface.json"
 
 // describe stages the tree's PackageInterface. The reading is THIS host's Runtime parsing the
 // source (hostruntime.Describe): package code is untrusted and nothing here imports it, so no
-// environment is built for the question. A private revision (Build) ships that reading. A
+// environment is built for the question. A unpublished package revision (Build) ships that reading. A
 // publication (BuildForPublish) treats it as a pre-flight only — the committed file is what
 // uploads — so a committed file that differs from the tree, or is absent, is refused naming
 // the first difference, and an equal one is staged unchanged.

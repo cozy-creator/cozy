@@ -428,7 +428,7 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.finalizations = append(p.finalizations, m.WeightsFinalizeRequest)
 			p.mu.Unlock()
 		case *pb.RecordOwnerFrame_LocalPackageFetchRequest:
-			return status.Error(codes.PermissionDenied, "private wheels must use direct upload")
+			return status.Error(codes.PermissionDenied, "captured wheels must use direct upload")
 		}
 	}
 }

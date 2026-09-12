@@ -122,7 +122,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
-			"cozy-runtime %s is release %s; this Cozy needs %s or newer to validate exact private dependency closures",
+			"cozy-runtime %s is release %s; this Cozy needs %s or newer to validate exact captured dependency closures",
 			path, answer.Distribution, Floor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}

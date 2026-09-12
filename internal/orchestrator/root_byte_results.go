@@ -10,18 +10,18 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func (c *Orchestrator) privateRootOutputs(req records.Request, attempt records.Attempt, doc canonical.Doc, holder *worker) ([]records.ByteOutput, []records.Output, *exit.Error) {
+func (c *Orchestrator) capturedRootOutputs(req records.Request, attempt records.Attempt, doc canonical.Doc, holder *worker) ([]records.ByteOutput, []records.Output, *exit.Error) {
 	resolver, ok := c.opt.Packages.(interface {
-		PrivateRetainedResultFields(records.Request) (map[string]bool, *exit.Error)
+		CapturedRetainedResultFields(records.Request) (map[string]bool, *exit.Error)
 	})
 	if !ok {
 		return nil, nil, exit.Unavailablef("native result schema verifier is absent")
 	}
-	retained, problem := resolver.PrivateRetainedResultFields(req)
+	retained, problem := resolver.CapturedRetainedResultFields(req)
 	if problem != nil {
 		return nil, nil, problem
 	}
-	all, problem := c.privateByteOutputs(req, attempt, doc)
+	all, problem := c.capturedByteOutputs(req, attempt, doc)
 	if problem != nil {
 		return nil, nil, problem
 	}

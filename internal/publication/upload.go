@@ -56,7 +56,7 @@ func UploadCheckpoint(ctx context.Context, client *hub.Client, operation string,
 	if problem := beforeWrite(); problem != nil {
 		return CheckpointRef{}, problem
 	}
-	opened, problem := client.OpenPublication(ctx, ref, operation, intent.Objects, "private script checkpoint upload")
+	opened, problem := client.OpenPublication(ctx, ref, operation, intent.Objects, "local script checkpoint upload")
 	if problem != nil {
 		return CheckpointRef{}, problem
 	}
@@ -81,7 +81,7 @@ func UploadCheckpoint(ctx context.Context, client *hub.Client, operation string,
 		if problem := beforeWrite(); problem != nil {
 			return CheckpointRef{}, problem
 		}
-		granted, problem := client.GrantKnownTransfers(ctx, ref, operation, []string{id}, "private script checkpoint upload")
+		granted, problem := client.GrantKnownTransfers(ctx, ref, operation, []string{id}, "local script checkpoint upload")
 		if problem != nil {
 			return CheckpointRef{}, problem
 		}
@@ -104,7 +104,7 @@ func UploadCheckpoint(ctx context.Context, client *hub.Client, operation string,
 	if problem := beforeWrite(); problem != nil {
 		return CheckpointRef{}, problem
 	}
-	checkpoint, problem := client.FinalizePublication(ctx, ref, operation, hub.FinalizePublicationRequest{ManifestID: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length}, "private script checkpoint upload")
+	checkpoint, problem := client.FinalizePublication(ctx, ref, operation, hub.FinalizePublicationRequest{ManifestID: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length}, "local script checkpoint upload")
 	if problem != nil {
 		return CheckpointRef{}, problem
 	}
