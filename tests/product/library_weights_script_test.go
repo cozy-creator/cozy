@@ -51,6 +51,16 @@ func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 		}
 	})
 	project := copyPrivateTensorProject(t, root, "")
+	// Catalog model preparation currently also reads construction config, even
+	// though this job never constructs a model. Include a real inline config so
+	// the actual Runtime preparation can validate the captured slot contract.
+	producerSource := filepath.Join(project, "source", "tensor_source.py")
+	sourceCode, err := os.ReadFile(producerSource)
+	must(t, err)
+	source := strings.Replace(string(sourceCode), "App, Context,", "App, Context, WeightsConfig,", 1)
+	source = strings.Replace(source, "configs={},", `configs={"model": WeightsConfig(data=b"{}")},`, 1)
+	source = strings.Replace(source, "        writer.add_part(", "        writer.add_config(\"model\", b\"{}\")\n        writer.add_part(", 1)
+	must(t, os.WriteFile(producerSource, []byte(source), 0600))
 	script := filepath.Join(project, "recipe.py")
 	body, err := os.ReadFile(script)
 	must(t, err)
