@@ -22,6 +22,7 @@ func TestNativeAndMixedOutputMediaReservation(t *testing.T) {
 		want    int64
 	}{
 		{"model", string(native), 0},
+		{"model", `[{"output_id":"model","mime_type":"application/vnd.cozy.model-manifest","max_bytes":9007199254740991}]`, 0},
 		{"image,model", string(native), 256},
 		{"image,video", `[]`, 512},
 	} {

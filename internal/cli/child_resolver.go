@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // ResolvePrivateChild resolves only the immutable interface binding captured by
@@ -231,7 +232,9 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 			}
 			// The same immutable closure predicate JobsInstall uses; no package
 			// code needs importing again merely to choose a machine class.
-			needed = needed || launch.AcceleratorRequired(strings.Split(child.Closure, "\n"))
+			if child.Package != "local/"+runtimeoperation.Name || surface.Application != runtimeoperation.Application {
+				needed = needed || launch.AcceleratorRequired(strings.Split(child.Closure, "\n"))
+			}
 			queue = append(queue, binding.ChildInstallID)
 		}
 	}

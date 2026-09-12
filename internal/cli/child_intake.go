@@ -32,6 +32,16 @@ type childIntake struct {
 
 func (i *childIntake) Finish(parentInstall string) *exit.Error {
 	bindings := append([]records.ChildBinding(nil), i.Bindings...)
+	builtin, created, problem := install.RuntimeOperations(context.Background(), i.layout, i.store)
+	if created != "" {
+		i.created = append(i.created, created)
+	}
+	if problem != nil {
+		return problem
+	}
+	if builtin != nil {
+		bindings = append(bindings, *builtin)
+	}
 	for n := range bindings {
 		bindings[n].ParentInstallID = parentInstall
 	}

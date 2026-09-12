@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // Facts is everything one package install needs to be served, gathered once.
@@ -24,6 +25,13 @@ type Facts struct {
 	Source           string
 	PackageInterface *PackageInterface
 	RuntimeCLI       RuntimeCLI
+}
+
+func (f *Facts) environmentPython() string {
+	if f.RuntimeCLI.EnvironmentPython != "" {
+		return f.RuntimeCLI.EnvironmentPython
+	}
+	return home.VenvPython(filepath.Join(f.Install.Dir, "venv"))
 }
 
 // Read gathers an install's facts: where its source is, the surface it proved at install,
@@ -40,13 +48,23 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 	if inst.SourceKind == "tensorhub" || inst.SourceKind == "wheel" {
 		packageInterface = PackageInterfacePath(inst.Dir)
 	}
+	environmentPython := home.VenvPython(filepath.Join(inst.Dir, "venv"))
+	if inst.Package == "local/"+runtimeoperation.Name {
+		if inst.SourceKind != "wheel" || d.Application != runtimeoperation.Application {
+			return nil, exit.New(exit.Conflict, "Runtime builtin install changed its fixed application")
+		}
+		environmentPython, e = runtimeoperation.ReadEnvironment(inst.Dir, inst.LockDigest, inst.PackageInterface, inst.SourceDigest)
+		if e != nil {
+			return nil, e
+		}
+	}
 	return &Facts{
 		Install:          inst,
 		Source:           source,
 		PackageInterface: d,
 		RuntimeCLI: RuntimeCLI{
 			Dir: source, PackageInterface: packageInterface, Home: cozyHome, Env: env,
-			EnvironmentPython: home.VenvPython(filepath.Join(inst.Dir, "venv")),
+			EnvironmentPython: environmentPython,
 		},
 	}, nil
 }
@@ -113,7 +131,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 		Devices:           devices,
 		GraceSec:          3,
 		ArtifactCache:     cache,
-		EnvironmentPython: home.VenvPython(filepath.Join(f.Install.Dir, "venv")),
+		EnvironmentPython: f.environmentPython(),
 		TensorFSRoot:      config.Frozen().TensorFSRoot,
 	}, nil
 }
