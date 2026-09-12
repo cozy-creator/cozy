@@ -16,6 +16,18 @@ func TestIdleRentalJobCanBecomeServing(t *testing.T) {
 	must(t, err)
 	var latestReady *pb.WorkerFrame
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
+	checkpoint := "sha256:" + strings.Repeat("b", 64)
+	pod.preparedPlacement = func(raw []byte, name, release string) *pb.Placement {
+		if name == "acme/tile" {
+			doc, err := canonical.Read(raw, &pb.DownloadDelegation{})
+			must(t, err)
+			models := doc.List("models")
+			if len(models) != 1 || models[0].Str("manifest") != checkpoint {
+				t.Error("serving preparation lost the requested checkpoint")
+			}
+		}
+		return podPlacement(raw, name, release, name)
+	}
 	pod.onJobReady = func(frame *pb.WorkerFrame, send func(*pb.WorkerFrame) error) error {
 		frame.GetObservedState().ConvergedRevision = 0
 		latestReady = proto.Clone(frame).(*pb.WorkerFrame)
@@ -58,6 +70,8 @@ func TestIdleRentalJobCanBecomeServing(t *testing.T) {
 	second, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "serving-after-job", Package: "acme/tile", Release: "1.0.0",
 		Entrypoint: "tile", PlanID: podPlanID("acme/tile"), Org: "paul", Payload: []byte(`{"size":16}`), Worker: podRental,
 		Rental: true, RentalRequired: true,
+		Models: []orchestrator.ModelRef{{Package: "acme/tile", Slot: "model", BindingPath: "tile.models.model",
+			Model: "proof/model", Release: "1.0.0", Lane: "native", Manifest: checkpoint, ManifestLength: 164, Bytes: 4096}},
 	})
 	fatal(t, problem)
 	waitUntil(t, "serving dispatch after completed job", func() bool {
@@ -100,5 +114,16 @@ func TestActiveRentalJobCannotBeReplacedByServing(t *testing.T) {
 	fatal(t, problem)
 	if len(rows) != 1 || rows[0].State == "closed" {
 		t.Fatal("active job disappeared")
+	}
+	instance := rows[0].InstanceID
+	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "acme/tile", Release: "1.0.0"}}, nil))
+	problem = o.c.EnsurePlacementReady(instance, "sha256:"+strings.Repeat("35", 32), "")
+	if problem == nil || !strings.Contains(problem.Message, "finishing its current job") {
+		t.Fatalf("direct convergence replaced an offered job: %v", problem)
+	}
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	if len(pod.desired) == 0 || pod.desired[len(pod.desired)-1].GetJob() == nil {
+		t.Fatal("serving desired state replaced the active job")
 	}
 }
