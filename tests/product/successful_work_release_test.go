@@ -129,3 +129,40 @@ func TestSuccessfulReleasePreservesHistoryIdentityAndRestartedIntent(t *testing.
 		t.Fatal("successful cleanup changed execution history")
 	}
 }
+
+func TestSuccessfulReleaseKeepsReturnedRootOwnership(t *testing.T) {
+	s := successReleaseStore(t)
+	root := offerChildParent(t, s, successReleaseRoot(t, s, "returned-root", true, true))
+	child, _, p := s.SubmitChild(records.Request{ID: "returned-child", IdemKey: "returned-child", BodyDigest: childDigest("c"), Package: "local/test", Entrypoint: "produce", Kind: "job", Payload: []byte(`{}`), ParentRequestID: root.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("d"), ChildTargetDigest: childDigest("e")}, 1, childDigest("1"), "private-boot", nil)
+	fatal(t, p)
+	closeChild(t, s, child, "SUCCEEDED", "succeeded")
+	closeChild(t, s, root, "SUCCEEDED", "succeeded")
+	current, p := s.RequestRow(root.ID)
+	fatal(t, p)
+	a, p := s.AttemptRow(root.ID, 1)
+	fatal(t, p)
+	started, p := s.BeginSuccessfulWorkRelease(*current, *a)
+	fatal(t, p)
+	if !started {
+		t.Fatal("new returned root was not armed for independent custody")
+	}
+	intent, p := s.SuccessfulWorkRelease(root.ID)
+	fatal(t, p)
+	if len(intent.Members) != 1 || intent.Members[0] != child.ID {
+		t.Fatalf("returned root entered implicit release set: %+v", intent.Members)
+	}
+	family, p := s.SuccessfulWorkFamily(root.ID)
+	fatal(t, p)
+	ready, p := s.ReadySuccessfulWorkRelease(root.ID, family)
+	fatal(t, p)
+	if !ready {
+		t.Fatal("independent returned custody bookkeeping did not settle")
+	}
+	kept, p := s.RequestRow(root.ID)
+	fatal(t, p)
+	released, p := s.RequestRow(child.ID)
+	fatal(t, p)
+	if !kept.RetainWork || kept.State != "succeeded" || released.RetainWork || released.State != "succeeded" {
+		t.Fatal("implicit release changed returned-root ownership or execution history")
+	}
+}
