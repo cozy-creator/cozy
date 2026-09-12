@@ -55,6 +55,12 @@ const (
 	RentalReleased         = "released"
 )
 
+// RentalAbsent reports states Tensorhub commits only after proving provider
+// absence. Degraded, draining, and unknown states may still be billing.
+func RentalAbsent(state string) bool {
+	return state == RentalFailed || state == RentalReleased
+}
+
 // Rental is one rented pod as the hub reports it. No plaintext media bearer or private
 // Creator key is part of this view.
 type Rental struct {
