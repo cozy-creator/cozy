@@ -30,13 +30,14 @@ import (
 )
 
 type State struct {
-	Addr    string // the local client API address the live owner published
-	Socket  string // the worker-protocol unix socket the live owner published
-	PID     int
-	Since   string
-	Up      bool
-	Path    string
-	Details string // why the probe answered as it did, for status output
+	Addr          string // the local client API address the live owner published
+	Socket        string // the worker-protocol unix socket the live owner published
+	PID           int
+	Since         string
+	Up            bool
+	Path          string
+	Details       string // why the probe answered as it did, for status output
+	OperatorOwned bool   // a complete record explicitly publishes no API address
 }
 
 // Probe answers from the lock, never from a file's existence.
@@ -61,8 +62,14 @@ func Probe(cfg config.Config) State {
 		return st
 	}
 	st.Up = true
+	// A held root's address comes only from its owner. In particular, an empty
+	// or partially written record must never direct a client to another root's
+	// daemon on the configured/default port.
+	st.Addr = ""
 	data, _ := os.ReadFile(st.Path)
-	for _, line := range strings.Split(string(data), "\n") {
+	addrPublished := false
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines[:len(lines)-1] {
 		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
 		if !ok {
 			continue
@@ -70,6 +77,7 @@ func Probe(cfg config.Config) State {
 		switch key {
 		case "addr":
 			st.Addr = value
+			addrPublished = true
 		case "socket":
 			st.Socket = value
 		case "pid":
@@ -78,6 +86,7 @@ func Probe(cfg config.Config) State {
 			st.Since = value
 		}
 	}
+	st.OperatorOwned = addrPublished && st.Addr == "" && st.PID > 0 && st.Since != ""
 	st.Details = "the daemon lock is held by pid " + strconv.Itoa(st.PID)
 	return st
 }
