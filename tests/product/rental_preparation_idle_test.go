@@ -110,9 +110,13 @@ func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 				Package: "proof/preparing", Entrypoint: "prepare", Payload: []byte("{}"),
 				Rental: true, RentalRequired: true, Worker: rentalID, RequestedRental: rentalID})
 			fatal(t, problem)
-			busy := listedRental(t, root, rentalID)
-			if busy.Queued == nil || *busy.Queued != 1 || busy.IdleSeconds != nil || busy.ReleaseDue != "" || peer.releases(rentalID) != 0 {
-				t.Fatalf("preparation did not hold the rental: %+v", busy)
+			// Observe the queued setup before starting the real daemon below.
+			// The listing command now starts it, allowing the intentional missing-
+			// bearer refusal to settle before an initial queued-state assertion.
+			queued, running, problem := store.RentalRunCounts(rentalID)
+			fatal(t, problem)
+			if queued != 1 || running != 0 || peer.releases(rentalID) != 0 {
+				t.Fatalf("preparation setup lost queued work: queued=%d running=%d", queued, running)
 			}
 			if outcome == "failed" {
 				// The real daemon rejects preparation: this recorded peer has no
