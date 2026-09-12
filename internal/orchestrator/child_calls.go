@@ -19,8 +19,8 @@ import (
 
 const childCallMaxBytes = 48 * 1024
 
-type privateChildResolver interface {
-	ResolvePrivateChild(records.Request, string, string, string, []byte) (Submission, string, *exit.Error)
+type unpublishedChildResolver interface {
+	ResolveUnpublishedChild(records.Request, string, string, string, []byte) (Submission, string, *exit.Error)
 }
 
 func (c *Orchestrator) childParent(s *session, id string, ordinal uint64, digest []byte) (*records.Request, *exit.Error) {
@@ -37,7 +37,7 @@ func (c *Orchestrator) childParent(s *session, id string, ordinal uint64, digest
 		return nil, exit.Named(exit.Conflict, "child.parent_fenced", "child call does not belong to this worker's current parent attempt")
 	}
 	if !parent.IsJob() || !parent.RetainWork || parent.InstallID == "" {
-		return nil, exit.Named(exit.Conflict, "child.parent_not_private", "child calls require a captured private job")
+		return nil, exit.Named(exit.Conflict, "child.parent_not_private", "child calls require a captured unpublished package job")
 	}
 	return parent, nil
 }
@@ -113,12 +113,23 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		c.watchChildCall(s, proto.Clone(call).(*pb.ChildCallRequest), existing.ID)
 		return
 	}
-	resolver, ok := c.opt.Packages.(privateChildResolver)
+	// A frozen callable is permission to resolve it, not spare execution capacity.
+	// Rented children currently run on their parent's worker. Refuse an actual
+	// nested call before queueing if that parent occupies its ordinary job slot;
+	// otherwise both requests can wait forever for that same slot. Native services
+	// above have their own admission and do not take the ordinary job slot.
+	if parent.Worker != "" {
+		if _, problem := c.retainedOrchestrationParent(records.Request{ParentRequestID: parent.ID, Worker: parent.Worker}); problem != nil {
+			refuse(problem)
+			return
+		}
+	}
+	resolver, ok := c.opt.Packages.(unpublishedChildResolver)
 	if !ok {
 		refuse(exit.Unavailablef("this package owner cannot resolve frozen child interfaces"))
 		return
 	}
-	spec, target, problem := resolver.ResolvePrivateChild(*parent, iface, call.Module, call.Export, payload)
+	spec, target, problem := resolver.ResolveUnpublishedChild(*parent, iface, call.Module, call.Export, payload)
 	if problem != nil {
 		refuse(problem)
 		return

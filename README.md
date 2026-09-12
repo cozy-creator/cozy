@@ -249,7 +249,7 @@ does not prohibit local execution; actual encoding support, model compatibility
 and memory capacity are still checked by Runtime. An explicit model/lane override
 takes precedence. Rental placement retains its existing capacity rules.
 
-Private scripts define ordinary `main()` or `main(ctx)`, synchronous or asynchronous.
+Local scripts define ordinary `main()` or `main(ctx)`, synchronous or asynchronous.
 They need no App, request/result class, published package, or separate install command.
 Dependencies may be declared with PEP 723 inline metadata:
 
@@ -290,7 +290,18 @@ Code and unpublished wheels go directly to the authenticated private worker, wit
 Tensorhub package publication or intermediate upload. Published dependencies can still come
 from their package repositories. Ordinary Python edits do not rebuild the worker image.
 
-Failed private jobs keep their resumable work and rental. `cozy run pause <id>` stops execution
+An **unpublished package** runs from captured source without a Tensorhub package release.
+A **local script** is its single-file form; **editable** describes a dependency's installation
+mode. These terms say where code comes from, not whether its model inputs must be downloaded
+or whether it is allowed to perform managed child calls.
+
+The existing worker protocol still uses `PreparePrivatePlacement` and related `Private*`
+messages. Persisted `private-revision` markers, historical SQLite column names, and stable
+`private_*` error codes also keep their serialized spellings so existing captures and workers
+remain readable. They are compatibility identifiers, not another package mode. Private rentals
+and access controls retain their security meaning.
+
+Failed unpublished package jobs keep their resumable work and rental. `cozy run pause <id>` stops execution
 while retaining that state; `cozy run resume <id>` runs the exact captured revision again.
 Changed code or parameters are captured by a new run, optionally linked with `--retry`.
 `cozy run cancel <id>` abandons the retained

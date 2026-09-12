@@ -80,7 +80,8 @@ type Server struct {
 
 	// rentals resolves only the non-secret, attempt-bound desired placement. The
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
-	rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
+	rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
+	rentalInventory func(bool) (RentalInventory, *exit.Error)
 
 	// shutdown asks the process that owns this server to drain and stop — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
@@ -130,7 +131,8 @@ type Options struct {
 	Packages     Resolver
 	// Rentals validates one attached generic worker id; desired package/model state is
 	// sent separately over WorkerControl.
-	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
+	Rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
+	RentalInventory func(bool) (RentalInventory, *exit.Error)
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
 }
@@ -144,7 +146,7 @@ func New(opt Options) *Server {
 		orchestrator: opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
-		rentals: opt.Rentals, shutdown: opt.Shutdown,
+		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, shutdown: opt.Shutdown,
 	}
 }
 
@@ -193,6 +195,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"GET /v1/media/{media_id}":                    s.media,
 		"GET /v1/local/attempts/{attempt_key}/triage": s.attemptTriage,
 		"POST /v1/local/rentals/{rental_id}/claim":    s.claimRental,
+		"GET /v1/local/rentals":                       s.listRentals,
 		"DELETE /v1/local/rentals/{rental_id}/claim":  s.detachRental,
 		"POST /v1/local/rentals/{rental_id}/prune":    s.pruneRental,
 		"POST /v1/local/cache/prune":                  s.pruneCache,

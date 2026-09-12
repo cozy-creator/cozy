@@ -773,7 +773,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.replayLocalAborts(s, w.spec.Connection.RentalID)
 		c.mu.Lock()
 		private := cloneLocalPackageSet(w.desiredLocal)
-		privatePlacement := clonePrivatePlacementSet(w.desiredPrivatePlacement)
+		privatePlacement := cloneUnpublishedPlacementSet(w.desiredUnpublishedPlacement)
 		packages := clonePackageRefs(w.desiredPackages)
 		models := cloneModelRefs(w.desiredModels)
 		c.mu.Unlock()
@@ -785,7 +785,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 			return true
 		}
 		if privatePlacement != nil {
-			if e := c.issuePrivatePlacementSet(s, w, privatePlacement); e != nil {
+			if e := c.issueUnpublishedPlacementSet(s, w, privatePlacement); e != nil {
 				c.logf("rental %s private_placement_set could not be issued: %s",
 					w.spec.Connection.RentalID, e.Message)
 			}

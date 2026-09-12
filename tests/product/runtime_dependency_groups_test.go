@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,7 +9,40 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
+
+func TestPrivateImageDependenciesRemainInTheInstalledGraph(t *testing.T) {
+	project := t.TempDir()
+	metadata := `[project]
+name = "image-closure-proof"
+version = "0.0.1"
+requires-python = ">=3.12,<3.13"
+dependencies = ["msgspec==0.21.1"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+[tool.hatch.build.targets.wheel]
+only-include = ["image_closure_proof.py"]
+`
+	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0600))
+	must(t, os.WriteFile(filepath.Join(project, "image_closure_proof.py"), []byte("VALUE = 7\n"), 0600))
+	command := exec.Command("uv", "lock", "--project", project)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("lock image dependency fixture: %v\n%s", err, output)
+	}
+	venv := filepath.Join(t.TempDir(), "venv")
+	environment, problem := install.MaterializeEnvironment(project, venv)
+	fatal(t, problem)
+	python, problem := install.BasePython(venv)
+	fatal(t, problem)
+	graph, problem := packagepublish.WheelClosures(context.Background(), project, python,
+		environment.Closure, "image-closure-proof", environment.Extra)
+	fatal(t, problem)
+	if graph["msgspec"]["msgspec"] != "0.21.1" || !strings.Contains(environment.Closure, "msgspec==0.21.1") {
+		t.Fatalf("exact installed image dependency was lost: closure=%s graph=%v", environment.Closure, graph)
+	}
+}
 
 func TestRuntimeCaptureExcludesDefaultDevelopmentGroups(t *testing.T) {
 	project := t.TempDir()

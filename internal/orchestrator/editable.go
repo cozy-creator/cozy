@@ -82,7 +82,7 @@ func (c *Orchestrator) PrepareRentalRevision(rentalID, operationID string,
 				"private_placement_model_unpublished",
 				"private serving requires exact published model releases")
 		}
-		if problem := c.ConvergePrivatePlacement(instance, operationID, revision.Digest,
+		if problem := c.ConvergeUnpublishedPlacement(instance, operationID, revision.Digest,
 			models); problem != nil {
 			return DesiredPlacement{}, problem
 		}

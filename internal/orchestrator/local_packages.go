@@ -42,7 +42,7 @@ type localTransferFile struct {
 	length  uint64
 }
 
-// Bounds match the host ledger. Private wheel bytes travel only over PodHost.
+// Bounds match the host ledger. Captured wheel bytes travel only over PodHost.
 const (
 	maxLocalWheelBytes    = int64(512 << 20)
 	maxLocalWheelSetBytes = int64(1 << 30)
@@ -267,7 +267,7 @@ func localSelection(operationID string, revision localpackage.Revision) (
 	return selected, transfer, nil
 }
 
-// transferLocalPackage sends private source wheels directly to the claimed host.
+// transferLocalPackage sends captured source wheels directly to the claimed host.
 // The host owns durable offsets; reconnect resumes verified prefixes without a
 // package repository, publication or intermediate object-storage grant.
 func (c *Orchestrator) transferLocalPackage(instanceID, operationID string,
@@ -301,13 +301,13 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 ) *exit.Error {
 	if current.host == nil {
 		return exit.Named(exit.Unavailable, "local_package_direct_transfer_unavailable",
-			"worker has no authenticated private package upload service")
+			"worker has no authenticated unpublished package upload service")
 	}
 	ctx, cancel := context.WithCancel(current.ctx)
 	defer cancel()
 	stream, err := current.host.LocalPackageUpload(ctx)
 	if err != nil {
-		return exit.Named(exit.Unavailable, "local_package_upload_unavailable", "private package upload could not connect: %s", err)
+		return exit.Named(exit.Unavailable, "local_package_upload_unavailable", "unpublished package upload could not connect: %s", err)
 	}
 	defer stream.CloseSend()
 	if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Header{
@@ -315,11 +315,11 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 			SourceDigest: transfer.source, File: &pb.LocalPackageFileRef{Digest: selected.digest,
 				Filename: selected.filename, Length: selected.length}},
 	}}); err != nil {
-		return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "private upload header was not accepted: %s", err)
+		return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "unpublished package upload header was not accepted: %s", err)
 	}
 	file, err := os.Open(selected.path)
 	if err != nil {
-		return exit.Named(exit.Structural, "local_package_wheel_unreadable", "cannot read private wheel: %s", err)
+		return exit.Named(exit.Structural, "local_package_wheel_unreadable", "cannot read captured wheel: %s", err)
 	}
 	defer file.Close()
 	buffer := make([]byte, 1<<20)
@@ -328,30 +328,30 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 	for {
 		status, err := stream.Recv()
 		if err != nil {
-			return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "private upload interrupted; the worker retains its verified prefix: %s", err)
+			return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "unpublished package upload interrupted; the worker retains its verified prefix: %s", err)
 		}
 		if status.OperationId != operationID || !bytes.Equal(status.SourceDigest, transfer.source) ||
 			!bytes.Equal(status.Digest, selected.digest) || status.Filename != selected.filename ||
 			status.Length != selected.length || status.ReceivedBytes > selected.length ||
 			(!first && status.ReceivedBytes != sent) {
-			return exit.Named(exit.Conflict, "local_package_upload_identity_changed", "worker returned another private file or unexpected upload offset")
+			return exit.Named(exit.Conflict, "local_package_upload_identity_changed", "worker returned another captured file or unexpected upload offset")
 		}
 		c.onLocalPackageFileStatus(current, status)
 		if status.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_REFUSED {
-			return exit.Named(exit.Failed, status.SafeCode, "worker refused private wheel %s: %s", selected.filename, status.SafeDetail)
+			return exit.Named(exit.Failed, status.SafeCode, "worker refused captured wheel %s: %s", selected.filename, status.SafeDetail)
 		}
 		if status.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
 			if status.ReceivedBytes != selected.length {
-				return exit.Named(exit.Conflict, "local_package_upload_incomplete", "worker verified an incomplete private wheel")
+				return exit.Named(exit.Conflict, "local_package_upload_incomplete", "worker verified an incomplete captured wheel")
 			}
 			return nil
 		}
 		if status.State != pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_RECEIVING || status.SafeCode != "" {
-			return exit.Named(exit.Unavailable, "local_package_upload_stopped", "worker stopped private wheel upload: %s", status.SafeDetail)
+			return exit.Named(exit.Unavailable, "local_package_upload_stopped", "worker stopped captured wheel upload: %s", status.SafeDetail)
 		}
 		if first {
 			if _, err := file.Seek(int64(status.ReceivedBytes), io.SeekStart); err != nil {
-				return exit.Internalf("cannot resume private wheel: %s", err)
+				return exit.Internalf("cannot resume captured wheel: %s", err)
 			}
 			sent, first = status.ReceivedBytes, false
 		}
@@ -359,11 +359,11 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 		canceled := transfer.canceled
 		c.mu.Unlock()
 		if canceled {
-			return exit.New(exit.Canceled, "private package upload was canceled")
+			return exit.New(exit.Canceled, "unpublished package upload was cancelled")
 		}
 		remaining := selected.length - sent
 		if remaining == 0 {
-			return exit.Named(exit.Conflict, "local_package_upload_unverified", "worker has all bytes but did not verify the private wheel")
+			return exit.Named(exit.Conflict, "local_package_upload_unverified", "worker has all bytes but did not verify the captured wheel")
 		}
 		chunk := buffer
 		if remaining < uint64(len(chunk)) {
@@ -371,12 +371,12 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 		}
 		n, err := io.ReadFull(file, chunk)
 		if err != nil {
-			return exit.Named(exit.Conflict, "local_package_wheel_changed", "private wheel changed during upload: %s", err)
+			return exit.Named(exit.Conflict, "local_package_wheel_changed", "captured wheel changed during upload: %s", err)
 		}
 		if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Chunk{
 			Chunk: &pb.LocalPackageUploadChunk{Offset: sent, Data: chunk[:n]},
 		}}); err != nil {
-			return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "private upload interrupted; retained bytes can be resumed: %s", err)
+			return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "unpublished package upload interrupted; retained bytes can be resumed: %s", err)
 		}
 		sent += uint64(n)
 	}
@@ -657,8 +657,8 @@ func (c *Orchestrator) localIssued(w *worker, s *session, revision string) bool 
 	if w.desiredLocal != nil && bytes.Equal(w.desiredLocal.Package.GetLocalRevisionDigest(), raw) {
 		return true
 	}
-	return w.desiredPrivatePlacement != nil &&
-		bytes.Equal(w.desiredPrivatePlacement.LocalRevisionDigest, raw)
+	return w.desiredUnpublishedPlacement != nil &&
+		bytes.Equal(w.desiredUnpublishedPlacement.LocalRevisionDigest, raw)
 }
 
 // localOperation names the operation the pod prepared revision under, when this owner
@@ -669,8 +669,8 @@ func (c *Orchestrator) localOperation(w *worker, revision []byte, fallback strin
 	if w.desiredLocal != nil && bytes.Equal(w.desiredLocal.Package.GetLocalRevisionDigest(), revision) {
 		return w.desiredLocal.OperationId
 	}
-	if w.desiredPrivatePlacement != nil && bytes.Equal(w.desiredPrivatePlacement.LocalRevisionDigest, revision) {
-		return w.desiredPrivatePlacement.OperationId
+	if w.desiredUnpublishedPlacement != nil && bytes.Equal(w.desiredUnpublishedPlacement.LocalRevisionDigest, revision) {
+		return w.desiredUnpublishedPlacement.OperationId
 	}
 	return fallback
 }
@@ -690,7 +690,7 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 	}
 	c.mu.Lock()
 	w.desiredLocal = cloneLocalPackageSet(selected)
-	w.desiredPrivatePlacement = nil
+	w.desiredUnpublishedPlacement = nil
 	w.desiredPackages, w.desiredModels, w.desiredDownloadSets = nil, nil, nil
 	w.desiredEpoch = s.epoch
 	_, held := w.observedRemote[revision]
@@ -709,15 +709,15 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 		})
 }
 
-// ConvergePrivatePlacement binds exact downloaded models to code already admitted under one
+// ConvergeUnpublishedPlacement binds exact downloaded models to code already admitted under one
 // local revision. Creator names logical refs only; Runtime authors the joined PlacementSet.
-func (c *Orchestrator) ConvergePrivatePlacement(instanceID, operationID,
+func (c *Orchestrator) ConvergeUnpublishedPlacement(instanceID, operationID,
 	localRevisionDigest string, models []*pb.DownloadModelRef,
 ) *exit.Error {
-	return c.convergePrivateModels(instanceID, operationID, localRevisionDigest, models, nil)
+	return c.convergeUnpublishedModels(instanceID, operationID, localRevisionDigest, models, nil)
 }
 
-func (c *Orchestrator) convergePrivateModels(instanceID, operationID, localRevisionDigest string, models []*pb.DownloadModelRef, native []*pb.NativeModelBinding) *exit.Error {
+func (c *Orchestrator) convergeUnpublishedModels(instanceID, operationID, localRevisionDigest string, models []*pb.DownloadModelRef, native []*pb.NativeModelBinding) *exit.Error {
 	if operationID == "" || !validDigest(localRevisionDigest) || len(models)+len(native) == 0 || (len(models) > 0 && len(native) > 0) {
 		return exit.Named(exit.Validation, "private_placement_incomplete",
 			"local package placement requires operation, exact revision, and models")
@@ -740,8 +740,8 @@ func (c *Orchestrator) convergePrivateModels(instanceID, operationID, localRevis
 		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
 	}
 	// The models bind OVER the local revision, so the pod must hold that revision first:
-	// `ConvergeLocalPackage` only ISSUES the prepare, and a private placement sent on its
-	// heels is refused `private_placement_invalid: private placement revision is not
+	// `ConvergeLocalPackage` only ISSUES the prepare, and an unpublished package placement sent on its
+	// heels is refused `private_placement_invalid: unpublished package placement revision is not
 	// prepared` (found live, L4 `shiranui`, cl-101). Wait on the pod's own report of it.
 	if problem := c.awaitLocalRevision(instanceID, localRevisionDigest); problem != nil {
 		return problem
@@ -762,21 +762,21 @@ func (c *Orchestrator) convergePrivateModels(instanceID, operationID, localRevis
 	operationID = c.localOperation(w, revision, operationID)
 	selected := &pb.DesiredPrivatePlacementSet{OperationId: operationID,
 		LocalRevisionDigest: revision, DownloadDelegation: downloadSet, NativeModels: native}
-	return c.issuePrivatePlacementSet(s, w, selected)
+	return c.issueUnpublishedPlacementSet(s, w, selected)
 }
 
-func (c *Orchestrator) issuePrivatePlacementSet(s *session, w *worker,
+func (c *Orchestrator) issueUnpublishedPlacementSet(s *session, w *worker,
 	selected *pb.DesiredPrivatePlacementSet,
 ) *exit.Error {
 	if selected == nil {
-		return exit.Internalf("cannot issue an empty private placement set")
+		return exit.Internalf("cannot issue an empty unpublished package placement set")
 	}
 	c.mu.Lock()
 	w.desiredLocal, w.desiredPackages, w.desiredModels, w.desiredDownloadSets = nil, nil, nil, nil
-	w.desiredPrivatePlacement = clonePrivatePlacementSet(selected)
+	w.desiredUnpublishedPlacement = cloneUnpublishedPlacementSet(selected)
 	w.desiredEpoch = s.epoch
 	c.mu.Unlock()
-	call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: clonePrivatePlacementSet(selected)}
+	call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: cloneUnpublishedPlacementSet(selected)}
 	return c.issueThroughHost(s, w, hostLabel("private_placement_set", selected.OperationId),
 		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 			return s.host.PreparePrivatePlacement(ctx, call)
@@ -802,7 +802,7 @@ func cloneLocalPackageSet(in *pb.DesiredLocalPackageSet) *pb.DesiredLocalPackage
 	return out
 }
 
-func clonePrivatePlacementSet(in *pb.DesiredPrivatePlacementSet) *pb.DesiredPrivatePlacementSet {
+func cloneUnpublishedPlacementSet(in *pb.DesiredPrivatePlacementSet) *pb.DesiredPrivatePlacementSet {
 	if in == nil {
 		return nil
 	}
@@ -816,17 +816,17 @@ func requireLocalPackageCapacity(s *session, files int) *exit.Error {
 		return nil
 	}
 	if s == nil || s.host == nil {
-		return exit.Unavailablef("private package capacity awaits the claimed Host")
+		return exit.Unavailablef("unpublished package capacity awaits the claimed Host")
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()
 	info, err := s.host.ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
 	if err != nil {
-		return exit.Unavailablef("private package capacity probe is unavailable")
+		return exit.Unavailablef("unpublished package capacity probe is unavailable")
 	}
 	if info == nil || info.WireMinor < pb.ExpandedLocalPackageFilesWireMinor {
 		return exit.Named(exit.Conflict, "local_package_worker_capacity_unsupported",
-			"private revision has %d wheels; this worker supports at most %d", files, pb.LegacyMaxLocalPackageFiles).
+			"unpublished package revision has %d wheels; this worker supports at most %d", files, pb.LegacyMaxLocalPackageFiles).
 			WithRemedy("select a worker with protocol minor %d or newer", pb.ExpandedLocalPackageFilesWireMinor)
 	}
 	return nil

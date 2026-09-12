@@ -14,7 +14,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// WithChildInterfaces prepares a private copy whose invocable dependencies are
+// WithChildInterfaces prepares an owned copy whose invocable dependencies are
 // exact lightweight interface wheels. The author's project and lock never change.
 // Unrelated local libraries retain their original declarations and are captured
 // by the ordinary snapshotter after this interface-only lock adjustment.
@@ -22,12 +22,12 @@ func WithChildInterfaces(ctx context.Context, parent *Package, replacements map[
 	if len(replacements) == 0 {
 		return parent, nil
 	}
-	return preparePrivateCopy(ctx, parent, replacements)
+	return prepareUnpublishedCopy(ctx, parent, replacements)
 }
 
-// Both ordinary private dependency resolution and interface substitution use
+// Both ordinary captured dependency resolution and interface substitution use
 // the same bounded source capture, path rebasing and uv resolver.
-func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[string]string, extras ...string) (*Package, *exit.Error) {
+func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements map[string]string, extras ...string) (*Package, *exit.Error) {
 	extras, problem := normalizedExtras(extras)
 	if problem != nil {
 		return nil, problem
@@ -42,7 +42,7 @@ func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[s
 	}
 	root, err := os.MkdirTemp("", "cozy-child-interfaces-")
 	if err != nil {
-		return nil, exit.Internalf("cannot stage private interfaces: %s", err)
+		return nil, exit.Internalf("cannot stage captured interfaces: %s", err)
 	}
 	fail := func(problem *exit.Error) (*Package, *exit.Error) { _ = os.RemoveAll(root); return nil, problem }
 	captured := &Package{Tree: parent.Tree, Files: map[string]string{}}
@@ -143,10 +143,10 @@ func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[s
 	delete(uv, "workspace") // all selected local members now have exact explicit paths
 	raw, err = toml.Marshal(document)
 	if err != nil {
-		return fail(exit.Internalf("cannot encode private interface metadata: %s", err))
+		return fail(exit.Internalf("cannot encode captured interface metadata: %s", err))
 	}
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return fail(exit.Internalf("cannot retain private interface metadata: %s", err))
+		return fail(exit.Internalf("cannot retain captured interface metadata: %s", err))
 	}
 	command := exec.CommandContext(ctx, "uv", "lock", "--no-progress")
 	command.Dir = root
@@ -167,7 +167,7 @@ func preparePrivateCopy(ctx context.Context, parent *Package, replacements map[s
 	}
 	after, _, _, problem := (&Package{Tree: tree, Files: files}).SourceIdentity(extras...)
 	if problem != nil || after != before {
-		return fail(exit.New(exit.Conflict, "private source or dependency changed while resolving dependencies"))
+		return fail(exit.New(exit.Conflict, "captured source or dependency changed while resolving dependencies"))
 	}
 	prepared, problem := PrepareLocalFrom(root)
 	if problem != nil {

@@ -22,7 +22,7 @@ type scriptMetadata struct {
 	Tool           map[string]any `toml:"tool"`
 }
 
-// PrepareScript adapts a bounded single file into an ordinary private Python
+// PrepareScript adapts a bounded single file into an ordinary unpublished Python
 // project. Only uv resolves dependencies; Runtime later discovers the explicit App.
 func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 	info, err := os.Lstat(path)

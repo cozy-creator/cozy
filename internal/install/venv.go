@@ -19,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
 // EnvironmentReceipt is the environment record: exactly what produced this install's venv.
@@ -90,7 +89,6 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 
 	env.Python = pythonVersion(venvDir)
 	env.Packages, env.Closure = closure(venvDir)
-	env.Closure = portableClosure(env.Closure)
 	if env.Python == "" || env.Packages == 0 {
 		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
 	}
@@ -167,7 +165,6 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	}
 	env.Python = pythonVersion(venvDir)
 	env.Packages, env.Closure = closure(venvDir)
-	env.Closure = portableClosure(env.Closure)
 	if env.Python == "" || env.Packages == 0 {
 		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
 	}
@@ -249,20 +246,6 @@ var requirementNormalize = regexp.MustCompile(`[-_.]+`)
 func normalizedRequirementName(row string) string {
 	name := requirementName.FindString(strings.TrimSpace(row))
 	return requirementNormalize.ReplaceAllString(strings.ToLower(name), "-")
-}
-
-// portableClosure records only package-owned distributions. Worker-image-owned
-// distributions remain installed locally for pip check, but their publisher-side
-// versions must never become a rental requirement.
-func portableClosure(installed string) string {
-	rows := make([]string, 0)
-	for _, row := range strings.Split(strings.TrimSpace(installed), "\n") {
-		name, _, _ := strings.Cut(row, "==")
-		if !packagepublish.ImageOwnedDistribution(normalizedRequirementName(name)) {
-			rows = append(rows, row)
-		}
-	}
-	return strings.Join(rows, "\n")
 }
 
 func runUV(dir string, env []string, code, message string, args ...string) *exit.Error {

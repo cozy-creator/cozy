@@ -1,6 +1,11 @@
 package install
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"io"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +15,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -38,23 +44,23 @@ func venvMetadata(venv string) map[string]string {
 func BasePython(venv string) (string, *exit.Error) {
 	metadata := venvMetadata(venv)
 	if metadata == nil {
-		return "", exit.New(exit.Structural, "private environment has no regular pyvenv.cfg")
+		return "", exit.New(exit.Structural, "captured environment has no regular pyvenv.cfg")
 	}
 	prefix, err := filepath.Abs(venv)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment path is invalid")
+		return "", exit.New(exit.Structural, "captured environment path is invalid")
 	}
 	prefix, err = filepath.EvalSymlinks(prefix)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment path is unavailable")
+		return "", exit.New(exit.Structural, "captured environment path is unavailable")
 	}
 	base, err := filepath.EvalSymlinks(home.VenvPython(venv))
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment base interpreter is unavailable")
+		return "", exit.New(exit.Structural, "captured environment base interpreter is unavailable")
 	}
 	base, err = filepath.Abs(base)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment base interpreter path is invalid")
+		return "", exit.New(exit.Structural, "captured environment base interpreter path is invalid")
 	}
 	inside := func(path string) bool {
 		rel, err := filepath.Rel(prefix, path)
@@ -65,7 +71,7 @@ func BasePython(venv string) (string, *exit.Error) {
 	}
 	info, err := os.Stat(base)
 	if err != nil || !info.Mode().IsRegular() || inside(base) {
-		return "", exit.New(exit.Structural, "private environment does not name an external base interpreter")
+		return "", exit.New(exit.Structural, "captured environment does not name an external base interpreter")
 	}
 	return base, nil
 }
@@ -92,8 +98,27 @@ func pythonVersion(venv string) string {
 
 // closure observes installed metadata directly. `uv pip list` can execute .pth
 // startup hooks to discover additional import paths; those paths are not part of
-// the exact installed-wheel roster and cannot enter private dependency capture.
+// the exact installed-wheel roster and cannot enter captured dependency capture.
 func closure(venv string) (int, string) {
+	distributions, ok := installedDistributions(venv)
+	if !ok {
+		return 0, ""
+	}
+	lines := make([]string, 0, len(distributions))
+	for name, distribution := range distributions {
+		lines = append(lines, name+"=="+distribution.version)
+	}
+	sort.Strings(lines)
+	return len(lines), strings.Join(lines, "\n")
+}
+
+type installedDistribution struct {
+	version  string
+	headers  textproto.MIMEHeader
+	metadata []byte
+}
+
+func installedDistributions(venv string) (map[string]installedDistribution, bool) {
 	metadata := venvMetadata(venv)
 	version := metadata["version_info"]
 	if version == "" {
@@ -101,26 +126,26 @@ func closure(venv string) (int, string) {
 	}
 	parts := strings.Split(version, ".")
 	if len(parts) < 2 {
-		return 0, ""
+		return nil, false
 	}
 	if _, err := strconv.Atoi(parts[0]); err != nil {
-		return 0, ""
+		return nil, false
 	}
 	if _, err := strconv.Atoi(parts[1]); err != nil {
-		return 0, ""
+		return nil, false
 	}
 	if parts[0] == "" || parts[1] == "" {
-		return 0, ""
+		return nil, false
 	}
 	roots := []string{filepath.Join(venv, "lib", "python"+parts[0]+"."+parts[1], "site-packages")}
 	if runtime.GOOS == "windows" {
 		roots = []string{filepath.Join(venv, "Lib", "site-packages")}
 	}
-	seen := map[string]string{}
+	seen := map[string]installedDistribution{}
 	for _, root := range roots {
 		entries, err := os.ReadDir(root)
 		if err != nil {
-			return 0, ""
+			return nil, false
 		}
 		for _, entry := range entries {
 			if !entry.IsDir() || !strings.HasSuffix(entry.Name(), ".dist-info") {
@@ -129,24 +154,53 @@ func closure(venv string) (int, string) {
 			path := filepath.Join(root, entry.Name(), "METADATA")
 			info, err := os.Lstat(path)
 			if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
-				return 0, ""
+				return nil, false
 			}
 			raw, err := os.ReadFile(path)
 			if err != nil {
-				return 0, ""
+				return nil, false
 			}
 			name, version, problem := wheel.MetadataIdentity(raw)
 			name = normalizedRequirementName(name)
-			if problem != nil || seen[name] != "" || len(seen) >= 4096 {
-				return 0, ""
+			if problem != nil || seen[name].version != "" || len(seen) >= 4096 {
+				return nil, false
 			}
-			seen[name] = version
+			headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw))).ReadMIMEHeader()
+			if err != nil && err != io.EOF {
+				return nil, false
+			}
+			seen[name] = installedDistribution{version: version, headers: headers, metadata: raw}
 		}
 	}
-	lines := make([]string, 0, len(seen))
-	for name, version := range seen {
-		lines = append(lines, name+"=="+version)
+	return seen, true
+}
+
+// ExecutionRequirements reads the selected package graph, stopping at image-owned
+// distributions. Local installed versions remain separate capture facts.
+func ExecutionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, *exit.Error) {
+	selected, _, problem := executionRequirements(ctx, venv, project, extras)
+	return selected, problem
+}
+
+func executionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, string, *exit.Error) {
+	distributions, ok := installedDistributions(venv)
+	root, found := distributions[normalizedRequirementName(project)]
+	if !ok || !found {
+		return packagepublish.RequirementSelection{}, "", exit.New(exit.Structural, "captured package requirements are unavailable")
 	}
-	sort.Strings(lines)
-	return len(lines), strings.Join(lines, "\n")
+	metadata := map[string]string{}
+	for name, distribution := range distributions {
+		if !packagepublish.ImageOwnedDistribution(name) {
+			metadata[name] = string(distribution.metadata)
+		}
+	}
+	selected, problem := packagepublish.ActiveRequirements(ctx, project, extras, metadata, pythonVersion(venv))
+	return selected, root.headers.Get("Requires-Python"), problem
+}
+
+// ImageRequirements preserves the authored Python bound and selected extras while
+// using the same requirement graph as unpublished wheel sealing.
+func ImageRequirements(venv, project string, extras ...string) ([]string, string, *exit.Error) {
+	selected, python, problem := executionRequirements(context.Background(), venv, project, extras)
+	return selected.ImageRequirements(), python, problem
 }

@@ -301,9 +301,18 @@ through one envelope, including an unknown route.
 Cozy-only control routes use `/v1/local/`. Uploads and embedded web assets use their product
 URLs but remain local-scope rows in the same guarded route table.
 
+Client API compatibility is independent of the daemon's SQLite schema. Updating
+the CLI never authorizes stopping a live owner. `cozy rental list` reads the
+daemon's inventory, including its idle-release policy; additive fields are ignored
+by older clients. A daemon returning `unknown_route` for this new inventory route
+can use the CLI's prior local reader only when the database is exactly compatible.
+Otherwise the command returns a schema requirement while the owner keeps running.
+Only a daemon holding the root lock may migrate an older database.
+
 | route | scope | auth | notes |
 |---|---|---|---|
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | one attempt's kept triage bundle from its own row; 404 when none was kept |
+| `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, and activity; `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
@@ -379,7 +388,7 @@ spends a durable budget that the settlement names when it is exhausted.
 
 ### Private transactions and child calls
 
-`retain_work:true` makes an ordinary private job retain its exact inputs, implementation
+`retain_work:true` makes an ordinary unpublished package job retain its exact inputs, implementation
 and native intermediate work across failed or paused attempts. `pause` durably fences
 admission and reaches `paused` only after its writers and child writers stop. `resume`
 continues the same captured request. A deterministic `blocked` failure requires a

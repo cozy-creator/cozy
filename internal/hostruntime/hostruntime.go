@@ -23,7 +23,8 @@ import (
 // Floor is the Runtime release that carries this Creator's current wire contract.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-const Floor = "0.16.5"
+// Python patch observations must be read by the backward-aware 0.16.7 parser.
+const Floor = "0.16.7"
 
 var floor = pep440.MustParse(Floor)
 
@@ -122,7 +123,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
-			"cozy-runtime %s is release %s; this Cozy needs %s or newer to validate exact private dependency closures",
+			"cozy-runtime %s is release %s; this Cozy needs %s or newer to validate exact captured dependency closures",
 			path, answer.Distribution, Floor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}

@@ -480,7 +480,7 @@ type Request struct {
 	// re-derive the same class without a client saying so again (cr-009: a job is an
 	// attempt class on the one machinery, not a second runtime).
 	Kind string
-	// RetainWork preserves a private job's artifacts and capacity until the owner
+	// RetainWork preserves a unpublished package job's artifacts and capacity until the owner
 	// resumes or permanently cancels it, including after an attempt fails.
 	RetainWork bool
 	// RetryOf names immutable predecessor history; ReuseScope identifies the

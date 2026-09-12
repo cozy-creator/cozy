@@ -48,7 +48,7 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 		return Open(layout, install, string(raw))
 	}
 	if install.Platform != "linux/amd64" || !strings.HasPrefix(install.Python, "3.12.") {
-		return Revision{}, exit.Named(exit.Validation, "private_dependency_platform_unsupported", "private worker revisions require a captured Linux amd64 Python 3.12 environment")
+		return Revision{}, exit.Named(exit.Validation, "private_dependency_platform_unsupported", "unpublished worker revisions require a captured Linux amd64 Python 3.12 environment")
 	}
 	if install.SourceKind != "local" || install.SourceRef == "" || install.SourceDigest == "" ||
 		!strings.HasPrefix(install.Package, "local/") {
@@ -77,7 +77,7 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	if problem := pack.Build(ctx); problem != nil {
 		return Revision{}, problem
 	}
-	if problem := pack.CapturePrivateClosure(ctx, install.Closure); problem != nil {
+	if problem := pack.CaptureUnpublishedClosure(ctx, install.Closure, strings.Fields(install.Extra), install.Python); problem != nil {
 		return Revision{}, problem
 	}
 	after, _, _, problem := pack.SourceIdentity()
@@ -105,7 +105,7 @@ func StageWheels(layout home.Layout, install records.PackageInstall, packageInte
 		return Revision{}, exit.Named(exit.Structural, "local_package_revision_invalid", "local package revision requires 1..%d wheels", maxFiles)
 	}
 	if len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
-		return Revision{}, exit.New(exit.Validation, "private wheel interface exceeds its document bound")
+		return Revision{}, exit.New(exit.Validation, "captured wheel interface exceeds its document bound")
 	}
 	sourceDigest := install.SourceDigest
 	normalized, normalizeErr := canonical.NormalizeJCS(packageInterfaceBytes)
