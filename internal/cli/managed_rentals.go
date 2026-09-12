@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -1163,12 +1164,12 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 		if problem != nil || installed == nil {
 			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
-		requirements, requiresPython, problem := install.ImageRequirements(
-			filepath.Join(installed.Dir, "venv"), strings.TrimPrefix(installed.Package, "local/"), strings.Fields(installed.Extra)...)
+		selection, problem := install.ExecutionRequirements(context.Background(), filepath.Join(installed.Dir, "venv"),
+			strings.TrimPrefix(installed.Package, "local/"), strings.Fields(installed.Extra))
 		if problem != nil {
 			return rental.Constraints{}, problem
 		}
-		return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython}, nil
+		return rental.Constraints{Requirements: selection.Requirements, RequiresPython: selection.RequiresPython}, nil
 	}
 	if req.Package == "" || req.Release == "" {
 		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)

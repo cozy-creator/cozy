@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -43,7 +44,8 @@ func TestInstalledClosureAndWorkerRequirementsHaveSeparateMeanings(t *testing.T)
 	metadata("cuda-bindings", "13.3.1", "")
 	metadata("numpy", "2.5.2", "")
 
-	requirements, python, problem := install.ImageRequirements(root, "fixture")
+	selection, problem := install.ExecutionRequirements(context.Background(), root, "fixture", nil)
+	requirements, python := selection.ImageRequirements(), selection.RequiresPython
 	if problem != nil || python != ">=3.12,<3.13" || !reflect.DeepEqual(requirements, []string{"cozy-runtime<1,>=0.16.1", "numpy>=1.26", "torch==2.13.0"}) {
 		t.Fatalf("captured package ranges changed: %v %q %v", requirements, python, problem)
 	}
@@ -55,14 +57,16 @@ func TestInstalledClosureAndWorkerRequirementsHaveSeparateMeanings(t *testing.T)
 		t.Fatalf("compatible image refused against client-local pins: %s", reason)
 	}
 	metadata("helper", "1.0", "Requires-Dist: numpy>=2.5.2\n")
-	requirements, python, problem = install.ImageRequirements(root, "fixture")
+	selection, problem = install.ExecutionRequirements(context.Background(), root, "fixture", nil)
+	requirements, python = selection.ImageRequirements(), selection.RequiresPython
 	if problem != nil || !strings.Contains(launch.InventoryMismatch(image, requirements, python), "numpy") {
 		t.Fatalf("actual transitive package requirement was not enforced: %v %v", requirements, problem)
 	}
 	// The installed graph's Python observation must not replace the author's bound.
 	metadata("helper", "1.0", "Requires-Dist: numpy>=1.26\n")
 	metadata("fixture", "1.0", "Requires-Python: >=3.12.11,<3.13\nRequires-Dist: helper==1.0\nRequires-Dist: torch==2.13.0\n")
-	requirements, python, problem = install.ImageRequirements(root, "fixture")
+	selection, problem = install.ExecutionRequirements(context.Background(), root, "fixture", nil)
+	requirements, python = selection.ImageRequirements(), selection.RequiresPython
 	image.Python = "3.12.3"
 	if problem != nil || python != ">=3.12.11,<3.13" || launch.InventoryMismatch(image, requirements, python) == "" {
 		t.Fatalf("authored Python constraint was lost: %v %q %v", requirements, python, problem)
