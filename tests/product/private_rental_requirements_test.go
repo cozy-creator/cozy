@@ -106,6 +106,38 @@ def main(ctx):
 	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "msgspec 0.20.0") {
 		t.Fatalf("authored image requirement was not enforced [%d]: %s", status, out)
 	}
+	library := filepath.Join(filepath.Dir(script), "library")
+	must(t, os.Mkdir(library, 0700))
+	must(t, os.WriteFile(filepath.Join(library, "pyproject.toml"), []byte(`[project]
+name = "marker-library"
+version = "1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+[project.optional-dependencies]
+gpu = ["msgspec>=0.21,<0.22"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+[tool.hatch.build.targets.wheel]
+only-include = ["marker_library.py"]
+`), 0600))
+	must(t, os.WriteFile(filepath.Join(library, "marker_library.py"), []byte("VALUE=1\n"), 0600))
+	for _, selected := range []bool{true, false} {
+		dependency := "marker-library"
+		if selected {
+			dependency += "[gpu]"
+		}
+		extraCode := strings.Replace(code, "msgspec>=0.21,<0.22", dependency, 1)
+		extraCode = strings.Replace(extraCode, "# ///\ndef", "# [tool.uv.sources]\n# marker-library = {path = './library'}\n# ///\ndef", 1)
+		must(t, os.WriteFile(script, []byte(extraCode), 0600))
+		status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
+		if selected && (status == 0 || !strings.Contains(out, "msgspec 0.20.0")) {
+			t.Fatalf("selected library extra did not enforce its image floor [%d]: %s", status, out)
+		}
+		if !selected && status != 0 {
+			t.Fatalf("unselected library extra constrained the image [%d]: %s", status, out)
+		}
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(*posts) != 0 {
