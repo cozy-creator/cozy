@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -1173,11 +1175,15 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
 		defer store.Close()
-		install, problem := store.Install(req.InstallID)
-		if problem != nil || install == nil {
+		installed, problem := store.Install(req.InstallID)
+		if problem != nil || installed == nil {
 			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
-		return rental.Constraints{Requirements: strings.Split(install.Closure, "\n"), RequiresPython: ">=3.12,<3.13"}, nil
+		requirements, problem := install.ExecutionRequirements(filepath.Join(installed.Dir, "venv"))
+		if problem != nil {
+			return rental.Constraints{}, problem
+		}
+		return rental.Constraints{Requirements: requirements, RequiresPython: ">=3.12,<3.13"}, nil
 	}
 	if req.Package == "" || req.Release == "" {
 		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)

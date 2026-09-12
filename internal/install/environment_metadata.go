@@ -1,6 +1,10 @@
 package install
 
 import (
+	"bufio"
+	"bytes"
+	"io"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +14,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -94,6 +99,51 @@ func pythonVersion(venv string) string {
 // startup hooks to discover additional import paths; those paths are not part of
 // the exact installed-wheel roster and cannot enter private dependency capture.
 func closure(venv string) (int, string) {
+	installed := installedMetadata(venv)
+	lines := make([]string, 0, len(installed))
+	for name, distribution := range installed {
+		lines = append(lines, name+"=="+distribution.version)
+	}
+	sort.Strings(lines)
+	return len(lines), strings.Join(lines, "\n")
+}
+
+// ExecutionRequirements reads the declarations of the code a rental will run.
+// Image-owned distributions resolve their own dependency subtree on that image:
+// e.g. a locally installed Torch wheel's CUDA pins do not constrain remote Torch.
+// The full installed roster remains separate and exact for local graph/custody checks.
+func ExecutionRequirements(venv string) ([]string, *exit.Error) {
+	installed := installedMetadata(venv)
+	if len(installed) == 0 {
+		return nil, exit.New(exit.Structural, "captured environment metadata is unavailable")
+	}
+	seen := map[string]bool{}
+	for name, distribution := range installed {
+		if packagepublish.ImageOwnedDistribution(name) {
+			continue
+		}
+		header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(distribution.metadata))).ReadMIMEHeader()
+		if err != nil && err != io.EOF {
+			return nil, exit.New(exit.Structural, "captured dependency metadata is invalid")
+		}
+		for _, requirement := range header.Values("Requires-Dist") {
+			seen[requirement] = true
+		}
+	}
+	requirements := make([]string, 0, len(seen))
+	for requirement := range seen {
+		requirements = append(requirements, requirement)
+	}
+	sort.Strings(requirements)
+	return requirements, nil
+}
+
+type installedDistribution struct {
+	version  string
+	metadata []byte
+}
+
+func installedMetadata(venv string) map[string]installedDistribution {
 	metadata := venvMetadata(venv)
 	version := metadata["version_info"]
 	if version == "" {
@@ -101,26 +151,26 @@ func closure(venv string) (int, string) {
 	}
 	parts := strings.Split(version, ".")
 	if len(parts) < 2 {
-		return 0, ""
+		return nil
 	}
 	if _, err := strconv.Atoi(parts[0]); err != nil {
-		return 0, ""
+		return nil
 	}
 	if _, err := strconv.Atoi(parts[1]); err != nil {
-		return 0, ""
+		return nil
 	}
 	if parts[0] == "" || parts[1] == "" {
-		return 0, ""
+		return nil
 	}
 	roots := []string{filepath.Join(venv, "lib", "python"+parts[0]+"."+parts[1], "site-packages")}
 	if runtime.GOOS == "windows" {
 		roots = []string{filepath.Join(venv, "Lib", "site-packages")}
 	}
-	seen := map[string]string{}
+	seen := map[string]installedDistribution{}
 	for _, root := range roots {
 		entries, err := os.ReadDir(root)
 		if err != nil {
-			return 0, ""
+			return nil
 		}
 		for _, entry := range entries {
 			if !entry.IsDir() || !strings.HasSuffix(entry.Name(), ".dist-info") {
@@ -129,24 +179,19 @@ func closure(venv string) (int, string) {
 			path := filepath.Join(root, entry.Name(), "METADATA")
 			info, err := os.Lstat(path)
 			if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
-				return 0, ""
+				return nil
 			}
 			raw, err := os.ReadFile(path)
 			if err != nil {
-				return 0, ""
+				return nil
 			}
 			name, version, problem := wheel.MetadataIdentity(raw)
 			name = normalizedRequirementName(name)
-			if problem != nil || seen[name] != "" || len(seen) >= 4096 {
-				return 0, ""
+			if problem != nil || seen[name].version != "" || len(seen) >= 4096 {
+				return nil
 			}
-			seen[name] = version
+			seen[name] = installedDistribution{version: version, metadata: raw}
 		}
 	}
-	lines := make([]string, 0, len(seen))
-	for name, version := range seen {
-		lines = append(lines, name+"=="+version)
-	}
-	sort.Strings(lines)
-	return len(lines), strings.Join(lines, "\n")
+	return seen
 }

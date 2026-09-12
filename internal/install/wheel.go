@@ -180,7 +180,6 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if installed != packagepublish.PinnedClosure(pins) {
 		return fail(exit.New(exit.Conflict, "installed callable wheel environment differs from its exact selected closure"))
 	}
-	portable := portableClosure(installed)
 	path := launch.PackageInterfacePath(dir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fail(exit.Internalf("cannot retain private wheel interface"))
@@ -195,7 +194,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	inst := records.PackageInstall{ID: id, Package: "local/" + project, Version: root.Version, Major: major,
 		SourceKind: "wheel", SourceRef: dir, SourceDigest: digest, ProjectDir: dir, Dir: dir,
 		Python: pythonVersion(venv), UV: toolVersion("uv", "--version"), LockDigest: digest,
-		Platform: "linux/amd64", Packages: count, Closure: portable, PackageInterface: surface.Digest}
+		Platform: "linux/amd64", Packages: count, Closure: installed, PackageInterface: surface.Digest}
 	inst.BytesExcl, inst.BytesShared = Disk(dir)
 	if problem := store.RecordInstall(inst); problem != nil {
 		return fail(problem)
