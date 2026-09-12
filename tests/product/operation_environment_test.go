@@ -92,7 +92,7 @@ func TestOldPendingLookupOnlyReconcilesForCancellation(t *testing.T) {
 	}
 	_, err = db.Exec(`INSERT INTO request_operation_lookups(request_id,computation_digest,state) VALUES(?,?,'pending')`, consumer.ID, key)
 	must(t, err)
-	_, err = db.Exec(`PRAGMA user_version=34`)
+	_, err = db.Exec(`DROP TABLE IF EXISTS successful_work_releases; PRAGMA user_version=34`)
 	must(t, err)
 	db.Close()
 	store, problem = records.OpenForDaemon(path, "")

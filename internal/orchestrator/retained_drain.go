@@ -10,6 +10,10 @@ type retainedCleanup struct {
 }
 
 func (c *Orchestrator) finishRetainedCancellation(id string) {
+	c.startRetainedCleanup(id, c.runRetainedCancellation)
+}
+
+func (c *Orchestrator) startRetainedCleanup(id string, run func(context.Context, string)) {
 	c.mu.Lock()
 	if c.closing || c.retainedCleaning[id] != nil {
 		c.mu.Unlock()
@@ -30,7 +34,7 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			close(call.done)
 			c.mu.Unlock()
 		}()
-		c.runRetainedCancellation(ctx, id)
+		run(ctx, id)
 	}()
 }
 

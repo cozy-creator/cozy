@@ -381,12 +381,21 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 			}
 		}
 	}
+	successfulPending := false
+	if req.State == "succeeded" && req.ParentRequestID == "" {
+		release, problem := c.opt.Store.SuccessfulWorkRelease(requestID)
+		if problem != nil {
+			c.retryOperationAck(s, requestID, ordinal)
+			return
+		}
+		successfulPending = release != nil && (release.State == "armed" || release.State == "draining")
+	}
 	ack := &pb.AttemptOutcomeAck{
 		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: specDigest,
 		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
 		WorkerBootId: s.bootID,
-		RetainWork: req.RetainWork && (records.RetainedState(req.State) || req.State == "requeue_pending" ||
+		RetainWork: req.RetainWork && (successfulPending || records.RetainedState(req.State) || req.State == "requeue_pending" ||
 			(req.RetainsLocalOutputs() && req.State != "canceling" && req.State != "releasing" && req.State != "canceled")),
 	}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {

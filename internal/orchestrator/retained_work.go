@@ -60,54 +60,10 @@ func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 		c.retryRetainedCancellation(id)
 		return
 	}
-	// Walk newest first: a repeated invocation has one transaction per slot and its
-	// latest recorded worker is the current holder after an ordinary recovery.
-	seen := map[string]bool{}
-	for i := len(attempts) - 1; i >= 0; i-- {
-		attempt := attempts[i]
-		if attempt.State != "closed" {
-			continue
-		}
-		outputs, problem := decodeWeightsOutputs(attempt.WeightsOutputs)
-		if problem != nil {
-			c.logf("request %s retained cancellation: %s", id, problem.Message)
-			return
-		}
-		for _, output := range outputs {
-			key := attempt.InvocationDigest + "/" + output.OutputID
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			if problem := c.opt.Store.RecordRetainedFinalization(records.WeightsFinalization{
-				RequestID: id, Attempt: attempt.Attempt, InstanceID: attempt.InstanceID,
-				OwnerScope: recordOwnerID, InvocationDigest: attempt.InvocationDigest, OutputSlot: output.OutputID,
-			}); problem != nil {
-				c.logf("request %s retained cancellation: %s", id, problem.Message)
-				return
-			}
-		}
-	}
-	for _, attempt := range attempts {
-		pending, problem := c.opt.Store.PendingWeightsFinalizations(id, attempt.Attempt)
-		if problem != nil {
-			return
-		}
-		if len(pending) > 0 {
-			c.mu.Lock()
-			var session *session
-			if w := c.workers[attempt.InstanceID]; w != nil && w.snapshotAcknowledged {
-				session = c.sessions[w.bootID]
-			}
-			c.mu.Unlock()
-			if session != nil {
-				_, _ = c.sendPendingWeightsFinalizations(session, id, attempt.Attempt)
-			} else if request.Worker != "" {
-				_, _, _, _ = c.EnsureRental(request.Worker)
-			}
-			c.retryRetainedCancellation(id)
-			return
-		}
+	ready, problem := c.settleRetainedWeights(*request, attempts, "")
+	if problem != nil || !ready {
+		c.retryRetainedCancellation(id)
+		return
 	}
 	if problem := c.releaseOriginalDerivedResults(ctx, id); problem != nil {
 		c.retryRetainedCancellation(id)
@@ -357,6 +313,13 @@ func (c *Orchestrator) ResumeRequest(id, actor string) *exit.Error {
 
 // restoreRetainedWork reconstructs control ownership without queueing paused work.
 func (c *Orchestrator) restoreRetainedWork() *exit.Error {
+	successful, problem := c.opt.Store.PendingSuccessfulWorkReleases()
+	if problem != nil {
+		return problem
+	}
+	for _, id := range successful {
+		c.finishSuccessfulWorkRelease(id)
+	}
 	completed, problem := c.opt.Store.CompletedNativeByteRecipients()
 	if problem != nil {
 		return problem
@@ -383,4 +346,64 @@ func (c *Orchestrator) restoreRetainedWork() *exit.Error {
 		}
 	}
 	return nil
+}
+
+// Exact older-slot finalization is shared by cancellation and successful release.
+// ACK(false) alone cannot abandon an unfinished derived writer.
+func (c *Orchestrator) settleRetainedWeights(request records.Request, attempts []records.Attempt, successRoot string) (bool, *exit.Error) {
+	id := request.ID
+	// Walk newest first: a repeated invocation has one transaction per slot and its
+	// latest recorded worker is the current holder after an ordinary recovery.
+	seen := map[string]bool{}
+	for i := len(attempts) - 1; i >= 0; i-- {
+		attempt := attempts[i]
+		if attempt.State != "closed" {
+			continue
+		}
+		outputs, problem := decodeWeightsOutputs(attempt.WeightsOutputs)
+		if problem != nil {
+			return false, problem
+		}
+		for _, output := range outputs {
+			key := attempt.InvocationDigest + "/" + output.OutputID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			finalization := records.WeightsFinalization{
+				RequestID: id, Attempt: attempt.Attempt, InstanceID: attempt.InstanceID,
+				OwnerScope: recordOwnerID, InvocationDigest: attempt.InvocationDigest, OutputSlot: output.OutputID,
+			}
+			var problem *exit.Error
+			if successRoot == "" {
+				problem = c.opt.Store.RecordRetainedFinalization(finalization)
+			} else {
+				problem = c.opt.Store.RecordSuccessfulFinalization(successRoot, finalization)
+			}
+			if problem != nil {
+				return false, problem
+			}
+		}
+	}
+	for _, attempt := range attempts {
+		pending, problem := c.opt.Store.PendingWeightsFinalizations(id, attempt.Attempt)
+		if problem != nil {
+			return false, problem
+		}
+		if len(pending) > 0 {
+			c.mu.Lock()
+			var session *session
+			if w := c.workers[attempt.InstanceID]; w != nil && w.snapshotAcknowledged {
+				session = c.sessions[w.bootID]
+			}
+			c.mu.Unlock()
+			if session != nil {
+				_, _ = c.sendPendingWeightsFinalizations(session, id, attempt.Attempt)
+			} else if request.Worker != "" {
+				_, _, _, _ = c.EnsureRental(request.Worker)
+			}
+			return false, nil
+		}
+	}
+	return true, nil
 }

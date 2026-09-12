@@ -483,6 +483,9 @@ type Request struct {
 	// RetainWork preserves a unpublished package job's artifacts and capacity until the owner
 	// resumes or permanently cancels it, including after an attempt fails.
 	RetainWork bool
+	// ReleaseImplicitWork is derived from a new captured no-artifact root schema.
+	// Its durable authority is successful_work_releases, not this admission-only field.
+	ReleaseImplicitWork bool `json:"-"`
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
 	// retained operation namespace shared by explicitly related revisions.
 	RetryOf                string
@@ -1368,7 +1371,11 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
-		if existing.BodyDigest != r.BodyDigest || existing.RetainWork != r.RetainWork || existing.RetryOf != r.RetryOf {
+		originalRetention, retentionErr := submittedRetainWorkTx(tx, existing)
+		if retentionErr != nil {
+			return Request{}, false, exit.Internalf("cannot read original retention intent: %s", retentionErr)
+		}
+		if existing.BodyDigest != r.BodyDigest || originalRetention != r.RetainWork || existing.RetryOf != r.RetryOf {
 			return Request{}, false, exit.New(exit.Conflict,
 				"idempotency key %s already names a request with a different body", r.IdemKey).
 				WithRemedy("one key, one body: %s was recorded, %s was submitted",
@@ -1418,6 +1425,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		assets, r.AttentionKernel, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision,
 		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
+	}
+	if problem := armSuccessfulWorkTx(tx, r); problem != nil {
+		return Request{}, false, problem
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
 		return Request{}, false, problem
