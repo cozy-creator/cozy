@@ -7,7 +7,7 @@ PLAIN = next(digest for alias, digest in tensorfs.seed_digests() if alias == "pl
 
 @invocable(memoize=True)
 async def produce(ctx: Context, *, weights: WeightsSink, value: int) -> ModelArtifact:
-    assert value == 1
+    assert 1 <= value <= 32
     names = ("linear_a.weight", "linear_b.weight")
     tensors = {name: WeightsTensor(logical_dtype="bf16", shape=(16, 64), encoding=PLAIN,
         parts={"value": WeightsPart("bf16", (16, 64))}) for name in names}
@@ -15,7 +15,7 @@ async def produce(ctx: Context, *, weights: WeightsSink, value: int) -> ModelArt
                       configs={}, order=tuple(("encoder", name) for name in names)) as writer:
         for index, name in enumerate(names):
             ctx.raise_if_cancelled()
-            raw = struct.pack("<1024H", *([0x3F80 if index == 0 else 0x3F00] * 1024))
+            raw = struct.pack("<1024H", *([0x3F80 + value if index == 0 else 0x3F00 + value] * 1024))
             writer.add_part("encoder", name, "value", raw)
         return writer.commit().artifact
 
