@@ -14,6 +14,7 @@ func TestAcceptedPublicationCallRefusesChangedInputsBeforeReexecution(t *testing
 			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 			fatal(t, problem)
 			defer store.Close()
+			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 			parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "effect-immutable", ""))
 			body := []byte(`{"destination":"owner/model","expected_revision":1,"lanes":{"bf16":"checkpoint-a"},"release":"proof"}`)
 			call := records.NativeCall{ID: "effect-immutable", ParentRequestID: parent.ID, Kind: "effect", Operation: "publish_release", IntentDigest: childDigest("4"), Request: body}
