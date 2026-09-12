@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -186,12 +187,20 @@ func TestConcurrentCLIStartsConvergeOnOneEphemeralDaemon(t *testing.T) {
 		exec.CommandContext(ctx, cozyBin, "run", "list", "--json"),
 		exec.CommandContext(ctx, cozyBin, "run", "list", "--json"),
 	}
-	for _, command := range commands {
+	outputs := make([]bytes.Buffer, len(commands))
+	for i, command := range commands {
+		command.Stdout = &outputs[i]
+		command.Stderr = &outputs[i]
 		command.Env = childEnv(t, root)
 		must(t, command.Start())
 	}
-	for _, command := range commands {
-		must(t, command.Wait())
+	for i, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Errorf("concurrent child %d: %v %s", i, err, outputs[i].String())
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
 	}
 	state := daemon.Probe(config.Config{Home: root})
 	if !state.Up || state.PID <= 0 || state.Addr == "" || strings.HasSuffix(state.Addr, ":0") {
