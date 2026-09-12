@@ -1,4 +1,4 @@
-package install
+package producttest
 
 import (
 	"fmt"
@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -39,12 +40,9 @@ func TestInstalledClosureAndWorkerRequirementsHaveSeparateMeanings(t *testing.T)
 	metadata("torch", "2.13.0", "Requires-Dist: cuda-bindings==13.3.1\n")
 	metadata("cuda-bindings", "13.3.1", "")
 	metadata("numpy", "2.5.2", "")
-	count, observed := closure(root)
-	if count != 6 || !strings.Contains(observed, "cozy-runtime==0.16.2") || !strings.Contains(observed, "cuda-bindings==13.3.1") {
-		t.Fatalf("exact installed closure lost image-owned observations: %d %q", count, observed)
-	}
-	requirements, python, problem := ImageRequirements(root, "fixture")
-	if problem != nil || python != ">=3.12,<3.13" || !reflect.DeepEqual(requirements, []string{"cozy-runtime>=0.16.1,<1", "cuda-bindings==99; extra == 'optional'", "numpy>=1.26", "torch==2.13.0"}) {
+
+	requirements, python, problem := install.ImageRequirements(root, "fixture")
+	if problem != nil || python != ">=3.12,<3.13" || !reflect.DeepEqual(requirements, []string{"cozy-runtime<1,>=0.16.1", "numpy>=1.26", "torch==2.13.0"}) {
 		t.Fatalf("captured package ranges changed: %v %q %v", requirements, python, problem)
 	}
 	image := &pb.ImageInventory{Python: "3.12.11", Distributions: []*pb.ImageDistribution{
@@ -55,8 +53,17 @@ func TestInstalledClosureAndWorkerRequirementsHaveSeparateMeanings(t *testing.T)
 		t.Fatalf("compatible image refused against client-local pins: %s", reason)
 	}
 	metadata("helper", "1.0", "Requires-Dist: numpy>=2.5.2\n")
-	requirements, python, problem = ImageRequirements(root, "fixture")
+	requirements, python, problem = install.ImageRequirements(root, "fixture")
 	if problem != nil || !strings.Contains(launch.InventoryMismatch(image, requirements, python), "numpy") {
 		t.Fatalf("actual transitive package requirement was not enforced: %v %v", requirements, problem)
 	}
+	// The installed graph's Python observation must not replace the author's bound.
+	metadata("helper", "1.0", "Requires-Dist: numpy>=1.26\n")
+	metadata("fixture", "1.0", "Requires-Python: >=3.12.11,<3.13\nRequires-Dist: helper==1.0\nRequires-Dist: torch==2.13.0\n")
+	requirements, python, problem = install.ImageRequirements(root, "fixture")
+	image.Python = "3.12.3"
+	if problem != nil || python != ">=3.12.11,<3.13" || launch.InventoryMismatch(image, requirements, python) == "" {
+		t.Fatalf("authored Python constraint was lost: %v %q %v", requirements, python, problem)
+	}
+
 }

@@ -96,7 +96,7 @@ func ReadInstalledInterface(ctx context.Context, python, distribution string) (*
 
 // CaptureWheel installs an exact wheel closure into an independent private
 // environment. It runs no resolver and records no fake source project or pin.
-func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store, parentPython, project string, dependencies map[string]packagepublish.CapturedDependency, surface *launch.PackageInterface) (*Result, *exit.Error) {
+func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store, parentPython, project string, extras []string, dependencies map[string]packagepublish.CapturedDependency, surface *launch.PackageInterface) (*Result, *exit.Error) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		return nil, exit.New(exit.Validation, "private callable wheels require Linux amd64")
 	}
@@ -118,10 +118,22 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 		return fail(problem)
 	}
 	exact := exactPrivateWheelRequirements(project, dependencies)
+	var paths []string
+	for name, dependency := range dependencies {
+		if packagepublish.ImageOwnedDistribution(name) {
+			continue
+		}
+		paths = append(paths, dependency.Path)
+	}
+	python := strings.TrimSpace(strings.TrimPrefix(runOut(parentPython, "-I", "-S", "-V"), "Python "))
+	selection, problem := packagepublish.ActiveWheelRequirements(ctx, project, extras, paths, python)
+	if problem != nil {
+		return fail(problem)
+	}
+	exact = append(exact, selection.ImageRequirements()...)
+	sort.Strings(exact)
 	executablePath := filepath.Join(dir, "wheels", filepath.Base(original))
-	if problem := wheel.PinDependenciesPreserving(original, executablePath, exact, func(raw string) bool {
-		return packagepublish.ImageOwnedDistribution(normalizedRequirementName(raw))
-	}); problem != nil {
+	if problem := wheel.PinDependencies(original, executablePath, exact); problem != nil {
 		return fail(problem)
 	}
 	executable, problem := packagepublish.CaptureDependency(executablePath)

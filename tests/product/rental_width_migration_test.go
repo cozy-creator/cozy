@@ -56,7 +56,7 @@ func tableRows(t *testing.T, db *sql.DB, table string) string {
 		must(t, rows.Scan(pointers...))
 		record := map[string]any{}
 		for i, name := range columns {
-			if name != "accelerator_count" && name != "native_service_id" && name != "requested_rental" {
+			if name != "accelerator_count" && name != "native_service_id" && name != "requested_rental" && name != "attention_kernel" {
 				record[name] = values[i]
 			}
 		}
@@ -106,6 +106,11 @@ func TestBothReleasedSchema33RentalShapesMigrateWithoutLosingWork(t *testing.T) 
 			if row.AcceleratorCount != expected {
 				t.Fatalf("width=%d, want %d", row.AcceleratorCount, expected)
 			}
+			request, problem := store.RequestRow("request")
+			fatal(t, problem)
+			if request.AttentionKernel != "" {
+				t.Fatalf("migration invented an attention override: %q", request.AttentionKernel)
+			}
 			store.Close()
 			for table, expected := range before {
 				if got := tableRows(t, db, table); got != expected {
@@ -113,7 +118,7 @@ func TestBothReleasedSchema33RentalShapesMigrateWithoutLosingWork(t *testing.T) 
 				}
 			}
 			must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-			if version != 37 {
+			if version != 38 {
 				t.Fatalf("migration version=%d", version)
 			}
 			violations, err := db.Query(`PRAGMA foreign_key_check`)
