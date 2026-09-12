@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	packageinstall "github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -1161,7 +1163,12 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 		if problem != nil || install == nil {
 			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
-		return rental.Constraints{Requirements: strings.Split(install.Closure, "\n"), RequiresPython: ">=3.12,<3.13"}, nil
+		requirements, requiresPython, problem := packageinstall.ImageRequirements(
+			filepath.Join(install.Dir, "venv"), strings.TrimPrefix(install.Package, "local/"))
+		if problem != nil {
+			return rental.Constraints{}, problem
+		}
+		return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython}, nil
 	}
 	if req.Package == "" || req.Release == "" {
 		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
