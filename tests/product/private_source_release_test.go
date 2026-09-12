@@ -28,7 +28,7 @@ func (p *fakePod) ModelSourceRelease(ctx context.Context, call *pb.ModelSourceRe
 	return p.sourceRelease(ctx, call)
 }
 
-func TestPrivateSourceCancellationWaitsForOriginalHostRelease(t *testing.T) {
+func TestUnpublishedSourceCancellationWaitsForOriginalHostRelease(t *testing.T) {
 	for _, cancelDrain := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cancel_drain=%t", cancelDrain), func(t *testing.T) { privateSourceCancellationDrain(t, cancelDrain) })
 	}

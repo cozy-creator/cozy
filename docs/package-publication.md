@@ -107,3 +107,14 @@ package release. Publishers do not write an audit reason or release message.
 
 Publication never builds a package-specific Docker image and does not move
 serving traffic.
+
+## Unpublished packages
+
+An unpublished package runs from captured source without creating a Tensorhub package
+release. A local script is the single-file form. Editable describes the dependency
+installation mode, not a separate execution or privacy mode.
+
+Worker protocol `Private*` names, stable `private_*` error codes, persisted capture markers,
+and historical database fields retain their serialized spellings for existing workers
+and requests. New code and explanations use the publication terminology. Private rentals
+and access controls continue to mean private access.

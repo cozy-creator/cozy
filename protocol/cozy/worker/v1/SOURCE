@@ -1,5 +1,5 @@
 repository=https://github.com/cozy-creator/worker-protocol-v2
-commit=46c8f4d6696b11a572f6e8497e68d63421555928
+commit=a41bfb080fd71a7ddb5721274a02398fa62d2fea
 wire_minor=49
 weights_limits.go=sha256:68fb0ba2695f864a0b3043b4c0d50574d5ed26f8d2798bc2d002e10ad1a15267
 wire_version.go=sha256:b2a27f672662dc4e4aba0ec99739152ed712da60cd398645b8fea21a1e2b82b3

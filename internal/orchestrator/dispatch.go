@@ -190,7 +190,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	}
 	if s.RetainWork && s.Kind != "job" {
 		return records.Request{}, nil, exit.Named(exit.Validation, "retain_work_not_job",
-			"retained work is an ordinary private job capability")
+			"retained work is an ordinary unpublished package job capability")
 	}
 	weightsOutputs, weightsBytes, e := normalizeWeightsOutputs(s)
 	if e != nil {
@@ -1139,7 +1139,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			minor = worker.wireMinor
 		}
 		c.mu.Unlock()
-		required, problem := c.requiredPrivateWire(req)
+		required, problem := c.requiredUnpublishedWire(req)
 		if problem != nil {
 			return WorkerLaunchSpec{}, "", problem
 		}
@@ -1193,7 +1193,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			if problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
-			if problem := c.convergePrivateModels(instance, req.ID, req.LocalPackageDigest, nil, native); problem != nil {
+			if problem := c.convergeUnpublishedModels(instance, req.ID, req.LocalPackageDigest, nil, native); problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
 		} else if !req.IsJob() && len(logical.Models) > 0 {
@@ -1203,7 +1203,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 					"private_placement_model_unpublished",
 					"private serving requires exact published model releases")
 			}
-			if e := c.ConvergePrivatePlacement(instance, req.ID,
+			if e := c.ConvergeUnpublishedPlacement(instance, req.ID,
 				req.LocalPackageDigest, models); e != nil {
 				return WorkerLaunchSpec{}, "", e
 			}
@@ -1278,7 +1278,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", problem
 		}
 		if current == nil || (current.State != "submitted" && current.State != "queued") {
-			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its private job was being prepared")
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its unpublished package job was being prepared")
 		}
 		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
 			return WorkerLaunchSpec{}, "", e
@@ -1414,7 +1414,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its operation lookup was in progress")
 	}
 	if req.RetainWork {
-		required, problem := c.requiredPrivateWire(req)
+		required, problem := c.requiredUnpublishedWire(req)
 		if problem != nil {
 			return 0, problem
 		}

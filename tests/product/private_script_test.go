@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-var privateScriptRuntimeWheel = flag.String("script-runtime-wheel", "", "Exact Runtime wheel used for private script product proofs")
+var privateScriptRuntimeWheel = flag.String("script-runtime-wheel", "", "Exact Runtime wheel used for local script product proofs")
 
 // A real Python library is captured with a script, even when its version and
 // pyproject stay unchanged. The corrected run must use the edited library while
@@ -45,7 +45,7 @@ only-include = ["algorithm.py"]
 	}
 	code := `# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime", "private-script-algorithm"] # //cozy:allow script dependency metadata, not a runtime invocation
+# dependencies = ["cozy-runtime==` + runtimeFixtureVersion(t, *privateScriptRuntimeWheel) + `", "private-script-algorithm"]
 # [tool.uv.sources]
 # private-script-algorithm = {path = "./algorithm", editable = true}
 ` + runtimeSource + `# ///

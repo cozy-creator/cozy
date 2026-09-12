@@ -78,12 +78,12 @@ func (c *Orchestrator) childResultArtifacts(request records.Request, raw []byte)
 		return nil, nil
 	}
 	resolver, ok := c.opt.Packages.(interface {
-		PrivateArtifactPaths(records.Request) ([][]string, *exit.Error)
+		CapturedArtifactPaths(records.Request) ([][]string, *exit.Error)
 	})
 	if !ok {
 		return nil, exit.Internalf("child result schema owner is unavailable")
 	}
-	paths, problem := resolver.PrivateArtifactPaths(request)
+	paths, problem := resolver.CapturedArtifactPaths(request)
 	if problem != nil {
 		return nil, problem
 	}

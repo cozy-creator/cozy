@@ -7,7 +7,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-// NativeSourceCredential is called only after a private parent source call was accepted.
+// NativeSourceCredential is called only after a unpublished parent source call was accepted.
 func (r *Resolver) NativeSourceCredential(operation string) string {
 	switch operation {
 	case "download_huggingface":

@@ -104,9 +104,9 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 			continue
 		}
 		if len(intake.Bindings) >= 32 {
-			return fail(exit.New(exit.Validation, "private parent exceeds 32 invocable dependency exports"))
+			return fail(exit.New(exit.Validation, "unpublished parent exceeds 32 invocable dependency exports"))
 		}
-		dependency, problem := packagepublish.PreparePrivateFrom(context.Background(), path, dependencies[name].Extras...)
+		dependency, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), path, dependencies[name].Extras...)
 		if problem != nil {
 			return fail(problem)
 		}

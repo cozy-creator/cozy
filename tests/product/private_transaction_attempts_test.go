@@ -19,7 +19,7 @@ import (
 // the first attempt's terminal until the test releases its writer, then verifies
 // that Creator acknowledges retained custody and issues a new immutable attempt
 // under the same request. Native output replay is proved by the actual Host test.
-func TestPrivateTransactionPauseFencesAttemptBeforeResume(t *testing.T) {
+func TestUnpublishedTransactionPauseFencesAttemptBeforeResume(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
@@ -139,7 +139,7 @@ func TestPrivateTransactionPauseFencesAttemptBeforeResume(t *testing.T) {
 // An older peer ignores an unknown protobuf bool and disposes state at outcome
 // acknowledgment. Refuse retained work before preparing packages or offering an
 // attempt, instead of discovering that incompatibility after expensive work.
-func TestPrivateTransactionRefusesPeerWithoutRetention(t *testing.T) {
+func TestUnpublishedTransactionRefusesPeerWithoutRetention(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true, wireMinor: 38}

@@ -21,7 +21,7 @@ import (
 
 // Pinned TLS and the real owner exercise both independent peer capabilities.
 // A newer Runtime ClaimAck behind an older Host must not authorize wheel upload.
-func TestPrivateWheelCapacityBeforeTransfer(t *testing.T) {
+func TestUnpublishedWheelCapacityBeforeTransfer(t *testing.T) {
 	for _, tc := range []struct {
 		name                    string
 		count                   int
@@ -47,7 +47,7 @@ func TestPrivateWheelCapacityBeforeTransfer(t *testing.T) {
 			revision := stageLocalRevision(t, root)
 			for i := len(revision.Files); i < tc.count; i++ {
 				name := fmt.Sprintf("helper%d-1.0.0-py3-none-any.whl", i)
-				body := []byte(fmt.Sprintf("private dependency %d", i))
+				body := []byte(fmt.Sprintf("captured dependency %d", i))
 				path := filepath.Join(root, name)
 				must(t, os.WriteFile(path, body, 0600))
 				digest, _ := canonical.Spell(sha256Of(body))
@@ -66,7 +66,7 @@ func TestPrivateWheelCapacityBeforeTransfer(t *testing.T) {
 				fatal(t, problem)
 			}
 			if tc.refusal == "" {
-				waitUntil(t, "private revision prepared", func() bool {
+				waitUntil(t, "unpublished package revision prepared", func() bool {
 					pod.mu.Lock()
 					defer pod.mu.Unlock()
 					return len(pod.localPrepares) == 1
@@ -86,7 +86,7 @@ func TestPrivateWheelCapacityBeforeTransfer(t *testing.T) {
 }
 
 // Even the maximum capability-bearing frame remains below the control ceiling.
-func TestPrivateWheelMaximumGrantFrameFitsControl(t *testing.T) {
+func TestUnpublishedWheelMaximumGrantFrameFitsControl(t *testing.T) {
 	request := &pb.LocalPackageFetchRequest{RecordOwnerEpoch: ^uint64(0), ControlStreamEpoch: ^uint64(0), WorkerBootId: strings.Repeat("b", 256), OperationId: strings.Repeat("o", 256), SourceDigest: bytes.Repeat([]byte{1}, 32)}
 	for i := 0; i < pb.MaxLocalPackageFiles; i++ {
 		request.Files = append(request.Files, &pb.LocalPackageFileGrant{Digest: bytes.Repeat([]byte{byte(i)}, 32), Filename: strings.Repeat("f", pb.MaxLocalPackageFilenameBytes), Length: ^uint64(0), Url: strings.Repeat("u", pb.MaxLocalPackageGrantURLBytes)})
@@ -97,5 +97,5 @@ func TestPrivateWheelMaximumGrantFrameFitsControl(t *testing.T) {
 	if len(encoded) > pb.MaxInlineControlBytes {
 		t.Fatalf("%d-byte frame exceeds %d-byte control ceiling", len(encoded), pb.MaxInlineControlBytes)
 	}
-	t.Logf("maximum private wheel grant frame: %d bytes of %d", len(encoded), pb.MaxInlineControlBytes)
+	t.Logf("maximum captured wheel grant frame: %d bytes of %d", len(encoded), pb.MaxInlineControlBytes)
 }

@@ -17,7 +17,7 @@ import (
 
 // CapturedDependency is one immutable original wheel, or an image-owned exact
 // requirement for local uv materialization. Base requirements never travel as
-// private worker overlays.
+// unpublished package overlays.
 type CapturedDependency struct {
 	Name, Version, Path, Digest string
 	Requirement                 string
@@ -31,7 +31,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 	if problem != nil {
 		return nil, problem
 	}
-	pins, problem := privatePins(installed)
+	pins, problem := capturedPins(installed)
 	if problem != nil {
 		return nil, problem
 	}
@@ -60,20 +60,20 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 	if err != nil {
 		return nil, exit.New(exit.Validation, "captured wheel dependencies have no uv.lock")
 	}
-	rows, _, problem := PrivateRegistryRows(raw, PinnedClosure(wanted), project, pins[project], existing)
+	rows, _, problem := CapturedRegistryRows(raw, PinnedClosure(wanted), project, pins[project], existing)
 	if problem != nil {
 		return nil, problem
 	}
 	client := &http.Client{CheckRedirect: func(request *http.Request, via []*http.Request) error {
 		if len(via) > 5 || request.URL.Scheme != "https" || request.URL.Host != "files.pythonhosted.org" {
-			return fmt.Errorf("private wheel download changed origin")
+			return fmt.Errorf("captured wheel download changed origin")
 		}
 		return nil
 	}}
 	for _, row := range rows {
 		address, _ := url.Parse(row.URL)
 		path := filepath.Join(stage, filepath.Base(address.Path))
-		if problem := fetchPrivateWheel(ctx, client, row, path); problem != nil {
+		if problem := fetchCapturedWheel(ctx, client, row, path); problem != nil {
 			return nil, problem
 		}
 		existing = append(existing, DependencyWheel{Filename: filepath.Base(path), Path: path})
@@ -95,7 +95,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 	if problem != nil {
 		return nil, problem
 	}
-	var lock privateLock
+	var lock capturedLock
 	if toml.Unmarshal(raw, &lock) != nil {
 		return nil, exit.New(exit.Validation, "captured dependency lock is invalid")
 	}

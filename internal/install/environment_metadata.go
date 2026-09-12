@@ -3,6 +3,7 @@ package install
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"net/textproto"
 	"os"
@@ -43,23 +44,23 @@ func venvMetadata(venv string) map[string]string {
 func BasePython(venv string) (string, *exit.Error) {
 	metadata := venvMetadata(venv)
 	if metadata == nil {
-		return "", exit.New(exit.Structural, "private environment has no regular pyvenv.cfg")
+		return "", exit.New(exit.Structural, "captured environment has no regular pyvenv.cfg")
 	}
 	prefix, err := filepath.Abs(venv)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment path is invalid")
+		return "", exit.New(exit.Structural, "captured environment path is invalid")
 	}
 	prefix, err = filepath.EvalSymlinks(prefix)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment path is unavailable")
+		return "", exit.New(exit.Structural, "captured environment path is unavailable")
 	}
 	base, err := filepath.EvalSymlinks(home.VenvPython(venv))
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment base interpreter is unavailable")
+		return "", exit.New(exit.Structural, "captured environment base interpreter is unavailable")
 	}
 	base, err = filepath.Abs(base)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment base interpreter path is invalid")
+		return "", exit.New(exit.Structural, "captured environment base interpreter path is invalid")
 	}
 	inside := func(path string) bool {
 		rel, err := filepath.Rel(prefix, path)
@@ -70,7 +71,7 @@ func BasePython(venv string) (string, *exit.Error) {
 	}
 	info, err := os.Stat(base)
 	if err != nil || !info.Mode().IsRegular() || inside(base) {
-		return "", exit.New(exit.Structural, "private environment does not name an external base interpreter")
+		return "", exit.New(exit.Structural, "captured environment does not name an external base interpreter")
 	}
 	return base, nil
 }
@@ -97,7 +98,7 @@ func pythonVersion(venv string) string {
 
 // closure observes installed metadata directly. `uv pip list` can execute .pth
 // startup hooks to discover additional import paths; those paths are not part of
-// the exact installed-wheel roster and cannot enter private dependency capture.
+// the exact installed-wheel roster and cannot enter captured dependency capture.
 func closure(venv string) (int, string) {
 	distributions, ok := installedDistributions(venv)
 	if !ok {
@@ -112,8 +113,9 @@ func closure(venv string) (int, string) {
 }
 
 type installedDistribution struct {
-	version string
-	headers textproto.MIMEHeader
+	version  string
+	headers  textproto.MIMEHeader
+	metadata []byte
 }
 
 func installedDistributions(venv string) (map[string]installedDistribution, bool) {
@@ -167,36 +169,38 @@ func installedDistributions(venv string) (map[string]installedDistribution, bool
 			if err != nil && err != io.EOF {
 				return nil, false
 			}
-			seen[name] = installedDistribution{version, headers}
+			seen[name] = installedDistribution{version: version, headers: headers, metadata: raw}
 		}
 	}
 	return seen, true
 }
 
-// ImageRequirements reads compatibility requirements from the actual captured
-// package metadata. The local installed-version roster is a capture fact, not a
-// requirement that a worker image reproduce the client's environment.
-func ImageRequirements(venv, project string) ([]string, string, *exit.Error) {
+// ExecutionRequirements reads the selected package graph, stopping at image-owned
+// distributions. Local installed versions remain separate capture facts.
+func ExecutionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, *exit.Error) {
+	selected, _, problem := executionRequirements(ctx, venv, project, extras)
+	return selected, problem
+}
+
+func executionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, string, *exit.Error) {
 	distributions, ok := installedDistributions(venv)
 	root, found := distributions[normalizedRequirementName(project)]
 	if !ok || !found {
-		return nil, "", exit.New(exit.Structural, "captured package requirements are unavailable")
+		return packagepublish.RequirementSelection{}, "", exit.New(exit.Structural, "captured package requirements are unavailable")
 	}
-	seen := map[string]bool{}
+	metadata := map[string]string{}
 	for name, distribution := range distributions {
-		if packagepublish.ImageOwnedDistribution(name) {
-			continue // The selected image owns its internal dependency closure.
-		}
-		for _, requirement := range distribution.headers.Values("Requires-Dist") {
-			if packagepublish.ImageOwnedDistribution(normalizedRequirementName(requirement)) {
-				seen[requirement] = true
-			}
+		if !packagepublish.ImageOwnedDistribution(name) {
+			metadata[name] = string(distribution.metadata)
 		}
 	}
-	requirements := make([]string, 0, len(seen))
-	for requirement := range seen {
-		requirements = append(requirements, requirement)
-	}
-	sort.Strings(requirements)
-	return requirements, root.headers.Get("Requires-Python"), nil
+	selected, problem := packagepublish.ActiveRequirements(ctx, project, extras, metadata, pythonVersion(venv))
+	return selected, root.headers.Get("Requires-Python"), problem
+}
+
+// ImageRequirements preserves the authored Python bound and selected extras while
+// using the same requirement graph as unpublished wheel sealing.
+func ImageRequirements(venv, project string, extras ...string) ([]string, string, *exit.Error) {
+	selected, python, problem := executionRequirements(context.Background(), venv, project, extras)
+	return selected.ImageRequirements(), python, problem
 }

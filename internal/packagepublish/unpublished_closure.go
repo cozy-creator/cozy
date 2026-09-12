@@ -1,6 +1,6 @@
 package packagepublish
 
-// Private revisions carry the selected installed closure, including extras. Public
+// Unpublished package revisions carry the selected installed closure, including extras. Public
 // publication keeps its registry references and image-owned version policy.
 
 import (
@@ -20,7 +20,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-type privateLock struct {
+type capturedLock struct {
 	Version  int `toml:"version"`
 	Packages []struct {
 		Name    string `toml:"name"`
@@ -36,12 +36,12 @@ type privateLock struct {
 	} `toml:"package"`
 }
 
-func privatePins(closure string) (map[string]string, *exit.Error) {
+func capturedPins(closure string) (map[string]string, *exit.Error) {
 	pins := map[string]string{}
 	for _, row := range strings.Split(strings.TrimSpace(closure), "\n") {
 		name, version, ok := strings.Cut(row, "==")
 		if !ok || name == "" || version == "" || strings.ContainsAny(version, " \t\r\n;<>!=") || normalizedProjectName(name) != name || pins[name] != "" {
-			return nil, exit.Named(exit.Validation, "private_dependency_closure_invalid", "private environment requires a unique exact installed name/version roster")
+			return nil, exit.Named(exit.Validation, "private_dependency_closure_invalid", "captured environment requires a unique exact installed name/version roster")
 		}
 		pins[name] = version
 	}
@@ -51,10 +51,10 @@ func privatePins(closure string) (map[string]string, *exit.Error) {
 	return pins, nil
 }
 
-// PrivateRegistryRows selects only the installed closure from the captured uv.lock.
+// CapturedRegistryRows selects only the installed closure from the captured uv.lock.
 // It does not guess selected extras from a second resolution or export all extras.
-func PrivateRegistryRows(raw []byte, closure, project, version string, existing []DependencyWheel) ([]RegistryRow, []string, *exit.Error) {
-	pins, problem := privatePins(closure)
+func CapturedRegistryRows(raw []byte, closure, project, version string, existing []DependencyWheel) ([]RegistryRow, []string, *exit.Error) {
+	pins, problem := capturedPins(closure)
 	if problem != nil {
 		return nil, nil, problem
 	}
@@ -77,9 +77,9 @@ func PrivateRegistryRows(raw []byte, closure, project, version string, existing 
 		}
 		delete(expected, fact.Distribution)
 	}
-	var lock privateLock
+	var lock capturedLock
 	if len(raw) == 0 || int64(len(raw)) > maxLockBytes || toml.Unmarshal(raw, &lock) != nil || lock.Version != 1 {
-		return nil, nil, exit.Named(exit.Validation, "private_dependency_lock_invalid", "private revision requires its captured uv.lock")
+		return nil, nil, exit.Named(exit.Validation, "private_dependency_lock_invalid", "unpublished package revision requires its captured uv.lock")
 	}
 	selected := registryLock{LockVersion: "1.0"}
 	matched := map[string]bool{}
@@ -96,7 +96,7 @@ func PrivateRegistryRows(raw []byte, closure, project, version string, existing 
 			continue
 		}
 		if entry.Source.Registry != "https://pypi.org/simple" {
-			return nil, nil, exit.Named(exit.Validation, "private_dependency_origin_unsupported", "private dependency %s is not a captured local wheel or public PyPI wheel", name)
+			return nil, nil, exit.Named(exit.Validation, "private_dependency_origin_unsupported", "captured dependency %s is not a captured local wheel or public PyPI wheel", name)
 		}
 		row := registryPackage{Name: name, Version: entry.Version, Index: entry.Source.Registry}
 		for _, candidate := range entry.Wheels {
@@ -124,7 +124,7 @@ func PrivateRegistryRows(raw []byte, closure, project, version string, existing 
 	}
 	encoded, err := toml.Marshal(selected)
 	if err != nil {
-		return nil, nil, exit.Internalf("cannot encode private dependency selection")
+		return nil, nil, exit.Internalf("cannot encode captured dependency selection")
 	}
 	rows, problem := RegistryRowsFromLock(encoded, existing, "")
 	if problem != nil {
@@ -140,75 +140,82 @@ func PrivateRegistryRows(raw []byte, closure, project, version string, existing 
 	return rows, requirements, nil
 }
 
-// CapturePrivateClosure keeps wheel bytes entirely on the client-to-worker path.
-func (p *Package) CapturePrivateClosure(ctx context.Context, closure string) *exit.Error {
+// CaptureUnpublishedClosure keeps wheel bytes entirely on the client-to-worker path.
+func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string, extras []string, python string) *exit.Error {
 	raw, err := os.ReadFile(p.Files["uv.lock"])
 	if err != nil {
-		return exit.Named(exit.Validation, "private_dependency_lock_invalid", "captured private uv.lock is unavailable")
+		return exit.Named(exit.Validation, "private_dependency_lock_invalid", "captured uv.lock is unavailable")
 	}
-	rows, requirements, problem := PrivateRegistryRows(raw, closure, p.Name, p.Release, p.DependencyWheels)
+	rows, requirements, problem := CapturedRegistryRows(raw, closure, p.Name, p.Release, p.DependencyWheels)
 	if problem != nil {
 		return problem
 	}
 	directory := filepath.Join(p.Root, "private-registry")
 	if err := os.Mkdir(directory, 0o700); err != nil {
-		return exit.Internalf("cannot stage private registry wheels: %s", err)
+		return exit.Internalf("cannot stage captured registry wheels: %s", err)
 	}
 	client := &http.Client{CheckRedirect: func(request *http.Request, via []*http.Request) error {
 		if len(via) > 5 || request.URL.Scheme != "https" || request.URL.Host != "files.pythonhosted.org" {
-			return exit.New(exit.Validation, "private registry download changed origin")
+			return exit.New(exit.Validation, "captured registry download changed origin")
 		}
 		return nil
 	}}
 	for _, row := range rows {
 		address, _ := url.Parse(row.URL)
 		path := filepath.Join(directory, filepath.Base(address.Path))
-		if problem := fetchPrivateWheel(ctx, client, row, path); problem != nil {
+		if problem := fetchCapturedWheel(ctx, client, row, path); problem != nil {
 			return problem
 		}
 		p.DependencyWheels = append(p.DependencyWheels, DependencyWheel{Filename: filepath.Base(path), Path: path})
 	}
 	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
-	if problem := wheel.PinDependenciesPreserving(p.Wheel, sealed, requirements, func(raw string) bool {
-		requirement, parseProblem := parseRequirement(raw)
-		return parseProblem == nil && ImageOwnedDistribution(requirement.name)
-	}); problem != nil {
+	paths := []string{p.Wheel}
+	for _, dependency := range p.DependencyWheels {
+		paths = append(paths, dependency.Path)
+	}
+	selection, problem := ActiveWheelRequirements(ctx, p.Name, extras, paths, python)
+	if problem != nil {
+		return problem
+	}
+	requirements = append(requirements, selection.ImageRequirements()...)
+	sort.Strings(requirements)
+	if problem := wheel.PinDependencies(p.Wheel, sealed, requirements); problem != nil {
 		return problem
 	}
 	p.Wheel = sealed
 	return nil
 }
 
-func fetchPrivateWheel(ctx context.Context, client *http.Client, row RegistryRow, path string) *exit.Error {
+func fetchCapturedWheel(ctx context.Context, client *http.Client, row RegistryRow, path string) *exit.Error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, row.URL, nil)
 	if err != nil {
-		return exit.New(exit.Validation, "private dependency download request is invalid")
+		return exit.New(exit.Validation, "captured dependency download request is invalid")
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return exit.Unavailablef("private dependency %s download was interrupted", row.Name)
+		return exit.Unavailablef("captured dependency %s download was interrupted", row.Name)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK || response.ContentLength > 0 && response.ContentLength != row.Size {
-		return exit.Named(exit.Conflict, "private_dependency_download_changed", "private dependency %s download differs from the captured wheel", row.Name)
+		return exit.Named(exit.Conflict, "private_dependency_download_changed", "captured dependency %s download differs from the captured wheel", row.Name)
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return exit.Internalf("cannot stage private dependency %s", row.Name)
+		return exit.Internalf("cannot stage captured dependency %s", row.Name)
 	}
 	hash := sha256.New()
 	n, copyErr := io.Copy(io.MultiWriter(file, hash), io.LimitReader(response.Body, row.Size+1))
 	syncErr := file.Sync()
 	closeErr := file.Close()
 	if copyErr != nil || syncErr != nil || closeErr != nil || n != row.Size || hex.EncodeToString(hash.Sum(nil)) != row.SHA256 {
-		return exit.Named(exit.Conflict, "private_dependency_download_changed", "private dependency %s bytes differ from the captured wheel", row.Name)
+		return exit.Named(exit.Conflict, "private_dependency_download_changed", "captured dependency %s bytes differ from the captured wheel", row.Name)
 	}
 	fact, problem := wheel.InspectIdentity(path)
 	if problem != nil {
 		return problem
 	}
 	if fact.Distribution != row.Name || fact.Version != row.Version {
-		return exit.New(exit.Conflict, "private dependency metadata differs from its locked identity")
+		return exit.New(exit.Conflict, "captured dependency metadata differs from its locked identity")
 	}
 	return nil
 }
