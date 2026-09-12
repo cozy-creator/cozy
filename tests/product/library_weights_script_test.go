@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -110,6 +112,20 @@ def main(*, source: Source, artifacts: WeightsSink) -> ModelArtifact:
 	fatal(t, problem)
 	if request == nil || request.State != "succeeded" || len(request.Models) != 1 || request.WeightsOutputs == "" {
 		t.Fatalf("ordinary model/weights attempt missing: %+v", request)
+	}
+	installed, problem := store.Install(request.InstallID)
+	fatal(t, problem)
+	if installed == nil {
+		t.Fatal("native output request lost its captured interface")
+	}
+	selection, err := json.Marshal(request.Models)
+	must(t, err)
+	selectionPath := filepath.Join(root, "model-selection.json")
+	must(t, os.WriteFile(selectionPath, selection, 0600))
+	checkSlots := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "verify_job_model_slots.py"),
+		launch.PackageInterfacePath(installed.Dir), selectionPath, filepath.Join(root, "tensorfs"))
+	if output, err := checkSlots.CombinedOutput(); err != nil {
+		t.Fatalf("captured job model selection cannot prepare on actual Runtime: %v %s", err, output)
 	}
 	children, problem := store.Children(request.ID)
 	fatal(t, problem)
