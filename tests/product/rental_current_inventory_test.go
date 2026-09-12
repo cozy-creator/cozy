@@ -1,0 +1,135 @@
+package producttest
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/records"
+)
+
+func TestRentalListOmitsEndedRowsFromOlderDaemon(t *testing.T) {
+	layout, lock, pid, done := compatibilityOwner(t)
+	states := []string{"ready", "acquiring", "degraded", "release_requested", "future_state", ""}
+	inventory := api.RentalInventory{MachinesRunning: len(states) * 3,
+		HourlySpendUSDMicros: int64(len(states) * 3 * 100_000)}
+	var visible, ended []string
+	for group, rows := range map[string]*[]api.RentalSummary{
+		"local": &inventory.Rentals, "remote": &inventory.Unrecorded, "pending": &inventory.Pending,
+	} {
+		for _, state := range append(append([]string(nil), states...), "failed", "released") {
+			name := group + "-" + state
+			*rows = append(*rows, api.RentalSummary{ID: name, MachineName: name, State: state,
+				HourlyRateUSDMicros: 100_000, AcceleratorCount: 1})
+			if state == "failed" || state == "released" {
+				ended = append(ended, name)
+			} else {
+				visible = append(visible, name)
+			}
+		}
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/local/rentals" {
+			_ = json.NewEncoder(w).Encode(inventory)
+		}
+	}))
+	defer server.Close()
+	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "schema=999\n")
+	for _, format := range []string{"--json", "--no-watch"} {
+		output, err := compatibilityCLI(t, layout.Root, "rental", "list", format, "--full")
+		if err != nil {
+			t.Fatalf("current inventory failed: %v %s", err, output)
+		}
+		for _, name := range ended {
+			if strings.Contains(output, name) {
+				t.Fatalf("provider-absent rental %s still listed: %s", name, output)
+			}
+		}
+		for _, name := range visible {
+			if !strings.Contains(output, name) {
+				t.Fatalf("possibly-billing rental %s hidden: %s", name, output)
+			}
+		}
+		if format == "--json" {
+			var doc struct {
+				Count int              `json:"machines_running"`
+				Rate  int64            `json:"hourly_spend_usd_micros"`
+				Rows  []map[string]any `json:"rentals"`
+			}
+			must(t, json.Unmarshal([]byte(output), &doc))
+			if doc.Count != inventory.MachinesRunning || doc.Rate != inventory.HourlySpendUSDMicros || len(doc.Rows) != len(visible) {
+				t.Fatalf("filtered inventory changed reconciled totals: %s", output)
+			}
+		}
+	}
+	select {
+	case <-done:
+		t.Fatal("listing stopped the older daemon owner")
+	default:
+	}
+}
+
+func TestRentalInventoryOmitsEndedMachinesButPreservesRunHistory(t *testing.T) {
+	root, hubURL, hub := rentalEndRoot(t, "rental-current-inventory")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	const rentalID, requestID = "rental-celty", "req-celty-history"
+	hub.add(rentalID, "celty")
+	hub.setState(rentalID, "failed", "authorization_exposure_exhausted")
+	fatal(t, store.RecordRental(records.Rental{ID: rentalID, MachineName: "celty",
+		State: "failed", Hub: hubURL, AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
+	_, _, problem = store.Submit(records.Request{ID: requestID, IdemKey: requestID,
+		BodyDigest: "sha256:" + strings.Repeat("ab", 32), Package: "fake/video", Entrypoint: "generate",
+		Payload: []byte("{}"), Rental: true, Worker: rentalID})
+	fatal(t, problem)
+	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "ins-celty",
+		Package: "fake/video", WorkerID: "remote", Devices: []string{"cpu"}}))
+	digest := "sha256:" + strings.Repeat("cd", 32)
+	attempt, problem := store.Dispatch(records.Attempt{RequestID: requestID, SessionID: "celty-boot",
+		InstanceID: "ins-celty", InvocationDigest: digest, InvocationCanonical: []byte("{}")})
+	fatal(t, problem)
+	fatal(t, store.OfferDispatch(requestID, attempt, "celty-boot"))
+	fatal(t, store.Accepted(requestID, attempt, "celty-boot"))
+	_, problem = store.AcceptTerminal(records.Terminal{RequestID: requestID, Attempt: attempt,
+		SessionID: "celty-boot", InvocationDigest: digest, TerminalID: "celty-outcome",
+		TerminalDigest: "sha256:" + strings.Repeat("ef", 32), Body: []byte("{}"),
+		Status: "SUCCEEDED", RequestState: "succeeded"})
+	fatal(t, problem)
+	fatal(t, store.Closed(requestID, attempt))
+	before, problem := store.RequestRow(requestID)
+	fatal(t, problem)
+	if before.Machine != "celty" {
+		t.Fatalf("fixture did not record rental history: %+v", before)
+	}
+	live := startDaemonProcess(t, root)
+	response := live.call(t, "GET", "/v1/local/rentals", nil)
+	if response.Status != http.StatusOK {
+		t.Fatalf("inventory API failed: %s", response.brief())
+	}
+	var inventory api.RentalInventory
+	must(t, json.Unmarshal(response.Body, &inventory))
+	if len(inventory.Rentals)+len(inventory.Unrecorded)+len(inventory.Pending) != 0 || inventory.MachinesRunning != 0 || inventory.HourlySpendUSDMicros != 0 {
+		t.Fatalf("API retained the absent rental in current fleet: %s", response.Body)
+	}
+	if code, out := runCozy(t, root, "rental", "list", "--json", "--full"); code != 0 || strings.Contains(out, "celty") {
+		t.Fatalf("rental list retained an ended machine: exit=%d %s", code, out)
+	}
+	if code, out := runCozy(t, root, "run", "list", "--json", "--full"); code != 0 || !strings.Contains(out, `"machine":"celty"`) {
+		t.Fatalf("run list lost historical machine: exit=%d %s", code, out)
+	}
+	row, problem := store.RentalRow(rentalID)
+	fatal(t, problem)
+	after, problem := store.RequestRow(requestID)
+	fatal(t, problem)
+	if row == nil || row.State != "failed" || after == nil || after.Machine != before.Machine || after.State != before.State {
+		t.Fatal("listing removed rental or request history")
+	}
+	if hub.releases(rentalID) != 0 {
+		t.Fatal("listing issued a provider release")
+	}
+}
