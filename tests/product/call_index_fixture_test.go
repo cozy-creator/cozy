@@ -7,7 +7,7 @@ import (
 )
 
 // Old-schema fixtures start with the released uint32-lifetime predecessor bound.
-// Preserve every row and historical index while removing only schema35 additions.
+// Preserve every row and historical index while removing schema35 and later additions.
 func restorePriorCallIndexBounds(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.Exec(`DROP INDEX IF EXISTS byte_outputs_native_service`)
@@ -39,6 +39,7 @@ func restorePriorCallIndexBounds(t *testing.T, db *sql.DB) {
 		must(t, rows.Close())
 		_, err = db.Exec(`ALTER TABLE ` + table + ` RENAME TO prior_call_bound`)
 		must(t, err)
+		ddl = strings.Replace(ddl, "  attention_kernel TEXT NOT NULL DEFAULT '',\n", "", 1)
 		ddl = strings.Replace(ddl, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)
 		_, err = db.Exec(strings.ReplaceAll(ddl, "call_index<4294967296", "call_index<32"))
 		must(t, err)

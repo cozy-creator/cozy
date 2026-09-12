@@ -3,6 +3,7 @@ package install
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"net/textproto"
 	"os"
@@ -112,8 +113,9 @@ func closure(venv string) (int, string) {
 }
 
 type installedDistribution struct {
-	version string
-	headers textproto.MIMEHeader
+	version  string
+	headers  textproto.MIMEHeader
+	metadata []byte
 }
 
 func installedDistributions(venv string) (map[string]installedDistribution, bool) {
@@ -167,36 +169,38 @@ func installedDistributions(venv string) (map[string]installedDistribution, bool
 			if err != nil && err != io.EOF {
 				return nil, false
 			}
-			seen[name] = installedDistribution{version, headers}
+			seen[name] = installedDistribution{version: version, headers: headers, metadata: raw}
 		}
 	}
 	return seen, true
 }
 
-// ImageRequirements reads compatibility requirements from the actual captured
-// package metadata. The local installed-version roster is a capture fact, not a
-// requirement that a worker image reproduce the client's environment.
-func ImageRequirements(venv, project string) ([]string, string, *exit.Error) {
+// ExecutionRequirements reads the selected package graph, stopping at image-owned
+// distributions. Local installed versions remain separate capture facts.
+func ExecutionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, *exit.Error) {
+	selected, _, problem := executionRequirements(ctx, venv, project, extras)
+	return selected, problem
+}
+
+func executionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, string, *exit.Error) {
 	distributions, ok := installedDistributions(venv)
 	root, found := distributions[normalizedRequirementName(project)]
 	if !ok || !found {
-		return nil, "", exit.New(exit.Structural, "captured package requirements are unavailable")
+		return packagepublish.RequirementSelection{}, "", exit.New(exit.Structural, "captured package requirements are unavailable")
 	}
-	seen := map[string]bool{}
+	metadata := map[string]string{}
 	for name, distribution := range distributions {
-		if packagepublish.ImageOwnedDistribution(name) {
-			continue // The selected image owns its internal dependency closure.
-		}
-		for _, requirement := range distribution.headers.Values("Requires-Dist") {
-			if packagepublish.ImageOwnedDistribution(normalizedRequirementName(requirement)) {
-				seen[requirement] = true
-			}
+		if !packagepublish.ImageOwnedDistribution(name) {
+			metadata[name] = string(distribution.metadata)
 		}
 	}
-	requirements := make([]string, 0, len(seen))
-	for requirement := range seen {
-		requirements = append(requirements, requirement)
-	}
-	sort.Strings(requirements)
-	return requirements, root.headers.Get("Requires-Python"), nil
+	selected, problem := packagepublish.ActiveRequirements(ctx, project, extras, metadata, pythonVersion(venv))
+	return selected, root.headers.Get("Requires-Python"), problem
+}
+
+// ImageRequirements preserves the authored Python bound and selected extras while
+// using the same requirement graph as unpublished wheel sealing.
+func ImageRequirements(venv, project string, extras ...string) ([]string, string, *exit.Error) {
+	selected, python, problem := executionRequirements(context.Background(), venv, project, extras)
+	return selected.ImageRequirements(), python, problem
 }

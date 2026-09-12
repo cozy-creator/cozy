@@ -77,7 +77,7 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	if problem := pack.Build(ctx); problem != nil {
 		return Revision{}, problem
 	}
-	if problem := pack.CaptureUnpublishedClosure(ctx, install.Closure); problem != nil {
+	if problem := pack.CaptureUnpublishedClosure(ctx, install.Closure, strings.Fields(install.Extra), install.Python); problem != nil {
 		return Revision{}, problem
 	}
 	after, _, _, problem := pack.SourceIdentity()

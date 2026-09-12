@@ -141,7 +141,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 }
 
 // CaptureUnpublishedClosure keeps wheel bytes entirely on the client-to-worker path.
-func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string) *exit.Error {
+func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string, extras []string, python string) *exit.Error {
 	raw, err := os.ReadFile(p.Files["uv.lock"])
 	if err != nil {
 		return exit.Named(exit.Validation, "private_dependency_lock_invalid", "captured uv.lock is unavailable")
@@ -169,10 +169,17 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string)
 		p.DependencyWheels = append(p.DependencyWheels, DependencyWheel{Filename: filepath.Base(path), Path: path})
 	}
 	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
-	if problem := wheel.PinDependenciesPreserving(p.Wheel, sealed, requirements, func(raw string) bool {
-		requirement, parseProblem := parseRequirement(raw)
-		return parseProblem == nil && ImageOwnedDistribution(requirement.name)
-	}); problem != nil {
+	paths := []string{p.Wheel}
+	for _, dependency := range p.DependencyWheels {
+		paths = append(paths, dependency.Path)
+	}
+	selection, problem := ActiveWheelRequirements(ctx, p.Name, extras, paths, python)
+	if problem != nil {
+		return problem
+	}
+	requirements = append(requirements, selection.ImageRequirements()...)
+	sort.Strings(requirements)
+	if problem := wheel.PinDependencies(p.Wheel, sealed, requirements); problem != nil {
 		return problem
 	}
 	p.Wheel = sealed

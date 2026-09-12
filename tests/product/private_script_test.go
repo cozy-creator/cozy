@@ -45,7 +45,7 @@ only-include = ["algorithm.py"]
 	}
 	code := `# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime", "private-script-algorithm"] # //cozy:allow script dependency metadata, not a runtime invocation
+# dependencies = ["cozy-runtime==` + runtimeFixtureVersion(t, *privateScriptRuntimeWheel) + `", "private-script-algorithm"]
 # [tool.uv.sources]
 # private-script-algorithm = {path = "./algorithm", editable = true}
 ` + runtimeSource + `# ///

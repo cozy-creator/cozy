@@ -30,6 +30,11 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	if problem != nil || !possible {
 		return problem
 	}
+	selection, problem := install.ExecutionRequirements(ctx, filepath.Join(parent.Install.Dir, "venv"),
+		i.Package.Name, strings.Fields(parent.Install.Extra))
+	if problem != nil {
+		return problem
+	}
 	basePython, problem := install.BasePython(filepath.Join(parent.Install.Dir, "venv"))
 	if problem != nil {
 		return problem
@@ -136,7 +141,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			overlays[name] = captured[name]
 			return nil
 		}
-		result, problem := install.CaptureWheel(ctx, i.layout, i.store, basePython, name, closure, surface)
+		result, problem := install.CaptureWheel(ctx, i.layout, i.store, basePython, name, selection.Extras[name], closure, surface)
 		if problem != nil {
 			return problem
 		}
