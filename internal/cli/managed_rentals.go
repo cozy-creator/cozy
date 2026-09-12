@@ -910,7 +910,7 @@ func (m *managedRentals) reconcileListingLocked() {
 		return
 	}
 	for _, seen := range remote {
-		if seen.State == hub.RentalReleased || seen.State == hub.RentalFailed {
+		if hub.RentalAbsent(seen.State) {
 			continue
 		}
 		row, rowProblem := m.store.RentalRow(seen.ID)
