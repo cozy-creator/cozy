@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -129,7 +130,19 @@ async def main(ctx):
 		if status != 0 {
 			t.Fatalf("builtin caller %d failed [%d]: %s", i, status, output)
 		}
-		parent, problem := store.RequestByReference(strconv.Itoa(1 + i*4))
+		reference := ""
+		for _, line := range strings.Split(output, "\n") {
+			var answer struct {
+				Job string `json:"job"`
+			}
+			if json.Unmarshal([]byte(line), &answer) == nil && answer.Job != "" {
+				reference = answer.Job
+			}
+		}
+		if reference == "" {
+			t.Fatal("CLI completion omitted its run reference")
+		}
+		parent, problem := store.RequestByReference(reference)
 		fatal(t, problem)
 		if parent == nil || parent.State != "succeeded" {
 			t.Fatalf("missing completed caller: %+v", parent)
