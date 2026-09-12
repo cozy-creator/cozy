@@ -113,6 +113,17 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		c.watchChildCall(s, proto.Clone(call).(*pb.ChildCallRequest), existing.ID)
 		return
 	}
+	// A frozen callable is permission to resolve it, not spare execution capacity.
+	// Rented children currently run on their parent's worker. Refuse an actual
+	// nested call before queueing if that parent occupies its ordinary job slot;
+	// otherwise both requests can wait forever for that same slot. Native services
+	// above have their own admission and do not take the ordinary job slot.
+	if parent.Worker != "" {
+		if _, problem := c.retainedOrchestrationParent(records.Request{ParentRequestID: parent.ID, Worker: parent.Worker}); problem != nil {
+			refuse(problem)
+			return
+		}
+	}
 	resolver, ok := c.opt.Packages.(privateChildResolver)
 	if !ok {
 		refuse(exit.Unavailablef("this package owner cannot resolve frozen child interfaces"))
