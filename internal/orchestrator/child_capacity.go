@@ -20,8 +20,9 @@ func (c *Orchestrator) requiredPrivateWire(req records.Request) (uint32, *exit.E
 	return RetainedWorkWireMinor, nil
 }
 
-// jobExecutionRole assigns the separate CPU orchestration slot from captured
-// dependency facts. A package never chooses this role in its invocation payload.
+// jobExecutionRole can place a resource-free caller in the separate CPU slot.
+// Captured dependencies make child calls available; they do not require delegation
+// or prevent an ordinary job from using Models, weights outputs, or a device.
 func (c *Orchestrator) jobExecutionRole(req records.Request, spec WorkerLaunchSpec) (WorkerLaunchSpec, *exit.Error) {
 	if !spec.IsJob() {
 		return spec, nil
@@ -38,10 +39,7 @@ func (c *Orchestrator) jobExecutionRole(req records.Request, spec WorkerLaunchSp
 	}
 	plan.Orchestration = false
 	plan.OrchestrationParent = nil
-	if bound {
-		if !req.RetainWork || req.NeedsAccelerator || len(req.Models) > 0 || len(plan.WeightsOutputs) > 0 {
-			return spec, exit.Named(exit.Structural, "child.orchestration_resources", "an invocable composition must keep its parent CPU-only and delegate model work to children")
-		}
+	if bound && req.RetainWork && !req.NeedsAccelerator && len(req.Models) == 0 && len(plan.WeightsOutputs) == 0 {
 		plan.Orchestration = req.Worker != ""
 		if plan.Orchestration {
 			raw, _, err := canonical.Identity(c.jobDirective(&plan))
