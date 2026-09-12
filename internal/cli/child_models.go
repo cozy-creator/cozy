@@ -170,12 +170,12 @@ func (r *Resolver) childAccelerator(parent records.Request) (string, *exit.Error
 	return row.AcceleratorModel, nil
 }
 
-// PrivateChildModels is every captured callee's declared model selection, with its rung
+// UnpublishedChildModels is every captured callee's declared model selection, with its rung
 // still open. Two consumers, one reading: the machine decision uses it so a composition
 // whose parent holds no model of its own can still use available authored/default
 // ladders for placement. Capturing a callable does not invoke it or establish its
 // future model arguments; absent selections are checked when the child is called.
-func (r *Resolver) PrivateChildModels(request records.Request) ([]records.ModelRef, *exit.Error) {
+func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.ModelRef, *exit.Error) {
 	if request.InstallID == "" {
 		return nil, nil
 	}

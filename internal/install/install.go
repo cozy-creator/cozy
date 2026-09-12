@@ -193,9 +193,9 @@ type Timing struct {
 
 type Result struct {
 	Install records.PackageInstall
-	// PrivateProjectWheel is the metadata-sealed executable of a captured App
+	// CapturedProjectWheel is the metadata-sealed executable of a captured App
 	// wheel. Its original archive remains under this install's original/ directory.
-	PrivateProjectWheel string
+	CapturedProjectWheel string
 	Superseded          string
 	Idempotent          bool
 	Timings             []Timing
@@ -374,10 +374,10 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	packageInterfacePath := launch.PackageInterfacePath(installDir)
 	if err := os.MkdirAll(filepath.Dir(packageInterfacePath), 0o700); err != nil {
-		return guard(exit.Internalf("cannot create private package interface root: %s", err))
+		return guard(exit.Internalf("cannot create unpublished package interface root: %s", err))
 	}
 	if err := os.WriteFile(packageInterfacePath, packageInterface.Raw, 0o600); err != nil {
-		return guard(exit.Internalf("cannot store private package interface: %s", err))
+		return guard(exit.Internalf("cannot store unpublished package interface: %s", err))
 	}
 	inst.PackageInterface = packageInterface.Digest
 	if req.Local != nil {

@@ -136,14 +136,14 @@ func readExecutionObservation(doc canonical.Doc) (*pb.ExecutionObservation, *exi
 	return &observation, nil
 }
 
-func (c *Orchestrator) privateByteOutputs(req records.Request, attempt records.Attempt, doc canonical.Doc) ([]records.ByteOutput, *exit.Error) {
+func (c *Orchestrator) capturedByteOutputs(req records.Request, attempt records.Attempt, doc canonical.Doc) ([]records.ByteOutput, *exit.Error) {
 	var out []records.ByteOutput
 	rows := doc.Sub("output_manifest").List("outputs")
 	if len(rows) > pb.MaxChildArtifactGrants {
 		return nil, exit.New(exit.Validation, "child byte output count exceeds 32")
 	}
 	bounds, ok := c.opt.Packages.(interface {
-		PrivateByteOutputBound(records.Request, string, string) (int64, *exit.Error)
+		CapturedByteOutputBound(records.Request, string, string) (int64, *exit.Error)
 	})
 	if !ok && len(rows) > 0 {
 		return nil, exit.Unavailablef("byte result schema verifier is absent")
@@ -194,7 +194,7 @@ func (c *Orchestrator) privateByteOutputs(req records.Request, attempt records.A
 		if b.OutputID == "runtime.capture" && req.Capture != "" {
 			maximum = min(int64(c.maxOutputBytes()), 128<<20)
 		} else {
-			maximum, problem = bounds.PrivateByteOutputBound(req, b.OutputID, b.MimeType)
+			maximum, problem = bounds.CapturedByteOutputBound(req, b.OutputID, b.MimeType)
 		}
 		if problem != nil {
 			return nil, problem

@@ -88,9 +88,10 @@ func (s *Store) SelfCallableEntrypoints(installID string) (map[string]bool, *exi
 	return out, nil
 }
 
-// CompositionParent answers whether one request's entrypoint is the CPU orchestration
-// parent of a captured composition: the install captured children, and this entrypoint
-// is not itself one of them.
+// CompositionParent identifies an entrypoint with captured callees that is not a
+// captured callee itself. This is availability, not an exclusive execution role:
+// only a request without model, device, or weights requirements can take the
+// spare CPU orchestration slot. Ordinary library consumers keep their resources.
 func (s *Store) CompositionParent(installID, entrypoint string) (bool, *exit.Error) {
 	bound, problem := s.HasChildBindings(installID)
 	if problem != nil || !bound {

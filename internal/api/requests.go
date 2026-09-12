@@ -553,7 +553,7 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 	}
 	if len(out.Models) == 0 {
 		// The editable install froze its model selection; the rental carries that exact
-		// intent (repo, release, lane, manifest) to the pod as its private placement.
+		// intent (repo, release, lane, manifest) to the pod as its unpublished package placement.
 		out.Models = append([]orchestrator.ModelRef(nil), placement.Models...)
 	}
 	planID, outputs, problem := placementPlan(placement, sub.Function)

@@ -79,7 +79,7 @@ func (s *Store) AcceptNativeCall(call NativeCall, parentAttempt int64, parentSpe
 		return NativeCall{}, false, exit.Internalf("cannot read native caller authority: %s", err)
 	}
 	if !owned || !parent.IsJob() || !parent.RetainWork || parent.State != "dispatching" || parent.Ordinal != parentAttempt {
-		return NativeCall{}, false, exit.Named(exit.Conflict, "native.parent_stopped", "native call has no current private parent attempt")
+		return NativeCall{}, false, exit.Named(exit.Conflict, "native.parent_stopped", "native call has no current unpublished parent attempt")
 	}
 	var occupied bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests WHERE parent_request_id=? AND parent_call_index=?)`, parent.ID, call.CallIndex).Scan(&occupied); err != nil {

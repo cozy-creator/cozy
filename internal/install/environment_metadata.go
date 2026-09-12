@@ -40,23 +40,23 @@ func venvMetadata(venv string) map[string]string {
 func BasePython(venv string) (string, *exit.Error) {
 	metadata := venvMetadata(venv)
 	if metadata == nil {
-		return "", exit.New(exit.Structural, "private environment has no regular pyvenv.cfg")
+		return "", exit.New(exit.Structural, "captured environment has no regular pyvenv.cfg")
 	}
 	prefix, err := filepath.Abs(venv)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment path is invalid")
+		return "", exit.New(exit.Structural, "captured environment path is invalid")
 	}
 	prefix, err = filepath.EvalSymlinks(prefix)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment path is unavailable")
+		return "", exit.New(exit.Structural, "captured environment path is unavailable")
 	}
 	base, err := filepath.EvalSymlinks(home.VenvPython(venv))
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment base interpreter is unavailable")
+		return "", exit.New(exit.Structural, "captured environment base interpreter is unavailable")
 	}
 	base, err = filepath.Abs(base)
 	if err != nil {
-		return "", exit.New(exit.Structural, "private environment base interpreter path is invalid")
+		return "", exit.New(exit.Structural, "captured environment base interpreter path is invalid")
 	}
 	inside := func(path string) bool {
 		rel, err := filepath.Rel(prefix, path)
@@ -67,7 +67,7 @@ func BasePython(venv string) (string, *exit.Error) {
 	}
 	info, err := os.Stat(base)
 	if err != nil || !info.Mode().IsRegular() || inside(base) {
-		return "", exit.New(exit.Structural, "private environment does not name an external base interpreter")
+		return "", exit.New(exit.Structural, "captured environment does not name an external base interpreter")
 	}
 	return base, nil
 }
@@ -94,7 +94,7 @@ func pythonVersion(venv string) string {
 
 // closure observes installed metadata directly. `uv pip list` can execute .pth
 // startup hooks to discover additional import paths; those paths are not part of
-// the exact installed-wheel roster and cannot enter private dependency capture.
+// the exact installed-wheel roster and cannot enter captured dependency capture.
 func closure(venv string) (int, string) {
 	installed := installedMetadata(venv)
 	lines := make([]string, 0, len(installed))

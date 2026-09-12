@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-var privateScriptRuntimeWheel = flag.String("script-runtime-wheel", "", "Exact Runtime wheel used for private script product proofs")
+var privateScriptRuntimeWheel = flag.String("script-runtime-wheel", "", "Exact Runtime wheel used for local script product proofs")
 
 // A real Python library is captured with a script, even when its version and
 // pyproject stay unchanged. The corrected run must use the edited library while

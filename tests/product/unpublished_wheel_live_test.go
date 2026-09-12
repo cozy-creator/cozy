@@ -12,11 +12,12 @@ import (
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/records"
+	capturedwheel "github.com/cozy-creator/cozy/internal/wheel"
 )
 
 // Every invocation uses the actual cozy CLI. A successful import alone does not
 // test worker dispatch, native custody, or independently edited caller reuse.
-func TestPrivateWheelCompositionTracksExecutableNotCaller(t *testing.T) {
+func TestUnpublishedWheelCompositionTracksExecutableNotCaller(t *testing.T) {
 	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	parsed, err := pep440.Parse(version)
 	must(t, err)
@@ -53,13 +54,13 @@ func TestPrivateWheelCompositionTracksExecutableNotCaller(t *testing.T) {
 		if !t.Failed() {
 			must(t, os.RemoveAll(root))
 		} else {
-			t.Log("private wheel evidence retained", root)
+			t.Log("captured wheel evidence retained", root)
 		}
 	})
 	library := filepath.Join(project, "library")
 	must(t, os.MkdirAll(library, 0o700))
 	metadata := fmt.Sprintf(`[project]
-name = "private-wheel-proof"
+name = "unpublished-wheel-proof"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = ["cozy-runtime[model-execution]==%s", "msgspec"]
@@ -94,15 +95,15 @@ app.job(second)
 	must(t, os.WriteFile(module, []byte(body), 0o600))
 	wheels := filepath.Join(project, "wheels")
 	runUV("build", "--wheel", "--out-dir", wheels, library)
-	wheel := filepath.Join(wheels, "private_wheel_proof-0.1.0-py3-none-any.whl")
+	wheel := filepath.Join(wheels, "unpublished_wheel_proof-0.1.0-py3-none-any.whl")
 	original, err := os.ReadFile(wheel)
 	must(t, err)
 	script := filepath.Join(project, "first.py")
 	code := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime[model-execution]==%s", "private-wheel-proof==0.1.0"]
+# dependencies = ["cozy-runtime[model-execution]==%s", "unpublished-wheel-proof==0.1.0"]
 # [tool.uv.sources]
-%s# private-wheel-proof = {path = %q}
+%s# unpublished-wheel-proof = {path = %q}
 # ///
 from wheel_proof import compose
 async def main(ctx):
@@ -129,6 +130,11 @@ async def main(ctx):
 	fatal(t, problem)
 	if inst.SourceKind != "wheel" {
 		t.Fatalf("captured wheel became a source project: %+v", inst)
+	}
+	sealed, problem := capturedwheel.Metadata(filepath.Join(inst.Dir, "wheels", filepath.Base(wheel)))
+	fatal(t, problem)
+	if !strings.Contains(string(sealed), "Requires-Dist: msgspec\n") || strings.Contains(string(sealed), "msgspec==") {
+		t.Fatalf("callable wheel replaced its authored image requirement with a client pin: %s", sealed)
 	}
 	retained := filepath.Join(inst.Dir, "original", filepath.Base(wheel))
 	raw, err := os.ReadFile(retained)

@@ -61,7 +61,7 @@ func (s *Store) CompleteNativeByteCall(service string, currentAttempt int64, cur
 	}
 	parent, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, call.ParentRequestID))
 	if err != nil || parent.State != "dispatching" || !parent.RetainWork || parent.Ordinal != currentAttempt || parent.Worker != call.Worker {
-		return fail("native byte recipient has no current private parent")
+		return fail("native byte recipient has no current unpublished parent")
 	}
 	var owned bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND attempt=? AND invocation_digest=? AND session_id=? AND state IN ('offered','accepted','recovered_open'))`, parent.ID, currentAttempt, currentSpec, currentBoot).Scan(&owned); err != nil || !owned {

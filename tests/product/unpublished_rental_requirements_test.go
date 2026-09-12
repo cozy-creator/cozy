@@ -20,7 +20,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-func TestPrivateExtraImageRequirementReachesTheSealedWheel(t *testing.T) {
+func TestUnpublishedExtraImageRequirementReachesTheSealedWheel(t *testing.T) {
 	for _, extra := range []string{"[gpu]", ""} {
 		t.Run(extra, func(t *testing.T) {
 			root := t.TempDir()
@@ -61,7 +61,7 @@ only-include = ["code.py"]
 				Files:            map[string]string{"uv.lock": filepath.Join(root, "uv.lock")},
 				DependencyWheels: []packagepublish.DependencyWheel{{Path: filepath.Join(wheels, "extra_proof-1.0-py3-none-any.whl")}},
 			}
-			fatal(t, pack.CapturePrivateClosure(context.Background(), environment.Closure, nil, environment.Python))
+			fatal(t, pack.CaptureUnpublishedClosure(context.Background(), environment.Closure, nil, environment.Python))
 			body, problem := wheel.Metadata(pack.Wheel)
 			fatal(t, problem)
 			text := string(body)
@@ -136,7 +136,7 @@ func TestRentalRequirementsStopAtTheWorkerImage(t *testing.T) {
 
 // This exercises actual script capture and named-rental admission through the
 // normal CLI. The HTTP peer supplies inventory only; it never buys a machine.
-func TestPrivateNamedRentalUsesAuthoredImageRequirements(t *testing.T) {
+func TestUnpublishedNamedRentalUsesAuthoredImageRequirements(t *testing.T) {
 	version := runtimeFixtureVersion(t, "")
 	const current, old, earlierPython = "pr-11111111111111111111", "pr-22222222222222222222", "pr-33333333333333333333"
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, _ *hub.PackageReleaseDetail) {
@@ -198,6 +198,12 @@ def main(ctx):
 	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--dry-run", "--json")
 	if status != 0 {
 		t.Fatalf("captured patch was substituted for the target patch [%d]: %s", status, out)
+	}
+	pythonCode := strings.Replace(patchCode, `requires-python = ">=3.12,<3.13"`, `requires-python = ">=3.12.5,<3.13"`, 1)
+	must(t, os.WriteFile(script, []byte(pythonCode), 0600))
+	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--dry-run", "--json")
+	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "3.12.3") {
+		t.Fatalf("authored Python patch floor was replaced by the default minor range [%d]: %s", status, out)
 	}
 	library := filepath.Join(filepath.Dir(script), "library")
 	must(t, os.Mkdir(library, 0700))
