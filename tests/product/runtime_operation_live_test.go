@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -179,7 +180,8 @@ async def main(ctx):
 	}
 	python, problem := launch.EnvironmentPython(*prepared)
 	fatal(t, problem)
-	requirements, _, problem := install.ImageRequirements(filepath.Dir(filepath.Dir(python)), "cozy-runtime-operations")
+	selection, problem := install.ExecutionRequirements(context.Background(), filepath.Dir(filepath.Dir(python)), "cozy-runtime-operations", nil)
+	requirements := selection.ImageRequirements()
 	fatal(t, problem)
 	numpyRange := false
 	for _, requirement := range requirements {
