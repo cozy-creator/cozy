@@ -982,7 +982,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			// $0.74 an hour — so the cell carries the card rather than a dash.
 			"machine": seen.MachineName,
 			"sku":     orNone(acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount)),
-			"state":   seen.State,
+			"state":   humanRentalState(seen.State),
 			"failure": "—", "uptime": rentalUptime(seen.RentedAt),
 			"running": "—", "queued": "—", "idle": "—",
 			"rental": seen.ID, "bought for": "—",
@@ -1027,7 +1027,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 	for _, op := range inventory.Pending {
 		machine := op.MachineName
 		list.Rows = append(list.Rows, map[string]string{
-			"machine": machine, "sku": orNone(op.SKU), "state": op.State,
+			"machine": machine, "sku": orNone(op.SKU), "state": humanRentalState(op.State),
 			"failure": "—", "uptime": rentalUptime(op.RentedAt), "running": "0", "queued": "0",
 			"idle": "—", "rental": orNone(op.ID), "bought for": orNone(op.BoughtFor),
 			"accelerator": "—", "address": "", "media": "", "hub": op.Hub,

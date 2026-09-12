@@ -20,6 +20,9 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 			return result, problem
 		}
 	}
+	// totalsLocked propagates a failed Hub census and refuses when the Hub has
+	// no listing route. Success therefore means the inventory can report totals;
+	// an unavailable account view never becomes an empty or partial success.
 	count, burn, problem := fleet.totalsLocked()
 	if problem != nil {
 		return result, problem

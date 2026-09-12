@@ -52,6 +52,25 @@ func TestRentalListUsesDaemonAPIWithoutOpeningSQLite(t *testing.T) {
 	}
 }
 
+func TestRentalInventoryHumanDrainingKeepsRawStates(t *testing.T) {
+	layout, lock, pid, _ := compatibilityOwner(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/local/rentals" {
+			_, _ = w.Write([]byte(`{"machines_running":2,"hourly_spend_usd_micros":200000,"idle_release_s":240,"rentals":[],"unrecorded":[{"rental_id":"remote-id","machine":"remote-machine","state":"release_requested","hourly_rate_usd_micros":100000}],"pending":[{"machine":"pending-machine","state":"release_requested","operation":"pending-id","hourly_rate_usd_micros":100000}]}`))
+		}
+	}))
+	defer server.Close()
+	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
+	output, err := compatibilityCLI(t, layout.Root, "rental", "list", "--no-watch")
+	if err != nil || strings.Count(output, "draining") != 2 || strings.Contains(output, "release_requested") || !strings.Contains(output, "Idle machines shut down after 4 minutes") {
+		t.Fatalf("inventory lost human state or daemon-owned idle policy: %v %s", err, output)
+	}
+	output, err = compatibilityCLI(t, layout.Root, "rental", "list", "--json")
+	if err != nil || strings.Count(output, `"state":"release_requested"`) != 2 || strings.Contains(output, `"state":"draining"`) {
+		t.Fatalf("human projection changed raw API states: %v %s", err, output)
+	}
+}
+
 func TestRentalSchemaGuardPreservesActiveOwnerAndRetainedRows(t *testing.T) {
 	layout, lock, pid, done := compatibilityOwner(t)
 	path, db := retainedWidthDatabase(t, true)
