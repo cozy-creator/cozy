@@ -72,7 +72,7 @@ func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 	}
 	// Register the already-produced bytes as an ordinary local checkpoint. This
 	// uses native repository custody, not a fake Model loader or HTTP response.
-	register := exec.Command("tfs", "local", "replace", filepath.Join(root, "tensorfs"), "library-seed", strings.TrimPrefix(weights[0].ManifestID, "sha256:"), weights[0].ManifestID, strconv.FormatInt(weights[0].ManifestLength, 10), "--observed", "absent")
+	register := exec.Command("tfs", "local", "replace", filepath.Join(root, "tensorfs"), "library-seed", strings.TrimPrefix(weights[0].ManifestID, "sha256:"), weights[0].ManifestID, strconv.FormatInt(weights[0].ManifestLength, 10), "--observed", "absent") //cozy:allow fixture uses native repository CLI to register a real produced checkpoint
 	if output, err := register.CombinedOutput(); err != nil {
 		t.Fatalf("retain native fixture checkpoint: %v %s", err, output)
 	}
@@ -102,7 +102,7 @@ def main(*, source: Source, artifacts: WeightsSink) -> ModelArtifact:
         return writer.commit().artifact
 `
 	must(t, os.WriteFile(script, []byte(code), 0600))
-	status, output := runCozyPath(t, root, path, "run", script, "model.source=local/library-seed", "--await", "--json")
+	status, output := runCozyPath(t, root, path, "run", script, "model.source=local/library-seed#"+weights[0].ManifestID, "--await", "--json")
 	if status != 0 {
 		t.Fatalf("ordinary library script failed [%d]: %s", status, output)
 	}
