@@ -43,7 +43,7 @@ only-include = ["code.py"]
 				must(t, os.WriteFile(filepath.Join(dir, "code.py"), []byte("VALUE=7\n"), 0600))
 			}
 			metadata(root, "root-proof", "dependencies = [\"extra-proof"+extra+"\"]\n[tool.uv.sources]\nextra-proof={path='library'}")
-			metadata(library, "extra-proof", "dependencies = []\n[project.optional-dependencies]\ngpu = [\"msgspec>=0.21,<0.22; python_full_version >= '3.12.5' or sys_platform == 'win32'\"]")
+			metadata(library, "extra-proof", "dependencies = []\n[project.optional-dependencies]\ngpu = [\"msgspec>=0.21,<0.22; python_full_version >= '3.12.5' and (python_full_version >= '3.12.12' or sys_platform == 'win32' or python_full_version < '3.12.4')\"]")
 			run := func(args ...string) {
 				t.Helper()
 				if out, err := exec.Command("uv", args...).CombinedOutput(); err != nil {
@@ -189,7 +189,7 @@ def main(ctx):
 	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "msgspec 0.20.0") {
 		t.Fatalf("authored image requirement was not enforced [%d]: %s", status, out)
 	}
-	patchCode := strings.Replace(code, "msgspec>=0.21,<0.22", "msgspec>=0.21,<0.22; python_full_version >= '3.12.5'", 1)
+	patchCode := strings.Replace(code, "msgspec>=0.21,<0.22", "msgspec>=0.21,<0.22; python_full_version >= '3.12.5' and (python_full_version >= '3.12.12' or sys_platform == 'win32' or python_full_version < '3.12.4')", 1)
 	must(t, os.WriteFile(script, []byte(patchCode), 0600))
 	status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
 	if status == 0 || !strings.Contains(out, "msgspec 0.20.0") {

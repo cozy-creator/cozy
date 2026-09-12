@@ -74,7 +74,7 @@ def bind_extra(node, extra):
         if not remaining:
             return True
         alternatives.append("(" + " and ".join(remaining) + ")")
-    return " or ".join(alternatives) if alternatives else False
+    return "(" + " or ".join(alternatives) + ")" if alternatives else False
 
 
 project = canonicalize_name(request["project"])
