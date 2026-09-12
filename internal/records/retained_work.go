@@ -76,6 +76,7 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 	}
 	request.RequestedRental = prior.RequestedRental
 	request.Worker, request.Rental, request.RentalRequired = prior.Worker, prior.Rental, prior.RentalRequired
+	request.AttentionKernel = prior.AttentionKernel
 	request.ReuseScope = prior.ReuseScope
 	if request.ReuseScope == "" {
 		request.ReuseScope = prior.ID

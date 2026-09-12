@@ -132,7 +132,7 @@ func PrivateRegistryRows(raw []byte, closure, project, version string, existing 
 	}
 	requirements := make([]string, 0, len(pins)-1)
 	for name, version := range pins {
-		if name != project {
+		if name != project && !ImageOwnedDistribution(name) {
 			requirements = append(requirements, name+"=="+version)
 		}
 	}
@@ -169,7 +169,10 @@ func (p *Package) CapturePrivateClosure(ctx context.Context, closure string) *ex
 		p.DependencyWheels = append(p.DependencyWheels, DependencyWheel{Filename: filepath.Base(path), Path: path})
 	}
 	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
-	if problem := wheel.PinDependencies(p.Wheel, sealed, requirements); problem != nil {
+	if problem := wheel.PinDependenciesPreserving(p.Wheel, sealed, requirements, func(raw string) bool {
+		requirement, parseProblem := parseRequirement(raw)
+		return parseProblem == nil && ImageOwnedDistribution(requirement.name)
+	}); problem != nil {
 		return problem
 	}
 	p.Wheel = sealed

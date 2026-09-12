@@ -190,8 +190,12 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 			}
 		}
 		if result.ShuttingDown {
+			cancelledLabel := "cancelled"
+			if ctx.Mode().JSON {
+				cancelledLabel = "canceled"
+			}
 			fields := []output.Field{
-				{K: "canceled", V: len(canceled)}, {K: "rentals_ended", V: len(ended)},
+				{K: cancelledLabel, V: len(canceled)}, {K: "rentals_ended", V: len(ended)},
 			}
 			// SAY WHAT WAS DESTROYED, and what survived. This cancels the owner's in-flight
 			// work by design, and a paid pod that could not be ended is still billing after

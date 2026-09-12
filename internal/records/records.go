@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 37
+const schemaVersion = 38
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -179,6 +179,12 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 			db.Close()
 			return nil, e
 		}
+	} else if version > schemaVersion {
+		db.Close()
+		return nil, exit.Named(exit.Conflict, "records_schema_newer",
+			"records database has schema %d; this Creator supports schema %d",
+			version, schemaVersion).
+			WithRemedy("upgrade Cozy Creator to a version that supports schema %d; keep %s in place", version, path)
 	} else if version != schemaVersion {
 		db.Close()
 		return nil, schemaReset(path,
@@ -273,7 +279,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 37 {
+	if sourceVersion < 38 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -741,6 +747,10 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		destinationColumns += ",capture"
 		selectColumns += ",capture"
 	}
+	if sourceVersion >= 38 {
+		destinationColumns += ",attention_kernel"
+		selectColumns += ",attention_kernel"
+	}
 	if _, err := tx.Exec(`INSERT INTO requests(` + destinationColumns + `) SELECT ` + selectColumns +
 		` FROM requests_prior`); err != nil {
 		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)
@@ -923,6 +933,9 @@ func priorStatements(version int) []string {
 		}
 		if requestStatement && version < 33 {
 			stmt = strings.Replace(stmt, "  capture      TEXT    NOT NULL DEFAULT '',\n", "", 1)
+		}
+		if requestStatement && version < 38 {
+			stmt = strings.Replace(stmt, "  attention_kernel TEXT NOT NULL DEFAULT '',\n", "", 1)
 		}
 		if version < 35 {
 			stmt = strings.ReplaceAll(stmt, "call_index<4294967296", "call_index<32")

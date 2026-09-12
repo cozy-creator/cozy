@@ -98,6 +98,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 			return unknownFunction(target, packageInterface)
 		}
 	}
+	if callable.Kind == "job" && ctx.Inv.Value("--attention-kernel") != "" {
+		return exit.Usagef("--attention-kernel applies only to serving callables")
+	}
 	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--await") {
 		return exit.Usagef("--dry-run and --await conflict")
 	}
@@ -174,6 +177,15 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if pin := strings.TrimSpace(ctx.Inv.Value("--attention-kernel")); pin != "" {
+		if overrides.AttentionKernel != "" {
+			return exit.Usagef("attention kernel was pinned more than once")
+		}
+		if strings.ContainsAny(pin, "= \t\r\n") {
+			return exit.Usagef("--attention-kernel must be one kernel name")
+		}
+		overrides.AttentionKernel = pin
+	}
 	prepareImage := imagePreparer(ctx)
 	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"], prepareImage)
 	if e != nil {
@@ -186,7 +198,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e := validateInvocationPayload(ctx, target.Package, ep, input); e != nil {
 		return e
 	}
-	models, e := resolveInvocationModels(ctx, target, ep, overrides, managedRental)
+	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models, managedRental)
 	if e != nil {
 		return e
 	}
@@ -208,6 +220,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		RequestedRental: selectedRental,
 		Models:          models,
 		OutputDirectory: outputDirectory,
+		AttentionKernel: overrides.AttentionKernel,
 	}, key)
 	if e != nil {
 		return e
@@ -716,7 +729,9 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		// the recorded actor, so a list is never a quiet no-output ending.
 		status := life.Status
 		if life.Status == "canceled" && life.CanceledBy != "" {
-			status = "canceled by " + life.CanceledBy
+			status = humanCancellationStatus(life.CanceledBy)
+		} else if life.Status == "canceled" {
+			status = "cancelled"
 		}
 		machine := life.Machine
 		if machine == "" {
@@ -1184,7 +1199,7 @@ func watch(ctx *Context, c *localapi.Client, requestID string,
 		select {
 		case <-interrupt:
 			if !ctx.Mode().JSON {
-				fmt.Fprintln(ctx.Err, "detached — the canceled terminal still lands in `cozy run list`")
+				fmt.Fprintln(ctx.Err, "detached — the cancelled terminal still lands in `cozy run list`")
 			}
 			stopWatch()
 		case problem := <-cancelResult:
@@ -1202,7 +1217,7 @@ func watch(ctx *Context, c *localapi.Client, requestID string,
 		select {
 		case <-interrupt:
 			if !ctx.Mode().JSON {
-				fmt.Fprintln(ctx.Err, "detached — the canceled terminal still lands in `cozy run list`")
+				fmt.Fprintln(ctx.Err, "detached — the cancelled terminal still lands in `cozy run list`")
 			}
 			stopWatch()
 		case <-done:
@@ -1852,7 +1867,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		shownStatus = life.Status + " (export pending: " + export.ErrorCode + ")"
 	}
 	if life.Status == "canceled" && life.CanceledBy != "" {
-		shownStatus = "canceled by " + life.CanceledBy
+		shownStatus = humanCancellationStatus(life.CanceledBy)
+	} else if life.Status == "canceled" {
+		shownStatus = "cancelled"
 	}
 	fields := []output.Field{
 		{K: "number", V: life.Number}, {K: "id", V: life.RequestID},
@@ -1938,7 +1955,11 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if code == exit.OK {
 		return emit(ctx, rec)
 	}
-	e := exit.Named(code, status, "request %s ended %s", life.RequestID, status)
+	humanStatus := status
+	if status == "canceled" {
+		humanStatus = humanCancellationStatus(life.CanceledBy)
+	}
+	e := exit.Named(code, humanStatus, "request %s ended %s", life.RequestID, humanStatus)
 	errType, why := life.ErrorType, life.Error
 	if why == "" && terminal != nil {
 		// A request that failed BEFORE ANY ATTEMPT has no attempt row to carry a cause —
@@ -1949,11 +1970,11 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	}
 	if why != "" {
 		e.Message = fmt.Sprintf("request %s ended %s: %s — %s",
-			life.RequestID, status, errType, why)
+			life.RequestID, humanStatus, errType, why)
 	}
 	// A canceled run is LOUD about WHO ended it (cl-108) — never a quiet no-output end.
 	if mapTerminal(status) == "canceled" && life.CanceledBy != "" {
-		e.Message = fmt.Sprintf("request %s was canceled by %s", life.RequestID, life.CanceledBy)
+		e.Message = fmt.Sprintf("request %s was %s", life.RequestID, humanCancellationStatus(life.CanceledBy))
 		if why != "" {
 			e.Message += ": " + why
 		}

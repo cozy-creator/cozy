@@ -133,7 +133,7 @@ func TestRentalReassignmentPreservesExecutionAndPurchaseCustody(t *testing.T) {
 			request, _, problem = st.Submit(request)
 			fatal(t, problem)
 			if mode == "purchased" {
-				op, _, problem := st.BeginRentalOperation(records.RentalOperation{Key: "purchase", Hub: "proof", Reason: "job", ManagedRequestID: request.ID, HourlyRateUSDMicros: 1}, 100, 0, func(string) ([]byte, string, *exit.Error) { return []byte(`{}`), "proof", nil })
+				op, _, problem := st.BeginRentalOperation(records.RentalOperation{Key: "purchase", Hub: "proof", Reason: "job", ManagedRequestID: request.ID, HourlyRateUSDMicros: 1}, 100, 0, func(string) ([]byte, string, *exit.Error) { return []byte(`{}`), "proof", nil }, nil)
 				fatal(t, problem)
 				fatal(t, st.AdvanceRentalOperation(op.Key, row.ID, "ready"))
 			}

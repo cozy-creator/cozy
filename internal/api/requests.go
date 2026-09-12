@@ -52,6 +52,8 @@ type Submission struct {
 	// OutputDirectory is the caller's --out. Empty means the package's own store under
 	// outputs/, which every run exports to.
 	OutputDirectory string `json:"output_directory,omitempty"`
+	// AttentionKernel is an optional developer execution-path pin.
+	AttentionKernel string `json:"attention_kernel,omitempty"`
 	AttemptKey      string `json:"-"`
 }
 
@@ -236,6 +238,8 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		RequestedRental:    sub.RequestedRental,
 		Models:             models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
+		// Replays retain the recorded execution-path pin.
+		AttentionKernel: recorded.AttentionKernel,
 	}
 }
 
@@ -277,6 +281,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.RentalRequired {
 		doc["rental_required"] = true
+	}
+	if spec.AttentionKernel != "" {
+		doc["attention_kernel"] = spec.AttentionKernel
 	}
 	if spec.RequestedRental != "" {
 		doc["requested_rental"] = spec.RequestedRental

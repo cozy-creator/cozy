@@ -25,7 +25,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-// The rental verbs (cl-015). `cozy rent` MINTS the pod's access token, asks the hub for a
+// The rental verbs (cl-015). `cozy rental new` MINTS the pod's access token, asks the hub for a
 // pod while presenting only that token's sha256, watches it provision, and PINS the
 // triple — the address, the certificate to trust, and the token it minted — so that
 // `cozy run --rental` lets the scheduler use the attached capacity.
@@ -67,7 +67,7 @@ func handleRent(ctx *Context) *exit.Error {
 		if ctx.Inv.Value("--idempotency-key") != "" ||
 			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || ctx.Inv.Bool("--development") || ctx.Inv.Value("--ssh-public-key") != "" {
 			return exit.Usagef("rental options require a GPU SKU").
-				WithRemedy("use `cozy rent` alone to list available machines")
+				WithRemedy("use `cozy rental new` alone to list available machines")
 		}
 		hctx, cancel := hub.Context()
 		skus, e := client(ctx).RentalSKUs(hctx)
@@ -77,7 +77,7 @@ func handleRent(ctx *Context) *exit.Error {
 		}
 		return emitRentalCatalog(ctx, skus)
 	}
-	reason := "cozy rent " + skuName
+	reason := "cozy rental new " + skuName
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
 	// rather than on a clock: a pod that is still booting is not a pod that has failed.
 	deadline := time.Time{}
@@ -193,7 +193,7 @@ func handleRent(ctx *Context) *exit.Error {
 	return emit(ctx, rec)
 }
 
-// acquireRental is the one paid mutation used by both `cozy rent` and
+// acquireRental is the one paid mutation used by both `cozy rental new` and
 // `cozy run --rental`. It returns only after the immutable retail rate and the
 // worker's authenticated attach projection are durable locally.
 func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName,
@@ -386,7 +386,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		// where it cannot be acted on and help where it can.
 		if e.Remedy == "" {
 			e = e.WithRemedy("the operation is persisted, so this exact rental can be "+
-				"resumed rather than a second one paid for: cozy rent %s "+
+				"resumed rather than a second one paid for: cozy rental new %s "+
 				"--idempotency-key %s", skuName, operationKey)
 		}
 		return records.Rental{}, hub.Rental{}, false, e
@@ -570,7 +570,7 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 		AllFields: []string{"name", "gpu", "accelerator model", "accelerator count", "compute",
 			"vram", "gpu price", "storage price", "price"},
 		Rows: rows, Total: len(rows),
-		Next: []string{"cozy rent <gpu-name>"},
+		Next: []string{"cozy rental new <machine-slug>"},
 	}
 	return emit(ctx, doc)
 }
@@ -651,7 +651,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 	for {
 		if lifecycle.Err() != nil {
 			return hub.Rental{}, exit.New(exit.Canceled,
-				"rental %s acquisition was canceled", id)
+				"rental %s acquisition was cancelled", id)
 		}
 		hctx, cancel := rentalCallContext(deadline)
 		r, e := c.Rental(hctx, id)
@@ -670,7 +670,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 			select {
 			case <-lifecycle.Done():
 				return hub.Rental{}, exit.New(exit.Canceled,
-					"rental %s acquisition was canceled", id)
+					"rental %s acquisition was cancelled", id)
 			case <-time.After(pollCadence):
 			}
 			continue
@@ -694,7 +694,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is %s: %s", id, r.State, detailOr(r.Detail)).
 				WithRemedy("the rental is leaving or gone; rent again if you still need a pod").
-				WithNext("cozy rent <gpu-name>")
+				WithNext("cozy rental new <machine-slug>")
 		case r.State == hub.RentalReady:
 			// READY without a whole triple is the hub contradicting itself, and dialling
 			// on a partial one would fail later as something that looks like a network
@@ -715,7 +715,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		select {
 		case <-lifecycle.Done():
 			return hub.Rental{}, exit.New(exit.Canceled,
-				"rental %s acquisition was canceled", id)
+				"rental %s acquisition was cancelled", id)
 		case <-time.After(pollCadence):
 		}
 	}
@@ -916,7 +916,7 @@ func rentalList(ctx *Context, st *records.Store, fleet *managedRentals,
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU),
-			"state": r.State, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
+			"state": humanRentalState(r.State), "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(idle.Running), "queued": strconv.Itoa(idle.Queued),
 			"idle":   idleCell(idle, grace),
 			"rental": r.ID, "bought for": orNone(boughtFor[r.ID]),

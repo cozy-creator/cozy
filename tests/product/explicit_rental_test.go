@@ -214,17 +214,28 @@ func TestSchema36MigrationKeepsAutomaticAssignments(t *testing.T) {
 	}
 }
 
-func TestRentPrimaryAndHiddenCreationAliasShareBehavior(t *testing.T) {
+func TestRentalNewIsTheOnlyCreationCommand(t *testing.T) {
 	root, _, _, _, _ := runModelCatalog(t)
-	for _, args := range [][]string{{"rent", "--json"}, {"rental", "new", "--json"}} {
-		code, out := runCozy(t, root, args...)
-		if code != 0 || !strings.Contains(out, "cpu") {
-			t.Fatalf("catalog %v: %d %s", args, code, out)
+	code, out := runCozy(t, root, "rental", "new", "--json")
+	if code != 0 || !strings.Contains(out, "cpu") {
+		t.Fatalf("rental new catalog: %d %s", code, out)
+	}
+	for _, args := range [][]string{{"--help"}, {"rental", "--help"}} {
+		code, out = runCozy(t, root, args...)
+		if code != 0 || !strings.Contains(out, "rental new") || strings.Contains(out, "\n  rent ") {
+			t.Fatalf("canonical creation command is not advertised by %v: %d %s", args, code, out)
 		}
 	}
-	code, out := runCozy(t, root, "rental", "--help")
-	if code != 0 || strings.Contains(out, "rental new") {
-		t.Fatalf("compatibility alias advertised: %d %s", code, out)
+	code, out = runCozy(t, root, "rental", "new", "--help")
+	if code != 0 || !strings.Contains(out, "<machine-slug>") || !strings.Contains(out, "h100-sxm5-80gb") {
+		t.Fatalf("rental new does not describe its machine slug: %d %s", code, out)
+	}
+	// The old root verb is removed, not a hidden second parser entry.
+	for _, args := range [][]string{{"rent"}, {"rent", "cpu", "--json"}} {
+		code, out = runCozy(t, root, args...)
+		if code == 0 || !strings.Contains(out, "unexpected argument rent") {
+			t.Fatalf("retired creation verb remains callable %v: %d %s", args, code, out)
+		}
 	}
 }
 

@@ -46,6 +46,12 @@ func OperationKey(request Request) (string, *exit.Error) {
 	if request.Capture != "" {
 		identity["capture"] = json.RawMessage(request.Capture)
 	}
+	if request.AttentionKernel != "" {
+		// A KERNEL NAMES COMPUTATION (cr-125). An 8-bit arm returns different bytes from the
+		// same inputs, so a memo keyed without the pin would hand back another kernel's
+		// result — which is the same lie a silent fallback would be, one layer up.
+		identity["attention_kernel"] = request.AttentionKernel
+	}
 	raw, err := json.Marshal(identity)
 	if err != nil {
 		return "", exit.Internalf("cannot encode operation identity: %s", err)

@@ -61,7 +61,7 @@ type exactDependency struct {
 
 func collectRegistryRows(ctx context.Context, project, stage, organization string, existing []DependencyWheel) ([]RegistryRow, *exit.Error) {
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
-	args := []string{"export", "--locked", "--no-dev", "--no-emit-project", "--no-emit-local",
+	args := []string{"export", "--locked", "--no-dev", "--no-default-groups", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project}
 	for _, name := range PrunedDistributions() {
 		args = append(args, "--prune", name)

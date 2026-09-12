@@ -19,6 +19,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
 // EnvironmentReceipt is the environment record: exactly what produced this install's venv.
@@ -65,7 +66,7 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 	}
 	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
 
-	args := []string{"sync", "--locked", "--no-progress"}
+	args := []string{"sync", "--locked", "--no-dev", "--no-default-groups", "--no-progress"}
 	if !editable {
 		args = append(args, "--no-editable")
 	}
@@ -89,6 +90,7 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 
 	env.Python = pythonVersion(venvDir)
 	env.Packages, env.Closure = closure(venvDir)
+	env.Closure = portableClosure(env.Closure)
 	if env.Python == "" || env.Packages == 0 {
 		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
 	}
@@ -132,7 +134,7 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	defer os.Remove(exported)
 	// Export the committed registry closure without the rows the release's own wheels
 	// supply; those rows are re-added below as exact org-index pins.
-	args := []string{"export", "--frozen", "--no-dev", "--no-emit-project",
+	args := []string{"export", "--frozen", "--no-dev", "--no-default-groups", "--no-emit-project",
 		"--format", "requirements.txt", "--output-file", exported, "--no-progress"}
 	seen := map[string]bool{}
 	for _, wheel := range appended {
@@ -165,6 +167,7 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	}
 	env.Python = pythonVersion(venvDir)
 	env.Packages, env.Closure = closure(venvDir)
+	env.Closure = portableClosure(env.Closure)
 	if env.Python == "" || env.Packages == 0 {
 		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
 	}
@@ -246,6 +249,20 @@ var requirementNormalize = regexp.MustCompile(`[-_.]+`)
 func normalizedRequirementName(row string) string {
 	name := requirementName.FindString(strings.TrimSpace(row))
 	return requirementNormalize.ReplaceAllString(strings.ToLower(name), "-")
+}
+
+// portableClosure records only package-owned distributions. Worker-image-owned
+// distributions remain installed locally for pip check, but their publisher-side
+// versions must never become a rental requirement.
+func portableClosure(installed string) string {
+	rows := make([]string, 0)
+	for _, row := range strings.Split(strings.TrimSpace(installed), "\n") {
+		name, _, _ := strings.Cut(row, "==")
+		if !packagepublish.ImageOwnedDistribution(normalizedRequirementName(name)) {
+			rows = append(rows, row)
+		}
+	}
+	return strings.Join(rows, "\n")
 }
 
 func runUV(dir string, env []string, code, message string, args ...string) *exit.Error {
