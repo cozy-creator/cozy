@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"slices"
 
 	"github.com/cozy-creator/cozy/internal/hub"
 )
@@ -17,6 +18,21 @@ type RentalInventory struct {
 	Rentals              []RentalSummary `json:"rentals"`
 	Unrecorded           []RentalSummary `json:"unrecorded"`
 	Pending              []RentalSummary `json:"pending"`
+}
+
+// Current removes proven-absent rentals from the fleet projection without
+// changing retained history or the Hub-reconciled spend totals. Applying it on
+// both sides of the API also supports older daemons that include terminal rows.
+func (inventory RentalInventory) Current() RentalInventory {
+	current := func(rows []RentalSummary) []RentalSummary {
+		return slices.DeleteFunc(slices.Clone(rows), func(row RentalSummary) bool {
+			return hub.RentalAbsent(row.State)
+		})
+	}
+	inventory.Rentals = current(inventory.Rentals)
+	inventory.Unrecorded = current(inventory.Unrecorded)
+	inventory.Pending = current(inventory.Pending)
+	return inventory
 }
 
 type RentalSummary struct {

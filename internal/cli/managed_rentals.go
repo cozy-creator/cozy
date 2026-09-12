@@ -306,10 +306,9 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if problem != nil {
 		return none, "", problem
 	}
-	// A composition parent holds no model of its own, so without its captured shots'
-	// selections this decision would rank cards against nothing and could buy one no shot
-	// declares a lane for (cl-210). `req` is this call's own copy; the record keeps the
-	// parent's own model set, which is empty and stays empty.
+	// CPU orchestration requests need their captured defaults to narrow the rental
+	// choice (cl-210). Accelerator-owning requests retain only their own model slots;
+	// unrelated captures must not inflate their residency or preparation selection.
 	childModels, problem := resolver.UnpublishedChildModels(req)
 	if problem != nil {
 		return none, "", problem
@@ -330,7 +329,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
 	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
 	// a machine that would be bought are held to the same declared degrees (cl-179).
-	constraints, _ := releaseConstraints(m.ctx, req)
+	constraints, _ := RentalConstraints(m.ctx, req)
 	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
@@ -911,7 +910,7 @@ func (m *managedRentals) reconcileListingLocked() {
 		return
 	}
 	for _, seen := range remote {
-		if seen.State == hub.RentalReleased || seen.State == hub.RentalFailed {
+		if hub.RentalAbsent(seen.State) {
 			continue
 		}
 		row, rowProblem := m.store.RentalRow(seen.ID)
@@ -1150,20 +1149,21 @@ func settledRequest(state string) bool {
 	return false
 }
 
-// releaseConstraints reads the release's own immutable requirements so the SKU choice
-// above can decline a base that contradicts them. Automatic selection preserves its
-// advisory fallback on an unavailable release; explicit rental selection requires
-// these facts before submitting work.
-func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
+// RentalConstraints reads the selected local install or published release's immutable
+// requirements and interface. Automatic selection preserves its advisory fallback
+// on unavailable facts; explicit rental selection requires them before submission.
+func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
+	var out rental.Constraints
+	var declared *launch.PackageInterface
 	if req.InstallID != "" && strings.HasPrefix(req.Package, "local/") {
 		_, store, problem := rentalStores(ctx)
 		if problem != nil {
-			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
+			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
 		defer store.Close()
 		installed, problem := store.Install(req.InstallID)
 		if problem != nil || installed == nil {
-			return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
+			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
 		python, problem := launch.EnvironmentPython(*installed)
 		if problem != nil {
@@ -1172,39 +1172,39 @@ func releaseConstraints(ctx *Context, req records.Request) (rental.Constraints, 
 		selection, problem := install.ExecutionRequirements(context.Background(), filepath.Dir(filepath.Dir(python)),
 			strings.TrimPrefix(installed.Package, "local/"), strings.Fields(installed.Extra))
 		if problem != nil {
-			return rental.Constraints{}, problem
+			return out, problem
 		}
-		return rental.Constraints{Requirements: selection.Requirements, RequiresPython: selection.RequiresPython}, nil
+		out.Requirements, out.RequiresPython = selection.Requirements, selection.RequiresPython
+		declared, _ = launch.ReadPackageInterface(launch.PackageInterfacePath(installed.Dir), installed.PackageInterface)
+	} else {
+		if req.Package == "" || req.Release == "" {
+			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
+		}
+		ref, problem := hub.ParseRef(req.Package)
+		if problem != nil {
+			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
+		}
+		hctx, cancel := hub.Context()
+		defer cancel()
+		detail, problem := client(ctx).PackageRelease(hctx, ref, req.Release)
+		if problem != nil {
+			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
+		}
+		requirements, requiresPython, problem := detail.Constraints()
+		if problem != nil {
+			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
+		}
+		out.Requirements, out.RequiresPython = requirements, requiresPython
+		declared, _ = launch.DecodePackageInterface(detail.PackageInterface)
 	}
-	if req.Package == "" || req.Release == "" {
-		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
-	}
-	ref, problem := hub.ParseRef(req.Package)
-	if problem != nil {
-		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
-	}
-	hctx, cancel := hub.Context()
-	defer cancel()
-	detail, problem := client(ctx).PackageRelease(hctx, ref, req.Release)
-	if problem != nil {
-		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
-	}
-	requirements, requiresPython, problem := detail.Constraints()
-	if problem != nil {
-		return rental.Constraints{}, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
-	}
-	// The committed interface says which group degrees this requested function can be built
-	// at, so a WIDE product is only a candidate when its author declared that width
-	// (cl-179). It rides the same advisory read as the base-image check: unreadable means
-	// nothing is declared, which excludes wide products rather than admitting them.
-	var degrees []int
-	if declared, e := launch.DecodePackageInterface(detail.PackageInterface); e == nil {
+	// Both sources apply the requested function's declared intersection. An unreadable
+	// interface declares no width, so wide products remain excluded rather than guessed.
+	if declared != nil {
 		if entrypoint, e := declared.Function(req.Entrypoint); e == nil && entrypoint.Kind != "job" {
-			degrees = entrypoint.SequenceParallelDegrees()
+			out.Degrees = entrypoint.SequenceParallelDegrees()
 		}
 	}
-	return rental.Constraints{Requirements: requirements, RequiresPython: requiresPython,
-		Degrees: degrees}, nil
+	return out, nil
 }
 
 func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints) *exit.Error {
