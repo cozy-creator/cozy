@@ -1,11 +1,7 @@
 package install
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"io"
-	"net/textproto"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -100,25 +96,40 @@ func pythonVersion(venv string) string {
 // startup hooks to discover additional import paths; those paths are not part of
 // the exact installed-wheel roster and cannot enter captured dependency capture.
 func closure(venv string) (int, string) {
-	distributions, ok := installedDistributions(venv)
-	if !ok {
-		return 0, ""
-	}
-	lines := make([]string, 0, len(distributions))
-	for name, distribution := range distributions {
+	installed := installedMetadata(venv)
+	lines := make([]string, 0, len(installed))
+	for name, distribution := range installed {
 		lines = append(lines, name+"=="+distribution.version)
 	}
 	sort.Strings(lines)
 	return len(lines), strings.Join(lines, "\n")
 }
 
+// ExecutionRequirements reads the declarations of the code a rental will run.
+// Image-owned distributions resolve their own dependency subtree on that image:
+// e.g. a locally installed Torch wheel's CUDA pins do not constrain remote Torch.
+// The full installed roster remains separate and exact for local graph/custody checks.
+func ExecutionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, *exit.Error) {
+	installed := installedMetadata(venv)
+	if len(installed) == 0 {
+		return packagepublish.RequirementSelection{}, exit.New(exit.Structural, "captured environment metadata is unavailable")
+	}
+	metadata := map[string]string{}
+	for name, distribution := range installed {
+		if packagepublish.ImageOwnedDistribution(name) {
+			continue
+		}
+		metadata[name] = string(distribution.metadata)
+	}
+	return packagepublish.ActiveRequirements(ctx, project, extras, metadata, pythonVersion(venv))
+}
+
 type installedDistribution struct {
 	version  string
-	headers  textproto.MIMEHeader
 	metadata []byte
 }
 
-func installedDistributions(venv string) (map[string]installedDistribution, bool) {
+func installedMetadata(venv string) map[string]installedDistribution {
 	metadata := venvMetadata(venv)
 	version := metadata["version_info"]
 	if version == "" {
@@ -126,16 +137,16 @@ func installedDistributions(venv string) (map[string]installedDistribution, bool
 	}
 	parts := strings.Split(version, ".")
 	if len(parts) < 2 {
-		return nil, false
+		return nil
 	}
 	if _, err := strconv.Atoi(parts[0]); err != nil {
-		return nil, false
+		return nil
 	}
 	if _, err := strconv.Atoi(parts[1]); err != nil {
-		return nil, false
+		return nil
 	}
 	if parts[0] == "" || parts[1] == "" {
-		return nil, false
+		return nil
 	}
 	roots := []string{filepath.Join(venv, "lib", "python"+parts[0]+"."+parts[1], "site-packages")}
 	if runtime.GOOS == "windows" {
@@ -145,7 +156,7 @@ func installedDistributions(venv string) (map[string]installedDistribution, bool
 	for _, root := range roots {
 		entries, err := os.ReadDir(root)
 		if err != nil {
-			return nil, false
+			return nil
 		}
 		for _, entry := range entries {
 			if !entry.IsDir() || !strings.HasSuffix(entry.Name(), ".dist-info") {
@@ -154,53 +165,19 @@ func installedDistributions(venv string) (map[string]installedDistribution, bool
 			path := filepath.Join(root, entry.Name(), "METADATA")
 			info, err := os.Lstat(path)
 			if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
-				return nil, false
+				return nil
 			}
 			raw, err := os.ReadFile(path)
 			if err != nil {
-				return nil, false
+				return nil
 			}
 			name, version, problem := wheel.MetadataIdentity(raw)
 			name = normalizedRequirementName(name)
 			if problem != nil || seen[name].version != "" || len(seen) >= 4096 {
-				return nil, false
+				return nil
 			}
-			headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw))).ReadMIMEHeader()
-			if err != nil && err != io.EOF {
-				return nil, false
-			}
-			seen[name] = installedDistribution{version: version, headers: headers, metadata: raw}
+			seen[name] = installedDistribution{version: version, metadata: raw}
 		}
 	}
-	return seen, true
-}
-
-// ExecutionRequirements reads the selected package graph, stopping at image-owned
-// distributions. Local installed versions remain separate capture facts.
-func ExecutionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, *exit.Error) {
-	selected, _, problem := executionRequirements(ctx, venv, project, extras)
-	return selected, problem
-}
-
-func executionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, string, *exit.Error) {
-	distributions, ok := installedDistributions(venv)
-	root, found := distributions[normalizedRequirementName(project)]
-	if !ok || !found {
-		return packagepublish.RequirementSelection{}, "", exit.New(exit.Structural, "captured package requirements are unavailable")
-	}
-	metadata := map[string]string{}
-	for name, distribution := range distributions {
-		if !packagepublish.ImageOwnedDistribution(name) {
-			metadata[name] = string(distribution.metadata)
-		}
-	}
-	selected, problem := packagepublish.ActiveRequirements(ctx, project, extras, metadata, pythonVersion(venv))
-	return selected, root.headers.Get("Requires-Python"), problem
-}
-
-// ImageRequirements preserves the authored Python bound and selected extras while
-// using the same requirement graph as unpublished wheel sealing.
-func ImageRequirements(venv, project string, extras ...string) ([]string, string, *exit.Error) {
-	selected, python, problem := executionRequirements(context.Background(), venv, project, extras)
-	return selected.ImageRequirements(), python, problem
+	return seen
 }
