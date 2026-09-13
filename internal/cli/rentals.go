@@ -275,12 +275,11 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		}
 	}
 	var workload hub.DeclaredWorkload
-	var development *hub.RentalDevelopment
+	development, e := rentalDevelopment(ctx, existing)
+	if e != nil {
+		return records.Rental{}, hub.Rental{}, false, e
+	}
 	if managedRequestID == "" {
-		development, e = manualRentalDevelopment(ctx, existing)
-		if e != nil {
-			return records.Rental{}, hub.Rental{}, false, e
-		}
 		workload.ServingModels, e = manualRentalModels(ctx, existing)
 		if e != nil {
 			return records.Rental{}, hub.Rental{}, false, e

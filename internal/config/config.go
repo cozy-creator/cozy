@@ -77,6 +77,10 @@ type Config struct {
 	// managed. A debounce over an observed fact, never the decision; zero leaves every
 	// rental to `cozy rental end`.
 	RentalsIdleRelease time.Duration
+	// Development rentals use the Hub's registered debug image and this owner's
+	// public SSH key. These defaults apply only when authoring a new acquisition.
+	RentalsDevelopment  bool
+	RentalsSSHPublicKey string
 
 	// DaemonIdleShutdown is how long "nothing to manage" must stay true before the daemon
 	// exits on its own. It is a debounce over an observed fact, never the decision; zero
@@ -117,6 +121,8 @@ type values struct {
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
 	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
 	RentalsIdleReleaseS      int64  `name:"rentals_idle_release_s" default:"300"`
+	RentalsDevelopment       bool   `name:"rentals_development"`
+	RentalsSSHPublicKey      string `name:"rentals_ssh_public_key"`
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
 	MaintenanceGCCron        string `name:"maintenance_gc_cron" default:"0 3 * * *"`
 	PlacementPrefer          string `name:"placement_prefer" default:"balanced"`
@@ -180,7 +186,8 @@ var fileKeys = map[string]bool{
 // nested spelling to the flat grammar name.
 var nestedFileKeys = map[string]map[string]string{
 	"rentals": {"max_hourly_spend_usd": "rentals_max_hourly_spend_usd",
-		"idle_release_s": "rentals_idle_release_s"},
+		"idle_release_s": "rentals_idle_release_s", "development": "rentals_development",
+		"ssh_public_key": "rentals_ssh_public_key"},
 	"daemon":      {"idle_shutdown_s": "daemon_idle_shutdown_s"},
 	"maintenance": {"gc_cron": "maintenance_gc_cron"},
 	"placement":   {"prefer": "placement_prefer"},
@@ -264,6 +271,8 @@ func load() (Config, *exit.Error) {
 		RentalsMaxHourlySpendUSDMicros: rentalCap,
 		RentalsMaxHourlySpendSource:    sourceOf("rentals_max_hourly_spend_usd", file, environment, "unset"),
 		RentalsIdleRelease:             time.Duration(input.RentalsIdleReleaseS) * time.Second,
+		RentalsDevelopment:             input.RentalsDevelopment,
+		RentalsSSHPublicKey:            strings.TrimSpace(input.RentalsSSHPublicKey),
 		DaemonIdleShutdown:             time.Duration(input.DaemonIdleShutdownS) * time.Second,
 		MaintenanceGCCron:              strings.TrimSpace(input.MaintenanceGCCron),
 		PlacementPrefer:                input.PlacementPrefer,
