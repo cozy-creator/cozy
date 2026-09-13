@@ -125,6 +125,15 @@ func TestPublishedInstallReportsSuccessWithWriterDuringPrefetch(t *testing.T) {
 					!strings.Contains(stdout, "package code is installed; default model prefetch failed")) {
 					t.Fatalf("prefetch refusal lost its warning: %s", stdout)
 				}
+				if mode == "retained" {
+					// The competing writer is still held. Replaying the exact install
+					// must remain read-only and must not force reclamation of its prior.
+					code, replay, stderr := runCozyStreams(t, root, "package", "install", "proof/install-reporting",
+						"--version=1.0.1", "--no-model-download", "--json", "--full")
+					if code != 0 || !strings.Contains(replay, `"status":"already installed"`) || strings.Contains(replay, `"reclaimed"`) {
+						t.Fatalf("idempotent install needs no writer or cleanup: %d %s %s", code, replay, stderr)
+					}
+				}
 			}
 			store, problem = records.Open(layout.DB)
 			fatal(t, problem)
