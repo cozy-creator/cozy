@@ -743,7 +743,7 @@ func (c *Orchestrator) ConvergeUnpublishedPlacement(instanceID, operationID,
 }
 
 func (c *Orchestrator) convergeUnpublishedModels(instanceID, operationID, localRevisionDigest string, models []*pb.DownloadModelRef, native []*pb.NativeModelBinding) *exit.Error {
-	if operationID == "" || !validDigest(localRevisionDigest) || len(models)+len(native) == 0 || (len(models) > 0 && len(native) > 0) {
+	if operationID == "" || !validDigest(localRevisionDigest) || len(models)+len(native) == 0 {
 		return exit.Named(exit.Validation, "private_placement_incomplete",
 			"local package placement requires operation, exact revision, and models")
 	}

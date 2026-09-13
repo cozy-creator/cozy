@@ -27,6 +27,9 @@ func (c *Orchestrator) nativeServingModels(request records.Request) ([]*pb.Nativ
 	}
 	bindings := make([]*pb.NativeModelBinding, 0, len(request.Models))
 	for _, model := range request.Models {
+		if model.Downloadable() {
+			continue // Hub inputs use the same exact-root downloader as top-level calls.
+		}
 		inputSlot := "result/" + model.Slot // childArtifacts uses one rooted JSON path for its custody rows.
 		var source *pb.DerivedRetentionRequest
 		for _, held := range native {

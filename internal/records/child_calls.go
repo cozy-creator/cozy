@@ -39,6 +39,11 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 		if !bytes.Equal(payload, r.Payload) || len(models) != len(r.Models) {
 			return Request{}, false, exit.Named(exit.Conflict, "child.arguments_changed", "serving call differs from its payload/model roster")
 		}
+		for _, model := range r.Models {
+			if _, present := models[model.Slot]; !present {
+				return Request{}, false, exit.Named(exit.Conflict, "child.arguments_changed", "serving call differs from its declared model slots")
+			}
+		}
 		arguments = models
 	}
 	r, assets, models, exports, problem := prepareRequest(r)
@@ -167,6 +172,9 @@ func (s *Store) SubmitChild(r Request, parentAttempt int64, parentSpec, parentSe
 		artifact, problem := DecodeModelArtifact(arguments[model.Slot])
 		if problem != nil {
 			return Request{}, false, problem
+		}
+		if artifact == nil && model.Downloadable() {
+			continue // Creator resolved the callee default; no native result custody exists.
 		}
 		if artifact == nil || artifact.Manifest.Digest != model.Manifest || artifact.Manifest.Length != model.ManifestLength {
 			return Request{}, false, exit.Named(exit.Conflict, "child.model_changed", "child model grant differs from its canonical artifact handle")
