@@ -11,13 +11,11 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/mattn/go-isatty"
@@ -987,6 +985,11 @@ func observe(ctx *Context, c *localapi.Client, requestID string,
 ) (*localapi.Event, *exit.Error) {
 	watchCtx, stop := context.WithTimeout(context.Background(), window)
 	defer stop()
+	watchCtx, restoreInput, _, problem := liveWatchContext(ctx, watchCtx, nil)
+	if problem != nil {
+		return nil, problem
+	}
+	defer restoreInput()
 	lines := NewProgress(ctx, false, began)
 	terminal, problem := c.WatchContext(watchCtx, requestID, 0, lines.On)
 	lines.Done()
@@ -1155,9 +1158,11 @@ func runStatus(status string) string {
 // happened.
 func watch(ctx *Context, c *localapi.Client, requestID string,
 	deadline time.Duration, began time.Time) (*localapi.Event, string, *exit.Error) {
-	interrupt := make(chan os.Signal, 2)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(interrupt)
+	interrupt, restoreInput, _, problem := liveSignals(ctx, nil)
+	if problem != nil {
+		return nil, "", problem
+	}
+	defer restoreInput()
 
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()

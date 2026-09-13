@@ -6,11 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -137,10 +135,15 @@ func handleRent(ctx *Context) *exit.Error {
 		return problem
 	}
 	ctx.Daemon = state
+	watchCtx, restoreInput, _, problem := liveWatchContext(ctx, context.Background(), nil)
+	if problem != nil {
+		return problem
+	}
+	defer restoreInput()
 	progress := NewProgress(ctx, false, time.Now())
-	completed := false
+	completed, detached := false, false
 	defer func() {
-		if !completed {
+		if !completed && !detached {
 			progress.On(localapi.Event{Type: "request.failed"})
 		}
 		progress.Done()
@@ -149,10 +152,16 @@ func handleRent(ctx *Context) *exit.Error {
 		AcceleratorModel: sku.AcceleratorModel, AcceleratorCount: sku.AcceleratorCount,
 		HourlyRateUSDMicros: sku.PriceUSDMicrosPerHour})
 
-	row, attachable, replay, e := acquireRental(ctx, l, st, skuName,
+	row, attachable, replay, e := acquireRentalContext(watchCtx, ctx, l, st, skuName,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
 		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", progress.rentalAcquisition, rentalRates(fleet.unrecorded))
 	if e != nil {
+		if watchCtx.Err() != nil && !ctx.Mode().JSON {
+			detached = true
+			progress.Done()
+			fmt.Fprintln(ctx.Err, "detached — rental acquisition continues; `cozy rental list` shows its status")
+			return nil
+		}
 		return e
 	}
 
@@ -666,8 +675,13 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 				"rental %s acquisition was cancelled", id)
 		}
 		hctx, cancel := rentalCallContext(deadline)
+		stopCancel := context.AfterFunc(lifecycle, cancel)
 		r, e := c.Rental(hctx, id)
+		stopCancel()
 		cancel()
+		if lifecycle.Err() != nil {
+			return hub.Rental{}, exit.New(exit.Canceled, "rental %s acquisition watch stopped", id)
+		}
 		if e != nil && !transient(e) {
 			return hub.Rental{}, e
 		}
@@ -1249,7 +1263,10 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		// recorded, so ask — but the answer is only believed when the hub AFFIRMS.
 		id = subject
 	}
-	rctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	rctx, stop, _, inputProblem := liveWatchContext(ctx, context.Background(), nil)
+	if inputProblem != nil {
+		return inputProblem
+	}
 	defer stop()
 	machine := known.Machine
 	if machine == "" {
