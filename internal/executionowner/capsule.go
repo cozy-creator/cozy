@@ -16,6 +16,9 @@ import (
 
 const CapsuleFormat = "cozy.creator.private-execution/1"
 
+// Host owns this private fixed-command argument shape; it carries no client paths.
+const AuthorityFormat = "cozy.creator.execution-authority/1"
+
 // A capsule contains identities and callable inventory, never executable paths,
 // credentials, a database export, or an invocation schedule. Its package wheels
 // travel through the existing signed LocalPackageUpload lane.
@@ -144,7 +147,7 @@ func Decode(raw []byte) (*Validated, *exit.Error) {
 			return nil, invalid("callable binding escapes the captured inventory")
 		}
 		entry, problem := child.Function(binding.Entrypoint)
-		if problem != nil || entry.Invocable != nil && (entry.Invocable.Module != binding.Module || entry.Invocable.Export != binding.Export) {
+		if problem != nil || entry.Invocable == nil || entry.Invocable.Module != binding.Module || entry.Invocable.Export != binding.Export {
 			return nil, invalid("callable binding differs from its captured export")
 		}
 		key := binding.ParentRevision + "\x00" + binding.InterfaceDigest + "\x00" + binding.Module + "\x00" + binding.Export

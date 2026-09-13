@@ -1620,6 +1620,8 @@ var RuntimeWeights_ServiceDesc = grpc.ServiceDesc{
 const (
 	PodHost_ProtocolInfo_FullMethodName            = "/cozy.worker.v1.PodHost/ProtocolInfo"
 	PodHost_NumericalEnvironment_FullMethodName    = "/cozy.worker.v1.PodHost/NumericalEnvironment"
+	PodHost_PrepareExecutionOwner_FullMethodName   = "/cozy.worker.v1.PodHost/PrepareExecutionOwner"
+	PodHost_AcceptExecutionOwner_FullMethodName    = "/cozy.worker.v1.PodHost/AcceptExecutionOwner"
 	PodHost_PreparePackageSet_FullMethodName       = "/cozy.worker.v1.PodHost/PreparePackageSet"
 	PodHost_PrepareLocalPackage_FullMethodName     = "/cozy.worker.v1.PodHost/PrepareLocalPackage"
 	PodHost_PreparePrivatePlacement_FullMethodName = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
@@ -1680,6 +1682,8 @@ type PodHostClient interface {
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
 	NumericalEnvironment(ctx context.Context, in *NumericalEnvironmentCall, opts ...grpc.CallOption) (*NumericalEnvironmentResult, error)
+	PrepareExecutionOwner(ctx context.Context, in *PrepareExecutionOwnerCall, opts ...grpc.CallOption) (*PreparedExecutionOwner, error)
+	AcceptExecutionOwner(ctx context.Context, in *AcceptExecutionOwnerCall, opts ...grpc.CallOption) (*ExecutionOwnerAcceptance, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	PrepareLocalPackage(ctx context.Context, in *PrepareLocalPackageCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
 	PreparePrivatePlacement(ctx context.Context, in *PreparePrivatePlacementCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PrepareEvent], error)
@@ -1728,6 +1732,26 @@ func (c *podHostClient) NumericalEnvironment(ctx context.Context, in *NumericalE
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(NumericalEnvironmentResult)
 	err := c.cc.Invoke(ctx, PodHost_NumericalEnvironment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) PrepareExecutionOwner(ctx context.Context, in *PrepareExecutionOwnerCall, opts ...grpc.CallOption) (*PreparedExecutionOwner, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PreparedExecutionOwner)
+	err := c.cc.Invoke(ctx, PodHost_PrepareExecutionOwner_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) AcceptExecutionOwner(ctx context.Context, in *AcceptExecutionOwnerCall, opts ...grpc.CallOption) (*ExecutionOwnerAcceptance, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExecutionOwnerAcceptance)
+	err := c.cc.Invoke(ctx, PodHost_AcceptExecutionOwner_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2074,6 +2098,8 @@ type PodHostServer interface {
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
 	NumericalEnvironment(context.Context, *NumericalEnvironmentCall) (*NumericalEnvironmentResult, error)
+	PrepareExecutionOwner(context.Context, *PrepareExecutionOwnerCall) (*PreparedExecutionOwner, error)
+	AcceptExecutionOwner(context.Context, *AcceptExecutionOwnerCall) (*ExecutionOwnerAcceptance, error)
 	PreparePackageSet(*PreparePackageSetCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	PrepareLocalPackage(*PrepareLocalPackageCall, grpc.ServerStreamingServer[PrepareEvent]) error
 	PreparePrivatePlacement(*PreparePrivatePlacementCall, grpc.ServerStreamingServer[PrepareEvent]) error
@@ -2113,6 +2139,12 @@ func (UnimplementedPodHostServer) ProtocolInfo(context.Context, *ProtocolInfoReq
 }
 func (UnimplementedPodHostServer) NumericalEnvironment(context.Context, *NumericalEnvironmentCall) (*NumericalEnvironmentResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method NumericalEnvironment not implemented")
+}
+func (UnimplementedPodHostServer) PrepareExecutionOwner(context.Context, *PrepareExecutionOwnerCall) (*PreparedExecutionOwner, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareExecutionOwner not implemented")
+}
+func (UnimplementedPodHostServer) AcceptExecutionOwner(context.Context, *AcceptExecutionOwnerCall) (*ExecutionOwnerAcceptance, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcceptExecutionOwner not implemented")
 }
 func (UnimplementedPodHostServer) PreparePackageSet(*PreparePackageSetCall, grpc.ServerStreamingServer[PrepareEvent]) error {
 	return status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
@@ -2239,6 +2271,42 @@ func _PodHost_NumericalEnvironment_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PodHostServer).NumericalEnvironment(ctx, req.(*NumericalEnvironmentCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_PrepareExecutionOwner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareExecutionOwnerCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).PrepareExecutionOwner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_PrepareExecutionOwner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).PrepareExecutionOwner(ctx, req.(*PrepareExecutionOwnerCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_AcceptExecutionOwner_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcceptExecutionOwnerCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).AcceptExecutionOwner(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_AcceptExecutionOwner_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).AcceptExecutionOwner(ctx, req.(*AcceptExecutionOwnerCall))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2629,6 +2697,14 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "NumericalEnvironment",
 			Handler:    _PodHost_NumericalEnvironment_Handler,
+		},
+		{
+			MethodName: "PrepareExecutionOwner",
+			Handler:    _PodHost_PrepareExecutionOwner_Handler,
+		},
+		{
+			MethodName: "AcceptExecutionOwner",
+			Handler:    _PodHost_AcceptExecutionOwner_Handler,
 		},
 		{
 			MethodName: "ModelSourcePrepare",

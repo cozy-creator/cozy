@@ -158,6 +158,10 @@ func messageFor(name string) proto.Message {
 		return &pb.WeightsReceipt{}
 	case "cozy.worker.v1.ClaimProof":
 		return &pb.ClaimProof{}
+	case "cozy.worker.v1.ExecutionOwnerGrant":
+		return &pb.ExecutionOwnerGrant{}
+	case "cozy.worker.v1.ExecutionClaimProof":
+		return &pb.ExecutionClaimProof{}
 	case "cozy.worker.v1.DownloadDelegation":
 		return &pb.DownloadDelegation{}
 	case "cozy.worker.v1.PlacementSet":
