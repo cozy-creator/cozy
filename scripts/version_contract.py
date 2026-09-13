@@ -22,8 +22,8 @@ PACKAGE = "tensorfs"
 # abi3 is forward compatible by construction: a cp312-abi3 wheel loads on 3.12 and every
 # later CPython. The floor is real; there is no ceiling to assert.
 PYTHON_SPEC = ">=3.12"
-CURRENT_CARGO_VERSION = "0.3.39"
-CURRENT_PYTHON_VERSION = "0.3.39"
+CURRENT_CARGO_VERSION = "0.3.40-dev.0"
+CURRENT_PYTHON_VERSION = "0.3.40.dev0"
 
 
 def _toml(path: pathlib.Path) -> dict[str, object]:
@@ -32,13 +32,14 @@ def _toml(path: pathlib.Path) -> dict[str, object]:
 
 
 def _python_version_from_cargo(version: str) -> str:
-    base, separator, prerelease = version.partition("-")
+    public, local_separator, local = version.partition("+")
+    base, separator, prerelease = public.partition("-")
     if not separator:
         return version
     phase, dot, number = prerelease.partition(".")
     if phase != "dev" or dot != "." or not number.isdigit():
         raise ValueError(f"Cargo development version {version!r} is not <release>-dev.<number>")
-    return f"{base}.dev{number}"
+    return f"{base}.dev{number}{local_separator}{local}"
 
 
 def source_versions() -> tuple[str, str]:

@@ -16,6 +16,7 @@ import threading
 
 import tensorfs
 from tensorfs.derived import (
+    Config,
     Derivation,
     DerivedTransaction,
     OutputCapability,
@@ -348,6 +349,34 @@ def exercise():
             flush=True,
         )
 
+        # The owner admits the native bound before pulling config bytes. Whitespace
+        # that would canonicalize to a tiny object must not escape that read budget.
+        config_plan = declaration(4096)
+        config_plan = Derivation(
+            config_plan.sources,
+            config_plan.targets,
+            {"model.json": Config("add")},
+            config_plan.order,
+        )
+        native = open_writer(store, 18, config_plan, 4096)
+        assert native.config_write_bound("model.json") == 4096
+        owner = Owner(native)
+        oversized = io.BytesIO(b" " * 8192 + b"{}")
+        try:
+            owner.client.add_config("model.json", oversized)
+        except tensorfs.errors.SizeCap:
+            pass
+        else:
+            raise AssertionError("config exceeded its native admitted read bound")
+        assert oversized.tell() == 4097, oversized.tell()
+        owner.finish(refused=True)
+        owner = Owner(open_writer(store, 18, config_plan, 4096, epoch=2))
+        assert owner.client.completed_configs() == []
+        owner.client.add_config("model.json", b'{"a":1}')
+        assert owner.client.completed_configs() == ["model.json"]
+        owner.finish()
+        print("PASS config pull obeys the native admitted byte bound", flush=True)
+
         # Real process exit at native commit; no in-memory callback state survives.
         left, right = socket.socketpair()
         child = subprocess.Popen(
@@ -406,9 +435,6 @@ def isolation():
                 str(left.fileno()),
             ],
             pass_fds=(left.fileno(),),
-            user=65533,
-            group=65533,
-            extra_groups=(),
         )
         left.close()
         receipts = []
@@ -437,6 +463,15 @@ def main():
         isolation()
         return
     if len(sys.argv) == 4 and sys.argv[1] == "--isolated-client":
+        # CI's interpreter can live below a private runner directory. Bootstrap
+        # imports first, then irreversibly drop every UID/group before opening any
+        # Store or using the exact inherited writer FD. No Store handle crosses.
+        os.setgroups([])
+        os.setgid(65533)
+        os.setuid(65533)
+        assert os.getresuid() == (65533, 65533, 65533)
+        assert os.getresgid() == (65533, 65533, 65533)
+        assert os.getgroups() == []
         try:
             tensorfs.Store.open(sys.argv[2])
         except tensorfs.errors.Refusal:

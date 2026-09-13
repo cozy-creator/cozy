@@ -2870,23 +2870,27 @@ pub fn add_config<R: Read>(
     reader: &mut R,
 ) -> Result<()> {
     let transaction = transaction_id(transaction)?;
-    {
+    let maximum = {
         let mut txn = meta.txn_for(&transaction)?;
         let row = open_row(&mut txn.rows, &transaction, writer_session)?;
         let declaration = declaration(row)?;
         require_added_config(&declaration, config_name)?;
-    }
+        declaration.max_new_bytes.min(limits::DOC_MAX_BYTES as u64)
+    };
 
     let mut input = Vec::new();
     reader
-        .take(limits::DOC_MAX_BYTES as u64 + 1)
+        .take(maximum + 1)
         .read_to_end(&mut input)
         .map_err(|error| Refusal {
             code: Code::IO_FAILED,
             detail: format!("read config: {error}"),
         })?;
-    if input.len() > limits::DOC_MAX_BYTES {
-        return refuse(Code::SIZE_CAP, "config exceeds the document byte cap");
+    if input.len() as u64 > maximum {
+        return refuse(
+            Code::SIZE_CAP,
+            "config exceeds the output or document byte cap",
+        );
     }
     let config = crate::header::canonical_config(&format!("config {config_name:?}"), &input)?;
 

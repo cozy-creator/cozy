@@ -1,6 +1,7 @@
 # Scoped derived writers (tfs-116 / tfs-115)
 
-Implementation owner: Codex `/root/offline_owner`.
+Implementation owner: Codex `/root/tensorfs_scoped_finish`, continuing the
+preserved work of `/root/offline_owner`.
 Worktree: `/home/fidika/cozy/.worktrees/tensorfs/tfs116-scoped-derived`.
 Branch: `feat/tfs116-scoped-derived`; fresh upstream base
 `49705e8294a152757ddc11ecfee4dca2810eb666`.
@@ -22,6 +23,9 @@ checkpoint/commit replies. A lost reply cannot remove native pending custody.
 This document records implementation ownership, not completed product proof.
 Runtime adapter/consumer migration is cr-174; ordinary CLI qualification is cl-265.
 No existing worker, release, profile, SDK or rental is changed by the isolated work.
+The source uses the unpublished `0.3.40.dev0` development identity; private test
+wheels additionally identify the exact source archive and build recipe. This is
+not a public release and does not mutate the published `0.3.39` identity.
 
 ## Integration contract
 
