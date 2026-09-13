@@ -2713,6 +2713,83 @@ fn declaration(row: &TransactionRow) -> Result<Declaration> {
     })?)
 }
 
+/// The exact native payload limit, checked against the current writer before
+/// an embedding owner admits storage or asks a producer to supply any bytes.
+pub fn part_write_bound(
+    meta: &Meta,
+    transaction: &str,
+    writer_session: u64,
+    value: (&str, &str, &str),
+) -> Result<u64> {
+    let transaction = transaction_id(transaction)?;
+    let mut rows: Vec<_> = meta.derived_row(&transaction)?.into_iter().collect();
+    let row = open_row(&mut rows, &transaction, writer_session)?;
+    let part = declared_addition(&declaration(row)?, value)?;
+    checked_bytes("derived part write", &part.shape, part.dtype)
+}
+
+pub fn config_write_bound(
+    meta: &Meta,
+    transaction: &str,
+    writer_session: u64,
+    name: &str,
+) -> Result<u64> {
+    let transaction = transaction_id(transaction)?;
+    let mut rows: Vec<_> = meta.derived_row(&transaction)?.into_iter().collect();
+    let row = open_row(&mut rows, &transaction, writer_session)?;
+    let declaration = declaration(row)?;
+    require_added_config(&declaration, name)?;
+    Ok(declaration.max_new_bytes.min(limits::DOC_MAX_BYTES as u64))
+}
+
+fn declared_addition(
+    declaration: &Declaration,
+    (component, tensor_key, role): (&str, &str, &str),
+) -> Result<PartDeclaration> {
+    let part = declaration
+        .components
+        .iter()
+        .find(|candidate| candidate.target == component)
+        .and_then(|candidate| {
+            candidate
+                .add
+                .iter()
+                .find(|candidate| candidate.key == tensor_key)
+        })
+        .and_then(|candidate| {
+            candidate
+                .parts
+                .iter()
+                .find(|candidate| candidate.role == role)
+        })
+        .cloned()
+        .ok_or_else(|| Refusal {
+            code: Code::MISSING_FIELD,
+            detail: format!("{component}/{tensor_key}#{role} is not a declared addition"),
+        })?;
+    if part.source.is_some() {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            "grafted part cannot receive byte writes",
+        );
+    }
+    Ok(part)
+}
+
+fn require_added_config(declaration: &Declaration, name: &str) -> Result<()> {
+    if declaration.configs.iter().any(|config| {
+        matches!(config, ConfigDeclaration::Add { target }
+            | ConfigDeclaration::Derive { target, .. } if target == name)
+    }) {
+        Ok(())
+    } else {
+        refuse(
+            Code::MISSING_FIELD,
+            format!("{name:?} is not a declared added config"),
+        )
+    }
+}
+
 pub fn add_part<R: Read>(
     store: &Store,
     meta: &Meta,
@@ -2723,40 +2800,11 @@ pub fn add_part<R: Read>(
 ) -> Result<crate::checkpoint::Written> {
     let (component, tensor_key, role) = value;
     let transaction = transaction_id(transaction)?;
-    let (declaration, expected) = {
+    let expected = {
         let mut txn = meta.txn_for(&transaction)?;
         let row = open_row(&mut txn.rows, &transaction, writer_session)?;
-        let declaration = declaration(row)?;
-        let expected = declaration
-            .components
-            .iter()
-            .find(|candidate| candidate.target == component)
-            .and_then(|candidate| {
-                candidate
-                    .add
-                    .iter()
-                    .find(|candidate| candidate.key == tensor_key)
-            })
-            .and_then(|candidate| {
-                candidate
-                    .parts
-                    .iter()
-                    .find(|candidate| candidate.role == role)
-            })
-            .cloned()
-            .ok_or_else(|| Refusal {
-                code: Code::MISSING_FIELD,
-                detail: format!("{component}/{tensor_key}#{role} is not a declared addition"),
-            })?;
-        (declaration, expected)
+        declared_addition(&declaration(row)?, value)?
     };
-    let _ = declaration;
-    if expected.source.is_some() {
-        return refuse(
-            Code::TRANSACTION_CONFLICT,
-            "grafted part cannot receive byte writes",
-        );
-    }
 
     let written = checkpoint::objectize(
         store,
@@ -2822,35 +2870,27 @@ pub fn add_config<R: Read>(
     reader: &mut R,
 ) -> Result<()> {
     let transaction = transaction_id(transaction)?;
-    {
+    let maximum = {
         let mut txn = meta.txn_for(&transaction)?;
         let row = open_row(&mut txn.rows, &transaction, writer_session)?;
         let declaration = declaration(row)?;
-        if !declaration.configs.iter().any(|config| {
-            matches!(
-                config,
-                ConfigDeclaration::Add { target }
-                    | ConfigDeclaration::Derive { target, .. }
-                    if target == config_name
-            )
-        }) {
-            return refuse(
-                Code::MISSING_FIELD,
-                format!("{config_name:?} is not a declared added config"),
-            );
-        }
-    }
+        require_added_config(&declaration, config_name)?;
+        declaration.max_new_bytes.min(limits::DOC_MAX_BYTES as u64)
+    };
 
     let mut input = Vec::new();
     reader
-        .take(limits::DOC_MAX_BYTES as u64 + 1)
+        .take(maximum + 1)
         .read_to_end(&mut input)
         .map_err(|error| Refusal {
             code: Code::IO_FAILED,
             detail: format!("read config: {error}"),
         })?;
-    if input.len() > limits::DOC_MAX_BYTES {
-        return refuse(Code::SIZE_CAP, "config exceeds the document byte cap");
+    if input.len() as u64 > maximum {
+        return refuse(
+            Code::SIZE_CAP,
+            "config exceeds the output or document byte cap",
+        );
     }
     let config = crate::header::canonical_config(&format!("config {config_name:?}"), &input)?;
 
