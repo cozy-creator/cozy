@@ -687,6 +687,8 @@ func bindAssets(assets []records.AssetBinding) ([]records.AssetBinding, *exit.Er
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
+	ParentRequestID string   `json:"parent_request_id,omitempty"`
+	ParentCallIndex *int64   `json:"parent_call_index,omitempty"`
 	Number          int64    `json:"number"`
 	Kind            string   `json:"kind"`
 	RequestID       string   `json:"request_id"`
@@ -808,6 +810,11 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{}, Rental: row.Rental, RentalID: row.Worker,
+	}
+	if row.ParentRequestID != "" {
+		life.ParentRequestID = row.ParentRequestID
+		index := row.ParentCallIndex
+		life.ParentCallIndex = &index
 	}
 	if row.RequestedRental != "" {
 		life.RequestedRental, life.RequestedMachine = row.RequestedRental, row.Machine

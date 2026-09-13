@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,8 @@ type Authority struct {
 	WorkerAddress            string `json:"worker_address"`
 	WorkerTLSCertificatePath string `json:"worker_tls_certificate_path"`
 	TensorFSRoot             string `json:"tensorfs_root"`
+	MediaAddress             string `json:"media_address"`
+	MediaBearer              string `json:"media_bearer,omitempty"`
 }
 
 type Bootstrap struct {
@@ -39,6 +42,21 @@ type Bootstrap struct {
 	Authority Authority
 	Grant     *pb.SignedExecutionOwnerGrant
 	Wheels    map[string][]string
+}
+
+// ForSubmission is called only after the Host authenticates a new submission
+// against this accepted generation. The initial grant remains unchanged; every
+// new captured root receives its own ordinary request and capsule identity.
+func (b *Bootstrap) ForSubmission(raw []byte) (*Bootstrap, *exit.Error) {
+	capsule, problem := Decode(raw)
+	if problem != nil {
+		return nil, problem
+	}
+	next := &Bootstrap{Capsule: capsule, Authority: b.Authority, Grant: b.Grant, Wheels: map[string][]string{}}
+	if problem := next.verifyWheels(); problem != nil {
+		return nil, problem
+	}
+	return next, nil
 }
 
 // ReadBootstrap checks Host configuration, exact capture identity and every
@@ -72,6 +90,11 @@ func ReadBootstrap(capsuleReader, authorityReader io.Reader, serving bool) (*Boo
 	if err != nil || port == "" || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
 		return nil, invalid("execution worker address must be Host loopback")
 	}
+	media, err := url.Parse(authority.MediaAddress)
+	if err != nil || media.Scheme != "https" || media.User != nil || media.Path != "" || media.RawQuery != "" || media.Fragment != "" ||
+		media.Port() == "" || net.ParseIP(media.Hostname()) == nil || !net.ParseIP(media.Hostname()).IsLoopback() {
+		return nil, invalid("execution media address must be pinned Host loopback")
+	}
 	grant := &pb.SignedExecutionOwnerGrant{}
 	if proto.Unmarshal(authority.SignedGrant, grant) != nil || len(grant.ProtoReflect().GetUnknown()) != 0 ||
 		grant.Grant == nil || len(grant.Grant.ProtoReflect().GetUnknown()) != 0 || len(grant.Signature) != ed25519.SignatureSize {
@@ -95,8 +118,11 @@ func ReadBootstrap(capsuleReader, authorityReader io.Reader, serving bool) (*Boo
 		if len(authority.ExecutionPrivateKey) != ed25519.PrivateKeySize || !bytes.Equal(ed25519.PrivateKey(authority.ExecutionPrivateKey).Public().(ed25519.PublicKey), g.ExecutionPublicKey) {
 			return nil, invalid("coordinator key differs from its execution grant")
 		}
-	} else if len(authority.ExecutionPrivateKey) != 0 {
-		return nil, invalid("validation must not receive the execution private key")
+		if len(authority.MediaBearer) < 32 || len(authority.MediaBearer) > 4096 || strings.TrimSpace(authority.MediaBearer) != authority.MediaBearer {
+			return nil, invalid("coordinator media credential is unavailable")
+		}
+	} else if len(authority.ExecutionPrivateKey) != 0 || authority.MediaBearer != "" {
+		return nil, invalid("validation must not receive execution credentials")
 	}
 	bootstrap := &Bootstrap{Capsule: capsule, Authority: authority, Grant: grant, Wheels: map[string][]string{}}
 	if problem := bootstrap.verifyWheels(); problem != nil {

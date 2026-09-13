@@ -228,10 +228,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	jobID, attempt := recorded.ID, uint64(recorded.Ordinal)
 	if fresh {
 		defer s.activateRecorded(recorded)
 	}
+	s.replyJob(w, r, recorded, fresh)
+}
+
+func (s *Server) replyJob(w http.ResponseWriter, r *http.Request, recorded records.Request, fresh bool) {
+	jobID, attempt := recorded.ID, uint64(recorded.Ordinal)
 	publicationRepo := ""
 	if !recorded.RetainsLocalOutputs() {
 		publicationRepo = home.ScratchRepo(recorded.Org, recorded.ID)

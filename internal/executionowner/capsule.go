@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"regexp"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -30,11 +31,14 @@ type Capsule struct {
 }
 
 type Root struct {
+	RequestID      string          `json:"request_id"`
 	Revision       string          `json:"revision"`
 	Entrypoint     string          `json:"entrypoint"`
 	Input          json.RawMessage `json:"input"`
 	IdempotencyKey string          `json:"idempotency_key"`
 }
+
+var rootID = regexp.MustCompile(`^job-[a-f0-9]{24}$`)
 
 // Revision is the existing canonical LocalPackageRevision document. The inline
 // interface is its exact declared reference; validation imports no Python code.
@@ -103,7 +107,7 @@ func Decode(raw []byte) (*Validated, *exit.Error) {
 		return nil, invalid("capsule differs from its closed schema")
 	}
 	if c.Format != CapsuleFormat || len(c.Packages) == 0 || len(c.Packages) > 1024 || len(c.Bindings) > 1024 ||
-		c.Root.IdempotencyKey == "" || len(c.Root.IdempotencyKey) > 256 || !identifier(c.Root.Entrypoint, false) {
+		!rootID.MatchString(c.Root.RequestID) || c.Root.IdempotencyKey == "" || len(c.Root.IdempotencyKey) > 256 || !identifier(c.Root.Entrypoint, false) {
 		return nil, invalid("capsule admission is incomplete or exceeds its inventory bound")
 	}
 	var input map[string]json.RawMessage

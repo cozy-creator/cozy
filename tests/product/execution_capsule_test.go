@@ -44,7 +44,7 @@ func executionCapsule(t *testing.T) executionowner.Capsule {
 	parent, parentID, _ := makePackage("parent", "main")
 	child, childID, iface := makePackage("step", "advance")
 	return executionowner.Capsule{Format: executionowner.CapsuleFormat,
-		Root:     executionowner.Root{Revision: parentID, Entrypoint: "main", Input: json.RawMessage(`{}`), IdempotencyKey: "first-admission"},
+		Root:     executionowner.Root{RequestID: "job-0123456789abcdef01234567", Revision: parentID, Entrypoint: "main", Input: json.RawMessage(`{}`), IdempotencyKey: "first-admission"},
 		Packages: []executionowner.Package{parent, child},
 		Bindings: []executionowner.Binding{{ParentRevision: parentID, ChildRevision: childID, InterfaceDigest: iface, Module: "step", Export: "advance", Entrypoint: "advance"}},
 	}

@@ -10,6 +10,20 @@ import (
 
 type ExecutionOwnerCmd struct {
 	Validate ExecutionOwnerValidateCmd `cmd:"" help:"Validate the Host-provided initial private capture."`
+	Serve    ExecutionOwnerServeCmd    `cmd:"" help:"Own the admitted client script on this worker."`
+}
+
+type ExecutionOwnerServeCmd struct {
+	CapsuleFD   int `name:"capsule-fd" required:""`
+	AuthorityFD int `name:"authority-fd" required:""`
+}
+
+func (command *ExecutionOwnerServeCmd) Run(runtime *Runtime) error {
+	bootstrap, problem := readExecutionBootstrap(command.CapsuleFD, command.AuthorityFD, true)
+	if problem != nil {
+		return problem
+	}
+	return serveExecutionOwner(runtime, bootstrap)
 }
 
 type ExecutionOwnerValidateCmd struct {

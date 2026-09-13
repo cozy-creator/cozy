@@ -32,6 +32,9 @@ func (c *Orchestrator) Managing() ([]string, *exit.Error) {
 		held = append(held, "spawn "+instance)
 	}
 	for _, w := range c.workers {
+		if c.opt.PrivateExecution != nil && c.idleRentalWorkerLocked(w) {
+			continue
+		}
 		if c.idleLocalWorkerLocked(w, active) {
 			continue
 		}
@@ -50,7 +53,7 @@ func (c *Orchestrator) Managing() ([]string, *exit.Error) {
 		held = append(held, "output export "+id)
 	}
 	c.mu.Unlock()
-	if n := c.frames.count(); n > 0 {
+	if n := c.frames.count(); n > 0 && c.opt.PrivateExecution == nil {
 		held = append(held, fmt.Sprintf("%d open event stream(s)", n))
 	}
 	sort.Strings(held)

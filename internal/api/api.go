@@ -50,6 +50,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -80,8 +81,11 @@ type Server struct {
 
 	// rentals resolves only the non-secret, attempt-bound desired placement. The
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
-	rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
-	rentalInventory func(bool) (RentalInventory, *exit.Error)
+	rentals              func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
+	rentalInventory      func(bool) (RentalInventory, *exit.Error)
+	executionCapture     ExecutionCapture
+	executionImports     atomic.Int64
+	executionGrantDigest string
 
 	// shutdown asks the process that owns this server to drain and stop — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
@@ -131,8 +135,10 @@ type Options struct {
 	Packages     Resolver
 	// Rentals validates one attached generic worker id; desired package/model state is
 	// sent separately over WorkerControl.
-	Rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
-	RentalInventory func(bool) (RentalInventory, *exit.Error)
+	Rentals              func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
+	RentalInventory      func(bool) (RentalInventory, *exit.Error)
+	ExecutionCapture     ExecutionCapture
+	ExecutionGrantDigest string
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
 }
@@ -147,6 +153,7 @@ func New(opt Options) *Server {
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
 		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, shutdown: opt.Shutdown,
+		executionCapture: opt.ExecutionCapture, executionGrantDigest: opt.ExecutionGrantDigest,
 	}
 }
 
@@ -167,7 +174,7 @@ func (s *Server) activateRecorded(request records.Request) {
 func (s *Server) recordSubmission(spec orchestrator.Submission,
 	newRequest bool,
 ) (records.Request, bool, *exit.Error) {
-	if newRequest && spec.Rental && s.cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
+	if newRequest && spec.Rental && spec.ExecutionGrantDigest == "" && s.cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
 		return records.Request{}, false, exit.Named(exit.Validation,
 			"rental.spend_cap_required",
 			"rented execution requires a positive rentals.max_hourly_spend_usd")
@@ -187,6 +194,9 @@ func (s *Server) recordSubmission(spec orchestrator.Submission,
 func (s *Server) Handler() (http.Handler, *exit.Error) {
 	mux := http.NewServeMux()
 	handlers := map[string]http.HandlerFunc{
+		"GET /v1/local/execution-activity":            s.executionActivity,
+		"POST /v1/local/execution-captures":           s.submitExecutionCapture,
+		"GET /v1/local/execution-roots/{id}":          s.executionRoot,
 		"POST /v1/requests":                           s.submit,
 		"GET /v1/requests":                            s.listRequests,
 		"GET /v1/requests/{id}":                       s.getRequest,

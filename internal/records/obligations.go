@@ -36,6 +36,12 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 		UNION ALL
 		SELECT 'output_export',request_id,state FROM request_output_exports
 		 WHERE state IN ('pending','exporting')
+		UNION ALL
+		SELECT 'native_'||kind,id,state FROM native_calls
+		 WHERE state IN (` + pendingNativeStates + `)
+		UNION ALL
+		SELECT 'work_release',s.request_id,s.state FROM successful_work_releases s JOIN requests r ON r.id=s.request_id
+		 WHERE r.state='succeeded' AND s.state IN ('armed','draining','release_work','deferred')
 		ORDER BY 1,2`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the daemon's obligations: %s", err)

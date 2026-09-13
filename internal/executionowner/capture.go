@@ -25,7 +25,7 @@ func Export(layout home.Layout, store *records.Store, request records.Request) (
 	if request.ParentRequestID != "" || request.Ordinal != 0 || request.InstallID == "" || request.LocalPackageDigest == "" {
 		return nil, invalid("execution export requires a fresh captured root")
 	}
-	capsule := Capsule{Format: CapsuleFormat, Root: Root{Revision: request.LocalPackageDigest,
+	capsule := Capsule{Format: CapsuleFormat, Root: Root{RequestID: request.ID, Revision: request.LocalPackageDigest,
 		Entrypoint: request.Entrypoint, Input: append(json.RawMessage(nil), request.Payload...), IdempotencyKey: request.IdemKey}, Bindings: []Binding{}}
 	out := &Exported{Packages: map[string]localpackage.Revision{}}
 	type selected struct{ install, revision string }

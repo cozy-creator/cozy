@@ -89,6 +89,15 @@ var Routes = []Route{
 
 	// ---- the JOB family (cl-004), LOCAL by design: the hub's job plane is th-008's,
 	// and a job's typed input trees are directories only a local caller owns.
+	{"POST", "/v1/local/execution-captures", Local, true, true, false, "Idempotency-Key",
+		"import a signed private capture into its existing execution owner and submit one root",
+		"private Host bridge for `cozy run`"},
+	{"GET", "/v1/local/execution-roots/{id}", Local, true, false, false, "",
+		"resolve a request to its admitted root in the current private execution generation",
+		"private Host observation and cancellation bridge"},
+	{"GET", "/v1/local/execution-activity", Local, true, false, false, "",
+		"report actual private execution and retained custody obligations independently of observer liveness",
+		"private Host rental idle-release policy"},
 	{"POST", "/v1/local/jobs", Local, true, true, false, "Idempotency-Key",
 		"submit one bounded job; 202 with the job handle and its publication repo",
 		"`cozy run` for a job callable"},

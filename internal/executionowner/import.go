@@ -134,3 +134,33 @@ func writeImmutable(path string, data []byte) *exit.Error {
 	}
 	return nil
 }
+
+// RecordAdmission follows the ordinary durable request insert. Host acceptance
+// and process startup alone never create this receipt.
+func (b *Bootstrap) RecordAdmission(requestID string) *exit.Error {
+	if requestID == "" {
+		return invalid("execution root receipt is incomplete")
+	}
+	raw, err := json.Marshal(map[string]any{"request_id": requestID, "capsule_digest": b.Capsule.Digest,
+		"record_owner_id": b.Grant.Grant.RecordOwnerId, "record_owner_epoch": b.Grant.Grant.RecordOwnerEpoch})
+	if err != nil {
+		return invalid("execution root receipt cannot be encoded")
+	}
+	return writeImmutable(filepath.Join(b.Authority.CreatorHome, "initial-root.json"), raw)
+}
+
+// PinGeneration precedes opening/reconciling the Creator journal. A different
+// grant may not adopt requests merely by pointing at an existing coordinator home.
+func (b *Bootstrap) PinGeneration() *exit.Error {
+	path := filepath.Join(b.Authority.CreatorHome, "execution-grant.json")
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		if _, err := os.Lstat(filepath.Join(b.Authority.CreatorHome, "creator.sqlite")); err == nil || !os.IsNotExist(err) {
+			return invalid("private execution home contains an unbound records database")
+		}
+	}
+	raw, err := canonical.Bytes(b.Grant.Grant)
+	if err != nil {
+		return invalid("execution generation cannot be identified")
+	}
+	return writeImmutable(path, raw)
+}

@@ -58,7 +58,7 @@ func TestExecutionBootstrapRequiresExactUploadedCustody(t *testing.T) {
 	must(t, err)
 	authority := executionowner.Authority{Format: executionowner.AuthorityFormat, SignedGrant: signed,
 		CreatorHome: filepath.Join(root, "creator"), PackageStageRoot: stage, WorkerAddress: "127.0.0.1:19781",
-		WorkerTLSCertificatePath: certPath, TensorFSRoot: filepath.Join(root, "tensorfs")}
+		WorkerTLSCertificatePath: certPath, TensorFSRoot: filepath.Join(root, "tensorfs"), MediaAddress: "https://127.0.0.1:19782"}
 	read := func(a executionowner.Authority, serving bool) (*executionowner.Bootstrap, error) {
 		raw, err := json.Marshal(a)
 		must(t, err)
@@ -72,6 +72,20 @@ func TestExecutionBootstrapRequiresExactUploadedCustody(t *testing.T) {
 	must(t, err)
 	if len(b.Wheels) != 2 || b.Capsule.Digest != parsed.Digest {
 		t.Fatal("bootstrap lost exact captured inventory")
+	}
+	fatal(t, b.PinGeneration())
+	fatal(t, b.PinGeneration())
+	foreign := *b
+	foreign.Grant = proto.Clone(b.Grant).(*pb.SignedExecutionOwnerGrant)
+	foreign.Grant.Grant.RecordOwnerEpoch++
+	if foreign.PinGeneration() == nil {
+		t.Fatal("another generation adopted this coordinator home")
+	}
+	unbound := *b
+	unbound.Authority.CreatorHome = t.TempDir()
+	must(t, os.WriteFile(filepath.Join(unbound.Authority.CreatorHome, "creator.sqlite"), []byte("prior records"), 0600))
+	if unbound.PinGeneration() == nil {
+		t.Fatal("unbound prior records were adopted")
 	}
 	layout, problem := home.Open(authority.CreatorHome)
 	fatal(t, problem)
@@ -90,7 +104,7 @@ func TestExecutionBootstrapRequiresExactUploadedCustody(t *testing.T) {
 	if len(pins) != 0 {
 		t.Fatal("remote capture replaced an active package pin")
 	}
-	exported, problem := executionowner.Export(layout, store, records.Request{InstallID: imported.ID,
+	exported, problem := executionowner.Export(layout, store, records.Request{ID: parsed.Capsule.Root.RequestID, InstallID: imported.ID,
 		LocalPackageDigest: parsed.Capsule.Root.Revision, Entrypoint: parsed.Capsule.Root.Entrypoint,
 		Payload: parsed.Capsule.Root.Input, IdemKey: parsed.Capsule.Root.IdempotencyKey})
 	fatal(t, problem)
@@ -122,6 +136,7 @@ func TestExecutionBootstrapRequiresExactUploadedCustody(t *testing.T) {
 		t.Fatal("serving admitted no pod private key")
 	}
 	authority.ExecutionPrivateKey = key
+	authority.MediaBearer = strings.Repeat("private-media", 4)
 	if _, err := read(authority, false); err == nil {
 		t.Fatal("validation unnecessarily received a private key")
 	}
