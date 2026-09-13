@@ -767,6 +767,11 @@ func (w *worker) observeJobs(n int) {
 // to tell an idempotent no-op from a real convergence, and a boolean `resident` could only
 // tell them "it was there", which is true of both.
 func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange, *exit.Error) {
+	if c.opt.PrivateExecution != nil {
+		if _, problem := c.executionClaimProof(spec.Connection); problem != nil {
+			return "", ChangeNone, problem
+		}
+	}
 	instanceID := spec.InstanceID()
 	var live *worker
 	var mine chan struct{}

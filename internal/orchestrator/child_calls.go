@@ -176,7 +176,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 }
 
 func (c *Orchestrator) sendChildResult(s *session, call *pb.ChildCallRequest, child string, state pb.ChildCallState, result []byte, problem *exit.Error, extras ...*pb.ChildCallResult) {
-	frame := &pb.ChildCallResult{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
+	frame := &pb.ChildCallResult{RecordOwnerEpoch: c.ownerEpoch(), ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
 		ParentRequestId: call.ParentRequestId, ParentAttemptOrdinal: call.ParentAttemptOrdinal, ParentInvocationSpecDigest: call.ParentInvocationSpecDigest,
 		CallIndex: call.CallIndex, IntentDigest: call.IntentDigest, ChildRequestId: child, State: state, ResultCanonicalBytes: result}
 	if len(extras) > 0 && extras[0] != nil {

@@ -71,7 +71,7 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 		return exit.Internalf("retained source selection is malformed")
 	}
 	call := &pb.ModelSourceAdoptCall{Claim: s.claim, FromOperationId: priorID,
-		Request: &pb.ModelSourcePrepareRequest{RecordOwnerEpoch: recordOwnerEpoch,
+		Request: &pb.ModelSourcePrepareRequest{RecordOwnerEpoch: c.ownerEpoch(),
 			WorkerBootId: s.bootID, OperationId: request.ID, SourceSelectionDigest: selection,
 			SourceUri: request.ModelTransfer.Source, DeclaredLicense: request.ModelTransfer.SourceLicense}}
 	for _, progress := range progress {
@@ -105,7 +105,7 @@ func (c *Orchestrator) adoptRetriedSource(ctx context.Context, request records.R
 		}
 	}
 	if answer == nil || answer.OperationId != request.ID || answer.WorkerBootId != s.bootID ||
-		answer.RecordOwnerEpoch != recordOwnerEpoch || answer.ControlStreamEpoch != 0 ||
+		answer.RecordOwnerEpoch != c.ownerEpoch() || answer.ControlStreamEpoch != 0 ||
 		!bytes.Equal(answer.SourceSelectionDigest, selection) || proto.Size(answer) > pb.MaxInlineControlBytes {
 		return exit.Named(exit.Structural, "request.source_adoption_changed", "source adoption changed its claimed request, source, or worker")
 	}

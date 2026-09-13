@@ -15,8 +15,8 @@ import (
 	"sort"
 )
 
-func nativeServiceID(parent string, index uint32) string {
-	raw, _ := json.Marshal([]any{recordOwnerID, parent, index})
+func (c *Orchestrator) nativeServiceID(parent string, index uint32) string {
+	raw, _ := json.Marshal([]any{c.ownerID(), parent, index})
 	raw, _ = canonical.NormalizeJCS(raw)
 	digest := sha256.Sum256(raw)
 	return "source-" + hex.EncodeToString(digest[:])[:48]
@@ -70,7 +70,7 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 	}
 	spec, _ := canonical.Spell(call.ParentInvocationSpecDigest)
 	intent, _ := canonical.Spell(call.IntentDigest)
-	row, _, problem := c.opt.Store.AcceptNativeCall(records.NativeCall{ID: nativeServiceID(parent.ID, call.CallIndex), ParentRequestID: parent.ID, CallIndex: int64(call.CallIndex), Kind: "source", Operation: call.Export, IntentDigest: intent, Request: call.RequestCanonicalBytes}, int64(call.ParentAttemptOrdinal), spec, s.bootID)
+	row, _, problem := c.opt.Store.AcceptNativeCall(records.NativeCall{ID: c.nativeServiceID(parent.ID, call.CallIndex), ParentRequestID: parent.ID, CallIndex: int64(call.CallIndex), Kind: "source", Operation: call.Export, IntentDigest: intent, Request: call.RequestCanonicalBytes}, int64(call.ParentAttemptOrdinal), spec, s.bootID)
 	if problem != nil {
 		refuse(problem)
 		return true
@@ -96,7 +96,7 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 	return true
 }
 func (c *Orchestrator) sendNativeSource(s *session, call *pb.ChildCallRequest, id string, phase pb.NativeSourcePhase, selection *pb.NativeSourceSelection) {
-	command := &pb.NativeSourceCommand{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, ParentCall: proto.Clone(call).(*pb.ChildCallRequest), ServiceId: id, Operation: nativeSourceOperation(call.Export), Phase: phase, Selection: selection}
+	command := &pb.NativeSourceCommand{RecordOwnerEpoch: c.ownerEpoch(), ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, ParentCall: proto.Clone(call).(*pb.ChildCallRequest), ServiceId: id, Operation: nativeSourceOperation(call.Export), Phase: phase, Selection: selection}
 	if credentials, ok := c.opt.Packages.(interface{ NativeSourceCredential(string) string }); ok && phase != pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_CANCEL {
 		command.Credential = credentials.NativeSourceCredential(call.Export)
 	}
@@ -179,7 +179,7 @@ func (c *Orchestrator) onNativeSourceStatus(s *session, status *pb.NativeSourceS
 			return
 		}
 		if row.Operation == "source_files" || row.Operation == "commit_file" {
-			output, problem := nativeSourceByteOutput(*row, status)
+			output, problem := c.nativeSourceByteOutput(*row, status)
 			if problem != nil {
 				c.sendChildResult(s, call, row.ID, pb.ChildCallState_CHILD_CALL_STATE_REFUSED, nil, problem)
 				return

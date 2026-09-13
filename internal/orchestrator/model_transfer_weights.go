@@ -162,7 +162,7 @@ func (c *Orchestrator) onModelTransferWeightsReceipt(s *session, frame *pb.Weigh
 		"weights_receipt_canonical_bytes": base64.StdEncoding.EncodeToString(
 			frame.WeightsReceipt.WeightsReceiptCanonicalBytes),
 	})
-	if problem != nil || receipt.OwnerScope != recordOwnerID || receipt.RequestID != frame.RequestId ||
+	if problem != nil || receipt.OwnerScope != c.ownerID() || receipt.RequestID != frame.RequestId ||
 		receipt.InvocationDigest != invocationDigest || receipt.OutputSlot != frame.OutputSlot {
 		return
 	}

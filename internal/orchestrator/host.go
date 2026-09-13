@@ -360,7 +360,7 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 	w.setDigest, w.setBytes = digest, setBytes
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{
-		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
+		RecordOwnerEpoch: c.ownerEpoch(), ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
 		Revision: rev, WireMinor: pb.WireMinor, Posture: pb.Posture_POSTURE_ACCEPTING,
 		Mode: &pb.DesiredWorkerState_PlacementSet{PlacementSet: &pb.DesiredPlacementSet{
 			PlacementSetDigest: digest, PlacementSetCanonicalBytes: setBytes, DevicePins: pins, OrchestrationParent: w.orchestrationParent}},

@@ -43,6 +43,9 @@ import (
 // Options is the frozen input to one Cozy daemon. Every field is decided by the
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
+	// PrivateExecution is the immutable, pod-local execution authority. A nil
+	// value keeps the ordinary laptop/local owner identity and proof path.
+	PrivateExecution *PrivateExecutionOwner
 	// ReclaimInstall delegates unpinned snapshot cleanup to the existing package owner.
 	ReclaimInstall func(string) *exit.Error
 	Cfg            config.Config
@@ -550,6 +553,16 @@ type wait struct {
 // Open builds the orchestrator. No listener binds here: the owner DIALS each worker's
 // own socket (#436); a second Cozy daemon on one root fails on the daemon lock instead.
 func Open(opt Options) (*Orchestrator, *exit.Error) {
+	if opt.PrivateExecution != nil {
+		if opt.AcquireManagedRental != nil || opt.ReleaseManagedRental != nil || opt.ReleaseRetainedRental != nil {
+			return nil, exit.New(exit.Validation, "private execution owner cannot acquire or release rentals")
+		}
+		held, problem := freezePrivateExecution(opt.PrivateExecution)
+		if problem != nil {
+			return nil, problem
+		}
+		opt.PrivateExecution = held
+	}
 	if opt.Log == nil {
 		opt.Log = io.Discard
 	}

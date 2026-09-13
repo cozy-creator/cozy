@@ -1598,7 +1598,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		AdmissionEpoch: admissionEpoch,
 	}
 	offer.RecordOwnerEpoch, offer.ControlStreamEpoch, offer.WorkerBootId =
-		recordOwnerEpoch, sess.epoch, sess.bootID
+		c.ownerEpoch(), sess.epoch, sess.bootID
 	if !c.commitDispatch(reservation, req.ID, attempt) {
 		cause := exit.Unavailablef("the worker selected for %s#%d left before its offer", req.ID, attempt)
 		c.rollbackGrant(req, attempt, w)
@@ -2326,7 +2326,7 @@ func (c *Orchestrator) Cancel(requestID string, attempt uint64, reason pb.Cancel
 		GraceMs: graceMS, InvocationSpecDigest: raw,
 	}
 	cancel.RecordOwnerEpoch, cancel.ControlStreamEpoch, cancel.WorkerBootId =
-		recordOwnerEpoch, sess.epoch, sess.bootID
+		c.ownerEpoch(), sess.epoch, sess.bootID
 	if !sess.trySend(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_CancelAttempt{CancelAttempt: cancel}}) {
 		return exit.Unavailablef("the control stream for %s#%d cannot accept cancellation now",
 			requestID, attempt)

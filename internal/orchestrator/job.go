@@ -194,7 +194,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker, replacement *Work
 		Posture: pb.Posture_POSTURE_ACCEPTING,
 		Mode:    &pb.DesiredWorkerState_Job{Job: c.jobDirective(plan)},
 	}
-	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = recordOwnerEpoch, s.epoch, s.bootID
+	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = c.ownerEpoch(), s.epoch, s.bootID
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
 		return exit.Unavailablef("worker %s control stream closed before job directive send", w.instanceID)
 	}
@@ -510,7 +510,7 @@ func (c *Orchestrator) onCheckpoint(s *session, r *pb.JobCheckpointRequest) {
 	if e != nil {
 		c.logf("checkpoint %s/%s of %s#%d NOT journaled: %s",
 			r.OperationKey, r.LogicalKey, r.RequestId, r.AttemptOrdinal, e.Message)
-		s.send(checkpointReceipt(s, r, "", pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
+		s.send(c.checkpointReceipt(s, r, "", pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
 			pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_UNKNOWN_ATTEMPT, e.Message))
 		return
 	}
@@ -518,16 +518,16 @@ func (c *Orchestrator) onCheckpoint(s *session, r *pb.JobCheckpointRequest) {
 		r.RequestId, r.AttemptOrdinal, outcome, shortDigest(digest))
 	switch outcome {
 	case "CONFLICT":
-		s.send(checkpointReceipt(s, r, row.ReceiptID, pb.CheckpointOutcome_CHECKPOINT_OUTCOME_CONFLICT,
+		s.send(c.checkpointReceipt(s, r, row.ReceiptID, pb.CheckpointOutcome_CHECKPOINT_OUTCOME_CONFLICT,
 			pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_IDENTITY_CONFLICT,
 			"this identity is already journaled at "+shortDigest(row.ContentDigest)))
 	default:
-		s.send(checkpointReceipt(s, r, row.ReceiptID,
+		s.send(c.checkpointReceipt(s, r, row.ReceiptID,
 			pb.CheckpointOutcome_CHECKPOINT_OUTCOME_RECORDED, 0, ""))
 	}
 }
 
-func checkpointReceipt(s *session, r *pb.JobCheckpointRequest, receiptID string,
+func (c *Orchestrator) checkpointReceipt(s *session, r *pb.JobCheckpointRequest, receiptID string,
 	outcome pb.CheckpointOutcome, code pb.CheckpointFaultCode, detail string) *pb.RecordOwnerFrame {
 	receipt := &pb.JobCheckpointReceipt{
 		RequestId: r.RequestId, AttemptOrdinal: r.AttemptOrdinal, OperationKey: r.OperationKey,
@@ -535,7 +535,7 @@ func checkpointReceipt(s *session, r *pb.JobCheckpointRequest, receiptID string,
 		ReceiptId: receiptID, Outcome: outcome,
 	}
 	receipt.RecordOwnerEpoch, receipt.ControlStreamEpoch, receipt.WorkerBootId =
-		recordOwnerEpoch, s.epoch, s.bootID
+		c.ownerEpoch(), s.epoch, s.bootID
 	if detail != "" {
 		receipt.Fault = &pb.CheckpointFault{Code: code, Detail: detail}
 	}

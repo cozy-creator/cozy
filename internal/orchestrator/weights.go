@@ -16,7 +16,7 @@ import (
 // weightsReceiptsFromOutcome validates the RecordOwner-specific joins the protocol's
 // generic canonical reader cannot know: job mode, local owner authority, exact request/spec,
 // and membership in the weights-output subset persisted beside this InvocationSpec.
-func weightsReceiptsFromOutcome(req records.Request, attempt records.Attempt,
+func (c *Orchestrator) weightsReceiptsFromOutcome(req records.Request, attempt records.Attempt,
 	doc canonical.Doc) ([]records.WeightsReceipt, map[string]records.WeightsReceipt, *exit.Error) {
 	refs := doc.List("weights_receipts")
 	if len(refs) == 0 {
@@ -46,12 +46,12 @@ func weightsReceiptsFromOutcome(req records.Request, attempt records.Attempt,
 		if e != nil {
 			return nil, nil, e
 		}
-		if receipt.OwnerScope != recordOwnerID || receipt.RequestID != req.ID ||
+		if receipt.OwnerScope != c.ownerID() || receipt.RequestID != req.ID ||
 			receipt.InvocationDigest != attempt.InvocationDigest {
 			return nil, nil, exit.Named(exit.Validation, "weights_receipt_identity_mismatch",
 				"weights receipt %s names owner/request/spec %q/%q/%s, expected %q/%q/%s",
 				receipt.OutputSlot, receipt.OwnerScope, receipt.RequestID,
-				shortDigest(receipt.InvocationDigest), recordOwnerID, req.ID,
+				shortDigest(receipt.InvocationDigest), c.ownerID(), req.ID,
 				shortDigest(attempt.InvocationDigest))
 		}
 		if !allowed[receipt.OutputSlot] {
@@ -94,7 +94,7 @@ func parseWeightsReceiptRef(ref canonical.Doc) (records.WeightsReceipt, *exit.Er
 	return out, nil
 }
 
-func weightsFinalizationIntents(req records.Request, attempt records.Attempt, status string,
+func (c *Orchestrator) weightsFinalizationIntents(req records.Request, attempt records.Attempt, status string,
 	requeuing bool, receipts map[string]records.WeightsReceipt) ([]records.WeightsFinalization, *exit.Error) {
 	declared, e := decodeWeightsOutputs(attempt.WeightsOutputs)
 	if e != nil {
@@ -118,7 +118,7 @@ func weightsFinalizationIntents(req records.Request, attempt records.Attempt, st
 			disposition = pb.WeightsFinalizeDisposition_WEIGHTS_FINALIZE_DISPOSITION_ADOPT
 			receiptDigest = receipt.ReceiptDigest
 			var err error
-			scratchRoot, err = weightsScratchRootID(req.ID, output.OutputID)
+			scratchRoot, err = c.weightsScratchRootID(req.ID, output.OutputID)
 			if err != nil {
 				return nil, exit.Internalf("cannot derive the weights scratch root: %s", err)
 			}
@@ -128,7 +128,7 @@ func weightsFinalizationIntents(req records.Request, attempt records.Attempt, st
 		}
 		out = append(out, records.WeightsFinalization{
 			RequestID: req.ID, Attempt: attempt.Attempt, InstanceID: attempt.InstanceID,
-			OwnerScope: recordOwnerID, InvocationDigest: attempt.InvocationDigest,
+			OwnerScope: c.ownerID(), InvocationDigest: attempt.InvocationDigest,
 			OutputSlot: output.OutputID,
 			Disposition: trimEnum(pb.WeightsFinalizeDisposition_name[int32(disposition)],
 				"WEIGHTS_FINALIZE_DISPOSITION_"),
@@ -140,10 +140,10 @@ func weightsFinalizationIntents(req records.Request, attempt records.Attempt, st
 
 // weightsScratchRootID is Runtime's exact private-root identity. It is a semantic id,
 // never a path and never the public `<org>/_job-*` repository name.
-func weightsScratchRootID(requestID, outputSlot string) (string, error) {
+func (c *Orchestrator) weightsScratchRootID(requestID, outputSlot string) (string, error) {
 	data, err := canonical.Write(map[string]canonical.Value{
 		"format":                "cozy.runtime.WeightsScratchRootIdentity/1",
-		"owner_authority_scope": recordOwnerID,
+		"owner_authority_scope": c.ownerID(),
 		"request_id":            requestID,
 		"output_slot":           outputSlot,
 	})
@@ -203,7 +203,7 @@ func (c *Orchestrator) sendPendingWeightsFinalizations(s *session, requestID str
 			}
 		}
 		request := &pb.WeightsFinalizeRequest{
-			RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
+			RecordOwnerEpoch: c.ownerEpoch(), ControlStreamEpoch: s.epoch,
 			WorkerBootId: s.bootID, RequestId: row.RequestID,
 			InvocationSpecDigest: specDigest, OutputSlot: row.OutputSlot,
 			Disposition:          pb.WeightsFinalizeDisposition(disposition),
@@ -237,7 +237,7 @@ func (c *Orchestrator) onWeightsFinalizeResult(s *session, frame *pb.WeightsFina
 	}
 	spelledSpec, err := canonical.Spell(frame.InvocationSpecDigest)
 	if err != nil || frame.RequestId == "" || frame.OutputSlot == "" ||
-		frame.OwnerAuthorityScope != recordOwnerID {
+		frame.OwnerAuthorityScope != c.ownerID() {
 		refuse("incomplete identity or owner divergence")
 		return
 	}
@@ -277,7 +277,7 @@ func (c *Orchestrator) onWeightsFinalizeResult(s *session, frame *pb.WeightsFina
 			refuse("%s", problem.Message)
 			return
 		}
-		if receipt.OwnerScope != recordOwnerID || receipt.RequestID != frame.RequestId ||
+		if receipt.OwnerScope != c.ownerID() || receipt.RequestID != frame.RequestId ||
 			receipt.InvocationDigest != spelledSpec || receipt.OutputSlot != frame.OutputSlot {
 			refuse("returned receipt does not close this owner/request/spec/slot")
 			return
@@ -394,7 +394,7 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 	ack := &pb.AttemptOutcomeAck{
 		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: specDigest,
 		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,
-		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
+		RecordOwnerEpoch: c.ownerEpoch(), ControlStreamEpoch: s.epoch,
 		WorkerBootId: s.bootID,
 		RetainWork: req.RetainWork && !successfulReleased && (successfulPending || records.RetainedState(req.State) || req.State == "requeue_pending" ||
 			(req.RetainsLocalOutputs() && req.State != "canceling" && req.State != "releasing" && req.State != "canceled")),

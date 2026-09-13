@@ -397,7 +397,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 		// that left the posture ACCEPTING would be asking for work it has nowhere to run.
 		d.Posture = pb.Posture_POSTURE_DRAINING
 	}
-	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = recordOwnerEpoch, s.epoch, s.bootID
+	d.RecordOwnerEpoch, d.ControlStreamEpoch, d.WorkerBootId = c.ownerEpoch(), s.epoch, s.bootID
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}})
 	c.logf("DesiredWorkerState revision=%d posture=%s placements=%d set=%s (%d canonical bytes) "+
 		"envelope=[%s] pins=%d -> %s",
@@ -936,7 +936,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		refuse("weights-only job also returned ordinary output-manifest entries")
 		return
 	}
-	weightsReceipts, receiptsBySlot, e := weightsReceiptsFromOutcome(*req, *attemptRow, doc)
+	weightsReceipts, receiptsBySlot, e := c.weightsReceiptsFromOutcome(*req, *attemptRow, doc)
 	if e != nil {
 		refuse("%s", e.Message)
 		return
@@ -1024,10 +1024,10 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		kept.Payload["status"] = "FINALIZING"
 		kept.Payload["execution_status"] = "SUCCEEDED"
 	}
-	weightsFinalizations, e := weightsFinalizationIntents(
+	weightsFinalizations, e := c.weightsFinalizationIntents(
 		*req, *attemptRow, status, requeuing || retaining, receiptsBySlot)
 	if req.State == "canceling" {
-		weightsFinalizations, e = weightsFinalizationIntents(*req, *attemptRow, "CANCELED", false, receiptsBySlot)
+		weightsFinalizations, e = c.weightsFinalizationIntents(*req, *attemptRow, "CANCELED", false, receiptsBySlot)
 	}
 	if e != nil {
 		refuse("%s", e.Message)

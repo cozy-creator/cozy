@@ -13,9 +13,9 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-func nativeSourceByteOutput(row records.NativeCall, status *pb.NativeSourceStatus) (records.ByteOutput, *exit.Error) {
+func (c *Orchestrator) nativeSourceByteOutput(row records.NativeCall, status *pb.NativeSourceStatus) (records.ByteOutput, *exit.Error) {
 	if row.Operation == "commit_file" {
-		return records.CommittedFileOutput(recordOwnerID, row, status)
+		return records.CommittedFileOutput(c.ownerID(), row, status)
 	}
 	fail := func(message string) (records.ByteOutput, *exit.Error) {
 		return records.ByteOutput{}, exit.New(exit.Validation, "%s", message)
@@ -41,7 +41,7 @@ func nativeSourceByteOutput(row records.NativeCall, status *pb.NativeSourceStatu
 	if err := json.Unmarshal(row.Request, &request); err != nil || request.Source.Manifest.Digest != manifest || request.Source.Manifest.Length != b.ManifestLength {
 		return fail("source view changed the accepted source manifest")
 	}
-	if b.ProducerRootID != records.NativeByteProducerRoot(recordOwnerID, b.RequestID, b.Attempt, status.ByteOutputInvocationSpecDigest, b.OutputID) {
+	if b.ProducerRootID != records.NativeByteProducerRoot(c.ownerID(), b.RequestID, b.Attempt, status.ByteOutputInvocationSpecDigest, b.OutputID) {
 		return fail("source view changed its original byte producer identity")
 	}
 	var value any

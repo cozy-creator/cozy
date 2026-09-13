@@ -473,7 +473,7 @@ func (c *Orchestrator) cancelLocalTransfer(operationID string) *exit.Error {
 	if localErr != nil {
 		return exit.Internalf("cannot decode local package abort identity: %s", localErr)
 	}
-	abort := &pb.LocalPackageAbort{RecordOwnerEpoch: recordOwnerEpoch,
+	abort := &pb.LocalPackageAbort{RecordOwnerEpoch: c.ownerEpoch(),
 		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
 		OperationId: operationID, SourceDigest: append([]byte(nil), transfer.source...),
 		LocalRevisionDigest: localDigest}
@@ -660,7 +660,7 @@ func (c *Orchestrator) replayLocalAborts(current *session, workerID string) {
 			continue
 		}
 		_ = current.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_LocalPackageAbort{
-			LocalPackageAbort: &pb.LocalPackageAbort{RecordOwnerEpoch: recordOwnerEpoch,
+			LocalPackageAbort: &pb.LocalPackageAbort{RecordOwnerEpoch: c.ownerEpoch(),
 				ControlStreamEpoch: current.epoch, WorkerBootId: current.bootID,
 				OperationId: row.ID, SourceDigest: source, LocalRevisionDigest: revision}}})
 	}

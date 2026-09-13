@@ -190,7 +190,7 @@ func (c *Orchestrator) moveModelTransferWeights(ctx context.Context,
 			}
 			// The Host binds one operation to one object within this transaction.
 			// The Hub publication is a separate scope shared by all of its objects.
-			transfer := &pb.WeightsTransferRequest{RecordOwnerEpoch: recordOwnerEpoch,
+			transfer := &pb.WeightsTransferRequest{RecordOwnerEpoch: c.ownerEpoch(),
 				ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 				RequestId: weights.RequestID, AttemptOrdinal: uint64(weights.Attempt),
 				InvocationSpecDigest: specDigest, OutputSlot: weights.OutputSlot,
@@ -428,7 +428,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			file, access := expected[member], byMember[member]
 			frame := &pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourceFileRequest{
 				ModelSourceFileRequest: &pb.ModelSourceFileRequest{
-					RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
+					RecordOwnerEpoch: c.ownerEpoch(), ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID,
 					OperationId: req.ID, SourceSelectionDigest: selection, Member: member,
 					ObjectId: "sha256:" + file.SHA256, Length: uint64(file.Length), Header: file.Header,
 					Provider: access.Provider, Url: url, ExpiresAtUnix: access.ExpiresAtUnix,
@@ -582,7 +582,7 @@ func (c *Orchestrator) prepareModelTransferRemote(ctx context.Context, req recor
 			sort.Slice(profiles, func(i, j int) bool { return profiles[i].Slot < profiles[j].Slot })
 			c.logf("model transfer %s: preparing %d profile(s) on %s with %d/%d source members fulfilled", req.ID, len(profiles), session.instanceID, fulfilled, len(expected))
 			if !session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ModelSourcePrepareRequest{
-				ModelSourcePrepareRequest: &pb.ModelSourcePrepareRequest{RecordOwnerEpoch: recordOwnerEpoch,
+				ModelSourcePrepareRequest: &pb.ModelSourcePrepareRequest{RecordOwnerEpoch: c.ownerEpoch(),
 					ControlStreamEpoch: session.epoch, WorkerBootId: session.bootID, OperationId: req.ID,
 					SourceSelectionDigest: selection, Profiles: profiles, Checkpoints: checkpoints,
 					SourceUri: intent.Source, DeclaredLicense: intent.SourceLicense}}}) {

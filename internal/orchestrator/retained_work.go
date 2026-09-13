@@ -136,7 +136,7 @@ func (c *Orchestrator) ackReleasedRetainedAttempts(ctx context.Context, request 
 		if err != nil {
 			return exit.Internalf("retained attempt has malformed terminal identity")
 		}
-		ack := &pb.AttemptOutcomeAck{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome, RetainWork: false}
+		ack := &pb.AttemptOutcomeAck{RecordOwnerEpoch: c.ownerEpoch(), ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome, RetainWork: false}
 		if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {
 			return exit.Unavailablef("released terminal acknowledgement awaits its workspace connection")
 		}
@@ -372,7 +372,7 @@ func (c *Orchestrator) settleRetainedWeights(request records.Request, attempts [
 			seen[key] = true
 			finalization := records.WeightsFinalization{
 				RequestID: id, Attempt: attempt.Attempt, InstanceID: attempt.InstanceID,
-				OwnerScope: recordOwnerID, InvocationDigest: attempt.InvocationDigest, OutputSlot: output.OutputID,
+				OwnerScope: c.ownerID(), InvocationDigest: attempt.InvocationDigest, OutputSlot: output.OutputID,
 			}
 			var problem *exit.Error
 			if successRoot == "" {

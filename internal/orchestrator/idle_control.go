@@ -29,7 +29,7 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 	if remote == nil || remote.CACert == "" || remote.WorkerBootID == "" || sign == nil {
 		return nil, exit.New(exit.Credential, "operator control requires a pinned rental and Claim signer")
 	}
-	proof, problem := sign(remote, recordOwnerEpoch)
+	proof, problem := sign(remote, defaultRecordOwnerEpoch)
 	if problem != nil {
 		return nil, problem
 	}
@@ -52,7 +52,7 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 	if err != nil {
 		return nil, idleControlEnd(err)
 	}
-	claim := &pb.Claim{RecordOwnerEpoch: recordOwnerEpoch, RecordOwnerId: recordOwnerID, WorkerId: remote.WorkerID, WorkerBootId: remote.WorkerBootID, WireMinor: pb.WireMinor, Proof: proof}
+	claim := &pb.Claim{RecordOwnerEpoch: defaultRecordOwnerEpoch, RecordOwnerId: defaultRecordOwnerID, WorkerId: remote.WorkerID, WorkerBootId: remote.WorkerBootID, WireMinor: pb.WireMinor, Proof: proof}
 	if err = stream.Send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: claim}}); err != nil {
 		return nil, idleControlEnd(err)
 	}
@@ -68,13 +68,13 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 		switch message := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
 			ack := message.ClaimAck
-			if !ack.Accepted || ack.RecordOwnerEpoch != recordOwnerEpoch || ack.WorkerId != remote.WorkerID || ack.WorkerBootId != remote.WorkerBootID || ack.ControlStreamEpoch == 0 || ack.WireMinor < pb.MinCompatibleWireMinor {
+			if !ack.Accepted || ack.RecordOwnerEpoch != defaultRecordOwnerEpoch || ack.WorkerId != remote.WorkerID || ack.WorkerBootId != remote.WorkerBootID || ack.ControlStreamEpoch == 0 || ack.WireMinor < pb.MinCompatibleWireMinor {
 				return nil, exit.New(exit.Conflict, "operator control claim was refused or changed the pinned worker")
 			}
 			epoch = ack.ControlStreamEpoch
 		case *pb.WorkerFrame_Snapshot:
 			snap := message.Snapshot
-			if epoch == 0 || snap.RecordOwnerEpoch != recordOwnerEpoch || snap.ControlStreamEpoch != epoch || snap.WorkerBootId != remote.WorkerBootID {
+			if epoch == 0 || snap.RecordOwnerEpoch != defaultRecordOwnerEpoch || snap.ControlStreamEpoch != epoch || snap.WorkerBootId != remote.WorkerBootID {
 				return nil, exit.New(exit.Conflict, "operator control snapshot changed its claimed envelope")
 			}
 			if problem := validateIdleSnapshot(snap, remote.RentalID, retained); problem != nil {

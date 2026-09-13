@@ -37,7 +37,7 @@ func (c *Orchestrator) onNativeEffect(s *session, parent records.Request, call *
 		return true
 	}
 	digest, _ := canonical.Spell(call.IntentDigest)
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d", recordOwnerID, parent.ID, call.CallIndex)))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%s/%d", c.ownerID(), parent.ID, call.CallIndex)))
 	id := "effect-" + hex.EncodeToString(sum[:])
 	parentSpec, _ := canonical.Spell(call.ParentInvocationSpecDigest)
 	row, _, problem := c.opt.Store.AcceptNativeCall(records.NativeCall{ID: id, ParentRequestID: parent.ID, CallIndex: int64(call.CallIndex), Kind: "effect", Operation: call.Export, IntentDigest: digest, Request: call.RequestCanonicalBytes}, int64(call.ParentAttemptOrdinal), parentSpec, s.bootID)

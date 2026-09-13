@@ -29,16 +29,15 @@ import (
 // dispatches. One goroutine per worker owns the whole conversation; the `session` is that
 // stream's sender half, fenced by the control stream epoch the worker minted.
 //
-// LAUNCH TIER (#437): record_owner_epoch is the constant 1 — this daemon is the one
-// RecordOwner of every worker it spawns or connects to; the machinery that MINTS competing
-// epochs is the hub's Wave-2 lease. Spawned workers authenticate Claim with their local
-// bootstrap; rented workers authenticate the channel with the provisioned Creator mTLS key.
+// Ordinary local/rental execution uses the default owner and epoch1. A private
+// pod coordinator uses only the immutable identity/generation in its accepted
+// execution grant; reconnecting observers never change that authority.
 
-const recordOwnerEpoch = 1
+const defaultRecordOwnerEpoch = 1
 
-// recordOwnerID names this owner on Claim. Stable per daemon run is enough at launch:
+// The default owner names an ordinary laptop coordinator on Claim:
 // equal-epoch claims from the SAME RecordOwner are reconnects, anything else is refused.
-const recordOwnerID = "cozy-local-client"
+const defaultRecordOwnerID = "cozy-local-client"
 
 type session struct {
 	ctx        context.Context
@@ -299,10 +298,16 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	var proof []byte
 	claimWorkerID, claimBootID := "", ""
 	if w.spec.Connection != nil {
-		if c.opt.RentalClaimProof == nil {
+		if c.opt.RentalClaimProof == nil && c.opt.PrivateExecution == nil {
 			return fmt.Errorf("the rental has no ClaimProof signer")
 		}
-		signed, problem := c.opt.RentalClaimProof(w.spec.Connection, recordOwnerEpoch)
+		var signed []byte
+		var problem *exit.Error
+		if c.opt.PrivateExecution != nil {
+			signed, problem = c.executionClaimProof(w.spec.Connection)
+		} else {
+			signed, problem = c.opt.RentalClaimProof(w.spec.Connection, c.ownerEpoch())
+		}
 		if problem != nil {
 			c.refuseClaim(w, problem)
 			return fmt.Errorf("%s", problem.Message)
@@ -311,15 +316,21 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		claimWorkerID, claimBootID = w.spec.Connection.WorkerID, w.spec.Connection.WorkerBootID
 		s.host = pb.NewPodHostClient(conn)
 	} else {
+		if c.opt.PrivateExecution != nil {
+			return fmt.Errorf("private execution owner cannot spawn another worker")
+		}
 		proof = []byte(w.bootstrap.Reveal())
 	}
 	s.claim = &pb.Claim{
-		RecordOwnerEpoch: recordOwnerEpoch,
-		RecordOwnerId:    recordOwnerID,
+		RecordOwnerEpoch: c.ownerEpoch(),
+		RecordOwnerId:    c.ownerID(),
 		WorkerId:         claimWorkerID,
 		WorkerBootId:     claimBootID,
 		WireMinor:        pb.WireMinor,
 		Proof:            proof,
+	}
+	if c.opt.PrivateExecution != nil {
+		s.claim.ExecutionOwner = proto.Clone(c.opt.PrivateExecution.Authorization).(*pb.SignedExecutionOwnerGrant)
 	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{
 		Claim: proto.Clone(s.claim).(*pb.Claim),
@@ -407,7 +418,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			if !c.jobMode(s) {
-				s.send(checkpointReceipt(s, r, "",
+				s.send(c.checkpointReceipt(s, r, "",
 					pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
 					pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_NOT_JOB_MODE,
 					"this worker is in serving mode; the checkpoint lane is the job lane's"))
@@ -475,8 +486,8 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 // fenced evaluates the three-field envelope in its fixed order, BEFORE any body field is
 // interpreted (02 §0).
 func (c *Orchestrator) fenced(s *session, owner, controlStream uint64, bootID string) bool {
-	if owner != recordOwnerEpoch {
-		c.logf("DROPPED: epoch %d is not this owner's %d", owner, recordOwnerEpoch)
+	if owner != c.ownerEpoch() {
+		c.logf("DROPPED: epoch %d is not this owner's %d", owner, c.ownerEpoch())
 		return true
 	}
 	if controlStream != s.epoch {
@@ -743,7 +754,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest,
 		HostSnapshotDigest: append([]byte(nil), snap.HostSnapshotDigest...)}
 	ackMsg.RecordOwnerEpoch, ackMsg.ControlStreamEpoch, ackMsg.WorkerBootId =
-		recordOwnerEpoch, s.epoch, s.bootID
+		c.ownerEpoch(), s.epoch, s.bootID
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}}) {
 		return false
 	}
@@ -914,7 +925,7 @@ func (c *Orchestrator) watchProgress(ctx context.Context, addr string, w *worker
 		return false, err
 	}
 	defer conn.Close()
-	open := &pb.ProgressOpen{RecordOwnerEpoch: recordOwnerEpoch,
+	open := &pb.ProgressOpen{RecordOwnerEpoch: c.ownerEpoch(),
 		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID}
 	watch, err := pb.NewWorkerControlClient(conn).WatchProgress(ctx, open)
 	if err != nil {
@@ -926,7 +937,7 @@ func (c *Orchestrator) watchProgress(ctx context.Context, addr string, w *worker
 		if err != nil {
 			return received, err
 		}
-		if p.RecordOwnerEpoch != recordOwnerEpoch || p.ControlStreamEpoch != s.epoch || p.WorkerBootId != s.bootID {
+		if p.RecordOwnerEpoch != c.ownerEpoch() || p.ControlStreamEpoch != s.epoch || p.WorkerBootId != s.bootID {
 			continue
 		}
 		received = true
