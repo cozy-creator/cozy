@@ -92,6 +92,7 @@ type fakePod struct {
 	// localJobOnly supplies a prepared interface without any serving entrypoints.
 	localJobOnly   bool
 	privatePrepare func(*pb.PreparePrivatePlacementCall, grpc.ServerStreamingServer[pb.PrepareEvent]) error
+	localPrepare   func(*pb.PrepareLocalPackageCall, grpc.ServerStreamingServer[pb.PrepareEvent]) error
 	// onJobReady can delay and sequence the independent peer's readiness facts.
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// answerOffer supplies a protocol outcome when a test exercises settlement.
@@ -491,6 +492,9 @@ func (p *fakePod) LocalPackageUpload(stream grpc.BidiStreamingServer[pb.LocalPac
 }
 
 func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
+	if p.localPrepare != nil {
+		return p.localPrepare(call, stream)
+	}
 	if err := p.verifyClaim(call.Claim, false); err != nil {
 		return err
 	}
