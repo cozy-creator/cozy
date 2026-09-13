@@ -200,6 +200,8 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "gpu", V: skuName},
 		{K: "accelerator", V: ready.AcceleratorModel},
 		{K: "base_worker_image_digest", V: ready.BaseWorkerImageDigest},
+		{K: "base_worker_image_tag", V: ready.BaseWorkerImageTag},
+		{K: "base_worker_profile", V: ready.BaseWorkerProfile},
 		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
 	}
 	if ready.Development {
@@ -569,19 +571,14 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 	})
 	rows := make([]map[string]string, 0, len(ladder))
 	for _, sku := range ladder {
-		// The ladder speaks ONE price and it is the whole pre-spend rate the pod will
-		// bill (th-126): GPU plus the SKU's storage adder, never the GPU rate alone,
-		// which is the figure that read $0.49/hr while RunPod billed ~$0.70. The
-		// components stay one --full away, where `gpu price` is the rate the accepted
-		// quote locks.
+		// The Hub quotes the GPU plus its default disk. Keep one combined price
+		// in both normal and expanded tables; pricing policy belongs to the Hub.
 		rows = append(rows, map[string]string{
 			"name": sku.Name, "gpu": acceleratorLabel(sku.AcceleratorModel, sku.AcceleratorCount),
 			"accelerator model": sku.AcceleratorModel,
 			"accelerator count": strconv.Itoa(sku.AcceleratorCount),
 			"compute":           computeCapabilityText(sku.ComputeCapability),
 			"vram":              fmt.Sprintf("%d GB", sku.VRAMGB),
-			"gpu price":         rentalPrice(sku.PriceUSDMicrosPerHour),
-			"storage price":     rentalPrice(sku.StorageUSDMicrosPerHour),
 			"price":             rentalPrice(total(sku)),
 		})
 	}
@@ -589,7 +586,7 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 		Name:   "gpus",
 		Fields: []string{"name", "gpu", "compute", "vram", "price"},
 		AllFields: []string{"name", "gpu", "accelerator model", "accelerator count", "compute",
-			"vram", "gpu price", "storage price", "price"},
+			"vram", "price"},
 		Rows: rows, Total: len(rows),
 		Next: []string{"cozy rental new <machine-slug>"},
 	}

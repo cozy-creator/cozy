@@ -62,7 +62,7 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		return map[string]any{"name": name, "accelerator_model": model,
 			"accelerator_count": 1, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",
 			"compute_capability": capability, "vram_gb": vram, "minimum_ram_per_gpu_gb": 64,
-			"price_usd_micros_per_hour": price, "storage_usd_micros_per_hour": 213_504}
+			"price_usd_micros_per_hour": price, "storage_usd_micros_per_hour": 41_700}
 	}
 	cpu := func(name string, price int64) map[string]any {
 		return map[string]any{"name": name, "accelerator_model": "CPU",
@@ -121,8 +121,8 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 	}
 
 	// ONE price, and it is the whole one: the components are not on this table.
-	if got := rows["rtx-a4000"][4]; got != "$0.46/hr" {
-		t.Fatalf("the A4000's price reads %q, not the combined $0.46/hr\n%s", got, out)
+	if got := rows["rtx-a4000"][4]; got != "$0.29/hr" {
+		t.Fatalf("the A4000's price reads %q, not the combined $0.29/hr\n%s", got, out)
 	}
 	// $0.07/hr is NOT checked here: rounded to the penny, the cpu SKU's COMBINED
 	// price ($0.07278) and its GPU component ($0.07) render identically, so the
@@ -135,7 +135,7 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 	}
 
 	// PRICES ARE READ IN PENNIES. Micro-dollar precision is how the provider quotes
-	// and how we bill; `$0.463504/hr` asks a reader to parse six decimals to learn
+	// and how we bill; `$0.291700/hr` asks a reader to parse six decimals to learn
 	// "about forty-six cents". This asserts the rendered table, so it holds against
 	// whichever formatter produced a cell -- there were two, rendering the same
 	// micros independently, and rounding one left the other six decimals wide.
@@ -150,20 +150,22 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		t.Fatalf("the ladder climbs %v, not cheapest-first %v\n%s", order, climb, out)
 	}
 
-	// --full still carries th-126's decomposition AND the verbatim provider id: the id
-	// Tensorhub matches live offers against is shortened for reading, never rewritten.
+	// Expanded output keeps the provider identity and the same combined price.
 	code, full := runCozy(t, root, "rental", "new", "--full")
 	if code != 0 {
 		t.Fatalf("cozy rental new --full [exit %d]:\n%s", code, full)
 	}
 	for _, kept := range []string{
-		"ACCELERATOR MODEL", "GPU PRICE", "STORAGE PRICE",
+		"ACCELERATOR MODEL",
 		"NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-		"$1.69/hr", "$0.21/hr", "$1.90/hr",
+		"$1.73/hr",
 	} {
 		if !strings.Contains(full, kept) {
 			t.Fatalf("--full lost %q from the ladder\n%s", kept, full)
 		}
+	}
+	if strings.Contains(full, "STORAGE") || strings.Contains(full, "GPU PRICE") {
+		t.Fatalf("expanded catalog itemizes storage instead of one total: %s", full)
 	}
 	hub.close()
 }
