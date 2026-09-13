@@ -98,15 +98,18 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 				finished <- o.c.ConvergeUnpublishedPlacement(instance, "model-only", wanted,
 					[]*pb.DownloadModelRef{{Slot: "generate.models.model", Model: "proof/native", Manifest: childDigest("b")}})
 			}()
-			state := &pb.ObservedWorkerState{
-				RecordOwnerEpoch: stage.desired.RecordOwnerEpoch, ControlStreamEpoch: stage.desired.ControlStreamEpoch,
-				WorkerBootId: pod.bootID(), AppliedWireMinor: pb.WireMinor,
-				AcceptedDesiredStateRevision: stage.desired.Revision, AcceptedPlacementSetDigest: code.PlacementSetDigest,
-				WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AdmissionState: pb.AdmissionState_ADMISSION_STATE_CLOSED,
-				AdmissionEpoch: 17, Placements: []*pb.PlacementStatus{{PlacementId: row.Str("placement_id"),
-					PlacementSetDigest: code.PlacementSetDigest, Materialization: pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
-					Serving: pb.ServingState_SERVING_STATE_OFFLINE}},
-			}
+			// Actual installed Runtime451 emitted this after preparing the fixture wheel,
+			// applying DesiredWorkerState and completing convergence. Only stream identity
+			// is rebound here; serving/materialization/admission facts remain its bytes.
+			observed, err := os.ReadFile(filepath.Join(root, "observed.pb"))
+			must(t, err)
+			state := &pb.ObservedWorkerState{}
+			must(t, proto.Unmarshal(observed, state))
+			state.RecordOwnerEpoch = stage.desired.RecordOwnerEpoch
+			state.ControlStreamEpoch = stage.desired.ControlStreamEpoch
+			state.WorkerBootId = pod.bootID()
+			state.AcceptedDesiredStateRevision = stage.desired.Revision
+
 			switch condition {
 			case "wrong_placement":
 				state.Placements[0].PlacementId = "package-other"
@@ -118,7 +121,7 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 				state.Placements[0].Materialization = pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 			}
 			must(t, stage.send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: proto.Clone(state).(*pb.ObservedWorkerState)}}))
-			waitUntil(t, "the actual observation applied by Creator", func() bool { return o.c.Worker(instance).AdmissionEpoch == 17 })
+			waitUntil(t, "the actual observation applied by Creator", func() bool { return o.c.Worker(instance).AdmissionEpoch == state.AdmissionEpoch })
 			facts := o.c.Worker(instance)
 			if facts.ConvergedRevision != 0 || facts.AvailableSlots != 0 || len(facts.Dispatchable) != 0 || facts.Admission != "CLOSED" {
 				t.Fatalf("code staging became executable: %+v", facts)
