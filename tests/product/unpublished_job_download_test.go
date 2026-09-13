@@ -27,12 +27,16 @@ func (p *fakePod) PreparePrivatePlacement(call *pb.PreparePrivatePlacementCall, 
 func TestUnpublishedJobDownloadsInputsBeforeDispatchWithoutServing(t *testing.T) {
 	for _, versioned := range []bool{false, true} {
 		t.Run(map[bool]string{false: "checkpoint", true: "release_lane"}[versioned], func(t *testing.T) {
-			privateJobDownload(t, versioned)
+			privateJobDownload(t, versioned, true)
 		})
 	}
 }
 
-func privateJobDownload(t *testing.T, versioned bool) {
+func TestUnpublishedJobLeavesImportedDefaultsForTheirCallee(t *testing.T) {
+	privateJobDownload(t, true, false)
+}
+
+func privateJobDownload(t *testing.T, versioned, rootModels bool) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, jobReady: true, localJobOnly: true}
@@ -65,6 +69,8 @@ func privateJobDownload(t *testing.T, versioned bool) {
 		Manifest: childDigest("8"), ManifestLength: 161, Bytes: 4096, HubCheckpoint: !versioned}
 	native := records.ModelRef{Package: revision.Package, Slot: "prior", BindingPath: "prepare.models.prior", Model: "job-source/weights",
 		Manifest: childDigest("9"), ManifestLength: 161}
+	imported := records.ModelRef{Package: "local/imported-invocable", Slot: "source", BindingPath: model.BindingPath,
+		Model: "proof/library-base", Release: "2.0.0", Lane: "f32", Manifest: childDigest("a"), ManifestLength: 161}
 	if versioned {
 		model.Release, model.Lane = "1.0.0", "bf16"
 	}
@@ -86,7 +92,7 @@ func privateJobDownload(t *testing.T, versioned bool) {
 			return err
 		}
 		rows := doc.List("models")
-		if len(rows) != 1 || rows[0].Str("manifest") != model.Manifest || rows[0].Str("slot") != model.BindingPath || rows[0].Str("release") != model.Release || rows[0].Str("lane") != model.Lane {
+		if len(rows) != 1 || rows[0].Str("package") != revision.Package || rows[0].Str("manifest") != model.Manifest || rows[0].Str("slot") != model.BindingPath || rows[0].Str("release") != model.Release || rows[0].Str("lane") != model.Lane {
 			t.Errorf("exact job input selection changed: %s", selected.DownloadDelegation)
 		}
 		entered <- struct{}{}
@@ -106,33 +112,50 @@ func privateJobDownload(t *testing.T, versioned bool) {
 		}
 		return false, nil
 	}
+	models, params := []records.ModelRef{imported}, []string(nil)
+	if rootModels {
+		models, params = []records.ModelRef{model, native, imported}, []string{"source", "prior"}
+	}
 	id, _, problem := o.c.Submit(orchestrator.Submission{
 		IdemKey: "private-job-download", Package: revision.Package, Entrypoint: "prepare", PlanID: childDigest("4"),
 		Release: revision.Release, LocalPackageDigest: revision.Digest, Payload: []byte(`{}`),
 		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true, Kind: "job", RetainWork: true,
-		ProducerParams: []string{"source", "prior"}, Models: []records.ModelRef{model, native},
+		ProducerParams: params, Models: models,
 	})
 	fatal(t, problem)
-	select {
-	case <-entered:
-	case early := <-offered:
-		t.Fatalf("attempt %s dispatched before model download", early)
-	case <-time.After(10 * time.Second):
-		t.Fatal("job never prepared its input models")
-	}
-	select {
-	case early := <-offered:
-		t.Fatalf("attempt %s ran while model preparation was blocked", early)
-	default:
+	if rootModels {
+		select {
+		case <-entered:
+		case early := <-offered:
+			t.Fatalf("attempt %s dispatched before model download", early)
+		case <-time.After(10 * time.Second):
+			t.Fatal("job never prepared its input models")
+		}
+		select {
+		case early := <-offered:
+			t.Fatalf("attempt %s ran while model preparation was blocked", early)
+		default:
+		}
 	}
 	close(release)
 	select {
+	case <-entered:
+		t.Fatal("root job prepared the imported callable's model")
 	case got := <-offered:
 		if got != id {
 			t.Fatalf("offered %s, wanted %s", got, id)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("prepared job did not dispatch")
+	}
+	recorded, problem := o.store.RequestRow(id)
+	fatal(t, problem)
+	if recorded == nil || len(recorded.Models) != len(models) {
+		t.Fatal("root preparation discarded the imported child's selection")
+	}
+	retained := recorded.Models[len(models)-1]
+	if retained.Package != imported.Package || retained.Manifest != imported.Manifest || retained.BindingPath != imported.BindingPath {
+		t.Fatal("root preparation discarded or rewrote the imported child's selection")
 	}
 	pod.mu.Lock()
 	defer pod.mu.Unlock()
