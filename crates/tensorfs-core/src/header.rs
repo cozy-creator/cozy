@@ -93,6 +93,14 @@ pub struct Tensor {
     pub parts: Vec<(String, Part)>,
 }
 
+impl Tensor {
+    /// Opaque equality of encoded geometry and bytes, independent of tensor names
+    /// and unrelated header configs or encodings. This is not a Store capability.
+    pub fn encoded_identity(&self) -> Result<String> {
+        crate::cbor::encoded_tensor_identity(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
     pub logical_sha256: String,

@@ -422,6 +422,7 @@ fn source_component<'p>(
         row.set_item("logical_dtype", tensor.dtype.name())?;
         row.set_item("shape", &tensor.shape)?;
         row.set_item("encoding", &tensor.encoding)?;
+        row.set_item("identity", tensor.encoded_identity().or_refuse(py)?)?;
         let parts = PyList::empty(py);
         for (role, part) in &tensor.parts {
             let part_row = PyDict::new(py);

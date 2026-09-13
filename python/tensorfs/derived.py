@@ -65,6 +65,7 @@ class SourceInspection:
     source: Source
     components: Mapping[str, Mapping[str, Tensor]]
     configs: Mapping[str, bytes]
+    identities: Mapping[tuple[str, str], str] = field(default_factory=dict)
 
     @classmethod
     def from_native(cls, value: Mapping[str, Any]) -> SourceInspection:
@@ -88,6 +89,11 @@ class SourceInspection:
                 for component in value["components"]
             },
             {config["name"]: config["data"] for config in value["configs"]},
+            {
+                (component["name"], tensor["key"]): tensor["identity"]
+                for component in value["components"]
+                for tensor in component["tensors"]
+            },
         )
 
 
@@ -103,6 +109,10 @@ class SourceCapability(Source):
         repr=False, compare=False
     )
     _close: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    _read_part: Callable[[str, str, str, int, object], None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
     def inspect(
         self, *, components: Sequence[str] = (), configs: Sequence[str] = ()
@@ -115,7 +125,20 @@ class SourceCapability(Source):
         from ._source_channel import SourceClient
 
         client = SourceClient(fd, Source(manifest, length))
-        return cls(manifest, length, client.inspect, client.close)
+        return cls(manifest, length, client.inspect, client.close, client.read_part_into, client.check)
+
+    def read_part_into(
+        self, component: str, key: str, role: str, offset: int, into: object
+    ) -> None:
+        """Fill a bounded writable buffer from one semantic part under this source lease."""
+        if self._read_part is None:
+            raise ValueError("source capability has no part reader")
+        self._read_part(component, key, role, offset, into)
+
+    def check(self) -> None:
+        """Recheck the native lease and accepted execution lifetime."""
+        if self._check is not None:
+            self._check()
 
     def close(self) -> None:
         if self._close is not None:
