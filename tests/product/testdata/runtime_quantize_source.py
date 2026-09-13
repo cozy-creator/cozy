@@ -1,32 +1,32 @@
 """Native bytes and a fresh reader for the shared Runtime invocation contract."""
+import io
 import struct
 import msgspec
 import tensorfs
 from cozy_runtime.author import (
-    App, Context, ModelArtifact, WeightsOutput, WeightsPart, WeightsReader,
-    WeightsSink, WeightsTarget, WeightsTensor, invocable,
+    App, Context, ModelArtifact, WeightsOutput, WeightsReader, invocable,
 )
+from tensorfs.derived import Derivation, Part, Target, Tensor
 from cozy_runtime.derive.operations import QuantizationSource
 
 app = App()
 PLAIN = dict(tensorfs.seed_digests())["plain/1"]
 
 @invocable(memoize=True)
-async def produce(ctx: Context, *, weights: WeightsSink) -> ModelArtifact:
-    matrix = WeightsTensor("f16", (16, 32), PLAIN,
-                           {"value": WeightsPart("f16", (16, 32))})
-    bias = WeightsTensor("f16", (16,), PLAIN,
-                         {"value": WeightsPart("f16", (16,))})
-    with weights.open("model", sources={}, targets={"body": WeightsTarget(
+async def produce(ctx: Context) -> ModelArtifact:
+    matrix = Tensor("f16", (16, 32), PLAIN,
+                           {"value": Part("f16", (16, 32))})
+    bias = Tensor("f16", (16,), PLAIN,
+                         {"value": Part("f16", (16,))})
+    with ctx.output("model").open(Derivation(sources={}, targets={"body": Target(
         add={"layer.weight": matrix, "layer.bias": bias})},
-        order=(("body", "layer.weight"), ("body", "layer.bias"))) as output:
-        if output.replayed:
-            assert output.receipt is not None
-            return output.receipt.artifact
+        configs={}, order=(("body", "layer.weight"), ("body", "layer.bias")))) as output:
+        if output.receipt is not None:
+            return ctx.adopt_model(output.receipt)
         output.add_part("body", "layer.weight", "value",
-                        struct.pack("<512e", *(i / 257 - 1 for i in range(512))))
-        output.add_part("body", "layer.bias", "value", struct.pack("<16e", *range(16)))
-        return output.commit().artifact
+                        io.BytesIO(struct.pack("<512e", *(i / 257 - 1 for i in range(512)))))
+        output.add_part("body", "layer.bias", "value", io.BytesIO(struct.pack("<16e", *range(16))))
+        return ctx.adopt_model(output.commit())
 
 class Checked(msgspec.Struct):
     nonzero: bool
