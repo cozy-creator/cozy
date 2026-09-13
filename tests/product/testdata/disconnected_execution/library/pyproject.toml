@@ -2,7 +2,7 @@
 name = "offline-steps"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime==0.16.10", "msgspec>=0.21"]
+dependencies = ["cozy-runtime>=0.16.10", "msgspec>=0.21"]
 
 [project.entry-points."cozy.application"]
 default = "offline_steps:app"
