@@ -158,10 +158,6 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	selectedRental, e := requestedRental(ctx, target, ep.Name)
-	if e != nil {
-		return e
-	}
 	key := requestKey(ctx.Inv.Value("--idempotency-key"))
 
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
@@ -196,6 +192,10 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return e
 	}
 	if e := validateInvocationPayload(ctx, target.Package, ep, input); e != nil {
+		return e
+	}
+	selectedRental, e := requestedRental(ctx, target, ep.Name)
+	if e != nil {
 		return e
 	}
 	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models, managedRental)
