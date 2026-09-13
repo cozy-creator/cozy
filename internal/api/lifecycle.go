@@ -77,7 +77,7 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	active, rentals, problem := s.downBlockers()
+	active, rentals, problem := s.downBlockers(body.All)
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
@@ -131,7 +131,7 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 		}
 		// Re-read rather than trusting the pre-pass sample: what a client is told is still
 		// holding the daemon has to be what IS.
-		remaining, remainingRentals, problem := s.downBlockers()
+		remaining, remainingRentals, problem := s.downBlockers(true)
 		if problem != nil {
 			remaining, remainingRentals = active, rentals
 		}
@@ -196,8 +196,12 @@ func (s *Server) StopUnlessManaging(managing func() ([]string, *exit.Error)) ([]
 // downBlockers is the subset of the daemon's obligations `down` refuses on: the work it
 // can cancel and the paid pods it must see ended. An attempt awaiting its ack and an
 // export mid-copy are on their way to settlement and are drained by the close itself.
-func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
-	obligations, problem := s.store.Obligations()
+func (s *Server) downBlockers(all bool) ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
+	read := s.store.ClientShutdownObligations
+	if all {
+		read = s.store.Obligations
+	}
+	obligations, problem := read()
 	if problem != nil {
 		return nil, nil, problem
 	}

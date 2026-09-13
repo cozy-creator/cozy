@@ -313,8 +313,12 @@ func (c *Client) SubmitJob(sub api.JobSubmission, key string) (api.JobHandle, *e
 
 // Job reads one job's state document.
 func (c *Client) Job(id string) (api.JobState, *exit.Error) {
+	return c.JobContext(context.Background(), id)
+}
+
+func (c *Client) JobContext(ctx context.Context, id string) (api.JobState, *exit.Error) {
 	var state api.JobState
-	e := c.call("GET", "/v1/local/jobs/"+id, nil, &state)
+	e := c.callContext(ctx, "GET", "/v1/local/jobs/"+id, nil, &state)
 	return state, e
 }
 

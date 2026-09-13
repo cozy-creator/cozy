@@ -213,6 +213,9 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if problem := store.RecordInstall(inst); problem != nil {
 		return fail(problem)
 	}
+	if problem := CaptureSelfBindings(store, inst, surface); problem != nil {
+		return nil, problem
+	}
 	return &Result{Install: inst, CapturedProjectWheel: executablePath}, nil
 }
 
