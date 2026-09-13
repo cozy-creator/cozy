@@ -1,24 +1,31 @@
 # Scoped source/open handoff for cr-174
 
-Owner: Codex /root/tensorfs_scoped_finish.
+Owner: Codex /root/tensorfs_native_resume.
 Worktree: ~/cozy/.worktrees/tensorfs/cr174-scoped-source-open.
 Branch: feat/cr174-scoped-source-open.
-Base: 91ee78442a956a27a788c666a9e41de4f0c38287 (fetched origin/master).
+Base: 91ee78442a956a27a788c666a9e41de4f0c38287; reconciled with the released
+0.3.40 tree at 8d9c5c0. This increment prepares the distinct 0.3.41 release.
 
-This increment lets Runtime move declaration/begin/replay/adopt and source
-inspection into its trusted worker, removing the executor's StoreProxy dependency.
-DerivedTransaction.accept(fd) asks the bound native channel whether its owner
-selected a live writer or retained receipt. serve_derived_replay records that
-receipt before success. SourceCapability.from_fd(manifest,length,fd) reads only
-that exact source's native metadata/configs via serve_source; it owns its connected
-FD and supports close/context-manager lifetime. Config payloads use bounded 1 MiB
-frames, not Runtime spool files or the 64 KiB executor control lane. Native parsing,
-identity/custody validation and geometry stay in the existing TensorFS core.
+DerivedTransaction.accept(fd) receives either the live writer or the retained native
+receipt selected by the storage owner. serve_derived_replay records the receipt before
+success. SourceCapability.from_fd(manifest, length, fd) opens only that exact granted
+source's native metadata/configs through serve_source. Configs use bounded 1 MiB frames;
+no executor Store or Runtime tensor spool is needed. All source selection, identity,
+custody and geometry stay in TensorFS. Inspection preserves the header's construction
+order and rejects every absent requested component before projecting selected rows.
 
-No native code, format or journal changes. The scoped-native test (including a
-2 MiB config and replay handoff) and strict facade typing pass with the unchanged
-native extension from source f0893ff / wheel SHA2562859c1398e227ceadb31d592a5d7d658a58a35b0bb6172d457913aafa3918ee4.
-The ignored python/tensorfs/_ext.abi3.so symlink is a local test binding only.
-An exact source-derived wheel, source-inspector UID boundary proof, malformed/fenced
-source controls and final Runtime integration remain required. Existing writer UID
-proof is not claimed to cover this new source inspector.
+The source/open/replay functions are additive to 0.3.40. Existing writer calls and
+protocol framing remain valid; no artifact format, schema or journal migration is added.
+
+Validation: PR169 native/format/conformance checks and installed manylinux wheel smoke
+pass. The isolated UID65533 client cannot open the privileged Store but can inspect its
+exact source, transfer a 2 MiB config, write its declared output and receive recorded
+replay. Native source and FD tests preserve nonlexical component/tensor order and reject
+unknown selections on both sides. Actual H3 source-order repair, restamp, shared VAE and
+lane byte controls use source853ccdc62e2e, wheel SHA256
+52faba71511c4930adb7963152b162f8c97c33ca25008b8a90bf1757af88fb99.
+
+The ordinary Creator CLI already exercised worker-owned source/output/adoption on the
+prior df816bf API build. An updated exact-wheel CLI run and final 0.3.41 CI/release wheel
+verification are still required before publishing this component. The Runtime0.18
+integration and its disconnected/private/default-home qualification are separate gates.
