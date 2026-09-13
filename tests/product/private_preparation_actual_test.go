@@ -272,11 +272,15 @@ from isolation_step import advance, serve
 	// work remains retained. This is a fresh chooser decision, unlike the second
 	// root above, which was already assigned before the serving transition.
 	failedScript := filepath.Join(project, "retained.py")
-	must(t, os.WriteFile(failedScript, []byte(header+`async def main(ctx):
+	retainedBody := `async def main(ctx):
     result = await serve(value=17)
     assert result.value == 34
     raise ValueError("retain work after completed inference")
-`), 0600))
+`
+	if modeled {
+		retainedBody = strings.Replace(retainedBody, "result = await serve(value=17)\n    assert result.value == 34", "model = await produce()\n    result = await generate(value=17, model=model)\n    assert result.value == 68", 1)
+	}
+	must(t, os.WriteFile(failedScript, []byte(header+retainedBody), 0600))
 	status, output := runCozyPath(t, layout.Root, path, "run", failedScript, "--rental-only", "--await", "--json", "--idempotency-key", "retained-serving")
 	must(t, os.WriteFile(filepath.Join(layout.Root, "retained-serving-result.json"), []byte(output), 0600))
 	if status == 0 || !strings.Contains(output, "retain work after completed inference") {
