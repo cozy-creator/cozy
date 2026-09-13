@@ -76,7 +76,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 			&install.PublishedSource{Package: ref.String(), Release: release,
 				PackageConfig: packageConfig,
 				Selection:     install.Selection{PackageInterface: packageInterface}}, result)
-		return emitInstallResult(ctx, existingLayout, existing, result)
+		return emitInstallResult(ctx, result)
 	}
 	existing.Close()
 	layout, problem := home.Open(ctx.Cfg.Home)
@@ -110,16 +110,11 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		writer.Unlock()
 		return problem
 	}
+	cleanup := reclaimInstallResult(layout, st, result)
 	st.Close()
 	writer.Unlock()
 	bestEffortDefaultModels(hctx, ctx, work.Path, published, result)
-	_, outputStore, outputWriter, problem := open(ctx.Cfg, true)
-	if problem != nil {
-		return problem
-	}
-	defer outputStore.Close()
-	defer outputWriter.Unlock()
-	return emitInstallResult(ctx, layout, outputStore, result)
+	return emitInstallResult(ctx, result, cleanup...)
 }
 
 func bestEffortDefaultModels(hctx context.Context, ctx *Context, root string,
