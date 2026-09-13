@@ -74,8 +74,9 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 func handleRent(ctx *Context) *exit.Error {
 	skuName := strings.TrimSpace(ctx.Inv.Args[0])
 	if skuName == "" {
+		_, developmentSet := ctx.Inv.Bools["--development"]
 		if ctx.Inv.Value("--idempotency-key") != "" ||
-			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || ctx.Inv.Bool("--development") || ctx.Inv.Value("--ssh-public-key") != "" {
+			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || developmentSet || ctx.Inv.Value("--ssh-public-key") != "" {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
 		}

@@ -22,13 +22,17 @@ func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.Re
 		}
 		pinned = req.Development
 	}
-	explicit := ctx.Inv.Bool("--development") || ctx.Inv.Value("--ssh-public-key") != ""
+	flagValue, flagSet := ctx.Inv.Bools["--development"]
+	explicit := flagSet || ctx.Inv.Value("--ssh-public-key") != ""
 	// An acquisition is immutable. A changed default or deleted public-key file
 	// cannot rewrite its mode, prevent reconciliation, or spend for another pod.
 	if existing != nil && !explicit {
 		return pinned, nil
 	}
-	enabled := ctx.Inv.Bool("--development") || ctx.Cfg.RentalsDevelopment
+	enabled := ctx.Cfg.RentalsDevelopment
+	if flagSet {
+		enabled = flagValue
+	}
 	path := ctx.Inv.Value("--ssh-public-key")
 	if path == "" && enabled {
 		path = ctx.Cfg.RentalsSSHPublicKey
@@ -37,6 +41,9 @@ func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.Re
 		}
 	}
 	if !enabled && path == "" {
+		if pinned != nil {
+			return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict", "rental operation already declares different development access").WithRemedy("resume without development flags or use a new operation key")
+		}
 		return nil, nil
 	}
 	if !enabled {
