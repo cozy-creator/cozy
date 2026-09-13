@@ -383,9 +383,10 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		if !c.enqueue(req.ID) {
 			return 0, nil
 		}
+		position, depth := c.QueueState(req.ID)
 		c.emit(req.ID, "request.queued", 0, waitFacts{cause: WaitQueueAhead}.decorate(map[string]any{
 			"reason":   "the dispatch queue is not empty; this request joins it in submission order",
-			"position": c.QueuePosition(req.ID),
+			"position": position, "depth": depth,
 		}, req))
 		c.logf("%s QUEUED behind %d waiting request(s)", req.ID, c.QueuePosition(req.ID)-1)
 		c.selectOrStart(req)

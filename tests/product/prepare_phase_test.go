@@ -110,10 +110,8 @@ func TestPreparationPhaseAdvancesWithTheStream(t *testing.T) {
 	if !ok || final.Name != orchestrator.PhaseWarming {
 		t.Fatalf("after PREPARED the phase is %q, want %q", final.Name, orchestrator.PhaseWarming)
 	}
-	// The denominator the pod declared is carried through unchanged, and the phase never
-	// reports more moved than declared.
-	if final.Total == 0 || final.Moved > final.Total {
-		t.Fatalf("the terminal reading does not carry the pod's own bounds: %+v", final)
+	if final.HasBytes || final.Total != 0 || final.Moved != 0 || final.Rate != 0 || len(final.Models) != 0 {
+		t.Fatalf("completed download counters leaked into model loading: %+v", final)
 	}
 }
 
@@ -208,7 +206,7 @@ func TestTheProviderDrawsTheProvisioningBoundary(t *testing.T) {
 func TestPackageSetupAndModelLoadingHaveDistinctLabels(t *testing.T) {
 	complete := int64(100 << 30)
 	if got := cli.PhaseCell(api.Lifecycle{Status: "queued", Kind: "invocation", Phase: orchestrator.PhasePreparing,
-		PhaseMovedBytes: &complete, PhaseTotalBytes: &complete}); !strings.HasPrefix(got, "setting up package") {
+		PhaseMovedBytes: &complete, PhaseTotalBytes: &complete}); got != "setting up package" {
 		t.Fatalf("completed downloads hide package setup: %q", got)
 	}
 	for _, tc := range []struct {

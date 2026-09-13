@@ -549,6 +549,20 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 					materialization:   p.Materialization, serving: p.Serving,
 					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
 				}
+				for _, fault := range p.Faults {
+					if fault != nil {
+						row.fault = fault
+						break
+					}
+				}
+				if row.fault == nil {
+					for _, fault := range r.Faults {
+						if fault != nil && fault.Subject == p.PlacementId {
+							row.fault = fault
+							break
+						}
+					}
+				}
 				for _, digest := range p.DispatchableBindingDigests {
 					planID := spellOf(digest)
 					row.dispatchablePlanIDs[planID] = true
