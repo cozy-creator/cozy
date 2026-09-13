@@ -25,11 +25,12 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
-	IdemKey    string // the caller's idempotency key
-	Package    string // org/name
-	Entrypoint string // the function
-	PlanID     string // the entrypoint_binding_plan_id this attempt binds
-	Release    string // immutable remote package release; empty for local execution
+	MachineExecutionObserver bool
+	IdemKey                  string // the caller's idempotency key
+	Package                  string // org/name
+	Entrypoint               string // the function
+	PlanID                   string // the entrypoint_binding_plan_id this attempt binds
+	Release                  string // immutable remote package release; empty for local execution
 	// LocalPackageDigest is the exact staged wheel-set identity for one editable rental.
 	LocalPackageDigest string
 	Models             []ModelRef
@@ -259,7 +260,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		id = records.NewID("job")
 	}
 	req := records.Request{
-		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
+		MachineExecutionObserver: s.MachineExecutionObserver,
+		ID:                       id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Release:            s.Release,
 		LocalPackageDigest: s.LocalPackageDigest,

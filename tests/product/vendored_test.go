@@ -46,9 +46,8 @@ const (
 	peerDir        = "gen/go/cozy/worker/v1"
 	wantRepository = "https://github.com/cozy-creator/worker-protocol-v2"
 	sourceManifest = vendorDir + "/SOURCE"
-	// worker-protocol's frozen canonical corpus, vendored so the cross-language
-	// identity fence needs no token. `positive/` is deliberately not vendored:
-	// nothing here reads it, and an unread file is a digest nobody benefits from.
+	// worker-protocol's canonical corpus and selected byte-transport fixtures,
+	// vendored so the cross-language identity fence needs no token.
 	corpusDir = "testdata/worker-protocol"
 	// Where that corpus lives inside a worker-protocol checkout.
 	peerCorpusDir  = "fixtures"

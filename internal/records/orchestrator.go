@@ -486,6 +486,9 @@ type Request struct {
 	// ReleaseImplicitWork is derived from a new captured result schema.
 	// Its durable authority is successful_work_releases, not this admission-only field.
 	ReleaseImplicitWork bool `json:"-"`
+	// MachineExecutionObserver is admission-only. The marker is committed with
+	// this request, before any scheduler can create a local attempt.
+	MachineExecutionObserver bool `json:"-"`
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
 	// retained operation namespace shared by explicitly related revisions.
 	RetryOf                string
@@ -1426,8 +1429,17 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
-	if problem := armSuccessfulWorkTx(tx, r); problem != nil {
-		return Request{}, false, problem
+	if r.MachineExecutionObserver {
+		if r.ParentRequestID != "" {
+			return Request{}, false, exit.New(exit.Validation, "a machine execution observer must be a root request")
+		}
+		if _, err := tx.Exec(`INSERT INTO machine_executions(request_id) VALUES(?)`, r.ID); err != nil {
+			return Request{}, false, exit.Internalf("cannot mark machine execution observation: %s", err)
+		}
+	} else {
+		if problem := armSuccessfulWorkTx(tx, r); problem != nil {
+			return Request{}, false, problem
+		}
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
 		return Request{}, false, problem
