@@ -3,7 +3,10 @@
 package producttest
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -28,44 +31,79 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 			stand.mu.Lock()
 			stand.rent = func(request map[string]any) map[string]any {
 				close(created)
-				return map[string]any{"rental_id": id, "name": request["name"], "state": "pending_acquisition",
+				row := map[string]any{"rental_id": id, "name": request["name"], "state": "pending_acquisition",
 					"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1,
 					"hourly_rate_usd_micros": 3_190_000, "base_worker_image_digest": image, "base_worker_image_tag": tag,
 					"base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",
 				}
+				if mode == "json" {
+					row["state"] = "failed"
+					row["detail"] = "fixture boot completed without a worker"
+				}
+				return row
 			}
 			stand.mu.Unlock()
-			finished := make(chan struct{})
-			go func() {
-				defer close(finished)
-				<-created
-				time.Sleep(300 * time.Millisecond)
-				stand.set(id, "provider_state", "RUNNING")
-				stand.set(id, "container_state", "PULLING")
-				time.Sleep(2 * time.Second)
-				stand.set(id, "container_state", "RUNNING")
-				time.Sleep(2 * time.Second)
-				stand.setState(id, "failed", "fixture boot completed without a worker")
-			}()
-			var code int
-			var log, stdout string
+			args := []string{"rental", "new", "h100-nvl", "--timeout=8s"}
+			var cmd *exec.Cmd
+			var reader io.ReadCloser
+			var stdout bytes.Buffer
 			if mode == "terminal" {
-				code, log = ptyRun(t, root, "rental", "new", "h100-nvl", "--timeout=8s")
+				reader, cmd = startPTY(t, root, 24, ptyColumns, args...)
 			} else {
-				args := []string{"rental", "new", "h100-nvl", "--timeout=8s"}
 				if mode == "json" {
 					args = append(args, "--json")
 				}
-				code, stdout, log = runCozyStreams(t, root, args...)
+				cmd = exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
+				cmd.Env = childEnv(t, root)
+				cmd.Stdout = &stdout
+				var err error
+				reader, err = cmd.StderrPipe()
+				must(t, err)
+				must(t, cmd.Start())
+				t.Cleanup(func() { _ = cmd.Process.Kill() })
 			}
-			<-finished
+			defer reader.Close()
+			// Keep each provider phase until the actual CLI renders it. Timed phase
+			// changes can occur between polls, especially on a busy CI runner.
+			var progress strings.Builder
+			stage := 0
+			chunk := make([]byte, 4096)
+			for {
+				n, err := reader.Read(chunk)
+				progress.Write(chunk[:n])
+				text := progress.String()
+				switch {
+				case stage == 0 && strings.Contains(text, "acquiring"):
+					select {
+					case <-created:
+					case <-time.After(10 * time.Second):
+						t.Fatal("CLI did not submit its rental request")
+					}
+					stand.mu.Lock()
+					stand.rentals[id]["provider_state"] = "RUNNING"
+					stand.rentals[id]["container_state"] = "PULLING"
+					stand.mu.Unlock()
+					stage++
+				case stage == 1 && strings.Contains(text, "pulling image on"):
+					stand.set(id, "container_state", "RUNNING")
+					stage++
+				case stage == 2 && strings.Contains(text, "booting on"):
+					stand.setState(id, "failed", "fixture boot completed without a worker")
+					stage++
+				}
+				if err != nil {
+					break
+				}
+			}
+			_ = cmd.Wait()
+			code, log := cmd.ProcessState.ExitCode(), progress.String()
 			if code == 0 {
 				t.Fatal("the terminal fixture failure unexpectedly succeeded")
 			}
 			if mode == "json" {
 				var result map[string]any
-				if err := json.Unmarshal([]byte(stdout), &result); err != nil || result["error"] == nil || log != "" {
-					t.Fatalf("manual rental JSON is not one clean error document: stdout=%q stderr=%q", stdout, log)
+				if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result["error"] == nil || log != "" {
+					t.Fatalf("manual rental JSON is not one clean error document: stdout=%q stderr=%q", stdout.String(), log)
 				}
 				return
 			}
