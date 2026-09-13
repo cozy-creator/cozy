@@ -337,7 +337,11 @@ def check_test_boundary():
     return bad
 
 
-DOCUMENT_KINDS = {}
+DOCUMENT_KINDS = {
+    # proto-051: Creator owns private captured admission; Host binds its exact
+    # digest as opaque bytes. See docs/private-execution.md.
+    "cozy.creator.private-execution/1": "internal/executionowner/capsule.go",
+}
 # HMAC domain-separation tags are security protocol constants, not document formats. A peer repo
 # reproduces these exact bytes, so they remain single-owner fenced without inflating the document
 # count.
