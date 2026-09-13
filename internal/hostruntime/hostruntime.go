@@ -23,9 +23,9 @@ import (
 // Floor is the Runtime release that carries this Creator's current wire contract.
 // Metadata description remains static against the captured source environment; one
 // coherent release remedy serves both host-tool and worker-wire admission checks.
-// Deferred Runtime-owned invocable capture and preparation require 0.16.9, which also
+// Preparing captured jobs must isolate live executors, provided by 0.16.10, which also
 // retains the backward-aware Python patch observation parser.
-const Floor = "0.16.9"
+const Floor = "0.16.10"
 
 var floor = pep440.MustParse(Floor)
 

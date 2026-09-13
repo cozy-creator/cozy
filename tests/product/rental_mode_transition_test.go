@@ -79,9 +79,26 @@ func TestIdleRentalJobCanBecomeServing(t *testing.T) {
 		fatal(t, p)
 		return len(rows) == 1 && rows[0].State == "closed"
 	})
+	waitUntil(t, "idle serving becomes job capacity", func() bool { reason, held := o.c.RentalStanding(podRental, true); return reason == "" && held == 0 })
+	pod.mu.Lock()
+	preparedBeforeNextJob := len(pod.prepares)
+	pod.mu.Unlock()
+	if preparedBeforeNextJob != 2 {
+		t.Fatalf("prepared old producer again during serving transition: %d prepares", preparedBeforeNextJob)
+	}
+	third, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "job-after-serving", Package: "cozy/h3-package",
+		Release: "1.0.7", Entrypoint: "four-lane", PlanID: "sha256:" + strings.Repeat("35", 32), Kind: "job", Org: "paul",
+		Payload: []byte("{}"), Worker: podRental, Rental: true, RentalRequired: true,
+	})
+	fatal(t, problem)
+	waitUntil(t, "job dispatch after completed serving", func() bool {
+		rows, p := o.store.Attempts(third)
+		fatal(t, p)
+		return len(rows) == 1 && rows[0].State == "closed"
+	})
 	pod.mu.Lock()
 	defer pod.mu.Unlock()
-	if len(pod.offers) != 2 || pod.offers[0].WorkerBootId != pod.offers[1].WorkerBootId {
+	if len(pod.offers) != 3 || pod.offers[0].WorkerBootId != pod.offers[1].WorkerBootId || pod.offers[0].WorkerBootId != pod.offers[2].WorkerBootId {
 		t.Fatal("reused rental changed worker or duplicated offer")
 	}
 	spec, err := canonical.Read(pod.offers[1].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
@@ -89,8 +106,10 @@ func TestIdleRentalJobCanBecomeServing(t *testing.T) {
 	if _, ok := spec["serving"]; !ok {
 		t.Fatal("second invocation remained a job")
 	}
-	if len(pod.prepares) != 2 {
-		t.Fatalf("prepared old producer again: %d prepares", len(pod.prepares))
+	spec, err = canonical.Read(pod.offers[2].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
+	must(t, err)
+	if _, ok := spec["job"]; !ok {
+		t.Fatal("third invocation remained serving")
 	}
 }
 

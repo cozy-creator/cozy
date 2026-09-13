@@ -13,6 +13,10 @@ import (
 // A unpublished package job needs its prepared environment and job records. Preparing it
 // must not activate a serving placement or remove a running orchestration parent.
 func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Request, revision localpackage.Revision) (*pb.DesiredPlacementSet, *exit.Error) {
+	return c.prepareUnpublishedPackage(instanceID, request, revision, true)
+}
+
+func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request records.Request, revision localpackage.Revision, jobModels bool) (*pb.DesiredPlacementSet, *exit.Error) {
 	selected, transfer, problem := localSelection(request.ID, revision)
 	if problem != nil {
 		return nil, problem
@@ -61,7 +65,7 @@ func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Reques
 	// Preparing code does not download a job's Model inputs. Reuse the private
 	// model preparation, but do not activate its result as a serving placement.
 	// Native operation inputs keep their existing custody and are not downloads.
-	if models := downloadModelRefs(request.Models); len(models) > 0 {
+	if models := downloadModelRefs(request.Models); jobModels && len(models) > 0 {
 		if c.opt.RentalPackageSet == nil {
 			return nil, exit.Unavailablef("unpublished package job models require a rental download set")
 		}

@@ -120,6 +120,9 @@ func TestCoTenantPackagesPreparePerPackage(t *testing.T) {
 	if len(alphaSet) != 1 {
 		t.Fatalf("the first tenant's set carries %d placements; want its one", len(alphaSet))
 	}
+	if reason, _ := o.c.RentalStanding(podRental, true); reason != orchestrator.ExcludedModeConflict {
+		t.Fatalf("an offered serving invocation allowed a job mode replacement: %s", reason)
+	}
 
 	// The second tenant joins the SAME rental (run 146: routing co-tenants a second
 	// package onto the machine already serving the first).

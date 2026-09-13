@@ -574,7 +574,11 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				c.logf("%s cannot assess retained rental job: %s", req.ID, problem.Message)
 				return
 			}
-			if retained {
+			// A retained client job may reuse its machine without discarding old
+			// bytes; its preparation still waits for active execution below. Legacy
+			// transfer jobs replan away from spent capacity as before. An active
+			// CPU parent's own child keeps that exact parent below.
+			if retained && (!req.IsJob() || !req.RetainWork) && !c.activeChild(req) {
 				reason = ExcludedModeConflict
 			}
 			row, problem := c.opt.Store.RentalRow(req.Worker)
@@ -706,6 +710,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	if req.IsJob() {
 		slot += "/job/" + req.Entrypoint
 	}
+	if req.Worker != "" {
+		slot = "rental-prepare/" + req.Worker
+	}
 	c.mu.Lock()
 	if c.starting[slot] {
 		for _, guard := range guards {
@@ -792,6 +799,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		// launch bounced off it too.
 		done := func() {
 			c.mu.Lock()
+			if w := c.workers[rentalInstanceID(req.Worker)]; req.Worker != "" && w != nil && w.preparingRequest == req.ID {
+				w.preparingRequest, w.preparingReady = "", false
+			}
 			for _, guard := range guards {
 				delete(c.starting, guard)
 			}
@@ -864,6 +874,11 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			c.failQueued(req.ID, autoRentalGate(req, e), instance)
 			return
 		}
+		c.mu.Lock()
+		if w := c.workers[instance]; w != nil && w.preparingRequest == req.ID {
+			w.preparingReady = true
+		}
+		c.mu.Unlock()
 		c.drain()
 		done()
 		// The launch is over and the queue's world has changed: whatever is at the head now
@@ -1072,6 +1087,14 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			resolved, problem = c.jobExecutionRole(req, resolved)
 		}
 	}()
+	if req.Worker != "" && req.InstallID != "" && req.LocalPackageDigest != "" {
+		if c.opt.Packages == nil {
+			return WorkerLaunchSpec{}, "", exit.Unavailablef("captured package owner is unavailable")
+		}
+		if problem := c.opt.Packages.ValidateExecutionCapture(req); problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+	}
 	if req.Worker == "" {
 		if c.opt.Packages == nil {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef("this host resolves no local packages")
@@ -1116,8 +1139,12 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
+	// A captured serving child obtains its binding plan from exact private
+	// preparation, including model-free entrypoints. Its sealed local revision
+	// is checked below before any package bytes can execute.
+	capturedChild := req.ParentRequestID != "" && req.InstallID != "" && validDigest(req.LocalPackageDigest)
 	if req.Release == "" ||
-		(len(req.Models) == 0 && !validDigest(req.PlanID)) {
+		(len(req.Models) == 0 && !validDigest(req.PlanID) && !capturedChild) {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
 			"remote package preparation requires one exact package revision")
 	}
@@ -1148,6 +1175,9 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
 		}
 	}
+	if problem := c.claimRentalPreparation(instance, req); problem != nil {
+		return WorkerLaunchSpec{}, "", problem
+	}
 	var jobPrepared *pb.DesiredPlacementSet
 	if req.InstallID != "" {
 		if c.opt.Packages == nil || !validDigest(req.LocalPackageDigest) {
@@ -1165,22 +1195,13 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 				"local_package_revision_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
-		var parent *pb.JobDirective
-		if req.ParentRequestID != "" {
-			plan, problem := c.retainedOrchestrationParent(req)
-			if problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-			parent = c.jobDirective(plan)
-		}
-		c.mu.Lock()
-		if worker := c.workers[instance]; worker != nil {
-			worker.orchestrationParent = parent
-		}
-		c.mu.Unlock()
 		if req.IsJob() {
 			jobPrepared, problem = c.prepareLocalJob(instance, req, revision)
 			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+		} else if req.ParentRequestID != "" {
+			if problem := c.prepareChildServing(instance, req, revision); problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
 		} else if e := c.ConvergeLocalPackage(instance, req.ID, revision,
@@ -1189,15 +1210,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			}); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		if !req.IsJob() && len(logical.Models) > 0 && req.ParentRequestID != "" {
-			native, problem := c.nativeServingModels(req)
-			if problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-			if problem := c.convergeUnpublishedModels(instance, req.ID, req.LocalPackageDigest, nil, native); problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-		} else if !req.IsJob() && len(logical.Models) > 0 {
+		if !req.IsJob() && len(logical.Models) > 0 && req.ParentRequestID == "" {
 			models := downloadModelRefs(logical.Models)
 			if len(models) != len(logical.Models) {
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
@@ -1388,6 +1401,17 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request %s is not queued for execution", req.ID)
 	}
 	req = *current
+
+	// A warm worker must not bypass the same immutable-capture check used by
+	// preparation. Replays of already terminal/live attempts never enter here.
+	if (req.Rental || req.Worker != "") && req.InstallID != "" && req.LocalPackageDigest != "" {
+		if c.opt.Packages == nil {
+			return 0, exit.Unavailablef("captured package owner is unavailable")
+		}
+		if problem := c.opt.Packages.ValidateExecutionCapture(req); problem != nil {
+			return 0, problem
+		}
+	}
 
 	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
@@ -1710,8 +1734,8 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			"worker %s carries no selected environment digest", instanceID)
 	}
 	if remote {
-		// Captured local wheels have a prepared Environment just like published packages.
-		// The invocation names exactly that identity, which Runtime checks at admission.
+		// Captured wheels name the exact prepared Environment that Runtime checks.
+
 		if req.EnvironmentDigest == "" {
 			e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID, environment)
 			if e != nil {

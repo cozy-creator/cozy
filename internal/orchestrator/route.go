@@ -198,6 +198,9 @@ func (c *Orchestrator) route(req records.Request) routing {
 	claims := c.claimsAhead(req.ID)
 	var out routing
 	for _, w := range c.workers {
+		if w.preparingRequest != "" && (!w.preparingReady || w.preparingRequest != req.ID) {
+			continue
+		}
 		slot, ok := c.eligible(w, req, planID)
 		if !ok {
 			continue
@@ -251,15 +254,25 @@ func (c *Orchestrator) route(req records.Request) routing {
 // take. Callers hold c.mu.
 func (c *Orchestrator) claimsAhead(requestID string) map[laneKey]string {
 	claims := map[laneKey]string{}
+	current, _ := c.opt.Store.RequestRow(requestID)
+	inherited := current != nil && c.activeChild(*current)
 	for _, id := range c.pending {
 		if id == requestID {
 			break
+		}
+		unrelated := false
+		if inherited {
+			prior, problem := c.opt.Store.RequestRow(id)
+			unrelated = problem == nil && prior != nil && prior.ParentRequestID != current.ParentRequestID
 		}
 		p := c.parked[id]
 		if p == nil || !p.claims() {
 			continue
 		}
 		for _, w := range c.workers {
+			if unrelated && w.instanceID == rentalInstanceID(current.Worker) {
+				continue
+			}
 			for _, lane := range w.laneKeys() {
 				if p.competes(lane) {
 					claims[lane] = id
@@ -320,6 +333,9 @@ func (w *worker) laneKeys() []laneKey {
 // the plan id alone once sent a request to a pod whose credential it never presented.
 func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (string, bool) {
 	if w.exited || w.stopping || !w.supportsCurrentProtocol() || c.sessions[w.bootID] == nil {
+		return "", false
+	}
+	if !c.rentalParentAllows(w, req) {
 		return "", false
 	}
 	if req.RequestedRental != "" && (w.spec.Connection == nil || w.spec.Connection.RentalID != req.RequestedRental) {

@@ -167,6 +167,7 @@ type ModelTransferMover func(context.Context, records.ModelTransferWeights,
 // worker asks only for ResolvePlacement; it must never force this host to materialize or
 // execute the target environment merely to author a remote plan.
 type Launcher interface {
+	ValidateExecutionCapture(records.Request) *exit.Error
 	ResolvePlacement(pkg string) (DesiredPlacement, *exit.Error)
 	Resolve(pkg string) (WorkerLaunchSpec, *exit.Error)
 	// ResolveInstall relaunches the immutable local install a durable request resolved
@@ -436,7 +437,7 @@ func (c *Orchestrator) RentalStanding(id string, job bool) (reason string, held 
 	}
 	serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
 		w.desiredUnpublishedPlacement != nil || len(w.observedRemote) > 0
-	if job && serving || !job && w.spec.IsJob() && !c.idleRentalWorkerLocked(w) {
+	if (job && serving || !job && w.spec.IsJob()) && !c.idleRentalWorkerLocked(w) {
 		return ExcludedModeConflict, 0
 	}
 	if c.sessions[w.bootID] == nil {
@@ -459,7 +460,8 @@ func (c *Orchestrator) idleRentalWorkerLocked(w *worker) bool {
 			return false
 		}
 	}
-	return true
+	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
+	return problem == nil && len(attempts) == 0
 }
 
 // Orchestrator is the Cozy daemon's scheduling role.
@@ -795,7 +797,7 @@ func (c *Orchestrator) drain() {
 			c.forget(id)
 			continue
 		}
-		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] {
+		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] && !c.activeChild(*req) {
 			c.park(*req, position, waitFacts{}, "an earlier request is waiting on this rental")
 			continue
 		}
