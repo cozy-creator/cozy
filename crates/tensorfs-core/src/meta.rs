@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::ascii_name;
@@ -92,7 +92,33 @@ impl Meta {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| sql("begin derived transaction", error))?;
         let rows = read_derived(&connection)?;
-        Ok(Txn { connection, rows })
+        Ok(Txn {
+            connection,
+            rows,
+            selected: None,
+        })
+    }
+
+    /// A writer mutates its own primary-key row; unrelated writers and retained history
+    /// must neither be decoded nor rewritten. The existing write lock still serializes
+    /// epoch changes, roots and accepted parts against global lifecycle operations.
+    pub(crate) fn txn_for(&self, id: &str) -> Result<Txn> {
+        let connection = self.connection()?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| sql("begin derived transaction", error))?;
+        let rows = read_derived_row(&connection, id)?.into_iter().collect();
+        Ok(Txn {
+            connection,
+            rows,
+            selected: Some(id.to_string()),
+        })
+    }
+
+    /// Observations do not acquire SQLite's writer lock. Source reads check this both
+    /// before and after I/O, so a concurrent fence still invalidates the read.
+    pub(crate) fn derived_row(&self, id: &str) -> Result<Option<crate::derived::TransactionRow>> {
+        read_derived_row(&self.connection()?, id)
     }
 
     pub(crate) fn derived_rows(&self) -> Result<Vec<crate::derived::TransactionRow>> {
@@ -162,6 +188,7 @@ impl Meta {
 pub(crate) struct Txn {
     connection: Connection,
     pub(crate) rows: Vec<crate::derived::TransactionRow>,
+    selected: Option<String>,
 }
 
 impl Txn {
@@ -176,9 +203,24 @@ impl Txn {
                 "duplicate derived transaction id",
             );
         }
-        self.connection
-            .execute("DELETE FROM tensorfs_derived_transactions", [])
-            .map_err(|error| sql("clear derived transactions", error))?;
+        if let Some(id) = &self.selected {
+            if self.rows.len() > 1 || self.rows.iter().any(|row| &row.id != id) {
+                return refuse(
+                    Code::TRANSACTION_CONFLICT,
+                    "scoped transaction changed another writer",
+                );
+            }
+            self.connection
+                .execute(
+                    "DELETE FROM tensorfs_derived_transactions WHERE id=?1",
+                    [id],
+                )
+                .map_err(|error| sql("replace derived transaction", error))?;
+        } else {
+            self.connection
+                .execute("DELETE FROM tensorfs_derived_transactions", [])
+                .map_err(|error| sql("clear derived transactions", error))?;
+        }
         for row in &self.rows {
             let bytes = crate::canon::write(&row.to_value());
             self.connection
@@ -192,6 +234,33 @@ impl Txn {
             .execute_batch("COMMIT")
             .map_err(|error| sql("commit derived transactions", error))
     }
+}
+
+fn read_derived_row(
+    connection: &Connection,
+    id: &str,
+) -> Result<Option<crate::derived::TransactionRow>> {
+    let bytes = connection
+        .query_row(
+            "SELECT bytes FROM tensorfs_derived_transactions WHERE id=?1",
+            [id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| sql("read derived transaction", error))?;
+    bytes
+        .map(|bytes| {
+            let value = crate::canon::parse_canonical(&bytes, limits::DOC_MAX_BYTES)?;
+            let row = crate::derived::TransactionRow::from_value(&value)?;
+            if row.id != id {
+                return refuse(
+                    Code::TRANSACTION_CONFLICT,
+                    "derived row differs from its primary key",
+                );
+            }
+            Ok(row)
+        })
+        .transpose()
 }
 
 fn read_derived(connection: &Connection) -> Result<Vec<crate::derived::TransactionRow>> {

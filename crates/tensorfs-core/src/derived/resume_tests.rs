@@ -918,3 +918,153 @@ fn source_free_restore_holds_survive_gc_until_begin_or_explicit_abandon() {
     release(&source_meta, writer);
     std::fs::remove_dir_all(source.root()).unwrap();
 }
+
+/// Opt-in generated-data profile. Payloads are tiny so metadata scaling is visible.
+/// Run in release mode; elapsed time is evidence, never a flaky unit-test threshold.
+#[test]
+#[ignore]
+fn profile_derived_transaction_scaling() {
+    use std::time::Instant;
+    let scenarios = [
+        (219, 1, 1),
+        (219, 1, 10),
+        (219, 4, 10),
+        (219, 32, 10),
+        (219, 128, 10),
+        (3968, 1, 10),
+        (3968, 4, 10),
+        (219, 1, 219),
+    ];
+    for (keys, histories, writes) in scenarios {
+        let (store, meta, id, _) = fixture("row-profile");
+        let mut declaration = super::tests::created_declaration();
+        let prototype = declaration.components[0].add[0].clone();
+        declaration.components[0].add = (0..keys)
+            .map(|index| {
+                let mut tensor = prototype.clone();
+                tensor.key = format!("weight_{index:04}");
+                tensor.shape = vec![4];
+                tensor.parts[0].shape = vec![4];
+                tensor
+            })
+            .collect();
+        declaration.order = declaration.components[0]
+            .add
+            .iter()
+            .map(|tensor| ("model".into(), tensor.key.clone()))
+            .collect();
+        declaration.max_new_bytes = (keys * 16) as u64;
+        let writer = begin(&store, &meta, &id, 1, declaration, None).unwrap();
+        // Populate representative unrelated transactions without timing fixture creation.
+        let mut txn = meta.txn().unwrap();
+        let prototype = txn.rows[0].clone();
+        let row_bytes = crate::canon::write(&prototype.to_value()).len();
+        for index in 1..histories {
+            let mut row = prototype.clone();
+            row.id = ObjectRef::of(format!("history-{index}").as_bytes()).id();
+            txn.rows.push(row);
+        }
+        txn.commit().unwrap();
+        let started = Instant::now();
+        for _ in 0..20 {
+            check_writer(&meta, &id, 1).unwrap();
+        }
+        let fence_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut part_ms = 0.0;
+        let mut checkpoint_ms = 0.0;
+        let mut prior = None;
+        for index in 0..writes {
+            let key = format!("weight_{index:04}");
+            let started = Instant::now();
+            add_part(
+                &store,
+                &meta,
+                &id,
+                1,
+                ("model", &key, "value"),
+                &mut [index as u8; 16].as_slice(),
+            )
+            .unwrap();
+            part_ms += started.elapsed().as_secs_f64() * 1000.0;
+            let started = Instant::now();
+            let (_, head) =
+                checkpoint_progress(&store, &meta, &id, 1, "profile", "model", prior.as_ref())
+                    .unwrap();
+            prior = head.head;
+            checkpoint_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+        eprintln!("PROFILE {{\"keys\":{keys},\"histories\":{histories},\"writes\":{writes},\"row_bytes\":{row_bytes},\"fence20_ms\":{fence_ms:.3},\"add_ms\":{part_ms:.3},\"checkpoint_ms\":{checkpoint_ms:.3}}}");
+        fence(&meta, &id, 1).unwrap();
+        release(&meta, writer);
+        std::fs::remove_dir_all(store.root()).unwrap();
+    }
+}
+
+#[test]
+fn named_writer_operations_leave_other_rows_and_writer_lock_alone() {
+    use rusqlite::{params, Connection};
+    let (store, meta, first_id, declaration) = fixture("scoped-row");
+    let second_id = ObjectRef::of(b"independent writer").id();
+    let first = begin(&store, &meta, &first_id, 1, declaration.clone(), None).unwrap();
+    let second = begin(&store, &meta, &second_id, 1, declaration.clone(), None).unwrap();
+    let connection = Connection::open(crate::catalog::Catalog::path(store.root())).unwrap();
+    let untouched: Vec<u8> = connection
+        .query_row(
+            "SELECT bytes FROM tensorfs_derived_transactions WHERE id=?1",
+            [&second_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Corrupt unrelated history makes an accidental whole-table read fail, while
+    // a scoped mutation must preserve it byte-for-byte and mutate only this writer.
+    let damaged = ObjectRef::of(b"unrelated damaged history").id();
+    connection
+        .execute(
+            "INSERT INTO tensorfs_derived_transactions(id,bytes) VALUES(?1,?2)",
+            params![damaged, b"broken".as_slice()],
+        )
+        .unwrap();
+    data(&store, &meta, &first_id, 1, 0x31);
+    let after: Vec<u8> = connection
+        .query_row(
+            "SELECT bytes FROM tensorfs_derived_transactions WHERE id=?1",
+            [&second_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(untouched, after);
+    // A read fence must succeed while an unrelated SQLite writer is active. The old
+    // BEGIN IMMEDIATE observation instead hit the five-second busy timeout.
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    check_writer(&meta, &second_id, 1).unwrap();
+    assert!(completed(&meta, &second_id, 1).unwrap().0.is_empty());
+    connection.execute_batch("ROLLBACK").unwrap();
+    // A named operation does not parse unrelated history. Global inventory still
+    // reports the damaged row rather than silently skipping it.
+    check_writer(&meta, &first_id, 1).unwrap();
+    assert!(meta.derived_rows().is_err());
+    connection
+        .execute(
+            "DELETE FROM tensorfs_derived_transactions WHERE id=?1",
+            [&damaged],
+        )
+        .unwrap();
+    assert!(fence(&meta, &first_id, 1).unwrap());
+    assert_eq!(
+        check_writer(&meta, &first_id, 1).unwrap_err().code,
+        Code::WRITER_FENCED
+    );
+    check_writer(&meta, &second_id, 1).unwrap();
+    release(&meta, first);
+    let resumed = begin(&store, &meta, &first_id, 2, declaration, None).unwrap();
+    assert_eq!(completed(&meta, &first_id, 2).unwrap().0.len(), 1);
+    assert_eq!(
+        check_writer(&meta, &first_id, 1).unwrap_err().code,
+        Code::WRITER_FENCED
+    );
+    fence(&meta, &first_id, 2).unwrap();
+    fence(&meta, &second_id, 1).unwrap();
+    release(&meta, resumed);
+    release(&meta, second);
+    std::fs::remove_dir_all(store.root()).unwrap();
+}

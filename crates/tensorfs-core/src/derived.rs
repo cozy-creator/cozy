@@ -2188,10 +2188,7 @@ pub fn begin(
     };
     // Byte verification can update the verification catalog. Keep it outside the SQL
     // writer transaction, then compare the observed row before assigning this epoch.
-    let initial = meta
-        .derived_rows()?
-        .into_iter()
-        .find(|row| row.id == transaction);
+    let initial = meta.derived_row(&transaction)?;
     let mut row = match planned_row(
         initial.as_ref(),
         &transaction,
@@ -2220,7 +2217,7 @@ pub fn begin(
         return Err(error);
     }
     let committed = (|| {
-        let mut txn = meta.txn()?;
+        let mut txn = meta.txn_for(&transaction)?;
         let current = txn.rows.iter_mut().find(|row| row.id == transaction);
         if current.as_deref() != initial.as_ref() {
             return refuse(
@@ -2430,8 +2427,8 @@ pub fn completed(
     transaction: &str,
     writer_session: u64,
 ) -> Result<(Vec<(String, String, String)>, Vec<String>)> {
-    let mut txn = meta.txn()?;
-    let row = open_row(&mut txn.rows, transaction, writer_session)?;
+    let mut rows: Vec<_> = meta.derived_row(transaction)?.into_iter().collect();
+    let row = open_row(&mut rows, transaction, writer_session)?;
     Ok((
         row.added_parts
             .iter()
@@ -2451,7 +2448,7 @@ pub fn checkpoint_progress(
     previous: Option<&ObjectRef>,
 ) -> Result<(String, crate::durability::Head)> {
     let progress = {
-        let mut txn = meta.txn()?;
+        let mut txn = meta.txn_for(transaction)?;
         progress_row(open_row(&mut txn.rows, transaction, writer_session)?)
     };
     let plan = progress_plan(&progress);
@@ -2513,7 +2510,7 @@ pub fn checkpoint_progress(
         objects,
         None,
     )?;
-    let mut txn = meta.txn()?;
+    let mut txn = meta.txn_for(transaction)?;
     let row = open_row(&mut txn.rows, transaction, writer_session)?;
     retain_progress(store, row, exported.head.head.as_ref())?;
     Ok((plan, exported.head))
@@ -2581,7 +2578,7 @@ pub(crate) fn retain_restore(
     if let Some(object) = object {
         require_payload_record(store, object, "restored checkpoint object")?;
     }
-    let txn = meta.txn()?;
+    let txn = meta.txn_for(&transaction)?;
     let row = txn.rows.iter().find(|row| row.id == transaction);
     let active = if let Some(row) = row {
         if row.state != TransactionState::Open {
@@ -2704,8 +2701,8 @@ fn open_row<'a>(
 
 pub fn check_writer(meta: &Meta, transaction: &str, writer_session: u64) -> Result<()> {
     let transaction = transaction_id(transaction)?;
-    let mut txn = meta.txn()?;
-    open_row(&mut txn.rows, &transaction, writer_session)?;
+    let mut rows: Vec<_> = meta.derived_row(&transaction)?.into_iter().collect();
+    open_row(&mut rows, &transaction, writer_session)?;
     Ok(())
 }
 
@@ -2727,7 +2724,7 @@ pub fn add_part<R: Read>(
     let (component, tensor_key, role) = value;
     let transaction = transaction_id(transaction)?;
     let (declaration, expected) = {
-        let mut txn = meta.txn()?;
+        let mut txn = meta.txn_for(&transaction)?;
         let row = open_row(&mut txn.rows, &transaction, writer_session)?;
         let declaration = declaration(row)?;
         let expected = declaration
@@ -2791,7 +2788,7 @@ pub fn add_part<R: Read>(
         }
     }
 
-    let mut txn = meta.txn()?;
+    let mut txn = meta.txn_for(&transaction)?;
     let row = open_row(&mut txn.rows, &transaction, writer_session)?;
     if let Some(existing) = row
         .added_parts
@@ -2826,7 +2823,7 @@ pub fn add_config<R: Read>(
 ) -> Result<()> {
     let transaction = transaction_id(transaction)?;
     {
-        let mut txn = meta.txn()?;
+        let mut txn = meta.txn_for(&transaction)?;
         let row = open_row(&mut txn.rows, &transaction, writer_session)?;
         let declaration = declaration(row)?;
         if !declaration.configs.iter().any(|config| {
@@ -2857,7 +2854,7 @@ pub fn add_config<R: Read>(
     }
     let config = crate::header::canonical_config(&format!("config {config_name:?}"), &input)?;
 
-    let mut txn = meta.txn()?;
+    let mut txn = meta.txn_for(&transaction)?;
     let row = open_row(&mut txn.rows, &transaction, writer_session)?;
     if let Some(existing) = row
         .added_configs
@@ -3006,7 +3003,7 @@ pub fn commit(
 ) -> Result<ReceiptFacts> {
     let transaction = transaction_id(transaction)?;
     let row_before = {
-        let mut txn = meta.txn()?;
+        let mut txn = meta.txn_for(&transaction)?;
         open_row(&mut txn.rows, &transaction, writer_session)?.clone()
     };
     let declaration = declaration(&row_before)?;
@@ -3028,7 +3025,7 @@ pub fn commit(
     let (inherited_payload_objects, inherited_payload_bytes) =
         inherit_observation(&header, &row_before)?;
 
-    let mut txn = meta.txn()?;
+    let mut txn = meta.txn_for(&transaction)?;
     let row = open_row(&mut txn.rows, &transaction, writer_session)?;
     if row.added_parts != row_before.added_parts || row.added_configs != row_before.added_configs {
         return refuse(
@@ -3058,8 +3055,7 @@ pub enum Lookup {
 
 pub fn lookup(store: &Store, meta: &Meta, transaction: &str) -> Result<Lookup> {
     let transaction = transaction_id(transaction)?;
-    let rows = meta.derived_rows()?;
-    let Some(row) = rows.iter().find(|row| row.id == transaction) else {
+    let Some(ref row) = meta.derived_row(&transaction)? else {
         return Ok(Lookup::Absent);
     };
     match row.state {
@@ -3079,7 +3075,7 @@ pub fn lookup(store: &Store, meta: &Meta, transaction: &str) -> Result<Lookup> {
 
 pub fn fence(meta: &Meta, transaction: &str, writer_session: u64) -> Result<bool> {
     let transaction = transaction_id(transaction)?;
-    let mut txn = meta.txn()?;
+    let mut txn = meta.txn_for(&transaction)?;
     let row = txn
         .rows
         .iter_mut()
@@ -3098,7 +3094,7 @@ pub fn fence(meta: &Meta, transaction: &str, writer_session: u64) -> Result<bool
 
 pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<ReceiptFacts>> {
     let transaction = transaction_id(transaction)?;
-    let mut txn = meta.txn()?;
+    let mut txn = meta.txn_for(&transaction)?;
     let result = match txn.rows.iter_mut().find(|row| row.id == transaction) {
         None => {
             txn.rows.push(TransactionRow {
@@ -3270,7 +3266,7 @@ fn effective_disposition(
 
 pub fn dispose(store: &Store, meta: &Meta, transaction: &str) -> Result<DispositionResult> {
     let transaction = transaction_id(transaction)?;
-    let mut txn = meta.txn()?;
+    let mut txn = meta.txn_for(&transaction)?;
     let index = txn
         .rows
         .iter()
