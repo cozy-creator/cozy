@@ -1208,8 +1208,9 @@ func handleRentRelease(ctx *Context) *exit.Error {
 			return emit(ctx, output.Record{Fields: []output.Field{
 				{K: "machine", V: either(known.Machine, subject)}, {K: "rental", V: ""},
 				{K: "state", V: "ended"}, {K: "changed", V: false}, {K: "forgotten", V: false},
-			}, Notes: []string{known.Operation.Hub + " REFUSED this ask (operation " +
-				known.Operation.Key + "), so no pod was ever created under it"}})
+			}, Summary: []string{"No remote machine was created for " + either(known.Machine, subject) + "."},
+				Next: []string{"cozy rental list"}, Notes: []string{known.Operation.Hub + " REFUSED this ask (operation " +
+					known.Operation.Key + "), so no pod was ever created under it"}})
 		}
 		id, problem := learnRentalIdentity(ctx, l, st, known.Operation)
 		if problem != nil {
@@ -1249,8 +1250,6 @@ func handleRentRelease(ctx *Context) *exit.Error {
 			if known.Machine == "" {
 				known.Machine = seen.Name
 			}
-			fmt.Fprintf(ctx.Err, "  the hub bills this account for %s (%s); this host holds no record of it\n",
-				seen.Name, seen.ID)
 			break
 		}
 	}
@@ -1311,6 +1310,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	w.say(hub.RentalReleaseRequested, "")
 	// A rental the hub already shows leaving needs no second DELETE; the poll settles it.
 	if seen.State != hub.RentalReleaseRequested {
 		if e := w.request(); e != nil {
@@ -1448,12 +1448,26 @@ func (w *releaseWatch) request() *exit.Error {
 }
 
 func (w *releaseWatch) say(state, detail string) {
-	line := state + ": " + detail
-	if detail == "" || line == w.said {
+	if w.ctx.Mode().JSON {
+		return
+	}
+	line := ""
+	switch state {
+	case hub.RentalReleaseRequested:
+		line = "Shutting down remote machine..."
+	case "hub":
+		line = "Waiting for Tensorhub; retrying..."
+		if w.ctx.Mode().Full && detail != "" {
+			line += " " + detail
+		}
+	default:
+		return
+	}
+	if line == w.said {
 		return
 	}
 	w.said = line
-	fmt.Fprintf(w.ctx.Err, "  %s\n", line)
+	fmt.Fprintln(w.ctx.Err, line)
 }
 
 func (w *releaseWatch) kept(e *exit.Error) *exit.Error {
@@ -1510,12 +1524,21 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 			notes = []string{note + "; this host holds no live record of it"}
 		}
 	}
+	message := w.machine + " shut down."
+	if !destroyed {
+		message = w.machine + " is already shut down."
+	}
+	summary := []string{message,
+		"Temporary pod files are gone. Local outputs and uploaded checkpoints remain."}
 	if line, problem := (&managedRentals{ctx: w.ctx, layout: l, store: st}).status(); problem == nil {
 		notes = append(notes, line)
+		summary = append(summary, line)
+	} else {
+		summary = append(summary, "Current rental count and spend are unavailable.")
 	}
 	return emit(w.ctx, output.Record{Fields: []output.Field{
 		{K: "machine", V: w.machine}, {K: "rental", V: w.id},
 		{K: "state", V: "ended"}, {K: "changed", V: destroyed},
 		{K: "forgotten", V: forgotten},
-	}, Notes: notes})
+	}, Summary: summary, Notes: notes, Next: []string{"cozy rental list"}})
 }
