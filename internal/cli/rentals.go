@@ -156,10 +156,10 @@ func handleRent(ctx *Context) *exit.Error {
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
 		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", progress.rentalAcquisition, rentalRates(fleet.unrecorded))
 	if e != nil {
-		if watchCtx.Err() != nil && !ctx.Mode().JSON {
+		if e.Code == exit.Canceled && watchCtx.Err() != nil && !ctx.Mode().JSON {
 			detached = true
 			progress.Done()
-			fmt.Fprintln(ctx.Err, "detached — rental acquisition continues; `cozy rental list` shows its status")
+			fmt.Fprintln(ctx.Err, "detached from acquisition; `cozy rental list` shows its status")
 			return nil
 		}
 		return e

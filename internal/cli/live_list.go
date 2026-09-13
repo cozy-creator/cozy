@@ -208,9 +208,9 @@ func (v *listViewport) frame(width, height int, full bool) string {
 	for i, line := range lines {
 		lines[i] = clampLine(line, width)
 	}
-	// Explicit CRLF also works with raw input. No final newline: at the bottom
-	// of the screen it would scroll the fixed heading out of the visible frame.
-	return strings.Join(lines, "\r\n")
+	// The shared terminal input mode keeps normal newline processing. No final
+	// newline: at the bottom it would scroll the fixed heading out of the frame.
+	return strings.Join(lines, "\n")
 }
 
 func terminalHeight(w io.Writer) int {

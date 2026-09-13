@@ -13,6 +13,7 @@ func setLiveInputMode(fd int) error {
 	}
 	state.Iflag &^= unix.IXON | unix.IXOFF
 	state.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.IEXTEN | unix.ISIG
+	state.Oflag |= unix.OPOST | unix.ONLCR
 	state.Cc[unix.VMIN], state.Cc[unix.VTIME] = 1, 0
 	return unix.IoctlSetTermios(fd, liveSetTermios, state)
 }
