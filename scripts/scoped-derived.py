@@ -519,6 +519,12 @@ def exercise():
         ordered_thread.start()
         with SourceCapability.from_fd(ordered_source.manifest, ordered_source.length, left.detach()) as ordered_capability:
             ordered_view = ordered_capability.inspect(components=["a-first", "z-last"])
+            try:
+                ordered_capability.inspect(components=["z-last", "absent"])
+            except tensorfs.errors.Refusal as exc:
+                assert exc.code == "MISSING_FIELD"
+            else:
+                raise AssertionError("scoped inspection silently omitted an absent component")
         ordered_thread.join(10)
         assert not ordered_thread.is_alive()
         assert tuple((component, key) for component, rows in ordered_view.components.items() for key in rows) == tuple(ordered_plan.order)
