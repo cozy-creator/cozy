@@ -3,10 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -78,9 +75,11 @@ func watchRunStream(ctx *Context, client *localclient.Client, id string,
 ) (*localclient.Event, bool, *exit.Error) {
 	watchCtx, stop := context.WithCancel(context.Background())
 	defer stop()
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(interrupt)
+	interrupt, restoreInput, _, problem := liveSignals(ctx, nil)
+	if problem != nil {
+		return nil, false, problem
+	}
+	defer restoreInput()
 	detached := make(chan struct{}, 1)
 	done := make(chan struct{})
 	defer close(done)

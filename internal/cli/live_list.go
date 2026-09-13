@@ -1,14 +1,11 @@
 package cli
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -38,12 +35,11 @@ const (
 func watchList(ctx *Context, anchor string,
 	fetch func(context.Context) (output.List, *exit.Error),
 ) *exit.Error {
-	signalCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	watchCtx, cancel := context.WithCancel(signalCtx)
-	defer stopSignals()
-	defer cancel()
 	navigation := make(chan listNavigation, 32)
-	restoreInput, mouse := startListInput(cancel, navigation)
+	watchCtx, restoreInput, mouse, problem := liveWatchContext(ctx, context.Background(), navigation)
+	if problem != nil {
+		return problem
+	}
 	controls := "\x1b[?1049h\x1b[?25l"
 	if mouse {
 		controls += "\x1b[?1000h\x1b[?1006h"
@@ -212,9 +208,9 @@ func (v *listViewport) frame(width, height int, full bool) string {
 	for i, line := range lines {
 		lines[i] = clampLine(line, width)
 	}
-	// Explicit CRLF also works with raw input. No final newline: at the bottom
-	// of the screen it would scroll the fixed heading out of the visible frame.
-	return strings.Join(lines, "\r\n")
+	// The shared terminal input mode keeps normal newline processing. No final
+	// newline: at the bottom it would scroll the fixed heading out of the frame.
+	return strings.Join(lines, "\n")
 }
 
 func terminalHeight(w io.Writer) int {
@@ -232,138 +228,4 @@ func terminalSize(w io.Writer) (int, int) {
 		return 0, 0
 	}
 	return width, height
-}
-
-func startListInput(cancel context.CancelFunc, navigation chan<- listNavigation) (func(), bool) {
-	fd := int(os.Stdin.Fd()) //cozy:stdin-value live-list navigation, never a prompt
-	if !term.IsTerminal(fd) {
-		return func() {}, false
-	}
-	state, err := term.MakeRaw(fd)
-	if err != nil {
-		return func() {}, false
-	}
-	go readListInput(bufio.NewReader(os.Stdin), cancel, navigation) //cozy:stdin-value navigation only
-	return func() { _ = term.Restore(fd, state) }, true
-}
-
-func readListInput(in *bufio.Reader, cancel context.CancelFunc, navigation chan<- listNavigation) {
-	send := func(move listNavigation) {
-		select {
-		case navigation <- move:
-		default:
-		}
-	}
-	for {
-		key, err := in.ReadByte()
-		if err != nil {
-			return
-		}
-		switch key {
-		case 3, 'q', 'Q':
-			cancel()
-			return
-		case 'k':
-			send(listUp)
-		case 'j':
-			send(listDown)
-		case 'g':
-			send(listHome)
-		case 'G':
-			send(listEnd)
-		case 0x1b:
-			if !readListEscape(in, send) {
-				cancel()
-				return
-			}
-		}
-	}
-}
-
-// readListEscape decides what the ESC byte just read meant, and reports whether the
-// board keeps running. Esc is both a key and the first byte of every arrow, page, and
-// wheel report, so the two have to be told apart before Esc can exit.
-//
-// The tell is structural, never a deadline waited out: a terminal writes a report's
-// bytes in one burst, so a report's introducer — CSI '[' or SS3 'O' — is already sitting
-// in the reader behind the ESC that introduced it. An ESC with nothing behind it, or
-// with a byte that cannot introduce a sequence behind it (a second ESC, an Alt chord),
-// is the Esc KEY, and the Esc key exits exactly as q does.
-func readListEscape(in *bufio.Reader, send func(listNavigation)) bool {
-	if in.Buffered() == 0 {
-		return false
-	}
-	introducer, err := in.Peek(1)
-	if err != nil || len(introducer) == 0 {
-		return false
-	}
-	switch introducer[0] {
-	case '[':
-		_, _ = in.ReadByte()
-		readListCSISequence(in, send)
-		return true
-	case 'O':
-		// SS3, the same cursor keys from a terminal in application cursor mode.
-		_, _ = in.ReadByte()
-		final, err := in.ReadByte()
-		if err != nil {
-			return true
-		}
-		switch final {
-		case 'A':
-			send(listUp)
-		case 'B':
-			send(listDown)
-		case 'H':
-			send(listHome)
-		case 'F':
-			send(listEnd)
-		}
-		return true
-	}
-	return false
-}
-
-func readListCSISequence(in *bufio.Reader, send func(listNavigation)) {
-	sequence := readListCSI(in)
-	if sequence == "" {
-		return
-	}
-	switch {
-	case sequence == "A":
-		send(listUp)
-	case sequence == "B":
-		send(listDown)
-	case sequence == "5~":
-		send(listPageUp)
-	case sequence == "6~":
-		send(listPageDown)
-	case sequence == "H", sequence == "1~", sequence == "7~":
-		send(listHome)
-	case sequence == "F", sequence == "4~", sequence == "8~":
-		send(listEnd)
-	case strings.HasPrefix(sequence, "<64;") && strings.HasSuffix(sequence, "M"):
-		for range 3 {
-			send(listUp)
-		}
-	case strings.HasPrefix(sequence, "<65;") && strings.HasSuffix(sequence, "M"):
-		for range 3 {
-			send(listDown)
-		}
-	}
-}
-
-func readListCSI(in *bufio.Reader) string {
-	var sequence strings.Builder
-	for sequence.Len() < 64 {
-		value, err := in.ReadByte()
-		if err != nil {
-			return ""
-		}
-		sequence.WriteByte(value)
-		if value >= 0x40 && value <= 0x7e {
-			return sequence.String()
-		}
-	}
-	return ""
 }
