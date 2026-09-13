@@ -141,7 +141,7 @@ func (c *Orchestrator) hostNothing(instanceID, revision string) *exit.Error {
 	if w != nil {
 		s = c.sessions[w.bootID]
 		held = len(w.observedRemote)
-		_, holdsRevision = w.observedRemote[revision]
+		holdsRevision = w.holdsLocalRevision(revision)
 	}
 	c.mu.Unlock()
 	if w == nil || s == nil || held == 0 || holdsRevision {
@@ -181,6 +181,31 @@ func (c *Orchestrator) hostNothing(instanceID, revision string) *exit.Error {
 	}
 }
 
+// holdsLocalRevision joins the verified set's code identity to the worker's placement
+// observation. Placement IDs and local revision digests are different namespaces.
+// STAGED is sufficient for model preparation; empty code cannot be dispatchable.
+// Called under c.mu, like all reads of the desired set and observed placements.
+func (w *worker) holdsLocalRevision(revision string) bool {
+	if !validDigest(revision) || len(w.setBytes) == 0 || len(w.setDigest) == 0 {
+		return false
+	}
+	doc, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
+	if err != nil {
+		return false
+	}
+	for _, row := range doc.List("placements") {
+		if row.Sub("development").Str("local_revision_digest") != revision {
+			continue
+		}
+		observed, ok := w.observedRemote[row.Str("placement_id")]
+		if ok && observed.placementSetDigest == spellOf(w.setDigest) &&
+			observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_STAGED {
+			return true
+		}
+	}
+	return false
+}
+
 // awaitLocalRevision waits until the rented worker REPORTS the local revision among its
 // placements — the pod's prepare has landed — or the desire it rides is refused, the
 // worker goes, or the daemon stops. Observation only: there is no clock in it.
@@ -191,7 +216,7 @@ func (c *Orchestrator) awaitLocalRevision(instanceID, revision string) *exit.Err
 		var held, current bool
 		var refused, desiredRefusal *exit.Error
 		if w != nil {
-			_, held = w.observedRemote[revision]
+			held = w.holdsLocalRevision(revision)
 			current = !w.exited
 			refused, desiredRefusal = w.refusal, w.desiredRefusal
 		}
@@ -693,7 +718,7 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 	w.desiredUnpublishedPlacement = nil
 	w.desiredPackages, w.desiredModels, w.desiredDownloadSets = nil, nil, nil
 	w.desiredEpoch = s.epoch
-	_, held := w.observedRemote[revision]
+	held := w.holdsLocalRevision(revision)
 	c.mu.Unlock()
 	if held {
 		// The pod reports this exact revision already: nothing to prepare, and asking would
