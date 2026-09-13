@@ -42,10 +42,15 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		machine = link.MachineID
 	}
 	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected}
+	retaining, retentionProblem := s.store.MachineExecutionOwesWork(row.ID)
+	if retentionProblem != nil {
+		retaining = true
+		view.ObservationError = retentionProblem.Message
+	}
 	state := JobState{
 		Number: row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal), Attempts: int(row.Ordinal),
-		RetainWork: row.RetainWork, Retaining: view.Accepted && !view.Collected && row.State != "canceled",
+		RetainWork: row.RetainWork, Retaining: retaining,
 		CreatedAt: row.CreatedAt, EventsURL: "/v1/requests/" + row.ID + "/events", Outputs: []MediaRef{},
 		MachineExecution: view,
 	}

@@ -69,10 +69,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
-	if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
-		return exit.Usagef("--timeout requires --await").
-			WithRemedy("a detached run has no client waiting to enforce a caller deadline")
-	}
 	target, packageInterface, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
@@ -105,6 +101,10 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Usagef("--dry-run and --await conflict")
 	}
 	if callable.Kind != "job" {
+		if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
+			return exit.Usagef("--timeout requires --await for serving callables").
+				WithRemedy("a detached serving call has no client waiting to enforce a caller deadline")
+		}
 		if ctx.Inv.Value("--retry") != "" {
 			return exit.Usagef("--retry applies only to job transactions")
 		}
@@ -118,10 +118,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 			return exit.Usagef("--org applies only to a job callable")
 		}
 		return handleRun(ctx, target, callable)
-	}
-	if ctx.Inv.Value("--timeout") != "" {
-		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --asset, --input-tree, --org, --out, --await, and --rental")
 	}
 	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",

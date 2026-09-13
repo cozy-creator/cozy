@@ -2,9 +2,13 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -19,6 +23,12 @@ func machineObserverFixture(t *testing.T) (*records.Store, records.Request, *pb.
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
 	t.Cleanup(func() { store.Close() })
+	request, receipt := machineObserverRecord(t, store)
+	return store, request, receipt
+}
+
+func machineObserverRecord(t *testing.T, store *records.Store) (records.Request, *pb.MachineExecutionReceipt) {
+	t.Helper()
 	request, _, problem := store.Submit(records.Request{ID: "job-observed", IdemKey: "observed", Package: "local/example", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-owned-machine"))
@@ -29,7 +39,48 @@ func machineObserverFixture(t *testing.T) (*records.Store, records.Request, *pb.
 	}
 	fatal(t, store.RecordMachineSubmission(request.ID, submission))
 	receipt := &pb.MachineExecutionReceipt{RequestId: request.ID, SubmissionId: request.IdemKey, CaptureDigest: submission.CaptureDigest, InvocationSpecDigest: submission.Offer.InvocationSpecDigest, AcceptedAtMs: 1000, WorkerId: "worker", WorkerBootId: "boot-1", ExecutionWorkspaceId: "persistent-workspace"}
-	return store, request, receipt
+	return request, receipt
+}
+
+type retentionReleaseMachine struct {
+	store   *records.Store
+	state   *pb.MachineExecutionState
+	control atomic.Int32
+}
+
+func (m *retentionReleaseMachine) Refresh(context.Context, records.Request) *exit.Error { return nil }
+
+func (m *retentionReleaseMachine) Control(_ context.Context, request records.Request, action string) *exit.Error {
+	if action != "cancel" {
+		return exit.Usagef("expected cancellation")
+	}
+	m.control.Add(1)
+	m.state.Sequence++
+	return m.store.ObserveMachineExecution(request.ID, m.state, &pb.MachineExecutionEventPage{
+		NextAfter: m.state.Sequence, HeadSequence: m.state.Sequence,
+		Events: []*pb.MachineExecutionEvent{{Sequence: m.state.Sequence, AttemptOrdinal: 1, AtMs: 1002, Kind: "retention_released", BodyCanonicalBytes: []byte(`{}`)}},
+	})
+}
+
+func TestMachineCancellationAfterDeadlineReleasesRetainedWork(t *testing.T) {
+	o := hostOwner(t, "machine-deadline-cancellation")
+	request, receipt := machineObserverRecord(t, o.store)
+	fatal(t, o.store.AcceptMachineExecution(request.ID, receipt))
+	state := &pb.MachineExecutionState{RequestId: request.ID, WorkerId: "worker", WorkerBootId: "boot-1", ExecutionWorkspaceId: receipt.ExecutionWorkspaceId, Generation: 1, AttemptOrdinal: 1, State: "canceled", Sequence: 1}
+	fatal(t, o.store.ObserveMachineExecution(request.ID, state, &pb.MachineExecutionEventPage{NextAfter: 1, HeadSequence: 1,
+		Events: []*pb.MachineExecutionEvent{{Sequence: 1, AttemptOrdinal: 1, AtMs: 1001, Kind: "terminal", BodyCanonicalBytes: []byte(`{}`)}},
+	}))
+	machine := &retentionReleaseMachine{store: o.store, state: state}
+	defer publicationControlAPI(t, o, func(options *api.Options) { options.MachineExecutions = machine })()
+	code, out := runCozy(t, o.root, "run", "cancel", request.ID, "--json")
+	if code != 0 || !strings.Contains(out, `"changed":true`) || machine.control.Load() != 1 {
+		t.Fatalf("terminal cancellation skipped Runtime retention release: [%d] %s controls=%d", code, out, machine.control.Load())
+	}
+	owed, problem := o.store.MachineExecutionOwesWork(request.ID)
+	fatal(t, problem)
+	if owed {
+		t.Fatal("explicit Runtime retention release remained owed")
+	}
 }
 
 func TestMachineObserverCannotOwnAttemptsBeforeOrAfterAcceptance(t *testing.T) {
