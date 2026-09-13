@@ -187,7 +187,7 @@ func resolveExecutionCapture(ctx context.Context, bootstrap *executionowner.Boot
 	return orchestrator.Submission{
 		RequestID: input.RequestID, ExecutionGrantDigest: grantDigest,
 		IdemKey: input.IdempotencyKey, BodyDigest: captured.Capsule.Digest,
-		Package: root.Package, Entrypoint: entry.Name, Release: root.Version, InstallID: root.ID,
+		Org: "local", Package: root.Package, Entrypoint: entry.Name, Release: root.Version, InstallID: root.ID,
 		PlanID: facts.DescriptorID, LocalPackageDigest: input.Revision,
 		Payload: input.Input, Kind: "job", RetainWork: true, ReleaseImplicitWork: !facts.RetainsArtifacts,
 		ChildArtifacts: facts.RetainsArtifacts, NeedsAccelerator: facts.NeedsAccelerator,
