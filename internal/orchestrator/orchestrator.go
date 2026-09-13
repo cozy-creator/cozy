@@ -167,6 +167,7 @@ type ModelTransferMover func(context.Context, records.ModelTransferWeights,
 // worker asks only for ResolvePlacement; it must never force this host to materialize or
 // execute the target environment merely to author a remote plan.
 type Launcher interface {
+	ValidateExecutionCapture(records.Request) *exit.Error
 	ResolvePlacement(pkg string) (DesiredPlacement, *exit.Error)
 	Resolve(pkg string) (WorkerLaunchSpec, *exit.Error)
 	// ResolveInstall relaunches the immutable local install a durable request resolved

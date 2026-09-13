@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cozy-creator/cozy/internal/canonical"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The only synthetic service is provider discovery. Submission and every call
@@ -90,10 +93,11 @@ def serve(ctx: Context, payload: Request) -> Result:
     return Result(payload.value * 2)
 `
 	if modeled {
+		source = strings.Replace(source, "@app.entrypoint\ndef serve", "def serve", 1)
 		source += `
 import struct
 import tensorfs
-from cozy_runtime.author import Config, Loader, Model, ModelArtifact, WeightsConfig, WeightsOutput, WeightsPart, WeightsSink, WeightsTarget, WeightsTensor, uses_components
+from cozy_runtime.author import Config, Loader, Model, ModelArtifact, WeightsConfig, WeightsOutput, WeightsPart, WeightsReader, WeightsSink, WeightsTarget, WeightsTensor, uses_components
 class Pipeline:
     def __init__(self):
         import torch
@@ -118,12 +122,26 @@ def generate(ctx: Context, payload: Request, model: TinyModel) -> Result:
 async def produce(ctx: Context, *, artifacts: WeightsSink) -> ModelArtifact:
     encoding = dict(tensorfs.seed_digests())["plain/1"]
     tensor = WeightsTensor(logical_dtype="f32", shape=(2, 2), encoding=encoding, parts={"value": WeightsPart("f32", (2, 2))})
-    with artifacts.open("weights", sources={}, targets={name: WeightsTarget(add={"weight": tensor}) for name in ("alpha", "zeta")}, configs={"pipeline": WeightsConfig(data=b"{}")}, order=(("alpha", "weight"), ("zeta", "weight"))) as writer:
+    targets = {name: WeightsTarget(add={"weight": tensor}) for name in ("alpha", "zeta")}
+    targets["matrix"] = WeightsTarget(add={"layer.weight": WeightsTensor("f16", (4, 32), encoding, {"value": WeightsPart("f16", (4, 32))})})
+    with artifacts.open("weights", sources={}, targets=targets, configs={"pipeline": WeightsConfig(data=b"{}")}, order=(("alpha", "weight"), ("zeta", "weight"), ("matrix", "layer.weight"))) as writer:
         for name, scale in (("alpha", 2.0), ("zeta", 1.0)):
             writer.add_part(name, "weight", "value", struct.pack("<4f", scale, 0, 0, scale))
+        writer.add_part("matrix", "layer.weight", "value", struct.pack("<128e", *(i / 67 - 1 for i in range(128))))
         writer.add_config("pipeline", b"{}")
         return writer.commit().artifact
 app.job(produce, weights=(WeightsOutput("weights", max_new_bytes=4096),))
+from cozy_runtime.derive.operations import QuantizationSource
+@invocable(memoize=False)
+async def check_quantized(ctx: Context, *, candidate: QuantizationSource, reader: WeightsReader) -> Result:
+    with reader.open(candidate) as source:
+        tensor = source.tensor("matrix", "layer.weight")
+        assert {part.name for part in tensor.parts} == {"data", "scale"}
+        payload = bytearray(128)
+        source.read_part_into("matrix", "layer.weight", "data", 0, payload)
+        assert any(payload)
+        return Result(1)
+app.job(check_quantized)
 `
 	}
 	must(t, os.WriteFile(filepath.Join(library, "isolation_step.py"), []byte(source), 0600))
@@ -138,7 +156,7 @@ from isolation_step import advance, serve
 	if modeled {
 		header = strings.Replace(header, `"isolation-step==1.0.0"]`, `"isolation-step==1.0.0", "torch==2.13.0"]`, 1)
 
-		header += "from isolation_step import produce, generate\n"
+		header += "from isolation_step import produce, generate, check_quantized\nfrom cozy_runtime.derive.operations import quantize, QuantizationPlan\n"
 	}
 	firstScript := filepath.Join(project, "first.py")
 	secondScript := filepath.Join(project, "second.py")
@@ -150,7 +168,7 @@ from isolation_step import advance, serve
     ctx.log("first parent and serving child completed")
 `
 	if modeled {
-		firstBody = strings.Replace(firstBody, "result = await serve(value=result.value)\n    assert result.value == 86", "model = await produce()\n    result = await generate(value=result.value, model=model)\n    assert result.value == 172", 1)
+		firstBody = strings.Replace(firstBody, "result = await serve(value=result.value)\n    assert result.value == 86", "model = await produce()\n    quantized = await quantize(source=model, plan=QuantizationPlan(components=(\"matrix\",)), encoding=\"fp8-rowwise/1\")\n    checked = await check_quantized(candidate=quantized)\n    assert checked.value == 1\n    result = await generate(value=result.value, model=model)\n    assert result.value == 172", 1)
 	}
 	must(t, os.WriteFile(firstScript, []byte(header+firstBody), 0600))
 	must(t, os.WriteFile(secondScript, []byte(header+`async def main(ctx):
@@ -239,7 +257,7 @@ from isolation_step import advance, serve
 	fatal(t, problem)
 	count := 3
 	if modeled {
-		count = 4
+		count = 6
 	}
 	if first.Ordinal != 1 || first.State != "succeeded" || len(completed) != count {
 		t.Fatalf("parent changed during serving switch: %+v %+v", first, completed)
@@ -249,6 +267,25 @@ from isolation_step import advance, serve
 			t.Fatalf("child retried or failed: %+v", child)
 		}
 	}
-	proof, _ := json.MarshalIndent(map[string]any{"parent": first, "children": completed, "second": second.ID, "host": host.Container}, "", "  ")
+	proofData := map[string]any{"parent": first, "children": completed, "second": second.ID, "host": host.Container}
+	if modeled {
+		produced := completed[2]
+		served := completed[5]
+		weights, problem := store.AllModelTransferWeights(produced.ID, produced.Ordinal)
+		fatal(t, problem)
+		if produced.Entrypoint != "produce" || completed[3].Package != "local/cozy-runtime-operations" || completed[3].Entrypoint != "quantize" || served.Entrypoint != "generate" || len(weights) != 1 || len(served.Models) != 1 || served.Models[0].Manifest != weights[0].ManifestID || served.Models[0].BindingPath != "generate.models.model" {
+			t.Fatalf("modeled child did not use its exact native producer: %+v %+v", weights, served)
+		}
+		attempt, problem := store.AttemptRow(served.ID, served.Ordinal)
+		fatal(t, problem)
+		invocation, err := canonical.Read(attempt.InvocationCanonical, &pb.InvocationSpec{})
+		must(t, err)
+		if served.EnvironmentDigest == "" || invocation.Str("environment_digest") != served.EnvironmentDigest {
+			t.Fatal("modeled child did not bind the activated prepared Environment")
+		}
+		proofData["native_weights"] = weights
+		proofData["serving_invocation"] = json.RawMessage(attempt.InvocationCanonical)
+	}
+	proof, _ := json.MarshalIndent(proofData, "", "  ")
 	must(t, os.WriteFile(filepath.Join(layout.Root, "execution-proof.json"), proof, 0600))
 }

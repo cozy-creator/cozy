@@ -574,7 +574,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				c.logf("%s cannot assess retained rental job: %s", req.ID, problem.Message)
 				return
 			}
-			if retained {
+			// Retained bytes protect custody; they do not consume another job
+			// slot. Only an unrelated serving transition crosses this mode fence.
+			// An active CPU parent's own child keeps that exact parent below.
+			if retained && !req.IsJob() && !c.activeChild(req) {
 				reason = ExcludedModeConflict
 			}
 			row, problem := c.opt.Store.RentalRow(req.Worker)
@@ -1083,6 +1086,14 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			resolved, problem = c.jobExecutionRole(req, resolved)
 		}
 	}()
+	if req.Worker != "" && req.InstallID != "" && req.LocalPackageDigest != "" {
+		if c.opt.Packages == nil {
+			return WorkerLaunchSpec{}, "", exit.Unavailablef("captured package owner is unavailable")
+		}
+		if problem := c.opt.Packages.ValidateExecutionCapture(req); problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+	}
 	if req.Worker == "" {
 		if c.opt.Packages == nil {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef("this host resolves no local packages")
@@ -1389,6 +1400,17 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request %s is not queued for execution", req.ID)
 	}
 	req = *current
+
+	// A warm worker must not bypass the same immutable-capture check used by
+	// preparation. Replays of already terminal/live attempts never enter here.
+	if (req.Rental || req.Worker != "") && req.InstallID != "" && req.LocalPackageDigest != "" {
+		if c.opt.Packages == nil {
+			return 0, exit.Unavailablef("captured package owner is unavailable")
+		}
+		if problem := c.opt.Packages.ValidateExecutionCapture(req); problem != nil {
+			return 0, problem
+		}
+	}
 
 	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence

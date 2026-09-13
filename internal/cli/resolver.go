@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -92,7 +93,11 @@ func (r *Resolver) LocalRevision(installID, digest string) (localpackage.Revisio
 	if problem != nil {
 		return localpackage.Revision{}, problem
 	}
-	return localpackage.Open(layout, *install, digest)
+	revision, problem := localpackage.Open(layout, *install, digest)
+	if problem != nil {
+		return localpackage.Revision{}, problem
+	}
+	return revision, nil
 }
 
 // EditableSnapshot is one reading of an editable install's live source tree against the
@@ -909,4 +914,32 @@ func ladderOffers(ladder []hub.BindingRung, model orchestrator.ModelRef) bool {
 		}
 	}
 	return true
+}
+
+// ValidateExecutionCapture checks the execution owner's immutable constraint.
+// Base-owned builtin carriers inherit this admitted parent's worker requirement;
+// their version label alone is not proof of the installed remote Runtime.
+func (r *Resolver) ValidateExecutionCapture(request records.Request) *exit.Error {
+	owner := request
+	for depth := 0; owner.ParentRequestID != ""; depth++ {
+		if depth >= 32 {
+			return exit.New(exit.Conflict, "captured execution ancestry exceeds its bound")
+		}
+		parent, problem := r.store.RequestRow(owner.ParentRequestID)
+		if problem != nil {
+			return problem
+		}
+		if parent == nil {
+			return exit.New(exit.Conflict, "captured execution owner is unavailable")
+		}
+		owner = *parent
+	}
+	if owner.InstallID == "" || owner.LocalPackageDigest == "" {
+		return exit.Named(exit.Conflict, "request.capture_runtime_floor_unproven", "the execution owner has no immutable Runtime minimum")
+	}
+	revision, problem := r.LocalRevision(owner.InstallID, owner.LocalPackageDigest)
+	if problem != nil {
+		return problem
+	}
+	return localpackage.RequireRuntimeFloor(revision, hostruntime.Floor)
 }

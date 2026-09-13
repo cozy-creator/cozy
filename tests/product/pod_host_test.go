@@ -1002,6 +1002,10 @@ type localLauncher struct {
 	revision localpackage.Revision
 }
 
+// Wire-peer controls use declared synthetic revisions; actual CLI tests exercise
+// the real resolver's sealed metadata gate.
+func (l localLauncher) ValidateExecutionCapture(records.Request) *exit.Error { return nil }
+
 func (l localLauncher) LocalRevision(installID, digest string) (localpackage.Revision, *exit.Error) {
 	if digest != l.revision.Digest {
 		return localpackage.Revision{}, exit.New(exit.NotFound, "no local revision %s", digest)

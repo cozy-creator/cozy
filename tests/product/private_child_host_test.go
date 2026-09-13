@@ -25,6 +25,8 @@ import (
 var childHostLauncher = flag.String("child-host-launcher", "", "actual isolated PodHost container launcher")
 var childHostHome = flag.String("child-host-home", "", "new retained proof home; kept for native custody inspection")
 var childHostProject = flag.String("child-host-project", "", "optional replacement for the shared private source/candidate artifact fixture")
+var childHostUpdatable = flag.Bool("child-host-updatable", false, "task-owned worker SDK may differ from immutable base inventory")
+
 var childHostRuntimeBin = flag.String("child-host-runtime-bin", "", "installed matching Runtime bin directory")
 
 // Only the provider catalog/readback is a test peer. Both control planes, package
@@ -158,7 +160,7 @@ print(json.dumps({"format":"tensorhub.image_inventory/1","profile":"python3.12-c
 	must(t, os.WriteFile(filepath.Join(layout.Root, "host-image-inventory.json"), inventory, 0600))
 	hub.inventories = map[string]json.RawMessage{rentalID: inventory}
 
-	hub.rentals[rentalID] = map[string]any{"rental_id": rentalID, "name": "child-host", "state": "ready", "worker_address": host.Control, "media_address": host.Media, "cert_pem": string(certificate), "worker_id": "private-child-host", "worker_boot_id": ready.WorkerBootID, "creator_public_key": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}, "accelerator_count": 1, "hourly_rate_usd_micros": 1}
+	hub.rentals[rentalID] = map[string]any{"development": *childHostUpdatable, "rental_id": rentalID, "name": "child-host", "state": "ready", "worker_address": host.Control, "media_address": host.Media, "cert_pem": string(certificate), "worker_id": "private-child-host", "worker_boot_id": ready.WorkerBootID, "creator_public_key": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}, "accelerator_count": 1, "hourly_rate_usd_micros": 1}
 	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: rentalID, MachineName: "child-host", SKU: sku, AcceleratorModel: accelerator, HourlyRateUSDMicros: 1, State: "ready", Hub: hub.server.URL, Address: host.Control, MediaAddress: host.Media, ExpectedWorkerID: "private-child-host", ExpectedWorkerBootID: ready.WorkerBootID}, string(certificate), token, identity))
 	must(t, os.WriteFile(filepath.Join(layout.Root, "config.yaml"), []byte("tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\nport: 0\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	path := *childHostRuntimeBin
