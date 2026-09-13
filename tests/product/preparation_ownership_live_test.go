@@ -145,7 +145,7 @@ func proveActualPreparationOwnership(t *testing.T, job, repeated bool) {
 		requestID, _, problem = o.c.Submit(orchestrator.Submission{
 			IdemKey: "actual-job-native-reensure", Package: "cozy/preparation-proof", Release: "1.0.0", Entrypoint: "inspect", PlanID: descriptor,
 			Kind: "job", Org: "cozy", Payload: []byte(`{"prompt":"37"}`), Worker: podRental, Rental: true, RentalRequired: true, ProducerParams: []string{"model"},
-			Models: []orchestrator.ModelRef{{Package: "cozy/preparation-proof", Slot: "model", BindingPath: binding, Model: "proof/input", Manifest: model, ManifestLength: length, Bytes: modelBytes}},
+			Models: []orchestrator.ModelRef{{Package: "cozy/preparation-proof", Slot: "model", BindingPath: binding, Model: "proof/input", Manifest: model, ManifestLength: length, Bytes: modelBytes, HubCheckpoint: true}},
 		})
 		fatal(t, problem)
 	} else {
@@ -213,7 +213,7 @@ func proveActualPreparationOwnership(t *testing.T, job, repeated bool) {
 					RequestID       string `json:"request_id"`
 				}
 				must(t, json.Unmarshal(body.Result.Inline, &result))
-				if row.TerminalStatus != "SUCCEEDED" || !body.ExecutionStarted || result.Value != 37 || result.Elements != 1 || result.Checkpoint != model || result.RequestID != requestID {
+				if row.TerminalStatus != "SUCCEEDED" || !body.ExecutionStarted || result.Value != 37 || result.Elements != 1 || result.Checkpoint != model || result.RequestID != fmt.Sprintf("%s#%d", requestID, row.Attempt) {
 					t.Fatalf("actual model-reader job result disagrees: %+v status=%s", result, row.TerminalStatus)
 				}
 			}
@@ -229,12 +229,52 @@ func proveActualPreparationOwnership(t *testing.T, job, repeated bool) {
 		Total int64 `json:"total"`
 	}
 	must(t, json.Unmarshal(verified["ensures"], &ensures))
+	if job {
+		var pids, exits []int
+		var offers, evictions int
+		must(t, json.Unmarshal(verified["offers"], &offers))
+		must(t, json.Unmarshal(verified["evictions"], &evictions))
+		must(t, json.Unmarshal(verified["runtime_pids"], &pids))
+		must(t, json.Unmarshal(verified["runtime_exits"], &exits))
+		wantProcesses := 2
+		if repeated {
+			wantProcesses = orchestrator.MaxRequeues + 1
+		}
+		wantEvictions := 1
+		if repeated {
+			wantEvictions = wantProcesses
+		}
+		if offers != wantProcesses || evictions != wantEvictions {
+			t.Fatalf("wrong actual offer/eviction barrier counts: offers=%d evictions=%d", offers, evictions)
+		}
+		if len(pids) < wantProcesses || len(exits) < wantProcesses-1 {
+			t.Fatalf("the real Runtime did not recycle/reconnect: pids=%v exits=%v", pids, exits)
+		}
+		for i := 0; i < wantProcesses-1; i++ {
+			if exits[i] != 75 || pids[i] == pids[i+1] {
+				t.Fatalf("not a real cooperative Runtime recycle: pids=%v exits=%v", pids, exits)
+			}
+		}
+		t.Logf("ordinary job retained request %s through Runtime pids=%v exits=%v", requestID, pids, exits)
+	}
 	wantEnsures := 2
 	if repeated {
 		wantEnsures = orchestrator.MaxRequeues + 1
 	}
-	if !retained || downloaded == repeated || len(ensures) != wantEnsures || ensures[1].Moved <= 0 {
+	if !retained || downloaded == repeated || len(ensures) < wantEnsures || (!job && len(ensures) != wantEnsures) {
 		t.Fatalf("incomplete real reacquisition: %v %v %+v", retained, downloaded, ensures)
+	}
+	var moved int64
+	for _, ensured := range ensures {
+		if ensured.Total != ensures[0].Total {
+			t.Fatal("re-ensure changed the native closure")
+		}
+		moved += ensured.Moved
+	}
+	// Reconnect may reissue an interrupted ensure, but verified bytes must be
+	// reused. Only the initial fill and actual evictions justify new bytes.
+	if ensures[0].Total <= 0 || moved != int64(wantEnsures)*ensures[0].Total {
+		t.Fatalf("warm re-ensure duplicated transfer work: %+v", ensures)
 	}
 	t.Logf("real Host/Runtime/Creator recovered %d B after native GC; independent output retained", ensures[1].Moved)
 }
