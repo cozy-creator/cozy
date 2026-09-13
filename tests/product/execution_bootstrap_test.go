@@ -17,6 +17,8 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/executionowner"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -70,6 +72,32 @@ func TestExecutionBootstrapRequiresExactUploadedCustody(t *testing.T) {
 	must(t, err)
 	if len(b.Wheels) != 2 || b.Capsule.Digest != parsed.Digest {
 		t.Fatal("bootstrap lost exact captured inventory")
+	}
+	layout, problem := home.Open(authority.CreatorHome)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	imported, problem := b.Import(layout, store)
+	fatal(t, problem)
+	again, problem := b.Import(layout, store)
+	fatal(t, problem)
+	if again.ID != imported.ID || imported.SourceKind != "wheel" || imported.Closure != "parent==1.0.0" {
+		t.Fatal("import replay changed its captured source facts")
+	}
+	pins, problem := store.Pins(imported.Package)
+	fatal(t, problem)
+	if len(pins) != 0 {
+		t.Fatal("remote capture replaced an active package pin")
+	}
+	exported, problem := executionowner.Export(layout, store, records.Request{InstallID: imported.ID,
+		LocalPackageDigest: parsed.Capsule.Root.Revision, Entrypoint: parsed.Capsule.Root.Entrypoint,
+		Payload: parsed.Capsule.Root.Input, IdemKey: parsed.Capsule.Root.IdempotencyKey})
+	fatal(t, problem)
+	roundtrip, problem := executionowner.Decode(exported.Raw)
+	fatal(t, problem)
+	if len(roundtrip.Packages) != 2 || len(roundtrip.Capsule.Bindings) != 1 || roundtrip.Capsule.Root.Revision != parsed.Capsule.Root.Revision {
+		t.Fatal("capture import/export changed root or callable identities")
 	}
 	// Exercise the fixed Creator command with inherited descriptors, the same
 	// interface the trusted Host launcher uses. It starts no daemon or Python.
