@@ -469,6 +469,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
 	var desiredRevision uint64
 	var reensureRevision uint64
+	var packageStaged bool
 	var laneBreaches []string
 	var heldVerdicts []heldVerdict
 	workerTerminal, repeatedFault, verdict := false, false, ""
@@ -482,6 +483,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		return
 	}
 	if w != nil {
+		wasStaged := w.materialization == pb.MaterializationState_MATERIALIZATION_STATE_STAGED &&
+			w.acceptedRevision == r.AcceptedDesiredStateRevision && bytes.Equal(w.acceptedSetDigest, r.AcceptedPlacementSetDigest)
 		desiredRevision = w.revision
 		w.lastReport = time.Now()
 		w.phase = r.WorkerPhase
@@ -617,6 +620,10 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable
+		packageStaged = !wasStaged && w.spec.Connection != nil && status != nil &&
+			status.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_STAGED &&
+			r.AcceptedDesiredStateRevision == desiredRevision && bytes.Equal(r.AcceptedPlacementSetDigest, w.setDigest) &&
+			bytes.Equal(status.PlacementSetDigest, w.setDigest)
 		// Fault rows explain state; FAILED axes decide terminality. In particular,
 		// BINDING_DEGRADED explicitly means "the worker still serves" and must never become
 		// kill authority merely because it shares the diagnostic list with fatal faults.
@@ -728,7 +735,12 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 	}
-	// DISPATCHABLE is the only state that can change the queue's answer. A free local
+	// A restored job-only package reaches STAGED without a serving endpoint.
+	// Wake its existing request resolver to continue through normal job activation.
+	if packageStaged {
+		go c.reviveQueue()
+	}
+	// Dispatchable capacity changes the queue's answer. A free local
 	// seat also re-asks the FIFO head's residency question: the head may name a different
 	// package whose launch was parked while this worker held the same device envelope.
 	// `selectOrStart` still passes through the durable holder and idle-worker fences, so a
