@@ -60,6 +60,10 @@ type Submission struct {
 	// alone would let a key be reused across functions and mean two different things.
 	// Empty falls back to the payload's digest.
 	BodyDigest string
+	// ExecutionGrantDigest is supplied only by trusted private capsule admission.
+	ExecutionGrantDigest string
+	// RequestID preserves the client identity only under that admitted private grant.
+	RequestID string
 
 	// Kind is the ATTEMPT CLASS: "" or `serving`, or `job`. A job carries two more facts
 	// a serving request has no version of.
@@ -163,6 +167,9 @@ func (c *Orchestrator) ActivateRecordedRequest(req records.Request) (uint64, *ex
 
 // RecordSubmission crosses the durable ordinary-request boundary.
 func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *exit.Error) {
+	if problem := c.validateExecutionSubmission(s); problem != nil {
+		return records.Request{}, false, problem
+	}
 	req, event, e := requestRecord(s)
 	if e != nil {
 		return records.Request{}, false, e
@@ -221,7 +228,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 		bodyDigest = spelled
 	}
-	if s.AttentionKernel != "" {
+	// A private capsule digest already binds the entire resolved submission.
+	if s.AttentionKernel != "" && s.ExecutionGrantDigest == "" {
 		identity, err := canonical.Write(map[string]canonical.Value{
 			"body_digest":      bodyDigest,
 			"attention_kernel": s.AttentionKernel,
@@ -240,26 +248,31 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 				"local_package_request_invalid",
 				"a local package revision requires one exact editable install")
 		}
-		identity, err := canonical.Write(map[string]canonical.Value{
-			"body_digest":          bodyDigest,
-			"local_package_digest": s.LocalPackageDigest,
-		})
-		if err != nil {
-			return records.Request{}, nil, exit.Internalf(
-				"cannot encode the local package request identity: %s", err)
-		}
-		bodyDigest, err = canonical.Spell(canonical.Digest(identity))
-		if err != nil {
-			return records.Request{}, nil, exit.Internalf(
-				"cannot digest the local package request identity: %s", err)
+		if s.ExecutionGrantDigest == "" {
+			identity, err := canonical.Write(map[string]canonical.Value{
+				"body_digest":          bodyDigest,
+				"local_package_digest": s.LocalPackageDigest,
+			})
+			if err != nil {
+				return records.Request{}, nil, exit.Internalf(
+					"cannot encode the local package request identity: %s", err)
+			}
+			bodyDigest, err = canonical.Spell(canonical.Digest(identity))
+			if err != nil {
+				return records.Request{}, nil, exit.Internalf(
+					"cannot digest the local package request identity: %s", err)
+			}
 		}
 	}
-	id := records.NewID("req")
-	if s.Kind == "job" {
-		id = records.NewID("job")
+	id := s.RequestID
+	if id == "" {
+		id = records.NewID("req")
+		if s.Kind == "job" {
+			id = records.NewID("job")
+		}
 	}
 	req := records.Request{
-		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
+		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest, ExecutionGrantDigest: s.ExecutionGrantDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Release:            s.Release,
 		LocalPackageDigest: s.LocalPackageDigest,
