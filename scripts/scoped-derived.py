@@ -64,6 +64,7 @@ class Owner:
     def __init__(self, writer, *, record=None):
         client, server = socket.socketpair()
         self.client = DerivedTransaction(client.detach())
+        self.stop_socket = server.dup()
         self.errors = []
         self.receipts = []
         self.checkpoints = []
@@ -108,6 +109,7 @@ class Owner:
     def finish(self, *, refused=False):
         self.client.close()
         self.thread.join(10)
+        self.stop_socket.close()
         assert not self.thread.is_alive(), "native writer channel did not stop"
         assert bool(self.errors) == refused, self.errors
 
@@ -300,6 +302,39 @@ def exercise():
             "PASS overbroad command/foreign epoch refusal and interrupted partial-stream recovery",
             flush=True,
         )
+
+        # Authority revocation must wake an owner blocked on a stalled producer,
+        # rather than wait for another frame before checking its grant again.
+        owner = Owner(open_writer(store, 19, small, 4096))
+        waiting, resume = threading.Event(), threading.Event()
+        client_errors = []
+
+        class Stalled:
+            def read(self, maximum):
+                waiting.set()
+                assert resume.wait(10), "cancellation test failed to unblock producer"
+                return b"x" * min(maximum, 4096)
+
+        def stalled_client():
+            try:
+                owner.client.add_part("model", "weight", "value", Stalled())
+            except Exception as error:
+                client_errors.append(error)
+
+        producer_thread = threading.Thread(target=stalled_client, daemon=True)
+        producer_thread.start()
+        assert waiting.wait(10), "native owner did not request producer bytes"
+        owner.stop_socket.shutdown(socket.SHUT_RDWR)
+        owner.thread.join(10)
+        assert not owner.thread.is_alive(), "revoked owner stayed blocked in recv"
+        resume.set()
+        producer_thread.join(10)
+        assert not producer_thread.is_alive() and client_errors
+        owner.finish()
+        replacement = open_writer(store, 19, small, 4096, epoch=2)
+        assert replacement.completed_parts() == []
+        replacement.fence()
+        print("PASS owner shutdown fences a stalled producer without waiting for bytes", flush=True)
 
         # Partial role custody is resumable; only a complete data+scale pair commits.
         fp8 = next(

@@ -52,7 +52,9 @@ serve_derived(
 
 `check_current()` revalidates the owner/attempt and is called before each native
 operation and every streamed pull. The Runtime owner still fences the native
-writer during cancellation/replacement. Closing the server FD wakes blocked I/O.
+writer during cancellation/replacement. The owner keeps a shutdown-capable socket
+duplicate and calls `shutdown(SHUT_RDWR)` to wake blocked I/O; merely closing a
+duplicate FD does not interrupt another thread's blocked syscall.
 `admit_io(operation, native_bound)` returns a context manager. `part`/`config`
 admission includes one bounded source-read window (at most 64 MiB); a nested read
 borrows that admission instead of recursively acquiring its global lock.
