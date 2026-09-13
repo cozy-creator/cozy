@@ -443,6 +443,10 @@ type worker struct {
 	// hostPrepareSeq numbers the logical desires issued through PodHost (proto-025); a
 	// prepare that completes for an older number sends nothing.
 	hostPrepareSeq uint64
+	// One bounded cache-miss recovery for a desired selection. Only in-flight
+	// coordination; Creator keeps no model residency or download journal here.
+	modelEnsureFromRevision uint64
+	modelEnsureRevision     uint64
 
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool

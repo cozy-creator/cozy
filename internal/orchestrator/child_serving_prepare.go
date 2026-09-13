@@ -57,7 +57,7 @@ func (c *Orchestrator) prepareChildServing(instance string, req records.Request,
 	c.mu.Unlock()
 	label := hostLabel("child_serving", req.ID)
 	if selected != nil {
-		call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: selected}
+		call := &pb.PreparePrivatePlacementCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PrivatePlacementSet: selected}
 		result := c.runHostPrepare(s, w, seq, label,
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 				return s.host.PreparePrivatePlacement(ctx, call)

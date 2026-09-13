@@ -801,7 +801,7 @@ func (c *Orchestrator) issueUnpublishedPlacementSet(s *session, w *worker,
 	w.desiredUnpublishedPlacement = cloneUnpublishedPlacementSet(selected)
 	w.desiredEpoch = s.epoch
 	c.mu.Unlock()
-	call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: cloneUnpublishedPlacementSet(selected)}
+	call := &pb.PreparePrivatePlacementCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PrivatePlacementSet: cloneUnpublishedPlacementSet(selected)}
 	return c.issueThroughHost(s, w, hostLabel("private_placement_set", selected.OperationId),
 		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 			return s.host.PreparePrivatePlacement(ctx, call)
