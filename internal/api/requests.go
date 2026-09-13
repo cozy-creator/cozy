@@ -732,10 +732,9 @@ type Lifecycle struct {
 	Outputs    []MediaRef `json:"outputs"`
 	Triage     *TriageRef `json:"triage,omitempty"`
 	Rental     bool       `json:"rental,omitempty"`
-	// Machine is the venue this request's work landed on: `local` for a worker this host
-	// spawned, or the rental's recorded owner-scoped machine word once an attempt exists.
-	// A provisional queue assignment has no execution venue. The word is history the run
-	// keeps after the rental is released. It never changes request identity or numbering.
+	// Machine names the selected or executing venue. Queued status does not imply
+	// that the machine has accepted an attempt; it may still be preparing this request.
+	// After execution, the recorded machine survives rental cleanup.
 	Machine string `json:"machine"`
 	// Caller affinity names a requested venue, not a remotely queued attempt.
 	RequestedRental  string `json:"requested_rental,omitempty"`
@@ -747,6 +746,18 @@ type Lifecycle struct {
 	QueuePosition *int             `json:"queue_position,omitempty"`
 	QueueDepth    *int             `json:"queue_depth,omitempty"`
 	OutputExport  *OutputExportRef `json:"output_export,omitempty"`
+}
+
+// DisplayMachine also reads the selection facts older daemons expose before an
+// attempt exists. An executing or historical venue always takes precedence.
+func (l Lifecycle) DisplayMachine() string {
+	if l.Machine != "" || l.Status != "queued" {
+		return l.Machine
+	}
+	if l.RequestedMachine != "" {
+		return l.RequestedMachine
+	}
+	return l.PhaseMachine
 }
 
 // OutputExportRef is where a run's result files go and whether they are there yet.
@@ -865,6 +876,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
 	life.Machine = s.machineOf(row, len(attempts) > 0)
+	life.Machine = life.DisplayMachine()
 	if life.Status == "canceled" {
 		// A canceled run says WHO (cl-108). The actor rides the durable cancellation
 		// events; a queued cancel also has no attempt row, so its cause lives only there.
@@ -928,15 +940,13 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 }
 
 // machineOf reads the machine word RECORDED on the request (cl-107): stamped the moment
-// the run is bound to a rental, but displayed only once an attempt exists, and kept as
+// the run is bound to a rental, shown during preparation, and kept as
 // history after the rental row is gone. The raw rental id never renders here;
 // pre-migration history no surviving rental row can name stays blank. A run with no
 // rental binding that attempted ran on a worker this host spawned: `local`.
 func (s *Server) machineOf(row records.Request, attempted bool) string {
-	if !attempted {
-		return ""
-	}
-	if row.Machine != "" {
+	// Unpinning keeps the old name as history. It is not a current destination.
+	if row.Machine != "" && (attempted || row.Worker != "" || row.RequestedRental != "") {
 		return row.Machine
 	}
 	if row.Worker == "" && attempted {

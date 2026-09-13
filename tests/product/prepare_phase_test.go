@@ -204,3 +204,22 @@ func TestTheProviderDrawsTheProvisioningBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestPackageSetupAndModelLoadingHaveDistinctLabels(t *testing.T) {
+	complete := int64(100 << 30)
+	if got := cli.PhaseCell(api.Lifecycle{Status: "queued", Kind: "invocation", Phase: orchestrator.PhasePreparing,
+		PhaseMovedBytes: &complete, PhaseTotalBytes: &complete}); !strings.HasPrefix(got, "setting up package") {
+		t.Fatalf("completed downloads hide package setup: %q", got)
+	}
+	for _, tc := range []struct {
+		phase, kind, want string
+	}{
+		{orchestrator.PhasePreparing, "invocation", "setting up package"},
+		{orchestrator.PhaseWarming, "invocation", "loading models"},
+		{orchestrator.PhasePreparing, "job", "preparing inputs"},
+	} {
+		if got := cli.PhaseCell(api.Lifecycle{Status: "queued", Phase: tc.phase, Kind: tc.kind}); got != tc.want {
+			t.Errorf("%s/%s = %q, want %q", tc.kind, tc.phase, got, tc.want)
+		}
+	}
+}

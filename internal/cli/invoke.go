@@ -716,11 +716,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	}
 	states := map[string]int{}
 	for _, life := range rows {
-		// An assignment still in this daemon's queue is not execution on that pod.
-		// Also correct older daemon projections that expose the provisional venue.
-		if life.Status == "queued" && life.Attempts == 0 && life.Attempt == 0 {
-			life.Machine = ""
-		}
+		life.Machine = life.DisplayMachine()
 		kind := life.Kind
 		if kind == "" {
 			kind = "invocation"
@@ -878,7 +874,10 @@ func PhaseCell(life api.Lifecycle) string {
 	case orchestrator.PhaseDownloading:
 		activity = "downloading models"
 	case orchestrator.PhasePreparing:
-		activity = "preparing models"
+		activity = "setting up package"
+		if life.Kind == "job" {
+			activity = "preparing inputs"
+		}
 	case orchestrator.PhaseWarming:
 		activity = "loading models"
 	}
