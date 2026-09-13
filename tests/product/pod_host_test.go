@@ -69,7 +69,7 @@ type fakePod struct {
 	protocolInfo    func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	watchProgress   func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
 	recordOperation func(*pb.RecordOperationResultCall) (*pb.RecordOperationResultResult, error)
-	pb.UnimplementedWorkerControlServer
+	controlDefaults
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
 	wireMinor  uint32 // zero uses the current protocol; tests can negotiate an older peer
