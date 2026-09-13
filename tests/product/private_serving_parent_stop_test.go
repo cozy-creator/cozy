@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
@@ -25,16 +26,19 @@ import (
 // cannot publish its finished placement after the CPU parent stops awaiting it.
 func TestStoppedParentPreventsSecondServingPlacementAfterModelPreparation(t *testing.T) {
 	for _, stop := range []string{"pause", "cancel"} {
-		for _, mixed := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/mixed=%t", stop, mixed), func(t *testing.T) { stoppedServingParent(t, stop, mixed) })
+		for _, selected := range []struct{ mixed, supported bool }{{false, false}, {true, true}, {true, false}} {
+			t.Run(fmt.Sprintf("%s/mixed=%t/supported=%t", stop, selected.mixed, selected.supported), func(t *testing.T) { stoppedServingParent(t, stop, selected.mixed, selected.supported) })
 		}
 	}
 }
 
-func stoppedServingParent(t *testing.T, stop string, mixed bool) {
+func stoppedServingParent(t *testing.T, stop string, mixed, supported bool) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
+	pod.protocolInfo = func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+		return &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor, SupportsMixedModelInputs: supported}, nil
+	}
 	root := t.TempDir()
 	connection, _ := startFakePod(t, root, pod)
 	revision := stageLocalRevision(t, root)
@@ -205,6 +209,22 @@ func stoppedServingParent(t *testing.T, stop string, mixed bool) {
 		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, PlacementSet: prepared})
 	}
 	fatal(t, o.c.ResumeRequest(second.ID, "second serving child"))
+	if mixed && !supported {
+		waitUntil(t, "old peer refuses mixed inputs before preparation", func() bool {
+			row, problem := o.store.RequestRow(second.ID)
+			fatal(t, problem)
+			return row.State == "blocked" && strings.Contains(tail(filepath.Join(o.root, "orchestrator.log")), "does not support retained and downloaded")
+		})
+		select {
+		case <-entered:
+			t.Fatal("unsupported peer received a mixed preparation")
+		default:
+		}
+		if !strings.Contains(tail(filepath.Join(o.root, "orchestrator.log")), "does not support retained and downloaded") {
+			t.Fatal("capability refusal lost its reason")
+		}
+		return
+	}
 	select {
 	case <-entered:
 	case <-time.After(10 * time.Second):

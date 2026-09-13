@@ -12,8 +12,9 @@ They are copied rather than imported as another Go module. Refresh the complete 
 worker-protocol; do not hand-edit generated files here.
 
 `cozy.worker.v1` is the wire major because it is part of the protobuf package and gRPC
-service path. `WireMinor` is its additive compatibility level. Additive changes bump the
-minor; a breaking change creates `cozy.worker.v2` instead of revising v1 in place.
+service path. `WireMinor` is its additive compatibility level. Additive changes normally bump the
+minor; independently negotiated optional capabilities are documented by the canonical
+protocol and default to unsupported, without inferring support from a version range. A breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
 `SOURCE` pins the upstream commit and per-file digests, matching what tensorhub and
 cozy-runtime already carry, so a hand edit or a stale re-vendor is detectable from this

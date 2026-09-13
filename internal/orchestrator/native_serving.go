@@ -1,11 +1,13 @@
 package orchestrator
 
 import (
+	"context"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"sort"
+	"time"
 )
 
 // nativeServingModels binds child input custody before preparation can read it.
@@ -69,4 +71,43 @@ func (c *Orchestrator) nativeServingModels(request records.Request) ([]*pb.Nativ
 	}
 	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Slot < bindings[j].Slot })
 	return bindings, nil
+}
+
+func mixedModelInputs(models []ModelRef) bool {
+	var downloaded, native bool
+	for _, model := range models {
+		if model.Downloadable() {
+			downloaded = true
+		} else {
+			native = true
+		}
+	}
+	return downloaded && native
+}
+
+// The optional preparation capability is independent of protocol minor. Older
+// peers omit it and remain usable for every single-source model selection.
+func requireMixedModelInputs(s *session, mixed bool) *exit.Error {
+	if !mixed {
+		return nil
+	}
+	if s == nil {
+		return exit.Unavailablef("mixed model preparation awaits its worker connection")
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	defer cancel()
+	var info *pb.ProtocolInfoResult
+	var err error
+	if s.host != nil {
+		info, err = s.host.ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
+	} else if s.preparation != nil {
+		info, err = s.preparation.ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
+	}
+	if err != nil {
+		return exit.Named(exit.Unavailable, "mixed_model_inputs_probe_failed", "worker model-input capability is unavailable")
+	}
+	if info == nil || !info.SupportsMixedModelInputs {
+		return exit.Named(exit.Conflict, "mixed_model_inputs_unsupported", "this worker does not support retained and downloaded model inputs together").WithRemedy("update the worker Runtime and supervisor before running this model selection")
+	}
+	return nil
 }

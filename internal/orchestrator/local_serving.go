@@ -48,6 +48,18 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	if s.preparation == nil || w.spec.Connection != nil || spec.Preparation == nil {
 		return WorkerLaunchSpec{}, "", exit.Internalf("local serving preparation has no local worker connection")
 	}
+	if problem := requireMixedModelInputs(s, mixedModelInputs(req.Models)); problem != nil {
+		return WorkerLaunchSpec{}, "", problem
+	}
+	if req.ParentRequestID != "" && len(downloadModelRefs(req.Models)) > 0 {
+		acquirer, ok := c.opt.Packages.(interface{ EnsureLocalModels([]ModelRef) *exit.Error })
+		if !ok {
+			return WorkerLaunchSpec{}, "", exit.Unavailablef("local model acquisition owner is unavailable")
+		}
+		if problem := acquirer.EnsureLocalModels(req.Models); problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+	}
 	w.localMu.Lock()
 	defer w.localMu.Unlock()
 	logical := LogicalPackage{Package: req.Package, Release: spec.Placement.Release, Function: req.Entrypoint,

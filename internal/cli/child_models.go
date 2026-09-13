@@ -280,7 +280,7 @@ func (r *Resolver) ensureLocalChildModel(model orchestrator.ModelRef) *exit.Erro
 	spec += "@" + model.Manifest
 	fetch := transfer.Fetch{Tool: tool, Hub: r.catalog, Spec: spec, Lane: model.Lane,
 		Scratch: work.Path, Locks: layout.AcquisitionLocks()}
-	ctx, cancel := hub.Context()
+	ctx, cancel := hub.LongContext()
 	defer cancel()
 	resolved, problem := fetch.Resolve(ctx)
 	if problem != nil {

@@ -15,6 +15,13 @@ import (
 // Prepare code, join its exact model inputs, then publish one complete placement
 // while retaining the CPU parent whose canonical invocation authorized this call.
 func (c *Orchestrator) prepareChildServing(instance string, req records.Request, revision localpackage.Revision) *exit.Error {
+	_, current, problem := c.localControl(instance)
+	if problem != nil {
+		return problem
+	}
+	if problem := requireMixedModelInputs(current, mixedModelInputs(req.Models)); problem != nil {
+		return problem
+	}
 	prepared, problem := c.prepareUnpublishedPackage(instance, req, revision, false)
 	if problem != nil {
 		return problem
