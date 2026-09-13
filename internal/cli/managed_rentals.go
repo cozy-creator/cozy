@@ -565,6 +565,8 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 						AcceleratorCount:      seen.AcceleratorCount,
 						HourlyRateUSDMicros:   seen.HourlyRateUSDMicros,
 						BaseWorkerImageDigest: seen.BaseWorkerImageDigest,
+						BaseWorkerImageTag:    seen.BaseWorkerImageTag,
+						BaseWorkerProfile:     seen.BaseWorkerProfile,
 					}})
 			}
 		}, rentalRates(m.unrecorded))

@@ -150,7 +150,8 @@ func (p *RunProgress) rentalAcquisition(r hub.Rental) {
 		"value": map[string]any{"phase": name, "machine": r.Name,
 			"rental": map[string]any{"accelerator_model": r.AcceleratorModel,
 				"accelerator_count": r.AcceleratorCount, "hourly_rate_usd_micros": r.HourlyRateUSDMicros,
-				"base_worker_image_digest": r.BaseWorkerImageDigest},
+				"base_worker_image_digest": r.BaseWorkerImageDigest,
+				"base_worker_image_tag":    r.BaseWorkerImageTag, "base_worker_profile": r.BaseWorkerProfile},
 		},
 	}})
 }
@@ -233,8 +234,11 @@ func phaseRows(fields map[string]any) []string {
 			}
 			rows = append(rows, row)
 		}
-		if digest, _ := rental["base_worker_image_digest"].(string); digest != "" {
-			rows = append(rows, "    image: "+digest)
+		for _, field := range []string{"base_worker_image_tag", "base_worker_profile"} {
+			if label, _ := rental[field].(string); label != "" {
+				rows = append(rows, "    image: "+label)
+				break
+			}
 		}
 	}
 	// Older workers report one aggregate transfer. Preserve that honest fallback;

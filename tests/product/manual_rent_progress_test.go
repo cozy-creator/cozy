@@ -22,6 +22,7 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 				"minimum_ram_per_gpu_gb": 64, "price_usd_micros_per_hour": 3_190_000,
 			})
 			const id = "pr-manual-progress"
+			const tag = "torch2.13.0-cu130-cp312-linux-x86-runtime0.17.1"
 			const image = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 			created := make(chan struct{})
 			stand.mu.Lock()
@@ -29,7 +30,8 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 				close(created)
 				return map[string]any{"rental_id": id, "name": request["name"], "state": "pending_acquisition",
 					"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1,
-					"hourly_rate_usd_micros": 3_190_000, "base_worker_image_digest": image,
+					"hourly_rate_usd_micros": 3_190_000, "base_worker_image_digest": image, "base_worker_image_tag": tag,
+					"base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",
 				}
 			}
 			stand.mu.Unlock()
@@ -67,10 +69,13 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 				}
 				return
 			}
-			for _, want := range []string{"acquiring", "NVIDIA H100 NVL · $3.19/hour", "image: sha256:0123456789abcdef", "pulling image on", "booting on"} {
+			for _, want := range []string{"acquiring", "NVIDIA H100 NVL · $3.19/hour", "image: " + tag, "pulling image on", "booting on"} {
 				if !strings.Contains(log, want) {
 					t.Fatalf("manual rent omitted %q: %q", want, log)
 				}
+			}
+			if strings.Contains(log, "image: sha256:") {
+				t.Fatalf("acquisition exposed an opaque image digest: %q", log)
 			}
 			if strings.Contains(log, "ETA") || strings.Contains(log, "%") {
 				t.Fatalf("boot acquired a fabricated estimate or percentage: %q", log)
