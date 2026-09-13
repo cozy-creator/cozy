@@ -512,10 +512,16 @@ def exercise():
         native_order = store.inspect_derived_source(ordered_source.manifest, ordered_source.length, ["a-first", "z-last"], [])
         assert [row["name"] for row in native_order["components"]] == ["z-last", "a-first"]
         left, right = socket.socketpair()
-        ordered_thread = threading.Thread(target=lambda: serve_source(
-            store, ordered_source, right.detach(), check_current=lambda: None,
-            admit_io=lambda: contextlib.nullcontext(),
-        ), daemon=True)
+        refused_components = []
+        def serve_ordered_source():
+            try:
+                serve_source(
+                    store, ordered_source, right.detach(), check_current=lambda: None,
+                    admit_io=lambda: contextlib.nullcontext(),
+                )
+            except tensorfs.errors.Refusal as exc:
+                refused_components.append(exc.code)
+        ordered_thread = threading.Thread(target=serve_ordered_source, daemon=True)
         ordered_thread.start()
         with SourceCapability.from_fd(ordered_source.manifest, ordered_source.length, left.detach()) as ordered_capability:
             ordered_view = ordered_capability.inspect(components=["a-first", "z-last"])
@@ -527,6 +533,7 @@ def exercise():
                 raise AssertionError("scoped inspection silently omitted an absent component")
         ordered_thread.join(10)
         assert not ordered_thread.is_alive()
+        assert refused_components == ["MISSING_FIELD"]
         assert tuple((component, key) for component, rows in ordered_view.components.items() for key in rows) == tuple(ordered_plan.order)
         print("PASS native source inspection and FD selection preserve nonlexical construction order", flush=True)
 
