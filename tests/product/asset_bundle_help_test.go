@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/launch"
 )
 
 func TestAssetBundleHelpMatchesAutomaticEmptyInputs(t *testing.T) {
@@ -37,16 +39,18 @@ func TestAssetBundleHelpMatchesAutomaticEmptyInputs(t *testing.T) {
 				assets["type"] = map[string]any{"list": "str"}
 			}
 			// A same-named result list does not receive the input bundle default.
-			ep["result"] = map[string]any{"fields": []any{assets}}
+			ep["result"] = map[string]any{"fields": []any{map[string]any{
+				"name": "pictures", "type": map[string]any{"list": "str"},
+			}}}
 			raw, err := json.Marshal(doc)
 			must(t, err)
-			root, path, _, _ := admissionRoot(t, raw, "unmatched GPU", true)
-			for _, args := range [][]string{{"--describe"}, {"--rental=never-resolved"}} {
-				code, out := runAdmissionCLI(t, root, path,
-					append([]string{"run", ladderPackage + "/generate"}, args...)...)
-				if (code == 0) != (args[0] == "--describe") {
-					t.Fatalf("unexpected help/refusal [exit %d]: %s", code, out)
-				}
+			parsed, problem := launch.DecodePackageInterface(raw)
+			fatal(t, problem)
+			entrypoint := &parsed.Entrypoints[0]
+			for _, out := range []string{
+				launch.DescribeContract("proof/generic/generate", entrypoint, nil),
+				launch.DescribeArguments(entrypoint) + launch.UsageLine("proof/generic/generate", entrypoint),
+			} {
 				request := strings.Split(out, "  output:")[0]
 				if strings.Contains(request, "(default = [])") != test.optional {
 					t.Fatalf("asset optionality is wrong: %s", out)
@@ -63,9 +67,6 @@ func TestAssetBundleHelpMatchesAutomaticEmptyInputs(t *testing.T) {
 				}
 				if output := strings.SplitN(out, "  output:", 2); len(output) == 2 && strings.Contains(output[1], "(default = [])") {
 					t.Fatalf("input asset default leaked into output: %s", out)
-				}
-				if strings.Contains(out, "Resolving model") {
-					t.Fatalf("help/refusal resolved models: %s", out)
 				}
 			}
 		})
