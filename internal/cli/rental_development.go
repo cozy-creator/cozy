@@ -8,11 +8,12 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-func manualRentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.RentalDevelopment, *exit.Error) {
+func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.RentalDevelopment, *exit.Error) {
 	var pinned *hub.RentalDevelopment
 	if existing != nil {
 		req, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
@@ -21,9 +22,22 @@ func manualRentalDevelopment(ctx *Context, existing *records.RentalOperation) (*
 		}
 		pinned = req.Development
 	}
-	enabled, path := ctx.Inv.Bool("--development"), ctx.Inv.Value("--ssh-public-key")
-	if !enabled && path == "" {
+	explicit := ctx.Inv.Bool("--development") || ctx.Inv.Value("--ssh-public-key") != ""
+	// An acquisition is immutable. A changed default or deleted public-key file
+	// cannot rewrite its mode, prevent reconciliation, or spend for another pod.
+	if existing != nil && !explicit {
 		return pinned, nil
+	}
+	enabled := ctx.Inv.Bool("--development") || ctx.Cfg.RentalsDevelopment
+	path := ctx.Inv.Value("--ssh-public-key")
+	if path == "" && enabled {
+		path = ctx.Cfg.RentalsSSHPublicKey
+		if path != "" && !filepath.IsAbs(path) && !strings.HasPrefix(path, "~/") {
+			path = filepath.Join(ctx.Cfg.Home, path)
+		}
+	}
+	if !enabled && path == "" {
+		return nil, nil
 	}
 	if !enabled {
 		return nil, exit.Usagef("--ssh-public-key requires --development")
@@ -32,7 +46,14 @@ func manualRentalDevelopment(ctx *Context, existing *records.RentalOperation) (*
 		if pinned != nil {
 			return pinned, nil
 		}
-		return nil, exit.Usagef("--development requires --ssh-public-key FILE")
+		return nil, exit.Usagef("development rentals require --ssh-public-key FILE or rentals.ssh_public_key in config.yaml")
+	}
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, exit.Usagef("cannot resolve the SSH public-key home directory")
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
 	}
 	file, err := os.Open(path)
 	if err != nil {
