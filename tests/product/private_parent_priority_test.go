@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -16,6 +17,14 @@ import (
 )
 
 func TestActiveParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T) {
+	for _, pinned := range []bool{true, false} {
+		t.Run(map[bool]string{true: "pinned", false: "unpinned"}[pinned], func(t *testing.T) {
+			activeParentChildRetryPrecedesUnrelatedRentalRoot(t, pinned)
+		})
+	}
+}
+
+func activeParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T, pinned bool) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, jobReady: true, localJobOnly: true}
@@ -24,6 +33,10 @@ func TestActiveParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T) {
 	revision := stageLocalRevision(t, root)
 	owner := hostOwner(t, "parent-priority", rentalWiring(connection, private), func(opt *orchestrator.Options) {
 		opt.Packages = libraryChildLauncher{localLauncher{revision: revision}}
+		opt.RentalFleet = func() (string, *exit.Error) { return "one busy rental", nil }
+		opt.AcquireManagedRental = func(records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
+			return orchestrator.PlacementDecision{}, "", nil
+		}
 	})
 	fatal(t, owner.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "otter", State: "ready", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000,
 		Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
@@ -75,15 +88,19 @@ func TestActiveParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T) {
 		}
 		return false, nil
 	}
-	submit := func(id string) string {
+	submit := func(id string, pinned bool) string {
+		worker := ""
+		if pinned {
+			worker = podRental
+		}
 		t.Helper()
 		request, _, problem := owner.c.Submit(orchestrator.Submission{IdemKey: id, Package: revision.Package, Entrypoint: "prepare", PlanID: childDigest("4"),
-			Release: revision.Release, LocalPackageDigest: revision.Digest, Payload: []byte(`{}`), Worker: podRental, RequestedRental: podRental,
+			Release: revision.Release, LocalPackageDigest: revision.Digest, Payload: []byte(`{}`), Worker: worker, RequestedRental: worker,
 			InstallID: install.ID, Rental: true, RentalRequired: true, Kind: "job", RetainWork: true})
 		fatal(t, problem)
 		return request
 	}
-	parent := submit("active-parent")
+	parent := submit("active-parent", true)
 	var first *pb.AttemptOffer
 	select {
 	case first = <-childOffers:
@@ -91,7 +108,7 @@ func TestActiveParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T) {
 		t.Fatal("parent did not dispatch its child")
 	}
 	before := offers.Load()
-	baseline := submit("unrelated-root")
+	baseline := submit("unrelated-root", pinned)
 	waitUntil(t, "unrelated root queued", func() bool { return owner.c.QueuePosition(baseline) > 0 })
 	outcomeIdentity, _ := canonical.Spell(first.InvocationSpecDigest)
 	raw, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{RequestId: first.RequestId, AttemptOrdinal: first.AttemptOrdinal, InvocationSpecDigest: outcomeIdentity,

@@ -1136,9 +1136,11 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	}
 	spec, err := canonical.Read(pod.offers[0].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
 	must(t, err)
-	if spec.Str("environment_digest") != "" {
-		t.Fatalf("the local-package InvocationSpec names environment %q; want none",
-			spec.Str("environment_digest"))
+	prepared, err := canonical.Read(pod.desired[0].GetPlacementSet().PlacementSetCanonicalBytes, &pb.PlacementSet{})
+	must(t, err)
+	environment := prepared.List("placements")[0].Str("environment_digest")
+	if spec.Str("environment_digest") != environment {
+		t.Fatalf("captured serving must name its actual prepared environment: got %q, want %q", spec.Str("environment_digest"), environment)
 	}
 }
 

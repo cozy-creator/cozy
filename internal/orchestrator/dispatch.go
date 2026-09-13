@@ -1126,8 +1126,12 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
+	// A captured serving child obtains its binding plan from exact private
+	// preparation, including model-free entrypoints. Its sealed local revision
+	// is checked below before any package bytes can execute.
+	capturedChild := req.ParentRequestID != "" && req.InstallID != "" && validDigest(req.LocalPackageDigest)
 	if req.Release == "" ||
-		(len(req.Models) == 0 && !validDigest(req.PlanID)) {
+		(len(req.Models) == 0 && !validDigest(req.PlanID) && !capturedChild) {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
 			"remote package preparation requires one exact package revision")
 	}
@@ -1706,20 +1710,15 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			"worker %s carries no selected environment digest", instanceID)
 	}
 	if remote {
-		// A local revision is DEVELOPMENT execution on the pod, and development execution
-		// has no published Environment identity: the worker refuses a spec that names one
-		// (development_environment_present). The pod's prepared Environment is still bound
-		// to the row, so a requeue derives the same identity; only the spec omits it.
-		specEnvironment := environment
-		if req.LocalPackageDigest != "" {
-			specEnvironment = ""
-		}
+		// Captured wheels execute the prepared Environment even when unpublished.
+		// Only legacy direct-source development lacks that identity; a retained
+		// local package digest is not evidence of direct-source execution.
 		if req.EnvironmentDigest == "" {
 			e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID, environment)
 			if e != nil {
 				return "", e
 			}
-			return specEnvironment, nil
+			return environment, nil
 		}
 		if req.EnvironmentDigest != environment {
 			return "", exit.Named(exit.Conflict,
@@ -1727,7 +1726,7 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				instanceID, req.ID)
 		}
-		return specEnvironment, nil
+		return environment, nil
 	}
 	return environment, nil
 }

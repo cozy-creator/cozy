@@ -24,6 +24,14 @@ func (c *Orchestrator) rentalPreparationAllowedLocked(w *worker, req records.Req
 	if w == nil || w.exited || w.stopping || !w.snapshotAcknowledged {
 		return exit.Unavailablef("rental preparation awaits its reconciled worker")
 	}
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil {
+		return problem
+	}
+	if current == nil || (current.State != "submitted" && current.State != "queued") || current.Worker != req.Worker {
+		return exit.Unavailablef("rental preparation request is no longer queued on this worker")
+	}
+	req = *current
 	parent, problem := c.activeParentFor(req)
 	if problem != nil {
 		return problem
@@ -75,4 +83,33 @@ func (c *Orchestrator) activeChild(req records.Request) bool {
 	}
 	_, problem := c.retainedOrchestrationParent(req)
 	return problem == nil
+}
+
+// An unrelated root cannot consume an already-prepared ordinary lane while a
+// CPU parent owns the machine's composition. This also covers unpinned claims.
+func (c *Orchestrator) rentalParentAllows(w *worker, req records.Request) bool {
+	if w.spec.Connection == nil {
+		return true
+	}
+	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
+	if problem != nil {
+		return false
+	}
+	for _, attempt := range attempts {
+		parent, problem := c.opt.Store.RequestRow(attempt.RequestID)
+		if problem != nil {
+			return false
+		}
+		if parent == nil || len(parent.OrchestrationDirective) == 0 {
+			continue
+		}
+		probe := records.Request{Worker: w.spec.Connection.RentalID, ParentRequestID: parent.ID}
+		if _, problem := c.retainedOrchestrationParent(probe); problem != nil {
+			return false
+		}
+		if req.ID != parent.ID && req.ParentRequestID != parent.ID {
+			return false
+		}
+	}
+	return true
 }
