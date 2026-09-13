@@ -895,10 +895,10 @@ func (c *Orchestrator) parkFor(req records.Request, reason string) bool {
 
 func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return cause }
 
-// requestSlot names what a request needs resident, before any pin: the package, an
-// install for an editable one, a job function for a job.
+// requestSlot names what a request needs resident before assignment. Explicit
+// rental affinity already identifies an independent machine at this point.
 func requestSlot(req records.Request) string {
-	slot := req.Package
+	slot := pinnedPackage(req.Package, req.RequestedRental)
 	if req.InstallID != "" {
 		slot += "/install/" + req.InstallID
 	}
@@ -915,6 +915,9 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 	for _, w := range c.workers {
 		if w.exited || w.stopping || !w.supportsCurrentProtocol() || w.spec.IsJob() != req.IsJob() ||
 			retirementGround(w) != "" || w.spec.Connection == nil {
+			continue
+		}
+		if req.RequestedRental != "" && w.spec.Connection.RentalID != req.RequestedRental {
 			continue
 		}
 		slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
