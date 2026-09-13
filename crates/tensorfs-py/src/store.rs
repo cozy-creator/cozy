@@ -1864,7 +1864,12 @@ impl PyStore {
         let identity = source_facts(py, std::slice::from_ref(&inspection.view))?;
         out.set_item("source", identity.get_item(0)?)?;
         let component_rows = PyList::empty(py);
-        for component in &inspection.view.fact.components {
+        // The selected fact is a normalized set. Author inspection must retain
+        // the header's construction traversal, including nonlexical components.
+        for (component, _) in &inspection.view.header.components {
+            if !inspection.view.fact.components.contains(component) {
+                continue;
+            }
             let row = PyDict::new(py);
             row.set_item("name", component)?;
             row.set_item(

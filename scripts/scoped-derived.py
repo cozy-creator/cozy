@@ -498,6 +498,32 @@ def exercise():
         owner.finish()
         print("PASS exact-source descriptor, multi-frame config and recorded native replay handoff", flush=True)
 
+        # Selection is a set; inspection preserves the artifact's constructor order.
+        plain = dict(tensorfs.seed_digests())["plain/1"]
+        ordered_plan = Derivation({}, {
+            "z-last": Target(add={"z-weight": Tensor("u8", (8,), plain, {"value": Part("u8", (8,))})}),
+            "a-first": Target(add={"a-weight": Tensor("u8", (8,), plain, {"value": Part("u8", (8,))})}),
+        }, {}, [("z-last", "z-weight"), ("a-first", "a-weight")])
+        writer = open_writer(store, 24, ordered_plan, 16)
+        writer.add_part("z-last", "z-weight", "value", io.BytesIO(bytes(8)))
+        writer.add_part("a-first", "a-weight", "value", io.BytesIO(bytes(8)))
+        ordered = writer.commit()["manifest"]
+        ordered_source = Source("sha256:" + ordered["sha256"], ordered["length"])
+        native_order = store.inspect_derived_source(ordered_source.manifest, ordered_source.length, ["a-first", "z-last"], [])
+        assert [row["name"] for row in native_order["components"]] == ["z-last", "a-first"]
+        left, right = socket.socketpair()
+        ordered_thread = threading.Thread(target=lambda: serve_source(
+            store, ordered_source, right.detach(), check_current=lambda: None,
+            admit_io=lambda: contextlib.nullcontext(),
+        ), daemon=True)
+        ordered_thread.start()
+        with SourceCapability.from_fd(ordered_source.manifest, ordered_source.length, left.detach()) as ordered_capability:
+            ordered_view = ordered_capability.inspect(components=["a-first", "z-last"])
+        ordered_thread.join(10)
+        assert not ordered_thread.is_alive()
+        assert tuple((component, key) for component, rows in ordered_view.components.items() for key in rows) == tuple(ordered_plan.order)
+        print("PASS native source inspection and FD selection preserve nonlexical construction order", flush=True)
+
         # Real process exit at native commit; no in-memory callback state survives.
         left, right = socket.socketpair()
         child = subprocess.Popen(
