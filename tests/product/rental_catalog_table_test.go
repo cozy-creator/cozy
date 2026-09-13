@@ -88,7 +88,7 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		t.Fatalf("cozy rental new [exit %d]:\n%s", code, out)
 	}
 	header, rows, order := catalogTable(t, out)
-	want := []string{"NAME", "GPU", "COMPUTE", "VRAM", "PRICE"}
+	want := []string{"NAME", "ACCELERATOR", "COMPUTE", "VRAM", "PRICE"}
 	if strings.Join(header, "|") != strings.Join(want, "|") {
 		t.Fatalf("the ladder's columns are %v, not %v — these are GPUs, priced once\n%s",
 			header, want, out)
@@ -150,18 +150,27 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		t.Fatalf("the ladder climbs %v, not cheapest-first %v\n%s", order, climb, out)
 	}
 
-	// Expanded output keeps the provider identity and the same combined price.
+	// --full expands the row limit without adding redundant human columns.
 	code, full := runCozy(t, root, "rental", "new", "--full")
 	if code != 0 {
 		t.Fatalf("cozy rental new --full [exit %d]:\n%s", code, full)
 	}
+	if full != out {
+		t.Fatalf("--full changed this complete catalog's columns or prices:\n%s", full)
+	}
+
+	// Structured output retains price components and the exact provider model ID.
+	code, structured := runCozy(t, root, "rental", "new", "--full", "--json")
+	if code != 0 {
+		t.Fatalf("cozy rental new --full --json [exit %d]:\n%s", code, structured)
+	}
 	for _, kept := range []string{
-		"ACCELERATOR MODEL",
+		`"gpu":`, `"accelerator model":`, `"accelerator count":`, `"gpu price":`, `"storage price":`,
 		"NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-		"$1.73/hr",
+		"$1.69/hr", "$0.04/hr", "$1.73/hr",
 	} {
-		if !strings.Contains(full, kept) {
-			t.Fatalf("--full lost %q from the ladder\n%s", kept, full)
+		if !strings.Contains(structured, kept) {
+			t.Fatalf("structured output lost %q from the ladder\n%s", kept, structured)
 		}
 	}
 	if strings.Contains(full, "STORAGE") || strings.Contains(full, "GPU PRICE") {
