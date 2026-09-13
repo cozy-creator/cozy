@@ -170,13 +170,12 @@ func (r *Resolver) childAccelerator(parent records.Request) (string, *exit.Error
 	return row.AcceleratorModel, nil
 }
 
-// UnpublishedChildModels is every captured callee's declared model selection, with its rung
-// still open. Two consumers, one reading: the machine decision uses it so a composition
-// whose parent holds no model of its own can still use available authored/default
-// ladders for placement. Capturing a callable does not invoke it or establish its
-// future model arguments; absent selections are checked when the child is called.
+// UnpublishedChildModels supplies captured defaults for a CPU request's rental choice.
+// An accelerator-owning request is sized from its own model slots: install-wide
+// callable capture does not mean those children are invoked or resident alongside it.
+// As with PrivateRentalNeedsAccelerator, only CPU orchestration needs the traversal.
 func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.ModelRef, *exit.Error) {
-	if request.InstallID == "" {
+	if request.NeedsAccelerator || request.InstallID == "" {
 		return nil, nil
 	}
 	var out []records.ModelRef

@@ -182,9 +182,13 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 		}
 		select {
 		case result := <-done:
-			// Another concurrent auto-start may be the winner. Keep observing the
-			// shared lock/credential readiness until it appears or that process exits.
+			// A clean child exit is the idempotent "another owner" path. A probe
+			// can briefly hold that same flock, so re-elect if no owner remains.
+			// Keep the original deadline and never replace a live owner.
 			childResult, child = &result, nil
+			if result.err == nil {
+				started, childResult = false, nil
+			}
 		case <-tick.C:
 		case <-timeout.C:
 			return daemon.State{}, false, exit.Named(exit.Unavailable, "daemon_startup_timeout",

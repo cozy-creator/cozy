@@ -1959,7 +1959,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if status == "canceled" {
 		humanStatus = humanCancellationStatus(life.CanceledBy)
 	}
-	e := exit.Named(code, humanStatus, "request %s ended %s", life.RequestID, humanStatus)
+	e := exit.Named(code, status, "request %s ended %s", life.RequestID, humanStatus)
 	errType, why := life.ErrorType, life.Error
 	if why == "" && terminal != nil {
 		// A request that failed BEFORE ANY ATTEMPT has no attempt row to carry a cause —

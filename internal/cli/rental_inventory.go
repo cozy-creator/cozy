@@ -94,5 +94,5 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 			Hub: op.Hub, RentedAt: op.CreatedAt, BoughtFor: op.ManagedRequestID, Operation: op.Key,
 		})
 	}
-	return result, nil
+	return result.Current(), nil
 }
