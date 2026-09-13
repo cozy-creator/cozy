@@ -28,6 +28,8 @@ from tensorfs.derived import (
     Tensor,
     derive,
     serve_derived,
+    serve_derived_replay,
+    serve_source,
 )
 
 WORK = "sha256:" + "ab" * 32
@@ -448,6 +450,93 @@ def exercise():
             raise AssertionError("native inspection accepted an absent component")
         print("PASS typed source inspection preserves native identity, geometry and config bytes", flush=True)
 
+        # Source metadata/config bytes use the exact-source descriptor as well;
+        # the client need not open a Store, even for a config larger than control.
+        large_config = b'{"text":"' + b"x" * (2 << 20) + b'"}'
+        writer = open_writer(store, 22, config_plan, 4096 + len(large_config))
+        writer.add_part("model", "weight", "value", io.BytesIO(bytes(4096)))
+        writer.add_config("model.json", io.BytesIO(large_config))
+        large_ref = writer.commit()["manifest"]
+        fixed = Source("sha256:" + large_ref["sha256"], large_ref["length"])
+        left, right = socket.socketpair()
+        failures = []
+
+        def inspect_owner():
+            try:
+                serve_source(store, fixed, right.detach(), check_current=lambda: None,
+                             admit_io=lambda: contextlib.nullcontext())
+            except Exception as error:
+                failures.append(error)
+
+        inspector = threading.Thread(target=inspect_owner, daemon=True)
+        inspector.start()
+        with SourceCapability.from_fd(fixed.manifest, fixed.length, left.detach()) as source:
+            actual = source.inspect()
+            assert actual.source == fixed
+            assert actual.configs == {"model.json": large_config}
+            assert actual.components["model"]["weight"].shape == (4096,)
+        inspector.join(10)
+        assert not inspector.is_alive() and not failures
+
+        replay_receipt = store.derived_lookup(identity(22))["receipt"]
+        recorded = []
+        left, right = socket.socketpair()
+
+        def replay_owner():
+            serve_derived_replay(replay_receipt, right.detach(), check_current=lambda: None,
+                                 record_receipt=recorded.append)
+
+        replay_thread = threading.Thread(target=replay_owner, daemon=True)
+        replay_thread.start()
+        replayed = DerivedTransaction.accept(left.detach())
+        assert replayed.receipt == replay_receipt and replayed.commit() == replay_receipt
+        assert recorded == [replay_receipt]
+        replay_thread.join(10)
+        assert not replay_thread.is_alive()
+        owner = Owner(open_writer(store, 23, small, 4096))
+        assert owner.client._call("receipt") is None
+        owner.finish()
+        print("PASS exact-source descriptor, multi-frame config and recorded native replay handoff", flush=True)
+
+        # Selection is a set; inspection preserves the artifact's constructor order.
+        plain = dict(tensorfs.seed_digests())["plain/1"]
+        ordered_plan = Derivation({}, {
+            "z-last": Target(add={"z-weight": Tensor("u8", (8,), plain, {"value": Part("u8", (8,))})}),
+            "a-first": Target(add={"a-weight": Tensor("u8", (8,), plain, {"value": Part("u8", (8,))})}),
+        }, {}, [("z-last", "z-weight"), ("a-first", "a-weight")])
+        writer = open_writer(store, 24, ordered_plan, 16)
+        writer.add_part("z-last", "z-weight", "value", io.BytesIO(bytes(8)))
+        writer.add_part("a-first", "a-weight", "value", io.BytesIO(bytes(8)))
+        ordered = writer.commit()["manifest"]
+        ordered_source = Source("sha256:" + ordered["sha256"], ordered["length"])
+        native_order = store.inspect_derived_source(ordered_source.manifest, ordered_source.length, ["a-first", "z-last"], [])
+        assert [row["name"] for row in native_order["components"]] == ["z-last", "a-first"]
+        left, right = socket.socketpair()
+        refused_components = []
+        def serve_ordered_source():
+            try:
+                serve_source(
+                    store, ordered_source, right.detach(), check_current=lambda: None,
+                    admit_io=lambda: contextlib.nullcontext(),
+                )
+            except tensorfs.errors.Refusal as exc:
+                refused_components.append(exc.code)
+        ordered_thread = threading.Thread(target=serve_ordered_source, daemon=True)
+        ordered_thread.start()
+        with SourceCapability.from_fd(ordered_source.manifest, ordered_source.length, left.detach()) as ordered_capability:
+            ordered_view = ordered_capability.inspect(components=["a-first", "z-last"])
+            try:
+                ordered_capability.inspect(components=["z-last", "absent"])
+            except tensorfs.errors.Refusal as exc:
+                assert exc.code == "MISSING_FIELD"
+            else:
+                raise AssertionError("scoped inspection silently omitted an absent component")
+        ordered_thread.join(10)
+        assert not ordered_thread.is_alive()
+        assert refused_components == ["MISSING_FIELD"]
+        assert tuple((component, key) for component, rows in ordered_view.components.items() for key in rows) == tuple(ordered_plan.order)
+        print("PASS native source inspection and FD selection preserve nonlexical construction order", flush=True)
+
         # Real process exit at native commit; no in-memory callback state survives.
         left, right = socket.socketpair()
         child = subprocess.Popen(
@@ -495,8 +584,36 @@ def isolation():
     )
     with tempfile.TemporaryDirectory(prefix="tensorfs-scoped-uid-") as root:
         store = tensorfs.Store.init(Path(root) / "store")
+        config_bytes = b'{"text":"' + b"x" * (2 << 20) + b'"}'
+        plan = declaration(4096)
+        configured = Derivation(plan.sources, plan.targets, {"model.json": Config("add")}, plan.order)
+        source_writer = open_writer(store, 31, configured, 4096 + len(config_bytes))
+        source_writer.add_part("model", "weight", "value", io.BytesIO(bytes(4096)))
+        source_writer.add_config("model.json", io.BytesIO(config_bytes))
+        source_receipt = source_writer.commit()
+        manifest = source_receipt["manifest"]
+        source = Source("sha256:" + manifest["sha256"], manifest["length"])
         writer = open_writer(store, 30, declaration(4096), 4096)
         left, right = socket.socketpair()
+        source_left, source_right = socket.socketpair()
+        replay_left, replay_right = socket.socketpair()
+        replay_recorded = []
+        errors = []
+
+        def inspect_owner():
+            try:
+                serve_source(store, source, source_right.detach(), check_current=lambda: None,
+                             admit_io=lambda: contextlib.nullcontext())
+            except Exception as exc:
+                errors.append(exc)
+
+        def replay_owner():
+            try:
+                serve_derived_replay(source_receipt, replay_right.detach(),
+                                     check_current=lambda: None, record_receipt=replay_recorded.append)
+            except Exception as exc:
+                errors.append(exc)
+
         child = subprocess.Popen(
             [
                 sys.executable,
@@ -504,10 +621,20 @@ def isolation():
                 "--isolated-client",
                 store.root,
                 str(left.fileno()),
+                str(source_left.fileno()),
+                source.manifest,
+                str(source.length),
+                str(replay_left.fileno()),
             ],
-            pass_fds=(left.fileno(),),
+            pass_fds=(left.fileno(), source_left.fileno(), replay_left.fileno()),
         )
         left.close()
+        source_left.close()
+        replay_left.close()
+        inspector = threading.Thread(target=inspect_owner, daemon=True)
+        replayer = threading.Thread(target=replay_owner, daemon=True)
+        inspector.start()
+        replayer.start()
         receipts = []
         serve_derived(
             writer,
@@ -521,10 +648,14 @@ def isolation():
             record_receipt=receipts.append,
         )
         assert child.wait(10) == 0
+        inspector.join(10)
+        replayer.join(10)
+        assert not inspector.is_alive() and not replayer.is_alive() and not errors
         assert len(receipts) == 1
         assert store.derived_lookup(identity(30))["receipt"] == receipts[0]
+        assert replay_recorded == [source_receipt]
         print(
-            "PASS UID65533 cannot open the Store but can write its exact granted native output",
+            "PASS UID65533 cannot open the Store but can inspect its exact source, read a 2MiB config, write its granted output and receive recorded native replay",
             flush=True,
         )
 
@@ -533,7 +664,7 @@ def main():
     if sys.argv[1:] == ["--isolation"]:
         isolation()
         return
-    if len(sys.argv) == 4 and sys.argv[1] == "--isolated-client":
+    if len(sys.argv) == 8 and sys.argv[1] == "--isolated-client":
         # CI's interpreter can live below a private runner directory. Bootstrap
         # imports first, then irreversibly drop every UID/group before opening any
         # Store or using the exact inherited writer FD. No Store handle crosses.
@@ -549,6 +680,13 @@ def main():
             pass
         else:
             raise AssertionError("isolated client opened the privileged Store")
+        with SourceCapability.from_fd(sys.argv[5], int(sys.argv[6]), int(sys.argv[4])) as source:
+            actual = source.inspect()
+            assert actual.configs["model.json"] == b'{"text":"' + b"x" * (2 << 20) + b'"}'
+            assert actual.components["model"]["weight"].shape == (4096,)
+        replayed = DerivedTransaction.accept(int(sys.argv[7]))
+        assert replayed.receipt is not None
+        assert "sha256:" + replayed.receipt["manifest"]["sha256"] == sys.argv[5]
         with DerivedTransaction(int(sys.argv[3])) as client:
             client.add_part("model", "weight", "value", b"q" * 4096)
             client.checkpoint()

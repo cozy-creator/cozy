@@ -146,6 +146,19 @@ class DerivedTransaction:
         value.receipt = dict(receipt)
         return value
 
+    @classmethod
+    def accept(cls, fd: int) -> DerivedTransaction:
+        """Receive the owner's live-writer or validated committed-result decision."""
+        value = cls(fd)
+        receipt = value._call("receipt")
+        if receipt is not None:
+            if not isinstance(receipt, dict):
+                value.close()
+                raise ChannelRefusal("WRONG_TYPE", "native receipt must be an object")
+            value.receipt = receipt
+            value.close()
+        return value
+
     def _open(self) -> _Channel:
         if self._channel is None:
             raise ChannelRefusal("TRANSACTION_CLOSED", "derived handle is closed")
@@ -406,6 +419,7 @@ def serve_derived(
                     check_current()
             else:
                 if op not in (
+                    "receipt",
                     "completed_parts",
                     "completed_configs",
                     "checkpoint",
@@ -418,7 +432,9 @@ def serve_derived(
                 _fields(frame, op, ())
                 with admit_io(op, 0):
                     check_current()
-                    if op == "completed_parts":
+                    if op == "receipt":
+                        result = None
+                    elif op == "completed_parts":
                         result = writer.completed_parts()
                     elif op == "completed_configs":
                         result = writer.completed_configs()
@@ -456,3 +472,31 @@ def serve_derived(
     finally:
         channel.close()
         writer.fence()
+
+
+def serve_derived_replay(
+    receipt: Mapping[str, Any],
+    fd: int,
+    *,
+    check_current: Callable[[], None],
+    record_receipt: Callable[[dict[str, Any]], None],
+) -> None:
+    """Deliver retained native custody selected by the trusted execution owner."""
+    channel = _Channel(fd)
+    try:
+        request = channel.receive()
+        if not isinstance(request, dict):
+            raise ChannelRefusal("WRONG_TYPE", "expected a receipt request")
+        _fields(request, "receipt", ())
+        check_current()
+        facts = dict(receipt)
+        record_receipt(facts)
+        channel.send({"result": facts})
+    except EOFError:
+        return
+    except Exception as exc:
+        with contextlib.suppress(OSError, EOFError):
+            channel.send({"error": str(getattr(exc, "code", "IO_FAILED")), "detail": "native receipt owner refused"})
+        raise
+    finally:
+        channel.close()

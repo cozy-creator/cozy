@@ -2005,6 +2005,19 @@ fn inspect_retained_source(
         code: Code::ROOT_ABSENT,
         detail: "source inspection resolved no source".into(),
     })?;
+    for component in &component_names {
+        if !source
+            .header
+            .components
+            .iter()
+            .any(|(name, _)| name == component)
+        {
+            return refuse(
+                Code::MISSING_FIELD,
+                format!("source has no component {component:?}"),
+            );
+        }
+    }
     let configs = config_names
         .iter()
         .map(|name| {
