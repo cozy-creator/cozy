@@ -198,6 +198,9 @@ func (c *Orchestrator) route(req records.Request) routing {
 	claims := c.claimsAhead(req.ID)
 	var out routing
 	for _, w := range c.workers {
+		if w.preparingRequest != "" && (!w.preparingReady || w.preparingRequest != req.ID) {
+			continue
+		}
 		slot, ok := c.eligible(w, req, planID)
 		if !ok {
 			continue
@@ -251,9 +254,17 @@ func (c *Orchestrator) route(req records.Request) routing {
 // take. Callers hold c.mu.
 func (c *Orchestrator) claimsAhead(requestID string) map[laneKey]string {
 	claims := map[laneKey]string{}
+	current, _ := c.opt.Store.RequestRow(requestID)
+	inherited := current != nil && c.activeChild(*current)
 	for _, id := range c.pending {
 		if id == requestID {
 			break
+		}
+		if inherited {
+			prior, problem := c.opt.Store.RequestRow(id)
+			if problem == nil && prior != nil && prior.Worker == current.Worker && prior.ParentRequestID != current.ParentRequestID {
+				continue
+			}
 		}
 		p := c.parked[id]
 		if p == nil || !p.claims() {

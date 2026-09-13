@@ -340,8 +340,14 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		return
 	}
 	if w.spec.IsJob() {
+		ownedChild := false
+		if w.preparingRequest != "" && w.orchestrationParent != nil {
+			request, problem := c.opt.Store.RequestRow(w.preparingRequest)
+			ownedChild = problem == nil && request != nil && request.ParentRequestID != "" &&
+				c.rentalPreparationAllowedLocked(w, *request) == nil
+		}
 		retained, problem := c.opt.Store.RentalHasRetainedJob(w.spec.Connection.RentalID)
-		if problem != nil || retained || !c.idleRentalWorkerLocked(w) {
+		if !ownedChild && (problem != nil || retained || !c.idleRentalWorkerLocked(w)) {
 			c.mu.Unlock()
 			c.setDesiredUnavailable(w, seq, exit.Unavailablef("rented worker is finishing its current job before changing mode"))
 			return

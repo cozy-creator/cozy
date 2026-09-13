@@ -795,7 +795,7 @@ func (c *Orchestrator) drain() {
 			c.forget(id)
 			continue
 		}
-		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] {
+		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] && !c.activeChild(*req) {
 			c.park(*req, position, waitFacts{}, "an earlier request is waiting on this rental")
 			continue
 		}

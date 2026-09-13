@@ -429,7 +429,9 @@ type worker struct {
 	// desiredUnpublishedPlacement is the model-only join for the already-prepared private
 	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
 	desiredUnpublishedPlacement *pb.DesiredPrivatePlacementSet
-	orchestrationParent     *pb.JobDirective
+	orchestrationParent         *pb.JobDirective
+	preparingRequest            string // the one request whose private preparation owns this worker
+	preparingReady              bool   // its exact desired state is ready for the dispatch at the end of preparation
 	// desiredEpoch is the control-stream epoch the local desire above was issued on. A
 	// desire issued on the live session and not refused is in flight or done; the same one
 	// asked again waits on the pod's report rather than asking the pod to prepare twice.

@@ -705,6 +705,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	if req.IsJob() {
 		slot += "/job/" + req.Entrypoint
 	}
+	if req.Worker != "" {
+		slot = "rental-prepare/" + req.Worker
+	}
 	c.mu.Lock()
 	if c.starting[slot] {
 		for _, guard := range guards {
@@ -791,6 +794,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		// launch bounced off it too.
 		done := func() {
 			c.mu.Lock()
+			if w := c.workers[rentalInstanceID(req.Worker)]; req.Worker != "" && w != nil && w.preparingRequest == req.ID {
+				w.preparingRequest, w.preparingReady = "", false
+			}
 			for _, guard := range guards {
 				delete(c.starting, guard)
 			}
@@ -863,6 +869,11 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			c.failQueued(req.ID, autoRentalGate(req, e), instance)
 			return
 		}
+		c.mu.Lock()
+		if w := c.workers[instance]; w != nil && w.preparingRequest == req.ID {
+			w.preparingReady = true
+		}
+		c.mu.Unlock()
 		c.drain()
 		done()
 		// The launch is over and the queue's world has changed: whatever is at the head now
@@ -1147,6 +1158,9 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
 		}
 	}
+	if problem := c.claimRentalPreparation(instance, req); problem != nil {
+		return WorkerLaunchSpec{}, "", problem
+	}
 	var jobPrepared *pb.DesiredPlacementSet
 	if req.InstallID != "" {
 		if c.opt.Packages == nil || !validDigest(req.LocalPackageDigest) {
@@ -1164,22 +1178,13 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 				"local_package_revision_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
-		var parent *pb.JobDirective
-		if req.ParentRequestID != "" {
-			plan, problem := c.retainedOrchestrationParent(req)
-			if problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-			parent = c.jobDirective(plan)
-		}
-		c.mu.Lock()
-		if worker := c.workers[instance]; worker != nil {
-			worker.orchestrationParent = parent
-		}
-		c.mu.Unlock()
 		if req.IsJob() {
 			jobPrepared, problem = c.prepareLocalJob(instance, req, revision)
 			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+		} else if req.ParentRequestID != "" {
+			if problem := c.prepareChildServing(instance, req, revision); problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
 		} else if e := c.ConvergeLocalPackage(instance, req.ID, revision,
@@ -1188,15 +1193,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			}); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		if !req.IsJob() && len(logical.Models) > 0 && req.ParentRequestID != "" {
-			native, problem := c.nativeServingModels(req)
-			if problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-			if problem := c.convergeUnpublishedModels(instance, req.ID, req.LocalPackageDigest, nil, native); problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-		} else if !req.IsJob() && len(logical.Models) > 0 {
+		if !req.IsJob() && len(logical.Models) > 0 && req.ParentRequestID == "" {
 			models := downloadModelRefs(logical.Models)
 			if len(models) != len(logical.Models) {
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
