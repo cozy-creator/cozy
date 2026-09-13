@@ -7,14 +7,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// Run venues describe actual attempts. A provisional rental assignment remains
-// in the local queue; its raw identity stays available without claiming execution.
-// Once an attempt exists, its recorded machine survives rental cleanup.
+// The machine column names the selected venue even while the request is queued.
+// Status and attempt facts still distinguish a local queue from remote execution.
+// The recorded machine survives rental cleanup.
 func TestRunListMachineColumn(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "machine-column")
 	must(t, os.RemoveAll(root))
@@ -93,8 +94,8 @@ func TestRunListMachineColumn(t *testing.T) {
 	if row := rows["req-machine-unclaimed"]; row.Status != "queued" || row.Machine != "" {
 		t.Fatalf("an unclaimed --rental run must wait with a BLANK machine: %+v", row)
 	}
-	if row := rows["req-machine-claimed"]; row.Status != "queued" || row.Machine != "" {
-		t.Fatalf("a provisionally assigned run must keep its execution venue blank: %+v", row)
+	if row := rows["req-machine-claimed"]; row.Status != "queued" || row.Machine != "otter" {
+		t.Fatalf("a selected queued run must show its planned machine: %+v", row)
 	}
 	if rows["req-machine-unclaimed"].Number < 1 || rows["req-machine-claimed"].Number < 1 {
 		t.Fatalf("the venue must never replace the monotonic number: %+v", rows)
@@ -109,11 +110,11 @@ func TestRunListMachineColumn(t *testing.T) {
 	// The default JSON document carries the field too — machine is a first-class column,
 	// not a --full extra.
 	if code, out := runCozy(t, root, "run", "list", "--json"); code != 0 ||
-		strings.Contains(out, `"machine":"otter"`) || !strings.Contains(out, `"machine":""`) {
+		!strings.Contains(out, `"machine":"otter"`) || !strings.Contains(out, `"machine":""`) {
 		t.Fatalf("default run list JSON lost the machine field [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "list"); code != 0 ||
-		!strings.Contains(out, "MACHINE") || strings.Contains(out, "otter") {
+		!strings.Contains(out, "MACHINE") || !strings.Contains(out, "otter") {
 		t.Fatalf("human run list does not show the MACHINE column [exit %d]\n%s", code, out)
 	}
 	// A pipe is always one snapshot: automation never inherits an endless refresh loop.
@@ -137,14 +138,28 @@ func TestRunListMachineColumn(t *testing.T) {
 		t.Fatalf("package filtering did not precede the list limit [exit %d]\n%s", code, out)
 	}
 
-	// Provisional assignment alone must not make queued work look remote.
+	// Assignment makes the planned venue visible; it does not start an attempt.
 	assigned, problem := store.PinRental("req-machine-unclaimed", "pr-machine-column", nil)
 	fatal(t, problem)
 	if !assigned {
 		t.Fatal("the queued run refused its rental assignment")
 	}
-	if row := listRuns()["req-machine-unclaimed"]; row.Machine != "" {
-		t.Fatalf("provisional assignment became an execution venue: %+v", row)
+	if row := listRuns()["req-machine-unclaimed"]; row.Machine != "otter" || row.Attempts != 0 || row.Status != "queued" {
+		t.Fatalf("selected venue lost its queued status: %+v", row)
+	}
+	// Replanning must not show the previous rental's retained historical name.
+	released, problem := store.ReleaseUnattemptedRentalAssignment("req-machine-unclaimed", "pr-machine-column")
+	fatal(t, problem)
+	if !released {
+		t.Fatal("unattempted automatic assignment was not released")
+	}
+	if row := listRuns()["req-machine-unclaimed"]; row.Machine != "" || row.RentalID != "" {
+		t.Fatalf("released assignment still appears selected: %+v", row)
+	}
+	assigned, problem = store.PinRental("req-machine-unclaimed", "pr-machine-column", nil)
+	fatal(t, problem)
+	if !assigned {
+		t.Fatal("queued run could not select its rental again")
 	}
 	// An explicit rental preference is still local waiting until an attempt starts.
 	_, _, problem = store.Submit(records.Request{
@@ -153,8 +168,8 @@ func TestRunListMachineColumn(t *testing.T) {
 		Rental: true, RequestedRental: "pr-machine-column",
 	})
 	fatal(t, problem)
-	if row := listRuns()["req-machine-explicit"]; row.Machine != "" || row.RequestedRental != "pr-machine-column" {
-		t.Fatalf("explicit affinity became a remotely queued attempt: %+v", row)
+	if row := listRuns()["req-machine-explicit"]; row.Machine != "otter" || row.RequestedRental != "pr-machine-column" || row.Attempts != 0 || row.Status != "queued" {
+		t.Fatalf("explicit affinity lost its planned machine or queued state: %+v", row)
 	}
 	if code, out := runCozy(t, root, "run", "list", "--package=fake/explicit"); code != 0 ||
 		!strings.Contains(out, "waiting for rental otter") {
@@ -191,7 +206,8 @@ func TestRunListMachineColumn(t *testing.T) {
 		}
 	}
 
-	// Acquisition mints a planned machine word, but no execution venue exists yet.
+	// An acquisition intent without a current phase is not yet a selected machine.
+	// The same recorded name can also belong to an unpinned earlier rental.
 	submit("req-machine-acquiring", "")
 	op, replay, problem := store.BeginRentalOperation(records.RentalOperation{
 		Key: "op-machine-acquiring", Hub: "http://127.0.0.1:1",
@@ -213,7 +229,7 @@ func TestRunListMachineColumn(t *testing.T) {
 		t.Fatalf("the rental operation minted no machine word: %s", op.RequestBody)
 	}
 	if row := listRuns()["req-machine-acquiring"]; row.Machine != "" || row.RentalID != "" {
-		t.Fatalf("acquisition without an attempt must leave the venue blank "+
+		t.Fatalf("acquisition with no current phase must leave its venue blank "+
 			"(want %q, no rental id yet): %+v", minted.Name, row)
 	}
 
@@ -221,5 +237,30 @@ func TestRunListMachineColumn(t *testing.T) {
 	if code, out := runCozy(t, root, "run", "list"); code != 0 ||
 		!strings.Contains(out, "otter") || strings.Contains(out, "pr-") {
 		t.Fatalf("default human run list must show words, never a pr- id [exit %d]\n%s", code, out)
+	}
+}
+
+// Older daemons already carry the pinned or preparing machine in separate facts.
+// A new client must show those facts without requiring a daemon restart.
+func TestQueuedRunMachineProjection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		life api.Lifecycle
+		want string
+	}{
+		{"pinned", api.Lifecycle{Status: "queued", RequestedMachine: "shuutarou"}, "shuutarou"},
+		{"downloading", api.Lifecycle{Status: "queued", Phase: "downloading", PhaseMachine: "shuutarou"}, "shuutarou"},
+		{"new pin supersedes previous phase", api.Lifecycle{Status: "queued", RequestedMachine: "new-pod", PhaseMachine: "old-pod"}, "new-pod"},
+		{"current selection", api.Lifecycle{Status: "queued", Machine: "selected", PhaseMachine: "old-pod"}, "selected"},
+		{"attempt", api.Lifecycle{Status: "in_progress", Machine: "executing", RequestedMachine: "planned", PhaseMachine: "preparing"}, "executing"},
+		{"completed", api.Lifecycle{Status: "completed", Machine: "historical", PhaseMachine: "preparing"}, "historical"},
+		{"unassigned", api.Lifecycle{Status: "queued"}, ""},
+		{"stale phase after failure", api.Lifecycle{Status: "failed", PhaseMachine: "old-pod"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.life.DisplayMachine(); got != tc.want {
+				t.Fatalf("machine = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
