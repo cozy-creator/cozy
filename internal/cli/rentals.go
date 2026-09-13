@@ -777,8 +777,13 @@ func rentalFailureCode(r hub.Rental) string {
 }
 
 func rentalProvisionFailure(id string, r hub.Rental) *exit.Error {
-	return exit.Named(exit.Failed, rentalFailureCode(r),
-		"rental %s failed to provision: %s", id, detailOr(r.Detail)).
+	refusal := exit.Named(exit.Failed, rentalFailureCode(r),
+		"rental %s failed to provision: %s", id, detailOr(r.Detail))
+	if rentalFailureCode(r) == "provider_create_did_not_happen" {
+		return refusal.WithRemedy("Please try again later or rent a different GPU.").
+			WithNext("cozy rental new")
+	}
+	return refusal.
 		WithRemedy("the pod is the hub's to reclaim; `cozy rental end %s` closes it out", id).
 		WithNext("cozy rental end " + id)
 }
