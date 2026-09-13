@@ -569,26 +569,36 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 		}
 		return ladder[i].Name < ladder[j].Name
 	})
+	human := ctx.Mode().Human && !ctx.Mode().JSON
+	acceleratorColumn := "gpu"
+	if human {
+		acceleratorColumn = "accelerator"
+	}
 	rows := make([]map[string]string, 0, len(ladder))
 	for _, sku := range ladder {
-		// The Hub quotes the GPU plus its default disk. Keep one combined price
-		// in both normal and expanded tables; pricing policy belongs to the Hub.
+		// The displayed price includes both compute and storage. Structured output
+		// retains the components and the provider accelerator identity.
 		rows = append(rows, map[string]string{
-			"name": sku.Name, "gpu": acceleratorLabel(sku.AcceleratorModel, sku.AcceleratorCount),
+			"name": sku.Name, acceleratorColumn: acceleratorLabel(sku.AcceleratorModel, sku.AcceleratorCount),
 			"accelerator model": sku.AcceleratorModel,
 			"accelerator count": strconv.Itoa(sku.AcceleratorCount),
 			"compute":           computeCapabilityText(sku.ComputeCapability),
 			"vram":              fmt.Sprintf("%d GB", sku.VRAMGB),
+			"gpu price":         rentalPrice(sku.PriceUSDMicrosPerHour),
+			"storage price":     rentalPrice(sku.StorageUSDMicrosPerHour),
 			"price":             rentalPrice(total(sku)),
 		})
 	}
 	doc := output.List{
 		Name:   "gpus",
-		Fields: []string{"name", "gpu", "compute", "vram", "price"},
+		Fields: []string{"name", acceleratorColumn, "compute", "vram", "price"},
 		AllFields: []string{"name", "gpu", "accelerator model", "accelerator count", "compute",
-			"vram", "price"},
+			"vram", "gpu price", "storage price", "price"},
 		Rows: rows, Total: len(rows),
 		Next: []string{"cozy rental new <machine-slug>"},
+	}
+	if human {
+		doc.AllFields = doc.Fields
 	}
 	return emit(ctx, doc)
 }
