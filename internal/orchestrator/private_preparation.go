@@ -40,8 +40,7 @@ func (c *Orchestrator) rentalPreparationAllowedLocked(w *worker, req records.Req
 	// share its existing serving slots. The captured job/executor replacement
 	// fence must not serialize those ordinary co-tenants. A CPU composition
 	// parent still owns the machine even after its first child began serving.
-	if parent == nil && !req.IsJob() && req.InstallID == "" && !w.spec.IsJob() &&
-		w.orchestrationParent == nil && c.rentalParentAllows(w, req) {
+	if c.ordinaryServingPreparation(w, req) {
 		return nil
 	}
 	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
@@ -74,6 +73,12 @@ func (c *Orchestrator) claimRentalPreparation(instance string, req records.Reque
 	if problem := c.rentalPreparationAllowedLocked(w, req); problem != nil {
 		return problem
 	}
+	// An ordinary serving prewarm may leave a useful immutable placement after
+	// its request is canceled. Do not attach that request's execution fence to
+	// later independent placement convergence on this worker.
+	if c.ordinaryServingPreparation(w, req) {
+		return nil
+	}
 	parent, problem := c.activeParentFor(req)
 	if problem != nil {
 		return problem
@@ -81,6 +86,11 @@ func (c *Orchestrator) claimRentalPreparation(instance string, req records.Reque
 	w.preparingRequest, w.preparingReady = req.ID, false
 	w.orchestrationParent = parent
 	return nil
+}
+
+func (c *Orchestrator) ordinaryServingPreparation(w *worker, req records.Request) bool {
+	return req.ParentRequestID == "" && !req.IsJob() && req.InstallID == "" && !w.spec.IsJob() &&
+		w.orchestrationParent == nil && c.rentalParentAllows(w, req)
 }
 
 // A parent awaiting its child cannot complete behind an unrelated root's FIFO
