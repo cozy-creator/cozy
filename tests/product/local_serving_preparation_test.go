@@ -34,6 +34,8 @@ type servingSeed struct {
 	Manifest         string           `json:"manifest"`
 	Length           int64            `json:"length"`
 	ManifestJSON     string           `json:"manifest_json"`
+	HeaderDigest     string           `json:"header_digest"`
+	SourceRoot       string           `json:"source_root"`
 	HeaderComponents []string         `json:"header_components"`
 	ComponentBytes   map[string]int64 `json:"component_bytes"`
 	Bytes            int64            `json:"weight_bytes"`
@@ -136,12 +138,21 @@ type servingPreparationEvent struct {
 func servingModelCatalog(t *testing.T, seed servingSeed) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
+	var server *httptest.Server
+	readObject := func(id string) ([]byte, error) {
+		path := filepath.Join(t.TempDir(), "object")
+		if err := exec.Command("tfs", "get", seed.SourceRoot, strings.TrimPrefix(id, "sha256:"), "--out", path).Run(); err != nil {
+			return nil, err
+		}
+		return os.ReadFile(path)
+	}
 	mux.HandleFunc("GET /v1/models/proof/ordered", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(hub.ModelCard{
 			Model: hub.Resource{Org: "proof", Name: "ordered"},
 			Releases: []hub.ModelReleaseSummary{{
 				ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0"},
-				Lanes:          []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: seed.Manifest, Bytes: seed.Bytes}},
+				Lanes: []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: seed.Manifest,
+					Components: seed.HeaderComponents, ComponentBytes: seed.ComponentBytes, Bytes: seed.Bytes}},
 			}},
 		})
 	})
@@ -156,11 +167,39 @@ func servingModelCatalog(t *testing.T, seed servingSeed) *httptest.Server {
 		}
 		_ = json.NewEncoder(w).Encode(hub.ModelResolution{
 			Model: "proof/ordered", Release: "1.0.0", Lane: "bf16",
-			ManifestID: seed.Manifest, ManifestLength: seed.Length,
+			ManifestID: seed.Manifest, ManifestLength: seed.Length, HeaderID: seed.HeaderDigest,
 			Bytes: seed.Bytes, Components: seed.HeaderComponents, ComponentBytes: seed.ComponentBytes,
 		})
 	})
-	return httptest.NewServer(mux)
+	mux.HandleFunc("POST /v1/models/proof/ordered/releases/1.0.0/lanes/bf16/reads", func(w http.ResponseWriter, r *http.Request) {
+		var ask struct {
+			IDs []string `json:"object_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&ask); err != nil {
+			http.Error(w, "bad request", 400)
+			return
+		}
+		reads := make([]hub.Read, 0, len(ask.IDs))
+		for _, id := range ask.IDs {
+			body, err := readObject(id)
+			if err != nil {
+				http.Error(w, "native object absent", 404)
+				return
+			}
+			reads = append(reads, hub.Read{ObjectID: id, Length: int64(len(body)), URL: server.URL + "/objects/" + id})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"reads": reads})
+	})
+	mux.HandleFunc("GET /objects/{id}", func(w http.ResponseWriter, r *http.Request) {
+		body, err := readObject(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "native object absent", 404)
+			return
+		}
+		_, _ = w.Write(body)
+	})
+	server = httptest.NewServer(mux)
+	return server
 }
 
 func preparationEvents(t *testing.T, path string) []servingPreparationEvent {

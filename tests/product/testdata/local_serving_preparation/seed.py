@@ -50,6 +50,8 @@ def main() -> None:
     header = tensorfs.parse_header(bytes(held["header"]))
     print(json.dumps({
         "manifest": manifest,
+        "header_digest": "sha256:" + hashlib.sha256(bytes(held["header"])).hexdigest(),
+        "source_root": str(root),
         "length": length,
         "manifest_json": bytes(held["manifest"]).decode(),
         "header_components": list(header["components"]),

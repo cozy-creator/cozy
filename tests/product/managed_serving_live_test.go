@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,7 +15,11 @@ import (
 
 // A plain script produces a retained native model, then calls the original GPU
 // serving function twice, observing capture without memoizing inference.
-func TestOrdinaryScriptNativeModelServing(t *testing.T) {
+func TestOrdinaryScriptNativeModelServing(t *testing.T) { ordinaryScriptModelServing(t, false) }
+
+func TestOrdinaryScriptMixedModelServing(t *testing.T) { ordinaryScriptModelServing(t, true) }
+
+func ordinaryScriptModelServing(t *testing.T, mixed bool) {
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires the exact wire44 Runtime candidate wheel")
 	}
@@ -22,8 +27,10 @@ func TestOrdinaryScriptNativeModelServing(t *testing.T) {
 	must(t, err)
 	version := strings.Split(filepath.Base(wheel), "-")[1]
 	control := filepath.Join(t.TempDir(), "control")
+	// Real worker images own the heavy numerical dependencies. Keep that boundary
+	// here so preparing this tiny package does not copy a second CUDA installation.
 	for _, args := range [][]string{{"venv", control, "--python", "3.12"},
-		{"pip", "install", "--python", filepath.Join(control, "bin", "python"), wheel}} {
+		{"pip", "install", "--python", filepath.Join(control, "bin", "python"), wheel, "torch>=2.13,<3", "numpy>=1.26"}} {
 		out, err := exec.Command("uv", args...).CombinedOutput()
 		if err != nil {
 			t.Fatalf("candidate environment: %v\n%s", err, out)
@@ -51,6 +58,27 @@ func TestOrdinaryScriptNativeModelServing(t *testing.T) {
 	must(t, os.MkdirAll(tools, 0700))
 	module, err := os.ReadFile(filepath.Join("testdata", "managed_serving", "model_tools.py"))
 	must(t, err)
+	if mixed {
+		seedSource, err := os.ReadFile(filepath.Join("testdata", "local_serving_preparation", "seed.py"))
+		must(t, err)
+		seedSource = []byte(strings.ReplaceAll(string(seedSource), "(\"alpha\", 2.0)", "(\"alpha\", 3.0)"))
+		seedFile := filepath.Join(project, "seed-base.py")
+		must(t, os.WriteFile(seedFile, seedSource, 0600))
+		seedBytes, err := exec.Command(filepath.Join(control, "bin", "python"), seedFile, filepath.Join(project, "catalog-store")).CombinedOutput()
+		if err != nil {
+			t.Fatalf("seed published base: %v\n%s", err, seedBytes)
+		}
+		var seed servingSeed
+		must(t, json.Unmarshal(seedBytes, &seed))
+		catalog := servingModelCatalog(t, seed)
+		defer catalog.Close()
+		must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte("tensorhub_url: "+catalog.URL+"\ntensorhub_token: local-serving-fixture\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+		module = []byte(strings.NewReplacer(
+			"@app.entrypoint\ndef generate", "@app.entrypoint(defaults={\"adapter\":[{\"gpu\":\"*\",\"lane\":\"proof/ordered@1.0.0/bf16\"}]})\ndef generate",
+			"model: OrderedModel, tel: Telemetry)", "model: OrderedModel, tel: Telemetry, adapter: OrderedModel)",
+			"return model.measure(payload.seed, payload.steps, tel)", "primary = model.measure(payload.seed, payload.steps, tel)\n    base = adapter.measure(payload.seed, payload.steps, tel)\n    assert primary.value != base.value\n    return msgspec.structs.replace(primary, value=primary.value + base.value)",
+		).Replace(string(module)))
+	}
 	must(t, os.WriteFile(filepath.Join(tools, "model_tools.py"), module, 0600))
 	metadata := fmt.Sprintf(`[project]
 name="model-tools"
@@ -72,6 +100,17 @@ only-include=["model_tools.py"]
 	body, err := os.ReadFile(filepath.Join("testdata", "managed_serving", "prepare.py"))
 	must(t, err)
 	body = []byte(strings.NewReplacer("__VERSION__", version, "__WHEEL__", strconv.Quote(wheel)).Replace(string(body)))
+	if mixed {
+		body = []byte(strings.ReplaceAll(string(body), "first = generate(seed=helper(), steps=2, model=model,\n        capture=ActivationCapture(components=(\"alpha\", \"zeta\"), steps=(0, 1)))", "first = generate(seed=helper(), steps=2, model=model)"))
+		lines := []string{}
+		for _, line := range strings.Split(string(body), "\n") {
+			if !strings.Contains(line, "assert first.observation") {
+				lines = append(lines, line)
+			}
+		}
+		body = []byte(strings.Join(lines, "\n"))
+	}
+
 	script := filepath.Join(project, "prepare.py")
 	must(t, os.WriteFile(script, body, 0600))
 	for run := range 2 {

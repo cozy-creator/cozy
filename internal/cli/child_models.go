@@ -3,17 +3,16 @@ package cli
 import (
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/scratch"
-	"github.com/cozy-creator/cozy/internal/tfs"
-	"github.com/cozy-creator/cozy/internal/transfer"
-
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/scratch"
+	"github.com/cozy-creator/cozy/internal/tfs"
+	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 // A captured child's model slot has ONE authority and it is not the calling package.

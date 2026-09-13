@@ -16,6 +16,12 @@ service path. `WireMinor` is its additive compatibility level. Additive changes 
 minor; independently negotiated optional capabilities are documented by the canonical
 protocol and default to unsupported, without inferring support from a version range. A breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
+This consumer cohort pins the official `2503fc1` generated snapshot at wire 49.
+It includes the independently negotiated mixed-input and model-materialization
+recovery capabilities. Later upstream wire 51 adds machine-execution RPCs that
+this cohort does not implement; copying those version constants would advertise
+support it does not provide. The capability fields remain identical upstream.
+
 `SOURCE` pins the upstream commit and per-file digests, matching what tensorhub and
 cozy-runtime already carry, so a hand edit or a stale re-vendor is detectable from this
 repository alone. When CI has permission to read the private worker-protocol repository, its
