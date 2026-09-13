@@ -25,11 +25,22 @@ import (
 var childHostLauncher = flag.String("child-host-launcher", "", "actual isolated PodHost container launcher")
 var childHostHome = flag.String("child-host-home", "", "new retained proof home; kept for native custody inspection")
 var childHostProject = flag.String("child-host-project", "", "optional replacement for the shared private source/candidate artifact fixture")
+var childHostUpdatable = flag.Bool("child-host-updatable", false, "task-owned worker SDK may differ from immutable base inventory")
+
 var childHostRuntimeBin = flag.String("child-host-runtime-bin", "", "installed matching Runtime bin directory")
 
 // Only the provider catalog/readback is a test peer. Both control planes, package
 // preparation, signed native effects and executors run in the actual Host image.
-func TestUnpublishedChildActualHostArtifacts(t *testing.T) {
+type actualChildHost struct {
+	Container   string `json:"container"`
+	Control     string `json:"control_address"`
+	Media       string `json:"media_url"`
+	Certificate string `json:"tls_certificate_path_in_container"`
+	Readiness   string `json:"readiness_url"`
+}
+
+func startActualChildHost(t *testing.T) (home.Layout, *records.Store, actualChildHost, string, func()) {
+	t.Helper()
 	if *childHostLauncher == "" || *childHostHome == "" || *childHostRuntimeBin == "" {
 		t.Skip("requires an explicit task-owned actual Host image and artifact fixture")
 	}
@@ -37,7 +48,7 @@ func TestUnpublishedChildActualHostArtifacts(t *testing.T) {
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 	identity, problem := rental.PendingCreatorIdentity(layout, "child-host-proof")
 	fatal(t, problem)
 	token, problem := rental.PendingMediaToken(layout, "child-host-proof")
@@ -54,13 +65,7 @@ func TestUnpublishedChildActualHostArtifacts(t *testing.T) {
 		must(t, os.WriteFile(filepath.Join(layout.Root, "host-container.json"), started, 0o600))
 	}
 	must(t, err)
-	var host struct {
-		Container   string `json:"container"`
-		Control     string `json:"control_address"`
-		Media       string `json:"media_url"`
-		Certificate string `json:"tls_certificate_path_in_container"`
-		Readiness   string `json:"readiness_url"`
-	}
+	var host actualChildHost
 	must(t, json.Unmarshal(started, &host))
 	host.Media = strings.TrimPrefix(host.Media, "https://")
 	t.Logf("actual Host container %s retained in %s", host.Container, layout.Root)
@@ -108,6 +113,10 @@ func TestUnpublishedChildActualHostArtifacts(t *testing.T) {
 	must(t, os.WriteFile(readinessPath, readiness, 0o600))
 	var ready struct {
 		WorkerBootID string `json:"pod_boot_id"`
+		GPUs         []struct {
+			Name   string `json:"device_name"`
+			Memory uint64 `json:"memory_bytes"`
+		} `json:"runtime_gpus"`
 	}
 	must(t, json.Unmarshal(readiness, &ready))
 	if ready.WorkerBootID == "" {
@@ -123,11 +132,36 @@ func TestUnpublishedChildActualHostArtifacts(t *testing.T) {
 			t.Fatal("Host restart replaced the retained public readiness identity")
 		}
 	}
+	profile, sku, accelerator := "python3.12-cpu-linux-x86", "cpu", "CPU"
+	if len(ready.GPUs) > 0 {
+		profile, sku, accelerator = "torch2.13.0-cu130-cp312-linux-x86", "gpu", ready.GPUs[0].Name
+	}
 	hub := newFakeRentalHub(t, 0)
-	hub.skus = []map[string]any{{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1, "price_usd_micros_per_hour": 1, "base_worker_profile": "python3.12-cpu-linux-x86"}}
+	hub.skus = []map[string]any{{"name": sku, "accelerator_model": accelerator, "accelerator_count": 1, "price_usd_micros_per_hour": 1, "base_worker_profile": profile}}
+	if len(ready.GPUs) > 0 {
+		capability, err := exec.Command("docker", "exec", host.Container, "nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader").Output()
+		must(t, err)
+		hub.skus[0]["compute_capability"] = strings.TrimSpace(string(capability))
+		hub.skus[0]["vram_gb"] = ready.GPUs[0].Memory / (1 << 30)
+		hub.skus[0]["minimum_ram_per_gpu_gb"] = 4 // exact launcher cgroup memory limit
+	}
 	const rentalID = "rental-private-child-host"
-	hub.rentals[rentalID] = map[string]any{"rental_id": rentalID, "name": "child-host", "state": "ready", "worker_address": host.Control, "media_address": host.Media, "cert_pem": string(certificate), "worker_id": "private-child-host", "worker_boot_id": ready.WorkerBootID, "creator_public_key": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}, "accelerator_count": 1, "hourly_rate_usd_micros": 1}
-	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: rentalID, MachineName: "child-host", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, State: "ready", Hub: hub.server.URL, Address: host.Control, MediaAddress: host.Media, ExpectedWorkerID: "private-child-host", ExpectedWorkerBootID: ready.WorkerBootID}, string(certificate), token, identity))
+	// The fixture catalog reports observed image facts, never invented package versions.
+	probeInventory := `import importlib.metadata as m,json,platform,re
+rows={re.sub(r"[-_.]+","-",d.metadata["Name"]).lower():d.version for d in m.distributions()}
+print(json.dumps({"format":"tensorhub.image_inventory/1","profile":"python3.12-cpu-linux-x86","python":platform.python_version(),"distributions":[{"name":k,"version":v} for k,v in sorted(rows.items())]}))`
+	inventory, err := exec.Command("docker", "exec", host.Container, "python3", "-c", probeInventory).Output()
+	must(t, err)
+	var observedInventory map[string]any
+	must(t, json.Unmarshal(inventory, &observedInventory))
+	observedInventory["profile"] = profile
+	inventory, err = json.Marshal(observedInventory)
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(layout.Root, "host-image-inventory.json"), inventory, 0600))
+	hub.inventories = map[string]json.RawMessage{rentalID: inventory}
+
+	hub.rentals[rentalID] = map[string]any{"development": *childHostUpdatable, "rental_id": rentalID, "name": "child-host", "state": "ready", "worker_address": host.Control, "media_address": host.Media, "cert_pem": string(certificate), "worker_id": "private-child-host", "worker_boot_id": ready.WorkerBootID, "creator_public_key": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}, "accelerator_count": 1, "hourly_rate_usd_micros": 1}
+	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: rentalID, MachineName: "child-host", SKU: sku, AcceleratorModel: accelerator, HourlyRateUSDMicros: 1, State: "ready", Hub: hub.server.URL, Address: host.Control, MediaAddress: host.Media, ExpectedWorkerID: "private-child-host", ExpectedWorkerBootID: ready.WorkerBootID}, string(certificate), token, identity))
 	must(t, os.WriteFile(filepath.Join(layout.Root, "config.yaml"), []byte("tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\nport: 0\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	path := *childHostRuntimeBin
 	for _, item := range childEnv(t, layout.Root) {
@@ -135,6 +169,11 @@ func TestUnpublishedChildActualHostArtifacts(t *testing.T) {
 			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
 		}
 	}
+	return layout, store, host, path, restartHost
+}
+
+func TestUnpublishedChildActualHostArtifacts(t *testing.T) {
+	layout, store, host, path, restartHost := startActualChildHost(t)
 	project := copyPrivateTensorProject(t, layout.Root, *childHostProject)
 	script := filepath.Join(project, "recipe.py")
 	status, out := runCozyPath(t, layout.Root, path, "run", script, "--rental-only", "--await", "--json")

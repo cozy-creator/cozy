@@ -234,12 +234,13 @@ func reservePort(t *testing.T) int {
 // release one rental — the way Tensorhub does: a DELETE moves the pod to `released`, and
 // every later read says so.
 type fakeRentalHub struct {
-	mu       sync.Mutex
-	rentals  map[string]map[string]any
-	skus     []map[string]any
-	rent     func(map[string]any) map[string]any
-	released map[string]int
-	server   *httptest.Server
+	mu          sync.Mutex
+	rentals     map[string]map[string]any
+	inventories map[string]json.RawMessage
+	skus        []map[string]any
+	rent        func(map[string]any) map[string]any
+	released    map[string]int
+	server      *httptest.Server
 	// publishes is whether this stand-in hub carries th-199's account listing.
 	publishes bool
 }
@@ -280,6 +281,17 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(row)
+	})
+	mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		raw := h.inventories[r.PathValue("id")]
+		if len(raw) == 0 || r.Header.Get("Authorization") != "Bearer rental-idle-test" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]json.RawMessage{"image_inventory": raw})
 	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()

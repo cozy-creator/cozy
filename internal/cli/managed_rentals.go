@@ -461,7 +461,7 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 				}
 			}
 
-			reason, problem := m.standingLocked(row)
+			reason, problem := m.standingLocked(row, req)
 			if problem != nil {
 				return nil, problem
 			}
@@ -487,12 +487,14 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 // standingLocked is the fleet-side reason an ATTACHED rental cannot take any new
 // placement, or "". Class, geometry and lifecycle are settled by the caller before this
 // is asked, so every answer here is a fact about what the pod is already holding.
-func (m *managedRentals) standingLocked(row records.Rental) (string, *exit.Error) {
+func (m *managedRentals) standingLocked(row records.Rental, req records.Request) (string, *exit.Error) {
 	retained, problem := m.store.RentalHasRetainedJob(row.ID)
 	if problem != nil {
 		return "", problem
 	}
-	if retained {
+	// Retained client jobs deliberately share this machine's durable work.
+	// Active execution is fenced separately by RentalStanding and preparation.
+	if retained && (!req.IsJob() || !req.RetainWork) {
 		return orchestrator.ExcludedModeConflict, nil
 	}
 	spent, problem := orchestrator.RentalSpent(m.store, row)

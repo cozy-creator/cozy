@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -339,9 +340,34 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		c.logf("PodHost prepare %s#%d superseded by #%d before its bytes were sent", label, seq, w.hostPrepareSeq)
 		return
 	}
+	// Model preparation can outlive cancellation, including when the previous
+	// child was already serving. Revalidate before ANY final desired-state send.
+	if w.preparingRequest != "" {
+		request, problem := c.opt.Store.RequestRow(w.preparingRequest)
+		if problem == nil && request != nil {
+			problem = c.rentalPreparationAllowedLocked(w, *request)
+		}
+		if c.sessions[s.bootID] != s || c.workers[w.instanceID] != w || request == nil || problem != nil {
+			c.mu.Unlock()
+			c.setDesiredUnavailable(w, seq, exit.Unavailablef("private preparation lost its current execution authority"))
+			return
+		}
+		parent, problem := c.activeParentFor(*request)
+		if problem != nil || !proto.Equal(parent, w.orchestrationParent) {
+			c.mu.Unlock()
+			c.setDesiredUnavailable(w, seq, exit.Unavailablef("private preparation changed its exact CPU parent"))
+			return
+		}
+	}
 	if w.spec.IsJob() {
+		ownedChild := false
+		if w.preparingRequest != "" && w.orchestrationParent != nil {
+			request, problem := c.opt.Store.RequestRow(w.preparingRequest)
+			ownedChild = problem == nil && request != nil && request.ParentRequestID != "" &&
+				c.rentalPreparationAllowedLocked(w, *request) == nil
+		}
 		retained, problem := c.opt.Store.RentalHasRetainedJob(w.spec.Connection.RentalID)
-		if problem != nil || retained || !c.idleRentalWorkerLocked(w) {
+		if !ownedChild && (problem != nil || retained || !c.idleRentalWorkerLocked(w)) {
 			c.mu.Unlock()
 			c.setDesiredUnavailable(w, seq, exit.Unavailablef("rented worker is finishing its current job before changing mode"))
 			return

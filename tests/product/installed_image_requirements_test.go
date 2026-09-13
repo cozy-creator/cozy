@@ -46,11 +46,11 @@ func TestInstalledClosureAndWorkerRequirementsHaveSeparateMeanings(t *testing.T)
 
 	selection, problem := install.ExecutionRequirements(context.Background(), root, "fixture", nil)
 	requirements, python := selection.ImageRequirements(), selection.RequiresPython
-	if problem != nil || python != ">=3.12,<3.13" || !reflect.DeepEqual(requirements, []string{"cozy-runtime<1,>=0.16.1", "numpy>=1.26", "torch==2.13.0"}) {
+	if problem != nil || python != ">=3.12,<3.13" || !reflect.DeepEqual(requirements, []string{"cozy-runtime>=0.16.10", "cozy-runtime<1,>=0.16.1", "numpy>=1.26", "torch==2.13.0"}) {
 		t.Fatalf("captured package ranges changed: %v %q %v", requirements, python, problem)
 	}
 	image := &pb.ImageInventory{Python: "3.12.11", Distributions: []*pb.ImageDistribution{
-		{Distribution: "cozy-runtime", Version: "0.16.5"}, {Distribution: "torch", Version: "2.13.0+cu130"}, //cozy:allow distribution metadata only; no Runtime process invocation
+		{Distribution: "cozy-runtime", Version: "0.16.10"}, {Distribution: "torch", Version: "2.13.0+cu130"}, //cozy:allow distribution metadata only; no Runtime process invocation
 		{Distribution: "cuda-bindings", Version: "13.0.3"}, {Distribution: "numpy", Version: "2.5.1"},
 	}}
 	if reason := launch.InventoryMismatch(image, requirements, python); reason != "" {
