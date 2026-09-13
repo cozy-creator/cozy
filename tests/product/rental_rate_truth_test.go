@@ -120,9 +120,8 @@ func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
 	hub.close()
 }
 
-// A confirmed pre-readiness container exit is a terminal rental diagnosis, not
-// a hidden Hub detail. The human list names the code and JSON retains the
-// bounded structured facts the Hub supplied.
+// A confirmed pre-readiness container exit leaves the current fleet. Its
+// bounded structured diagnosis remains recorded and names an acquisition failure.
 func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-boot-failure")
 	must(t, os.RemoveAll(root))
@@ -158,38 +157,25 @@ func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
 	store.Close()
 
 	code, human := runCozy(t, root, "rental", "list")
-	if code != 0 || !strings.Contains(human, "container_exited_before_readiness") {
-		t.Fatalf("human rental list hid the boot failure [exit %d]:\n%s", code, human)
+	if code != 0 || strings.Contains(human, "yuzuriha") {
+		t.Fatalf("human current fleet retained the failed rental [exit %d]:\n%s", code, human)
 	}
 	code, raw := runCozy(t, root, "rental", "list", "--full", "--json")
 	var listed struct {
-		Rentals []struct {
-			State                 string `json:"state"`
-			Failure               string `json:"failure_code"`
-			BaseWorkerImageDigest string `json:"base_worker_image_digest"`
-			Provider              string `json:"provider"`
-			ProviderResourceID    string `json:"provider_resource_id"`
-			ProviderHostID        string `json:"provider_host_id"`
-			ProviderState         string `json:"provider_state"`
-			ContainerState        string `json:"container_state"`
-		} `json:"rentals"`
+		Rentals []rentalListingRow `json:"rentals"`
 	}
-	if code != 0 || json.Unmarshal([]byte(raw), &listed) != nil || len(listed.Rentals) != 1 {
-		t.Fatalf("typed rental list is unreadable [exit %d]:\n%s", code, raw)
-	}
-	row := listed.Rentals[0]
-	if row.State != "failed" || row.Failure != "container_exited_before_readiness" ||
-		row.BaseWorkerImageDigest != "sha256:"+strings.Repeat("a", 64) ||
-		row.Provider != "runpod" || row.ProviderResourceID != "nuowj42m20y65g" ||
-		row.ProviderHostID != "host-7" || row.ProviderState != "running" ||
-		row.ContainerState != "exited" {
-		t.Fatalf("typed rental failure lost facts: %+v", listed.Rentals[0])
+	if code != 0 || json.Unmarshal([]byte(raw), &listed) != nil || len(listed.Rentals) != 0 {
+		t.Fatalf("typed current fleet retained the failed rental [exit %d]:\n%s", code, raw)
 	}
 	persisted, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	stored, problem := persisted.RentalRow("pr-boot-failed")
 	fatal(t, problem)
-	if stored == nil || stored.Failure.ProviderResourceID != "nuowj42m20y65g" {
+	if stored == nil || stored.State != "failed" || stored.Failure.Code != "container_exited_before_readiness" ||
+		stored.Failure.BaseWorkerImageDigest != "sha256:"+strings.Repeat("a", 64) ||
+		stored.Failure.Provider != "runpod" || stored.Failure.ProviderResourceID != "nuowj42m20y65g" ||
+		stored.Failure.ProviderHostID != "host-7" || stored.Failure.ProviderState != "running" ||
+		stored.Failure.ContainerState != "exited" {
 		t.Fatalf("local records lost the terminal diagnosis: %+v", stored)
 	}
 	changed := *stored
