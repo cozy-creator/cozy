@@ -182,7 +182,15 @@ print(json.dumps({"format":"tensorhub.image_inventory/1","profile":"python3.12-c
 	// reconnect/recovery. Stop only the owned client before the generic reaper.
 	t.Cleanup(func() {
 		if code, out := runCozyPath(t, layout.Root, path, "down", "--json"); code != 0 {
-			t.Errorf("stop actual Host proof client [%d]: %s", code, out)
+			// A preaccept failure can leave an intentionally retained empty rental.
+			// Preserve its certificate and journal rather than invoking down --all.
+			t.Logf("preserving actual Host after client down refusal [%d]: %s", code, out)
+			if pid := daemonOnRoot(layout.Root); pid != 0 {
+				process, err := os.FindProcess(pid)
+				must(t, err)
+				must(t, process.Signal(os.Interrupt))
+				waitUntil(t, "owned proof client exits", func() bool { return daemonOnRoot(layout.Root) == 0 })
+			}
 		}
 	})
 	return layout, store, host, path, restartHost

@@ -20,11 +20,8 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the Runtime release that carries this Creator's current wire contract.
-// Metadata description remains static against the captured source environment; one
-// coherent release remedy serves both host-tool and worker-wire admission checks.
-// Preparing captured jobs must isolate live executors, provided by 0.16.10, which also
-// retains the backward-aware Python patch observation parser.
+// Floor preserves the required static metadata and isolated preparation behavior.
+// WireFloor independently checks the installed execution ownership capability.
 const Floor = "0.16.10"
 
 // WireFloor supports Runtime-owned execution without external effects. Optional
@@ -34,11 +31,9 @@ const WireFloor uint32 = 51
 var floor = pep440.MustParse(Floor)
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
-// Select the supported interpreter explicitly: uv ignores dependency Requires-Python
-// upper bounds, so the package's <3.13 metadata does not constrain `uv tool install`.
 var hostRuntimeInstall = fmt.Sprintf(
-	"install cozy-runtime %s or newer: uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=%s' — then retry",
-	Floor, Floor)
+	"install a coherent cozy-runtime build for Python 3.12 supporting %s+minor.%d or newer, then retry",
+	wirePackage(), WireFloor)
 
 func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }
 

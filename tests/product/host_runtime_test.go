@@ -24,7 +24,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtimes are POSIX shell scripts")
 	}
-	install := "uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=" + hostruntime.Floor + "'"
+	install := fmt.Sprintf("Python 3.12 supporting cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)
 
 	// (a) An older minor cannot serve: `cozy up` refuses under the tool's own words, and
 	// `cozy run` — which starts the same daemon — answers the same code instead of queuing.
