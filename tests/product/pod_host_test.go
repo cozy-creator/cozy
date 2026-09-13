@@ -1125,7 +1125,7 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	}()
 	// THE POD SERVES: the request is DISPATCHED to the rented worker exactly once — the
 	// install that pins a local relaunch never hides the rental — and the spec names the
-	// local revision with no Environment identity, which development execution has none of.
+	// captured local revision's exact prepared Environment.
 	waitUntil(t, "the attempt offer on the pod", func() bool {
 		pod.mu.Lock()
 		defer pod.mu.Unlock()
@@ -1140,9 +1140,12 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	}
 	spec, err := canonical.Read(pod.offers[0].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
 	must(t, err)
-	if spec.Str("environment_digest") != "" {
-		t.Fatalf("the local-package InvocationSpec names environment %q; want none",
-			spec.Str("environment_digest"))
+	prepared, err := canonical.Read(pod.preparedSet, &pb.PlacementSet{})
+	must(t, err)
+	want := prepared.List("placements")[0].Str("environment_digest")
+	if want == "" || spec.Str("environment_digest") != want {
+		t.Fatalf("the local-package InvocationSpec names environment %q; prepared placement requires %q",
+			spec.Str("environment_digest"), want)
 	}
 }
 

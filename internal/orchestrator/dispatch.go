@@ -1710,20 +1710,14 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			"worker %s carries no selected environment digest", instanceID)
 	}
 	if remote {
-		// A local revision is DEVELOPMENT execution on the pod, and development execution
-		// has no published Environment identity: the worker refuses a spec that names one
-		// (development_environment_present). The pod's prepared Environment is still bound
-		// to the row, so a requeue derives the same identity; only the spec omits it.
-		specEnvironment := environment
-		if req.LocalPackageDigest != "" {
-			specEnvironment = ""
-		}
+		// Captured local wheels have a prepared Environment just like published packages.
+		// The invocation names exactly that identity, which Runtime checks at admission.
 		if req.EnvironmentDigest == "" {
 			e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID, environment)
 			if e != nil {
 				return "", e
 			}
-			return specEnvironment, nil
+			return environment, nil
 		}
 		if req.EnvironmentDigest != environment {
 			return "", exit.Named(exit.Conflict,
@@ -1731,7 +1725,7 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 				"worker %s no longer matches the invocation identity pinned to request %s",
 				instanceID, req.ID)
 		}
-		return specEnvironment, nil
+		return environment, nil
 	}
 	return environment, nil
 }
