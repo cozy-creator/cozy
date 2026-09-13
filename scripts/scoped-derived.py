@@ -545,8 +545,36 @@ def isolation():
     )
     with tempfile.TemporaryDirectory(prefix="tensorfs-scoped-uid-") as root:
         store = tensorfs.Store.init(Path(root) / "store")
+        config_bytes = b'{"text":"' + b"x" * (2 << 20) + b'"}'
+        plan = declaration(4096)
+        configured = Derivation(plan.sources, plan.targets, {"model.json": Config("add")}, plan.order)
+        source_writer = open_writer(store, 31, configured, 4096 + len(config_bytes))
+        source_writer.add_part("model", "weight", "value", io.BytesIO(bytes(4096)))
+        source_writer.add_config("model.json", io.BytesIO(config_bytes))
+        source_receipt = source_writer.commit()
+        manifest = source_receipt["manifest"]
+        source = Source("sha256:" + manifest["sha256"], manifest["length"])
         writer = open_writer(store, 30, declaration(4096), 4096)
         left, right = socket.socketpair()
+        source_left, source_right = socket.socketpair()
+        replay_left, replay_right = socket.socketpair()
+        replay_recorded = []
+        errors = []
+
+        def inspect_owner():
+            try:
+                serve_source(store, source, source_right.detach(), check_current=lambda: None,
+                             admit_io=lambda: contextlib.nullcontext())
+            except Exception as exc:
+                errors.append(exc)
+
+        def replay_owner():
+            try:
+                serve_derived_replay(source_receipt, replay_right.detach(),
+                                     check_current=lambda: None, record_receipt=replay_recorded.append)
+            except Exception as exc:
+                errors.append(exc)
+
         child = subprocess.Popen(
             [
                 sys.executable,
@@ -554,10 +582,20 @@ def isolation():
                 "--isolated-client",
                 store.root,
                 str(left.fileno()),
+                str(source_left.fileno()),
+                source.manifest,
+                str(source.length),
+                str(replay_left.fileno()),
             ],
-            pass_fds=(left.fileno(),),
+            pass_fds=(left.fileno(), source_left.fileno(), replay_left.fileno()),
         )
         left.close()
+        source_left.close()
+        replay_left.close()
+        inspector = threading.Thread(target=inspect_owner, daemon=True)
+        replayer = threading.Thread(target=replay_owner, daemon=True)
+        inspector.start()
+        replayer.start()
         receipts = []
         serve_derived(
             writer,
@@ -571,10 +609,14 @@ def isolation():
             record_receipt=receipts.append,
         )
         assert child.wait(10) == 0
+        inspector.join(10)
+        replayer.join(10)
+        assert not inspector.is_alive() and not replayer.is_alive() and not errors
         assert len(receipts) == 1
         assert store.derived_lookup(identity(30))["receipt"] == receipts[0]
+        assert replay_recorded == [source_receipt]
         print(
-            "PASS UID65533 cannot open the Store but can write its exact granted native output",
+            "PASS UID65533 cannot open the Store but can inspect its exact source, read a 2MiB config, write its granted output and receive recorded native replay",
             flush=True,
         )
 
@@ -583,7 +625,7 @@ def main():
     if sys.argv[1:] == ["--isolation"]:
         isolation()
         return
-    if len(sys.argv) == 4 and sys.argv[1] == "--isolated-client":
+    if len(sys.argv) == 8 and sys.argv[1] == "--isolated-client":
         # CI's interpreter can live below a private runner directory. Bootstrap
         # imports first, then irreversibly drop every UID/group before opening any
         # Store or using the exact inherited writer FD. No Store handle crosses.
@@ -599,6 +641,13 @@ def main():
             pass
         else:
             raise AssertionError("isolated client opened the privileged Store")
+        with SourceCapability.from_fd(sys.argv[5], int(sys.argv[6]), int(sys.argv[4])) as source:
+            actual = source.inspect()
+            assert actual.configs["model.json"] == b'{"text":"' + b"x" * (2 << 20) + b'"}'
+            assert actual.components["model"]["weight"].shape == (4096,)
+        replayed = DerivedTransaction.accept(int(sys.argv[7]))
+        assert replayed.receipt is not None
+        assert "sha256:" + replayed.receipt["manifest"]["sha256"] == sys.argv[5]
         with DerivedTransaction(int(sys.argv[3])) as client:
             client.add_part("model", "weight", "value", b"q" * 4096)
             client.checkpoint()
