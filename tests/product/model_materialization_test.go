@@ -22,6 +22,7 @@ func TestAcceptedModelCacheMissReensuresTheSameSelectionOnce(t *testing.T) {
 			must(t, err)
 			pod := &fakePod{controlKey: public, latch: &pb.Fault{Kind: pb.FaultKind_FAULT_KIND_ARTIFACT_FETCH_FAILED, Reason: "model_materialization_required", Detail: "native object absent"}}
 			var desires atomic.Int64
+			var observed func(uint64)
 			second := make(chan struct{})
 			pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
 				desired := frame.GetDesiredState()
@@ -30,6 +31,24 @@ func TestAcceptedModelCacheMissReensuresTheSameSelectionOnce(t *testing.T) {
 				}
 				n := desires.Add(1)
 				if n == 1 {
+					for index, change := range []func(*pb.ObservedWorkerState){
+						func(r *pb.ObservedWorkerState) { r.AcceptedDesiredStateRevision-- },
+						func(r *pb.ObservedWorkerState) { r.AcceptedPlacementSetDigest = bytes.Repeat([]byte{7}, 32) },
+						func(r *pb.ObservedWorkerState) { r.Faults[0].Subject = "unrelated-placement" },
+						func(r *pb.ObservedWorkerState) { r.Faults[0].Reason = "tensorfs_refused" },
+					} {
+						frame := pod.report(desired, 1)
+						state := frame.GetObservedState()
+						change(state)
+						state.AdmissionEpoch = uint64(100 + index)
+						if err := send(frame); err != nil {
+							return true, err
+						}
+						observed(state.AdmissionEpoch)
+						if desires.Load() != 1 {
+							t.Error("historical or unrelated fault caused a model re-ensure")
+						}
+					}
 					return true, send(pod.report(desired, 1))
 				}
 				if n == 2 {
@@ -51,6 +70,9 @@ func TestAcceptedModelCacheMissReensuresTheSameSelectionOnce(t *testing.T) {
 			o := hostOwner(t, "cache-reensure", rentalWiring(connection, private))
 			instance, _, _, problem := o.c.EnsureRental(podRental)
 			fatal(t, problem)
+			observed = func(epoch uint64) {
+				waitUntil(t, "owner consumed unrelated miss report", func() bool { w := o.c.Worker(instance); return w != nil && w.AdmissionEpoch == epoch })
+			}
 			fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "cozy/h3-package", Release: "1.0.7"}}, nil))
 			select {
 			case <-second:

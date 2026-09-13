@@ -121,7 +121,7 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			}
 			return
 		}
-		call := &pb.PreparePackageSetCall{Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
+		call := &pb.PreparePackageSetCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
 			DownloadDelegation: append([]byte(nil), prep.downloadSet...),
 		},
 			Application:        facts.Application,

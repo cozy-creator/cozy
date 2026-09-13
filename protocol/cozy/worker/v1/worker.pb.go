@@ -2969,8 +2969,14 @@ type ProtocolInfoResult struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	WireMinor        uint32                 `protobuf:"varint,1,opt,name=wire_minor,json=wireMinor,proto3" json:"wire_minor,omitempty"`
 	MinimumWireMinor uint32                 `protobuf:"varint,2,opt,name=minimum_wire_minor,json=minimumWireMinor,proto3" json:"minimum_wire_minor,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Additive capability at wire49; absent/false peers retain the single-source rule.
+	// Host reports true only when both its own fetch path and Runtime implement it.
+	SupportsMixedModelInputs bool `protobuf:"varint,3,opt,name=supports_mixed_model_inputs,json=supportsMixedModelInputs,proto3" json:"supports_mixed_model_inputs,omitempty"`
+	// Runtime admits absent downloaded inputs as model_materialization_required;
+	// Host does not turn a completed prepare into durable residency authority.
+	SupportsModelMaterializationRecovery bool `protobuf:"varint,4,opt,name=supports_model_materialization_recovery,json=supportsModelMaterializationRecovery,proto3" json:"supports_model_materialization_recovery,omitempty"`
+	unknownFields                        protoimpl.UnknownFields
+	sizeCache                            protoimpl.SizeCache
 }
 
 func (x *ProtocolInfoResult) Reset() {
@@ -3017,6 +3023,20 @@ func (x *ProtocolInfoResult) GetMinimumWireMinor() uint32 {
 	return 0
 }
 
+func (x *ProtocolInfoResult) GetSupportsMixedModelInputs() bool {
+	if x != nil {
+		return x.SupportsMixedModelInputs
+	}
+	return false
+}
+
+func (x *ProtocolInfoResult) GetSupportsModelMaterializationRecovery() bool {
+	if x != nil {
+		return x.SupportsModelMaterializationRecovery
+	}
+	return false
+}
+
 // The three preparations name the same logical sets the retiring DesiredWorkerState modes
 // carried; the difference is who sends the result to the worker.
 // MINOR 30 (xs-019): beside the signed set ride the facts prepare consumes, every one of them
@@ -3032,8 +3052,19 @@ type PreparePackageSetCall struct {
 	// sorted unique; <= MaxModelSlotPaths
 	ImageInventory     *ImageInventory `protobuf:"bytes,5,opt,name=image_inventory,json=imageInventory,proto3" json:"image_inventory,omitempty"`             // the placed image's exact pinned inventory
 	LockedRequirements []byte          `protobuf:"bytes,6,opt,name=locked_requirements,json=lockedRequirements,proto3" json:"locked_requirements,omitempty"` // hash-pinned requirements export of the release's
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// uv.lock (project pin included), installable with
+	// --require-hashes against PyPI plus the org index.
+	// The only admitted rows are blank/comment lines,
+	// https --index-url/--extra-index-url directives
+	// (how the installer learns the two indexes; the org
+	// index is anonymous public, th-113 — no credential
+	// is spellable here), and exact hash-pinned
+	// requirements; <= MaxLockedRequirementsBytes
+	// Caller re-ensures exact inputs after Runtime's typed cache miss. Required by
+	// a Host without durable preparation records when the set downloads models.
+	SupportsModelMaterializationRecovery bool `protobuf:"varint,7,opt,name=supports_model_materialization_recovery,json=supportsModelMaterializationRecovery,proto3" json:"supports_model_materialization_recovery,omitempty"`
+	unknownFields                        protoimpl.UnknownFields
+	sizeCache                            protoimpl.SizeCache
 }
 
 func (x *PreparePackageSetCall) Reset() {
@@ -3108,6 +3139,13 @@ func (x *PreparePackageSetCall) GetLockedRequirements() []byte {
 	return nil
 }
 
+func (x *PreparePackageSetCall) GetSupportsModelMaterializationRecovery() bool {
+	if x != nil {
+		return x.SupportsModelMaterializationRecovery
+	}
+	return false
+}
+
 type PrepareLocalPackageCall struct {
 	state           protoimpl.MessageState  `protogen:"open.v1"`
 	Claim           *Claim                  `protobuf:"bytes,1,opt,name=claim,proto3" json:"claim,omitempty"`
@@ -3164,8 +3202,11 @@ type PreparePrivatePlacementCall struct {
 	state               protoimpl.MessageState      `protogen:"open.v1"`
 	Claim               *Claim                      `protobuf:"bytes,1,opt,name=claim,proto3" json:"claim,omitempty"`
 	PrivatePlacementSet *DesiredPrivatePlacementSet `protobuf:"bytes,2,opt,name=private_placement_set,json=privatePlacementSet,proto3" json:"private_placement_set,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Same contract as PreparePackageSetCall field 7; retained-only inputs need no
+	// download/re-ensure capability because their existing owner retains the bytes.
+	SupportsModelMaterializationRecovery bool `protobuf:"varint,3,opt,name=supports_model_materialization_recovery,json=supportsModelMaterializationRecovery,proto3" json:"supports_model_materialization_recovery,omitempty"`
+	unknownFields                        protoimpl.UnknownFields
+	sizeCache                            protoimpl.SizeCache
 }
 
 func (x *PreparePrivatePlacementCall) Reset() {
@@ -3210,6 +3251,13 @@ func (x *PreparePrivatePlacementCall) GetPrivatePlacementSet() *DesiredPrivatePl
 		return x.PrivatePlacementSet
 	}
 	return nil
+}
+
+func (x *PreparePrivatePlacementCall) GetSupportsModelMaterializationRecovery() bool {
+	if x != nil {
+		return x.SupportsModelMaterializationRecovery
+	}
+	return false
 }
 
 // One preparation's observable progress. Byte counters are monotonic within a call; the
@@ -5781,8 +5829,10 @@ type PreparePrivatePlacementRequest struct {
 	// pod host so Runtime's TensorFS can present `delegation <payload> <signature>` to the hub's
 	// tensorfs routes.
 	DownloadDelegationSignature []byte `protobuf:"bytes,5,opt,name=download_delegation_signature,json=downloadDelegationSignature,proto3" json:"download_delegation_signature,omitempty"`
-	// MINOR44: exactly one model access form. Native bindings are already retained in the
-	// worker's Store; they never cause a registry query, delegation signature or download.
+	// MINOR44: native bindings are already retained in the worker's Store and never
+	// cause a registry query or download. When ProtocolInfo supports_mixed_model_inputs
+	// is true, download_delegation may independently bind other slots in the same set.
+	// The combined selection must name each declared slot at most once.
 	NativeModels []*NativeModelBinding `protobuf:"bytes,6,rep,name=native_models,json=nativeModels,proto3" json:"native_models,omitempty"`
 	// Required in the native arm: exact existing outer PodHost Claim. Runtime verifies
 	// its current owner/epoch and proof before every native custody lookup or cached reply.
@@ -10038,9 +10088,11 @@ type DesiredPrivatePlacementSet struct {
 	LocalRevisionDigest         []byte                 `protobuf:"bytes,2,opt,name=local_revision_digest,json=localRevisionDigest,proto3" json:"local_revision_digest,omitempty"`
 	DownloadDelegation          []byte                 `protobuf:"bytes,3,opt,name=download_delegation,json=downloadDelegation,proto3" json:"download_delegation,omitempty"`
 	DownloadDelegationSignature []byte                 `protobuf:"bytes,4,opt,name=download_delegation_signature,json=downloadDelegationSignature,proto3" json:"download_delegation_signature,omitempty"` // 64-byte Ed25519 signature by rental Creator key
-	NativeModels                []*NativeModelBinding  `protobuf:"bytes,5,rep,name=native_models,json=nativeModels,proto3" json:"native_models,omitempty"`                                                // MINOR44; XOR both download fields
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// MINOR44. Single-source unless ProtocolInfo supports_mixed_model_inputs is true;
+	// then these retained slots and the download set must be disjoint.
+	NativeModels  []*NativeModelBinding `protobuf:"bytes,5,rep,name=native_models,json=nativeModels,proto3" json:"native_models,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DesiredPrivatePlacementSet) Reset() {
@@ -20540,11 +20592,13 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\bimported\x18\x03 \x01(\bR\bimported\"i\n" +
 	"\x17WorkspaceActivationCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12!\n" +
-	"\fmigration_id\x18\x02 \x01(\tR\vmigrationId\"a\n" +
+	"\fmigration_id\x18\x02 \x01(\tR\vmigrationId\"\xf7\x01\n" +
 	"\x12ProtocolInfoResult\x12\x1d\n" +
 	"\n" +
 	"wire_minor\x18\x01 \x01(\rR\twireMinor\x12,\n" +
-	"\x12minimum_wire_minor\x18\x02 \x01(\rR\x10minimumWireMinor\"\xce\x02\n" +
+	"\x12minimum_wire_minor\x18\x02 \x01(\rR\x10minimumWireMinor\x12=\n" +
+	"\x1bsupports_mixed_model_inputs\x18\x03 \x01(\bR\x18supportsMixedModelInputs\x12U\n" +
+	"'supports_model_materialization_recovery\x18\x04 \x01(\bR$supportsModelMaterializationRecovery\"\xa5\x03\n" +
 	"\x15PreparePackageSetCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12B\n" +
 	"\vpackage_set\x18\x02 \x01(\v2!.cozy.worker.v1.DesiredPackageSetR\n" +
@@ -20552,13 +20606,15 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\vapplication\x18\x03 \x01(\tR\vapplication\x12(\n" +
 	"\x10model_slot_paths\x18\x04 \x03(\tR\x0emodelSlotPaths\x12G\n" +
 	"\x0fimage_inventory\x18\x05 \x01(\v2\x1e.cozy.worker.v1.ImageInventoryR\x0eimageInventory\x12/\n" +
-	"\x13locked_requirements\x18\x06 \x01(\fR\x12lockedRequirements\"\x9a\x01\n" +
+	"\x13locked_requirements\x18\x06 \x01(\fR\x12lockedRequirements\x12U\n" +
+	"'supports_model_materialization_recovery\x18\a \x01(\bR$supportsModelMaterializationRecovery\"\x9a\x01\n" +
 	"\x17PrepareLocalPackageCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12R\n" +
-	"\x11local_package_set\x18\x02 \x01(\v2&.cozy.worker.v1.DesiredLocalPackageSetR\x0flocalPackageSet\"\xaa\x01\n" +
+	"\x11local_package_set\x18\x02 \x01(\v2&.cozy.worker.v1.DesiredLocalPackageSetR\x0flocalPackageSet\"\x81\x02\n" +
 	"\x1bPreparePrivatePlacementCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12^\n" +
-	"\x15private_placement_set\x18\x02 \x01(\v2*.cozy.worker.v1.DesiredPrivatePlacementSetR\x13privatePlacementSet\"\xe5\x02\n" +
+	"\x15private_placement_set\x18\x02 \x01(\v2*.cozy.worker.v1.DesiredPrivatePlacementSetR\x13privatePlacementSet\x12U\n" +
+	"'supports_model_materialization_recovery\x18\x03 \x01(\bR$supportsModelMaterializationRecovery\"\xe5\x02\n" +
 	"\fPrepareEvent\x122\n" +
 	"\x05stage\x18\x01 \x01(\x0e2\x1c.cozy.worker.v1.PrepareStageR\x05stage\x12\x1f\n" +
 	"\vtotal_bytes\x18\x02 \x01(\x04R\n" +

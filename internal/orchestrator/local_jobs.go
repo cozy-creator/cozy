@@ -73,7 +73,7 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 		if problem != nil {
 			return nil, problem
 		}
-		call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: &pb.DesiredPrivatePlacementSet{
+		call := &pb.PreparePrivatePlacementCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PrivatePlacementSet: &pb.DesiredPrivatePlacementSet{
 			OperationId: selected.OperationId, LocalRevisionDigest: selected.Package.LocalRevisionDigest, DownloadDelegation: downloads}}
 		result = c.runHostPrepare(s, w, 0, hostLabel("local_job_models", request.ID),
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
