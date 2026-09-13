@@ -22,6 +22,8 @@ from tensorfs.derived import (
     OutputCapability,
     Part,
     Source,
+    SourceCapability,
+    SourceInspection,
     Target,
     Tensor,
     derive,
@@ -411,6 +413,40 @@ def exercise():
         assert owner.client.completed_configs() == ["model.json"]
         owner.finish()
         print("PASS config pull obeys the native admitted byte bound", flush=True)
+
+        # Inspection uses the same native parser before a target plan exists.
+        source_writer = open_writer(store, 21, config_plan, 4103)
+        source_writer.add_part("model", "weight", "value", io.BytesIO(bytes(4096)))
+        source_writer.add_config("model.json", io.BytesIO(b'{"a":1}'))
+        source_ref = source_writer.commit()["manifest"]
+        selected = Source("sha256:" + source_ref["sha256"], source_ref["length"])
+
+        def inspect_bound_source(components, configs):
+            native = store.inspect_derived_source(
+                selected.manifest, selected.length, components, configs
+            )
+            projected = SourceInspection.from_native(native)
+            if configs:
+                assert projected.configs["model.json"] is native["configs"][0]["data"]
+            return projected
+
+        capability = SourceCapability(
+            selected.manifest, selected.length, inspect_bound_source
+        )
+        inspected = capability.inspect(components=["model"], configs=["model.json"])
+        assert inspected.source == selected
+        assert inspected.configs == {"model.json": b'{"a":1}'}
+        assert inspected.components["model"]["weight"] == config_plan.targets["model"].add["weight"]
+        assert declaration(4096, capability).native_arguments(4096) == declaration(
+            4096, selected
+        ).native_arguments(4096)
+        try:
+            capability.inspect(components=["absent"])
+        except tensorfs.errors.Refusal:
+            pass
+        else:
+            raise AssertionError("native inspection accepted an absent component")
+        print("PASS typed source inspection preserves native identity, geometry and config bytes", flush=True)
 
         # Real process exit at native commit; no in-memory callback state survives.
         left, right = socket.socketpair()

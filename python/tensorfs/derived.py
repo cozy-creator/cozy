@@ -59,6 +59,57 @@ class Config:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceInspection:
+    """Selected native source geometry and canonical configs; no payload locations."""
+
+    source: Source
+    components: Mapping[str, Mapping[str, Tensor]]
+    configs: Mapping[str, bytes]
+
+    @classmethod
+    def from_native(cls, value: Mapping[str, Any]) -> SourceInspection:
+        """Project Store.inspect_derived_source facts without validating them again."""
+        source = value["source"]
+        return cls(
+            Source(source["manifest_id"], source["manifest_length"]),
+            {
+                component["name"]: {
+                    tensor["key"]: Tensor(
+                        tensor["logical_dtype"],
+                        tuple(tensor["shape"]),
+                        tensor["encoding"],
+                        {
+                            part["role"]: Part(part["dtype"], tuple(part["shape"]))
+                            for part in tensor["parts"]
+                        },
+                    )
+                    for tensor in component["tensors"]
+                }
+                for component in value["components"]
+            },
+            {config["name"]: config["data"] for config in value["configs"]},
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCapability(Source):
+    """An exact source whose trusted owner admits metadata inspection before derive.
+
+    The owner binds the callable to this source and the accepted input scope.
+    Constructing this data object never grants Store access or broader I/O.
+    """
+
+    _inspect: Callable[[Sequence[str], Sequence[str]], SourceInspection] = field(
+        repr=False, compare=False
+    )
+
+    def inspect(
+        self, *, components: Sequence[str] = (), configs: Sequence[str] = ()
+    ) -> SourceInspection:
+        return self._inspect(tuple(components), tuple(configs))
+
+
+@dataclass(frozen=True, slots=True)
 class Derivation:
     sources: Mapping[str, Source]
     targets: Mapping[str, Target]
@@ -147,6 +198,8 @@ __all__ = [
     "Tensor",
     "Target",
     "Config",
+    "SourceInspection",
+    "SourceCapability",
     "Derivation",
     "OutputCapability",
     "DerivedTransaction",

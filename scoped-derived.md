@@ -36,6 +36,17 @@ the unchanged native declaration/estimate/begin APIs. The owner injects
 that single opener. The opener freezes the exact native declaration, checks
 admitted inputs/slot/limits, binds the epoch, restores custody and admits capacity.
 
+Before constructing a declaration, algorithms can call
+`SourceCapability(manifest, length, inspect_bound_source).inspect(components=...,
+configs=...)`. The trusted owner binds that callback to the accepted source and
+its input/component scope; the callback accepts no path, Store or different
+manifest. It returns `SourceInspection.from_native(store.inspect_derived_source(...))`
+through the existing execution metadata channel. The projection reuses `Tensor`
+and `Part` for native logical/stored geometry and exposes canonical config bytes;
+it does not parse headers, validate geometry, move payloads or open a Store. A
+source capability is also a `Source` in a derivation. The output opener still
+checks the exact admitted roots even if a caller constructs its own Source value.
+
 The opener returns `DerivedTransaction(fd)` with ownership of a preconnected
 AF_UNIX stream FD, or `DerivedTransaction.replay(receipt)` after validating native
 committed and retained custody. Its peer serves an already-open native writer:

@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Literal, TypedDict, cast
 
 from . import errors
-from .derived import Derivation, OutputCapability, derive
+from .derived import Derivation, OutputCapability, SourceCapability, SourceInspection, derive
 from ._ext import (
     _fit,
     Batch,
@@ -190,6 +190,8 @@ DTYPES: dict[str, int] = dtypes()
 __all__ = [
     "Derivation",
     "OutputCapability",
+    "SourceCapability",
+    "SourceInspection",
     "derive",
     "Asset",
     "DTYPES",
