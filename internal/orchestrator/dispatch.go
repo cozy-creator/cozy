@@ -923,10 +923,10 @@ func (c *Orchestrator) parkFor(req records.Request, reason string) bool {
 
 func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return cause }
 
-// requestSlot names what a request needs resident, before any pin: the package, an
-// install for an editable one, a job function for a job.
+// requestSlot names what a request needs resident before assignment. Explicit
+// rental affinity already identifies an independent machine at this point.
 func requestSlot(req records.Request) string {
-	slot := req.Package
+	slot := pinnedPackage(req.Package, req.RequestedRental)
 	if req.InstallID != "" {
 		slot += "/install/" + req.InstallID
 	}
@@ -943,6 +943,9 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 	for _, w := range c.workers {
 		if w.exited || w.stopping || !w.supportsCurrentProtocol() || w.spec.IsJob() != req.IsJob() ||
 			retirementGround(w) != "" || w.spec.Connection == nil {
+			continue
+		}
+		if req.RequestedRental != "" && w.spec.Connection.RentalID != req.RequestedRental {
 			continue
 		}
 		slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
@@ -1747,9 +1750,8 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			"worker %s carries no selected environment digest", instanceID)
 	}
 	if remote {
-		// Captured wheels execute the prepared Environment even when unpublished.
-		// Only legacy direct-source development lacks that identity; a retained
-		// local package digest is not evidence of direct-source execution.
+		// Captured wheels name the exact prepared Environment that Runtime checks.
+
 		if req.EnvironmentDigest == "" {
 			e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID, environment)
 			if e != nil {

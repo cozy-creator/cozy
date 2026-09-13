@@ -4,8 +4,48 @@ import (
 	"bytes"
 	"github.com/cozy-creator/cozy/internal/records"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestAcceptedPublicationCallRefusesChangedInputsBeforeReexecution(t *testing.T) {
+	for _, phase := range []string{"accepted", "frozen", "executing"} {
+		t.Run(phase, func(t *testing.T) {
+			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+			fatal(t, problem)
+			defer store.Close()
+			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
+			parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "effect-immutable", ""))
+			body := []byte(`{"destination":"owner/model","expected_revision":1,"lanes":{"bf16":"checkpoint-a"},"release":"proof"}`)
+			call := records.NativeCall{ID: "effect-immutable", ParentRequestID: parent.ID, Kind: "effect", Operation: "publish_release", IntentDigest: childDigest("4"), Request: body}
+			_, _, problem = store.AcceptNativeCall(call, 1, childDigest("1"), "private-boot")
+			fatal(t, problem)
+			if phase != "accepted" {
+				fatal(t, store.FreezeNativeCall(call.ID, body))
+			}
+			if phase == "executing" {
+				fatal(t, store.StartNativeEffectWrite(call.ID))
+			}
+			before, problem := store.NativeCall(parent.ID, 0)
+			fatal(t, problem)
+			for _, change := range [][2]string{{"owner/model", "other/model"}, {"checkpoint-a", "checkpoint-b"}, {`"expected_revision":1`, `"expected_revision":2`}} {
+				changed := call
+				changed.Request = []byte(strings.Replace(string(body), change[0], change[1], 1))
+				for _, digest := range []string{call.IntentDigest, childDigest("5")} {
+					changed.IntentDigest = digest
+					if _, _, problem := store.AcceptNativeCall(changed, 1, childDigest("1"), "private-boot"); problem == nil || problem.ErrName() != "child.intent_changed" {
+						t.Fatalf("%s changed accepted publication inputs: %v", phase, problem)
+					}
+				}
+			}
+			after, problem := store.NativeCall(parent.ID, 0)
+			fatal(t, problem)
+			if before.State != after.State || !bytes.Equal(before.Request, after.Request) || !bytes.Equal(before.Frozen, after.Frozen) || before.IntentDigest != after.IntentDigest {
+				t.Fatal("refused replay mutated the accepted publication")
+			}
+		})
+	}
+}
 
 func TestNativeAndPackageCallsShareOneParentIndexAndFreezeBeforeEffects(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))

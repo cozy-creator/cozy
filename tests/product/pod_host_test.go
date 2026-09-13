@@ -1129,7 +1129,7 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	}()
 	// THE POD SERVES: the request is DISPATCHED to the rented worker exactly once — the
 	// install that pins a local relaunch never hides the rental — and the spec names the
-	// local revision with no Environment identity, which development execution has none of.
+	// captured local revision's exact prepared Environment.
 	waitUntil(t, "the attempt offer on the pod", func() bool {
 		pod.mu.Lock()
 		defer pod.mu.Unlock()
@@ -1147,8 +1147,9 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	prepared, err := canonical.Read(pod.desired[0].GetPlacementSet().PlacementSetCanonicalBytes, &pb.PlacementSet{})
 	must(t, err)
 	environment := prepared.List("placements")[0].Str("environment_digest")
-	if spec.Str("environment_digest") != environment {
+	if environment == "" || spec.Str("environment_digest") != environment {
 		t.Fatalf("captured serving must name its actual prepared environment: got %q, want %q", spec.Str("environment_digest"), environment)
+
 	}
 }
 

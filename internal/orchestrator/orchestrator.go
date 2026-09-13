@@ -1000,10 +1000,17 @@ func (c *Orchestrator) reviveQueue() {
 	asked := map[string]bool{}
 	for _, id := range queued {
 		req, e := c.opt.Store.RequestRow(id)
-		if e != nil || req == nil || asked[req.Worker] {
+		if e != nil || req == nil {
 			continue
 		}
-		asked[req.Worker] = true
+		machine := req.Worker
+		if machine == "" {
+			machine = req.RequestedRental
+		}
+		if asked[machine] {
+			continue
+		}
+		asked[machine] = true
 		c.selectOrStart(*req)
 	}
 }
