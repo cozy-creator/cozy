@@ -248,19 +248,14 @@ func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatu
 			WithRemedy("choose one of the names it does sell: %s", offeredNames(skus)).
 			WithNext("cozy rental new")
 	}
-	// Known but not buyable: a real product in a stock-out. The timestamp is the
-	// actionable half — it separates "gone for ten seconds" from "gone all night".
-	seen := "and no offer for it has been observed at all"
+	message := fmt.Sprintf("Sorry, but our GPU providers have no inventory for %s right now.", skuName)
 	if status.LastSeenAt != nil {
-		seen = fmt.Sprintf("and it was last offered at %s (%s ago)",
+		message += fmt.Sprintf(" %s was last available at %s (%s ago).", skuName,
 			status.LastSeenAt.UTC().Format(time.RFC3339),
 			roughDuration(now.Sub(*status.LastSeenAt)))
 	}
 	return exit.Named(exit.Capacity, "rental.sku_out_of_stock",
-		"%q is a Tensorhub product, but it has no provider inventory right now, %s — %s",
-		skuName, seen, said).
-		WithRemedy("this is a stock-out, not a bad name: retry in a minute or two, or "+
-			"see what is buyable this minute (currently %s)", offeredNames(skus)).
+		"%s Please try again later or rent a different GPU.", message).
 		WithNext("cozy rental new "+skuName, "cozy rental new")
 }
 

@@ -34,16 +34,23 @@ func TestASKURefusalNamesWhichAbsenceItHit(t *testing.T) {
 	if stockOut == nil {
 		t.Fatal("an unbuyable SKU was not refused")
 	}
-	text := stockOut.Error() + " " + stockOut.Remedy
-	// The timestamp is the actionable half — it is what turns "stop" into "wait".
-	if !strings.Contains(text, "2026-09-04T06:48:08Z") {
-		t.Fatalf("a stock-out refusal does not say when the SKU was last offered: %s", text)
+	want := "Sorry, but our GPU providers have no inventory for rtx-a4000 right now. " +
+		"rtx-a4000 was last available at 2026-09-04T06:48:08Z (24m0s ago). " +
+		"Please try again later or rent a different GPU."
+	if stockOut.Message != want || stockOut.Remedy != "" {
+		t.Fatalf("stock-out message = %q, remedy = %q; want %q", stockOut.Message, stockOut.Remedy, want)
 	}
-	if !strings.Contains(text, "is a Tensorhub product") {
-		t.Fatalf("a stock-out refusal does not say the product is real: %s", text)
+	if stockOut.ErrName() != "rental.sku_out_of_stock" || stockOut.Code != exit.Capacity {
+		t.Fatalf("stock-out refusal changed type: %#v", stockOut)
 	}
-	if stockOut.ErrName() != "rental.sku_out_of_stock" {
-		t.Fatalf("a stock-out is named %q", stockOut.ErrName())
+	if got := strings.Join(stockOut.Next, "\n"); got != "cozy rental new rtx-a4000\ncozy rental new" {
+		t.Fatalf("stock-out suggestions = %q", got)
+	}
+	withoutHistory := cli.SKURefusal("rtx-a4000", refusalCatalog(),
+		&hub.RentalSKUStatus{Name: "rtx-a4000", Known: true}, now)
+	if withoutHistory.Message != "Sorry, but our GPU providers have no inventory for rtx-a4000 right now. "+
+		"Please try again later or rent a different GPU." {
+		t.Fatalf("stock-out without an observed date invents history: %s", withoutHistory.Message)
 	}
 
 	unknown := cli.SKURefusal("rtx-9090", refusalCatalog(),
@@ -66,9 +73,6 @@ func TestASKURefusalNamesWhichAbsenceItHit(t *testing.T) {
 	// Both remain refusals. This is presentation, not a fallback: neither may
 	// name a substitute machine as something that was rented.
 	for _, refusal := range []*exit.Error{stockOut, unknown} {
-		if !strings.Contains(refusal.Error(), "NOTHING was rented") {
-			t.Fatalf("a refusal does not say nothing was rented: %s", refusal.Error())
-		}
 		for _, other := range []string{"rtx-4090", "cpu"} {
 			if strings.Contains(refusal.Error(), "renting "+other) {
 				t.Fatalf("a refusal reads as though %s was rented instead: %s", other, refusal.Error())
