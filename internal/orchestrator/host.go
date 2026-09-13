@@ -430,6 +430,13 @@ func (c *Orchestrator) observePrepareEvent(instanceID, machine, label string, ev
 	default:
 		return
 	}
+	sample := PhaseSample{Name: name, Machine: machine, Detail: label}
+	// PrepareEvent counters are cumulative across the entire call. After download,
+	// they still describe the completed transfer, not package setup or GPU loading.
+	if name != PhaseDownloading {
+		c.ObservePhase(instanceID, sample)
+		return
+	}
 	models := make([]ModelDownloadProgress, 0, len(event.GetModelProgress()))
 	for _, item := range event.GetModelProgress() {
 		ref := item.GetModel()
@@ -443,9 +450,8 @@ func (c *Orchestrator) observePrepareEvent(instanceID, machine, label string, ev
 			OriginBytes: item.GetOriginBytes(), CachedBytes: item.GetCachedBytes(),
 		})
 	}
-	c.ObservePhase(instanceID, PhaseSample{
-		Name: name, Machine: machine, Detail: label, Models: models,
-		HasBytes: event.GetTotalBytes() > 0 || event.GetTransferredBytes() > 0,
-		Moved:    event.GetTransferredBytes(), Total: event.GetTotalBytes(),
-	})
+	sample.Models = models
+	sample.HasBytes = event.GetTotalBytes() > 0 || event.GetTransferredBytes() > 0
+	sample.Moved, sample.Total = event.GetTransferredBytes(), event.GetTotalBytes()
+	c.ObservePhase(instanceID, sample)
 }

@@ -941,24 +941,51 @@ func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
 // position is the real thing rather than an estimate (cr-019: many queued jobs against
 // one worker drain FIFO, and a client can watch it happen).
 func (c *Orchestrator) QueuePosition(requestID string) int {
-	position, _ := c.QueueState(requestID)
-	return position
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, id := range c.pending {
+		if id == requestID {
+			return i + 1
+		}
+	}
+	return 0
 }
 
-// QueueState returns one atomic snapshot of a waiting request's one-based position and
-// the total queue depth. Reading both under one lock matters to a client spelling 9/9:
-// two separate observations could otherwise pair a position from one queue generation
-// with a depth from another.
+// QueueState describes the request's machine queue. The dispatcher visits one global
+// list, but requests pinned to another machine do not occupy this machine's queue.
+// Read both numbers from the same pending snapshot and exclude settled/open attempts.
 func (c *Orchestrator) QueueState(requestID string) (position, depth int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	depth = len(c.pending)
-	for i, id := range c.pending {
+	owed, problem := c.opt.Store.Owed()
+	if problem != nil {
+		return 0, 0
+	}
+	venues := make(map[string]string, len(owed))
+	for _, request := range owed {
+		venue := request.Worker
+		if venue == "" {
+			venue = request.RequestedRental
+		}
+		if venue == "" && request.RentalRequired {
+			venue = "unassigned-rental"
+		}
+		venues[request.ID] = venue
+	}
+	venue, found := venues[requestID]
+	if !found {
+		return 0, 0
+	}
+	for _, id := range c.pending {
+		if other, waiting := venues[id]; !waiting || other != venue {
+			continue
+		}
+		depth++
 		if id == requestID {
-			return i + 1, depth
+			position = depth
 		}
 	}
-	return 0, depth
+	return position, depth
 }
 
 // reviveQueue re-asks select-or-start for the HEAD of the dispatch queue — the head per

@@ -880,6 +880,11 @@ func PhaseCell(life api.Lifecycle) string {
 		activity = "loading models"
 	}
 	parts := []string{activity}
+	// Older daemons carried completed download counters into these phases.
+	// Job preparation may report real conversion progress; serving setup cannot.
+	if life.Phase == orchestrator.PhaseWarming || life.Phase == orchestrator.PhasePreparing && life.Kind != "job" {
+		return activity
+	}
 	if life.PhaseMovedBytes != nil {
 		moved := output.Bytes(*life.PhaseMovedBytes)
 		if life.PhaseTotalBytes != nil && *life.PhaseTotalBytes > 0 {

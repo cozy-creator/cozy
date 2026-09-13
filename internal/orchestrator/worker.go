@@ -569,6 +569,7 @@ type remotePlacementObservation struct {
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
 	knownPlanIDs        map[string]bool
+	fault               *pb.Fault
 }
 
 // dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).
@@ -1042,6 +1043,7 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 		w := c.workers[instanceID]
 		gone := w == nil || w.exited
 		var refused, desiredRefusal *exit.Error
+		var placementFault *pb.Fault
 		placementFailed := false
 		if w != nil {
 			refused, desiredRefusal = w.refusal, w.desiredRefusal
@@ -1054,6 +1056,9 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			placementFailed = found && w.acceptedRevision == w.revision &&
 				observed.placementSetDigest == desired.PlacementSetDigest &&
 				observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+			if placementFailed {
+				placementFault = observed.fault
+			}
 			planID := logical.PlanID
 			if planID == "" {
 				// Runtime authored each binding beside its callable name. Other
@@ -1098,6 +1103,10 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 		case desiredRefusal != nil:
 			return WorkerLaunchSpec{}, "", desiredRefusal
 		case placementFailed:
+			if placementFault != nil {
+				return WorkerLaunchSpec{}, "", exit.Named(exit.Failed,
+					"worker.placement_refused", "%s: %s", placementFault.Reason, brief(placementFault.Detail, 4096))
+			}
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Failed,
 				"rental.package_materialization_failed",
 				"the rented worker could not materialize package %s", logical.Package)
