@@ -11,13 +11,11 @@ import (
 	"io"
 	"math"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/mattn/go-isatty"
@@ -154,10 +152,6 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	selectedRental, e := requestedRental(ctx, target, ep.Name)
-	if e != nil {
-		return e
-	}
 	key := requestKey(ctx.Inv.Value("--idempotency-key"))
 
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
@@ -192,6 +186,10 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return e
 	}
 	if e := validateInvocationPayload(ctx, target.Package, ep, input); e != nil {
+		return e
+	}
+	selectedRental, e := requestedRental(ctx, target, ep.Name)
+	if e != nil {
 		return e
 	}
 	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models, managedRental)
@@ -712,11 +710,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	}
 	states := map[string]int{}
 	for _, life := range rows {
-		// An assignment still in this daemon's queue is not execution on that pod.
-		// Also correct older daemon projections that expose the provisional venue.
-		if life.Status == "queued" && life.Attempts == 0 && life.Attempt == 0 {
-			life.Machine = ""
-		}
+		life.Machine = life.DisplayMachine()
 		kind := life.Kind
 		if kind == "" {
 			kind = "invocation"
@@ -874,7 +868,10 @@ func PhaseCell(life api.Lifecycle) string {
 	case orchestrator.PhaseDownloading:
 		activity = "downloading models"
 	case orchestrator.PhasePreparing:
-		activity = "preparing models"
+		activity = "setting up package"
+		if life.Kind == "job" {
+			activity = "preparing inputs"
+		}
 	case orchestrator.PhaseWarming:
 		activity = "loading models"
 	}
@@ -984,6 +981,11 @@ func observe(ctx *Context, c *localapi.Client, requestID string,
 ) (*localapi.Event, *exit.Error) {
 	watchCtx, stop := context.WithTimeout(context.Background(), window)
 	defer stop()
+	watchCtx, restoreInput, _, problem := liveWatchContext(ctx, watchCtx, nil)
+	if problem != nil {
+		return nil, problem
+	}
+	defer restoreInput()
 	lines := NewProgress(ctx, false, began)
 	terminal, problem := c.WatchContext(watchCtx, requestID, 0, lines.On)
 	lines.Done()
@@ -1152,9 +1154,11 @@ func runStatus(status string) string {
 // happened.
 func watch(ctx *Context, c *localapi.Client, requestID string,
 	deadline time.Duration, began time.Time) (*localapi.Event, string, *exit.Error) {
-	interrupt := make(chan os.Signal, 2)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(interrupt)
+	interrupt, restoreInput, _, problem := liveSignals(ctx, nil)
+	if problem != nil {
+		return nil, "", problem
+	}
+	defer restoreInput()
 
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()

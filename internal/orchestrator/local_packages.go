@@ -750,7 +750,7 @@ func (c *Orchestrator) ConvergeUnpublishedPlacement(instanceID, operationID,
 }
 
 func (c *Orchestrator) convergeUnpublishedModels(instanceID, operationID, localRevisionDigest string, models []*pb.DownloadModelRef, native []*pb.NativeModelBinding) *exit.Error {
-	if operationID == "" || !validDigest(localRevisionDigest) || len(models)+len(native) == 0 || (len(models) > 0 && len(native) > 0) {
+	if operationID == "" || !validDigest(localRevisionDigest) || len(models)+len(native) == 0 {
 		return exit.Named(exit.Validation, "private_placement_incomplete",
 			"local package placement requires operation, exact revision, and models")
 	}
@@ -770,6 +770,9 @@ func (c *Orchestrator) convergeUnpublishedModels(instanceID, operationID, localR
 	}
 	if s == nil {
 		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
+	}
+	if problem := requireMixedModelInputs(s, len(models) > 0 && len(native) > 0); problem != nil {
+		return problem
 	}
 	// The models bind OVER the local revision, so the pod must hold that revision first:
 	// `ConvergeLocalPackage` only ISSUES the prepare, and an unpublished package placement sent on its
@@ -808,7 +811,7 @@ func (c *Orchestrator) issueUnpublishedPlacementSet(s *session, w *worker,
 	w.desiredUnpublishedPlacement = cloneUnpublishedPlacementSet(selected)
 	w.desiredEpoch = s.epoch
 	c.mu.Unlock()
-	call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: cloneUnpublishedPlacementSet(selected)}
+	call := &pb.PreparePrivatePlacementCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PrivatePlacementSet: cloneUnpublishedPlacementSet(selected)}
 	return c.issueThroughHost(s, w, hostLabel("private_placement_set", selected.OperationId),
 		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 			return s.host.PreparePrivatePlacement(ctx, call)

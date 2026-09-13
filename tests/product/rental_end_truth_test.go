@@ -145,6 +145,51 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 	}
 }
 
+func TestRentalShutdownHasAConciseHumanSummary(t *testing.T) {
+	for _, mode := range []string{"human", "json", "full"} {
+		t.Run(mode, func(t *testing.T) {
+			root, _, stand := rentalEndRoot(t, "rental-shutdown-summary-"+mode)
+			stand.publishListing()
+			const id = "pr-1234567890abcdef1234"
+			stand.add(id, "bellows")
+			args := []string{"rental", "end", "bellows"}
+			if mode != "human" {
+				args = append(args, "--"+mode)
+			}
+			code, out, progress := runCozyStreams(t, root, args...)
+			if code != 0 || stand.releases(id) != 1 {
+				t.Fatalf("shutdown failed: exit=%d %s %s", code, out, progress)
+			}
+			if mode == "json" {
+				if progress != "" || !strings.Contains(out, `"state":"ended"`) || !strings.Contains(out, `"changed":true`) {
+					t.Fatalf("structured shutdown changed: %s %s", out, progress)
+				}
+				return
+			}
+			if progress != "Shutting down remote machine...\n" {
+				t.Fatalf("unexpected shutdown progress: %q", progress)
+			}
+			if mode == "full" {
+				if !strings.Contains(out, "state:") || !strings.Contains(out, id) {
+					t.Fatalf("expanded details missing: %s", out)
+				}
+				return
+			}
+			for _, want := range []string{"bellows shut down.", "Temporary pod files are gone.",
+				"Local outputs and uploaded checkpoints remain.", "0 remote machines", "$0.00/hour", "Next: cozy rental list"} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("shutdown omitted %q: %s", want, out)
+				}
+			}
+			for _, detail := range []string{"release_requested", "owner_stop", "forgotten:", "media bearer", "this host holds"} {
+				if strings.Contains(out+progress, detail) {
+					t.Fatalf("default shutdown exposes %q: %s %s", detail, out, progress)
+				}
+			}
+		})
+	}
+}
+
 // TestAnAcceptedAskSurvivesAnUnusableCreateAnswer is the incident's ROOT, reproduced
 // through the paid path: tensorhub answers 202 for a pod it really created, with the
 // create answer th-198 was missing a field from. Creator cannot attach it — that refusal

@@ -2703,8 +2703,11 @@ type MachineExecutionSubmit struct {
 	// execution or become authority to buy capacity. Runtime retains/revalidates its
 	// own immutable preparation paths; client paths are not restart authority.
 	PayloadCanonicalBytes []byte `protobuf:"bytes,9,opt,name=payload_canonical_bytes,json=payloadCanonicalBytes,proto3" json:"payload_canonical_bytes,omitempty"` // bounded typed arguments; hash must equal InvocationSpec.payload_digest
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Runtime retains payload and native input custody before acceptance. No later
+	// attempt may depend on a laptop file URL or an expired original delivery grant.
+	PublicationAuthorizationId string `protobuf:"bytes,10,opt,name=publication_authorization_id,json=publicationAuthorizationId,proto3" json:"publication_authorization_id,omitempty"` // minor52; optional canonical nonzero UUID
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *MachineExecutionSubmit) Reset() {
@@ -2800,18 +2803,26 @@ func (x *MachineExecutionSubmit) GetPayloadCanonicalBytes() []byte {
 	return nil
 }
 
+func (x *MachineExecutionSubmit) GetPublicationAuthorizationId() string {
+	if x != nil {
+		return x.PublicationAuthorizationId
+	}
+	return ""
+}
+
 type MachineExecutionReceipt struct {
-	state                protoimpl.MessageState `protogen:"open.v1"`
-	RequestId            string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	SubmissionId         string                 `protobuf:"bytes,2,opt,name=submission_id,json=submissionId,proto3" json:"submission_id,omitempty"`
-	CaptureDigest        []byte                 `protobuf:"bytes,3,opt,name=capture_digest,json=captureDigest,proto3" json:"capture_digest,omitempty"`
-	InvocationSpecDigest []byte                 `protobuf:"bytes,4,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
-	AcceptedAtMs         uint64                 `protobuf:"varint,5,opt,name=accepted_at_ms,json=acceptedAtMs,proto3" json:"accepted_at_ms,omitempty"`
-	WorkerId             string                 `protobuf:"bytes,6,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
-	WorkerBootId         string                 `protobuf:"bytes,7,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`                         // acceptance boot; a later boot may reopen the same execution journal
-	ExecutionWorkspaceId string                 `protobuf:"bytes,8,opt,name=execution_workspace_id,json=executionWorkspaceId,proto3" json:"execution_workspace_id,omitempty"` // Runtime journal lifetime identity, not a filesystem path
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	state                      protoimpl.MessageState `protogen:"open.v1"`
+	RequestId                  string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	SubmissionId               string                 `protobuf:"bytes,2,opt,name=submission_id,json=submissionId,proto3" json:"submission_id,omitempty"`
+	CaptureDigest              []byte                 `protobuf:"bytes,3,opt,name=capture_digest,json=captureDigest,proto3" json:"capture_digest,omitempty"`
+	InvocationSpecDigest       []byte                 `protobuf:"bytes,4,opt,name=invocation_spec_digest,json=invocationSpecDigest,proto3" json:"invocation_spec_digest,omitempty"`
+	AcceptedAtMs               uint64                 `protobuf:"varint,5,opt,name=accepted_at_ms,json=acceptedAtMs,proto3" json:"accepted_at_ms,omitempty"`
+	WorkerId                   string                 `protobuf:"bytes,6,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerBootId               string                 `protobuf:"bytes,7,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`                                           // acceptance boot; a later boot may reopen the same execution journal
+	ExecutionWorkspaceId       string                 `protobuf:"bytes,8,opt,name=execution_workspace_id,json=executionWorkspaceId,proto3" json:"execution_workspace_id,omitempty"`                   // Runtime journal lifetime identity, not a filesystem path
+	PublicationAuthorizationId string                 `protobuf:"bytes,9,opt,name=publication_authorization_id,json=publicationAuthorizationId,proto3" json:"publication_authorization_id,omitempty"` // exact accepted scope reference, or empty
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *MachineExecutionReceipt) Reset() {
@@ -2896,6 +2907,13 @@ func (x *MachineExecutionReceipt) GetWorkerBootId() string {
 func (x *MachineExecutionReceipt) GetExecutionWorkspaceId() string {
 	if x != nil {
 		return x.ExecutionWorkspaceId
+	}
+	return ""
+}
+
+func (x *MachineExecutionReceipt) GetPublicationAuthorizationId() string {
+	if x != nil {
+		return x.PublicationAuthorizationId
 	}
 	return ""
 }
@@ -21530,7 +21548,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16callee_revision_digest\x18\x05 \x01(\fR\x14calleeRevisionDigest\x12\x1e\n" +
 	"\n" +
 	"entrypoint\x18\x06 \x01(\tR\n" +
-	"entrypoint\"\xc9\x03\n" +
+	"entrypoint\"\x8b\x04\n" +
 	"\x16MachineExecutionSubmit\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12#\n" +
 	"\rsubmission_id\x18\x02 \x01(\tR\fsubmissionId\x12%\n" +
@@ -21540,7 +21558,9 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fmax_attempts\x18\x06 \x01(\rR\vmaxAttempts\x12$\n" +
 	"\x0eretry_delay_ms\x18\a \x01(\x04R\fretryDelayMs\x12I\n" +
 	"\x0eprepared_state\x18\b \x01(\v2\".cozy.worker.v1.DesiredWorkerStateR\rpreparedState\x126\n" +
-	"\x17payload_canonical_bytes\x18\t \x01(\fR\x15payloadCanonicalBytes\"\xd9\x02\n" +
+	"\x17payload_canonical_bytes\x18\t \x01(\fR\x15payloadCanonicalBytes\x12@\n" +
+	"\x1cpublication_authorization_id\x18\n" +
+	" \x01(\tR\x1apublicationAuthorizationId\"\x9b\x03\n" +
 	"\x17MachineExecutionReceipt\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12#\n" +
@@ -21550,7 +21570,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0eaccepted_at_ms\x18\x05 \x01(\x04R\facceptedAtMs\x12\x1b\n" +
 	"\tworker_id\x18\x06 \x01(\tR\bworkerId\x12$\n" +
 	"\x0eworker_boot_id\x18\a \x01(\tR\fworkerBootId\x124\n" +
-	"\x16execution_workspace_id\x18\b \x01(\tR\x14executionWorkspaceId\"\xaa\x01\n" +
+	"\x16execution_workspace_id\x18\b \x01(\tR\x14executionWorkspaceId\x12@\n" +
+	"\x1cpublication_authorization_id\x18\t \x01(\tR\x1apublicationAuthorizationId\"\xaa\x01\n" +
 	"\x15MachineExecutionQuery\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12\x1d\n" +
 	"\n" +

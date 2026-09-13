@@ -4,10 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/signal"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -348,9 +346,11 @@ func microUSD(n int64) string {
 // before this process existed. That is the whole reason `follow` reads the durable stream
 // rather than watching for a live frame.
 func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) *exit.Error {
-	interrupt := make(chan os.Signal, 2)
-	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(interrupt)
+	interrupt, restoreInput, _, problem := liveSignals(ctx, nil)
+	if problem != nil {
+		return problem
+	}
+	defer restoreInput()
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
 	detached := make(chan struct{}, 1)

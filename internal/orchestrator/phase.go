@@ -102,6 +102,8 @@ type RentalProgress struct {
 	AcceleratorCount      int    `json:"accelerator_count"`
 	HourlyRateUSDMicros   int64  `json:"hourly_rate_usd_micros"`
 	BaseWorkerImageDigest string `json:"base_worker_image_digest,omitempty"`
+	BaseWorkerImageTag    string `json:"base_worker_image_tag,omitempty"`
+	BaseWorkerProfile     string `json:"base_worker_profile,omitempty"`
 }
 
 // Elapsed is how long this phase has been the current one.

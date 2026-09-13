@@ -27,8 +27,11 @@ type Field struct {
 type Record struct {
 	Fields    []Field
 	AllFields []Field
-	Notes     []string
-	Next      []string
+	// Summary replaces the default human field table for completed actions.
+	// JSON, --full and explicit field selection retain the structured record.
+	Summary []string
+	Notes   []string
+	Next    []string
 }
 
 type List struct {
@@ -124,6 +127,15 @@ func (r Record) Emit(w io.Writer, mode Mode) error {
 		data["next"] = next
 	}
 	if mode.Human && !mode.JSON {
+		if len(r.Summary) > 0 && !mode.Full && len(mode.Fields) == 0 {
+			var rendered strings.Builder
+			for _, line := range r.Summary {
+				fmt.Fprintln(&rendered, strings.TrimSpace(line))
+			}
+			writeGuidanceLines(&rendered, nil, r.Next)
+			_, err := io.WriteString(w, rendered.String())
+			return err
+		}
 		return writeHumanRecord(w, fields, data, r.Notes, r.Next, mode.Full)
 	}
 	return Write(w, data, mode)

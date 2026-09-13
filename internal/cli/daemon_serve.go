@@ -63,6 +63,12 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 
+	// Arm shutdown before publishing the daemon or starting owned work. Clients
+	// can send SIGTERM as soon as the lock/credential or API becomes visible.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
+
 	socket := l.Root + "/worker.sock"
 
 	// LOOPBACK-ONLY, and the bind happens before anything durable does. internal/api
@@ -186,10 +192,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 
-	// The stop channel exists before the server so the shutdown route can feed it: the
-	// route is the ask a platform with no process signal still has (#449), and it takes
-	// exactly the path a SIGTERM takes.
-	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{
 		MachineExecutions: machines,
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
@@ -271,8 +273,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		go sweep.run(quit)
 	}
 
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(stop)
 	<-stop
 	close(quit)
 	fmt.Fprintln(ctx.Out, "draining package processes…")

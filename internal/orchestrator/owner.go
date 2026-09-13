@@ -763,7 +763,12 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),
 		len(held), len(hostHeld), doc.Int("accepted_desired_state_revision"),
 		doc.Int("converged_revision"))
-	if w.spec.IsJob() {
+	c.mu.Lock()
+	// Native absence invalidates the existing prepared plan. Reissue its saved
+	// inputs before JOB mode so the queued retry can become dispatchable.
+	replayJob := w.spec.IsJob() && (w.spec.Connection == nil || staged(w, w.spec.Placement.Jobs[0].DescriptorID))
+	c.mu.Unlock()
+	if replayJob {
 		c.signalAllTransfers()
 		_ = c.sendJobDirective(s, w, nil)
 		return true

@@ -52,6 +52,10 @@ func ptyRunInput(t *testing.T, root string, rows uint16, input [][]byte, args ..
 }
 
 func startPTY(t *testing.T, root string, rows, columns uint16, args ...string) (*os.File, *exec.Cmd) {
+	return startPTYSetup(t, root, rows, columns, nil, args...)
+}
+
+func startPTYSetup(t *testing.T, root string, rows, columns uint16, setup func(*os.File), args ...string) (*os.File, *exec.Cmd) {
 	t.Helper()
 	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
 	must(t, err)
@@ -66,6 +70,9 @@ func startPTY(t *testing.T, root string, rows, columns uint16, args ...string) (
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 	cmd.Env = childEnv(t, root)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave //cozy:stdin-value test pty navigation
+	if setup != nil {
+		setup(master)
+	}
 	must(t, cmd.Start())
 	must(t, slave.Close()) // the child holds the slave now; EOF/EIO on master ends the read
 	// The kill is a stuck-terminal stop for a child that never answers its inputs; the

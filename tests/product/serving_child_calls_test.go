@@ -104,3 +104,48 @@ func TestServingArgumentsSchemaUpgradePreservesPrivateParent(t *testing.T) {
 		})
 	}
 }
+
+// Null is the captured caller asking Creator to resolve the callee's default.
+// Only native artifact arguments acquire output retention obligations.
+func TestServingChildDownloadedDefaultPreservesArguments(t *testing.T) {
+	for _, checkpoint := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checkpoint=%t", checkpoint), func(t *testing.T) {
+			store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+			fatal(t, problem)
+			defer store.Close()
+			fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
+			parent := offerChildParent(t, store, recordPrivateTransaction(t, store, "default-parent", ""))
+			model := records.ModelRef{Package: "local/renderer", Slot: "model", BindingPath: "generate.models.model", Model: "proof/base", Manifest: childDigest("4"), ManifestLength: 161, Release: "1.0.0", Lane: "bf16"}
+			if checkpoint {
+				model.Release, model.Lane, model.HubCheckpoint = "", "", true
+			}
+			call := records.Request{ID: "default-child", IdemKey: "default-child", Kind: "serving", Package: "local/renderer", Entrypoint: "generate", Payload: []byte(`{"prompt":"same","seed":1234}`), BodyDigest: childDigest("1"), ParentRequestID: parent.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("2"), ChildTargetDigest: childDigest("3"), Models: []records.ModelRef{model}}
+			arguments := []byte(`{"models":{"model":null},"payload":{"prompt":"same","seed":1234}}`)
+			accepted, fresh, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", arguments)
+			fatal(t, problem)
+			if !fresh || len(accepted.Models) != 1 || accepted.Models[0].Manifest != model.Manifest {
+				t.Fatal("downloaded default changed during admission")
+			}
+			retained, problem := store.WeightsRetentions(accepted.ID)
+			fatal(t, problem)
+			if len(retained) != 0 {
+				t.Fatal("Hub default invented native custody")
+			}
+			actual, problem := store.ChildArguments(accepted)
+			fatal(t, problem)
+			if string(actual) != string(arguments) {
+				t.Fatal("model selection changed caller arguments")
+			}
+
+			call.ID, call.IdemKey, call.ParentCallIndex = "wrong-child", "wrong-child", 1
+			wrong := []byte(`{"models":{"other":null},"payload":{"prompt":"same","seed":1234}}`)
+			if _, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", wrong); problem == nil {
+				t.Fatal("unknown slot silently selected the declared default")
+			}
+			call.Models[0].Release, call.Models[0].Lane, call.Models[0].HubCheckpoint = "", "", false
+			if _, _, problem := store.SubmitChild(call, 1, childDigest("1"), "private-boot", arguments); problem == nil {
+				t.Fatal("native input without custody was admitted as a default")
+			}
+		})
+	}
+}

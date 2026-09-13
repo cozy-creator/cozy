@@ -468,6 +468,8 @@ func devicePins(setBytes []byte, envelope []string) ([]*pb.PlacementDevicePin, *
 func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
 	var desiredRevision uint64
+	var reensureRevision uint64
+	var packageStaged bool
 	var laneBreaches []string
 	var heldVerdicts []heldVerdict
 	workerTerminal, repeatedFault, verdict := false, false, ""
@@ -481,6 +483,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		return
 	}
 	if w != nil {
+		wasStaged := w.materialization == pb.MaterializationState_MATERIALIZATION_STATE_STAGED &&
+			w.acceptedRevision == r.AcceptedDesiredStateRevision && bytes.Equal(w.acceptedSetDigest, r.AcceptedPlacementSetDigest)
 		desiredRevision = w.revision
 		w.lastReport = time.Now()
 		w.phase = r.WorkerPhase
@@ -616,6 +620,10 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable
+		packageStaged = !wasStaged && w.spec.Connection != nil && status != nil &&
+			status.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_STAGED &&
+			r.AcceptedDesiredStateRevision == desiredRevision && bytes.Equal(r.AcceptedPlacementSetDigest, w.setDigest) &&
+			bytes.Equal(status.PlacementSetDigest, w.setDigest)
 		// Fault rows explain state; FAILED axes decide terminality. In particular,
 		// BINDING_DEGRADED explicitly means "the worker still serves" and must never become
 		// kill authority merely because it shares the diagnostic list with fatal faults.
@@ -651,14 +659,29 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 			}
 		}
-		if refused := w.observeLatchedFault(r); refused != nil {
-			if w.desiredRefusal == nil {
-				verdict = fmt.Sprintf("worker %s: desired revision %d REFUSED — the placement fault "+
-					"repeated unchanged on %d consecutive reports and nothing here can answer it: %s",
-					w.instanceID, desiredRevision, w.latchedFaultReports, refused.Message)
+		recovering := false
+		if w.modelMaterializationMiss(r) {
+			switch {
+			case w.modelEnsureFromRevision != 0 && w.modelEnsureRevision == 0:
+				recovering = true // the ensure call is still issuing its replacement revision
+			case r.AcceptedDesiredStateRevision == w.modelEnsureFromRevision:
+				recovering = true // duplicate report while the same ensure is in flight
+			case r.AcceptedDesiredStateRevision == desiredRevision && desiredRevision != w.modelEnsureRevision:
+				w.modelEnsureFromRevision, w.modelEnsureRevision = desiredRevision, 0
+				reensureRevision, recovering = desiredRevision, true
 			}
-			w.desiredRefusal = refused
 		}
+		if !recovering {
+			if refused := w.observeLatchedFault(r); refused != nil {
+				if w.desiredRefusal == nil {
+					verdict = fmt.Sprintf("worker %s: desired revision %d REFUSED — the placement fault "+
+						"repeated unchanged on %d consecutive reports and nothing here can answer it: %s",
+						w.instanceID, desiredRevision, w.latchedFaultReports, refused.Message)
+				}
+				w.desiredRefusal = refused
+			}
+		}
+
 		if refused := w.jobExecutorRefusal(r); refused != nil {
 			w.desiredRefusal = refused
 		}
@@ -667,6 +690,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	phase := trimEnum(pb.WorkerPhase_name[int32(r.WorkerPhase)], "WORKER_PHASE_")
 	c.mu.Unlock()
+	if reensureRevision != 0 {
+		go c.reensureModels(s, w, reensureRevision)
+	}
 	if w != nil && w.media != nil {
 		go c.retryMediaCleanup(w)
 	}
@@ -709,7 +735,12 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 	}
-	// DISPATCHABLE is the only state that can change the queue's answer. A free local
+	// A restored job-only package reaches STAGED without a serving endpoint.
+	// Wake its existing request resolver to continue through normal job activation.
+	if packageStaged {
+		go c.reviveQueue()
+	}
+	// Dispatchable capacity changes the queue's answer. A free local
 	// seat also re-asks the FIFO head's residency question: the head may name a different
 	// package whose launch was parked while this worker held the same device envelope.
 	// `selectOrStart` still passes through the durable holder and idle-worker fences, so a
@@ -1193,6 +1224,24 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 	}
 	c.signalClosed(key(req.ID, uint64(attempt.Attempt)), verdict)
 	if requeue {
+		if req.IsJob() && attempt.TerminalStatus == "REFUSED" &&
+			attempt.TerminalCause == "PLACEMENT_NOT_DISPATCHABLE" &&
+			strings.HasPrefix(attempt.SafeMessage, "model_materialization_required:") {
+			// A newer native admission result revoked the old preparation's
+			// readiness. Keep the exact desired input; requeue must re-enter
+			// its normal TensorFS preparation instead of borrowing old credit.
+			c.mu.Lock()
+			if holder != nil && holder.spec.Connection != nil && stagedFor(holder, req) {
+				plans := holder.planIDs[:0]
+				for _, plan := range holder.planIDs {
+					if plan != req.PlanID {
+						plans = append(plans, plan)
+					}
+				}
+				holder.planIDs = plans
+			}
+			c.mu.Unlock()
+		}
 		why := attempt.TerminalStatus + "/" + attempt.TerminalCause
 		if CapacityRefusal(attempt.TerminalStatus, attempt.TerminalCause) {
 			c.RequeueForCapacity(req.ID, why)

@@ -170,6 +170,8 @@ func TestRunValidatesArgumentsBeforeModelResolution(t *testing.T) {
 		{name: "invalid steps", field: "steps", args: []string{"prompt=hello", "steps=0"}},
 		{name: "missing image collection", field: "assets", args: []string{"prompt=hello"}, images: true},
 		{name: "rented missing prompt", field: "prompt", args: []string{"--rental-only"}},
+		{name: "named rental missing prompt", field: "prompt", args: []string{"--rental=not-resolved"}},
+		{name: "named rental empty prompt", field: "prompt", args: []string{"--rental=not-resolved", "prompt="}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root, path, activity, probe := admissionRoot(t, admissionInterface(t, false, test.images),

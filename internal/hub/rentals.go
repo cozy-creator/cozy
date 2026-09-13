@@ -101,6 +101,8 @@ type Rental struct {
 	ProviderState         string
 	ContainerState        string
 	BaseWorkerImageDigest string
+	BaseWorkerImageTag    string
+	BaseWorkerProfile     string
 	// CreatedAt is when the hub opened the rental, which is when it began billing.
 	// It is how long a pod this host holds no record of has been costing money —
 	// there is no local `rented_at` for a rental the records never saw. RFC 3339 as
@@ -172,6 +174,8 @@ type wireRental struct {
 	ProviderState         string         `json:"provider_state,omitempty"`
 	ContainerState        string         `json:"container_state,omitempty"`
 	BaseWorkerImageDigest string         `json:"base_worker_image_digest,omitempty"`
+	BaseWorkerImageTag    string         `json:"base_worker_image_tag,omitempty"`
+	BaseWorkerProfile     string         `json:"base_worker_profile,omitempty"`
 	CreatedAt             string         `json:"created_at,omitempty"`
 }
 
@@ -207,6 +211,8 @@ func (w wireRental) rental() Rental {
 		ProviderState:         w.ProviderState,
 		ContainerState:        w.ContainerState,
 		BaseWorkerImageDigest: w.BaseWorkerImageDigest,
+		BaseWorkerImageTag:    w.BaseWorkerImageTag,
+		BaseWorkerProfile:     w.BaseWorkerProfile,
 		CreatedAt:             w.CreatedAt,
 	}
 }

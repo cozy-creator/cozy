@@ -12,9 +12,16 @@ import (
 )
 
 // A modeled child must not activate the intermediate code-only PlacementSet.
-// Prepare code, join its exact native inputs, then publish one complete placement
+// Prepare code, join its exact model inputs, then publish one complete placement
 // while retaining the CPU parent whose canonical invocation authorized this call.
 func (c *Orchestrator) prepareChildServing(instance string, req records.Request, revision localpackage.Revision) *exit.Error {
+	_, current, problem := c.localControl(instance)
+	if problem != nil {
+		return problem
+	}
+	if problem := requireMixedModelInputs(current, mixedModelInputs(req.Models)); problem != nil {
+		return problem
+	}
 	prepared, problem := c.prepareUnpublishedPackage(instance, req, revision, false)
 	if problem != nil {
 		return problem
@@ -45,7 +52,17 @@ func (c *Orchestrator) prepareChildServing(instance string, req records.Request,
 		if err != nil {
 			return exit.Internalf("child code revision is not canonical")
 		}
-		selected = &pb.DesiredPrivatePlacementSet{OperationId: req.ID, LocalRevisionDigest: digest, NativeModels: native}
+		var downloadSet []byte
+		if models := downloadModelRefs(req.Models); len(models) > 0 {
+			if c.opt.RentalPackageSet == nil {
+				return exit.Named(exit.Unavailable, "rental.package_set_signer_missing", "this Cozy daemon has no package_set signer")
+			}
+			downloadSet, problem = c.opt.RentalPackageSet(nil, models)
+			if problem != nil {
+				return problem
+			}
+		}
+		selected = &pb.DesiredPrivatePlacementSet{OperationId: req.ID, LocalRevisionDigest: digest, NativeModels: native, DownloadDelegation: downloadSet}
 	}
 	rev := c.nextRevision()
 	c.mu.Lock()
@@ -57,7 +74,7 @@ func (c *Orchestrator) prepareChildServing(instance string, req records.Request,
 	c.mu.Unlock()
 	label := hostLabel("child_serving", req.ID)
 	if selected != nil {
-		call := &pb.PreparePrivatePlacementCall{Claim: s.claim, PrivatePlacementSet: selected}
+		call := &pb.PreparePrivatePlacementCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PrivatePlacementSet: selected}
 		result := c.runHostPrepare(s, w, seq, label,
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 				return s.host.PreparePrivatePlacement(ctx, call)
