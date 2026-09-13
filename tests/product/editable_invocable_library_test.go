@@ -41,7 +41,7 @@ func TestEditableInvocableLibraryTracksCodeWithoutPackageManifest(t *testing.T) 
 	t.Cleanup(func() {
 		compositionDown(t, root, path)
 		if !t.Failed() {
-			must(t, os.RemoveAll(root))
+			must(t, removeAllForce(root))
 		} else {
 			t.Log("retained editable proof home", root)
 		}

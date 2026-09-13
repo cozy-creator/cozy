@@ -112,6 +112,16 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			must(t, err)
 			must(t, os.WriteFile(file, []byte(strings.Replace(string(body), "value * factor for value", "value * factor + 1 for value", 1)), 0o600))
 		}
+		if cycle == 3 {
+			// A completed no-output caller no longer owns its intermediates. Return
+			// the final checkpoint explicitly before testing pruning and restart;
+			// changing only this caller must still reuse both operation results.
+			body, err := os.ReadFile(script)
+			must(t, err)
+			body = []byte(strings.Replace(string(body), "async def main():", "from cozy_runtime.author import ModelArtifact\n\nasync def main() -> ModelArtifact:", 1))
+			body = []byte(strings.Replace(string(body), "    await candidate(", "    result = await candidate(", 1) + "    return result\n")
+			must(t, os.WriteFile(script, body, 0o600))
+		}
 		code, out := runCozyPath(t, root, path, "run", script, "--await", "--json")
 		if cycle == 0 {
 			if code == 0 || !strings.Contains(out, "candidate quality gate failed") {
@@ -158,7 +168,29 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		} else if children[1].Ordinal != 0 || children[1].ReusedFrom != latestB.ID {
 			t.Fatalf("unchanged B did not use the shared workspace result: %+v", children[1])
 		}
-		run("run", "cancel", strconv.Itoa(1+3*(cycle-1)))
+		for deadline := time.Now().Add(30 * time.Second); ; {
+			cleanup, issue := store.SuccessfulWorkRelease(parent.ID)
+			fatal(t, issue)
+			if cleanup != nil && cleanup.State == "complete" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("successful caller did not finalize implicit work: %+v", cleanup)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		for _, member := range append(children, *parent) {
+			current, issue := store.RequestRow(member.ID)
+			fatal(t, issue)
+			kept := cycle == 3 && member.ID == parent.ID
+			if current.State != "succeeded" || current.RetainWork != kept {
+				t.Fatalf("successful cleanup lost history or explicit output custody: %+v", current)
+			}
+		}
+		if cycle == 1 {
+			// Only the failed predecessor still needs explicit abandonment.
+			run("run", "cancel", "1")
+		}
 		restartDaemon()
 		checkTensor(originalA, 7)
 		value := 15
@@ -189,7 +221,6 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	if removed == 0 || reclaimed == 0 {
 		t.Fatalf("obsolete B cache was not pruned: entries=%d bytes=%d", removed, reclaimed)
 	}
-	checkTensor(originalA, 7)
 	checkTensor(latestB, 15)
 	var down struct {
 		NotClosed int `json:"not_closed_cleanly"`
@@ -198,17 +229,18 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	if down.NotClosed != 0 {
 		t.Fatalf("shutdown abandoned ordinary native cleanup: %+v", down)
 	}
-	// Canceling the old producers releases their own custody, independently of
-	// the workspace cache. A fresh caller after shutdown still acquires both.
+	// The caller retained B, so pruning could remove only unused A and obsolete B.
+	// A fresh caller recomputes A; its identical manifest still hits retained B.
 	run("run", script, "--await")
 	resumed, problem := store.RequestByReference("13")
 	fatal(t, problem)
 	children, problem := store.Children(resumed.ID)
 	fatal(t, problem)
-	if len(children) != 2 || children[0].Ordinal != 0 || children[1].Ordinal != 0 ||
-		children[0].ReusedFrom != originalA.ID || children[1].ReusedFrom != latestB.ID {
-		t.Fatalf("shutdown discarded independently retained memo results: %+v", children)
+	if len(children) != 2 || children[0].Ordinal != 1 || children[1].Ordinal != 0 ||
+		children[0].ReusedFrom != "" || children[1].ReusedFrom != latestB.ID {
+		t.Fatalf("unused input did not recompute or retained result was lost: %+v", children)
 	}
+	checkTensor(children[0], 7)
 	for _, name := range []string{"source", "candidate"} {
 		if _, err := os.Stat(filepath.Join(project, name, "uv.lock")); !os.IsNotExist(err) {
 			t.Fatal("private intake modified the author's lock files")

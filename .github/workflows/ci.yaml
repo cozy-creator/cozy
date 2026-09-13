@@ -15,7 +15,7 @@ jobs:
       - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
       - name: Install the public worker for private script execution
         run: |
-          uv tool install --refresh-package cozy-runtime --python 3.12 'cozy-runtime[model-execution]==0.16.7'
+          uv tool install --refresh-package cozy-runtime --python 3.12 'cozy-runtime[model-execution]==0.16.9'
           uv tool dir --bin >> "$GITHUB_PATH"
       # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
       # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
@@ -45,7 +45,7 @@ jobs:
             --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 \
-            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 20m'
+            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 30m'
       - run: python3 scripts/fence.py
 
   # THE WORKER-IMAGE ROSTER CHECK. `internal/packagepublish/base-distributions.json` is

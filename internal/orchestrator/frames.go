@@ -1135,6 +1135,26 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 	if req.State == "succeeded" && attempt.TerminalStatus == "SUCCEEDED" {
 		go c.finishNativeByteRecipients(req.ID)
 	}
+	if req.ParentRequestID == "" && req.State == "succeeded" {
+		release, problem := c.opt.Store.SuccessfulWorkRelease(req.ID)
+		if problem == nil && release != nil && release.State == "complete" {
+			// Successful retention release is not cancellation or rental lifecycle.
+			// Keep historical source/result records; normal independent GC owns bytes.
+			c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
+			c.signalClosed(key(req.ID, uint64(attempt.Attempt)), nil)
+			c.signalClosed(requestWaitKey(req.ID), nil)
+			c.forget(req.ID)
+			return
+		}
+	}
+	if c.beginSuccessfulWorkRelease(req, attempt.Attempt) {
+		c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
+		c.signalClosed(key(req.ID, uint64(attempt.Attempt)), nil)
+		c.signalClosed(requestWaitKey(req.ID), nil)
+		c.forget(req.ID)
+		c.finishSuccessfulWorkRelease(req.ID)
+		return
+	}
 	if req.State == "succeeded" && req.RetainsLocalOutputs() {
 		c.cleanupAttempt(req, uint64(attempt.Attempt), holder, false)
 		c.signalClosed(key(req.ID, uint64(attempt.Attempt)), nil)

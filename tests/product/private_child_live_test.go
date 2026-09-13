@@ -55,7 +55,7 @@ func TestUnpublishedChildCompositionReusesLocalWorkspace(t *testing.T) {
 		if t.Failed() {
 			t.Log("private composition evidence retained", root)
 		} else {
-			must(t, os.RemoveAll(root))
+			must(t, removeAllForce(root))
 		}
 	})
 	project := t.TempDir()

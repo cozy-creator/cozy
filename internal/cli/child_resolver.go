@@ -1,15 +1,19 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // ResolveUnpublishedChild resolves only the immutable interface binding captured by
@@ -20,6 +24,20 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 	binding, problem := r.store.ChildBinding(parent.InstallID, iface, module, export)
 	if problem != nil {
 		return out, "", problem
+	}
+	if binding == nil && module == runtimeoperation.Module && export == "quantize" {
+		parentInstall, problem := r.store.Install(parent.InstallID)
+		if problem != nil || parentInstall == nil {
+			return out, "", exit.New(exit.Conflict, "builtin caller install is unavailable")
+		}
+		layout, problem := home.Open(r.cfg.Home)
+		if problem != nil {
+			return out, "", problem
+		}
+		binding, problem = install.ResolveRuntimeOperations(context.Background(), layout, r.store, *parentInstall, iface)
+		if problem != nil {
+			return out, "", problem
+		}
 	}
 	if binding == nil {
 		return out, "", exit.Named(exit.Conflict, "child.binding_absent", "the parent did not capture this invocable dependency")
@@ -231,7 +249,9 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 			}
 			// The same immutable closure predicate JobsInstall uses; no package
 			// code needs importing again merely to choose a machine class.
-			needed = needed || launch.AcceleratorRequired(strings.Split(child.Closure, "\n"))
+			if child.Package != "local/"+runtimeoperation.Name || surface.Application != runtimeoperation.Application {
+				needed = needed || launch.AcceleratorRequired(strings.Split(child.Closure, "\n"))
+			}
 			queue = append(queue, binding.ChildInstallID)
 		}
 	}

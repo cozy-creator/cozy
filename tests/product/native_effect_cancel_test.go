@@ -277,7 +277,7 @@ func TestNativeEffectCancellationMigrationPreservesExecutingIntent(t *testing.T)
 		_, err = db.Exec(statement)
 		must(t, err)
 	}
-	_, err = db.Exec(`PRAGMA user_version=31`)
+	_, err = db.Exec(`DROP TABLE IF EXISTS successful_work_releases; PRAGMA user_version=31`)
 	must(t, err)
 	must(t, db.Close())
 	migrated, problem := records.OpenForDaemon(path, filepath.Join(t.TempDir(), "triage"))

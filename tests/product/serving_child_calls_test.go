@@ -88,6 +88,8 @@ func TestServingArgumentsSchemaUpgradePreservesPrivateParent(t *testing.T) {
 			must(t, err)
 			_, err = db.Exec(`DROP TABLE request_child_arguments`)
 			must(t, err)
+			_, err = db.Exec(`DROP TABLE successful_work_releases`)
+			must(t, err)
 			_, err = db.Exec(fmt.Sprintf(`PRAGMA user_version=%d`, version))
 			must(t, err)
 			db.Close()
