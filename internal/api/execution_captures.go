@@ -74,6 +74,10 @@ func (s *Server) executionActivity(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, exit.New(exit.NotFound, "this daemon has no private execution generation"))
 		return
 	}
+	// Admission cannot commit between the durable and live halves of this read.
+	// Imports still preparing their bytes are represented by executionImports.
+	s.shutdownAdmission.Lock()
+	defer s.shutdownAdmission.Unlock()
 	durable, problem := s.store.Obligations()
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
