@@ -1103,6 +1103,15 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Unavailablef("this host resolves no local packages")
 		}
 		if req.InstallID != "" {
+			if req.ParentRequestID != "" && len(downloadModelRefs(req.Models)) > 0 {
+				acquirer, ok := c.opt.Packages.(interface{ EnsureLocalModels([]ModelRef) *exit.Error })
+				if !ok {
+					return WorkerLaunchSpec{}, "", exit.Unavailablef("local model acquisition owner is unavailable")
+				}
+				if problem := acquirer.EnsureLocalModels(req.Models); problem != nil {
+					return WorkerLaunchSpec{}, "", problem
+				}
+			}
 			if req.IsJob() {
 				spec, e := c.opt.Packages.ResolveJobInstall(req.InstallID, req.Entrypoint)
 				return c.exactLocalTransferProducer(req, spec, e)
