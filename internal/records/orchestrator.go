@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS requests (
   reused_from TEXT NOT NULL DEFAULT '',
   orchestration_directive BLOB NOT NULL DEFAULT x'',
   child_artifacts INTEGER NOT NULL DEFAULT 0 CHECK(child_artifacts IN (0,1)),
-  requested_rental TEXT NOT NULL DEFAULT ''
+  requested_rental TEXT NOT NULL DEFAULT '',
+  execution_grant_digest TEXT NOT NULL DEFAULT '' CHECK(execution_grant_digest='' OR (parent_request_id='' AND length(execution_grant_digest)=71 AND substr(execution_grant_digest,1,7)='sha256:' AND substr(execution_grant_digest,8) NOT GLOB '*[^0-9a-f]*'))
 )`
 
 const workerProcessesDDL = `
@@ -458,10 +460,13 @@ type Request struct {
 	ID         string
 	IdemKey    string
 	BodyDigest string
-	Package    string
-	Entrypoint string
-	PlanID     string
-	Release    string
+	// ExecutionGrantDigest tags only roots admitted by the trusted private coordinator.
+	// Descendants retain their ordinary ParentRequestID ancestry; this is no second registry.
+	ExecutionGrantDigest string
+	Package              string
+	Entrypoint           string
+	PlanID               string
+	Release              string
 	// LocalPackageDigest names Creator's sealed carrier set. UploadedBootID binds the
 	// completed transfer to the exact pod generation that acknowledged every file.
 	LocalPackageDigest         string
@@ -759,7 +764,7 @@ func Lanes(models []ModelRef) string {
 	return strings.Join(parts, ",")
 }
 
-const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
+const requestCols = `id,idem_key,body_digest,execution_grant_digest,package,entrypoint,plan_id,package_release,
 	local_package_digest,local_package_uploaded_boot_id,
 	environment_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
@@ -767,7 +772,7 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
-	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
+	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.ExecutionGrantDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.Release, &r.LocalPackageDigest,
 		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
@@ -1331,6 +1336,13 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 }
 
 func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
+	if r.ExecutionGrantDigest != "" {
+		raw, err := canonical.Raw(r.ExecutionGrantDigest)
+		spelled, _ := canonical.Spell(raw)
+		if err != nil || spelled != r.ExecutionGrantDigest || r.ParentRequestID != "" {
+			return Request{}, "", "", "", exit.Named(exit.Validation, "execution_grant_root_only", "execution grant must be an exact digest on a root request")
+		}
+	}
 	r.CreatedAt = now()
 	r.State = "submitted"
 	r.OrchestrationDirective = nil
@@ -1375,7 +1387,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		if retentionErr != nil {
 			return Request{}, false, exit.Internalf("cannot read original retention intent: %s", retentionErr)
 		}
-		if existing.BodyDigest != r.BodyDigest || originalRetention != r.RetainWork || existing.RetryOf != r.RetryOf {
+		if existing.BodyDigest != r.BodyDigest || existing.ExecutionGrantDigest != r.ExecutionGrantDigest || (r.ExecutionGrantDigest != "" && existing.ID != r.ID) || originalRetention != r.RetainWork || existing.RetryOf != r.RetryOf {
 			return Request{}, false, exit.New(exit.Conflict,
 				"idempotency key %s already names a request with a different body", r.IdemKey).
 				WithRemedy("one key, one body: %s was recorded, %s was submitted",
@@ -1389,6 +1401,15 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
+	}
+	if r.ExecutionGrantDigest != "" {
+		var exists bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests WHERE id=?)`, r.ID).Scan(&exists); err != nil {
+			return Request{}, false, exit.Internalf("cannot check private request identity: %s", err)
+		}
+		if exists {
+			return Request{}, false, exit.Named(exit.Conflict, "execution_request_id_conflict", "private request ID already belongs to another admission")
+		}
 	}
 	if r.RetryOf != "" {
 		if problem := retainRetryTx(tx, &r); problem != nil {
@@ -1408,14 +1429,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	if machineRental == "" {
 		machineRental = r.RequestedRental
 	}
-	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
+	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,execution_grant_digest,package,entrypoint,
 		plan_id,package_release,local_package_digest,
 		local_package_uploaded_boot_id,environment_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
 		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
 		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
+		r.ID, r.IdemKey, r.BodyDigest, r.ExecutionGrantDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalPackageDigest,
 		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker,

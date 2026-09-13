@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 39
+const schemaVersion = 40
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -279,7 +279,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			return e
 		}
 	}
-	if sourceVersion < 38 {
+	if sourceVersion < 40 {
 		if e := migrateRequests(tx, path, sourceVersion); e != nil {
 			return e
 		}
@@ -912,6 +912,9 @@ func priorStatements(version int) []string {
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
+		}
+		if requestStatement && version < 40 {
+			stmt = strings.Replace(stmt, ",\n  execution_grant_digest TEXT NOT NULL DEFAULT '' CHECK(execution_grant_digest='' OR (parent_request_id='' AND length(execution_grant_digest)=71 AND substr(execution_grant_digest,1,7)='sha256:' AND substr(execution_grant_digest,8) NOT GLOB '*[^0-9a-f]*'))", "", 1)
 		}
 		if requestStatement && version < 37 {
 			stmt = strings.Replace(stmt, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)

@@ -95,7 +95,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 39 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 40 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	if columns := columnNames(t, db, "attempts"); !columns["triage_bundle"] || columns["triage_path"] {
@@ -188,14 +188,16 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "records.db")
-	store, problem := records.OpenForDaemon(path, "")
-	if problem != nil {
-		t.Fatalf("initialize records: %v", problem)
+	prior, err := os.ReadFile("testdata/records/schema-39.sql")
+	if err != nil {
+		t.Fatal(err)
 	}
-	store.Close()
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(prior)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,plan_id,payload,state,created_at)
@@ -219,7 +221,7 @@ func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 		}
 		t.Fatalf("ordinary Open = %v, want records_schema_upgrade_required", problem)
 	}
-	store, problem = records.OpenForDaemon(path, "")
+	store, problem := records.OpenForDaemon(path, "")
 	if problem != nil {
 		t.Fatalf("schema-37 database did not migrate: %v", problem)
 	}
@@ -231,7 +233,7 @@ func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 39 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 40 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	var pin string
@@ -252,7 +254,7 @@ func TestRecordsRejectsNewerSchemaWithoutResetHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`PRAGMA user_version=40`); err != nil {
+	if _, err := db.Exec(`PRAGMA user_version=1000`); err != nil {
 		db.Close()
 		t.Fatalf("stamp future schema: %v", err)
 	}
