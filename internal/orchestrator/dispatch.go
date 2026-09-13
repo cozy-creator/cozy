@@ -63,11 +63,12 @@ type Submission struct {
 
 	// Kind is the ATTEMPT CLASS: "" or `serving`, or `job`. A job carries two more facts
 	// a serving request has no version of.
-	Kind           string
-	RetainWork     bool
-	RetryOf        string
-	ChildReusable  bool
-	ChildArtifacts bool
+	Kind                string
+	RetainWork          bool
+	ReleaseImplicitWork bool
+	RetryOf             string
+	ChildReusable       bool
+	ChildArtifacts      bool
 	// Org is the publishing org whose scratch repo this job publishes into.
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
@@ -264,7 +265,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		LocalPackageDigest: s.LocalPackageDigest,
 		Outputs:            strings.Join(s.Outputs, ","),
 		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
-		Kind: s.Kind, RetainWork: s.RetainWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Kind: s.Kind, RetainWork: s.RetainWork, ReleaseImplicitWork: s.ReleaseImplicitWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		RequestedRental: s.RequestedRental,
 		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,

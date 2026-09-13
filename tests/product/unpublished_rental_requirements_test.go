@@ -163,6 +163,8 @@ func TestUnpublishedNamedRentalUsesAuthoredImageRequirements(t *testing.T) {
 			}})
 		})
 	})
+	// Dry-run capture owns read-only SDK generations, with no daemon or execution.
+	t.Cleanup(func() { must(t, removeAllForce(root)) })
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	for id, name := range map[string]string{current: "isao", old: "giriko", earlierPython: "priorpython"} {

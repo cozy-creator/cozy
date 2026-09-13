@@ -98,6 +98,9 @@ func privateSourceCancellationDrain(t *testing.T, cancelDrain bool) {
 	if row.State != "canceling" || !retained {
 		t.Fatalf("source cleanup acknowledged while native work was live: state=%s retained=%t", row.State, retained)
 	}
+	// A repeat arriving while another cleanup owns the registry must remain
+	// harmless; a delayed continuation cannot duplicate the confirmed native effect.
+	fatal(t, o.c.CancelRetainedRequest(request.ID, "repeat while native release is active"))
 
 	drain, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -144,5 +147,8 @@ func privateSourceCancellationDrain(t *testing.T, cancelDrain bool) {
 	fatal(t, problem)
 	if rental.State != "ready" {
 		t.Fatal("canceling one source ended the manually reserved rental")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("duplicate cleanup repeated an already-confirmed native release: %d", calls.Load())
 	}
 }

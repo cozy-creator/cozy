@@ -131,3 +131,8 @@ func (r RuntimeCLI) callInputContext(ctx context.Context, input []byte, out any,
 	}
 	return nil
 }
+
+// CapturedBuiltinTool selects only the interpreter whose owned metadata was verified.
+func CapturedBuiltinTool(root, python string, env []string) RuntimeCLI {
+	return RuntimeCLI{Bin: filepath.Join(filepath.Dir(python), "cozy-runtime"), Dir: root, Home: root, Env: env}
+}

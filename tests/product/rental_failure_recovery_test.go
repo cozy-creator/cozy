@@ -188,11 +188,15 @@ func TestRentalFailureRecovery(t *testing.T) {
 			"charging the budget: requeues=%d", row.Requeues)
 	}
 
-	// (c) THE DISPLAY. An operator reading `RUNNING 1` on a failed machine is being told
-	// something that cannot be true, and that is how this bug was found at all.
-	listed := listedRental(t, root, "rental-lost")
-	if listed.Machine != "nitian" || listed.State != "failed" || listed.Failure != "readiness.receipt_conflict" || listed.Running == nil || *listed.Running != 0 || listed.Queued == nil || *listed.Queued != 0 {
-		t.Fatalf("failed rental listing does not reflect reclaimed work: %+v", listed)
+	// A failed machine has left the current fleet; its retained diagnosis and
+	// historical request association survive the inventory projection.
+	if code, out := runCozy(t, root, "rental", "list", "--json", "--full"); code != 0 || strings.Contains(out, "rental-lost") {
+		t.Fatalf("failed rental remained in the current fleet [exit %d]: %s", code, out)
+	}
+	stored, problem := store.RentalRow("rental-lost")
+	fatal(t, problem)
+	if stored == nil || stored.MachineName != "nitian" || stored.State != "failed" || stored.Failure.Code != "readiness.receipt_conflict" {
+		t.Fatalf("failed rental history lost its diagnosis: %+v", stored)
 	}
 
 }

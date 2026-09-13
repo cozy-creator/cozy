@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 38
+const schemaVersion = 39
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -115,7 +115,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 	append(modelTransferSchema, append(eventSchema, append(rentalSchema, packageEventSchema...)...)...)...)...)
 
 func init() {
-	schema = append(schema, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
+	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -444,6 +444,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			if _, err := tx.Exec(statement); err != nil {
 				return exit.Internalf("cannot preserve native byte producer authority: %s", err)
 			}
+		}
+	}
+	if sourceVersion < 39 {
+		if _, err := tx.Exec(successfulWorkDDL); err != nil {
+			return exit.Internalf("cannot add successful work release records: %s", err)
 		}
 	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
@@ -818,6 +823,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 39 && statement == successfulWorkDDL {
+			continue
+		}
 		if version < 36 && statement == nativeByteOutputIndex {
 			continue
 		}
