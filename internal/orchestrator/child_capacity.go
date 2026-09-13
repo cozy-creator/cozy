@@ -39,7 +39,7 @@ func (c *Orchestrator) jobExecutionRole(req records.Request, spec WorkerLaunchSp
 	}
 	plan.Orchestration = false
 	plan.OrchestrationParent = nil
-	if bound && req.RetainWork && !req.NeedsAccelerator && len(req.Models) == 0 && len(plan.WeightsOutputs) == 0 {
+	if bound && req.RetainWork && !req.NeedsAccelerator && len(ownModelInputs(req)) == 0 && len(plan.WeightsOutputs) == 0 {
 		plan.Orchestration = req.Worker != ""
 		if plan.Orchestration {
 			raw, _, err := canonical.Identity(c.jobDirective(&plan))
@@ -62,6 +62,19 @@ func (c *Orchestrator) jobExecutionRole(req records.Request, spec WorkerLaunchSp
 		plan.OrchestrationParent = parent
 	}
 	return spec, nil
+}
+
+// Captured defaults can belong to imported callees. They remain on the request
+// for child resolution but are neither this caller's model inputs nor resources.
+// Missing package attribution is not proof that an input belongs elsewhere.
+func ownModelInputs(req records.Request) []ModelRef {
+	var models []ModelRef
+	for _, model := range req.Models {
+		if model.Package == "" || model.Package == req.Package {
+			models = append(models, model)
+		}
+	}
+	return models
 }
 
 func (c *Orchestrator) retainedOrchestrationParent(child records.Request) (*JobPlan, *exit.Error) {

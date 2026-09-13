@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"slices"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -69,9 +68,7 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 	// Imported invocable defaults belong to the child's package. Keep those exact
 	// selections on the request for child resolution, but do not bind them against
 	// this root script's interface; the child prepares its own package when called.
-	models := slices.DeleteFunc(downloadModelRefs(request.Models), func(model *pb.DownloadModelRef) bool {
-		return model.Package != request.Package
-	})
+	models := downloadModelRefs(ownModelInputs(request))
 	if jobModels && len(models) > 0 {
 		if c.opt.RentalPackageSet == nil {
 			return nil, exit.Unavailablef("unpublished package job models require a rental download set")
