@@ -9,7 +9,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
@@ -30,7 +29,7 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 	sort.Strings(slots)
 	spec := orchestrator.WorkerLaunchSpec{
 		Python: runtime, Args: []string{"serve"}, Dir: f.Install.Dir,
-		EnvironmentPython: home.VenvPython(filepath.Join(f.Install.Dir, "venv")),
+		EnvironmentPython: f.environmentPython(),
 		Devices:           devices, GraceSec: 3,
 		ArtifactCache: filepath.Join(f.Install.Dir, "artifact-cache"),
 		InstallRoot:   filepath.Join(f.Install.Dir, "worker-environments"),

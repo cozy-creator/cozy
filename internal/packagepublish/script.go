@@ -16,6 +16,8 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
+const ScriptApplication = "cozy_script_entry:app"
+
 type scriptMetadata struct {
 	Dependencies   []string       `toml:"dependencies"`
 	RequiresPython string         `toml:"requires-python"`
@@ -97,7 +99,7 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		"project": map[string]any{
 			"name": name, "version": "0.0.0", "requires-python": metadata.RequiresPython,
 			"dependencies": metadata.Dependencies,
-			"entry-points": map[string]any{applicationGroup: map[string]string{"default": "cozy_script_entry:app"}},
+			"entry-points": map[string]any{applicationGroup: map[string]string{"default": ScriptApplication}},
 		},
 		"build-system": map[string]any{"requires": []string{"hatchling>=1.25"}, "build-backend": "hatchling.build"},
 		"tool":         tool,
@@ -120,7 +122,7 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		"cozy_script.py":       raw,
 		"cozy_script_entry.py": []byte("from cozy_runtime.author import script_app\napp = script_app(\"cozy_script\")\n"),
 		"pyproject.toml":       project,
-		"package.toml":         []byte("[application]\nobject = \"cozy_script_entry:app\"\n"),
+		"package.toml":         []byte("[application]\nobject = \"" + ScriptApplication + "\"\n"),
 		// The current Runtime contract requires standard CPython 3.12. Keep
 		// uv's choice with the snapshot; incompatible script metadata refuses.
 		".python-version": []byte("3.12\n"),
