@@ -31,7 +31,8 @@ func CaptureRuntimeOperations(ctx context.Context, layout home.Layout, parent re
 	} else if !os.IsNotExist(err) {
 		return exit.New(exit.Conflict, "captured Runtime metadata is unavailable")
 	}
-	env := config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
+	env := config.Frozen().Tool("COZY_HOME="+runtimeScratchHome(),
+		"COZY_DEPENDENCY_CACHE="+layout.DependencyCache())
 	tool, problem := launch.BuiltinOperationsTool(layout.Root, runtimeScratchHome(), env)
 	if problem != nil {
 		return problem
@@ -152,7 +153,8 @@ func ResolveRuntimeOperations(ctx context.Context, layout home.Layout, store *re
 	if surface.Digest != iface {
 		return nil, exit.Named(exit.Conflict, "child.builtin_changed", "call differs from its captured Runtime interface")
 	}
-	env := config.Frozen().Tool("COZY_HOME=" + runtimeScratchHome())
+	env := config.Frozen().Tool("COZY_HOME="+runtimeScratchHome(),
+		"COZY_DEPENDENCY_CACHE="+layout.DependencyCache())
 	tool := launch.CapturedBuiltinTool(root, capture.EnvironmentPython, env)
 	binding, _, problem := prepareRuntimeOperations(ctx, layout, store, tool, capture)
 	if problem != nil {
