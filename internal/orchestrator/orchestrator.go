@@ -437,7 +437,7 @@ func (c *Orchestrator) RentalStanding(id string, job bool) (reason string, held 
 	}
 	serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
 		w.desiredUnpublishedPlacement != nil || len(w.observedRemote) > 0
-	if job && serving || !job && w.spec.IsJob() && !c.idleRentalWorkerLocked(w) {
+	if (job && serving || !job && w.spec.IsJob()) && !c.idleRentalWorkerLocked(w) {
 		return ExcludedModeConflict, 0
 	}
 	if c.sessions[w.bootID] == nil {
@@ -460,7 +460,8 @@ func (c *Orchestrator) idleRentalWorkerLocked(w *worker) bool {
 			return false
 		}
 	}
-	return true
+	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
+	return problem == nil && len(attempts) == 0
 }
 
 // Orchestrator is the Cozy daemon's scheduling role.

@@ -78,7 +78,8 @@ only-include = ["code.py"]
 				requirements, problem := packagepublish.EvaluateRequirements(context.Background(), sealed.Requirements, python)
 				fatal(t, problem)
 				why := launch.InventoryMismatch(&pb.ImageInventory{Python: python,
-					Distributions: []*pb.ImageDistribution{{Distribution: "msgspec", Version: "0.20.0"}}}, requirements, "")
+					Distributions: []*pb.ImageDistribution{{Distribution: "cozy-runtime", Version: "0.16.10"}, //cozy:allow distribution metadata only; no Runtime process invocation
+						{Distribution: "msgspec", Version: "0.20.0"}}}, requirements, "")
 				wantRefusal := extra != "" && python == "3.12.12"
 				if wantRefusal != strings.Contains(why, "msgspec 0.20.0") {
 					t.Fatalf("sealed extra/patch boolean expression changed meaning on %s: %s", python, why)

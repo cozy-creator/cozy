@@ -36,6 +36,14 @@ func (c *Orchestrator) rentalPreparationAllowedLocked(w *worker, req records.Req
 	if problem != nil {
 		return problem
 	}
+	// Published serving adds immutable placements to the resident set and may
+	// share its existing serving slots. The captured job/executor replacement
+	// fence must not serialize those ordinary co-tenants. A CPU composition
+	// parent still owns the machine even after its first child began serving.
+	if parent == nil && !req.IsJob() && req.InstallID == "" && !w.spec.IsJob() &&
+		w.orchestrationParent == nil && c.rentalParentAllows(w, req) {
+		return nil
+	}
 	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
 	if problem != nil {
 		return problem

@@ -268,6 +268,40 @@ from isolation_step import advance, serve
 		}
 	}
 	proofData := map[string]any{"parent": first, "children": completed, "second": second.ID, "host": host.Container}
+	// A new script must be admitted after inference even while earlier failed
+	// work remains retained. This is a fresh chooser decision, unlike the second
+	// root above, which was already assigned before the serving transition.
+	failedScript := filepath.Join(project, "retained.py")
+	must(t, os.WriteFile(failedScript, []byte(header+`async def main(ctx):
+    result = await serve(value=17)
+    assert result.value == 34
+    raise ValueError("retain work after completed inference")
+`), 0600))
+	status, output := runCozyPath(t, layout.Root, path, "run", failedScript, "--rental-only", "--await", "--json", "--idempotency-key", "retained-serving")
+	must(t, os.WriteFile(filepath.Join(layout.Root, "retained-serving-result.json"), []byte(output), 0600))
+	if status == 0 || !strings.Contains(output, "retain work after completed inference") {
+		t.Fatalf("retained script did not reach its deliberate failure: %d %s", status, output)
+	}
+	retained, problem := store.RequestByIdempotencyKey("retained-serving")
+	fatal(t, problem)
+	if retained == nil || retained.State != "blocked" || !retained.RetainWork {
+		t.Fatalf("failed script did not retain its work: %+v", retained)
+	}
+	status, output = runCozyPath(t, layout.Root, path, "run", secondScript, "--rental=rental-private-child-host", "--await", "--json", "--idempotency-key", "fresh-after-serving")
+	must(t, os.WriteFile(filepath.Join(layout.Root, "fresh-after-serving-result.json"), []byte(output), 0600))
+	if status != 0 {
+		t.Fatalf("fresh script could not reuse idle serving and retained work: %d %s", status, output)
+	}
+	fresh, problem := store.RequestByIdempotencyKey("fresh-after-serving")
+	fatal(t, problem)
+	stillRetained, problem := store.RequestRow(retained.ID)
+	fatal(t, problem)
+	if fresh == nil || fresh.State != "succeeded" || fresh.Ordinal != 1 || fresh.Worker != first.Worker ||
+		stillRetained.State != "blocked" || !stillRetained.RetainWork {
+		t.Fatalf("fresh execution changed retained history or moved machine: fresh=%+v old=%+v", fresh, stillRetained)
+	}
+	proofData["retained_serving_parent"] = stillRetained
+	proofData["fresh_after_serving"] = fresh
 	if modeled {
 		produced := completed[2]
 		served := completed[5]

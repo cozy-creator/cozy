@@ -574,10 +574,11 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				c.logf("%s cannot assess retained rental job: %s", req.ID, problem.Message)
 				return
 			}
-			// Retained bytes protect custody; they do not consume another job
-			// slot. Only an unrelated serving transition crosses this mode fence.
-			// An active CPU parent's own child keeps that exact parent below.
-			if retained && !req.IsJob() && !c.activeChild(req) {
+			// A retained client job may reuse its machine without discarding old
+			// bytes; its preparation still waits for active execution below. Legacy
+			// transfer jobs replan away from spent capacity as before. An active
+			// CPU parent's own child keeps that exact parent below.
+			if retained && (!req.IsJob() || !req.RetainWork) && !c.activeChild(req) {
 				reason = ExcludedModeConflict
 			}
 			row, problem := c.opt.Store.RentalRow(req.Worker)
