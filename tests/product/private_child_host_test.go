@@ -140,7 +140,7 @@ func startActualChildHost(t *testing.T) (home.Layout, *records.Store, actualChil
 		capability, err := exec.Command("docker", "exec", host.Container, "nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader").Output()
 		must(t, err)
 		hub.skus[0]["compute_capability"] = strings.TrimSpace(string(capability))
-		hub.skus[0]["vram_gb"] = float64(ready.GPUs[0].Memory) / (1 << 30)
+		hub.skus[0]["vram_gb"] = ready.GPUs[0].Memory / (1 << 30)
 		hub.skus[0]["minimum_ram_per_gpu_gb"] = 4 // exact launcher cgroup memory limit
 	}
 	const rentalID = "rental-private-child-host"
