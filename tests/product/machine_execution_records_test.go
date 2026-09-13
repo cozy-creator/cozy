@@ -101,6 +101,24 @@ func TestMachineObserverCannotOwnAttemptsBeforeOrAfterAcceptance(t *testing.T) {
 	}
 }
 
+func TestMachineRetryUsesRetainedAuthorityAfterErrorCollection(t *testing.T) {
+	store, prior, receipt := machineObserverFixture(t)
+	fatal(t, store.AcceptMachineExecution(prior.ID, receipt))
+	state := &pb.MachineExecutionState{RequestId: prior.ID, WorkerId: receipt.WorkerId, WorkerBootId: receipt.WorkerBootId, ExecutionWorkspaceId: receipt.ExecutionWorkspaceId, Generation: 1, AttemptOrdinal: 1, State: "failed", Collected: true}
+	fatal(t, store.ObserveMachineExecution(prior.ID, state, &pb.MachineExecutionEventPage{}))
+	request := records.Request{ID: "job-retry-machine", IdemKey: "retry-machine", Kind: "job", Package: prior.Package, Entrypoint: prior.Entrypoint, Payload: []byte(`{}`), BodyDigest: childDigest("6"), RetainWork: true, RetryOf: prior.ID, MachineExecutionObserver: true}
+	retried, fresh, problem := store.Submit(request)
+	fatal(t, problem)
+	if !fresh || retried.RetryOf != prior.ID {
+		t.Fatal("collected error prevented retry against retained machine authority")
+	}
+	fatal(t, store.RecordMachineControl(prior.ID, &pb.MachineExecutionControl{Execution: &pb.MachineExecutionQuery{RequestId: prior.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId}, CommandId: "cancel-before-retry", ExpectedGeneration: 1, Action: pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL}))
+	request.ID, request.IdemKey = "job-retry-after-cancel", "retry-after-cancel"
+	if _, _, problem := store.Submit(request); problem == nil {
+		t.Fatal("retry raced past pending authoritative cancellation")
+	}
+}
+
 func TestExplicitClientShutdownRequiresDurableMachineAcceptance(t *testing.T) {
 	store, request, receipt := machineObserverFixture(t)
 	for _, accepted := range []bool{false, true} {
@@ -289,6 +307,9 @@ func TestMachineInvocationCarriesFrozenDeadlineAndRefusesUnstagedInputs(t *testi
 	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
 	if spec.DeadlineUnixMs != request.DeadlineUnixMS || submission.MaxAttempts != uint32(orchestrator.MaxRequeues+1) {
 		t.Fatal("machine execution dropped its deadline or retry bound")
+	}
+	if !submission.PreparedState.GetJob().Orchestration {
+		t.Fatal("CPU captured root occupied its managed children's device lane")
 	}
 	request.Models = []records.ModelRef{{Slot: "model", Manifest: childDigest("4"), ManifestLength: 123}}
 	if _, problem := orchestrator.MachineJobSubmission(request, capture, plan); problem == nil || problem.Code != exit.Structural {

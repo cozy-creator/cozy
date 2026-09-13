@@ -40,6 +40,9 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	}
 	root := *plan
 	root.BuildID, root.OrchestrationParent, root.FrozenDirective = request.LocalPackageDigest, nil, nil
+	// A captured CPU caller must not occupy the execution lane its managed
+	// model children need. Device-bearing roots keep their declared lane.
+	root.Orchestration = !root.NeedsAccelerator && len(request.Models) == 0 && len(root.WeightsOutputs) == 0
 	directive := jobDirectiveWithLimit(&root, limit)
 	return &pb.MachineExecutionSubmit{
 		SubmissionId: request.IdemKey, CaptureCanonicalBytes: capture.Canonical, CaptureDigest: capture.Digest,

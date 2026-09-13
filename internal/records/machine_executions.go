@@ -329,7 +329,7 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 	if _, err := tx.Exec(`UPDATE machine_executions SET observed_state=?,remote_cursor=?,collected=?,outcome=CASE WHEN ? THEN x'' ELSE outcome END WHERE request_id=?`, raw, cursor, state.Collected, resetOutcome, id); err != nil {
 		return exit.Internalf("cannot update machine observation cursor: %s", err)
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state=?,ordinal=?,retain_work=CASE WHEN ? OR ?='canceled' THEN 0 ELSE retain_work END WHERE id=?`, nextState, state.AttemptOrdinal, state.Collected, nextState, id); err != nil {
+	if _, err := tx.Exec(`UPDATE requests SET state=?,ordinal=?,retain_work=CASE WHEN (? AND ?='succeeded') OR ?='canceled' THEN 0 ELSE retain_work END WHERE id=?`, nextState, state.AttemptOrdinal, state.Collected, nextState, nextState, id); err != nil {
 		return exit.Internalf("cannot project machine execution status: %s", err)
 	}
 	if retentionReleased {
