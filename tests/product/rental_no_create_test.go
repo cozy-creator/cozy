@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRentalNoCreateReturnsFailureWithoutReclaimAdvice(t *testing.T) {
+func TestRentalNoCreateAfterAcceptedPendingReturnsFailure(t *testing.T) {
 	root, _, stand := rentalEndRoot(t, "rental-no-create")
 	stand.setSKUs(map[string]any{
 		"name": "l4", "accelerator_model": "NVIDIA L4", "accelerator_count": 1,
@@ -18,20 +18,32 @@ func TestRentalNoCreateReturnsFailureWithoutReclaimAdvice(t *testing.T) {
 		"vram_gb": 24, "minimum_ram_per_gpu_gb": 64, "price_usd_micros_per_hour": 100_000,
 	})
 	creates := 0
+	accepted, stop := make(chan struct{}), make(chan struct{})
+	defer close(stop)
 	stand.mu.Lock()
 	stand.rent = func(request map[string]any) map[string]any {
 		creates++
+		if creates == 1 {
+			close(accepted)
+		}
 		return map[string]any{
-			"rental_id": "pr-no-create", "name": request["name"], "state": "failed",
+			"rental_id": "pr-no-create", "name": request["name"], "state": "pending_acquisition",
 			"requested_accelerator_model": "NVIDIA L4", "accelerator_count": 1,
-			"hourly_rate_usd_micros": 100_000, "detail": "provider_create_did_not_happen",
-			"failure": map[string]any{"code": "provider_create_did_not_happen",
-				"base_worker_image_digest": "sha256:" + strings.Repeat("a", 64), "provider": "runpod"},
+			"hourly_rate_usd_micros": 100_000,
 		}
 	}
 	stand.mu.Unlock()
+	go func() {
+		select {
+		case <-accepted:
+			// The POST handler holds stand.mu until its pending response is
+			// serialized. Only the subsequent poll can observe this failure.
+			stand.setState("pr-no-create", "failed", "provider_create_did_not_happen")
+		case <-stop:
+		}
+	}()
 
-	code, raw, _ := runCozyStreams(t, root, "rental", "new", "l4", "--json")
+	code, raw, _ := runCozyStreams(t, root, "rental", "new", "l4", "--json", "--timeout=10s")
 	var refused struct {
 		Error struct {
 			Code   string `json:"code"`
