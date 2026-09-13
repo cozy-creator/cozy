@@ -25,7 +25,14 @@ func TestModelPrepareProgressReachesLateSSESubscriber(t *testing.T) {
 	h3 := &pb.DownloadModelRef{Package: "cozy/h3-package", Slot: "model", Model: "paul/minimax-h3", Release: "1.0.0", Lane: "fp8", Manifest: strings.Repeat("a", 64)}
 	encoder := &pb.DownloadModelRef{Package: "cozy/h3-package", Slot: "encoder", Model: "paul/encoder", Release: "2.0.0", Lane: "bf16", Manifest: strings.Repeat("b", 64)}
 	pod := &fakePod{controlKey: public, downloadSamples: 3}
+	finishDownload := make(chan struct{})
+	defer close(finishDownload)
 	pod.prepareEvent = func(event *pb.PrepareEvent) {
+		// Keep the download phase until the late subscriber observes its rows.
+		// Setup and warming intentionally discard completed download counters.
+		if event.Stage == pb.PrepareStage_PREPARE_STAGE_PREPARING {
+			<-finishDownload
+		}
 		event.ModelProgress = []*pb.PrepareModelProgress{
 			{Model: h3, TotalBytes: 10000, TransferredBytes: 10000, OriginBytes: 4000, CachedBytes: 1000},
 			{Model: encoder, TotalBytes: 9000, TransferredBytes: 9000},
@@ -35,14 +42,20 @@ func TestModelPrepareProgressReachesLateSSESubscriber(t *testing.T) {
 	o := hostOwner(t, "model-prepare-sse", rentalWiring(connection, private))
 	instance, _, _, e := o.c.EnsureRental(podRental)
 	fatal(t, e)
+	t.Cleanup(func() {
+		if t.Failed() {
+			phase, present := o.c.PreparationPhase(instance)
+			t.Logf("preparation present=%v phase=%+v events=%v", present, phase, o.c.Events())
+		}
+	})
 	_, _, e = o.store.Submit(records.Request{ID: "model-download-request", IdemKey: "model-download-request",
 		BodyDigest: "model-download-request", Package: "cozy/h3-package", Entrypoint: "fake",
 		State: "queued", Payload: []byte("{}"), Outputs: "[]", Worker: podRental, Rental: true})
 	fatal(t, e)
-	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "cozy/h3-package", Release: "1.0.7"}}, nil))
+	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "cozy/h3-package", Release: "1.0.7"}}, []*pb.DownloadModelRef{h3, encoder}))
 	waitUntil(t, "model preparation rows received", func() bool {
 		phase, ok := o.c.PreparationPhase(instance)
-		return ok && phase.Name == orchestrator.PhaseWarming && len(phase.Models) == 2
+		return ok && phase.Name == orchestrator.PhaseDownloading && len(phase.Models) == 2
 	})
 	closeAPI := publicationControlAPI(t, o)
 	defer closeAPI()
@@ -67,7 +80,7 @@ func TestModelPrepareProgressReachesLateSSESubscriber(t *testing.T) {
 		return false
 	})
 	fatal(t, e)
-	if phaseName != orchestrator.PhaseWarming || len(rows) != 2 {
+	if phaseName != orchestrator.PhaseDownloading || len(rows) != 2 {
 		t.Fatalf("SSE lost model rows: phase=%s rows=%+v", phaseName, rows)
 	}
 	if rows[0].Model != encoder.Model || rows[0].Moved != 9000 || rows[0].Total != 9000 || rows[0].OriginBytes != 0 || rows[0].Rate != 0 || rows[0].RemainingMS != nil {
