@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // The LOCAL module's package resolver: `org/name` -> the spec that makes its worker
@@ -632,17 +633,38 @@ func (r *Resolver) installPackageInterface(installID string) (*records.PackageIn
 }
 
 func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
-	install, e := r.installRecord(installID)
+	installed, e := r.installRecord(installID)
 	if e != nil {
 		return nil, e
 	}
-	facts, problem := launch.Read(*install, r.cfg.Home, r.cfg.Tool())
+	facts, problem := launch.Read(*installed, r.cfg.Home, r.cfg.Tool())
 	if problem != nil {
 		return nil, problem
 	}
 	facts.CPUOrchestration, problem = r.store.HasChildBindings(installID)
 	if problem != nil {
 		return nil, problem
+	}
+	if !facts.CPUOrchestration && facts.PackageInterface.Application == packagepublish.ScriptApplication {
+		facts.CPUOrchestration, problem = install.HasRuntimeOperationsCapture(*installed)
+		if problem != nil {
+			return nil, problem
+		}
+	}
+	if facts.CPUOrchestration && facts.PackageInterface.Application != packagepublish.ScriptApplication {
+		bindings, problem := r.store.ChildBindings(installID)
+		if problem != nil {
+			return nil, problem
+		}
+		// Runtime availability alone does not mean an ordinary package delegates
+		// its GPU work. Explicit captured package calls keep the prior CPU rule.
+		facts.CPUOrchestration = false
+		for _, binding := range bindings {
+			if binding.Module != runtimeoperation.Module {
+				facts.CPUOrchestration = true
+				break
+			}
+		}
 	}
 	facts.SelfCallable, problem = r.store.SelfCallableEntrypoints(installID)
 	return facts, problem
