@@ -68,10 +68,10 @@ func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
 }
 
 // th-126, the selection half: pre-spend quotes speak the total the pod will
-// bill, decomposed. Paul's live L4 read $0.49/hr in the ladder while RunPod
+// bill, with structured price components. Paul's live L4 read $0.49/hr in the ladder while RunPod
 // billed ~$0.70 — the 1536 GB image spec adds 1536 × 139 micros/GB/h of
-// storage. The ladder must render gpu + storage = total on every rung.
-func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
+// storage. Every displayed price must include both GPU and storage charges.
+func TestRentalLadderRendersTotalAndStructuredBreakdown(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-ladder")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
@@ -107,19 +107,18 @@ func TestRentalLadderRendersTheTotalDecomposed(t *testing.T) {
 				component, out)
 		}
 	}
-	// The decomposition is retained, one flag away: both widths of the card carry their
-	// own GPU rate beside the one pod-disk adder.
-	code, full := runCozy(t, root, "rental", "new", "--full")
+	// Structured output retains each width's GPU rate and the shared pod-disk adder.
+	code, full := runCozy(t, root, "rental", "new", "--full", "--json")
 	if code != 0 {
-		t.Fatalf("cozy rental new --full [exit %d]:\n%s", code, full)
+		t.Fatalf("cozy rental new --full --json [exit %d]:\n%s", code, full)
 	}
 	for _, want := range []string{
 		"$0.49/hr", "$0.21/hr", "$0.70/hr", // the L4 rung, decomposed
 		"$1.96/hr", "$2.17/hr", // the x4 rung: its own price, the same adder
-		"GPU PRICE", "STORAGE PRICE", "PRICE",
+		`"gpu price"`, `"storage price"`, `"price"`,
 	} {
 		if !strings.Contains(full, want) {
-			t.Fatalf("--full does not render %q:\n%s", want, full)
+			t.Fatalf("--full --json does not render %q:\n%s", want, full)
 		}
 	}
 	hub.close()
