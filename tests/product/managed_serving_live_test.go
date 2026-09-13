@@ -15,11 +15,15 @@ import (
 
 // A plain script produces a retained native model, then calls the original GPU
 // serving function twice, observing capture without memoizing inference.
-func TestOrdinaryScriptNativeModelServing(t *testing.T) { ordinaryScriptModelServing(t, false) }
+func TestOrdinaryScriptNativeModelServing(t *testing.T) { ordinaryScriptModelServing(t, false, false) }
 
-func TestOrdinaryScriptMixedModelServing(t *testing.T) { ordinaryScriptModelServing(t, true) }
+func TestOrdinaryScriptMixedModelServing(t *testing.T) { ordinaryScriptModelServing(t, true, false) }
 
-func ordinaryScriptModelServing(t *testing.T, mixed bool) {
+func TestEditedScriptsReuseImmutableDependencies(t *testing.T) {
+	ordinaryScriptModelServing(t, false, true)
+}
+
+func ordinaryScriptModelServing(t *testing.T, mixed, dependencyReuse bool) {
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires the exact wire44 Runtime candidate wheel")
 	}
@@ -95,11 +99,18 @@ build-backend="hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include=["model_tools.py"]
 `, version, strconv.Quote(wheel))
+	if dependencyReuse {
+		metadata = strings.Replace(metadata, `, "torch>=2.13,<3"`, "", 1)
+		metadata += "\n[project.optional-dependencies]\ncu130=[\"torch>=2.13,<3\"]\n"
+	}
 	must(t, os.WriteFile(filepath.Join(tools, "pyproject.toml"), []byte(metadata), 0600))
 	must(t, os.WriteFile(filepath.Join(tools, "package.toml"), []byte("[application]\nobject=\"model_tools:app\"\n"), 0600))
 	body, err := os.ReadFile(filepath.Join("testdata", "managed_serving", "prepare.py"))
 	must(t, err)
 	body = []byte(strings.NewReplacer("__VERSION__", version, "__WHEEL__", strconv.Quote(wheel)).Replace(string(body)))
+	if dependencyReuse {
+		body = []byte(strings.ReplaceAll(string(body), "model-tools==0.0.1", "model-tools[cu130]==0.0.1"))
+	}
 	if mixed {
 		body = []byte(strings.ReplaceAll(string(body), "first = generate(seed=helper(), steps=2, model=model,\n        capture=ActivationCapture(components=(\"alpha\", \"zeta\"), steps=(0, 1)))", "first = generate(seed=helper(), steps=2, model=model)"))
 		lines := []string{}
@@ -157,9 +168,11 @@ only-include=["model_tools.py"]
 	installs, err := db.Query(`SELECT dir FROM installs WHERE package='local/model-tools'`)
 	must(t, err)
 	var staged []string
+	var modelInstalls []string
 	for installs.Next() {
 		var install string
 		must(t, installs.Scan(&install))
+		modelInstalls = append(modelInstalls, install)
 		paths, err := filepath.Glob(filepath.Join(install, "worker-environments", ".stage", "*", "wheels"))
 		must(t, err)
 		staged = append(staged, paths...)
@@ -198,5 +211,47 @@ only-include=["model_tools.py"]
 	must(t, db.QueryRow(`SELECT count(*) FROM requests WHERE parent_request_id=? AND entrypoint='produce' AND reused_from<>'' AND ordinal=0`, parent).Scan(&memoized))
 	if memoized != 1 {
 		t.Fatal("canceled serving script repeated its completed model production")
+	}
+	if dependencyReuse {
+		proveSharedDependencies(t, root, path, control, modelInstalls)
+	}
+}
+
+func proveSharedDependencies(t *testing.T, root, path, control string, installs []string) {
+	t.Helper()
+	var generations []string
+	for _, install := range installs {
+		found, err := filepath.Glob(filepath.Join(install, "worker-environments", "contents", "*"))
+		must(t, err)
+		generations = append(generations, found...)
+	}
+	if len(generations) != 2 {
+		t.Fatalf("edited script proof needs two retained generations: %v", generations)
+	}
+	for _, library := range []string{"libtorch_cpu.so", "libtorch_cuda.so"} {
+		relative := filepath.Join("lib", "python3.12", "site-packages", "torch", "lib", library)
+		first, err := os.Stat(filepath.Join(generations[0], relative))
+		must(t, err)
+		second, err := os.Stat(filepath.Join(generations[1], relative))
+		must(t, err)
+		sdk, err := os.Stat(filepath.Join(control, relative))
+		must(t, err)
+		if !os.SameFile(first, second) || os.SameFile(first, sdk) || first.Mode().Perm()&0222 != 0 {
+			t.Fatalf("%s was copied again, shares mutable SDK storage, or is writable", library)
+		}
+		t.Logf("%s reused one immutable %d-byte inode across edited captures", library, first.Size())
+	}
+	// Stop fixture processes before modifying/removing their source environments.
+	compositionDown(t, root, path)
+	for _, install := range installs {
+		must(t, os.RemoveAll(filepath.Join(install, "venv")))
+	}
+	must(t, os.RemoveAll(filepath.Join(root, "local-packages", "dependency-objects")))
+	for _, generation := range generations {
+		out, err := exec.Command(filepath.Join(generation, "bin", "python"), "-I", "-c",
+			"import model_tools, torch; x=torch.tensor([2.,3.],device='cuda'); assert x.sum().item()==5").CombinedOutput()
+		if err != nil {
+			t.Fatalf("retained generation lost dependencies after source/cache removal: %v\n%s", err, out)
+		}
 	}
 }

@@ -17,12 +17,19 @@ import (
 func UsageLine(target string, ep *Entrypoint) string {
 	line := "cozy run " + target
 	for i := range ep.Request.Fields {
-		line += " " + usageTerm(&ep.Request.Fields[i])
+		line += " " + usageTerm(&ep.Request.Fields[i], ep.Assets)
 	}
 	return line
 }
 
-func usageTerm(f *Field) string {
+func usageTerm(f *Field, assets *AssetsSlot) string {
+	if isAssetsField(f, assets) {
+		term := "[--asset <file>]..."
+		if !acceptsEmptyAssets(f) {
+			term = "--asset <file> " + term
+		}
+		return term
+	}
 	kind, _ := typeOf(f.Type)
 	var term string
 	switch {
@@ -121,7 +128,7 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 		b.WriteString("  request: none\n")
 	} else {
 		b.WriteString("  request:\n")
-		writeFields(&b, ep.Request.Fields, "    ", "request", ep.Invocable)
+		writeFields(&b, ep.Request.Fields, "    ", "request", ep.Invocable, ep.Assets)
 	}
 	if len(ep.Models) > 0 {
 		b.WriteString("  models:\n")
@@ -135,7 +142,7 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 	}
 	if len(ep.Result.Fields) > 0 {
 		b.WriteString("  output:\n")
-		writeFields(&b, ep.Result.Fields, "    ", "result", ep.Invocable)
+		writeFields(&b, ep.Result.Fields, "    ", "result", ep.Invocable, nil)
 	}
 	b.WriteString("\nusage: " + UsageLine(target, ep) + "\n")
 	return b.String()
@@ -146,19 +153,19 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 func DescribeArguments(ep *Entrypoint) string {
 	var b strings.Builder
 	b.WriteString("Arguments:\n")
-	writeFields(&b, ep.Request.Fields, "  ", "request", ep.Invocable)
+	writeFields(&b, ep.Request.Fields, "  ", "request", ep.Invocable, ep.Assets)
 	return b.String()
 }
 
-func writeFields(b *strings.Builder, fields []Field, indent, path string, invocable *Invocable) {
+func writeFields(b *strings.Builder, fields []Field, indent, path string, invocable *Invocable, assets *AssetsSlot) {
 	for i := range fields {
 		field := &fields[i]
 		fieldPath := path + "/" + field.Name
 		b.WriteString(indent + field.Name + ": " + describePhrase(field))
-		b.WriteString(fieldNotes(field, fieldPath, invocable))
+		b.WriteString(fieldNotes(field, fieldPath, invocable, assets))
 		b.WriteString("\n")
 		if kind, nested := typeOf(field.Type); kind == "struct" && len(indent) < 12 {
-			writeFields(b, nested.Fields, indent+"  ", fieldPath, invocable)
+			writeFields(b, nested.Fields, indent+"  ", fieldPath, invocable, nil)
 		}
 	}
 }
@@ -180,7 +187,7 @@ func describePhrase(f *Field) string {
 	return typePhrase(f.Type)
 }
 
-func fieldNotes(f *Field, path string, invocable *Invocable) string {
+func fieldNotes(f *Field, path string, invocable *Invocable, assets *AssetsSlot) string {
 	notes := ""
 	if c := constraintPhrase(f.Constraints); c != "" {
 		notes += " " + c
@@ -190,6 +197,11 @@ func fieldNotes(f *Field, path string, invocable *Invocable) string {
 			return notes + " (default = " + string(value) + ")"
 		}
 	}
+	if isAssetsField(f, assets) && acceptsEmptyAssets(f) {
+		// ParseAssets supplies an empty bundle when this framework parameter is
+		// omitted. This is input syntax, not a default for arbitrary list fields.
+		return notes + " (default = [])"
+	}
 	switch f.Wire {
 	case "optional":
 		notes += " (optional)"
@@ -197,6 +209,14 @@ func fieldNotes(f *Field, path string, invocable *Invocable) string {
 		notes += " (optional; model default)"
 	}
 	return notes
+}
+
+func isAssetsField(field *Field, assets *AssetsSlot) bool {
+	return assets != nil && field.Name == assets.Parameter
+}
+
+func acceptsEmptyAssets(field *Field) bool {
+	return field.Constraints.MinLength == nil || *field.Constraints.MinLength == 0
 }
 
 func constraintPhrase(c FieldConstraints) string {

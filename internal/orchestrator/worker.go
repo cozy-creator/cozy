@@ -1289,6 +1289,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// imposes. COZY_HOME points the worker at its own staged records and nothing else.
 	imposed := append([]string{
 		"COZY_HOME=" + workerHome,
+		"COZY_DEPENDENCY_CACHE=" + c.opt.Layout.DependencyCache(),
 		"CUDA_VISIBLE_DEVICES=" + strings.Join(spec.Devices, ","),
 	}, spec.Imposed...)
 	// The launcher mints a PER-SPAWN bootstrap credential and hands it over through the
