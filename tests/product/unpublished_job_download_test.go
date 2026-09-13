@@ -65,6 +65,18 @@ func privateJobDownload(t *testing.T, versioned, rootModels bool) {
 		Dir: filepath.Join(o.root, "installs", "job"), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, problem := o.store.Activate(install)
 	fatal(t, problem)
+	child := install
+	child.ID, child.Package, child.Dir = "imported-child", "local/imported-invocable", filepath.Join(o.root, "installs", "child")
+	fatal(t, o.store.RecordInstall(child))
+	fatal(t, o.store.RecordChildBindings([]records.ChildBinding{{
+		ParentInstallID: install.ID, ChildInstallID: child.ID,
+		InterfaceDigest: childDigest("b"), LocalRevisionDigest: childDigest("c"),
+		Module: "imported_invocable", Export: "child", Entrypoint: "child",
+	}}))
+	pod.onJobReady = func(frame *pb.WorkerFrame, send func(*pb.WorkerFrame) error) error {
+		frame.GetObservedState().JobCapacity.OrchestrationAvailable = 1
+		return send(frame)
+	}
 	model := records.ModelRef{Package: revision.Package, Slot: "source", BindingPath: "prepare.models.source", Model: "proof/input",
 		Manifest: childDigest("8"), ManifestLength: 161, Bytes: 4096, HubCheckpoint: !versioned}
 	native := records.ModelRef{Package: revision.Package, Slot: "prior", BindingPath: "prepare.models.prior", Model: "job-source/weights",
@@ -157,11 +169,17 @@ func privateJobDownload(t *testing.T, versioned, rootModels bool) {
 	if retained.Package != imported.Package || retained.Manifest != imported.Manifest || retained.BindingPath != imported.BindingPath {
 		t.Fatal("root preparation discarded or rewrote the imported child's selection")
 	}
+	if (len(recorded.OrchestrationDirective) > 0) == rootModels {
+		t.Fatal("imported defaults changed the parent's role, or actual root models lost their ordinary slot")
+	}
 	pod.mu.Lock()
 	defer pod.mu.Unlock()
 	for _, desired := range pod.desired {
 		if desired.GetPlacementSet() != nil {
 			t.Fatal("job model preparation activated serving")
+		}
+		if job := desired.GetJob(); job != nil && job.Orchestration == rootModels {
+			t.Fatalf("wrong orchestration role for rootModels=%t: %+v", rootModels, job)
 		}
 	}
 }
