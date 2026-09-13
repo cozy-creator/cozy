@@ -547,6 +547,13 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 			}
 		}
 	}
+	for _, field := range ep.Result.Fields {
+		if path := ungrantedCollectionOutput(field.Type, field.Name, false); path != "" {
+			return exit.Named(exit.Validation, "output_collection_unsupported",
+				"%s result %s contains a native output in a collection without fixed destination grants", ep.Name, path).
+				WithRemedy("return one FileAsset or Tree, or a fixed msgspec.Struct with named output fields")
+		}
+	}
 	if ep.Kind != "job" && len(ep.WeightsOutputs) > 0 {
 		return exit.New(exit.Validation, "%s declares weights outputs outside the job surface", ep.Name)
 	}
@@ -561,6 +568,50 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 		seenWeights[output.OutputID] = true
 	}
 	return nil
+}
+
+// Result grants name exact field paths. Collections and unions cannot supply those
+// paths before execution; scalar collections and fixed native fields remain valid.
+// The closed type grammar has already been validated before this semantic walk.
+func ungrantedCollectionOutput(raw json.RawMessage, path string, dynamic bool) string {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil {
+		return ""
+	}
+	if dynamic && (object["asset"] != nil || string(object["input"]) == `"tree"`) {
+		return path
+	}
+	if fields := object["fields"]; fields != nil {
+		var rows []Field
+		_ = json.Unmarshal(fields, &rows)
+		for _, field := range rows {
+			if found := ungrantedCollectionOutput(field.Type, path+"."+field.Name, dynamic); found != "" {
+				return found
+			}
+		}
+	}
+	if item := object["list"]; item != nil {
+		return ungrantedCollectionOutput(item, path+"[]", true)
+	}
+	if mapping := object["map"]; mapping != nil {
+		var pair map[string]json.RawMessage
+		_ = json.Unmarshal(mapping, &pair)
+		for _, side := range []string{"key", "value"} {
+			if found := ungrantedCollectionOutput(pair[side], path+"["+side+"]", true); found != "" {
+				return found
+			}
+		}
+	}
+	if union := object["union"]; union != nil {
+		var branches []json.RawMessage
+		_ = json.Unmarshal(union, &branches)
+		for _, branch := range branches {
+			if found := ungrantedCollectionOutput(branch, path, true); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
 }
 
 // PackageInterfacePath is the one install-scoped location for Runtime-derived bytes.

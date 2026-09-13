@@ -98,7 +98,9 @@ func (c *Orchestrator) ConvergePackageSet(instanceID string, packages []*pb.Down
 	w.desiredMu.Lock()
 	defer w.desiredMu.Unlock()
 	c.mu.Lock()
-	packages, models = mergePackageSet(w.desiredPackages, w.desiredModels, packages, models)
+	if !w.spec.IsJob() {
+		packages, models = mergePackageSet(w.desiredPackages, w.desiredModels, packages, models)
+	}
 	c.mu.Unlock()
 	return c.issuePackageSet(s, w, packages, models)
 }

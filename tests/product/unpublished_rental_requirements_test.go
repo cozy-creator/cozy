@@ -20,7 +20,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-func TestPrivateExtraImageRequirementReachesTheSealedWheel(t *testing.T) {
+func TestUnpublishedExtraImageRequirementReachesTheSealedWheel(t *testing.T) {
 	for _, extra := range []string{"[gpu]", ""} {
 		t.Run(extra, func(t *testing.T) {
 			root := t.TempDir()
@@ -43,7 +43,7 @@ only-include = ["code.py"]
 				must(t, os.WriteFile(filepath.Join(dir, "code.py"), []byte("VALUE=7\n"), 0600))
 			}
 			metadata(root, "root-proof", "dependencies = [\"extra-proof"+extra+"\"]\n[tool.uv.sources]\nextra-proof={path='library'}")
-			metadata(library, "extra-proof", "dependencies = []\n[project.optional-dependencies]\ngpu = [\"msgspec>=0.21,<0.22; python_full_version >= '3.12.5' or sys_platform == 'win32'\"]")
+			metadata(library, "extra-proof", "dependencies = []\n[project.optional-dependencies]\ngpu = [\"msgspec>=0.21,<0.22; python_full_version >= '3.12.5' and (python_full_version >= '3.12.12' or sys_platform == 'win32' or python_full_version < '3.12.4')\"]")
 			run := func(args ...string) {
 				t.Helper()
 				if out, err := exec.Command("uv", args...).CombinedOutput(); err != nil {
@@ -136,7 +136,7 @@ func TestRentalRequirementsStopAtTheWorkerImage(t *testing.T) {
 
 // This exercises actual script capture and named-rental admission through the
 // normal CLI. The HTTP peer supplies inventory only; it never buys a machine.
-func TestPrivateNamedRentalUsesAuthoredImageRequirements(t *testing.T) {
+func TestUnpublishedNamedRentalUsesAuthoredImageRequirements(t *testing.T) {
 	version := runtimeFixtureVersion(t, "")
 	const current, old, earlierPython = "pr-11111111111111111111", "pr-22222222222222222222", "pr-33333333333333333333"
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, _ *hub.PackageReleaseDetail) {
@@ -189,7 +189,7 @@ def main(ctx):
 	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "msgspec 0.20.0") {
 		t.Fatalf("authored image requirement was not enforced [%d]: %s", status, out)
 	}
-	patchCode := strings.Replace(code, "msgspec>=0.21,<0.22", "msgspec>=0.21,<0.22; python_full_version >= '3.12.5'", 1)
+	patchCode := strings.Replace(code, "msgspec>=0.21,<0.22", "msgspec>=0.21,<0.22; python_full_version >= '3.12.5' and (python_full_version >= '3.12.12' or sys_platform == 'win32' or python_full_version < '3.12.4')", 1)
 	must(t, os.WriteFile(script, []byte(patchCode), 0600))
 	status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
 	if status == 0 || !strings.Contains(out, "msgspec 0.20.0") {
@@ -198,6 +198,12 @@ def main(ctx):
 	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--dry-run", "--json")
 	if status != 0 {
 		t.Fatalf("captured patch was substituted for the target patch [%d]: %s", status, out)
+	}
+	pythonCode := strings.Replace(patchCode, `requires-python = ">=3.12,<3.13"`, `requires-python = ">=3.12.5,<3.13"`, 1)
+	must(t, os.WriteFile(script, []byte(pythonCode), 0600))
+	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--dry-run", "--json")
+	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "3.12.3") {
+		t.Fatalf("authored Python patch floor was replaced by the default minor range [%d]: %s", status, out)
 	}
 	library := filepath.Join(filepath.Dir(script), "library")
 	must(t, os.Mkdir(library, 0700))

@@ -879,6 +879,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 
 // renderRentalList formats the daemon's public read model; it never opens SQLite.
 func renderRentalList(inventory api.RentalInventory) output.List {
+	inventory = inventory.Current()
 	count, burn := inventory.MachinesRunning, inventory.HourlySpendUSDMicros
 	rows, unrecorded := inventory.Rentals, inventory.Unrecorded
 	grace := time.Duration(inventory.IdleReleaseSeconds) * time.Second

@@ -12,6 +12,7 @@ import (
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/records"
+	capturedwheel "github.com/cozy-creator/cozy/internal/wheel"
 )
 
 // Every invocation uses the actual cozy CLI. A successful import alone does not
@@ -129,6 +130,11 @@ async def main(ctx):
 	fatal(t, problem)
 	if inst.SourceKind != "wheel" {
 		t.Fatalf("captured wheel became a source project: %+v", inst)
+	}
+	sealed, problem := capturedwheel.Metadata(filepath.Join(inst.Dir, "wheels", filepath.Base(wheel)))
+	fatal(t, problem)
+	if !strings.Contains(string(sealed), "Requires-Dist: msgspec\n") || strings.Contains(string(sealed), "msgspec==") {
+		t.Fatalf("callable wheel replaced its authored image requirement with a client pin: %s", sealed)
 	}
 	retained := filepath.Join(inst.Dir, "original", filepath.Base(wheel))
 	raw, err := os.ReadFile(retained)

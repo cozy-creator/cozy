@@ -117,13 +117,15 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if problem != nil {
 		return fail(problem)
 	}
-	exact := exactCapturedWheelRequirements(project, dependencies)
-	var paths []string
+	var exact, paths []string
 	for name, dependency := range dependencies {
 		if packagepublish.ImageOwnedDistribution(name) {
 			continue
 		}
 		paths = append(paths, dependency.Path)
+		if name != project {
+			exact = append(exact, name+"=="+dependency.Version)
+		}
 	}
 	python := strings.TrimSpace(strings.TrimPrefix(runOut(parentPython, "-I", "-S", "-V"), "Python "))
 	selection, problem := packagepublish.ActiveWheelRequirements(ctx, project, extras, paths, python)
@@ -212,17 +214,6 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 		return fail(problem)
 	}
 	return &Result{Install: inst, CapturedProjectWheel: executablePath}, nil
-}
-
-func exactCapturedWheelRequirements(project string, dependencies map[string]packagepublish.CapturedDependency) []string {
-	exact := make([]string, 0, len(dependencies)-1)
-	for name, dependency := range dependencies {
-		if name != project && !packagepublish.ImageOwnedDistribution(name) {
-			exact = append(exact, name+"=="+dependency.Version)
-		}
-	}
-	sort.Strings(exact)
-	return exact
 }
 
 func capturedWheelNames(dependencies map[string]packagepublish.CapturedDependency) []string {
