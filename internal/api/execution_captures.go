@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"sort"
@@ -137,6 +139,43 @@ func (s *Server) executionRoot(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, exit.New(exit.NotFound, "request is outside this private execution generation"))
 		return
 	}
-	s.ok(w, r, http.StatusOK, map[string]any{"subject_request_id": subject, "request_id": row.ID,
-		"capsule_digest": row.BodyDigest, "execution_grant_digest": row.ExecutionGrantDigest})
+	value := map[string]any{"subject_request_id": subject, "request_id": row.ID,
+		"capsule_digest": row.BodyDigest, "execution_grant_digest": row.ExecutionGrantDigest}
+	collection, problem := s.store.ExecutionCollection(row.ID, row.ExecutionGrantDigest)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	if collection != nil {
+		value["terminal_event_id"], value["attempt"], value["collected"] = collection.TerminalEventID, collection.Attempt, collection.Collected
+	}
+	s.ok(w, r, http.StatusOK, value)
+}
+
+func (s *Server) collectExecution(w http.ResponseWriter, r *http.Request) {
+	if s.executionGrantDigest == "" {
+		s.refuseTyped(w, r, exit.New(exit.NotFound, "this daemon has no private execution generation"))
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 4097))
+	if err != nil || len(raw) > 4096 {
+		s.refuseTyped(w, r, exit.New(exit.Validation, "collection acknowledgement exceeds its bound"))
+		return
+	}
+	var body struct {
+		TerminalEventID int64 `json:"terminal_event_id"`
+		Attempt         int64 `json:"attempt"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&body) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		s.refuseTyped(w, r, exit.New(exit.Validation, "collection acknowledgement differs from its closed schema"))
+		return
+	}
+	receipt, problem := s.store.CollectExecution(r.PathValue("id"), s.executionGrantDigest, body.TerminalEventID, body.Attempt)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	s.ok(w, r, http.StatusOK, receipt)
 }

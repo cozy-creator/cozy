@@ -322,6 +322,7 @@ Only a daemon holding the root lock may migrate an older database.
 | `POST /v1/local/execution-captures` | local | yes | import an exact private capture into its existing execution owner; `Idempotency-Key`; ordinary root job admission, no additional rental authority |
 | `GET /v1/local/execution-roots/{id}` | local | yes | validate immutable ancestry within the current private execution grant; returns exact subject, root, capsule and grant identities for the Host bridge |
 | `GET /v1/local/execution-activity` | local | yes | current execution grant plus busy/obligations from existing durable work and live transitions; idle coordinator and observation streams alone are not work |
+| `POST /v1/local/execution-roots/{id}/collect` | local | yes | acknowledge exact current terminal_event_id/attempt; append an idempotent collection event; clear only the uncollected-history obligation, never partial work or artifact custody |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |

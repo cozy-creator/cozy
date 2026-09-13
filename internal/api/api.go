@@ -194,6 +194,7 @@ func (s *Server) recordSubmission(spec orchestrator.Submission,
 func (s *Server) Handler() (http.Handler, *exit.Error) {
 	mux := http.NewServeMux()
 	handlers := map[string]http.HandlerFunc{
+		"POST /v1/local/execution-roots/{id}/collect": s.collectExecution,
 		"GET /v1/local/execution-activity":            s.executionActivity,
 		"POST /v1/local/execution-captures":           s.submitExecutionCapture,
 		"GET /v1/local/execution-roots/{id}":          s.executionRoot,

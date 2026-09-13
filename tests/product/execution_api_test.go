@@ -95,8 +95,63 @@ func TestExecutionCaptureAPIReconcilesAndScopesRoots(t *testing.T) {
 		t.Fatal("paused retained root was idle")
 	}
 	fatal(t, store.SettleRequest(row.ID, "succeeded"))
+	fatal(t, store.AppendEvent(row.ID, "request.completed", 0, map[string]any{"result": nil}))
 	fatal(t, store.SettleRequest("other-root", "succeeded"))
+	if !busy() {
+		t.Fatal("uncollected scalar outcome allowed idle release")
+	}
+	collection, problem := store.ExecutionCollection(row.ID, grant)
+	fatal(t, problem)
+	if collection == nil || collection.Collected {
+		t.Fatal("status lookup acknowledged collection")
+	}
+	if _, problem := store.CollectExecution(row.ID, childDigest("f"), collection.TerminalEventID, 0); problem == nil {
+		t.Fatal("foreign grant collected a root")
+	}
+	if _, problem := store.CollectExecution(row.ID, grant, collection.TerminalEventID, 1); problem == nil {
+		t.Fatal("wrong attempt collected a root")
+	}
+	body, err := json.Marshal(map[string]any{"terminal_event_id": collection.TerminalEventID, "attempt": 0})
+	must(t, err)
+	collected := call(http.MethodPost, "/v1/local/execution-roots/"+row.ID+"/collect", body, "")
+	if collected.Code != http.StatusOK {
+		t.Fatalf("explicit collection failed: %d %s", collected.Code, collected.Body.String())
+	}
+	firstReceipt, problem := store.ExecutionCollection(row.ID, grant)
+	fatal(t, problem)
+	if firstReceipt == nil || !firstReceipt.Collected {
+		t.Fatal("explicit collection was not durable")
+	}
+	collected = call(http.MethodPost, "/v1/local/execution-roots/"+row.ID+"/collect", body, "")
+	if collected.Code != http.StatusOK {
+		t.Fatal("collection replay failed")
+	}
+	replayed, problem := store.ExecutionCollection(row.ID, grant)
+	fatal(t, problem)
+	if replayed.CollectionEventID != firstReceipt.CollectionEventID {
+		t.Fatal("collection replay appended another receipt")
+	}
+	reopened, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	persisted, problem := reopened.ExecutionCollection(row.ID, grant)
+	fatal(t, problem)
+	reopened.Close()
+	if persisted == nil || !persisted.Collected || persisted.CollectionEventID != firstReceipt.CollectionEventID {
+		t.Fatal("collection receipt did not survive reopening records")
+	}
 	if busy() {
-		t.Fatal("completed scalar roots kept an idle coordinator busy")
+		t.Fatal("collected scalar roots kept an idle coordinator busy")
+	}
+	fatal(t, store.SettleRequest(row.ID, "blocked"))
+	fatal(t, store.AppendEvent(row.ID, "request.blocked", 0, map[string]any{"error": "retained work"}))
+	blocked, problem := store.ExecutionCollection(row.ID, grant)
+	fatal(t, problem)
+	if blocked == nil || blocked.Collected {
+		t.Fatal("old collection covered a changed outcome")
+	}
+	_, problem = store.CollectExecution(row.ID, grant, blocked.TerminalEventID, 0)
+	fatal(t, problem)
+	if !busy() {
+		t.Fatal("collection released blocked retained work")
 	}
 }

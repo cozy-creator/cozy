@@ -42,6 +42,12 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 		UNION ALL
 		SELECT 'work_release',s.request_id,s.state FROM successful_work_releases s JOIN requests r ON r.id=s.request_id
 		 WHERE r.state='succeeded' AND s.state IN ('armed','draining','release_work','deferred')
+		UNION ALL
+		SELECT 'uncollected_execution',r.id,r.state FROM requests r
+		 WHERE r.parent_request_id='' AND r.execution_grant_digest!='' AND r.state IN ('succeeded','failed')
+		 AND NOT EXISTS (SELECT 1 FROM request_events c WHERE c.request_id=r.id AND c.type='request.execution_collected'
+		   AND c.attempt=r.ordinal AND json_extract(c.payload,'$.execution_grant_digest')=r.execution_grant_digest
+		   AND json_extract(c.payload,'$.terminal_event_id')=(SELECT MAX(e.seq) FROM request_events e WHERE e.request_id=r.id AND e.attempt=r.ordinal AND e.type=CASE r.state WHEN 'succeeded' THEN 'request.completed' ELSE 'request.failed' END))
 		ORDER BY 1,2`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the daemon's obligations: %s", err)
