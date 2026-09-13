@@ -102,6 +102,12 @@ func Open(root string) (Layout, *exit.Error) {
 	return l, nil
 }
 
+// DependencyCache is disposable immutable payload storage. Captured generations
+// retain independent hardlinks, so deleting cache entries never invalidates them.
+func (l Layout) DependencyCache() string {
+	return filepath.Join(l.LocalPackages, "dependency-objects")
+}
+
 // renameRecords moves a pre-cl-116 records.db (and its WAL/SHM siblings) onto the
 // creator.sqlite spelling. It refuses when both databases exist — two lifecycle
 // authorities in one root is a state no rename may silently pick a winner for — and it
