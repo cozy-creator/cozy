@@ -99,6 +99,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Usagef("--dry-run and --await conflict")
 	}
 	if callable.Kind != "job" {
+		if len(ctx.Inv.Values["--allow-publish"]) > 0 {
+			return exit.Usagef("--allow-publish applies only to Runtime-owned job transactions")
+		}
 		if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
 			return exit.Usagef("--timeout requires --await for serving callables").
 				WithRemedy("a detached serving call has no client waiting to enforce a caller deadline")

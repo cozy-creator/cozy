@@ -33,7 +33,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	refusal := refusalOf(t, out)
 	if code == 0 || refusal.Code != "host_runtime_wire_mismatch" ||
 		!strings.Contains(refusal.Message, fmt.Sprintf("release 0.0.29 and speaks cozy.worker.v1+minor.%d", pb.WireMinor-6)) ||
-		!strings.Contains(refusal.Message, fmt.Sprintf("needs cozy.worker.v1+minor.%d or newer", pb.WireMinor)) ||
+		!strings.Contains(refusal.Message, fmt.Sprintf("needs cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)) ||
 		!strings.Contains(refusal.Remedy, install) {
 		t.Fatalf("an older host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}
@@ -70,6 +70,16 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	root, path = hostRuntimeRoot(t, "newer", stubRuntime(t, "9.9.9", pb.WireMinor+1))
 	if code, out := runCozyPath(t, root, path, "up"); code != 0 {
 		t.Fatalf("a newer host tool was refused [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozyPath(t, root, path, "down"); code != 0 {
+		t.Fatalf("down [exit %d]\n%s", code, out)
+	}
+
+	// Publication is optional: a machine with the no-effects execution floor
+	// remains usable even when this client vendors publication's newer schema.
+	root, path = hostRuntimeRoot(t, "execution-floor", stubRuntime(t, "9.9.9", hostruntime.WireFloor))
+	if code, out := runCozyPath(t, root, path, "up"); code != 0 {
+		t.Fatalf("the no-effects Runtime floor was refused [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyPath(t, root, path, "down"); code != 0 {
 		t.Fatalf("down [exit %d]\n%s", code, out)

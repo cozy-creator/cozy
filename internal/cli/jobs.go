@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/output"
 )
@@ -35,6 +36,16 @@ import (
 // ---------------------------------------------------------------------- job submit
 
 func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.Error {
+	if names := ctx.Inv.Values["--allow-publish"]; len(names) > 0 {
+		normalized, problem := hub.NormalizePublicationRepositories(names)
+		if problem != nil {
+			return problem
+		}
+		if !rentalRequested(ctx) {
+			return exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-publish requires a rented transaction with its own certificate identity")
+		}
+		ctx.Inv.Values["--allow-publish"] = normalized
+	}
 	deadline, problem := runDeadline(ctx)
 	if problem != nil {
 		return problem
@@ -69,8 +80,9 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
-		TimeoutMS:  int64(deadline / time.Millisecond),
-		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
+		AllowPublish: ctx.Inv.Values["--allow-publish"],
+		TimeoutMS:    int64(deadline / time.Millisecond),
+		RetainWork:   strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentalRequired: ctx.Inv.Bool("--rental-only") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory}

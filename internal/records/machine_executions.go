@@ -49,6 +49,18 @@ type MachineExecution struct {
 
 const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected`
 
+func (s *Store) MachinePackageUpload(boot, revision string) (string, *exit.Error) {
+	var request string
+	err := s.db.QueryRow(`SELECT request_id FROM request_events WHERE type='machine.package_uploaded' AND json_extract(payload,'$.worker_boot_id')=? AND json_extract(payload,'$.revision')=? ORDER BY seq DESC LIMIT 1`, boot, revision).Scan(&request)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", exit.Internalf("cannot read machine package transfer progress: %s", err)
+	}
+	return request, nil
+}
+
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
 // than a status projection. A failed or paused root remains owed after its small
 // error result is collected, and cancellation alone never proves native cleanup.
@@ -185,7 +197,8 @@ func (s *Store) AcceptMachineExecution(id string, receipt *pb.MachineExecutionRe
 	var submission pb.MachineExecutionSubmit
 	if proto.Unmarshal(link.Submission, &submission) != nil || submission.Offer == nil ||
 		receipt.SubmissionId != submission.SubmissionId || !bytes.Equal(receipt.CaptureDigest, submission.CaptureDigest) ||
-		!bytes.Equal(receipt.InvocationSpecDigest, submission.Offer.InvocationSpecDigest) {
+		!bytes.Equal(receipt.InvocationSpecDigest, submission.Offer.InvocationSpecDigest) ||
+		receipt.PublicationAuthorizationId != submission.PublicationAuthorizationId {
 		return exit.New(exit.Conflict, "machine accepted a different capture or invocation")
 	}
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(receipt)

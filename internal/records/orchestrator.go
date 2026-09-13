@@ -1312,6 +1312,12 @@ func (s *Store) BeginRequeue(id string, max int64, charge bool) (count int64, st
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
+	return s.SubmitWithEvent(r, nil)
+}
+
+// SubmitWithEvent freezes intake-only facts with the request. Deadline and
+// publication consent must survive a crash before any observer goroutine starts.
+func (s *Store) SubmitWithEvent(r Request, event map[string]any) (Request, bool, *exit.Error) {
 	if problem := NormalizeModelTransferIntent(r.ModelTransfer); problem != nil {
 		return Request{}, false, problem
 	}
@@ -1327,6 +1333,11 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, exportOutputs)
 	if problem != nil {
 		return Request{}, false, problem
+	}
+	if fresh && event != nil {
+		if err := appendEventTx(tx, recorded.ID, "request.submitted", 0, event); err != nil {
+			return Request{}, false, exit.Internalf("cannot freeze request submission intent: %s", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Request{}, false, exit.Internalf("cannot commit request %s: %s", r.ID, err)

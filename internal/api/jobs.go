@@ -16,6 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
@@ -35,6 +36,7 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
+	AllowPublish    []string               `json:"allow_publish,omitempty"`
 	TimeoutMS       int64                  `json:"timeout_ms,omitempty"`
 	RequestedRental string                 `json:"requested_rental,omitempty"`
 	LocalAssets     []records.AssetBinding `json:"local_assets,omitempty"`
@@ -123,7 +125,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
 	if (len(sub.LocalAssets) > 0 || len(sub.Trees) > 0 || sub.Worker != "" || sub.RequestedRental != "" || len(sub.Models) > 0 ||
-		sub.ModelTransfer != nil || sub.RetryOf != "" || sub.OutputDirectory != "") &&
+		sub.ModelTransfer != nil || sub.RetryOf != "" || sub.OutputDirectory != "" || len(sub.AllowPublish) > 0) &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
@@ -171,11 +173,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	var spec orchestrator.Submission
 	if existing != nil {
-		if e = s.verifyJobReplayInstall(sub, *existing); e != nil {
+		if e = s.verifyJobReplayInstall(r.Context(), sub, *existing); e != nil {
 			s.refuseTyped(w, r, e)
 			return
 		}
 		spec, e = replayJobSubmission(sub, *existing)
+		if e == nil && spec.LocalPackageDigest != "" && spec.InstallID == "" {
+			spec.InstallID = sub.InstallID
+		}
 		if e == nil {
 			export, problem := s.store.OutputExportOf(existing.ID)
 			if problem != nil {
@@ -214,6 +219,17 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.IdemKey = key
+	if len(sub.AllowPublish) > 0 {
+		spec.AllowPublish, e = hub.NormalizePublicationRepositories(sub.AllowPublish)
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		if !spec.Rental || spec.LocalPackageDigest == "" || s.machineExecutions == nil {
+			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-publish requires a Runtime-owned rented transaction with its own certificate identity"))
+			return
+		}
+	}
 	if sub.TimeoutMS < 0 || sub.TimeoutMS > int64((1<<63-1)/int64(time.Millisecond)) {
 		s.refuseTyped(w, r, exit.New(exit.Validation, "job timeout is outside the supported duration range"))
 		return
@@ -599,8 +615,20 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"trees":           strings.Join(spec.Trees, ","),
 		"models":          models,
 	}
+	if spec.LocalPackageDigest != "" {
+		// The immutable code identity outlives its reclaimable intake install.
+		delete(doc, "install_id")
+		doc["local_package_digest"] = spec.LocalPackageDigest
+	}
 	if spec.TimeoutMS > 0 {
 		doc["timeout_ms"] = spec.TimeoutMS
+	}
+	if len(spec.AllowPublish) > 0 {
+		values := make([]canonical.Value, 0, len(spec.AllowPublish))
+		for _, repository := range spec.AllowPublish {
+			values = append(values, repository)
+		}
+		doc["allow_publish"] = values
 	}
 	if assets := assetIdentity(spec.Assets); len(assets) > 0 {
 		doc["assets"] = assets

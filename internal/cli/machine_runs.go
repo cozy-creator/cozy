@@ -33,10 +33,12 @@ type machineExecutionClient interface {
 }
 
 type machineConnection struct {
-	connection *grpc.ClientConn
-	client     machineExecutionClient
-	claim      *pb.Claim
-	prepare    func(context.Context, localpackage.Revision) *exit.Error
+	connection        *grpc.ClientConn
+	client            machineExecutionClient
+	claim             *pb.Claim
+	prepare           func(context.Context, string, localpackage.Revision) *exit.Error
+	wireMinor         uint32
+	certificateDigest []byte
 }
 
 // machineRuns is a client transport and observer. Stopping it closes connections
@@ -193,13 +195,20 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if err := proto.Unmarshal(link.Submission, submission); err != nil {
 			return exit.Internalf("recorded machine submission is unreadable: %s", err)
 		}
+		if submission.PublicationAuthorizationId != "" && connection.wireMinor < 52 {
+			return exit.Named(exit.Structural, "publication.worker_upgrade_required", "the frozen publication authorization requires actual Runtime protocol 52")
+		}
 	} else {
+		authorization, problem := m.publicationAuthorization(m.ctx, request.ID, link.MachineID, connection)
+		if problem != nil {
+			return problem
+		}
 		capture, problem := m.resolver.CaptureMachineExecution(request)
 		if problem != nil {
 			return problem
 		}
 		for _, revision := range capture.Revisions {
-			if problem := connection.prepare(m.ctx, revision); problem != nil {
+			if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
 				return problem
 			}
 		}
@@ -214,6 +223,8 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if problem != nil {
 			return problem
 		}
+		built.PublicationAuthorizationId = authorization
+		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.wireMinor)
 		if problem := m.store.RecordMachineSubmission(request.ID, built); problem != nil {
 			return problem
 		}

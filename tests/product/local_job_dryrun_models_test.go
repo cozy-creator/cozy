@@ -72,6 +72,13 @@ func TestLocalJobDryRunResolvesOnlyModelMetadata(t *testing.T) {
 	if rootReads.Load() != 1 || bodyReads.Load() != 0 {
 		t.Fatalf("dryrun fetched beyond root: roots=%d bodies=%d", rootReads.Load(), bodyReads.Load())
 	}
+	code, out = runAdmissionCLI(t, root, tools, append(args, "--allow-publish=alice/model")...)
+	if code == 0 || !strings.Contains(out, "publication.machine_identity_required") {
+		t.Fatalf("local publication permission bypassed rented identity admission: %d %s", code, out)
+	}
+	if rootReads.Load() != 1 || bodyReads.Load() != 0 {
+		t.Fatal("local publication refusal performed additional model reads")
+	}
 	trace, err := os.ReadFile(activity)
 	must(t, err)
 	for _, line := range strings.Split(strings.TrimSpace(string(trace)), "\n") {

@@ -49,16 +49,26 @@ func startActualChildHost(t *testing.T) (home.Layout, *records.Store, actualChil
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	t.Cleanup(func() { store.Close() })
-	identity, problem := rental.PendingCreatorIdentity(layout, "child-host-proof")
-	fatal(t, problem)
-	token, problem := rental.PendingMediaToken(layout, "child-host-proof")
+	const rentalID = "rental-private-child-host"
+	started, err := os.ReadFile(filepath.Join(layout.Root, "host-container.json"))
+	var identity rental.CreatorIdentity
+	var token secret.Value
+	if os.IsNotExist(err) {
+		identity, problem = rental.PendingCreatorIdentity(layout, "child-host-proof")
+		fatal(t, problem)
+		token, problem = rental.PendingMediaToken(layout, "child-host-proof")
+	} else {
+		must(t, err)
+		identity, problem = rental.CreatorIdentityFor(layout, rentalID)
+		fatal(t, problem)
+		token, problem = rental.MediaToken(layout, rentalID)
+	}
 	fatal(t, problem)
 	authority, err := json.Marshal(map[string]any{"worker_id": "private-child-host", "control_public_key_ed25519_b64url": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}})
 	must(t, err)
 	authorityPath := filepath.Join(layout.Root, "host-authority.json")
 	must(t, os.WriteFile(authorityPath, authority, 0o600))
-	started, err := os.ReadFile(filepath.Join(layout.Root, "host-container.json"))
-	if os.IsNotExist(err) {
+	if len(started) == 0 {
 		command := exec.Command("python3", *childHostLauncher, authorityPath)
 		started, err = command.Output()
 		must(t, err)
@@ -145,7 +155,6 @@ func startActualChildHost(t *testing.T) (home.Layout, *records.Store, actualChil
 		hub.skus[0]["vram_gb"] = ready.GPUs[0].Memory / (1 << 30)
 		hub.skus[0]["minimum_ram_per_gpu_gb"] = 4 // exact launcher cgroup memory limit
 	}
-	const rentalID = "rental-private-child-host"
 	// The fixture catalog reports observed image facts, never invented package versions.
 	probeInventory := `import importlib.metadata as m,json,platform,re
 rows={re.sub(r"[-_.]+","-",d.metadata["Name"]).lower():d.version for d in m.distributions()}
@@ -169,6 +178,13 @@ print(json.dumps({"format":"tensorhub.image_inventory/1","profile":"python3.12-c
 			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
 		}
 	}
+	// This fixture deliberately preserves its exact Host and Runtime journal for
+	// reconnect/recovery. Stop only the owned client before the generic reaper.
+	t.Cleanup(func() {
+		if code, out := runCozyPath(t, layout.Root, path, "down", "--json"); code != 0 {
+			t.Errorf("stop actual Host proof client [%d]: %s", code, out)
+		}
+	})
 	return layout, store, host, path, restartHost
 }
 

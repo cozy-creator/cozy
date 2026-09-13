@@ -25,6 +25,7 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
+	AllowPublish             []string
 	MachineExecutionObserver bool
 	TimeoutMS                int64
 	DeadlineUnixMS           uint64
@@ -170,7 +171,7 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 	if e != nil {
 		return records.Request{}, false, e
 	}
-	req, fresh, e := c.opt.Store.Submit(req)
+	req, fresh, e := c.opt.Store.SubmitWithEvent(req, event)
 	if e != nil {
 		return records.Request{}, false, e
 	}
@@ -178,7 +179,6 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 		c.logRecordedReplay(req, s.IdemKey)
 		return req, false, nil
 	}
-	c.emit(req.ID, "request.submitted", 0, event)
 	return req, true, nil
 }
 
@@ -277,13 +277,17 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
 	}
 	event := map[string]any{
-		"package": s.Package, "function": s.Entrypoint,
+		"retain_work": s.RetainWork,
+		"package":     s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"weights_outputs": weightsOutputs,
 	}
 	if s.TimeoutMS > 0 {
 		event["timeout_ms"] = s.TimeoutMS
 		event["deadline_unix_ms"] = s.DeadlineUnixMS
+	}
+	if len(s.AllowPublish) > 0 {
+		event["allow_publish"] = s.AllowPublish
 	}
 	if s.AttentionKernel != "" {
 		event["attention_kernel"] = s.AttentionKernel

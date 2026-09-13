@@ -75,11 +75,27 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		m.claimed[machine] = claim.WorkerBootId
 		m.mu.Unlock()
 	}
-	result := &machineConnection{connection: connection, client: host, claim: claim}
-	result.prepare = func(ctx context.Context, revision localpackage.Revision) *exit.Error {
-		operation := machinePackageOperation(revision)
-		if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
+	result := &machineConnection{connection: connection, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
+	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
+		uploadedBy, problem := m.store.MachinePackageUpload(claim.WorkerBootId, revision.Digest)
+		if problem != nil {
 			return problem
+		}
+		operation := machinePackageOperation(request, revision)
+		if uploadedBy != "" {
+			// The worker still verifies the exact preparation. This local progress
+			// record only avoids resending that revision's completed carrier upload.
+			operation = machinePackageOperation(uploadedBy, revision)
+		} else {
+			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
+				return problem
+			}
+			// Preparation may remove wheel carriers after installing their bytes.
+			// Freeze the verified upload before crossing that boundary, so recovery
+			// replays preparation rather than trying to reopen a terminal upload.
+			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest}); problem != nil {
+				return problem
+			}
 		}
 		selected, problem := orchestrator.LocalPackageSelection(operation, revision)
 		if problem != nil {
@@ -94,8 +110,8 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	return result, nil
 }
 
-func machinePackageOperation(revision localpackage.Revision) string {
-	return "machine." + strings.TrimPrefix(revision.Digest, "sha256:")
+func machinePackageOperation(request string, revision localpackage.Revision) string {
+	return request + "." + strings.TrimPrefix(revision.Digest, "sha256:")
 }
 
 // The ordinary Host upload has durable verified prefixes. Private code moves
@@ -289,9 +305,9 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		}
 		m.localPID = process.PID
 	}
-	result := &machineConnection{connection: connection, client: client, claim: claim}
-	result.prepare = func(ctx context.Context, revision localpackage.Revision) *exit.Error {
-		selected, problem := orchestrator.LocalPackageSelection(machinePackageOperation(revision), revision)
+	result := &machineConnection{connection: connection, client: client, claim: claim, wireMinor: info.WireMinor}
+	result.prepare = func(ctx context.Context, requestID string, revision localpackage.Revision) *exit.Error {
+		selected, problem := orchestrator.LocalPackageSelection(machinePackageOperation(requestID, revision), revision)
 		if problem != nil {
 			return problem
 		}

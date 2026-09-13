@@ -27,6 +27,10 @@ import (
 // retains the backward-aware Python patch observation parser.
 const Floor = "0.16.10"
 
+// WireFloor supports Runtime-owned execution without external effects. Optional
+// publication authority is checked against the actual worker's minor 52 at use.
+const WireFloor uint32 = 51
+
 var floor = pep440.MustParse(Floor)
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
@@ -48,7 +52,7 @@ var hostRuntimeVerdicts = struct {
 }{admitted: map[string]bool{}}
 
 // Path is the admitted tool. A cozy-runtime on PATH is not yet a tool this daemon can drive. It must vendor this daemon's
-// wire package at this daemon's minor or newer — the minor is additive, so a newer tool serves
+// wire package at WireFloor or newer — the minor is additive, so a newer tool serves
 // an older daemon and an older tool cannot (cl-086's live run: a 0.0.29 tool (minor 16) under
 // a minor-22 daemon launched, never came READY, and the request sat `queued` with nothing
 // said). Floor also requires the static script and managed-operation metadata contract.
@@ -111,10 +115,10 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 		return unreadableHostRuntime(path, "`cozy-runtime --json version` names wire_protocol %q, "+
 			"not <package>+minor.<n>", answer.WireProtocol)
 	}
-	if spoken != wirePackage() || uint32(minor) < pb.WireMinor {
+	if spoken != wirePackage() || uint32(minor) < WireFloor {
 		return exit.Named(exit.Structural, "host_runtime_wire_mismatch",
 			"cozy-runtime %s is release %s and speaks %s; this Cozy needs %s+minor.%d or newer",
-			path, answer.Distribution, answer.WireProtocol, wirePackage(), pb.WireMinor).
+			path, answer.Distribution, answer.WireProtocol, wirePackage(), WireFloor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
 	release, err := pep440.Parse(answer.Distribution)
