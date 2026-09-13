@@ -22,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
+	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
 // This is bootstrap wiring for the existing coordinator and API. There is no
@@ -72,6 +73,7 @@ func serveExecutionOwner(runtime *Runtime, bootstrap *executionowner.Bootstrap) 
 		Media: &media.Spec{Addr: strings.TrimPrefix(authority.MediaAddress, "https://"), CACert: authority.WorkerTLSCertificatePath, Token: secret.New(authority.MediaBearer)}}
 	owner, problem := orchestrator.Open(orchestrator.Options{Cfg: cfg, Layout: layout, Store: store, Yield: "never", Log: runtime.Err,
 		Packages:         resolver,
+		ObserveRental:    bootstrap.ObserveWorker,
 		PrivateExecution: &orchestrator.PrivateExecutionOwner{Authorization: bootstrap.Grant, PrivateKey: ed25519.PrivateKey(authority.ExecutionPrivateKey)},
 		Rentals: func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
 			if id != worker {
@@ -92,6 +94,7 @@ func serveExecutionOwner(runtime *Runtime, bootstrap *executionowner.Bootstrap) 
 	}
 	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{Orchestrator: owner, Cfg: cfg, Creds: creds, Addr: address, Log: runtime.Err,
+		Web:      cozyweb.Handler(),
 		Packages: resolver, ExecutionGrantDigest: grantDigest,
 		ExecutionCapture: func(ctx context.Context, key string, raw []byte) (orchestrator.Submission, *exit.Error) {
 			return resolveExecutionCapture(ctx, bootstrap, layout, store, resolver, worker, grantDigest, key, raw)

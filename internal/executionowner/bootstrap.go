@@ -17,6 +17,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
@@ -42,6 +43,23 @@ type Bootstrap struct {
 	Authority Authority
 	Grant     *pb.SignedExecutionOwnerGrant
 	Wheels    map[string][]string
+}
+
+// ObserveWorker binds the live ClaimAck to this coordinator's accepted boot.
+// The initial CPU cohort has no device envelope; GPU qualification supplies
+// separately observed Host hardware facts before it can be admitted here.
+func (b *Bootstrap) ObserveWorker(observed orchestrator.RentalObservation) *exit.Error {
+	grant := b.Grant.Grant
+	if observed.WorkerID != grant.WorkerId || observed.WorkerBootID != grant.WorkerBootId || observed.WorkerInstance == "" ||
+		observed.DeviceCount != 0 || observed.Accelerator != "" || observed.Backend != "none" || observed.DeviceMemoryTotalBytes != 0 ||
+		observed.DriverVersion != "" || observed.BackendVersion != "" {
+		return invalid("worker readback differs from the granted CPU execution boot")
+	}
+	raw, err := json.Marshal(observed)
+	if err != nil {
+		return invalid("worker readback cannot be encoded")
+	}
+	return writeImmutable(filepath.Join(b.Authority.CreatorHome, "worker-observation.json"), raw)
 }
 
 // ForSubmission is called only after the Host authenticates a new submission

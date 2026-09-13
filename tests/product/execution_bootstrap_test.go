@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/executionowner"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
@@ -75,6 +76,19 @@ func TestExecutionBootstrapRequiresExactUploadedCustody(t *testing.T) {
 	}
 	fatal(t, b.PinGeneration())
 	fatal(t, b.PinGeneration())
+	observation := orchestrator.RentalObservation{RentalID: "private-execution-worker", WorkerID: "private-worker", WorkerBootID: "private-boot", WorkerInstance: "instance", Backend: "none"}
+	fatal(t, b.ObserveWorker(observation))
+	fatal(t, b.ObserveWorker(observation))
+	changedObservation := observation
+	changedObservation.WorkerBootID = "foreign-boot"
+	if b.ObserveWorker(changedObservation) == nil {
+		t.Fatal("foreign worker observation crossed the grant")
+	}
+	changedObservation = observation
+	changedObservation.DeviceCount = 1
+	if b.ObserveWorker(changedObservation) == nil {
+		t.Fatal("CPU authority admitted an unobserved GPU")
+	}
 	foreign := *b
 	foreign.Grant = proto.Clone(b.Grant).(*pb.SignedExecutionOwnerGrant)
 	foreign.Grant.Grant.RecordOwnerEpoch++
