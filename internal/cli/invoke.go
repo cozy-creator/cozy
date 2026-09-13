@@ -875,7 +875,7 @@ func PhaseCell(life api.Lifecycle) string {
 		activity = "downloading models"
 	case orchestrator.PhasePreparing:
 		activity = "setting up package"
-		if life.Kind == "job" || life.PhaseMovedBytes != nil {
+		if life.Kind == "job" {
 			activity = "preparing inputs"
 		}
 	case orchestrator.PhaseWarming:
