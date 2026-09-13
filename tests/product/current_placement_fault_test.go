@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,47 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+func TestFailedRentalPackagePreservesItsRuntimeDiagnosis(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	detail := "ordinal 0 has 84460830720 B measured headroom for 103012383680 B of declared simultaneous weights"
+	pod := &fakePod{controlKey: public}
+	pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
+		desired := frame.GetDesiredState()
+		if desired == nil || desired.GetPlacementSet() == nil {
+			return false, nil
+		}
+		answer := pod.served(desired, 1)
+		observed := answer.GetObservedState()
+		observed.ConvergedRevision = 0
+		observed.AvailableAttemptSlots = 0
+		placement := observed.Placements[0]
+		placement.Materialization = pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+		placement.Serving = pb.ServingState_SERVING_STATE_OFFLINE
+		placement.DispatchableBindingDigests = nil
+		placement.Faults = []*pb.Fault{{Kind: pb.FaultKind_FAULT_KIND_CONFIG_REFUSED,
+			Subject: placement.PlacementId, Reason: "device_group_infeasible", Detail: detail}}
+		// An unrelated global diagnosis must not replace this placement's failure.
+		observed.Faults = []*pb.Fault{{Kind: pb.FaultKind_FAULT_KIND_CONFIG_REFUSED,
+			Subject: "other-placement", Reason: "unrelated", Detail: "other request's failure"}}
+		return true, send(answer)
+	}
+	connection, _ := startFakePod(t, t.TempDir(), pod)
+	o := hostOwner(t, "failed-package-diagnosis", rentalWiring(connection, private))
+	id, _, problem := o.c.Submit(orchestrator.Submission{
+		IdemKey: "failed-package-diagnosis", Package: "acme/weightless", Entrypoint: "tile",
+		PlanID: podPlanID("acme/weightless"), Release: "1.0.0", Payload: []byte(`{"size":16}`),
+		Outputs: []string{"image"}, Worker: podRental, Rental: true, RentalRequired: true,
+	})
+	fatal(t, problem)
+	failed := awaitDurable(t, o, id, "request.failed")
+	message, _ := failed.Payload["error"].(string)
+	if failed.Payload["error_type"] != "worker.placement_refused" ||
+		!strings.Contains(message, "device_group_infeasible: "+detail) || strings.Contains(message, "unrelated") {
+		t.Fatalf("Runtime diagnosis was lost or came from another placement: %+v", failed.Payload)
+	}
+}
 
 func TestInitialPackageRefusalNeedsNoOwnedPlacementSet(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
