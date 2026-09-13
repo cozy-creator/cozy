@@ -10,10 +10,18 @@ type retainedCleanup struct {
 }
 
 func (c *Orchestrator) finishRetainedCancellation(id string) {
+	if !c.startRetainedCleanup(id, c.runRetainedCancellation) {
+		// Cancellation can arrive while a successful-root pass is still draining.
+		// Its durable intent needs a new pass after that owner leaves the registry.
+		c.retryRetainedCancellation(id)
+	}
+}
+
+func (c *Orchestrator) startRetainedCleanup(id string, run func(context.Context, string)) bool {
 	c.mu.Lock()
 	if c.closing || c.retainedCleaning[id] != nil {
 		c.mu.Unlock()
-		return
+		return false
 	}
 	if c.retainedCleaning == nil {
 		c.retainedCleaning = make(map[string]*retainedCleanup)
@@ -30,8 +38,9 @@ func (c *Orchestrator) finishRetainedCancellation(id string) {
 			close(call.done)
 			c.mu.Unlock()
 		}()
-		c.runRetainedCancellation(ctx, id)
+		run(ctx, id)
 	}()
+	return true
 }
 
 // WaitRetainedCancellations waits for the cleanup passes already accepted by the

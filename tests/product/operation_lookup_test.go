@@ -250,7 +250,7 @@ func TestOperationLookupSchemaUpgradePreservesRequests(t *testing.T) {
 	revertRentalsBeforeWidth(t, db)
 	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN capture`)
 	must(t, err)
-	_, err = db.Exec(`PRAGMA user_version=28`)
+	_, err = db.Exec(`DROP TABLE IF EXISTS successful_work_releases; PRAGMA user_version=28`)
 	must(t, err)
 	must(t, db.Close())
 	store, problem = records.OpenForDaemon(path, "")

@@ -280,14 +280,28 @@ func (s *Store) RequestRetainedCancellation(id, actor string) *exit.Error {
 // RecordRetainedFinalization supplies a disposition after the stopped attempt was
 // already acknowledged. The original invocation and writer identity stay intact.
 func (s *Store) RecordRetainedFinalization(f WeightsFinalization) *exit.Error {
+	return s.recordWorkFinalization(f, "")
+}
+
+func (s *Store) RecordSuccessfulFinalization(root string, f WeightsFinalization) *exit.Error {
+	if root == "" {
+		return exit.Internalf("successful finalization has no root intent")
+	}
+	return s.recordWorkFinalization(f, root)
+}
+
+func (s *Store) recordWorkFinalization(f WeightsFinalization, successRoot string) *exit.Error {
 	_, err := s.db.Exec(`INSERT INTO weights_finalizations(request_id,attempt,instance_id,
 		owner_scope,invocation_digest,output_slot,disposition,receipt_digest,scratch_root_id,recorded_at)
 		SELECT ?,?,?,?,?,?,'ABANDON_UNCOMMITTED','','',?
-		WHERE EXISTS(SELECT 1 FROM requests WHERE id=? AND state='canceling' AND retain_work=1)
+		WHERE EXISTS(SELECT 1 FROM requests r WHERE r.id=? AND r.retain_work=1 AND
+		 (r.state='canceling' OR (r.state='succeeded' AND EXISTS(SELECT 1 FROM successful_work_releases w,json_each(w.members) m
+		 WHERE w.request_id=? AND w.state='draining' AND m.value=r.id
+		 AND EXISTS(SELECT 1 FROM requests root WHERE root.id=w.request_id AND root.state='succeeded')))))
 		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
 		ON CONFLICT(request_id,invocation_digest,output_slot) DO NOTHING`,
 		f.RequestID, f.Attempt, f.InstanceID, f.OwnerScope, f.InvocationDigest, f.OutputSlot,
-		now(), f.RequestID, f.RequestID)
+		now(), f.RequestID, successRoot, f.RequestID)
 	if err != nil {
 		return exit.Internalf("cannot record retained artifact abandonment: %s", err)
 	}
