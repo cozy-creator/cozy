@@ -1734,9 +1734,8 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 			"worker %s carries no selected environment digest", instanceID)
 	}
 	if remote {
-		// Captured wheels execute the prepared Environment even when unpublished.
-		// Only legacy direct-source development lacks that identity; a retained
-		// local package digest is not evidence of direct-source execution.
+		// Captured wheels name the exact prepared Environment that Runtime checks.
+
 		if req.EnvironmentDigest == "" {
 			e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID, environment)
 			if e != nil {
