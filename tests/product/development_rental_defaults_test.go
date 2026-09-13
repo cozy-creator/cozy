@@ -63,9 +63,19 @@ func TestDevelopmentDefaultsReachManualAndManagedAcquisitions(t *testing.T) {
 				t.Fatalf("replay consulted the deleted public key: %d %s", code, out)
 			}
 			mu.Lock()
-			defer mu.Unlock()
-			if len(*posts) != 2 || !bytes.Equal(body, (*posts)[1]) {
+			unchanged := len(*posts) == 2 && bytes.Equal(body, (*posts)[1])
+			mu.Unlock()
+			if !unchanged {
 				t.Fatal("replay changed development acquisition bytes")
+			}
+			code, out = runCozy(t, root, append(args, "--development=false")...)
+			if code == 0 || !strings.Contains(out, "rental.idempotency_conflict") {
+				t.Fatalf("explicit false changed pinned development access: %d %s", code, out)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(*posts) != 2 {
+				t.Fatal("changed development mode reached acquisition")
 			}
 		})
 	}
@@ -89,5 +99,37 @@ func TestDevelopmentDefaultsRefuseMissingOrPrivateKeyBeforeAcquisition(t *testin
 		if count != 0 {
 			t.Fatal("an invalid development key reached paid acquisition")
 		}
+	}
+}
+
+func TestDevelopmentFalseOverridesConfiguredDefault(t *testing.T) {
+	root, mu, posts, _, _ := runModelCatalog(t)
+	configureDevelopmentRental(t, root)
+	// The configured key deliberately does not exist: disabling development
+	// must neither read it nor require SSH credentials.
+	startDaemonProcess(t, root)
+	args := []string{"rental", "new", "cpu", "--idempotency-key", "ordinary-override", "--json"}
+	code, out := runCozy(t, root, append(args, "--development=false")...)
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("explicit ordinary mode did not reach isolated acquisition: %d %s", code, out)
+	}
+	mu.Lock()
+	body := append([]byte(nil), (*posts)[0]...)
+	mu.Unlock()
+	request, problem := hub.ParseRentalRequestBytes(body)
+	fatal(t, problem)
+	if request.Development != nil {
+		t.Fatal("--development=false still authorized developer access")
+	}
+	// An omitted flag on replay retains the original ordinary request even
+	// though the configured default still enables development.
+	code, out = runCozy(t, root, args...)
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("ordinary replay consulted the configured development key: %d %s", code, out)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*posts) != 2 || !bytes.Equal(body, (*posts)[1]) {
+		t.Fatal("replay changed ordinary acquisition bytes")
 	}
 }

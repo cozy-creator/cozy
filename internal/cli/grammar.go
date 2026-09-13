@@ -425,7 +425,7 @@ type RentalCmd struct {
 }
 
 type RentalNewCmd struct {
-	Development    bool     `help:"Rent an explicit developer worker for SSH/SFTP wheel updates."`
+	Development    *bool    `help:"Rent a developer worker; false overrides the configured default."`
 	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
 	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
@@ -442,7 +442,11 @@ func (c *RentalPruneCmd) Run(r *Runtime) error {
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
-	return r.call(handleRent, []string{c.SKU}, bools("--development", c.Development), values(
+	flags := map[string]bool{}
+	if c.Development != nil {
+		flags["--development"] = *c.Development
+	}
+	return r.call(handleRent, []string{c.SKU}, flags, values(
 		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
 }
 

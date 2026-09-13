@@ -65,7 +65,11 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 	// Preparing code does not download a job's Model inputs. Reuse the private
 	// model preparation, but do not activate its result as a serving placement.
 	// Native operation inputs keep their existing custody and are not downloads.
-	if models := downloadModelRefs(request.Models); jobModels && len(models) > 0 {
+	// Imported invocable defaults belong to the child's package. Keep those exact
+	// selections on the request for child resolution, but do not bind them against
+	// this root script's interface; the child prepares its own package when called.
+	models := downloadModelRefs(ownModelInputs(request))
+	if jobModels && len(models) > 0 {
 		if c.opt.RentalPackageSet == nil {
 			return nil, exit.Unavailablef("unpublished package job models require a rental download set")
 		}
