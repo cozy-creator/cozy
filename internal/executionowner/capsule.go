@@ -41,6 +41,16 @@ type Root struct {
 type Package struct {
 	Revision  json.RawMessage `json:"revision"`
 	Interface json.RawMessage `json:"interface"`
+	Capture   Capture         `json:"capture"`
+}
+
+// Capture preserves the source install's observed metadata. These are captured
+// client facts, not a claim that the pod has already materialized this environment.
+type Capture struct {
+	Python   string `json:"python"`
+	Platform string `json:"platform"`
+	Closure  string `json:"closure"`
+	Extra    string `json:"extra"`
 }
 
 type Binding struct {
@@ -110,6 +120,10 @@ func Decode(raw []byte) (*Validated, *exit.Error) {
 		id, _ := canonical.Spell(canonical.Digest(pkg.Revision))
 		if v.Packages[id] != nil {
 			return nil, invalid("capsule repeats a package revision")
+		}
+		if pkg.Capture.Platform != "linux/amd64" || !strings.HasPrefix(pkg.Capture.Python, "3.12.") ||
+			!strings.Contains("\n"+pkg.Capture.Closure+"\n", "\n"+strings.TrimPrefix(doc.Str("package"), "local/")+"=="+doc.Str("release")+"\n") {
+			return nil, invalid("capsule omitted its captured source environment facts")
 		}
 		surface, problem := launch.DecodePackageInterface(pkg.Interface)
 		ref := doc.Sub("package_interface")

@@ -38,7 +38,8 @@ func executionCapsule(t *testing.T) executionowner.Capsule {
 		})
 		must(t, err)
 		id, _ := canonical.Spell(digest)
-		return executionowner.Package{Revision: revision, Interface: iface}, id, ifaceID
+		return executionowner.Package{Revision: revision, Interface: iface,
+			Capture: executionowner.Capture{Python: "3.12.12", Platform: "linux/amd64", Closure: name + "==1.0.0"}}, id, ifaceID
 	}
 	parent, parentID, _ := makePackage("parent", "main")
 	child, childID, iface := makePackage("step", "advance")
