@@ -59,6 +59,11 @@ func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
 	if row == nil || row.HourlyRateUSDMicros != 720_000 {
 		t.Fatalf("the local row did not adopt the billed rate: %+v", row)
 	}
+	// Settle the synthetic rental while its provider is still available. The
+	// ordinary test shutdown must not wait on a Hub this fixture already closed.
+	if code, out := runCozy(t, root, "rental", "end", "pr-redarm", "--json"); code != 0 {
+		t.Fatalf("fixture rental release failed [exit %d]: %s", code, out)
+	}
 	hub.close()
 }
 

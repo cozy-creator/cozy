@@ -32,8 +32,16 @@ func TestProductPath(t *testing.T) {
 	root, err := os.MkdirTemp(os.TempDir(), "cozy-product-")
 	must(t, err)
 	t.Cleanup(func() {
-		_, _ = runCozy(t, root, "down", "--all")
-		_ = os.RemoveAll(root)
+		args := []string{"down"}
+		if !t.Failed() {
+			args = append(args, "--all")
+		}
+		_, _ = runCozy(t, root, args...)
+		if t.Failed() {
+			t.Logf("product path evidence retained at %s", root)
+		} else {
+			_ = os.RemoveAll(root)
+		}
 	})
 
 	project := weightlessProject(t)
@@ -69,7 +77,8 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("package list does not show SIZE and DEPENDENCIES in units [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", localWeightlessRef); code != 0 ||
-		!strings.Contains(out, "- tile") || !strings.Contains(out, "- refuse") {
+		!regexp.MustCompile(`(?m)^tile +available$`).MatchString(out) ||
+		!regexp.MustCompile(`(?m)^refuse +available$`).MatchString(out) {
 		t.Fatalf("package-only run did not list functions [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", localWeightlessRef+"/v1.0.0/tile"); code != 2 ||
