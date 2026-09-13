@@ -22,3 +22,57 @@ checkpoint/commit replies. A lost reply cannot remove native pending custody.
 This document records implementation ownership, not completed product proof.
 Runtime adapter/consumer migration is cr-174; ordinary CLI qualification is cl-265.
 No existing worker, release, profile, SDK or rental is changed by the isolated work.
+
+## Integration contract
+
+`tensorfs.derived.Derivation` contains typed `Source`, `Target`, `Tensor`, `Part`,
+`PartSource` and `Config` values. `native_arguments(max_new_bytes)` marshals into
+the unchanged native declaration/estimate/begin APIs. The owner injects
+`OutputCapability(open_output)`; `tensorfs.derive(output, declaration)` invokes
+that single opener. The opener freezes the exact native declaration, checks
+admitted inputs/slot/limits, binds the epoch, restores custody and admits capacity.
+
+The opener returns `DerivedTransaction(fd)` with ownership of a preconnected
+AF_UNIX stream FD, or `DerivedTransaction.replay(receipt)` after validating native
+committed and retained custody. Its peer serves an already-open native writer:
+
+```python
+serve_derived(
+    writer, fd, operation_id=request_id, slot=output_slot, checkpoint=restore_head,
+    check_current=check_attempt_authority,
+    admit_io=admit_operation,
+    record_checkpoint=record_native_head,
+    record_receipt=record_native_receipt,
+)
+```
+
+`check_current()` revalidates the owner/attempt and is called before each native
+operation and every streamed pull. The Runtime owner still fences the native
+writer during cancellation/replacement. Closing the server FD wakes blocked I/O.
+`admit_io(operation, native_bound)` returns a context manager. `part`/`config`
+admission includes one bounded source-read window (at most 64 MiB); a nested read
+borrows that admission instead of recursively acquiring its global lock.
+Metadata operations have bound zero but still need the existing native document
+allowance. Native `part_write_bound` and `config_write_bound` own payload geometry;
+the existing whole-writer estimate supplies preflight before the opener returns.
+
+`record_checkpoint(facts)` and `record_receipt(facts)` are mandatory trusted-owner
+hooks, completed before success replies. A receipt hook must reconcile a real
+native commit even if cancellation raced with it. The native pending root survives
+a hook failure or owner-process exit; the owner reconciles it through native
+lookup on restart. The channel has no durable state or automatic reconnection.
+
+The client exposes completed roles/configs, source reads, buffer/reader additions,
+checkpoint, commit and fence. The peer cannot select a transaction/epoch, open a
+path, inspect arbitrary objects, release custody or invoke GC. The only nested
+command during a pull is a bounded read from the same native writer's sources.
+Binary pulls are capped at 1 MiB; source destinations at 64 MiB. Transform input
+buffers are retained until the synchronous add call finishes. Copying a bounded
+chunk does not make a complete duplicate tensor/role. No async DMA buffer ownership
+is transferred by this channel; native asynchronous readers still require their
+existing lease/batch-release discipline.
+
+Native checkpoints may retain completed roles of an incomplete encoded tensor.
+Such a checkpoint is recovery state, not a usable artifact. Commit refuses until
+all required roles (for example FP8 data and scale) exist. Algorithms choose to
+checkpoint after their semantic unit; this API does not change that policy.

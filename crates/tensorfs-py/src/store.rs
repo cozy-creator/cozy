@@ -2338,6 +2338,36 @@ impl PyDerivedWriter {
 
 #[pymethods]
 impl PyDerivedWriter {
+    fn part_write_bound(
+        &self,
+        py: Python<'_>,
+        component: &str,
+        key: &str,
+        role: &str,
+    ) -> PyResult<u64> {
+        py.detach(|| {
+            derived::part_write_bound(
+                &self.meta,
+                &self.transaction_id,
+                self.writer_session_id,
+                (component, key, role),
+            )
+        })
+        .or_refuse(py)
+    }
+
+    fn config_write_bound(&self, py: Python<'_>, name: &str) -> PyResult<u64> {
+        py.detach(|| {
+            derived::config_write_bound(
+                &self.meta,
+                &self.transaction_id,
+                self.writer_session_id,
+                name,
+            )
+        })
+        .or_refuse(py)
+    }
+
     /// Effective exact sources after TensorFS has checked installed identity and closure.
     fn sources<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyList>> {
         source_facts(py, &self.source_views)
