@@ -27,8 +27,7 @@ func ordinaryScriptModelServing(t *testing.T, mixed bool) {
 	must(t, err)
 	version := strings.Split(filepath.Base(wheel), "-")[1]
 	control := filepath.Join(t.TempDir(), "control")
-	// Real worker images own the heavy numerical dependencies. Keep that boundary
-	// here so preparing this tiny package does not copy a second CUDA installation.
+	// Give the base the numerical dependencies present in real worker images.
 	for _, args := range [][]string{{"venv", control, "--python", "3.12"},
 		{"pip", "install", "--python", filepath.Join(control, "bin", "python"), wheel, "torch>=2.13,<3", "numpy>=1.26"}} {
 		out, err := exec.Command("uv", args...).CombinedOutput()
