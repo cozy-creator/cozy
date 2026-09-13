@@ -38,6 +38,9 @@ func (s *Server) pauseJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.machineJobControl(w, r, row, "pause") {
+		return
+	}
 	if problem := s.orchestrator.PauseRequest(row.ID, requestActor(r)); problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
@@ -57,6 +60,9 @@ func (s *Server) pauseJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 	row, ok := s.jobRow(w, r)
 	if !ok {
+		return
+	}
+	if s.machineJobControl(w, r, row, "resume") {
 		return
 	}
 	s.shutdownAdmission.RLock()

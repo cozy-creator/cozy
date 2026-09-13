@@ -687,23 +687,24 @@ func bindAssets(assets []records.AssetBinding) ([]records.AssetBinding, *exit.Er
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
-	Number          int64    `json:"number"`
-	Kind            string   `json:"kind"`
-	RequestID       string   `json:"request_id"`
-	Status          string   `json:"status"`
-	Package         string   `json:"package"`
-	Function        string   `json:"function"`
-	Attempt         uint64   `json:"attempt"`
-	Attempts        int      `json:"attempts"`
-	QueuedMS        int64    `json:"queued_ms"`
-	ExecutionMS     int64    `json:"execution_ms"`
-	ProgressStage   string   `json:"progress_stage,omitempty"`
-	StageFraction   *float64 `json:"stage_fraction,omitempty"`
-	OverallFraction *float64 `json:"overall_fraction,omitempty"`
-	Position        *int64   `json:"position,omitempty"`
-	Total           *int64   `json:"total,omitempty"`
-	RemainingMS     *int64   `json:"remaining_ms,omitempty"`
-	StepMS          *float64 `json:"step_ms,omitempty"`
+	MachineExecution *MachineExecutionView `json:"machine_execution,omitempty"`
+	Number           int64                 `json:"number"`
+	Kind             string                `json:"kind"`
+	RequestID        string                `json:"request_id"`
+	Status           string                `json:"status"`
+	Package          string                `json:"package"`
+	Function         string                `json:"function"`
+	Attempt          uint64                `json:"attempt"`
+	Attempts         int                   `json:"attempts"`
+	QueuedMS         int64                 `json:"queued_ms"`
+	ExecutionMS      int64                 `json:"execution_ms"`
+	ProgressStage    string                `json:"progress_stage,omitempty"`
+	StageFraction    *float64              `json:"stage_fraction,omitempty"`
+	OverallFraction  *float64              `json:"overall_fraction,omitempty"`
+	Position         *int64                `json:"position,omitempty"`
+	Total            *int64                `json:"total,omitempty"`
+	RemainingMS      *int64                `json:"remaining_ms,omitempty"`
+	StepMS           *float64              `json:"step_ms,omitempty"`
 	// The PREPARATION facts (cl-121). A queued request is not idle — it is acquiring a
 	// machine, booting one, or landing model bytes on it — and these say which, with
 	// whatever advancement that phase actually has. Absent for anything that has left
@@ -794,10 +795,31 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 			"no request "+reference+" on this host", "")
 		return
 	}
-	s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
+	problem := s.refreshMachineExecution(r.Context(), *row)
+	if current, e := s.store.RequestRow(row.ID); e == nil && current != nil {
+		current.Number = row.Number
+		row = current
+	}
+	life := s.lifecycleOf(*row)
+	if life.MachineExecution != nil && problem != nil {
+		life.MachineExecution.ObservationError = problem.Message
+	}
+	s.ok(w, r, http.StatusOK, life)
 }
 
 func (s *Server) lifecycleOf(row records.Request) Lifecycle {
+	if link, problem := s.store.MachineExecution(row.ID); problem == nil && link != nil {
+		state := s.machineJobState(row, link)
+		machine := row.Machine
+		if machine == "" {
+			machine = link.MachineID
+		}
+		return Lifecycle{Number: row.Number, Kind: "job", RequestID: row.ID, Status: state.Status,
+			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
+			Result: state.Result, Error: state.Error, ErrorType: state.ErrorType, Outputs: state.Outputs,
+			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
+			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution}
+	}
 	kind := "invocation"
 	if row.IsJob() {
 		kind = "job"
@@ -1012,6 +1034,9 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	if row == nil {
 		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+reference+" on this host", "")
+		return
+	}
+	if s.machineRequestControl(w, r, *row, "cancel") {
 		return
 	}
 	id := row.ID

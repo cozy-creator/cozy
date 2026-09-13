@@ -37,6 +37,10 @@ import (
 // ---------------------------------------------------------------------- job submit
 
 func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.Error {
+	deadline, problem := runDeadline(ctx)
+	if problem != nil {
+		return problem
+	}
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA before a job exists — the same
 	// client-side check `cozy run` makes, over the job's own declared request struct.
 	input, overrides, e := launch.ParsePayload(&launch.Entrypoint{
@@ -67,10 +71,14 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
+		TimeoutMS:  int64(deadline / time.Millisecond),
 		RetainWork: strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
 		RentalRequired: ctx.Inv.Bool("--rental-only") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory}
+	if deadline%time.Millisecond != 0 {
+		sub.TimeoutMS++
+	}
 	source, profiles, models, e := resolveJobModelInputs(ctx, target, job, overrides.Models)
 	if e != nil {
 		return e
@@ -107,6 +115,21 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if !ctx.Mode().JSON {
 		fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", handle.Package, handle.Function)
 	}
+	if handle.MachineExecution {
+		state, detached, problem := waitMachineAcceptance(ctx, c, handle)
+		if problem != nil {
+			return problem
+		}
+		if detached {
+			return renderSubmittedJob(ctx, state, !handle.Replay)
+		}
+		if settled(state.Status) || state.Status == "blocked" || state.Status == "paused" {
+			return renderJobTerminal(ctx, state, nil, began)
+		}
+		if !ctx.Inv.Bool("--follow") {
+			return renderSubmittedJob(ctx, state, !handle.Replay)
+		}
+	}
 	if ctx.Inv.Bool("--follow") {
 		return followJob(ctx, c, handle.JobID, began)
 	}
@@ -132,6 +155,17 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 		{K: "status", V: runStatus(state.Status)},
 	}
 	defaults := []string{"target", "status"}
+	if machine := state.MachineExecution; machine != nil {
+		fields = append(fields, output.Field{K: "machine_accepted", V: machine.Accepted}, output.Field{K: "machine", V: machine.Machine})
+		defaults = append(defaults, "machine")
+		if ctx.Mode().JSON {
+			defaults = append(defaults, "machine_accepted")
+		}
+		if !machine.Accepted {
+			fields = append(fields, output.Field{K: "stage", V: "queued locally; machine acceptance is pending"})
+			defaults = append(defaults, "stage")
+		}
+	}
 	if state.QueuePosition != nil {
 		queue := fmt.Sprint(*state.QueuePosition)
 		if state.QueueDepth != nil && *state.QueueDepth >= *state.QueuePosition {
@@ -381,6 +415,9 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event,
 	began time.Time,
 ) *exit.Error {
+	if machine := state.MachineExecution; machine != nil && state.Status == "completed" && !machine.Collected {
+		return exit.Named(exit.Unavailable, "machine_execution.result_collection_pending", "run %s completed on its machine, but its result has not been collected: %s", state.JobID, machine.ObservationError)
+	}
 	if state.Status == "completed" && state.OutputExport != nil {
 		client, problem := dial(ctx)
 		if problem != nil {

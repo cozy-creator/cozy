@@ -119,10 +119,13 @@ func serveDaemon(ctx *Context) *exit.Error {
 	knownRentals := rental.Known(st)
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
+	machines := newMachineRuns(ctx, l, st, resolver, fleet)
+	defer machines.cancel()
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	defects := newDefectReporter(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
-		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
+		StartMachineExecution: machines.Start,
+		Cfg:                   ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
 		RentalPrepareFacts: rental.PrepareFactsSource(client(ctx)),
@@ -188,7 +191,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// exactly the path a SIGTERM takes.
 	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{
-		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
+		MachineExecutions: machines,
+		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
 		RentalInventory: func(reconcile bool) (api.RentalInventory, *exit.Error) {
 			return readRentalInventory(st, fleet, reconcile)
@@ -200,6 +204,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		closeListeners()
 		return e
 	}
+	machines.Resume()
 
 	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
 		addr, strings.Join(bound, "+"), socket)

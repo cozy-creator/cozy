@@ -488,7 +488,8 @@ type Request struct {
 	ReleaseImplicitWork bool `json:"-"`
 	// MachineExecutionObserver is admission-only. The marker is committed with
 	// this request, before any scheduler can create a local attempt.
-	MachineExecutionObserver bool `json:"-"`
+	MachineExecutionObserver bool   `json:"-"`
+	DeadlineUnixMS           uint64 `json:"-"` // frozen submission event is its durable source
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
 	// retained operation namespace shared by explicitly related revisions.
 	RetryOf                string

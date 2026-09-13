@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -26,6 +27,7 @@ var machineExecutionSchema = []string{
  remote_cursor INTEGER NOT NULL DEFAULT 0 CHECK(remote_cursor>=0),
  outcome BLOB NOT NULL DEFAULT x'',
  pending_control BLOB NOT NULL DEFAULT x'',
+ cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
  collected INTEGER NOT NULL DEFAULT 0 CHECK(collected IN (0,1))
  ) STRICT`,
 	`CREATE TRIGGER machine_execution_no_local_attempt BEFORE INSERT ON attempts
@@ -41,15 +43,55 @@ type MachineExecution struct {
 	RemoteCursor         int64
 	Outcome              []byte
 	PendingControl       []byte
+	CancelRequested      bool
 	Collected            bool
 }
 
-const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,collected`
+const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected`
+
+// e/r are the observer and request aliases. Explicit Runtime release is stronger
+// than a status projection. A failed or paused root remains owed after its small
+// error result is collected, and cancellation alone never proves native cleanup.
+const machineExecutionOwed = `NOT EXISTS(SELECT 1 FROM request_events released
+ WHERE released.request_id=r.id AND released.type='machine.retention_released') AND (
+ (length(e.receipt)=0 AND r.state!='refused' AND (length(e.submission)>0 OR r.state!='canceled')) OR
+ (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0)))`
+
+func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
+	var owed bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND `+machineExecutionOwed+`)`, id).Scan(&owed)
+	if err != nil {
+		return false, exit.Internalf("cannot inspect Runtime execution obligations: %s", err)
+	}
+	return owed, nil
+}
+
+func (s *Store) RentalHasMachineObligations(id string) (bool, *exit.Error) {
+	var owed bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE (e.machine_id=? OR r.worker=?) AND `+machineExecutionOwed+`)`, id, id).Scan(&owed)
+	if err != nil {
+		return false, exit.Internalf("cannot inspect rented Runtime execution obligations: %s", err)
+	}
+	return owed, nil
+}
+
+func (s *Store) RequestExecutionTiming(id string) (int64, uint64, *exit.Error) {
+	var duration int64
+	var deadline uint64
+	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.timeout_ms'),0),COALESCE(json_extract(payload,'$.deadline_unix_ms'),0) FROM request_events WHERE request_id=? AND type='request.submitted' ORDER BY seq LIMIT 1`, id).Scan(&duration, &deadline)
+	if err == sql.ErrNoRows {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, exit.Internalf("cannot read frozen execution deadline: %s", err)
+	}
+	return duration, deadline, nil
+}
 
 func scanMachineExecution(row interface{ Scan(...any) error }) (*MachineExecution, error) {
 	var value MachineExecution
 	err := row.Scan(&value.RequestID, &value.MachineID, &value.Submission, &value.Receipt,
-		&value.ObservedState, &value.RemoteCursor, &value.Outcome, &value.PendingControl, &value.Collected)
+		&value.ObservedState, &value.RemoteCursor, &value.Outcome, &value.PendingControl, &value.CancelRequested, &value.Collected)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -116,7 +158,7 @@ func (s *Store) RecordMachineSubmission(id string, submission *pb.MachineExecuti
 	if err != nil || len(raw) > 8<<20 {
 		return exit.New(exit.Validation, "machine submission exceeds its bounded envelope")
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET submission=? WHERE request_id=? AND machine_id!='' AND (length(submission)=0 OR submission=?)`, raw, id, raw)
+	result, err := s.db.Exec(`UPDATE machine_executions SET submission=? WHERE request_id=? AND machine_id!='' AND (length(submission)=0 OR submission=?) AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state!='canceled')`, raw, id, raw, id)
 	if err != nil {
 		return exit.Internalf("cannot retain machine submission: %s", err)
 	}
@@ -181,7 +223,7 @@ func machineObservationIdentity(link *MachineExecution, state *pb.MachineExecuti
 
 func observedMachineRequestState(value string) string {
 	switch value {
-	case "queued":
+	case "queued", "retrying":
 		return "queued"
 	case "running":
 		return "dispatching"
@@ -224,6 +266,7 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 		}
 	}
 	cursor := uint64(link.RemoteCursor)
+	retentionReleased := false
 	// A replayed page cannot regress the durable cursor. Its state snapshot may
 	// still be newer, so project it after ignoring already recorded event bytes.
 	if page.NextAfter < cursor {
@@ -240,8 +283,24 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 			event.Kind == "" || len(event.Kind) > 128 || len(event.BodyCanonicalBytes) > 64<<10 || !json.Valid(event.BodyCanonicalBytes) {
 			return exit.New(exit.Conflict, "machine returned an invalid execution event")
 		}
+		kind, payload := "machine."+event.Kind, event.BodyCanonicalBytes
+		if event.Kind == "retention_released" {
+			retentionReleased = true
+		}
+		if event.Kind == "running" {
+			kind = "request.accepted"
+		}
+		if event.Kind == "progress" || event.Kind == "log" {
+			var progress struct {
+				Type    string          `json:"type"`
+				Payload json.RawMessage `json:"payload"`
+			}
+			if json.Unmarshal(payload, &progress) == nil && progress.Type == "log" && json.Valid(progress.Payload) {
+				kind, payload = "request.log", progress.Payload
+			}
+		}
 		if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`,
-			id, "machine."+event.Kind, event.AttemptOrdinal, event.BodyCanonicalBytes, time.UnixMilli(int64(event.AtMs)).UTC().Format(time.RFC3339Nano)); err != nil {
+			id, kind, event.AttemptOrdinal, string(payload), time.UnixMilli(int64(event.AtMs)).UTC().Format(time.RFC3339Nano)); err != nil {
 			return exit.Internalf("cannot cache machine event: %s", err)
 		}
 		cursor = event.Sequence
@@ -253,11 +312,25 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 	if err != nil {
 		return exit.Internalf("cannot retain machine state: %s", err)
 	}
-	if _, err := tx.Exec(`UPDATE machine_executions SET observed_state=?,remote_cursor=?,collected=? WHERE request_id=?`, raw, cursor, state.Collected, id); err != nil {
+	resetOutcome := previous.AttemptOrdinal != 0 && previous.AttemptOrdinal != state.AttemptOrdinal
+	if _, err := tx.Exec(`UPDATE machine_executions SET observed_state=?,remote_cursor=?,collected=?,outcome=CASE WHEN ? THEN x'' ELSE outcome END WHERE request_id=?`, raw, cursor, state.Collected, resetOutcome, id); err != nil {
 		return exit.Internalf("cannot update machine observation cursor: %s", err)
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state=?,ordinal=? WHERE id=?`, nextState, state.AttemptOrdinal, id); err != nil {
+	if _, err := tx.Exec(`UPDATE requests SET state=?,ordinal=?,retain_work=CASE WHEN ? OR ?='canceled' THEN 0 ELSE retain_work END WHERE id=?`, nextState, state.AttemptOrdinal, state.Collected, nextState, id); err != nil {
 		return exit.Internalf("cannot project machine execution status: %s", err)
+	}
+	if retentionReleased {
+		if _, err := tx.Exec(`UPDATE machine_executions SET pending_control=x'',cancel_requested=0 WHERE request_id=?`, id); err != nil {
+			return exit.Internalf("cannot record Runtime retention release: %s", err)
+		}
+		if _, err := tx.Exec(`UPDATE requests SET retain_work=0 WHERE id=?`, id); err != nil {
+			return exit.Internalf("cannot project Runtime retention release: %s", err)
+		}
+	}
+	if previous.State != state.State && (state.State == "paused" || state.State == "canceled") {
+		if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, id, "request."+state.State, state.AttemptOrdinal, `{"machine_execution":true}`, now()); err != nil {
+			return exit.Internalf("cannot record observed machine control completion: %s", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit machine observation: %s", err)
@@ -268,9 +341,14 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 // RecordMachineOutcome retains the exact Runtime terminal before result readback
 // or acknowledgement. It does not claim custody of referenced model/file bytes.
 func (s *Store) RecordMachineOutcome(id string, outcome *pb.AttemptOutcome) *exit.Error {
-	link, problem := s.MachineExecution(id)
-	if problem != nil {
-		return problem
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin machine outcome observation: %s", err)
+	}
+	defer tx.Rollback()
+	link, err := scanMachineExecution(tx.QueryRow(`SELECT `+machineExecutionColumns+` FROM machine_executions WHERE request_id=?`, id))
+	if err != nil {
+		return exit.Internalf("cannot read machine outcome observation: %s", err)
 	}
 	var state pb.MachineExecutionState
 	var body pb.AttemptOutcomeBody
@@ -290,12 +368,35 @@ func (s *Store) RecordMachineOutcome(id string, outcome *pb.AttemptOutcome) *exi
 	if err != nil || len(raw) > 8<<20 {
 		return exit.New(exit.Conflict, "machine outcome is not bounded")
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET outcome=? WHERE request_id=? AND observed_state=? AND (length(outcome)=0 OR outcome=?)`, raw, id, link.ObservedState, raw)
+	if len(link.Outcome) > 0 {
+		if !bytes.Equal(link.Outcome, raw) {
+			return exit.New(exit.Conflict, "machine returned a different terminal for the observed attempt")
+		}
+		return nil
+	}
+	result, err := tx.Exec(`UPDATE machine_executions SET outcome=? WHERE request_id=? AND observed_state=?`, raw, id, link.ObservedState)
 	if err != nil {
 		return exit.Internalf("cannot retain machine outcome: %s", err)
 	}
 	if n, _ := result.RowsAffected(); n != 1 {
 		return exit.New(exit.Conflict, "machine execution changed during result collection")
+	}
+	kind := "request.failed"
+	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
+		kind = "request.completed"
+	} else if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_CANCELED {
+		kind = "request.canceled"
+	}
+	facts := map[string]any{"machine_execution": true, "status": strings.TrimPrefix(body.Status.String(), "OUTCOME_STATUS_"), "outputs": []any{}}
+	if body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
+		facts["error"] = body.SafeMessage
+	}
+	payload, _ := json.Marshal(facts)
+	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, id, kind, outcome.AttemptOrdinal, string(payload), now()); err != nil {
+		return exit.Internalf("cannot record machine terminal observation: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit machine terminal observation: %s", err)
 	}
 	return nil
 }
@@ -324,7 +425,7 @@ func (s *Store) RecordMachineControl(id string, command *pb.MachineExecutionCont
 	if err != nil {
 		return exit.Internalf("cannot encode machine control: %s", err)
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET pending_control=? WHERE request_id=? AND (length(pending_control)=0 OR pending_control=?)`, raw, id, raw)
+	result, err := s.db.Exec(`UPDATE machine_executions SET pending_control=?,cancel_requested=CASE WHEN ? THEN 1 ELSE cancel_requested END WHERE request_id=? AND (length(pending_control)=0 OR pending_control=?)`, raw, command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL, id, raw)
 	if err != nil {
 		return exit.Internalf("cannot retain machine control: %s", err)
 	}
@@ -335,12 +436,98 @@ func (s *Store) RecordMachineControl(id string, command *pb.MachineExecutionCont
 }
 
 func (s *Store) CompleteMachineControl(id string, command []byte) *exit.Error {
-	result, err := s.db.Exec(`UPDATE machine_executions SET pending_control=x'' WHERE request_id=? AND pending_control=?`, id, command)
+	var decoded pb.MachineExecutionControl
+	if proto.Unmarshal(command, &decoded) != nil {
+		return exit.New(exit.Conflict, "machine control acknowledgement has an invalid command")
+	}
+	if decoded.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL {
+		var released bool
+		if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='machine.retention_released')`, id).Scan(&released); err != nil {
+			return exit.Internalf("cannot inspect cancellation cleanup: %s", err)
+		}
+		if !released {
+			return nil // acknowledgement is not proof that native retention was released
+		}
+	}
+	result, err := s.db.Exec(`UPDATE machine_executions SET pending_control=x'',cancel_requested=CASE WHEN ? THEN 0 ELSE cancel_requested END WHERE request_id=? AND pending_control=?`, decoded.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL, id, command)
 	if err != nil {
 		return exit.Internalf("cannot acknowledge machine control: %s", err)
 	}
 	if n, _ := result.RowsAffected(); n != 1 {
+		current, problem := s.MachineExecution(id)
+		if problem == nil && current != nil && len(current.PendingControl) == 0 {
+			return nil
+		}
 		return exit.New(exit.Conflict, "machine control acknowledgement changed its command")
+	}
+	return nil
+}
+
+// CancelMachineBeforeAcceptance distinguishes an unsent local intent from a
+// submission whose reply may have been lost. The latter must reconcile its exact
+// receipt and cancel Runtime; the client cannot claim it never executed.
+func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot record machine cancellation intent: %s", err)
+	}
+	defer tx.Rollback()
+	link, err := scanMachineExecution(tx.QueryRow(`SELECT `+machineExecutionColumns+` FROM machine_executions WHERE request_id=?`, id))
+	if err != nil {
+		return false, exit.Internalf("cannot read machine cancellation intent: %s", err)
+	}
+	if link == nil || len(link.Receipt) > 0 {
+		return false, nil
+	}
+	state := "canceling"
+	if len(link.Submission) == 0 {
+		state = "canceled"
+	}
+	if _, err := tx.Exec(`UPDATE machine_executions SET cancel_requested=1 WHERE request_id=?`, id); err != nil {
+		return false, exit.Internalf("cannot retain machine cancellation intent: %s", err)
+	}
+	if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=CASE WHEN ?='canceled' THEN 0 ELSE retain_work END WHERE id=?`, state, state, id); err != nil {
+		return false, exit.Internalf("cannot project pending machine cancellation: %s", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,0,?,?)`, id, "request."+state, `{"scope":"before_machine_acceptance"}`, now()); err != nil {
+		return false, exit.Internalf("cannot record pending machine cancellation event: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot commit machine cancellation intent: %s", err)
+	}
+	return true, nil
+}
+
+// RefuseMachineSubmission is called only for Runtime's explicit guarantee that
+// this request was not accepted. An arbitrary RPC failure is never that proof.
+func (s *Store) RefuseMachineSubmission(id, code, detail string) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot record machine submission refusal: %s", err)
+	}
+	defer tx.Rollback()
+	var receipt []byte
+	if err := tx.QueryRow(`SELECT receipt FROM machine_executions WHERE request_id=?`, id).Scan(&receipt); err != nil || len(receipt) != 0 {
+		return exit.New(exit.Conflict, "machine refusal contradicts accepted execution")
+	}
+	if _, err := tx.Exec(`UPDATE requests SET state='refused',retain_work=0 WHERE id=?`, id); err != nil {
+		return exit.Internalf("cannot retain machine refusal state: %s", err)
+	}
+	if err := appendEventTx(tx, id, "request.failed", 0, map[string]any{"error_type": code, "error": detail, "machine_accepted": false}); err != nil {
+		return exit.Internalf("cannot retain machine refusal event: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit machine refusal: %s", err)
+	}
+	return nil
+}
+
+func (s *Store) RejectMachineControl(id string, command []byte) *exit.Error {
+	// Unlike an acknowledgement, a rejected cancellation must retain its desire
+	// so acceptance-reconciliation can retry it against the current generation.
+	_, err := s.db.Exec(`UPDATE machine_executions SET pending_control=x'' WHERE request_id=? AND pending_control=?`, id, command)
+	if err != nil {
+		return exit.Internalf("cannot record rejected machine control: %s", err)
 	}
 	return nil
 }
