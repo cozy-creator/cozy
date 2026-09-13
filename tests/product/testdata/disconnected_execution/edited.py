@@ -8,7 +8,7 @@ from offline_steps import finish, prepare
 
 
 async def main(ctx) -> int:
-    ctx.log("edited caller after coordinator restart")
+    print("edited caller after coordinator restart")
     prepared = await prepare(value=7)
     finished = await finish(value=prepared.value + 10)
     assert finished.value == 60

@@ -19,7 +19,6 @@ async def prepare(ctx: Context, *, value: int) -> Result:
     # Qualification-only execution count, independent of the deterministic value.
     with (ROOT / "prepare-count").open("a") as handle:
         handle.write("executed\n")
-    ctx.log("expensive preparation completed")
     return Result(value * value)
 
 
