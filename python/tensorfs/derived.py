@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from ._derived_channel import DerivedTransaction, serve_derived
+from ._derived_channel import DerivedTransaction, serve_derived, serve_derived_replay
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,11 +102,31 @@ class SourceCapability(Source):
     _inspect: Callable[[Sequence[str], Sequence[str]], SourceInspection] = field(
         repr=False, compare=False
     )
+    _close: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
     def inspect(
         self, *, components: Sequence[str] = (), configs: Sequence[str] = ()
     ) -> SourceInspection:
         return self._inspect(tuple(components), tuple(configs))
+
+    @classmethod
+    def from_fd(cls, manifest: str, length: int, fd: int) -> SourceCapability:
+        """Own a preconnected inspector for one exact already-admitted source."""
+        from ._source_channel import SourceClient
+
+        client = SourceClient(fd, Source(manifest, length))
+        return cls(manifest, length, client.inspect, client.close)
+
+    def close(self) -> None:
+        if self._close is not None:
+            self._close()
+
+    def __enter__(self) -> SourceCapability:
+        return self
+
+    def __exit__(self, *exc: object) -> Literal[False]:
+        self.close()
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +211,9 @@ def derive(output: OutputCapability, declaration: Derivation) -> DerivedTransact
     return output.open(declaration)
 
 
+from ._source_channel import serve_source  # noqa: E402
+
+
 __all__ = [
     "Source",
     "PartSource",
@@ -205,4 +228,6 @@ __all__ = [
     "DerivedTransaction",
     "derive",
     "serve_derived",
+    "serve_derived_replay",
+    "serve_source",
 ]

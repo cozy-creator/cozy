@@ -28,6 +28,8 @@ from tensorfs.derived import (
     Tensor,
     derive,
     serve_derived,
+    serve_derived_replay,
+    serve_source,
 )
 
 WORK = "sha256:" + "ab" * 32
@@ -447,6 +449,54 @@ def exercise():
         else:
             raise AssertionError("native inspection accepted an absent component")
         print("PASS typed source inspection preserves native identity, geometry and config bytes", flush=True)
+
+        # Source metadata/config bytes use the exact-source descriptor as well;
+        # the client need not open a Store, even for a config larger than control.
+        large_config = b'{"text":"' + b"x" * (2 << 20) + b'"}'
+        writer = open_writer(store, 22, config_plan, 4096 + len(large_config))
+        writer.add_part("model", "weight", "value", io.BytesIO(bytes(4096)))
+        writer.add_config("model.json", io.BytesIO(large_config))
+        large_ref = writer.commit()["manifest"]
+        fixed = Source("sha256:" + large_ref["sha256"], large_ref["length"])
+        left, right = socket.socketpair()
+        failures = []
+
+        def inspect_owner():
+            try:
+                serve_source(store, fixed, right.detach(), check_current=lambda: None,
+                             admit_io=lambda: contextlib.nullcontext())
+            except Exception as error:
+                failures.append(error)
+
+        inspector = threading.Thread(target=inspect_owner, daemon=True)
+        inspector.start()
+        with SourceCapability.from_fd(fixed.manifest, fixed.length, left.detach()) as source:
+            actual = source.inspect()
+            assert actual.source == fixed
+            assert actual.configs == {"model.json": large_config}
+            assert actual.components["model"]["weight"].shape == (4096,)
+        inspector.join(10)
+        assert not inspector.is_alive() and not failures
+
+        replay_receipt = store.derived_lookup(identity(22))["receipt"]
+        recorded = []
+        left, right = socket.socketpair()
+
+        def replay_owner():
+            serve_derived_replay(replay_receipt, right.detach(), check_current=lambda: None,
+                                 record_receipt=recorded.append)
+
+        replay_thread = threading.Thread(target=replay_owner, daemon=True)
+        replay_thread.start()
+        replayed = DerivedTransaction.accept(left.detach())
+        assert replayed.receipt == replay_receipt and replayed.commit() == replay_receipt
+        assert recorded == [replay_receipt]
+        replay_thread.join(10)
+        assert not replay_thread.is_alive()
+        owner = Owner(open_writer(store, 23, small, 4096))
+        assert owner.client._call("receipt") is None
+        owner.finish()
+        print("PASS exact-source descriptor, multi-frame config and recorded native replay handoff", flush=True)
 
         # Real process exit at native commit; no in-memory callback state survives.
         left, right = socket.socketpair()
