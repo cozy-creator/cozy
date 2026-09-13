@@ -111,6 +111,11 @@ class PreparedModelSource(TypedDict):
     required_write_bytes: int
     write_interval_bytes: int
 
+class DerivedWriteEstimate(TypedDict):
+    payload_bytes: int
+    largest_part_bytes: int
+    parts: int
+
 class ManifestRow(TypedDict):
     manifest_id: str
     manifest: bytes
@@ -570,6 +575,19 @@ class Store:
         work_fingerprint: str,
         checkpoint: tuple[str, int] | None = None,
     ) -> DerivedWriter: ...
+    def derived_write_estimate(
+        self,
+        transaction_id: str,
+        writer_session_id: int,
+        sources: dict[str, Any],
+        targets: dict[str, Any],
+        configs: dict[str, Any],
+        order: Sequence[tuple[str, str]],
+        max_new_bytes: int,
+        *,
+        work_fingerprint: str,
+        checkpoint: tuple[str, int] | None = None,
+    ) -> DerivedWriteEstimate: ...
     def adopt_derived_checkpoint(
         self, transaction_id: str, source_transaction_id: str, declaration: bytes,
         head_id: str, head_length: int, *, operation_id: str, slot: str,
