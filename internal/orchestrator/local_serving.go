@@ -48,6 +48,18 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	if s.preparation == nil || w.spec.Connection != nil || spec.Preparation == nil {
 		return WorkerLaunchSpec{}, "", exit.Internalf("local serving preparation has no local worker connection")
 	}
+	if problem := requireMixedModelInputs(s, mixedModelInputs(req.Models)); problem != nil {
+		return WorkerLaunchSpec{}, "", problem
+	}
+	if req.ParentRequestID != "" && len(downloadModelRefs(req.Models)) > 0 {
+		acquirer, ok := c.opt.Packages.(interface{ EnsureLocalModels([]ModelRef) *exit.Error })
+		if !ok {
+			return WorkerLaunchSpec{}, "", exit.Unavailablef("local model acquisition owner is unavailable")
+		}
+		if problem := acquirer.EnsureLocalModels(req.Models); problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
+	}
 	w.localMu.Lock()
 	defer w.localMu.Unlock()
 	logical := LogicalPackage{Package: req.Package, Release: spec.Placement.Release, Function: req.Entrypoint,
@@ -120,8 +132,17 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			call := &pb.PreparePrivatePlacementRequest{OperationId: operation, LocalRevisionDigest: digest, Claim: s.claim}
 			if req.ParentRequestID != "" {
 				call.NativeModels, problem = c.nativeServingModels(req)
-			} else {
-				call.DownloadDelegation, problem = localDownloadSelection(req.Models, nil)
+			}
+			if problem == nil {
+				downloads := make([]ModelRef, 0, len(req.Models))
+				for _, model := range req.Models {
+					if model.Downloadable() {
+						downloads = append(downloads, model)
+					}
+				}
+				if len(downloads) > 0 {
+					call.DownloadDelegation, problem = localDownloadSelection(downloads, nil)
+				}
 			}
 			if problem != nil {
 				return WorkerLaunchSpec{}, "", problem
@@ -222,7 +243,13 @@ func localDownloadSelection(models []ModelRef, packages []*pb.DownloadPackageRef
 		if !model.Pinned() {
 			return nil, exit.Named(exit.Validation, "local_model_selection_incomplete", "local preparation needs exact model manifests")
 		}
-		selected = append(selected, &pb.DownloadModelRef{Package: model.Package, Slot: model.Slot, Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
+		path := model.Slot
+		if model.BindingPath != "" {
+			path = model.BindingPath
+		}
+		for _, slot := range append([]string{path}, model.SharedSlots...) {
+			selected = append(selected, &pb.DownloadModelRef{Package: model.Package, Slot: slot, Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
+		}
 	}
 	sort.Slice(selected, func(i, j int) bool {
 		return selected[i].Package+"/"+selected[i].Slot < selected[j].Package+"/"+selected[j].Slot

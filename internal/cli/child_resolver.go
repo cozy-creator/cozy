@@ -130,6 +130,9 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 	models := make([]orchestrator.ModelRef, 0, len(job.Models))
 	accelerator, machineRead := "", false
 	for _, slot := range job.Models {
+		if _, present := arguments[slot.Param]; job.Kind == "entrypoint" && !present {
+			return out, "", exit.Named(exit.Conflict, "child.model_unbound", "serving model arguments differ from declared slots")
+		}
 		artifact, problem := records.DecodeModelArtifact(arguments[slot.Param])
 		if problem != nil {
 			return out, "", problem

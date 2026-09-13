@@ -1103,6 +1103,15 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Unavailablef("this host resolves no local packages")
 		}
 		if req.InstallID != "" {
+			if req.IsJob() && req.ParentRequestID != "" && len(downloadModelRefs(req.Models)) > 0 {
+				acquirer, ok := c.opt.Packages.(interface{ EnsureLocalModels([]ModelRef) *exit.Error })
+				if !ok {
+					return WorkerLaunchSpec{}, "", exit.Unavailablef("local model acquisition owner is unavailable")
+				}
+				if problem := acquirer.EnsureLocalModels(req.Models); problem != nil {
+					return WorkerLaunchSpec{}, "", problem
+				}
+			}
 			if req.IsJob() {
 				spec, e := c.opt.Packages.ResolveJobInstall(req.InstallID, req.Entrypoint)
 				return c.exactLocalTransferProducer(req, spec, e)
@@ -1214,12 +1223,14 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", e
 		}
 		if !req.IsJob() && len(logical.Models) > 0 && req.ParentRequestID == "" {
-			models := downloadModelRefs(logical.Models)
-			if len(models) != len(logical.Models) {
-				return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
-					"private_placement_model_unpublished",
-					"private serving requires exact published model releases")
+			for _, model := range logical.Models {
+				if !model.Downloadable() {
+					return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
+						"private_placement_model_unpublished",
+						"unpublished serving requires downloadable checkpoints or retained child inputs")
+				}
 			}
+			models := downloadModelRefs(logical.Models)
 			if e := c.ConvergeUnpublishedPlacement(instance, req.ID,
 				req.LocalPackageDigest, models); e != nil {
 				return WorkerLaunchSpec{}, "", e

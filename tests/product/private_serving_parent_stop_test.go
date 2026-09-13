@@ -1,9 +1,11 @@
 package producttest
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -23,19 +26,31 @@ import (
 // cannot publish its finished placement after the CPU parent stops awaiting it.
 func TestStoppedParentPreventsSecondServingPlacementAfterModelPreparation(t *testing.T) {
 	for _, stop := range []string{"pause", "cancel"} {
-		t.Run(stop, func(t *testing.T) { stoppedServingParent(t, stop) })
+		for _, selected := range []struct{ mixed, supported bool }{{false, false}, {true, true}, {true, false}} {
+			t.Run(fmt.Sprintf("%s/mixed=%t/supported=%t", stop, selected.mixed, selected.supported), func(t *testing.T) { stoppedServingParent(t, stop, selected.mixed, selected.supported) })
+		}
 	}
 }
 
-func stoppedServingParent(t *testing.T, stop string) {
+func stoppedServingParent(t *testing.T, stop string, mixed, supported bool) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
+	pod.protocolInfo = func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+		return &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor, SupportsMixedModelInputs: supported}, nil
+	}
 	root := t.TempDir()
 	connection, _ := startFakePod(t, root, pod)
 	revision := stageLocalRevision(t, root)
 	o := hostOwner(t, "stopped-serving-parent-"+stop, rentalWiring(connection, private), func(opt *orchestrator.Options) {
 		opt.Packages = libraryChildLauncher{localLauncher{revision: revision}}
+		opt.RentalPackageSet = func(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRef) ([]byte, *exit.Error) {
+			raw, _, err := canonical.Identity(&pb.DownloadDelegation{Packages: packages, Models: models})
+			if err != nil {
+				return nil, exit.Internalf("encode fixture download set: %s", err)
+			}
+			return raw, nil
+		}
 	})
 	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "otter", State: "ready", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000,
 		Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
@@ -139,11 +154,19 @@ func stoppedServingParent(t *testing.T, stop string) {
 	fatal(t, o.store.RecordModelTransferWeights(weights))
 	closeChild(t, o.store, producer, "SUCCEEDED", "succeeded")
 	artifact := records.ModelArtifact{ProducerRequestID: producer.ID, OutputSlot: "weights", Manifest: records.ArtifactObjectRef{Digest: weights.ManifestID, Length: 161}, TensorFSReceiptDigest: nativeDigest}
-	arguments, err := json.Marshal(map[string]any{"models": map[string]any{"model": artifact}, "payload": map[string]any{"size": 48}})
+	modelArguments := map[string]any{"model": artifact}
+	if mixed {
+		modelArguments["adapter"] = nil
+	} // The caller leaves selection to the callee's default.
+	arguments, err := json.Marshal(map[string]any{"models": modelArguments, "payload": map[string]any{"size": 48}})
 	must(t, err)
 	arguments, err = canonical.NormalizeJCS(arguments)
 	must(t, err)
-	second := child("second-serving", 2, []records.ModelRef{{Package: revision.Package, Slot: "model", BindingPath: "tile.models.model", Model: "fixture/model", Manifest: weights.ManifestID, ManifestLength: 161}}, arguments)
+	models := []records.ModelRef{{Package: revision.Package, Slot: "model", BindingPath: "tile.models.model", Model: "fixture/model", Manifest: weights.ManifestID, ManifestLength: 161}}
+	if mixed {
+		models = append(models, records.ModelRef{Package: revision.Package, Slot: "adapter", BindingPath: "tile.models.adapter", Model: "fixture/base", Release: "1.0.0", Lane: "bf16", Manifest: childDigest("7"), ManifestLength: 161})
+	}
+	second := child("second-serving", 2, models, arguments)
 	retentions, problem := o.store.WeightsRetentions(second.ID)
 	fatal(t, problem)
 	if len(retentions) != 1 {
@@ -161,6 +184,19 @@ func stoppedServingParent(t *testing.T, stop string) {
 		if call.PrivatePlacementSet.OperationId != second.ID || len(call.PrivatePlacementSet.NativeModels) != 1 {
 			t.Error("final preparation changed its native child selection")
 		}
+		if mixed {
+			download, err := canonical.Read(call.PrivatePlacementSet.DownloadDelegation, &pb.DownloadDelegation{})
+			if err != nil {
+				t.Error(err)
+			} else {
+				rows := download.List("models")
+				if len(rows) != 1 || rows[0].Str("slot") != "tile.models.adapter" || rows[0].Str("manifest") != childDigest("7") {
+					t.Error("mixed child changed or lost its exact downloaded input")
+				}
+			}
+		} else if len(call.PrivatePlacementSet.DownloadDelegation) != 0 {
+			t.Error("native input was sent to the registry")
+		}
 		entered <- struct{}{}
 		select {
 		case <-release:
@@ -173,6 +209,22 @@ func stoppedServingParent(t *testing.T, stop string) {
 		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, PlacementSet: prepared})
 	}
 	fatal(t, o.c.ResumeRequest(second.ID, "second serving child"))
+	if mixed && !supported {
+		waitUntil(t, "old peer refuses mixed inputs before preparation", func() bool {
+			row, problem := o.store.RequestRow(second.ID)
+			fatal(t, problem)
+			return row.State == "blocked" && strings.Contains(tail(filepath.Join(o.root, "orchestrator.log")), "does not support retained and downloaded")
+		})
+		select {
+		case <-entered:
+			t.Fatal("unsupported peer received a mixed preparation")
+		default:
+		}
+		if !strings.Contains(tail(filepath.Join(o.root, "orchestrator.log")), "does not support retained and downloaded") {
+			t.Fatal("capability refusal lost its reason")
+		}
+		return
+	}
 	select {
 	case <-entered:
 	case <-time.After(10 * time.Second):
