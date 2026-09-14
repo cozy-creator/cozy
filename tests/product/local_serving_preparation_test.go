@@ -302,7 +302,8 @@ build-backend="hatchling.build"
 only-include=["serving_fixture.py"]
 [tool.uv.sources]
 cozy-runtime={path=%q}
-`, version, wheel)
+%s
+`, version, wheel, servingTorchIndex())
 			must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0600))
 			uv("lock", "--project", project, "--no-progress")
 			pkg := "local/cozy-serving-preparation-fixture"
@@ -376,6 +377,10 @@ cozy-runtime={path=%q}
 			}
 			if !slices.Equal(components, []string{"zeta", "alpha"}) {
 				t.Fatalf("worker lost actual construction order: %v; header=%v", components, seed.HeaderComponents)
+			}
+			if os.Getenv("UV_TORCH_BACKEND") == "cpu" {
+				t.Logf("CPU fixture proved actual meta construction and ordered components %v; CUDA inference is covered by the separate serving fixture (CLI exit %d)", components, code)
+				return
 			}
 			after := activeInstall(t, root, pkg)
 			retained, err := os.ReadFile(filepath.Join(after.Dir, "artifact-cache", prepared.Digest))
