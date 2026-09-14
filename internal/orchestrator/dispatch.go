@@ -1184,12 +1184,12 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
-	// A captured serving child obtains its binding plan from exact private
-	// preparation, including model-free entrypoints. Its sealed local revision
-	// is checked below before any package bytes can execute.
-	capturedChild := req.ParentRequestID != "" && req.InstallID != "" && validDigest(req.LocalPackageDigest)
+	// Captured packages obtain their binding plan from private preparation,
+	// including model-free root entrypoints. The capture was checked above;
+	// its exact local revision is checked below before any package upload.
+	capturedPackage := req.InstallID != "" && validDigest(req.LocalPackageDigest)
 	if req.Release == "" ||
-		(len(req.Models) == 0 && !validDigest(req.PlanID) && !capturedChild) {
+		(len(req.Models) == 0 && !validDigest(req.PlanID) && !capturedPackage) {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
 			"remote package preparation requires one exact package revision")
 	}
