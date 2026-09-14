@@ -3,6 +3,7 @@ package launch
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -18,7 +19,16 @@ func TreeInputRefs(entry *Entrypoint, payload []byte) (map[string]string, *exit.
 		return nil, exit.New(exit.Validation, "tree arguments are unreadable")
 	}
 	refs := map[string]string{}
-	for _, name := range AssetPaths(entry.Request) {
+	paths := map[string]bool{}
+	for _, field := range entry.Request.Fields {
+		treeInputPaths(field.Type, field.Name, paths)
+	}
+	names := make([]string, 0, len(paths))
+	for name := range paths {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		spec, ok := AssetSpec(entry, name)
 		if !ok || spec.Kind != "tree" {
 			continue
@@ -45,6 +55,33 @@ func TreeInputRefs(entry *Entrypoint, payload []byte) (map[string]string, *exit.
 		}
 	}
 	return refs, nil
+}
+
+func treeInputPaths(raw json.RawMessage, path string, paths map[string]bool) {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil {
+		return
+	}
+	if string(object["input"]) == `"tree"` {
+		paths[path] = true
+		return
+	}
+	if union := object["union"]; union != nil {
+		var branches []json.RawMessage
+		if json.Unmarshal(union, &branches) == nil {
+			for _, branch := range branches {
+				treeInputPaths(branch, path, paths)
+			}
+		}
+	}
+	if fields := object["fields"]; fields != nil {
+		var nested []Field
+		if json.Unmarshal(fields, &nested) == nil {
+			for _, field := range nested {
+				treeInputPaths(field.Type, path+"."+field.Name, paths)
+			}
+		}
+	}
 }
 
 func ReplaceTreeInputRefs(payload []byte, replacements map[string]string) ([]byte, *exit.Error) {
