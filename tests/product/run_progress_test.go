@@ -284,7 +284,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 
 	// The live inventory is a real terminal viewport: a wheel event moves the bounded page,
 	// q exits cleanly, and every input/mouse/output mode is restored without echoing keys.
-	code, tty = ptyRunInput(t, root, 8,
+	// Seven terminal rows leave room for three data rows; four must scroll.
+	code, tty = ptyRunInput(t, root, 7,
 		[][]byte{[]byte("\x1b[<65;2;3M"), []byte("q")}, "run", "list", "--limit", "10")
 	if code != 0 {
 		t.Fatalf("q did not exit the live list cleanly [exit %d]\n%q", code, tty)
