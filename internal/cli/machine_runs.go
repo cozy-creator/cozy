@@ -288,6 +288,9 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		submission = built
 	}
+	if _, problem := m.resolver.capturedResultInterface(request); problem != nil {
+		return problem
+	}
 	if request.LocalPackageDigest == "" && connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
 		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires Runtime protocol 54")
 	}
