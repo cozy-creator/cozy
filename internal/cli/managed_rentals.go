@@ -835,7 +835,15 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 	if problem != nil {
 		return "", problem
 	}
-	if row.State != hub.RentalReleaseRequested {
+	confirmed := row.State == hub.RentalReleased
+	if operationKey != "" {
+		operation, problem := m.store.RentalOperation(operationKey)
+		if problem != nil {
+			return "", problem
+		}
+		confirmed = confirmed || operation != nil && operation.State == hub.RentalReleased
+	}
+	if !confirmed && row.State != hub.RentalReleaseRequested {
 		row.State = hub.RentalReleaseRequested
 		if problem := m.store.RecordRental(*row); problem != nil {
 			return "", problem
@@ -844,19 +852,24 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 			fmt.Fprintln(m.ctx.Out, line)
 		}
 	}
-	hctx, cancel := hub.Context()
-	problem = client(m.ctx).Release(hctx, id, "")
-	cancel()
-	if problem != nil && problem.Code != exit.NotFound {
-		return "", problem
+	if !confirmed {
+		hctx, cancel := hub.Context()
+		problem = client(m.ctx).Release(hctx, id, "")
+		cancel()
+		if problem != nil {
+			if problem.Code == exit.NotFound {
+				return "", rentalReleaseUnconfirmed(id)
+			}
+			return "", problem
+		}
 	}
-	for problem == nil {
-		hctx, cancel = hub.Context()
+	for !confirmed {
+		hctx, cancel := hub.Context()
 		remote, observed := client(m.ctx).Rental(hctx, id)
 		cancel()
 		switch {
 		case observed == nil && remote.State == hub.RentalReleased:
-			problem = exit.New(exit.NotFound, "rental released")
+			confirmed = true
 		case observed == nil:
 			row.State = remote.State
 			copyRentalFailure(row, remote)
@@ -865,7 +878,7 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 			}
 			time.Sleep(pollCadence)
 		case observed.Code == exit.NotFound:
-			problem = observed
+			return "", rentalReleaseUnconfirmed(id)
 		case transient(observed):
 			time.Sleep(pollCadence)
 		default:

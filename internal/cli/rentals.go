@@ -1309,6 +1309,9 @@ func handleRentRelease(ctx *Context) *exit.Error {
 				"This hub publishes no rental listing (th-199), so name the rental id instead").
 			WithNext("cozy rental", "cozy rental end <rental-id>")
 	}
+	if verdict == rentalAbsent && (known.Operation == nil || known.Operation.State != hub.RentalReleased) {
+		return rentalReleaseUnconfirmed(id)
+	}
 	if problem := st.RequestRetainedRentalAbandonment(id, "cozy rental end"); problem != nil {
 		return problem
 	}
@@ -1336,6 +1339,9 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		_, verdict, e := w.observe()
 		if e != nil {
 			return e
+		}
+		if verdict == rentalAbsent {
+			return w.kept(rentalReleaseUnconfirmed(id))
 		}
 		if verdict != rentalLive {
 			return w.finish(l, st, operationKey, row != nil, true, known.Operation,
@@ -1443,13 +1449,21 @@ func (w *releaseWatch) observe() (hub.Rental, rentalVerdict, *exit.Error) {
 	}
 }
 
-// request sends the DELETE. A 404 is absence; any other typed refusal ends the release.
+func rentalReleaseUnconfirmed(id string) *exit.Error {
+	return exit.Named(exit.Conflict, "rental.hub_record_missing",
+		"Tensorhub has not confirmed release of rental %s; its missing record is not proof of provider destruction", id).
+		WithRemedy("keep the local rental and operation records; reconcile Tensorhub with its provider before forgetting the machine")
+}
+
+// request sends the DELETE. Only an affirmative release observation can finish it.
 func (w *releaseWatch) request() *exit.Error {
 	for {
 		e := w.c.Release(w.rctx, w.id, "cozy rental end")
 		switch {
-		case e == nil, e.Code == exit.NotFound:
+		case e == nil:
 			return nil
+		case e.Code == exit.NotFound:
+			return w.kept(rentalReleaseUnconfirmed(w.id))
 		case !transient(e):
 			return w.kept(e)
 		}
