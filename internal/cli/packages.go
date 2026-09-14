@@ -96,7 +96,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emitInstallResult(ctx, l, st, result)
+	return emitInstallResult(ctx, result, reclaimInstallResult(l, st, result)...)
 }
 
 func handlePackageRecover(ctx *Context) *exit.Error {
@@ -138,7 +138,22 @@ func runExample(inst records.PackageInstall) string {
 	return launch.UsageLine(inst.Package+"/"+callables[0].Name, &callables[0])
 }
 
-func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *install.Result) *exit.Error {
+// Reclaim while the caller still owns the install writer. Reporting after model
+// prefetch must not acquire another writer or turn an active install into failure.
+func reclaimInstallResult(l home.Layout, st *records.Store, res *install.Result) []output.Field {
+	if res.Idempotent || res.Superseded == "" {
+		return nil
+	}
+	reclaimed, problem := install.Reclaim(l, st, res.Superseded)
+	if problem != nil {
+		res.Warnings = append(res.Warnings,
+			"the new version is active; cleanup of the prior version was deferred: "+problem.Message)
+		return nil
+	}
+	return []output.Field{{K: "superseded", V: res.Superseded}, {K: "reclaimed", V: output.Bytes(reclaimed)}}
+}
+
+func emitInstallResult(ctx *Context, res *install.Result, cleanup ...output.Field) *exit.Error {
 	inst := res.Install
 	status := "installed"
 	if res.Idempotent {
@@ -172,17 +187,7 @@ func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *inst
 		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s", res.Files, output.Bytes(res.Bytes))},
 		output.Field{K: "timings", V: timingsText(res.Timings)},
 	)
-	if res.Superseded != "" {
-		reclaimed, problem := install.Reclaim(l, st, res.Superseded)
-		if problem != nil {
-			res.Warnings = append(res.Warnings,
-				"the new version is active; cleanup of the prior version was deferred: "+problem.Message)
-		} else {
-			fields = append(fields,
-				output.Field{K: "superseded", V: res.Superseded},
-				output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
-		}
-	}
+	fields = append(fields, cleanup...)
 	rec := compactRecord(fields, "package", "version", "status", "disk", "model_download")
 	rec.Notes = append(rec.Notes, res.Warnings...)
 	rec.Next = []string{runExample(inst), "cozy package list"}
