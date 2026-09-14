@@ -59,6 +59,9 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
+	if overrides.AttentionKernel != "" {
+		return exit.Usagef("kernel.attention applies only to serving callables")
+	}
 	prepareImage := imagePreparer(ctx)
 	input, assetFiles, assetTrees, e := launch.ParseTreeAssets(job, input, ctx.Inv.Values["--asset"])
 	if e != nil {

@@ -112,6 +112,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			`{"package":"org/name","function":"denoise","input":{…}}`)
 		return
 	}
+	if problem := launch.ValidateAttentionOverride(sub.AttentionKernel); problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
 	if (len(sub.LocalAssets) > 0 || sub.OutputDirectory != "" || sub.RequestedRental != "") && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"local assets and output directories require the OS-protected CLI credential",
