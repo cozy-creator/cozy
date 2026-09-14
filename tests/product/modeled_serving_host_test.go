@@ -3,9 +3,6 @@ package producttest
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +11,7 @@ import (
 	"testing"
 )
 
-// The provider/catalog are fixtures; every submission, preparation, managed call,
+// Only the provider is a fixture; every submission, preparation, managed call,
 // model load and result transfer runs through the ordinary CLI and actual Host.
 func TestModeledServingConsecutiveCallsActualHost(t *testing.T) {
 	if *privateChildRuntimeWheel == "" || *childHostRuntimeBin == "" || *childHostHome == "" {
@@ -28,27 +25,7 @@ func TestModeledServingConsecutiveCallsActualHost(t *testing.T) {
 	project := filepath.Join(*childHostHome, "modeled-project")
 	library := filepath.Join(project, "model_tools")
 	must(t, os.MkdirAll(library, 0700))
-	seedRaw, err := exec.Command(python, filepath.Join("testdata", "local_serving_preparation", "seed.py"), filepath.Join(project, "catalog")).CombinedOutput()
-	if err != nil {
-		t.Fatalf("native model: %v %s", err, seedRaw)
-	}
-	var seed servingSeed
-	must(t, json.Unmarshal(seedRaw, &seed))
-	catalog, downloads := capturedDefaultCatalog(t, seed, python)
-	defer catalog.Close()
-	endpoint, err := url.Parse(catalog.URL)
-	must(t, err)
-	proxy := httputil.NewSingleHostReverseProxy(endpoint)
-	layout, store, host, path, _ := startActualChildHostConfigured(t, func(h *fakeRentalHub) {
-		fallback := h.server.Config.Handler
-		h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasPrefix(r.URL.Path, "/v1/models/") || strings.HasPrefix(r.URL.Path, "/v1/tensorfs/") || strings.HasPrefix(r.URL.Path, "/objects/") {
-				proxy.ServeHTTP(w, r)
-				return
-			}
-			fallback.ServeHTTP(w, r)
-		})
-	})
+	layout, store, host, path, _ := startActualChildHost(t)
 	module, err := os.ReadFile(filepath.Join("testdata", "managed_serving", "model_tools.py"))
 	must(t, err)
 	// A unique marker changes only on actual model construction, so object-id reuse
@@ -72,8 +49,9 @@ app.entrypoint(segment)
 
 @invocable(memoize=False)
 async def long_form(ctx:Context)->SegmentProof:
-    first=await segment(payload=Request(seed=1234,steps=2))
-    second=await segment(payload=Request(seed=1234,steps=2))
+    weights=await produce()
+    first=await segment(payload=Request(seed=1234,steps=2),model=weights)
+    second=await segment(payload=Request(seed=1234,steps=2),model=weights)
     assert first.value==second.value and first.cuda_rng==second.cuda_rng
     assert first.device==second.device=="cuda"
     return second
@@ -104,10 +82,11 @@ only-include=["model_tools.py"]
 # cozy-runtime={path=%s}
 # model-tools={path="./model_tools"}
 # ///
-from model_tools import long_form,segment,Request
+from model_tools import long_form,segment,Request,produce
 async def main()->int:
+    weights=await produce()
     own=await long_form()
-    imported=await segment(payload=Request(seed=1234,steps=2))
+    imported=await segment(payload=Request(seed=1234,steps=2),model=weights)
     assert own.value==imported.value and own.cuda_rng==imported.cuda_rng
     assert imported.device=="cuda"
     return 3
@@ -135,8 +114,9 @@ from cozy_runtime.internal.placement_materialization import LOCAL_TENSORFS_ROOT
 c=sqlite3.connect('file:'+str(LOCAL_TENSORFS_ROOT/'.cozy-workspace/journal.sqlite3')+'?mode=ro',uri=True)
 rows=c.execute("select c.child_request,c.result,e.state from execution_calls c join executions e on e.owner=c.owner and e.request=c.child_request where json_extract(cast(c.intent as text),'$.export')='segment' order by c.created_ms").fetchall()
 results=[dict(request=r,result=json.loads(b),state=s) for r,b,s in rows]
-pins=c.execute("select count(*) from execution_checkpoint_inputs where input_id='model:model' and repository='proof/ordered' and state='released'").fetchone()[0]
-print(json.dumps(dict(segments=results,released_catalog_pins=pins)))`).CombinedOutput()
+source_calls=c.execute("select count(*) from execution_calls where json_extract(cast(intent as text),'$.export')='produce'").fetchone()[0]
+source_executions=c.execute("select count(*) from attempts a where exists(select 1 from execution_calls c where c.owner=a.owner and c.child_request=a.request and json_extract(cast(c.intent as text),'$.export')='produce')").fetchone()[0]
+print(json.dumps(dict(segments=results,source_calls=source_calls,source_executions=source_executions)))`).CombinedOutput()
 	if err != nil {
 		t.Fatalf("actual model result evidence: %v %s", err, proof)
 	}
@@ -149,10 +129,11 @@ print(json.dumps(dict(segments=results,released_catalog_pins=pins)))`).CombinedO
 				Load string `json:"load_identity"`
 			} `json:"result"`
 		} `json:"segments"`
-		Pins int `json:"released_catalog_pins"`
+		SourceCalls      int `json:"source_calls"`
+		SourceExecutions int `json:"source_executions"`
 	}
 	must(t, json.Unmarshal(proof, &observed))
-	if len(observed.Segments) != 3 || observed.Pins != 3 || downloads.Load() == 0 {
+	if len(observed.Segments) != 3 || observed.SourceCalls != 2 || observed.SourceExecutions != 1 {
 		t.Fatalf("missing actual serving/custody proof: %s", proof)
 	}
 	for _, segment := range observed.Segments {
