@@ -132,7 +132,25 @@ func (r *Resolver) capturedResultInterface(request records.Request) (*launch.Pac
 			source := filepath.Join(layout.LocalPackages, strings.TrimPrefix(request.LocalPackageDigest, "sha256:"), launch.PackageInterfaceFile)
 			surface, problem = launch.ReadPackageInterface(source, digest)
 			if problem != nil {
-				return nil, problem
+				// Before request-owned interface retention, an edited install could
+				// reclaim this revision. Another verified copy of the exact digest
+				// is sufficient; its current package version is not authority.
+				installed, read := r.store.Installed()
+				if read != nil {
+					return nil, read
+				}
+				for _, candidate := range installed {
+					if candidate.Package != request.Package || candidate.PackageInterface != digest {
+						continue
+					}
+					if exact, read := launch.ReadPackageInterface(launch.PackageInterfacePath(candidate.Dir), digest); read == nil {
+						surface = exact
+						break
+					}
+				}
+				if surface == nil {
+					return nil, problem
+				}
 			}
 		} else {
 			// Older accepted requests can recover only byte-identical public metadata.

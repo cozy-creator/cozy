@@ -45,14 +45,27 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	must(t, os.MkdirAll(directory, 0700))
 	path := filepath.Join(directory, launch.PackageInterfaceFile)
 	must(t, os.WriteFile(path, raw, 0600))
+	// An old run can recover after its original install AND staged revision
+	// disappear, but only from another byte-identical schema copy.
+	replacement := filepath.Join(root, "replacement")
+	must(t, os.MkdirAll(filepath.Join(replacement, "documents"), 0700))
+	replacementPath := launch.PackageInterfacePath(replacement)
+	must(t, os.WriteFile(replacementPath, []byte(`{}`), 0600))
+	_, problem = store.Activate(records.PackageInstall{ID: "replacement", Package: request.Package, Major: 1, Version: "1.0.1", Dir: replacement, PackageInterface: surface.Digest})
+	fatal(t, problem)
+	must(t, os.Remove(path))
 	resolver := cli.NewResolver(store, config.Config{Home: root, HubURL: "http://127.0.0.1:1"}, nil)
+	if _, problem := resolver.CapturedByteOutputBound(request, "clip", "video/mp4"); problem == nil {
+		t.Fatal("mismatched replacement metadata was accepted")
+	}
+	must(t, os.WriteFile(replacementPath, raw, 0600))
 	bound, problem := resolver.CapturedByteOutputBound(request, "clip", "video/mp4")
 	fatal(t, problem)
 	if bound != 200000 {
 		t.Fatalf("captured bound changed: %d", bound)
 	}
 	// The request now owns its exact schema independently of installation/source cleanup.
-	must(t, os.Remove(path))
+	must(t, os.Remove(replacementPath))
 	bound, problem = resolver.CapturedByteOutputBound(request, "clip", "video/mp4")
 	fatal(t, problem)
 	if bound != 200000 {
