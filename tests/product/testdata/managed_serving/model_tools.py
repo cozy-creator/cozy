@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import time
 
 import msgspec
@@ -80,7 +81,8 @@ def generate(ctx: Context, payload: Request, model: OrderedModel, tel: Telemetry
     return model.measure(payload.seed, payload.steps, tel)
 
 
-from cozy_runtime.author import (ModelArtifact, WeightsConfig, WeightsOutput, WeightsPart, WeightsSink, WeightsTarget, WeightsTensor, invocable)
+from cozy_runtime.author import ModelArtifact, WeightsOutput, invocable
+from tensorfs.derived import Config as DerivedConfig, Derivation, Part, Target, Tensor
 import struct
 import tensorfs
 
@@ -90,18 +92,20 @@ def helper() -> int:
 
 
 @invocable(memoize=True)
-async def produce(ctx: Context, *, artifacts: WeightsSink) -> ModelArtifact:
+async def produce(ctx: Context) -> ModelArtifact:
     encoding = dict(tensorfs.seed_digests())["plain/1"]
-    tensor = WeightsTensor(logical_dtype="f32", shape=(2, 2), encoding=encoding,
-        parts={"value": WeightsPart("f32", (2, 2))})
-    with artifacts.open("weights", sources={},
-        targets={name: WeightsTarget(add={"weight": tensor}) for name in ("alpha", "spare", "zeta")},
-        configs={"pipeline": WeightsConfig(data=b"{}")},
+    tensor = Tensor(logical_dtype="f32", shape=(2, 2), encoding=encoding,
+        parts={"value": Part("f32", (2, 2))})
+    with ctx.output("weights").open(Derivation(sources={},
+        targets={name: Target(add={"weight": tensor}) for name in ("alpha", "spare", "zeta")},
+        configs={"pipeline": DerivedConfig("add")},
         order=tuple((name, "weight") for name in ("alpha", "spare", "zeta")),
-    ) as writer:
+    )) as writer:
+        if writer.receipt is not None:
+            return ctx.adopt_model(writer.receipt)
         for name, scale in (("alpha", 2.0), ("spare", 7.0), ("zeta", 1.0)):
-            writer.add_part(name, "weight", "value", struct.pack("<4f", scale, 0, 0, scale))
+            writer.add_part(name, "weight", "value", io.BytesIO(struct.pack("<4f", scale, 0, 0, scale)))
         writer.add_config("pipeline", b"{}")
-        return writer.commit().artifact
+        return ctx.adopt_model(writer.commit())
 
 app.job(produce, weights=(WeightsOutput("weights", max_new_bytes=4096),))

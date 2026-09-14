@@ -293,6 +293,13 @@ func localSelection(operationID string, revision localpackage.Revision) (
 	return selected, transfer, nil
 }
 
+// LocalPackageSelection is the passive code-preparation document. Calling it
+// neither converges worker state nor creates an execution attempt.
+func LocalPackageSelection(operationID string, revision localpackage.Revision) (*pb.DesiredLocalPackageSet, *exit.Error) {
+	selected, _, problem := localSelection(operationID, revision)
+	return selected, problem
+}
+
 // localPackageUploadProblem shares preparation's terminal/refusable distinction.
 // A host verdict on an exact header cannot improve by reconnecting.
 func localPackageUploadProblem(err error) *exit.Error {

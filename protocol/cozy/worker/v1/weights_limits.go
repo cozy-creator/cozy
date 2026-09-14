@@ -15,8 +15,14 @@ const MaxWeightsGrantURLBytes = 16 << 10
 // scripts/fence.py convicts any content-bearing bound declared above it.
 const MaxInlineControlBytes = 4 << 20
 const MaxChildArtifactGrants = 32
+const MaxRetainedModelResults = 32
+const MaxRetainedModelArtifactBytes = 4096
+const MaxModelResultPointerBytes = 1024
 const MaxActiveChildCalls = 32
 const MaxNativeByteReadChunkBytes = 32 << 10
+const NativeRootInputsWireMinor = 55
+const MaxInputTreeManifestBytes = 1 << 20
+const MaxInputTreeChunkBytes = 1 << 20
 const MaxModelSourceHeaderBytes = MaxInlineControlBytes
 const MaxCheckpointObjects = 128
 const MaxModelSourceFiles = 4096

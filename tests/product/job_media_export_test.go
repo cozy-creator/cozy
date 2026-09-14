@@ -40,9 +40,9 @@ func TestTopLevelJobMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		_, _ = runCozyPath(t, root, path, "down", "--all")
+		compositionDown(t, root, path)
 		if !t.Failed() {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	project := t.TempDir()
@@ -138,6 +138,16 @@ def picture(payload:Request,out:Outputs)->Picture:
 		fatal(t, problem)
 		if len(outputs) != 1 || outputs[0].Path == target {
 			t.Fatal("user copy replaced internal publication custody")
+		}
+		files, problem := store.MachineFileResults(request.ID)
+		fatal(t, problem)
+		if len(files) != 1 || !files[0].Copied || files[0].State != "released" || files[0].Source.Digest != outputs[0].Digest {
+			t.Fatal("collected image has no exact copied receipt and released recipient hold")
+		}
+		attempts, problem := store.Attempts(request.ID)
+		fatal(t, problem)
+		if len(attempts) != 0 {
+			t.Fatal("file collection created a Creator execution attempt")
 		}
 		must(t, os.WriteFile(target, []byte("user edit"), 0600))
 		internal, err := os.ReadFile(outputs[0].Path)

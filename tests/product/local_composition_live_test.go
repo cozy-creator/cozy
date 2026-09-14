@@ -100,7 +100,7 @@ func TestOrdinaryScriptNativePreparationQuantizationAndScore(t *testing.T) {
 		if t.Failed() {
 			t.Log("composition evidence retained", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	defer tracePrivateChildWait(t, root)()
@@ -401,6 +401,9 @@ func compositionDown(t *testing.T, root, path string) {
 	code, out := runCozyPath(t, root, path, "down", "--all", "--json")
 	if code != 0 {
 		t.Errorf("normal composition teardown refused (%d): %s", code, compositionTail(out))
+	}
+	if !reapMachineRuntimeRoot(root) {
+		t.Error("owned test Runtime remains alive; preserve its home")
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for len(processes) > 0 {

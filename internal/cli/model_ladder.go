@@ -152,7 +152,7 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, Lane: rung.Lane,
 			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
-	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(),
+	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(), CatalogRepository: ref.String(),
 		Release: selected.Release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
 }
 

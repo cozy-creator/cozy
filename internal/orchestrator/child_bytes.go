@@ -203,7 +203,7 @@ func (c *Orchestrator) capturedByteOutputs(req records.Request, attempt records.
 			return nil, exit.New(exit.Validation, "byte output exceeds its declared capacity")
 		}
 		if b.OutputID != "runtime.capture" {
-			if problem := verifyByteResultRow(result, b); problem != nil {
+			if problem := VerifyByteResultRow(result, b); problem != nil {
 				return nil, problem
 			}
 		} else if b.MimeType != "application/vnd.cozy.tree-manifest" || b.Digest != b.ManifestID || b.Length != b.ManifestLength {
@@ -246,7 +246,8 @@ func captureOptions(value *pb.ActivationCapture) (string, *exit.Error) {
 	return string(raw), nil
 }
 
-func verifyByteResultRow(result any, b records.ByteOutput) *exit.Error {
+// VerifyByteResultRow binds a native output receipt to its typed result position.
+func VerifyByteResultRow(result any, b records.ByteOutput) *exit.Error {
 	value := result
 	for _, part := range strings.Split(b.OutputID, ".") {
 		switch current := value.(type) {

@@ -307,6 +307,15 @@ func publicationRoot(l home.Layout, st *records.Store, root, requestID string) (
 		return 0, false, problem
 	}
 	if publication == nil {
+		files, problem := st.MachineFileResults(requestID)
+		if problem != nil {
+			return 0, false, problem
+		}
+		for _, file := range files {
+			if file.Copied {
+				return 0, false, nil
+			}
+		}
 		freed, problem := removeTree(root)
 		return freed, problem == nil, problem
 	}

@@ -66,14 +66,15 @@ const MaxBody = 8 << 20
 
 // Server is the local client API. One per Cozy daemon.
 type Server struct {
-	orchestrator *orchestrator.Orchestrator
-	store        *records.Store
-	layout       home.Layout
-	cfg          config.Config
-	creds        Credentials
-	addr         string
-	log          io.Writer
-	web          http.Handler
+	machineExecutions MachineExecutions
+	orchestrator      *orchestrator.Orchestrator
+	store             *records.Store
+	layout            home.Layout
+	cfg               config.Config
+	creds             Credentials
+	addr              string
+	log               io.Writer
+	web               http.Handler
 	// packages resolves a package ref to a spec the orchestrator can start. It is the
 	// LOCAL module's resolver; the pod profile (cl-014) supplies its own.
 	packages Resolver
@@ -122,13 +123,14 @@ type Resolver interface {
 
 // Options is the frozen input to one API server.
 type Options struct {
-	Orchestrator *orchestrator.Orchestrator
-	Cfg          config.Config
-	Creds        Credentials
-	Addr         string
-	Log          io.Writer
-	Web          http.Handler
-	Packages     Resolver
+	MachineExecutions MachineExecutions
+	Orchestrator      *orchestrator.Orchestrator
+	Cfg               config.Config
+	Creds             Credentials
+	Addr              string
+	Log               io.Writer
+	Web               http.Handler
+	Packages          Resolver
 	// Rentals validates one attached generic worker id; desired package/model state is
 	// sent separately over WorkerControl.
 	Rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
@@ -143,7 +145,8 @@ func New(opt Options) *Server {
 		opt.Log = io.Discard
 	}
 	return &Server{
-		orchestrator: opt.Orchestrator, store: opt.Orchestrator.Store(),
+		machineExecutions: opt.MachineExecutions,
+		orchestrator:      opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
 		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, shutdown: opt.Shutdown,

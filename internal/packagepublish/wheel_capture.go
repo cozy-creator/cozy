@@ -127,21 +127,42 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 			continue
 		}
 		var hashes []string
+		var requirement string
 		matched := false
 		for _, entry := range lock.Packages {
 			if normalizedProjectName(entry.Name) != name || entry.Version != version {
 				continue
 			}
-			if matched || entry.Source.Registry != "https://pypi.org/simple" {
-				return nil, exit.New(exit.Conflict, "base dependency has ambiguous or unsupported locked origin")
+			if matched {
+				return nil, exit.New(exit.Conflict, "base dependency has ambiguous locked origin")
 			}
 			matched = true
+			if entry.Source.Registry != "https://pypi.org/simple" {
+				var candidates []registryWheel
+				for _, candidate := range entry.Wheels {
+					if !strings.HasPrefix(candidate.Hash, "sha256:") {
+						return nil, exit.Named(exit.Conflict, "base_dependency_hash_invalid", "base dependency %s has no SHA-256 wheel hash", name)
+					}
+					candidates = append(candidates, registryWheel{URL: candidate.URL, Size: candidate.Size,
+						Hashes: map[string]string{"sha256": strings.TrimPrefix(candidate.Hash, "sha256:")}})
+				}
+				var problem *exit.Error
+				requirement, problem = pytorchBaseRequirement(name, version, entry.Source.Registry, candidates)
+				if problem != nil {
+					return nil, problem
+				}
+				continue
+			}
 			for _, candidate := range entry.Wheels {
 				hash := strings.TrimPrefix(candidate.Hash, "sha256:")
 				if len(hash) == 64 && candidate.Hash == "sha256:"+hash {
 					hashes = append(hashes, "--hash="+candidate.Hash)
 				}
 			}
+		}
+		if requirement != "" {
+			out[name] = CapturedDependency{Name: name, Version: version, Requirement: requirement}
+			continue
 		}
 		if len(hashes) == 0 {
 			return nil, exit.New(exit.Conflict, "base dependency has no captured wheel hashes")

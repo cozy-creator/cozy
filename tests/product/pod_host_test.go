@@ -71,7 +71,7 @@ type fakePod struct {
 	recordOperation func(*pb.RecordOperationResultCall) (*pb.RecordOperationResultResult, error)
 	derivedRelease  func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
 	resultRelease   func(context.Context, *pb.DerivedResultReleaseCall) (*pb.DerivedResultReleaseResult, error)
-	pb.UnimplementedWorkerControlServer
+	controlDefaults
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
 	wireMinor  uint32 // zero uses the current protocol; tests can negotiate an older peer

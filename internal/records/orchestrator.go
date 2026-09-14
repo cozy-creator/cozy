@@ -486,6 +486,10 @@ type Request struct {
 	// ReleaseImplicitWork is derived from a new captured result schema.
 	// Its durable authority is successful_work_releases, not this admission-only field.
 	ReleaseImplicitWork bool `json:"-"`
+	// MachineExecutionObserver is admission-only. The marker is committed with
+	// this request, before any scheduler can create a local attempt.
+	MachineExecutionObserver bool   `json:"-"`
+	DeadlineUnixMS           uint64 `json:"-"` // frozen submission event is its durable source
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
 	// retained operation namespace shared by explicitly related revisions.
 	RetryOf                string
@@ -547,15 +551,24 @@ type Request struct {
 // `references.0.image`); position is identity for mixed reference lists, never a file
 // name inferred later. LocalPath is resolution only and is excluded from submission
 // identity; Digest, Length and MediaType are the claims inside InvocationSpec.
+type ByteInputSnapshot struct {
+	Body         []byte            `json:"body"`
+	Reference    string            `json:"reference,omitempty"`
+	Manifest     ArtifactObjectRef `json:"manifest"`
+	ContentBytes int64             `json:"content_bytes"`
+	Path         string            `json:"path"`
+}
+
 type AssetBinding struct {
-	Native    *ByteAssetBinding `json:"native,omitempty"`
-	FieldPath string            `json:"field_path"`
-	LocalPath string            `json:"local_path"`
-	Digest    string            `json:"digest"`
-	Length    int64             `json:"length"`
-	MediaType string            `json:"media_type,omitempty"`
-	Order     uint32            `json:"order"`
-	MaxBytes  int64             `json:"max_bytes,omitempty"`
+	Snapshot  *ByteInputSnapshot `json:"snapshot,omitempty"`
+	Native    *ByteAssetBinding  `json:"native,omitempty"`
+	FieldPath string             `json:"field_path"`
+	LocalPath string             `json:"local_path"`
+	Digest    string             `json:"digest"`
+	Length    int64              `json:"length"`
+	MediaType string             `json:"media_type,omitempty"`
+	Order     uint32             `json:"order"`
+	MaxBytes  int64              `json:"max_bytes,omitempty"`
 }
 
 // ModelRef is one exact user-selected model binding. Creator resolves the human
@@ -568,9 +581,13 @@ type ModelRef struct {
 	// Jobs keep Slot as the bare invocation parameter; serving already uses a path.
 	BindingPath string `json:"binding_path,omitempty"`
 	Model       string `json:"model"`
-	Release     string `json:"release"`
-	Lane        string `json:"lane,omitempty"`
-	Manifest    string `json:"manifest"`
+	// CatalogRepository is populated only by native local/Hub model resolution.
+	// Model also carries synthetic producer/slot names for private artifacts;
+	// those never gain repository authority from their spelling.
+	CatalogRepository string `json:"catalog_repository,omitempty"`
+	Release           string `json:"release"`
+	Lane              string `json:"lane,omitempty"`
+	Manifest          string `json:"manifest"`
 	// HubCheckpoint records that Hub resolved an exact retained checkpoint without
 	// a release. It routes downloads; the Hub still checks repository custody.
 	HubCheckpoint bool `json:"hub_checkpoint,omitempty"`
@@ -1308,6 +1325,12 @@ func (s *Store) BeginRequeue(id string, max int64, charge bool) (count int64, st
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
+	return s.SubmitWithEvent(r, nil)
+}
+
+// SubmitWithEvent freezes intake-only facts with the request. Deadline and
+// publication consent must survive a crash before any observer goroutine starts.
+func (s *Store) SubmitWithEvent(r Request, event map[string]any) (Request, bool, *exit.Error) {
 	if problem := NormalizeModelTransferIntent(r.ModelTransfer); problem != nil {
 		return Request{}, false, problem
 	}
@@ -1323,6 +1346,11 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, exportOutputs)
 	if problem != nil {
 		return Request{}, false, problem
+	}
+	if fresh && event != nil {
+		if err := appendEventTx(tx, recorded.ID, "request.submitted", 0, event); err != nil {
+			return Request{}, false, exit.Internalf("cannot freeze request submission intent: %s", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Request{}, false, exit.Internalf("cannot commit request %s: %s", r.ID, err)
@@ -1426,8 +1454,17 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
-	if problem := armSuccessfulWorkTx(tx, r); problem != nil {
-		return Request{}, false, problem
+	if r.MachineExecutionObserver {
+		if r.ParentRequestID != "" {
+			return Request{}, false, exit.New(exit.Validation, "a machine execution observer must be a root request")
+		}
+		if _, err := tx.Exec(`INSERT INTO machine_executions(request_id) VALUES(?)`, r.ID); err != nil {
+			return Request{}, false, exit.Internalf("cannot mark machine execution observation: %s", err)
+		}
+	} else {
+		if problem := armSuccessfulWorkTx(tx, r); problem != nil {
+			return Request{}, false, problem
+		}
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
 		return Request{}, false, problem
@@ -2222,6 +2259,25 @@ func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
 		}
 		out = append(out, o)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish output read: %s", err)
+	}
+	rows.Close()
+	link, problem := s.MachineExecution(requestID)
+	if problem != nil {
+		return nil, problem
+	}
+	if link != nil && link.Collected {
+		files, problem := s.MachineFileResults(requestID)
+		if problem != nil {
+			return nil, problem
+		}
+		for _, file := range files {
+			if file.Copied {
+				out = append(out, file.Output)
+			}
+		}
+	}
 	return out, nil
 }
 
@@ -2241,7 +2297,23 @@ func (s *Store) Media(mediaID string) (*Output, string, int64, *exit.Error) {
 		Scan(&o.OutputID, &o.MediaID, &o.Path, &o.Digest, &o.Length, &o.MimeType,
 			&requestID, &attempt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, "", 0, nil
+		var raw []byte
+		err = s.db.QueryRow(`SELECT hold.payload,hold.request_id FROM request_events hold
+ JOIN machine_executions e ON e.request_id=hold.request_id
+ WHERE hold.type='machine.file_result' AND e.collected=1
+ AND json_extract(hold.payload,'$.output.MediaID')=?
+ ORDER BY hold.seq DESC LIMIT 1`, mediaID).Scan(&raw, &requestID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, "", 0, nil
+		}
+		var file MachineFileResult
+		if err != nil || json.Unmarshal(raw, &file) != nil {
+			return nil, "", 0, exit.Internalf("cannot read collected media")
+		}
+		if !file.Copied {
+			return nil, "", 0, nil
+		}
+		return &file.Output, requestID, file.Source.Attempt, nil
 	}
 	if err != nil {
 		return nil, "", 0, exit.Internalf("cannot read media %s: %s", mediaID, err)
