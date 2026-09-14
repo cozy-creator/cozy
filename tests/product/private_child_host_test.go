@@ -168,10 +168,11 @@ print(json.dumps({"format":"tensorhub.image_inventory/1","profile":"python3.12-c
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(layout.Root, "host-image-inventory.json"), inventory, 0600))
 	hub.inventories = map[string]json.RawMessage{rentalID: inventory}
+	hubToken := bindMachinePublicationFixture(t, layout, host, hub, identity.PublicKey(), secret.HashHex(token))
 
 	hub.rentals[rentalID] = map[string]any{"development": *childHostUpdatable, "rental_id": rentalID, "name": "child-host", "state": "ready", "worker_address": host.Control, "media_address": host.Media, "cert_pem": string(certificate), "worker_id": "private-child-host", "worker_boot_id": ready.WorkerBootID, "creator_public_key": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}, "accelerator_count": 1, "hourly_rate_usd_micros": 1}
 	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: rentalID, MachineName: "child-host", SKU: sku, AcceleratorModel: accelerator, HourlyRateUSDMicros: 1, State: "ready", Hub: hub.server.URL, Address: host.Control, MediaAddress: host.Media, ExpectedWorkerID: "private-child-host", ExpectedWorkerBootID: ready.WorkerBootID}, string(certificate), token, identity))
-	must(t, os.WriteFile(filepath.Join(layout.Root, "config.yaml"), []byte("tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\nport: 0\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(layout.Root, "config.yaml"), []byte("tensorhub_url: "+hub.server.URL+"\ntensorhub_token: "+hubToken+"\nport: 0\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	path := *childHostRuntimeBin
 	for _, item := range childEnv(t, layout.Root) {
 		if strings.HasPrefix(item, "PATH=") {
