@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -130,10 +131,33 @@ def main(ctx: Context, *, source: Model) -> ModelArtifact:
 	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer journal.Close()
-	var inputHolds int
-	must(t, journal.QueryRow(`SELECT count(*) FROM execution_model_holds WHERE recipient=? AND path='input/source'`, request.ID).Scan(&inputHolds))
-	if inputHolds != 1 {
-		t.Fatal("Runtime did not record independent root Model input custody")
+	var repository, inputState, nativeOwner string
+	var manifest []byte
+	var manifestLength, generation int64
+	must(t, journal.QueryRow(`SELECT repository,manifest,manifest_length,generation,native_owner,state FROM execution_checkpoint_inputs WHERE recipient=? AND input_id='model:source'`, request.ID).Scan(&repository, &manifest, &manifestLength, &generation, &nativeOwner, &inputState))
+	manifestID, err := canonical.Spell(manifest)
+	must(t, err)
+	if repository != "local/library-seed" || manifestID != seedModel.Manifest.Digest || manifestLength != seedModel.Manifest.Length || generation != 1 || inputState != "released" {
+		t.Fatalf("catalog input lost its exact released root: repo=%s manifest=%s length=%d generation=%d state=%s", repository, manifestID, manifestLength, generation, inputState)
+	}
+	if _, err := canonical.Raw(nativeOwner); err != nil {
+		t.Fatal("catalog input has no exact native owner")
+	}
+	var derivedInputs int
+	must(t, journal.QueryRow(`SELECT count(*) FROM execution_model_holds WHERE recipient=? AND path='input/source'`, request.ID).Scan(&derivedInputs))
+	if derivedInputs != 0 {
+		t.Fatal("catalog input fabricated a derived receipt hold")
+	}
+	native := exec.Command(filepath.Join(control, "bin", "python"), "-c", `import json,sys,tensorfs
+value=tensorfs.Store.open(sys.argv[1]).checkpoint_root(sys.argv[2])
+assert value['owner']==sys.argv[2] and value['released'] is True
+assert value['repository']=='local/library-seed' and value['manifest_digest']==sys.argv[3]
+assert value['manifest_length']==int(sys.argv[4])
+print(json.dumps(value,sort_keys=True))`, filepath.Join(root, "tensorfs"), nativeOwner, manifestID, strconv.FormatInt(manifestLength, 10))
+	if output, err := native.CombinedOutput(); err != nil {
+		t.Fatalf("native catalog input tombstone: %v %s", err, output)
+	} else {
+		t.Logf("native catalog input released: %s", output)
 	}
 	outputs, problem := store.MachineModelRetentions(request.ID)
 	fatal(t, problem)
