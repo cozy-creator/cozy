@@ -3,6 +3,8 @@ on: [push, pull_request]
 jobs:
   checks:
     runs-on: ubuntu-latest
+    env:
+      COZY_RUNTIME_SOURCE: 53b46c6c1321eb833a5dddb01d4980577ec13c17
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -17,13 +19,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: cozy-creator/cozy-runtime
-          ref: b03ae4793c56162bd567cc32ae9a922f303269e7
+          ref: ${{ env.COZY_RUNTIME_SOURCE }}
           path: runtime-peer
           ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
           persist-credentials: false
       - name: Build and install the source-addressed CPU worker
         run: |
-          wheel="$(python3 scripts/build-runtime-peer.py runtime-peer b03ae4793c56162bd567cc32ae9a922f303269e7 "$RUNNER_TEMP/runtime-peer")"
+          wheel="$(python3 scripts/build-runtime-peer.py runtime-peer "$COZY_RUNTIME_SOURCE" "$RUNNER_TEMP/runtime-peer")"
           uv tool install --force --python 3.12 "$wheel[model-execution]"
           uv tool dir --bin >> "$GITHUB_PATH"
           echo "COZY_TEST_RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
