@@ -250,6 +250,10 @@ func (r *Resolver) resolveHF(ctx context.Context, source Source) (Plan, *exit.Er
 			"Hugging Face metadata lacks one full commit or has an invalid member count")
 	}
 	commit := strings.ToLower(metadata.SHA)
+	if source.Revision != "" && commit != source.Revision {
+		return Plan{}, exit.Named(exit.Validation, "model_source_revision_mismatch",
+			"Hugging Face metadata does not match the requested commit")
+	}
 	base := "https://huggingface.co/" + url.PathEscape(source.Org) + "/" +
 		url.PathEscape(source.Repo) + "/resolve/" + commit + "/"
 	byMember := make(map[string]File)
@@ -269,7 +273,7 @@ func (r *Resolver) resolveHF(ctx context.Context, source Source) (Plan, *exit.Er
 		} else {
 			file.Length = sibling.Size
 		}
-		if strings.HasSuffix(lower, ".index.json") {
+		if strings.HasSuffix(lower, ".index.json") && (source.Member == "" || source.Member == sibling.Name) {
 			indexes = append(indexes, sibling.Name)
 		}
 		byMember[sibling.Name] = file
@@ -277,6 +281,10 @@ func (r *Resolver) resolveHF(ctx context.Context, source Source) (Plan, *exit.Er
 	if len(byMember) == 0 {
 		return Plan{}, exit.Named(exit.Validation, "model_source_files_absent",
 			"Hugging Face revision contains no supported tensor carriers")
+	}
+	if source.Member != "" && byMember[source.Member].Member == "" {
+		return Plan{}, exit.Named(exit.NotFound, "model_source_file_absent",
+			"Hugging Face revision %s does not contain %s", commit, source.Member)
 	}
 	referenced := make(map[string]bool)
 	for _, member := range indexes {
@@ -312,6 +320,9 @@ func (r *Resolver) resolveHF(ctx context.Context, source Source) (Plan, *exit.Er
 	}
 	files := make([]File, 0, len(byMember))
 	for member, file := range byMember {
+		if source.Member != "" && member != source.Member && !referenced[member] {
+			continue
+		}
 		if strings.HasSuffix(strings.ToLower(member), ".safetensors") && !referenced[member] {
 			file.Carrier = true
 		}
@@ -324,7 +335,7 @@ func (r *Resolver) resolveHF(ctx context.Context, source Source) (Plan, *exit.Er
 	sort.Slice(files, func(i, j int) bool { return files[i].Member < files[j].Member })
 	resolved := source
 	resolved.Revision, resolved.Reference = commit, commit
-	resolved.Canonical = "hf://" + source.Org + "/" + source.Repo + "@" + commit
+	resolved.Canonical = resolved.hfCanonical()
 	return finishPlan(resolved, metadata.CardData.License, files)
 }
 
@@ -529,7 +540,7 @@ func finishPlan(source Source, license string, files []File) (Plan, *exit.Error)
 
 func safeMember(member string) bool {
 	if member == "" || len(member) > 1024 || strings.HasPrefix(member, ".") ||
-		path.IsAbs(member) || strings.Contains(member, "\\") {
+		path.IsAbs(member) || strings.Contains(member, "\\") || strings.IndexFunc(member, func(r rune) bool { return r < 32 || r == 127 }) >= 0 {
 		return false
 	}
 	for _, part := range strings.Split(member, "/") {
