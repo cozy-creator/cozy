@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
+	"github.com/cozy-creator/cozy/internal/scratch"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -171,6 +172,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			existing = nil
 		}
 	}
+	var inputStage *scratch.Dir
+	defer func() {
+		if inputStage != nil {
+			inputStage.Release()
+		}
+	}()
 	var spec orchestrator.Submission
 	if existing != nil {
 		if e = s.verifyJobReplayInstall(r.Context(), sub, *existing); e != nil {
@@ -204,6 +211,9 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 		if e == nil {
 			spec.Assets, e = bindAssets(spec.Assets)
+		}
+		if e == nil {
+			inputStage, e = s.freezeMachineInputs(&spec)
 		}
 	}
 	if e != nil {
@@ -257,7 +267,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			spec.MachineExecutionObserver = link != nil
 		}
 	}
-	if spec.MachineExecutionObserver && (len(spec.Assets) > 0 || len(spec.Models) > 0 || len(spec.Trees) > 0 || spec.ModelTransfer != nil) {
+	if spec.MachineExecutionObserver && (uncapturedRootBytes(spec.Assets) || len(spec.Models) > 0 || len(spec.Trees) > 0 || spec.ModelTransfer != nil) {
 		s.refuseTyped(w, r, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; no execution or rental was submitted"))
 		return
 	}
@@ -270,6 +280,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
+	}
+	if inputStage != nil {
+		if recorded.ID == spec.RequestID {
+			inputStage.Detach()
+		} else {
+			inputStage.Release()
+		}
+		inputStage = nil
 	}
 	jobID, attempt := recorded.ID, uint64(recorded.Ordinal)
 	if fresh || spec.MachineExecutionObserver {
@@ -310,6 +328,11 @@ func replayJobSubmission(sub JobSubmission,
 	payload := []byte(sub.Input)
 	if len(payload) == 0 {
 		payload = []byte("{}")
+	}
+	var problem *exit.Error
+	payload, sub.LocalAssets, problem = replayMachineInputSnapshots(payload, sub.LocalAssets, sub.Trees, recorded)
+	if problem != nil {
+		return orchestrator.Submission{}, problem
 	}
 	models := append([]orchestrator.ModelRef(nil), sub.Models...)
 	if len(models) == 0 && !recorded.ModelTransfer.HasAcquisition() {
@@ -513,10 +536,6 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 	out orchestrator.Submission, installID string,
 ) (orchestrator.Submission, *exit.Error) {
-	if len(sub.Trees) > 0 {
-		return out, exit.Named(exit.Validation, "rental.job_local_tree_unsupported",
-			"remote jobs cannot grant directories from the Creator host")
-	}
 	spec, problem := s.packages.ResolveInstall(installID, nil)
 	if problem != nil || spec.Placement.Package != sub.Package {
 		if problem != nil {
@@ -555,6 +574,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 	}
 	out.InstallID = installID
 	out.Release = revision.Release
+	out.Trees = append([]string(nil), sub.Trees...)
 	out.LocalPackageDigest = revision.Digest
 	return out, nil
 }

@@ -301,7 +301,7 @@ func TestMachineInvocationCarriesFrozenDeadlineAndRefusesUnstagedInputs(t *testi
 	request := records.Request{ID: "job-deadline", IdemKey: "deadline", Kind: "job", Package: "local/example", Entrypoint: "main", Org: "local", Payload: []byte(`{}`), PlanID: childDigest("2"), LocalPackageDigest: childDigest("3"), DeadlineUnixMS: 1900000000123}
 	plan := &orchestrator.JobPlan{Function: "main", DescriptorID: request.PlanID}
 	capture := localpackage.ExecutionCapture{Canonical: []byte(`{}`), Digest: canonical.Digest([]byte(`{}`))}
-	submission, problem := orchestrator.MachineJobSubmission(request, capture, plan)
+	submission, problem := orchestrator.MachineJobSubmission(request, capture, plan, nil)
 	fatal(t, problem)
 	var spec pb.InvocationSpec
 	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
@@ -312,7 +312,7 @@ func TestMachineInvocationCarriesFrozenDeadlineAndRefusesUnstagedInputs(t *testi
 		t.Fatal("CPU captured root occupied its managed children's device lane")
 	}
 	request.Models = []records.ModelRef{{Slot: "model", Manifest: childDigest("4"), ManifestLength: 123}}
-	if _, problem := orchestrator.MachineJobSubmission(request, capture, plan); problem == nil || problem.Code != exit.Structural {
+	if _, problem := orchestrator.MachineJobSubmission(request, capture, plan, nil); problem == nil || problem.Code != exit.Structural {
 		t.Fatalf("unstaged inputs would retry indefinitely: %v", problem)
 	}
 }

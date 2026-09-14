@@ -33,6 +33,7 @@ type machineExecutionClient interface {
 }
 
 type machineConnection struct {
+	importInputTree   func(context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error)
 	connection        *grpc.ClientConn
 	client            machineExecutionClient
 	claim             *pb.Claim
@@ -94,9 +95,22 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 			}
 			if len(link.Receipt) == 0 {
 				if current.State == "canceled" && len(link.Submission) == 0 {
-					return
+					if link.MachineID != "" {
+						var connection *machineConnection
+						connection, problem = m.connect(m.ctx, link.MachineID)
+						if problem == nil {
+							problem = m.releaseMachineInputs(m.ctx, *current, connection)
+							connection.connection.Close()
+						}
+						if problem == nil {
+							return
+						}
+					} else {
+						return
+					}
+				} else {
+					problem = m.submit(*current, link)
 				}
-				problem = m.submit(*current, link)
 			} else {
 				if link.CancelRequested {
 					problem = m.Control(m.ctx, *current, "cancel")
@@ -225,7 +239,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if len(prepared.Placement.Jobs) != 1 {
 			return exit.New(exit.Conflict, "machine root requires its exact prepared job declaration")
 		}
-		built, problem := orchestrator.MachineJobSubmission(request, capture, prepared.Placement.Jobs[0])
+		byteInputs, problem := m.stageMachineInputs(m.ctx, request, connection)
+		if problem != nil {
+			return problem
+		}
+		built, problem := orchestrator.MachineJobSubmission(request, capture, prepared.Placement.Jobs[0], byteInputs)
 		if problem != nil {
 			return problem
 		}
@@ -256,7 +274,10 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if receipt.WorkerId != connection.claim.WorkerId || receipt.WorkerBootId == "" {
 		return exit.New(exit.Conflict, "execution was accepted by an unexpected worker")
 	}
-	return m.store.AcceptMachineExecution(request.ID, receipt)
+	if problem := m.store.AcceptMachineExecution(request.ID, receipt); problem != nil {
+		return problem
+	}
+	return m.releaseMachineInputs(m.ctx, request, connection)
 }
 
 func machineTransport(err error) *exit.Error {
@@ -307,6 +328,9 @@ func (m *machineRuns) refresh(ctx context.Context, request records.Request) *exi
 		return problem
 	}
 	defer connection.connection.Close()
+	if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
+		return problem
+	}
 	if len(link.PendingControl) > 0 {
 		if _, problem := m.flushMachineControl(ctx, connection, link); problem != nil {
 			return problem

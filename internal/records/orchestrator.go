@@ -551,15 +551,24 @@ type Request struct {
 // `references.0.image`); position is identity for mixed reference lists, never a file
 // name inferred later. LocalPath is resolution only and is excluded from submission
 // identity; Digest, Length and MediaType are the claims inside InvocationSpec.
+type ByteInputSnapshot struct {
+	Body         []byte            `json:"body"`
+	Reference    string            `json:"reference,omitempty"`
+	Manifest     ArtifactObjectRef `json:"manifest"`
+	ContentBytes int64             `json:"content_bytes"`
+	Path         string            `json:"path"`
+}
+
 type AssetBinding struct {
-	Native    *ByteAssetBinding `json:"native,omitempty"`
-	FieldPath string            `json:"field_path"`
-	LocalPath string            `json:"local_path"`
-	Digest    string            `json:"digest"`
-	Length    int64             `json:"length"`
-	MediaType string            `json:"media_type,omitempty"`
-	Order     uint32            `json:"order"`
-	MaxBytes  int64             `json:"max_bytes,omitempty"`
+	Snapshot  *ByteInputSnapshot `json:"snapshot,omitempty"`
+	Native    *ByteAssetBinding  `json:"native,omitempty"`
+	FieldPath string             `json:"field_path"`
+	LocalPath string             `json:"local_path"`
+	Digest    string             `json:"digest"`
+	Length    int64              `json:"length"`
+	MediaType string             `json:"media_type,omitempty"`
+	Order     uint32             `json:"order"`
+	MaxBytes  int64              `json:"max_bytes,omitempty"`
 }
 
 // ModelRef is one exact user-selected model binding. Creator resolves the human

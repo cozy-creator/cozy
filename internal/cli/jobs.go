@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -226,7 +227,11 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 			return nil, exit.New(exit.NotFound, "--input-tree %s: %s is not a directory", ref, dir).
 				WithRemedy("an input tree is a MATERIALIZED directory the orchestrator grants a read of")
 		}
-		out = append(out, v)
+		absolute, err := filepath.Abs(dir)
+		if err != nil {
+			return nil, exit.New(exit.Validation, "input tree directory is invalid")
+		}
+		out = append(out, ref+"="+absolute)
 	}
 	return out, nil
 }

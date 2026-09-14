@@ -598,6 +598,7 @@ const (
 	RuntimePreparation_WorkspaceRetainByteTree_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/WorkspaceRetainByteTree"
 	RuntimePreparation_WorkspaceReleaseByteTree_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseByteTree"
 	RuntimePreparation_WorkspaceReadByteTreeObject_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceReadByteTreeObject"
+	RuntimePreparation_ImportInputTree_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportInputTree"
 	RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady"
 	RuntimePreparation_ImportWorkspace_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportWorkspace"
 	RuntimePreparation_ActivateWorkspaceImport_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport"
@@ -642,6 +643,8 @@ type RuntimePreparationClient interface {
 	WorkspaceRetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	WorkspaceReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	WorkspaceReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error)
+	// MINOR55. Authenticated root input intake; native bytes commit before a receipt.
+	ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error)
 	WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
 	// One-time authority transfer from a quiesced legacy Host journal. This is
 	// never forwarded from PodHost or exposed as an author-controlled cache write.
@@ -789,6 +792,19 @@ func (c *runtimePreparationClient) WorkspaceReadByteTreeObject(ctx context.Conte
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RuntimePreparation_WorkspaceReadByteTreeObjectClient = grpc.ServerStreamingClient[NativeByteReadChunk]
 
+func (c *runtimePreparationClient) ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RuntimePreparation_ServiceDesc.Streams[1], RuntimePreparation_ImportInputTree_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[InputTreeImportFrame, NativeByteRetentionResult]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimePreparation_ImportInputTreeClient = grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult]
+
 func (c *runtimePreparationClient) WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(WeightsHostAck)
@@ -801,7 +817,7 @@ func (c *runtimePreparationClient) WorkspaceWeightsIntentReady(ctx context.Conte
 
 func (c *runtimePreparationClient) ImportWorkspace(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &RuntimePreparation_ServiceDesc.Streams[1], RuntimePreparation_ImportWorkspace_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &RuntimePreparation_ServiceDesc.Streams[2], RuntimePreparation_ImportWorkspace_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -978,6 +994,8 @@ type RuntimePreparationServer interface {
 	WorkspaceRetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	WorkspaceReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	WorkspaceReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error
+	// MINOR55. Authenticated root input intake; native bytes commit before a receipt.
+	ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error
 	WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
 	// One-time authority transfer from a quiesced legacy Host journal. This is
 	// never forwarded from PodHost or exposed as an author-controlled cache write.
@@ -1038,6 +1056,9 @@ func (UnimplementedRuntimePreparationServer) WorkspaceReleaseByteTree(context.Co
 }
 func (UnimplementedRuntimePreparationServer) WorkspaceReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error {
 	return status.Error(codes.Unimplemented, "method WorkspaceReadByteTreeObject not implemented")
+}
+func (UnimplementedRuntimePreparationServer) ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error {
+	return status.Error(codes.Unimplemented, "method ImportInputTree not implemented")
 }
 func (UnimplementedRuntimePreparationServer) WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error) {
 	return nil, status.Error(codes.Unimplemented, "method WorkspaceWeightsIntentReady not implemented")
@@ -1298,6 +1319,13 @@ func _RuntimePreparation_WorkspaceReadByteTreeObject_Handler(srv interface{}, st
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RuntimePreparation_WorkspaceReadByteTreeObjectServer = grpc.ServerStreamingServer[NativeByteReadChunk]
+
+func _RuntimePreparation_ImportInputTree_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(RuntimePreparationServer).ImportInputTree(&grpc.GenericServerStream[InputTreeImportFrame, NativeByteRetentionResult]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RuntimePreparation_ImportInputTreeServer = grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]
 
 func _RuntimePreparation_WorkspaceWeightsIntentReady_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(WeightsIntentReadyCall)
@@ -1691,6 +1719,11 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 		{
+			StreamName:    "ImportInputTree",
+			Handler:       _RuntimePreparation_ImportInputTree_Handler,
+			ClientStreams: true,
+		},
+		{
 			StreamName:    "ImportWorkspace",
 			Handler:       _RuntimePreparation_ImportWorkspace_Handler,
 			ClientStreams: true,
@@ -1874,6 +1907,7 @@ const (
 	PodHost_RetainByteTree_FullMethodName                        = "/cozy.worker.v1.PodHost/RetainByteTree"
 	PodHost_ReleaseByteTree_FullMethodName                       = "/cozy.worker.v1.PodHost/ReleaseByteTree"
 	PodHost_ReadByteTreeObject_FullMethodName                    = "/cozy.worker.v1.PodHost/ReadByteTreeObject"
+	PodHost_ImportInputTree_FullMethodName                       = "/cozy.worker.v1.PodHost/ImportInputTree"
 	PodHost_RecordOperationResult_FullMethodName                 = "/cozy.worker.v1.PodHost/RecordOperationResult"
 	PodHost_LookupOperation_FullMethodName                       = "/cozy.worker.v1.PodHost/LookupOperation"
 	PodHost_PruneOperationCache_FullMethodName                   = "/cozy.worker.v1.PodHost/PruneOperationCache"
@@ -1941,6 +1975,8 @@ type PodHostClient interface {
 	RetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	ReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	ReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error)
+	// MINOR55. Proxies the bounded stream to Runtime without owning its byte custody.
+	ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error)
 	RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error)
 	LookupOperation(ctx context.Context, in *LookupOperationCall, opts ...grpc.CallOption) (*LookupOperationResult, error)
 	PruneOperationCache(ctx context.Context, in *PruneOperationCacheCall, opts ...grpc.CallOption) (*PruneOperationCacheResult, error)
@@ -2217,6 +2253,19 @@ func (c *podHostClient) ReadByteTreeObject(ctx context.Context, in *NativeByteRe
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_ReadByteTreeObjectClient = grpc.ServerStreamingClient[NativeByteReadChunk]
 
+func (c *podHostClient) ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_ImportInputTree_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[InputTreeImportFrame, NativeByteRetentionResult]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_ImportInputTreeClient = grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult]
+
 func (c *podHostClient) RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RecordOperationResultResult)
@@ -2279,7 +2328,7 @@ func (c *podHostClient) CheckpointTransfer(ctx context.Context, in *CheckpointTr
 
 func (c *podHostClient) LocalPackageFetch(ctx context.Context, in *LocalPackageFetchCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalPackageFileStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_LocalPackageFetch_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[6], PodHost_LocalPackageFetch_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2298,7 +2347,7 @@ type PodHost_LocalPackageFetchClient = grpc.ServerStreamingClient[LocalPackageFi
 
 func (c *podHostClient) LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[6], PodHost_LocalPackageUpload_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[7], PodHost_LocalPackageUpload_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2321,7 +2370,7 @@ func (c *podHostClient) LocalPackageAbort(ctx context.Context, in *LocalPackageA
 
 func (c *podHostClient) WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[7], PodHost_WeightsTransfer_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[8], PodHost_WeightsTransfer_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2402,6 +2451,8 @@ type PodHostServer interface {
 	RetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	ReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	ReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error
+	// MINOR55. Proxies the bounded stream to Runtime without owning its byte custody.
+	ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error
 	RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error)
 	LookupOperation(context.Context, *LookupOperationCall) (*LookupOperationResult, error)
 	PruneOperationCache(context.Context, *PruneOperationCacheCall) (*PruneOperationCacheResult, error)
@@ -2485,6 +2536,9 @@ func (UnimplementedPodHostServer) ReleaseByteTree(context.Context, *NativeByteRe
 }
 func (UnimplementedPodHostServer) ReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error {
 	return status.Error(codes.Unimplemented, "method ReadByteTreeObject not implemented")
+}
+func (UnimplementedPodHostServer) ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error {
+	return status.Error(codes.Unimplemented, "method ImportInputTree not implemented")
 }
 func (UnimplementedPodHostServer) RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method RecordOperationResult not implemented")
@@ -2883,6 +2937,13 @@ func _PodHost_ReadByteTreeObject_Handler(srv interface{}, stream grpc.ServerStre
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_ReadByteTreeObjectServer = grpc.ServerStreamingServer[NativeByteReadChunk]
 
+func _PodHost_ImportInputTree_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(PodHostServer).ImportInputTree(&grpc.GenericServerStream[InputTreeImportFrame, NativeByteRetentionResult]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type PodHost_ImportInputTreeServer = grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]
+
 func _PodHost_RecordOperationResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RecordOperationResultCall)
 	if err := dec(in); err != nil {
@@ -3185,6 +3246,11 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "ReadByteTreeObject",
 			Handler:       _PodHost_ReadByteTreeObject_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "ImportInputTree",
+			Handler:       _PodHost_ImportInputTree_Handler,
+			ClientStreams: true,
 		},
 		{
 			StreamName:    "LocalPackageFetch",

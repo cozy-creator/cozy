@@ -13,12 +13,21 @@ import (
 
 // MachineJobSubmission reuses the ordinary invocation and job-directive codecs.
 // The first ordinal is an intake proposal; only Runtime records its attempts.
-func MachineJobSubmission(request records.Request, capture localpackage.ExecutionCapture, plan *JobPlan) (*pb.MachineExecutionSubmit, *exit.Error) {
+func MachineJobSubmission(request records.Request, capture localpackage.ExecutionCapture, plan *JobPlan, byteInputs []*pb.InputAccess) (*pb.MachineExecutionSubmit, *exit.Error) {
 	if !request.IsJob() || plan == nil || plan.DescriptorID != request.PlanID || request.LocalPackageDigest == "" {
 		return nil, exit.New(exit.Conflict, "machine job no longer names its captured declaration")
 	}
-	if len(request.Assets) > 0 || len(request.Models) > 0 || request.Trees != "" || request.ModelTransfer != nil {
+	if len(request.Models) > 0 || request.Trees != "" || request.ModelTransfer != nil {
 		return nil, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; execution was not submitted")
+	}
+	if len(byteInputs) != len(request.Assets) {
+		return nil, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "root bytes have no exact native input receipt")
+	}
+	for index, asset := range request.Assets {
+		input := byteInputs[index]
+		if input == nil || input.InputId != asset.FieldPath || input.Url != "" || input.NativeTree == nil || records.ValidateByteRef(input.NativeTree.Source) != nil || input.NativeTree.RetentionId == "" {
+			return nil, exit.New(exit.Conflict, "root byte grant changed its staged field or native receipt")
+		}
 	}
 	weights, problem := decodeWeightsOutputs(request.WeightsOutputs)
 	if problem != nil {
@@ -58,7 +67,7 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 		PayloadCanonicalBytes: request.Payload, MaxAttempts: uint32(MaxRequeues + 1),
 		Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1,
 			InvocationSpecCanonicalBytes: raw, InvocationSpecDigest: digest,
-			Grant: &pb.DeliveryGrant{InvocationSpecDigest: digest, Inputs: []*pb.InputAccess{{InputId: "payload", Url: "data:application/json;base64," + base64.StdEncoding.EncodeToString(request.Payload)}}, Outputs: access}},
+			Grant: &pb.DeliveryGrant{InvocationSpecDigest: digest, Inputs: append([]*pb.InputAccess{{InputId: "payload", Url: "data:application/json;base64," + base64.StdEncoding.EncodeToString(request.Payload)}}, byteInputs...), Outputs: access}},
 		PreparedState: &pb.DesiredWorkerState{Revision: 1, WireMinor: pb.WireMinor, Posture: pb.Posture_POSTURE_ACCEPTING, Mode: &pb.DesiredWorkerState_Job{Job: directive}},
 	}, nil
 }

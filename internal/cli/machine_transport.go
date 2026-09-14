@@ -88,6 +88,9 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	result.releaseBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
 		return host.ReleaseByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
 	}
+	result.importInputTree = func(ctx context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error) {
+		return host.ImportInputTree(ctx)
+	}
 	result.readBytes = func(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
 		return host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
 	}
@@ -332,6 +335,9 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 	}
 	result.releaseBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
 		return preparation.WorkspaceReleaseByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
+	}
+	result.importInputTree = func(ctx context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error) {
+		return preparation.ImportInputTree(ctx)
 	}
 	result.readBytes = func(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
 		return preparation.WorkspaceReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})

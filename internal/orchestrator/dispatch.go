@@ -25,6 +25,7 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
+	RequestID                string // server-reserved identity for request-owned input capture
 	AllowPublish             []string
 	MachineExecutionObserver bool
 	TimeoutMS                int64
@@ -257,9 +258,12 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 				"cannot digest the local package request identity: %s", err)
 		}
 	}
-	id := records.NewID("req")
-	if s.Kind == "job" {
-		id = records.NewID("job")
+	id := s.RequestID
+	if id == "" {
+		id = records.NewID("req")
+		if s.Kind == "job" {
+			id = records.NewID("job")
+		}
 	}
 	req := records.Request{
 		MachineExecutionObserver: s.MachineExecutionObserver,

@@ -120,10 +120,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
-		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
-			"remote jobs cannot grant a local input-tree directory")
-	}
 	if ctx.Inv.Bool("--await") {
 		ctx.Inv.Bools["--follow"] = true
 	}
