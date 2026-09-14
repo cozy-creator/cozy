@@ -235,7 +235,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
-		if !spec.Rental || spec.LocalPackageDigest == "" || s.machineExecutions == nil {
+		if !spec.Rental || (spec.LocalPackageDigest == "" && !publishedMachineJob(spec)) || s.machineExecutions == nil {
 			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-publish requires a Runtime-owned rented transaction with its own certificate identity"))
 			return
 		}
@@ -260,14 +260,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.BodyDigest = digest
-	if s.machineExecutions != nil && spec.LocalPackageDigest != "" {
+	if s.machineExecutions != nil && (spec.LocalPackageDigest != "" || publishedMachineJob(spec)) {
 		if existing == nil {
 			spec.MachineExecutionObserver = true
 		} else if link, problem := s.store.MachineExecution(existing.ID); problem == nil {
 			spec.MachineExecutionObserver = link != nil
 		}
 	}
-	if spec.MachineExecutionObserver && (uncapturedRootBytes(spec.Assets) || len(spec.Models) > 0 || len(spec.Trees) > 0 || spec.ModelTransfer != nil) {
+	if spec.MachineExecutionObserver && (uncapturedRootBytes(spec.Assets) || len(spec.Trees) > 0 || spec.ModelTransfer != nil) {
 		s.refuseTyped(w, r, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; no execution or rental was submitted"))
 		return
 	}
@@ -320,6 +320,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	s.ok(w, r, status, handle)
+}
+
+// Installed local roots and explicitly pinned rentals use Runtime submission
+// once their input shape has a complete machine-side path.
+func publishedMachineJob(spec orchestrator.Submission) bool {
+	return ((spec.Rental && (spec.RequestedRental != "" || spec.Worker != "")) || (!spec.Rental && spec.MachineExecutionObserver)) &&
+		len(spec.Assets) == 0 && len(spec.Trees) == 0 && spec.ModelTransfer == nil
 }
 
 func replayJobSubmission(sub JobSubmission,
@@ -488,6 +495,16 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			jobs, e = s.packages.JobsInstall(sub.InstallID)
 			out.InstallID = sub.InstallID
 		}
+		if e == nil && s.machineExecutions != nil {
+			installed, problem := s.store.Install(sub.InstallID)
+			if problem != nil {
+				return out, problem
+			}
+			if installed != nil && installed.SourceKind == "tensorhub" {
+				out.Release = installed.Version
+				out.MachineExecutionObserver = true
+			}
+		}
 	} else {
 		jobs, e = s.packages.Jobs(sub.Package)
 	}
@@ -518,6 +535,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		return out, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function).
 			WithRemedy("it registers: %s", strings.Join(names, ", "))
+	}
+	if out.MachineExecutionObserver && (len(out.Assets) > 0 || len(sub.Trees) > 0 || out.ModelTransfer != nil) {
+		out.MachineExecutionObserver = false
 	}
 	for _, pair := range sub.Trees {
 		ref, dir, ok := strings.Cut(pair, "=")

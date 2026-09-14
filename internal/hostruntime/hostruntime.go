@@ -22,11 +22,11 @@ import (
 
 // Floor preserves the required static metadata and isolated preparation behavior.
 // WireFloor independently checks the installed execution ownership capability.
-const Floor = "0.16.10"
+const Floor = "0.18.0"
 
-// WireFloor supports Runtime-owned execution without external effects. Optional
-// publication authority is checked against the actual worker's minor 52 at use.
-const WireFloor uint32 = 51
+// WireFloor covers the native Context/TensorFS surface and published captures.
+// Root native inputs require their newer capability at the call site.
+const WireFloor uint32 = 54
 
 var floor = pep440.MustParse(Floor)
 
@@ -123,7 +123,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
-			"cozy-runtime %s is release %s; this Cozy needs %s or newer to validate exact captured dependency closures",
+			"cozy-runtime %s is release %s; this Cozy needs %s or newer to read the native Context/TensorFS package surface",
 			path, answer.Distribution, Floor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}

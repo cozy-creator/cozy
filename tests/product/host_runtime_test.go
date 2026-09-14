@@ -109,6 +109,33 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	}
 }
 
+// A wire-compatible pre-native SDK must not inspect current Context metadata.
+func TestHostRuntimeNativeAPIFloor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stand-in runtimes are POSIX shell scripts")
+	}
+	for _, arm := range []struct {
+		name, release, refusal string
+		minor                  uint32
+	}{
+		{"old-api", "0.17.2", "host_runtime_below_floor", 54},
+		{"old-wire", "0.18.0", "host_runtime_wire_mismatch", 53},
+		{"native", "0.18.0", "", 54},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			root, path := hostRuntimeRoot(t, "native-floor-"+arm.name, stubRuntime(t, arm.release, arm.minor))
+			code, out := runCozyPath(t, root, path, "up", "--json")
+			if arm.refusal != "" {
+				if code == 0 || refusalOf(t, out).Code != arm.refusal {
+					t.Fatalf("stale host SDK was not refused before use: %d %s", code, out)
+				}
+			} else if code != 0 {
+				t.Fatalf("native API cohort refused: %d %s", code, out)
+			}
+		})
+	}
+}
+
 // stubRuntime answers `cozy-runtime --json version` the way the real tool does.
 func stubRuntime(t *testing.T, release string, minor uint32) string {
 	t.Helper()

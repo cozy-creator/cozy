@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -78,7 +79,7 @@ only-include = ["code.py"]
 				requirements, problem := packagepublish.EvaluateRequirements(context.Background(), sealed.Requirements, python)
 				fatal(t, problem)
 				why := launch.InventoryMismatch(&pb.ImageInventory{Python: python,
-					Distributions: []*pb.ImageDistribution{{Distribution: "cozy-runtime", Version: "0.16.10"}, //cozy:allow distribution metadata only; no Runtime process invocation
+					Distributions: []*pb.ImageDistribution{{Distribution: "cozy-runtime", Version: hostruntime.Floor}, //cozy:allow distribution metadata only; no Runtime process invocation
 						{Distribution: "msgspec", Version: "0.20.0"}}}, requirements, "")
 				wantRefusal := extra != "" && python == "3.12.12"
 				if wantRefusal != strings.Contains(why, "msgspec 0.20.0") {

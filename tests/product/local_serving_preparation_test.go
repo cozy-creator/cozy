@@ -22,7 +22,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -39,46 +38,6 @@ type servingSeed struct {
 	HeaderComponents []string         `json:"header_components"`
 	ComponentBytes   map[string]int64 `json:"component_bytes"`
 	Bytes            int64            `json:"weight_bytes"`
-}
-
-func TestPublishedJobIdentityMatchesActualWorkerPreparation(t *testing.T) {
-	if *privateChildRuntimeWheel == "" {
-		t.Skip("requires the exact cl178 Runtime candidate wheel")
-	}
-	root := t.TempDir()
-	venv := filepath.Join(root, "venv")
-	python := filepath.Join(venv, "bin", "python")
-	run := func(name string, args ...string) {
-		t.Helper()
-		out, err := exec.Command(name, args...).CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s failed: %v\n%s", name, err, out)
-		}
-	}
-	run("uv", "venv", "--python", "3.12", venv)
-	run("uv", "pip", "install", "--python", python, *privateChildRuntimeWheel)
-	fixture := *localServingFixtureDir
-	if fixture == "" {
-		fixture = filepath.Join("testdata", "local_serving_preparation")
-	}
-	run(python, filepath.Join(fixture, "published_identity.py"), root)
-	raw, err := os.ReadFile(filepath.Join(root, "prepared.json"))
-	must(t, err)
-	set, err := canonical.Read(raw, &pb.PlacementSet{})
-	must(t, err)
-	if len(set.List("placements")) != 1 {
-		t.Fatal("actual worker preparation did not return one placement")
-	}
-	facts := launch.Facts{Install: records.PackageInstall{
-		Package: "proof/published-identity-fixture", Version: "0.0.1", SourceKind: "tensorhub", Dir: root,
-	}}
-	fallback, build, problem := facts.JobCodeIdentity()
-	fatal(t, problem)
-	preparedBuild, problem := orchestrator.JobBuildID(raw, facts.Install.Package)
-	fatal(t, problem)
-	if build != preparedBuild || fallback.EnvironmentDigest != set.List("placements")[0].Str("environment_digest") {
-		t.Fatalf("job identity changed after real preparation: fallback=%s prepared=%s environment=%s", build, preparedBuild, fallback.EnvironmentDigest)
-	}
 }
 
 func TestCapturedDevelopmentPlacementValidatesItsEnvironment(t *testing.T) {

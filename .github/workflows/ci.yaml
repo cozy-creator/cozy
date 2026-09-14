@@ -3,8 +3,13 @@ on: [push, pull_request]
 jobs:
   checks:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tests: ['^Test[A-H]', '^Test[I-O]', '^Test[P-Q]', '^Test[R-Z]']
     env:
-      COZY_RUNTIME_SOURCE: 53b46c6c1321eb833a5dddb01d4980577ec13c17
+      UV_TORCH_BACKEND: cpu
+      COZY_RUNTIME_SOURCE: f204aed975a4e46e4fda3bd8cc1c7dd3087d0bfa
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -33,7 +38,7 @@ jobs:
       - name: Retain Runtime test provenance
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-test-provenance
+          name: runtime-test-provenance-${{ strategy.job-index }}
           path: ${{ runner.temp }}/runtime-peer/manifest.json
       # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
       # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
@@ -64,7 +69,8 @@ jobs:
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 \
             --setenv="COZY_TEST_RUNTIME_WHEEL=$COZY_TEST_RUNTIME_WHEEL" \
-            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 30m -args -script-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"'
+            --setenv=UV_TORCH_BACKEND=cpu \
+            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -run "${{ matrix.tests }}" -timeout 30m -args -script-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"'
       - run: python3 scripts/fence.py
 
   # THE WORKER-IMAGE ROSTER CHECK. `internal/packagepublish/base-distributions.json` is

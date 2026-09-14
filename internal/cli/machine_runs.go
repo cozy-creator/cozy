@@ -38,6 +38,7 @@ type machineConnection struct {
 	client            machineExecutionClient
 	claim             *pb.Claim
 	prepare           func(context.Context, string, localpackage.Revision) *exit.Error
+	preparePublished  func(context.Context, records.Request) (*pb.DesiredPlacementSet, *exit.Error)
 	wireMinor         uint32
 	certificateDigest []byte
 	retainModel       func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
@@ -210,6 +211,16 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		return problem
 	}
 	defer connection.connection.Close()
+	if len(request.Models) > 0 {
+		if connection.wireMinor < pb.NativeRootInputsWireMinor {
+			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "durable root Model inputs require Runtime protocol 55")
+		}
+		if !request.Rental {
+			if problem := m.resolver.EnsureLocalModels(request.Models); problem != nil {
+				return problem
+			}
+		}
+	}
 	submission := &pb.MachineExecutionSubmit{}
 	if len(link.Submission) > 0 {
 		if err := proto.Unmarshal(link.Submission, submission); err != nil {
@@ -223,29 +234,38 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if problem != nil {
 			return problem
 		}
-		capture, problem := m.resolver.CaptureMachineExecution(request)
-		if problem != nil {
-			return problem
-		}
-		for _, revision := range capture.Revisions {
-			if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
+		var built *pb.MachineExecutionSubmit
+		if request.LocalPackageDigest == "" {
+			built, problem = m.publishedSubmission(m.ctx, request, connection)
+			if problem != nil {
 				return problem
 			}
-		}
-		prepared, problem := m.resolver.ResolveJobInstall(request.InstallID, request.Entrypoint)
-		if problem != nil {
-			return problem
-		}
-		if len(prepared.Placement.Jobs) != 1 {
-			return exit.New(exit.Conflict, "machine root requires its exact prepared job declaration")
-		}
-		byteInputs, problem := m.stageMachineInputs(m.ctx, request, connection)
-		if problem != nil {
-			return problem
-		}
-		built, problem := orchestrator.MachineJobSubmission(request, capture, prepared.Placement.Jobs[0], byteInputs)
-		if problem != nil {
-			return problem
+		} else {
+			capture, problem := m.resolver.CaptureMachineExecution(request)
+			if problem != nil {
+				return problem
+			}
+			for _, revision := range capture.Revisions {
+				if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
+					return problem
+				}
+			}
+			prepared, problem := m.resolver.ResolveJobInstall(request.InstallID, request.Entrypoint)
+			if problem != nil {
+				return problem
+			}
+			if len(prepared.Placement.Jobs) != 1 {
+				return exit.New(exit.Conflict, "machine root requires its exact prepared job declaration")
+			}
+			byteInputs, problem := m.stageMachineInputs(m.ctx, request, connection)
+			if problem != nil {
+				return problem
+			}
+			built, problem = orchestrator.MachineJobSubmission(request, capture, prepared.Placement.Jobs[0], byteInputs)
+			if problem != nil {
+				return problem
+			}
+
 		}
 		built.PublicationAuthorizationId = authorization
 		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.wireMinor)
@@ -253,6 +273,9 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return problem
 		}
 		submission = built
+	}
+	if request.LocalPackageDigest == "" && connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
+		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires Runtime protocol 54")
 	}
 	submission.Claim = connection.claim
 	submission.Offer.WorkerBootId = connection.claim.WorkerBootId
@@ -475,19 +498,24 @@ func validateMachinePrepared(result *pb.DesiredPlacementSet) *exit.Error {
 }
 
 func readMachinePreparation(stream grpc.ServerStreamingClient[pb.PrepareEvent]) *exit.Error {
+	_, problem := readMachinePreparedSet(stream)
+	return problem
+}
+
+func readMachinePreparedSet(stream grpc.ServerStreamingClient[pb.PrepareEvent]) (*pb.DesiredPlacementSet, *exit.Error) {
 	for {
 		event, err := stream.Recv()
 		if err != nil {
 			if err == io.EOF {
-				return exit.Unavailablef("machine preparation ended before verified completion")
+				return nil, exit.Unavailablef("machine preparation ended before verified completion")
 			}
-			return machineTransport(err)
+			return nil, machineTransport(err)
 		}
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:
-			return exit.Named(exit.Conflict, "machine_execution.prepare_refused", "%s: %s", event.SafeCode, event.SafeDetail)
+			return nil, exit.Named(exit.Conflict, "machine_execution.prepare_refused", "%s: %s", event.SafeCode, event.SafeDetail)
 		case pb.PrepareStage_PREPARE_STAGE_PREPARED:
-			return validateMachinePrepared(event.PlacementSet)
+			return event.PlacementSet, validateMachinePrepared(event.PlacementSet)
 		}
 	}
 }

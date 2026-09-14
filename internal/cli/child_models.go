@@ -116,7 +116,7 @@ func (r *Resolver) childModelLadder(pkg, entrypoint string, slot launch.Slot) (o
 			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
 	return orchestrator.ModelRef{Package: pkg, Slot: slot.Param, BindingPath: slot.Path,
-		Model: ref.String(), Release: selected.Release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
+		Model: ref.String(), CatalogRepository: ref.String(), Release: selected.Release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
 }
 
 // childSlotBinding is the selection order minus the run key: a run key belongs to the

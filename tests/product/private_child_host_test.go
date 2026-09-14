@@ -40,6 +40,10 @@ type actualChildHost struct {
 }
 
 func startActualChildHost(t *testing.T) (home.Layout, *records.Store, actualChildHost, string, func()) {
+	return startActualChildHostConfigured(t, nil)
+}
+
+func startActualChildHostConfigured(t *testing.T, configure func(*fakeRentalHub)) (home.Layout, *records.Store, actualChildHost, string, func()) {
 	t.Helper()
 	if *childHostLauncher == "" || *childHostHome == "" || *childHostRuntimeBin == "" {
 		t.Skip("requires an explicit task-owned actual Host image and artifact fixture")
@@ -169,6 +173,9 @@ print(json.dumps({"format":"tensorhub.image_inventory/1","profile":"python3.12-c
 	must(t, os.WriteFile(filepath.Join(layout.Root, "host-image-inventory.json"), inventory, 0600))
 	hub.inventories = map[string]json.RawMessage{rentalID: inventory}
 	hubToken := bindMachinePublicationFixture(t, layout, host, hub, identity.PublicKey(), secret.HashHex(token))
+	if configure != nil {
+		configure(hub)
+	}
 
 	hub.rentals[rentalID] = map[string]any{"development": *childHostUpdatable, "rental_id": rentalID, "name": "child-host", "state": "ready", "worker_address": host.Control, "media_address": host.Media, "cert_pem": string(certificate), "worker_id": "private-child-host", "worker_boot_id": ready.WorkerBootID, "creator_public_key": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}, "accelerator_count": 1, "hourly_rate_usd_micros": 1}
 	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: rentalID, MachineName: "child-host", SKU: sku, AcceleratorModel: accelerator, HourlyRateUSDMicros: 1, State: "ready", Hub: hub.server.URL, Address: host.Control, MediaAddress: host.Media, ExpectedWorkerID: "private-child-host", ExpectedWorkerBootID: ready.WorkerBootID}, string(certificate), token, identity))
