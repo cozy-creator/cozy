@@ -39,7 +39,7 @@ func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCap
 		if err != nil {
 			return capture, exit.New(exit.Conflict, "captured default revision changed")
 		}
-		r.captureDefaultRows(document, revision.Package, digest, iface, rental)
+		r.captureDefaultRows(document, revision.Package, digest, iface, rental, "")
 	}
 	var err error
 	capture.Canonical, capture.Digest, err = canonical.Identity(document)
@@ -49,7 +49,7 @@ func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCap
 	return capture, nil
 }
 
-func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg string, revision []byte, iface *launch.PackageInterface, rental bool) {
+func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg string, revision []byte, iface *launch.PackageInterface, rental bool, publicOrigin string) {
 	entries := map[string]bool{}
 	for _, binding := range document.Bindings {
 		if bytes.Equal(binding.CalleeRevisionDigest, revision) {
@@ -62,7 +62,7 @@ func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg 
 		}
 		for _, slot := range entry.Models {
 			row := &pb.MachineModelDefault{CalleeRevisionDigest: revision, Entrypoint: entry.Name, Parameter: slot.Param}
-			row.PublicOrigin, row.Rungs, row.UnavailableCode = r.captureDefaultLadder(pkg, entry.Name, slot, rental)
+			row.PublicOrigin, row.Rungs, row.UnavailableCode = r.captureDefaultLadder(pkg, entry.Name, slot, rental, publicOrigin)
 			document.ModelDefaults = append(document.ModelDefaults, row)
 		}
 	}
@@ -78,7 +78,7 @@ func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg 
 	})
 }
 
-func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot, rental bool) (string, []*pb.MachineModelDefaultRung, string) {
+func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot, rental bool, publicOrigin string) (string, []*pb.MachineModelDefaultRung, string) {
 	selected, problem := r.childModelLadder(pkg, entrypoint, slot)
 	if problem != nil {
 		code := "model_default_unavailable"
@@ -88,6 +88,9 @@ func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot
 		return "", nil, code
 	}
 	origin := strings.TrimRight(r.cfg.HubURL, "/")
+	if publicOrigin != "" {
+		origin = publicOrigin
+	}
 	parsed, err := url.Parse(origin)
 	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
 		(parsed.Scheme != "https" && (rental || parsed.Scheme != "http" || !(parsed.Hostname() == "localhost" || net.ParseIP(parsed.Hostname()).IsLoopback()))) {
@@ -96,6 +99,7 @@ func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot
 	// The read probe deliberately has no configured token or machine-key provider.
 	// Public card metadata alone does not establish anonymous byte-read authority.
 	config := r.cfg
+	config.HubURL = origin
 	config.HubToken, config.HubTokenSource = secret.New(""), "unset"
 	public := hub.New(config, "cozy-captured-model-defaults")
 	ref, problem := hub.ParseRef(selected.Model)
