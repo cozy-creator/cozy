@@ -265,10 +265,12 @@ func (s *Store) Children(parent string) ([]Request, *exit.Error) {
 	return out, nil
 }
 
-const retainedDescendantsSQL = `WITH RECURSIVE descendants(id) AS (
-		SELECT id FROM requests WHERE parent_request_id=?
+const requestDescendantsCTE = `WITH RECURSIVE descendants(id) AS (
+		SELECT id FROM requests WHERE parent_request_id=? AND parent_request_id!=''
 		UNION ALL SELECT r.id FROM requests r JOIN descendants d ON r.parent_request_id=d.id
-	) SELECT EXISTS(SELECT 1 FROM descendants d JOIN requests r ON r.id=d.id
+	) `
+
+const retainedDescendantsSQL = requestDescendantsCTE + `SELECT EXISTS(SELECT 1 FROM descendants d JOIN requests r ON r.id=d.id
 		LEFT JOIN request_model_transfers t ON t.request_id=r.id WHERE r.retain_work=1 AND
 		(r.state IN (` + activeRequestStates + `) OR (r.state='succeeded' AND
 		(r.child_artifacts=1 OR r.weights_outputs NOT IN ('','[]')) AND COALESCE(json_extract(t.intent,'$.destination'),'')='')))`

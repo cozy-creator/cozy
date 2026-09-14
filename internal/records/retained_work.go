@@ -251,30 +251,48 @@ func (s *Store) RentalRetainsWork(id string) (bool, *exit.Error) {
 }
 
 func (s *Store) RequestRetainedCancellation(id, actor string) *exit.Error {
+	_, problem := s.requestRetainedCancellation(id, actor, "")
+	return problem
+}
+
+// The child may complete after the scheduler reads it. The parent's cancellation
+// never changes a success that won that race, including an ordinal-zero cache hit.
+func (s *Store) RequestDescendantCancellation(parent, child, actor string) (bool, *exit.Error) {
+	return s.requestRetainedCancellation(child, actor, parent)
+}
+
+func (s *Store) requestRetainedCancellation(id, actor, parent string) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return exit.Internalf("cannot begin retained cancellation: %s", err)
+		return false, exit.Internalf("cannot begin retained cancellation: %s", err)
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec(`UPDATE requests SET state='canceling',control_revision=control_revision+1 WHERE id=? AND retain_work=1
-		AND state NOT IN ('failed','canceled','refused','abandoned','canceling','releasing')`, id)
+	statement := `UPDATE requests SET state='canceling',control_revision=control_revision+1 WHERE id=? AND retain_work=1
+		AND state NOT IN ('failed','canceled','refused','abandoned','canceling','releasing')`
+	args := []any{id}
+	if parent != "" {
+		statement = requestDescendantsCTE + statement + ` AND state!='succeeded' AND id IN (SELECT id FROM descendants)
+			AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state='canceling')`
+		args = []any{parent, id, parent}
+	}
+	result, err := tx.Exec(statement, args...)
 	if err != nil {
-		return exit.Internalf("cannot record retained cancellation: %s", err)
+		return false, exit.Internalf("cannot record retained cancellation: %s", err)
 	}
 	changed, _ := result.RowsAffected()
 	if changed == 0 {
-		return nil
+		return false, nil
 	}
 	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='canceling',updated_at=? WHERE request_id=? AND state NOT IN ('completed','canceled')`, now(), id); err != nil {
-		return exit.Internalf("cannot fence retained source and publication work: %s", err)
+		return false, exit.Internalf("cannot fence retained source and publication work: %s", err)
 	}
 	if err := appendEventTx(tx, id, "request.cancel_requested", 0, map[string]any{"actor": actor, "status": "canceling"}); err != nil {
-		return exit.Internalf("cannot journal retained cancellation: %s", err)
+		return false, exit.Internalf("cannot journal retained cancellation: %s", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit retained cancellation: %s", err)
+		return false, exit.Internalf("cannot commit retained cancellation: %s", err)
 	}
-	return nil
+	return true, nil
 }
 
 // RecordRetainedFinalization supplies a disposition after the stopped attempt was
@@ -290,22 +308,61 @@ func (s *Store) RecordSuccessfulFinalization(root string, f WeightsFinalization)
 	return s.recordWorkFinalization(f, root)
 }
 
-func (s *Store) recordWorkFinalization(f WeightsFinalization, successRoot string) *exit.Error {
-	_, err := s.db.Exec(`INSERT INTO weights_finalizations(request_id,attempt,instance_id,
+func (s *Store) recordWorkFinalization(f WeightsFinalization, releaseRoot string) *exit.Error {
+	_, err := s.db.Exec(requestDescendantsCTE+`INSERT INTO weights_finalizations(request_id,attempt,instance_id,
 		owner_scope,invocation_digest,output_slot,disposition,receipt_digest,scratch_root_id,recorded_at)
 		SELECT ?,?,?,?,?,?,'ABANDON_UNCOMMITTED','','',?
 		WHERE EXISTS(SELECT 1 FROM requests r WHERE r.id=? AND r.retain_work=1 AND
-		 (r.state='canceling' OR (r.state='succeeded' AND EXISTS(SELECT 1 FROM successful_work_releases w,json_each(w.members) m
+		 (r.state='canceling' OR (r.state='succeeded' AND (EXISTS(SELECT 1 FROM successful_work_releases w,json_each(w.members) m
 		 WHERE w.request_id=? AND w.state='draining' AND m.value=r.id
-		 AND EXISTS(SELECT 1 FROM requests root WHERE root.id=w.request_id AND root.state='succeeded')))))
+		 AND EXISTS(SELECT 1 FROM requests root WHERE root.id=w.request_id AND root.state='succeeded'))
+		 OR (r.id IN (SELECT id FROM descendants) AND EXISTS(SELECT 1 FROM requests root WHERE root.id=? AND root.state='canceling'))))))
 		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
 		ON CONFLICT(request_id,invocation_digest,output_slot) DO NOTHING`,
-		f.RequestID, f.Attempt, f.InstanceID, f.OwnerScope, f.InvocationDigest, f.OutputSlot,
-		now(), f.RequestID, successRoot, f.RequestID)
+		releaseRoot, f.RequestID, f.Attempt, f.InstanceID, f.OwnerScope, f.InvocationDigest, f.OutputSlot,
+		now(), f.RequestID, releaseRoot, releaseRoot, f.RequestID)
 	if err != nil {
 		return exit.Internalf("cannot record retained artifact abandonment: %s", err)
 	}
 	return nil
+}
+
+// The cancelled ancestor owns this cleanup. Success remains the child's result,
+// including a validated memo hit with no execution attempt. The existing parent
+// cancellation and retain_work bit make the cut replayable without another ledger.
+func (s *Store) ReleaseCompletedChildWork(parent, child string) (bool, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot begin completed child release: %s", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(requestDescendantsCTE+`UPDATE requests SET retain_work=0
+		WHERE id=? AND state='succeeded' AND retain_work=1 AND id IN (SELECT id FROM descendants)
+		AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state='canceling')
+		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=requests.id AND state IN (`+openAttemptStates+`))
+		AND NOT EXISTS(SELECT 1 FROM request_operation_lookups WHERE request_id=requests.id AND state='pending')
+		AND NOT EXISTS(SELECT 1 FROM request_weights_retentions WHERE request_id=requests.id AND state!='released')
+		AND NOT EXISTS(SELECT 1 FROM native_artifact_retentions WHERE consumer_id=requests.id AND state!='released')
+		AND NOT EXISTS(SELECT 1 FROM weights_finalizations WHERE request_id=requests.id AND completed_at='')`, parent, child, parent)
+	if err != nil {
+		return false, exit.Internalf("cannot release completed child ownership: %s", err)
+	}
+	changed, _ := result.RowsAffected()
+	if changed > 0 {
+		if err := appendEventTx(tx, child, "request.work_released", 0, map[string]any{"status": "SUCCEEDED", "parent_request_id": parent}); err != nil {
+			return false, exit.Internalf("cannot journal completed child release: %s", err)
+		}
+	}
+	var ready bool
+	if err := tx.QueryRow(requestDescendantsCTE+`SELECT EXISTS(SELECT 1 FROM requests
+		WHERE id=? AND state='succeeded' AND retain_work=0 AND id IN (SELECT id FROM descendants))
+		AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state='canceling')`, parent, child, parent).Scan(&ready); err != nil {
+		return false, exit.Internalf("cannot read completed child release: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot commit completed child release: %s", err)
+	}
+	return ready, nil
 }
 
 func (s *Store) ReleaseRetainedWork(id string) (bool, *exit.Error) {
@@ -314,12 +371,13 @@ func (s *Store) ReleaseRetainedWork(id string) (bool, *exit.Error) {
 		return false, exit.Internalf("cannot begin retained cancellation completion: %s", err)
 	}
 	defer tx.Rollback()
-	result, err := tx.Exec(`UPDATE requests SET state='releasing' WHERE id=? AND state='canceling'
+	result, err := tx.Exec(requestDescendantsCTE+`UPDATE requests SET state='releasing' WHERE id=? AND state='canceling'
 		AND NOT EXISTS(SELECT 1 FROM request_operation_lookups WHERE request_id=requests.id AND state='pending')
 		AND NOT EXISTS(SELECT 1 FROM request_weights_retentions WHERE request_id=requests.id AND state!='released')
 		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=? AND state IN (`+openAttemptStates+`))
 		AND NOT EXISTS(SELECT 1 FROM weights_finalizations WHERE request_id=? AND completed_at='')
-		AND NOT EXISTS(SELECT 1 FROM requests WHERE parent_request_id=? AND state IN (`+activeRequestStates+`))`, id, id, id, id)
+		AND NOT EXISTS(SELECT 1 FROM requests r JOIN descendants d ON d.id=r.id
+		  WHERE r.state IN (`+activeRequestStates+`) OR (r.state='succeeded' AND r.retain_work=1))`, id, id, id, id)
 	if err != nil {
 		return false, exit.Internalf("cannot complete retained cancellation: %s", err)
 	}

@@ -69,6 +69,8 @@ type fakePod struct {
 	protocolInfo    func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	watchProgress   func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
 	recordOperation func(*pb.RecordOperationResultCall) (*pb.RecordOperationResultResult, error)
+	derivedRelease  func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
+	resultRelease   func(context.Context, *pb.DerivedResultReleaseCall) (*pb.DerivedResultReleaseResult, error)
 	pb.UnimplementedWorkerControlServer
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
