@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 use tensorfs_core::{
+    catalog::WriterGuard,
     gc,
     ids::{Doc, ObjectRef},
     providers::{self, Provenance, Resolution, ResolvedMember},
@@ -20,6 +21,10 @@ use tensorfs_core::{
     transport::{Anonymous, Deadline, SourceDownload, SourcePolicy},
 };
 const BLOCK: u64 = 1 << 20;
+// These controls deliberately fork/kill owners. A sibling fork can temporarily
+// inherit another test's shared recovery lock until exec, even with CLOEXEC.
+// Serializing fixture lifetimes keeps each GC assertion's no-other-owner premise true.
+static PROCESS_FIXTURE: Mutex<()> = Mutex::new(());
 fn bytes() -> Vec<u8> {
     (0..3 * BLOCK + 19)
         .map(|i| (i.wrapping_mul(17) % 251) as u8)
@@ -169,6 +174,7 @@ fn run(
 }
 #[test]
 fn transfer_child() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     let Some(dir) = std::env::var_os("TFS_PREFIX_CHILD") else {
         return;
     };
@@ -213,6 +219,7 @@ fn kill_at(dir: &std::path::Path, origin: &Origin, stage: &str) {
 }
 #[test]
 fn sigkill_resumes_only_verified_prefix_and_never_downloads_completed_objects() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     for (stage, expected) in [
         ("prefix-written", 0),
         ("prefix-fsync", 0),
@@ -262,6 +269,7 @@ fn sigkill_resumes_only_verified_prefix_and_never_downloads_completed_objects() 
 }
 #[test]
 fn tampered_prefix_restarts_and_ignored_range_restarts_honestly() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     for (tamper, ignore_range) in [(true, false), (false, true)] {
         let dir = root();
         let store = Store::init(&dir).unwrap();
@@ -311,6 +319,7 @@ fn tampered_prefix_restarts_and_ignored_range_restarts_honestly() {
 }
 #[test]
 fn partial_adoption_survives_source_release_and_gc_and_disk_budget_counts_prefixes() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     let dir = root();
     let store = Store::init(&dir).unwrap();
     let origin = Origin::new(false);
@@ -355,6 +364,7 @@ fn partial_adoption_survives_source_release_and_gc_and_disk_budget_counts_prefix
 
 #[test]
 fn expired_authority_and_transformed_responses_preserve_verified_identity_prefix() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     for encoded in [false, true] {
         let dir = root();
         let store = Store::init(&dir).unwrap();
@@ -452,19 +462,65 @@ fn fresh_owner_after_admission(stage: &str, remove_cas: bool) {
 
 #[test]
 fn fresh_owner_after_link_before_record() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     fresh_owner_after_admission("linked", false);
 }
 #[test]
 fn fresh_owner_after_record_before_landed() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     fresh_owner_after_admission("record", false);
 }
 #[test]
 fn fresh_owner_after_admission_before_landed() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     fresh_owner_after_admission("prefix-admitted", false);
 }
 
 #[test]
 fn fresh_owner_admits_readonly_prefix_without_cas_link() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
     fresh_owner_after_admission("chmod", false);
     fresh_owner_after_admission("linked", true);
+}
+
+#[test]
+fn forked_descriptor_keeps_recovery_excluded_after_parent_guard_drop() {
+    let _process_fixture = PROCESS_FIXTURE.lock().unwrap();
+    let dir = root();
+    let _store = Store::init(&dir).unwrap();
+    let writer = WriterGuard::acquire(&dir).unwrap();
+    let mut signal = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(signal.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        // Only async-signal-safe syscalls between fork and exit.
+        unsafe {
+            libc::close(signal[1]);
+            let mut byte = 0u8;
+            libc::read(signal[0], (&mut byte as *mut u8).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    unsafe {
+        libc::close(signal[0]);
+    }
+    drop(writer);
+    let held = gc::collect(&dir, false);
+    // Always release/reap the child before asserting the result.
+    unsafe {
+        libc::write(signal[1], b"x".as_ptr().cast(), 1);
+        libc::close(signal[1]);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+        assert_eq!(status, 0);
+    }
+    let refused = held.unwrap_err();
+    assert_eq!(refused.code, tensorfs_core::err::Code::STORE_BUSY);
+    assert!(refused.detail.contains("recovery lock shared"));
+    gc::collect(&dir, false).unwrap();
+    fs::remove_dir_all(dir).unwrap();
 }

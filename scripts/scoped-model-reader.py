@@ -64,6 +64,7 @@ def exercise():
             assert tuple(observed.components) == ("zeta", "alpha")
             identity = observed.identities["zeta", "weight"]
             assert identity == observed.identities["alpha", "renamed"]
+            tensorfs.gc(store.root)  # metadata-only planning must not pin a read lease
             output = bytearray(len(data))
             handle.read_part_into("zeta", "weight", "value", 0, output)
             assert output == data
@@ -108,7 +109,12 @@ def exercise():
         with source_handle(store, source) as (handle, errors):
             handle.check()
             store.derived_dispose(transaction)
-            tensorfs.gc(store.root)
+            try:
+                tensorfs.gc(store.root)
+            except tensorfs.errors.StoreBusy:
+                pass
+            else:
+                raise AssertionError("native GC ignored an active read lease")
             output = bytearray(len(data))
             handle.read_part_into("zeta", "weight", "value", 0, output)
             assert output == data and not errors

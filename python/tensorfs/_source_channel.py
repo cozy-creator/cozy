@@ -97,6 +97,8 @@ def serve_source(
 ) -> None:
     """Own a native read lease for one fixed source until descriptor close/fence.
 
+    Metadata-only inspection leaves no live read lease that could block writer admission.
+    Checks/part reads pin the source until descriptor close/fence.
     Only semantic source parts can be read. Native ReadLease validates header custody,
     geometry, ranges, part contents and revocation; no arbitrary object reader is exposed.
     """
@@ -125,18 +127,22 @@ def serve_source(
             if op in {"read", "check"} and (request["manifest"] != source.manifest or type(request["manifest_length"]) is not int or request["manifest_length"] != source.length):
                 raise ChannelRefusal("TRANSACTION_CONFLICT", "source operation changed its bound identity")
             check_current()
-            with admit_io():
+            # Acquiring/inspecting native metadata may write custody bookkeeping.
+            # Reads/checks on an existing lease write no files and need no disk grant.
+            with admit_io() if op == "inspect" or lease is None else contextlib.nullcontext():
                 check_current()
-                if lease is None:
+                if raw_header is None:
                     raw_header = store.manifest(source.manifest)["header"]
                     if raw_header is None:
                         raise ChannelRefusal("MISSING_FIELD", "source has no tensor header")
                     header = _ext.parse_header(raw_header)
                     # Native exact-source validation runs even when the first operation is a read.
                     store.inspect_derived_source(source.manifest, source.length, list(header["components"]), [])
-                    lease = store.acquire_cozytensors(source.manifest)
                 assert header is not None and raw_header is not None
-                lease.recheck()
+                if op in {"read", "check"} and lease is None:
+                    lease = store.acquire_cozytensors(source.manifest)
+                if lease is not None:
+                    lease.recheck()
                 if op == "inspect":
                     components, configs = request["components"], request["configs"]
                     if not isinstance(components, list) or not isinstance(configs, list):
@@ -147,8 +153,10 @@ def serve_source(
                     )
                 elif op == "read":
                     data = bytearray(request["length"])
+                    assert lease is not None
                     lease.read_part_into(raw_header, request["component"], request["key"], request["role"], request["offset"], data)
-                lease.recheck()
+                if lease is not None:
+                    lease.recheck()
             check_current()
             if op == "inspect":
                 configuration = value["configs"]
