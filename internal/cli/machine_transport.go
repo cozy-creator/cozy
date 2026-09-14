@@ -118,16 +118,15 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		return host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
 	}
 	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
-		uploadedBy, problem := m.store.MachinePackageUpload(claim.WorkerBootId, revision.Digest)
+		uploaded, problem := m.store.MachinePackageUploaded(request, claim.WorkerBootId, revision.Digest)
 		if problem != nil {
 			return problem
 		}
 		operation := machinePackageOperation(request, revision)
-		if uploadedBy != "" {
-			// The worker still verifies the exact preparation. This local progress
-			// record only avoids resending that revision's completed carrier upload.
-			operation = machinePackageOperation(uploadedBy, revision)
-		} else {
+		if !uploaded {
+			// A prior request's Host receipt does not establish this Runtime's
+			// process-local prepared registry after a worker restart. New roots use
+			// their own normal upload/prepare; only this root's transfer may replay.
 			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
 				return problem
 			}
