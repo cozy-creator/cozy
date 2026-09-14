@@ -264,11 +264,7 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 // CapturedByteOutputBound uses the captured result schema, with the same finite
 // asset bounds as ordinary inputs. A manifest entry cannot invent a result field.
 func (r *Resolver) CapturedByteOutputBound(request records.Request, path, mediaType string) (int64, *exit.Error) {
-	install, problem := r.store.Install(request.InstallID)
-	if problem != nil || install == nil {
-		return 0, exit.Unavailablef("byte result schema install is absent")
-	}
-	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
+	surface, problem := r.capturedResultInterface(request)
 	if problem != nil {
 		return 0, problem
 	}
@@ -288,11 +284,7 @@ func (r *Resolver) CapturedByteOutputBound(request records.Request, path, mediaT
 }
 
 func (r *Resolver) CapturedRetainedResultFields(request records.Request) (map[string]bool, *exit.Error) {
-	install, problem := r.store.Install(request.InstallID)
-	if problem != nil || install == nil {
-		return nil, exit.Unavailablef("native result schema install is absent")
-	}
-	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
+	surface, problem := r.capturedResultInterface(request)
 	if problem != nil {
 		return nil, problem
 	}

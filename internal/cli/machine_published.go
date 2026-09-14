@@ -77,6 +77,9 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 	if err != nil || !bytes.Equal(codeDigest, placement.EnvironmentDigest) || !bytes.Equal(placement.PackageInterface.Digest, canonical.Digest(iface.Raw)) || placement.PackageInterface.Length != uint64(len(iface.Raw)) {
 		return nil, exit.New(exit.Conflict, "published preparation differs from its immutable catalog release")
 	}
+	if problem := m.resolver.captureMachineInterface(request, iface); problem != nil {
+		return nil, problem
+	}
 	capture := &pb.MachineExecutionCapture{
 		RootRevisionDigest: codeDigest,
 		PublishedRevisions: []*pb.PublishedPackageRevision{{Package: placement.GetPackage(), Environment: placement.Environment, PackageInterface: placement.PackageInterface}},

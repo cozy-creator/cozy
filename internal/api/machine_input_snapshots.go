@@ -18,19 +18,23 @@ import (
 	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
-func (s *Server) freezeMachineInputs(spec *orchestrator.Submission) (*scratch.Dir, *exit.Error) {
-	if s.machineExecutions == nil || spec.InstallID == "" {
+func (s *Server) freezeMachineInputs(spec *orchestrator.Submission, entry *launch.Entrypoint) (*scratch.Dir, *exit.Error) {
+	if s.machineExecutions == nil || (spec.InstallID == "" && entry == nil) {
 		return nil, nil
 	}
-	jobs, problem := s.packages.JobsInstall(spec.InstallID)
-	if problem != nil {
-		return nil, problem
+	if spec.InstallID == "" && !publishedMachineJob(*spec) {
+		return nil, nil
 	}
-	var entry *launch.Entrypoint
-	for _, job := range jobs {
-		if job.Name == spec.Entrypoint {
-			entry = &launch.Entrypoint{Name: job.Name, Request: job.Request, Assets: job.Assets}
-			break
+	if entry == nil {
+		jobs, problem := s.packages.JobsInstall(spec.InstallID)
+		if problem != nil {
+			return nil, problem
+		}
+		for _, job := range jobs {
+			if job.Name == spec.Entrypoint {
+				entry = &launch.Entrypoint{Name: job.Name, Request: job.Request, Assets: job.Assets}
+				break
+			}
 		}
 	}
 	if entry == nil {

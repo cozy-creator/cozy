@@ -34,7 +34,7 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 	if len(entries) > pb.MaxChildArtifactGrants || body.Result == nil || body.Result.ResultBlob != nil {
 		return false, exit.New(exit.Conflict, "file result exceeds the captured control bounds")
 	}
-	_, surface, problem := m.resolver.installPackageInterface(request.InstallID)
+	surface, problem := m.resolver.capturedResultInterface(request)
 	if problem != nil {
 		return false, problem
 	}

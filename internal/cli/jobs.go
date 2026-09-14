@@ -60,14 +60,18 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	prepareImage := imagePreparer(ctx)
-	input, assets, e := launch.ParseAssets(job, input, ctx.Inv.Values["--asset"], ctx.Inv.Values["--asset-fidelity"], prepareImage)
+	input, assetFiles, assetTrees, e := launch.ParseTreeAssets(job, input, ctx.Inv.Values["--asset"])
+	if e != nil {
+		return e
+	}
+	input, assets, e := launch.ParseAssets(job, input, assetFiles, ctx.Inv.Values["--asset-fidelity"], prepareImage)
 	if e != nil {
 		return e
 	}
 	if e := validateInvocationPayload(ctx, target.Package, job, input); e != nil {
 		return e
 	}
-	trees, e := parseTrees(ctx.Inv.Values["--input"])
+	trees, e := parseTrees(append(append([]string(nil), ctx.Inv.Values["--input"]...), assetTrees...))
 	if e != nil {
 		return e
 	}
@@ -221,6 +225,13 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 			return nil, exit.Usagef("--input-tree %q is not <ref>=<directory>", v).
 				WithRemedy("a job's typed model/dataset input arrives as a materialized tree").
 				WithNext("cozy run <target> --input-tree cozy/sdxl@lane=/path/to/store")
+		}
+		if dir == "~" || strings.HasPrefix(dir, "~/") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return nil, exit.New(exit.NotFound, "cannot resolve input directory home: %s", err)
+			}
+			dir = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(dir, "~"), "/"))
 		}
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
