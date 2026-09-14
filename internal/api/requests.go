@@ -209,6 +209,15 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 }
 
 func replaySubmission(sub Submission, recorded records.Request) orchestrator.Submission {
+	// Resolve omitted install/release defaults from the original admission. They
+	// were filled during first submission and remain part of the same identity.
+	installID, release := sub.InstallID, sub.Release
+	if installID == "" {
+		installID = recorded.InstallID
+	}
+	if release == "" {
+		release = recorded.Release
+	}
 	planID := sub.PlanID
 	if planID == "" {
 		planID = recorded.PlanID
@@ -231,15 +240,15 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 	return orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
-		InstallID: sub.InstallID, Release: sub.Release,
+		InstallID: installID, Release: release,
 		LocalPackageDigest: recorded.LocalPackageDigest,
 		Rental:             sub.Rental || sub.RentalRequired || sub.RequestedRental != "",
 		RentalRequired:     sub.RentalRequired || sub.RequestedRental != "",
 		RequestedRental:    sub.RequestedRental,
 		Models:             models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
-		// Replays retain the recorded execution-path pin.
-		AttentionKernel: recorded.AttentionKernel,
+		// Replays compare the caller's requested execution path with the original.
+		AttentionKernel: sub.AttentionKernel,
 	}
 }
 
@@ -371,6 +380,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		Rental:  sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
 		RequestedRental: sub.RequestedRental,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
+		AttentionKernel: sub.AttentionKernel,
 		OutputDirectory: sub.OutputDirectory,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {

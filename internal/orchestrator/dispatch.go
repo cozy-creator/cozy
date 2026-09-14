@@ -267,6 +267,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
 		Kind: s.Kind, RetainWork: s.RetainWork, ReleaseImplicitWork: s.ReleaseImplicitWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		RequestedRental: s.RequestedRental,
+		AttentionKernel: s.AttentionKernel,
 		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
