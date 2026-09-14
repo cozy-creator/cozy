@@ -125,6 +125,8 @@ type fakePod struct {
 	prepares           []*pb.PreparePackageSetCall
 	localPrepares      []*pb.PrepareLocalPackageCall
 	uploads            []*pb.LocalPackageFileRef
+	uploadEnds         []codes.Code
+	uploadCalls        int
 	lanes              []string // the order lanes were used: fetch, prepare_private, placement_set
 	prepareCodes       []codes.Code
 	prepareUnavailable int
@@ -450,6 +452,17 @@ func (p *fakePod) LocalPackageUpload(stream grpc.BidiStreamingServer[pb.LocalPac
 	}
 	if err := p.verifyClaim(header.Claim, false); err != nil {
 		return err
+	}
+	p.mu.Lock()
+	uploadIndex := p.uploadCalls
+	p.uploadCalls++
+	var uploadEnd codes.Code
+	if uploadIndex < len(p.uploadEnds) {
+		uploadEnd = p.uploadEnds[uploadIndex]
+	}
+	p.mu.Unlock()
+	if uploadEnd != codes.OK {
+		return status.Error(uploadEnd, "invalid local package upload header: filename refused")
 	}
 	file := header.File
 	if file.Length == 0 || file.Length > 512<<20 {
