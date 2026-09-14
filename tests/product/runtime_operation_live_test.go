@@ -161,7 +161,9 @@ async def main(ctx):
 		if children[2].Executions != 1 {
 			t.Fatal("native readback was skipped")
 		}
-		t.Logf("Runtime caller %d children: %+v", i, children)
+		for index, child := range children {
+			t.Logf("Runtime caller %d child %d: request=%s revision=%s computation=%s executions=%d state=%s", i, index, child.Request, child.Revision, child.Computation, child.Executions, child.State)
+		}
 		if i == 0 {
 			first = children
 			if first[0].Executions != 1 || first[1].Executions != 1 {

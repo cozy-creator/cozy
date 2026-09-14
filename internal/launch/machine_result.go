@@ -60,7 +60,7 @@ func ValidateMachineResult(schema json.RawMessage, envelope *pb.ResultEnvelope) 
 			}
 			asset, ok := child.(map[string]any)
 			spec, declared := ResultAssetSpec(entrypoint, path)
-			if !ok || !declared || len(asset) != 5 || asset["kind"] != spec.Kind {
+			if !ok || !declared || asset["kind"] != spec.Kind || spec.Kind == "tree" && len(asset) != 4 || spec.Kind != "tree" && len(asset) != 5 {
 				return exit.New(exit.Conflict, "machine asset result has no closed typed metadata")
 			}
 			ref, ok := asset["asset_ref"].(string)
@@ -73,7 +73,7 @@ func ValidateMachineResult(schema json.RawMessage, envelope *pb.ResultEnvelope) 
 			size, ok := asset["size_bytes"].(json.Number)
 			length, err := size.Int64()
 			media, mediaOK := asset["media_type"].(string)
-			if !ok || err != nil || length < 0 || spec.MaxBytes > 0 && length > spec.MaxBytes || !mediaOK || !spec.AcceptsMediaType(media) {
+			if !ok || err != nil || length < 0 || spec.MaxBytes > 0 && length > spec.MaxBytes || spec.Kind != "tree" && (!mediaOK || !spec.AcceptsMediaType(media)) {
 				return exit.New(exit.Conflict, "machine asset result exceeds its declared media contract")
 			}
 			switch node := parent.(type) {

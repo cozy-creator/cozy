@@ -488,7 +488,7 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 		media := paths[:0]
 		for _, path := range paths {
 			if spec, ok := launch.ResultAssetSpec(entrypoint, path); ok &&
-				(spec.Kind == "image" || spec.Kind == "video" || spec.Kind == "audio") {
+				(spec.Kind == "image" || spec.Kind == "video" || spec.Kind == "audio" || spec.Kind == "tree") {
 				media = append(media, path)
 			}
 		}
@@ -524,6 +524,9 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 				"result asset %s is not an exact granted output", outputID)
 		}
 		spec, ok := launch.ResultAssetSpec(entrypoint, outputID)
+		if ok && spec.Kind == "tree" {
+			spec.MediaTypes = []string{resultfiles.TreeMediaType}
+		}
 		if !ok || len(spec.MediaTypes) != 1 {
 			return exit.Named(exit.Validation, "output_export_media_type_ambiguous",
 				"result asset %s must declare exactly one media type", outputID)
