@@ -82,6 +82,15 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	result.releaseModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
 		return host.ReleaseDerivedRetention(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
 	}
+	result.retainBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
+		return host.RetainByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
+	}
+	result.releaseBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
+		return host.ReleaseByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
+	}
+	result.readBytes = func(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
+		return host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
+	}
 	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
 		uploadedBy, problem := m.store.MachinePackageUpload(claim.WorkerBootId, revision.Digest)
 		if problem != nil {
@@ -317,6 +326,15 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 	}
 	result.releaseModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
 		return preparation.WorkspaceReleaseDerivedRetention(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
+	}
+	result.retainBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
+		return preparation.WorkspaceRetainByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
+	}
+	result.releaseBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
+		return preparation.WorkspaceReleaseByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
+	}
+	result.readBytes = func(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
+		return preparation.WorkspaceReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
 	}
 	result.prepare = func(ctx context.Context, requestID string, revision localpackage.Revision) *exit.Error {
 		selected, problem := orchestrator.LocalPackageSelection(machinePackageOperation(requestID, revision), revision)

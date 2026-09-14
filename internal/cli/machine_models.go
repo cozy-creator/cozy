@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -24,26 +23,15 @@ func (m *machineRuns) collectMachineModels(ctx context.Context, request records.
 	if problem != nil {
 		return false, problem
 	}
-	if len(launch.RetainedAssetPaths(entrypoint)) > 0 || len(body.GetOutputManifest().GetOutputs()) > 0 || body.Result.ResultBlob != nil {
+	if body.Result.ResultBlob != nil {
 		return false, nil // ordinary file custody needs its separate byte transport
 	}
 	if len(launch.ModelArtifactPaths(entrypoint.Result)) > 0 && connection.wireMinor < 53 {
 		return false, exit.Named(exit.Unavailable, "machine_execution.model_collection_upgrade_required", "native model collection requires actual Runtime protocol 53; its result remains retained")
 	}
-	var document struct {
-		Jobs []struct {
-			Name   string          `json:"name"`
-			Result json.RawMessage `json:"result"`
-		} `json:"jobs"`
-	}
-	if json.Unmarshal(surface.Raw, &document) != nil {
-		return false, exit.New(exit.Conflict, "captured result schema is unreadable")
-	}
-	var schema json.RawMessage
-	for _, job := range document.Jobs {
-		if job.Name == request.Entrypoint {
-			schema = job.Result
-		}
+	schema, problem := machineResultSchema(surface, request.Entrypoint)
+	if problem != nil {
+		return false, problem
 	}
 	models, native, problem := launch.ValidateMachineModelResults(schema, body.Result)
 	if problem != nil || !native {

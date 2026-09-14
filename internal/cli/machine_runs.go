@@ -41,23 +41,27 @@ type machineConnection struct {
 	certificateDigest []byte
 	retainModel       func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
 	releaseModel      func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
+	retainBytes       func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
+	releaseBytes      func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
+	readBytes         func(context.Context, *pb.NativeByteRetentionRequest, *pb.Ref) (machineByteStream, error)
 }
 
 // machineRuns is a client transport and observer. Stopping it closes connections
 // and upload/observation work; it never sends an execution cancellation.
 type machineRuns struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	context  *Context
-	layout   home.Layout
-	store    *records.Store
-	resolver *Resolver
-	fleet    *managedRentals
-	mu       sync.Mutex
-	running  map[string]bool
-	claimed  map[string]string
-	localMu  sync.Mutex
-	localPID int
+	ctx       context.Context
+	cancel    context.CancelFunc
+	context   *Context
+	layout    home.Layout
+	store     *records.Store
+	resolver  *Resolver
+	fleet     *managedRentals
+	mu        sync.Mutex
+	running   map[string]bool
+	claimed   map[string]string
+	localMu   sync.Mutex
+	localPID  int
+	observers sync.Map // one collection/control lock per observed request
 }
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals) *machineRuns {
@@ -284,6 +288,18 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 }
 
 func (m *machineRuns) Refresh(ctx context.Context, request records.Request) *exit.Error {
+	lock := m.observationLock(request.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	return m.refresh(ctx, request)
+}
+
+func (m *machineRuns) observationLock(request string) *sync.Mutex {
+	lock, _ := m.observers.LoadOrStore(request, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+func (m *machineRuns) refresh(ctx context.Context, request records.Request) *exit.Error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	connection, link, query, problem := m.executionConnection(ctx, request)
@@ -342,7 +358,11 @@ func (m *machineRuns) Refresh(ctx context.Context, request records.Request) *exi
 	if problem != nil {
 		return problem
 	}
-	if len(body.WeightsReceipts) > 0 && !models || len(body.GetOutputManifest().GetOutputs()) > 0 || body.GetResult().GetResultBlob() != nil || request.ChildArtifacts && !models {
+	files, problem := m.collectMachineFiles(ctx, request, connection, outcome, &body)
+	if problem != nil {
+		return problem
+	}
+	if len(body.WeightsReceipts) > 0 && !models || len(body.GetOutputManifest().GetOutputs()) > 0 && !files || body.GetResult().GetResultBlob() != nil || body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ChildArtifacts && !models && !files {
 		return exit.Named(exit.Unavailable, "machine_execution.result_custody_required", "execution finished; referenced output bytes remain retained on the machine until recipient custody is established")
 	}
 	ack := &pb.AttemptOutcomeAck{RequestId: outcome.RequestId, AttemptOrdinal: outcome.AttemptOrdinal, InvocationSpecDigest: outcome.InvocationSpecDigest, OutcomeId: outcome.OutcomeId, OutcomeDigest: outcome.OutcomeDigest}
@@ -354,6 +374,9 @@ func (m *machineRuns) Refresh(ctx context.Context, request records.Request) *exi
 }
 
 func (m *machineRuns) Control(ctx context.Context, request records.Request, action string) *exit.Error {
+	lock := m.observationLock(request.ID)
+	lock.Lock()
+	defer lock.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	value := map[string]pb.MachineExecutionAction{"pause": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_PAUSE, "resume": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_RESUME, "cancel": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL}[action]
@@ -371,7 +394,7 @@ func (m *machineRuns) Control(ctx context.Context, request records.Request, acti
 			return problem
 		}
 		if previous == value {
-			return m.Refresh(ctx, request)
+			return m.refresh(ctx, request)
 		}
 	}
 	state, err := connection.client.GetMachineExecution(ctx, query)
@@ -382,7 +405,7 @@ func (m *machineRuns) Control(ctx context.Context, request records.Request, acti
 	if problem := m.store.RecordMachineControl(request.ID, command); problem != nil {
 		return problem
 	}
-	if problem := m.Refresh(ctx, request); problem != nil {
+	if problem := m.refresh(ctx, request); problem != nil {
 		return problem
 	}
 	return m.Start(request)
@@ -395,6 +418,9 @@ func (m *machineRuns) flushMachineControl(ctx context.Context, connection *machi
 	}
 	command.Execution.Claim = connection.claim
 	if command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL {
+		if problem := m.releaseMachineFiles(ctx, link.RequestID, connection); problem != nil {
+			return command.Action, problem
+		}
 		if problem := m.releaseMachineModels(ctx, link.RequestID, connection); problem != nil {
 			return command.Action, problem
 		}

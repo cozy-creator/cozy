@@ -26,6 +26,10 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	}
 	limit := uint64(DefaultMaxOutputMiB) << 20
 	outputs := invocationOutputBindings(splitList(request.Outputs), weights, limit)
+	access := make([]*pb.OutputAccess, 0, len(outputs))
+	for _, output := range outputs {
+		access = append(access, &pb.OutputAccess{OutputId: output.OutputId})
+	}
 	payloadDigest := spellOf(canonical.Digest(request.Payload))
 	publication := &pb.PublicationContract{GrantId: home.ScratchRepo(request.Org, request.ID), Outputs: outputs}
 	spec := &pb.InvocationSpec{
@@ -54,7 +58,7 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 		PayloadCanonicalBytes: request.Payload, MaxAttempts: uint32(MaxRequeues + 1),
 		Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1,
 			InvocationSpecCanonicalBytes: raw, InvocationSpecDigest: digest,
-			Grant: &pb.DeliveryGrant{InvocationSpecDigest: digest, Inputs: []*pb.InputAccess{{InputId: "payload", Url: "data:application/json;base64," + base64.StdEncoding.EncodeToString(request.Payload)}}}},
+			Grant: &pb.DeliveryGrant{InvocationSpecDigest: digest, Inputs: []*pb.InputAccess{{InputId: "payload", Url: "data:application/json;base64," + base64.StdEncoding.EncodeToString(request.Payload)}}, Outputs: access}},
 		PreparedState: &pb.DesiredWorkerState{Revision: 1, WireMinor: pb.WireMinor, Posture: pb.Posture_POSTURE_ACCEPTING, Mode: &pb.DesiredWorkerState_Job{Job: directive}},
 	}, nil
 }

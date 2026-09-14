@@ -2246,6 +2246,25 @@ func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
 		}
 		out = append(out, o)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish output read: %s", err)
+	}
+	rows.Close()
+	link, problem := s.MachineExecution(requestID)
+	if problem != nil {
+		return nil, problem
+	}
+	if link != nil && link.Collected {
+		files, problem := s.MachineFileResults(requestID)
+		if problem != nil {
+			return nil, problem
+		}
+		for _, file := range files {
+			if file.Copied {
+				out = append(out, file.Output)
+			}
+		}
+	}
 	return out, nil
 }
 
@@ -2265,7 +2284,23 @@ func (s *Store) Media(mediaID string) (*Output, string, int64, *exit.Error) {
 		Scan(&o.OutputID, &o.MediaID, &o.Path, &o.Digest, &o.Length, &o.MimeType,
 			&requestID, &attempt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, "", 0, nil
+		var raw []byte
+		err = s.db.QueryRow(`SELECT hold.payload,hold.request_id FROM request_events hold
+ JOIN machine_executions e ON e.request_id=hold.request_id
+ WHERE hold.type='machine.file_result' AND e.collected=1
+ AND json_extract(hold.payload,'$.output.MediaID')=?
+ ORDER BY hold.seq DESC LIMIT 1`, mediaID).Scan(&raw, &requestID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, "", 0, nil
+		}
+		var file MachineFileResult
+		if err != nil || json.Unmarshal(raw, &file) != nil {
+			return nil, "", 0, exit.Internalf("cannot read collected media")
+		}
+		if !file.Copied {
+			return nil, "", 0, nil
+		}
+		return &file.Output, requestID, file.Source.Attempt, nil
 	}
 	if err != nil {
 		return nil, "", 0, exit.Internalf("cannot read media %s: %s", mediaID, err)
