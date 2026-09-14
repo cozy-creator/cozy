@@ -166,12 +166,12 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if pin := strings.TrimSpace(ctx.Inv.Value("--attention-kernel")); pin != "" {
+	if pin := ctx.Inv.Value("--attention-kernel"); pin != "" {
 		if overrides.AttentionKernel != "" {
 			return exit.Usagef("attention kernel was pinned more than once")
 		}
-		if strings.ContainsAny(pin, "= \t\r\n") {
-			return exit.Usagef("--attention-kernel must be one kernel name")
+		if problem := launch.ValidateAttentionOverride(pin); problem != nil {
+			return problem
 		}
 		overrides.AttentionKernel = pin
 	}

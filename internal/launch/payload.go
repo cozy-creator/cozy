@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -215,7 +216,27 @@ func kernelOverrideTerm(term string) (axis, name string, problem *exit.Error) {
 	if !slices.Contains(KernelAxes, asked) {
 		return "", "", refuse()
 	}
-	return asked, strings.TrimSpace(raw), nil
+	if problem := ValidateAttentionOverride(raw); problem != nil {
+		return "", "", problem
+	}
+	return asked, raw, nil
+}
+
+// ValidateAttentionOverride checks transport syntax only. Runtime owns backend names,
+// component existence, hardware eligibility and compiled/context-parallel restrictions.
+// Empty is the ordinary request with no override; nonempty values are carried verbatim.
+func ValidateAttentionOverride(pin string) *exit.Error {
+	if pin == "" {
+		return nil
+	}
+	scope, backend, scoped := strings.Cut(pin, "=")
+	if strings.IndexFunc(pin, unicode.IsSpace) >= 0 ||
+		(scoped && (scope == "" || backend == "" || strings.Contains(backend, "="))) {
+		return exit.Named(exit.Usage, "attention_override_invalid",
+			"invalid attention override %q", pin).
+			WithRemedy("use --attention-kernel=backend or --attention-kernel=[model/]component=backend; no whitespace")
+	}
+	return nil
 }
 
 // modelOverrideTerm claims one `model.`-prefixed argv term for the reserved run-key

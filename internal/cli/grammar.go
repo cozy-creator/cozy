@@ -325,13 +325,13 @@ type RunCmd struct {
 
 type RunExecuteCmd struct {
 	Target          string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
-	Input           []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=<name> to pin one attention kernel for this request (DEV)."`
+	Input           []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
 	Out             string   `help:"Output directory." type:"path"`
 	Timeout         string   `help:"Request deadline."`
 	PayloadFile     string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
 	Assets          []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	AssetFidelity   []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
-	AttentionKernel string   `name:"attention-kernel" help:"DEV: pin one runtime attention kernel for this request (for example flash-attn3-fp8)."`
+	AttentionKernel string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend. Example: model/fl2va_dit=kitchen-int8. No fallback; Runtime validates hardware, compiled mode and parallelism."`
 	Rental          *string  `help:"Run only on this existing rental name or id; never buy a replacement."`
 	RentalOnly      bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey  string   `help:"Stable request identity for safe retries."`
