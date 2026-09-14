@@ -79,6 +79,21 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	}
 	root := *plan
 	root.BuildID, root.OrchestrationParent, root.FrozenDirective = buildID, nil, nil
+	// The frozen capture also contains self-serving exports which need not have
+	// separate install binding rows. Apply the same composition-parent rule to
+	// those actual capabilities, rather than inferring a GPU from package imports.
+	hasCallees, isCallee := false, false
+	for _, binding := range rootCapture.List("bindings") {
+		if binding.Str("caller_revision_digest") == buildID {
+			hasCallees = true
+		}
+		if binding.Str("callee_revision_digest") == buildID && binding.Str("entrypoint") == request.Entrypoint {
+			isCallee = true
+		}
+	}
+	if hasCallees && !isCallee && len(request.Models) == 0 && len(root.WeightsOutputs) == 0 {
+		root.NeedsAccelerator = false
+	}
 	// A captured CPU caller must not occupy the execution lane its managed
 	// model children need. Device-bearing roots keep their declared lane.
 	root.Orchestration = !root.NeedsAccelerator && len(request.Models) == 0 && len(root.WeightsOutputs) == 0
