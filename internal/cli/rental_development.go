@@ -23,7 +23,8 @@ func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.Re
 		pinned = req.Development
 	}
 	flagValue, flagSet := ctx.Inv.Bools["--development"]
-	explicit := flagSet || ctx.Inv.Value("--ssh-public-key") != ""
+	imageDigest := ctx.Inv.Value("--development-image")
+	explicit := flagSet || ctx.Inv.Value("--ssh-public-key") != "" || imageDigest != ""
 	// An acquisition is immutable. A changed default or deleted public-key file
 	// cannot rewrite its mode, prevent reconciliation, or spend for another pod.
 	if existing != nil && !explicit {
@@ -32,6 +33,16 @@ func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.Re
 	enabled := ctx.Cfg.RentalsDevelopment
 	if flagSet {
 		enabled = flagValue
+	}
+	if imageDigest != "" && !enabled {
+		return nil, exit.Usagef("--development-image requires --development")
+	}
+	if pinned != nil {
+		if imageDigest == "" {
+			imageDigest = pinned.ImageDigest
+		} else if imageDigest != pinned.ImageDigest {
+			return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict", "rental operation already pins a different development image").WithRemedy("resume without development flags or use a new operation key")
+		}
 	}
 	path := ctx.Inv.Value("--ssh-public-key")
 	if path == "" && enabled {
@@ -76,8 +87,8 @@ func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.Re
 	if len(fields) < 2 || strings.ContainsAny(key, "\r\n\x00") || !(strings.HasPrefix(fields[0], "ssh-") || strings.HasPrefix(fields[0], "ecdsa-") || strings.HasPrefix(fields[0], "sk-")) {
 		return nil, exit.Usagef("supply one public SSH key line, not private key material or authorized-key options")
 	}
-	selected := &hub.RentalDevelopment{SSHPublicKey: key}
-	if existing != nil && (pinned == nil || pinned.SSHPublicKey != selected.SSHPublicKey) {
+	selected := &hub.RentalDevelopment{SSHPublicKey: key, ImageDigest: imageDigest}
+	if existing != nil && (pinned == nil || *pinned != *selected) {
 		return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict", "rental operation already declares different development access").WithRemedy("resume without development flags or use a new operation key")
 	}
 	return selected, nil
