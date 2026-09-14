@@ -47,7 +47,7 @@ func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 		if t.Failed() {
 			t.Log("library script evidence retained", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	project := copyPrivateTensorProject(t, root, "")

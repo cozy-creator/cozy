@@ -52,7 +52,7 @@ func ordinaryScriptModelServing(t *testing.T, mixed, dependencyReuse bool) {
 		if t.Failed() {
 			t.Log("native serving evidence retained", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	defer tracePrivateChildWait(t, root)()

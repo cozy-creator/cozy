@@ -42,7 +42,7 @@ func TestOrdinaryScriptByteResultsAndMemoReuse(t *testing.T) {
 		if t.Failed() {
 			t.Log("byte artifact evidence retained", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	defer tracePrivateChildWait(t, root)()

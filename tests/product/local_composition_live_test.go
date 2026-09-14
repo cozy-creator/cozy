@@ -100,7 +100,7 @@ func TestOrdinaryScriptNativePreparationQuantizationAndScore(t *testing.T) {
 		if t.Failed() {
 			t.Log("composition evidence retained", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	defer tracePrivateChildWait(t, root)()

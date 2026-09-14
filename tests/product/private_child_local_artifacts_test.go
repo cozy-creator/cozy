@@ -42,15 +42,11 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		args := []string{"down"}
-		if !t.Failed() {
-			args = append(args, "--all")
-		}
-		_, _ = runCozyPath(t, root, path, args...)
+		compositionDown(t, root, path)
 		if t.Failed() {
 			t.Logf("local native memo evidence retained at %s", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	defer tracePrivateChildWait(t, root)()

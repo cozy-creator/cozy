@@ -161,7 +161,7 @@ func TestPrivateScriptTypedOutputsUseNormalAttempt(t *testing.T) {
 		if t.Failed() {
 			t.Log("typed script evidence retained", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	script := filepath.Join(t.TempDir(), "image.py")

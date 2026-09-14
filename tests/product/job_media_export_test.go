@@ -40,9 +40,9 @@ func TestTopLevelJobMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		_, _ = runCozyPath(t, root, path, "down", "--all")
+		compositionDown(t, root, path)
 		if !t.Failed() {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	project := t.TempDir()
