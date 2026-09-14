@@ -3,6 +3,8 @@ on: [push, pull_request]
 jobs:
   checks:
     runs-on: ubuntu-latest
+    env:
+      COZY_TEST_RUNTIME_REV: f084c910f0ce5bd5027905d592c0099621009fac
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -13,40 +15,39 @@ jobs:
           version: '0.12.11'
       - run: uv python install 3.12
       - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
-      - name: Verify and install the immutable development Runtime fixture
+      - name: Check out the exact development Runtime with the existing read-only key
+        uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/cozy-runtime
+          ref: ${{ env.COZY_TEST_RUNTIME_REV }}
+          path: .ci-runtime-peer
+          ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
+          persist-credentials: false
+      - name: Build and qualify the immutable Runtime wheel
         run: |
-          # A coordinated wire update can be qualified before a public PyPI release.
-          # This private-repository test fixture grants no sibling checkout credential.
-          python3 - <<'PYTHON'
-          import ast, hashlib, json, os, pathlib, re, zipfile
-          root = pathlib.Path("tests/product/testdata/runtime-development")
-          peer = json.loads((root / "peer.json").read_bytes())
-          wheel = (root / peer["wheel"]).resolve()
-          assert hashlib.sha256(wheel.read_bytes()).hexdigest() == peer["sha256"]
-          with zipfile.ZipFile(wheel) as archive:
-              tree = ast.parse(archive.read("cozy_runtime/_build_provenance.py"))
-              commits = [ast.literal_eval(row.value) for row in tree.body
-                         if isinstance(row, ast.Assign)
-                         and any(isinstance(name, ast.Name) and name.id == "COMMIT"
-                                 for name in row.targets)]
-              assert commits == [peer["source_commit"]], commits
-          source = pathlib.Path("protocol/cozy/worker/v1/wire_version.go").read_text()
-          required = int(re.search(r"WireMinor(?:\s+uint32)?\s*=\s*(\d+)", source)[1])
-          assert peer["wire_minor"] >= required
-          with open(os.environ["GITHUB_ENV"], "a") as env:
-              env.write(f"COZY_TEST_RUNTIME_WHEEL={wheel}\n")
-          PYTHON
-          wheel="$(python3 -c 'import json,pathlib; p=pathlib.Path("tests/product/testdata/runtime-development"); print((p/json.loads((p/"peer.json").read_bytes())["wheel"]).resolve())')"
-          uv tool install --python 3.12 "$wheel[model-execution]"
+          test "$(git -C .ci-runtime-peer rev-parse HEAD)" = "$COZY_TEST_RUNTIME_REV"
+          source_root="$RUNNER_TEMP/cozy-runtime-source"
+          mkdir -p "$source_root"
+          git -C .ci-runtime-peer archive HEAD | tar -x -C "$source_root"
+          uv run --isolated --no-project --python 3.12 python \
+            "$source_root/scripts/stamp-build-provenance.py" "$COZY_TEST_RUNTIME_REV"
+          uv build --wheel --out-dir "$RUNNER_TEMP/cozy-runtime-wheel" "$source_root"
+          wheels=("$RUNNER_TEMP"/cozy-runtime-wheel/*.whl)
+          test "${#wheels[@]}" -eq 1
+          sha256sum "${wheels[0]}"
+          uv tool install --python 3.12 "${wheels[0]}[model-execution]"
           tool_bin="$(uv tool dir --bin)"
           echo "$tool_bin" >> "$GITHUB_PATH"
+          echo "COZY_TEST_RUNTIME_WHEEL=${wheels[0]}" >> "$GITHUB_ENV"
           "$tool_bin/cozy-runtime" --json version > "$RUNNER_TEMP/runtime-version.json"
-          python3 - "$RUNNER_TEMP/runtime-version.json" <<'PYTHON'
-          import json, pathlib, sys
-          peer = json.loads(pathlib.Path("tests/product/testdata/runtime-development/peer.json").read_bytes())
+          python3 - "$RUNNER_TEMP/runtime-version.json" "$COZY_TEST_RUNTIME_REV" <<'PYTHON'
+          import json, pathlib, re, sys
           version = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
-          assert version["commit"] == peer["source_commit"][:12], version
-          assert version["wire_protocol"] == f"cozy.worker.v1+minor.{peer['wire_minor']}", version
+          assert version["commit"] == sys.argv[2][:12], version
+          source = pathlib.Path("protocol/cozy/worker/v1/wire_version.go").read_text()
+          required = int(re.search(r"WireMinor(?:\s+uint32)?\s*=\s*(\d+)", source)[1])
+          package, minor = version["wire_protocol"].split("+minor.")
+          assert package == "cozy.worker.v1" and int(minor) >= required, version
           PYTHON
       # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
       # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
@@ -78,7 +79,7 @@ jobs:
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 \
             --setenv="COZY_TEST_RUNTIME_WHEEL=$COZY_TEST_RUNTIME_WHEEL" \
             /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 30m \
-              -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"'
+              -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -cozy-runtime-repo="$PWD/.ci-runtime-peer"'
       - run: python3 scripts/fence.py
 
   # THE WORKER-IMAGE ROSTER CHECK. `internal/packagepublish/base-distributions.json` is
@@ -94,34 +95,26 @@ jobs:
   # variable.
   runtime-roster:
     runs-on: ubuntu-latest
-    env:
-      COZY_RUNTIME_TOKEN: ${{ secrets.COZY_RUNTIME_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
           path: cozy
       - name: Check out the runtime peer
-        if: env.COZY_RUNTIME_TOKEN != ''
         uses: actions/checkout@v4
         with:
-          repository: cozy-creator/cozy-runtime-v2
+          repository: cozy-creator/cozy-runtime
           path: cozy-runtime
-          token: ${{ env.COZY_RUNTIME_TOKEN }}
+          ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
+          persist-credentials: false
       - uses: actions/setup-go@v5
-        if: env.COZY_RUNTIME_TOKEN != ''
         with:
           go-version: stable
       - name: Compare the vendored roster and authored defaults against cozy-runtime
-        if: env.COZY_RUNTIME_TOKEN != ''
         working-directory: cozy
         run: |
           nice -n 19 go test ./tests/product/ -run 'TestVendoredBaseDistributions|TestAuthoredDefaultsMatchRuntimeCorpus' -v -timeout 5m \
             -cozy-runtime-repo="$GITHUB_WORKSPACE/cozy-runtime" \
             -require-cozy-runtime-peer
-      - name: Report unarmed roster comparison
-        if: env.COZY_RUNTIME_TOKEN == ''
-        run: |
-          echo '::warning::COZY_RUNTIME_TOKEN is absent, so the vendored base-distributions.json was not byte-compared against cozy-runtime. This is a missing ceiling, not a missing floor: the always-armed half ran in `checks` and proves the publish prune list is derived from these bytes with nothing added or dropped.'
 
   # THE VENDORED-BINDING CHECK. `protocol/` is copied, never imported as a module, so
   # worker-protocol regenerates from its own .proto with its pinned toolchain and
