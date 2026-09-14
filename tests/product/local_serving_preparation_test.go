@@ -28,6 +28,7 @@ import (
 )
 
 var localServingFixtureDir = flag.String("serving-fixture-dir", "", "Fixture source directory for local serving preparation qualification")
+var servingCPUFixture = flag.Bool("serving-cpu-fixture", false, "Use CPU Torch for serving preparation qualification without claiming CUDA inference")
 
 type servingSeed struct {
 	Manifest         string           `json:"manifest"`
@@ -378,7 +379,7 @@ cozy-runtime={path=%q}
 			if !slices.Equal(components, []string{"zeta", "alpha"}) {
 				t.Fatalf("worker lost actual construction order: %v; header=%v", components, seed.HeaderComponents)
 			}
-			if os.Getenv("UV_TORCH_BACKEND") == "cpu" {
+			if *servingCPUFixture {
 				t.Logf("CPU fixture proved actual meta construction and ordered components %v; CUDA inference is covered by the separate serving fixture (CLI exit %d)", components, code)
 				return
 			}
