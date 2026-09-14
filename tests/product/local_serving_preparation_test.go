@@ -302,7 +302,8 @@ build-backend="hatchling.build"
 only-include=["serving_fixture.py"]
 [tool.uv.sources]
 cozy-runtime={path=%q}
-`, version, wheel)
+%s
+`, version, wheel, servingTorchIndex())
 			must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0600))
 			uv("lock", "--project", project, "--no-progress")
 			pkg := "local/cozy-serving-preparation-fixture"
