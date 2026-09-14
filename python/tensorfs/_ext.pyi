@@ -54,6 +54,13 @@ class TreeRoot(TypedDict):
     complete: bool
     released: bool
 
+class CheckpointRoot(TypedDict):
+    owner: str
+    repository: str
+    manifest_digest: str
+    manifest_length: int
+    released: bool
+
 class SelectedSource(TypedDict):
     canonical: str
     selection_sha256: str
@@ -434,6 +441,16 @@ class Store:
     def root(self) -> str: ...
     @property
     def implementation_sha256(self) -> str: ...
+    def verify_checkpoint_source(
+        self, repository: str, manifest_id: str, manifest_length: int,
+    ) -> None: ...
+    def retain_checkpoint_root(
+        self, owner: str, repository: str, manifest_id: str, manifest_length: int,
+    ) -> CheckpointRoot: ...
+    def checkpoint_root(self, owner: str) -> CheckpointRoot | None: ...
+    def release_checkpoint_root(
+        self, owner: str, repository: str, manifest_id: str, manifest_length: int,
+    ) -> CheckpointRoot: ...
     def create_tree_root(self, owner: str, manifest_id: str, manifest_length: int) -> TreeRoot: ...
     def import_tree(
         self, owner: str, manifest_bytes: bytes, files: Sequence[tuple[str, StrPath]],

@@ -106,8 +106,13 @@ impl HeldKey {
         fields.done()?;
         let sha256 = match kind.as_str() {
             "blob" => digest_from_blob_key(&key)?,
-            "manifest" => digest_from_manifest_key(&key)?,
-            _ => return refuse(Code::UNKNOWN_FIELD, "hold kind must be blob or manifest"),
+            "manifest" | "cozytensors" => digest_from_manifest_key(&key)?,
+            _ => {
+                return refuse(
+                    Code::UNKNOWN_FIELD,
+                    "hold kind must be blob, manifest or cozytensors",
+                )
+            }
         };
         Ok(Self {
             key,
@@ -115,6 +120,10 @@ impl HeldKey {
             length,
             sha256,
         })
+    }
+
+    pub(crate) fn is_manifest(&self) -> bool {
+        matches!(self.kind.as_str(), "manifest" | "cozytensors")
     }
 }
 
@@ -755,6 +764,7 @@ impl Census {
                 live_manifests.insert(checkpoint.manifest.sha256.clone());
             }
         }
+        let mut full_manifests = live_manifests.clone();
         for hold in holds {
             match hold.kind.as_str() {
                 "blob" => {
@@ -770,7 +780,7 @@ impl Census {
                     }
                     live_blobs.insert(hold.sha256.clone());
                 }
-                "manifest" => {
+                "manifest" | "cozytensors" => {
                     if self
                         .manifests
                         .get(&hold.sha256)
@@ -782,6 +792,9 @@ impl Census {
                         );
                     }
                     live_manifests.insert(hold.sha256.clone());
+                    if hold.kind == "manifest" {
+                        full_manifests.insert(hold.sha256.clone());
+                    }
                 }
                 _ => unreachable!("HeldKey parser closes the kind"),
             }
@@ -796,7 +809,9 @@ impl Census {
                 sha256: sha256.clone(),
                 length: bytes.len() as u64,
             };
-            for object in self.manifest_blob_refs(manifest, &reference)? {
+            for object in
+                self.manifest_blob_refs(manifest, &reference, !full_manifests.contains(sha256))?
+            {
                 live_blobs.insert(object.sha256);
             }
         }
@@ -842,13 +857,15 @@ impl Census {
         }
         // A held manifest keeps its whole closure, exactly as the plan does.
         for hold in holds {
-            if hold.kind == "manifest" {
+            if hold.is_manifest() {
                 if let Some((manifest, bytes)) = self.manifests.get(&hold.sha256) {
                     let reference = ObjectRef {
                         sha256: hold.sha256.clone(),
                         length: bytes.len() as u64,
                     };
-                    for object in self.manifest_blob_refs(manifest, &reference)? {
+                    for object in
+                        self.manifest_blob_refs(manifest, &reference, hold.kind == "cozytensors")?
+                    {
                         held.insert(object.sha256);
                     }
                 }
@@ -870,7 +887,7 @@ impl Census {
                     .or_insert((bytes.len() as u64, BTreeSet::new()))
                     .1
                     .insert(position);
-                for object in self.manifest_blob_refs(manifest, &checkpoint.manifest)? {
+                for object in self.manifest_blob_refs(manifest, &checkpoint.manifest, false)? {
                     index
                         .objects
                         .entry(object.sha256)
@@ -912,7 +929,7 @@ impl Census {
             let mut blobs = BTreeMap::new();
             for checkpoint in &repository.checkpoints {
                 let (manifest, _) = self.manifest(&checkpoint.manifest)?;
-                for object in self.manifest_blob_refs(manifest, &checkpoint.manifest)? {
+                for object in self.manifest_blob_refs(manifest, &checkpoint.manifest, false)? {
                     blobs.insert(object.sha256, object.length);
                 }
             }
@@ -1048,8 +1065,15 @@ impl Census {
         &self,
         manifest: &Manifest,
         _reference: &ObjectRef,
+        runtime_only: bool,
     ) -> Result<Vec<ObjectRef>> {
         let mut objects = BTreeMap::new();
+        if runtime_only && manifest.header().is_none() {
+            return refuse(
+                Code::ATTACHMENT_CARDINALITY,
+                "runtime closure hold needs a CozyTensors header",
+            );
+        }
         if let Some(header_ref) = manifest.header() {
             insert_ref(&mut objects, "header", header_ref)?;
             let header = self.header(header_ref)?;
@@ -1068,9 +1092,11 @@ impl Census {
                 }
             }
         }
-        for (_, entry) in manifest.entries() {
-            if let Entry::File(object) = entry {
-                insert_ref(&mut objects, "file", object)?;
+        if !runtime_only {
+            for (_, entry) in manifest.entries() {
+                if let Entry::File(object) = entry {
+                    insert_ref(&mut objects, "file", object)?;
+                }
             }
         }
         for (kind, object) in objects.values() {

@@ -134,7 +134,13 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
         .collect::<Result<Vec<_>>>()?;
     holds.extend(crate::derived::retained_objects(store)?);
     holds.extend(crate::source_artifact::held_objects(store)?);
-    holds.sort_by(|left, right| left.key.cmp(&right.key));
+    holds.extend(crate::checkpoint_root::held_objects(store)?);
+    // A full snapshot obligation wins over a runtime-only pin of the same manifest.
+    holds.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| (left.kind == "cozytensors").cmp(&(right.kind == "cozytensors")))
+    });
     if holds
         .windows(2)
         .any(|pair| pair[0].key == pair[1].key && pair[0].length != pair[1].length)
@@ -165,7 +171,7 @@ pub(crate) fn retained_manifests(store: &Store) -> Result<Vec<crate::ids::Object
     roots.extend(
         holds
             .into_iter()
-            .filter(|hold| hold.kind == "manifest")
+            .filter(|hold| hold.is_manifest())
             .map(|hold| crate::ids::ObjectRef {
                 sha256: hold.sha256,
                 length: hold.length,
