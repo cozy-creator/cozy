@@ -333,3 +333,119 @@ fn real_headers_match_by_structure_and_multiple_versions_require_file_selection(
     assert!(error.detail.contains(&heads[1].member));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn full_cli_conversion_mints_a_receipt_after_the_live_golden_suite() {
+    use std::process::Command;
+    let root = root();
+    let file = write_source(&root, false, "blocks.0");
+    let plan = plan(&file).unwrap();
+    let order = root.join("order.json");
+    fs::write(
+        &order,
+        canon::write(&Value::arr(
+            plan.ops
+                .iter()
+                .map(|op| {
+                    Value::arr(vec![
+                        Value::str(op.component.clone()),
+                        Value::str(op.out_key.clone()),
+                    ])
+                })
+                .collect(),
+        )),
+    )
+    .unwrap();
+    let registry = root.join("registry.json");
+    let source_plan = root.join("source-plan.json");
+    let store = root.join("store");
+    let bin = env!("CARGO_BIN_EXE_tfs");
+    for args in [
+        vec!["store".into(), "init".into(), store.display().to_string()],
+        vec![
+            "ingest".into(),
+            "bank".into(),
+            "safetensors.h3_lora".into(),
+            "h3.lora/1".into(),
+            "--source".into(),
+            format!("adapter={}", file.path.display()),
+            "--registry".into(),
+            registry.display().to_string(),
+            "--source-name".into(),
+            "trusted-test-fixture".into(),
+            "--source-profile".into(),
+            "fixture/h3-lora".into(),
+            "--target".into(),
+            "adapter=plain/1".into(),
+            "--order".into(),
+            order.display().to_string(),
+        ],
+        vec![
+            "ingest".into(),
+            "source-plan".into(),
+            "--registry".into(),
+            registry.display().to_string(),
+            "--carrier".into(),
+            file.path.display().to_string(),
+            "--out".into(),
+            source_plan.display().to_string(),
+        ],
+        vec![
+            "ingest".into(),
+            "run".into(),
+            store.display().to_string(),
+            "--source-plan".into(),
+            source_plan.display().to_string(),
+        ],
+    ] {
+        let output = Command::new(bin).args(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let Value::Obj(fields) = canon::parse(&fs::read(&source_plan).unwrap(), 1 << 20).unwrap()
+    else {
+        panic!("source plan")
+    };
+    let Value::Str(session) = &fields.iter().find(|(k, _)| k == "session").unwrap().1 else {
+        panic!("session")
+    };
+    let receipt = fs::read(store.join("tmp/ingest").join(session).join("receipt.json")).unwrap();
+    assert!(String::from_utf8_lossy(&receipt).contains("\"golden_cases\":2"));
+    let rejected = Command::new(bin)
+        .args([
+            "ingest",
+            "restamp",
+            &store.display().to_string(),
+            session,
+            "--plant",
+            "quota-bytes",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("QUOTA_EXHAUSTED"));
+    let replay = Command::new(bin)
+        .args([
+            "ingest",
+            "run",
+            &store.display().to_string(),
+            "--source-plan",
+            &source_plan.display().to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay_receipt =
+        fs::read(store.join("tmp/ingest").join(session).join("receipt.json")).unwrap();
+    assert!(String::from_utf8_lossy(&replay_receipt).contains("\"roles_resumed\":18"));
+    assert!(String::from_utf8_lossy(&replay_receipt).contains("\"bytes_written\":0"));
+    fs::remove_dir_all(root).unwrap();
+}

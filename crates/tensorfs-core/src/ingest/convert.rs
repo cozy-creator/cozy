@@ -383,7 +383,12 @@ impl Plan {
         let mut n = 0u64;
         for o in &self.ops {
             for r in &o.roles {
-                n += checked_bytes(&o.out_key, &r.shape, r.dtype)?;
+                n = n
+                    .checked_add(checked_bytes(&o.out_key, &r.shape, r.dtype)?)
+                    .ok_or_else(|| crate::err::Refusal {
+                        code: Code::ARITH_OVERFLOW,
+                        detail: "conversion output byte count overflow".into(),
+                    })?;
             }
         }
         Ok(n)
@@ -1754,6 +1759,23 @@ pub fn h3_geometry(
 /// error at ~90% numerically while nothing raised.
 pub fn golden_cases(c: &Converter) -> Vec<(&'static str, Xform)> {
     match c.name {
+        "h3.lora/1" => vec![
+            (
+                "H3 LoRA SwiGLU B rows",
+                Xform::SwapHalves {
+                    half_bytes: 14336 * 16 * 2,
+                },
+            ),
+            (
+                "H3 LoRA QKV B rows",
+                Xform::QkvSplit {
+                    groups: H3_HEADS,
+                    shares: [1, 1, 1],
+                    take: 0,
+                    unit_bytes: H3_HEAD_DIM * 16 * 2,
+                },
+            ),
+        ],
         "h3.native/2" => vec![
             (
                 "h3-swiglu gate/value rows",
