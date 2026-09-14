@@ -359,6 +359,7 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 	if name == "objects" {
 		f.say("Downloading %s: %s remaining", f.Ref.String(), size(remaining))
 	}
+	lastProgress := time.Now()
 
 	dir := filepath.Join(f.Scratch, "in")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -406,8 +407,9 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 			}
 			out.Moved += n
 			downloaded += n
-			if name == "objects" {
+			if name == "objects" && (downloaded == remaining || time.Since(lastProgress) >= time.Second) {
 				f.say("Downloading %s: %s of %s", f.Ref.String(), size(downloaded), size(remaining))
+				lastProgress = time.Now()
 			}
 			fmt.Fprintf(&plan, "%s %d %s\n", strings.TrimPrefix(o.ID, "sha256:"), o.Length, dst)
 		}
