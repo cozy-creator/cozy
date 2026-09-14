@@ -255,6 +255,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		}
 	}
 	id := records.NewID("req")
+	if s.Kind == "job" && hasModelAdapters(s.Models) {
+		return records.Request{}, nil, exit.Usagef("model adapters apply only to serving requests")
+	}
 	if s.Kind == "job" {
 		id = records.NewID("job")
 	}
@@ -1015,18 +1018,24 @@ func exactJobSelection(placement DesiredPlacement, req records.Request) bool {
 // are then facts for the row, not residency evidence.
 func selectionServes(requested, held []ModelRef) bool {
 	if len(requested) == 0 || len(held) == 0 {
-		return true
+		return !hasModelAdapters(requested)
 	}
-	holds := make(map[string]string, len(held))
+	holds := make(map[string]ModelRef, len(held))
 	for _, m := range held {
-		holds[m.Slot] = m.Manifest
+		holds[m.Slot] = m
 	}
 	for _, m := range requested {
-		manifest, ok := holds[m.Slot]
+		current, ok := holds[m.Slot]
 		if !ok {
+			if len(m.Adapters) > 0 {
+				return false
+			}
 			continue
 		}
-		if _, fits := rungHolding(m, manifest); !fits {
+		if !records.SameAdapters(m.Adapters, current.Adapters) {
+			return false
+		}
+		if _, fits := rungHolding(m, current.Manifest); !fits {
 			return false
 		}
 	}
@@ -1532,6 +1541,9 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			return 0, exit.Named(exit.Conflict, "serving.placement_evidence_absent", "serving dispatch needs the exact prepared model bindings")
 		}
 	}
+	if hasModelAdapters(req.Models) && w.wireMinor < pb.ModelAdapterWireMinor {
+		return 0, exit.Named(exit.Structural, "model_adapters_protocol_unsupported", "model adapters require worker protocol minor %d or newer", pb.ModelAdapterWireMinor)
+	}
 	if req.AttentionKernel != "" && w.declaredInstance != "" && w.wireMinor < pb.AttentionKernelWireMinor {
 		return 0, exit.Named(exit.Unavailable, "attention_kernel_protocol_unsupported",
 			"worker protocol minor %d cannot carry attention-kernel requests; need minor %d",
@@ -1837,7 +1849,7 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 		// placement it prepares.
 		for _, slot := range append([]string{path}, model.SharedSlots...) {
 			out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: slot,
-				Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
+				Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, Adapters: downloadAdapters(model.Adapters)})
 		}
 	}
 	return out

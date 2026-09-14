@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -562,8 +563,9 @@ type AssetBinding struct {
 // spelling before it rents anything, records this row with the request, and sends it
 // only to the attached worker in the desired download set.
 type ModelRef struct {
-	Package string `json:"package"`
-	Slot    string `json:"slot"`
+	Adapters []ModelAdapterRef `json:"adapters,omitempty"`
+	Package  string            `json:"package"`
+	Slot     string            `json:"slot"`
 	// BindingPath is the exact interface Model path used for package preparation.
 	// Jobs keep Slot as the bare invocation parameter; serving already uses a path.
 	BindingPath string `json:"binding_path,omitempty"`
@@ -602,6 +604,35 @@ type ModelRef struct {
 	// prepare. Sizing reads Slot alone: the siblings share the construction, they do not
 	// add to it.
 	SharedSlots []string `json:"shared_slots,omitempty"`
+}
+
+// ModelAdapterRef is an ordered, exact adapter checkpoint for one base component.
+// Scales are canonical decimal strings, so zero is distinct from omission.
+type ModelAdapterRef struct {
+	Component       string `json:"component"`
+	Model           string `json:"model"`
+	Release         string `json:"release,omitempty"`
+	Lane            string `json:"lane,omitempty"`
+	Manifest        string `json:"manifest"`
+	ManifestLength  int64  `json:"manifest_length,omitempty"`
+	SourceComponent string `json:"source_component"`
+	Scale           string `json:"scale"`
+	Bytes           int64  `json:"bytes,omitempty"`
+}
+
+// SameAdapters compares execution/custody identity, excluding sizing observations.
+func SameAdapters(a, b []ModelAdapterRef) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, left := range a {
+		right := b[i]
+		if left.Component != right.Component || left.Model != right.Model || left.Release != right.Release ||
+			left.Lane != right.Lane || left.Manifest != right.Manifest || left.SourceComponent != right.SourceComponent || left.Scale != right.Scale {
+			return false
+		}
+	}
+	return true
 }
 
 // ModelRung is one (gpu, lane) fit resolved against the model card.
@@ -691,7 +722,12 @@ func Resident(models []ModelRef, accelerator string, job bool) Residency {
 	var fits, needs []string
 	for _, model := range models {
 		bytes, need, fit := model.resident(accelerator, job)
-		out.Bytes += bytes
+		if !job {
+			for _, adapter := range model.Adapters {
+				bytes = addResidencyBytes(bytes, adapter.Bytes)
+			}
+		}
+		out.Bytes = addResidencyBytes(out.Bytes, bytes)
 		if need != "" {
 			needs = append(needs, need)
 		}
@@ -701,6 +737,13 @@ func Resident(models []ModelRef, accelerator string, job bool) Residency {
 	}
 	out.Fit, out.Need = strings.Join(fits, "+"), strings.Join(needs, "; ")
 	return out
+}
+
+func addResidencyBytes(current, additional int64) int64 {
+	if current < 0 || additional < 0 || additional > math.MaxInt64-current {
+		return math.MaxInt64
+	}
+	return current + additional
 }
 
 func (m ModelRef) resident(accelerator string, job bool) (int64, string, string) {

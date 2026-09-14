@@ -202,7 +202,7 @@ func placementModels(pkg string, row canonical.Doc) []ModelRef {
 			manifest := model.Sub("manifest")
 			out = append(out, ModelRef{Package: pkg, Slot: path,
 				Model: model.Str("repo"), Release: model.Str("version"), Lane: model.Str("lane"),
-				Manifest: manifest.Str("digest"), ManifestLength: manifest.Int("length")})
+				Manifest: manifest.Str("digest"), ManifestLength: manifest.Int("length"), Adapters: placementAdapters(slot, byID)})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
@@ -706,20 +706,22 @@ func preparedPlacementServes(w *worker, logical LogicalPackage) bool {
 	if err != nil {
 		return false
 	}
-	pinned := make(map[string]string, len(logical.Models))
+	pinned := make(map[string]ModelRef, len(logical.Models))
 	for _, model := range logical.Models {
 		if !model.Pinned() {
 			return false
 		}
-		pinned[model.Slot] = model.Manifest
+		pinned[model.Slot] = model
 	}
 	for _, row := range doc.List("placements") {
 		if row.Str("placement_id") != desired.PlacementIDValue {
 			continue
 		}
 		manifests := map[string]string{}
+		modelRows := map[string]canonical.Doc{}
 		for _, model := range row.List("models") {
 			manifests[model.Str("id")] = model.Sub("manifest").Str("digest")
+			modelRows[model.Str("id")] = model
 		}
 		for _, entrypoint := range row.List("entrypoints") {
 			if entrypoint.Str("name") != logical.Function {
@@ -732,7 +734,7 @@ func preparedPlacementServes(w *worker, logical LogicalPackage) bool {
 			for _, slot := range slots {
 				path := logical.Function + ".models." + slot.Str("slot")
 				held := manifests[slot.Str("reference_model_id")]
-				if held == "" || pinned[path] != held {
+				if held == "" || pinned[path].Manifest != held || !records.SameAdapters(pinned[path].Adapters, placementAdapters(slot, modelRows)) {
 					return false
 				}
 			}

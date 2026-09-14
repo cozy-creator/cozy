@@ -340,7 +340,7 @@ func cloneModelRefs(in []*pb.DownloadModelRef) []*pb.DownloadModelRef {
 		if ref != nil {
 			out = append(out, &pb.DownloadModelRef{
 				Manifest: ref.Manifest, Model: ref.Model, Release: ref.Release,
-				Package: ref.Package, Slot: ref.Slot, Lane: ref.Lane,
+				Package: ref.Package, Slot: ref.Slot, Lane: ref.Lane, Adapters: cloneDownloadAdapters(ref.Adapters),
 			})
 		}
 	}
@@ -1977,4 +1977,14 @@ func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.F
 	c.logf("relaying package-interface defect for %s@%s from rental %s",
 		report.Package, report.Release, report.RentalID)
 	go c.opt.ReportReleaseDefect(report)
+}
+
+func cloneDownloadAdapters(in []*pb.DownloadAdapterRef) []*pb.DownloadAdapterRef {
+	out := make([]*pb.DownloadAdapterRef, 0, len(in))
+	for _, a := range in {
+		if a != nil {
+			out = append(out, &pb.DownloadAdapterRef{Component: a.Component, Model: a.Model, Release: a.Release, Lane: a.Lane, Manifest: a.Manifest, SourceComponent: a.SourceComponent, Scale: a.Scale})
+		}
+	}
+	return out
 }
