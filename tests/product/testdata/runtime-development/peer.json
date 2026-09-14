@@ -1,0 +1,7 @@
+{
+  "source_repository": "https://github.com/cozy-creator/cozy-runtime",
+  "source_commit": "f084c910f0ce5bd5027905d592c0099621009fac",
+  "wheel": "a28d222ada11b43c99a5c2704afa13186f18c7cccee9bf8fc92363a182c8e842/cozy_runtime-0.18.0-py3-none-any.whl",
+  "sha256": "a28d222ada11b43c99a5c2704afa13186f18c7cccee9bf8fc92363a182c8e842",
+  "wire_minor": 55
+}

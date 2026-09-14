@@ -13,10 +13,41 @@ jobs:
           version: '0.12.11'
       - run: uv python install 3.12
       - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
-      - name: Install the public worker for private script execution
+      - name: Verify and install the immutable development Runtime fixture
         run: |
-          uv tool install --refresh-package cozy-runtime --python 3.12 'cozy-runtime[model-execution]==0.16.10'
-          uv tool dir --bin >> "$GITHUB_PATH"
+          # A coordinated wire update can be qualified before a public PyPI release.
+          # This private-repository test fixture grants no sibling checkout credential.
+          python3 - <<'PYTHON'
+          import ast, hashlib, json, os, pathlib, re, zipfile
+          root = pathlib.Path("tests/product/testdata/runtime-development")
+          peer = json.loads((root / "peer.json").read_bytes())
+          wheel = (root / peer["wheel"]).resolve()
+          assert hashlib.sha256(wheel.read_bytes()).hexdigest() == peer["sha256"]
+          with zipfile.ZipFile(wheel) as archive:
+              tree = ast.parse(archive.read("cozy_runtime/_build_provenance.py"))
+              commits = [ast.literal_eval(row.value) for row in tree.body
+                         if isinstance(row, ast.Assign)
+                         and any(isinstance(name, ast.Name) and name.id == "COMMIT"
+                                 for name in row.targets)]
+              assert commits == [peer["source_commit"]], commits
+          source = pathlib.Path("protocol/cozy/worker/v1/wire_version.go").read_text()
+          required = int(re.search(r"WireMinor(?:\s+uint32)?\s*=\s*(\d+)", source)[1])
+          assert peer["wire_minor"] >= required
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"COZY_TEST_RUNTIME_WHEEL={wheel}\n")
+          PYTHON
+          wheel="$(python3 -c 'import json,pathlib; p=pathlib.Path("tests/product/testdata/runtime-development"); print((p/json.loads((p/"peer.json").read_bytes())["wheel"]).resolve())')"
+          uv tool install --python 3.12 "$wheel[model-execution]"
+          tool_bin="$(uv tool dir --bin)"
+          echo "$tool_bin" >> "$GITHUB_PATH"
+          "$tool_bin/cozy-runtime" --json version > "$RUNNER_TEMP/runtime-version.json"
+          python3 - "$RUNNER_TEMP/runtime-version.json" <<'PYTHON'
+          import json, pathlib, sys
+          peer = json.loads(pathlib.Path("tests/product/testdata/runtime-development/peer.json").read_bytes())
+          version = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+          assert version["commit"] == peer["source_commit"][:12], version
+          assert version["wire_protocol"] == f"cozy.worker.v1+minor.{peer['wire_minor']}", version
+          PYTHON
       # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
       # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
       # what keeps a C dependency from arriving unnoticed and silently ending the
@@ -45,7 +76,9 @@ jobs:
             --uid="$(id -u)" --gid="$(id -g)" \
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 \
-            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 30m'
+            --setenv="COZY_TEST_RUNTIME_WHEEL=$COZY_TEST_RUNTIME_WHEEL" \
+            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 30m \
+              -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"'
       - run: python3 scripts/fence.py
 
   # THE WORKER-IMAGE ROSTER CHECK. `internal/packagepublish/base-distributions.json` is
