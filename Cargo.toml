@@ -3,5 +3,5 @@ resolver = "2"
 members = ["crates/tensorfs-core", "crates/tensorfs-py"]
 
 [workspace.package]
-version = "0.3.43-dev.1"
+version = "0.3.43"
 edition = "2021"
