@@ -26,11 +26,11 @@ func TestUnpublishedWheelCompositionTracksExecutableNotCaller(t *testing.T) {
 	}
 	project := t.TempDir()
 	control := filepath.Join(project, "control")
-	runtimeInstall, runtimeSource := "cozy-runtime[model-execution]=="+version, ""
+	runtimeInstall, runtimeSource := "cozy-runtime=="+version, ""
 	if *privateChildRuntimeWheel != "" {
 		path, err := filepath.Abs(*privateChildRuntimeWheel)
 		must(t, err)
-		runtimeInstall = path + "[model-execution]"
+		runtimeInstall = path
 		runtimeSource = "# cozy-runtime = {path = " + strconv.Quote(path) + "}\n"
 	}
 	runUV := func(args ...string) {
@@ -63,7 +63,7 @@ func TestUnpublishedWheelCompositionTracksExecutableNotCaller(t *testing.T) {
 name = "unpublished-wheel-proof"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime[model-execution]==%s", "msgspec"]
+dependencies = ["cozy-runtime==%s", "msgspec"]
 [project.entry-points."cozy.application"]
 default = "wheel_proof:app"
 [build-system]
@@ -101,7 +101,7 @@ app.job(second)
 	script := filepath.Join(project, "first.py")
 	code := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime[model-execution]==%s", "unpublished-wheel-proof==0.1.0"]
+# dependencies = ["cozy-runtime==%s", "unpublished-wheel-proof==0.1.0"]
 # [tool.uv.sources]
 %s# unpublished-wheel-proof = {path = %q}
 # ///
@@ -111,36 +111,54 @@ async def main(ctx):
     assert result.value == 42
 `, version, runtimeSource, wheel)
 	must(t, os.WriteFile(script, []byte(code), 0o600))
-	status, output := runCozyPath(t, root, path, "run", script, "--await", "--json")
+	status, output := runCozyPath(t, root, path, "run", script, "--describe", "--json")
 	if status != 0 {
-		t.Fatalf("wheel helper failed [%d]: %s", status, output)
+		t.Fatalf("wheel capture refused [%d]: %s", status, output)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	first, problem := store.RequestByReference("1")
+	installs, problem := store.Installed()
 	fatal(t, problem)
-	children, problem := store.Children(first.ID)
+	pending, problem := store.Unreferenced()
 	fatal(t, problem)
-	if len(children) != 2 || children[0].Ordinal != 1 || children[1].Ordinal != 1 {
-		t.Fatalf("wheel helper did not dispatch two leaves: %+v", children)
+	installs = append(installs, pending...)
+	var inst *records.PackageInstall
+	for _, candidate := range installs {
+		if candidate.SourceKind == "wheel" && candidate.Package == "local/unpublished-wheel-proof" {
+			value := candidate
+			inst = &value
+		}
 	}
-	before := append([]records.Request(nil), children...)
-	inst, problem := store.Install(children[0].InstallID)
-	fatal(t, problem)
-	if inst.SourceKind != "wheel" {
-		t.Fatalf("captured wheel became a source project: %+v", inst)
+	if inst == nil {
+		t.Fatal("captured wheel has no immutable wheel install")
 	}
 	sealed, problem := capturedwheel.Metadata(filepath.Join(inst.Dir, "wheels", filepath.Base(wheel)))
 	fatal(t, problem)
 	if !strings.Contains(string(sealed), "Requires-Dist: msgspec\n") || strings.Contains(string(sealed), "msgspec==") {
-		t.Fatalf("callable wheel replaced its authored image requirement with a client pin: %s", sealed)
+		t.Fatalf("wheel changed authored image requirements: %s", sealed)
 	}
 	retained := filepath.Join(inst.Dir, "original", filepath.Base(wheel))
 	raw, err := os.ReadFile(retained)
 	must(t, err)
 	if !bytes.Equal(raw, original) {
-		t.Fatal("original library wheel was not retained byte-exactly")
+		t.Fatal("original wheel was not captured byte-exactly")
+	}
+	status, output = runCozyPath(t, root, path, "run", script, "--await", "--json")
+	if status != 0 {
+		t.Fatalf("wheel helper failed [%d]: %s", status, output)
+	}
+	first, problem := store.RequestByReference("1")
+	fatal(t, problem)
+	children := machineChildren(t, root, store, "1")
+	if len(children) != 2 || children[0].Executions != 1 || children[1].Executions != 1 {
+		t.Fatalf("wheel helper did not execute two leaves: %+v", children)
+	}
+	before := append([]machineChildProof(nil), children...)
+	captured, problem := store.MachineExecution(first.ID)
+	fatal(t, problem)
+	if captured == nil || len(captured.Receipt) == 0 {
+		t.Fatal("Runtime did not retain the captured wheel execution")
 	}
 	edited := filepath.Join(project, "independent.py")
 	must(t, os.WriteFile(edited, []byte(strings.Replace(code, "    result =", "    ctx.log('independent caller')\n    result =", 1)), 0o600))
@@ -148,15 +166,12 @@ async def main(ctx):
 	if status != 0 {
 		t.Fatalf("edited wheel caller failed [%d]: %s", status, output)
 	}
-	second, problem := store.RequestByReference("4")
-	fatal(t, problem)
-	children, problem = store.Children(second.ID)
-	fatal(t, problem)
+	children = machineChildren(t, root, store, "2")
 	if len(children) != 2 {
 		t.Fatalf("edited caller lost children: %+v", children)
 	}
 	for n, child := range children {
-		if child.Ordinal != 0 || child.ReusedFrom != before[n].ID || child.ChildTargetDigest != before[n].ChildTargetDigest || child.LocalPackageDigest != before[n].LocalPackageDigest {
+		if child.Executions != 0 || child.Computation != before[n].Computation || child.Revision != before[n].Revision || string(child.Result) != string(before[n].Result) {
 			t.Fatalf("caller edit invalidated wheel computation: %+v", children)
 		}
 	}
@@ -167,22 +182,19 @@ async def main(ctx):
 	if status != 0 {
 		t.Fatalf("same-version wheel edit failed [%d]: %s", status, output)
 	}
-	third, problem := store.RequestByReference("7")
-	fatal(t, problem)
-	children, problem = store.Children(third.ID)
-	fatal(t, problem)
+	children = machineChildren(t, root, store, "3")
 	if len(children) != 2 {
 		t.Fatalf("changed wheel lost children: %+v", children)
 	}
 	for n, child := range children {
-		if child.Ordinal != 1 || child.ChildTargetDigest == before[n].ChildTargetDigest || child.LocalPackageDigest == before[n].LocalPackageDigest {
+		if child.Executions != 1 || child.Revision == before[n].Revision || child.Computation == before[n].Computation {
 			t.Fatalf("changed wheel reused old implementation: %+v", children)
 		}
 	}
-	raw, err = os.ReadFile(retained)
-	must(t, err)
-	if !bytes.Equal(raw, original) {
-		t.Fatal("wheel edit changed original source custody")
+	held, problem := store.MachineExecution(first.ID)
+	fatal(t, problem)
+	if held == nil || !bytes.Equal(held.Submission, captured.Submission) {
+		t.Fatal("wheel edit changed the original frozen Runtime capture")
 	}
 	// Describing a remote-capable script is not permission to execute a selected
 	// wheel's Python startup hooks on the client, in either parent or child venv.
