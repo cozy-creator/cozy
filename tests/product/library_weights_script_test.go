@@ -89,11 +89,11 @@ func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 	code := metadata + `# ///
 import io
 import struct
-from cozy_runtime.author import Context, ModelArtifact
+from cozy_runtime.author import Context, Model, ModelArtifact
 from tensorfs.derived import Derivation, Part, Target, Tensor
-from tensor_candidate import Source, PLAIN, scale_values
+from tensor_candidate import PLAIN, scale_values
 
-def main(ctx: Context, *, source: Source) -> ModelArtifact:
+def main(ctx: Context, *, source: Model) -> ModelArtifact:
     tensor = Tensor(logical_dtype="f32", shape=(512,), encoding=PLAIN,
                     parts={"value": Part("f32", (512,))})
     with ctx.output("weights").open(Derivation(sources={"original": ctx.tensorfs_source(source)},
