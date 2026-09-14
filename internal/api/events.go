@@ -99,10 +99,15 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 
 	frames, unsubscribe := s.orchestrator.Subscribe(requestID)
 	defer unsubscribe()
+	machineOwned := false
+	if requestID != "" {
+		link, problem := s.store.MachineExecution(requestID)
+		machineOwned = problem == nil && link != nil
+	}
 
 	// The latest tick, immediately. A subscriber attaching to a running attempt sees
 	// where it IS, not where it goes next.
-	if requestID != "" {
+	if requestID != "" && !machineOwned {
 		if frame, ok := s.orchestrator.LatestFrame(requestID); ok {
 			writeEvent(w, 0, liveEnvelope(frame))
 			flusher.Flush()
@@ -135,6 +140,12 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 			}
 			for _, row := range rows {
 				cursor = row.Seq
+				if machineOwned && records.TerminalEvent(row.Type) {
+					current, problem := s.store.RequestRow(requestID)
+					if problem == nil && current != nil && row.Attempt < current.Ordinal {
+						continue // an explicitly resumed Runtime attempt owns the live stream
+					}
+				}
 				writeEvent(w, row.Seq, durableEnvelope(row))
 				if requestID != "" && records.TerminalEvent(row.Type) {
 					// TERMINAL-STOP. The client is told to stop by the event itself,

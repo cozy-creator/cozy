@@ -78,7 +78,9 @@ func preflightConversionPlan(runCtx context.Context, ctx *Context, source publis
 	slots map[string]string,
 ) (conversionPreflight, *exit.Error) {
 	if len(slots) == 0 {
-		return conversionPreflight{Undecided: "no producer source profile to plan"}, nil
+		// Standalone imports use the same automatic header classification as
+		// their real transfer. A dry run must also refuse ambiguous versions.
+		slots = map[string]string{"model": ""}
 	}
 	if source.Resolver == nil {
 		// A local file, a `local/` alias, or a Tensorhub checkpoint. None of those has a

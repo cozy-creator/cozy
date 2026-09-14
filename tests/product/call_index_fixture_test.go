@@ -10,7 +10,9 @@ import (
 // Preserve every row and historical index while removing schema35 and later additions.
 func restorePriorCallIndexBounds(t *testing.T, db *sql.DB) {
 	t.Helper()
-	_, err := db.Exec(`DROP INDEX IF EXISTS byte_outputs_native_service`)
+	_, err := db.Exec(`DROP TRIGGER IF EXISTS machine_execution_no_local_attempt; DROP TABLE IF EXISTS machine_executions`)
+	must(t, err)
+	_, err = db.Exec(`DROP INDEX IF EXISTS byte_outputs_native_service`)
 	must(t, err)
 	var byteDDL string
 	if db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='byte_outputs'`).Scan(&byteDDL) == nil && strings.Contains(byteDDL, "native_service_id") {

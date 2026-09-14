@@ -67,10 +67,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
-	if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
-		return exit.Usagef("--timeout requires --await").
-			WithRemedy("a detached run has no client waiting to enforce a caller deadline")
-	}
 	target, packageInterface, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
@@ -106,6 +102,13 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Usagef("--dry-run and --await conflict")
 	}
 	if callable.Kind != "job" {
+		if len(ctx.Inv.Values["--allow-publish"]) > 0 {
+			return exit.Usagef("--allow-publish applies only to Runtime-owned job transactions")
+		}
+		if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
+			return exit.Usagef("--timeout requires --await for serving callables").
+				WithRemedy("a detached serving call has no client waiting to enforce a caller deadline")
+		}
 		if ctx.Inv.Value("--retry") != "" {
 			return exit.Usagef("--retry applies only to job transactions")
 		}
@@ -119,14 +122,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 			return exit.Usagef("--org applies only to a job callable")
 		}
 		return handleRun(ctx, target, callable)
-	}
-	if ctx.Inv.Value("--timeout") != "" {
-		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --asset, --input-tree, --org, --out, --await, and --rental")
-	}
-	if rentalRequested(ctx) && len(ctx.Inv.Values["--input"]) > 0 {
-		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
-			"remote jobs cannot grant a local input-tree directory")
 	}
 	if ctx.Inv.Bool("--await") {
 		ctx.Inv.Bools["--follow"] = true
@@ -371,7 +366,7 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 			return nil, problem
 		}
 		out = append(out, orchestrator.ModelRef{Package: target.Package, Slot: spec.Slot,
-			Model: model.Model, Release: model.Release, Lane: model.Lane,
+			Model: model.Model, CatalogRepository: model.Model, Release: model.Release, Lane: model.Lane,
 			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
 	}
 	retained, retainProblem := exactInvocationInstall(ctx, target)
@@ -548,7 +543,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 			return empty, problem
 		}
 		return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
-			Model: ref.String(), Manifest: manifest, HubCheckpoint: true,
+			Model: ref.String(), CatalogRepository: ref.String(), Manifest: manifest, HubCheckpoint: true,
 			ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
 			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}, nil
 	}
@@ -598,7 +593,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 		return empty, problem
 	}
 	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
-		Model: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
+		Model: ref.String(), CatalogRepository: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
 		Bytes: manifestBytes[manifest], ComponentBytes: manifestComponentBytes[manifest],
 		ComponentUse: slot.ComponentUse, Ladder: assertedRungs(binding, ref, selected)}, nil
 }

@@ -133,3 +133,61 @@ func TestDevelopmentFalseOverridesConfiguredDefault(t *testing.T) {
 		t.Fatal("replay changed ordinary acquisition bytes")
 	}
 }
+
+func TestDevelopmentImageIsPinnedPerRentalAndReplay(t *testing.T) {
+	root, mu, posts, _, _ := runModelCatalog(t)
+	keyPath := filepath.Join(root, "operator.pub")
+	must(t, os.WriteFile(keyPath, []byte(developmentFixtureKey+"\n"), 0600))
+	startDaemonProcess(t, root)
+	image := "sha256:" + strings.Repeat("a", 64)
+	base := []string{"rental", "new", "cpu", "--idempotency-key", "candidate-image", "--json"}
+	code, out := runCozy(t, root, append(base, "--development", "--ssh-public-key", keyPath, "--development-image", image)...)
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("candidate did not reach acquisition: %d %s", code, out)
+	}
+	mu.Lock()
+	body := append([]byte(nil), (*posts)[0]...)
+	mu.Unlock()
+	request, problem := hub.ParseRentalRequestBytes(body)
+	fatal(t, problem)
+	if request.Development == nil || request.Development.ImageDigest != image {
+		t.Fatalf("image not captured: %+v", request.Development)
+	}
+	must(t, os.Remove(keyPath))
+	code, out = runCozy(t, root, base...)
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("replay lost image: %d %s", code, out)
+	}
+	code, out = runCozy(t, root, append(base, "--development", "--development-image", "sha256:"+strings.Repeat("b", 64))...)
+	if code == 0 || !strings.Contains(out, "rental.idempotency_conflict") {
+		t.Fatalf("changed image was accepted: %d %s", code, out)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*posts) != 2 || !bytes.Equal(body, (*posts)[1]) {
+		t.Fatal("candidate replay changed request bytes or changed image reached acquisition")
+	}
+}
+
+func TestDevelopmentImageRefusesNonDevelopmentAndMutableNames(t *testing.T) {
+	for _, image := range []string{"image:latest", "sha256:" + strings.Repeat("g", 64), "sha256:" + strings.Repeat("a", 64)} {
+		root, mu, posts, _, _ := runModelCatalog(t)
+		keyPath := filepath.Join(root, "operator.pub")
+		must(t, os.WriteFile(keyPath, []byte(developmentFixtureKey+"\n"), 0600))
+		startDaemonProcess(t, root)
+		args := []string{"rental", "new", "cpu", "--development-image", image, "--json"}
+		if image != "sha256:"+strings.Repeat("a", 64) {
+			args = append(args, "--development", "--ssh-public-key", keyPath)
+		}
+		code, out := runCozy(t, root, args...)
+		if code == 0 || !strings.Contains(out, "development") {
+			t.Fatalf("bad image request was accepted: %d %s", code, out)
+		}
+		mu.Lock()
+		count := len(*posts)
+		mu.Unlock()
+		if count != 0 {
+			t.Fatal("invalid image request reached acquisition")
+		}
+	}
+}

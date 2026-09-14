@@ -3,8 +3,13 @@ on: [push, pull_request]
 jobs:
   checks:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tests: ['^Test[A-H]', '^Test[I-O]', '^Test[P-Q]', '^Test[R-Z]']
     env:
-      COZY_TEST_RUNTIME_REV: f084c910f0ce5bd5027905d592c0099621009fac
+      UV_TORCH_BACKEND: cpu
+      COZY_RUNTIME_SOURCE: bb0e393b4bfb41794ab3e2c8c0659b7bc0def50f
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -15,40 +20,26 @@ jobs:
           version: '0.12.11'
       - run: uv python install 3.12
       - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
-      - name: Check out the exact development Runtime with the existing read-only key
+      - name: Check out the exact Runtime execution peer
         uses: actions/checkout@v4
         with:
           repository: cozy-creator/cozy-runtime
-          ref: ${{ env.COZY_TEST_RUNTIME_REV }}
-          path: .ci-runtime-peer
+          ref: ${{ env.COZY_RUNTIME_SOURCE }}
+          path: runtime-peer
           ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
           persist-credentials: false
-      - name: Build and qualify the immutable Runtime wheel
+      - name: Build and install the source-addressed CPU worker
         run: |
-          test "$(git -C .ci-runtime-peer rev-parse HEAD)" = "$COZY_TEST_RUNTIME_REV"
-          source_root="$RUNNER_TEMP/cozy-runtime-source"
-          mkdir -p "$source_root"
-          git -C .ci-runtime-peer archive HEAD | tar -x -C "$source_root"
-          uv run --isolated --no-project --python 3.12 python \
-            "$source_root/scripts/stamp-build-provenance.py" "$COZY_TEST_RUNTIME_REV"
-          uv build --wheel --out-dir "$RUNNER_TEMP/cozy-runtime-wheel" "$source_root"
-          wheels=("$RUNNER_TEMP"/cozy-runtime-wheel/*.whl)
-          test "${#wheels[@]}" -eq 1
-          sha256sum "${wheels[0]}"
-          uv tool install --python 3.12 "${wheels[0]}[model-execution]"
-          tool_bin="$(uv tool dir --bin)"
-          echo "$tool_bin" >> "$GITHUB_PATH"
-          echo "COZY_TEST_RUNTIME_WHEEL=${wheels[0]}" >> "$GITHUB_ENV"
-          "$tool_bin/cozy-runtime" --json version > "$RUNNER_TEMP/runtime-version.json"
-          python3 - "$RUNNER_TEMP/runtime-version.json" "$COZY_TEST_RUNTIME_REV" <<'PYTHON'
-          import json, pathlib, re, sys
-          version = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
-          assert version["commit"] == sys.argv[2][:12], version
-          source = pathlib.Path("protocol/cozy/worker/v1/wire_version.go").read_text()
-          required = int(re.search(r"WireMinor(?:\s+uint32)?\s*=\s*(\d+)", source)[1])
-          package, minor = version["wire_protocol"].split("+minor.")
-          assert package == "cozy.worker.v1" and int(minor) >= required, version
-          PYTHON
+          wheel="$(python3 scripts/build-runtime-peer.py runtime-peer "$COZY_RUNTIME_SOURCE" "$RUNNER_TEMP/runtime-peer")"
+          uv tool install --force --python 3.12 "$wheel[model-execution]"
+          uv tool dir --bin >> "$GITHUB_PATH"
+          echo "COZY_TEST_RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/runtime-peer/manifest.json"
+      - name: Retain Runtime test provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-test-provenance-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/runtime-peer/manifest.json
       # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
       # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
       # what keeps a C dependency from arriving unnoticed and silently ending the
@@ -78,8 +69,8 @@ jobs:
             --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 \
             --setenv="COZY_TEST_RUNTIME_WHEEL=$COZY_TEST_RUNTIME_WHEEL" \
-            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -timeout 30m \
-              -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -cozy-runtime-repo="$PWD/.ci-runtime-peer"'
+            --setenv=UV_TORCH_BACKEND=cpu \
+            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -run "${{ matrix.tests }}" -timeout 30m -args -serving-cpu-fixture -script-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"'
       - run: python3 scripts/fence.py
 
   # THE WORKER-IMAGE ROSTER CHECK. `internal/packagepublish/base-distributions.json` is
@@ -115,6 +106,10 @@ jobs:
           nice -n 19 go test ./tests/product/ -run 'TestVendoredBaseDistributions|TestAuthoredDefaultsMatchRuntimeCorpus' -v -timeout 5m \
             -cozy-runtime-repo="$GITHUB_WORKSPACE/cozy-runtime" \
             -require-cozy-runtime-peer
+      - name: Report unarmed roster comparison
+        if: env.COZY_RUNTIME_TOKEN == ''
+        run: |
+          echo '::warning::COZY_RUNTIME_TOKEN is absent, so the vendored base-distributions.json was not byte-compared against cozy-runtime. This is a missing ceiling, not a missing floor: the always-armed half ran in `checks` and proves the publish prune list is derived from these bytes with nothing added or dropped.'
 
   # THE VENDORED-BINDING CHECK. `protocol/` is copied, never imported as a module, so
   # worker-protocol regenerates from its own .proto with its pinned toolchain and

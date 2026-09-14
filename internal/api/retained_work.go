@@ -1,18 +1,51 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"net/http"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // Fresh snapshots may have different local install IDs with identical immutable
 // contents. An idempotency replay accepts that equivalence, but it must never
 // silently replace newly supplied code/dependencies with the prior request's code.
-func (s *Server) verifyJobReplayInstall(sub JobSubmission, recorded records.Request) *exit.Error {
+func (s *Server) verifyJobReplayInstall(ctx context.Context, sub JobSubmission, recorded records.Request) *exit.Error {
 	if sub.InstallID == "" || sub.InstallID == recorded.InstallID {
 		return nil
+	}
+	if recorded.LocalPackageDigest != "" && s.packages != nil {
+		link, problem := s.store.MachineExecution(recorded.ID)
+		if problem != nil {
+			return problem
+		}
+		if link != nil {
+			// Completed snapshot trees may be reclaimed. The durable submitted
+			// capture still proves whether the new intake is the identical code.
+			revision, problem := s.packages.PrepareLocal(ctx, sub.InstallID)
+			if problem != nil {
+				return problem
+			}
+			if revision.Digest != recorded.LocalPackageDigest || revision.Package != recorded.Package || revision.Release != recorded.Release {
+				return exit.Named(exit.Conflict, "request.replay_install_changed", "this idempotency key names a different captured package; submit a new request to run the edited revision")
+			}
+			if len(link.Submission) > 0 {
+				capture, problem := localpackage.CaptureExecution(sub.InstallID, revision, s.store.ChildBindings, s.packages.LocalRevision)
+				if problem != nil {
+					return problem
+				}
+				var submitted pb.MachineExecutionSubmit
+				if proto.Unmarshal(link.Submission, &submitted) != nil || !bytes.Equal(capture.Digest, submitted.CaptureDigest) {
+					return exit.Named(exit.Conflict, "request.replay_install_changed", "this idempotency key names different captured dependencies; submit a new request to run the edited revision")
+				}
+			}
+			return nil
+		}
 	}
 	prior, problem := s.store.Install(recorded.InstallID)
 	if problem != nil {
@@ -38,6 +71,9 @@ func (s *Server) pauseJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.machineJobControl(w, r, row, "pause") {
+		return
+	}
 	if problem := s.orchestrator.PauseRequest(row.ID, requestActor(r)); problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
@@ -57,6 +93,9 @@ func (s *Server) pauseJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 	row, ok := s.jobRow(w, r)
 	if !ok {
+		return
+	}
+	if s.machineJobControl(w, r, row, "resume") {
 		return
 	}
 	s.shutdownAdmission.RLock()

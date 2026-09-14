@@ -166,6 +166,8 @@ func messageFor(name string) proto.Message {
 		return &pb.MachineExecutionCapture{}
 	case "cozy.worker.v1.LocalPackageRevision":
 		return &pb.LocalPackageRevision{}
+	case "cozy.worker.v1.MachineExecutionCapture":
+		return &pb.MachineExecutionCapture{}
 	case "cozy.worker.v1.WorkerSnapshotBody":
 		return &pb.WorkerSnapshotBody{}
 	case "cozy.worker.v1.HostSnapshotBody":

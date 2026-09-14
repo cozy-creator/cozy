@@ -289,7 +289,7 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 		return nil, problem
 	}
 	defer store.Close()
-	obligations, problem := store.Obligations()
+	obligations, problem := store.ClientShutdownObligations()
 	if problem != nil {
 		return nil, problem
 	}

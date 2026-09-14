@@ -56,7 +56,7 @@ func nativeSourceByteOutput(row records.NativeCall, status *pb.NativeSourceStatu
 	}
 	binding := b
 	binding.OutputID = "files"
-	if problem := verifyByteResultRow(value, binding); problem != nil {
+	if problem := VerifyByteResultRow(value, binding); problem != nil {
 		return records.ByteOutput{}, problem
 	}
 	return b, nil

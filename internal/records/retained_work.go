@@ -44,8 +44,16 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 			return exit.Internalf("cannot inspect predecessor child custody: %s", err)
 		}
 	}
-	if !request.RetainWork || request.Kind != "job" || !prior.RetainWork || !prior.IsJob() ||
-		(prior.State != "paused" && prior.State != "blocked" && !(prior.State == "succeeded" && retainedResult)) {
+	retained, stopped := prior.RetainWork, prior.State == "paused" || prior.State == "blocked" || prior.State == "succeeded" && retainedResult
+	if request.MachineExecutionObserver {
+		var machineRetained bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND length(e.receipt)>0 AND length(e.pending_control)=0 AND e.cancel_requested=0 AND `+machineExecutionOwed+`)`, prior.ID).Scan(&machineRetained); err != nil {
+			return exit.Internalf("cannot inspect predecessor machine custody: %s", err)
+		}
+		retained = machineRetained
+		stopped = machineRetained && (prior.State == "failed" || prior.State == "paused" || prior.State == "succeeded")
+	}
+	if !request.RetainWork || request.Kind != "job" || !retained || !prior.IsJob() || !stopped {
 		return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s must retain stopped work; current state %s", prior.ID, prior.State)
 	}
 	var open int

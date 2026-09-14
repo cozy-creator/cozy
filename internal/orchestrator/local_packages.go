@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"time"
@@ -292,6 +293,32 @@ func localSelection(operationID string, revision localpackage.Revision) (
 	return selected, transfer, nil
 }
 
+// LocalPackageSelection is the passive code-preparation document. Calling it
+// neither converges worker state nor creates an execution attempt.
+func LocalPackageSelection(operationID string, revision localpackage.Revision) (*pb.DesiredLocalPackageSet, *exit.Error) {
+	selected, _, problem := localSelection(operationID, revision)
+	return selected, problem
+}
+
+// localPackageUploadProblem shares preparation's terminal/refusable distinction.
+// A host verdict on an exact header cannot improve by reconnecting.
+func localPackageUploadProblem(err error) *exit.Error {
+	if result := classifyPrepareEnd(err); result.err == nil {
+		return exit.Named(exit.Structural, "local_package_upload_refused", "worker refused unpublished wheel upload: %s", result.refusal)
+	}
+	return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "unpublished upload interrupted; acknowledged bytes can be resumed: %s", err)
+}
+
+// gRPC Send can report EOF before exposing the server's actual terminal status.
+func localPackageUploadSendProblem(stream pb.PodHost_LocalPackageUploadClient, err error) *exit.Error {
+	if errors.Is(err, io.EOF) {
+		if _, terminal := stream.Recv(); terminal != nil {
+			err = terminal
+		}
+	}
+	return localPackageUploadProblem(err)
+}
+
 // transferLocalPackage sends captured source wheels directly to the claimed host.
 // The host owns durable offsets; reconnect resumes verified prefixes without a
 // package repository, publication or intermediate object-storage grant.
@@ -332,7 +359,7 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 	defer cancel()
 	stream, err := current.host.LocalPackageUpload(ctx)
 	if err != nil {
-		return exit.Named(exit.Unavailable, "local_package_upload_unavailable", "unpublished package upload could not connect: %s", err)
+		return localPackageUploadProblem(err)
 	}
 	defer stream.CloseSend()
 	if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Header{
@@ -340,7 +367,7 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 			SourceDigest: transfer.source, File: &pb.LocalPackageFileRef{Digest: selected.digest,
 				Filename: selected.filename, Length: selected.length}},
 	}}); err != nil {
-		return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "unpublished package upload header was not accepted: %s", err)
+		return localPackageUploadSendProblem(stream, err)
 	}
 	file, err := os.Open(selected.path)
 	if err != nil {
@@ -353,7 +380,7 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 	for {
 		status, err := stream.Recv()
 		if err != nil {
-			return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "unpublished package upload interrupted; the worker retains its verified prefix: %s", err)
+			return localPackageUploadProblem(err)
 		}
 		if status.OperationId != operationID || !bytes.Equal(status.SourceDigest, transfer.source) ||
 			!bytes.Equal(status.Digest, selected.digest) || status.Filename != selected.filename ||
@@ -401,7 +428,7 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 		if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Chunk{
 			Chunk: &pb.LocalPackageUploadChunk{Offset: sent, Data: chunk[:n]},
 		}}); err != nil {
-			return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "unpublished package upload interrupted; retained bytes can be resumed: %s", err)
+			return localPackageUploadSendProblem(stream, err)
 		}
 		sent += uint64(n)
 	}

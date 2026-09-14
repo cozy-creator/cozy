@@ -340,6 +340,7 @@ type RunExecuteCmd struct {
 	Trees           []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org             string   `help:"Job publication organization (defaults to local)."`
 	PublishTo       string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
+	AllowPublish    []string `help:"Allow this rented transaction to publish only to org/model (repeatable)."`
 	SourceProfiles  []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
 	DryRun          bool     `help:"Resolve exact job inputs and conversion headers without queueing or renting."`
 	Await           bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
@@ -359,7 +360,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
-		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
+		"--publish-to", c.PublishTo, "--allow-publish", c.AllowPublish, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
 }
 
 type RunRetryPublicationCmd struct {
@@ -426,12 +427,13 @@ type RentalCmd struct {
 }
 
 type RentalNewCmd struct {
-	Development    *bool    `help:"Rent a developer worker; false overrides the configured default."`
-	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
-	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
-	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
-	IdempotencyKey string   `help:"Stable paid-operation identity."`
-	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
+	Development      *bool    `help:"Rent a developer worker; false overrides the configured default."`
+	SSHPublicKey     string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
+	DevelopmentImage string   `name:"development-image" help:"Pin one registered developer image by sha256 digest for this rental."`
+	SKU              string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
+	Models           []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
+	IdempotencyKey   string   `help:"Stable paid-operation identity."`
+	Timeout          string   `help:"Caller wait deadline; does not release the rental."`
 }
 
 type RentalPruneCmd struct {
@@ -448,7 +450,7 @@ func (c *RentalNewCmd) Run(r *Runtime) error {
 		flags["--development"] = *c.Development
 	}
 	return r.call(handleRent, []string{c.SKU}, flags, values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey, "--development-image", c.DevelopmentImage), false)
 }
 
 type RentalEndCmd struct {

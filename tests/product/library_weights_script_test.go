@@ -1,7 +1,7 @@
 package producttest
 
 import (
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,11 +10,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// A real native Model input and WeightsSink stay in this attempt even when its
+// A real native Model input and TensorFS output stay in this attempt even when its
 // ordinary helper library also exports a managed callable. No worker is mocked.
 func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 	wheel := *privateChildRuntimeWheel
@@ -47,24 +47,16 @@ func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 		if t.Failed() {
 			t.Log("library script evidence retained", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	project := copyPrivateTensorProject(t, root, "")
-	// Catalog model preparation currently also reads construction config, even
-	// though this job never constructs a model. Include a real inline config so
-	// the actual Runtime preparation can validate the captured slot contract.
-	producerSource := filepath.Join(project, "source", "tensor_source.py")
-	sourceCode, err := os.ReadFile(producerSource)
-	must(t, err)
-	source := strings.Replace(string(sourceCode), "App, Context,", "App, Context, WeightsConfig,", 1)
-	source = strings.Replace(source, "configs={},", `configs={"model": WeightsConfig(data=b"{}")},`, 1)
-	source = strings.Replace(source, "        writer.add_part(", "        writer.add_config(\"model\", b\"{}\")\n        writer.add_part(", 1)
-	must(t, os.WriteFile(producerSource, []byte(source), 0600))
 	script := filepath.Join(project, "recipe.py")
 	body, err := os.ReadFile(script)
 	must(t, err)
 	seed := strings.Replace(string(body), "    await candidate(source=original, factor=0)", "    return original", 1)
+	seed = strings.Replace(seed, "async def main():", "async def main() -> ModelArtifact:", 1)
+	seed = strings.Replace(seed, "from tensor_source import", "from cozy_runtime.author import ModelArtifact\nfrom tensor_source import", 1)
 	must(t, os.WriteFile(script, []byte(seed), 0600))
 	if status, output := runCozyPath(t, root, path, "run", script, "--await", "--json"); status != 0 {
 		t.Fatalf("native fixture seed failed [%d]: %s", status, output)
@@ -72,19 +64,20 @@ func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	producer, problem := store.RequestByReference("2")
+	producer, problem := store.RequestByReference("1")
 	fatal(t, problem)
 	if producer == nil || producer.State != "succeeded" {
 		t.Fatalf("native seed did not complete: %+v", producer)
 	}
-	weights, problem := store.AllModelTransferWeights(producer.ID, producer.Ordinal)
+	weights, problem := store.MachineModelRetentions(producer.ID)
 	fatal(t, problem)
-	if len(weights) != 1 {
-		t.Fatalf("native seed has no committed manifest: %+v", weights)
+	if len(weights) != 1 || weights[0].State != "held" {
+		t.Fatalf("native seed has no verified recipient custody: %+v", weights)
 	}
-	// Register the already-produced bytes as an ordinary local checkpoint. This
-	// uses native repository custody, not a fake Model loader or HTTP response.
-	register := exec.Command("tfs", "local", "replace", filepath.Join(root, "tensorfs"), "library-seed", strings.TrimPrefix(weights[0].ManifestID, "sha256:"), weights[0].ManifestID, strconv.FormatInt(weights[0].ManifestLength, 10), "--observed", "absent") //cozy:allow fixture uses native repository CLI to register a real produced checkpoint
+	seedModel, problem := records.DecodeModelArtifact(weights[0].Artifact)
+	fatal(t, problem)
+	// Register the already-produced bytes as an ordinary local checkpoint.
+	register := exec.Command(filepath.Join(control, "bin", "tfs"), "local", "replace", filepath.Join(root, "tensorfs"), "library-seed", strings.TrimPrefix(seedModel.Manifest.Digest, "sha256:"), seedModel.Manifest.Digest, strconv.FormatInt(seedModel.Manifest.Length, 10), "--observed", "absent") //cozy:allow fixture uses native repository CLI to register a real produced checkpoint
 	if output, err := register.CombinedOutput(); err != nil {
 		t.Fatalf("retain native fixture checkpoint: %v %s", err, output)
 	}
@@ -96,60 +89,86 @@ func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 	metadata, _, _ := strings.Cut(string(body), "# ///\nfrom")
 	metadata = strings.Replace(metadata, "# [tool.uv.sources]", "# [tool.cozy.weights]\n# weights = 4096\n# [tool.uv.sources]", 1)
 	code := metadata + `# ///
+import io
 import struct
-from cozy_runtime.author import ModelArtifact, WeightsPart, WeightsSink, WeightsTarget, WeightsTensor
-from tensor_candidate import Source, PLAIN, scale_values
+from cozy_runtime.author import Context, Model, ModelArtifact
+from tensorfs.derived import Derivation, Part, Target, Tensor
+from tensor_candidate import PLAIN, scale_values
 
-def main(*, source: Source, artifacts: WeightsSink) -> ModelArtifact:
-    tensor = WeightsTensor(logical_dtype="f32", shape=(512,), encoding=PLAIN,
-                          parts={"value": WeightsPart("f32", (512,))})
-    with artifacts.open("weights", sources={"original": source},
-        targets={"model": WeightsTarget(source="original", source_component="model",
+def main(ctx: Context, *, source: Model) -> ModelArtifact:
+    tensor = Tensor(logical_dtype="f32", shape=(512,), encoding=PLAIN,
+                    parts={"value": Part("f32", (512,))})
+    with ctx.output("weights").open(Derivation(sources={"original": ctx.tensorfs_source(source)},
+        targets={"model": Target(source="original", source_component="model",
             drop=("weight",), add={"weight": tensor})},
-        configs={}, order=(("model", "weight"),)) as writer:
+        configs={}, order=(("model", "weight"),))) as writer:
+        if writer.receipt is not None:
+            return ctx.adopt_model(writer.receipt)
         data = bytearray(2048)
         writer.source_read_into("original", "model", "weight", "value", 0, data)
         writer.add_part("model", "weight", "value",
-                        struct.pack("<512f", *scale_values(struct.unpack("<512f", data))))
-        return writer.commit().artifact
+                        io.BytesIO(struct.pack("<512f", *scale_values(struct.unpack("<512f", data)))))
+        return ctx.adopt_model(writer.commit())
 `
 	must(t, os.WriteFile(script, []byte(code), 0600))
-	status, output := runCozyPath(t, root, path, "run", script, "model.source=local/library-seed#"+weights[0].ManifestID, "--await", "--json")
+	status, output := runCozyPath(t, root, path, "run", script, "model.source=local/library-seed#"+seedModel.Manifest.Digest, "--await", "--json")
 	if status != 0 {
 		t.Fatalf("ordinary library script failed [%d]: %s", status, output)
 	}
-	request, problem := store.RequestByReference("3")
+	request, problem := store.RequestByReference("2")
 	fatal(t, problem)
 	if request == nil || request.State != "succeeded" || len(request.Models) != 1 || request.WeightsOutputs == "" {
 		t.Fatalf("ordinary model/weights attempt missing: %+v", request)
-	}
-	installed, problem := store.Install(request.InstallID)
-	fatal(t, problem)
-	if installed == nil {
-		t.Fatal("native output request lost its captured interface")
-	}
-	selection, err := json.Marshal(request.Models)
-	must(t, err)
-	selectionPath := filepath.Join(root, "model-selection.json")
-	must(t, os.WriteFile(selectionPath, selection, 0600))
-	checkSlots := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "verify_job_model_slots.py"),
-		launch.PackageInterfacePath(installed.Dir), selectionPath, filepath.Join(root, "tensorfs"))
-	if output, err := checkSlots.CombinedOutput(); err != nil {
-		t.Fatalf("captured job model selection cannot prepare on actual Runtime: %v %s", err, output)
 	}
 	children, problem := store.Children(request.ID)
 	fatal(t, problem)
 	if len(children) != 0 {
 		t.Fatalf("helper import produced child requests: %+v", children)
 	}
-	outputs, problem := store.AllModelTransferWeights(request.ID, request.Ordinal)
+	if calls := machineChildren(t, root, store, "2"); len(calls) != 0 {
+		t.Fatalf("ordinary helper import dispatched a managed child: %+v", calls)
+	}
+	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
+	must(t, err)
+	defer journal.Close()
+	var repository, inputState, nativeOwner string
+	var manifest []byte
+	var manifestLength, generation int64
+	must(t, journal.QueryRow(`SELECT repository,manifest,manifest_length,generation,native_owner,state FROM execution_checkpoint_inputs WHERE recipient=? AND input_id='model:source'`, request.ID).Scan(&repository, &manifest, &manifestLength, &generation, &nativeOwner, &inputState))
+	manifestID, err := canonical.Spell(manifest)
+	must(t, err)
+	if repository != "local/library-seed" || manifestID != seedModel.Manifest.Digest || manifestLength != seedModel.Manifest.Length || generation != 1 || inputState != "released" {
+		t.Fatalf("catalog input lost its exact released root: repo=%s manifest=%s length=%d generation=%d state=%s", repository, manifestID, manifestLength, generation, inputState)
+	}
+	if _, err := canonical.Raw(nativeOwner); err != nil {
+		t.Fatal("catalog input has no exact native owner")
+	}
+	var derivedInputs int
+	must(t, journal.QueryRow(`SELECT count(*) FROM execution_model_holds WHERE recipient=? AND path='input/source'`, request.ID).Scan(&derivedInputs))
+	if derivedInputs != 0 {
+		t.Fatal("catalog input fabricated a derived receipt hold")
+	}
+	native := exec.Command(filepath.Join(control, "bin", "python"), "-c", `import json,sys,tensorfs
+value=tensorfs.Store.open(sys.argv[1]).checkpoint_root(sys.argv[2])
+assert value['owner']==sys.argv[2] and value['released'] is True
+assert value['repository']=='local/library-seed' and value['manifest_digest']==sys.argv[3]
+assert value['manifest_length']==int(sys.argv[4])
+print(json.dumps(value,sort_keys=True))`, filepath.Join(root, "tensorfs"), nativeOwner, manifestID, strconv.FormatInt(manifestLength, 10))
+	if output, err := native.CombinedOutput(); err != nil {
+		t.Fatalf("native catalog input tombstone: %v %s", err, output)
+	} else {
+		t.Logf("native catalog input released: %s", output)
+	}
+	outputs, problem := store.MachineModelRetentions(request.ID)
 	fatal(t, problem)
-	if len(outputs) != 1 {
+	if len(outputs) != 1 || outputs[0].State != "held" {
 		t.Fatalf("ordinary native output missing: %+v", outputs)
 	}
-	read := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "private_child_read.py"), outputs[0].ManifestID, "14", filepath.Join(root, "tensorfs"))
+	result, problem := records.DecodeModelArtifact(outputs[0].Artifact)
+	fatal(t, problem)
+	read := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "private_child_read.py"), result.Manifest.Digest, "14", filepath.Join(root, "tensorfs"))
 	if output, err := read.CombinedOutput(); err != nil {
 		t.Fatalf("real transformed tensor: %v %s", err, output)
 	}
-	t.Log(fmt.Sprintf("one ordinary request read native Model and wrote value 14; %s", outputs[0].ManifestID))
+	t.Log(fmt.Sprintf("one ordinary request read native Model and wrote value 14; %s", result.Manifest.Digest))
 }

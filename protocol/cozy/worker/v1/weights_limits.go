@@ -20,6 +20,9 @@ const MaxRetainedModelArtifactBytes = 4096
 const MaxModelResultPointerBytes = 1024
 const MaxActiveChildCalls = 32
 const MaxNativeByteReadChunkBytes = 32 << 10
+const NativeRootInputsWireMinor = 55
+const MaxInputTreeManifestBytes = 1 << 20
+const MaxInputTreeChunkBytes = 1 << 20
 const MaxModelSourceHeaderBytes = MaxInlineControlBytes
 const MaxCheckpointObjects = 128
 const MaxModelSourceFiles = 4096
@@ -38,6 +41,6 @@ const MaxLocalPackageGrantURLBytes = 16 << 10
 const MaxModelSlotPaths = 256
 
 // ModelAdapterWireMinor is required before sending a nonempty model adapter stack.
-const ModelAdapterWireMinor uint32 = 55
+const ModelAdapterWireMinor uint32 = 57
 const MaxImageInventoryDistributions = 4096
 const MaxLockedRequirementsBytes = 1 << 20
