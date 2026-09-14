@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,8 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/install"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -119,7 +116,11 @@ async def main(ctx):
 		}
 	}
 	assertBaseUnchanged()
-	var original records.Request
+	builtinRoot := filepath.Join(root, "runtime", "environments", "runtime-builtins")
+	if _, err := os.Stat(filepath.Join(builtinRoot, "numerical")); !os.IsNotExist(err) {
+		t.Fatal("unrelated script eagerly prepared a numerical Runtime environment")
+	}
+	var first []machineChildProof
 	for i := range 2 {
 		script := filepath.Join(project, fmt.Sprintf("caller%d.py", i))
 		current := body
@@ -148,54 +149,54 @@ async def main(ctx):
 		if parent == nil || parent.State != "succeeded" {
 			t.Fatalf("missing completed caller: %+v", parent)
 		}
-		children, problem := store.Children(parent.ID)
-		fatal(t, problem)
+		children := machineChildren(t, root, store, reference)
 		if len(children) != 3 {
-			t.Fatalf("expected source, builtin and fresh reader: %+v", children)
+			t.Fatalf("expected Runtime source, builtin and fresh reader: %+v", children)
 		}
 		for _, child := range children {
 			if child.State != "succeeded" {
-				t.Fatalf("child failed: %+v", child)
+				t.Fatalf("Runtime child failed: %+v", child)
 			}
-			if child.Entrypoint == "quantize" {
-				if child.Package != "local/cozy-runtime-operations" {
-					t.Fatalf("quantization escaped the shared library: %+v", child)
-				}
-				if i == 0 {
-					original = child
-				} else if child.Ordinal != 0 || child.ReusedFrom != original.ID || child.ChildTargetDigest != original.ChildTargetDigest {
-					t.Fatalf("caller edit invalidated the shared computation: original=%+v retry=%+v", original, child)
-				}
+		}
+		if children[2].Executions != 1 {
+			t.Fatal("native readback was skipped")
+		}
+		for index, child := range children {
+			t.Logf("Runtime caller %d child %d: request=%s revision=%s computation=%s executions=%d state=%s", i, index, child.Request, child.Revision, child.Computation, child.Executions, child.State)
+		}
+		if i == 0 {
+			first = children
+			if first[0].Executions != 1 || first[1].Executions != 1 {
+				t.Fatalf("Runtime did not execute source and builtin: %+v", first)
 			}
-			if child.Entrypoint == "inspect" && child.Ordinal != 1 {
-				t.Fatal("native readback was skipped")
+		} else {
+			for index := range 2 {
+				if children[index].Executions != 0 || first[index].Revision != children[index].Revision || first[index].Computation == "" || first[index].Computation != children[index].Computation {
+					t.Fatalf("caller edit invalidated Runtime computation: first=%+v edited=%+v", first, children)
+				}
 			}
 		}
 	}
+
 	assertBaseUnchanged()
-	prepared, problem := store.Install(original.InstallID)
-	fatal(t, problem)
-	if prepared == nil || !strings.Contains(prepared.Closure, "numpy==") {
-		t.Fatal("actual quantizer has no observed numerical dependency")
+	// Runtime owns the on-demand numerical environment, while the caller SDK
+	// remains NumPy-free. Inspect its installed carrier metadata independently.
+	interpreters, err := filepath.Glob(filepath.Join(builtinRoot, "numerical", "contents", "*", "bin", "python"))
+	must(t, err)
+	if len(interpreters) != 1 {
+		t.Fatalf("expected one Runtime numerical environment, got %v", interpreters)
 	}
-	python, problem := launch.EnvironmentPython(*prepared)
-	fatal(t, problem)
-	selection, problem := install.ExecutionRequirements(context.Background(), filepath.Dir(filepath.Dir(python)), "cozy-runtime-operations", nil)
-	requirements := selection.ImageRequirements()
-	fatal(t, problem)
-	numpyRange := false
-	for _, requirement := range requirements {
-		if strings.HasPrefix(requirement, "numpy") {
-			numpyRange = requirement == "numpy>=1.26"
-			if !numpyRange {
-				t.Fatalf("observed local NumPy became a worker image pin: %s", requirement)
-			}
-		}
-	}
-	if !numpyRange {
-		t.Fatal("worker image requirement lost the authored NumPy range")
-	}
-	if original.ID == "" {
-		t.Fatal("no Runtime quantization child")
+	out, err := exec.Command(interpreters[0], "-I", "-c", `import importlib.metadata as m
+import numpy
+from cozy_runtime.derive.operations import app
+from cozy_runtime.author import describe
+assert describe(app)
+requirements = m.requires("cozy-runtime-operations")
+assert [item for item in requirements if item.startswith("numpy")] == ["numpy>=1.26"], requirements
+print("numpy==" + m.version("numpy"))
+`).CombinedOutput()
+	t.Logf("Runtime numerical callee: %s", out)
+	if err != nil || !strings.Contains(string(out), "numpy==") {
+		t.Fatalf("Runtime quantizer lost its numerical dependency or authored range: %v\n%s", err, out)
 	}
 }

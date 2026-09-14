@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -122,13 +123,12 @@ async def main():
 	defer store.Close()
 	first, problem := store.RequestByReference("1")
 	fatal(t, problem)
-	children, problem := store.Children(first.ID)
-	fatal(t, problem)
-	if first.State != "blocked" || len(children) != 2 || children[0].State != "succeeded" || children[1].State != "blocked" {
+	children := machineChildren(t, root, store, "1")
+	if first.State != "failed" || len(children) != 2 || children[0].State != "succeeded" || children[1].State != "failed" || children[0].Executions != 1 || children[1].Executions != 1 {
 		t.Fatalf("first parent/children lost their state: %+v %+v", first, children)
 	}
 	originalA, originalB := children[0], children[1]
-	originalBInstall, problem := store.Install(originalB.InstallID)
+	originalCapture, problem := store.MachineExecution(first.ID)
 	fatal(t, problem)
 	code = strings.Replace(code, "factor=0", "factor=2", 1)
 	must(t, os.WriteFile(script, []byte(code), 0o600))
@@ -136,15 +136,12 @@ async def main():
 	if status != 0 {
 		t.Fatalf("edited parent did not complete [%d]: %s", status, out)
 	}
-	second, problem := store.RequestByReference("4")
-	fatal(t, problem)
-	children, problem = store.Children(second.ID)
-	fatal(t, problem)
-	if len(children) != 2 || children[0].ReusedFrom != originalA.ID || children[0].Ordinal != 0 || children[0].ChildTargetDigest != originalA.ChildTargetDigest || children[1].Ordinal != 1 || children[1].ChildTargetDigest != originalB.ChildTargetDigest || children[1].ChildIntentDigest == originalB.ChildIntentDigest {
+	children = machineChildren(t, root, store, "2")
+	if len(children) != 2 || children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[1].Executions != 1 || children[1].Revision != originalB.Revision || children[1].Intent == originalB.Intent {
 		t.Fatalf("local composition did not reuse A and execute changed B: %+v", children)
 	}
 	secondB := children[1]
-	assertChildScalar(t, store, secondB.ID, 214)
+	assertMachineChildScalar(t, secondB, 214)
 	implementation := filepath.Join(project, "candidate", "private_candidate.py")
 	raw, err := os.ReadFile(implementation)
 	must(t, err)
@@ -153,34 +150,30 @@ async def main():
 	if status != 0 {
 		t.Fatalf("same-version library edit did not execute [%d]: %s", status, out)
 	}
-	third, problem := store.RequestByReference("7")
-	fatal(t, problem)
-	children, problem = store.Children(third.ID)
-	fatal(t, problem)
-	if len(children) != 2 || children[0].ReusedFrom != originalA.ID || children[0].Ordinal != 0 || children[0].ChildTargetDigest != originalA.ChildTargetDigest || children[1].Ordinal != 1 || children[1].ChildTargetDigest == secondB.ChildTargetDigest || children[1].ChildIntentDigest != secondB.ChildIntentDigest {
+	children = machineChildren(t, root, store, "3")
+	if len(children) != 2 || children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[1].Executions != 1 || children[1].Revision == secondB.Revision || children[1].Intent != secondB.Intent {
 		t.Fatalf("library edit did not invalidate exactly B: %+v", children)
 	}
-	assertChildScalar(t, store, children[1].ID, 215)
+	assertMachineChildScalar(t, children[1], 215)
 	thirdB := children[1]
 	status, out = runCozyPath(t, root, path, "run", script, "--await", "--json")
 	if status != 0 {
 		t.Fatalf("fresh scalar run did not reuse its local workspace [%d]: %s", status, out)
 	}
-	fresh, problem := store.RequestByReference("10")
+	fresh, problem := store.RequestByReference("4")
 	fatal(t, problem)
-	cached, problem := store.Children(fresh.ID)
-	fatal(t, problem)
-	if fresh.RetryOf != "" || len(cached) != 2 || cached[0].Ordinal != 0 || cached[1].Ordinal != 0 || cached[0].ReusedFrom != originalA.ID || cached[1].ReusedFrom != thirdB.ID {
+	cached := machineChildren(t, root, store, "4")
+	if fresh.RetryOf != "" || len(cached) != 2 || cached[0].Executions != 0 || cached[1].Executions != 0 || cached[0].Computation != originalA.Computation || cached[1].Computation != thirdB.Computation {
 		t.Fatalf("fresh scalar run computed instead of acquiring cached results: %+v", cached)
 	}
 	old, problem := store.RequestRow(first.ID)
 	fatal(t, problem)
-	if old.State != "blocked" || old.BodyDigest != first.BodyDigest {
+	if old.State != "failed" || old.BodyDigest != first.BodyDigest {
 		t.Fatal("new parent rewrote the original transaction")
 	}
-	retained, err := os.ReadFile(filepath.Join(originalBInstall.SourceRef, "private_candidate.py"))
-	must(t, err)
-	if strings.Contains(string(retained), "value * factor + 1") {
+	retained, problem := store.MachineExecution(first.ID)
+	fatal(t, problem)
+	if !bytes.Equal(originalCapture.Submission, retained.Submission) {
 		t.Fatal("library edit modified the original captured implementation")
 	}
 	for _, name := range []string{"source", "candidate"} {

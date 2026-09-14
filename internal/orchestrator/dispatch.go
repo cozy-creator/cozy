@@ -25,11 +25,16 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
-	IdemKey    string // the caller's idempotency key
-	Package    string // org/name
-	Entrypoint string // the function
-	PlanID     string // the entrypoint_binding_plan_id this attempt binds
-	Release    string // immutable remote package release; empty for local execution
+	RequestID                string // server-reserved identity for request-owned input capture
+	AllowPublish             []string
+	MachineExecutionObserver bool
+	TimeoutMS                int64
+	DeadlineUnixMS           uint64
+	IdemKey                  string // the caller's idempotency key
+	Package                  string // org/name
+	Entrypoint               string // the function
+	PlanID                   string // the entrypoint_binding_plan_id this attempt binds
+	Release                  string // immutable remote package release; empty for local execution
 	// LocalPackageDigest is the exact staged wheel-set identity for one editable rental.
 	LocalPackageDigest string
 	Models             []ModelRef
@@ -167,7 +172,7 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 	if e != nil {
 		return records.Request{}, false, e
 	}
-	req, fresh, e := c.opt.Store.Submit(req)
+	req, fresh, e := c.opt.Store.SubmitWithEvent(req, event)
 	if e != nil {
 		return records.Request{}, false, e
 	}
@@ -175,7 +180,6 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 		c.logRecordedReplay(req, s.IdemKey)
 		return req, false, nil
 	}
-	c.emit(req.ID, "request.submitted", 0, event)
 	return req, true, nil
 }
 
@@ -254,12 +258,17 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 				"cannot digest the local package request identity: %s", err)
 		}
 	}
-	id := records.NewID("req")
-	if s.Kind == "job" {
-		id = records.NewID("job")
+	id := s.RequestID
+	if id == "" {
+		id = records.NewID("req")
+		if s.Kind == "job" {
+			id = records.NewID("job")
+		}
 	}
 	req := records.Request{
-		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
+		MachineExecutionObserver: s.MachineExecutionObserver,
+		DeadlineUnixMS:           s.DeadlineUnixMS,
+		ID:                       id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Release:            s.Release,
 		LocalPackageDigest: s.LocalPackageDigest,
@@ -273,9 +282,17 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
 	}
 	event := map[string]any{
-		"package": s.Package, "function": s.Entrypoint,
+		"retain_work": s.RetainWork,
+		"package":     s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"weights_outputs": weightsOutputs,
+	}
+	if s.TimeoutMS > 0 {
+		event["timeout_ms"] = s.TimeoutMS
+		event["deadline_unix_ms"] = s.DeadlineUnixMS
+	}
+	if len(s.AllowPublish) > 0 {
+		event["allow_publish"] = s.AllowPublish
 	}
 	if s.AttentionKernel != "" {
 		event["attention_kernel"] = s.AttentionKernel
@@ -361,6 +378,14 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 	current, problem := c.opt.Store.RequestRow(req.ID)
 	if problem != nil || current == nil {
 		return 0, problem
+	}
+	if link, problem := c.opt.Store.MachineExecution(req.ID); problem != nil {
+		return 0, problem
+	} else if link != nil {
+		if c.opt.StartMachineExecution == nil {
+			return 0, exit.Unavailablef("this client cannot reconnect its Runtime-owned execution")
+		}
+		return 0, c.opt.StartMachineExecution(*current)
 	}
 	if current.State != "submitted" && current.State != "queued" {
 		return uint64(current.Ordinal), nil
@@ -545,6 +570,12 @@ func (c *Orchestrator) requeue(requestID, why string, charge bool) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	if link, problem := c.opt.Store.MachineExecution(req.ID); problem != nil || link != nil {
+		if problem == nil && c.opt.StartMachineExecution != nil {
+			_ = c.opt.StartMachineExecution(req)
+		}
+		return
+	}
 	current, problem := c.opt.Store.RequestRow(req.ID)
 	if problem != nil || current == nil || (current.State != "submitted" && current.State != "queued") {
 		return
@@ -1409,6 +1440,11 @@ func (c *Orchestrator) releaseManagedNow(req records.Request) *exit.Error {
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
+	if link, problem := c.opt.Store.MachineExecution(req.ID); problem != nil {
+		return 0, problem
+	} else if link != nil {
+		return 0, exit.New(exit.Conflict, "Runtime-owned execution cannot create a local attempt")
+	}
 	current, problem := c.opt.Store.RequestRow(req.ID)
 	if problem != nil {
 		return 0, problem

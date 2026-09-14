@@ -24,7 +24,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtimes are POSIX shell scripts")
 	}
-	install := "uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=" + hostruntime.Floor + "'"
+	install := fmt.Sprintf("Python 3.12 supporting cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)
 
 	// (a) An older minor cannot serve: `cozy up` refuses under the tool's own words, and
 	// `cozy run` — which starts the same daemon — answers the same code instead of queuing.
@@ -33,12 +33,12 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	refusal := refusalOf(t, out)
 	if code == 0 || refusal.Code != "host_runtime_wire_mismatch" ||
 		!strings.Contains(refusal.Message, fmt.Sprintf("release 0.0.29 and speaks cozy.worker.v1+minor.%d", pb.WireMinor-6)) ||
-		!strings.Contains(refusal.Message, fmt.Sprintf("needs cozy.worker.v1+minor.%d or newer", pb.WireMinor)) ||
+		!strings.Contains(refusal.Message, fmt.Sprintf("needs cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)) ||
 		!strings.Contains(refusal.Remedy, install) {
 		t.Fatalf("an older host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyPath(t, root, path, "up"); code == 0 ||
-		!strings.Contains(out, "Try: install cozy-runtime "+hostruntime.Floor+" or newer") {
+		!strings.Contains(out, "Try: install a coherent cozy-runtime build for "+install) {
 		t.Fatalf("the human form of the refusal lost its remedy [exit %d]\n%s", code, out)
 	}
 	code, out = runCozyPath(t, root, path, "run", "fake/older/generate", "prompt=fox", "--json")
@@ -75,6 +75,16 @@ func TestHostRuntimeWireFence(t *testing.T) {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
 
+	// Publication is optional: a machine with the no-effects execution floor
+	// remains usable even when this client vendors publication's newer schema.
+	root, path = hostRuntimeRoot(t, "execution-floor", stubRuntime(t, "9.9.9", hostruntime.WireFloor))
+	if code, out := runCozyPath(t, root, path, "up"); code != 0 {
+		t.Fatalf("the no-effects Runtime floor was refused [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozyPath(t, root, path, "down"); code != 0 {
+		t.Fatalf("down [exit %d]\n%s", code, out)
+	}
+
 	// (d) No tool at all starts the daemon: rentals and the hub need none, and a local
 	// launch refuses `host_runtime_missing` for itself.
 	root, path = hostRuntimeRoot(t, "missing", "")
@@ -96,6 +106,33 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	}
 	if code, out := runCozy(t, root, "down"); code != 0 {
 		t.Fatalf("down [exit %d]\n%s", code, out)
+	}
+}
+
+// A wire-compatible pre-native SDK must not inspect current Context metadata.
+func TestHostRuntimeNativeAPIFloor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stand-in runtimes are POSIX shell scripts")
+	}
+	for _, arm := range []struct {
+		name, release, refusal string
+		minor                  uint32
+	}{
+		{"old-api", "0.17.2", "host_runtime_below_floor", 54},
+		{"old-wire", "0.18.0", "host_runtime_wire_mismatch", 53},
+		{"native", "0.18.0", "", 54},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			root, path := hostRuntimeRoot(t, "native-floor-"+arm.name, stubRuntime(t, arm.release, arm.minor))
+			code, out := runCozyPath(t, root, path, "up", "--json")
+			if arm.refusal != "" {
+				if code == 0 || refusalOf(t, out).Code != arm.refusal {
+					t.Fatalf("stale host SDK was not refused before use: %d %s", code, out)
+				}
+			} else if code != 0 {
+				t.Fatalf("native API cohort refused: %d %s", code, out)
+			}
+		})
 	}
 }
 

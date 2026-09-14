@@ -204,6 +204,10 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker, replacement *Work
 }
 
 func (c *Orchestrator) jobDirective(plan *JobPlan) *pb.JobDirective {
+	return jobDirectiveWithLimit(plan, c.maxOutputBytes())
+}
+
+func jobDirectiveWithLimit(plan *JobPlan, outputLimit uint64) *pb.JobDirective {
 	if plan.FrozenDirective != nil {
 		return proto.Clone(plan.FrozenDirective).(*pb.JobDirective)
 	}
@@ -219,7 +223,7 @@ func (c *Orchestrator) jobDirective(plan *JobPlan) *pb.JobDirective {
 		// drains a queue publishes into a different scratch repo per request.
 		PublicationContract: &pb.PublicationContract{
 			GrantId: home.ScratchRepo("local", "queue"),
-			Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, c.maxOutputBytes()),
+			Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, outputLimit),
 		},
 		// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
 		// running one bounded attempt; deep queueing is the orchestrator's dispatch
@@ -229,7 +233,7 @@ func (c *Orchestrator) jobDirective(plan *JobPlan) *pb.JobDirective {
 		Orchestration:     plan.Orchestration,
 	}
 	if plan.OrchestrationParent != nil {
-		directive.OrchestrationParent = c.jobDirective(plan.OrchestrationParent)
+		directive.OrchestrationParent = jobDirectiveWithLimit(plan.OrchestrationParent, outputLimit)
 	}
 	return directive
 }

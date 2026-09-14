@@ -64,13 +64,20 @@ func TestLocalJobDryRunResolvesOnlyModelMetadata(t *testing.T) {
 	_, problem = st.Activate(records.PackageInstall{ID: "dryrun-install", Package: "proof/dryrun", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, PackageInterface: parsed.Digest, SourceDigest: "sha256:" + strings.Repeat("4", 64), Platform: "linux-x86"})
 	fatal(t, problem)
 	st.Close()
-	args := []string{"run", "proof/dryrun/prepare", "--model.source=proof/source@1.0.0/bf16", "--dry-run", "--json", "--full", "--idempotency-key=dryrun-only"}
+	args := []string{"run", "proof/dryrun/prepare", "--model.source=proof/source@1.0.0/bf16", "--timeout=20s", "--dry-run", "--json", "--full", "--idempotency-key=dryrun-only"}
 	code, out := runAdmissionCLI(t, root, tools, args...)
 	if code != 0 || !strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, digest) {
 		t.Fatalf("local dryrun acquired or failed: %d %s", code, out)
 	}
 	if rootReads.Load() != 1 || bodyReads.Load() != 0 {
 		t.Fatalf("dryrun fetched beyond root: roots=%d bodies=%d", rootReads.Load(), bodyReads.Load())
+	}
+	code, out = runAdmissionCLI(t, root, tools, append(args, "--allow-publish=alice/model")...)
+	if code == 0 || !strings.Contains(out, "publication.machine_identity_required") {
+		t.Fatalf("local publication permission bypassed rented identity admission: %d %s", code, out)
+	}
+	if rootReads.Load() != 1 || bodyReads.Load() != 0 {
+		t.Fatal("local publication refusal performed additional model reads")
 	}
 	trace, err := os.ReadFile(activity)
 	must(t, err)

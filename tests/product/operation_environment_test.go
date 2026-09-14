@@ -69,7 +69,11 @@ func TestOldPendingLookupOnlyReconcilesForCancellation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
 	fatal(t, problem)
-	defer func() { store.Close() }()
+	defer func() {
+		if store != nil {
+			store.Close()
+		}
+	}()
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
 	first := offerChildParent(t, store, recordPrivateTransaction(t, store, "old-source-script", ""))
 	source := offerChildParent(t, store, operationHistory(t, store, "old-source", first, true))

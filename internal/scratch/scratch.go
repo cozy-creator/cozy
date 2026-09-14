@@ -99,3 +99,17 @@ func Held(path string) bool {
 	_ = flock.Release(file)
 	return false
 }
+
+// Detach transfers cleanup to the durable request named by this directory.
+// A later sweep follows that request's state instead of this process's lifetime.
+func (d *Dir) Detach() {
+	if d == nil {
+		return
+	}
+	if d.claim != nil {
+		_ = flock.Release(d.claim)
+		_ = d.claim.Close()
+		d.claim = nil
+	}
+	d.Path = ""
+}

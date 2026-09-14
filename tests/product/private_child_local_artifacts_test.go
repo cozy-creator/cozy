@@ -42,15 +42,11 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() {
-		args := []string{"down"}
-		if !t.Failed() {
-			args = append(args, "--all")
-		}
-		_, _ = runCozyPath(t, root, path, args...)
+		compositionDown(t, root, path)
 		if t.Failed() {
 			t.Logf("local native memo evidence retained at %s", root)
 		} else {
-			_ = os.RemoveAll(root)
+			must(t, removeAllForce(root))
 		}
 	})
 	defer tracePrivateChildWait(t, root)()
@@ -81,19 +77,19 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		process, err := os.FindProcess(pid)
 		must(t, err)
 		must(t, process.Kill())
-		run("up") // normal startup reaps prior worker processes and reopens the journal
+		run("up") // normal startup reattaches the Runtime-owned journal
 	}
 	var store *records.Store
-	var originalA, originalB, latestB records.Request
-	checkTensor := func(producer records.Request, value int) {
+	var originalA, originalB, latestB machineChildProof
+	checkTensor := func(producer machineChildProof, value int) {
 		t.Helper()
-		outputs, problem := store.AllModelTransferWeights(producer.ID, producer.Ordinal)
+		artifact, problem := records.DecodeModelArtifact(producer.Result)
 		fatal(t, problem)
-		if len(outputs) != 1 {
-			t.Fatalf("native result has no exact producer receipt: %+v", outputs)
+		if artifact == nil {
+			t.Fatal("native result has no exact artifact")
 		}
 		command := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "private_child_read.py"),
-			outputs[0].ManifestID, strconv.Itoa(value), filepath.Join(root, "tensorfs"))
+			artifact.Manifest.Digest, strconv.Itoa(value), filepath.Join(root, "tensorfs"))
 		out, err := command.CombinedOutput()
 		if err != nil {
 			t.Fatalf("native tensor after restart and GC: %v %s", err, out)
@@ -134,58 +130,45 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		} else if code != 0 {
 			t.Fatalf("fresh local cycle %d failed [%d]: %s", cycle, code, out)
 		}
-		parent, problem := store.RequestByReference(strconv.Itoa(1 + 3*cycle))
+		parent, problem := store.RequestByReference(strconv.Itoa(1 + cycle))
 		fatal(t, problem)
 		if parent == nil || parent.RetryOf != "" || parent.Worker != "" {
 			t.Fatalf("local fresh run gained retry or rental identity: %+v", parent)
 		}
-		children, problem := store.Children(parent.ID)
-		fatal(t, problem)
+		children := machineChildren(t, root, store, strconv.Itoa(1+cycle))
 		if len(children) != 2 {
 			t.Fatalf("cycle %d children: %+v", cycle, children)
 		}
 		if cycle == 0 {
 			originalA, originalB = children[0], children[1]
-			if originalA.State != "succeeded" || originalB.State != "blocked" {
+			if originalA.State != "succeeded" || originalB.State != "failed" {
 				t.Fatalf("A/B failure custody was not preserved: %+v", children)
 			}
 			continue
 		}
-		if children[0].Ordinal != 0 || children[0].ReusedFrom != originalA.ID || children[0].ChildTargetDigest != originalA.ChildTargetDigest {
+		if children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[0].Revision != originalA.Revision || string(children[0].Result) != string(originalA.Result) {
 			t.Fatalf("cycle %d recomputed or changed A: %+v", cycle, children[0])
 		}
 		if cycle < 3 {
-			if children[1].Ordinal != 1 || children[1].ReusedFrom != "" {
+			if children[1].Executions != 1 {
 				t.Fatalf("changed B was not executed exactly once: %+v", children[1])
 			}
-			if cycle == 1 && (children[1].ChildTargetDigest != originalB.ChildTargetDigest || children[1].ChildIntentDigest == originalB.ChildIntentDigest) {
+			if cycle == 1 && (children[1].Revision != originalB.Revision || children[1].Intent == originalB.Intent) {
 				t.Fatal("parameter edit changed B's implementation or reused its failed input")
 			}
-			if cycle == 2 && (children[1].ChildTargetDigest == latestB.ChildTargetDigest || children[1].ChildIntentDigest != latestB.ChildIntentDigest) {
+			if cycle == 2 && (children[1].Revision == latestB.Revision || children[1].Intent != latestB.Intent) {
 				t.Fatal("same-version library edit did not change only implementation identity")
 			}
 			latestB = children[1]
-		} else if children[1].Ordinal != 0 || children[1].ReusedFrom != latestB.ID {
+		} else if children[1].Executions != 0 || children[1].Computation != latestB.Computation || string(children[1].Result) != string(latestB.Result) {
 			t.Fatalf("unchanged B did not use the shared workspace result: %+v", children[1])
 		}
-		for deadline := time.Now().Add(30 * time.Second); ; {
-			cleanup, issue := store.SuccessfulWorkRelease(parent.ID)
-			fatal(t, issue)
-			if cleanup != nil && cleanup.State == "complete" {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("successful caller did not finalize implicit work: %+v", cleanup)
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-		for _, member := range append(children, *parent) {
-			current, issue := store.RequestRow(member.ID)
-			fatal(t, issue)
-			kept := cycle == 3 && member.ID == parent.ID
-			if current.State != "succeeded" || current.RetainWork != kept {
-				t.Fatalf("successful cleanup lost history or explicit output custody: %+v", current)
-			}
+		link, issue := store.MachineExecution(parent.ID)
+		fatal(t, issue)
+		owed, issue := store.MachineExecutionOwesWork(parent.ID)
+		fatal(t, issue)
+		if link == nil || !link.Collected || owed != (cycle == 3) {
+			t.Fatalf("successful caller collection lost explicit result custody: link=%+v owed=%v", link, owed)
 		}
 		if cycle == 1 {
 			// Only the failed predecessor still needs explicit abandonment.
@@ -232,12 +215,9 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 	// The caller retained B, so pruning could remove only unused A and obsolete B.
 	// A fresh caller recomputes A; its identical manifest still hits retained B.
 	run("run", script, "--await")
-	resumed, problem := store.RequestByReference("13")
-	fatal(t, problem)
-	children, problem := store.Children(resumed.ID)
-	fatal(t, problem)
-	if len(children) != 2 || children[0].Ordinal != 1 || children[1].Ordinal != 0 ||
-		children[0].ReusedFrom != "" || children[1].ReusedFrom != latestB.ID {
+	children := machineChildren(t, root, store, "5")
+	if len(children) != 2 || children[0].Executions != 1 || children[1].Executions != 0 ||
+		children[1].Computation != latestB.Computation || string(children[1].Result) != string(latestB.Result) {
 		t.Fatalf("unused input did not recompute or retained result was lost: %+v", children)
 	}
 	checkTensor(children[0], 7)
