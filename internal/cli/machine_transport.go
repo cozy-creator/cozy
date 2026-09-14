@@ -76,6 +76,12 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		m.mu.Unlock()
 	}
 	result := &machineConnection{connection: connection, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
+	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
+		return host.RetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
+	}
+	result.releaseModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
+		return host.ReleaseDerivedRetention(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
+	}
 	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
 		uploadedBy, problem := m.store.MachinePackageUpload(claim.WorkerBootId, revision.Digest)
 		if problem != nil {
@@ -306,6 +312,12 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		m.localPID = process.PID
 	}
 	result := &machineConnection{connection: connection, client: client, claim: claim, wireMinor: info.WireMinor}
+	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
+		return preparation.WorkspaceRetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
+	}
+	result.releaseModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
+		return preparation.WorkspaceReleaseDerivedRetention(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
+	}
 	result.prepare = func(ctx context.Context, requestID string, revision localpackage.Revision) *exit.Error {
 		selected, problem := orchestrator.LocalPackageSelection(machinePackageOperation(requestID, revision), revision)
 		if problem != nil {

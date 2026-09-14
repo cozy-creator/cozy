@@ -43,6 +43,11 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	// A captured CPU caller must not occupy the execution lane its managed
 	// model children need. Device-bearing roots keep their declared lane.
 	root.Orchestration = !root.NeedsAccelerator && len(request.Models) == 0 && len(root.WeightsOutputs) == 0
+	if root.Orchestration && root.RSSCap == DefaultJobRSSCap {
+		// The legacy local launch ceiling is not an authored memory demand.
+		// Let Runtime admit a CPU caller using its own measured host policy.
+		root.RSSCap = 0
+	}
 	directive := jobDirectiveWithLimit(&root, limit)
 	return &pb.MachineExecutionSubmit{
 		SubmissionId: request.IdemKey, CaptureCanonicalBytes: capture.Canonical, CaptureDigest: capture.Digest,

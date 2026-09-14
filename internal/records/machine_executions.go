@@ -64,10 +64,10 @@ func (s *Store) MachinePackageUpload(boot, revision string) (string, *exit.Error
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
 // than a status projection. A failed or paused root remains owed after its small
 // error result is collected, and cancellation alone never proves native cleanup.
-const machineExecutionOwed = `NOT EXISTS(SELECT 1 FROM request_events released
+const machineExecutionOwed = `(` + machineModelRetentionOwed + ` OR (NOT EXISTS(SELECT 1 FROM request_events released
  WHERE released.request_id=r.id AND released.type='machine.retention_released') AND (
  (length(e.receipt)=0 AND r.state!='refused' AND (length(e.submission)>0 OR r.state!='canceled')) OR
- (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0)))`
+ (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0)))))`
 
 func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 	var owed bool

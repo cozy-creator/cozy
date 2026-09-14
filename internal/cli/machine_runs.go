@@ -39,6 +39,8 @@ type machineConnection struct {
 	prepare           func(context.Context, string, localpackage.Revision) *exit.Error
 	wireMinor         uint32
 	certificateDigest []byte
+	retainModel       func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
+	releaseModel      func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
 }
 
 // machineRuns is a client transport and observer. Stopping it closes connections
@@ -320,6 +322,13 @@ func (m *machineRuns) Refresh(ctx context.Context, request records.Request) *exi
 	}
 	outcome, err := connection.client.CollectMachineExecution(ctx, &pb.MachineExecutionCollect{Execution: query, AttemptOrdinal: state.AttemptOrdinal})
 	if err != nil {
+		// Another observer may have completed the same collection after our
+		// status read. Its ACK releases the original root hold, so re-read the
+		// authority before treating that now-stale collect as a custody failure.
+		latest, readError := connection.client.GetMachineExecution(ctx, query)
+		if readError == nil && latest.Collected && latest.AttemptOrdinal == state.AttemptOrdinal {
+			return m.store.ObserveMachineExecution(request.ID, latest, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, latest.Sequence)})
+		}
 		return machineTransport(err)
 	}
 	if problem := m.store.RecordMachineOutcome(request.ID, outcome); problem != nil {
@@ -329,7 +338,11 @@ func (m *machineRuns) Refresh(ctx context.Context, request records.Request) *exi
 	if err := canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body); err != nil {
 		return exit.New(exit.Conflict, "machine outcome is not its canonical document")
 	}
-	if len(body.WeightsReceipts) > 0 || len(body.GetOutputManifest().GetOutputs()) > 0 || body.GetResult().GetResultBlob() != nil || request.ChildArtifacts {
+	models, problem := m.collectMachineModels(ctx, request, connection, outcome, &body)
+	if problem != nil {
+		return problem
+	}
+	if len(body.WeightsReceipts) > 0 && !models || len(body.GetOutputManifest().GetOutputs()) > 0 || body.GetResult().GetResultBlob() != nil || request.ChildArtifacts && !models {
 		return exit.Named(exit.Unavailable, "machine_execution.result_custody_required", "execution finished; referenced output bytes remain retained on the machine until recipient custody is established")
 	}
 	ack := &pb.AttemptOutcomeAck{RequestId: outcome.RequestId, AttemptOrdinal: outcome.AttemptOrdinal, InvocationSpecDigest: outcome.InvocationSpecDigest, OutcomeId: outcome.OutcomeId, OutcomeDigest: outcome.OutcomeDigest}
@@ -381,6 +394,11 @@ func (m *machineRuns) flushMachineControl(ctx context.Context, connection *machi
 		return 0, exit.Internalf("recorded machine control is unreadable")
 	}
 	command.Execution.Claim = connection.claim
+	if command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL {
+		if problem := m.releaseMachineModels(ctx, link.RequestID, connection); problem != nil {
+			return command.Action, problem
+		}
+	}
 	var trailer metadata.MD
 	if _, err := connection.client.ControlMachineExecution(ctx, &command, grpc.Trailer(&trailer)); err != nil {
 		for _, code := range trailer.Get("cozy-error-code") {
