@@ -196,7 +196,7 @@ func TestPrivateCancellationReleasesManagedRentalWithIdleCleanupDisabled(t *test
 	root := t.TempDir()
 	hub := newFakeRentalHub(t, 0)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
-		"tensorhub_url: "+hub.server.URL+"\ntensorhub_token: retained-cancel-proof\n"+
+		"tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\n"+
 			"rentals:\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	daemon := startDaemonProcess(t, root)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

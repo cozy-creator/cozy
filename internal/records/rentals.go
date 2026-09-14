@@ -1105,6 +1105,9 @@ func (s *Store) ForgetRental(id string) (bool, *exit.Error) {
 		return false, exit.Internalf("cannot begin forgetting rental %s: %s", id, err)
 	}
 	defer tx.Rollback()
+	if problem := loseMachineExecutions(tx, id); problem != nil {
+		return false, problem
+	}
 	if _, err := tx.Exec(`UPDATE rental_operations SET state='released', updated_at=?
 		WHERE rental_id=? AND state<>'released'`, now(), id); err != nil {
 		return false, exit.Internalf("cannot close rental operation for %s: %s", id, err)
