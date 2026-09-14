@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"database/sql"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,13 +8,15 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // Ordinary scripts receive large native files/trees and forward them without
 // inlining bytes, publishing code, or requiring a prior run identifier.
 func TestOrdinaryScriptByteResultsAndMemoReuse(t *testing.T) {
 	if *privateChildRuntimeWheel == "" {
-		t.Skip("requires the exact wire43 Runtime candidate wheel")
+		t.Skip("requires an exact Runtime wheel with native child custody")
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
@@ -82,13 +83,11 @@ only-include=["byte_tools.py"]
 			t.Fatalf("plain byte script %d [exit %d]\n%s\n%s", run, code, out, productWorkerLogs(root))
 		}
 	}
-	db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))
-	must(t, err)
-	defer db.Close()
-	var produced, reused, verified int
-	must(t, db.QueryRow("SELECT count(*),sum(CASE WHEN reused_from<>'' THEN 1 ELSE 0 END) FROM requests WHERE parent_request_id<>'' AND entrypoint='produce' AND state='succeeded'").Scan(&produced, &reused))
-	must(t, db.QueryRow("SELECT count(*) FROM requests WHERE parent_request_id<>'' AND entrypoint='verify' AND state='succeeded' AND reused_from=''").Scan(&verified))
-	if produced != 2 || reused != 1 || verified != 2 {
-		t.Fatalf("independent scripts did not reuse production and execute both recipient reads: produce=%d reused=%d verify=%d", produced, reused, verified)
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	first, second := machineChildren(t, root, store, "1"), machineChildren(t, root, store, "2")
+	if len(first) != 2 || len(second) != 2 || first[0].Executions != 1 || first[1].Executions != 1 || second[0].Executions != 0 || second[1].Executions != 1 || first[0].Computation != second[0].Computation || first[0].Revision != second[0].Revision {
+		t.Fatalf("Runtime did not reuse native production and execute both recipient reads: first=%+v second=%+v", first, second)
 	}
 }
