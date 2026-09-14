@@ -489,6 +489,13 @@ func (s *Store) CancelMachineBeforeAcceptance(id string) (bool, *exit.Error) {
 		return false, exit.Internalf("cannot record machine cancellation intent: %s", err)
 	}
 	defer tx.Rollback()
+	lost, err := machineExecutionLostIn(tx, id)
+	if err != nil {
+		return false, exit.Internalf("cannot inspect canceled machine loss: %s", err)
+	}
+	if lost {
+		return false, exit.Named(exit.Conflict, "machine_execution.state_lost", "execution's rented machine was confirmed destroyed")
+	}
 	link, err := scanMachineExecution(tx.QueryRow(`SELECT `+machineExecutionColumns+` FROM machine_executions WHERE request_id=?`, id))
 	if err != nil {
 		return false, exit.Internalf("cannot read machine cancellation intent: %s", err)

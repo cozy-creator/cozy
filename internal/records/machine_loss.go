@@ -9,15 +9,15 @@ import (
 // Destruction ends remote obligations, not by pretending that a native release
 // or collection happened. Keep the exact acceptance, control and outcome history.
 const machineExecutionLost = `EXISTS(SELECT 1 FROM request_events loss
- WHERE loss.request_id=r.id AND loss.type='machine.state_lost'
+ WHERE loss.request_id=e.request_id AND loss.type='machine.state_lost'
  AND json_extract(loss.payload,'$.machine_id')=e.machine_id)`
 
 func machineExecutionLostIn(q interface {
 	QueryRow(string, ...any) *sql.Row
 }, id string) (bool, error) {
 	var lost bool
-	err := q.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r
- ON r.id=e.request_id WHERE r.id=? AND `+machineExecutionLost+`)`, id).Scan(&lost)
+	err := q.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e
+ WHERE e.request_id=? AND `+machineExecutionLost+`)`, id).Scan(&lost)
 	return lost, err
 }
 
@@ -102,14 +102,17 @@ func loseMachineExecutions(tx *sql.Tx, machine string) *exit.Error {
 		if err := appendEventTx(tx, value.id, "machine.state_lost", 0, detail); err != nil {
 			return exit.Internalf("cannot record destroyed machine: %s", err)
 		}
+		next := value.state
 		if !settledRequestState(value.state) {
-			next := "failed"
+			next = "failed"
 			if value.cancel || value.state == "canceling" {
 				next = "canceled"
 			}
-			if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, next, value.id); err != nil {
-				return exit.Internalf("cannot project destroyed execution: %s", err)
-			}
+		}
+		if _, err := tx.Exec(`UPDATE requests SET state=?,retain_work=0 WHERE id=?`, next, value.id); err != nil {
+			return exit.Internalf("cannot project destroyed execution: %s", err)
+		}
+		if next != value.state {
 			if err := appendEventTx(tx, value.id, "request."+next, 0, detail); err != nil {
 				return exit.Internalf("cannot record destroyed execution projection: %s", err)
 			}
