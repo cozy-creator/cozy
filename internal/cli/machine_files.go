@@ -68,14 +68,11 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 		if entry == nil || !declared[entry.OutputId] || len(entry.Digest) != 32 || entry.Length > math.MaxInt64 || records.ValidateByteRef(entry.NativeTree) != nil {
 			return false, exit.New(exit.Conflict, "file result omits its declared field or exact native receipt")
 		}
-		if entry.MimeType == "application/vnd.cozy.tree-manifest" {
-			return false, exit.Named(exit.Unavailable, "machine_execution.tree_collection_required", "native tree result remains retained until its complete closure can be collected")
-		}
 		maximum, problem := m.resolver.CapturedByteOutputBound(request, entry.OutputId, entry.MimeType)
 		if problem != nil {
 			return false, problem
 		}
-		if entry.Length > uint64(maximum) || entry.NativeTree.ContentBytes != entry.Length {
+		if entry.NativeTree.ContentBytes > uint64(maximum) || entry.MimeType != resultfiles.TreeMediaType && entry.NativeTree.ContentBytes != entry.Length {
 			return false, exit.New(exit.Conflict, "file result exceeds its declared size or changes native content length")
 		}
 		digest, _ := canonical.Spell(entry.Digest)
@@ -115,7 +112,7 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 			if problem := m.store.AdvanceMachineFileResult(request.ID, file.RetentionID, "copied"); problem != nil {
 				return false, problem
 			}
-		} else if problem := verifyMachineFileCopy(file.Output); problem != nil {
+		} else if problem := verifyMachineResultCopy(file); problem != nil {
 			return false, problem
 		}
 		if file.State != "released" {
@@ -141,7 +138,7 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 			found := false
 			for _, file := range files {
 				if file.Output.OutputID == declared.OutputID {
-					path, problem := resultfiles.Materialize(file.Output.Path, export.Directory, file.Output.Digest, file.Output.MimeType, file.Output.Length)
+					path, problem := materializeMachineResult(file, export.Directory)
 					if problem != nil {
 						_ = m.store.FailOutputExport(request.ID, problem.ErrName(), problem.Message)
 						return false, problem
@@ -189,8 +186,8 @@ func verifyFileRetention(file records.MachineFileResult, result *pb.NativeByteRe
 	return nil
 }
 
-func receiveMachineFile(ctx context.Context, connection *machineConnection, file records.MachineFileResult) *exit.Error {
-	directory := filepath.Dir(file.Output.Path)
+func receiveMachineBlob(ctx context.Context, connection *machineConnection, retention *pb.NativeByteRetentionRequest, descriptor records.Output) *exit.Error {
+	directory := filepath.Dir(descriptor.Path)
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return exit.Internalf("cannot create received file custody: %s", err)
 	}
@@ -205,8 +202,8 @@ func receiveMachineFile(ctx context.Context, connection *machineConnection, file
 		return exit.Internalf("cannot stage received file: %s", err)
 	}
 	defer func() { output.Close(); _ = root.Remove(name) }()
-	digest, _ := canonical.Raw(file.Output.Digest)
-	stream, err := connection.readBytes(ctx, fileRetentionRequest(file), &pb.Ref{Digest: digest, Length: uint64(file.Output.Length)})
+	digest, _ := canonical.Raw(descriptor.Digest)
+	stream, err := connection.readBytes(ctx, retention, &pb.Ref{Digest: digest, Length: uint64(descriptor.Length)})
 	if err != nil {
 		return machineTransport(err)
 	}
@@ -220,7 +217,7 @@ func receiveMachineFile(ctx context.Context, connection *machineConnection, file
 		if err != nil {
 			return machineTransport(err)
 		}
-		if chunk == nil || chunk.Offset != offset || len(chunk.Data) == 0 || len(chunk.Data) > pb.MaxNativeByteReadChunkBytes || uint64(len(chunk.Data)) > uint64(file.Output.Length)-offset {
+		if chunk == nil || chunk.Offset != offset || len(chunk.Data) == 0 || len(chunk.Data) > pb.MaxNativeByteReadChunkBytes || uint64(len(chunk.Data)) > uint64(descriptor.Length)-offset {
 			return exit.New(exit.Conflict, "received file stream changed its exact object bounds")
 		}
 		if _, err := io.MultiWriter(output, hash).Write(chunk.Data); err != nil {
@@ -228,7 +225,7 @@ func receiveMachineFile(ctx context.Context, connection *machineConnection, file
 		}
 		offset += uint64(len(chunk.Data))
 	}
-	if offset != uint64(file.Output.Length) || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != file.Output.Digest {
+	if offset != uint64(descriptor.Length) || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != descriptor.Digest {
 		return exit.New(exit.Conflict, "received file differs from its immutable digest")
 	}
 	if err := output.Sync(); err != nil {
@@ -237,7 +234,7 @@ func receiveMachineFile(ctx context.Context, connection *machineConnection, file
 	if err := output.Close(); err != nil {
 		return exit.Internalf("cannot close received file: %s", err)
 	}
-	if err := root.Rename(name, filepath.Base(file.Output.Path)); err != nil {
+	if err := root.Rename(name, filepath.Base(descriptor.Path)); err != nil {
 		return exit.Internalf("cannot commit received file: %s", err)
 	}
 	parent, err := root.Open(".")
