@@ -1506,6 +1506,27 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     let build = tensorfs_core::ids::object_id(
         format!("{}|{}", p.conv.name, env!("CARGO_PKG_VERSION")).as_bytes(),
     );
+    let source_bytes = match p.files.iter().try_fold(0u64, |total, source| {
+        total.checked_add(source.header.file_len)
+    }) {
+        Some(bytes) => bytes,
+        None => {
+            return bail(tensorfs_core::err::Refusal {
+                code: Code::ARITH_OVERFLOW,
+                detail: "conversion input byte count overflow".into(),
+            })
+        }
+    };
+    let logical_output_bytes = ok!(p.plan.declared_bytes());
+    let logical_output_observation = match i64::try_from(logical_output_bytes) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return bail(tensorfs_core::err::Refusal {
+                code: Code::ARITH_OVERFLOW,
+                detail: "conversion output exceeds signed accounting extent".into(),
+            })
+        }
+    };
     let profile = IngestProfile {
         class: "normal".to_string(),
         source_dialect: p.conv.dialect.to_string(),
@@ -1518,7 +1539,10 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             v.dedup_by(|a, b| a.sha256 == b.sha256);
             v
         },
-        max_source_bytes: p.files.iter().map(|s| s.header.file_len).sum(),
+        // The receipt quota counts materialized bytes. A reviewed permutation can
+        // duplicate a low-rank factor into several canonical projections; its exact
+        // planned output, not only the carrier length, must fit the same bound.
+        max_source_bytes: source_bytes.max(logical_output_bytes),
         max_tensors: limits::MAX_TENSORS as u64,
     };
     ok!(profile.validate(&registry::platform_digests()));
@@ -1547,6 +1571,10 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     let isolation_tier: u64 = flag_num(f, "isolation-tier", 1);
     out.obs
         .push(("source_bytes".to_string(), profile.max_source_bytes as i64));
+    out.obs.push((
+        "logical_output_bytes".to_string(),
+        logical_output_observation,
+    ));
     out.obs.push(("golden_cases".to_string(), golden as i64));
     out.obs
         .push(("isolation_tier".to_string(), isolation_tier as i64));
