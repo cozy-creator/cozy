@@ -59,9 +59,9 @@ class FixtureWorker(session.Worker):
         record("PrepareLocalPackage", self, request, result=result)
         return result
 
-    def prepare_private_placement(self, request):
+    def prepare_unpublished_placement(self, request):
         try:
-            result = super().prepare_private_placement(request)
+            result = super().prepare_unpublished_placement(request)
         except Exception as error:
             record("PreparePrivatePlacement", self, request, error=error)
             raise

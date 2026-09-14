@@ -188,6 +188,11 @@ only-include=["model_tools.py"]
 	if hold.RetentionId == "" {
 		t.Fatal("serving input has no native retention identity")
 	}
+	var held string
+	must(t, db.QueryRow(`SELECT state FROM holds WHERE id=?`, hold.RetentionId).Scan(&held))
+	if held != "held" {
+		t.Fatalf("running serving input has custody state %s", held)
+	}
 	if code, out := runCozyPath(t, root, path, "run", "cancel", parent, "--json"); code != 0 {
 		t.Fatalf("cancel serving script [%d]: %s", code, out)
 	}

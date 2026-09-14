@@ -62,16 +62,15 @@ func TestEditedScriptsReuseImmutableDependencies(t *testing.T) {
 	library := filepath.Join(project, "library")
 	must(t, os.MkdirAll(library, 0700))
 	module := `import msgspec
-from cozy_runtime.author import App, Context
+from cozy_runtime.author import App, Context, invocable
 app=App()
-class Request(msgspec.Struct):
-    value: int
 class Result(msgspec.Struct):
     value: int
-@app.job
-def double(ctx: Context, payload: Request) -> Result:
+@invocable
+async def double(ctx: Context, *, value: int) -> Result:
     import numpy as np
-    return Result(int(np.asarray([payload.value, payload.value]).sum()))
+    return Result(int(np.asarray([value, value]).sum()))
+app.job(double)
 `
 	must(t, os.WriteFile(filepath.Join(library, "numerical_tools.py"), []byte(module), 0600))
 	metadata := fmt.Sprintf(`[project]

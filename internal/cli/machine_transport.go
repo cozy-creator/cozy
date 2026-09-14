@@ -296,7 +296,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 			"--artifact-cache", filepath.Join(root, "artifacts"), "--tensorfs-root", m.context.Cfg.TensorFSRoot,
 			"--environment-python", python, "--accelerator-backend", backend, "--devices", devices,
 			"--grant-root", filepath.Join(root, "grants"))
-		command.Env = m.context.Cfg.Child("COZY_HOME="+root, "COZY_BOOTSTRAP_CREDENTIAL="+string(bootstrap), "CUDA_VISIBLE_DEVICES="+devices)
+		command.Env = m.context.Cfg.Child("COZY_HOME="+root, "COZY_BOOTSTRAP_CREDENTIAL="+string(bootstrap), "CUDA_VISIBLE_DEVICES="+devices, "COZY_DEPENDENCY_CACHE="+m.layout.DependencyCache())
 		command.Dir = root
 		log, err := os.OpenFile(filepath.Join(root, "worker.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
