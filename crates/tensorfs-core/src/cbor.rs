@@ -436,6 +436,26 @@ fn encode_part(e: &mut Encoder<Bounded>, role: &str, part: &Part) -> Result<()> 
     Ok(())
 }
 
+pub(crate) fn encoded_tensor_identity(tensor: &Tensor) -> Result<String> {
+    let mut encoder = Encoder::new(Bounded { bytes: Vec::new() });
+    emit("tensor identity", encoder.array(5))?;
+    emit(
+        "tensor identity domain",
+        encoder.str("tensorfs.encoded-tensor/1"),
+    )?;
+    emit("tensor identity dtype", encoder.u8(tensor.dtype.code()))?;
+    encode_shape(&mut encoder, &tensor.shape)?;
+    emit("tensor identity encoding", encoder.str(&tensor.encoding))?;
+    emit(
+        "tensor identity parts",
+        encoder.array(tensor.parts.len() as u64),
+    )?;
+    for (role, part) in &tensor.parts {
+        encode_part(&mut encoder, role, part)?;
+    }
+    Ok(crate::ids::object_id(&encoder.into_writer().bytes))
+}
+
 fn decode_part(d: &mut Decoder<'_>, what: &str) -> Result<(String, Part)> {
     exact_array(d, what, 4)?;
     let role = text(d, &format!("{what}.role"), limits::MAX_NAME_BYTES)?;
