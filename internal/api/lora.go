@@ -12,7 +12,7 @@ import (
 
 func validateModelAdapters(models []orchestrator.ModelRef) *exit.Error {
 	for _, model := range models {
-		if len(model.Adapters) > 0 && !model.Downloadable() && model.BindingPath == "" {
+		if len(model.Adapters) > 0 && !model.Downloadable() && len(model.Ladder) == 0 && model.BindingPath == "" {
 			return exit.Named(exit.Structural, "native_model_adapters_unsupported", "this base has no downloadable or native model binding; upload the base checkpoint first")
 		}
 		for _, adapter := range model.Adapters {
