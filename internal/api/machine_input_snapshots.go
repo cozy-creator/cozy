@@ -19,7 +19,7 @@ import (
 )
 
 func (s *Server) freezeMachineInputs(spec *orchestrator.Submission) (*scratch.Dir, *exit.Error) {
-	if s.machineExecutions == nil || spec.LocalPackageDigest == "" {
+	if s.machineExecutions == nil || spec.InstallID == "" {
 		return nil, nil
 	}
 	jobs, problem := s.packages.JobsInstall(spec.InstallID)

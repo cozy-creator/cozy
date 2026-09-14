@@ -114,5 +114,9 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 	for _, output := range job.WeightsOutputs {
 		plan.WeightsOutputs = append(plan.WeightsOutputs, orchestrator.WeightsOutput{OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes})
 	}
-	return orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan, nil)
+	byteInputs, problem := m.stageMachineInputs(ctx, request, connection)
+	if problem != nil {
+		return nil, problem
+	}
+	return orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan, byteInputs)
 }
