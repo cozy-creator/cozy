@@ -15,7 +15,7 @@ import (
 // uv pip's backend setting does not configure uv lock. Pin the fixture's lock
 // index explicitly so CPU CI never snapshots the multi-gigabyte CUDA closure.
 func servingTorchIndex() string {
-	if os.Getenv("UV_TORCH_BACKEND") != "cpu" {
+	if !*servingCPUFixture {
 		return ""
 	}
 	return `torch={index="fixture-torch"}
