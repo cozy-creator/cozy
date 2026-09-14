@@ -73,3 +73,22 @@ func TestEndedRentalSettlesMachineControlWithoutInventingOutcome(t *testing.T) {
 		})
 	}
 }
+
+func TestRuntimeEventCannotClaimRentalDestruction(t *testing.T) {
+	store, request, receipt := machineObserverFixture(t)
+	fatal(t, store.AcceptMachineExecution(request.ID, receipt))
+	state := &pb.MachineExecutionState{RequestId: request.ID, WorkerId: receipt.WorkerId,
+		WorkerBootId: receipt.WorkerBootId, ExecutionWorkspaceId: receipt.ExecutionWorkspaceId,
+		Generation: 1, AttemptOrdinal: 1, State: "running", Sequence: 1}
+	fatal(t, store.ObserveMachineExecution(request.ID, state, &pb.MachineExecutionEventPage{
+		NextAfter: 1, HeadSequence: 1, Events: []*pb.MachineExecutionEvent{{Sequence: 1, AttemptOrdinal: 1,
+			AtMs: 1001, Kind: "state_lost", BodyCanonicalBytes: []byte(`{"machine_id":"pr-owned-machine"}`)}},
+	}))
+	lost, problem := store.MachineExecutionLost(request.ID)
+	fatal(t, problem)
+	owed, problem := store.MachineExecutionOwesWork(request.ID)
+	fatal(t, problem)
+	if lost || !owed {
+		t.Fatal("a Runtime observation impersonated the client's confirmed rental destruction")
+	}
+}

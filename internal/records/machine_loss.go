@@ -9,7 +9,7 @@ import (
 // Destruction ends remote obligations, not by pretending that a native release
 // or collection happened. Keep the exact acceptance, control and outcome history.
 const machineExecutionLost = `EXISTS(SELECT 1 FROM request_events loss
- WHERE loss.request_id=e.request_id AND loss.type='machine.state_lost'
+ WHERE loss.request_id=e.request_id AND loss.type='client.machine_lost'
  AND json_extract(loss.payload,'$.machine_id')=e.machine_id)`
 
 func machineExecutionLostIn(q interface {
@@ -99,7 +99,7 @@ func loseMachineExecutions(tx *sql.Tx, machine string) *exit.Error {
 			"error":                  "rented machine was confirmed destroyed; its execution and retained bytes can no longer be observed",
 			"had_acceptance_receipt": value.accepted, "had_recorded_outcome": value.hasResult,
 		}
-		if err := appendEventTx(tx, value.id, "machine.state_lost", 0, detail); err != nil {
+		if err := appendEventTx(tx, value.id, "client.machine_lost", 0, detail); err != nil {
 			return exit.Internalf("cannot record destroyed machine: %s", err)
 		}
 		next := value.state
