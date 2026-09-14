@@ -61,10 +61,10 @@ func (s *Store) MachinePackageUploaded(request, boot, revision string) (bool, *e
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
 // than a status projection. A failed or paused root remains owed after its small
 // error result is collected, and cancellation alone never proves native cleanup.
-const machineExecutionOwed = `(` + machineInputOwed + ` OR ` + machineModelRetentionOwed + ` OR ` + machineFileResultOwed + ` OR (NOT EXISTS(SELECT 1 FROM request_events released
+const machineExecutionOwed = `(NOT ` + machineExecutionLost + ` AND (` + machineInputOwed + ` OR ` + machineModelRetentionOwed + ` OR ` + machineFileResultOwed + ` OR (NOT EXISTS(SELECT 1 FROM request_events released
  WHERE released.request_id=r.id AND released.type='machine.retention_released') AND (
  (length(e.receipt)=0 AND r.state!='refused' AND (length(e.submission)>0 OR r.state!='canceled')) OR
- (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0)))))`
+ (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))))`
 
 func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 	var owed bool
@@ -258,6 +258,13 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 	}
 	if problem := machineObservationIdentity(link, state); problem != nil {
 		return problem
+	}
+	lost, err := machineExecutionLostIn(tx, id)
+	if err != nil {
+		return exit.Internalf("cannot inspect machine observation loss: %s", err)
+	}
+	if lost {
+		return exit.Named(exit.Conflict, "machine_execution.state_lost", "cannot observe execution on a confirmed destroyed machine")
 	}
 	nextState := observedMachineRequestState(state.State)
 	if nextState == "" || page == nil || page.NextAfter > page.HeadSequence || page.HeadSequence > math.MaxInt64 || page.CompactedThrough > page.HeadSequence {

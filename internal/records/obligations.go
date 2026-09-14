@@ -13,9 +13,9 @@ type Obligation struct {
 }
 
 // Obligations is every durable reason this daemon may not stop, read in ONE statement so
-// no fence can see half of the picture. A rental row counts in every state, including one
-// whose release is requested but not yet confirmed by the hub: the row leaves only when
-// the pod is proved gone. A rental operation counts until it is final, and only when no
+// no fence can see half of the picture. A rental counts until the hub proves it
+// gone or explicitly confirms that creation never happened. Failed provisioning
+// alone is not that proof. A rental operation counts until it is final, and only when no
 // rental row already stands for it.
 func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 	rows, err := s.db.Query(`
@@ -29,6 +29,7 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 		 WHERE state IN (` + openAttemptStates + `)
 		UNION ALL
 		SELECT 'rental',id,state FROM rentals
+		 WHERE NOT (state='failed' AND failure_code='provider_create_did_not_happen')
 		UNION ALL
 		SELECT 'rental_operation',operation_key,state FROM rental_operations
 		 WHERE state NOT IN (` + finalRentalOperationStates + `)

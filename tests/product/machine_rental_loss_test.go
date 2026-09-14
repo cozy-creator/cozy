@@ -12,7 +12,7 @@ func TestEndedRentalSettlesMachineControlWithoutInventingOutcome(t *testing.T) {
 	for _, accepted := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ambiguous-submission", true: "accepted"}[accepted], func(t *testing.T) {
 			store, request, receipt := machineObserverFixture(t)
-			fatal(t, store.RecordRental(records.Rental{ID: "pr-owned-machine", State: "ready", Hub: "https://hub.example"}))
+			fatal(t, store.RecordRental(records.Rental{ID: "pr-owned-machine", MachineName: "ayanojou", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, State: "ready", Hub: "https://hub.example"}))
 			if accepted {
 				fatal(t, store.AcceptMachineExecution(request.ID, receipt))
 				fatal(t, store.RecordMachineControl(request.ID, &pb.MachineExecutionControl{
@@ -56,6 +56,19 @@ func TestEndedRentalSettlesMachineControlWithoutInventingOutcome(t *testing.T) {
 			fatal(t, problem)
 			if row.State != "canceled" {
 				t.Fatalf("explicit cancellation after destruction remains %s", row.State)
+			}
+			lost, problem := store.MachineExecutionLost(request.ID)
+			fatal(t, problem)
+			if !lost {
+				t.Fatal("remote obligations disappeared without an explicit loss observation")
+			}
+			if accepted {
+				late := &pb.MachineExecutionState{RequestId: request.ID, WorkerId: receipt.WorkerId,
+					WorkerBootId: receipt.WorkerBootId, ExecutionWorkspaceId: receipt.ExecutionWorkspaceId,
+					Generation: 1, AttemptOrdinal: 1, State: "running", Sequence: 1}
+				if problem := store.ObserveMachineExecution(request.ID, late, &pb.MachineExecutionEventPage{NextAfter: 1, HeadSequence: 1}); problem == nil {
+					t.Fatal("late machine observation resurrected execution after confirmed destruction")
+				}
 			}
 		})
 	}

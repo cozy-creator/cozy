@@ -88,6 +88,9 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 			if problem != nil || current == nil {
 				return
 			}
+			if owed, problem := m.store.MachineExecutionOwesWork(request.ID); problem != nil || !owed {
+				return
+			}
 			if current.State == "refused" {
 				return
 			}
@@ -156,6 +159,10 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 }
 
 func (m *machineRuns) Resume() {
+	if problem := m.store.ReconcileEndedMachineExecutions(); problem != nil {
+		fmt.Fprintf(m.context.Out, "machine execution loss recovery: %s\n", problem.Message)
+		return
+	}
 	links, problem := m.store.MachineExecutions()
 	if problem != nil {
 		fmt.Fprintf(m.context.Out, "machine execution observation recovery: %s\n", problem.Message)
@@ -322,6 +329,12 @@ func machineTransport(err error) *exit.Error {
 }
 
 func (m *machineRuns) executionConnection(ctx context.Context, request records.Request) (*machineConnection, *records.MachineExecution, *pb.MachineExecutionQuery, *exit.Error) {
+	if lost, problem := m.store.MachineExecutionLost(request.ID); problem != nil || lost {
+		if problem != nil {
+			return nil, nil, nil, problem
+		}
+		return nil, nil, nil, exit.Named(exit.Conflict, "machine_execution.state_lost", "execution's rented machine was confirmed destroyed")
+	}
 	link, problem := m.store.MachineExecution(request.ID)
 	if problem != nil {
 		return nil, nil, nil, problem
