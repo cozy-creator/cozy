@@ -300,7 +300,12 @@ func TestRuntimeObligationsPreventPrematureRentalRelease(t *testing.T) {
 func TestMachineInvocationCarriesFrozenDeadlineAndRefusesUnstagedInputs(t *testing.T) {
 	request := records.Request{ID: "job-deadline", IdemKey: "deadline", Kind: "job", Package: "local/example", Entrypoint: "main", Org: "local", Payload: []byte(`{}`), PlanID: childDigest("2"), LocalPackageDigest: childDigest("3"), DeadlineUnixMS: 1900000000123}
 	plan := &orchestrator.JobPlan{Function: "main", DescriptorID: request.PlanID}
-	capture := localpackage.ExecutionCapture{Canonical: []byte(`{}`), Digest: canonical.Digest([]byte(`{}`))}
+	root := machineCaptureRevision(t, request.Package, 3)
+	request.LocalPackageDigest = root.Digest
+	capture, problem := localpackage.CaptureExecution("root", root,
+		func(string) ([]records.ChildBinding, *exit.Error) { return nil, nil },
+		func(string, string) (localpackage.Revision, *exit.Error) { return root, nil })
+	fatal(t, problem)
 	submission, problem := orchestrator.MachineJobSubmission(request, capture, plan)
 	fatal(t, problem)
 	var spec pb.InvocationSpec

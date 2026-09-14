@@ -14,8 +14,16 @@ import (
 // MachineJobSubmission reuses the ordinary invocation and job-directive codecs.
 // The first ordinal is an intake proposal; only Runtime records its attempts.
 func MachineJobSubmission(request records.Request, capture localpackage.ExecutionCapture, plan *JobPlan) (*pb.MachineExecutionSubmit, *exit.Error) {
-	if !request.IsJob() || plan == nil || plan.DescriptorID != request.PlanID || request.LocalPackageDigest == "" {
+	if !request.IsJob() || plan == nil || plan.DescriptorID != request.PlanID {
 		return nil, exit.New(exit.Conflict, "machine job no longer names its captured declaration")
+	}
+	rootCapture, err := canonical.Read(capture.Canonical, &pb.MachineExecutionCapture{})
+	if err != nil {
+		return nil, exit.New(exit.Conflict, "machine job has no canonical execution capture")
+	}
+	buildID := rootCapture.Str("root_revision_digest")
+	if _, err := canonical.Raw(buildID); err != nil || (request.LocalPackageDigest != "" && request.LocalPackageDigest != buildID) || (request.LocalPackageDigest == "" && plan.BuildID != buildID) {
+		return nil, exit.New(exit.Conflict, "machine job changed its captured code identity")
 	}
 	if len(request.Assets) > 0 || len(request.Models) > 0 || request.Trees != "" || request.ModelTransfer != nil {
 		return nil, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; execution was not submitted")
@@ -36,14 +44,14 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 		DeadlineUnixMs: request.DeadlineUnixMS,
 		PayloadDigest:  payloadDigest, Inputs: inputBindings(request, payloadDigest), Outputs: outputs,
 		AttentionKernel: request.AttentionKernel,
-		Spec:            &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{BuildId: request.LocalPackageDigest, JobDescriptorId: request.PlanID, PublicationContract: publication}},
+		Spec:            &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{BuildId: buildID, JobDescriptorId: request.PlanID, PublicationContract: publication}},
 	}
 	raw, digest, err := canonical.Identity(spec)
 	if err != nil {
 		return nil, exit.Internalf("cannot encode machine invocation: %s", err)
 	}
 	root := *plan
-	root.BuildID, root.OrchestrationParent, root.FrozenDirective = request.LocalPackageDigest, nil, nil
+	root.BuildID, root.OrchestrationParent, root.FrozenDirective = buildID, nil, nil
 	// A captured CPU caller must not occupy the execution lane its managed
 	// model children need. Device-bearing roots keep their declared lane.
 	root.Orchestration = !root.NeedsAccelerator && len(request.Models) == 0 && len(root.WeightsOutputs) == 0

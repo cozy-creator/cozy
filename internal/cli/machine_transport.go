@@ -76,6 +76,27 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		m.mu.Unlock()
 	}
 	result := &machineConnection{connection: connection, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
+	result.preparePublished = func(ctx context.Context, pkg, release string) (*pb.DesiredPlacementSet, *exit.Error) {
+		ref := &pb.DownloadPackageRef{Package: pkg, Release: release}
+		facts, problem := rental.PrepareFactsSource(m.resolver.catalog)(ctx, identity, ref)
+		if problem != nil {
+			return nil, problem
+		}
+		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, nil)
+		if problem != nil {
+			return nil, problem
+		}
+		stream, err := host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
+			Claim: claim, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
+			Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
+			ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
+		})
+		if err != nil {
+			return nil, machineTransport(err)
+		}
+		return readMachinePreparedSet(stream)
+	}
+
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
 		return host.RetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
 	}

@@ -225,7 +225,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
-		if !spec.Rental || spec.LocalPackageDigest == "" || s.machineExecutions == nil {
+		if !spec.Rental || (spec.LocalPackageDigest == "" && !publishedMachineJob(spec)) || s.machineExecutions == nil {
 			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-publish requires a Runtime-owned rented transaction with its own certificate identity"))
 			return
 		}
@@ -250,7 +250,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.BodyDigest = digest
-	if s.machineExecutions != nil && spec.LocalPackageDigest != "" {
+	if s.machineExecutions != nil && (spec.LocalPackageDigest != "" || publishedMachineJob(spec)) {
 		if existing == nil {
 			spec.MachineExecutionObserver = true
 		} else if link, problem := s.store.MachineExecution(existing.ID); problem == nil {
@@ -302,6 +302,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	s.ok(w, r, status, handle)
+}
+
+// Published roots cut over only when their explicit machine and input shape
+// already have a complete Runtime submission path. Other published jobs keep
+// the existing placement and staging path.
+func publishedMachineJob(spec orchestrator.Submission) bool {
+	return spec.Rental && (spec.RequestedRental != "" || spec.Worker != "") &&
+		len(spec.Assets) == 0 && len(spec.Models) == 0 && len(spec.Trees) == 0 && spec.ModelTransfer == nil
 }
 
 func replayJobSubmission(sub JobSubmission,

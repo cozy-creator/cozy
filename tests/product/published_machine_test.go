@@ -1,0 +1,205 @@
+package producttest
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/secret"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
+)
+
+func TestPublishedMachineJobPreservesEnvironmentBuildIdentity(t *testing.T) {
+	environment := &pb.Environment{LockedRequirements: &pb.Ref{Digest: bytes.Repeat([]byte{7}, 32), Length: 100}}
+	_, code, err := canonical.Identity(environment)
+	must(t, err)
+	buildID, err := canonical.Spell(code)
+	must(t, err)
+	raw, digest, err := canonical.Identity(&pb.MachineExecutionCapture{RootRevisionDigest: code,
+		PublishedRevisions: []*pb.PublishedPackageRevision{{Package: &pb.PackageSelection{Package: "alice/ops", Release: "1.0.0"}, Environment: environment, PackageInterface: &pb.Ref{Digest: bytes.Repeat([]byte{8}, 32), Length: 200}}},
+	})
+	must(t, err)
+	request := records.Request{ID: "published-root", IdemKey: "published-root", Kind: "job", Package: "alice/ops", Release: "1.0.0", PlanID: childDigest("9"), Payload: []byte(`{}`), Org: "local"}
+	plan := &orchestrator.JobPlan{Function: "main", DescriptorID: request.PlanID, BuildID: buildID}
+	submitted, problem := orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan)
+	fatal(t, problem)
+	var spec pb.InvocationSpec
+	must(t, canonical.Unmarshal(submitted.Offer.InvocationSpecCanonicalBytes, &spec))
+	if spec.GetJob().BuildId != buildID || submitted.PreparedState.GetJob().BuildId != buildID || request.LocalPackageDigest != "" {
+		t.Fatal("published code acquired a private revision identity")
+	}
+	plan.BuildID = childDigest("a")
+	if _, problem := orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan); problem == nil {
+		t.Fatal("a different prepared build was accepted")
+	}
+}
+
+type publishedRouteResolver struct{ api.Resolver }
+
+func (publishedRouteResolver) ResolveRemoteJob(pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
+	return orchestrator.LogicalJob{Package: pkg, Release: release, Function: function, DescriptorID: childDigest("9")}, &launch.Entrypoint{Name: function, Kind: "job", Request: launch.Struct{Fields: []launch.Field{}}, Result: launch.Struct{Fields: []launch.Field{}}}, nil
+}
+
+type publishedRouteObserver struct{}
+
+func (publishedRouteObserver) Refresh(context.Context, records.Request) *exit.Error { return nil }
+func (publishedRouteObserver) Control(context.Context, records.Request, string) *exit.Error {
+	return nil
+}
+
+func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
+	o := hostOwner(t, "published-machine-routing", func(options *orchestrator.Options) {
+		options.Cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
+	})
+	o.cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
+	fatal(t, o.store.RecordRental(records.Rental{ID: "rental-pinned", MachineName: "otter", SKU: "cpu", AcceleratorModel: "CPU", State: "ready", Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1", AcceleratorCount: 1, HourlyRateUSDMicros: 1}))
+	const bearer = "published-machine-routing-fixture"
+	credential := secret.New(bearer)
+	handler, problem := api.New(api.Options{Orchestrator: o.c, Cfg: o.cfg, Creds: api.Credentials{CLI: credential}, Addr: "127.0.0.1:11111", Web: http.NotFoundHandler(), Packages: publishedRouteResolver{}, MachineExecutions: publishedRouteObserver{}}).Handler()
+	fatal(t, problem)
+	for _, arm := range []string{"default", "rental-only", "pinned"} {
+		body := map[string]any{"package": "alice/ops", "release": "1.0.0", "function": "main", "input": map[string]any{}, "rental": true}
+		if arm == "pinned" {
+			body["requested_rental"] = "rental-pinned"
+		} else if arm == "rental-only" {
+			body["rental_required"] = true
+		}
+		raw, err := json.Marshal(body)
+		must(t, err)
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:11111/v1/local/jobs", bytes.NewReader(raw))
+		request.RemoteAddr = "127.0.0.1:12345"
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+bearer)
+		request.Header.Set("Idempotency-Key", arm)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("%s submission: %d %s", arm, response.Code, response.Body.String())
+		}
+		row, problem := o.store.RequestByIdempotencyKey(arm)
+		fatal(t, problem)
+		link, problem := o.store.MachineExecution(row.ID)
+		fatal(t, problem)
+		if (link != nil) != (arm == "pinned") || row.LocalPackageDigest != "" {
+			t.Fatalf("%s changed published routing or code origin", arm)
+		}
+	}
+}
+
+var publishedMachineFixture = flag.String("published-machine-fixture", "", "exact public-shaped wheel/interface fixture for the owned actual Host proof")
+
+func TestPublishedMachineActualHostAndNewRootAfterRestart(t *testing.T) {
+	if *publishedMachineFixture == "" {
+		t.Skip("requires an exact wheel/interface fixture and owned actual Host")
+	}
+	var fixture struct {
+		Package   string          `json:"package"`
+		Release   string          `json:"release"`
+		Wheel     string          `json:"wheel"`
+		Interface json.RawMessage `json:"interface"`
+	}
+	raw, err := os.ReadFile(*publishedMachineFixture)
+	must(t, err)
+	must(t, json.Unmarshal(raw, &fixture))
+	iface, problem := launch.DecodePackageInterface(fixture.Interface)
+	fatal(t, problem)
+	wheel, err := os.ReadFile(fixture.Wheel)
+	must(t, err)
+	wheelDigest, err := canonical.Spell(canonical.Digest(wheel))
+	must(t, err)
+	wheelURL := publishedFixtureWheel(t, wheel, filepath.Base(fixture.Wheel))
+	layout, store, host, path, restart := startActualChildHostConfigured(t, func(h *fakeRentalHub) {
+		fallback := h.server.Config.Handler
+		h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/v1/packages/" + fixture.Package:
+				org, name, _ := strings.Cut(fixture.Package, "/")
+				_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: org, Name: name}, Releases: []hub.ReleaseSummary{{Release: fixture.Release}}})
+			case "/v1/packages/" + fixture.Package + "/releases/" + fixture.Release:
+				var detail hub.PackageReleaseDetail
+				detail.Release.Release = fixture.Release
+				detail.Release.PackageInterfaceDigest = iface.Digest
+				detail.Release.PackageInterfaceLength = int64(len(iface.Raw))
+				detail.PackageInterface = iface.Raw
+				detail.ExecutionRequirements = []string{"cozy-runtime>=0.17.2"}
+				detail.RequiresPython = ">=3.12,<3.13"
+				_ = json.NewEncoder(w).Encode(detail)
+			case "/v1/rentals/rental-private-child-host/prepare-facts":
+				if r.URL.Query().Get("package") != fixture.Package || r.URL.Query().Get("release") != fixture.Release {
+					http.Error(w, "unknown exact release", 404)
+					return
+				}
+				_, distribution, _ := strings.Cut(fixture.Package, "/")
+				locked := fmt.Sprintf("--index-url https://pypi.org/simple\n%s @ %s --hash=%s\n", distribution, wheelURL, wheelDigest)
+				_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: iface.Application, ModelSlotPaths: []string{}, ImageInventory: h.inventories["rental-private-child-host"], LockedRequirements: locked})
+			case "/wheels/" + filepath.Base(fixture.Wheel):
+				w.Header().Set("Content-Type", "application/octet-stream")
+				_, _ = w.Write(wheel)
+			default:
+				fallback.ServeHTTP(w, r)
+			}
+		})
+	})
+	var build string
+	for index := 0; index < 2; index++ {
+		if index == 1 {
+			restart() // The production supervisor restarts Host and Runtime together.
+		}
+		key := fmt.Sprintf("published-host-%d", index)
+		code, out := runCozyPath(t, layout.Root, path, "run", fixture.Package+"/main", "--rental", "child-host", "--await", "--json", "--idempotency-key", key)
+		if code != 0 {
+			t.Fatalf("published root %d [%d]: %s", index, code, out)
+		}
+		request, problem := store.RequestByIdempotencyKey(key)
+		fatal(t, problem)
+		if request == nil || request.State != "succeeded" || request.LocalPackageDigest != "" || request.Release != fixture.Release {
+			t.Fatalf("published request changed origin or failed: %+v", request)
+		}
+		link, problem := store.MachineExecution(request.ID)
+		fatal(t, problem)
+		if link == nil || !link.Collected || len(link.Receipt) == 0 {
+			t.Fatal("published root has no collected Runtime receipt")
+		}
+		var submitted pb.MachineExecutionSubmit
+		must(t, proto.Unmarshal(link.Submission, &submitted))
+		var capture pb.MachineExecutionCapture
+		must(t, canonical.Unmarshal(submitted.CaptureCanonicalBytes, &capture))
+		if len(capture.Revisions) != 0 || len(capture.PublishedRevisions) != 1 {
+			t.Fatal("published root was recast as a private revision")
+		}
+		_, identity, err := canonical.Identity(capture.PublishedRevisions[0].Environment)
+		must(t, err)
+		current, err := canonical.Spell(identity)
+		must(t, err)
+		if !bytes.Equal(identity, capture.RootRevisionDigest) || submitted.PreparedState.GetJob().BuildId != current || (build != "" && current != build) {
+			t.Fatal("published build identity changed across re-preparation")
+		}
+		build = current
+		attempts, problem := store.Attempts(request.ID)
+		fatal(t, problem)
+		children, problem := store.Children(request.ID)
+		fatal(t, problem)
+		if len(attempts) != 0 || len(children) != 0 {
+			t.Fatal("Creator owns published attempts or children")
+		}
+		t.Logf("published root %s accepted/collected, build=%s, container=%s: %s", request.ID, build, host.Container, out)
+	}
+}
