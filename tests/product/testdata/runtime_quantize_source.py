@@ -37,7 +37,7 @@ async def inspect(ctx: Context, *, original: QuantizationSource,
     with reader.open(original) as source, reader.open(candidate) as result:
         tensor = result.tensor("body", "layer.weight")
         assert tensor.logical_dtype == "f16"
-        assert {part.name for part in tensor.parts} == {"data", "scale"}
+        assert set(tensor.parts) == {"data", "scale"}
         assert source.identity("body", "layer.bias") == result.identity("body", "layer.bias")
         payload = bytearray(512)
         result.read_part_into("body", "layer.weight", "data", 0, payload)
