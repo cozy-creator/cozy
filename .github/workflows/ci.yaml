@@ -9,7 +9,7 @@ jobs:
         tests: ['^Test[A-H]', '^Test[I-O]', '^Test[P-Q]', '^Test[R-Z]']
     env:
       UV_TORCH_BACKEND: cpu
-      COZY_RUNTIME_SOURCE: bb0e393b4bfb41794ab3e2c8c0659b7bc0def50f
+      COZY_RUNTIME_SOURCE: 6cd2d539c27e01bde780f2076e1aa9ddc4043ef2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
