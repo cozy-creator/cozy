@@ -37,18 +37,10 @@ func ValidateMachineModelResults(schema json.RawMessage, envelope *pb.ResultEnve
 	if envelope == nil || envelope.ResultBlob != nil || len(envelope.InlineResult) == 0 || len(envelope.RetainedModels) > 32 {
 		return refuse("model result needs its bounded inline result and complete custody descriptors")
 	}
-	normalized, err := canonical.NormalizeJCS(schema)
-	if err != nil || !bytes.Equal(canonical.Digest(normalized), envelope.ResultSchemaDigest) {
-		return refuse("model result differs from the captured schema identity")
-	}
-	inline, err := canonical.NormalizeJCS(envelope.InlineResult)
-	if err != nil || !bytes.Equal(inline, envelope.InlineResult) {
-		return refuse("model result is not exact canonical JSON")
-	}
-	wrapped, _ := json.Marshal(map[string]json.RawMessage{"result": inline})
-	if problem := ValidatePayload("machine result", &Entrypoint{Name: "result", Request: Struct{Fields: []Field{{Name: "result", Wire: "required", Type: schema}}}}, wrapped); problem != nil {
+	if problem := ValidateMachineResult(schema, envelope); problem != nil {
 		return refuse(problem.Message)
 	}
+	inline := envelope.InlineResult
 	expected := map[string][]byte{}
 	var visit func(json.RawMessage, []string, string)
 	visit = func(value json.RawMessage, path []string, pointer string) {

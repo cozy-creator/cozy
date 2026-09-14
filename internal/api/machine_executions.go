@@ -54,6 +54,12 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		CreatedAt: row.CreatedAt, EventsURL: "/v1/requests/" + row.ID + "/events", Outputs: []MediaRef{},
 		MachineExecution: view,
 	}
+	state.OutputExport = s.outputExportOf(row.ID)
+	if outputs, problem := s.store.VisibleOutputs(row.ID); problem == nil {
+		for _, output := range outputs {
+			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MediaID: output.MediaID, URL: "/v1/media/" + output.MediaID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
+		}
+	}
 	if !view.Accepted {
 		state.Stage = "waiting for durable machine acceptance"
 		if len(link.Submission) > 0 && state.Status == "blocked" {
