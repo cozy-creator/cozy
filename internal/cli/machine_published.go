@@ -15,38 +15,53 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Only an explicit fixed machine selects this path. Publication itself does not
-// move default or externally placed roots away from their existing coordinator.
+// Local installed code and explicit rented machines use the same execution path.
+// Rented roots with external placement keep their existing coordinator.
 func (m *machineRuns) publishedSubmission(ctx context.Context, request records.Request, connection *machineConnection) (*pb.MachineExecutionSubmit, *exit.Error) {
-	if !request.Rental || (request.RequestedRental == "" && request.Worker == "") || connection.preparePublished == nil {
-		return nil, exit.New(exit.Conflict, "published machine execution requires an explicit pinned rental")
+	if (request.Rental && request.RequestedRental == "" && request.Worker == "") || connection.preparePublished == nil {
+		return nil, exit.New(exit.Conflict, "published machine execution requires a local install or pinned rental")
 	}
 	if connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
 		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires actual Runtime protocol 54")
 	}
-	ref, problem := hub.ParseRef(request.Package)
-	if problem != nil {
-		return nil, problem
-	}
-	detail, problem := m.resolver.catalog.PackageRelease(ctx, ref, request.Release)
-	if problem != nil {
-		return nil, problem
-	}
-	if _, problem := detail.Requirements(); problem != nil {
-		return nil, problem
-	}
-	iface, problem := launch.DecodePackageInterface(detail.PackageInterface)
-	if problem != nil {
-		return nil, problem
+	var iface *launch.PackageInterface
+	if request.Rental {
+		ref, problem := hub.ParseRef(request.Package)
+		if problem != nil {
+			return nil, problem
+		}
+		detail, problem := m.resolver.catalog.PackageRelease(ctx, ref, request.Release)
+		if problem != nil {
+			return nil, problem
+		}
+		if _, problem := detail.Requirements(); problem != nil {
+			return nil, problem
+		}
+		if detail.Release.Release != request.Release {
+			return nil, exit.New(exit.Conflict, "published machine root changed its release")
+		}
+		iface, problem = launch.DecodePackageInterface(detail.PackageInterface)
+		if problem != nil {
+			return nil, problem
+		}
+	} else {
+		facts, problem := m.resolver.installFacts(request.InstallID)
+		if problem != nil {
+			return nil, problem
+		}
+		if facts.Install.SourceKind != "tensorhub" || facts.Install.Package != request.Package || facts.Install.Version != request.Release {
+			return nil, exit.New(exit.Conflict, "published local root changed its immutable install")
+		}
+		iface = facts.PackageInterface
 	}
 	job, problem := iface.Function(request.Entrypoint)
 	if problem != nil {
 		return nil, problem
 	}
-	if detail.Release.Release != request.Release || job.Kind != "job" || job.DescriptorID != request.PlanID {
+	if job.Kind != "job" || job.DescriptorID != request.PlanID {
 		return nil, exit.New(exit.Conflict, "published machine root changed its captured declaration")
 	}
-	prepared, problem := connection.preparePublished(ctx, request.Package, request.Release)
+	prepared, problem := connection.preparePublished(ctx, request)
 	if problem != nil {
 		return nil, problem
 	}

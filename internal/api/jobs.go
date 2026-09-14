@@ -304,11 +304,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, status, handle)
 }
 
-// Published roots cut over only when their explicit machine and input shape
-// already have a complete Runtime submission path. Other published jobs keep
-// the existing placement and staging path.
+// Installed local roots and explicitly pinned rentals use Runtime submission
+// once their input shape has a complete machine-side path.
 func publishedMachineJob(spec orchestrator.Submission) bool {
-	return spec.Rental && (spec.RequestedRental != "" || spec.Worker != "") &&
+	return ((spec.Rental && (spec.RequestedRental != "" || spec.Worker != "")) || (!spec.Rental && spec.MachineExecutionObserver)) &&
 		len(spec.Assets) == 0 && len(spec.Models) == 0 && len(spec.Trees) == 0 && spec.ModelTransfer == nil
 }
 
@@ -473,6 +472,16 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			jobs, e = s.packages.JobsInstall(sub.InstallID)
 			out.InstallID = sub.InstallID
 		}
+		if e == nil && s.machineExecutions != nil {
+			installed, problem := s.store.Install(sub.InstallID)
+			if problem != nil {
+				return out, problem
+			}
+			if installed != nil && installed.SourceKind == "tensorhub" {
+				out.Release = installed.Version
+				out.MachineExecutionObserver = true
+			}
+		}
 	} else {
 		jobs, e = s.packages.Jobs(sub.Package)
 	}
@@ -503,6 +512,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		return out, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function).
 			WithRemedy("it registers: %s", strings.Join(names, ", "))
+	}
+	if out.MachineExecutionObserver && (len(out.Assets) > 0 || len(out.Models) > 0 || len(sub.Trees) > 0 || out.ModelTransfer != nil) {
+		out.MachineExecutionObserver = false
 	}
 	for _, pair := range sub.Trees {
 		ref, dir, ok := strings.Cut(pair, "=")

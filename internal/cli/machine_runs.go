@@ -37,7 +37,7 @@ type machineConnection struct {
 	client            machineExecutionClient
 	claim             *pb.Claim
 	prepare           func(context.Context, string, localpackage.Revision) *exit.Error
-	preparePublished  func(context.Context, string, string) (*pb.DesiredPlacementSet, *exit.Error)
+	preparePublished  func(context.Context, records.Request) (*pb.DesiredPlacementSet, *exit.Error)
 	wireMinor         uint32
 	certificateDigest []byte
 	retainModel       func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)

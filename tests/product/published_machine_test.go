@@ -57,6 +57,14 @@ func (publishedRouteResolver) ResolveRemoteJob(pkg, release, function string, mo
 	return orchestrator.LogicalJob{Package: pkg, Release: release, Function: function, DescriptorID: childDigest("9")}, &launch.Entrypoint{Name: function, Kind: "job", Request: launch.Struct{Fields: []launch.Field{}}, Result: launch.Struct{Fields: []launch.Field{}}}, nil
 }
 
+func (publishedRouteResolver) ResolveInstall(id string, _ []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return orchestrator.WorkerLaunchSpec{Placement: orchestrator.DesiredPlacement{Package: "alice/ops", Release: "1.0.0", InstallID: id}}, nil
+}
+
+func (publishedRouteResolver) JobsInstall(string) ([]launch.JobFacts, *exit.Error) {
+	return []launch.JobFacts{{Name: "main", DescriptorID: childDigest("9"), Request: launch.Struct{Fields: []launch.Field{}}, Result: launch.Struct{Fields: []launch.Field{}}}}, nil
+}
+
 type publishedRouteObserver struct{}
 
 func (publishedRouteObserver) Refresh(context.Context, records.Request) *exit.Error { return nil }
@@ -69,14 +77,19 @@ func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
 		options.Cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
 	})
 	o.cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
+	_, problem := o.store.Activate(records.PackageInstall{ID: "published-local-install", Package: "alice/ops", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir(), PackageInterface: childDigest("8"), SourceDigest: childDigest("7"), Platform: "linux-x86_64"})
+	fatal(t, problem)
 	fatal(t, o.store.RecordRental(records.Rental{ID: "rental-pinned", MachineName: "otter", SKU: "cpu", AcceleratorModel: "CPU", State: "ready", Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1", AcceleratorCount: 1, HourlyRateUSDMicros: 1}))
 	const bearer = "published-machine-routing-fixture"
 	credential := secret.New(bearer)
 	handler, problem := api.New(api.Options{Orchestrator: o.c, Cfg: o.cfg, Creds: api.Credentials{CLI: credential}, Addr: "127.0.0.1:11111", Web: http.NotFoundHandler(), Packages: publishedRouteResolver{}, MachineExecutions: publishedRouteObserver{}}).Handler()
 	fatal(t, problem)
-	for _, arm := range []string{"default", "rental-only", "pinned"} {
+	for _, arm := range []string{"default", "rental-only", "pinned", "local"} {
 		body := map[string]any{"package": "alice/ops", "release": "1.0.0", "function": "main", "input": map[string]any{}, "rental": true}
-		if arm == "pinned" {
+		if arm == "local" {
+			body["rental"] = false
+			body["install_id"] = "published-local-install"
+		} else if arm == "pinned" {
 			body["requested_rental"] = "rental-pinned"
 		} else if arm == "rental-only" {
 			body["rental_required"] = true
@@ -97,7 +110,7 @@ func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
 		fatal(t, problem)
 		link, problem := o.store.MachineExecution(row.ID)
 		fatal(t, problem)
-		if (link != nil) != (arm == "pinned") || row.LocalPackageDigest != "" {
+		if (link != nil) != (arm == "pinned" || arm == "local") || row.LocalPackageDigest != "" {
 			t.Fatalf("%s changed published routing or code origin", arm)
 		}
 	}

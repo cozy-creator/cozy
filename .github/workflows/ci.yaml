@@ -4,7 +4,7 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     env:
-      COZY_RUNTIME_SOURCE: 7ff937454ab7584c38b36e0b16eeb9357dd924ec
+      COZY_RUNTIME_SOURCE: 3c3ec67ac9755c537087bfbf1f0437c24ea548a3
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

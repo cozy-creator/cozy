@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/processtree"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -76,8 +77,8 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		m.mu.Unlock()
 	}
 	result := &machineConnection{connection: connection, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
-	result.preparePublished = func(ctx context.Context, pkg, release string) (*pb.DesiredPlacementSet, *exit.Error) {
-		ref := &pb.DownloadPackageRef{Package: pkg, Release: release}
+	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
+		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
 		facts, problem := rental.PrepareFactsSource(m.resolver.catalog)(ctx, identity, ref)
 		if problem != nil {
 			return nil, problem
@@ -342,6 +343,36 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		m.localPID = process.PID
 	}
 	result := &machineConnection{connection: connection, client: client, claim: claim, wireMinor: info.WireMinor}
+	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
+		facts, problem := m.resolver.installFacts(request.InstallID)
+		if problem != nil {
+			return nil, problem
+		}
+		if facts.Install.SourceKind != "tensorhub" || facts.Install.Package != request.Package || facts.Install.Version != request.Release {
+			return nil, exit.New(exit.Conflict, "published local preparation changed its immutable install")
+		}
+		spec, problem := facts.PreparationSpec(m.resolver.Devices)
+		if problem != nil {
+			return nil, problem
+		}
+		locked, err := os.ReadFile(spec.Preparation.LockedRequirements)
+		if err != nil {
+			return nil, exit.Internalf("cannot read retained published requirements: %s", err)
+		}
+		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{{Package: request.Package, Release: request.Release}}, nil)
+		if problem != nil {
+			return nil, problem
+		}
+		prepared, err := preparation.PreparePackageSet(ctx, &pb.PreparePackageSetRequest{
+			InstallRoot: filepath.Join(root, "environments"), DownloadDelegation: downloads,
+			Application: facts.PackageInterface.Application, LockedRequirements: locked,
+			ModelSlotPaths: spec.Preparation.ModelSlotPaths,
+		})
+		if err != nil {
+			return nil, machineTransport(err)
+		}
+		return prepared.PlacementSet, validateMachinePrepared(prepared.PlacementSet)
+	}
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
 		return preparation.WorkspaceRetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
 	}
