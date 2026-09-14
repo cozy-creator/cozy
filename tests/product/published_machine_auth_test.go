@@ -23,7 +23,7 @@ func TestPublishedRentalPreparationUsesPersistedMachineKey(t *testing.T) {
 	challenge := bytes.Repeat([]byte{17}, 32)
 	var token atomic.Value
 	token.Store("")
-	var minted, prepared atomic.Int64
+	var minted, prepared, publicationReads, publicationRequests atomic.Int64
 	var origin string
 	proof := startPublishedMachineHost(t, func(h *fakeRentalHub) {
 		origin = h.server.URL
@@ -52,7 +52,18 @@ func TestPublishedRentalPreparationUsesPersistedMachineKey(t *testing.T) {
 				}
 				minted.Add(1)
 				_ = json.NewEncoder(w).Encode(map[string]any{"token_set": map[string]any{"access_token": token.Load().(string), "token_type": "Bearer", "expires_in": 3600}, "device_key": map[string]string{"id": "prepare-machine"}})
+			case "/v1/auth/delegated/token":
+				if r.Header.Get("Authorization") != "Bearer "+token.Load().(string) || minted.Load() == 0 {
+					http.Error(w, "no machine authentication", 401)
+					return
+				}
+				publicationRequests.Add(1)
+				w.WriteHeader(http.StatusForbidden)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"code": "publication.auth_probe", "message": "controlled stop before granting publication"}})
 			default:
+				if r.URL.Path == "/v1/rentals/rental-private-child-host" && r.Header.Get("Authorization") == "Bearer "+token.Load().(string) {
+					publicationReads.Add(1)
+				}
 				if strings.HasSuffix(r.URL.Path, "/prepare-facts") {
 					if r.Header.Get("Authorization") != "Bearer "+token.Load().(string) || minted.Load() == 0 {
 						http.Error(w, "no machine authentication", 401)
@@ -97,4 +108,17 @@ func TestPublishedRentalPreparationUsesPersistedMachineKey(t *testing.T) {
 		t.Fatalf("machine-key preparation was not exercised: state=%s minted=%d prepares=%d", request.State, minted.Load(), prepared.Load())
 	}
 	t.Logf("machine-key-only published request %s completed and collected; minted=%d authenticated prepare-facts=%d", request.ID, minted.Load(), prepared.Load())
+	before := publicationReads.Load()
+	code, output = runCozyPath(t, proof.Layout.Root, proof.Path, "run", proof.Package.Package+"/main", "--rental", "child-host", "--allow-publish", "proof/checkpoint", "--await", "--json", "--idempotency-key", "machine-key-publication")
+	if code == 0 || !strings.Contains(output, "controlled stop before granting publication") || publicationReads.Load() <= before || publicationRequests.Load() != 1 {
+		t.Fatalf("publication machine-key bridge [%d], reads=%d grants=%d: %s", code, publicationReads.Load()-before, publicationRequests.Load(), output)
+	}
+	request, problem = proof.Store.RequestByIdempotencyKey("machine-key-publication")
+	fatal(t, problem)
+	link, problem = proof.Store.MachineExecution(request.ID)
+	fatal(t, problem)
+	if link == nil || len(link.Receipt) != 0 {
+		t.Fatal("controlled refusal admitted an execution")
+	}
+	t.Log("authenticated rental readback and scoped publication request reached the server; no grant, execution or upload occurred")
 }
