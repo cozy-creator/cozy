@@ -266,19 +266,19 @@ func (p *phases) forget(subject string) {
 // from a hung one.
 func (c *Orchestrator) ObservePhase(subject string, sample PhaseSample) {
 	c.phases.observe(subject, sample)
-	observed, ok := c.phases.snapshot(subject)
-	if !ok {
-		return
-	}
 	for _, requestID := range c.phaseAudience(subject) {
-		c.frames.publish(observed.Frame(requestID))
+		// A shared worker observation must not replace this request's FIFO or
+		// capacity wait. Live frames and newly attached watchers use one view.
+		if observed, ok := c.QueuePhase(requestID); ok {
+			c.frames.publish(observed.Frame(requestID))
+		}
 	}
 }
 
 // phaseAudience names the queued requests this subject's phase describes. A request-scoped
-// subject describes exactly itself; a worker-scoped one describes every queued request
-// waiting on that worker, which is the whole point of keying preparation by worker rather
-// than by request.
+// subject describes exactly itself; a worker-scoped one may affect queued requests
+// waiting on that worker. Each recipient still projects its own current queue wait
+// before the observation is broadcast; it does not inherit raw worker preparation.
 func (c *Orchestrator) phaseAudience(subject string) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -342,7 +342,7 @@ func (p PhaseObservation) wire() map[string]any {
 // refuses everywhere else.
 func (c *Orchestrator) QueuePhase(requestID string) (PhaseObservation, bool) {
 	row, problem := c.opt.Store.RequestRow(requestID)
-	if problem != nil || row == nil {
+	if problem != nil || row == nil || (row.State != "submitted" && row.State != "queued") {
 		return PhaseObservation{}, false
 	}
 	facts := c.waitOf(*row)

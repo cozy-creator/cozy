@@ -58,6 +58,10 @@ func (f waitFacts) decorate(payload map[string]any, req records.Request) map[str
 // answer means the routing is not the blocker (a pick exists; the refusal was elsewhere).
 // Callers hold c.mu.
 func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) waitFacts {
+	if ahead := c.rentalQueueAhead(req); ahead != nil {
+		return waitFacts{cause: WaitQueueAhead, on: c.machineWord(rentalInstanceID(req.RequestedRental)),
+			waitingFor: ahead}
+	}
 	if r.pick() != nil {
 		return waitFacts{}
 	}
@@ -89,6 +93,14 @@ func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) wait
 		}
 		if req.Worker != "" && w.spec.Connection != nil {
 			if w.instanceID == rentalInstanceID(req.Worker) {
+				// A new selection may not advertise an eligible placement yet,
+				// while all reported seats are still occupied by another run.
+				// That is a capacity wait, not evidence this request is loading.
+				if w.seats.slots <= 0 {
+					if blocking := c.blockingRun(laneKey{worker: w.instanceID}); blocking != nil {
+						return waitFacts{cause: WaitSlotBusy, on: c.machineWord(w.instanceID), waitingFor: blocking}
+					}
+				}
 				return waitFacts{cause: WaitWorkerWarming, on: c.machineWord(w.instanceID)}
 			}
 			continue
@@ -101,6 +113,39 @@ func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) wait
 		return waitFacts{cause: WaitRental}
 	}
 	return waitFacts{cause: WaitWorkerStart}
+}
+
+// Named-rental FIFO also blocks requests whose placement is not ready yet. The
+// lane router cannot see that wait: it has no eligible lane to claim. Reuse the
+// actual drain's typed observation, provided its blocker is still queued ahead.
+// This adds no second FIFO policy or per-request database scan. Callers hold c.mu.
+func (c *Orchestrator) rentalQueueAhead(req records.Request) *WaitingRun {
+	if req.RequestedRental == "" || c.activeChild(req) {
+		return nil
+	}
+	parked := c.parked[req.ID]
+	if parked == nil || parked.wait.cause != WaitQueueAhead || parked.wait.waitingFor == nil {
+		return nil
+	}
+	blocker := parked.wait.waitingFor
+	ahead := false
+	for _, id := range c.pending {
+		if id == req.ID {
+			if !ahead {
+				return nil
+			}
+			prior, problem := c.opt.Store.RequestRow(blocker.RequestID)
+			if problem == nil && prior != nil && prior.RequestedRental == req.RequestedRental &&
+				(prior.State == "submitted" || prior.State == "queued") {
+				return blocker
+			}
+			return nil
+		}
+		if id == blocker.RequestID {
+			ahead = true
+		}
+	}
+	return nil
 }
 
 // blockingRun reads the owner's existing open attempts on the actual blocked

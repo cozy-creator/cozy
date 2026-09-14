@@ -127,6 +127,7 @@ type parking struct {
 	overtaken int
 	budget    int
 	logged    string
+	wait      waitFacts // the queue's last typed wait, never parsed from logged text
 }
 
 func (p *parking) claims() bool { return p.overtaken >= p.budget }
