@@ -15,7 +15,7 @@ func (m *machineRuns) collectMachineModels(ctx context.Context, request records.
 	if body.Result == nil || !request.ChildArtifacts && len(body.Result.RetainedModels) == 0 {
 		return false, nil
 	}
-	_, surface, problem := m.resolver.installPackageInterface(request.InstallID)
+	surface, problem := m.resolver.capturedResultInterface(request)
 	if problem != nil {
 		return false, problem
 	}
