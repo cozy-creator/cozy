@@ -7,10 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -91,27 +94,22 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 		}
 		return value
 	}
+	metadata, problem := readProjectDocument(filepath.Join(parent.Tree, "pyproject.toml"))
+	if problem != nil {
+		return fail(problem)
+	}
+	requirements := append([]string(nil), metadata.Project.Dependencies...)
 	if len(extras) > 0 {
-		source, problem := readProjectDocument(filepath.Join(parent.Tree, "pyproject.toml"))
-		if problem != nil {
-			return fail(problem)
-		}
 		// A self-extra requirement lets uv evaluate the original optional
 		// markers in their proper extra context. The selected set becomes part
 		// of this immutable copied metadata, never the editable source.
-		requirements := append([]string(nil), source.Project.Dependencies...)
 		requirements = append(requirements, fmt.Sprintf("%s[%s]==%s",
-			normalizedProjectName(source.Project.Name), strings.Join(extras, ","), source.Project.Version))
-		nested(document, "project")["dependencies"] = requirements
+			normalizedProjectName(metadata.Project.Name), strings.Join(extras, ","), metadata.Project.Version))
 	}
 	uv := nested(nested(document, "tool"), "uv")
 	sources := nested(uv, "sources")
 	// uv lock resolves every optional group, including inactive ones. Preserve
 	// those declared source locations when the root project moves into its copy.
-	metadata, problem := readProjectDocument(filepath.Join(parent.Tree, "pyproject.toml"))
-	if problem != nil {
-		return fail(problem)
-	}
 	declared, problem := localSources(metadata)
 	if problem != nil {
 		return fail(problem)
@@ -137,8 +135,31 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 	for name, path := range dependencies {
 		sources[name] = map[string]any{"path": path.Path}
 	}
-	for name, path := range replacements {
+	names := make([]string, 0, len(replacements))
+	for name := range replacements {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		path := replacements[name]
+		identity, problem := wheel.InspectIdentity(path)
+		if problem != nil {
+			return fail(problem)
+		}
+		if identity.Distribution != name {
+			return fail(exit.New(exit.Conflict, "captured interface replacement changed its distribution"))
+		}
 		sources[name] = map[string]any{"path": path}
+		// uv applies root source overrides only to direct requirements. A callable
+		// may be selected transitively, so pin its already-selected overlay here too.
+		// Otherwise bindings advertise its exports while uv installs the original.
+		pin := name + "==" + identity.Version
+		if !slices.Contains(requirements, pin) {
+			requirements = append(requirements, pin)
+		}
+	}
+	if len(replacements) > 0 || len(extras) > 0 {
+		nested(document, "project")["dependencies"] = requirements
 	}
 	delete(uv, "workspace") // all selected local members now have exact explicit paths
 	raw, err = toml.Marshal(document)
