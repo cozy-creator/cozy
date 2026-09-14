@@ -46,7 +46,7 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 		}
 	})
 	script, source, report, data := rootByteInputProject(t, wheel)
-	code, out := runCozyPath(t, root, path, "run", script, "tree=original", "--input-tree", "original="+source, "--asset", "report="+report, "--json")
+	code, out := runCozyPath(t, root, path, "run", script, "--asset", "tree="+source, "--asset", "report="+report, "--json")
 	if code != 0 {
 		t.Fatalf("native root intake failed [%d]: %s\n%s", code, out, productWorkerLogs(root))
 	}
