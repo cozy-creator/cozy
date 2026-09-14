@@ -421,6 +421,11 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
 	}
+	normalized, err := canonical.NormalizeJCS(out.Payload)
+	if err != nil {
+		return out, nil, exit.New(exit.Validation, "job input cannot be encoded as canonical JSON: %s", err)
+	}
+	out.Payload = normalized
 	if out.Org == "" {
 		out.Org = "local"
 	}
