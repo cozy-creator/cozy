@@ -97,4 +97,9 @@ func TestRentalNoCreateStartupReconcilesStaleAcquiringRow(t *testing.T) {
 	if stand.releases("pr-no-create-stale") != 0 {
 		t.Fatal("startup attempted to release a nonexistent pod")
 	}
+	blocked, problem := st.ClientShutdownObligations()
+	fatal(t, problem)
+	if len(blocked) != 0 {
+		t.Fatalf("definitive no-create still blocks client shutdown: %+v", blocked)
+	}
 }

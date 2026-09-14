@@ -128,8 +128,11 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 	if n := stand.releases(id); n != 1 {
 		t.Fatalf("the hub saw %d release(s), wanted 1", n)
 	}
-	// Second time: the rental row is forgotten, the hub says released, and the PAID ASK is
-	// what entitles this host to answer at all — it outlives the row on purpose.
+	// The Hub may later prune its released record. The already-confirmed local operation
+	// still proves the idempotent no-op; a newly observed 404 proves no destruction.
+	stand.mu.Lock()
+	delete(stand.rentals, id)
+	stand.mu.Unlock()
 	code, out = runCozy(t, root, "rental", "end", machine, "--json")
 	if code != 0 || !strings.Contains(out, `"state":"ended"`) || !strings.Contains(out, `"changed":false`) {
 		t.Fatalf("the second end is not an idempotent no-op [exit %d]\n%s", code, out)

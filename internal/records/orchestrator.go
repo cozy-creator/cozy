@@ -2263,11 +2263,14 @@ func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
 		return nil, exit.Internalf("cannot finish output read: %s", err)
 	}
 	rows.Close()
-	link, problem := s.MachineExecution(requestID)
-	if problem != nil {
-		return nil, problem
+	// Verified local copies survive loss of the remote collection ACK. The
+	// complete result still requires its separate collection/custody gate.
+	var readable bool
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e
+ WHERE e.request_id=? AND (e.collected=1 OR `+machineExecutionLost+`))`, requestID).Scan(&readable); err != nil {
+		return nil, exit.Internalf("cannot read machine output availability: %s", err)
 	}
-	if link != nil && link.Collected {
+	if readable {
 		files, problem := s.MachineFileResults(requestID)
 		if problem != nil {
 			return nil, problem
@@ -2300,7 +2303,7 @@ func (s *Store) Media(mediaID string) (*Output, string, int64, *exit.Error) {
 		var raw []byte
 		err = s.db.QueryRow(`SELECT hold.payload,hold.request_id FROM request_events hold
  JOIN machine_executions e ON e.request_id=hold.request_id
- WHERE hold.type='machine.file_result' AND e.collected=1
+ WHERE hold.type='machine.file_result' AND (e.collected=1 OR `+machineExecutionLost+`)
  AND json_extract(hold.payload,'$.output.MediaID')=?
  ORDER BY hold.seq DESC LIMIT 1`, mediaID).Scan(&raw, &requestID)
 		if errors.Is(err, sql.ErrNoRows) {
