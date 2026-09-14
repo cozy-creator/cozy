@@ -13,6 +13,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
+// Future calls may override an unavailable default or never run. Capture records
+// the unavailable fact; the actual omitted-argument call must refuse, as covered
+// by TestCapturedModelDefaultsDoNotAcquireUnusedOrInaccessibleModels.
 func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 	for _, mode := range []string{"job-unbound", "entrypoint-unbound", "job-default", "job-owner-unreadable"} {
 		t.Run(mode, func(t *testing.T) {
@@ -58,7 +61,7 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 			resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.server.URL, HubToken: secret.New("ladder-test")}, nil)
 			models, problem := resolver.UnpublishedChildModels(records.Request{InstallID: parent.ID, Kind: "job"})
 			switch mode {
-			case "job-unbound", "entrypoint-unbound":
+			case "job-unbound", "entrypoint-unbound", "job-owner-unreadable":
 				fatal(t, problem)
 				if len(models) != 0 {
 					t.Fatal("future retained artifact acquired a fabricated static selection")
@@ -67,10 +70,6 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 				fatal(t, problem)
 				if len(models) != 1 || models[0].Model != ladderModel || len(models[0].Ladder) != 1 || models[0].Ladder[0].Lane != ladderLane {
 					t.Fatal("deferral discarded an authored model ladder")
-				}
-			case "job-owner-unreadable":
-				if problem == nil || problem.ErrName() != "child.model_binding_unreadable" {
-					t.Fatal("unreadable owner binding silently fell back or was deferred", problem)
 				}
 			}
 		})

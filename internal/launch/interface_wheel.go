@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-const interfaceGeneratorABI = "cozy.interface-generator/5"
+const interfaceGeneratorABI = "cozy.interface-generator/6"
 const interfaceGeneratorRuntimeFloor = "0.11.0"
 
 func GenerateInterfaceWheel(ctx context.Context, install records.PackageInstall, home string, env []string, implementation, source, sourceDigest, output string) (InterfaceWheel, *exit.Error) {
@@ -76,7 +76,11 @@ func (r RuntimeCLI) InterfaceWheel(ctx context.Context, interfacePath, distribut
 	if problem := r.callInputContext(ctx, raw, &wheel, "interface-wheel"); problem != nil {
 		return wheel, problem
 	}
-	if filepath.Base(wheel.Filename) != wheel.Filename || filepath.Clean(wheel.Path) != filepath.Join(output, wheel.Filename) || wheel.Length <= 0 || wheel.Length > 256<<20 || wheel.GeneratorABI != interfaceGeneratorABI {
+	if wheel.GeneratorABI != interfaceGeneratorABI {
+		return wheel, exit.Named(exit.Structural, "interface_generator_incompatible", "Runtime interface generator %q does not match Creator %q", wheel.GeneratorABI, interfaceGeneratorABI).
+			WithRemedy("update Creator and its host Runtime to the same supported cohort")
+	}
+	if filepath.Base(wheel.Filename) != wheel.Filename || filepath.Clean(wheel.Path) != filepath.Join(output, wheel.Filename) || wheel.Length <= 0 || wheel.Length > 256<<20 {
 		return wheel, exit.New(exit.Validation, "interface generator returned an invalid bounded artifact")
 	}
 	info, err := os.Lstat(wheel.Path)
