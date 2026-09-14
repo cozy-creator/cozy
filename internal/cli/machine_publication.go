@@ -33,8 +33,9 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 		return "", problem
 	}
 	var intent hub.MachinePublicationGrantIntent
+	account := client(m.context)
 	if len(raw) == 0 {
-		selected, problem := m.resolver.catalog.Rental(ctx, machine)
+		selected, problem := account.Rental(ctx, machine)
 		if problem != nil {
 			return "", problem
 		}
@@ -75,7 +76,7 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 	if problem := m.store.RecordMachinePublicationIntent(request, raw); problem != nil {
 		return "", problem
 	}
-	if problem := m.resolver.catalog.AuthorizeMachinePublication(ctx, intent); problem != nil {
+	if problem := account.AuthorizeMachinePublication(ctx, intent); problem != nil {
 		return "", problem
 	}
 	return intent.AuthorizationID, nil
