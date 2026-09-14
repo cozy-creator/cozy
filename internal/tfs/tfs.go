@@ -80,6 +80,14 @@ func (t *Tool) runContext(ctx context.Context, args ...string) (string, *exit.Er
 		if said == "" {
 			said = err.Error()
 		}
+		// Namespace/tool warnings can precede the actual refusal. Preserve the
+		// byte plane's typed cause instead of attributing failure to a warning.
+		for _, line := range strings.Split(said, "\n") {
+			if line = strings.TrimSpace(line); strings.HasPrefix(line, "REFUSED ") {
+				said = line
+				break
+			}
+		}
 		return out.String(), exit.Named(exit.Validation, "tfs_refused",
 			"tfs %s: %s", strings.Join(redact(args), " "), firstLine(said)).
 			WithRemedy("the byte plane refused in its own words; nothing above it may overrule that")
