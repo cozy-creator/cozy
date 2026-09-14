@@ -16,6 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -118,16 +119,28 @@ func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
 
 var publishedMachineFixture = flag.String("published-machine-fixture", "", "exact public-shaped wheel/interface fixture for the owned actual Host proof")
 
-func TestPublishedMachineActualHostAndNewRootAfterRestart(t *testing.T) {
+type publishedPackageFixture struct {
+	Package   string          `json:"package"`
+	Release   string          `json:"release"`
+	Wheel     string          `json:"wheel"`
+	Interface json.RawMessage `json:"interface"`
+}
+
+type publishedHostFixture struct {
+	Package publishedPackageFixture
+	Layout  home.Layout
+	Store   *records.Store
+	Host    actualChildHost
+	Path    string
+	Restart func()
+}
+
+func startPublishedMachineHost(t *testing.T) publishedHostFixture {
+	t.Helper()
 	if *publishedMachineFixture == "" {
 		t.Skip("requires an exact wheel/interface fixture and owned actual Host")
 	}
-	var fixture struct {
-		Package   string          `json:"package"`
-		Release   string          `json:"release"`
-		Wheel     string          `json:"wheel"`
-		Interface json.RawMessage `json:"interface"`
-	}
+	var fixture publishedPackageFixture
 	raw, err := os.ReadFile(*publishedMachineFixture)
 	must(t, err)
 	must(t, json.Unmarshal(raw, &fixture))
@@ -171,6 +184,13 @@ func TestPublishedMachineActualHostAndNewRootAfterRestart(t *testing.T) {
 			}
 		})
 	})
+	return publishedHostFixture{fixture, layout, store, host, path, restart}
+}
+
+func TestPublishedMachineActualHostAndNewRootAfterRestart(t *testing.T) {
+	proof := startPublishedMachineHost(t)
+	fixture, layout, store, host, path, restart := proof.Package, proof.Layout, proof.Store, proof.Host, proof.Path, proof.Restart
+
 	var build string
 	for index := 0; index < 2; index++ {
 		if index == 1 {

@@ -198,6 +198,13 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if !managedRental {
+		packagePublishStatus(ctx, "Execution target: local machine")
+	} else if selectedRental != "" {
+		packagePublishStatus(ctx, "Execution target: rental %s", ctx.Inv.Value("--rental"))
+	} else {
+		packagePublishStatus(ctx, "Finding a rental machine...")
+	}
 	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models, managedRental)
 	if e != nil {
 		return e
@@ -344,7 +351,7 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 	defer cancel()
 	out := make([]orchestrator.ModelRef, 0, len(selected))
 	for index, spec := range selected {
-		packagePublishStatus(ctx, "Resolving model for %s...", spec.Slot)
+		packagePublishStatus(ctx, "Preparing model %s for local execution...", spec.Ref)
 		slot, ok := slots[spec.Slot]
 		if !ok {
 			return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)

@@ -205,7 +205,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			unlock := localpackage.Guard()
 			defer unlock()
 		}
-		spec, e = s.resolveJob(r.Context(), sub)
+		var inputDeclaration *launch.Entrypoint
+		spec, inputDeclaration, e = s.resolveJob(r.Context(), sub)
 		if e == nil && spec.OutputExport != nil {
 			e = resultfiles.Preflight(spec.OutputExport.Directory)
 		}
@@ -213,7 +214,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			spec.Assets, e = bindAssets(spec.Assets)
 		}
 		if e == nil {
-			inputStage, e = s.freezeMachineInputs(&spec)
+			inputStage, e = s.freezeMachineInputs(&spec, inputDeclaration)
 		}
 	}
 	if e != nil {
@@ -326,7 +327,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 // once their input shape has a complete machine-side path.
 func publishedMachineJob(spec orchestrator.Submission) bool {
 	return ((spec.Rental && (spec.RequestedRental != "" || spec.Worker != "")) || (!spec.Rental && spec.MachineExecutionObserver)) &&
-		len(spec.Assets) == 0 && len(spec.Trees) == 0 && spec.ModelTransfer == nil
+		spec.ModelTransfer == nil
 }
 
 func replayJobSubmission(sub JobSubmission,
@@ -394,16 +395,16 @@ func replayJobSubmission(sub JobSubmission,
 // resolveJob turns package+function into the orchestrator's Submission. The
 // `job_descriptor_id` is resolved HERE, from the installed package's own PackageInterface —
 // a client never names a digest, exactly as it never names a binding plan id.
-func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrator.Submission, *exit.Error) {
+func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
 	if sub.ModelTransfer != nil && sub.Package == "" && sub.Function == "" {
 		if sub.Rental || sub.RentalRequired {
-			return orchestrator.Submission{}, exit.Named(exit.Unavailable,
+			return orchestrator.Submission{}, nil, exit.Named(exit.Unavailable,
 				"model_transfer.rented_pass_through_unavailable",
 				"rented pass-through has no typed TensorFS source profiles")
 		}
 		return orchestrator.Submission{Kind: "job", Package: "cozy/platform",
 			Entrypoint: "model-pass-through", Payload: []byte("{}"), Org: "local",
-			PlanID: "sha256:" + strings.Repeat("0", 64), ModelTransfer: sub.ModelTransfer}, nil
+			PlanID: "sha256:" + strings.Repeat("0", 64), ModelTransfer: sub.ModelTransfer}, nil, nil
 	}
 	out := orchestrator.Submission{
 		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
@@ -415,7 +416,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		ModelTransfer: sub.ModelTransfer,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
-		return out, problem
+		return out, nil, problem
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -424,63 +425,71 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.Org = "local"
 	}
 	if e := validOrg(out.Org); e != nil {
-		return out, e
+		return out, nil, e
 	}
 	if s.packages == nil {
-		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
+		return out, nil, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
 	if sub.Worker != "" && !sub.Rental && !sub.RentalRequired {
-		return out, exit.Named(exit.Validation, "rental.job_worker_without_rental",
+		return out, nil, exit.Named(exit.Validation, "rental.job_worker_without_rental",
 			"a pinned remote worker requires rental authorization")
 	}
 	if out.Rental {
 		if strings.HasPrefix(sub.Package, "local/") {
 			if sub.InstallID != "" {
-				return s.resolveLocalJob(ctx, sub, out, sub.InstallID)
+				resolved, problem := s.resolveLocalJob(ctx, sub, out, sub.InstallID)
+				return resolved, nil, problem
 			}
 			refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
 			if refreshProblem != nil {
-				return out, refreshProblem
+				return out, nil, refreshProblem
 			}
 			if !editable {
-				return out, exit.Named(exit.Conflict, "local_package_install_invalid",
+				return out, nil, exit.Named(exit.Conflict, "local_package_install_invalid",
 					"%s is not one editable local package", sub.Package)
 			}
-			return s.resolveLocalJob(ctx, sub, out, refreshed)
+			resolved, problem := s.resolveLocalJob(ctx, sub, out, refreshed)
+			return resolved, nil, problem
 		}
-		if sub.InstallID != "" || sub.Release == "" || len(sub.Trees) > 0 {
-			return out, exit.Named(exit.Validation, "rental.job_release_incomplete",
-				"remote jobs require one exact published release and no local input trees")
+		if sub.InstallID != "" || sub.Release == "" {
+			return out, nil, exit.Named(exit.Validation, "rental.job_release_incomplete",
+				"remote jobs require one exact published release")
+		}
+		if len(sub.Trees) > 0 && (s.machineExecutions == nil || (out.RequestedRental == "" && out.Worker == "")) {
+			return out, nil, exit.Named(exit.Validation, "rental.job_tree_worker_required",
+				"Tree inputs require a named private Runtime worker")
 		}
 		logical, job, problem := s.packages.ResolveRemoteJob(
 			sub.Package, sub.Release, sub.Function, sub.Models,
 			sub.ModelTransfer.HasAcquisition())
 		if problem != nil {
-			return out, problem
+			return out, nil, problem
 		}
 		if problem := validateInputs(job, &out); problem != nil {
-			return out, problem
+			return out, nil, problem
 		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
 		out.WeightsOutputs, out.NeedsAccelerator = logical.WeightsOutputs, logical.NeedsAccelerator
 		out.ProducerParams = logical.ProducerParams
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		if problem := s.deriveOutputExport(job, &out); problem != nil {
-			return out, problem
+			return out, nil, problem
 		}
-		return out, nil
+		out.Trees = append([]string(nil), sub.Trees...)
+		return out, job, nil
 	}
 	if sub.InstallID == "" {
 		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
 		if refreshProblem != nil {
-			return out, refreshProblem
+			return out, nil, refreshProblem
 		}
 		if editable {
 			sub.InstallID = refreshed
 		}
 	}
 	if s.machineExecutions != nil && strings.HasPrefix(sub.Package, "local/") && sub.InstallID != "" {
-		return s.resolveLocalJob(ctx, sub, out, sub.InstallID)
+		resolved, problem := s.resolveLocalJob(ctx, sub, out, sub.InstallID)
+		return resolved, nil, problem
 	}
 	var jobs []launch.JobFacts
 	var e *exit.Error
@@ -498,7 +507,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		if e == nil && s.machineExecutions != nil {
 			installed, problem := s.store.Install(sub.InstallID)
 			if problem != nil {
-				return out, problem
+				return out, nil, problem
 			}
 			if installed != nil && installed.SourceKind == "tensorhub" {
 				out.Release = installed.Version
@@ -509,7 +518,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		jobs, e = s.packages.Jobs(sub.Package)
 	}
 	if e != nil {
-		return out, e
+		return out, nil, e
 	}
 	names := make([]string, 0, len(jobs))
 	for _, job := range jobs {
@@ -525,32 +534,32 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.NeedsAccelerator = job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
 		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request, Assets: job.Assets}, &out); problem != nil {
-			return out, problem
+			return out, nil, problem
 		}
 		if problem := s.deriveOutputExport(&launch.Entrypoint{Result: job.Result}, &out); problem != nil {
-			return out, problem
+			return out, nil, problem
 		}
 	}
 	if out.PlanID == "" {
-		return out, exit.Named(exit.NotFound, "unknown_job",
+		return out, nil, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", sub.Package, sub.Function).
 			WithRemedy("it registers: %s", strings.Join(names, ", "))
 	}
-	if out.MachineExecutionObserver && (len(out.Assets) > 0 || len(sub.Trees) > 0 || out.ModelTransfer != nil) {
+	if out.MachineExecutionObserver && out.ModelTransfer != nil {
 		out.MachineExecutionObserver = false
 	}
 	for _, pair := range sub.Trees {
 		ref, dir, ok := strings.Cut(pair, "=")
 		if !ok || ref == "" || dir == "" {
-			return out, exit.Usagef("%q is not ref=<directory>", pair)
+			return out, nil, exit.Usagef("%q is not ref=<directory>", pair)
 		}
 		abs, err := filepath.Abs(dir)
 		if err != nil {
-			return out, exit.Usagef("%q is not a resolvable directory: %s", dir, err)
+			return out, nil, exit.Usagef("%q is not a resolvable directory: %s", dir, err)
 		}
 		out.Trees = append(out.Trees, ref+"="+abs)
 	}
-	return out, nil
+	return out, nil, nil
 }
 
 func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,

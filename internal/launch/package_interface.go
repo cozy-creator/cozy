@@ -180,8 +180,9 @@ type Field struct {
 	Wire        string           `json:"wire"`
 	Constraints FieldConstraints `json:"constraints"`
 	AssetBound  struct {
-		MaxBytes   int64    `json:"max_bytes"`
-		MediaTypes []string `json:"media_types"`
+		MaxBytes        int64    `json:"max_bytes"`
+		MaxDecodedBytes int64    `json:"max_decoded_bytes,omitempty"`
+		MediaTypes      []string `json:"media_types"`
 	} `json:"asset_bound"`
 }
 
@@ -420,8 +421,15 @@ func validateStructRaw(raw json.RawMessage) error {
 			return err
 		}
 		if bound := field["asset_bound"]; bound != nil {
-			if _, err := exactKeys(bound, nil, []string{"max_bytes", "media_types"}); err != nil {
+			members, err := exactKeys(bound, nil, []string{"max_bytes", "max_decoded_bytes", "media_types"})
+			if err != nil {
 				return err
+			}
+			if raw, present := members["max_decoded_bytes"]; present {
+				var maximum int64
+				if json.Unmarshal(raw, &maximum) != nil || maximum <= 0 || maximum > (1<<53)-1 {
+					return fmt.Errorf("asset max_decoded_bytes must be a positive exact integer")
+				}
 			}
 		}
 		if constraints := field["constraints"]; constraints != nil {
