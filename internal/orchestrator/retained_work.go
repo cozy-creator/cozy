@@ -17,8 +17,12 @@ func (c *Orchestrator) CancelRetainedRequest(id, actor string) *exit.Error {
 	if problem := c.opt.Store.RequestRetainedCancellation(id, actor); problem != nil {
 		return problem
 	}
+	return c.finishRequestedCancellation(id)
+}
+
+func (c *Orchestrator) finishRequestedCancellation(id string) *exit.Error {
 	c.forget(id)
-	if problem := c.cancelChildCalls(id); problem != nil {
+	if problem := c.cancelChildCalls(id, id); problem != nil {
 		return problem
 	}
 	if problem := c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_CLIENT); problem != nil {
@@ -37,7 +41,15 @@ func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 		c.finishRetainedRelease(*request)
 		return
 	}
-	if _, problem := c.lookupOperationPending(ctx, *request, true); problem != nil {
+	if problem := c.cancelChildCalls(id, id); problem != nil {
+		c.retryRetainedCancellation(id)
+		return
+	}
+	ready, problem := c.releaseCompletedChildCalls(ctx, id, id)
+	if problem != nil || !ready {
+		if problem != nil {
+			c.logf("request %s completed child cleanup remains pending: %s", id, problem.Message)
+		}
 		c.retryRetainedCancellation(id)
 		return
 	}
@@ -45,51 +57,11 @@ func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 	if problem != nil {
 		return
 	}
-	borrowed, problem := c.opt.Store.PendingArtifactBorrowers(id)
-	if problem != nil || borrowed {
-		c.retryRetainedCancellation(id)
-		return
-	}
-	for _, attempt := range attempts {
-		if openAttempt(attempt.State) || attempt.State == "preparing" {
-			_ = c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_CLIENT)
-			return
-		}
-	}
-	if problem := c.releaseChildRetentions(ctx, id, false); problem != nil {
-		c.retryRetainedCancellation(id)
-		return
-	}
-	ready, problem := c.settleRetainedWeights(*request, attempts, "")
+	ready, problem = c.releaseAbandonedWork(ctx, *request, attempts, "")
 	if problem != nil || !ready {
+		_ = c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_CLIENT)
 		c.retryRetainedCancellation(id)
 		return
-	}
-	if problem := c.releaseOriginalDerivedResults(ctx, id); problem != nil {
-		c.retryRetainedCancellation(id)
-		return
-	}
-	if request.ModelTransfer != nil {
-		pending, problem := c.opt.Store.RetriedSourceCustodyPending(id)
-		if problem != nil || pending {
-			c.retryRetainedCancellation(id)
-			return
-		}
-		if problem := c.releaseRetainedSource(ctx, *request); problem != nil {
-			c.logf("request %s retained source release: %s", id, problem.Message)
-			c.retryRetainedCancellation(id)
-			return
-		}
-	}
-	if request.ModelTransfer != nil && c.opt.ModelTransfers != nil {
-		if problem := c.opt.ModelTransfers.AbandonModelTransferPublications(ctx, id); problem != nil {
-			c.retryRetainedCancellation(id)
-			return
-		}
-		if problem := c.opt.ModelTransfers.ReleaseCheckpoints(ctx, id); problem != nil {
-			c.retryRetainedCancellation(id)
-			return
-		}
 	}
 	if problem := c.ackReleasedRetainedAttempts(ctx, *request, attempts); problem != nil {
 		c.retryRetainedCancellation(id)
@@ -102,6 +74,53 @@ func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 	}
 	request.State = "releasing"
 	c.finishRetainedRelease(*request)
+}
+
+// Cancellation and completed-descendant cleanup drop the same request-owned
+// byte holds. The latter uses its ancestor's cancellation to authorize native
+// finalization, while keeping the child's successful execution immutable.
+func (c *Orchestrator) releaseAbandonedWork(ctx context.Context, request records.Request, attempts []records.Attempt, releaseRoot string) (bool, *exit.Error) {
+	id := request.ID
+	if _, problem := c.lookupOperationPending(ctx, request, true); problem != nil {
+		return false, problem
+	}
+	borrowed, problem := c.opt.Store.PendingArtifactBorrowers(id)
+	if problem != nil || borrowed {
+		return false, problem
+	}
+	for _, attempt := range attempts {
+		if openAttempt(attempt.State) || attempt.State == "preparing" {
+			return false, nil
+		}
+	}
+	if problem := c.releaseChildRetentions(ctx, id, false); problem != nil {
+		return false, problem
+	}
+	ready, problem := c.settleRetainedWeights(request, attempts, releaseRoot)
+	if problem != nil || !ready {
+		return false, problem
+	}
+	if problem := c.releaseOriginalDerivedResults(ctx, id); problem != nil {
+		return false, problem
+	}
+	if request.ModelTransfer != nil {
+		pending, problem := c.opt.Store.RetriedSourceCustodyPending(id)
+		if problem != nil || pending {
+			return false, problem
+		}
+		if problem := c.releaseRetainedSource(ctx, request); problem != nil {
+			return false, problem
+		}
+		if c.opt.ModelTransfers != nil {
+			if problem := c.opt.ModelTransfers.AbandonModelTransferPublications(ctx, id); problem != nil {
+				return false, problem
+			}
+			if problem := c.opt.ModelTransfers.ReleaseCheckpoints(ctx, id); problem != nil {
+				return false, problem
+			}
+		}
+	}
+	return true, nil
 }
 
 // A retained terminal remains a Host obligation after the attempt first closes.
@@ -350,7 +369,7 @@ func (c *Orchestrator) restoreRetainedWork() *exit.Error {
 
 // Exact older-slot finalization is shared by cancellation and successful release.
 // ACK(false) alone cannot abandon an unfinished derived writer.
-func (c *Orchestrator) settleRetainedWeights(request records.Request, attempts []records.Attempt, successRoot string) (bool, *exit.Error) {
+func (c *Orchestrator) settleRetainedWeights(request records.Request, attempts []records.Attempt, releaseRoot string) (bool, *exit.Error) {
 	id := request.ID
 	// Walk newest first: a repeated invocation has one transaction per slot and its
 	// latest recorded worker is the current holder after an ordinary recovery.
@@ -375,10 +394,10 @@ func (c *Orchestrator) settleRetainedWeights(request records.Request, attempts [
 				OwnerScope: recordOwnerID, InvocationDigest: attempt.InvocationDigest, OutputSlot: output.OutputID,
 			}
 			var problem *exit.Error
-			if successRoot == "" {
+			if releaseRoot == "" {
 				problem = c.opt.Store.RecordRetainedFinalization(finalization)
 			} else {
-				problem = c.opt.Store.RecordSuccessfulFinalization(successRoot, finalization)
+				problem = c.opt.Store.RecordSuccessfulFinalization(releaseRoot, finalization)
 			}
 			if problem != nil {
 				return false, problem
