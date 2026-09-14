@@ -23,7 +23,7 @@ func TestCapturedPyTorchRequirementPreservesOfficialObjectAndImageOwnership(t *t
 		lock := fmt.Sprintf("version=1\n[[package]]\nname='capture-root'\nversion='1.0.0'\nsource={editable='.'}\n[[package]]\nname=%s\nversion=%s\nsource={registry=%s}\nwheels=[{url=%s,hash=%s}]\n", strconv.Quote(name), strconv.Quote(version), strconv.Quote(selectedIndex), strconv.Quote(selectedURL), strconv.Quote(selectedHash))
 		must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600))
 		closure := "capture-root==1.0.0\n" + name + "==" + version
-		rows, _, problem := packagepublish.PrivateRegistryRows([]byte(lock), closure, "capture-root", "1.0.0", nil)
+		rows, _, problem := packagepublish.CapturedRegistryRows([]byte(lock), closure, "capture-root", "1.0.0", nil)
 		if packagepublish.ImageOwnedDistribution(name) && problem == nil && len(rows) != 0 {
 			t.Fatal("framework became a private overlay")
 		}
