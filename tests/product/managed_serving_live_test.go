@@ -156,7 +156,7 @@ only-include=["model_tools.py"]
 		if state == "failed" || state == "canceled" || state == "succeeded" {
 			t.Fatalf("script settled before cancellation: %s", state)
 		}
-		err := db.QueryRow(`SELECT c.child_request FROM execution_calls c JOIN executions e ON e.owner=c.owner AND e.request=c.child_request WHERE c.parent_request=? AND json_extract(CAST(c.intent AS TEXT),'$.export')='generate' AND json_extract(CAST(c.intent AS TEXT),'$.request.wait_for_cancel')=1 AND e.state='running'`, parent).Scan(&child)
+		err := db.QueryRow(`SELECT c.child_request FROM execution_calls c JOIN executions e ON e.owner=c.owner AND e.request=c.child_request WHERE c.parent_request=? AND json_extract(CAST(c.intent AS TEXT),'$.export')='generate' AND json_extract(CAST(c.intent AS TEXT),'$.request.payload.wait_for_cancel')=1 AND e.state='running'`, parent).Scan(&child)
 		if err != nil && err != sql.ErrNoRows {
 			t.Fatal(err)
 		}
