@@ -105,7 +105,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		// CaptureWheel adds the worker Runtime contract to every managed App.
 		// Validate it against the Runtime already selected by this caller, even
 		// when the ordinary library metadata did not depend on Runtime itself.
-		for dependency, version := range graph["cozy-runtime"] {
+		for dependency, version := range graph["cozy-runtime"] { //cozy:allow distribution metadata, not a Runtime command
 			selected[dependency] = version
 		}
 		dependencyNames := make([]string, 0, len(selected))
