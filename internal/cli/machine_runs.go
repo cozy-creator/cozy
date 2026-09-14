@@ -197,6 +197,16 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		return problem
 	}
 	defer connection.connection.Close()
+	if len(request.Models) > 0 {
+		if connection.wireMinor < pb.NativeRootInputsWireMinor {
+			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "durable root Model inputs require Runtime protocol 55")
+		}
+		if !request.Rental {
+			if problem := m.resolver.EnsureLocalModels(request.Models); problem != nil {
+				return problem
+			}
+		}
+	}
 	submission := &pb.MachineExecutionSubmit{}
 	if len(link.Submission) > 0 {
 		if err := proto.Unmarshal(link.Submission, submission); err != nil {

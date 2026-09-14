@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"encoding/base64"
+	"sort"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -25,7 +26,7 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	if _, err := canonical.Raw(buildID); err != nil || (request.LocalPackageDigest != "" && request.LocalPackageDigest != buildID) || (request.LocalPackageDigest == "" && plan.BuildID != buildID) {
 		return nil, exit.New(exit.Conflict, "machine job changed its captured code identity")
 	}
-	if len(request.Assets) > 0 || len(request.Models) > 0 || request.Trees != "" || request.ModelTransfer != nil {
+	if len(request.Assets) > 0 || request.Trees != "" || request.ModelTransfer != nil {
 		return nil, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; execution was not submitted")
 	}
 	weights, problem := decodeWeightsOutputs(request.WeightsOutputs)
@@ -38,6 +39,11 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	for _, output := range outputs {
 		access = append(access, &pb.OutputAccess{OutputId: output.OutputId})
 	}
+	if len(jobModels(request)) != len(request.Models) {
+		return nil, exit.Named(exit.Structural, "machine_execution.model_identity_missing", "root Model inputs require exact manifest identities and lengths")
+	}
+	inputs := append([]*pb.InputAccess{{InputId: "payload", Url: "data:application/json;base64," + base64.StdEncoding.EncodeToString(request.Payload)}}, modelAccess(request)...)
+	sort.Slice(inputs, func(i, j int) bool { return inputs[i].InputId < inputs[j].InputId })
 	payloadDigest := spellOf(canonical.Digest(request.Payload))
 	publication := &pb.PublicationContract{GrantId: home.ScratchRepo(request.Org, request.ID), Outputs: outputs}
 	spec := &pb.InvocationSpec{
@@ -66,7 +72,7 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 		PayloadCanonicalBytes: request.Payload, MaxAttempts: uint32(MaxRequeues + 1),
 		Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1,
 			InvocationSpecCanonicalBytes: raw, InvocationSpecDigest: digest,
-			Grant: &pb.DeliveryGrant{InvocationSpecDigest: digest, Inputs: []*pb.InputAccess{{InputId: "payload", Url: "data:application/json;base64," + base64.StdEncoding.EncodeToString(request.Payload)}}, Outputs: access}},
+			Grant: &pb.DeliveryGrant{InvocationSpecDigest: digest, Inputs: inputs, Outputs: access}},
 		PreparedState: &pb.DesiredWorkerState{Revision: 1, WireMinor: pb.WireMinor, Posture: pb.Posture_POSTURE_ACCEPTING, Mode: &pb.DesiredWorkerState_Job{Job: directive}},
 	}, nil
 }

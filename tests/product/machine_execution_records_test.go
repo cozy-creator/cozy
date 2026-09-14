@@ -317,8 +317,15 @@ func TestMachineInvocationCarriesFrozenDeadlineAndRefusesUnstagedInputs(t *testi
 		t.Fatal("CPU captured root occupied its managed children's device lane")
 	}
 	request.Models = []records.ModelRef{{Slot: "model", Manifest: childDigest("4"), ManifestLength: 123}}
+	submission, problem = orchestrator.MachineJobSubmission(request, capture, plan)
+	fatal(t, problem)
+	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
+	if len(spec.Inputs) != 2 || spec.Inputs[1].InputId != "model:model" || spec.Inputs[1].Digest != childDigest("4") || spec.Inputs[1].Length != 123 || submission.Offer.Grant.Inputs[0].Url != "model://"+childDigest("4") {
+		t.Fatal("root Model input lost its exact content/access binding")
+	}
+	request.Models[0].ManifestLength = 0
 	if _, problem := orchestrator.MachineJobSubmission(request, capture, plan); problem == nil || problem.Code != exit.Structural {
-		t.Fatalf("unstaged inputs would retry indefinitely: %v", problem)
+		t.Fatalf("unidentified Model input was accepted: %v", problem)
 	}
 }
 

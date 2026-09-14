@@ -257,7 +257,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			spec.MachineExecutionObserver = link != nil
 		}
 	}
-	if spec.MachineExecutionObserver && (len(spec.Assets) > 0 || len(spec.Models) > 0 || len(spec.Trees) > 0 || spec.ModelTransfer != nil) {
+	if spec.MachineExecutionObserver && (len(spec.Assets) > 0 || len(spec.Trees) > 0 || spec.ModelTransfer != nil) {
 		s.refuseTyped(w, r, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; no execution or rental was submitted"))
 		return
 	}
@@ -308,7 +308,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 // once their input shape has a complete machine-side path.
 func publishedMachineJob(spec orchestrator.Submission) bool {
 	return ((spec.Rental && (spec.RequestedRental != "" || spec.Worker != "")) || (!spec.Rental && spec.MachineExecutionObserver)) &&
-		len(spec.Assets) == 0 && len(spec.Models) == 0 && len(spec.Trees) == 0 && spec.ModelTransfer == nil
+		len(spec.Assets) == 0 && len(spec.Trees) == 0 && spec.ModelTransfer == nil
 }
 
 func replayJobSubmission(sub JobSubmission,
@@ -513,7 +513,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			"%s registers no job named %q", sub.Package, sub.Function).
 			WithRemedy("it registers: %s", strings.Join(names, ", "))
 	}
-	if out.MachineExecutionObserver && (len(out.Assets) > 0 || len(out.Models) > 0 || len(sub.Trees) > 0 || out.ModelTransfer != nil) {
+	if out.MachineExecutionObserver && (len(out.Assets) > 0 || len(sub.Trees) > 0 || out.ModelTransfer != nil) {
 		out.MachineExecutionObserver = false
 	}
 	for _, pair := range sub.Trees {

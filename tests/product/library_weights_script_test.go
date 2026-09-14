@@ -53,6 +53,8 @@ func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
 	body, err := os.ReadFile(script)
 	must(t, err)
 	seed := strings.Replace(string(body), "    await candidate(source=original, factor=0)", "    return original", 1)
+	seed = strings.Replace(seed, "async def main():", "async def main() -> ModelArtifact:", 1)
+	seed = strings.Replace(seed, "from tensor_source import", "from cozy_runtime.author import ModelArtifact\nfrom tensor_source import", 1)
 	must(t, os.WriteFile(script, []byte(seed), 0600))
 	if status, output := runCozyPath(t, root, path, "run", script, "--await", "--json"); status != 0 {
 		t.Fatalf("native fixture seed failed [%d]: %s", status, output)
