@@ -245,6 +245,12 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			if problem != nil {
 				return problem
 			}
+			if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
+				capture, problem = m.resolver.captureMachineModelDefaults(capture, request.Rental)
+				if problem != nil {
+					return problem
+				}
+			}
 			for _, revision := range capture.Revisions {
 				if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
 					return problem
