@@ -15,6 +15,7 @@ pub mod capability;
 pub mod catalog;
 mod cbor;
 pub mod checkpoint;
+pub mod checkpoint_root;
 pub mod corpus;
 pub mod derived;
 pub mod dtype;

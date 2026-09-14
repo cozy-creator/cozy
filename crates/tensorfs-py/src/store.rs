@@ -522,6 +522,22 @@ fn tree_root_dict<'p>(
     Ok(result)
 }
 
+fn checkpoint_root_dict<'p>(
+    py: Python<'p>,
+    root: &tensorfs_core::checkpoint_root::CheckpointRoot,
+) -> PyResult<Bound<'p, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("owner", &root.owner)?;
+    result.set_item(
+        "repository",
+        format!("{}/{}", root.repository.org, root.repository.name),
+    )?;
+    result.set_item("manifest_digest", root.manifest.id())?;
+    result.set_item("manifest_length", root.manifest.length)?;
+    result.set_item("released", root.released)?;
+    Ok(result)
+}
+
 #[pyclass(name = "Store")]
 pub struct PyStore {
     pub store: Arc<CoreStore>,
@@ -573,6 +589,65 @@ impl PyStore {
     #[getter]
     fn implementation_sha256(&self) -> &'static str {
         tensorfs_core::IMPLEMENTATION_SHA256
+    }
+
+    fn verify_checkpoint_source(
+        &self,
+        py: Python<'_>,
+        repository: &str,
+        manifest_id: &str,
+        manifest_length: u64,
+    ) -> PyResult<()> {
+        let manifest = obj_ref(py, manifest_id, manifest_length)?;
+        py.detach(|| {
+            tensorfs_core::checkpoint_root::check_source(&self.store, repository, &manifest)
+        })
+        .or_refuse(py)
+    }
+
+    fn retain_checkpoint_root<'p>(
+        &self,
+        py: Python<'p>,
+        owner: &str,
+        repository: &str,
+        manifest_id: &str,
+        manifest_length: u64,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let manifest = obj_ref(py, manifest_id, manifest_length)?;
+        let root = py
+            .detach(|| {
+                tensorfs_core::checkpoint_root::retain(&self.store, owner, repository, manifest)
+            })
+            .or_refuse(py)?;
+        checkpoint_root_dict(py, &root)
+    }
+
+    fn checkpoint_root<'p>(
+        &self,
+        py: Python<'p>,
+        owner: &str,
+    ) -> PyResult<Option<Bound<'p, PyDict>>> {
+        py.detach(|| tensorfs_core::checkpoint_root::read(&self.store, owner))
+            .or_refuse(py)?
+            .map(|root| checkpoint_root_dict(py, &root))
+            .transpose()
+    }
+
+    fn release_checkpoint_root<'p>(
+        &self,
+        py: Python<'p>,
+        owner: &str,
+        repository: &str,
+        manifest_id: &str,
+        manifest_length: u64,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let manifest = obj_ref(py, manifest_id, manifest_length)?;
+        let root = py
+            .detach(|| {
+                tensorfs_core::checkpoint_root::release(&self.store, owner, repository, manifest)
+            })
+            .or_refuse(py)?;
+        checkpoint_root_dict(py, &root)
     }
 
     /// Retain a complete ordinary-file manifest under an independent producer root.
