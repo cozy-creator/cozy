@@ -462,7 +462,10 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
 	defaults := []string{"job", "status"}
 	if state.OutputExport != nil {
-		defaults = append(defaults, "saved", "output_export")
+		defaults = append(defaults, "output_export")
+		if saved := exportedOutputs(api.Lifecycle{OutputExport: state.OutputExport, Outputs: state.Outputs}); len(saved) > 0 {
+			defaults = append(defaults, "saved")
+		}
 	}
 	if state.Result != nil {
 		defaults = append(defaults, "result")

@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -22,7 +21,20 @@ var privateScriptRuntimeWheel = flag.String("script-runtime-wheel", "", "Exact R
 func TestPrivateScriptCapturesEditableDependencyAndRetries(t *testing.T) {
 	root, err := os.MkdirTemp("", "cozy-script-proof-")
 	must(t, err)
-	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
+	t.Cleanup(func() {
+		path := ""
+		for _, value := range childEnv(t, root) {
+			if strings.HasPrefix(value, "PATH=") {
+				path = strings.TrimPrefix(value, "PATH=")
+			}
+		}
+		compositionDown(t, root, path)
+		if t.Failed() {
+			t.Log("script retry evidence retained", root)
+		} else {
+			must(t, removeAllForce(root))
+		}
+	})
 	project := t.TempDir()
 	lib := filepath.Join(project, "algorithm")
 	must(t, os.MkdirAll(lib, 0o700))
@@ -74,13 +86,13 @@ def main(ctx):
 	defer store.Close()
 	first, problem := store.RequestByReference("1")
 	fatal(t, problem)
-	if first == nil || first.State != "blocked" || !first.RetainWork {
+	if first == nil || first.State != "failed" || !first.RetainWork {
 		t.Fatalf("failed run lost retention: %+v", first)
 	}
-	original, problem := store.Install(first.InstallID)
+	original, problem := store.MachineExecution(first.ID)
 	fatal(t, problem)
-	if original == nil {
-		t.Fatal("failed run lost immutable code")
+	if original == nil || len(original.Receipt) == 0 || len(original.Submission) == 0 {
+		t.Fatal("failed run lost its retained Runtime capture")
 	}
 	must(t, os.WriteFile(module, []byte("def compute(value):\n    return value + 100\n"), 0o600))
 	status, out = runCozy(t, root, "run", script, "--retry", "1", "--await", "--json")
@@ -94,24 +106,27 @@ def main(ctx):
 	}
 	second, problem := store.RequestByReference("2")
 	fatal(t, problem)
-	if second == nil || second.RetryOf != first.ID || second.ID == first.ID || second.InstallID == first.InstallID {
+	if second == nil || second.RetryOf != first.ID || second.ID == first.ID || second.LocalPackageDigest == first.LocalPackageDigest {
 		t.Fatalf("corrected run replaced original history: first=%+v second=%+v", first, second)
 	}
-	current, problem := store.Install(second.InstallID)
-	fatal(t, problem)
-	// Successful weightless installs can already be reclaimed. The old failed
-	// install remains owned and proves the dependency snapshot is independent.
-	_ = current
-	python := filepath.Join(original.Dir, "venv", "bin", "python")
-	probe := exec.Command(python, "-c", "from algorithm import compute; compute(7)")
-	probe.Dir = original.SourceRef
-	result, err := probe.CombinedOutput()
-	if err == nil || !strings.Contains(string(result), "candidate failed quality gate") {
-		t.Fatalf("editing local library mutated prior environment: %v %s", err, result)
+	status, resumed := runCozy(t, root, "run", "resume", "1", "--json")
+	if status != 0 {
+		t.Fatalf("resume the retained original capture [%d]: %s", status, resumed)
 	}
+	status, resumed = runCozy(t, root, "run", "watch", "1", "--json")
+	if status == 0 || !strings.Contains(resumed, "candidate failed quality gate") {
+		t.Fatalf("resuming the original capture used edited source [%d]: %s", status, resumed)
+	}
+	held, problem := store.MachineExecution(first.ID)
+	fatal(t, problem)
+	if held == nil || string(held.Submission) != string(original.Submission) {
+		t.Fatal("retry or resume rewrote immutable Runtime capture")
+	}
+	machineChildren(t, root, store, "1")
+	machineChildren(t, root, store, "2")
 	unchanged, problem := store.RequestRow(first.ID)
 	fatal(t, problem)
-	if unchanged.State != "blocked" || unchanged.BodyDigest != first.BodyDigest {
+	if unchanged.State != "failed" || unchanged.BodyDigest != first.BodyDigest {
 		t.Fatal("retry rewrote failed request")
 	}
 	t.Logf("%s failed; %s uses edited library; original source/environment preserved", first.ID, second.ID)
@@ -171,9 +186,10 @@ func TestPrivateScriptTypedOutputsUseNormalAttempt(t *testing.T) {
 # [tool.uv.sources]
 # cozy-runtime = {path = %q}
 # ///
-from cozy_runtime.author import ImageFrame, ImageAsset, Outputs, Telemetry
+from typing import Annotated
+from cozy_runtime.author import AssetBound, ImageFrame, ImageAsset, Outputs, Telemetry
 
-def main(*, out: Outputs, tel: Telemetry) -> ImageAsset:
+def main(*, out: Outputs, tel: Telemetry) -> Annotated[ImageAsset, AssetBound(media_types=("image/png",))]:
     tel.log("typed main saved a real image")
     return out.save_image(ImageFrame(2, 2, b"\xff\x00\x00" * 4), format="png")
 `, *privateScriptRuntimeWheel)
@@ -192,6 +208,15 @@ def main(*, out: Outputs, tel: Telemetry) -> ImageAsset:
 	}
 	if !strings.Contains(stdout, "image/png") {
 		t.Fatalf("typed image result missing: %s", stdout)
+	}
+	failing := strings.Replace(code, `return out.save_image(ImageFrame(2, 2, b"\xff\x00\x00" * 4), format="png")`, `raise ValueError("image-output-canary")`, 1)
+	if failing == code {
+		t.Fatal("failure fixture did not replace its image writer")
+	}
+	must(t, os.WriteFile(script, []byte(failing), 0600))
+	status, stdout, stderr = runCozyStreams(t, root, "run", script, "--await", "--json")
+	if status == 0 || !strings.Contains(stdout+stderr, "image-output-canary") || strings.Contains(stdout+stderr, "panic:") {
+		t.Fatalf("declared image failure was not rendered as a typed refusal [%d]: %s %s", status, stdout, stderr)
 	}
 }
 
