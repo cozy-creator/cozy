@@ -49,16 +49,13 @@ type MachineExecution struct {
 
 const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected`
 
-func (s *Store) MachinePackageUpload(boot, revision string) (string, *exit.Error) {
-	var request string
-	err := s.db.QueryRow(`SELECT request_id FROM request_events WHERE type='machine.package_uploaded' AND json_extract(payload,'$.worker_boot_id')=? AND json_extract(payload,'$.revision')=? ORDER BY seq DESC LIMIT 1`, boot, revision).Scan(&request)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
+func (s *Store) MachinePackageUploaded(request, boot, revision string) (bool, *exit.Error) {
+	var uploaded bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='machine.package_uploaded' AND json_extract(payload,'$.worker_boot_id')=? AND json_extract(payload,'$.revision')=?)`, request, boot, revision).Scan(&uploaded)
 	if err != nil {
-		return "", exit.Internalf("cannot read machine package transfer progress: %s", err)
+		return false, exit.Internalf("cannot read machine package transfer progress: %s", err)
 	}
-	return request, nil
+	return uploaded, nil
 }
 
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
