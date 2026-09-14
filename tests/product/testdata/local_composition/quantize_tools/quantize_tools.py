@@ -3,7 +3,8 @@ import json
 import os
 import time
 
-from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, WeightsOutput, WeightsSink, WeightsTarget, WeightsTransaction, invocable
+from cozy_runtime.author import App, Context, ModelArtifact, Telemetry, WeightsOutput, invocable
+from tensorfs.derived import Derivation, DerivedTransaction, Target
 from cozy_runtime.derive import plan, quantize_artifact
 from cozy_runtime.derive.quantization import QuantizationSource
 
@@ -14,8 +15,8 @@ INTERRUPT_MARKER = ""
 
 @invocable(memoize=True)
 async def quantize(ctx: Context, *, source: QuantizationSource, encoding: str,
-                   weights: WeightsSink, tel: Telemetry) -> ModelArtifact:
-    checkpoint = WeightsTransaction.checkpoint
+                   tel: Telemetry) -> ModelArtifact:
+    checkpoint = DerivedTransaction.checkpoint
 
     def pause_after_checkpoint(writer):
         checkpoint(writer)
@@ -25,17 +26,17 @@ async def quantize(ctx: Context, *, source: QuantizationSource, encoding: str,
             return
         with os.fdopen(fd, "w") as stream:
             json.dump({"pid": os.getpid(), "request": ctx.request_id,
-                       "parts": sorted(writer.completed_parts)}, stream)
+                       "parts": sorted(writer.completed_parts())}, stream)
             stream.flush()
             os.fsync(stream.fileno())
         while True:
             time.sleep(0.05)
 
-    WeightsTransaction.checkpoint = pause_after_checkpoint
+    DerivedTransaction.checkpoint = pause_after_checkpoint
     try:
-        return quantize_artifact(source, plan(("encoder",), encoding), sink=weights, ctx=ctx, tel=tel)
+        return quantize_artifact(source, plan(("encoder",), encoding), ctx=ctx, tel=tel)
     finally:
-        WeightsTransaction.checkpoint = checkpoint
+        DerivedTransaction.checkpoint = checkpoint
 
 
 app = App()
@@ -43,16 +44,17 @@ app.job(quantize, weights=(WeightsOutput("model", max_new_bytes=1 << 20),))
 
 
 @invocable(memoize=True)
-async def graft(ctx: Context, *, source: QuantizationSource, weights: WeightsSink) -> ModelArtifact:
+async def graft(ctx: Context, *, source: QuantizationSource) -> ModelArtifact:
     """Retain the raw fixture's tensors without permitting new payload bytes."""
-    structure = weights.structure(source)
+    capability = ctx.tensorfs_source(source)
+    structure = capability.inspect()
     assert not structure.configs
-    components = sorted({tensor.component for tensor in structure.tensors})
-    with weights.open("model", sources={"source": source},
-                      targets={name: WeightsTarget(source="source", source_component=name)
+    components = structure.components
+    with ctx.output("model").open(Derivation(sources={"source": capability},
+                      targets={name: Target(source="source", source_component=name)
                                for name in components},
-                      order=tuple((tensor.component, tensor.key) for tensor in structure.tensors)) as writer:
-        return writer.commit().artifact
+                      configs={}, order=tuple((component, key) for component, tensors in components.items() for key in tensors))) as writer:
+        return ctx.adopt_model(writer.receipt if writer.receipt is not None else writer.commit())
 
 
 app.job(graft, weights=(WeightsOutput("model", max_new_bytes=0),))

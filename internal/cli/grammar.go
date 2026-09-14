@@ -339,6 +339,7 @@ type RunExecuteCmd struct {
 	Trees           []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org             string   `help:"Job publication organization (defaults to local)."`
 	PublishTo       string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
+	AllowPublish    []string `help:"Allow this rented transaction to publish only to org/model (repeatable)."`
 	SourceProfiles  []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
 	DryRun          bool     `help:"Resolve exact job inputs and conversion headers without queueing or renting."`
 	Await           bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
@@ -358,7 +359,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--attention-kernel", c.AttentionKernel,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
-		"--publish-to", c.PublishTo, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
+		"--publish-to", c.PublishTo, "--allow-publish", c.AllowPublish, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
 }
 
 type RunRetryPublicationCmd struct {

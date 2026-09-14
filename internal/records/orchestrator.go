@@ -486,6 +486,10 @@ type Request struct {
 	// ReleaseImplicitWork is derived from a new captured result schema.
 	// Its durable authority is successful_work_releases, not this admission-only field.
 	ReleaseImplicitWork bool `json:"-"`
+	// MachineExecutionObserver is admission-only. The marker is committed with
+	// this request, before any scheduler can create a local attempt.
+	MachineExecutionObserver bool   `json:"-"`
+	DeadlineUnixMS           uint64 `json:"-"` // frozen submission event is its durable source
 	// RetryOf names immutable predecessor history; ReuseScope identifies the
 	// retained operation namespace shared by explicitly related revisions.
 	RetryOf                string
@@ -1308,6 +1312,12 @@ func (s *Store) BeginRequeue(id string, max int64, charge bool) (count int64, st
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
+	return s.SubmitWithEvent(r, nil)
+}
+
+// SubmitWithEvent freezes intake-only facts with the request. Deadline and
+// publication consent must survive a crash before any observer goroutine starts.
+func (s *Store) SubmitWithEvent(r Request, event map[string]any) (Request, bool, *exit.Error) {
 	if problem := NormalizeModelTransferIntent(r.ModelTransfer); problem != nil {
 		return Request{}, false, problem
 	}
@@ -1323,6 +1333,11 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, exportOutputs)
 	if problem != nil {
 		return Request{}, false, problem
+	}
+	if fresh && event != nil {
+		if err := appendEventTx(tx, recorded.ID, "request.submitted", 0, event); err != nil {
+			return Request{}, false, exit.Internalf("cannot freeze request submission intent: %s", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Request{}, false, exit.Internalf("cannot commit request %s: %s", r.ID, err)
@@ -1426,8 +1441,17 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
-	if problem := armSuccessfulWorkTx(tx, r); problem != nil {
-		return Request{}, false, problem
+	if r.MachineExecutionObserver {
+		if r.ParentRequestID != "" {
+			return Request{}, false, exit.New(exit.Validation, "a machine execution observer must be a root request")
+		}
+		if _, err := tx.Exec(`INSERT INTO machine_executions(request_id) VALUES(?)`, r.ID); err != nil {
+			return Request{}, false, exit.Internalf("cannot mark machine execution observation: %s", err)
+		}
+	} else {
+		if problem := armSuccessfulWorkTx(tx, r); problem != nil {
+			return Request{}, false, problem
+		}
 	}
 	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
 		return Request{}, false, problem

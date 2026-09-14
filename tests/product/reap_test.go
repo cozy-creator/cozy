@@ -102,6 +102,7 @@ func trackedRoots() []string {
 // which a signal cannot. The kill is what makes the outcome certain when it does not, or
 // when there is nothing left healthy enough to answer.
 func reapDaemonRoot(root string) {
+	defer reapMachineRuntimeRoot(root)
 	if len(daemonPidsOn(root)) == 0 {
 		return
 	}
@@ -131,6 +132,52 @@ func reapDaemonRoot(root string) {
 			fmt.Fprintf(os.Stderr, "cozy-daemon %d on %s survived SIGKILL\n", pid, root)
 		}
 	}
+}
+
+// Runtime intentionally survives the client's ordinary down. Test teardown owns
+// both processes, and must stop its exact Runtime before deleting the test home.
+func reapMachineRuntimeRoot(root string) bool {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return true
+	}
+	var owned []int
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		raw, err := os.ReadFile("/proc/" + entry.Name() + "/cmdline")
+		if err != nil {
+			continue
+		}
+		args := splitNul(raw, -1)
+		if len(args) < 5 || filepath.Base(args[1]) != "cozy-runtime" || args[2] != "serve" || args[3] != "--socket" || args[4] != filepath.Join(root, "runtime", "control.sock") { //cozy:allow exact process identity inspection; no Runtime command is launched
+			continue
+		}
+		env, err := os.ReadFile("/proc/" + entry.Name() + "/environ")
+		if err != nil {
+			continue
+		}
+		for _, value := range splitNul(env, -1) {
+			if value == "COZY_HOME="+filepath.Join(root, "runtime") {
+				process, _ := os.FindProcess(pid)
+				_ = process.Signal(syscall.SIGTERM)
+				owned = append(owned, pid)
+				break
+			}
+		}
+	}
+	for i := 0; i < 200 && anyAlive(owned); i++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	for _, pid := range owned {
+		if alive(pid) {
+			fmt.Fprintf(os.Stderr, "owned test Runtime %d did not finish explicit teardown\n", pid)
+			return false
+		}
+	}
+	return true
 }
 
 func anyAlive(pids []int) bool {

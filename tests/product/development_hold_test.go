@@ -34,7 +34,7 @@ import (
 // This independent protocol peer verifies the real rental signature over pinned TLS.
 // It issues no byte verdicts; actual Runtime restart joins the separate wrapper proof.
 type idleHoldPeer struct {
-	pb.UnimplementedWorkerControlServer
+	controlDefaults
 	pb.UnimplementedPodHostServer
 	key                  ed25519.PublicKey
 	pin                  []byte

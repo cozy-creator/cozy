@@ -292,6 +292,13 @@ func localSelection(operationID string, revision localpackage.Revision) (
 	return selected, transfer, nil
 }
 
+// LocalPackageSelection is the passive code-preparation document. Calling it
+// neither converges worker state nor creates an execution attempt.
+func LocalPackageSelection(operationID string, revision localpackage.Revision) (*pb.DesiredLocalPackageSet, *exit.Error) {
+	selected, _, problem := localSelection(operationID, revision)
+	return selected, problem
+}
+
 // transferLocalPackage sends captured source wheels directly to the claimed host.
 // The host owns durable offsets; reconnect resumes verified prefixes without a
 // package repository, publication or intermediate object-storage grant.
