@@ -786,7 +786,7 @@ func (c *Orchestrator) drain() {
 	// (for example because its selected lane is still warming), later requests on
 	// that same rental must not overtake it merely because they select a different
 	// already-ready lane. Automatic requests remain work-conserving across rentals.
-	blockedRentals := map[string]bool{}
+	blockedRentals := map[string]*WaitingRun{}
 	for position, id := range queued {
 		req, e := c.opt.Store.RequestRow(id)
 		if e != nil || req == nil {
@@ -797,8 +797,9 @@ func (c *Orchestrator) drain() {
 			c.forget(id)
 			continue
 		}
-		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] && !c.activeChild(*req) {
-			c.park(*req, position, waitFacts{}, "an earlier request is waiting on this rental")
+		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] != nil && !c.activeChild(*req) {
+			c.park(*req, position, waitFacts{cause: WaitQueueAhead, waitingFor: blockedRentals[rentalID]},
+				"an earlier request is waiting on this rental")
 			continue
 		}
 		if req.ModelTransfer != nil {
@@ -824,7 +825,7 @@ func (c *Orchestrator) drain() {
 			// `continue`.
 			if e.Code == exit.Unavailable || e.Code == exit.Conflict {
 				if req.RequestedRental != "" {
-					blockedRentals[req.RequestedRental] = true
+					blockedRentals[req.RequestedRental] = &WaitingRun{Number: req.Number, RequestID: req.ID}
 				}
 				c.park(*req, position, waitFacts{}, e.Message)
 				continue
@@ -858,6 +859,7 @@ func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, 
 	if facts.cause == "" {
 		facts = c.classifyCapacityWait(req, r)
 	}
+	p.wait = facts
 	lanes := r.lanes
 	sort.Slice(lanes, func(i, j int) bool { return lanes[i].String() < lanes[j].String() })
 	p.lanes = lanes

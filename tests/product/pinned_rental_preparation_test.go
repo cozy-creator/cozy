@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -122,6 +123,47 @@ func TestPreparationScopesExplicitRentalsIndependently(t *testing.T) {
 			if heldOffers != 0 || o.c.QueuePosition(first) == 0 || o.c.QueuePosition(third) == 0 {
 				t.Fatal("same-rental work overtook unfinished preparation")
 			}
+			if explicit {
+				// A selected follower must not inherit the head's worker-wide
+				// download/setup/loading phase, in either list reads or live frames.
+				_, problem := o.store.PinRental(third, a.RentalID, nil)
+				fatal(t, problem)
+				o.c.WakeQueue()
+				waitUntil(t, "the actual rental FIFO blocker is visible", func() bool {
+					phase, ok := o.c.QueuePhase(third)
+					return ok && phase.Name == orchestrator.WaitQueueAhead && phase.WaitingFor != nil && phase.WaitingFor.RequestID == first
+				})
+				instance, _, _, problem := o.c.EnsureRental(a.RentalID)
+				fatal(t, problem)
+				frames, unsubscribe := o.c.Subscribe(third)
+				defer unsubscribe()
+				for _, name := range []string{orchestrator.PhaseDownloading, orchestrator.PhasePreparing, orchestrator.PhaseWarming} {
+					o.c.ObservePhase(instance, orchestrator.PhaseSample{Name: name, HasBytes: true, Moved: 50, Total: 100})
+					phase, ok := o.c.QueuePhase(third)
+					if !ok || phase.Name != orchestrator.WaitQueueAhead || phase.HasBytes || phase.WaitingFor == nil || phase.WaitingFor.RequestID != first {
+						t.Fatalf("follower inherited %s preparation: %+v", name, phase)
+					}
+					if head, ok := o.c.QueuePhase(first); !ok || head.Name != name {
+						t.Fatalf("head lost its own preparation: %+v", head)
+					}
+					select {
+					case frame := <-frames:
+						body, ok := frame.Value.(map[string]any)
+						if !ok || body["phase"] != orchestrator.WaitQueueAhead || body["moved_bytes"] != nil {
+							t.Fatalf("live follower frame borrowed worker preparation: %+v", frame)
+						}
+					case <-time.After(time.Second):
+						t.Fatal("worker progress did not publish the follower's own wait")
+					}
+				}
+				fatal(t, o.c.CancelQueued(first, "preparation progress fixture"))
+				if phase, _ := o.c.QueuePhase(third); phase.WaitingFor != nil && phase.WaitingFor.RequestID == first {
+					t.Fatalf("cancelled head remains the follower's blocker: %+v", phase)
+				}
+				if phase, ok := o.c.QueuePhase(first); ok {
+					t.Fatalf("terminal request retained a preparation phase: %+v", phase)
+				}
+			}
 		})
 	}
 }
@@ -155,6 +197,43 @@ func TestWakeQueuePreservesUnassignedRequestedRentalAffinities(t *testing.T) {
 	defer mu.Unlock()
 	if !seen["wanted-a"] || !seen["wanted-b"] {
 		t.Fatalf("wake omitted an independent requested rental: %v", seen)
+	}
+}
+
+func TestUnreadyRentalSelectionNamesTheRunHoldingCapacity(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	pod := &fakePod{identity: "progress-busy", controlKey: public, serve: true}
+	connection, _ := startFakePod(t, t.TempDir(), pod)
+	o := hostOwner(t, "unready-rental-progress", rentalWiring(connection, private))
+	instance, _, _, problem := o.c.EnsureRental(connection.RentalID)
+	fatal(t, problem)
+	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "proof/current", Release: "1.0.0"}}, nil))
+	waitUntil(t, "current rental placement is dispatchable", func() bool {
+		facts := o.c.Worker(instance)
+		return facts != nil && len(facts.Dispatchable) > 0
+	})
+	active, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "active-progress-owner",
+		Package: "proof/current", Release: "1.0.0", Entrypoint: "tile", PlanID: podPlanID("proof/current"),
+		Payload: []byte(`{"size":16}`), Outputs: []string{"image"}, Worker: connection.RentalID,
+		RequestedRental: connection.RentalID, Rental: true, RentalRequired: true})
+	fatal(t, problem)
+	waitUntil(t, "the peer holds the existing offer", func() bool {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		return len(pod.offers) == 1
+	})
+	// This different selection has no eligible placement yet. Its absence must
+	// not hide the existing owner-side reservation of the rental's only seat.
+	_, _, problem = o.store.Submit(records.Request{ID: "new-selection-progress", IdemKey: "new-selection-progress",
+		BodyDigest: childDigest("a"), Package: "proof/next", Entrypoint: "tile", Release: "1.0.0",
+		PlanID: childDigest("b"), State: "queued", Payload: []byte(`{}`), Outputs: "[]",
+		Worker: connection.RentalID, RequestedRental: connection.RentalID, Rental: true})
+	fatal(t, problem)
+	o.c.ObservePhase(instance, orchestrator.PhaseSample{Name: orchestrator.PhaseWarming})
+	phase, ok := o.c.QueuePhase("new-selection-progress")
+	if !ok || phase.Name != orchestrator.WaitSlotBusy || phase.WaitingFor == nil || phase.WaitingFor.RequestID != active {
+		t.Fatalf("new selection borrowed warming while another run owns capacity: %+v", phase)
 	}
 }
 
