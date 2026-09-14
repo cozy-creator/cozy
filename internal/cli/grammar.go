@@ -331,7 +331,7 @@ type RunExecuteCmd struct {
 	PayloadFile     string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
 	Assets          []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	AssetFidelity   []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
-	LoRAs           []string `name:"lora" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
+	LoRAs           []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
 	AttentionKernel string   `name:"attention-kernel" help:"DEV: pin one runtime attention kernel for this request (for example flash-attn3-fp8)."`
 	Rental          *string  `help:"Run only on this existing rental name or id; never buy a replacement."`
 	RentalOnly      bool     `help:"Require a remote rental even when local capacity is ready."`
