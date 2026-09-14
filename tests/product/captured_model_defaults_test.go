@@ -18,7 +18,21 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/hub"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+func requireCapturedModelDefaults(t *testing.T, python string) {
+	t.Helper()
+	out, err := exec.Command(python, "-c", "from cozy.worker.v1.wire_version import WIRE_MINOR; print(WIRE_MINOR)").CombinedOutput()
+	if err != nil {
+		t.Fatalf("actual Runtime wire: %v %s", err, out)
+	}
+	minor, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	must(t, err)
+	if minor < int(pb.CapturedModelDefaultsWireMinor) {
+		t.Skip("captured Model defaults require Runtime wire56")
+	}
+}
 
 // A tiny native checkpoint backs both the metadata and actual public byte routes.
 // No placement, execution, receipt, or Model construction is returned by this fixture.
@@ -150,6 +164,7 @@ func TestCapturedModelDefaultsDoNotAcquireUnusedOrInaccessibleModels(t *testing.
 			t.Fatalf("SDK: %v %s", err, out)
 		}
 	}
+	requireCapturedModelDefaults(t, python)
 	root, err := os.MkdirTemp("", "cozy-defaults-")
 	must(t, err)
 	defer tracePrivateChildWait(t, root)()

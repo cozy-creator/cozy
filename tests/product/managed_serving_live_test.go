@@ -44,6 +44,9 @@ func ordinaryScriptModelServing(t *testing.T, mixed bool) {
 		}
 		t.Fatalf("CUDA peer probe: %v %s", err, probe)
 	}
+	if mixed {
+		requireCapturedModelDefaults(t, filepath.Join(control, "bin", "python"))
+	}
 	root, err := os.MkdirTemp("", "cozy-native-serving-")
 	must(t, err)
 	path := filepath.Join(control, "bin")
@@ -78,7 +81,7 @@ func ordinaryScriptModelServing(t *testing.T, mixed bool) {
 		}
 		var seed servingSeed
 		must(t, json.Unmarshal(seedBytes, &seed))
-		catalog := servingModelCatalog(t, seed)
+		catalog, _ := capturedDefaultCatalog(t, seed, filepath.Join(control, "bin", "python"))
 		defer catalog.Close()
 		must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte("tensorhub_url: "+catalog.URL+"\ntensorhub_token: local-serving-fixture\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 		module = []byte(strings.NewReplacer(
@@ -181,6 +184,13 @@ only-include=["model_tools.py"]
 	if inputs != 5 {
 		t.Fatalf("expected independent per-call native custody, found %d", inputs)
 	}
+	if mixed {
+		var defaults int
+		must(t, db.QueryRow(`SELECT count(*) FROM execution_checkpoint_inputs i JOIN execution_calls c ON c.owner=i.owner AND c.child_request=i.recipient WHERE json_extract(CAST(c.intent AS TEXT),'$.export')='generate' AND i.input_id='model:adapter' AND i.repository='proof/ordered'`).Scan(&defaults))
+		if defaults != 5 {
+			t.Fatalf("expected independent catalog default inputs, found %d", defaults)
+		}
+	}
 	var retained []byte
 	must(t, db.QueryRow(`SELECT retention FROM execution_model_holds WHERE recipient=? AND path='input/model'`, child).Scan(&retained))
 	var hold pb.DerivedRetentionRequest
@@ -199,6 +209,11 @@ only-include=["model_tools.py"]
 	waitUntil(t, "Runtime serving cancellation releases recipient custody", func() bool {
 		var remaining int
 		must(t, db.QueryRow(`SELECT (SELECT count(*) FROM executions WHERE request IN (?,?) AND state<>'canceled') + (SELECT count(*) FROM holds WHERE id=? AND state<>'released')`, parent, child, hold.RetentionId).Scan(&remaining))
+		if mixed {
+			var catalog int
+			must(t, db.QueryRow(`SELECT count(*) FROM execution_checkpoint_inputs WHERE recipient=? AND state<>'released'`, child).Scan(&catalog))
+			remaining += catalog
+		}
 		return remaining == 0
 	})
 }
