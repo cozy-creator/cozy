@@ -1,0 +1,91 @@
+package producttest
+
+import (
+	"context"
+	"flag"
+	"strings"
+	"testing"
+
+	"github.com/cozy-creator/cozy/internal/modelsource"
+	"github.com/cozy-creator/cozy/internal/secret"
+)
+
+func TestHuggingFaceFileURLsPreserveSelectionAcrossCanonicalRoundTrip(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	for _, raw := range []string{
+		"https://huggingface.co/owner/model/blob/main/adapters/my%20lora.safetensors?download=true",
+		"https://huggingface.co/owner/model/resolve/" + commit + "/adapters/my%20lora.safetensors",
+		"hf://owner/model@" + commit + "/adapters/my%20lora.safetensors",
+	} {
+		source, problem := modelsource.Parse(raw, t.TempDir())
+		if problem != nil {
+			t.Fatal(problem)
+		}
+		again, problem := modelsource.Parse(source.Canonical, t.TempDir())
+		if problem != nil || again != source {
+			t.Fatalf("lost selection: %#v -> %#v: %v", source, again, problem)
+		}
+		if source.Member != "adapters/my lora.safetensors" {
+			t.Fatal(source)
+		}
+	}
+	for _, suffix := range []string{"tool.exe", "../bad.safetensors", "%2e%2e/bad.safetensors", "foo%5cbar.safetensors", "foo%00.safetensors", "", "model.safetensors/"} {
+		_, problem := modelsource.Parse("https://huggingface.co/owner/model/blob/main/"+suffix, t.TempDir())
+		if problem == nil {
+			t.Fatalf("accepted unsafe/non-carrier %q", suffix)
+		}
+	}
+}
+
+var liveHuggingFaceFiles = flag.Bool("live-huggingface-files", false, "Resolve pinned public HF tensor files through the production provider client")
+
+// Public-origin proof is opt-in; unit runs never require Hugging Face availability.
+func TestHuggingFaceExplicitFilesResolveThroughPublicProvider(t *testing.T) {
+	if !*liveHuggingFaceFiles {
+		t.Skip("pass -live-huggingface-files for public provider proof")
+	}
+	resolver, problem := modelsource.NewResolver(modelsource.HuggingFace, secret.Value{})
+	fatal(t, problem)
+	for _, row := range []struct {
+		repo, commit, file string
+		size               int64
+	}{
+		{"Jojocodex/minimax-h3-spatial-physics-lora", "476b24df28b9b7cc5481b750469698f5cc4b0558", "wushu_spatial_physics_clean_3000_pruned.safetensors", 155109672},
+		{"Jojocodex/wushu-action-v7-minimax-h3-fl2va-ref2va-lora", "9598ef0b02f4590e202e956b4e6328dc71ae2bf5", "wushu_action_v7_fl2va_aitoolkit_adaln_full-int8convrot_bf16te_2000step.safetensors", 596451088},
+	} {
+		source, problem := modelsource.Parse("https://huggingface.co/"+row.repo+"/blob/"+row.commit+"/"+row.file, "")
+		fatal(t, problem)
+		plan, problem := resolver.Resolve(context.Background(), source)
+		fatal(t, problem)
+		if len(plan.Files) != 1 || plan.Files[0].Member != row.file || !plan.Files[0].Carrier || plan.Bytes != row.size {
+			t.Fatalf("selected sibling files: %+v", plan)
+		}
+		if plan.Canonical != "hf://"+row.repo+"@"+row.commit+"/"+row.file {
+			t.Fatal(plan.Canonical)
+		}
+	}
+}
+
+func TestHuggingFaceSelectedIndexKeepsOnlyItsShardClosure(t *testing.T) {
+	source, problem := modelsource.Parse("hf://owner/model@"+strings.Repeat("a", 40)+"/folder/selected.safetensors.index.json", "")
+	fatal(t, problem)
+	files := []modelsource.File{
+		{Member: "folder/selected.safetensors.index.json", Carrier: true, Requires: []string{"folder/part-1.safetensors", "folder/part-2.safetensors"}},
+		{Member: "folder/part-1.safetensors"}, {Member: "folder/part-2.safetensors"}, {Member: "other.safetensors", Carrier: true},
+	}
+	for i := range files {
+		files[i].URL = "https://huggingface.co/owner/model/resolve/" + source.Revision + "/" + files[i].Member
+		files[i].SHA256 = strings.Repeat("1", 64)
+		files[i].Length = 8
+	}
+	plan, problem := (modelsource.Plan{Source: source, Files: files}).Select([]string{source.Member})
+	fatal(t, problem)
+	if len(plan.Files) != 3 || plan.Bytes != 24 {
+		t.Fatalf("wrong closure: %+v", plan)
+	}
+	for _, file := range plan.Files {
+		if !strings.HasPrefix(file.Member, "folder/") {
+			t.Fatal(file.Member)
+		}
+	}
+}

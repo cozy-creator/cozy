@@ -31,6 +31,7 @@ type Source struct {
 	Repo      string
 	Reference string
 	Revision  string
+	Member    string // Optional exact Hugging Face carrier, relative to the pinned repository.
 	VersionID uint64
 	Path      string
 	Bytes     int64
@@ -63,14 +64,19 @@ func parseHFURI(raw string) (Source, *exit.Error) {
 		return Source{}, badSource(raw, "hf source contains credentials, query, fragment, or invalid escaping")
 	}
 	org := u.Host
-	repo, revision, ok := strings.Cut(strings.TrimPrefix(u.EscapedPath(), "/"), "@")
+	repo, suffix, ok := strings.Cut(strings.TrimPrefix(u.EscapedPath(), "/"), "@")
+	revision, escapedMember, hasMember := strings.Cut(suffix, "/")
+	member, memberErr := url.PathUnescape(escapedMember)
 	decodedRepo, decodeErr := url.PathUnescape(repo)
-	if !ok || decodeErr != nil || !portablePart(org) || !portablePart(decodedRepo) || !fullCommit(revision) {
-		return Source{}, badSource(raw, "hf sources are hf://org/repo@<40-character-commit>")
+	if !ok || decodeErr != nil || !portablePart(org) || !portablePart(decodedRepo) || !fullCommit(revision) ||
+		memberErr != nil || (hasMember && !supportedHFMember(member)) {
+		return Source{}, badSource(raw, "hf sources are hf://org/repo@<40-character-commit>[/file.safetensors]")
 	}
 	revision = strings.ToLower(revision)
-	return Source{Kind: HuggingFace, Canonical: "hf://" + org + "/" + decodedRepo + "@" + revision,
-		Org: org, Repo: decodedRepo, Reference: revision, Revision: revision}, nil
+	source := Source{Kind: HuggingFace, Org: org, Repo: decodedRepo,
+		Reference: revision, Revision: revision, Member: member}
+	source.Canonical = source.hfCanonical()
+	return source, nil
 }
 
 func parseCivitaiURI(raw string) (Source, *exit.Error) {
@@ -110,6 +116,9 @@ func parseHTTPS(raw string) (Source, *exit.Error) {
 
 func parseHFPasted(raw string, u *url.URL) (Source, *exit.Error) {
 	parts := splitPath(u.EscapedPath())
+	if len(parts) > 4 && strings.HasSuffix(u.EscapedPath(), "/") {
+		return Source{}, badSource(raw, "a Hugging Face file URL cannot end with a slash")
+	}
 	if len(parts) < 2 {
 		return Source{}, badSource(raw, "Hugging Face URLs must name org/repo")
 	}
@@ -118,31 +127,53 @@ func parseHFPasted(raw string, u *url.URL) (Source, *exit.Error) {
 	if err1 != nil || err2 != nil || !portablePart(org) || !portablePart(repo) {
 		return Source{}, badSource(raw, "Hugging Face URL contains an invalid org or repo")
 	}
-	revision, reference := "", "main"
+	revision, reference, member := "", "main", ""
 	if len(parts) > 2 {
-		if len(parts) != 4 || parts[2] != "tree" {
-			return Source{}, badSource(raw, "use a repository or repository tree URL, not an arbitrary Hugging Face path")
+		if len(parts) < 4 || (parts[2] != "tree" && parts[2] != "blob" && parts[2] != "resolve") {
+			return Source{}, badSource(raw, "use a Hugging Face repository, tree, or tensor file URL")
 		}
 		reference, _ = url.PathUnescape(parts[3])
-		if reference == "" || strings.Contains(reference, "..") {
-			return Source{}, badSource(raw, "Hugging Face tree URL contains an invalid revision")
-		}
 		if fullCommit(reference) {
-			revision = reference
-		} else if reference == "main" {
-			// A branch/tag is moving. The provider resolver deliberately resolves it once.
-			revision = ""
+			revision = strings.ToLower(reference)
+		} else if reference != "main" {
+			return Source{}, badSource(raw, "a non-main Hugging Face URL must use its full commit")
+		}
+		if parts[2] == "tree" {
+			if len(parts) != 4 {
+				return Source{}, badSource(raw, "select a tensor file, not a repository subdirectory")
+			}
 		} else {
-			return Source{}, badSource(raw, "a non-main Hugging Face tree URL must use its full commit")
+			var err error
+			member, err = url.PathUnescape(strings.Join(parts[4:], "/"))
+			if err != nil || !supportedHFMember(member) {
+				return Source{}, badSource(raw, "Hugging Face file URLs must select a safe .safetensors file or .safetensors.index.json")
+			}
 		}
 	}
-	canonical := "hf://" + org + "/" + repo
-	if revision != "" {
-		revision = strings.ToLower(revision)
-		canonical += "@" + revision
+	source := Source{Kind: HuggingFace, Org: org, Repo: repo,
+		Reference: reference, Revision: revision, Member: member}
+	source.Canonical = source.hfCanonical()
+	return source, nil
+}
+
+func supportedHFMember(member string) bool {
+	lower := strings.ToLower(member)
+	return safeMember(member) && (strings.HasSuffix(lower, ".safetensors") ||
+		strings.HasSuffix(lower, ".safetensors.index.json"))
+}
+
+func (s Source) hfCanonical() string {
+	if s.Revision == "" && s.Member != "" {
+		return "https://huggingface.co/" + s.Org + "/" + s.Repo + "/resolve/main/" + escapeMember(s.Member)
 	}
-	return Source{Kind: HuggingFace, Canonical: canonical, Org: org, Repo: repo,
-		Reference: reference, Revision: revision}, nil
+	canonical := "hf://" + s.Org + "/" + s.Repo
+	if s.Revision != "" {
+		canonical += "@" + s.Revision
+	}
+	if s.Member != "" {
+		canonical += "/" + escapeMember(s.Member)
+	}
+	return canonical
 }
 
 func parseCivitaiPasted(raw string, u *url.URL) (Source, *exit.Error) {
