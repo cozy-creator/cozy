@@ -655,6 +655,7 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 			continue
 		}
 		placement := DesiredPlacement{Package: pkg, Release: release,
+			Models:           placementModels(pkg, row),
 			PlacementIDValue: row.Str("placement_id"), PlacementSetDigest: digest,
 			BindingsDigest:    row.Str("bindings_digest"),
 			PlacementSetBytes: append([]byte(nil), w.setBytes...),
@@ -1086,11 +1087,14 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 					"worker resolved package %s without complete invocation identity", logical.Package)
 			}
 			if ready {
+				if problem := requireAdapterEcho(logical.Models, desired.Models); problem != nil {
+					c.mu.Unlock()
+					return WorkerLaunchSpec{}, "", problem
+				}
 				placement := desired
 				placement.Package = pinnedPackage(logical.Package, rentalID)
 				placement.Entrypoints = []Entrypoint{{Name: logical.Function, Digest: planID,
 					Outputs: append([]string(nil), logical.Outputs...)}}
-				placement.Models = append([]ModelRef(nil), logical.Models...)
 				w.remotePlacements[remotePlanKey(placement.Package, planID)] = placement
 				spec := w.spec
 				spec.Placement = placement
