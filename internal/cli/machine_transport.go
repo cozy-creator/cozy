@@ -79,10 +79,11 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	result := &machineConnection{connection: connection, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
 		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
-		facts, problem := rental.PrepareFactsSource(m.resolver.catalog)(ctx, identity, ref)
+		facts, problem := rental.PrepareFactsSource(client(m.context))(ctx, identity, ref)
 		if problem != nil {
 			return nil, problem
 		}
+		result.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
 		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, nil)
 		if problem != nil {
 			return nil, problem

@@ -135,7 +135,7 @@ type publishedHostFixture struct {
 	Restart func()
 }
 
-func startPublishedMachineHost(t *testing.T) publishedHostFixture {
+func startPublishedMachineHost(t *testing.T, configure ...func(*fakeRentalHub)) publishedHostFixture {
 	t.Helper()
 	if *publishedMachineFixture == "" {
 		t.Skip("requires an exact wheel/interface fixture and owned actual Host")
@@ -183,6 +183,9 @@ func startPublishedMachineHost(t *testing.T) publishedHostFixture {
 				fallback.ServeHTTP(w, r)
 			}
 		})
+		for _, update := range configure {
+			update(h)
+		}
 	})
 	return publishedHostFixture{fixture, layout, store, host, path, restart}
 }
