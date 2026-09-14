@@ -42,7 +42,18 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	if len(jobModels(request)) != len(request.Models) {
 		return nil, exit.Named(exit.Structural, "machine_execution.model_identity_missing", "root Model inputs require exact manifest identities and lengths")
 	}
-	inputs := append([]*pb.InputAccess{{InputId: "payload", Url: "data:application/json;base64," + base64.StdEncoding.EncodeToString(request.Payload)}}, modelAccess(request)...)
+	models := jobModels(request)
+	modelInputs := modelAccess(request)
+	for index, model := range models {
+		if model.CatalogRepository == "" {
+			continue
+		}
+		if model.CatalogRepository != model.Model {
+			return nil, exit.Named(exit.Structural, "machine_execution.model_source_changed", "catalog Model input differs from its resolved repository")
+		}
+		modelInputs[index].CatalogModel = &pb.CatalogModelSource{Repository: model.CatalogRepository}
+	}
+	inputs := append([]*pb.InputAccess{{InputId: "payload", Url: "data:application/json;base64," + base64.StdEncoding.EncodeToString(request.Payload)}}, modelInputs...)
 	sort.Slice(inputs, func(i, j int) bool { return inputs[i].InputId < inputs[j].InputId })
 	payloadDigest := spellOf(canonical.Digest(request.Payload))
 	publication := &pb.PublicationContract{GrantId: home.ScratchRepo(request.Org, request.ID), Outputs: outputs}

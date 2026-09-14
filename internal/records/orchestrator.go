@@ -572,9 +572,13 @@ type ModelRef struct {
 	// Jobs keep Slot as the bare invocation parameter; serving already uses a path.
 	BindingPath string `json:"binding_path,omitempty"`
 	Model       string `json:"model"`
-	Release     string `json:"release"`
-	Lane        string `json:"lane,omitempty"`
-	Manifest    string `json:"manifest"`
+	// CatalogRepository is populated only by native local/Hub model resolution.
+	// Model also carries synthetic producer/slot names for private artifacts;
+	// those never gain repository authority from their spelling.
+	CatalogRepository string `json:"catalog_repository,omitempty"`
+	Release           string `json:"release"`
+	Lane              string `json:"lane,omitempty"`
+	Manifest          string `json:"manifest"`
 	// HubCheckpoint records that Hub resolved an exact retained checkpoint without
 	// a release. It routes downloads; the Hub still checks repository custody.
 	HubCheckpoint bool `json:"hub_checkpoint,omitempty"`

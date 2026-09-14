@@ -323,6 +323,22 @@ func TestMachineInvocationCarriesFrozenDeadlineAndRefusesUnstagedInputs(t *testi
 	if len(spec.Inputs) != 2 || spec.Inputs[1].InputId != "model:model" || spec.Inputs[1].Digest != childDigest("4") || spec.Inputs[1].Length != 123 || submission.Offer.Grant.Inputs[0].Url != "model://"+childDigest("4") {
 		t.Fatal("root Model input lost its exact content/access binding")
 	}
+	if submission.Offer.Grant.Inputs[0].CatalogModel != nil {
+		t.Fatal("private Model input acquired inferred catalog authority")
+	}
+	request.Models[0].Model = "alice/checkpoint"
+	request.Models[0].CatalogRepository = "alice/checkpoint"
+	catalog, problem := orchestrator.MachineJobSubmission(request, capture, plan)
+	fatal(t, problem)
+	if catalog.Offer.Grant.Inputs[0].GetCatalogModel().GetRepository() != "alice/checkpoint" ||
+		!bytes.Equal(catalog.Offer.InvocationSpecDigest, submission.Offer.InvocationSpecDigest) {
+		t.Fatal("catalog source was dropped or changed content invocation identity")
+	}
+	request.Models[0].CatalogRepository = "other/checkpoint"
+	if _, problem := orchestrator.MachineJobSubmission(request, capture, plan); problem == nil {
+		t.Fatal("a catalog origin different from the selected model was accepted")
+	}
+	request.Models[0].CatalogRepository = ""
 	request.Models[0].ManifestLength = 0
 	if _, problem := orchestrator.MachineJobSubmission(request, capture, plan); problem == nil || problem.Code != exit.Structural {
 		t.Fatalf("unidentified Model input was accepted: %v", problem)

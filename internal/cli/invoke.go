@@ -360,7 +360,7 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 			return nil, problem
 		}
 		out = append(out, orchestrator.ModelRef{Package: target.Package, Slot: spec.Slot,
-			Model: model.Model, Release: model.Release, Lane: model.Lane,
+			Model: model.Model, CatalogRepository: model.Model, Release: model.Release, Lane: model.Lane,
 			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
 	}
 	retained, retainProblem := exactInvocationInstall(ctx, target)
@@ -537,7 +537,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 			return empty, problem
 		}
 		return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
-			Model: ref.String(), Manifest: manifest, HubCheckpoint: true,
+			Model: ref.String(), CatalogRepository: ref.String(), Manifest: manifest, HubCheckpoint: true,
 			ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
 			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}, nil
 	}
@@ -587,7 +587,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 		return empty, problem
 	}
 	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path,
-		Model: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
+		Model: ref.String(), CatalogRepository: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest,
 		Bytes: manifestBytes[manifest], ComponentBytes: manifestComponentBytes[manifest],
 		ComponentUse: slot.ComponentUse, Ladder: assertedRungs(binding, ref, selected)}, nil
 }
