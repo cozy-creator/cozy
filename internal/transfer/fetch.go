@@ -134,8 +134,8 @@ type Fetched struct {
 	Objects        int
 	Bytes          int64
 	// Moved is blob payload that came off the object plane; Held is verified blob
-	// payload skipped. The small manifest control document is reported by its own
-	// progress phase and is not mixed into blob accounting.
+	// payload skipped. The small manifest control document is not mixed into blob
+	// accounting or shown as model download progress.
 	Moved    int64
 	Held     int64
 	Admitted int
@@ -206,17 +206,12 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	if err := os.WriteFile(path, doc, 0o644); err != nil {
 		return out, exit.Internalf("cannot stage the manifest: %s", err)
 	}
-	admitted, e := f.Tool.AdmitManifest(path, row.ManifestID, int64(len(doc)))
+	_, e = f.Tool.AdmitManifest(path, row.ManifestID, int64(len(doc)))
 	if e != nil {
 		return out, e
 	}
 	out.MS["manifest"] = since(t0)
 	out.Rounds = 1
-	verb := "already resident"
-	if admitted {
-		verb = "admitted"
-	}
-	f.say("manifest %s %s (%s)", short1(row.ManifestID), verb, size(int64(len(doc))))
 
 	// Round 2 — what the manifest names directly: the header, the encoding specs and
 	// their vectors, the configs. With these resident the closure below is computable
@@ -260,7 +255,6 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 		return out, e
 	}
 	out.MS["verify"] = since(t0)
-	f.say("verified %d blobs — every declared byte", len(objects))
 
 	if row.Release == "" {
 		e = f.Tool.CommitCheckpoint(f.Ref.Org, f.Ref.Name, row.ManifestID, int64(len(doc)), f.Scratch)
@@ -270,7 +264,7 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	if e != nil {
 		return out, e
 	}
-	f.say("timing: %s", Timing(out.MS))
+	f.say("Model files ready: %s", f.Ref.String())
 	return out, nil
 }
 
@@ -356,15 +350,20 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 		want = append(want, o)
 	}
 	if len(want) == 0 {
-		f.say("%s: nothing to fetch, this store already holds them", name)
 		return nil
+	}
+	var remaining, downloaded int64
+	for _, object := range want {
+		remaining += object.Length
+	}
+	if name == "objects" {
+		f.say("Downloading %s: %s remaining", f.Ref.String(), size(remaining))
 	}
 
 	dir := filepath.Join(f.Scratch, "in")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return exit.Internalf("cannot create the fetch scratch: %s", err)
 	}
-	admitted, skipped := out.Admitted, out.Skipped
 	const batchObjects = 64
 	for start := 0; start < len(want); start += batchObjects {
 		end := min(start+batchObjects, len(want))
@@ -406,6 +405,10 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 				return e
 			}
 			out.Moved += n
+			downloaded += n
+			if name == "objects" {
+				f.say("Downloading %s: %s of %s", f.Ref.String(), size(downloaded), size(remaining))
+			}
 			fmt.Fprintf(&plan, "%s %d %s\n", strings.TrimPrefix(o.ID, "sha256:"), o.Length, dst)
 		}
 		// A killed transfer keeps every completed batch in TensorFS's verified
@@ -414,8 +417,6 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 			return e
 		}
 	}
-	f.say("%s: installed %d, skipped %d already verified here",
-		name, out.Admitted-admitted, out.Skipped-skipped)
 	_ = os.RemoveAll(dir)
 	return nil
 }
