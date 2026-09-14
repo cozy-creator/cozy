@@ -18,11 +18,11 @@ func TestEditableInvocableLibraryTracksCodeWithoutPackageManifest(t *testing.T) 
 	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	project := t.TempDir()
 	control := filepath.Join(project, "control")
-	runtimeInstall, runtimeSource := "cozy-runtime[model-execution]=="+version, ""
+	runtimeInstall, runtimeSource := "cozy-runtime=="+version, ""
 	if *privateChildRuntimeWheel != "" {
 		wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 		must(t, err)
-		runtimeInstall = wheel + "[model-execution]"
+		runtimeInstall = wheel
 		runtimeSource = "# cozy-runtime = {path = " + strconv.Quote(wheel) + "}\n"
 	}
 	for _, args := range [][]string{{"venv", control, "--python", "3.12"}, {"pip", "install", "--python", filepath.Join(control, "bin/python"), runtimeInstall}} {
@@ -96,33 +96,30 @@ async def main(ctx):
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	child := func(parentRef string) records.Request {
+	child := func(parentRef string) machineChildProof {
 		t.Helper()
-		parent, problem := store.RequestByReference(parentRef)
-		fatal(t, problem)
-		children, problem := store.Children(parent.ID)
-		fatal(t, problem)
+		children := machineChildren(t, root, store, parentRef)
 		if len(children) != 1 {
 			t.Fatalf("expected one child: %+v", children)
 		}
 		return children[0]
 	}
 	first := child("1")
-	if first.Ordinal != 1 {
+	if first.Executions != 1 {
 		t.Fatalf("first call did not run: %+v", first)
 	}
 	edited := filepath.Join(project, "edited.py")
 	must(t, os.WriteFile(edited, []byte(strings.Replace(script, "    assert", "    ctx.log('caller changed')\n    assert", 1)), 0600))
 	run(edited)
-	second := child("3")
-	if second.Ordinal != 0 || second.ReusedFrom != first.ID || second.ChildTargetDigest != first.ChildTargetDigest {
+	second := child("2")
+	if second.Executions != 0 || second.Revision != first.Revision || second.Computation != first.Computation {
 		t.Fatalf("caller edit invalidated helper: %+v", second)
 	}
 	must(t, os.WriteFile(module, []byte(strings.Replace(body, "Result(42)", "Result(43)", 1)), 0600))
 	must(t, os.WriteFile(edited, []byte(strings.Replace(script, "== 42", "== 43", 1)), 0600))
 	run(edited)
-	third := child("5")
-	if third.Ordinal != 1 || third.ChildTargetDigest == first.ChildTargetDigest {
+	third := child("3")
+	if third.Executions != 1 || third.Revision == first.Revision || third.Computation == first.Computation {
 		t.Fatalf("helper edit reused old code: %+v", third)
 	}
 	if _, err := os.Stat(filepath.Join(library, "package.toml")); !os.IsNotExist(err) {

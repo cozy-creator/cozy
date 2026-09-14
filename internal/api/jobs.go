@@ -16,6 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
@@ -35,6 +36,8 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
+	AllowPublish    []string               `json:"allow_publish,omitempty"`
+	TimeoutMS       int64                  `json:"timeout_ms,omitempty"`
 	RequestedRental string                 `json:"requested_rental,omitempty"`
 	LocalAssets     []records.AssetBinding `json:"local_assets,omitempty"`
 	Package         string                 `json:"package"`
@@ -65,19 +68,20 @@ type JobSubmission struct {
 
 // JobHandle is the 202 answer.
 type JobHandle struct {
-	Number        int64  `json:"number"`
-	JobID         string `json:"job_id"`
-	Status        string `json:"status"`
-	Attempt       uint64 `json:"attempt"`
-	Package       string `json:"package"`
-	Function      string `json:"function"`
-	Repo          string `json:"publication_repo,omitempty"`
-	StatusURL     string `json:"status_url"`
-	CancelURL     string `json:"cancel_url"`
-	EventsURL     string `json:"events_url"`
-	QueuePosition *int   `json:"queue_position,omitempty"`
-	QueueDepth    *int   `json:"queue_depth,omitempty"`
-	Replay        bool   `json:"idempotent_replay"`
+	MachineExecution bool   `json:"machine_execution,omitempty"`
+	Number           int64  `json:"number"`
+	JobID            string `json:"job_id"`
+	Status           string `json:"status"`
+	Attempt          uint64 `json:"attempt"`
+	Package          string `json:"package"`
+	Function         string `json:"function"`
+	Repo             string `json:"publication_repo,omitempty"`
+	StatusURL        string `json:"status_url"`
+	CancelURL        string `json:"cancel_url"`
+	EventsURL        string `json:"events_url"`
+	QueuePosition    *int   `json:"queue_position,omitempty"`
+	QueueDepth       *int   `json:"queue_depth,omitempty"`
+	Replay           bool   `json:"idempotent_replay"`
 }
 
 func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +125,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
 	if (len(sub.LocalAssets) > 0 || len(sub.Trees) > 0 || sub.Worker != "" || sub.RequestedRental != "" || len(sub.Models) > 0 ||
-		sub.ModelTransfer != nil || sub.RetryOf != "" || sub.OutputDirectory != "") &&
+		sub.ModelTransfer != nil || sub.RetryOf != "" || sub.OutputDirectory != "" || len(sub.AllowPublish) > 0) &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
@@ -169,11 +173,14 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	var spec orchestrator.Submission
 	if existing != nil {
-		if e = s.verifyJobReplayInstall(sub, *existing); e != nil {
+		if e = s.verifyJobReplayInstall(r.Context(), sub, *existing); e != nil {
 			s.refuseTyped(w, r, e)
 			return
 		}
 		spec, e = replayJobSubmission(sub, *existing)
+		if e == nil && spec.LocalPackageDigest != "" && spec.InstallID == "" {
+			spec.InstallID = sub.InstallID
+		}
 		if e == nil {
 			export, problem := s.store.OutputExportOf(existing.ID)
 			if problem != nil {
@@ -212,12 +219,48 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.IdemKey = key
+	if len(sub.AllowPublish) > 0 {
+		spec.AllowPublish, e = hub.NormalizePublicationRepositories(sub.AllowPublish)
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		if !spec.Rental || spec.LocalPackageDigest == "" || s.machineExecutions == nil {
+			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-publish requires a Runtime-owned rented transaction with its own certificate identity"))
+			return
+		}
+	}
+	if sub.TimeoutMS < 0 || sub.TimeoutMS > int64((1<<63-1)/int64(time.Millisecond)) {
+		s.refuseTyped(w, r, exit.New(exit.Validation, "job timeout is outside the supported duration range"))
+		return
+	}
+	spec.TimeoutMS = sub.TimeoutMS
+	if existing != nil {
+		_, spec.DeadlineUnixMS, e = s.store.RequestExecutionTiming(existing.ID)
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+	} else if spec.TimeoutMS > 0 {
+		spec.DeadlineUnixMS = uint64(time.Now().UnixMilli() + spec.TimeoutMS)
+	}
 	digest, e := jobSubmissionDigest(spec)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
 	spec.BodyDigest = digest
+	if s.machineExecutions != nil && spec.LocalPackageDigest != "" {
+		if existing == nil {
+			spec.MachineExecutionObserver = true
+		} else if link, problem := s.store.MachineExecution(existing.ID); problem == nil {
+			spec.MachineExecutionObserver = link != nil
+		}
+	}
+	if spec.MachineExecutionObserver && (len(spec.Assets) > 0 || len(spec.Models) > 0 || len(spec.Trees) > 0 || spec.ModelTransfer != nil) {
+		s.refuseTyped(w, r, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; no execution or rental was submitted"))
+		return
+	}
 
 	// NO CAPACITY IS A STATE, never a refusal — this route cannot answer "busy". The
 	// orchestrator records the row, queues it and makes the worker resident; several jobs
@@ -229,7 +272,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobID, attempt := recorded.ID, uint64(recorded.Ordinal)
-	if fresh {
+	if fresh || spec.MachineExecutionObserver {
 		defer s.activateRecorded(recorded)
 	}
 	publicationRepo := ""
@@ -237,7 +280,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		publicationRepo = home.ScratchRepo(recorded.Org, recorded.ID)
 	}
 	handle := JobHandle{
-		Number: recorded.Number, JobID: jobID, Status: contractStatus(recorded.State), Attempt: attempt,
+		MachineExecution: spec.MachineExecutionObserver,
+		Number:           recorded.Number, JobID: jobID, Status: contractStatus(recorded.State), Attempt: attempt,
 		Package: recorded.Package, Function: recorded.Entrypoint,
 		Repo:      publicationRepo,
 		StatusURL: "/v1/local/jobs/" + jobID,
@@ -405,6 +449,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			sub.InstallID = refreshed
 		}
 	}
+	if s.machineExecutions != nil && strings.HasPrefix(sub.Package, "local/") && sub.InstallID != "" {
+		return s.resolveLocalJob(ctx, sub, out, sub.InstallID)
+	}
 	var jobs []launch.JobFacts
 	var e *exit.Error
 	if sub.InstallID != "" {
@@ -568,6 +615,21 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"trees":           strings.Join(spec.Trees, ","),
 		"models":          models,
 	}
+	if spec.LocalPackageDigest != "" {
+		// The immutable code identity outlives its reclaimable intake install.
+		delete(doc, "install_id")
+		doc["local_package_digest"] = spec.LocalPackageDigest
+	}
+	if spec.TimeoutMS > 0 {
+		doc["timeout_ms"] = spec.TimeoutMS
+	}
+	if len(spec.AllowPublish) > 0 {
+		values := make([]canonical.Value, 0, len(spec.AllowPublish))
+		for _, repository := range spec.AllowPublish {
+			values = append(values, repository)
+		}
+		doc["allow_publish"] = values
+	}
 	if assets := assetIdentity(spec.Assets); len(assets) > 0 {
 		doc["assets"] = assets
 	}
@@ -613,20 +675,21 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 // JobState is one job's document: the lifecycle a request has, plus the two facts only a
 // job has — its publication and its running bill.
 type JobState struct {
-	ParentRequestID string `json:"parent_request_id,omitempty"`
-	ParentCallIndex *int64 `json:"parent_call_index,omitempty"`
-	ReusedFrom      string `json:"reused_from,omitempty"`
-	RetainWork      bool   `json:"retain_work,omitempty"`
-	Retaining       bool   `json:"retaining,omitempty"`
-	RetryOf         string `json:"retry_of,omitempty"`
-	ReuseScope      string `json:"reuse_scope,omitempty"`
-	Number          int64  `json:"number"`
-	JobID           string `json:"job_id"`
-	Status          string `json:"status"`
-	Package         string `json:"package"`
-	Function        string `json:"function"`
-	Attempt         uint64 `json:"attempt"`
-	Attempts        int    `json:"attempts"`
+	MachineExecution *MachineExecutionView `json:"machine_execution,omitempty"`
+	ParentRequestID  string                `json:"parent_request_id,omitempty"`
+	ParentCallIndex  *int64                `json:"parent_call_index,omitempty"`
+	ReusedFrom       string                `json:"reused_from,omitempty"`
+	RetainWork       bool                  `json:"retain_work,omitempty"`
+	Retaining        bool                  `json:"retaining,omitempty"`
+	RetryOf          string                `json:"retry_of,omitempty"`
+	ReuseScope       string                `json:"reuse_scope,omitempty"`
+	Number           int64                 `json:"number"`
+	JobID            string                `json:"job_id"`
+	Status           string                `json:"status"`
+	Package          string                `json:"package"`
+	Function         string                `json:"function"`
+	Attempt          uint64                `json:"attempt"`
+	Attempts         int                   `json:"attempts"`
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
 	QueuePosition *int `json:"queue_position,omitempty"`
@@ -748,7 +811,16 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.ok(w, r, http.StatusOK, s.jobStateOf(row))
+	problem := s.refreshMachineExecution(r.Context(), row)
+	if current, e := s.store.RequestRow(row.ID); e == nil && current != nil {
+		current.Number = row.Number
+		row = *current
+	}
+	state := s.jobStateOf(row)
+	if state.MachineExecution != nil && problem != nil {
+		state.MachineExecution.ObservationError = problem.Message
+	}
+	s.ok(w, r, http.StatusOK, state)
 }
 
 func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request, bool) {
@@ -767,6 +839,9 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 }
 
 func (s *Server) jobStateOf(row records.Request) JobState {
+	if link, problem := s.store.MachineExecution(row.ID); problem == nil && link != nil {
+		return s.machineJobState(row, link)
+	}
 	retaining, retentionProblem := s.store.RequestRetaining(row)
 	if retentionProblem != nil {
 		retaining = row.RetainWork
@@ -1070,6 +1145,9 @@ func settledRequestState(state string) bool {
 func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	row, ok := s.jobRow(w, r)
 	if !ok {
+		return
+	}
+	if s.machineJobControl(w, r, row, "cancel") {
 		return
 	}
 	actor := requestActor(r)

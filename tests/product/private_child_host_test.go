@@ -49,16 +49,26 @@ func startActualChildHost(t *testing.T) (home.Layout, *records.Store, actualChil
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	t.Cleanup(func() { store.Close() })
-	identity, problem := rental.PendingCreatorIdentity(layout, "child-host-proof")
-	fatal(t, problem)
-	token, problem := rental.PendingMediaToken(layout, "child-host-proof")
+	const rentalID = "rental-private-child-host"
+	started, err := os.ReadFile(filepath.Join(layout.Root, "host-container.json"))
+	var identity rental.CreatorIdentity
+	var token secret.Value
+	if os.IsNotExist(err) {
+		identity, problem = rental.PendingCreatorIdentity(layout, "child-host-proof")
+		fatal(t, problem)
+		token, problem = rental.PendingMediaToken(layout, "child-host-proof")
+	} else {
+		must(t, err)
+		identity, problem = rental.CreatorIdentityFor(layout, rentalID)
+		fatal(t, problem)
+		token, problem = rental.MediaToken(layout, rentalID)
+	}
 	fatal(t, problem)
 	authority, err := json.Marshal(map[string]any{"worker_id": "private-child-host", "control_public_key_ed25519_b64url": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}})
 	must(t, err)
 	authorityPath := filepath.Join(layout.Root, "host-authority.json")
 	must(t, os.WriteFile(authorityPath, authority, 0o600))
-	started, err := os.ReadFile(filepath.Join(layout.Root, "host-container.json"))
-	if os.IsNotExist(err) {
+	if len(started) == 0 {
 		command := exec.Command("python3", *childHostLauncher, authorityPath)
 		started, err = command.Output()
 		must(t, err)
@@ -145,7 +155,6 @@ func startActualChildHost(t *testing.T) (home.Layout, *records.Store, actualChil
 		hub.skus[0]["vram_gb"] = ready.GPUs[0].Memory / (1 << 30)
 		hub.skus[0]["minimum_ram_per_gpu_gb"] = 4 // exact launcher cgroup memory limit
 	}
-	const rentalID = "rental-private-child-host"
 	// The fixture catalog reports observed image facts, never invented package versions.
 	probeInventory := `import importlib.metadata as m,json,platform,re
 rows={re.sub(r"[-_.]+","-",d.metadata["Name"]).lower():d.version for d in m.distributions()}
@@ -159,16 +168,32 @@ print(json.dumps({"format":"tensorhub.image_inventory/1","profile":"python3.12-c
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(layout.Root, "host-image-inventory.json"), inventory, 0600))
 	hub.inventories = map[string]json.RawMessage{rentalID: inventory}
+	hubToken := bindMachinePublicationFixture(t, layout, host, hub, identity.PublicKey(), secret.HashHex(token))
 
 	hub.rentals[rentalID] = map[string]any{"development": *childHostUpdatable, "rental_id": rentalID, "name": "child-host", "state": "ready", "worker_address": host.Control, "media_address": host.Media, "cert_pem": string(certificate), "worker_id": "private-child-host", "worker_boot_id": ready.WorkerBootID, "creator_public_key": identity.PublicKey(), "media_token_sha256": []string{secret.HashHex(token)}, "accelerator_count": 1, "hourly_rate_usd_micros": 1}
 	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: rentalID, MachineName: "child-host", SKU: sku, AcceleratorModel: accelerator, HourlyRateUSDMicros: 1, State: "ready", Hub: hub.server.URL, Address: host.Control, MediaAddress: host.Media, ExpectedWorkerID: "private-child-host", ExpectedWorkerBootID: ready.WorkerBootID}, string(certificate), token, identity))
-	must(t, os.WriteFile(filepath.Join(layout.Root, "config.yaml"), []byte("tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\nport: 0\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(layout.Root, "config.yaml"), []byte("tensorhub_url: "+hub.server.URL+"\ntensorhub_token: "+hubToken+"\nport: 0\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	path := *childHostRuntimeBin
 	for _, item := range childEnv(t, layout.Root) {
 		if strings.HasPrefix(item, "PATH=") {
 			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
 		}
 	}
+	// This fixture deliberately preserves its exact Host and Runtime journal for
+	// reconnect/recovery. Stop only the owned client before the generic reaper.
+	t.Cleanup(func() {
+		if code, out := runCozyPath(t, layout.Root, path, "down", "--json"); code != 0 {
+			// A preaccept failure can leave an intentionally retained empty rental.
+			// Preserve its certificate and journal rather than invoking down --all.
+			t.Logf("preserving actual Host after client down refusal [%d]: %s", code, out)
+			if pid := daemonOnRoot(layout.Root); pid != 0 {
+				process, err := os.FindProcess(pid)
+				must(t, err)
+				must(t, process.Signal(os.Interrupt))
+				waitUntil(t, "owned proof client exits", func() bool { return daemonOnRoot(layout.Root) == 0 })
+			}
+		}
+	})
 	return layout, store, host, path, restartHost
 }
 

@@ -43,6 +43,9 @@ import (
 // Options is the frozen input to one Cozy daemon. Every field is decided by the
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
+	// StartMachineExecution transfers and observes an execution owned by Runtime.
+	// It never offers an attempt through this legacy cross-machine dispatcher.
+	StartMachineExecution func(records.Request) *exit.Error
 	// ReclaimInstall delegates unpinned snapshot cleanup to the existing package owner.
 	ReclaimInstall func(string) *exit.Error
 	Cfg            config.Config
@@ -736,6 +739,9 @@ func (c *Orchestrator) signalClosed(k string, e *exit.Error) {
 
 // enqueue parks a request until some worker advertises its binding as ready.
 func (c *Orchestrator) enqueue(requestID string) bool {
+	if link, problem := c.opt.Store.MachineExecution(requestID); problem != nil || link != nil {
+		return false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// Cancellation and asynchronous activation race at this boundary. Read the

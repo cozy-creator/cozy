@@ -402,6 +402,9 @@ func compositionDown(t *testing.T, root, path string) {
 	if code != 0 {
 		t.Errorf("normal composition teardown refused (%d): %s", code, compositionTail(out))
 	}
+	if !reapMachineRuntimeRoot(root) {
+		t.Error("owned test Runtime remains alive; preserve its home")
+	}
 	deadline := time.Now().Add(30 * time.Second)
 	for len(processes) > 0 {
 		for pid, birth := range processes {

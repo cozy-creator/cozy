@@ -164,7 +164,7 @@ type presentedDownloadSet struct {
 // terminal REFUSED event carrying the hub's code and words, which is what pod-supervisor
 // answers; the owner then sends the prepared placement_set itself on WorkerControl.
 type standInPod struct {
-	pb.UnimplementedWorkerControlServer
+	controlDefaults
 	pb.UnimplementedPodHostServer
 	workerID, bootID, instance string
 	creatorPublicKey           ed25519.PublicKey

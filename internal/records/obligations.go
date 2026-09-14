@@ -56,3 +56,52 @@ func (s *Store) Obligations() ([]Obligation, *exit.Error) {
 }
 
 func (o Obligation) String() string { return o.Kind + " " + o.ID + " (" + o.State + ")" }
+
+// ClientShutdownObligations is the explicit disconnect boundary. A machine's
+// durable receipt permits its observer to stop while execution and custody stay
+// with Runtime. Automatic idle release still uses the complete Obligations set.
+func (s *Store) ClientShutdownObligations() ([]Obligation, *exit.Error) {
+	all, problem := s.Obligations()
+	if problem != nil {
+		return nil, problem
+	}
+	links, problem := s.MachineExecutions()
+	if problem != nil {
+		return nil, problem
+	}
+	accepted, machines := map[string]bool{}, map[string]bool{}
+	for _, link := range links {
+		if len(link.Receipt) > 0 && len(link.PendingControl) == 0 && !link.CancelRequested {
+			accepted[link.RequestID] = true
+			machines[link.MachineID] = true
+		}
+	}
+	var held []Obligation
+	for _, obligation := range all {
+		if (obligation.Kind == "job" || obligation.Kind == "invocation") && accepted[obligation.ID] ||
+			obligation.Kind == "rental" && machines[obligation.ID] {
+			continue
+		}
+		held = append(held, obligation)
+	}
+	for _, link := range links {
+		if len(link.Receipt) > 0 && len(link.PendingControl) == 0 && !link.CancelRequested {
+			continue
+		}
+		owed, problem := s.MachineExecutionOwesWork(link.RequestID)
+		if problem != nil {
+			return nil, problem
+		}
+		if !owed {
+			continue
+		}
+		found := false
+		for _, obligation := range held {
+			found = found || obligation.ID == link.RequestID
+		}
+		if !found {
+			held = append(held, Obligation{Kind: "job", ID: link.RequestID, State: "machine_control_pending"})
+		}
+	}
+	return held, nil
+}

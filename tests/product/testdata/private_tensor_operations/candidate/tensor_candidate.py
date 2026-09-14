@@ -1,10 +1,11 @@
+import io
 import struct
 
 import tensorfs
 from cozy_runtime.author import (
-    App, Context, Loader, Model, ModelArtifact, WeightsOutput, WeightsPart,
-    WeightsSink, WeightsTarget, WeightsTensor, invocable,
+    App, Context, Loader, Model, ModelArtifact, WeightsOutput, invocable,
 )
+from tensorfs.derived import Derivation, Part, Target, Tensor
 
 PLAIN = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
 
@@ -15,24 +16,26 @@ class Source(Model[object]):
 
 
 @invocable(memoize=True)
-async def compute(ctx: Context, *, artifacts: WeightsSink, source: Source, factor: int) -> ModelArtifact:
+async def compute(ctx: Context, *, source: Source, factor: int) -> ModelArtifact:
     if factor == 0:
         raise ValueError("candidate quality gate failed")
-    tensor = WeightsTensor(
+    tensor = Tensor(
         logical_dtype="f32", shape=(512,), encoding=PLAIN,
-        parts={"value": WeightsPart("f32", (512,))},
+        parts={"value": Part("f32", (512,))},
     )
-    with artifacts.open(
-        "weights", sources={"original": source},
-        targets={"model": WeightsTarget(
+    with ctx.output("weights").open(Derivation(
+        sources={"original": ctx.tensorfs_source(source)},
+        targets={"model": Target(
             source="original", source_component="model", drop=("weight",), add={"weight": tensor},
         )}, configs={}, order=(("model", "weight"),),
-    ) as writer:
+    )) as writer:
+        if writer.receipt is not None:
+            return ctx.adopt_model(writer.receipt)
         buf = bytearray(2048)
         writer.source_read_into("original", "model", "weight", "value", 0, buf)
         values = struct.unpack("<512f", buf)
-        writer.add_part("model", "weight", "value", struct.pack("<512f", *(value * factor for value in values)))
-        return writer.commit().artifact
+        writer.add_part("model", "weight", "value", io.BytesIO(struct.pack("<512f", *(value * factor for value in values))))
+        return ctx.adopt_model(writer.commit())
 
 
 app = App()

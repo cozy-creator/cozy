@@ -15,6 +15,9 @@ import (
 // buyer is still queued for it (cl-113, observed live: rental pr-b192da1a released
 // mid-boot while req-ff3f79f4 waited on it).
 func RentalOwedBy(st *records.Store, row records.Rental) (bool, *exit.Error) {
+	if owed, problem := st.RentalHasMachineObligations(row.ID); problem != nil || owed {
+		return owed, problem
+	}
 	if retained, problem := st.RentalRetainsWork(row.ID); problem != nil || retained {
 		return retained, problem
 	}

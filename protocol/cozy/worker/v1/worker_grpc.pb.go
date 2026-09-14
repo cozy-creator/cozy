@@ -193,8 +193,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	WorkerControl_Control_FullMethodName       = "/cozy.worker.v1.WorkerControl/Control"
-	WorkerControl_WatchProgress_FullMethodName = "/cozy.worker.v1.WorkerControl/WatchProgress"
+	WorkerControl_SubmitMachineExecution_FullMethodName                = "/cozy.worker.v1.WorkerControl/SubmitMachineExecution"
+	WorkerControl_GetMachineExecution_FullMethodName                   = "/cozy.worker.v1.WorkerControl/GetMachineExecution"
+	WorkerControl_ListMachineExecutionEvents_FullMethodName            = "/cozy.worker.v1.WorkerControl/ListMachineExecutionEvents"
+	WorkerControl_ControlMachineExecution_FullMethodName               = "/cozy.worker.v1.WorkerControl/ControlMachineExecution"
+	WorkerControl_CollectMachineExecution_FullMethodName               = "/cozy.worker.v1.WorkerControl/CollectMachineExecution"
+	WorkerControl_AcknowledgeMachineExecutionCollection_FullMethodName = "/cozy.worker.v1.WorkerControl/AcknowledgeMachineExecutionCollection"
+	WorkerControl_Control_FullMethodName                               = "/cozy.worker.v1.WorkerControl/Control"
+	WorkerControl_WatchProgress_FullMethodName                         = "/cozy.worker.v1.WorkerControl/WatchProgress"
 )
 
 // WorkerControlClient is the client API for WorkerControl service.
@@ -203,6 +209,15 @@ const (
 //
 // The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
 type WorkerControlClient interface {
+	// MINOR51. Runtime owns accepted work independently of the caller connection.
+	// These calls observe/control that authority; they do not establish a second
+	// RecordOwner or require a client coordinator inside the worker.
+	SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error)
+	GetMachineExecution(ctx context.Context, in *MachineExecutionQuery, opts ...grpc.CallOption) (*MachineExecutionState, error)
+	ListMachineExecutionEvents(ctx context.Context, in *MachineExecutionEventsQuery, opts ...grpc.CallOption) (*MachineExecutionEventPage, error)
+	ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error)
+	CollectMachineExecution(ctx context.Context, in *MachineExecutionCollect, opts ...grpc.CallOption) (*AttemptOutcome, error)
+	AcknowledgeMachineExecutionCollection(ctx context.Context, in *MachineExecutionCollectionAck, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	// Durable control: the RecordOwner's request stream carries RecordOwnerFrames, the worker's
 	// response stream carries WorkerFrames. Durable messages are never shed to backpressure.
 	// Outcome authority lives only here. gRPC orders each DIRECTION independently — there is no
@@ -222,6 +237,66 @@ type workerControlClient struct {
 
 func NewWorkerControlClient(cc grpc.ClientConnInterface) WorkerControlClient {
 	return &workerControlClient{cc}
+}
+
+func (c *workerControlClient) SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionReceipt)
+	err := c.cc.Invoke(ctx, WorkerControl_SubmitMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerControlClient) GetMachineExecution(ctx context.Context, in *MachineExecutionQuery, opts ...grpc.CallOption) (*MachineExecutionState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionState)
+	err := c.cc.Invoke(ctx, WorkerControl_GetMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerControlClient) ListMachineExecutionEvents(ctx context.Context, in *MachineExecutionEventsQuery, opts ...grpc.CallOption) (*MachineExecutionEventPage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionEventPage)
+	err := c.cc.Invoke(ctx, WorkerControl_ListMachineExecutionEvents_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerControlClient) ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionState)
+	err := c.cc.Invoke(ctx, WorkerControl_ControlMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerControlClient) CollectMachineExecution(ctx context.Context, in *MachineExecutionCollect, opts ...grpc.CallOption) (*AttemptOutcome, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AttemptOutcome)
+	err := c.cc.Invoke(ctx, WorkerControl_CollectMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerControlClient) AcknowledgeMachineExecutionCollection(ctx context.Context, in *MachineExecutionCollectionAck, opts ...grpc.CallOption) (*MachineExecutionState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionState)
+	err := c.cc.Invoke(ctx, WorkerControl_AcknowledgeMachineExecutionCollection_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *workerControlClient) Control(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RecordOwnerFrame, WorkerFrame], error) {
@@ -262,6 +337,15 @@ type WorkerControl_WatchProgressClient = grpc.ServerStreamingClient[AttemptProgr
 //
 // The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
 type WorkerControlServer interface {
+	// MINOR51. Runtime owns accepted work independently of the caller connection.
+	// These calls observe/control that authority; they do not establish a second
+	// RecordOwner or require a client coordinator inside the worker.
+	SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error)
+	GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error)
+	ListMachineExecutionEvents(context.Context, *MachineExecutionEventsQuery) (*MachineExecutionEventPage, error)
+	ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error)
+	CollectMachineExecution(context.Context, *MachineExecutionCollect) (*AttemptOutcome, error)
+	AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error)
 	// Durable control: the RecordOwner's request stream carries RecordOwnerFrames, the worker's
 	// response stream carries WorkerFrames. Durable messages are never shed to backpressure.
 	// Outcome authority lives only here. gRPC orders each DIRECTION independently — there is no
@@ -283,6 +367,24 @@ type WorkerControlServer interface {
 // pointer dereference when methods are called.
 type UnimplementedWorkerControlServer struct{}
 
+func (UnimplementedWorkerControlServer) SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitMachineExecution not implemented")
+}
+func (UnimplementedWorkerControlServer) GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMachineExecution not implemented")
+}
+func (UnimplementedWorkerControlServer) ListMachineExecutionEvents(context.Context, *MachineExecutionEventsQuery) (*MachineExecutionEventPage, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListMachineExecutionEvents not implemented")
+}
+func (UnimplementedWorkerControlServer) ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error) {
+	return nil, status.Error(codes.Unimplemented, "method ControlMachineExecution not implemented")
+}
+func (UnimplementedWorkerControlServer) CollectMachineExecution(context.Context, *MachineExecutionCollect) (*AttemptOutcome, error) {
+	return nil, status.Error(codes.Unimplemented, "method CollectMachineExecution not implemented")
+}
+func (UnimplementedWorkerControlServer) AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcknowledgeMachineExecutionCollection not implemented")
+}
 func (UnimplementedWorkerControlServer) Control(grpc.BidiStreamingServer[RecordOwnerFrame, WorkerFrame]) error {
 	return status.Error(codes.Unimplemented, "method Control not implemented")
 }
@@ -310,6 +412,114 @@ func RegisterWorkerControlServer(s grpc.ServiceRegistrar, srv WorkerControlServe
 	s.RegisterService(&WorkerControl_ServiceDesc, srv)
 }
 
+func _WorkerControl_SubmitMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionSubmit)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).SubmitMachineExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_SubmitMachineExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).SubmitMachineExecution(ctx, req.(*MachineExecutionSubmit))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerControl_GetMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).GetMachineExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_GetMachineExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).GetMachineExecution(ctx, req.(*MachineExecutionQuery))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerControl_ListMachineExecutionEvents_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionEventsQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).ListMachineExecutionEvents(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_ListMachineExecutionEvents_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).ListMachineExecutionEvents(ctx, req.(*MachineExecutionEventsQuery))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerControl_ControlMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionControl)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).ControlMachineExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_ControlMachineExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).ControlMachineExecution(ctx, req.(*MachineExecutionControl))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerControl_CollectMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionCollect)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).CollectMachineExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_CollectMachineExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).CollectMachineExecution(ctx, req.(*MachineExecutionCollect))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerControl_AcknowledgeMachineExecutionCollection_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionCollectionAck)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).AcknowledgeMachineExecutionCollection(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_AcknowledgeMachineExecutionCollection_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).AcknowledgeMachineExecutionCollection(ctx, req.(*MachineExecutionCollectionAck))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _WorkerControl_Control_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(WorkerControlServer).Control(&grpc.GenericServerStream[RecordOwnerFrame, WorkerFrame]{ServerStream: stream})
 }
@@ -334,7 +544,32 @@ type WorkerControl_WatchProgressServer = grpc.ServerStreamingServer[AttemptProgr
 var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "cozy.worker.v1.WorkerControl",
 	HandlerType: (*WorkerControlServer)(nil),
-	Methods:     []grpc.MethodDesc{},
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "SubmitMachineExecution",
+			Handler:    _WorkerControl_SubmitMachineExecution_Handler,
+		},
+		{
+			MethodName: "GetMachineExecution",
+			Handler:    _WorkerControl_GetMachineExecution_Handler,
+		},
+		{
+			MethodName: "ListMachineExecutionEvents",
+			Handler:    _WorkerControl_ListMachineExecutionEvents_Handler,
+		},
+		{
+			MethodName: "ControlMachineExecution",
+			Handler:    _WorkerControl_ControlMachineExecution_Handler,
+		},
+		{
+			MethodName: "CollectMachineExecution",
+			Handler:    _WorkerControl_CollectMachineExecution_Handler,
+		},
+		{
+			MethodName: "AcknowledgeMachineExecutionCollection",
+			Handler:    _WorkerControl_AcknowledgeMachineExecutionCollection_Handler,
+		},
+	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "Control",
@@ -1618,32 +1853,38 @@ var RuntimeWeights_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	PodHost_ProtocolInfo_FullMethodName            = "/cozy.worker.v1.PodHost/ProtocolInfo"
-	PodHost_NumericalEnvironment_FullMethodName    = "/cozy.worker.v1.PodHost/NumericalEnvironment"
-	PodHost_PreparePackageSet_FullMethodName       = "/cozy.worker.v1.PodHost/PreparePackageSet"
-	PodHost_PrepareLocalPackage_FullMethodName     = "/cozy.worker.v1.PodHost/PrepareLocalPackage"
-	PodHost_PreparePrivatePlacement_FullMethodName = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
-	PodHost_ModelSourceFile_FullMethodName         = "/cozy.worker.v1.PodHost/ModelSourceFile"
-	PodHost_ModelSourcePrepare_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourcePrepare"
-	PodHost_ModelSourceRelease_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourceRelease"
-	PodHost_ModelSourceControl_FullMethodName      = "/cozy.worker.v1.PodHost/ModelSourceControl"
-	PodHost_RetainDerivedResult_FullMethodName     = "/cozy.worker.v1.PodHost/RetainDerivedResult"
-	PodHost_ReleaseDerivedRetention_FullMethodName = "/cozy.worker.v1.PodHost/ReleaseDerivedRetention"
-	PodHost_ReleaseDerivedResult_FullMethodName    = "/cozy.worker.v1.PodHost/ReleaseDerivedResult"
-	PodHost_RetainByteTree_FullMethodName          = "/cozy.worker.v1.PodHost/RetainByteTree"
-	PodHost_ReleaseByteTree_FullMethodName         = "/cozy.worker.v1.PodHost/ReleaseByteTree"
-	PodHost_ReadByteTreeObject_FullMethodName      = "/cozy.worker.v1.PodHost/ReadByteTreeObject"
-	PodHost_RecordOperationResult_FullMethodName   = "/cozy.worker.v1.PodHost/RecordOperationResult"
-	PodHost_LookupOperation_FullMethodName         = "/cozy.worker.v1.PodHost/LookupOperation"
-	PodHost_PruneOperationCache_FullMethodName     = "/cozy.worker.v1.PodHost/PruneOperationCache"
-	PodHost_ModelSourceAdopt_FullMethodName        = "/cozy.worker.v1.PodHost/ModelSourceAdopt"
-	PodHost_CheckpointPage_FullMethodName          = "/cozy.worker.v1.PodHost/CheckpointPage"
-	PodHost_CheckpointTransfer_FullMethodName      = "/cozy.worker.v1.PodHost/CheckpointTransfer"
-	PodHost_LocalPackageFetch_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageFetch"
-	PodHost_LocalPackageUpload_FullMethodName      = "/cozy.worker.v1.PodHost/LocalPackageUpload"
-	PodHost_LocalPackageAbort_FullMethodName       = "/cozy.worker.v1.PodHost/LocalPackageAbort"
-	PodHost_WeightsTransfer_FullMethodName         = "/cozy.worker.v1.PodHost/WeightsTransfer"
-	PodHost_WeightsIntentReady_FullMethodName      = "/cozy.worker.v1.PodHost/WeightsIntentReady"
+	PodHost_SubmitMachineExecution_FullMethodName                = "/cozy.worker.v1.PodHost/SubmitMachineExecution"
+	PodHost_GetMachineExecution_FullMethodName                   = "/cozy.worker.v1.PodHost/GetMachineExecution"
+	PodHost_ListMachineExecutionEvents_FullMethodName            = "/cozy.worker.v1.PodHost/ListMachineExecutionEvents"
+	PodHost_ControlMachineExecution_FullMethodName               = "/cozy.worker.v1.PodHost/ControlMachineExecution"
+	PodHost_CollectMachineExecution_FullMethodName               = "/cozy.worker.v1.PodHost/CollectMachineExecution"
+	PodHost_AcknowledgeMachineExecutionCollection_FullMethodName = "/cozy.worker.v1.PodHost/AcknowledgeMachineExecutionCollection"
+	PodHost_ProtocolInfo_FullMethodName                          = "/cozy.worker.v1.PodHost/ProtocolInfo"
+	PodHost_NumericalEnvironment_FullMethodName                  = "/cozy.worker.v1.PodHost/NumericalEnvironment"
+	PodHost_PreparePackageSet_FullMethodName                     = "/cozy.worker.v1.PodHost/PreparePackageSet"
+	PodHost_PrepareLocalPackage_FullMethodName                   = "/cozy.worker.v1.PodHost/PrepareLocalPackage"
+	PodHost_PreparePrivatePlacement_FullMethodName               = "/cozy.worker.v1.PodHost/PreparePrivatePlacement"
+	PodHost_ModelSourceFile_FullMethodName                       = "/cozy.worker.v1.PodHost/ModelSourceFile"
+	PodHost_ModelSourcePrepare_FullMethodName                    = "/cozy.worker.v1.PodHost/ModelSourcePrepare"
+	PodHost_ModelSourceRelease_FullMethodName                    = "/cozy.worker.v1.PodHost/ModelSourceRelease"
+	PodHost_ModelSourceControl_FullMethodName                    = "/cozy.worker.v1.PodHost/ModelSourceControl"
+	PodHost_RetainDerivedResult_FullMethodName                   = "/cozy.worker.v1.PodHost/RetainDerivedResult"
+	PodHost_ReleaseDerivedRetention_FullMethodName               = "/cozy.worker.v1.PodHost/ReleaseDerivedRetention"
+	PodHost_ReleaseDerivedResult_FullMethodName                  = "/cozy.worker.v1.PodHost/ReleaseDerivedResult"
+	PodHost_RetainByteTree_FullMethodName                        = "/cozy.worker.v1.PodHost/RetainByteTree"
+	PodHost_ReleaseByteTree_FullMethodName                       = "/cozy.worker.v1.PodHost/ReleaseByteTree"
+	PodHost_ReadByteTreeObject_FullMethodName                    = "/cozy.worker.v1.PodHost/ReadByteTreeObject"
+	PodHost_RecordOperationResult_FullMethodName                 = "/cozy.worker.v1.PodHost/RecordOperationResult"
+	PodHost_LookupOperation_FullMethodName                       = "/cozy.worker.v1.PodHost/LookupOperation"
+	PodHost_PruneOperationCache_FullMethodName                   = "/cozy.worker.v1.PodHost/PruneOperationCache"
+	PodHost_ModelSourceAdopt_FullMethodName                      = "/cozy.worker.v1.PodHost/ModelSourceAdopt"
+	PodHost_CheckpointPage_FullMethodName                        = "/cozy.worker.v1.PodHost/CheckpointPage"
+	PodHost_CheckpointTransfer_FullMethodName                    = "/cozy.worker.v1.PodHost/CheckpointTransfer"
+	PodHost_LocalPackageFetch_FullMethodName                     = "/cozy.worker.v1.PodHost/LocalPackageFetch"
+	PodHost_LocalPackageUpload_FullMethodName                    = "/cozy.worker.v1.PodHost/LocalPackageUpload"
+	PodHost_LocalPackageAbort_FullMethodName                     = "/cozy.worker.v1.PodHost/LocalPackageAbort"
+	PodHost_WeightsTransfer_FullMethodName                       = "/cozy.worker.v1.PodHost/WeightsTransfer"
+	PodHost_WeightsIntentReady_FullMethodName                    = "/cozy.worker.v1.PodHost/WeightsIntentReady"
 )
 
 // PodHostClient is the client API for PodHost service.
@@ -1676,6 +1917,13 @@ const (
 // Locally PodHost is not a service: the daemon calls the same host functions in-process.
 // ---------------------------------------------------------------------------
 type PodHostClient interface {
+	// Authenticated forwarding only. Runtime is the sole execution journal/owner.
+	SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error)
+	GetMachineExecution(ctx context.Context, in *MachineExecutionQuery, opts ...grpc.CallOption) (*MachineExecutionState, error)
+	ListMachineExecutionEvents(ctx context.Context, in *MachineExecutionEventsQuery, opts ...grpc.CallOption) (*MachineExecutionEventPage, error)
+	ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error)
+	CollectMachineExecution(ctx context.Context, in *MachineExecutionCollect, opts ...grpc.CallOption) (*AttemptOutcome, error)
+	AcknowledgeMachineExecutionCollection(ctx context.Context, in *MachineExecutionCollectionAck, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	// Static, read-only compatibility probe over the existing pinned TLS connection.
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
@@ -1712,6 +1960,66 @@ type podHostClient struct {
 
 func NewPodHostClient(cc grpc.ClientConnInterface) PodHostClient {
 	return &podHostClient{cc}
+}
+
+func (c *podHostClient) SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionReceipt)
+	err := c.cc.Invoke(ctx, PodHost_SubmitMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) GetMachineExecution(ctx context.Context, in *MachineExecutionQuery, opts ...grpc.CallOption) (*MachineExecutionState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionState)
+	err := c.cc.Invoke(ctx, PodHost_GetMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ListMachineExecutionEvents(ctx context.Context, in *MachineExecutionEventsQuery, opts ...grpc.CallOption) (*MachineExecutionEventPage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionEventPage)
+	err := c.cc.Invoke(ctx, PodHost_ListMachineExecutionEvents_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionState)
+	err := c.cc.Invoke(ctx, PodHost_ControlMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) CollectMachineExecution(ctx context.Context, in *MachineExecutionCollect, opts ...grpc.CallOption) (*AttemptOutcome, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AttemptOutcome)
+	err := c.cc.Invoke(ctx, PodHost_CollectMachineExecution_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) AcknowledgeMachineExecutionCollection(ctx context.Context, in *MachineExecutionCollectionAck, opts ...grpc.CallOption) (*MachineExecutionState, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionState)
+	err := c.cc.Invoke(ctx, PodHost_AcknowledgeMachineExecutionCollection_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *podHostClient) ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error) {
@@ -2070,6 +2378,13 @@ func (c *podHostClient) WeightsIntentReady(ctx context.Context, in *WeightsInten
 // Locally PodHost is not a service: the daemon calls the same host functions in-process.
 // ---------------------------------------------------------------------------
 type PodHostServer interface {
+	// Authenticated forwarding only. Runtime is the sole execution journal/owner.
+	SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error)
+	GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error)
+	ListMachineExecutionEvents(context.Context, *MachineExecutionEventsQuery) (*MachineExecutionEventPage, error)
+	ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error)
+	CollectMachineExecution(context.Context, *MachineExecutionCollect) (*AttemptOutcome, error)
+	AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error)
 	// Static, read-only compatibility probe over the existing pinned TLS connection.
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
@@ -2108,6 +2423,24 @@ type PodHostServer interface {
 // pointer dereference when methods are called.
 type UnimplementedPodHostServer struct{}
 
+func (UnimplementedPodHostServer) SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitMachineExecution not implemented")
+}
+func (UnimplementedPodHostServer) GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMachineExecution not implemented")
+}
+func (UnimplementedPodHostServer) ListMachineExecutionEvents(context.Context, *MachineExecutionEventsQuery) (*MachineExecutionEventPage, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListMachineExecutionEvents not implemented")
+}
+func (UnimplementedPodHostServer) ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error) {
+	return nil, status.Error(codes.Unimplemented, "method ControlMachineExecution not implemented")
+}
+func (UnimplementedPodHostServer) CollectMachineExecution(context.Context, *MachineExecutionCollect) (*AttemptOutcome, error) {
+	return nil, status.Error(codes.Unimplemented, "method CollectMachineExecution not implemented")
+}
+func (UnimplementedPodHostServer) AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcknowledgeMachineExecutionCollection not implemented")
+}
 func (UnimplementedPodHostServer) ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProtocolInfo not implemented")
 }
@@ -2205,6 +2538,114 @@ func RegisterPodHostServer(s grpc.ServiceRegistrar, srv PodHostServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&PodHost_ServiceDesc, srv)
+}
+
+func _PodHost_SubmitMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionSubmit)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).SubmitMachineExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_SubmitMachineExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).SubmitMachineExecution(ctx, req.(*MachineExecutionSubmit))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_GetMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).GetMachineExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_GetMachineExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).GetMachineExecution(ctx, req.(*MachineExecutionQuery))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ListMachineExecutionEvents_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionEventsQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ListMachineExecutionEvents(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ListMachineExecutionEvents_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ListMachineExecutionEvents(ctx, req.(*MachineExecutionEventsQuery))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ControlMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionControl)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ControlMachineExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ControlMachineExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ControlMachineExecution(ctx, req.(*MachineExecutionControl))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_CollectMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionCollect)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).CollectMachineExecution(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_CollectMachineExecution_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).CollectMachineExecution(ctx, req.(*MachineExecutionCollect))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_AcknowledgeMachineExecutionCollection_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionCollectionAck)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).AcknowledgeMachineExecutionCollection(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_AcknowledgeMachineExecutionCollection_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).AcknowledgeMachineExecutionCollection(ctx, req.(*MachineExecutionCollectionAck))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _PodHost_ProtocolInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -2622,6 +3063,30 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "cozy.worker.v1.PodHost",
 	HandlerType: (*PodHostServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "SubmitMachineExecution",
+			Handler:    _PodHost_SubmitMachineExecution_Handler,
+		},
+		{
+			MethodName: "GetMachineExecution",
+			Handler:    _PodHost_GetMachineExecution_Handler,
+		},
+		{
+			MethodName: "ListMachineExecutionEvents",
+			Handler:    _PodHost_ListMachineExecutionEvents_Handler,
+		},
+		{
+			MethodName: "ControlMachineExecution",
+			Handler:    _PodHost_ControlMachineExecution_Handler,
+		},
+		{
+			MethodName: "CollectMachineExecution",
+			Handler:    _PodHost_CollectMachineExecution_Handler,
+		},
+		{
+			MethodName: "AcknowledgeMachineExecutionCollection",
+			Handler:    _PodHost_AcknowledgeMachineExecutionCollection_Handler,
+		},
 		{
 			MethodName: "ProtocolInfo",
 			Handler:    _PodHost_ProtocolInfo_Handler,

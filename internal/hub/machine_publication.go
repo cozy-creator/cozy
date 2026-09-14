@@ -47,21 +47,13 @@ func PrepareMachinePublicationGrant(rental Rental, repositories []string, now, e
 	if !expires.After(now.Add(time.Second)) || expires.After(now.Add(7*24*time.Hour)) || expires.After(certificate.NotAfter) {
 		return MachinePublicationGrantIntent{}, exit.New(exit.Validation, "publication permission exceeds its certificate or seven-day window")
 	}
-	names := slices.Clone(repositories)
-	slices.Sort(names)
-	names = slices.Compact(names)
-	if len(names) < 1 || len(names) > 16 {
-		return MachinePublicationGrantIntent{}, exit.New(exit.Validation, "publication permission needs 1..16 explicit model repositories")
+	names, problem := NormalizePublicationRepositories(repositories)
+	if problem != nil {
+		return MachinePublicationGrantIntent{}, problem
 	}
 	wanted := make([]PublicationRepository, 0, len(names))
 	for _, name := range names {
-		ref, problem := ParseRef(name)
-		if problem != nil {
-			return MachinePublicationGrantIntent{}, problem
-		}
-		if ref.Org == "local" {
-			return MachinePublicationGrantIntent{}, exit.New(exit.Validation, "publication permission needs public model repository names")
-		}
+		ref, _ := ParseRef(name)
 		wanted = append(wanted, PublicationRepository{Org: ref.Org, Name: ref.Name})
 	}
 	id, err := uuid.NewRandom()
@@ -70,6 +62,27 @@ func PrepareMachinePublicationGrant(rental Rental, repositories []string, now, e
 	}
 	return MachinePublicationGrantIntent{AuthorizationID: id.String(), RentalID: rental.ID, Repositories: wanted,
 		Permissions: []string{"assessment", "checkpoint", "release"}, ExpiresAtUnix: expires.Unix(), CertificateDER: base64.RawURLEncoding.EncodeToString(block.Bytes)}, nil
+}
+
+// NormalizePublicationRepositories validates explicit consent before selecting or
+// buying a machine. The order and duplicates do not change request identity.
+func NormalizePublicationRepositories(repositories []string) ([]string, *exit.Error) {
+	names := slices.Clone(repositories)
+	slices.Sort(names)
+	names = slices.Compact(names)
+	if len(names) < 1 || len(names) > 16 {
+		return nil, exit.New(exit.Validation, "publication permission needs 1..16 explicit model repositories")
+	}
+	for _, name := range names {
+		ref, problem := ParseRef(name)
+		if problem != nil {
+			return nil, problem
+		}
+		if ref.Org == "local" {
+			return nil, exit.New(exit.Validation, "publication permission needs public model repository names")
+		}
+	}
+	return names, nil
 }
 
 // AuthorizeMachinePublication uses the client's ordinary AuthKit credential once.
