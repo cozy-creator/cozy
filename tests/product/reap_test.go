@@ -152,7 +152,7 @@ func reapMachineRuntimeRoot(root string) bool {
 			continue
 		}
 		args := splitNul(raw, -1)
-		if len(args) < 5 || filepath.Base(args[1]) != "cozy-runtime" || args[2] != "serve" || args[3] != "--socket" || args[4] != filepath.Join(root, "runtime", "control.sock") {
+		if len(args) < 5 || filepath.Base(args[1]) != "cozy-runtime" || args[2] != "serve" || args[3] != "--socket" || args[4] != filepath.Join(root, "runtime", "control.sock") { //cozy:allow exact process identity inspection; no Runtime command is launched
 			continue
 		}
 		env, err := os.ReadFile("/proc/" + entry.Name() + "/environ")
