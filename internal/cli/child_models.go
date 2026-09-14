@@ -215,13 +215,11 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 			for _, slot := range job.Models {
 				selected, problem := r.childModelLadder(child.Package, binding.Entrypoint, slot)
 				if problem != nil {
-					// A callable can receive an artifact produced later by its
-					// parent, or remain uninvoked. Its actual call proves custody;
-					// absence of a static default is not a preflight failure.
-					if problem.ErrName() == "child.model_unbound" {
-						continue
-					}
-					return nil, problem
+					// This is advisory sizing for an unknown future call. An
+					// inaccessible default may be unused or explicitly overridden;
+					// the frozen capture records its unavailable outcome and only
+					// an actual omitted argument requires that source.
+					continue
 				}
 				// Qualified so a shot's slot cannot collide with the parent's own.
 				selected.Slot = binding.Entrypoint + "/" + slot.Param

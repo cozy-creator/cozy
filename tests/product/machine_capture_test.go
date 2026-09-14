@@ -2,15 +2,56 @@ package producttest
 
 import (
 	"bytes"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+func TestMachineCaptureIncludesInvocableServingSelfBindings(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	root := machineCaptureRevision(t, "local/model-tools", 20)
+	inst := records.PackageInstall{ID: "model-tools", Dir: t.TempDir(), Package: root.Package, Version: root.Release, SourceKind: "local"}
+	fatal(t, store.RecordInstall(inst))
+	surface := &launch.PackageInterface{Digest: root.PackageInterfaceDigest,
+		Jobs: []launch.Entrypoint{{Name: "long_form", Invocable: &launch.Invocable{Module: "model_tools", Export: "long_form"}}},
+		Entrypoints: []launch.Entrypoint{
+			{Name: "segment", Invocable: &launch.Invocable{Module: "model_tools", Export: "segment"}},
+			{Name: "unmanaged"},
+		},
+	}
+	for range 2 { // Existing immutable installs must capture the same rows on reuse.
+		fatal(t, install.CaptureSelfBindings(store, inst, surface))
+	}
+	capture, problem := localpackage.CaptureExecution(inst.ID, root, store.ChildBindings,
+		func(string, string) (localpackage.Revision, *exit.Error) {
+			t.Fatal("self calls must use the already frozen revision")
+			return localpackage.Revision{}, nil
+		})
+	fatal(t, problem)
+	var doc pb.MachineExecutionCapture
+	must(t, canonical.Unmarshal(capture.Canonical, &doc))
+	if len(doc.Bindings) != 2 || len(doc.Revisions) != 1 {
+		t.Fatalf("job and serving self bindings were not closed: %v", &doc)
+	}
+	for _, binding := range doc.Bindings {
+		if binding.Export != "long_form" && binding.Export != "segment" {
+			t.Fatalf("unmanaged function captured: %v", binding)
+		}
+		if !bytes.Equal(binding.CallerRevisionDigest, binding.CalleeRevisionDigest) {
+			t.Fatal("self binding changed the captured revision")
+		}
+	}
+}
 
 func machineCaptureRevision(t *testing.T, name string, code byte) localpackage.Revision {
 	t.Helper()
