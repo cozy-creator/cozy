@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"os/exec"
@@ -125,6 +126,14 @@ def main(ctx: Context, *, source: Model) -> ModelArtifact:
 	}
 	if calls := machineChildren(t, root, store, "2"); len(calls) != 0 {
 		t.Fatalf("ordinary helper import dispatched a managed child: %+v", calls)
+	}
+	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
+	must(t, err)
+	defer journal.Close()
+	var inputHolds int
+	must(t, journal.QueryRow(`SELECT count(*) FROM execution_model_holds WHERE recipient=? AND path='input/source'`, request.ID).Scan(&inputHolds))
+	if inputHolds != 1 {
+		t.Fatal("Runtime did not record independent root Model input custody")
 	}
 	outputs, problem := store.MachineModelRetentions(request.ID)
 	fatal(t, problem)

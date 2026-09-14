@@ -21338,7 +21338,11 @@ func (x *InputTreeImportBlob) GetData() []byte {
 }
 
 type InputTreeImportCommit struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Fence this exact intake permanently. No objects are required. Reconciles a
+	// native commit that beat the abort, then releases only the intake recipient.
+	// The result has released=true; source is absent if no native commit occurred.
+	Abort         bool `protobuf:"varint,1,opt,name=abort,proto3" json:"abort,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -21371,6 +21375,13 @@ func (x *InputTreeImportCommit) ProtoReflect() protoreflect.Message {
 // Deprecated: Use InputTreeImportCommit.ProtoReflect.Descriptor instead.
 func (*InputTreeImportCommit) Descriptor() ([]byte, []int) {
 	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{211}
+}
+
+func (x *InputTreeImportCommit) GetAbort() bool {
+	if x != nil {
+		return x.Abort
+	}
+	return false
 }
 
 type InputTreeImportFrame struct {
@@ -23642,8 +23653,9 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x13InputTreeImportBlob\x12+\n" +
 	"\x06object\x18\x01 \x01(\v2\x13.cozy.worker.v1.RefR\x06object\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x04R\x06offset\x12\x12\n" +
-	"\x04data\x18\x03 \x01(\fR\x04data\"\x17\n" +
-	"\x15InputTreeImportCommit\"\xdb\x01\n" +
+	"\x04data\x18\x03 \x01(\fR\x04data\"-\n" +
+	"\x15InputTreeImportCommit\x12\x14\n" +
+	"\x05abort\x18\x01 \x01(\bR\x05abort\"\xdb\x01\n" +
 	"\x14InputTreeImportFrame\x12?\n" +
 	"\x06header\x18\x01 \x01(\v2%.cozy.worker.v1.InputTreeImportHeaderH\x00R\x06header\x129\n" +
 	"\x04blob\x18\x02 \x01(\v2#.cozy.worker.v1.InputTreeImportBlobH\x00R\x04blob\x12?\n" +
