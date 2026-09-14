@@ -15,6 +15,8 @@ import (
 	capturedwheel "github.com/cozy-creator/cozy/internal/wheel"
 )
 
+// A callable may omit the worker-owned Runtime from its library dependencies.
+// Capture must install the Runtime constraint it adds to that callable.
 // Every invocation uses the actual cozy CLI. A successful import alone does not
 // test worker dispatch, native custody, or independently edited caller reuse.
 func TestUnpublishedWheelCompositionTracksExecutableNotCaller(t *testing.T) {
@@ -59,11 +61,11 @@ func TestUnpublishedWheelCompositionTracksExecutableNotCaller(t *testing.T) {
 	})
 	library := filepath.Join(project, "library")
 	must(t, os.MkdirAll(library, 0o700))
-	metadata := fmt.Sprintf(`[project]
+	metadata := `[project]
 name = "unpublished-wheel-proof"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime==%s", "msgspec"]
+dependencies = ["msgspec"]
 [project.entry-points."cozy.application"]
 default = "wheel_proof:app"
 [build-system]
@@ -71,7 +73,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include = ["wheel_proof.py"]
-`, version)
+`
 	must(t, os.WriteFile(filepath.Join(library, "pyproject.toml"), []byte(metadata), 0o600))
 	body := `import msgspec
 from cozy_runtime.author import App, Context, FileAsset, Outputs, invocable
