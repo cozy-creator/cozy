@@ -19,6 +19,7 @@ pub mod carrier;
 pub mod convert;
 pub mod fingerprint;
 pub mod gguf;
+mod h3_lora;
 pub mod journal;
 pub mod preflight;
 pub mod source;
@@ -94,7 +95,11 @@ impl Plain for IngestProfile {
             );
         }
         let source_dialect = f.req_str("source_dialect")?.to_string();
-        if !DIALECTS.contains(&source_dialect.as_str()) {
+        if !DIALECTS.contains(&source_dialect.as_str())
+            && !convert::CONVERTERS
+                .iter()
+                .any(|converter| converter.dialect == source_dialect)
+        {
             return refuse(
                 Code::UNKNOWN_FIELD,
                 format!("source_dialect {source_dialect:?} is unknown"),

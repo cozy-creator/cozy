@@ -53,7 +53,7 @@ pub struct Converter {
     pub validated_on_real_bytes: bool,
 }
 
-pub const CONVERTERS: [Converter; 4] = [
+pub const CONVERTERS: [Converter; 5] = [
     Converter {
         name: "diffusers.identity/1",
         dialect: "safetensors.diffusers",
@@ -78,6 +78,13 @@ pub const CONVERTERS: [Converter; 4] = [
         doc: "An already-canonical source. Every untouched tensor carries by OBJECT \
               REFERENCE; nothing is re-hashed and nothing is re-uploaded.",
         validated_on_real_bytes: true,
+    },
+    Converter {
+        name: "h3.lora/1",
+        dialect: "safetensors.h3_lora",
+        class: Class::Permutation,
+        doc: "Native H3 LoRA A/B and Kohya down/up factors: split head-interleaved QKV B rows, swap SwiGLU B halves, preserve A and alpha without arithmetic.",
+        validated_on_real_bytes: false,
     },
     Converter {
         name: "h3.native/2",
@@ -947,6 +954,15 @@ fn plan_carrier(
     cands: &Candidates<'_>,
     p: &mut Plan,
 ) -> Result<()> {
+    if conv.name == "h3.lora/1" {
+        if allowed != ["plain/1"] {
+            return refuse(
+                Code::UNKNOWN_ENCODING,
+                "H3 LoRA ingestion preserves floating point factors in plain/1",
+            );
+        }
+        return super::h3_lora::plan(component, file, h, cands.plain, p);
+    }
     let alias = Allowed(allowed);
     p.header_bytes += h.header_bytes;
     let plain_map = role_map("plain/1")?;

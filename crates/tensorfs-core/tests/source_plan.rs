@@ -430,7 +430,9 @@ fn source_plan_refuses_identical_header_component_permutations() {
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("AMBIGUOUS_CLASSIFICATION"), "{error}");
     assert!(
-        error.contains("provider member/slot review is required"),
+        error.contains("Candidate members:")
+            && error.contains("first.bin")
+            && error.contains("second.bin"),
         "{error}"
     );
     let _ = fs::remove_dir_all(root);

@@ -257,7 +257,9 @@ fn profile_assignments(
                     ) {
                         (Some(expected), None, Some(observed)) => expected == observed,
                         (None, Some(prefix), Some(observed)) => observed.starts_with(prefix),
-                        (None, None, None) => true,
+                        // An explicit empty prefix permits this reviewed structure
+                        // under any filename, including a local unlabeled carrier.
+                        (None, Some(""), None) | (None, None, None) => true,
                         _ => false,
                     };
                     if !member_matches {
@@ -636,11 +638,25 @@ fn plan_source_prepared(
             .iter()
             .map(|(profile, _)| profile.name.as_str())
             .collect();
+        let mut members: Vec<String> = matches
+            .iter()
+            .flat_map(|(_, assignments)| {
+                assignments.iter().map(|assignment| {
+                    let carrier = &carriers[assignment.carrier];
+                    carrier
+                        .member
+                        .clone()
+                        .unwrap_or_else(|| carrier.path.display().to_string())
+                })
+            })
+            .collect();
+        members.sort();
+        members.dedup();
         return refuse(
             Code::AMBIGUOUS_CLASSIFICATION,
             format!(
-                "carrier headers admit multiple component assignments in profiles \
-                 {profiles:?}; exact provider member/slot review is required"
+                "multiple tensor selections match profiles {profiles:?}; select an exact file \
+                 URL or source profile. Candidate members: {members:?}"
             ),
         );
     }

@@ -855,7 +855,9 @@ pub fn validate_source_member(member: &str) -> Result<()> {
 }
 
 pub fn validate_source_member_prefix(prefix: &str) -> Result<()> {
-    if !prefix.ends_with('/') || validate_source_member(&format!("{prefix}member")).is_err() {
+    if !prefix.is_empty()
+        && (!prefix.ends_with('/') || validate_source_member(&format!("{prefix}member")).is_err())
+    {
         return refuse(
             Code::KEY_GRAMMAR,
             format!("source member prefix {prefix:?} is not a safe canonical prefix"),
@@ -867,8 +869,9 @@ pub fn validate_source_member_prefix(prefix: &str) -> Result<()> {
 /// Decoded `__metadata__` facts the border is willing to carry as EVIDENCE STAMPS. Foreign
 /// JSON is decoded through this strict list or discarded — it never survives as itself.
 pub fn evidence_stamps(h: &SourceHeader) -> Result<Vec<(String, String)>> {
-    const KEPT: [&str; 4] = [
+    const KEPT: [&str; 5] = [
         "modelspec.architecture",
+        "ss_h3_training_mode",
         "modelspec.prediction_type",
         "format",
         "scaled_fp8",

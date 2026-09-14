@@ -1,0 +1,38 @@
+[
+  {
+    "member": "wushu_spatial_physics_clean_3000_pruned.safetensors",
+    "source": "Jojocodex/minimax-h3-spatial-physics-lora@476b24df28b9b7cc5481b750469698f5cc4b0558",
+    "full_length": 155109672,
+    "source_sha256": "7d14f3701560068e7004159c8b2a7278bd2dbfc9e5e3b60d0bc9aef6c049919d",
+    "header_sha256": "06ec4724938de9bd04170180aee6391150aecfd925fc57a70a5ef30c7d9edea5",
+    "header_bytes": 51496,
+    "logical_keys": 416
+  },
+  {
+    "member": "wushu_spatial_physics_v2_1000_pruned.safetensors",
+    "source": "Jojocodex/minimax-h3-spatial-physics-lora@476b24df28b9b7cc5481b750469698f5cc4b0558",
+    "full_length": 155109488,
+    "source_sha256": "c38b8f9c43614c91a2847d290d9c5b3341536acb4d6d8ce2d825d4caf7eaee6b",
+    "header_sha256": "726dd043f2b4e410d95f1e9b57fcb7bcb0dc0f367e8b96210bbb70a4b5ad95e6",
+    "header_bytes": 51312,
+    "logical_keys": 416
+  },
+  {
+    "member": "wushu_action_v7_fl2va_aitoolkit_adaln_full-int8convrot_bf16te_1000step.safetensors",
+    "source": "Jojocodex/wushu-action-v7-minimax-h3-fl2va-ref2va-lora@9598ef0b02f4590e202e956b4e6328dc71ae2bf5",
+    "full_length": 596451088,
+    "source_sha256": "93ba294b7d6068a3bd930606bc853554973cb56664b5ff1392008ededf7f5efe",
+    "header_sha256": "d6ce84a73fe5271bf097b90cc6e2f8dea1837ce5a3a2bd0c3897cc8e79e6ce33",
+    "header_bytes": 72688,
+    "logical_keys": 600
+  },
+  {
+    "member": "wushu_action_v7_fl2va_aitoolkit_adaln_full-int8convrot_bf16te_2000step.safetensors",
+    "source": "Jojocodex/wushu-action-v7-minimax-h3-fl2va-ref2va-lora@9598ef0b02f4590e202e956b4e6328dc71ae2bf5",
+    "full_length": 596451088,
+    "source_sha256": "2fdc4a990591abfeb6fa4bc83b7c1974dcac0a6132c982ef386cd6243790be64",
+    "header_sha256": "6984d8434284c7114cef9420b215150af23938a456ecf62f80dc33d6a539f8b3",
+    "header_bytes": 72688,
+    "logical_keys": 600
+  }
+]
