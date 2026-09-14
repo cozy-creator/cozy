@@ -149,7 +149,7 @@ only-include=["model_tools.py"]
 		t.Fatal("edited script has no request")
 	}
 	parent := parentRow.ID
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro&_pragma=busy_timeout(5000)")
 	must(t, err)
 	defer db.Close()
 	var child string
