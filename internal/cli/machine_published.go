@@ -102,7 +102,7 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 		return a.Export < b.Export
 	})
 	if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
-		m.resolver.captureDefaultRows(capture, request.Package, codeDigest, iface, request.Rental)
+		m.resolver.captureDefaultRows(capture, request.Package, codeDigest, iface, request.Rental, connection.publicOrigin)
 	}
 	raw, digest, err := canonical.Identity(capture)
 	if err != nil {

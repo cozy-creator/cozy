@@ -83,6 +83,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if problem != nil {
 			return nil, problem
 		}
+		result.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
 		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, nil)
 		if problem != nil {
 			return nil, problem

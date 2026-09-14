@@ -40,6 +40,7 @@ type machineConnection struct {
 	prepare           func(context.Context, string, localpackage.Revision) *exit.Error
 	preparePublished  func(context.Context, records.Request) (*pb.DesiredPlacementSet, *exit.Error)
 	wireMinor         uint32
+	publicOrigin      string // renter-authenticated prepare facts name the public byte endpoint
 	certificateDigest []byte
 	retainModel       func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
 	releaseModel      func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)

@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -21,6 +23,34 @@ import (
 )
 
 const inventoryFormat = "tensorhub.image_inventory/1"
+
+// PublicOrigin reads the Hub-owned package index endpoint already embedded in
+// authenticated prepare facts. It never changes the control URL or sends a
+// credential to that endpoint. Ambiguous or non-HTTPS facts supply no override.
+func PublicOrigin(requirements []byte, pkg string) string {
+	ref, problem := hub.ParseRef(pkg)
+	if problem != nil {
+		return ""
+	}
+	wanted := "/v1/index/" + ref.Org + "/simple/"
+	origin := ""
+	for _, line := range strings.Split(string(requirements), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "--extra-index-url" {
+			continue
+		}
+		value, err := url.Parse(fields[1])
+		if err != nil || value.Scheme != "https" || value.Host == "" || value.User != nil || value.RawQuery != "" || value.Fragment != "" || value.RawPath != "" || value.Path != wanted {
+			continue
+		}
+		selected := value.Scheme + "://" + value.Host
+		if origin != "" && origin != selected {
+			return ""
+		}
+		origin = selected
+	}
+	return origin
+}
 
 // PrepareFactsSource fetches one package release's facts for one rental and
 // answers them in the call's own shape.
