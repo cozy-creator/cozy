@@ -25,7 +25,7 @@ func TestDeclaredAssetsActualCallable(t *testing.T) {
 	must(t, err)
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
 	project := t.TempDir()
-	version := strings.Split(filepath.Base(*assetsRuntimeWheel), "-")[1]
+	version := runtimeFixtureVersion(t, *assetsRuntimeWheel)
 	script := filepath.Join(project, "assets_app.py")
 	code := `
 from typing import Annotated
@@ -69,7 +69,7 @@ async def empty(payload: Request, assets: OptionalPictures) -> Result:
 name = "cozy-assets-proof"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime[media]==` + version + `"]
+dependencies = ["cozy-runtime[media]>=` + version + `"]
 [project.entry-points."cozy.application"]
 default = "assets_app:app"
 [build-system]

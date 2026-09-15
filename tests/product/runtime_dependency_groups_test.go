@@ -18,7 +18,10 @@ func TestPrivateImageDependenciesRemainInTheInstalledGraph(t *testing.T) {
 name = "image-closure-proof"
 version = "0.0.1"
 requires-python = ">=3.12,<3.13"
-dependencies = ["msgspec==0.21.1"]
+dependencies = ["msgspec>=0.21.1"]
+[tool.uv]
+# This fixture selects exact bytes without publishing an exact requirement.
+constraint-dependencies = ["msgspec==0.21.1"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -50,12 +53,13 @@ func TestRuntimeCaptureExcludesDefaultDevelopmentGroups(t *testing.T) {
 name = "runtime-group-proof"
 version = "0.0.1"
 requires-python = ">=3.12,<3.13"
-dependencies = ["packaging==26.2"]
+dependencies = ["packaging>=26.2"]
 [dependency-groups]
 dev = ["ruff==0.16.4"]
 qa = ["mypy==2.3.1"]
 [tool.uv]
 default-groups = ["dev", "qa"]
+constraint-dependencies = ["packaging==26.2"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

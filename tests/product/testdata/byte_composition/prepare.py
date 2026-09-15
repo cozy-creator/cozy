@@ -1,6 +1,6 @@
 # /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==__VERSION__", "byte-tools==0.0.1"]
+# dependencies=["cozy-runtime>=__VERSION__", "byte-tools>=0.0.1"]
 # [tool.uv.sources]
 # cozy-runtime={path=__WHEEL__}
 # byte-tools={path="./byte_tools",editable=true}

@@ -79,7 +79,7 @@ tools={path="./library",editable=true}
 	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte(`[project]
 name="caller"
 version="0.0.1"
-dependencies=["tools","cozy-runtime==0.11.0"]
+dependencies=["tools","cozy-runtime>=0.11.0"]
 [tool.uv.sources]
 tools={path="./library",editable=true}
 cozy-runtime={path="./cozy_runtime-0.11.0-py3-none-any.whl"}

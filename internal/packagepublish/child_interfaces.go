@@ -103,8 +103,8 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 		// A self-extra requirement lets uv evaluate the original optional
 		// markers in their proper extra context. The selected set becomes part
 		// of this immutable copied metadata, never the editable source.
-		requirements = append(requirements, fmt.Sprintf("%s[%s]==%s",
-			normalizedProjectName(metadata.Project.Name), strings.Join(extras, ","), metadata.Project.Version))
+		requirements = append(requirements, fmt.Sprintf("%s[%s]",
+			normalizedProjectName(metadata.Project.Name), strings.Join(extras, ",")))
 	}
 	uv := nested(nested(document, "tool"), "uv")
 	sources := nested(uv, "sources")
@@ -151,11 +151,12 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 		}
 		sources[name] = map[string]any{"path": path}
 		// uv applies root source overrides only to direct requirements. A callable
-		// may be selected transitively, so pin its already-selected overlay here too.
+		// may be selected transitively, so declare its already-selected overlay here too.
 		// Otherwise bindings advertise its exports while uv installs the original.
-		pin := name + "==" + identity.Version
-		if !slices.Contains(requirements, pin) {
-			requirements = append(requirements, pin)
+		// The exact source wheel above and uv.lock select its identity; the
+		// dependency declaration need not invent an exact compatibility pin.
+		if !slices.Contains(requirements, name) {
+			requirements = append(requirements, name)
 		}
 	}
 	if len(replacements) > 0 || len(extras) > 0 {

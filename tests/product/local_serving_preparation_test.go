@@ -190,7 +190,7 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
-	version := strings.Split(filepath.Base(wheel), "-")[1]
+	version := runtimeFixtureVersion(t, wheel)
 	fixture := *localServingFixtureDir
 	if fixture == "" {
 		fixture = filepath.Join("testdata", "local_serving_preparation")
@@ -293,7 +293,7 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 name="cozy-serving-preparation-fixture"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s","torch>=2.13,<3"]
+dependencies=["cozy-runtime>=%s","torch>=2.13,<3"]
 [project.entry-points."cozy.application"]
 default="serving_fixture:app"
 [build-system]

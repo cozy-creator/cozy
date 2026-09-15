@@ -47,7 +47,7 @@ func TestOrdinaryScriptTreeResultExportsCompleteClosure(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "reports.py")
 	body := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s"]
+# dependencies=["cozy-runtime>=%s"]
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
 # ///

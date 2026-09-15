@@ -177,7 +177,7 @@ func TestUnpublishedNamedRentalUsesAuthoredImageRequirements(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "main.py")
 	code := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==%s", "msgspec>=0.21,<0.22"]
+# dependencies = ["cozy-runtime>=%s", "msgspec>=0.21,<0.22"]
 # [tool.uv]
 # constraint-dependencies = ["msgspec==0.21.1"]
 # ///
@@ -215,7 +215,7 @@ def main(ctx):
 name = "marker-library"
 version = "1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime==%s"]
+dependencies = ["cozy-runtime>=%s"]
 [project.entry-points."cozy.application"]
 default = "marker_library:app"
 [project.optional-dependencies]

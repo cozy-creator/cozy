@@ -77,7 +77,7 @@ app.job(double)
 name="numerical-tools"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s", "numpy>=1.26"]
+dependencies=["cozy-runtime>=%s", "numpy>=1.26"]
 [project.entry-points."cozy.application"]
 default="numerical_tools:app"
 [build-system]
@@ -92,7 +92,7 @@ cozy-runtime={path=%s}
 	must(t, os.WriteFile(filepath.Join(library, "package.toml"), []byte("[application]\nobject=\"numerical_tools:app\"\n"), 0600))
 	body := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s","numerical-tools==1.0.0"]
+# dependencies=["cozy-runtime>=%s","numerical-tools>=1.0.0"]
 # [tool.uv.sources]
 # cozy-runtime={path=%s}
 # numerical-tools={path="./library",editable=true}

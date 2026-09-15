@@ -137,11 +137,11 @@ version="0.0.1"
 requires-python=">=3.12,<3.13"
 dependencies=[]
 [project.optional-dependencies]
-managed=["private-extra-library==0.0.1"]
-Tool_Box=["private-extra-alternate==0.0.1"]
+managed=["private-extra-library>=0.0.1"]
+Tool_Box=["private-extra-alternate>=0.0.1"]
 all=["private-extra-operation[managed,tool-box]"]
 windows=["private-extra-operation[managed]; sys_platform == 'win32'"]
-marker=["six==1.17.0; extra == 'marker'"]
+marker=["six>=1.17.0; extra == 'marker'"]
 [tool.uv.sources]
 private-extra-library={path="../library"}
 private-extra-alternate={path="../alternate"}
@@ -176,7 +176,7 @@ private-extra-alternate={path="../alternate"}
 	conditional, _ := capture("windows")
 	conditionalMetadata, err := os.ReadFile(filepath.Join(conditional.Tree, "pyproject.toml"))
 	must(t, err)
-	if !strings.Contains(string(conditionalMetadata), "private-extra-operation[windows]==0.0.1") || !strings.Contains(string(conditionalMetadata), "sys_platform == 'win32'") {
+	if !strings.Contains(string(conditionalMetadata), "private-extra-operation[windows]") || !strings.Contains(string(conditionalMetadata), "sys_platform == 'win32'") {
 		t.Fatal("conditional self extra lost its selection or environment marker")
 	}
 	marked, _ := capture("marker")
@@ -216,7 +216,7 @@ private-extra-alternate={path="../alternate"}
 	if edited == one {
 		t.Fatal("selected same-version helper edit did not change captured closure")
 	}
-	changed := strings.Replace(metadata, "private-extra-library==0.0.1", "private-extra-library>=0.0.1", 1)
+	changed := strings.Replace(metadata, "private-extra-library>=0.0.1", "private-extra-library>=0.0.1,<1", 1)
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(changed), 0600))
 	_, repinned := capture("managed")
 	if repinned == edited {

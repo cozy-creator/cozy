@@ -103,7 +103,7 @@ app.job(second)
 	script := filepath.Join(project, "first.py")
 	code := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==%s", "unpublished-wheel-proof==0.1.0"]
+# dependencies = ["cozy-runtime>=%s", "unpublished-wheel-proof>=0.1.0"]
 # [tool.uv.sources]
 %s# unpublished-wheel-proof = {path = %q}
 # ///

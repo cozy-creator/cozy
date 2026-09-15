@@ -165,7 +165,7 @@ func reportingRelease(t *testing.T) (hub.PackageDownloadPlan, []byte) {
 name = "install-reporting"
 version = "1.0.1"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime==0.16.8"]
+dependencies = ["cozy-runtime>=0.16.8"]
 [project.entry-points."cozy.application"]
 default = "reporting:app"
 [build-system]
