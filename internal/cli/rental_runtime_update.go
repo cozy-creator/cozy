@@ -211,6 +211,15 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			return exit.New(exit.Structural, "recorded Runtime update selection is unreadable")
 		}
 		if row.State == "updating" || row.State == "reconciling" {
+			if row.Error != "" {
+				if _, problem := u.transport(ctx, selection, "resume"); problem != nil {
+					return problem
+				}
+				row.Error = ""
+				if problem := u.machines.store.SaveRuntimeUpdate(*row); problem != nil {
+					return problem
+				}
+			}
 			return u.reconcile(ctx, row, identity, selection)
 		}
 	} else {
@@ -324,16 +333,19 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 
 type runtimeUpdateStatus struct {
 	Update struct {
-		Operation string   `json:"operation"`
-		Expected  []string `json:"expected"`
-		State     string   `json:"state"`
-		Error     string   `json:"error"`
+		Operation      string   `json:"operation"`
+		Expected       []string `json:"expected"`
+		State          string   `json:"state"`
+		Phase          string   `json:"phase"`
+		UpdaterRunning *bool    `json:"updater_running"`
+		Error          string   `json:"error"`
 	} `json:"update"`
 }
 
 func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.RuntimeUpdate, identity *orchestrator.WorkerConnection, selection runtimeUpdateSelection) *exit.Error {
 	expected := []string{strings.TrimPrefix(selection.Target.RuntimeUpdate.Runtime.Digest, "sha256:"), strings.TrimPrefix(selection.Target.RuntimeUpdate.TensorFS.Digest, "sha256:")}
 	slices.Sort(expected)
+	resumed := false
 	for ctx.Err() == nil {
 		raw, problem := u.transport(ctx, selection, "status")
 		if problem == nil {
@@ -343,6 +355,10 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 				return exit.New(exit.Structural, "maintenance reconciliation returned invalid operation metadata")
 			}
 			if status.Update.State == "missing" {
+				if resumed {
+					return exit.New(exit.Conflict, "worker did not acknowledge the recorded update; maintenance remains closed, retry cozy rental update")
+				}
+				resumed = true
 				// The enqueue response may have been lost before acceptance. Replaying
 				// this same immutable stage is idempotent, including while running.
 				if _, problem := u.transport(ctx, selection, "apply"); problem != nil {
@@ -355,7 +371,22 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 				}
 				switch status.Update.State {
 				case "queued", "running":
+					if status.Update.UpdaterRunning != nil && !*status.Update.UpdaterRunning && status.Update.Phase != "recovery_required" {
+						if resumed {
+							return exit.New(exit.Conflict, "the worker update guardian did not start; maintenance remains closed, retry cozy rental update")
+						}
+						resumed = true
+						if _, problem := u.transport(ctx, selection, "resume"); problem != nil {
+							return problem
+						}
+					}
+					if status.Update.Phase == "recovery_required" {
+						return exit.New(exit.Conflict, "the worker update needs recovery: %s; run cozy rental update again to resume the same recorded operation", status.Update.Error)
+					}
 				case "succeeded", "rolled_back", "refused":
+					if actual.Observed.Updating {
+						break
+					}
 					control, problem := orchestrator.DialIdleControl(ctx, identity, rental.ClaimProof(u.machines.layout), u.machines.store)
 					if problem != nil {
 						return problem

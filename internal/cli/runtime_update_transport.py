@@ -98,6 +98,12 @@ def main():
     request = json.load(sys.stdin)
     arguments = request["ssh_arguments"]
     action = request["action"]
+    if action == "resume":
+        stage = request["stage"]
+        expected = [row["sha256"] for row in request["selection"]["wheels"]]
+        if not re.fullmatch(r"[a-f0-9]{32}", stage) or len(expected) != 2 or any(not re.fullmatch(r"[a-f0-9]{64}", value) for value in expected):
+            raise ValueError("Invalid recorded update identity")
+        return {"update": json.loads(ssh(arguments, "python3 /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected)))}
     if action == "status":
         stage = request["stage"]
         if not re.fullmatch(r"[a-f0-9]{32}", stage):
