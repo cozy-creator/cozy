@@ -20,7 +20,7 @@ func TestOrdinaryScriptByteResultsAndMemoReuse(t *testing.T) {
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
-	version := strings.Split(filepath.Base(wheel), "-")[1]
+	version := runtimeFixtureVersion(t, wheel)
 	control := filepath.Join(t.TempDir(), "control")
 	for _, args := range [][]string{{"venv", control, "--python", "3.12"},
 		{"pip", "install", "--python", filepath.Join(control, "bin", "python"), wheel}} {

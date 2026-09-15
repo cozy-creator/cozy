@@ -25,7 +25,7 @@ func TestDeclaredAssetsActualCallable(t *testing.T) {
 	must(t, err)
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
 	project := t.TempDir()
-	version := strings.Split(filepath.Base(*assetsRuntimeWheel), "-")[1]
+	version := runtimeFixtureVersion(t, *assetsRuntimeWheel)
 	script := filepath.Join(project, "assets_app.py")
 	code := `
 from typing import Annotated

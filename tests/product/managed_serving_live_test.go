@@ -28,7 +28,7 @@ func ordinaryScriptModelServing(t *testing.T, mixed bool) {
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
-	version := strings.Split(filepath.Base(wheel), "-")[1]
+	version := runtimeFixtureVersion(t, wheel)
 	control := filepath.Join(t.TempDir(), "control")
 	// Give the base the numerical dependencies present in real worker images.
 	for _, args := range [][]string{{"venv", control, "--python", "3.12"},

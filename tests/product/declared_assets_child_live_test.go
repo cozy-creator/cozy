@@ -24,7 +24,7 @@ func TestDeclaredAssetsManagedLabelsAndMemo(t *testing.T) {
 	}
 	wheel, err := filepath.Abs(*assetsRuntimeWheel)
 	must(t, err)
-	version := strings.Split(filepath.Base(wheel), "-")[1]
+	version := runtimeFixtureVersion(t, wheel)
 	root, err := os.MkdirTemp("", "cozy-assets-child-")
 	must(t, err)
 	t.Cleanup(func() {

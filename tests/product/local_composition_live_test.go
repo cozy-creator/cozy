@@ -33,8 +33,8 @@ func TestOrdinaryScriptNativePreparationQuantizationAndScore(t *testing.T) {
 	must(t, err)
 	evalWheel, err := filepath.Abs(*privateChildEvalWheel)
 	must(t, err)
-	runtimeVersion := strings.Split(filepath.Base(runtimeWheel), "-")[1]
-	evalVersion := strings.Split(filepath.Base(evalWheel), "-")[1]
+	runtimeVersion := runtimeFixtureVersion(t, runtimeWheel)
+	evalVersion := strings.SplitN(strings.Split(filepath.Base(evalWheel), "-")[1], "+", 2)[0]
 	fixture := filepath.Join("testdata", "local_composition")
 	body, err := os.ReadFile(filepath.Join(fixture, "model.safetensors"))
 	must(t, err)

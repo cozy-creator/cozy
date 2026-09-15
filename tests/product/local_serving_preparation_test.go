@@ -190,7 +190,7 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
-	version := strings.Split(filepath.Base(wheel), "-")[1]
+	version := runtimeFixtureVersion(t, wheel)
 	fixture := *localServingFixtureDir
 	if fixture == "" {
 		fixture = filepath.Join("testdata", "local_serving_preparation")

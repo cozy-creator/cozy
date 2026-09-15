@@ -105,7 +105,7 @@ def inspect(payload: Request, assets: Pictures) -> Result:
     info = assets.info("reference")
     return Result(assets[0].width, assets[0].height, info.media_type, info.size_bytes)
 `), 0600))
-	version := strings.Split(filepath.Base(*assetsRuntimeWheel), "-")[1]
+	version := runtimeFixtureVersion(t, *assetsRuntimeWheel)
 	metadata := `[project]
 name = "prepared-input"
 version = "1.0.0"
