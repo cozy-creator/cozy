@@ -127,6 +127,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	machines := newMachineRuns(ctx, l, st, resolver, fleet)
 	defer machines.cancel()
+	updates := &rentalRuntimeUpdates{machines: machines}
+	machines.updates = updates
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	defects := newDefectReporter(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
@@ -194,8 +196,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 
-	updates := &rentalRuntimeUpdates{machines: machines}
-	machines.updates = updates
 	server := api.New(api.Options{
 		RuntimeUpdate:     updates.Start,
 		MachineExecutions: machines,

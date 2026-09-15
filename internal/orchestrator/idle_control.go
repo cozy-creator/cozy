@@ -9,6 +9,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -26,6 +28,16 @@ type IdleControl struct {
 func (s *IdleControl) Close() error { s.cancel(); return s.connection.Close() }
 
 func DialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
+	control, problem := dialIdleControl(parent, remote, sign, retained)
+	if problem != nil && problem.ErrName() == "rental.control_reconnect" {
+		// A cold Host transfers its workspace ledger to Runtime once and then
+		// requires a new Claim. Never accept that first, unrecovered snapshot.
+		return dialIdleControl(parent, remote, sign, retained)
+	}
+	return control, problem
+}
+
+func dialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
 	if remote == nil || remote.CACert == "" || remote.WorkerBootID == "" || sign == nil {
 		return nil, exit.New(exit.Credential, "operator control requires a pinned rental and Claim signer")
 	}
@@ -104,8 +116,11 @@ func DialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 }
 
 func idleControlEnd(err error) *exit.Error {
+	if status.Code(err) == codes.Unavailable && status.Convert(err).Message() == "workspace authority transferred; reconnect for the recovered snapshot" {
+		return exit.Named(exit.Unavailable, "rental.control_reconnect", "the worker transferred workspace authority; reconnecting for its recovered snapshot")
+	}
 	if classifyPrepareEnd(err).err != nil {
-		return exit.Unavailablef("operator control is unavailable before its idle snapshot")
+		return exit.Unavailablef("operator control is unavailable before its idle snapshot: %s", err)
 	}
 	return exit.New(exit.Conflict, "operator control refused the fixed rental Claim")
 }
