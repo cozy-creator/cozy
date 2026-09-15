@@ -110,7 +110,7 @@ def inspect(payload: Request, assets: Pictures) -> Result:
 name = "prepared-input"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime[media]==` + version + `"]
+dependencies = ["cozy-runtime[media]>=` + version + `"]
 [project.entry-points."cozy.application"]
 default = "prepared_input:app"
 [build-system]

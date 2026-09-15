@@ -54,7 +54,7 @@ func privateParentSurvivesAnotherScriptPreparation(t *testing.T, modeled bool) {
 name="isolation-step"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==0.16.10"]
+dependencies=["cozy-runtime>=0.16.10"]
 [project.entry-points."cozy.application"]
 default="isolation_step:app"
 [build-system]
@@ -147,7 +147,7 @@ app.job(check_quantized)
 	must(t, os.WriteFile(filepath.Join(library, "isolation_step.py"), []byte(source), 0600))
 	header := `# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==0.16.10", "isolation-step==1.0.0"]
+# dependencies=["cozy-runtime>=0.16.10", "isolation-step>=1.0.0"]
 # [tool.uv.sources]
 # isolation-step={path="./library", editable=true}
 # ///

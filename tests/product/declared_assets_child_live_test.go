@@ -47,7 +47,7 @@ func TestDeclaredAssetsManagedLabelsAndMemo(t *testing.T) {
 name=%q
 version="0.1.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime[media]==%s"%s]
+dependencies=["cozy-runtime[media]>=%s"%s]
 [tool.uv.sources]
 cozy-runtime={path=%q}
 %s

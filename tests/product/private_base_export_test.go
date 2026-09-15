@@ -16,7 +16,7 @@ func TestPrivateBuildPrunesExplicitCUDAFamilies(t *testing.T) {
 name = "base-prefix-fixture"
 version = "0.0.1"
 requires-python = ">=3.12,<3.13"
-dependencies = ["nvidia-cublas==13.1.1.3", "nvidia-cudnn-cu13==9.20.0.48", "cuda-toolkit==13.0.3.0", "packaging==26.3"]
+dependencies = ["nvidia-cublas>=13.1.1.3", "nvidia-cudnn-cu13>=9.20.0.48", "cuda-toolkit>=13.0.3.0", "packaging>=26.3"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

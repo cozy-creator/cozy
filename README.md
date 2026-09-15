@@ -127,6 +127,14 @@ From that project directory, publishing is simply:
 cozy package publish
 ```
 
+Declare dependencies as compatibility ranges, for example `pydantic-core>=2.46.4`
+or `pydantic-core>=2.46.4,<3`. Major and minor ranges such as `==2.*`, `==2.46.*`
+and `~=2.46.4` are supported. Package capture and publication reject exact versions
+and patch upper bounds in project dependencies, optional dependencies, and the
+project wheel's `Requires-Dist`. Script dependencies follow the same rule. Keep
+exact resolved versions and artifact hashes in `uv.lock`; third-party dependency
+metadata and explicit local wheel sources retain their normal behavior.
+
 If the logged-in account is `paul`, this publishes `paul/marco-polo-package@1.0.0`; Cozy never
 invents a `v` prefix. The destination comes from `tensorhub_url`, and an enrolled machine
 authenticates automatically.

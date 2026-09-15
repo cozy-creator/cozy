@@ -51,7 +51,7 @@ func TestOfficialCPUPyTorchInvocableUsesExactCapturedFramework(t *testing.T) {
 name="cpu-torch-operations"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s", "torch==2.13.0"]
+dependencies=["cozy-runtime>=%s", "torch>=2.13.0"]
 [project.entry-points."cozy.application"]
 default="cpu_torch_ops:app"
 [build-system]
@@ -88,7 +88,7 @@ app.job(square_sum)
 	must(t, os.WriteFile(filepath.Join(library, "cpu_torch_ops.py"), []byte(module), 0600))
 	body := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s","cpu-torch-operations==1.0.0","torch==2.13.0"]
+# dependencies=["cozy-runtime>=%s","cpu-torch-operations>=1.0.0","torch>=2.13.0"]
 # [tool.uv.sources]
 # cozy-runtime={path=%s}
 # cpu-torch-operations={path="./library",editable=true}

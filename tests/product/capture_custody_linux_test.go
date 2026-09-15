@@ -99,7 +99,7 @@ func TestCaptureReaderHandoffReleasesWriterBeforeAwait(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "reader.py")
 	must(t, os.WriteFile(script, []byte(fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s"]
+# dependencies=["cozy-runtime>=%s"]
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
 # ///

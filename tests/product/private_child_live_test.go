@@ -68,7 +68,7 @@ func TestUnpublishedChildCompositionReusesLocalWorkspace(t *testing.T) {
 name = "private-%s"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime==%s"]
+dependencies = ["cozy-runtime>=%s"]
 [tool.uv.sources]
 %s
 [build-system]
@@ -102,7 +102,7 @@ class Result(msgspec.Struct, frozen=True):
 	}
 	code := `# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==` + runtimeVersion + `", "private-source==0.1.0", "private-candidate==0.1.0"]
+# dependencies = ["cozy-runtime>=` + runtimeVersion + `", "private-source>=0.1.0", "private-candidate>=0.1.0"]
 # [tool.uv.sources]
 ` + runtimeScriptSource + `# private-source = {path = "./source"}
 # private-candidate = {path = "./candidate"}

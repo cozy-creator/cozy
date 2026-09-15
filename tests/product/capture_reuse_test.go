@@ -230,7 +230,7 @@ only-include=["arithmetic.py"]
 	resultPath := filepath.Join(root, "value.txt")
 	source := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s","capture-arithmetic==1.0.0"]
+# dependencies=["cozy-runtime>=%s","capture-arithmetic>=1.0.0"]
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
 # capture-arithmetic={path="./arithmetic",editable=true}

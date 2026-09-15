@@ -57,7 +57,7 @@ only-include = ["algorithm.py"]
 	}
 	code := `# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==` + runtimeFixtureVersion(t, *privateScriptRuntimeWheel) + `", "private-script-algorithm"]
+# dependencies = ["cozy-runtime>=` + runtimeFixtureVersion(t, *privateScriptRuntimeWheel) + `", "private-script-algorithm"]
 # [tool.uv.sources]
 # private-script-algorithm = {path = "./algorithm", editable = true}
 ` + runtimeSource + `# ///
@@ -259,7 +259,7 @@ class Probe(Model[object], encoded_leaves="accept"):
 	script := filepath.Join(project, "prepare.py")
 	must(t, os.WriteFile(script, []byte(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==`+runtimeFixtureVersion(t, *privateScriptRuntimeWheel)+`","private-script-model-types==0.0.1"]
+# dependencies=["cozy-runtime>=`+runtimeFixtureVersion(t, *privateScriptRuntimeWheel)+`","private-script-model-types>=0.0.1"]
 # [tool.uv.sources]
 # private-script-model-types={path="./model_types",editable=true}
 `+sources+`# ///

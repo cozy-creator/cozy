@@ -69,7 +69,7 @@ async def empty(payload: Request, assets: OptionalPictures) -> Result:
 name = "cozy-assets-proof"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime[media]==` + version + `"]
+dependencies = ["cozy-runtime[media]>=` + version + `"]
 [project.entry-points."cozy.application"]
 default = "assets_app:app"
 [build-system]

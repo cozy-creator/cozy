@@ -55,7 +55,7 @@ func TestRuntimeBuiltinQuantizeSurvivesCallerEdit(t *testing.T) {
 name="native-quantize-fixture"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s"]
+dependencies=["cozy-runtime>=%s"]
 [project.entry-points."cozy.application"]
 default="runtime_quantize_source:app"
 [build-system]
@@ -71,7 +71,7 @@ only-include=["runtime_quantize_source.py"]
 	must(t, os.WriteFile(filepath.Join(library, "runtime_quantize_source.py"), source, 0600))
 	body := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s", "native-quantize-fixture==1.0.0"]
+# dependencies=["cozy-runtime>=%s", "native-quantize-fixture>=1.0.0"]
 # [tool.uv.sources]
 # native-quantize-fixture={path="./library", editable=true}
 %s# ///
@@ -89,7 +89,7 @@ async def main(ctx):
 	unrelated := filepath.Join(project, "unrelated.py")
 	coreScript := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s"]
+# dependencies=["cozy-runtime>=%s"]
 # [tool.uv.sources]
 %s# ///
 async def main(ctx):

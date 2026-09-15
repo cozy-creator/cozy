@@ -96,7 +96,7 @@ func ordinaryScriptModelServing(t *testing.T, mixed bool) {
 name="model-tools"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s", "torch==2.13.0", "numpy>=1.26"]
+dependencies=["cozy-runtime>=%s", "torch>=2.13.0", "numpy>=1.26"]
 [project.entry-points."cozy.application"]
 default="model_tools:app"
 [tool.uv.sources]

@@ -72,7 +72,7 @@ func TestTransitiveCallableOverlayBecomesAnExactCallerDependency(t *testing.T) {
 name = "captured-parent"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["captured-wrapper==0.1.0"]
+dependencies = ["captured-wrapper>=0.1.0"]
 [tool.uv]
 no-index = true
 find-links = [%q]

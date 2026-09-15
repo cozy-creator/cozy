@@ -132,11 +132,11 @@ func TestOrdinaryScriptNativePreparationQuantizationAndScore(t *testing.T) {
 			code = bytes.Replace(code, []byte(`INTERRUPT_MARKER = ""`), []byte("INTERRUPT_MARKER = "+strconv.Quote(marker)), 1)
 			must(t, os.WriteFile(module, code, 0600))
 		}
-		deps := `"cozy-runtime==` + runtimeVersion + `","numpy>=1.26"`
+		deps := `"cozy-runtime>=` + runtimeVersion + `","numpy>=1.26"`
 		sources := `cozy-runtime={path=` + strconv.Quote(runtimeWheel) + `}`
 		wheelFiles := `only-include=["quantize_tools.py"]`
 		if name == "score_tools" {
-			deps += `,"cozy-eval==` + evalVersion + `"`
+			deps += `,"cozy-eval>=` + evalVersion + `"`
 			sources += "\ncozy-eval={path=" + strconv.Quote(evalWheel) + "}"
 			wheelFiles = `packages=["src/score_tools"]`
 		}

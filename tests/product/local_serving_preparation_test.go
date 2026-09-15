@@ -293,7 +293,7 @@ func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T
 name="cozy-serving-preparation-fixture"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s","torch>=2.13,<3"]
+dependencies=["cozy-runtime>=%s","torch>=2.13,<3"]
 [project.entry-points."cozy.application"]
 default="serving_fixture:app"
 [build-system]

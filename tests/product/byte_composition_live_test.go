@@ -56,7 +56,7 @@ func TestOrdinaryScriptByteResultsAndMemoReuse(t *testing.T) {
 name="byte-tools"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s"]
+dependencies=["cozy-runtime>=%s"]
 [project.entry-points."cozy.application"]
 default="byte_tools:app"
 [tool.uv.sources]

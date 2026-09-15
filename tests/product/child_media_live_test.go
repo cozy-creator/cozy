@@ -83,7 +83,7 @@ func privateChildMediaProof(t *testing.T, directSource string) {
 name=%q
 version="0.1.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime[media]==%s"%s]
+dependencies=["cozy-runtime[media]>=%s"%s]
 [tool.uv.sources]
 cozy-runtime={path=%q}
 %s
@@ -117,7 +117,7 @@ only-include=[%q]
 			} `toml:"project"`
 		}
 		must(t, toml.Unmarshal(sourceMetadata, &parsed))
-		write(project, "pyproject.toml", metadata("private-media-parent", "parent", `,"cozy-eval[managed]==`+parsed.Project.Version+`"`, `cozy-eval={path="./child"}`))
+		write(project, "pyproject.toml", metadata("private-media-parent", "parent", `,"cozy-eval[managed]>=`+parsed.Project.Version+`"`, `cozy-eval={path="./child"}`))
 		base := filepath.Join(t.TempDir(), "base")
 		uv("venv", base, "--python", "3.12")
 		uv("pip", "install", "--python", filepath.Join(base, "bin", "python"), child)
@@ -129,10 +129,10 @@ only-include=[%q]
 		evalWheel, err := filepath.Abs(*privateChildEvalWheel)
 		must(t, err)
 		evalVersion := strings.Split(filepath.Base(evalWheel), "-")[1]
-		write(child, "pyproject.toml", metadata("private-media-scorer", "scorer", `,"cozy-eval==`+evalVersion+`"`, "cozy-eval={path="+strconv.Quote(evalWheel)+"}"))
+		write(child, "pyproject.toml", metadata("private-media-scorer", "scorer", `,"cozy-eval>=`+evalVersion+`"`, "cozy-eval={path="+strconv.Quote(evalWheel)+"}"))
 		write(child, "package.toml", "[application]\nobject=\"scorer:app\"\n")
 		write(child, "scorer.py", "from cozy_eval.operations import app\n")
-		write(project, "pyproject.toml", metadata("private-media-parent", "parent", `,"private-media-scorer==0.1.0"`, "private-media-scorer={path=\"./child\"}"))
+		write(project, "pyproject.toml", metadata("private-media-parent", "parent", `,"private-media-scorer>=0.1.0"`, "private-media-scorer={path=\"./child\"}"))
 	}
 	write(project, "package.toml", "[application]\nobject=\"parent:app\"\n")
 	write(project, "parent.py", `import msgspec

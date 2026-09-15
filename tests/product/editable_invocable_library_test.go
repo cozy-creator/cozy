@@ -52,7 +52,7 @@ func TestEditableInvocableLibraryTracksCodeWithoutPackageManifest(t *testing.T) 
 name="editable-leaf-proof"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s"]
+dependencies=["cozy-runtime>=%s"]
 [project.entry-points."cozy.application"]
 default="editable_leaf:app"
 [build-system]
@@ -76,7 +76,7 @@ app.job(value)
 	must(t, os.WriteFile(module, []byte(body), 0600))
 	script := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==%s", "editable-leaf-proof==1.0.0"]
+# dependencies = ["cozy-runtime>=%s", "editable-leaf-proof>=1.0.0"]
 # [tool.uv.sources]
 %s# editable-leaf-proof = {path = %q, editable = true}
 # ///

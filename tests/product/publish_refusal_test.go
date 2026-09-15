@@ -157,7 +157,7 @@ func TestPublishRefusesAuthorLocalLockRows(t *testing.T) {
 // and dependency wheels, and stops only at the PackageInterface step (this fixture
 // deliberately has no cozy-runtime to describe it).
 func TestPublishStagesInTreeDependencies(t *testing.T) {
-	tree := fixtureTree(t, fixturePyproject("cozy-fixture-helper==0.0.1")+`
+	tree := fixtureTree(t, fixturePyproject("cozy-fixture-helper>=0.0.1")+`
 [tool.uv.sources]
 cozy-fixture-helper = { path = "libs/helper" }
 `, minimalFixtureLock)
