@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -120,13 +121,27 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		return host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
 	}
 	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
-		operation := machinePackageOperation(request, revision)
+		baseOperation := machinePackageOperation(request, revision)
+		operation, transfers, problem := m.store.MachinePackageTransfer(request, claim.WorkerBootId, revision.Digest)
+		if problem != nil {
+			return problem
+		}
+		if operation == "" {
+			operation = baseOperation
+		}
+		if operation != baseOperation {
+			sequence, err := strconv.Atoi(strings.TrimPrefix(operation, baseOperation+".repair-"))
+			if err != nil || sequence < 1 || sequence > transfers {
+				return exit.New(exit.Conflict, "captured package transfer names another operation")
+			}
+		}
 		selected, problem := orchestrator.LocalPackageSelection(operation, revision)
 		if problem != nil {
 			return problem
 		}
+		uploaded := transfers > 0
 		// Installation belongs to the worker. A new request asks about its immutable
-		// revision; no previous client's upload event is evidence of current readiness.
+		// revision; no client's upload event proves current installation readiness.
 		if info.SupportsLocalInstallationReuse {
 			stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
 			if err != nil {
@@ -139,17 +154,23 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			if event == nil || event.Stage != pb.PrepareStage_PREPARE_STAGE_REFUSED || event.SafeCode != "local_package_reuse_unavailable" {
 				return problem
 			}
-		}
-		uploaded, problem := m.store.MachinePackageUploaded(request, claim.WorkerBootId, revision.Digest)
-		if problem != nil {
-			return problem
+			if uploaded {
+				// A prepared transfer is terminal and its wheel carriers may be gone.
+				// Repair missing installation bytes with a fresh, replayable transfer;
+				// preserve the original transfer's history and the execution's identity.
+				operation = baseOperation + ".repair-" + strconv.Itoa(transfers)
+				selected, problem = orchestrator.LocalPackageSelection(operation, revision)
+				if problem != nil {
+					return problem
+				}
+				uploaded = false
+			}
 		}
 		if !uploaded {
 			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
 				return problem
 			}
-			// Retain this root's verified transfer before preparation removes carriers.
-			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest}); problem != nil {
+			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest, "operation_id": operation}); problem != nil {
 				return problem
 			}
 		}

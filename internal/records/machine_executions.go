@@ -49,13 +49,23 @@ type MachineExecution struct {
 
 const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected`
 
-func (s *Store) MachinePackageUploaded(request, boot, revision string) (bool, *exit.Error) {
-	var uploaded bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='machine.package_uploaded' AND json_extract(payload,'$.worker_boot_id')=? AND json_extract(payload,'$.revision')=?)`, request, boot, revision).Scan(&uploaded)
-	if err != nil {
-		return false, exit.Internalf("cannot read machine package transfer progress: %s", err)
+// MachinePackageTransfer returns this request's last completed transfer and its
+// sequence. A failed repair upload resumes the same next operation after reconnect.
+// This records transfer progress; it is never evidence of an installed package.
+func (s *Store) MachinePackageTransfer(request, boot, revision string) (string, int, *exit.Error) {
+	var operation string
+	var count int
+	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.operation_id'),''), count(*) OVER ()
+ FROM request_events WHERE request_id=? AND type='machine.package_uploaded'
+ AND json_extract(payload,'$.worker_boot_id')=? AND json_extract(payload,'$.revision')=?
+ ORDER BY seq DESC LIMIT 1`, request, boot, revision).Scan(&operation, &count)
+	if err == sql.ErrNoRows {
+		return "", 0, nil
 	}
-	return uploaded, nil
+	if err != nil {
+		return "", 0, exit.Internalf("cannot read machine package transfer operation: %s", err)
+	}
+	return operation, count, nil
 }
 
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
