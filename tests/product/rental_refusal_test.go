@@ -1,11 +1,19 @@
 package producttest
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/cli"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 )
@@ -98,5 +106,84 @@ func TestARefusalSurvivesAHubThatCannotAnswer(t *testing.T) {
 	// It must still list what IS buyable, so the person has somewhere to go.
 	if !strings.Contains(refusal.Remedy, "rtx-4090") {
 		t.Fatalf("the fallback refusal does not show the live catalog: %v", refusal.Remedy)
+	}
+}
+
+func TestRentalCLIExplainsBootFailureExclusions(t *testing.T) {
+	const sku = "h100-sxm5-80gb-x2"
+	retryAfter := time.Date(2026, 9, 15, 22, 5, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, reason, code, want string
+		retryAfter               *time.Time
+		offered                  bool
+	}{
+		{"cooldown", "cooldown", "rental.sku_cooldown",
+			"temporarily excluded after a recent boot failure. Retry after 2026-09-15T22:05:00Z.", &retryAfter, false},
+		{"cooldown_without_time", "cooldown", "rental.sku_cooldown",
+			"temporarily excluded after a recent boot failure. Please try again shortly.", nil, false},
+		{"recovery_retry", "retry_in_progress", "rental.sku_retry_in_progress",
+			"while one retry after a recent boot failure is in progress", nil, false},
+		{"older_hub", "", "rental.sku_out_of_stock", "our GPU providers have no inventory", nil, false},
+		{"cooldown_expired_after_listing", "", "rental.sku_availability_changed",
+			"became available after the catalog was read. Please retry the rental request.", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var writes atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method != http.MethodGet {
+					writes.Add(1)
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				switch r.URL.Path {
+				case "/v1/rentals":
+					_, _ = w.Write([]byte(`{"rentals":[]}`))
+				case "/v1/rental-skus":
+					_, _ = w.Write([]byte(`[]`))
+				case "/v1/rental-skus/" + sku:
+					_ = json.NewEncoder(w).Encode(hub.RentalSKUStatus{
+						Name: sku, Known: true, Offered: tc.offered,
+						UnavailableReason: tc.reason, RetryAfter: tc.retryAfter,
+					})
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			root, err := os.MkdirTemp("", "cozy-sku-refusal-")
+			must(t, err)
+			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
+				fmt.Sprintf("tensorhub_url: %s\ntensorhub_token: rental-refusal-test\n", server.URL)), 0o600))
+			for _, format := range []string{"human", "json"} {
+				args := []string{"rental", "new", sku}
+				if format == "json" {
+					args = append(args, "--json")
+				}
+				code, out := runCozy(t, root, args...)
+				if code != 1 || !strings.Contains(out, tc.want) {
+					t.Fatalf("cozy %s [exit %d]: %s", strings.Join(args, " "), code, out)
+				}
+				if (tc.reason != "" || tc.offered) && strings.Contains(out, "no inventory") {
+					t.Fatalf("temporary exclusion was described as missing provider inventory: %s", out)
+				}
+				if format == "json" {
+					var reply struct {
+						Error struct {
+							Code string `json:"code"`
+						} `json:"error"`
+					}
+					must(t, json.Unmarshal([]byte(out), &reply))
+					if reply.Error.Code != tc.code {
+						t.Fatalf("wrong structured refusal: %s", out)
+					}
+				}
+				t.Logf("cozy %s: %s", strings.Join(args, " "), strings.TrimSpace(out))
+			}
+			if got := writes.Load(); got != 0 {
+				t.Fatalf("reading availability attempted %d rental mutations", got)
+			}
+		})
 	}
 }

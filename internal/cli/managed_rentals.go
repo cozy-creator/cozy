@@ -201,18 +201,8 @@ func (m *managedRentals) admit(skuName string) (string, hub.RentalSKU, *exit.Err
 	return "", hub.RentalSKU{}, m.refuseSKULocked(skuName, skus)
 }
 
-// refuseSKULocked names the absence. The catalog is live provider inventory, so a
-// name missing from it means one of two completely different things:
-//
-//	"Tensorhub sells no such machine"      -> you typed something wrong; stop
-//	"that machine has no inventory now"    -> wait a couple of minutes; retry
-//
-// They used to share one sentence. On 2026-09-04 an explicit `cozy rental new
-// rtx-a4000` was refused during a 32-minute stock-out, the message read as the
-// first, and the conclusion drawn was that the rental code had substituted a
-// dearer card — it had not, and two issues were filed against a defect that does
-// not exist. The hub knows which absence it is; this asks, on the refusal path
-// only, and a hub that cannot answer just gets the plain refusal.
+// refuseSKULocked distinguishes unknown products, provider stock-outs, and
+// temporary boot-failure exclusions. Reading status never acquires a rental.
 func (m *managedRentals) refuseSKULocked(skuName string, skus []hub.RentalSKU) *exit.Error {
 	hctx, cancel := hub.Context()
 	status, problem := client(m.ctx).RentalSKUStatus(hctx, skuName)
@@ -247,8 +237,28 @@ func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatu
 			"Tensorhub sells no rental SKU named %q — %s", skuName, said).
 			WithRemedy("choose one of the names it does sell: %s", offeredNames(skus)).
 			WithNext("cozy rental new")
+	case status.Offered:
+		return exit.Named(exit.Capacity, "rental.sku_availability_changed",
+			"%s became available after the catalog was read. Please retry the rental request.", skuName).
+			WithNext("cozy rental new "+skuName, "cozy rental new")
 	}
 	message := fmt.Sprintf("Sorry, but our GPU providers have no inventory for %s right now.", skuName)
+	switch status.UnavailableReason {
+	case "cooldown":
+		message = fmt.Sprintf("%s is temporarily excluded after a recent boot failure.", skuName)
+		if status.RetryAfter != nil {
+			message += " Retry after " + status.RetryAfter.UTC().Format(time.RFC3339) + "."
+		} else {
+			message += " Please try again shortly."
+		}
+		return exit.Named(exit.Capacity, "rental.sku_cooldown", "%s", message).
+			WithNext("cozy rental new "+skuName, "cozy rental new")
+	case "retry_in_progress":
+		return exit.Named(exit.Capacity, "rental.sku_retry_in_progress",
+			"%s is temporarily unavailable while one retry after a recent boot failure is in progress. "+
+				"Please try again once it finishes.", skuName).
+			WithNext("cozy rental new "+skuName, "cozy rental new")
+	}
 	if status.LastSeenAt != nil {
 		message += fmt.Sprintf(" %s was last available at %s (%s ago).", skuName,
 			status.LastSeenAt.UTC().Format(time.RFC3339),
