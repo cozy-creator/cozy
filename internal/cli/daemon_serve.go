@@ -127,11 +127,15 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	machines := newMachineRuns(ctx, l, st, resolver, fleet)
 	defer machines.cancel()
+	updates := &rentalRuntimeUpdates{machines: machines}
+	machines.updates = updates
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	defects := newDefectReporter(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
-		StartMachineExecution: machines.Start,
-		Cfg:                   ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
+		StartMachineExecution:  machines.Start,
+		RentalRuntimePreflight: machines.updates.preflight,
+		RentalRuntimeMismatch:  machines.updates.reobserve,
+		Cfg:                    ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
 		RentalPrepareFacts: rental.PrepareFactsSource(client(ctx)),
@@ -193,6 +197,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 
 	server := api.New(api.Options{
+		RuntimeUpdate:     updates.Start,
 		MachineExecutions: machines,
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
@@ -206,6 +211,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		closeListeners()
 		return e
 	}
+	updates.Resume()
 	machines.Resume()
 
 	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",

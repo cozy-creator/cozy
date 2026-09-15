@@ -83,6 +83,7 @@ type Server struct {
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
 	rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	rentalInventory func(bool) (RentalInventory, *exit.Error)
+	runtimeUpdate   func(string) (*records.RuntimeUpdate, *exit.Error)
 
 	// shutdown asks the process that owns this server to drain and stop — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
@@ -135,6 +136,7 @@ type Options struct {
 	// sent separately over WorkerControl.
 	Rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	RentalInventory func(bool) (RentalInventory, *exit.Error)
+	RuntimeUpdate   func(string) (*records.RuntimeUpdate, *exit.Error)
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
 }
@@ -149,7 +151,7 @@ func New(opt Options) *Server {
 		orchestrator:      opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
-		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, shutdown: opt.Shutdown,
+		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, runtimeUpdate: opt.RuntimeUpdate, shutdown: opt.Shutdown,
 	}
 }
 
@@ -190,29 +192,31 @@ func (s *Server) recordSubmission(spec orchestrator.Submission,
 func (s *Server) Handler() (http.Handler, *exit.Error) {
 	mux := http.NewServeMux()
 	handlers := map[string]http.HandlerFunc{
-		"POST /v1/requests":                           s.submit,
-		"GET /v1/requests":                            s.listRequests,
-		"GET /v1/requests/{id}":                       s.getRequest,
-		"POST /v1/requests/{id}/cancel":               s.cancelRequest,
-		"GET /v1/requests/{id}/events":                s.requestEvents,
-		"GET /v1/media/{media_id}":                    s.media,
-		"GET /v1/local/attempts/{attempt_key}/triage": s.attemptTriage,
-		"POST /v1/local/rentals/{rental_id}/claim":    s.claimRental,
-		"GET /v1/local/rentals":                       s.listRentals,
-		"DELETE /v1/local/rentals/{rental_id}/claim":  s.detachRental,
-		"POST /v1/local/rentals/{rental_id}/prune":    s.pruneRental,
-		"POST /v1/local/cache/prune":                  s.pruneCache,
-		"POST /v1/local/daemon/unload":                s.unload,
-		"POST /v1/local/daemon/down":                  s.downDaemon,
-		"POST /v1/local/jobs":                         s.submitJob,
-		"GET /v1/local/jobs/{id}":                     s.getJob,
-		"POST /v1/local/jobs/{id}/pause":              s.pauseJob,
-		"POST /v1/local/jobs/{id}/resume":             s.resumeJob,
-		"POST /v1/local/jobs/{id}/retry-publication":  s.retryJobPublication,
-		"POST /v1/local/jobs/{id}/cancel":             s.cancelJob,
-		"GET /{$}":                                    s.webUI,
-		"GET /app.css":                                s.webUI,
-		"GET /app.js":                                 s.webUI,
+		"POST /v1/requests":                                 s.submit,
+		"GET /v1/requests":                                  s.listRequests,
+		"GET /v1/requests/{id}":                             s.getRequest,
+		"POST /v1/requests/{id}/cancel":                     s.cancelRequest,
+		"GET /v1/requests/{id}/events":                      s.requestEvents,
+		"GET /v1/media/{media_id}":                          s.media,
+		"GET /v1/local/attempts/{attempt_key}/triage":       s.attemptTriage,
+		"POST /v1/local/rentals/{rental_id}/claim":          s.claimRental,
+		"GET /v1/local/rentals":                             s.listRentals,
+		"DELETE /v1/local/rentals/{rental_id}/claim":        s.detachRental,
+		"POST /v1/local/rentals/{rental_id}/prune":          s.pruneRental,
+		"POST /v1/local/rentals/{rental_id}/runtime-update": s.startRuntimeUpdate,
+		"GET /v1/local/rentals/{rental_id}/runtime-update":  s.readRuntimeUpdate,
+		"POST /v1/local/cache/prune":                        s.pruneCache,
+		"POST /v1/local/daemon/unload":                      s.unload,
+		"POST /v1/local/daemon/down":                        s.downDaemon,
+		"POST /v1/local/jobs":                               s.submitJob,
+		"GET /v1/local/jobs/{id}":                           s.getJob,
+		"POST /v1/local/jobs/{id}/pause":                    s.pauseJob,
+		"POST /v1/local/jobs/{id}/resume":                   s.resumeJob,
+		"POST /v1/local/jobs/{id}/retry-publication":        s.retryJobPublication,
+		"POST /v1/local/jobs/{id}/cancel":                   s.cancelJob,
+		"GET /{$}":                                          s.webUI,
+		"GET /app.css":                                      s.webUI,
+		"GET /app.js":                                       s.webUI,
 	}
 	registered := map[string]bool{}
 	for _, r := range Routes {

@@ -159,7 +159,8 @@ func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *t
 	if verdicts["guchuko"] != "excluded:attaching: lumachina" || verdicts["lumachina"] != "attaching" ||
 		verdicts["h100-80"] != fleetCapVerdict || verdicts["h200"] != fleetCapVerdict || verdicts["b200"] != fleetCapVerdict ||
 		placement["line"] != "placement: wait for lumachina (h100-80, fp8-adaln-pruned) to attach — balanced" {
-		t.Fatalf("the wait record: %v", placement)
+		held, _ := store.RequestRow("req-held")
+		t.Fatalf("the wait record: %v; held request: %+v\n%s", placement, held, tail(filepath.Join(root, "daemon.log")))
 	}
 	if current, problem := store.RequestByIdempotencyKey("fleet-wait"); problem != nil || current.Worker != "" || settled(current.State) {
 		t.Fatalf("the waiting request is %+v; want queued and unpinned", current)

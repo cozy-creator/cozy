@@ -425,6 +425,7 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
+	Update  RentalUpdateCmd  `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
 	SSHInfo RentalSSHInfoCmd `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List    RentalListCmd    `cmd:"" help:"List rented machines, live on a terminal."`
 	New     RentalNewCmd     `cmd:"" help:"Start a private rental, or list available machine types."`
@@ -432,8 +433,16 @@ type RentalCmd struct {
 	Prune   RentalPruneCmd   `cmd:"" help:"Free unused cached operation results on a private rental."`
 }
 
+type RentalUpdateCmd struct {
+	Rental string `arg:"" help:"Existing rental name or id."`
+}
+
+func (c *RentalUpdateCmd) Run(r *Runtime) error {
+	return r.call(handleRentalUpdate, []string{c.Rental}, nil, nil, false)
+}
+
 type RentalNewCmd struct {
-	Development      *bool    `help:"Rent a developer worker; false overrides the configured default."`
+	Development      *bool    `help:"Use a maintenance-capable private worker (default); false selects an immutable worker."`
 	SSHPublicKey     string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
 	DevelopmentImage string   `name:"development-image" help:"Pin one registered developer image by sha256 digest for this rental."`
 	SKU              string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`

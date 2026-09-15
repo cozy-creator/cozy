@@ -121,7 +121,7 @@ type values struct {
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
 	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
 	RentalsIdleReleaseS      int64  `name:"rentals_idle_release_s" default:"300"`
-	RentalsDevelopment       bool   `name:"rentals_development"`
+	RentalsDevelopment       bool   `name:"rentals_development" default:"true"`
 	RentalsSSHPublicKey      string `name:"rentals_ssh_public_key"`
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
 	MaintenanceGCCron        string `name:"maintenance_gc_cron" default:"0 3 * * *"`

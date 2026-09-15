@@ -89,6 +89,9 @@ func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, 
 	root, path = t.TempDir(), t.TempDir()
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 	activity = filepath.Join(root, "tool-activity")
+	sshKeygen, err := exec.LookPath("ssh-keygen")
+	must(t, err)
+	must(t, os.Symlink(sshKeygen, filepath.Join(path, "ssh-keygen")))
 	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 	// Both stand-ins append to one observable trace. An invalid request must not
 	// even ensure the empty store or query the accelerator.

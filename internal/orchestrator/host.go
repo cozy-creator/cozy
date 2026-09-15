@@ -12,12 +12,14 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -179,6 +181,9 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 			if err == io.EOF {
 				err = status.Error(codes.FailedPrecondition, "the host closed the prepare stream without a terminal event")
 			}
+			if problem := RuntimeRequirementTrailer(stream.Trailer()); problem != nil {
+				return hostPrepareResult{fault: problem}
+			}
 			return classifyPrepareEnd(err)
 		}
 		c.observePrepareEvent(w.instanceID, machine, label, event)
@@ -190,6 +195,12 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 		}
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:
+			if problem := RuntimeRequirementEvent(event); problem != nil {
+				return hostPrepareResult{fault: problem}
+			}
+			if event.SafeCode == "package_environment_dependency_base_conflict" {
+				return hostPrepareResult{fault: exit.Named(exit.Structural, "machine_execution.runtime_requirement", "%s", event.SafeDetail)}
+			}
 			return hostPrepareResult{refusal: event.SafeCode + ": " + event.SafeDetail}
 		case pb.PrepareStage_PREPARE_STAGE_PREPARED:
 			prepared := event.PlacementSet
@@ -454,4 +465,46 @@ func (c *Orchestrator) observePrepareEvent(instanceID, machine, label string, ev
 	sample.HasBytes = event.GetTotalBytes() > 0 || event.GetTransferredBytes() > 0
 	sample.Moved, sample.Total = event.GetTransferredBytes(), event.GetTotalBytes()
 	c.ObservePhase(instanceID, sample)
+}
+
+// RuntimeRequirementTrailer preserves authenticated worker dependency facts for both preparation paths.
+func RuntimeRequirementTrailer(trailer metadata.MD) *exit.Error {
+	first := func(key string) string {
+		values := trailer.Get(key)
+		if len(values) == 1 && len(values[0]) <= 2048 {
+			return values[0]
+		}
+		return ""
+	}
+	packageName, distribution := first("cozy-requirement-package"), first("cozy-requirement-distribution")
+	required, installed := first("cozy-requirement-required"), first("cozy-requirement-installed")
+	if packageName == "" || distribution == "" || required == "" || installed == "" {
+		return nil
+	}
+	name := "machine_execution.package_requirement"
+	if distribution == "cozy-runtime" || distribution == "tensorfs" { //cozy:allow distribution metadata, not a binary invocation
+		name = "machine_execution.runtime_requirement"
+	}
+	return exit.Named(exit.Structural, name, "%s requires %s; this worker has %s %s", packageName, required, distribution, installed)
+}
+
+// RuntimeRequirementEvent decodes the Host's bounded dependency verdict. It is
+// shared by ordinary serving and Runtime-owned root preparation.
+func RuntimeRequirementEvent(event *pb.PrepareEvent) *exit.Error {
+	if event.SafeCode != "package_runtime_incompatible" && event.SafeCode != "package_sdk_incompatible" {
+		return nil
+	}
+	if len(event.SafeDetail) > 8192 {
+		return nil
+	}
+	var detail struct {
+		Package      string `json:"package"`
+		Distribution string `json:"distribution"`
+		Required     string `json:"required"`
+		Installed    string `json:"installed"`
+	}
+	if json.Unmarshal([]byte(event.SafeDetail), &detail) != nil {
+		return nil
+	}
+	return RuntimeRequirementTrailer(metadata.Pairs("cozy-requirement-package", detail.Package, "cozy-requirement-distribution", detail.Distribution, "cozy-requirement-required", detail.Required, "cozy-requirement-installed", detail.Installed))
 }

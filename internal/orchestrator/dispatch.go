@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"math"
@@ -840,6 +841,25 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			}
 			c.mu.Unlock()
 		}
+		if req.Worker != "" && c.opt.RentalRuntimePreflight != nil {
+			problem := c.opt.RentalRuntimePreflight(context.Background(), req, req.Worker)
+			current, readProblem := c.opt.Store.RequestRow(req.ID)
+			if readProblem != nil || current == nil || (current.State != "queued" && current.State != "submitted") || current.Worker != req.Worker {
+				// Rental reconciliation can unpin this request while the remote
+				// compatibility observation is in flight. Its stale selection must
+				// never settle the request that is now awaiting replacement capacity.
+				done()
+				c.drain()
+				return
+			}
+			if problem != nil {
+				done()
+				if deferred, _ := c.deferUnavailable(req, problem); !deferred {
+					c.failQueued(req.ID, problem, "")
+				}
+				return
+			}
+		}
 		spec, planID, e := c.resolveFor(req)
 		if e != nil {
 			done()
@@ -886,6 +906,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		}
 		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
 		if e := c.EnsurePlacementReady(instance, req.PlanID, req.ID); e != nil {
+			if c.opt.RentalRuntimeMismatch != nil && req.Worker != "" {
+				e = c.opt.RentalRuntimeMismatch(req, req.Worker, e)
+			}
 			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				done()
 				return

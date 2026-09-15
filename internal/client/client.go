@@ -266,6 +266,18 @@ func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Erro
 	return result, problem
 }
 
+func (c *Client) UpdateRentalRuntime(rentalID string) (api.RuntimeUpdate, *exit.Error) {
+	var result api.RuntimeUpdate
+	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", map[string]any{}, &result)
+	return result, problem
+}
+
+func (c *Client) RentalRuntimeUpdate(rentalID string) (api.RuntimeUpdate, *exit.Error) {
+	var result api.RuntimeUpdate
+	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", nil, &result)
+	return result, problem
+}
+
 func (c *Client) PruneLocalCache() (api.CachePruneResult, *exit.Error) {
 	var result api.CachePruneResult
 	problem := c.call(http.MethodPost, "/v1/local/cache/prune", map[string]any{}, &result)

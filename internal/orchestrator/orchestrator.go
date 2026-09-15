@@ -45,7 +45,9 @@ import (
 type Options struct {
 	// StartMachineExecution transfers and observes an execution owned by Runtime.
 	// It never offers an attempt through this legacy cross-machine dispatcher.
-	StartMachineExecution func(records.Request) *exit.Error
+	StartMachineExecution  func(records.Request) *exit.Error
+	RentalRuntimePreflight func(context.Context, records.Request, string) *exit.Error
+	RentalRuntimeMismatch  func(records.Request, string, *exit.Error) *exit.Error
 	// ReclaimInstall delegates unpinned snapshot cleanup to the existing package owner.
 	ReclaimInstall func(string) *exit.Error
 	Cfg            config.Config
@@ -514,11 +516,13 @@ type Orchestrator struct {
 	// ensuring is the per-instance creation fence beneath every caller, including child
 	// recovery. `starting` serializes queue policy; this prevents two callers that already
 	// chose the same deterministic slot from spawning two processes into it.
-	ensuring         map[string]chan struct{}
-	revision         uint64 // hub-owned, monotonic; every Directive bumps it
-	residentRevision uint64 // local serving-worker arrival order; tie-breaks never-used LRU rows
-	lastUseRevision  uint64 // successful local serving dispatch order
-	events           []string
+	ensuring          map[string]chan struct{}
+	rentalUses        map[string]int
+	rentalMaintenance map[string]bool
+	revision          uint64 // hub-owned, monotonic; every Directive bumps it
+	residentRevision  uint64 // local serving-worker arrival order; tie-breaks never-used LRU rows
+	lastUseRevision   uint64 // successful local serving dispatch order
+	events            []string
 
 	// frames is the LOSSY live lane's fanout (stream.go). The durable lane is rows in
 	// the records authority; these two are the whole event surface cl-006 serves.
@@ -573,6 +577,8 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		starting:             map[string]bool{},
 		parked:               map[string]*parking{},
 		ensuring:             map[string]chan struct{}{},
+		rentalUses:           map[string]int{},
+		rentalMaintenance:    map[string]bool{},
 		frames:               newFanout(),
 		phases:               newPhases(),
 		transferWake:         make(map[string]chan struct{}),
