@@ -433,7 +433,7 @@ type RentalCmd struct {
 }
 
 type RentalNewCmd struct {
-	Development      *bool    `help:"Rent a developer worker; false overrides the configured default."`
+	Development      *bool    `help:"Use a maintenance-capable private worker (default); false selects an immutable worker."`
 	SSHPublicKey     string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
 	DevelopmentImage string   `name:"development-image" help:"Pin one registered developer image by sha256 digest for this rental."`
 	SKU              string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`

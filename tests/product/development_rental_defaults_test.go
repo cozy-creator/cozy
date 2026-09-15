@@ -178,6 +178,8 @@ func TestDevelopmentImageRefusesNonDevelopmentAndMutableNames(t *testing.T) {
 		args := []string{"rental", "new", "cpu", "--development-image", image, "--json"}
 		if image != "sha256:"+strings.Repeat("a", 64) {
 			args = append(args, "--development", "--ssh-public-key", keyPath)
+		} else {
+			args = append(args, "--development=false")
 		}
 		code, out := runCozy(t, root, args...)
 		if code == 0 || !strings.Contains(out, "development") {
@@ -189,5 +191,61 @@ func TestDevelopmentImageRefusesNonDevelopmentAndMutableNames(t *testing.T) {
 		if count != 0 {
 			t.Fatal("invalid image request reached acquisition")
 		}
+	}
+}
+
+func TestPrivateRentalDefaultCreatesAndReusesManagedSSHIdentity(t *testing.T) {
+	root, mu, posts, _, _ := runModelCatalog(t)
+	startDaemonProcess(t, root)
+	args := []string{"rental", "new", "cpu", "--idempotency-key", "managed-ssh-default", "--json"}
+	code, out := runCozy(t, root, args...)
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("private default did not reach isolated acquisition: %d %s", code, out)
+	}
+	keyPath := filepath.Join(root, "auth", "rental-ssh")
+	private, err := os.ReadFile(keyPath)
+	must(t, err)
+	info, err := os.Stat(keyPath)
+	must(t, err)
+	if info.Mode().Perm() != 0600 || strings.Contains(out, string(private)) {
+		t.Fatal("managed SSH identity is not private")
+	}
+	public, err := os.ReadFile(keyPath + ".pub")
+	must(t, err)
+	mu.Lock()
+	body := append([]byte(nil), (*posts)[0]...)
+	mu.Unlock()
+	request, problem := hub.ParseRentalRequestBytes(body)
+	fatal(t, problem)
+	if request.Development == nil || request.Development.SSHPublicKey != strings.TrimSpace(string(public)) {
+		t.Fatal("new private rental did not capture the managed public key")
+	}
+	code, out = runCozy(t, root, "rental", "new", "cpu", "--idempotency-key", "managed-ssh-second", "--json")
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("second private acquisition failed: %d %s", code, out)
+	}
+	after, err := os.ReadFile(keyPath)
+	must(t, err)
+	if !bytes.Equal(private, after) {
+		t.Fatal("a new rental replaced the maintenance identity")
+	}
+}
+
+func TestImmutableRentalOverrideDoesNotCreateManagedSSHIdentity(t *testing.T) {
+	root, mu, posts, _, _ := runModelCatalog(t)
+	startDaemonProcess(t, root)
+	code, out := runCozy(t, root, "rental", "new", "cpu", "--development=false", "--json")
+	if code == 0 || !strings.Contains(out, "proof.no_paid_create") {
+		t.Fatalf("immutable override did not reach isolated acquisition: %d %s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "auth", "rental-ssh")); !os.IsNotExist(err) {
+		t.Fatal("immutable rental created maintenance credentials")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	request, problem := hub.ParseRentalRequestBytes((*posts)[0])
+	fatal(t, problem)
+	if request.Development != nil {
+		t.Fatal("immutable rental carries developer access")
 	}
 }
