@@ -355,11 +355,22 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 		}
 		c.mu.Unlock()
 	}()
-	return localpackage.UploadFile(ctx, current.host,
+	problem := localpackage.UploadFile(ctx, current.host,
 		&pb.LocalPackageUploadHeader{Claim: current.claim, OperationId: operationID,
 			SourceDigest: transfer.source, File: &pb.LocalPackageFileRef{Digest: selected.digest,
 				Filename: selected.filename, Length: selected.length}}, selected.path,
 		func(status *pb.LocalPackageFileStatus) { c.onLocalPackageFileStatus(current, status) })
+	c.mu.Lock()
+	canceled := transfer.canceled
+	c.mu.Unlock()
+	if problem != nil && problem.Code == exit.Canceled && current.ctx.Err() != nil && !canceled {
+		// The upload inherits the control stream's lifetime. Losing that stream is
+		// not user cancellation: reconnect can resume the Host's durable prefix.
+		// Explicit request cancellation sets transfer.canceled before canceling it.
+		return exit.Named(exit.Unavailable, "local_package_upload_interrupted",
+			"worker control stream ended during unpublished upload; acknowledged bytes can be resumed")
+	}
+	return problem
 }
 
 // proveLocalWheelsUnchanged reads the local files the revision named. The digest is the
