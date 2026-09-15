@@ -223,6 +223,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		OutputDirectory: outputDirectory,
 		AttentionKernel: overrides.AttentionKernel,
 	}, key)
+	releaseSnapshotReader(target)
 	if e != nil {
 		return e
 	}
@@ -2160,11 +2161,12 @@ func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 
 // Target is one installed package and optional callable selected for invocation.
 type Target struct {
-	Package   string
-	Function  string
-	InstallID string
-	Release   string
-	Snapshot  bool
+	Package        string
+	Function       string
+	InstallID      string
+	Release        string
+	Snapshot       bool
+	releaseCapture func()
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path

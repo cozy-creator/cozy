@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 40
+const schemaVersion = 41
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -117,6 +117,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 func init() {
 	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
+	schema = append(schema, capturePinsDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -457,6 +458,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			if _, err := tx.Exec(statement); err != nil {
 				return exit.Internalf("cannot add machine execution observations: %s", err)
 			}
+		}
+	}
+	if sourceVersion < 41 {
+		if _, err := tx.Exec(capturePinsDDL); err != nil {
+			return exit.Internalf("cannot add completed capture ownership: %s", err)
 		}
 	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
@@ -831,6 +837,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 41 && statement == capturePinsDDL {
+			continue
+		}
 		if version < 40 && containsStatement(machineExecutionSchema, statement) {
 			continue
 		}
@@ -1320,6 +1329,7 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
 		FROM installs i WHERE i.id NOT IN (SELECT install_id FROM pins)
+		AND NOT EXISTS(SELECT 1 FROM capture_pins WHERE install_id=i.id)
 		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND (state IN (` + activeRequestStates + `) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
 		AND NOT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=i.id AND parent_install_id!=i.id)
 		ORDER BY i.created_at`)
@@ -1379,9 +1389,10 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	// not sever the result schema from a completed child still owned by its parent.
 	var held bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM pins WHERE install_id=?)
+		OR EXISTS(SELECT 1 FROM capture_pins WHERE install_id=?)
 		OR EXISTS(SELECT 1 FROM requests WHERE install_id=? AND (state IN (`+activeRequestStates+`) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
 		OR EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=? AND parent_install_id!=child_install_id)
-		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`, id, id, id, id).Scan(&held); err != nil {
+		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`, id, id, id, id, id).Scan(&held); err != nil {
 		return false, exit.New(exit.Conflict, "cannot inspect install %s gc ownership: %s", id, err)
 	}
 	if held {
@@ -1398,11 +1409,12 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	}
 	result, err := tx.Exec(`DELETE FROM installs WHERE id=?
 		AND NOT EXISTS (SELECT 1 FROM pins WHERE install_id=?)
+		AND NOT EXISTS (SELECT 1 FROM capture_pins WHERE install_id=?)
 		AND NOT EXISTS (SELECT 1 FROM requests WHERE install_id=?
 		  AND state IN (`+activeRequestStates+`))
 		AND NOT EXISTS (SELECT 1 FROM private_child_bindings WHERE child_install_id=? AND parent_install_id!=child_install_id)
 		AND NOT EXISTS (SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`,
-		id, id, id, id, id)
+		id, id, id, id, id, id)
 	if err != nil {
 		return false, exit.New(exit.Conflict, "cannot claim install %s for gc: %s", id, err)
 	}
