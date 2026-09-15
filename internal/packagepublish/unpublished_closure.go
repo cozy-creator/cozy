@@ -113,8 +113,11 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 			if _, problem := registryWheelIdentityBound(name, entry.Version, candidate, 2<<30); problem != nil {
 				return nil, nil, problem
 			}
-		} else if _, problem := pytorchBaseRequirement(name, entry.Version, entry.Source.Registry, row.Wheels); problem != nil {
-			return nil, nil, problem
+		} else {
+			candidate, problem = pytorchRegistryWheel(name, entry.Version, entry.Source.Registry, row.Wheels)
+			if problem != nil {
+				return nil, nil, problem
+			}
 		}
 		rows = append(rows, RegistryRow{Name: name, Version: entry.Version, URL: candidate.URL, SHA256: candidate.Hashes["sha256"], Size: candidate.Size})
 		delete(expected, name)

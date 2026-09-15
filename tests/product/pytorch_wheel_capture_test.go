@@ -31,8 +31,12 @@ func TestCapturedPyTorchRequirementPreservesOfficialObjectInPrivateEnvironment(t
 		return captured[name], problem == nil
 	}
 	good, ok := capture(t, "torch", index, object, hash)
-	if !ok || good.Requirement != "torch @ "+object+" --hash="+hash || good.Path != "" || good.Digest != "" || good.Application {
+	if !ok || good.Requirement != "torch @ "+strings.Replace(object, "download-r2.pytorch.org", "download.pytorch.org", 1)+" --hash="+hash || good.Path != "" || good.Digest != "" || good.Application {
 		t.Fatalf("official framework capture lost exact local identity or image ownership: %+v", good)
+	}
+	canonical, ok := capture(t, "torch", index, strings.Replace(object, "download-r2.pytorch.org", "download.pytorch.org", 1), hash)
+	if !ok || canonical.Requirement != good.Requirement {
+		t.Fatal("official mirrors changed the selected artifact identity")
 	}
 	for _, arm := range []struct{ name, index, url, hash string }{
 		{"foreign-index", "https://example.org/whl/cpu", object, hash},
