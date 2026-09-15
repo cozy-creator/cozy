@@ -61,6 +61,9 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 	if problem != nil {
 		return out, "", problem
 	}
+	if job.Internal && (binding.ChildInstallID != parent.InstallID || revision != parent.LocalPackageDigest) {
+		return out, "", exit.Named(exit.Conflict, "callable_internal", "internal functions require an admitted parent from the same package revision")
+	}
 	if (job.Kind != "job" && job.Kind != "entrypoint") || job.Invocable == nil || job.Invocable.Module != module || job.Invocable.Export != export {
 		return out, "", exit.Named(exit.Conflict, "child.export_changed", "the captured implementation does not expose the exact managed callable")
 	}

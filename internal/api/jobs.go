@@ -538,7 +538,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		out.WeightsOutputs = job.WeightsOutputs
 		out.NeedsAccelerator = job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request, Assets: job.Assets}, &out); problem != nil {
+		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Internal: job.Internal, Request: job.Request, Assets: job.Assets}, &out); problem != nil {
 			return out, nil, problem
 		}
 		if problem := s.deriveOutputExport(&launch.Entrypoint{Result: job.Result}, &out); problem != nil {
@@ -591,7 +591,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 		out.ReleaseImplicitWork = (job.Result.Fields != nil || job.Result.Input == "model") && len(job.WeightsOutputs) == 0 && (len(job.Outputs) == 0 || job.RetainsArtifacts)
 		out.WeightsOutputs, out.NeedsAccelerator = job.WeightsOutputs, job.NeedsAccelerator
 		out.ProducerParams = job.ModelParams
-		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Request: job.Request, Assets: job.Assets}, &out); problem != nil {
+		if problem := validateInputs(&launch.Entrypoint{Name: job.Name, Kind: "job", Internal: job.Internal, Request: job.Request, Assets: job.Assets}, &out); problem != nil {
 			return out, problem
 		}
 		if problem := s.deriveOutputExport(&launch.Entrypoint{Result: job.Result}, &out); problem != nil {
