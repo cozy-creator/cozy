@@ -283,7 +283,7 @@ func TestRentalInventoryAllowsPackageOwnedVersions(t *testing.T) {
 		t.Fatal(why)
 	}
 	for _, requirement := range []string{"cozy-runtime>=0.15.0", "Cozy_Runtime[media]>=0.15.0", "  cozy..runtime >=0.15.0"} {
-		if why := launch.InventoryMismatch(inventory, []string{requirement}, ""); !strings.Contains(why, "cozy-runtime 0.13.0") {
+		if why := launch.InventoryMismatch(inventory, []string{requirement}, ""); why != "" {
 			t.Fatalf("%s mismatch: %s", requirement, why)
 		}
 	}
@@ -297,11 +297,11 @@ func TestDevelopmentRentalInventoryLeavesMutablePairToWorker(t *testing.T) {
 	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13", true); why != "" {
 		t.Fatal(why)
 	}
-	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); !strings.Contains(why, runtimeDistribution) {
-		t.Fatalf("production image incorrectly exempted its Runtime: %s", why)
+	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); why != "" {
+		t.Fatalf("base Runtime constrained a package-private SDK: %s", why)
 	}
-	if why := launch.InventoryMismatch(inventory, []string{"torch>=3"}, "", true); !strings.Contains(why, "torch") {
-		t.Fatalf("development image ignored immutable Torch: %s", why)
+	if why := launch.InventoryMismatch(inventory, []string{"torch>=3"}, "", true); why != "" {
+		t.Fatalf("base Torch constrained a package-private version: %s", why)
 	}
 	if why := launch.InventoryMismatch(inventory, nil, ">=3.13", true); !strings.Contains(why, "Python") {
 		t.Fatalf("development image ignored Python: %s", why)
@@ -453,13 +453,13 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 	}
 }
 
-func TestRentalInventoryRefusesMalformedProtectedVersions(t *testing.T) {
+func TestRentalInventoryChecksPythonNotIncidentalDistributionVersions(t *testing.T) {
 	inventory := &pb.ImageInventory{Python: "broken", Distributions: []*pb.ImageDistribution{{Distribution: runtimeDistribution, Version: "broken"}}}
 	if why := launch.InventoryMismatch(inventory, nil, ">=3.12"); !strings.Contains(why, "invalid Python version") {
 		t.Fatal(why)
 	}
 	inventory.Python = "3.12.12"
-	if why := launch.InventoryMismatch(inventory, []string{"cozy-runtime>=0.15"}, ""); !strings.Contains(why, "invalid version for cozy-runtime") {
+	if why := launch.InventoryMismatch(inventory, []string{"cozy-runtime>=0.15"}, ""); why != "" {
 		t.Fatal(why)
 	}
 }
