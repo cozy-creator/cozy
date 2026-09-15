@@ -26,8 +26,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConnection, *exit.Error) {
@@ -118,28 +120,38 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		return host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
 	}
 	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
+		operation := machinePackageOperation(request, revision)
+		selected, problem := orchestrator.LocalPackageSelection(operation, revision)
+		if problem != nil {
+			return problem
+		}
+		// Installation belongs to the worker. A new request asks about its immutable
+		// revision; no previous client's upload event is evidence of current readiness.
+		if info.SupportsLocalInstallationReuse {
+			stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
+			if err != nil {
+				return machineTransport(err)
+			}
+			event, problem := readMachinePreparationEvent(stream)
+			if problem == nil {
+				return m.store.AppendEvent(request, "machine.package_reused", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest})
+			}
+			if event == nil || event.Stage != pb.PrepareStage_PREPARE_STAGE_REFUSED || event.SafeCode != "local_package_reuse_unavailable" {
+				return problem
+			}
+		}
 		uploaded, problem := m.store.MachinePackageUploaded(request, claim.WorkerBootId, revision.Digest)
 		if problem != nil {
 			return problem
 		}
-		operation := machinePackageOperation(request, revision)
 		if !uploaded {
-			// A prior request's Host receipt does not establish this Runtime's
-			// process-local prepared registry after a worker restart. New roots use
-			// their own normal upload/prepare; only this root's transfer may replay.
 			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
 				return problem
 			}
-			// Preparation may remove wheel carriers after installing their bytes.
-			// Freeze the verified upload before crossing that boundary, so recovery
-			// replays preparation rather than trying to reopen a terminal upload.
+			// Retain this root's verified transfer before preparation removes carriers.
 			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest}); problem != nil {
 				return problem
 			}
-		}
-		selected, problem := orchestrator.LocalPackageSelection(operation, revision)
-		if problem != nil {
-			return problem
 		}
 		stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
 		if err != nil {
@@ -147,6 +159,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		}
 		return readMachinePreparation(stream)
 	}
+
 	return result, nil
 }
 
@@ -400,6 +413,23 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 			return problem
 		}
 		request := &pb.PrepareLocalPackageRequest{OperationId: selected.OperationId, Package: selected.Package, InstallRoot: filepath.Join(root, "environments")}
+		if info.SupportsLocalInstallationReuse {
+			for _, file := range revision.Files {
+				digest, _ := canonical.Raw(file.Digest)
+				request.Wheels = append(request.Wheels, &pb.LocalPackageWheel{Digest: digest, Filename: file.Filename, Length: uint64(file.Length)})
+			}
+			prepared, err := preparation.PrepareLocalPackage(ctx, request)
+			if err == nil {
+				if problem := validateMachinePrepared(prepared.PlacementSet); problem != nil {
+					return problem
+				}
+				return m.store.AppendEvent(requestID, "machine.package_reused", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest})
+			}
+			if status.Code(err) != codes.FailedPrecondition || !strings.HasPrefix(status.Convert(err).Message(), "local_package_reuse_unavailable:") {
+				return machineTransport(err)
+			}
+			request.Wheels = nil
+		}
 		wheelRoot := filepath.Join(request.InstallRoot, ".stage", selected.OperationId, "wheels")
 		if err := os.MkdirAll(wheelRoot, 0o700); err != nil {
 			return exit.Internalf("cannot stage local Runtime wheels: %s", err)
