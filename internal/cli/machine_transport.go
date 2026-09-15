@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,8 +27,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConnection, *exit.Error) {
@@ -118,28 +121,74 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		return host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
 	}
 	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
-		uploaded, problem := m.store.MachinePackageUploaded(request, claim.WorkerBootId, revision.Digest)
+		baseOperation := machinePackageOperation(request, revision)
+		transfer, problem := m.store.MachinePackageTransfer(request, claim.WorkerBootId, revision.Digest)
 		if problem != nil {
 			return problem
 		}
-		operation := machinePackageOperation(request, revision)
-		if !uploaded {
-			// A prior request's Host receipt does not establish this Runtime's
-			// process-local prepared registry after a worker restart. New roots use
-			// their own normal upload/prepare; only this root's transfer may replay.
-			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
-				return problem
-			}
-			// Preparation may remove wheel carriers after installing their bytes.
-			// Freeze the verified upload before crossing that boundary, so recovery
-			// replays preparation rather than trying to reopen a terminal upload.
-			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest}); problem != nil {
-				return problem
+		operation := transfer.Operation
+		if operation == "" {
+			operation = baseOperation
+		}
+		if operation != baseOperation {
+			prefix := baseOperation + ".repair-"
+			sequence, err := strconv.Atoi(strings.TrimPrefix(operation, prefix))
+			if !strings.HasPrefix(operation, prefix) || err != nil || sequence < 1 || sequence > transfer.Completed {
+				return exit.New(exit.Conflict, "captured package transfer names another operation")
 			}
 		}
 		selected, problem := orchestrator.LocalPackageSelection(operation, revision)
 		if problem != nil {
 			return problem
+		}
+		uploaded := transfer.Uploaded
+		// Installation belongs to the worker. A new request asks about its immutable
+		// revision; no client's upload event proves current installation readiness.
+		if info.SupportsLocalInstallationReuse && (transfer.Operation == "" || uploaded) {
+			stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
+			if err != nil {
+				return machineTransport(err)
+			}
+			event, problem := readMachinePreparationEvent(stream)
+			if problem == nil {
+				return m.store.AppendEvent(request, "machine.package_reused", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest})
+			}
+			if event == nil || event.Stage != pb.PrepareStage_PREPARE_STAGE_REFUSED {
+				return problem
+			}
+			switch event.SafeCode {
+			case "local_package_reuse_unavailable":
+				if uploaded {
+					// Prepared transfers are terminal; repair with a new recorded
+					// operation, leaving the previous transfer and root intact.
+					operation = baseOperation + ".repair-" + strconv.Itoa(transfer.Completed)
+					selected, problem = orchestrator.LocalPackageSelection(operation, revision)
+					if problem != nil {
+						return problem
+					}
+					uploaded = false
+				}
+			case "local_package_transfer_incomplete":
+				// An older client may have left a durable prefix before recording
+				// upload-start. Host has verified that every received header still
+				// belongs to this exact source and selected wheel inventory.
+				uploaded = false
+			default:
+				return problem
+			}
+		}
+		if !uploaded {
+			if transfer.Operation != operation || transfer.Uploaded {
+				if problem := m.store.AppendEvent(request, "machine.package_upload_started", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest, "operation_id": operation}); problem != nil {
+					return problem
+				}
+			}
+			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
+				return problem
+			}
+			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest, "operation_id": operation}); problem != nil {
+				return problem
+			}
 		}
 		stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
 		if err != nil {
@@ -147,6 +196,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		}
 		return readMachinePreparation(stream)
 	}
+
 	return result, nil
 }
 
@@ -166,74 +216,10 @@ func uploadMachinePackage(ctx context.Context, host pb.PodHostClient, claim *pb.
 		if err != nil {
 			return exit.New(exit.Conflict, "captured wheel identity is invalid")
 		}
-		stream, err := host.LocalPackageUpload(ctx)
-		if err != nil {
-			return machineTransport(err)
-		}
-		header := &pb.LocalPackageUploadHeader{Claim: claim, OperationId: operation, SourceDigest: source, File: &pb.LocalPackageFileRef{Digest: digest, Length: uint64(file.Length), Filename: file.Filename}}
-		if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Header{Header: header}}); err != nil {
-			stream.CloseSend()
-			return machineTransport(err)
-		}
-		held, err := stream.Recv()
-		if err != nil {
-			stream.CloseSend()
-			return machineTransport(err)
-		}
-		if held.ReceivedBytes > uint64(file.Length) {
-			stream.CloseSend()
-			return exit.New(exit.Conflict, "machine upload returned an impossible verified prefix")
-		}
-		if held.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
-			stream.CloseSend()
-			continue
-		}
-		if held.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_REFUSED {
-			stream.CloseSend()
-			return exit.New(exit.Conflict, "machine refused captured wheel: %s", held.SafeDetail)
-		}
-		reader, err := os.Open(file.Path)
-		if err != nil {
-			stream.CloseSend()
-			return exit.New(exit.NotFound, "captured wheel is unavailable: %s", err)
-		}
-		offset := held.ReceivedBytes
-		if _, err := reader.Seek(int64(offset), io.SeekStart); err != nil {
-			reader.Close()
-			stream.CloseSend()
-			return exit.Internalf("cannot resume captured wheel upload: %s", err)
-		}
-		buffer := make([]byte, 1<<20)
-		for offset < uint64(file.Length) {
-			n, err := io.ReadFull(reader, buffer[:min(uint64(len(buffer)), uint64(file.Length)-offset)])
-			if err != nil {
-				reader.Close()
-				stream.CloseSend()
-				return exit.New(exit.Conflict, "captured wheel changed during upload: %s", err)
-			}
-			if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Chunk{Chunk: &pb.LocalPackageUploadChunk{Offset: offset, Data: buffer[:n]}}}); err != nil {
-				reader.Close()
-				stream.CloseSend()
-				return machineTransport(err)
-			}
-			next, err := stream.Recv()
-			if err != nil {
-				reader.Close()
-				stream.CloseSend()
-				return machineTransport(err)
-			}
-			offset += uint64(n)
-			if next.ReceivedBytes != offset {
-				reader.Close()
-				stream.CloseSend()
-				return exit.New(exit.Conflict, "machine upload changed its acknowledged prefix")
-			}
-			held = next
-		}
-		reader.Close()
-		stream.CloseSend()
-		if held.State != pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
-			return exit.New(exit.Conflict, "captured wheel has no verified upload completion")
+		header := &pb.LocalPackageUploadHeader{Claim: claim, OperationId: operation, SourceDigest: source,
+			File: &pb.LocalPackageFileRef{Digest: digest, Length: uint64(file.Length), Filename: file.Filename}}
+		if problem := localpackage.UploadFile(ctx, host, header, file.Path, nil); problem != nil {
+			return problem
 		}
 	}
 	return nil
@@ -400,6 +386,23 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 			return problem
 		}
 		request := &pb.PrepareLocalPackageRequest{OperationId: selected.OperationId, Package: selected.Package, InstallRoot: filepath.Join(root, "environments")}
+		if info.SupportsLocalInstallationReuse {
+			for _, file := range revision.Files {
+				digest, _ := canonical.Raw(file.Digest)
+				request.Wheels = append(request.Wheels, &pb.LocalPackageWheel{Digest: digest, Filename: file.Filename, Length: uint64(file.Length)})
+			}
+			prepared, err := preparation.PrepareLocalPackage(ctx, request)
+			if err == nil {
+				if problem := validateMachinePrepared(prepared.PlacementSet); problem != nil {
+					return problem
+				}
+				return m.store.AppendEvent(requestID, "machine.package_reused", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest})
+			}
+			if status.Code(err) != codes.FailedPrecondition || !strings.HasPrefix(status.Convert(err).Message(), "local_package_reuse_unavailable:") {
+				return machineTransport(err)
+			}
+			request.Wheels = nil
+		}
 		wheelRoot := filepath.Join(request.InstallRoot, ".stage", selected.OperationId, "wheels")
 		if err := os.MkdirAll(wheelRoot, 0o700); err != nil {
 			return exit.Internalf("cannot stage local Runtime wheels: %s", err)

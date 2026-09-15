@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/accountauth"
@@ -43,12 +44,13 @@ func (i *Invocation) Value(name string) string {
 // Context is the retained mechanism boundary. Handlers receive typed values and
 // frozen configuration; they never parse argv or read ambient configuration.
 type Context struct {
-	Inv         *Invocation
-	Out         io.Writer
-	Err         io.Writer
-	Cfg         config.Config
-	Daemon      daemon.State
-	AccountAuth *accountauth.Manager
+	commandStarted time.Time // includes capture and resolution before a request exists
+	Inv            *Invocation
+	Out            io.Writer
+	Err            io.Writer
+	Cfg            config.Config
+	Daemon         daemon.State
+	AccountAuth    *accountauth.Manager
 }
 
 func (c *Context) Mode() output.Mode { return c.Inv.Mode }
@@ -67,6 +69,7 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 	values map[string][]string, daemon bool,
 ) error {
 	ctx := &Context{
+		commandStarted: time.Now(),
 		Inv: &Invocation{
 			Args: append([]string(nil), args...), Bools: flags,
 			Values: values, Mode: r.Mode,

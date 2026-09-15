@@ -4172,8 +4172,13 @@ type ProtocolInfoResult struct {
 	// Runtime admits absent downloaded inputs as model_materialization_required;
 	// Host does not turn a completed prepare into durable residency authority.
 	SupportsModelMaterializationRecovery bool `protobuf:"varint,4,opt,name=supports_model_materialization_recovery,json=supportsModelMaterializationRecovery,proto3" json:"supports_model_materialization_recovery,omitempty"`
-	unknownFields                        protoimpl.UnknownFields
-	sizeCache                            protoimpl.SizeCache
+	// Runtime can reopen and register an exact installed local revision after
+	// restart, without its transferred wheels. Host revalidates every retained
+	// operation through that Runtime before acknowledging preparation. Callers
+	// must check this capability before probing an exact revision for a new root.
+	SupportsLocalInstallationReuse bool `protobuf:"varint,5,opt,name=supports_local_installation_reuse,json=supportsLocalInstallationReuse,proto3" json:"supports_local_installation_reuse,omitempty"`
+	unknownFields                  protoimpl.UnknownFields
+	sizeCache                      protoimpl.SizeCache
 }
 
 func (x *ProtocolInfoResult) Reset() {
@@ -4230,6 +4235,13 @@ func (x *ProtocolInfoResult) GetSupportsMixedModelInputs() bool {
 func (x *ProtocolInfoResult) GetSupportsModelMaterializationRecovery() bool {
 	if x != nil {
 		return x.SupportsModelMaterializationRecovery
+	}
+	return false
+}
+
+func (x *ProtocolInfoResult) GetSupportsLocalInstallationReuse() bool {
+	if x != nil {
+		return x.SupportsLocalInstallationReuse
 	}
 	return false
 }
@@ -6876,11 +6888,15 @@ func (x *CheckPackageSetCompatibilityResult) GetRefusalDetail() string {
 // index, so their exact bytes are the install input (xs-017). Exactly one row must MEASURE as
 // the project wheel — its wheel metadata names the package's own distribution and release.
 type PrepareLocalPackageRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	OperationId   string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
-	Package       *DevelopmentPackage    `protobuf:"bytes,2,opt,name=package,proto3" json:"package,omitempty"`
-	Wheels        []*LocalPackageWheel   `protobuf:"bytes,5,rep,name=wheels,proto3" json:"wheels,omitempty"`                              // sorted unique by digest; <= MaxLocalPackageFiles
-	InstallRoot   string                 `protobuf:"bytes,6,opt,name=install_root,json=installRoot,proto3" json:"install_root,omitempty"` // absolute immutable install destination
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	OperationId string                 `protobuf:"bytes,1,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
+	Package     *DevelopmentPackage    `protobuf:"bytes,2,opt,name=package,proto3" json:"package,omitempty"`
+	// With supports_local_installation_reuse, Host may send exact wheel identities
+	// with empty paths to check for an already installed revision. Runtime reopens its own
+	// installation receipt or refuses local_package_reuse_unavailable; no transfer
+	// or environment is inferred from a previous request's successful result.
+	Wheels        []*LocalPackageWheel `protobuf:"bytes,5,rep,name=wheels,proto3" json:"wheels,omitempty"`                              // sorted unique by digest; <= MaxLocalPackageFiles
+	InstallRoot   string               `protobuf:"bytes,6,opt,name=install_root,json=installRoot,proto3" json:"install_root,omitempty"` // absolute immutable install destination
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22315,13 +22331,14 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\bimported\x18\x03 \x01(\bR\bimported\"i\n" +
 	"\x17WorkspaceActivationCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12!\n" +
-	"\fmigration_id\x18\x02 \x01(\tR\vmigrationId\"\xf7\x01\n" +
+	"\fmigration_id\x18\x02 \x01(\tR\vmigrationId\"\xc2\x02\n" +
 	"\x12ProtocolInfoResult\x12\x1d\n" +
 	"\n" +
 	"wire_minor\x18\x01 \x01(\rR\twireMinor\x12,\n" +
 	"\x12minimum_wire_minor\x18\x02 \x01(\rR\x10minimumWireMinor\x12=\n" +
 	"\x1bsupports_mixed_model_inputs\x18\x03 \x01(\bR\x18supportsMixedModelInputs\x12U\n" +
-	"'supports_model_materialization_recovery\x18\x04 \x01(\bR$supportsModelMaterializationRecovery\"\xa5\x03\n" +
+	"'supports_model_materialization_recovery\x18\x04 \x01(\bR$supportsModelMaterializationRecovery\x12I\n" +
+	"!supports_local_installation_reuse\x18\x05 \x01(\bR\x1esupportsLocalInstallationReuse\"\xa5\x03\n" +
 	"\x15PreparePackageSetCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12B\n" +
 	"\vpackage_set\x18\x02 \x01(\v2!.cozy.worker.v1.DesiredPackageSetR\n" +
