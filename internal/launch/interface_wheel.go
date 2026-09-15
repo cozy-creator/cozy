@@ -42,8 +42,8 @@ func interfaceRuntimeFloor(distribution, version string) *exit.Error {
 	release, err := pep440.Parse(version)
 	if err != nil || release.LessThan(pep440.MustParse(interfaceGeneratorRuntimeFloor)) {
 		return exit.Named(exit.Structural, "interface_runtime_below_floor",
-			"interface generation for %s uses cozy-runtime %q; %s requires Runtime %s or newer",
-			distribution, version, interfaceGeneratorABI, interfaceGeneratorRuntimeFloor).
+			"interface generation for %s uses cozy-runtime %q; Runtime %s or newer is required",
+			distribution, version, interfaceGeneratorRuntimeFloor).
 			WithRemedy("upgrade this dependency project's cozy-runtime requirement and uv.lock to >=%s (uv lock --upgrade-package cozy-runtime), then retry cozy run", interfaceGeneratorRuntimeFloor)
 	}
 	return nil
@@ -76,7 +76,19 @@ func (r RuntimeCLI) InterfaceWheel(ctx context.Context, interfacePath, distribut
 	if problem := r.callInputContext(ctx, raw, &wheel, "interface-wheel"); problem != nil {
 		return wheel, problem
 	}
-	if wheel.GeneratorABI != interfaceGeneratorABI {
+	if wheel.GeneratorABI == "cozy.interface-generator/5" {
+		// Older generators remain valid for public-only packages. They cannot
+		// establish the internal-export filtering promised by generator 6.
+		surface, problem := ReadPackageInterface(interfacePath, "")
+		if problem != nil {
+			return wheel, problem
+		}
+		for _, entry := range append(append([]Entrypoint(nil), surface.Entrypoints...), surface.Jobs...) {
+			if entry.Internal {
+				return wheel, exit.Named(exit.Structural, "interface_generator_internal_unsupported", "internal callables require Runtime 0.18.3 or newer for interface generation")
+			}
+		}
+	} else if wheel.GeneratorABI != interfaceGeneratorABI {
 		return wheel, exit.Named(exit.Structural, "interface_generator_incompatible", "Runtime interface generator %q does not match Creator %q", wheel.GeneratorABI, interfaceGeneratorABI).
 			WithRemedy("update Creator and its host Runtime to the same supported cohort")
 	}
