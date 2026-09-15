@@ -41,24 +41,24 @@ func TestMachineExecutionActualHostInstallationReuse(t *testing.T) {
 		var result struct {
 			WallMS int64 `json:"wall_ms"`
 			Result struct {
-				Token string `json:"token"`
+				Value string `json:"value"`
 			} `json:"result"`
 		}
 		for _, line := range strings.Split(out, "\n") {
 			var candidate struct {
 				WallMS int64 `json:"wall_ms"`
 				Result struct {
-					Token string `json:"token"`
+					Value string `json:"value"`
 				} `json:"result"`
 			}
 			if json.Unmarshal([]byte(line), &candidate) == nil && candidate.WallMS > 0 {
 				result = candidate
 			}
 		}
-		if result.Result.Token == "" || tokens[result.Result.Token] {
+		if result.Result.Value == "" || tokens[result.Result.Value] {
 			t.Fatalf("%s did not execute fresh code: %s", label, out)
 		}
-		tokens[result.Result.Token] = true
+		tokens[result.Result.Value] = true
 		if delta := elapsed - result.WallMS; delta < -100 || delta > 2000 {
 			t.Fatalf("command timer omitted preparation: real=%dms reported=%dms", elapsed, result.WallMS)
 		}
