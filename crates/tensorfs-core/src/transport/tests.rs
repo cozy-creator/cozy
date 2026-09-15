@@ -57,6 +57,8 @@ impl Request {
 }
 
 enum Serve {
+    /// Read the request, then hold the socket without sending response headers.
+    StallHead,
     /// Content-Length framed whole answer.
     Whole {
         status: u16,
@@ -146,6 +148,11 @@ fn handle(mut socket: TcpStream, dispatch: Dispatch, hits: Arc<Mutex<HashMap<Str
         .entry(request.path.clone())
         .or_insert(0) += 1;
     match dispatch(&request) {
+        Serve::StallHead => {
+            let mut sink = [0u8; 16];
+            let _ = socket.set_read_timeout(Some(Duration::from_secs(30)));
+            let _ = socket.read(&mut sink);
+        }
         Serve::Whole {
             status,
             body,
@@ -915,6 +922,120 @@ fn black_holed_stream_is_stalled_by_the_ledger_and_reasked() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+fn prebody_silence_is_judged(https: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        // Accept HTTP request bytes or a TLS ClientHello, but never answer.
+        let mut bytes = [0u8; 8192];
+        while matches!(socket.read(&mut bytes), Ok(n) if n > 0) {}
+    });
+    let scheme = if https { "https" } else { "http" };
+    let checked = local_policy()
+        .check(&format!("{scheme}://127.0.0.1:{port}/object"))
+        .unwrap();
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    ledger.moved(1024); // A pull that has already moved bytes, as on the real pod.
+    let response = super::http::request(
+        &super::http::Client::new(),
+        &checked,
+        "GET",
+        &[],
+        None,
+        Deadline::after_seconds(Some(1.0)),
+        &ledger,
+        super::http::Judge::Stream,
+        None,
+        Code::TRANSFER_FAILED,
+    );
+    let refusal = match response {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("silent origin unexpectedly answered"),
+    };
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED, "{refusal}");
+    assert!(
+        refusal.detail.contains(if https {
+            "TLS handshake"
+        } else {
+            "response head"
+        }),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn an_object_stalled_before_headers_is_judged_by_stream_progress() {
+    prebody_silence_is_judged(false);
+}
+
+#[test]
+fn an_object_stalled_during_tls_is_judged_by_stream_progress() {
+    prebody_silence_is_judged(true);
+}
+
+#[test]
+fn a_prebody_stall_is_reasked_without_discarding_completed_objects() {
+    let root = temporary("head-stall-retry");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(2, 64 * 1024));
+    let victim = checkpoint.objects[0].sha256.clone();
+    let selected = victim.clone();
+    let origin = hub_origin(Arc::clone(&checkpoint), move |hex, attempt| {
+        (hex == selected && attempt == 1).then_some(Serve::StallHead)
+    });
+    let policy = SourcePolicy::default();
+    let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!(report.fetched, 4);
+    for object in &checkpoint.objects {
+        assert!(store.record_valid(&object.sha256).is_ok());
+        assert_eq!(
+            origin.hits(&format!("/obj/{}", object.sha256)),
+            if object.sha256 == victim { 2 } else { 1 }
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn fragmented_headers_can_progress_across_multiple_stream_windows() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        read_request(&mut socket).unwrap();
+        socket.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(50));
+            socket.write_all(b"X-Progress: yes\r\n").unwrap();
+        }
+        socket.write_all(b"Content-Length: 3\r\n\r\nabc").unwrap();
+    });
+    let checked = local_policy()
+        .check(&format!("http://127.0.0.1:{port}/object"))
+        .unwrap();
+    let ledger = Ledger::with_resolution(Duration::from_millis(25));
+    let started = std::time::Instant::now();
+    let response = super::http::request(
+        &super::http::Client::new(),
+        &checked,
+        "GET",
+        &[],
+        None,
+        Deadline::none(),
+        &ledger,
+        super::http::Judge::Stream,
+        None,
+        Code::TRANSFER_FAILED,
+    )
+    .unwrap();
+    assert_eq!(response.read_capped(3).unwrap(), b"abc");
+    assert!(started.elapsed() > ledger.floor() * 2);
+}
+
 #[test]
 fn slow_origin_teaches_the_ledger_and_is_left_alone() {
     let root = temporary("slow");
@@ -923,21 +1044,26 @@ fn slow_origin_teaches_the_ledger_and_is_left_alone() {
     let slow = checkpoint.objects[0].sha256.clone();
     let slow_for = slow.clone();
     let bodies = checkpoint.bodies.clone();
-    // 400 ms to first byte teaches the ledger this origin pauses; the 200 ms drip gaps
-    // that follow are far over the 150 ms noise floor and must NOT be called stalls.
+    // A successful 400 ms first answer teaches this origin's latency; subsequent
+    // 800 ms gaps exceed the initial floor but remain below that measured term.
+    // Unlike the old body-only rule,
+    // initial pre-header silence is now bounded, so this fixture gives the first
+    // answer a sufficient 600 ms floor. Production timing constants are unchanged.
     let origin = hub_origin(Arc::clone(&checkpoint), move |hex, _| {
         if hex == slow_for {
             return Some(Serve::Drip {
                 body: bodies[hex].clone(),
                 chunk: 1024,
-                gap: Duration::from_millis(200),
+                gap: Duration::from_millis(800),
                 ttfb: Duration::from_millis(400),
             });
         }
         None
     });
     let policy = SourcePolicy::default();
-    let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    let mut request = request_for(&store, &origin.base, &policy);
+    request.sample_seconds = 0.1;
+    let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 3);
     assert_eq!(origin.hits(&format!("/obj/{slow}")), 1); // one ask; never condemned
     let _ = std::fs::remove_dir_all(root);

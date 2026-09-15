@@ -21,6 +21,11 @@
 //! exactly zero bytes. A CONTROL-plane exchange now answers to `Judge::Transfer`: the
 //! pull's own progress, which is a measurement, and never to this call's own duration,
 //! which would be a constant.
+//!
+//! Object GETs also apply their existing measured stream-silence rule while
+//! handshaking, writing and reading headers (h3a-070). Previously Judge::Stream
+//! was ignored in those phases, so body retries were unreachable for a silent
+//! TLS peer. Phase progress resets that phase's clock; no object wall limit is added.
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::transport::ledger::{Deadline, Ledger};
@@ -118,6 +123,24 @@ fn transfer_verdict(
             still.silent.as_secs_f64(),
             patience.as_secs_f64(),
             crate::transport::ledger::STALL_FACTOR,
+        ),
+    )
+}
+
+/// Object-stream silence is judged before the body too. Each phase starts with
+/// its own window and advances only when transport bytes actually move; slow
+/// progress may span arbitrarily many windows without exhausting a wall budget.
+fn stream_verdict(judge: Judge, ledger: &Ledger, advanced: Instant, phase: &str) -> Result<()> {
+    if judge != Judge::Stream || advanced.elapsed() <= ledger.patience() {
+        return Ok(());
+    }
+    refuse(
+        Code::TRANSFER_FAILED,
+        format!(
+            "the object stream stopped during {phase}: silent {:.1} s against the \
+             {:.1} s this pull's measured pace allows",
+            advanced.elapsed().as_secs_f64(),
+            ledger.patience().as_secs_f64(),
         ),
     )
 }
@@ -283,6 +306,7 @@ fn tls_handshake(
     fail: Code,
 ) -> Result<()> {
     let sample = ledger.sample();
+    let mut advanced = Instant::now();
     while conn.is_handshaking() {
         transfer_verdict(judge, ledger, since, "a TLS handshake")?;
         let tick = match deadline.remaining()? {
@@ -293,8 +317,11 @@ fn tls_handshake(
         let _ = sock.set_write_timeout(Some(tick.max(Duration::from_millis(1))));
         if conn.wants_write() {
             match conn.write_tls(sock) {
+                Ok(n) if n > 0 => advanced = Instant::now(),
                 Ok(_) => {}
-                Err(e) if would_block(&e) => {}
+                Err(e) if would_block(&e) => {
+                    stream_verdict(judge, ledger, advanced, "TLS handshake")?;
+                }
                 Err(e) => return refuse(fail, format!("TLS handshake write: {e}")),
             }
             continue;
@@ -302,12 +329,15 @@ fn tls_handshake(
         match conn.read_tls(sock) {
             Ok(0) => return refuse(fail, "origin closed the connection mid-handshake"),
             Ok(_) => {
+                advanced = Instant::now();
                 conn.process_new_packets().map_err(|e| Refusal {
                     code: fail,
                     detail: format!("TLS refused: {e}"),
                 })?;
             }
-            Err(e) if would_block(&e) => {}
+            Err(e) if would_block(&e) => {
+                stream_verdict(judge, ledger, advanced, "TLS handshake")?;
+            }
             Err(e) => return refuse(fail, format!("TLS handshake read: {e}")),
         }
     }
@@ -733,6 +763,7 @@ fn write_all(
                 Err(e) => return refuse(fail, format!("the connection failed mid-write: {e}")),
             }
         }
+        stream_verdict(judge, ledger, advanced, "request write")?;
         if let Some(bound) = silence {
             if advanced.elapsed() > bound {
                 return refuse(
@@ -811,6 +842,7 @@ fn read_step_ticking(
     since: Instant,
     fail: Code,
 ) -> Result<usize> {
+    let advanced = Instant::now();
     loop {
         transfer_verdict(judge, ledger, since, "a response head")?;
         let tick = match deadline.remaining()? {
@@ -820,7 +852,9 @@ fn read_step_ticking(
         wire.set_read_timeout(tick);
         match wire.read_step(buf) {
             Ok(n) => return Ok(n),
-            Err(e) if would_block(&e) => {}
+            Err(e) if would_block(&e) => {
+                stream_verdict(judge, ledger, advanced, "response head")?;
+            }
             Err(e) => return refuse(fail, format!("the connection failed: {e}")),
         }
     }
