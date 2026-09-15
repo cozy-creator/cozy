@@ -349,7 +349,7 @@ FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.package.", "cozy.runtime.", "t
                          "tensorfs.", "cozytensors")
 # Runtime owns this deterministic wheel generator ABI. Creator checks returned
 # metadata; it neither authors a new document nor defines the generator format.
-FOREIGN_ABI_TAGS = {"cozy.interface-generator/5"}
+FOREIGN_ABI_TAGS = {"cozy.interface-generator/5", "cozy.interface-generator/6"}
 KIND_READERS: dict[str, set[str]] = {}
 # No trailing quote: a domain-separation tag is a PREFIX inside a longer literal — it ends
 # in `\x00` or `\n`, and requiring the close quote made both of this repo's tags invisible
