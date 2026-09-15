@@ -106,9 +106,8 @@ func closure(venv string) (int, string) {
 }
 
 // ExecutionRequirements reads the declarations of the code a rental will run.
-// Image-owned distributions resolve their own dependency subtree on that image:
-// e.g. a locally installed Torch wheel's CUDA pins do not constrain remote Torch.
-// The full installed roster remains separate and exact for local graph/custody checks.
+// Every package owns its complete dependency subtree, including Torch and CUDA.
+// The selected installed roster remains exact for local and remote capture.
 func ExecutionRequirements(ctx context.Context, venv, project string, extras []string) (packagepublish.RequirementSelection, *exit.Error) {
 	installed := installedMetadata(venv)
 	if len(installed) == 0 {
@@ -116,9 +115,6 @@ func ExecutionRequirements(ctx context.Context, venv, project string, extras []s
 	}
 	metadata := map[string]string{}
 	for name, distribution := range installed {
-		if packagepublish.ImageOwnedDistribution(name) {
-			continue
-		}
 		metadata[name] = string(distribution.metadata)
 	}
 	return packagepublish.ActiveRequirements(ctx, project, extras, metadata, pythonVersion(venv))

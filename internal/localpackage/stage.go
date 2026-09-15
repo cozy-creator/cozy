@@ -23,9 +23,10 @@ import (
 )
 
 const (
-	maxFiles                  = pb.MaxLocalPackageFiles
-	localPackageInterfaceFile = "package-interface.json"
-	localRevisionFile         = "revision.json"
+	maxFiles                   = pb.MaxLocalPackageFiles
+	localPackageInterfaceFile  = "package-interface.json"
+	localRevisionFile          = "revision.json"
+	dependencyRequirementsFile = "dependency-requirements.txt"
 )
 
 type File struct {
@@ -37,6 +38,7 @@ type Revision struct {
 	Package, Release, SourceDigest, Digest, PackageInterfaceDigest string
 	PackageInterfaceLength                                         int64
 	Files                                                          []File
+	DependencyRequirements                                         []byte
 }
 
 func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Revision, *exit.Error) {
@@ -74,8 +76,13 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 			"editable source changed after its install revision was selected").
 			WithRemedy("retry the command to select and build the new revision")
 	}
+	recapture := false
 	if raw, err := os.ReadFile(filepath.Join(install.Dir, "private-revision")); err == nil {
-		return Open(layout, install, string(raw))
+		previous, problem := Open(layout, install, string(raw))
+		if problem == nil || problem.Name != "local_package_recapture_required" {
+			return previous, problem
+		}
+		recapture = true
 	} else if !os.IsNotExist(err) {
 		return Revision{}, exit.New(exit.Conflict, "captured source revision is unavailable")
 	}
@@ -100,12 +107,20 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	for _, dependency := range pack.DependencyWheels {
 		paths = append(paths, dependency.Path)
 	}
-	return StageWheels(layout, install, packageInterfaceBytes, paths)
+	revision, problem := StageWheels(layout, install, packageInterfaceBytes, paths, pack.DependencyRequirements)
+	if problem == nil && recapture {
+		problem = RetainRevision(install, revision.Digest)
+	}
+	return revision, problem
 }
 
-// StageWheels uses the same immutable revision writer for source builds and
-// already-built library wheels. It preserves every supplied original byte.
-func StageWheels(layout home.Layout, install records.PackageInstall, packageInterfaceBytes []byte, paths []string) (Revision, *exit.Error) {
+// StageWheels binds the complete captured closure to this revision. Public
+// requirements may be empty only when every dependency is a supplied local wheel.
+func StageWheels(layout home.Layout, install records.PackageInstall, packageInterfaceBytes []byte, paths []string, requirements []byte) (Revision, *exit.Error) {
+	if len(requirements) > pb.MaxLockedRequirementsBytes {
+		return Revision{}, exit.New(exit.Validation, "private dependency requirements exceed their byte bound")
+	}
+
 	if len(paths) == 0 || len(paths) > maxFiles {
 		return Revision{}, exit.Named(exit.Structural, "local_package_revision_invalid", "local package revision requires 1..%d wheels", maxFiles)
 	}
@@ -139,8 +154,20 @@ func StageWheels(layout home.Layout, install records.PackageInstall, packageInte
 	if problem := copyPackageInterface(packageInterfaceBytes, filepath.Join(stage, localPackageInterfaceFile)); problem != nil {
 		return Revision{}, problem
 	}
+	if problem := copyPackageInterface(requirements, filepath.Join(stage, dependencyRequirementsFile)); problem != nil {
+		return Revision{}, problem
+	}
 	files := make([]File, 0, len(paths))
+	names := map[string]bool{}
 	for index, source := range paths {
+		fact, problem := wheel.InspectIdentity(source)
+		if problem != nil {
+			return Revision{}, problem
+		}
+		if names[fact.Distribution] {
+			return Revision{}, exit.New(exit.Validation, "unpublished revision repeats a wheel distribution")
+		}
+		names[fact.Distribution] = true
 		kind := "dependency"
 		if index == 0 {
 			kind = "project"
@@ -152,7 +179,7 @@ func StageWheels(layout home.Layout, install records.PackageInstall, packageInte
 		files = append(files, file)
 	}
 	revision, revisionBytes, problem := identity(install.Package, install.Version, sourceDigest,
-		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files)
+		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files, requirements)
 	if problem != nil {
 		return Revision{}, problem
 	}
@@ -219,11 +246,31 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 	}
 	root := filepath.Join(layout.LocalPackages, strings.TrimPrefix(digest, "sha256:"))
 	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 3 || entries[0].Name() != localPackageInterfaceFile ||
-		!entries[0].Type().IsRegular() || entries[1].Name() != localRevisionFile ||
-		!entries[1].Type().IsRegular() || entries[2].Name() != "wheels" || !entries[2].IsDir() {
-		return Revision{}, exit.Named(exit.NotFound, "local_package_revision_absent",
-			"local package revision %s is absent or incomplete", digest)
+	if err != nil {
+		return Revision{}, exit.Named(exit.NotFound, "local_package_revision_absent", "local package revision %s is absent or incomplete", digest)
+	}
+	allowed := map[string]bool{localPackageInterfaceFile: false, localRevisionFile: false, "wheels": true, dependencyRequirementsFile: false}
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		directory, ok := allowed[entry.Name()]
+		if !ok || entry.IsDir() != directory || !directory && !entry.Type().IsRegular() {
+			return Revision{}, exit.Named(exit.NotFound, "local_package_revision_absent", "local package revision %s is absent or incomplete", digest)
+		}
+		seen[entry.Name()] = true
+	}
+	if !seen[localPackageInterfaceFile] || !seen[localRevisionFile] || !seen["wheels"] {
+		return Revision{}, exit.New(exit.NotFound, "local package revision is incomplete")
+	}
+	if !seen[dependencyRequirementsFile] {
+		return Revision{}, exit.Named(exit.Conflict, "local_package_recapture_required", "captured dependency closure predates the complete environment contract").WithRemedy("run the original source again to capture its full dependency closure")
+	}
+	info, err := os.Stat(filepath.Join(root, dependencyRequirementsFile))
+	if err != nil || info.Size() < 0 || info.Size() > pb.MaxLockedRequirementsBytes {
+		return Revision{}, exit.New(exit.Conflict, "private dependency requirements exceed their byte bound")
+	}
+	requirements, err := os.ReadFile(filepath.Join(root, dependencyRequirementsFile))
+	if err != nil || len(requirements) > pb.MaxLockedRequirementsBytes {
+		return Revision{}, exit.New(exit.Conflict, "private dependency requirements changed")
 	}
 	packageInterfacePath := filepath.Join(root, localPackageInterfaceFile)
 	packageInterfaceBytes, err := os.ReadFile(packageInterfacePath)
@@ -271,7 +318,7 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 			"local package revision has %d project wheels", projects)
 	}
 	revision, revisionBytes, problem := identity(install.Package, install.Version, install.SourceDigest,
-		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files)
+		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files, requirements)
 	if problem != nil {
 		return Revision{}, problem
 	}
@@ -348,7 +395,7 @@ func measured(path string, fact wheel.Identity, kind string) (File, *exit.Error)
 }
 
 func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
-	packageInterfaceLength int64, files []File,
+	packageInterfaceLength int64, files []File, requirements []byte,
 ) (Revision, []byte, *exit.Error) {
 	rows := append([]File(nil), files...)
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Digest < rows[j].Digest })
@@ -379,7 +426,14 @@ func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
 		return Revision{}, nil, exit.Named(exit.Structural, "local_package_revision_invalid",
 			"local package revision has invalid source or package interface identity")
 	}
-	revisionBytes, rawDigest, err := canonical.Identity(&pb.LocalPackageRevision{Package: packageName,
+	var requirementsRef *pb.Ref
+	if len(requirements) > pb.MaxLockedRequirementsBytes {
+		return Revision{}, nil, exit.New(exit.Validation, "private dependency requirements exceed their byte bound")
+	}
+	if len(requirements) > 0 {
+		requirementsRef = &pb.Ref{Digest: canonical.Digest(requirements), Length: uint64(len(requirements))}
+	}
+	revisionBytes, rawDigest, err := canonical.Identity(&pb.LocalPackageRevision{DependencyRequirements: requirementsRef, Package: packageName,
 		Release: release, SourceDigest: source, PackageInterface: &pb.Ref{Digest: packageInterface,
 			Length: uint64(packageInterfaceLength)}, Files: refs})
 	if err != nil {
@@ -391,7 +445,7 @@ func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
 	}
 	return Revision{Package: packageName, Release: release, SourceDigest: sourceDigest,
 		Digest: digest, PackageInterfaceDigest: packageInterfaceDigest, PackageInterfaceLength: packageInterfaceLength,
-		Files: rows}, revisionBytes, nil
+		Files: rows, DependencyRequirements: append([]byte(nil), requirements...)}, revisionBytes, nil
 }
 
 func syncDirectory(path string) error {

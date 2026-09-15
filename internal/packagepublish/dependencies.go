@@ -222,7 +222,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 			return duplicateDependency(name, prior, canonical, version)
 		}
 		newExtras := c.activateExtras(canonical, req.extras)
-		if ImageOwnedDistribution(name) {
+		if c.publish && ImageOwnedDistribution(name) {
 			return nil
 		}
 		if len(newExtras) == 0 {
@@ -239,7 +239,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	c.count++
 	c.byName[name] = dependencyRecord{source: canonical, version: version}
 	newExtras := c.activateExtras(canonical, req.extras)
-	if !ImageOwnedDistribution(name) {
+	if !c.publish || !ImageOwnedDistribution(name) {
 		c.stack[canonical] = true
 		if problem := c.collectProject(canonical, document, newExtras, true); problem != nil {
 			return problem
@@ -358,10 +358,9 @@ func LocalDependencySelections(root string, extras ...string) (map[string]LocalD
 }
 
 func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Error {
-	// Base-owned distributions are requirements checked against the selected base inventory,
-	// never package overlays. Their exact author-side wheels remain in source custody so
-	// Creator can materialize its independent local environment.
-	if ImageOwnedDistribution(identity.Distribution) {
+	// Publication keeps its existing platform-family custody path. Unpublished
+	// captures retain every supplied local dependency wheel, including frameworks.
+	if c.publish && ImageOwnedDistribution(identity.Distribution) {
 		return nil
 	}
 	if len(c.wheels) >= MaxDependencyWheels {

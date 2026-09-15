@@ -117,22 +117,13 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if problem != nil {
 		return fail(problem)
 	}
-	var exact, paths []string
+	var exact []string
 	for name, dependency := range dependencies {
-		if packagepublish.ImageOwnedDistribution(name) {
-			continue
-		}
-		paths = append(paths, dependency.Path)
 		if name != project {
 			exact = append(exact, name+"=="+dependency.Version)
 		}
 	}
-	python := strings.TrimSpace(strings.TrimPrefix(runOut(parentPython, "-I", "-S", "-V"), "Python "))
-	selection, problem := packagepublish.ActiveWheelRequirements(ctx, project, extras, paths, python)
-	if problem != nil {
-		return fail(problem)
-	}
-	exact = append(exact, selection.ImageRequirements()...)
+	exact = append(exact, "cozy-runtime>="+hostruntime.Floor)
 	sort.Strings(exact)
 	executablePath := filepath.Join(dir, "wheels", filepath.Base(original))
 	if problem := wheel.PinDependencies(original, executablePath, exact); problem != nil {

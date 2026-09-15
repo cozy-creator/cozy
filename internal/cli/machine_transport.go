@@ -73,12 +73,12 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
 	info, err := host.ProtocolInfo(probeContext, &pb.ProtocolInfoRequest{})
 	cancel()
-	if err != nil || info.WireMinor < 51 {
+	if err != nil || info == nil || info.MinimumWireMinor == 0 || info.WireMinor < pb.MinCompatibleWireMinor || info.MinimumWireMinor > pb.WireMinor {
 		connection.Close()
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "Runtime-owned execution requires worker protocol 51; this worker reports %d", info.WireMinor)
+		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "Runtime-owned execution requires worker protocol %d; this worker reports %d", pb.MinCompatibleWireMinor, info.GetWireMinor())
 	}
 	m.mu.Lock()
 	alreadyClaimed := m.claimed[machine] == claim.WorkerBootId
@@ -329,12 +329,12 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 	ready, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	info, err := preparation.ProtocolInfo(ready, &pb.ProtocolInfoRequest{}, grpc.WaitForReady(true))
-	if err != nil || info.WireMinor < 51 {
+	if err != nil || info == nil || info.MinimumWireMinor == 0 || info.WireMinor < pb.MinCompatibleWireMinor || info.MinimumWireMinor > pb.WireMinor {
 		connection.Close()
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "local Runtime requires protocol 51; installed Runtime reports %d", info.WireMinor)
+		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "local Runtime requires protocol %d; installed Runtime reports %d", pb.MinCompatibleWireMinor, info.GetWireMinor())
 	}
 	client := pb.NewWorkerControlClient(connection)
 	claim := &pb.Claim{RecordOwnerEpoch: 1, RecordOwnerId: "cozy-local-client", WorkerId: workerID, WireMinor: pb.WireMinor, Proof: bootstrap}
@@ -399,7 +399,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		if problem != nil {
 			return problem
 		}
-		request := &pb.PrepareLocalPackageRequest{OperationId: selected.OperationId, Package: selected.Package, InstallRoot: filepath.Join(root, "environments")}
+		request := &pb.PrepareLocalPackageRequest{OperationId: selected.OperationId, Package: selected.Package, DependencyRequirements: append([]byte(nil), selected.DependencyRequirements...), InstallRoot: filepath.Join(root, "environments")}
 		if info.SupportsLocalInstallationReuse {
 			for _, file := range revision.Files {
 				digest, _ := canonical.Raw(file.Digest)

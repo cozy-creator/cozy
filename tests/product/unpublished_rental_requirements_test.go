@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -66,31 +65,17 @@ only-include = ["code.py"]
 			body, problem := wheel.Metadata(pack.Wheel)
 			fatal(t, problem)
 			text := string(body)
-			if extra != "" && (!strings.Contains(text, "Requires-Dist: msgspec<0.22,>=0.21;") || !strings.Contains(text, `python_full_version >= "3.12.5"`) || strings.Contains(text, "msgspec==") || strings.Contains(text, "extra ==")) {
-				t.Fatalf("selected image range lost its target marker or retained its extra condition: %s", text)
+			if extra != "" && (!strings.Contains(text, "Requires-Dist: msgspec==") || !strings.Contains(string(pack.DependencyRequirements), "msgspec @ https://files.pythonhosted.org/")) {
+				t.Fatalf("selected extra lost its exact private closure: %s; %s", text, pack.DependencyRequirements)
 			}
-			if extra == "" && strings.Contains(text, "msgspec") {
-				t.Fatalf("unselected extra constrained the worker: %s", text)
-			}
-			sealed, problem := packagepublish.ActiveWheelRequirements(context.Background(), "root-proof", nil,
-				[]string{pack.Wheel, filepath.Join(wheels, "extra_proof-1.0-py3-none-any.whl")}, environment.Python)
-			fatal(t, problem)
-			for _, python := range []string{"3.12.3", "3.12.12"} {
-				requirements, problem := packagepublish.EvaluateRequirements(context.Background(), sealed.Requirements, python)
-				fatal(t, problem)
-				why := launch.InventoryMismatch(&pb.ImageInventory{Python: python,
-					Distributions: []*pb.ImageDistribution{{Distribution: "cozy-runtime", Version: hostruntime.Floor}, //cozy:allow distribution metadata only; no Runtime process invocation
-						{Distribution: "msgspec", Version: "0.20.0"}}}, requirements, "")
-				wantRefusal := extra != "" && python == "3.12.12"
-				if wantRefusal != strings.Contains(why, "msgspec 0.20.0") {
-					t.Fatalf("sealed extra/patch boolean expression changed meaning on %s: %s", python, why)
-				}
+			if extra == "" && (strings.Contains(text, "msgspec") || strings.Contains(string(pack.DependencyRequirements), "msgspec")) {
+				t.Fatalf("unselected extra entered private closure: %s; %s", text, pack.DependencyRequirements)
 			}
 		})
 	}
 }
 
-func TestRentalRequirementsStopAtTheWorkerImage(t *testing.T) {
+func TestRentalRequirementsIncludeTheWholeSelectedClosure(t *testing.T) {
 	venv := t.TempDir()
 	if out, err := exec.Command("uv", "venv", "--python", "3.12", venv).CombinedOutput(); err != nil {
 		t.Fatalf("venv: %v\n%s", err, out)
@@ -115,30 +100,24 @@ func TestRentalRequirementsStopAtTheWorkerImage(t *testing.T) {
 	fatal(t, problem)
 	requirements, problem := packagepublish.EvaluateRequirements(context.Background(), selection.Requirements, inventory.Python)
 	fatal(t, problem)
+	joined := strings.Join(requirements, "\n")
+	for _, required := range []string{"cuda-bindings==13.3.1", "numpy<2.6,>=2.5", "torch<3,>=2.13"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("selected subtree omitted %s: %v", required, requirements)
+		}
+	}
+	if strings.Contains(joined, "torch>=3") || strings.Contains(joined, "torch>=99") {
+		t.Fatal("inactive or development dependency entered selected closure")
+	}
 	if why := launch.InventoryMismatch(inventory, requirements, ""); why != "" {
-		t.Fatalf("local image implementation pins constrained a compatible worker: %s (%v)", why, requirements)
+		t.Fatalf("private dependency versions constrained base image: %s", why)
 	}
-	if strings.Contains(strings.Join(requirements, "\n"), "torch>=3") {
-		t.Fatal("inactive environment marker constrained the worker")
-	}
-	inventory.Distributions[2].Version = "2.4.0"
-	if why := launch.InventoryMismatch(inventory, requirements, ""); !strings.Contains(why, "numpy 2.4.0") {
-		t.Fatalf("package-owned SciPy requirement was dropped: %q", why)
-	}
-	inventory.Distributions[2].Version = "2.5.2"
-	metadata("project", "1", "Requires-Dist: torch>=2.13,<3\nRequires-Dist: scipy>=1.18\nRequires-Dist: cuda-bindings>=13.2\n")
-	selection, problem = install.ExecutionRequirements(context.Background(), venv, "project", nil)
-	fatal(t, problem)
-	requirements, problem = packagepublish.EvaluateRequirements(context.Background(), selection.Requirements, inventory.Python)
-	fatal(t, problem)
-	if why := launch.InventoryMismatch(inventory, requirements, ""); !strings.Contains(why, "cuda-bindings 13.0.3") {
-		t.Fatalf("explicit project CUDA floor was dropped: %q", why)
-	}
+
 }
 
 // This exercises actual script capture and named-rental admission through the
 // normal CLI. The HTTP peer supplies inventory only; it never buys a machine.
-func TestUnpublishedNamedRentalUsesAuthoredImageRequirements(t *testing.T) {
+func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 	version := runtimeFixtureVersion(t, "")
 	const current, old, earlierPython = "pr-11111111111111111111", "pr-22222222222222222222", "pr-33333333333333333333"
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, _ *hub.PackageReleaseDetail) {
@@ -190,14 +169,14 @@ def main(ctx):
 		t.Fatalf("compatible image was held to the local exact pin [%d]: %s", status, out)
 	}
 	status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
-	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "msgspec 0.20.0") {
-		t.Fatalf("authored image requirement was not enforced [%d]: %s", status, out)
+	if status != 0 {
+		t.Fatalf("private msgspec version constrained the image [%d]: %s", status, out)
 	}
 	patchCode := strings.Replace(code, "msgspec>=0.21,<0.22", "msgspec>=0.21,<0.22; python_full_version >= '3.12.5' and (python_full_version >= '3.12.12' or sys_platform == 'win32' or python_full_version < '3.12.4')", 1)
 	must(t, os.WriteFile(script, []byte(patchCode), 0600))
 	status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
-	if status == 0 || !strings.Contains(out, "msgspec 0.20.0") {
-		t.Fatalf("actual Python patch requirement was ignored [%d]: %s", status, out)
+	if status != 0 {
+		t.Fatalf("private marked requirement constrained the image [%d]: %s", status, out)
 	}
 	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--dry-run", "--json")
 	if status != 0 {
@@ -254,11 +233,8 @@ app.job(value)
 		extraCode = strings.Replace(extraCode, "# ///\ndef", "# [tool.uv.sources]\n# marker-library = {path = '"+source+"'}\n# ///\ndef", 1)
 		must(t, os.WriteFile(script, []byte(extraCode), 0600))
 		status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
-		if selected && (status == 0 || !strings.Contains(out, "msgspec 0.20.0")) {
-			t.Fatalf("selected library extra did not enforce its image floor (wheel=%v) [%d]: %s", test.wheel, status, out)
-		}
-		if !selected && status != 0 {
-			t.Fatalf("unselected library extra constrained the image (wheel=%v) [%d]: %s", test.wheel, status, out)
+		if status != 0 {
+			t.Fatalf("private library extra constrained the image (selected=%v, wheel=%v) [%d]: %s", selected, test.wheel, status, out)
 		}
 	}
 	mu.Lock()

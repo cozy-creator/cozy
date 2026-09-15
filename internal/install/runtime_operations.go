@@ -96,7 +96,7 @@ func prepareRuntimeOperations(ctx context.Context, layout home.Layout, store *re
 	if problem := store.RecordInstall(inst); problem != nil {
 		return fail(problem)
 	}
-	revision, problem := localpackage.StageWheels(layout, inst, surface.Raw, []string{carrier})
+	revision, problem := localpackage.StageWheels(layout, inst, surface.Raw, []string{carrier}, nil)
 	if problem != nil {
 		return nil, id, problem
 	}

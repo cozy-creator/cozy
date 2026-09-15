@@ -12,8 +12,8 @@ import (
 
 var pytorchIndexPath = regexp.MustCompile(`^/whl/(cpu|cu[0-9]{3}|rocm[0-9]+\.[0-9]+|xpu)$`)
 
-// This requirement reconstructs a local captured environment only. The framework
-// remains image-owned; its wheel is never a private overlay or publication row.
+// Official framework wheels retain their exact URL and hash in each private
+// environment. Runtime fetches them through bounded public artifact storage.
 func pytorchBaseRequirement(name, version, index string, wheels []registryWheel) (string, *exit.Error) {
 	refuse := func() (string, *exit.Error) {
 		return "", exit.Named(exit.Conflict, "base_dependency_origin_unsupported", "base dependency %s has no exact supported official PyTorch wheel", name)
@@ -26,6 +26,9 @@ func pytorchBaseRequirement(name, version, index string, wheels []registryWheel)
 		return refuse()
 	}
 	for _, candidate := range wheels {
+		if candidate.Size < 0 || candidate.Size > 2<<30 {
+			return refuse()
+		}
 		object, err := url.Parse(candidate.URL)
 		if err != nil || object.Scheme != "https" || (object.Host != "download.pytorch.org" && object.Host != "download-r2.pytorch.org") || object.User != nil || object.RawQuery != "" || object.Fragment != "" || object.Path != origin.Path+"/"+path.Base(object.Path) {
 			return refuse()

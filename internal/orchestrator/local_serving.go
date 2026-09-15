@@ -122,7 +122,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			result, rpcError = s.preparation.PrepareLocalPackage(s.ctx, &pb.PrepareLocalPackageRequest{
 				InstallRoot: spec.InstallRoot, OperationId: operation,
 				Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, SourceDigest: source, LocalRevisionDigest: digest},
-				Wheels:  files,
+				Wheels:  files, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
 			})
 			if rpcError == nil && result != nil && baseProblem == nil {
 				preparedCode = &localPreparedCode{operation: operation, revision: revision.Digest, base: base, result: proto.Clone(result).(*pb.PreparePackageSetResult)}

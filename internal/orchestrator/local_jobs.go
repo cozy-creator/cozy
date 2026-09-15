@@ -45,9 +45,6 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 	if s.host == nil || s.claim == nil {
 		return nil, exit.Unavailablef("unpublished package job preparation awaits the claimed Host")
 	}
-	if problem := requireLocalPackageCapacity(s, len(selected.Files)); problem != nil {
-		return nil, problem
-	}
 	call := &pb.PrepareLocalPackageCall{Claim: s.claim, LocalPackageSet: selected}
 	result := c.runHostPrepare(s, w, 0, hostLabel("local_job", request.ID),
 		func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {

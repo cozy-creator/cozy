@@ -47,9 +47,21 @@ func TestCapturedRegistryStage(t *testing.T) {
 		fatal(t, problem)
 		versions[identity.Distribution] = identity.Version
 	}
+	for _, line := range strings.Split(string(revision.DependencyRequirements), "\n") {
+		name, address, ok := strings.Cut(line, " @ ")
+		if !ok {
+			continue
+		}
+		for _, pin := range strings.Split(install.Closure, "\n") {
+			selected, version, _ := strings.Cut(pin, "==")
+			if selected == name && strings.Contains(address, strings.ReplaceAll(name, "-", "_")+"-"+version+"-") {
+				versions[name] = version
+			}
+		}
+	}
 	for _, pin := range strings.Split(install.Closure, "\n") {
 		name, version, _ := strings.Cut(pin, "==")
-		if !packagepublish.ImageOwnedDistribution(name) && versions[name] != version {
+		if versions[name] != version {
 			t.Fatalf("captured dependency omitted or changed: %s; supplied=%v", pin, versions)
 		}
 	}
@@ -69,6 +81,7 @@ source = { editable = "." }
 name = "numpy"
 version = "2.5.3"
 source = { registry = "https://pypi.org/simple" }
+wheels = [{url = "https://files.pythonhosted.org/packages/ab/cd/numpy-2.5.3-py3-none-any.whl", size = 1024, hash = "sha256:` + strings.Repeat("b", 64) + `"}]
 [[package]]
 name = "scipy"
 version = "1.18.1"
@@ -81,12 +94,12 @@ source = { registry = "https://pypi.org/simple" }
 `)
 }
 
-func TestCapturedRegistryClosureIncludesSelectedExtrasAndLeavesImageBaseToWorker(t *testing.T) {
+func TestCapturedRegistryClosureIncludesSelectedExtrasAndFrameworkClosure(t *testing.T) {
 	closure := "fixture==1.0\nnumpy==2.5.3\nscipy==1.18.1"
 	rows, pins, problem := packagepublish.CapturedRegistryRows(capturedClosureLock(), closure, "fixture", "1.0", nil)
 	fatal(t, problem)
-	if len(rows) != 1 || rows[0].Name != "scipy" || rows[0].SHA256 != strings.Repeat("a", 64) || !reflect.DeepEqual(pins, []string{"scipy==1.18.1"}) {
-		t.Fatalf("selected extra omitted or image-owned base was repinned: rows=%+v pins=%v", rows, pins)
+	if len(rows) != 2 || rows[0].Name != "numpy" || rows[1].Name != "scipy" || rows[1].SHA256 != strings.Repeat("a", 64) || !reflect.DeepEqual(pins, []string{"numpy==2.5.3", "scipy==1.18.1"}) {
+		t.Fatalf("selected extra or framework dependency changed: rows=%+v pins=%v", rows, pins)
 	}
 	for _, candidate := range []struct {
 		label, closure string
@@ -180,5 +193,22 @@ func TestUnpublishedWheelPinsPreserveImplementationAndVerifyRecord(t *testing.T)
 	must(t, err)
 	if !bytes.Equal(a, b) {
 		t.Fatal("private metadata pinning is not deterministic")
+	}
+}
+
+func TestCapturedRegistryRequirementsKeepLargeArtifactsOffUpload(t *testing.T) {
+	raw := bytes.Replace(capturedClosureLock(), []byte("size = 1024"), []byte("size = 943718400"), 1)
+	rows, _, problem := packagepublish.CapturedRegistryRows(raw, "fixture==1.0\nnumpy==2.5.3\nscipy==1.18.1", "fixture", "1.0", nil)
+	fatal(t, problem)
+	if rows[0].Size != 943718400 {
+		t.Fatal("public artifact lost its locked size")
+	}
+	requirements := packagepublish.RegistryRequirements(rows)
+	if !bytes.Contains(requirements, []byte("numpy @ https://files.pythonhosted.org/")) || !bytes.Contains(requirements, []byte("--hash=sha256:"+strings.Repeat("b", 64))) {
+		t.Fatalf("public artifact lost its exact source: %s", requirements)
+	}
+	raw = bytes.Replace(raw, []byte("size = 943718400"), []byte("size = 2147483649"), 1)
+	if _, _, problem := packagepublish.CapturedRegistryRows(raw, "fixture==1.0\nnumpy==2.5.3\nscipy==1.18.1", "fixture", "1.0", nil); problem == nil {
+		t.Fatal("artifact exceeding Runtime storage bound was admitted")
 	}
 }

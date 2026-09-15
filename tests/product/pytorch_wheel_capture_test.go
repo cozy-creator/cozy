@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
-func TestCapturedPyTorchRequirementPreservesOfficialObjectAndImageOwnership(t *testing.T) {
+func TestCapturedPyTorchRequirementPreservesOfficialObjectInPrivateEnvironment(t *testing.T) {
 	const version = "2.13.0+cpu"
 	const index = "https://download.pytorch.org/whl/cpu"
 	const object = "https://download-r2.pytorch.org/whl/cpu/torch-2.13.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl"
@@ -24,8 +24,8 @@ func TestCapturedPyTorchRequirementPreservesOfficialObjectAndImageOwnership(t *t
 		must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600))
 		closure := "capture-root==1.0.0\n" + name + "==" + version
 		rows, _, problem := packagepublish.CapturedRegistryRows([]byte(lock), closure, "capture-root", "1.0.0", nil)
-		if packagepublish.ImageOwnedDistribution(name) && problem == nil && len(rows) != 0 {
-			t.Fatal("framework became a private overlay")
+		if packagepublish.ImageOwnedDistribution(name) && problem == nil && len(rows) != 1 {
+			t.Fatal("framework direct reference was omitted")
 		}
 		captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "capture-root", closure, t.TempDir(), map[string]map[string]string{"library": {name: version}})
 		return captured[name], problem == nil
