@@ -62,7 +62,7 @@ type RuntimeCLI struct {
 	Bin               string   // the binary selected for the question: hostruntime.Path for metadata, Binary(install) for interface-wheel
 	Dir               string   // the package project root
 	EnvironmentPython string   // captured environment location for static source reads only
-	PackageInterface  string   // exact published package interface; empty for editable/source installs
+	PackageInterface  string   // exact installed interface; empty only for live editable source
 	Home              string   // COZY_HOME the runtime reads its artifact index out of
 	Env               []string // the allowlisted child environment (config.Tool)
 }

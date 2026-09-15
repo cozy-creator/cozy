@@ -126,12 +126,16 @@ func TestRentalFailureRecovery(t *testing.T) {
 	for {
 		queued, running, problem = store.RentalRunCounts("rental-lost")
 		fatal(t, problem)
-		if queued == 0 && running == 0 {
+		recovered, problem := store.RequestRow("req-lost-running")
+		fatal(t, problem)
+		// Recovery commits the unpin before charging the retry budget. Zero
+		// rental counts alone can observe the interval between those two facts.
+		if queued == 0 && running == 0 && recovered != nil && recovered.Requeues > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the failed rental still holds %d queued and %d running after 60s; "+
-				"its pinned work was never recovered\n%s", queued, running, tail(logPath))
+			t.Fatalf("rental recovery did not finish after 60s: %d queued, %d running, recovered request %+v\n%s",
+				queued, running, recovered, tail(logPath))
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

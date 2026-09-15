@@ -19,6 +19,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/processtree"
@@ -2287,11 +2288,19 @@ func (c *Orchestrator) idleLocalServingWorkerLocked(w *worker, active []records.
 // orphan and is killed (it holds a device grant and a socket this daemon no longer
 // knows); a mismatch is a REUSED PID and is never signalled — only its row is closed.
 func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
-	unlockLocal := localpackage.Guard()
-	e = localpackage.Sweep(c.opt.Layout, c.opt.Store)
-	unlockLocal()
-	if e != nil {
-		return 0, 0, e
+	writer, problem := home.LockWriter(c.opt.Layout)
+	if problem != nil {
+		// A CLI may be starting this daemon while handing off a captured run.
+		// That writer owns its not-yet-submitted revision; defer optional GC.
+		c.logf("local package sweep deferred: %s", problem.Message)
+	} else {
+		unlockLocal := localpackage.Guard()
+		e = localpackage.Sweep(c.opt.Layout, c.opt.Store)
+		unlockLocal()
+		writer.Unlock()
+		if e != nil {
+			return 0, 0, e
+		}
 	}
 	rows, e := c.opt.Store.LiveWorkers()
 	if e != nil {

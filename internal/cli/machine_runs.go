@@ -526,6 +526,14 @@ func readMachinePreparation(stream grpc.ServerStreamingClient[pb.PrepareEvent]) 
 }
 
 func readMachinePreparedSet(stream grpc.ServerStreamingClient[pb.PrepareEvent]) (*pb.DesiredPlacementSet, *exit.Error) {
+	event, problem := readMachinePreparationEvent(stream)
+	if problem != nil {
+		return nil, problem
+	}
+	return event.PlacementSet, nil
+}
+
+func readMachinePreparationEvent(stream grpc.ServerStreamingClient[pb.PrepareEvent]) (*pb.PrepareEvent, *exit.Error) {
 	for {
 		event, err := stream.Recv()
 		if err != nil {
@@ -536,9 +544,9 @@ func readMachinePreparedSet(stream grpc.ServerStreamingClient[pb.PrepareEvent]) 
 		}
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:
-			return nil, exit.Named(exit.Conflict, "machine_execution.prepare_refused", "%s: %s", event.SafeCode, event.SafeDetail)
+			return event, exit.Named(exit.Conflict, "machine_execution.prepare_refused", "%s: %s", event.SafeCode, event.SafeDetail)
 		case pb.PrepareStage_PREPARE_STAGE_PREPARED:
-			return event.PlacementSet, validateMachinePrepared(event.PlacementSet)
+			return event, validateMachinePrepared(event.PlacementSet)
 		}
 	}
 }

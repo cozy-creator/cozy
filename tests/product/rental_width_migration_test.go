@@ -118,7 +118,7 @@ func TestBothReleasedSchema33RentalShapesMigrateWithoutLosingWork(t *testing.T) 
 				}
 			}
 			must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-			if version != 40 {
+			if version != 41 {
 				t.Fatalf("migration version=%d", version)
 			}
 			violations, err := db.Query(`PRAGMA foreign_key_check`)

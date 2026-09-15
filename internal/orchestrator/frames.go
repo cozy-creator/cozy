@@ -13,6 +13,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -1431,6 +1432,12 @@ func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
 	if req.LocalPackageDigest == "" {
 		return
 	}
+	writer, problem := home.LockWriter(c.opt.Layout)
+	if problem != nil {
+		c.logf("request %s local package cleanup deferred: %s", req.ID, problem.Message)
+		return
+	}
+	defer writer.Unlock()
 	unlockLocal := localpackage.Guard()
 	defer unlockLocal()
 	if e := localpackage.DropDigestUnowned(c.opt.Layout, c.opt.Store,

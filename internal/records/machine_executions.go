@@ -49,13 +49,29 @@ type MachineExecution struct {
 
 const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected`
 
-func (s *Store) MachinePackageUploaded(request, boot, revision string) (bool, *exit.Error) {
-	var uploaded bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='machine.package_uploaded' AND json_extract(payload,'$.worker_boot_id')=? AND json_extract(payload,'$.revision')=?)`, request, boot, revision).Scan(&uploaded)
-	if err != nil {
-		return false, exit.Internalf("cannot read machine package transfer progress: %s", err)
+type MachinePackageTransferProgress struct {
+	Operation string
+	Uploaded  bool
+	Completed int
+}
+
+// MachinePackageTransfer observes only this request's transfer progress. Recording
+// its start before the first byte lets reconnect resume an incomplete initial
+// upload without asking the installer to consume unverified wheel carriers.
+func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachinePackageTransferProgress, *exit.Error) {
+	var progress MachinePackageTransferProgress
+	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.operation_id'),''),
+ type='machine.package_uploaded',sum(CASE WHEN type='machine.package_uploaded' THEN 1 ELSE 0 END) OVER ()
+ FROM request_events WHERE request_id=? AND type IN ('machine.package_upload_started','machine.package_uploaded')
+ AND json_extract(payload,'$.worker_boot_id')=? AND json_extract(payload,'$.revision')=?
+ ORDER BY seq DESC LIMIT 1`, request, boot, revision).Scan(&progress.Operation, &progress.Uploaded, &progress.Completed)
+	if err == sql.ErrNoRows {
+		return progress, nil
 	}
-	return uploaded, nil
+	if err != nil {
+		return progress, exit.Internalf("cannot read machine package transfer operation: %s", err)
+	}
+	return progress, nil
 }
 
 // e/r are the observer and request aliases. Explicit Runtime release is stronger

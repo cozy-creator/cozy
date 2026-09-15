@@ -196,12 +196,12 @@ type Result struct {
 	// CapturedProjectWheel is the metadata-sealed executable of a captured App
 	// wheel. Its original archive remains under this install's original/ directory.
 	CapturedProjectWheel string
-	Superseded          string
-	Idempotent          bool
-	Timings             []Timing
-	Warnings            []string
-	Files               int
-	Bytes               int64
+	Superseded           string
+	Idempotent           bool
+	Timings              []Timing
+	Warnings             []string
+	Files                int
+	Bytes                int64
 	// ModelStatus is post-commit Creator UX, not part of the install transaction.
 	// A failed optional prefetch therefore cannot roll this successful result back.
 	ModelStatus string
@@ -303,6 +303,9 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		// The same source is the same self-callable surface. Capture is idempotent, so
 		// this also gives an install made before self bindings existed its rows back.
 		if e := CaptureSelfBindings(st, *priorInstall, nil); e != nil {
+			return nil, e
+		}
+		if e := invalidateCapture(st, req); e != nil {
 			return nil, e
 		}
 		return res, nil
@@ -430,7 +433,21 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	res.Install, res.Superseded = inst, superseded
 	mark("activate")
+	if e := invalidateCapture(st, req); e != nil {
+		return nil, e
+	}
 	return res, nil
+}
+
+func invalidateCapture(store *records.Store, req Request) *exit.Error {
+	if req.Snapshot || req.Local == nil {
+		return nil
+	}
+	caller, problem := CaptureCaller(req.Local.Tree)
+	if problem != nil {
+		return problem
+	}
+	return store.ForgetCapturePin(caller)
 }
 
 // readDevelopmentInterface reads only the source interface. Model construction

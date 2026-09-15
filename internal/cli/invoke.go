@@ -221,7 +221,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	began := time.Now()
+	began := ctx.commandStarted
+	submitting := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
@@ -232,10 +233,11 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		OutputDirectory: outputDirectory,
 		AttentionKernel: overrides.AttentionKernel,
 	}, key)
+	releaseSnapshotReader(target)
 	if e != nil {
 		return e
 	}
-	submitted := time.Since(began)
+	submitted := time.Since(submitting)
 	if !ctx.Mode().JSON {
 		if ctx.Mode().Full {
 			fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
@@ -2169,11 +2171,12 @@ func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
 
 // Target is one installed package and optional callable selected for invocation.
 type Target struct {
-	Package   string
-	Function  string
-	InstallID string
-	Release   string
-	Snapshot  bool
+	Package        string
+	Function       string
+	InstallID      string
+	Release        string
+	Snapshot       bool
+	releaseCapture func()
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path

@@ -95,6 +95,7 @@ type fakePod struct {
 	localJobOnly   bool
 	privatePrepare func(*pb.PreparePrivatePlacementCall, grpc.ServerStreamingServer[pb.PrepareEvent]) error
 	localPrepare   func(*pb.PrepareLocalPackageCall, grpc.ServerStreamingServer[pb.PrepareEvent]) error
+	localUpload    func(grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error
 	// onJobReady can delay and sequence the independent peer's readiness facts.
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// answerOffer supplies a protocol outcome when a test exercises settlement.
@@ -442,6 +443,9 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 // already holds verified, and the prepared placement is a development one carrying the
 // exact project wheel and the local revision digest, as Runtime authors it.
 func (p *fakePod) LocalPackageUpload(stream grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error {
+	if p.localUpload != nil {
+		return p.localUpload(stream)
+	}
 	frame, err := stream.Recv()
 	if err != nil {
 		return err
