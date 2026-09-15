@@ -16,7 +16,7 @@ service path. `WireMinor` is its additive compatibility level. Additive changes 
 minor; independently negotiated optional capabilities are documented by the canonical
 protocol and default to unsupported, without inferring support from a version range. A breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
-This consumer cohort pins the official `5a447bf` generated snapshot at wire 57.
+This integrated cohort pins the feature-preserving `61f9e3c` generated snapshot at wire 57.
 It includes machine execution and publication authority references, together with
 mixed-input and model-materialization recovery capabilities. Runtime-owned execution
 without publication requires actual worker minor 51; publication requires actual
@@ -33,3 +33,7 @@ independent `vendored-diff.sh` comparison additionally regenerates from the `.pr
 byte-compares this complete generated set against upstream. That job is gated on the
 `WORKER_PROTOCOL_TOKEN` secret; while the secret is unset it is a no-op and Cozy makes no
 independent upstream-provenance or drift claim beyond `SOURCE`.
+
+This integration retains the qualified generic LoRA adapter protocol and the complete
+unpublished dependency requirement fields in one generated snapshot. Both families use
+wire 57 with minimum 57; no dependency compatibility path is negotiated.

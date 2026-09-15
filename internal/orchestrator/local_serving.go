@@ -94,6 +94,9 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		if root == "" {
 			root = filepath.Dir(filepath.Dir(spec.EnvironmentPython))
 		}
+		if problem := requireAdapterDownloadPeer(s, selected); problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
 		result, rpcError = s.preparation.PreparePackageSet(s.ctx, &pb.PreparePackageSetRequest{
 			InstallRoot: root, DownloadDelegation: selected, Application: prep.Application,
 			ModelSlotPaths: prep.ModelSlotPaths, LockedRequirements: locked,
@@ -145,6 +148,12 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 				}
 			}
 			if problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+			if problem := requireAdapterDownloadPeer(s, call.DownloadDelegation); problem != nil {
+				return WorkerLaunchSpec{}, "", problem
+			}
+			if problem := requireAdapterPeer(s, hasModelAdapters(req.Models)); problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
 			result, rpcError = s.preparation.PreparePrivatePlacement(s.ctx, call)
@@ -248,7 +257,7 @@ func localDownloadSelection(models []ModelRef, packages []*pb.DownloadPackageRef
 			path = model.BindingPath
 		}
 		for _, slot := range append([]string{path}, model.SharedSlots...) {
-			selected = append(selected, &pb.DownloadModelRef{Package: model.Package, Slot: slot, Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
+			selected = append(selected, &pb.DownloadModelRef{Package: model.Package, Slot: slot, Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, Adapters: downloadAdapters(model.Adapters)})
 		}
 	}
 	sort.Slice(selected, func(i, j int) bool {
