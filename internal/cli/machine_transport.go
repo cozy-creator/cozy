@@ -200,74 +200,10 @@ func uploadMachinePackage(ctx context.Context, host pb.PodHostClient, claim *pb.
 		if err != nil {
 			return exit.New(exit.Conflict, "captured wheel identity is invalid")
 		}
-		stream, err := host.LocalPackageUpload(ctx)
-		if err != nil {
-			return machineTransport(err)
-		}
-		header := &pb.LocalPackageUploadHeader{Claim: claim, OperationId: operation, SourceDigest: source, File: &pb.LocalPackageFileRef{Digest: digest, Length: uint64(file.Length), Filename: file.Filename}}
-		if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Header{Header: header}}); err != nil {
-			stream.CloseSend()
-			return machineTransport(err)
-		}
-		held, err := stream.Recv()
-		if err != nil {
-			stream.CloseSend()
-			return machineTransport(err)
-		}
-		if held.ReceivedBytes > uint64(file.Length) {
-			stream.CloseSend()
-			return exit.New(exit.Conflict, "machine upload returned an impossible verified prefix")
-		}
-		if held.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
-			stream.CloseSend()
-			continue
-		}
-		if held.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_REFUSED {
-			stream.CloseSend()
-			return exit.New(exit.Conflict, "machine refused captured wheel: %s", held.SafeDetail)
-		}
-		reader, err := os.Open(file.Path)
-		if err != nil {
-			stream.CloseSend()
-			return exit.New(exit.NotFound, "captured wheel is unavailable: %s", err)
-		}
-		offset := held.ReceivedBytes
-		if _, err := reader.Seek(int64(offset), io.SeekStart); err != nil {
-			reader.Close()
-			stream.CloseSend()
-			return exit.Internalf("cannot resume captured wheel upload: %s", err)
-		}
-		buffer := make([]byte, 1<<20)
-		for offset < uint64(file.Length) {
-			n, err := io.ReadFull(reader, buffer[:min(uint64(len(buffer)), uint64(file.Length)-offset)])
-			if err != nil {
-				reader.Close()
-				stream.CloseSend()
-				return exit.New(exit.Conflict, "captured wheel changed during upload: %s", err)
-			}
-			if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Chunk{Chunk: &pb.LocalPackageUploadChunk{Offset: offset, Data: buffer[:n]}}}); err != nil {
-				reader.Close()
-				stream.CloseSend()
-				return machineTransport(err)
-			}
-			next, err := stream.Recv()
-			if err != nil {
-				reader.Close()
-				stream.CloseSend()
-				return machineTransport(err)
-			}
-			offset += uint64(n)
-			if next.ReceivedBytes != offset {
-				reader.Close()
-				stream.CloseSend()
-				return exit.New(exit.Conflict, "machine upload changed its acknowledged prefix")
-			}
-			held = next
-		}
-		reader.Close()
-		stream.CloseSend()
-		if held.State != pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
-			return exit.New(exit.Conflict, "captured wheel has no verified upload completion")
+		header := &pb.LocalPackageUploadHeader{Claim: claim, OperationId: operation, SourceDigest: source,
+			File: &pb.LocalPackageFileRef{Digest: digest, Length: uint64(file.Length), Filename: file.Filename}}
+		if problem := localpackage.UploadFile(ctx, host, header, file.Path, nil); problem != nil {
+			return problem
 		}
 	}
 	return nil
