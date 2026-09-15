@@ -191,11 +191,8 @@ func writeHelperProject(t *testing.T, dir, distribution, module, version string)
 		[]byte(fmt.Sprintf("__version__ = %q\n", version)), 0o644))
 }
 
-// TestPublishBuildAcceptsCompliantPackage is the green arm over the runtime
-// peer fixture: an image-owned RANGE plus one in-tree local dependency builds
-// the complete publication staging — PackageInterface included — vendors exactly the
-// in-tree dep, keeps the roster wheel in source custody, and reports the
-// th-113 publish nudge.
+// Publication retains local SDK and helper wheels with their complete public
+// dependency closure, and reports the helper's ordinary publication nudge.
 func TestPublishBuildAcceptsCompliantPackage(t *testing.T) {
 	project := weightlessProject(t)
 
@@ -222,22 +219,30 @@ func TestPublishBuildAcceptsCompliantPackage(t *testing.T) {
 	}
 
 	pack := buildForPublish(t, project)
-	if len(pack.Vendored) != 1 || pack.Vendored[0].Name != "cozy-weightless-helper" ||
-		pack.Vendored[0].Version != "0.0.1" {
-		t.Fatalf("vendored = %+v", pack.Vendored)
+	vendored := map[string]packagepublish.VendoredDependency{}
+	for _, dependency := range pack.Vendored {
+		vendored[dependency.Name] = dependency
 	}
-	note := packagepublish.VendoredNote("acme", pack.Vendored[0])
+	if vendored["cozy-weightless-helper"].Version != "0.0.1" || vendored[runtimeDistribution].Name == "" {
+		t.Fatalf("local helper or SDK omitted: %+v", pack.Vendored)
+	}
+	note := packagepublish.VendoredNote("acme", vendored["cozy-weightless-helper"])
 	want := "Vendored cozy-weightless-helper 0.0.1 (unpublished). " +
 		"Next: publish it and depend on acme/cozy-weightless-helper instead"
 	if note != want {
 		t.Fatalf("nudge = %q, want %q", note, want)
 	}
-	if len(pack.DependencyWheels) != 1 ||
-		!strings.HasPrefix(pack.DependencyWheels[0].Filename, "cozy_weightless_helper-0.0.1-") {
-		t.Fatalf("dependency wheels = %+v", pack.DependencyWheels)
+	if len(pack.DependencyWheels) != len(pack.Vendored) {
+		t.Fatalf("local distribution omitted from wheels: %+v", pack.DependencyWheels)
 	}
-	if len(pack.Registry) != 0 {
-		t.Fatalf("registry rows = %+v", pack.Registry)
+	found := false
+	for _, row := range pack.Registry {
+		if row.Name == "msgspec" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("SDK public dependency closure omitted: %+v", pack.Registry)
 	}
 	if pack.PackageInterface == "" || pack.Wheel == "" {
 		t.Fatalf("staging incomplete: wheel %q package interface %q", pack.Wheel, pack.PackageInterface)

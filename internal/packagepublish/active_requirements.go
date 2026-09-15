@@ -19,6 +19,7 @@ import (
 var activeRequirementsScript string
 
 type RequirementSelection struct {
+	Markers        []bool              `json:"markers"`
 	RequiresPython string              `json:"requires_python"`
 	Requirements   []string            `json:"requirements"`
 	Extras         map[string][]string `json:"extras"`

@@ -28,6 +28,18 @@ def variables(node):
         return {token.value for token in node if isinstance(token, Variable)}
     return set().union(*(variables(item) for item in node if item not in ("and", "or")))
 
+if "markers" in request:
+    known = {"implementation_name", "implementation_version", "os_name", "platform_machine",
+             "platform_python_implementation", "python_full_version", "python_version", "sys_platform"}
+    selected = []
+    for raw in request["markers"]:
+        marker = Marker(raw) if raw else None
+        if marker and not variables(marker._markers).issubset(known):
+            raise ValueError("registry marker requires facts absent from the publication target")
+        selected.append(marker is None or marker.evaluate(environment))
+    json.dump({"markers": selected}, sys.stdout)
+    sys.exit(0)
+
 if "requirements" in request:
     active = set()
     for raw in request["requirements"]:

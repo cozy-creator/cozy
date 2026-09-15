@@ -38,7 +38,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 			wanted[name] = version
 		}
 	}
-	existing, _, _, problem := collectLocalDependencies(ctx, tree, metadata, stage, false)
+	existing, _, _, problem := collectLocalDependencies(ctx, tree, metadata, stage)
 	if problem != nil {
 		return nil, problem
 	}

@@ -228,20 +228,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		link.MachineID = machine
 	}
-	defer func() {
-		if out == nil || out.ErrName() != "machine_execution.runtime_requirement" || m.updates == nil || len(link.Submission) != 0 {
-			return
-		}
-		latest, problem := m.store.MachineExecution(request.ID)
-		if problem != nil {
-			out = problem
-			return
-		}
-		if latest == nil || len(latest.Submission) > 0 {
-			return
-		}
-		out = m.updates.reobserve(request, link.MachineID, out)
-	}()
+
 	if len(link.Submission) == 0 && m.updates != nil {
 		if problem := m.updates.preflight(m.ctx, request, link.MachineID); problem != nil {
 			return problem

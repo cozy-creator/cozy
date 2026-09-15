@@ -9,7 +9,7 @@ jobs:
         tests: ['^Test[A-H]', '^Test[I-O]', '^Test[P-Q]', '^Test[R-Z]']
     env:
       UV_TORCH_BACKEND: cpu
-      COZY_RUNTIME_SOURCE: eb4049e10a3835890a6d8158cfd2a133e5969d13
+      COZY_RUNTIME_SOURCE: 6c5322120ca123939818c43e0d974b993ca94faa
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -73,17 +73,8 @@ jobs:
             /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -run "${{ matrix.tests }}" -timeout 30m -args -serving-cpu-fixture -script-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"'
       - run: python3 scripts/fence.py
 
-  # THE WORKER-IMAGE ROSTER CHECK. `internal/packagepublish/base-distributions.json` is
-  # cozy-runtime's generated file, copied. It decides what `uv export --prune` strips from
-  # a publication, so drift between the copy and the original either strips a wheel the
-  # package needs or uploads one the worker will refuse — which is exactly what had already
-  # happened, by three names, when the two lists were separately authored.
-  #
-  # The always-armed half runs in `checks` with no credential: it proves the Go side prunes
-  # exactly the vendored roster and nothing else. This job is the ceiling — the byte
-  # comparison against cozy-runtime itself — and it self-arms the moment a read credential
-  # for the private sibling exists, rather than sitting red or hiding behind a flipped
-  # variable.
+  # Framework artifact classification uses the Runtime-owned generated roster.
+  # Public and private package closures both retain every selected distribution.
   runtime-roster:
     runs-on: ubuntu-latest
     env:
@@ -113,7 +104,7 @@ jobs:
       - name: Report unarmed roster comparison
         if: env.COZY_RUNTIME_TOKEN == ''
         run: |
-          echo '::warning::COZY_RUNTIME_TOKEN is absent, so the vendored base-distributions.json was not byte-compared against cozy-runtime. This is a missing ceiling, not a missing floor: the always-armed half ran in `checks` and proves the publish prune list is derived from these bytes with nothing added or dropped.'
+          echo '::warning::COZY_RUNTIME_TOKEN is absent, so the vendored base-distributions.json was not byte-compared against cozy-runtime. This is a missing ceiling, not a missing floor: the always-armed half ran in `checks` and proves framework classification is derived from the vendored roster.'
 
   # THE VENDORED-BINDING CHECK. `protocol/` is copied, never imported as a module, so
   # worker-protocol regenerates from its own .proto with its pinned toolchain and

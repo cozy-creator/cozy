@@ -134,7 +134,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution:  machines.Start,
 		RentalRuntimePreflight: machines.updates.preflight,
-		RentalRuntimeMismatch:  machines.updates.reobserve,
 		Cfg:                    ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),

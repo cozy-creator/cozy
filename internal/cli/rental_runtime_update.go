@@ -30,10 +30,8 @@ import (
 var runtimeUpdateTransport string
 
 type rentalRuntimeUpdates struct {
-	machines         *machineRuns
-	running          sync.Map
-	observed         sync.Map
-	requirementFacts sync.Map
+	machines *machineRuns
+	running  sync.Map
 }
 
 type runtimeUpdateSelection struct {
@@ -118,7 +116,6 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		if problem := m.store.SaveRuntimeUpdate(row); problem != nil {
 			fmt.Fprintln(m.context.Out, problem.Message)
 		}
-		u.observed.Delete(row.RentalID)
 		m.mu.Lock()
 		delete(m.claimed, row.RentalID)
 		m.mu.Unlock()

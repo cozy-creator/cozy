@@ -32,25 +32,15 @@ def run(*args: str) -> bytes:
 
 
 def prepare(root: Path) -> None:
-    # Give the child a real image-owned base, containing the exact Runtime wheel
-    # installed by the Go test. A venv cannot act as another venv's base prefix.
-    image = root / "image"
-    shutil.copytree(sys.base_prefix, image, symlinks=True)
-    relative_site = (
-        Path("lib")
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
-    shutil.copytree(
-        Path(sys.prefix) / relative_site, image / relative_site, dirs_exist_ok=True
-    )
-    python = image / "bin" / "python3"
+    python = Path(sys.executable)
+    dependency_requirements = (root / "dependency-requirements.txt").read_bytes()
     project = root / "project"
     project.mkdir()
     (project / "pyproject.toml").write_text("""[project]
 name="weightless"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
+dependencies=["cozy-runtime"]
 [project.entry-points."cozy.application"]
 default="private_environment_fixture:app"
 [build-system]
@@ -82,12 +72,19 @@ def tile(ctx: Context, payload: Request) -> Result:
     wheels.mkdir(parents=True)
     run("uv", "build", "--wheel", "--out-dir", str(wheels), str(project))
     (wheel,) = wheels.glob("*.whl")
-    row = pb.LocalPackageWheel(
-        digest=documents.digest_of(wheel.read_bytes()),
-        filename=wheel.name,
-        path=str(wheel),
-        length=wheel.stat().st_size,
-    )
+    sdk_wheel = (root / "sdk-wheel.txt").read_text()
+    if sdk_wheel:
+        shutil.copyfile(sdk_wheel, wheels / Path(sdk_wheel).name)
+    rows = [
+        pb.LocalPackageWheel(
+            digest=documents.digest_of(path.read_bytes()),
+            filename=path.name,
+            path=str(path),
+            length=path.stat().st_size,
+        )
+        for path in sorted(wheels.glob("*.whl"))
+    ]
+    rows.sort(key=lambda row: row.digest)
     revision = pb.LocalPackageRevision(
         package="local/weightless",
         release="1.0.0",
@@ -99,7 +96,11 @@ def tile(ctx: Context, payload: Request) -> Result:
             pb.LocalPackageFileRef(
                 digest=row.digest, filename=row.filename, length=row.length
             )
+            for row in rows
         ],
+        dependency_requirements=pb.Ref(
+            digest=documents.digest_of(dependency_requirements), length=len(dependency_requirements)
+        ),
     )
     revision_digest = documents.identity(revision)[1]
 
@@ -121,7 +122,8 @@ def tile(ctx: Context, payload: Request) -> Result:
             source_digest=revision.source_digest,
             local_revision_digest=revision_digest,
         ),
-        wheels=[row],
+        wheels=rows,
+        dependency_requirements=dependency_requirements,
         install_root=str(install),
     )
     (root / "prepare-request.bin").write_bytes(request.SerializeToString())
@@ -153,10 +155,11 @@ def tile(ctx: Context, payload: Request) -> Result:
                     {
                         "digest": documents.spell(row.digest),
                         "filename": row.filename,
-                        "kind": "project",
+                        "kind": "project" if row.filename == wheel.name else "dependency",
                         "path": row.path,
                         "length": row.length,
                     }
+                    for row in rows
                 ],
             }
         )

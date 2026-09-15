@@ -5,14 +5,17 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -41,6 +44,25 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 	}
 	run("uv", "venv", "--python", "3.12", filepath.Dir(filepath.Dir(python)))
 	run("uv", "pip", "install", "--python", python, runtime)
+	// Freeze the fixture's SDK as package-owned wheels and exact public refs.
+	// Its child must not inherit the control interpreter's site-packages.
+	sdkProject := filepath.Join(root, "sdk-project")
+	must(t, os.Mkdir(sdkProject, 0700))
+	sdkMetadata := fmt.Sprintf("[project]\nname=\"private-sdk-fixture\"\nversion=\"1.0\"\nrequires-python=\">=3.12,<3.13\"\ndependencies=[%s]\n", strconv.Quote("cozy-runtime=="+runtimeFixtureVersion(t, *privateChildRuntimeWheel)))
+	if *privateChildRuntimeWheel != "" {
+		sdkMetadata += "[tool.uv.sources]\ncozy-runtime={path=" + strconv.Quote(runtime) + "}\n"
+	}
+	must(t, os.WriteFile(filepath.Join(sdkProject, "pyproject.toml"), []byte(sdkMetadata), 0600))
+	run("uv", "lock", "--project", sdkProject)
+	lock := filepath.Join(root, "pylock.sdk.toml")
+	run("uv", "export", "--quiet", "--locked", "--no-dev", "--no-default-groups", "--no-emit-project", "--no-emit-local", "--format", "pylock.toml", "--output-file", lock, "--project", sdkProject)
+	lockBytes, err := os.ReadFile(lock)
+	must(t, err)
+	sdkRows, sdkProblem := packagepublish.RegistryRowsFromLock(lockBytes, nil, "")
+	fatal(t, sdkProblem)
+	dependencyRequirements := packagepublish.RegistryRequirements(sdkRows)
+	must(t, os.WriteFile(filepath.Join(root, "dependency-requirements.txt"), dependencyRequirements, 0600))
+	must(t, os.WriteFile(filepath.Join(root, "sdk-wheel.txt"), []byte(*privateChildRuntimeWheel), 0600))
 	helper := filepath.Join("testdata", "local_serving_preparation", "private_environment.py")
 	run(python, helper, "prepare", root)
 	raw, err := os.ReadFile(filepath.Join(root, "prepared.json"))
@@ -68,6 +90,7 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 		Package: receipt.Package, Release: receipt.Release, SourceDigest: receipt.SourceDigest,
 		Digest: receipt.Digest, PackageInterfaceDigest: receipt.PackageInterfaceDigest,
 		PackageInterfaceLength: receipt.PackageInterfaceLength, Files: receipt.Files,
+		DependencyRequirements: dependencyRequirements,
 	}
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)

@@ -137,7 +137,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 	p.Root = root
 	// Declared-metadata refusals and dependency staging run before the project
 	// wheel build, so a doomed publication is refused before the expensive work.
-	dependencies, needsRegistry, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root, publish)
+	dependencies, needsRegistry, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
