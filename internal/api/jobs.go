@@ -527,7 +527,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	}
 	names := make([]string, 0, len(jobs))
 	for _, job := range jobs {
-		names = append(names, job.Name)
+		if !job.Internal {
+			names = append(names, job.Name)
+		}
 		if job.Name != sub.Function {
 			continue
 		}
