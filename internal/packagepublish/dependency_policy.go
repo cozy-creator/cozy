@@ -24,6 +24,9 @@ func validateDependencyPolicy(raw, source string) *exit.Error {
 	if problem != nil || !req.hasSpec {
 		return problem
 	}
+	if strings.Contains(req.specifier.String(), "||") {
+		return invalidRequirement(raw) // PEP 508 has no union specifier syntax.
+	}
 	for _, spec := range strings.Split(req.specifier.String(), ",") {
 		spec = strings.TrimSpace(spec)
 		operator := ""
@@ -40,7 +43,7 @@ func validateDependencyPolicy(raw, source string) *exit.Error {
 			parts := strings.Split(release[2], ".")
 			switch operator {
 			case ">=", ">":
-				allowed = !strings.Contains(version, "||")
+				allowed = true
 			case "==":
 				allowed = release[3] == ".*" && len(parts) <= 2
 			case "~=":
