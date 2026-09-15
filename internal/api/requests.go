@@ -844,7 +844,8 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		}
 		return Lifecycle{Number: row.Number, Kind: "job", RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
-			Result: state.Result, Error: state.Error, ErrorType: state.ErrorType, Outputs: state.Outputs,
+			ExecutionMS: state.ExecutionMS,
+			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, Outputs: state.Outputs,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution}
 	}

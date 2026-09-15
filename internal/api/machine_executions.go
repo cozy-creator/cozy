@@ -3,7 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
+	"slices"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -79,10 +82,12 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	if proto.Unmarshal(link.Submission, &submission) == nil {
 		state.RetryBudget = int64(submission.MaxAttempts)
 	}
+	var terminal *pb.AttemptOutcomeBody
 	if len(link.Outcome) > 0 {
 		var outcome pb.AttemptOutcome
 		var body pb.AttemptOutcomeBody
 		if proto.Unmarshal(link.Outcome, &outcome) == nil && canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body) == nil {
+			terminal = &body
 			if body.Cause != nil && body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
 				state.Error = body.SafeMessage
 				state.ErrorType = body.Cause.Code.String()
@@ -95,7 +100,65 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			}
 		}
 	}
+	if intervals, problem := s.store.MachineExecutionIntervals(row.ID); problem != nil {
+		view.ObservationError = problem.Message
+	} else {
+		state.ExecutionMS = machineExecutionMS(row, link, intervals, terminal, time.Now().UnixMilli())
+	}
 	return state
+}
+
+// Machine attempts belong to Runtime. Count each admission-to-outcome interval,
+// just as local attempts count dispatch-to-close. Paused/retry gaps and delayed
+// result collection are outside those intervals. An active interval alone uses
+// the current clock; a terminal interval never grows when read back later.
+func machineExecutionMS(row records.Request, link *records.MachineExecution, intervals []records.MachineExecutionInterval, terminal *pb.AttemptOutcomeBody, now int64) int64 {
+	var receipt pb.MachineExecutionReceipt
+	if proto.Unmarshal(link.Receipt, &receipt) != nil || receipt.RequestId != row.ID ||
+		receipt.AcceptedAtMs == 0 || receipt.AcceptedAtMs > math.MaxInt64 {
+		return 0
+	}
+	type span struct{ start, end int64 }
+	spans := map[int64]span{1: {start: int64(receipt.AcceptedAtMs)}}
+	for _, interval := range intervals {
+		if interval.Attempt <= 0 {
+			continue
+		}
+		value := spans[interval.Attempt]
+		if interval.Attempt > 1 {
+			if stamp := parseStamp(interval.ResumedAt); !stamp.IsZero() {
+				value.start = stamp.UnixMilli()
+			}
+		}
+		if stamp := parseStamp(interval.FinishedAt); !stamp.IsZero() {
+			value.end = stamp.UnixMilli()
+		}
+		spans[interval.Attempt] = value
+	}
+	current := max(row.Ordinal, 1)
+	if _, exists := spans[current]; !exists {
+		spans[current] = span{}
+	}
+	var total int64
+	for attempt, value := range spans {
+		if attempt == current && (value.start == 0 || value.end == 0) {
+			// Older observations may have retained the terminal without its event
+			// page. The outcome's own measured runtime is the bounded fallback.
+			if terminal != nil && terminal.AttemptOrdinal == uint64(attempt) && terminal.Metrics != nil &&
+				terminal.Metrics.RuntimeMs <= math.MaxInt64 && !slices.Contains(terminal.Metrics.UnverifiedFields, "runtime_ms") {
+				total += int64(terminal.Metrics.RuntimeMs)
+				continue
+			}
+			switch row.State {
+			case "submitted", "queued", "dispatching", "pausing", "canceling":
+				value.end = now
+			}
+		}
+		if value.start > 0 && value.end > value.start {
+			total += value.end - value.start
+		}
+	}
+	return total
 }
 
 func (s *Server) machineJobControl(w http.ResponseWriter, r *http.Request, row records.Request, action string) bool {
