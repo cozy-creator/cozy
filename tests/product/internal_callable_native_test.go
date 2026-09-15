@@ -21,7 +21,12 @@ func TestInternalCallableNativeParentExecutesItsOwnChild(t *testing.T) {
 	}
 	root, err := os.MkdirTemp("", "cozy-ic-")
 	must(t, err)
-	path := os.Getenv("PATH")
+	path := ""
+	for _, value := range childEnv(t, root) {
+		if strings.HasPrefix(value, "PATH=") {
+			path = strings.TrimPrefix(value, "PATH=")
+		}
+	}
 	t.Cleanup(func() {
 		compositionDown(t, root, path)
 		if t.Failed() {
