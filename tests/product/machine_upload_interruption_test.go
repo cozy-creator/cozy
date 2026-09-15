@@ -42,7 +42,7 @@ type interruptedHostControl struct {
 
 func newInterruptedHostControl(t *testing.T, upstream string) *interruptedHostControl {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow test-only loopback relay preserves end-to-end TLS while interrupting an upload
 	must(t, err)
 	p := &interruptedHostControl{listener: listener, upstream: upstream, peers: map[net.Conn]bool{}, dropped: make(chan struct{}), resume: make(chan struct{}), stop: make(chan struct{})}
 	p.wait.Add(1)
