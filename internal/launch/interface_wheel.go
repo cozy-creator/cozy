@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-const interfaceGeneratorABI = "cozy.interface-generator/5"
+const interfaceGeneratorABI = "cozy.interface-generator/6"
 const interfaceGeneratorRuntimeFloor = "0.11.0"
 
 func GenerateInterfaceWheel(ctx context.Context, install records.PackageInstall, home string, env []string, implementation, source, sourceDigest, output string) (InterfaceWheel, *exit.Error) {
@@ -42,8 +42,8 @@ func interfaceRuntimeFloor(distribution, version string) *exit.Error {
 	release, err := pep440.Parse(version)
 	if err != nil || release.LessThan(pep440.MustParse(interfaceGeneratorRuntimeFloor)) {
 		return exit.Named(exit.Structural, "interface_runtime_below_floor",
-			"interface generation for %s uses cozy-runtime %q; %s requires Runtime %s or newer",
-			distribution, version, interfaceGeneratorABI, interfaceGeneratorRuntimeFloor).
+			"interface generation for %s uses cozy-runtime %q; Runtime %s or newer is required",
+			distribution, version, interfaceGeneratorRuntimeFloor).
 			WithRemedy("upgrade this dependency project's cozy-runtime requirement and uv.lock to >=%s (uv lock --upgrade-package cozy-runtime), then retry cozy run", interfaceGeneratorRuntimeFloor)
 	}
 	return nil
@@ -76,7 +76,22 @@ func (r RuntimeCLI) InterfaceWheel(ctx context.Context, interfacePath, distribut
 	if problem := r.callInputContext(ctx, raw, &wheel, "interface-wheel"); problem != nil {
 		return wheel, problem
 	}
-	if filepath.Base(wheel.Filename) != wheel.Filename || filepath.Clean(wheel.Path) != filepath.Join(output, wheel.Filename) || wheel.Length <= 0 || wheel.Length > 256<<20 || wheel.GeneratorABI != interfaceGeneratorABI {
+	if wheel.GeneratorABI == "cozy.interface-generator/5" {
+		// Older generators remain valid for public-only packages. They cannot
+		// establish the internal-export filtering promised by generator 6.
+		surface, problem := ReadPackageInterface(interfacePath, "")
+		if problem != nil {
+			return wheel, problem
+		}
+		for _, entry := range append(append([]Entrypoint(nil), surface.Entrypoints...), surface.Jobs...) {
+			if entry.Internal {
+				return wheel, exit.Named(exit.Structural, "interface_generator_internal_unsupported", "internal callables require Runtime 0.18.3 or newer for interface generation")
+			}
+		}
+	} else if wheel.GeneratorABI != interfaceGeneratorABI {
+		return wheel, exit.New(exit.Validation, "interface generator returned an unsupported ABI")
+	}
+	if filepath.Base(wheel.Filename) != wheel.Filename || filepath.Clean(wheel.Path) != filepath.Join(output, wheel.Filename) || wheel.Length <= 0 || wheel.Length > 256<<20 {
 		return wheel, exit.New(exit.Validation, "interface generator returned an invalid bounded artifact")
 	}
 	info, err := os.Lstat(wheel.Path)

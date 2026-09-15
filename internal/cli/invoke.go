@@ -79,6 +79,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem != nil {
 		return unknownFunction(target, packageInterface)
 	}
+	if problem := callable.RequirePublic(); problem != nil {
+		return problem
+	}
 	if ctx.Inv.Bool("--describe") {
 		return emitDescribe(ctx, target, packageInterface, callable)
 	}
@@ -90,6 +93,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		callable, problem = packageInterface.Function(target.Function)
 		if problem != nil {
 			return unknownFunction(target, packageInterface)
+		}
+		if problem := callable.RequirePublic(); problem != nil {
+			return problem
 		}
 	}
 	if callable.Kind == "job" && ctx.Inv.Value("--attention-kernel") != "" {
@@ -2348,14 +2354,20 @@ func describeBindings(ctx *Context, target Target, ep *launch.Entrypoint) map[st
 }
 
 func emitFunctions(ctx *Context, target Target, packageInterface *launch.PackageInterface) *exit.Error {
-	slots := declaredModelSlots(packageInterface.Entrypoints)
+	var public []launch.Entrypoint
+	for _, entrypoint := range packageInterface.Entrypoints {
+		if !entrypoint.Internal {
+			public = append(public, entrypoint)
+		}
+	}
+	slots := declaredModelSlots(public)
 	defaults := effectiveModelBindings(slots, nil)
 	var bindingProblem *exit.Error
 	if len(slots) > 0 && !strings.HasPrefix(target.Package, "local/") {
 		defaults, bindingProblem = invocationDefaultBindings(ctx, target, slots)
 	}
 	list := output.List{Name: "functions", Fields: []string{"function", "availability"}, AllFields: []string{"function", "availability"}}
-	for _, name := range packageInterface.Names() {
+	for _, name := range packageInterface.PublicNames() {
 		callable, _ := packageInterface.Function(name)
 		availability := modelDefaultAvailability(callable, defaults)
 		if bindingProblem != nil && callable.Kind != "job" && len(callable.Models) > 0 {
@@ -2370,7 +2382,7 @@ func emitFunctions(ctx *Context, target Target, packageInterface *launch.Package
 }
 
 func unknownFunction(target Target, packageInterface *launch.PackageInterface) *exit.Error {
-	names := packageInterface.Names()
+	names := packageInterface.PublicNames()
 	problem := exit.New(exit.NotFound, "%s registers no function %q", target.Package, target.Function)
 	if len(names) == 0 {
 		return problem.WithRemedy("this release registers no callable functions")
