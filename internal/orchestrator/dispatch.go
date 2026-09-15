@@ -847,7 +847,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		if req.Worker != "" && c.opt.RentalRuntimePreflight != nil {
 			problem := c.opt.RentalRuntimePreflight(context.Background(), req, req.Worker)
 			current, readProblem := c.opt.Store.RequestRow(req.ID)
-			if readProblem != nil || current == nil || current.State != "queued" || current.Worker != req.Worker {
+			if readProblem != nil || current == nil || (current.State != "queued" && current.State != "submitted") || current.Worker != req.Worker {
 				// Rental reconciliation can unpin this request while the remote
 				// compatibility observation is in flight. Its stale selection must
 				// never settle the request that is now awaiting replacement capacity.

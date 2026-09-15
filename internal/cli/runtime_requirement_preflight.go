@@ -41,6 +41,11 @@ func (u *rentalRuntimeUpdates) preflight(ctx context.Context, request records.Re
 	if current != nil && current.Active() {
 		return exit.Named(exit.Unavailable, "rental.maintenance", "this rental is updating its Runtime; this request remains queued")
 	}
+	if request.Release == "" && request.LocalPackageDigest == "" {
+		// Older request records may not carry frozen dependency metadata. Do
+		// not invent a release lookup; their preparation remains authoritative.
+		return nil
+	}
 	row, problem := u.machines.store.RentalRow(machine)
 	if problem != nil {
 		return problem
@@ -49,7 +54,7 @@ func (u *rentalRuntimeUpdates) preflight(ctx context.Context, request records.Re
 		return exit.New(exit.NotFound, "the requested rental is no longer attached")
 	}
 	if !records.RentalReadyState(row.State) {
-		return nil // The existing rental lifecycle owns recovery and replacement.
+		return exit.Named(exit.Unavailable, "rental.not_ready", "%s is %s; waiting for rental status reconciliation", row.MachineName, row.State)
 	}
 	if cached, ok := u.observed.Load(machine); ok && cached.(runtimeObservation).Target.WorkerBootID != row.ExpectedWorkerBootID {
 		u.observed.Delete(machine)
@@ -75,8 +80,8 @@ func (u *rentalRuntimeUpdates) preflight(ctx context.Context, request records.Re
 			}
 			return problem
 		}
-		if !remote.Ready() {
-			return nil
+		if !records.RentalReadyState(remote.State) {
+			return exit.Named(exit.Unavailable, "rental.not_ready", "%s is %s; waiting for rental status reconciliation", row.MachineName, remote.State)
 		}
 		if !remote.Development {
 			raw, problem := client(u.machines.context).RentalImageInventory(ctx, machine)
