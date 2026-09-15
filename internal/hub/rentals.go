@@ -642,18 +642,20 @@ func canonicalServingModels(models []ServingModel) []ServingModel {
 // RentalSKUStatus is one product name's standing (th-150), and it is asked ONLY
 // on the refusal path: the catalog is live provider inventory, so a name missing
 // from RentalSKUs may be a product this hub never sells OR a real one whose
-// inventory is momentarily empty. The two want opposite next actions from a
-// person, and the catalog spells both as absence.
+// inventory is momentarily empty or temporarily excluded after boot failures.
+// The status distinguishes these reasons without initiating another rental.
 //
 // A hub too old to serve the route answers 404; that is not an error worth
 // failing a refusal over, so the caller gets an empty status and says the plain
 // thing instead.
 type RentalSKUStatus struct {
-	Name       string     `json:"name"`
-	Known      bool       `json:"known"`
-	Offered    bool       `json:"offered"`
-	SKU        *RentalSKU `json:"sku,omitempty"`
-	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	Name              string     `json:"name"`
+	Known             bool       `json:"known"`
+	Offered           bool       `json:"offered"`
+	SKU               *RentalSKU `json:"sku,omitempty"`
+	LastSeenAt        *time.Time `json:"last_seen_at,omitempty"`
+	UnavailableReason string     `json:"unavailable_reason,omitempty"`
+	RetryAfter        *time.Time `json:"retry_after,omitempty"`
 }
 
 func (c *Client) RentalSKUStatus(ctx context.Context, name string) (RentalSKUStatus, *exit.Error) {
