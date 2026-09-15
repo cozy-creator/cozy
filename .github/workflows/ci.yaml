@@ -9,7 +9,7 @@ jobs:
         tests: ['^Test[A-H]', '^Test[I-O]', '^Test[P-Q]', '^Test[R-Z]']
     env:
       UV_TORCH_BACKEND: cpu
-      COZY_RUNTIME_SOURCE: 5f1f93cee57608190894b3f4e744695e981e7520
+      COZY_RUNTIME_SOURCE: 7f0792c0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -31,7 +31,7 @@ jobs:
       - name: Build and install the source-addressed CPU worker
         run: |
           wheel="$(python3 scripts/build-runtime-peer.py runtime-peer "$COZY_RUNTIME_SOURCE" "$RUNNER_TEMP/runtime-peer")"
-          uv tool install --force --python 3.12 "$wheel[model-execution]"
+          uv tool install --force --python 3.12 "$wheel[model-execution,lora]"
           uv tool dir --bin >> "$GITHUB_PATH"
           echo "COZY_TEST_RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
           cat "$RUNNER_TEMP/runtime-peer/manifest.json"
