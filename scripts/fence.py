@@ -553,7 +553,7 @@ def check_manifest():
         "Package PackageCmd", "Model ModelCmd", "Run RunCmd", "Rental RentalCmd",
         "Up UpCmd", "Down DownCmd", "Unload UnloadCmd",
         "Search PackageSearchCmd", "Install PackageInstallCmd", "Remove PackageRemoveCmd",
-        "List PackageListCmd", "Publish PackagePublishCmd",
+        "List PackageListCmd", "Publish PackagePublishCmd", "UpdateAll PackageUpdateAllCmd",
         "Search ModelSearchCmd", "Download ModelDownloadCmd", "Remove ModelRemoveCmd",
         "List ModelListCmd", "Upload ModelUploadCmd", "Publish ModelPublishCmd", "Yank ModelYankCmd",
         "Execute RunExecuteCmd", "Cancel RunCancelCmd", "List RunListCmd", "Watch RunWatchCmd",
@@ -822,16 +822,6 @@ def check_typed_resources():
             bad.append(f"{path}: [resources] retired package-domain vocabulary remains")
 
     manifest = pathlib.Path("internal/cli/grammar.go").read_text()
-    required_commands = (
-        "Search  PackageSearchCmd", "Install PackageInstallCmd", "Remove  PackageRemoveCmd",
-        "List    PackageListCmd", "Publish PackagePublishCmd",
-        "Search   ModelSearchCmd", "Download ModelDownloadCmd", "Remove   ModelRemoveCmd",
-        "List     ModelListCmd", "Upload   ModelUploadCmd", "Publish  ModelPublishCmd",
-        "Yank     ModelYankCmd",
-    )
-    for command in required_commands:
-        if command not in manifest:
-            bad.append(f"internal/cli/grammar.go: [resources] missing typed command {command}")
     if "--kind" in manifest:
         bad.append("internal/cli/grammar.go: [resources] retired --kind discriminator remains")
 
