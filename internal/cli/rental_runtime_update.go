@@ -164,6 +164,9 @@ func (u *rentalRuntimeUpdates) connectionSelection(ctx context.Context, row reco
 		return selection, exit.Internalf("cannot create update staging: %s", err)
 	}
 	knownHosts := filepath.Join(m.layout.Rentals, row.RentalID, "ssh-known-hosts")
+	if err := os.MkdirAll(filepath.Dir(knownHosts), 0700); err != nil {
+		return selection, exit.Internalf("cannot retain the rental SSH host identity: %s", err)
+	}
 	common := []string{"-oBatchMode=yes", "-oStrictHostKeyChecking=accept-new", "-oUserKnownHostsFile=" + knownHosts, "-oIdentitiesOnly=yes", "-i", key}
 	var entropy [16]byte
 	if _, err := rand.Read(entropy[:]); err != nil {
