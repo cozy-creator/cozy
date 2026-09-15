@@ -24,9 +24,17 @@ func TestDaemonLeavesARootThatNoLongerCarriesItsClaim(t *testing.T) {
 		[]byte("daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	live := startDaemonProcess(t, root)
 	logPath := filepath.Join(root, "daemon.log")
-	log, _ := os.ReadFile(logPath)
-	if !strings.Contains(string(log), "claim: "+filepath.Join(root, "daemon.lock")) {
-		t.Fatalf("the daemon did not name the claim it holds\n%s", tail(logPath))
+	// The listener can answer before startup finishes writing its claim log.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		log, _ := os.ReadFile(logPath)
+		if strings.Contains(string(log), "claim: "+filepath.Join(root, "daemon.lock")) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the daemon did not name the claim it holds\n%s", tail(logPath))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// A daemon that still owns its root stays, and says nothing about leaving: the rule

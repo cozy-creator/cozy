@@ -655,6 +655,9 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 // validateInputs checks the payload and every local asset against the entrypoint that
 // will run it — the same law for a local install and a rental's frozen PackageInterface.
 func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
+	if problem := entrypoint.RequirePublic(); problem != nil {
+		return problem
+	}
 	if e := launch.ValidatePayload(out.Package, entrypoint, out.Payload); e != nil {
 		return e
 	}

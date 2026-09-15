@@ -57,6 +57,7 @@ type PackageInterface struct {
 // its result shape.
 type Entrypoint struct {
 	Name         string `json:"name"`
+	Internal     bool   `json:"internal,omitempty"`
 	Kind         string `json:"-"`
 	DescriptorID string `json:"-"`
 	Models       []Slot `json:"models"`
@@ -268,7 +269,7 @@ func validateClosedPackageInterface(data []byte) error {
 		}
 		for _, row := range rows {
 			required := []string{"name", "request", "result"}
-			optional := []string{"models", "invocable", "assets"}
+			optional := []string{"models", "invocable", "assets", "internal"}
 			if kind == "job" {
 				required = append(required, "publishes")
 				optional = append(optional, "weights_outputs")
@@ -276,6 +277,9 @@ func validateClosedPackageInterface(data []byte) error {
 			callable, err := exactKeys(row, required, optional)
 			if err != nil {
 				return err
+			}
+			if raw, present := callable["internal"]; present && string(raw) != "true" && string(raw) != "false" {
+				return fmt.Errorf("internal must be a boolean")
 			}
 			if metadata := callable["invocable"]; metadata != nil {
 				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"memoize", "capabilities"}); err != nil {
@@ -718,17 +722,36 @@ func (d *PackageInterface) Function(name string) (*Entrypoint, *exit.Error) {
 		}
 	}
 	return nil, exit.New(exit.NotFound, "this release registers no function %q", name).
-		WithRemedy("it registers: %s", strings.Join(d.Names(), ", "))
+		WithRemedy("it registers: %s", strings.Join(d.PublicNames(), ", "))
 }
 
-// Names is every callable this release registers.
-func (d *PackageInterface) Names() []string {
+// RequirePublic guards user-facing discovery and root submission. Managed child
+// resolution reads the complete interface and checks its admitted parent instead.
+func (e *Entrypoint) RequirePublic() *exit.Error {
+	if e.Internal {
+		return exit.Named(exit.NotFound, "callable_internal", "%s is an internal package function", e.Name).
+			WithRemedy("invoke a public function from this package")
+	}
+	return nil
+}
+
+// Names lists all registered callables for execution and dependency capture.
+func (d *PackageInterface) Names() []string { return d.names(false) }
+
+// PublicNames lists only externally callable entrypoints and jobs.
+func (d *PackageInterface) PublicNames() []string { return d.names(true) }
+
+func (d *PackageInterface) names(publicOnly bool) []string {
 	out := []string{}
 	for _, e := range d.Entrypoints {
-		out = append(out, e.Name)
+		if !publicOnly || !e.Internal {
+			out = append(out, e.Name)
+		}
 	}
 	for _, j := range d.Jobs {
-		out = append(out, j.Name)
+		if !publicOnly || !j.Internal {
+			out = append(out, j.Name)
+		}
 	}
 	sort.Strings(out)
 	return out

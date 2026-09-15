@@ -27,7 +27,8 @@ const jobRSSBudget = orchestrator.DefaultJobRSSCap
 
 // JobFacts is one resolved `@job` on an installed package.
 type JobFacts struct {
-	Name string
+	Name     string
+	Internal bool
 	// Request is the exact callable schema used by the admission authority before
 	// the request enters the ordinary queue.
 	Request          Struct
@@ -150,7 +151,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	if declared == nil {
 		return nil, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", f.Install.Package, function).
-			WithRemedy("it registers: %s", strings.Join(f.PackageInterface.Names(), ", ")).
+			WithRemedy("it registers: %s", strings.Join(f.PackageInterface.PublicNames(), ", ")).
 			WithNext("cozy package list --full")
 	}
 	runtimeBin, problem := hostruntime.Path(f.RuntimeCLI.Env)
@@ -186,6 +187,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	}
 	facts := &JobFacts{
 		Name: function, Request: declared.Request, Result: declared.Result, Assets: declared.Assets, DescriptorID: said.DescriptorID, Outputs: outputs,
+		Internal:         declared.Internal,
 		WeightsOutputs:   weightsOutputs,
 		Publishes:        declared.Publishes,
 		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")) && !(f.CPUOrchestration && !f.SelfCallable[function] && len(declared.Models) == 0 && len(declared.WeightsOutputs) == 0),

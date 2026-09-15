@@ -139,7 +139,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		}
 		var exports []launch.Entrypoint
 		for _, entry := range append(append([]launch.Entrypoint(nil), surface.Entrypoints...), surface.Jobs...) {
-			if entry.Invocable != nil {
+			if entry.Invocable != nil && !entry.Internal {
 				exports = append(exports, entry)
 			}
 		}
