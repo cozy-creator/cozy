@@ -107,7 +107,7 @@ func TestPackageUpdateAllContinuesFailuresAndPreservesSelections(t *testing.T) {
 			t.Fatalf("failed/current/skipped package selection changed: %+v", row)
 		}
 		if row["status"] == "failed" {
-			if row["error_code"] == "" {
+			if row["error_code"] == "" || !strings.Contains(row["detail"], "cause:") {
 				t.Fatal("failed package lost its reason")
 			}
 			raw, err := os.ReadFile(filepath.Join(prior.Dir, "prior.py"))

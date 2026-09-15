@@ -46,6 +46,9 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 	row := map[string]string{"package": prior.Package, "from": prior.Version, "to": prior.Version, "status": "skipped"}
 	fail := func(problem *exit.Error) map[string]string {
 		row["status"], row["error_code"], row["detail"] = "failed", problem.ErrName(), problem.Message
+		if problem.Remedy != "" {
+			row["detail"] += "; " + problem.Remedy
+		}
 		return row
 	}
 	if prior.SourceKind != "tensorhub" {
