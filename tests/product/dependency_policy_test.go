@@ -71,6 +71,25 @@ func TestDependencyPolicyCLIRefusesBeforeBuildOrPublication(t *testing.T) {
 	}
 }
 
+func TestDependencyPolicySuggestsPublicVersionFloors(t *testing.T) {
+	for _, version := range []string{"0.18.4+dev.abc", "1!0.18.4+dev.abc"} {
+		t.Run(version, func(t *testing.T) {
+			project := fixtureTree(t, fixturePyproject("cozy-runtime=="+version), minimalFixtureLock)
+			_, problem := packagepublish.PrepareFrom(project)
+			if problem == nil || problem.Name != dependencyPolicyCode {
+				t.Fatalf("expected exact-pin refusal, got %v", problem)
+			}
+			public := strings.SplitN(version, "+", 2)[0]
+			if !strings.Contains(problem.Remedy, "cozy-runtime>="+public) || strings.Contains(problem.Remedy, "+dev") {
+				t.Fatalf("refusal suggests an invalid local version floor: %s", problem.Remedy)
+			}
+			if strings.Contains(version, "!") && !strings.Contains(problem.Remedy, ",<1!1") {
+				t.Fatalf("suggested range crossed epochs: %s", problem.Remedy)
+			}
+		})
+	}
+}
+
 func TestDependencyPolicyChecksDynamicWheelRequirements(t *testing.T) {
 	// The project declares no dependencies; its backend injects one during build.
 	// Use a real PEP 517 backend through uv, without a package index or imports.

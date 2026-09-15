@@ -207,7 +207,7 @@ func TestPublishBuildAcceptsCompliantPackage(t *testing.T) {
 	if match == nil {
 		t.Fatalf("weightless fixture no longer declares its bounded cozy-runtime range:\n%s", metadata)
 	}
-	ranged := fmt.Sprintf(`"cozy-runtime[media]>=%s,<2", "cozy-weightless-helper==0.0.1"`, match[1])
+	ranged := fmt.Sprintf(`"cozy-runtime[media]>=%s,<2", "cozy-weightless-helper>=0.0.1"`, match[1])
 	rewritten := strings.Replace(string(metadata), match[0], ranged, 1)
 	// [tool.uv.sources] is the fixture pyproject's last table.
 	rewritten += "cozy-weightless-helper = { path = \"libs/helper\" }\n"

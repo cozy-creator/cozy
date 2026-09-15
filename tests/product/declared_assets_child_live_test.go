@@ -78,7 +78,7 @@ async def inspect_assets(ctx: Context, *, assets: Pictures) -> Result:
 app=App()
 app.job(inspect_assets)
 `)
-	write(project, "pyproject.toml", metadata("labelled-assets-parent", "label_parent", `,"labelled-assets-child==0.1.0"`, `labelled-assets-child={path="./child"}`))
+	write(project, "pyproject.toml", metadata("labelled-assets-parent", "label_parent", `,"labelled-assets-child>=0.1.0"`, `labelled-assets-child={path="./child"}`))
 	write(project, "package.toml", "[application]\nobject=\"label_parent:app\"\n")
 	write(project, "label_parent.py", `from typing import Annotated
 import msgspec

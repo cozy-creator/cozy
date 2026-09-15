@@ -64,7 +64,7 @@ build-backend="hatchling.build"
 only-include=["isolation_step.py"]
 `
 	if modeled {
-		metadata = strings.Replace(metadata, `"cozy-runtime==0.16.10"]`, `"cozy-runtime==0.16.10", "torch==2.13.0", "tensorfs"]`, 1)
+		metadata = strings.Replace(metadata, `"cozy-runtime>=0.16.10"]`, `"cozy-runtime>=0.16.10", "torch>=2.13.0", "tensorfs"]`, 1)
 
 	}
 	must(t, os.WriteFile(filepath.Join(library, "pyproject.toml"), []byte(metadata), 0600))
@@ -154,7 +154,7 @@ app.job(check_quantized)
 from isolation_step import advance, serve
 `
 	if modeled {
-		header = strings.Replace(header, `"isolation-step==1.0.0"]`, `"isolation-step==1.0.0", "torch==2.13.0"]`, 1)
+		header = strings.Replace(header, `"isolation-step>=1.0.0"]`, `"isolation-step>=1.0.0", "torch>=2.13.0"]`, 1)
 
 		header += "from isolation_step import produce, generate, check_quantized\nfrom cozy_runtime.derive.operations import quantize, QuantizationPlan\n"
 	}
