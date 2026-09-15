@@ -44,6 +44,7 @@ func (i *Invocation) Value(name string) string {
 // Context is the retained mechanism boundary. Handlers receive typed values and
 // frozen configuration; they never parse argv or read ambient configuration.
 type Context struct {
+	exitCode       int       // a completed aggregate can report partial failures without a second document
 	commandStarted time.Time // includes capture and resolution before a request exists
 	Inv            *Invocation
 	Out            io.Writer
@@ -59,10 +60,11 @@ type handler func(*Context) *exit.Error
 
 // Runtime is injected into the selected Kong command's Run method.
 type Runtime struct {
-	Cfg  config.Config
-	Out  io.Writer
-	Err  io.Writer
-	Mode output.Mode
+	exitCode int
+	Cfg      config.Config
+	Out      io.Writer
+	Err      io.Writer
+	Mode     output.Mode
 }
 
 func (r *Runtime) call(h handler, args []string, flags map[string]bool,
@@ -83,7 +85,9 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 		}
 		ctx.Daemon = state
 	}
-	return h(ctx)
+	problem := h(ctx)
+	r.exitCode = ctx.exitCode
+	return problem
 }
 
 // Run parses and executes one public CLI invocation.
@@ -154,7 +158,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		_ = output.EmitError(stdout, problem, mode)
 		return output.ShellCode(problem)
 	}
-	return 0
+	return runtime.exitCode
 }
 
 func presentationMode(w io.Writer, json bool) output.Mode {

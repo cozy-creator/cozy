@@ -194,6 +194,12 @@ cozy run org/quantize/convert --model.source=org/model@release/bf16 \
   --in quantize.json --publish-to org/quantized --rental-only
 ```
 
+`cozy package update-all` upgrades installed Tensorhub packages to newer published
+releases, without downloading model weights. It keeps local/editable packages,
+development versions, and versions newer than the registry unchanged. Each package
+is reported as updated, current, failed, or skipped; a failure leaves its previous
+install active and does not stop other packages.
+
 `--publish-to` retains each declared weight output as an owner-only immutable checkpoint;
 it does not create public lane pointers. `--source-profile slot=profile` narrows each foreign
 input to a reviewed TensorFS profile. Currently every foreign input must name the same
