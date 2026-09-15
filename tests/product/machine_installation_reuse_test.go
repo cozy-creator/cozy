@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ func TestMachineExecutionActualHostInstallationReuse(t *testing.T) {
 	script := filepath.Join(layout.Root, "installation-reuse.py")
 	must(t, os.WriteFile(script, raw, 0600))
 	tokens := map[string]bool{}
+	runKey := strconv.FormatInt(time.Now().UnixNano(), 10)
 	type proof struct {
 		Request               string `json:"request"`
 		Uploaded, Reused      int
@@ -31,7 +33,7 @@ func TestMachineExecutionActualHostInstallationReuse(t *testing.T) {
 	var rows []proof
 	run := func(label string, reused bool) {
 		t.Helper()
-		key := "installation-" + label
+		key := "installation-" + runKey + "-" + label
 		began := time.Now()
 		code, out := runCozyPath(t, layout.Root, path, "run", script, "--rental", "child-host", "--await", "--json", "--full", "--idempotency-key", key)
 		elapsed := time.Since(began).Milliseconds()
