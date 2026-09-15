@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -53,12 +54,16 @@ only-include=["internal_proof.py"]
 cozy-runtime={path=%s}
 `, runtimeFixtureVersion(t, wheel), strconv.Quote(wheel))
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0600))
+	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject=\"internal_proof:app\"\n"), 0600))
 	code := `import msgspec
-from cozy_runtime import App, Context, invocable
+from cozy_runtime.author import App, Context, invocable
 
 app = App()
 class Value(msgspec.Struct):
     value: int
+
+class Request(msgspec.Struct):
+    pass
 
 @invocable
 async def segment(ctx: Context, *, value: int) -> Value:
@@ -75,11 +80,16 @@ async def internal_job(ctx: Context, *, value: int) -> Value:
 app.job(internal=True)(internal_job)
 
 @app.job
-async def long_form(ctx: Context) -> Value:
+async def long_form(ctx: Context, payload: Request) -> Value:
     first = await segment(value=40)
     return await internal_job(value=first.value)
 `
 	must(t, os.WriteFile(filepath.Join(project, "internal_proof.py"), []byte(code), 0600))
+	lock := exec.Command("uv", "lock", "--project", project)
+	lock.Env = childEnv(t, root, "PATH="+path)
+	if out, err := lock.CombinedOutput(); err != nil {
+		t.Fatalf("fixture lock: %v %s", err, out)
+	}
 	if status, out := runCozyPath(t, root, path, "package", "install", project, "--editable", "--no-model-download", "--json"); status != 0 {
 		t.Fatalf("install: %d %s", status, out)
 	}
@@ -98,7 +108,19 @@ async def long_form(ctx: Context) -> Value:
 			Value int `json:"value"`
 		} `json:"result"`
 	}
-	if status != 0 || json.Unmarshal([]byte(out), &result) != nil || result.Status != "completed" || result.Result.Value != 42 {
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		var candidate struct {
+			Status string `json:"status"`
+			Result struct {
+				Value int `json:"value"`
+			} `json:"result"`
+		}
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.Status == "completed" {
+			result.Status = candidate.Status
+			result.Result.Value = candidate.Result.Value
+		}
+	}
+	if status != 0 || result.Status != "completed" || result.Result.Value != 42 {
 		t.Fatalf("native parent/children: %d %s", status, out)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
