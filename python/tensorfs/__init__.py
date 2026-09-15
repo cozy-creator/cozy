@@ -4,8 +4,9 @@ Marshal only. Every byte-level fact — hashing, canonical bytes, geometry, veri
 leases, the reader pool — comes from the extension, and `scripts/fence.py` enforces that
 this package computes none of them. What lives here is types and names.
 
-Torch is OUTSIDE the boundary. A read fills a buffer YOU own and hands back plain data;
-element sizes come from `DTYPES`, which is the compiled dtype enum, exported once::
+The default inference reader returns owned Torch tensors (install `tensorfs[torch]`).
+Torch loads only when tensor access is requested. Storage and metadata remain lightweight.
+The lower-level read interface still fills caller-owned buffers::
 
     import torch, tensorfs
 
@@ -35,7 +36,21 @@ from dataclasses import dataclass
 from typing import Literal, TypedDict, cast
 
 from . import errors
-from .derived import Derivation, OutputCapability, SourceCapability, SourceInspection, derive
+from .derived import (
+    Derivation,
+    OutputCapability,
+    SourceCapability,
+    SourceInspection,
+    derive,
+)
+from ._tensors import (
+    TensorAccessError,
+    TensorAllocation,
+    TensorReader,
+    from_parts,
+    physical_tensors,
+    tensors,
+)
 from ._ext import (
     _fit,
     Batch,
@@ -182,12 +197,19 @@ def fit(
         ),
     )
 
+
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
 #: knowledge: a consumer sizing a `torch.frombuffer` reads it from here, never from a
 #: table of its own.
 DTYPES: dict[str, int] = dtypes()
 
 __all__ = [
+    "TensorAccessError",
+    "TensorAllocation",
+    "TensorReader",
+    "from_parts",
+    "physical_tensors",
+    "tensors",
     "Derivation",
     "OutputCapability",
     "SourceCapability",

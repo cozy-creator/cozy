@@ -135,6 +135,16 @@ jobs:
         run: |
           sudo "${RUNNER_TEMP}/smoke/venv/bin/python" scripts/scoped-derived.py --isolation
           sudo "${RUNNER_TEMP}/smoke/venv/bin/python" scripts/scoped-model-reader.py --isolation
+      - name: Optional PyTorch interface over the exact built wheel
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          UV_TORCH_BACKEND: cpu
+        run: |
+          uv venv "${RUNNER_TEMP}/tensor-interface" --python 3.12
+          for wheel in dist/*.whl; do
+            uv pip install --python "${RUNNER_TEMP}/tensor-interface/bin/python" "$wheel[torch]" "torch==2.13.0"
+          done
+          "${RUNNER_TEMP}/tensor-interface/bin/python" scripts/torch-interface.py
       # wheel-smoke builds a host CLI to create its fixture. Replacing only the
       # portable wheel's CLI with that newer-host ELF must falsify its platform tag.
       - run: |
