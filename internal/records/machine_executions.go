@@ -49,23 +49,29 @@ type MachineExecution struct {
 
 const machineExecutionColumns = `request_id,machine_id,submission,receipt,observed_state,remote_cursor,outcome,pending_control,cancel_requested,collected`
 
-// MachinePackageTransfer returns this request's last completed transfer and its
-// sequence. A failed repair upload resumes the same next operation after reconnect.
-// This records transfer progress; it is never evidence of an installed package.
-func (s *Store) MachinePackageTransfer(request, boot, revision string) (string, int, *exit.Error) {
-	var operation string
-	var count int
-	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.operation_id'),''), count(*) OVER ()
- FROM request_events WHERE request_id=? AND type='machine.package_uploaded'
+type MachinePackageTransferProgress struct {
+	Operation string
+	Uploaded  bool
+	Completed int
+}
+
+// MachinePackageTransfer observes only this request's transfer progress. Recording
+// its start before the first byte lets reconnect resume an incomplete initial
+// upload without asking the installer to consume unverified wheel carriers.
+func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachinePackageTransferProgress, *exit.Error) {
+	var progress MachinePackageTransferProgress
+	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.operation_id'),''),
+ type='machine.package_uploaded',sum(CASE WHEN type='machine.package_uploaded' THEN 1 ELSE 0 END) OVER ()
+ FROM request_events WHERE request_id=? AND type IN ('machine.package_upload_started','machine.package_uploaded')
  AND json_extract(payload,'$.worker_boot_id')=? AND json_extract(payload,'$.revision')=?
- ORDER BY seq DESC LIMIT 1`, request, boot, revision).Scan(&operation, &count)
+ ORDER BY seq DESC LIMIT 1`, request, boot, revision).Scan(&progress.Operation, &progress.Uploaded, &progress.Completed)
 	if err == sql.ErrNoRows {
-		return "", 0, nil
+		return progress, nil
 	}
 	if err != nil {
-		return "", 0, exit.Internalf("cannot read machine package transfer operation: %s", err)
+		return progress, exit.Internalf("cannot read machine package transfer operation: %s", err)
 	}
-	return operation, count, nil
+	return progress, nil
 }
 
 // e/r are the observer and request aliases. Explicit Runtime release is stronger

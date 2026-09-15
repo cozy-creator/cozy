@@ -122,16 +122,18 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	}
 	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
 		baseOperation := machinePackageOperation(request, revision)
-		operation, transfers, problem := m.store.MachinePackageTransfer(request, claim.WorkerBootId, revision.Digest)
+		transfer, problem := m.store.MachinePackageTransfer(request, claim.WorkerBootId, revision.Digest)
 		if problem != nil {
 			return problem
 		}
+		operation := transfer.Operation
 		if operation == "" {
 			operation = baseOperation
 		}
 		if operation != baseOperation {
-			sequence, err := strconv.Atoi(strings.TrimPrefix(operation, baseOperation+".repair-"))
-			if err != nil || sequence < 1 || sequence > transfers {
+			prefix := baseOperation + ".repair-"
+			sequence, err := strconv.Atoi(strings.TrimPrefix(operation, prefix))
+			if !strings.HasPrefix(operation, prefix) || err != nil || sequence < 1 || sequence > transfer.Completed {
 				return exit.New(exit.Conflict, "captured package transfer names another operation")
 			}
 		}
@@ -139,10 +141,10 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if problem != nil {
 			return problem
 		}
-		uploaded := transfers > 0
+		uploaded := transfer.Uploaded
 		// Installation belongs to the worker. A new request asks about its immutable
 		// revision; no client's upload event proves current installation readiness.
-		if info.SupportsLocalInstallationReuse {
+		if info.SupportsLocalInstallationReuse && (transfer.Operation == "" || uploaded) {
 			stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
 			if err != nil {
 				return machineTransport(err)
@@ -158,7 +160,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 				// A prepared transfer is terminal and its wheel carriers may be gone.
 				// Repair missing installation bytes with a fresh, replayable transfer;
 				// preserve the original transfer's history and the execution's identity.
-				operation = baseOperation + ".repair-" + strconv.Itoa(transfers)
+				operation = baseOperation + ".repair-" + strconv.Itoa(transfer.Completed)
 				selected, problem = orchestrator.LocalPackageSelection(operation, revision)
 				if problem != nil {
 					return problem
@@ -167,6 +169,11 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			}
 		}
 		if !uploaded {
+			if transfer.Operation != operation || transfer.Uploaded {
+				if problem := m.store.AppendEvent(request, "machine.package_upload_started", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest, "operation_id": operation}); problem != nil {
+					return problem
+				}
+			}
 			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
 				return problem
 			}

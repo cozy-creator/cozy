@@ -22,8 +22,8 @@ func TestMachinePackageUploadProgressBelongsToItsSubmittingRoot(t *testing.T) {
 		{first.ID, "another-boot", revision, false},
 		{first.ID, boot, childDigest("8"), false},
 	} {
-		_, count, problem := store.MachinePackageTransfer(row.request, row.boot, row.revision)
-		got := count > 0
+		progress, problem := store.MachinePackageTransfer(row.request, row.boot, row.revision)
+		got := progress.Uploaded
 		fatal(t, problem)
 		if got != row.expected {
 			t.Fatalf("upload scope %+v: %v", row, got)
@@ -32,8 +32,8 @@ func TestMachinePackageUploadProgressBelongsToItsSubmittingRoot(t *testing.T) {
 	// A concurrent second root must not hide the first root's own resumable upload.
 	fatal(t, store.AppendEvent(second.ID, "machine.package_uploaded", 0, progress))
 	for _, request := range []string{first.ID, second.ID} {
-		_, count, problem := store.MachinePackageTransfer(request, boot, revision)
-		got := count > 0
+		progress, problem := store.MachinePackageTransfer(request, boot, revision)
+		got := progress.Uploaded
 		fatal(t, problem)
 		if !got {
 			t.Fatal("same-root upload retry lost its progress")
@@ -44,28 +44,42 @@ func TestMachinePackageUploadProgressBelongsToItsSubmittingRoot(t *testing.T) {
 func TestMachinePackageRepairTransferPreservesRootAndBootScope(t *testing.T) {
 	store, first, _ := machineObserverFixture(t)
 	boot, revision := "same-boot", childDigest("7")
-	operation, count, problem := store.MachinePackageTransfer(first.ID, boot, revision)
+	progress, problem := store.MachinePackageTransfer(first.ID, boot, revision)
 	fatal(t, problem)
-	if operation != "" || count != 0 {
+	if progress.Operation != "" || progress.Completed != 0 || progress.Uploaded {
 		t.Fatal("new request has transfer progress")
 	}
-	fatal(t, store.AppendEvent(first.ID, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": boot, "revision": revision}))
-	operation, count, problem = store.MachinePackageTransfer(first.ID, boot, revision)
+	start := map[string]any{"worker_boot_id": boot, "revision": revision, "operation_id": first.ID}
+	fatal(t, store.AppendEvent(first.ID, "machine.package_upload_started", 0, start))
+	progress, problem = store.MachinePackageTransfer(first.ID, boot, revision)
 	fatal(t, problem)
-	if operation != "" || count != 1 {
-		t.Fatal("existing transfer without operation metadata was lost")
+	if progress.Operation != first.ID || progress.Completed != 0 || progress.Uploaded {
+		t.Fatal("initial partial upload cannot resume")
+	}
+	fatal(t, store.AppendEvent(first.ID, "machine.package_uploaded", 0, start))
+	progress, problem = store.MachinePackageTransfer(first.ID, boot, revision)
+	fatal(t, problem)
+	if progress.Operation != first.ID || progress.Completed != 1 || !progress.Uploaded {
+		t.Fatal("completed transfer was lost")
 	}
 	repair := first.ID + ".repair-1"
-	fatal(t, store.AppendEvent(first.ID, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": boot, "revision": revision, "operation_id": repair}))
-	operation, count, problem = store.MachinePackageTransfer(first.ID, boot, revision)
+	next := map[string]any{"worker_boot_id": boot, "revision": revision, "operation_id": repair}
+	fatal(t, store.AppendEvent(first.ID, "machine.package_upload_started", 0, next))
+	progress, problem = store.MachinePackageTransfer(first.ID, boot, revision)
 	fatal(t, problem)
-	if operation != repair || count != 2 {
-		t.Fatal("repair progress did not remain separate from initial upload")
+	if progress.Operation != repair || progress.Completed != 1 || progress.Uploaded {
+		t.Fatal("partial repair lost the previous completed transfer")
+	}
+	fatal(t, store.AppendEvent(first.ID, "machine.package_uploaded", 0, next))
+	progress, problem = store.MachinePackageTransfer(first.ID, boot, revision)
+	fatal(t, problem)
+	if progress.Operation != repair || progress.Completed != 2 || !progress.Uploaded {
+		t.Fatal("repair completion changed its operation")
 	}
 	for _, scope := range [][3]string{{"another-root", boot, revision}, {first.ID, "another-boot", revision}, {first.ID, boot, childDigest("8")}} {
-		operation, count, problem = store.MachinePackageTransfer(scope[0], scope[1], scope[2])
+		progress, problem = store.MachinePackageTransfer(scope[0], scope[1], scope[2])
 		fatal(t, problem)
-		if operation != "" || count != 0 {
+		if progress.Operation != "" || progress.Completed != 0 || progress.Uploaded {
 			t.Fatalf("another scope inherited transfer progress: %v", scope)
 		}
 	}
