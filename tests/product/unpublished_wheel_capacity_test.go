@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
@@ -19,32 +18,25 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Pinned TLS and the real owner exercise both independent peer capabilities.
-// A newer Runtime ClaimAck behind an older Host must not authorize wheel upload.
+// Pinned TLS and the real owner validate complete revision bounds before upload.
 func TestUnpublishedWheelCapacityBeforeTransfer(t *testing.T) {
 	for _, tc := range []struct {
-		name                    string
-		count                   int
-		hostMinor, runtimeMinor uint32
-		refusal                 string
+		name    string
+		count   int
+		refusal string
 	}{
-		{"legacy33", 33, 46, 46, ""},
-		{"legacy34", 34, 46, 46, "local_package_worker_capacity_unsupported"},
-		{"old-host-new-runtime", 34, 46, 47, "local_package_worker_capacity_unsupported"},
-		{"current34", 34, 47, 47, ""},
-		{"current129", 129, 47, 47, ""},
-		{"too-many130", 130, 47, 47, "local_package_revision_invalid"},
+		{"current34", 34, ""},
+		{"current129", 129, ""},
+		{"too-many130", 130, "local_package_revision_invalid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			public, private, err := ed25519.GenerateKey(rand.Reader)
 			must(t, err)
-			pod := &fakePod{controlKey: public, wireMinor: tc.runtimeMinor}
-			pod.protocolInfo = func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
-				return &pb.ProtocolInfoResult{WireMinor: tc.hostMinor, MinimumWireMinor: 44}, nil
-			}
+			pod := &fakePod{controlKey: public}
 			root := t.TempDir()
 			connection, _ := startFakePod(t, root, pod)
 			revision := stageLocalRevision(t, root)
+			revision.DependencyRequirements = []byte("torch @ https://files.pythonhosted.org/torch-2.13.0-py3-none-any.whl --hash=sha256:" + strings.Repeat("a", 64) + "\n")
 			for i := len(revision.Files); i < tc.count; i++ {
 				name := fmt.Sprintf("helper%d-1.0.0-py3-none-any.whl", i)
 				body := []byte(fmt.Sprintf("captured dependency %d", i))
@@ -78,6 +70,8 @@ func TestUnpublishedWheelCapacityBeforeTransfer(t *testing.T) {
 				if len(pod.uploads) != 0 || len(pod.localPrepares) != 0 {
 					t.Fatalf("refused revision caused upload/preparation: %d/%d", len(pod.uploads), len(pod.localPrepares))
 				}
+			} else if !bytes.Equal(pod.localPrepares[0].LocalPackageSet.DependencyRequirements, revision.DependencyRequirements) {
+				t.Fatal("Host preparation lost the captured dependency requirements")
 			} else if len(pod.uploads) != tc.count || len(pod.localPrepares) != 1 {
 				t.Fatalf("got %d uploads/%d preparations; want %d/1", len(pod.uploads), len(pod.localPrepares), tc.count)
 			}

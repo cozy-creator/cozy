@@ -7,20 +7,17 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/wheel"
-	"github.com/pelletier/go-toml/v2"
 )
 
-// CapturedDependency is one immutable original wheel, or an image-owned exact
-// requirement for local uv materialization. Base requirements never travel as
-// unpublished package overlays.
+// CapturedDependency retains an immutable wheel and/or an exact public registry
+// requirement. Public dependency bytes are fetched independently by each Runtime.
 type CapturedDependency struct {
 	Name, Version, Path, Digest string
 	Requirement                 string
+	RegistryRequirement         string
 	Application                 bool
 }
 
@@ -70,14 +67,6 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 		}
 		return nil
 	}}
-	for _, row := range rows {
-		address, _ := url.Parse(row.URL)
-		path := filepath.Join(stage, filepath.Base(address.Path))
-		if problem := fetchCapturedWheel(ctx, client, row, path); problem != nil {
-			return nil, problem
-		}
-		existing = append(existing, DependencyWheel{Filename: filepath.Base(path), Path: path})
-	}
 	out := map[string]CapturedDependency{}
 	for _, dependency := range existing {
 		captured, problem := CaptureDependency(dependency.Path)
@@ -89,86 +78,28 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 		}
 		out[captured.Name] = captured
 	}
-	// uv installs these from its captured lock hashes (and existing artifact cache),
-	// without resolving versions. A supplied local base wheel remains exact.
-	local, problem := LocalDependencySelections(tree)
-	if problem != nil {
-		return nil, problem
-	}
-	var lock capturedLock
-	if toml.Unmarshal(raw, &lock) != nil {
-		return nil, exit.New(exit.Validation, "captured dependency lock is invalid")
-	}
-	for name, version := range wanted {
-		if name == project || !ImageOwnedDistribution(name) {
-			continue
-		}
-		if source := local[name]; source.Path != "" {
-			path := source.Path
-			info, err := os.Stat(path)
-			if err != nil {
-				return nil, exit.New(exit.Conflict, "captured base dependency disappeared")
+	for _, row := range rows {
+		requirement := row.Name + " @ " + row.URL + " --hash=sha256:" + row.SHA256
+		captured := CapturedDependency{Name: row.Name, Version: row.Version, Requirement: requirement, RegistryRequirement: requirement}
+		// Inspect ordinary dependency wheels for callable App exports. Large
+		// framework artifacts already have their selected identity in uv.lock.
+		if !ImageOwnedDistribution(row.Name) {
+			address, _ := url.Parse(row.URL)
+			path := filepath.Join(stage, filepath.Base(address.Path))
+			if row.Size > MaxDependencyWheelBytes {
+				return nil, exit.New(exit.Validation, "callable wheel exceeds the unpublished wheel bound")
 			}
-			if info.IsDir() {
-				built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: path, OutDir: stage})
-				if problem != nil {
-					return nil, problem
-				}
-				path = built.Path
+			if problem := fetchCapturedWheel(ctx, client, row, path); problem != nil {
+				return nil, problem
 			}
-			captured, problem := CaptureDependency(path)
+			var problem *exit.Error
+			captured, problem = CaptureDependency(path)
 			if problem != nil {
 				return nil, problem
 			}
-			if captured.Name != name || captured.Version != version {
-				return nil, exit.New(exit.Conflict, "captured base wheel identity changed")
-			}
-			out[name] = captured
-			continue
+			captured.RegistryRequirement = requirement
 		}
-		var hashes []string
-		var requirement string
-		matched := false
-		for _, entry := range lock.Packages {
-			if normalizedProjectName(entry.Name) != name || entry.Version != version {
-				continue
-			}
-			if matched {
-				return nil, exit.New(exit.Conflict, "base dependency has ambiguous locked origin")
-			}
-			matched = true
-			if entry.Source.Registry != "https://pypi.org/simple" {
-				var candidates []registryWheel
-				for _, candidate := range entry.Wheels {
-					if !strings.HasPrefix(candidate.Hash, "sha256:") {
-						return nil, exit.Named(exit.Conflict, "base_dependency_hash_invalid", "base dependency %s has no SHA-256 wheel hash", name)
-					}
-					candidates = append(candidates, registryWheel{URL: candidate.URL, Size: candidate.Size,
-						Hashes: map[string]string{"sha256": strings.TrimPrefix(candidate.Hash, "sha256:")}})
-				}
-				var problem *exit.Error
-				requirement, problem = pytorchBaseRequirement(name, version, entry.Source.Registry, candidates)
-				if problem != nil {
-					return nil, problem
-				}
-				continue
-			}
-			for _, candidate := range entry.Wheels {
-				hash := strings.TrimPrefix(candidate.Hash, "sha256:")
-				if len(hash) == 64 && candidate.Hash == "sha256:"+hash {
-					hashes = append(hashes, "--hash="+candidate.Hash)
-				}
-			}
-		}
-		if requirement != "" {
-			out[name] = CapturedDependency{Name: name, Version: version, Requirement: requirement}
-			continue
-		}
-		if len(hashes) == 0 {
-			return nil, exit.New(exit.Conflict, "base dependency has no captured wheel hashes")
-		}
-		sort.Strings(hashes)
-		out[name] = CapturedDependency{Name: name, Version: version, Requirement: name + "==" + version + " " + strings.Join(hashes, " ")}
+		out[row.Name] = captured
 	}
 	return out, nil
 }

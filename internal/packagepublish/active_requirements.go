@@ -36,25 +36,23 @@ func ActiveWheelRequirements(ctx context.Context, project string, extras []strin
 			return RequirementSelection{}, problem
 		}
 		name = normalizedProjectName(name)
-		if !ImageOwnedDistribution(name) {
-			if _, duplicate := metadata[name]; duplicate {
-				return RequirementSelection{}, exit.New(exit.Conflict, "captured wheel metadata repeats a distribution")
-			}
-			metadata[name] = string(raw)
+		if _, duplicate := metadata[name]; duplicate {
+			return RequirementSelection{}, exit.New(exit.Conflict, "captured wheel metadata repeats a distribution")
 		}
+		metadata[name] = string(raw)
 	}
 	return ActiveRequirements(ctx, project, extras, metadata, python)
 }
 
 // ActiveRequirements binds selected extras using the standard PEP 508 parser,
 // preserving target-specific markers. Captured metadata arrives on stdin; no
-// captured module, .pth, interpreter or resolver runs. Images own their subtree.
+// captured module, .pth, interpreter or resolver runs. Every selected dependency contributes its own subtree.
 func ActiveRequirements(ctx context.Context, project string, extras []string, metadata map[string]string, python string) (RequirementSelection, *exit.Error) {
 	if extras == nil {
 		extras = []string{}
 	}
 	return readActiveRequirements(ctx, map[string]any{"project": project, "extras": extras,
-		"metadata": metadata, "image": json.RawMessage(baseDistributionsJSON), "python": python})
+		"metadata": metadata, "python": python})
 }
 
 func EvaluateRequirements(ctx context.Context, requirements []string, python string) ([]string, *exit.Error) {

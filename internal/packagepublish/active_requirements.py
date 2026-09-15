@@ -46,13 +46,6 @@ if "requirements" in request:
     sys.exit(0)
 
 metadata = {name: Parser().parsestr(raw) for name, raw in request["metadata"].items()}
-image = request["image"]
-
-
-def image_owned(name):
-    return name in image["distributions"] or any(name.startswith(p) for p in image["prefixes"])
-
-
 def bind_extra(node, extra):
     """Partially evaluate packaging 26.2's parsed tree, retaining target markers."""
     if isinstance(node, tuple):
@@ -100,9 +93,7 @@ while pending:
             requirement.marker = None if bound is True else Marker(bound)
         requirements.add(str(requirement))
         target = canonicalize_name(requirement.name)
-        if not image_owned(target) and (
-            requirement.marker is None or requirement.marker.evaluate(environment)
-        ):
+        if requirement.marker is None or requirement.marker.evaluate(environment):
             pending.extend((target, value) for value in ["", *sorted(requirement.extras)])
 
 json.dump({"requirements": sorted(requirements),

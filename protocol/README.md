@@ -16,12 +16,15 @@ service path. `WireMinor` is its additive compatibility level. Additive changes 
 minor; independently negotiated optional capabilities are documented by the canonical
 protocol and default to unsupported, without inferring support from a version range. A breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
-This consumer cohort pins the official `4d1af2e` generated snapshot at wire 53.
+This consumer cohort pins the official `5a447bf` generated snapshot at wire 57.
 It includes machine execution and publication authority references, together with
 mixed-input and model-materialization recovery capabilities. Runtime-owned execution
 without publication requires actual worker minor 51; publication requires actual
 Runtime minor 52 and the exact accepted authority ID. Native Model result collection
-requires actual Runtime minor 53 and its hashed retained-model descriptors.
+requires actual Runtime minor 53 and its hashed retained-model descriptors. Private dependency
+requirements travel with every complete unpublished closure and bind their exact bytes
+to the immutable local revision. This cohort requires the coordinated wire 57 Runtime,
+Creator and Host release.
 
 `SOURCE` pins the upstream commit and per-file digests, matching what tensorhub and
 cozy-runtime already carry, so a hand edit or a stale re-vendor is detectable from this

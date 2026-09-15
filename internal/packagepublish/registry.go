@@ -202,8 +202,12 @@ func registryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 // bounded sha256/size identity and the exact files.pythonhosted.org origin
 // shape. Tensorhub re-runs the same checks and then hashes what it fetched.
 func registryWheelIdentity(name, version string, selected registryWheel) (string, *exit.Error) {
+	return registryWheelIdentityBound(name, version, selected, MaxDependencyWheelBytes)
+}
+
+func registryWheelIdentityBound(name, version string, selected registryWheel, maxBytes int64) (string, *exit.Error) {
 	digest := selected.Hashes["sha256"]
-	if selected.Size <= 0 || selected.Size > MaxDependencyWheelBytes || len(digest) != 64 {
+	if selected.Size <= 0 || selected.Size > maxBytes || len(digest) != 64 {
 		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
 			"%s==%s has no bounded SHA-256 wheel identity", name, version)
 	}
