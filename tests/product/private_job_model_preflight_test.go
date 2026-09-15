@@ -13,6 +13,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
+// Future calls may override an unavailable default or never run. Capture records
+// the unavailable fact; the actual omitted-argument call must refuse, as covered
+// by TestCapturedModelDefaultsDoNotAcquireUnusedOrInaccessibleModels.
 func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 	for _, mode := range []string{"job-unbound", "entrypoint-unbound", "job-default", "job-owner-unreadable"} {
 		t.Run(mode, func(t *testing.T) {
