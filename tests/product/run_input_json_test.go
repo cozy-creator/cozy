@@ -66,13 +66,9 @@ func TestRunInputJSONFileAndAliasPreserveNestedPayload(t *testing.T) {
 			code, out := runCozy(t, root, args...)
 			var result struct {
 				Input any
-				Trees []string
 			}
 			if code != 0 || json.Unmarshal([]byte(out), &result) != nil || !reflect.DeepEqual(result.Input, expected) {
 				t.Fatalf("%s inline=%t: %d %s", flag, inline, code, out)
-			}
-			if !reflect.DeepEqual(result.Trees, []string{"prior=" + root}) {
-				t.Fatalf("JSON input changed input-tree binding: %s", out)
 			}
 		}
 	}
@@ -80,6 +76,11 @@ func TestRunInputJSONFileAndAliasPreserveNestedPayload(t *testing.T) {
 		`shots:=[{"prompt":"Edited shot","seed":999}]`, "steps=8", "--rental-only", "--dry-run", "--json", "--full")
 	if code != 0 || !strings.Contains(out, `"prompt":"Edited shot"`) || !strings.Contains(out, `"seed":999`) || !strings.Contains(out, `"steps":8`) || strings.Contains(out, "First shot") {
 		t.Fatalf("nested inline override changed: %d %s", code, out)
+	}
+	code, out = runCozy(t, root, "run", "proof/input/prepare", "--input="+infile,
+		"--input-tree", "prior="+filepath.Join(root, "missing"), "--rental-only", "--dry-run", "--json")
+	if code == 0 || !strings.Contains(out, "--input-tree prior") || !strings.Contains(out, "not a directory") {
+		t.Fatalf("JSON input suppressed tree validation: %d %s", code, out)
 	}
 	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
 		t.Fatal("JSON dry-run started a daemon")
