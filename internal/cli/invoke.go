@@ -211,7 +211,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	began := time.Now()
+	began := ctx.commandStarted
+	submitting := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
@@ -226,7 +227,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	submitted := time.Since(began)
+	submitted := time.Since(submitting)
 	if !ctx.Mode().JSON {
 		if ctx.Mode().Full {
 			fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",

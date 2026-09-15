@@ -3,8 +3,6 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"errors"
-	"io"
 	"os"
 	"time"
 
@@ -23,6 +21,8 @@ type localTransfer struct {
 	instanceID, bootID string
 	epoch              uint64
 	canceled           bool
+	uploadCancel       context.CancelFunc
+	uploadGeneration   uint64
 	files              map[string]localTransferFile
 	status             map[string]localTransferStatus
 	abortC             chan localAbortStatus
@@ -300,25 +300,6 @@ func LocalPackageSelection(operationID string, revision localpackage.Revision) (
 	return selected, problem
 }
 
-// localPackageUploadProblem shares preparation's terminal/refusable distinction.
-// A host verdict on an exact header cannot improve by reconnecting.
-func localPackageUploadProblem(err error) *exit.Error {
-	if result := classifyPrepareEnd(err); result.err == nil {
-		return exit.Named(exit.Structural, "local_package_upload_refused", "worker refused unpublished wheel upload: %s", result.refusal)
-	}
-	return exit.Named(exit.Unavailable, "local_package_upload_interrupted", "unpublished upload interrupted; acknowledged bytes can be resumed: %s", err)
-}
-
-// gRPC Send can report EOF before exposing the server's actual terminal status.
-func localPackageUploadSendProblem(stream pb.PodHost_LocalPackageUploadClient, err error) *exit.Error {
-	if errors.Is(err, io.EOF) {
-		if _, terminal := stream.Recv(); terminal != nil {
-			err = terminal
-		}
-	}
-	return localPackageUploadProblem(err)
-}
-
 // transferLocalPackage sends captured source wheels directly to the claimed host.
 // The host owns durable offsets; reconnect resumes verified prefixes without a
 // package repository, publication or intermediate object-storage grant.
@@ -356,82 +337,29 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 			"worker has no authenticated unpublished package upload service")
 	}
 	ctx, cancel := context.WithCancel(current.ctx)
-	defer cancel()
-	stream, err := current.host.LocalPackageUpload(ctx)
-	if err != nil {
-		return localPackageUploadProblem(err)
-	}
-	defer stream.CloseSend()
-	if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Header{
-		Header: &pb.LocalPackageUploadHeader{Claim: current.claim, OperationId: operationID,
-			SourceDigest: transfer.source, File: &pb.LocalPackageFileRef{Digest: selected.digest,
-				Filename: selected.filename, Length: selected.length}},
-	}}); err != nil {
-		return localPackageUploadSendProblem(stream, err)
-	}
-	file, err := os.Open(selected.path)
-	if err != nil {
-		return exit.Named(exit.Structural, "local_package_wheel_unreadable", "cannot read captured wheel: %s", err)
-	}
-	defer file.Close()
-	buffer := make([]byte, 1<<20)
-	sent := uint64(0)
-	first := true
-	for {
-		status, err := stream.Recv()
-		if err != nil {
-			return localPackageUploadProblem(err)
-		}
-		if status.OperationId != operationID || !bytes.Equal(status.SourceDigest, transfer.source) ||
-			!bytes.Equal(status.Digest, selected.digest) || status.Filename != selected.filename ||
-			status.Length != selected.length || status.ReceivedBytes > selected.length ||
-			(!first && status.ReceivedBytes != sent) {
-			return exit.Named(exit.Conflict, "local_package_upload_identity_changed", "worker returned another captured file or unexpected upload offset")
-		}
-		c.onLocalPackageFileStatus(current, status)
-		if status.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_REFUSED {
-			return exit.Named(exit.Failed, status.SafeCode, "worker refused captured wheel %s: %s", selected.filename, status.SafeDetail)
-		}
-		if status.State == pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED {
-			if status.ReceivedBytes != selected.length {
-				return exit.Named(exit.Conflict, "local_package_upload_incomplete", "worker verified an incomplete captured wheel")
-			}
-			return nil
-		}
-		if status.State != pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_RECEIVING || status.SafeCode != "" {
-			return exit.Named(exit.Unavailable, "local_package_upload_stopped", "worker stopped captured wheel upload: %s", status.SafeDetail)
-		}
-		if first {
-			if _, err := file.Seek(int64(status.ReceivedBytes), io.SeekStart); err != nil {
-				return exit.Internalf("cannot resume captured wheel: %s", err)
-			}
-			sent, first = status.ReceivedBytes, false
-		}
-		c.mu.Lock()
-		canceled := transfer.canceled
+	c.mu.Lock()
+	if transfer.canceled {
 		c.mu.Unlock()
-		if canceled {
-			return exit.New(exit.Canceled, "unpublished package upload was cancelled")
-		}
-		remaining := selected.length - sent
-		if remaining == 0 {
-			return exit.Named(exit.Conflict, "local_package_upload_unverified", "worker has all bytes but did not verify the captured wheel")
-		}
-		chunk := buffer
-		if remaining < uint64(len(chunk)) {
-			chunk = chunk[:int(remaining)]
-		}
-		n, err := io.ReadFull(file, chunk)
-		if err != nil {
-			return exit.Named(exit.Conflict, "local_package_wheel_changed", "captured wheel changed during upload: %s", err)
-		}
-		if err := stream.Send(&pb.LocalPackageUploadFrame{Body: &pb.LocalPackageUploadFrame_Chunk{
-			Chunk: &pb.LocalPackageUploadChunk{Offset: sent, Data: chunk[:n]},
-		}}); err != nil {
-			return localPackageUploadSendProblem(stream, err)
-		}
-		sent += uint64(n)
+		cancel()
+		return exit.New(exit.Canceled, "unpublished package upload was cancelled")
 	}
+	transfer.uploadGeneration++
+	generation := transfer.uploadGeneration
+	transfer.uploadCancel = cancel
+	c.mu.Unlock()
+	defer func() {
+		cancel()
+		c.mu.Lock()
+		if transfer.uploadGeneration == generation {
+			transfer.uploadCancel = nil
+		}
+		c.mu.Unlock()
+	}()
+	return localpackage.UploadFile(ctx, current.host,
+		&pb.LocalPackageUploadHeader{Claim: current.claim, OperationId: operationID,
+			SourceDigest: transfer.source, File: &pb.LocalPackageFileRef{Digest: selected.digest,
+				Filename: selected.filename, Length: selected.length}}, selected.path,
+		func(status *pb.LocalPackageFileStatus) { c.onLocalPackageFileStatus(current, status) })
 }
 
 // proveLocalWheelsUnchanged reads the local files the revision named. The digest is the
@@ -491,8 +419,12 @@ func (c *Orchestrator) cancelLocalTransfer(operationID string) *exit.Error {
 	}
 	transfer.canceled = true
 	transfer.status = nil
+	cancelUpload := transfer.uploadCancel
 	s := c.sessions[transfer.bootID]
 	c.mu.Unlock()
+	if cancelUpload != nil {
+		cancelUpload()
+	}
 	if s == nil || s.instanceID != transfer.instanceID || s.epoch != transfer.epoch {
 		return exit.Unavailablef("local package transfer has no current worker session to abort")
 	}
