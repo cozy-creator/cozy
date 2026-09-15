@@ -15,15 +15,27 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 func handleRegistryInstall(ctx *Context) *exit.Error {
-	ref, release, problem := registryPackageRef(ctx.Inv.Args[0], ctx.Inv.Value("--version"))
+	result, cleanup, problem := installRegistryPackage(ctx, "")
 	if problem != nil {
 		return problem
+	}
+	return emitInstallResult(ctx, result, cleanup...)
+}
+
+// installRegistryPackage is the ordinary installer. A bulk update additionally
+// pins the observed active install so a concurrent edit or removal wins safely.
+func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Result, []output.Field, *exit.Error) {
+	ref, release, problem := registryPackageRef(ctx.Inv.Args[0], ctx.Inv.Value("--version"))
+	if problem != nil {
+		return nil, nil, problem
 	}
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
@@ -31,37 +43,41 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	packagePublishStatus(ctx, "Resolving %s...", ref.String())
 	plan, problem := c.PackageDownloads(hctx, ref, release)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	if plan.Release == "" || release != "" && plan.Release != release {
-		return exit.Internalf("Tensorhub returned a changed or absent package release")
+		return nil, nil, exit.Internalf("Tensorhub returned a changed or absent package release")
 	}
 	packageConfig, problem := exactPackageInstallDocument("package.toml", plan.PackageConfig)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	packageInterface, problem := exactPackageInstallDocument(
 		"package interface", plan.PackageInterface)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	pyproject, problem := exactPackageInstallDocument("pyproject.toml", plan.Pyproject)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	uvLock, problem := exactPackageInstallDocument("uv.lock", plan.UVLock)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	release = plan.Release
 	existingLayout, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	_, existingInstall, problem := existing.ActivePackage(ref.String())
 	if problem != nil {
 		existing.Close()
-		return problem
+		return nil, nil, problem
+	}
+	if problem := requirePackageUpdatePin(existing, ref.String(), expectedInstallID); problem != nil {
+		existing.Close()
+		return nil, nil, problem
 	}
 	if existingInstall != nil && existingInstall.SourceKind == "tensorhub" &&
 		existingInstall.Package == ref.String() && existingInstall.Version == release {
@@ -69,33 +85,38 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		result := &install.Result{Install: *existingInstall, Idempotent: true}
 		modelScratch, problem := scratch.Temp(existingLayout.Tmp, "package-model-prefetch-")
 		if problem != nil {
-			return problem
+			return nil, nil, problem
 		}
 		defer modelScratch.Release()
 		bestEffortDefaultModels(hctx, ctx, modelScratch.Path,
 			&install.PublishedSource{Package: ref.String(), Release: release,
 				PackageConfig: packageConfig,
 				Selection:     install.Selection{PackageInterface: packageInterface}}, result)
-		return emitInstallResult(ctx, result)
+		return result, nil, nil
 	}
 	existing.Close()
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	work, problem := scratch.Temp(layout.Tmp, "package-install-")
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	defer work.Release()
 	published, problem := packageInstallPlanFacts(ctx, ref, release,
 		plan, packageConfig, packageInterface, pyproject, uvLock)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
 	}
 	_, st, writer, problem := open(ctx.Cfg, true)
 	if problem != nil {
-		return problem
+		return nil, nil, problem
+	}
+	if problem := requirePackageUpdatePin(st, ref.String(), expectedInstallID); problem != nil {
+		st.Close()
+		writer.Unlock()
+		return nil, nil, problem
 	}
 	var result *install.Result
 	problem = packagePublishStage(ctx, "Creating local package environment", func() *exit.Error {
@@ -108,13 +129,27 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		st.Close()
 		writer.Unlock()
-		return problem
+		return nil, nil, problem
 	}
 	cleanup := reclaimInstallResult(layout, st, result)
 	st.Close()
 	writer.Unlock()
 	bestEffortDefaultModels(hctx, ctx, work.Path, published, result)
-	return emitInstallResult(ctx, result, cleanup...)
+	return result, cleanup, nil
+}
+
+func requirePackageUpdatePin(st *records.Store, pkg, expected string) *exit.Error {
+	if expected == "" {
+		return nil
+	}
+	_, installed, problem := st.ActivePackage(pkg)
+	if problem != nil {
+		return problem
+	}
+	if installed == nil || installed.ID != expected || installed.SourceKind != "tensorhub" {
+		return exit.Named(exit.Conflict, "package.update_changed", "%s changed after the bulk update began; its current selection was preserved", pkg)
+	}
+	return nil
 }
 
 func bestEffortDefaultModels(hctx context.Context, ctx *Context, root string,

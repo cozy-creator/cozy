@@ -76,13 +76,14 @@ func (c *AuthRevokeOtherMachinesCmd) Run(r *Runtime) error {
 }
 
 type PackageCmd struct {
-	Search  PackageSearchCmd  `cmd:"" help:"Search for AI magic."`
-	Install PackageInstallCmd `cmd:"" help:"Install a published package or explicit local directory."`
-	Recover PackageRecoverCmd `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
-	Remove  PackageRemoveCmd  `cmd:"" help:"Delete source-code."`
-	List    PackageListCmd    `cmd:"" help:"List installed packages."`
-	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
-	Yank    PackageYankCmd    `cmd:"" help:"Permanently yank a package release."`
+	UpdateAll PackageUpdateAllCmd `cmd:"" help:"Update installed published packages to newer releases without downloading model weights; local and development installs are skipped."`
+	Search    PackageSearchCmd    `cmd:"" help:"Search for AI magic."`
+	Install   PackageInstallCmd   `cmd:"" help:"Install a published package or explicit local directory."`
+	Recover   PackageRecoverCmd   `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
+	Remove    PackageRemoveCmd    `cmd:"" help:"Delete source-code."`
+	List      PackageListCmd      `cmd:"" help:"List installed packages."`
+	Publish   PackagePublishCmd   `cmd:"" help:"Publish a package release."`
+	Yank      PackageYankCmd      `cmd:"" help:"Permanently yank a package release."`
 
 	Bind     PackageBindCmd     `cmd:"" help:"Set an owner model override for one package slot."`
 	Unbind   PackageUnbindCmd   `cmd:"" help:"Remove an owner override and use the package default."`
@@ -132,6 +133,12 @@ type PackageInstallCmd struct {
 	Version         string `help:"Install this release instead of the newest, e.g. 1.2.3."`
 	Editable        bool   `help:"Keep an explicit local directory live for development."`
 	NoModelDownload bool   `help:"Install package code without prefetching its configured default model."`
+}
+
+type PackageUpdateAllCmd struct{}
+
+func (c *PackageUpdateAllCmd) Run(r *Runtime) error {
+	return r.call(handlePackageUpdateAll, nil, nil, nil, false)
 }
 
 type PackageRecoverCmd struct {
