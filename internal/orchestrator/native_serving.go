@@ -68,7 +68,7 @@ func (c *Orchestrator) nativeServingModels(request records.Request) ([]*pb.Nativ
 		if err != nil {
 			return nil, exit.Internalf("retained model manifest identity is invalid")
 		}
-		bindings = append(bindings, &pb.NativeModelBinding{Slot: model.BindingPath, Model: model.Model, Manifest: &pb.Ref{Digest: digest, Length: uint64(model.ManifestLength)}, Retention: source})
+		bindings = append(bindings, &pb.NativeModelBinding{Slot: model.BindingPath, Model: model.Model, Manifest: &pb.Ref{Digest: digest, Length: uint64(model.ManifestLength)}, Retention: source, Adapters: downloadAdapters(model.Adapters)})
 	}
 	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Slot < bindings[j].Slot })
 	return bindings, nil

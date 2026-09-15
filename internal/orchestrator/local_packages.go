@@ -769,6 +769,17 @@ func (c *Orchestrator) issueUnpublishedPlacementSet(s *session, w *worker,
 	if selected == nil {
 		return exit.Internalf("cannot issue an empty unpublished package placement set")
 	}
+	if problem := requireAdapterDownloadPeer(s, selected.DownloadDelegation); problem != nil {
+		return problem
+	}
+	for _, native := range selected.NativeModels {
+		if native != nil && len(native.Adapters) > 0 {
+			if problem := requireAdapterPeer(s, true); problem != nil {
+				return problem
+			}
+			break
+		}
+	}
 	c.mu.Lock()
 	w.desiredLocal, w.desiredPackages, w.desiredModels, w.desiredDownloadSets = nil, nil, nil, nil
 	w.desiredUnpublishedPlacement = cloneUnpublishedPlacementSet(selected)
