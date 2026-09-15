@@ -154,7 +154,7 @@ app.job(verify)
 name="byte-tools"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s"]
+dependencies=["cozy-runtime>=%s"]
 [project.entry-points."cozy.application"]
 default="byte_tools:app"
 [tool.uv.sources]
@@ -169,7 +169,7 @@ only-include=["byte_tools.py"]
 	script := filepath.Join(project, "consume.py")
 	body := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s", "byte-tools==0.0.1"]
+# dependencies=["cozy-runtime>=%s", "byte-tools>=0.0.1"]
 # [tool.uv.sources]
 # cozy-runtime={path=%q}
 # byte-tools={path="./byte_tools",editable=true}

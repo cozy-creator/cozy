@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==__VERSION__", "model-tools==0.0.1"]
+# dependencies = ["cozy-runtime>=__VERSION__", "model-tools>=0.0.1"]
 # [tool.uv.sources]
 # cozy-runtime = {path=__WHEEL__}
 # model-tools = {path="./model_tools"}

@@ -50,7 +50,7 @@ func TestTopLevelJobMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
 name="job-media-export-proof"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s"]
+dependencies=["cozy-runtime>=%s"]
 [tool.uv.sources]
 cozy-runtime={path=%q}
 [project.entry-points."cozy.application"]

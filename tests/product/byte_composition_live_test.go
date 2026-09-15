@@ -20,7 +20,7 @@ func TestOrdinaryScriptByteResultsAndMemoReuse(t *testing.T) {
 	}
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
-	version := strings.Split(filepath.Base(wheel), "-")[1]
+	version := runtimeFixtureVersion(t, wheel)
 	control := filepath.Join(t.TempDir(), "control")
 	for _, args := range [][]string{{"venv", control, "--python", "3.12"},
 		{"pip", "install", "--python", filepath.Join(control, "bin", "python"), wheel}} {
@@ -56,7 +56,7 @@ func TestOrdinaryScriptByteResultsAndMemoReuse(t *testing.T) {
 name="byte-tools"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s"]
+dependencies=["cozy-runtime>=%s"]
 [project.entry-points."cozy.application"]
 default="byte_tools:app"
 [tool.uv.sources]

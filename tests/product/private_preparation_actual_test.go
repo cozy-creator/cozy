@@ -54,7 +54,7 @@ func privateParentSurvivesAnotherScriptPreparation(t *testing.T, modeled bool) {
 name="isolation-step"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==0.16.10"]
+dependencies=["cozy-runtime>=0.16.10"]
 [project.entry-points."cozy.application"]
 default="isolation_step:app"
 [build-system]
@@ -64,7 +64,7 @@ build-backend="hatchling.build"
 only-include=["isolation_step.py"]
 `
 	if modeled {
-		metadata = strings.Replace(metadata, `"cozy-runtime==0.16.10"]`, `"cozy-runtime==0.16.10", "torch==2.13.0", "tensorfs"]`, 1)
+		metadata = strings.Replace(metadata, `"cozy-runtime>=0.16.10"]`, `"cozy-runtime>=0.16.10", "torch>=2.13.0", "tensorfs"]`, 1)
 
 	}
 	must(t, os.WriteFile(filepath.Join(library, "pyproject.toml"), []byte(metadata), 0600))
@@ -147,14 +147,14 @@ app.job(check_quantized)
 	must(t, os.WriteFile(filepath.Join(library, "isolation_step.py"), []byte(source), 0600))
 	header := `# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==0.16.10", "isolation-step==1.0.0"]
+# dependencies=["cozy-runtime>=0.16.10", "isolation-step>=1.0.0"]
 # [tool.uv.sources]
 # isolation-step={path="./library", editable=true}
 # ///
 from isolation_step import advance, serve
 `
 	if modeled {
-		header = strings.Replace(header, `"isolation-step==1.0.0"]`, `"isolation-step==1.0.0", "torch==2.13.0"]`, 1)
+		header = strings.Replace(header, `"isolation-step>=1.0.0"]`, `"isolation-step>=1.0.0", "torch>=2.13.0"]`, 1)
 
 		header += "from isolation_step import produce, generate, check_quantized\nfrom cozy_runtime.derive.operations import quantize, QuantizationPlan\n"
 	}

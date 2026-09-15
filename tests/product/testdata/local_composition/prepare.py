@@ -1,6 +1,6 @@
 # /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==__RUNTIME_VERSION__","quantize-tools==0.0.1","score-tools==0.0.1"]
+# dependencies=["cozy-runtime>=__RUNTIME_VERSION__","quantize-tools>=0.0.1","score-tools>=0.0.1"]
 # [tool.uv.sources]
 # cozy-runtime={path=__RUNTIME_WHEEL__}
 # quantize-tools={path="./quantize_tools"}

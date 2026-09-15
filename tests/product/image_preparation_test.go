@@ -105,12 +105,12 @@ def inspect(payload: Request, assets: Pictures) -> Result:
     info = assets.info("reference")
     return Result(assets[0].width, assets[0].height, info.media_type, info.size_bytes)
 `), 0600))
-	version := strings.Split(filepath.Base(*assetsRuntimeWheel), "-")[1]
+	version := runtimeFixtureVersion(t, *assetsRuntimeWheel)
 	metadata := `[project]
 name = "prepared-input"
 version = "1.0.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime[media]==` + version + `"]
+dependencies = ["cozy-runtime[media]>=` + version + `"]
 [project.entry-points."cozy.application"]
 default = "prepared_input:app"
 [build-system]

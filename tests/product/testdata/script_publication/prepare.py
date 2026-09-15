@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime==0.14.1", "tensorfs==0.3.36", "publication-source-tools==0.0.1"]
+# dependencies = ["cozy-runtime>=0.14.1", "tensorfs>=0.3.36", "publication-source-tools>=0.0.1"]
 # [tool.uv.sources]
 # publication-source-tools = {path = "./source_tools", editable = true}
 # ///

@@ -202,7 +202,7 @@ func TestCapturedModelDefaultsDoNotAcquireUnusedOrInaccessibleModels(t *testing.
 name="default-tools"
 version="1.0.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s"]
+dependencies=["cozy-runtime>=%s"]
 [project.entry-points."cozy.application"]
 default="default_tools:app"
 [tool.uv.sources]
@@ -236,7 +236,7 @@ def unavailable(payload:Request,model:Weights)->Result:
 	must(t, os.WriteFile(filepath.Join(library, "default_tools.py"), []byte(module), 0600))
 	body := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s","default-tools==1.0.0"]
+# dependencies=["cozy-runtime>=%s","default-tools>=1.0.0"]
 # [tool.uv.sources]
 # cozy-runtime={path=%s}
 # default-tools={path="./library",editable=true}

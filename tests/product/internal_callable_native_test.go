@@ -42,7 +42,7 @@ func TestInternalCallableNativeParentExecutesItsOwnChild(t *testing.T) {
 name="internal-proof"
 version="0.1.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s"]
+dependencies=["cozy-runtime>=%s"]
 [project.entry-points."cozy.application"]
 default="internal_proof:app"
 [build-system]

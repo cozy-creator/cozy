@@ -24,7 +24,7 @@ func TestDeclaredAssetsManagedLabelsAndMemo(t *testing.T) {
 	}
 	wheel, err := filepath.Abs(*assetsRuntimeWheel)
 	must(t, err)
-	version := strings.Split(filepath.Base(wheel), "-")[1]
+	version := runtimeFixtureVersion(t, wheel)
 	root, err := os.MkdirTemp("", "cozy-assets-child-")
 	must(t, err)
 	t.Cleanup(func() {
@@ -47,7 +47,7 @@ func TestDeclaredAssetsManagedLabelsAndMemo(t *testing.T) {
 name=%q
 version="0.1.0"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime[media]==%s"%s]
+dependencies=["cozy-runtime[media]>=%s"%s]
 [tool.uv.sources]
 cozy-runtime={path=%q}
 %s
@@ -78,7 +78,7 @@ async def inspect_assets(ctx: Context, *, assets: Pictures) -> Result:
 app=App()
 app.job(inspect_assets)
 `)
-	write(project, "pyproject.toml", metadata("labelled-assets-parent", "label_parent", `,"labelled-assets-child==0.1.0"`, `labelled-assets-child={path="./child"}`))
+	write(project, "pyproject.toml", metadata("labelled-assets-parent", "label_parent", `,"labelled-assets-child>=0.1.0"`, `labelled-assets-child={path="./child"}`))
 	write(project, "package.toml", "[application]\nobject=\"label_parent:app\"\n")
 	write(project, "label_parent.py", `from typing import Annotated
 import msgspec

@@ -33,8 +33,8 @@ func TestOrdinaryScriptNativePreparationQuantizationAndScore(t *testing.T) {
 	must(t, err)
 	evalWheel, err := filepath.Abs(*privateChildEvalWheel)
 	must(t, err)
-	runtimeVersion := strings.Split(filepath.Base(runtimeWheel), "-")[1]
-	evalVersion := strings.Split(filepath.Base(evalWheel), "-")[1]
+	runtimeVersion := runtimeFixtureVersion(t, runtimeWheel)
+	evalVersion := strings.SplitN(strings.Split(filepath.Base(evalWheel), "-")[1], "+", 2)[0]
 	fixture := filepath.Join("testdata", "local_composition")
 	body, err := os.ReadFile(filepath.Join(fixture, "model.safetensors"))
 	must(t, err)
@@ -132,11 +132,11 @@ func TestOrdinaryScriptNativePreparationQuantizationAndScore(t *testing.T) {
 			code = bytes.Replace(code, []byte(`INTERRUPT_MARKER = ""`), []byte("INTERRUPT_MARKER = "+strconv.Quote(marker)), 1)
 			must(t, os.WriteFile(module, code, 0600))
 		}
-		deps := `"cozy-runtime==` + runtimeVersion + `","numpy>=1.26"`
+		deps := `"cozy-runtime>=` + runtimeVersion + `","numpy>=1.26"`
 		sources := `cozy-runtime={path=` + strconv.Quote(runtimeWheel) + `}`
 		wheelFiles := `only-include=["quantize_tools.py"]`
 		if name == "score_tools" {
-			deps += `,"cozy-eval==` + evalVersion + `"`
+			deps += `,"cozy-eval>=` + evalVersion + `"`
 			sources += "\ncozy-eval={path=" + strconv.Quote(evalWheel) + "}"
 			wheelFiles = `packages=["src/score_tools"]`
 		}

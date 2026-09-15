@@ -25,7 +25,7 @@ import (
 
 // The normal CLI builds, uploads and commits a real wheel to an independent local
 // publication peer. The peer verifies the declared hashes and retained wheel metadata.
-func TestPublishCLIHonorsNarrowImageCompatibility(t *testing.T) {
+func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 	project := weightlessProject(t)
 	path := filepath.Join(project, "pyproject.toml")
 	raw, err := os.ReadFile(path)
@@ -35,9 +35,9 @@ func TestPublishCLIHonorsNarrowImageCompatibility(t *testing.T) {
 	if matched == nil {
 		t.Fatal("fixture lost its Runtime dependency")
 	}
-	exactRuntime := "cozy-runtime[media]==" + matched[1]
+	compatibleRuntime := "cozy-runtime[media]>=" + matched[1] + ",<1"
 	narrow := "tensorfs>=0.3.35,<0.4"
-	authored := strings.Replace(string(raw), matched[0], fmt.Sprintf("%q, %q", exactRuntime, narrow), 1)
+	authored := strings.Replace(string(raw), matched[0], fmt.Sprintf("%q, %q", compatibleRuntime, narrow), 1)
 	must(t, os.WriteFile(path, []byte(authored), 0644))
 	lock := exec.Command("uv", "lock")
 	lock.Dir = project
@@ -140,7 +140,7 @@ func TestPublishCLIHonorsNarrowImageCompatibility(t *testing.T) {
 		}
 	}
 	compact := strings.ReplaceAll(metadata, " ", "")
-	if !strings.Contains(compact, "Requires-Dist:"+exactRuntime) || !strings.Contains(compact, "Requires-Dist:tensorfs<0.4,>=0.3.35") {
+	if !strings.Contains(compact, "Requires-Dist:cozy-runtime[media]<1,>="+matched[1]) || !strings.Contains(compact, "Requires-Dist:tensorfs<0.4,>=0.3.35") {
 		t.Fatalf("published wheel changed the declared compatibility bounds:\n%s", metadata)
 	}
 }

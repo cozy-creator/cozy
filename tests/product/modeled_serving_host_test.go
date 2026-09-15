@@ -62,7 +62,7 @@ app.job(long_form)
 name="model-tools"
 version="0.0.1"
 requires-python=">=3.12,<3.13"
-dependencies=["cozy-runtime==%s","torch==2.13.0","numpy>=1.26"]
+dependencies=["cozy-runtime>=%s","torch>=2.13.0","numpy>=1.26"]
 [project.entry-points."cozy.application"]
 default="model_tools:app"
 [tool.uv.sources]
@@ -77,7 +77,7 @@ only-include=["model_tools.py"]
 	must(t, os.WriteFile(filepath.Join(library, "package.toml"), []byte("[application]\nobject=\"model_tools:app\"\n"), 0600))
 	body := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
-# dependencies=["cozy-runtime==%s","model-tools==0.0.1"]
+# dependencies=["cozy-runtime>=%s","model-tools>=0.0.1"]
 # [tool.uv.sources]
 # cozy-runtime={path=%s}
 # model-tools={path="./model_tools"}
