@@ -121,6 +121,10 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			}
 			return
 		}
+		if problem := requireAdapterDownloadPeer(s, prep.downloadSet); problem != nil {
+			c.setDesiredRefusal(w, seq, problem)
+			return
+		}
 		call := &pb.PreparePackageSetCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
 			DownloadDelegation: append([]byte(nil), prep.downloadSet...),
 		},

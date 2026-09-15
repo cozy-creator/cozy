@@ -39,5 +39,8 @@ const MaxLocalPackageFiles = 129
 const MaxLocalPackageFilenameBytes = 255
 const MaxLocalPackageGrantURLBytes = 16 << 10
 const MaxModelSlotPaths = 256
+
+// ModelAdapterWireMinor is required before sending a nonempty model adapter stack.
+const ModelAdapterWireMinor uint32 = 57
 const MaxImageInventoryDistributions = 4096
 const MaxLockedRequirementsBytes = 1 << 20

@@ -19,6 +19,9 @@ func (c *Orchestrator) prepareChildServing(instance string, req records.Request,
 	if problem != nil {
 		return problem
 	}
+	if problem := requireAdapterPeer(current, hasModelAdapters(req.Models)); problem != nil {
+		return problem
+	}
 	if problem := requireMixedModelInputs(current, mixedModelInputs(req.Models)); problem != nil {
 		return problem
 	}
