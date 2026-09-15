@@ -202,7 +202,7 @@ func placementModels(pkg string, row canonical.Doc) []ModelRef {
 			manifest := model.Sub("manifest")
 			out = append(out, ModelRef{Package: pkg, Slot: path,
 				Model: model.Str("repo"), Release: model.Str("version"), Lane: model.Str("lane"),
-				Manifest: manifest.Str("digest"), ManifestLength: manifest.Int("length")})
+				Manifest: manifest.Str("digest"), ManifestLength: manifest.Int("length"), Adapters: placementAdapters(slot, byID)})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
@@ -655,6 +655,7 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 			continue
 		}
 		placement := DesiredPlacement{Package: pkg, Release: release,
+			Models:           placementModels(pkg, row),
 			PlacementIDValue: row.Str("placement_id"), PlacementSetDigest: digest,
 			BindingsDigest:    row.Str("bindings_digest"),
 			PlacementSetBytes: append([]byte(nil), w.setBytes...),
@@ -706,20 +707,22 @@ func preparedPlacementServes(w *worker, logical LogicalPackage) bool {
 	if err != nil {
 		return false
 	}
-	pinned := make(map[string]string, len(logical.Models))
+	pinned := make(map[string]ModelRef, len(logical.Models))
 	for _, model := range logical.Models {
 		if !model.Pinned() {
 			return false
 		}
-		pinned[model.Slot] = model.Manifest
+		pinned[model.Slot] = model
 	}
 	for _, row := range doc.List("placements") {
 		if row.Str("placement_id") != desired.PlacementIDValue {
 			continue
 		}
 		manifests := map[string]string{}
+		modelRows := map[string]canonical.Doc{}
 		for _, model := range row.List("models") {
 			manifests[model.Str("id")] = model.Sub("manifest").Str("digest")
+			modelRows[model.Str("id")] = model
 		}
 		for _, entrypoint := range row.List("entrypoints") {
 			if entrypoint.Str("name") != logical.Function {
@@ -732,7 +735,7 @@ func preparedPlacementServes(w *worker, logical LogicalPackage) bool {
 			for _, slot := range slots {
 				path := logical.Function + ".models." + slot.Str("slot")
 				held := manifests[slot.Str("reference_model_id")]
-				if held == "" || pinned[path] != held {
+				if held == "" || pinned[path].Manifest != held || !records.SameAdapters(pinned[path].Adapters, placementAdapters(slot, modelRows)) {
 					return false
 				}
 			}
@@ -1084,11 +1087,14 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 					"worker resolved package %s without complete invocation identity", logical.Package)
 			}
 			if ready {
+				if problem := requireAdapterEcho(logical.Models, desired.Models); problem != nil {
+					c.mu.Unlock()
+					return WorkerLaunchSpec{}, "", problem
+				}
 				placement := desired
 				placement.Package = pinnedPackage(logical.Package, rentalID)
 				placement.Entrypoints = []Entrypoint{{Name: logical.Function, Digest: planID,
 					Outputs: append([]string(nil), logical.Outputs...)}}
-				placement.Models = append([]ModelRef(nil), logical.Models...)
 				w.remotePlacements[remotePlanKey(placement.Package, planID)] = placement
 				spec := w.spec
 				spec.Placement = placement
