@@ -34,7 +34,7 @@ type machineExecutionClient interface {
 
 type machineConnection struct {
 	importInputTree   func(context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error)
-	connection        *grpc.ClientConn
+	connection        *machineClientConnection
 	client            machineExecutionClient
 	claim             *pb.Claim
 	prepare           func(context.Context, string, localpackage.Revision) *exit.Error
@@ -47,6 +47,19 @@ type machineConnection struct {
 	retainBytes       func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
 	releaseBytes      func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
 	readBytes         func(context.Context, *pb.NativeByteRetentionRequest, *pb.Ref) (machineByteStream, error)
+}
+
+type machineClientConnection struct {
+	*grpc.ClientConn
+	release func()
+}
+
+func (c *machineClientConnection) Close() error {
+	err := c.ClientConn.Close()
+	if c.release != nil {
+		c.release()
+	}
+	return err
 }
 
 // machineRuns is a client transport and observer. Stopping it closes connections
@@ -65,6 +78,7 @@ type machineRuns struct {
 	localMu   sync.Mutex
 	localPID  int
 	observers sync.Map // one collection/control lock per observed request
+	updates   *rentalRuntimeUpdates
 }
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals) *machineRuns {
@@ -213,6 +227,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return problem
 		}
 		link.MachineID = machine
+	}
+	if len(link.Submission) == 0 && m.updates != nil {
+		if problem := m.updates.preflight(m.ctx, request, link.MachineID); problem != nil {
+			return problem
+		}
 	}
 	connection, problem := m.connect(m.ctx, link.MachineID)
 	if problem != nil {

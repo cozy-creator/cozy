@@ -192,7 +192,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 
+	updates := &rentalRuntimeUpdates{machines: machines}
+	machines.updates = updates
 	server := api.New(api.Options{
+		RuntimeUpdate:     updates.Start,
 		MachineExecutions: machines,
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
@@ -206,6 +209,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		closeListeners()
 		return e
 	}
+	updates.Resume()
 	machines.Resume()
 
 	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
