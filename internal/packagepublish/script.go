@@ -47,6 +47,11 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
+	for _, requirement := range metadata.Dependencies {
+		if problem := validateDependencyPolicy(requirement, "script dependencies"); problem != nil {
+			return nil, problem
+		}
+	}
 	models, problem := scriptModels(metadata)
 	if problem != nil {
 		return nil, problem

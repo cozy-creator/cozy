@@ -264,6 +264,9 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 			"local project declares %s==%s but its wheel declares %s==%s",
 			name, version, identity.Distribution, identity.Version)
 	}
+	if problem := validateProjectWheelDependencies(built.Path); problem != nil {
+		return problem
+	}
 	return c.add(identity, built.Path)
 }
 
