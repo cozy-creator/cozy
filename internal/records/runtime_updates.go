@@ -131,8 +131,12 @@ func (s *Store) ActiveRuntimeUpdates() ([]RuntimeUpdate, *exit.Error) {
 }
 
 func (s *Store) RuntimeUpdateAttempted(request string) (bool, *exit.Error) {
+	return s.RequestHasEvent(request, "machine.runtime_update_attempted")
+}
+
+func (s *Store) RequestHasEvent(request, kind string) (bool, *exit.Error) {
 	var found bool
-	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type='machine.runtime_update_attempted')`, request).Scan(&found)
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM request_events WHERE request_id=? AND type=?)`, request, kind).Scan(&found)
 	if err != nil {
 		return false, exit.Internalf("cannot read automatic Runtime update history: %s", err)
 	}

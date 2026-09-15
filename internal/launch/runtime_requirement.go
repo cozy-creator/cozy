@@ -18,7 +18,7 @@ type RuntimeRequirementConflict struct {
 func RuntimeRequirementMismatch(requirements []string, runtime, tensorfs string) *RuntimeRequirementConflict {
 	for _, raw := range requirements {
 		name, tail := requirementParts(raw)
-		if name != "cozy-runtime" && name != "tensorfs" {
+		if name != "cozy-runtime" && name != "tensorfs" { //cozy:allow distribution metadata, not a binary invocation
 			continue
 		}
 		if strings.HasPrefix(tail, "[") {

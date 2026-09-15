@@ -192,7 +192,7 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(posts) != 4 || bytes.Contains(posts[3], []byte("serving_models")) || bytes.Contains(posts[3], []byte("development")) {
+	if len(posts) != 4 || bytes.Contains(posts[3], []byte("serving_models")) || !bytes.Contains(posts[3], []byte("development")) {
 		t.Fatalf("undeclared manual rental changed its request shape: %q", posts)
 	}
 }

@@ -193,7 +193,7 @@ func (m *machineRuns) Resume() {
 	}
 }
 
-func (m *machineRuns) submit(request records.Request, link *records.MachineExecution) *exit.Error {
+func (m *machineRuns) submit(request records.Request, link *records.MachineExecution) (out *exit.Error) {
 	_, deadline, problem := m.store.RequestExecutionTiming(request.ID)
 	if problem != nil {
 		return problem
@@ -228,6 +228,20 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		link.MachineID = machine
 	}
+	defer func() {
+		if out == nil || out.ErrName() != "machine_execution.runtime_requirement" || m.updates == nil || len(link.Submission) != 0 {
+			return
+		}
+		latest, problem := m.store.MachineExecution(request.ID)
+		if problem != nil {
+			out = problem
+			return
+		}
+		if latest == nil || len(latest.Submission) > 0 {
+			return
+		}
+		out = m.updates.reobserve(request, link.MachineID, out)
+	}()
 	if len(link.Submission) == 0 && m.updates != nil {
 		if problem := m.updates.preflight(m.ctx, request, link.MachineID); problem != nil {
 			return problem
@@ -559,10 +573,19 @@ func readMachinePreparationEvent(stream grpc.ServerStreamingClient[pb.PrepareEve
 			if err == io.EOF {
 				return nil, exit.Unavailablef("machine preparation ended before verified completion")
 			}
+			if problem := orchestrator.RuntimeRequirementTrailer(stream.Trailer()); problem != nil {
+				return nil, problem
+			}
 			return nil, machineTransport(err)
 		}
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:
+			if problem := orchestrator.RuntimeRequirementEvent(event); problem != nil {
+				return event, problem
+			}
+			if event.SafeCode == "package_environment_dependency_base_conflict" {
+				return event, exit.Named(exit.Structural, "machine_execution.runtime_requirement", "%s", event.SafeDetail)
+			}
 			return event, exit.Named(exit.Conflict, "machine_execution.prepare_refused", "%s: %s", event.SafeCode, event.SafeDetail)
 		case pb.PrepareStage_PREPARE_STAGE_PREPARED:
 			return event, validateMachinePrepared(event.PlacementSet)

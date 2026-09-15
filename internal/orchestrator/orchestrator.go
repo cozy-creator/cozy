@@ -45,7 +45,9 @@ import (
 type Options struct {
 	// StartMachineExecution transfers and observes an execution owned by Runtime.
 	// It never offers an attempt through this legacy cross-machine dispatcher.
-	StartMachineExecution func(records.Request) *exit.Error
+	StartMachineExecution  func(records.Request) *exit.Error
+	RentalRuntimePreflight func(context.Context, records.Request, string) *exit.Error
+	RentalRuntimeMismatch  func(records.Request, string, *exit.Error) *exit.Error
 	// ReclaimInstall delegates unpinned snapshot cleanup to the existing package owner.
 	ReclaimInstall func(string) *exit.Error
 	Cfg            config.Config

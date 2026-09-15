@@ -31,10 +31,15 @@ if lock.exists():
 runtime=json.loads(subprocess.check_output(['cozy-runtime','version','--json'],text=True))
 base=Path('/var/lib/cozy/dev/base.json')
 current=Path('/var/lib/cozy/dev/current')
+updater=Path('/opt/cozy/dev/update.py')
+capability_probe=subprocess.run(['python3',str(updater),'capabilities'],text=True,capture_output=True) if updater.is_file() else None
+capabilities=json.loads(capability_probe.stdout) if capability_probe and capability_probe.returncode == 0 else {}
+try: torch_version=m.version('torch')
+except m.PackageNotFoundError: torch_version=''
 print(json.dumps({'runtime':runtime,'tensorfs':m.version('tensorfs'),'python':platform.python_version(),
- 'tags':[str(t) for t in sys_tags()], 'updater':base.is_file() and Path('/opt/cozy/dev/update.py').is_file(),
+ 'tags':[str(t) for t in sys_tags()], 'updater':base.is_file() and updater.is_file(), 'durable_updates':capabilities.get('durable_updates',False),
  'selection':str(current.resolve()) if current.exists() else '',
- 'torch':m.version('torch') if m.packages_distributions().get('torch') else ''}))
+ 'torch':torch_version}))
 """
 
 
@@ -92,6 +97,16 @@ def wheel(name, selected, tags, directory, native):
 def main():
     request = json.load(sys.stdin)
     arguments = request["ssh_arguments"]
+    action = request["action"]
+    if action == "status":
+        stage = request["stage"]
+        if not re.fullmatch(r"[a-f0-9]{32}", stage):
+            raise ValueError("Invalid update operation identity")
+        update = json.loads(ssh(arguments, "python3 /opt/cozy/dev/update.py status " + stage))
+        result = {"update": update}
+        if update.get("state") in {"succeeded", "rolled_back", "refused"}:
+            result["observed"] = inspect(arguments)
+        return result
     observed = inspect(arguments)
     if request["action"] == "inspect":
         return {"observed": observed}
@@ -99,7 +114,7 @@ def main():
         raise ValueError("The worker is already applying a Runtime update")
     if request["action"] == "plan" and observed["runtime"]["distribution"] == request["target"]["runtime_update"]["runtime"]["version"] and observed["tensorfs"] == request["target"]["runtime_update"]["tensorfs"]["version"]:
         return {"observed": observed, "unchanged": True}
-    if not observed["updater"] or not observed["runtime"].get("supports_guarded_restart", False):
+    if not observed["updater"] or not observed.get("durable_updates", False) or not observed["runtime"].get("supports_guarded_restart", False):
         raise ValueError("This worker image does not support safe Runtime updates; select a current maintenance-capable private image")
     directory = Path(request["directory"])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -131,11 +146,12 @@ def main():
     reply = ssh(arguments, "python3 /opt/cozy/dev/update.py apply " + stage + " " +
                 " ".join(row["sha256"] for row in wheels))
     result = json.loads(reply.strip().splitlines()[-1])
-    after = inspect(arguments)
-    expected = {row["distribution"]: row["version"] for row in wheels}
-    if result.get("outcome") != "updated" or after["runtime"]["distribution"] != expected["cozy-runtime"] or after["tensorfs"] != expected["tensorfs"]:
-        raise ValueError("Runtime update requires reconciliation: selected versions were not observed")
-    return {"outcome": "updated", "observed": after, "update": result}
+    if result.get("operation") != stage or result.get("state") not in {
+        "queued", "running", "succeeded", "rolled_back", "refused"
+    }:
+        raise ValueError("Worker did not acknowledge this durable Runtime update")
+    return {"update": result}
+
 
 
 if __name__ == "__main__":

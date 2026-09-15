@@ -3,7 +3,11 @@ package producttest
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/metadata"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -83,7 +87,7 @@ func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testi
 func TestRuntimeRequirementUsesActualPairAndPreservesAuthoredRange(t *testing.T) {
 	for _, requirement := range []string{"cozy-runtime>=0.18.3,<1", "cozy-runtime[media]>=0.18.3,<1"} {
 		mismatch := launch.RuntimeRequirementMismatch([]string{requirement, "torch>=2.13"}, "0.18.2", "0.3.43")
-		if mismatch == nil || mismatch.Distribution != "cozy-runtime" || mismatch.Installed != "0.18.2" || mismatch.Required != requirement {
+		if mismatch == nil || mismatch.Distribution != "cozy-runtime" || mismatch.Installed != "0.18.2" || mismatch.Required != requirement { //cozy:allow distribution metadata assertion, not a binary invocation
 			t.Fatalf("lost compatibility facts: %+v", mismatch)
 		}
 		if launch.RuntimeRequirementMismatch([]string{requirement}, "0.18.3", "0.3.43") != nil {
@@ -120,4 +124,32 @@ func TestRuntimeUpdateMigrationFrom41PreservesRental(t *testing.T) {
 	}
 	_, problem = store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "")
 	fatal(t, problem)
+}
+
+func TestRentalDependencyVerdictIsSharedByRootAndServingPreparation(t *testing.T) {
+	fields := map[string]string{"package": "paul/minimax-h3", "distribution": "cozy-runtime", "required": "cozy-runtime>=0.18.4,<1", "installed": "0.18.2"} //cozy:allow dependency metadata fixture, not a binary invocation
+	raw, err := json.Marshal(fields)
+	must(t, err)
+	event := &pb.PrepareEvent{SafeCode: "package_runtime_incompatible", SafeDetail: string(raw)}
+	fromEvent := orchestrator.RuntimeRequirementEvent(event)
+	fromTrailer := orchestrator.RuntimeRequirementTrailer(metadata.Pairs(
+		"cozy-requirement-package", fields["package"], "cozy-requirement-distribution", fields["distribution"],
+		"cozy-requirement-required", fields["required"], "cozy-requirement-installed", fields["installed"]))
+	for _, problem := range []*exit.Error{fromEvent, fromTrailer} {
+		if problem == nil || problem.ErrName() != "machine_execution.runtime_requirement" ||
+			!strings.Contains(problem.Message, "cozy-runtime 0.18.2") || !strings.Contains(problem.Message, "requires cozy-runtime>=0.18.4,<1") {
+			t.Fatalf("lost actionable dependency facts: %v", problem)
+		}
+	}
+	event.SafeDetail = `{"package":"x"}`
+	if orchestrator.RuntimeRequirementEvent(event) != nil {
+		t.Fatal("incomplete error became update authority")
+	}
+	fields["distribution"] = "torch"
+	raw, err = json.Marshal(fields)
+	must(t, err)
+	event.SafeCode, event.SafeDetail = "package_sdk_incompatible", string(raw)
+	if problem := orchestrator.RuntimeRequirementEvent(event); problem == nil || problem.ErrName() != "machine_execution.package_requirement" {
+		t.Fatalf("non-updatable distribution became Runtime update authority: %v", problem)
+	}
 }

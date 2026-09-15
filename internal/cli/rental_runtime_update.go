@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,9 +30,10 @@ import (
 var runtimeUpdateTransport string
 
 type rentalRuntimeUpdates struct {
-	machines *machineRuns
-	running  sync.Map
-	observed sync.Map
+	machines         *machineRuns
+	running          sync.Map
+	observed         sync.Map
+	requirementFacts sync.Map
 }
 
 type runtimeUpdateSelection struct {
@@ -86,7 +88,13 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		return
 	}
 	go func() {
-		defer u.running.Delete(row.RentalID)
+		defer func() {
+			u.running.Delete(row.RentalID)
+			current, problem := u.machines.store.RuntimeUpdate(row.RentalID)
+			if problem == nil && current != nil && current.Active() && current.ID != row.ID {
+				u.run(*current)
+			}
+		}()
 		m := u.machines
 		problem := m.fleet.owner.MaintainRental(m.ctx, row.RentalID, func(ctx context.Context, identity *orchestrator.WorkerConnection) *exit.Error {
 			if identity.WorkerBootID != row.BootID {
@@ -114,19 +122,13 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		m.mu.Lock()
 		delete(m.claimed, row.RentalID)
 		m.mu.Unlock()
+		m.fleet.owner.WakeQueue()
 	}()
 }
 
-func (u *rentalRuntimeUpdates) selection(ctx context.Context, row records.RuntimeUpdate) (runtimeUpdateSelection, *exit.Error) {
+func (u *rentalRuntimeUpdates) connectionSelection(ctx context.Context, row records.RuntimeUpdate) (runtimeUpdateSelection, *exit.Error) {
 	m := u.machines
 	var selection runtimeUpdateSelection
-	target, problem := client(m.context).RentalRuntimeUpdateTarget(ctx, row.RentalID)
-	if problem != nil {
-		return selection, problem
-	}
-	if target.WorkerBootID != row.BootID {
-		return selection, exit.New(exit.Conflict, "approved Runtime update refers to another worker boot")
-	}
 	remote, problem := client(m.context).Rental(ctx, row.RentalID)
 	if problem != nil {
 		return selection, problem
@@ -167,7 +169,7 @@ func (u *rentalRuntimeUpdates) selection(ctx context.Context, row records.Runtim
 	if _, err := rand.Read(entropy[:]); err != nil {
 		return selection, exit.Internalf("cannot name Runtime update staging: %s", err)
 	}
-	selection = runtimeUpdateSelection{Target: target, Directory: directory, Stage: hex.EncodeToString(entropy[:]), Host: "root@" + host}
+	selection = runtimeUpdateSelection{Directory: directory, Stage: hex.EncodeToString(entropy[:]), Host: "root@" + host}
 	selection.SSHArguments = append(append([]string{}, common...), "-p", port, selection.Host)
 	selection.SFTPArguments = append(append([]string{}, common...), "-P", port)
 	return selection, nil
@@ -244,34 +246,17 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 	if problem := u.machines.store.SaveRuntimeUpdate(*row); problem != nil {
 		return problem
 	}
-	result, problem := u.transport(ctx, selection, "apply")
-	if problem != nil {
-		return problem
-	}
+	_, problem = u.transport(ctx, selection, "apply")
 	_ = control.Close()
-	for ctx.Err() == nil {
-		check, problem := orchestrator.DialIdleControl(ctx, identity, rental.ClaimProof(u.machines.layout), u.machines.store)
-		if problem == nil {
-			epoch := check.ControlStreamEpoch
-			_ = check.Close()
-			if epoch <= control.ControlStreamEpoch {
-				return exit.New(exit.Conflict, "updated Runtime did not advance its authenticated control stream")
-			}
-			row.Result = result
-			row.State = "succeeded"
-			row.Error = ""
-			return nil
-		}
-		if problem.Code != exit.Unavailable {
-			return problem
-		}
-		select {
-		case <-ctx.Done():
-			return exit.New(exit.Canceled, "Runtime update observer disconnected")
-		case <-time.After(time.Second):
-		}
+	// Once apply may have reached the guardian, only its durable operation
+	// journal may decide completion. SSH loss is not an update failure.
+	row.State = "reconciling"
+	row.Error = ""
+	if saveProblem := u.machines.store.SaveRuntimeUpdate(*row); saveProblem != nil {
+		return saveProblem
 	}
-	return exit.New(exit.Canceled, "Runtime update observer disconnected")
+	return u.reconcile(ctx, row, identity, selection)
+
 }
 
 func handleRentalUpdate(ctx *Context) *exit.Error {
@@ -295,50 +280,109 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	lastState := ""
 	for result.Active() {
+		if !ctx.Mode().JSON && lastState != result.State {
+			messages := map[string]string{"preparing": "Checking Runtime and the approved update", "updating": "Updating Runtime", "reconciling": "Checking the worker after an interrupted update"}
+			if message := messages[result.State]; message != "" {
+				fmt.Fprintf(ctx.Err, "%s: %s...\n", row.MachineName, message)
+			}
+			lastState = result.State
+		}
 		time.Sleep(time.Second)
 		result, problem = c.RentalRuntimeUpdate(row.ID)
 		if problem != nil {
 			return problem
 		}
-		if result.State == "reconciling" {
+		if result.State == "reconciling" && result.Error != "" {
 			return exit.Named(exit.Unavailable, "rental.runtime_update_reconciliation_required", "%s: %s", row.MachineName, result.Error)
 		}
 	}
 	if result.State == "failed" {
 		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.MachineName, result.Error)
 	}
-	return emit(ctx, output.Record{Fields: []output.Field{{K: "machine", V: row.MachineName}, {K: "state", V: result.State}, {K: "update", V: result.Result}}})
+	var actual runtimeObservation
+	_ = json.Unmarshal(result.Result, &actual)
+	var selection runtimeUpdateSelection
+	var previous runtimeObservation
+	_ = json.Unmarshal(result.Selection, &selection)
+	_ = json.Unmarshal(selection.Selection, &previous)
+	var state struct {
+		Unchanged bool `json:"unchanged"`
+	}
+	_ = json.Unmarshal(result.Result, &state)
+	status := "ready"
+	if state.Unchanged {
+		status = "already current"
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "machine", V: row.MachineName}, {K: "runtime", V: actual.Observed.Runtime.Distribution},
+		{K: "tensorfs", V: actual.Observed.TensorFS}, {K: "status", V: status},
+		{K: "previous_runtime", V: previous.Observed.Runtime.Distribution}, {K: "update_id", V: result.ID},
+		{K: "details", V: result.Result}}, "machine", "runtime", "tensorfs", "status"))
+}
+
+type runtimeUpdateStatus struct {
+	Update struct {
+		Operation string   `json:"operation"`
+		Expected  []string `json:"expected"`
+		State     string   `json:"state"`
+		Error     string   `json:"error"`
+	} `json:"update"`
 }
 
 func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.RuntimeUpdate, identity *orchestrator.WorkerConnection, selection runtimeUpdateSelection) *exit.Error {
+	expected := []string{strings.TrimPrefix(selection.Target.RuntimeUpdate.Runtime.Digest, "sha256:"), strings.TrimPrefix(selection.Target.RuntimeUpdate.TensorFS.Digest, "sha256:")}
+	slices.Sort(expected)
 	for ctx.Err() == nil {
-		raw, problem := u.transport(ctx, selection, "inspect")
+		raw, problem := u.transport(ctx, selection, "status")
 		if problem == nil {
+			var status runtimeUpdateStatus
 			var actual runtimeObservation
-			if json.Unmarshal(raw, &actual) != nil {
-				return exit.New(exit.Structural, "maintenance reconciliation returned invalid observed versions")
+			if json.Unmarshal(raw, &status) != nil || json.Unmarshal(raw, &actual) != nil {
+				return exit.New(exit.Structural, "maintenance reconciliation returned invalid operation metadata")
 			}
-			if !actual.Observed.Updating {
-				control, problem := orchestrator.DialIdleControl(ctx, identity, rental.ClaimProof(u.machines.layout), u.machines.store)
-				if problem != nil {
+			if status.Update.State == "missing" {
+				// The enqueue response may have been lost before acceptance. Replaying
+				// this same immutable stage is idempotent, including while running.
+				if _, problem := u.transport(ctx, selection, "apply"); problem != nil {
 					return problem
 				}
-				_ = control.Close()
-				if actual.Observed.Runtime.Distribution == selection.Target.RuntimeUpdate.Runtime.Version && actual.Observed.TensorFS == selection.Target.RuntimeUpdate.TensorFS.Version {
-					row.State = "succeeded"
+			} else {
+				slices.Sort(status.Update.Expected)
+				if status.Update.Operation != selection.Stage || !slices.Equal(status.Update.Expected, expected) {
+					return exit.New(exit.Conflict, "worker update journal does not match this recorded operation; maintenance remains closed")
+				}
+				switch status.Update.State {
+				case "queued", "running":
+				case "succeeded", "rolled_back", "refused":
+					control, problem := orchestrator.DialIdleControl(ctx, identity, rental.ClaimProof(u.machines.layout), u.machines.store)
+					if problem != nil {
+						return problem
+					}
+					_ = control.Close()
+					if status.Update.State == "succeeded" {
+						if actual.Observed.Runtime.Distribution != selection.Target.RuntimeUpdate.Runtime.Version || actual.Observed.TensorFS != selection.Target.RuntimeUpdate.TensorFS.Version {
+							return exit.New(exit.Conflict, "completed update does not match the worker's actual Runtime/TensorFS pair; maintenance remains closed")
+						}
+						row.State, row.Error = "succeeded", ""
+					} else {
+						var prior runtimeObservation
+						_ = json.Unmarshal(selection.Selection, &prior)
+						if actual.Observed.Runtime.Distribution != prior.Observed.Runtime.Distribution || actual.Observed.TensorFS != prior.Observed.TensorFS {
+							return exit.New(exit.Conflict, "worker did not retain the recorded healthy Runtime/TensorFS pair; maintenance remains closed")
+						}
+						row.State = "failed"
+						row.Error = "the update was refused or rolled back; the previous healthy Runtime/TensorFS pair is retained"
+						if status.Update.Error != "" {
+							row.Error += ": " + status.Update.Error
+						}
+					}
 					row.Result = raw
-					row.Error = ""
 					return nil
+				default:
+					return exit.New(exit.Structural, "worker reported an unknown update state; maintenance remains closed")
 				}
-				var prior runtimeObservation
-				_ = json.Unmarshal(selection.Selection, &prior)
-				if actual.Observed.Runtime.Distribution == prior.Observed.Runtime.Distribution && actual.Observed.TensorFS == prior.Observed.TensorFS {
-					row.State = "failed"
-					row.Error = "the update did not activate; the previous healthy Runtime/TensorFS pair is retained"
-					return nil
-				}
-				return exit.New(exit.Conflict, "worker software changed outside this recorded update; maintenance remains closed for inspection")
 			}
 		}
 		select {
@@ -348,4 +392,20 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 		}
 	}
 	return exit.New(exit.Canceled, "Runtime update observation interrupted")
+}
+
+func (u *rentalRuntimeUpdates) selection(ctx context.Context, row records.RuntimeUpdate) (runtimeUpdateSelection, *exit.Error) {
+	selected, problem := u.connectionSelection(ctx, row)
+	if problem != nil {
+		return selected, problem
+	}
+	target, problem := client(u.machines.context).RentalRuntimeUpdateTarget(ctx, row.RentalID)
+	if problem != nil {
+		return selected, problem
+	}
+	if target.WorkerBootID != row.BootID {
+		return selected, exit.New(exit.Conflict, "approved Runtime update refers to another worker boot")
+	}
+	selected.Target = target
+	return selected, nil
 }
