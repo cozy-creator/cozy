@@ -195,7 +195,7 @@ func TestPlacementReusesTheMeasuredCard(t *testing.T) {
 	}
 	const line = "placement: reuse morgiana (h100-80, fp8-adaln-pruned) — balanced, 1016 s, $0.76"
 	if !strings.Contains(out, line) {
-		t.Fatalf("cozy run did not print %q:\n%s", line, out)
+		t.Fatalf("cozy run did not print %q:\n%s\nDaemon log:\n%s", line, out, tail(filepath.Join(root, "daemon.log")))
 	}
 	placement := placementEvent(t, store, row.ID)
 	if placement["tier"] != "balanced" || placement["config_digest"] != digest || placement["line"] != line ||
