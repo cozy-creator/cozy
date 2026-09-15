@@ -95,7 +95,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 40 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 41 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	if columns := columnNames(t, db, "attempts"); !columns["triage_bundle"] || columns["triage_path"] {
@@ -208,7 +208,7 @@ func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 		t.Fatalf("make schema-37 requests shape: %v", err)
 	}
 	if _, err := db.Exec(`DROP TRIGGER machine_execution_no_local_attempt; DROP TABLE machine_executions;
-		DROP TABLE IF EXISTS successful_work_releases; PRAGMA user_version=37`); err != nil {
+		DROP TABLE IF EXISTS successful_work_releases; DROP TABLE capture_pins; PRAGMA user_version=37`); err != nil {
 		db.Close()
 		t.Fatalf("stamp schema-37 database: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 40 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 41 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	var pin string

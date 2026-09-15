@@ -285,6 +285,13 @@ cozy run ./experiment.py --retry <prior-run-id> --rental-only --await
 
 Each execution captures its source and dependency closure. A corrected retry creates a new
 record linked to the previous run; it never rewrites the old attempt's code or result.
+Unchanged callers reuse their completed local installation after source, local dependency,
+lock, Python, and capture-tool identities are checked. Each invocation still creates a new
+run. One completed capture is retained per caller; a failed preparation keeps the previous
+one. Script dependency locking still runs through uv on each command. Build backends remain
+the versions selected by the completed installation until source, dependencies, the lock,
+or capture tools change. Explicit `cozy package install ./project` also refreshes that
+package's capture on its next run.
 Retained source preparation can be adopted when its exact source/profile still matches.
 Code and unpublished wheels go directly to the authenticated private worker, without a
 Tensorhub package publication or intermediate upload. Published dependencies can still come

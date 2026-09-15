@@ -74,6 +74,11 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 			"editable source changed after its install revision was selected").
 			WithRemedy("retry the command to select and build the new revision")
 	}
+	if raw, err := os.ReadFile(filepath.Join(install.Dir, "private-revision")); err == nil {
+		return Open(layout, install, string(raw))
+	} else if !os.IsNotExist(err) {
+		return Revision{}, exit.New(exit.Conflict, "captured source revision is unavailable")
+	}
 	if problem := pack.Build(ctx); problem != nil {
 		return Revision{}, problem
 	}
@@ -180,6 +185,31 @@ func StageWheels(layout home.Layout, install records.PackageInstall, packageInte
 		revision.Files[index].Path = filepath.Join(final, "wheels", revision.Files[index].Filename)
 	}
 	return revision, nil
+}
+
+// RetainRevision commits the existing install-private pointer only after the
+// revision's immutable wheel directory is durable.
+func RetainRevision(install records.PackageInstall, digest string) *exit.Error {
+	if !validDigest(digest) {
+		return exit.New(exit.Validation, "captured revision requires an exact digest")
+	}
+	file, err := os.CreateTemp(install.Dir, ".capture-revision-")
+	if err != nil {
+		return exit.Internalf("cannot stage captured revision pointer: %s", err)
+	}
+	defer os.Remove(file.Name())
+	_, writeErr := file.WriteString(digest)
+	syncErr, closeErr := file.Sync(), file.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		return exit.Internalf("cannot retain captured revision pointer")
+	}
+	if err := os.Rename(file.Name(), filepath.Join(install.Dir, "private-revision")); err != nil {
+		return exit.Internalf("cannot publish captured revision pointer: %s", err)
+	}
+	if err := syncDirectory(install.Dir); err != nil {
+		return exit.Internalf("cannot commit captured revision pointer: %s", err)
+	}
+	return nil
 }
 
 func Open(layout home.Layout, install records.PackageInstall, digest string) (Revision, *exit.Error) {

@@ -63,7 +63,22 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 		return Target{}, nil, problem
 	}
 	defer store.Close()
-	defer writer.Unlock()
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			writer.Unlock()
+		}
+	}()
+	reuse, problem := prepareCaptureReuse(ctx, pack, layout, store)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	if existing, surface, problem := reuse.lookup(); problem != nil {
+		return Target{}, nil, problem
+	} else if existing != nil {
+		handedOff = true
+		return Target{Package: existing.Package, InstallID: existing.ID, Release: existing.Version, Snapshot: true, releaseCapture: writer.Unlock}, surface, nil
+	}
 	var intake *childIntake
 	var result *install.Result
 	problem = packagePublishStage(ctx, "Preparing local script environment", func() *exit.Error {
@@ -95,8 +110,15 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 		_, _ = install.Reclaim(layout, store, result.Install.ID)
 		return Target{}, nil, problem
 	}
+	if !ctx.Inv.Bool("--describe") {
+		if problem := reuse.complete(result.Install); problem != nil {
+			_, _ = install.Reclaim(layout, store, result.Install.ID)
+			return Target{}, nil, problem
+		}
+	}
+	handedOff = true
 	return Target{Package: result.Install.Package, InstallID: result.Install.ID,
-		Release: result.Install.Version, Snapshot: true}, surface, nil
+		Release: result.Install.Version, Snapshot: true, releaseCapture: writer.Unlock}, surface, nil
 }
 
 func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
@@ -115,6 +137,7 @@ func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInter
 }
 
 func reclaimSnapshot(ctx *Context, target Target) {
+	releaseSnapshotReader(target)
 	if !target.Snapshot || target.InstallID == "" {
 		return
 	}
@@ -127,6 +150,12 @@ func reclaimSnapshot(ctx *Context, target Target) {
 	// Accepted requests keep the install through the existing in-use predicate.
 	// A refusal/describe-only command has no owner and can reclaim it immediately.
 	_, _ = install.Reclaim(layout, store, target.InstallID)
+}
+
+func releaseSnapshotReader(target Target) {
+	if target.releaseCapture != nil {
+		target.releaseCapture()
+	}
 }
 
 func isScriptTarget(value string) bool {

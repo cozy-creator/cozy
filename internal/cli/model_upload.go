@@ -288,6 +288,9 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 		submission.Org = org
 	}
 	handle, problem := local.SubmitJob(submission, requestKey(ctx.Inv.Value("--idempotency-key")))
+	if invocation != nil {
+		releaseSnapshotReader(invocation.Target)
+	}
 	if problem != nil {
 		return problem
 	}

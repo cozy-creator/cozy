@@ -70,9 +70,6 @@ func (r *Resolver) PrepareLocal(ctx context.Context, installID string) (
 	if problem != nil {
 		return localpackage.Revision{}, problem
 	}
-	if problem := localpackage.Sweep(layout, r.store); problem != nil {
-		return localpackage.Revision{}, problem
-	}
 	revision, problem := localpackage.Stage(ctx, layout, *install)
 	if problem != nil {
 		return localpackage.Revision{}, problem

@@ -127,6 +127,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	key := requestKey(ctx.Inv.Value("--idempotency-key"))
 	began := time.Now()
 	handle, e := c.SubmitJob(sub, key)
+	releaseSnapshotReader(target)
 	if e != nil {
 		return e
 	}
