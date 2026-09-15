@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/cozy-creator/cozy/internal/wheel"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -13,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 type runtimeObservation struct {
@@ -48,6 +48,9 @@ func (u *rentalRuntimeUpdates) preflight(ctx context.Context, request records.Re
 	if row == nil {
 		return exit.New(exit.NotFound, "the requested rental is no longer attached")
 	}
+	if !records.RentalReadyState(row.State) {
+		return nil // The existing rental lifecycle owns recovery and replacement.
+	}
 	if cached, ok := u.observed.Load(machine); ok && cached.(runtimeObservation).Target.WorkerBootID != row.ExpectedWorkerBootID {
 		u.observed.Delete(machine)
 	}
@@ -64,11 +67,23 @@ func (u *rentalRuntimeUpdates) preflight(ctx context.Context, request records.Re
 		}
 		remote, problem := client(u.machines.context).Rental(ctx, machine)
 		if problem != nil {
+			// This is an advance observation, not a new availability dependency.
+			// Older/offline Hubs may lack these facts; Runtime still checks the
+			// actual installed dependency boundary before package import.
+			if problem.Code == exit.NotFound || problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
+				return nil
+			}
 			return problem
+		}
+		if !remote.Ready() {
+			return nil
 		}
 		if !remote.Development {
 			raw, problem := client(u.machines.context).RentalImageInventory(ctx, machine)
 			if problem != nil {
+				if problem.Code == exit.NotFound || problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
+					return nil
+				}
 				return problem
 			}
 			inventory, err := rental.ImageInventory(raw)
