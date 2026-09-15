@@ -115,14 +115,17 @@ func TestRentalCLIExplainsBootFailureExclusions(t *testing.T) {
 	for _, tc := range []struct {
 		name, reason, code, want string
 		retryAfter               *time.Time
+		offered                  bool
 	}{
 		{"cooldown", "cooldown", "rental.sku_cooldown",
-			"temporarily excluded after a recent boot failure. Retry after 2026-09-15T22:05:00Z.", &retryAfter},
+			"temporarily excluded after a recent boot failure. Retry after 2026-09-15T22:05:00Z.", &retryAfter, false},
 		{"cooldown_without_time", "cooldown", "rental.sku_cooldown",
-			"temporarily excluded after a recent boot failure. Please try again shortly.", nil},
+			"temporarily excluded after a recent boot failure. Please try again shortly.", nil, false},
 		{"recovery_retry", "retry_in_progress", "rental.sku_retry_in_progress",
-			"while one retry after a recent boot failure is in progress", nil},
-		{"older_hub", "", "rental.sku_out_of_stock", "our GPU providers have no inventory", nil},
+			"while one retry after a recent boot failure is in progress", nil, false},
+		{"older_hub", "", "rental.sku_out_of_stock", "our GPU providers have no inventory", nil, false},
+		{"cooldown_expired_after_listing", "", "rental.sku_availability_changed",
+			"became available after the catalog was read. Please retry the rental request.", nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var writes atomic.Int32
@@ -140,7 +143,8 @@ func TestRentalCLIExplainsBootFailureExclusions(t *testing.T) {
 					_, _ = w.Write([]byte(`[]`))
 				case "/v1/rental-skus/" + sku:
 					_ = json.NewEncoder(w).Encode(hub.RentalSKUStatus{
-						Name: sku, Known: true, UnavailableReason: tc.reason, RetryAfter: tc.retryAfter,
+						Name: sku, Known: true, Offered: tc.offered,
+						UnavailableReason: tc.reason, RetryAfter: tc.retryAfter,
 					})
 				default:
 					w.WriteHeader(http.StatusNotFound)
@@ -161,7 +165,7 @@ func TestRentalCLIExplainsBootFailureExclusions(t *testing.T) {
 				if code != 1 || !strings.Contains(out, tc.want) {
 					t.Fatalf("cozy %s [exit %d]: %s", strings.Join(args, " "), code, out)
 				}
-				if tc.reason != "" && strings.Contains(out, "no inventory") {
+				if (tc.reason != "" || tc.offered) && strings.Contains(out, "no inventory") {
 					t.Fatalf("temporary exclusion was described as missing provider inventory: %s", out)
 				}
 				if format == "json" {

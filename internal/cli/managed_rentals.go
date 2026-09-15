@@ -237,6 +237,10 @@ func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatu
 			"Tensorhub sells no rental SKU named %q — %s", skuName, said).
 			WithRemedy("choose one of the names it does sell: %s", offeredNames(skus)).
 			WithNext("cozy rental new")
+	case status.Offered:
+		return exit.Named(exit.Capacity, "rental.sku_availability_changed",
+			"%s became available after the catalog was read. Please retry the rental request.", skuName).
+			WithNext("cozy rental new "+skuName, "cozy rental new")
 	}
 	message := fmt.Sprintf("Sorry, but our GPU providers have no inventory for %s right now.", skuName)
 	switch status.UnavailableReason {
