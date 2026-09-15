@@ -109,7 +109,7 @@ func TestCapturePinsMigrateAndPreserveOrdinaryInstallOwners(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", layout.DB)
 	must(t, err)
-	_, err = db.Exec(`DROP TABLE capture_pins; PRAGMA user_version=40`)
+	_, err = db.Exec(`DROP TABLE rental_runtime_updates; DROP TABLE capture_pins; PRAGMA user_version=40`)
 	must(t, err)
 	if ordinary, problem := records.Open(layout.DB); problem == nil || problem.ErrName() != "records_schema_upgrade_required" {
 		if ordinary != nil {
@@ -126,7 +126,7 @@ func TestCapturePinsMigrateAndPreserveOrdinaryInstallOwners(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 41 {
+	if version != 42 {
 		t.Fatalf("daemon did not migrate capture ownership: %d", version)
 	}
 	db.Close()

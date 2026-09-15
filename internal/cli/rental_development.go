@@ -2,12 +2,14 @@ package cli
 
 import (
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -64,7 +66,11 @@ func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.Re
 		if pinned != nil {
 			return pinned, nil
 		}
-		return nil, exit.Usagef("development rentals require --ssh-public-key FILE or rentals.ssh_public_key in config.yaml")
+		var problem *exit.Error
+		path, problem = managedRentalSSHKey(ctx)
+		if problem != nil {
+			return nil, problem
+		}
 	}
 	if strings.HasPrefix(path, "~/") {
 		home, err := os.UserHomeDir()
@@ -92,6 +98,44 @@ func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.Re
 		return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict", "rental operation already declares different development access").WithRemedy("resume without development flags or use a new operation key")
 	}
 	return selected, nil
+}
+
+// managedRentalSSHKey keeps the operator's maintenance identity in the existing
+// protected credential directory. Explicit operator keys still take precedence.
+func managedRentalSSHKey(ctx *Context) (string, *exit.Error) {
+	directory := filepath.Join(ctx.Cfg.Home, "auth")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return "", exit.Internalf("cannot create private rental credentials: %s", err)
+	}
+	lock, err := os.OpenFile(filepath.Join(directory, "rental-ssh.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return "", exit.Internalf("cannot lock private rental credentials: %s", err)
+	}
+	defer lock.Close()
+	if err := flock.Exclusive(lock); err != nil {
+		return "", exit.Unavailablef("another rental command is creating maintenance credentials; retry shortly")
+	}
+	path := filepath.Join(directory, "rental-ssh")
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+			return "", exit.New(exit.Credential, "rental SSH private key must be a private regular file")
+		}
+		if _, err := os.Stat(path + ".pub"); err != nil {
+			return "", exit.New(exit.Credential, "rental SSH identity is incomplete; restore its public key")
+		}
+		return path + ".pub", nil
+	} else if !os.IsNotExist(err) {
+		return "", exit.New(exit.Credential, "rental SSH private key cannot be inspected")
+	}
+	if _, err := os.Lstat(path + ".pub"); !os.IsNotExist(err) {
+		return "", exit.New(exit.Credential, "rental SSH public key already exists without its private key; restore that identity")
+	}
+	command := exec.Command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "cozy-private-rental", "-f", path)
+	command.Env = ctx.Cfg.Tool()
+	if err := command.Run(); err != nil {
+		return "", exit.New(exit.Credential, "cannot create a private rental SSH key").WithRemedy("install OpenSSH client tools, or select --ssh-public-key FILE")
+	}
+	return path + ".pub", nil
 }
 
 func handleRentalSSHInfo(ctx *Context) *exit.Error {

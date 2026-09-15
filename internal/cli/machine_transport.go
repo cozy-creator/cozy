@@ -37,6 +37,19 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	if machine == "local" {
 		return m.connectLocalMachine(ctx)
 	}
+	if m.fleet == nil || m.fleet.owner == nil {
+		return nil, exit.Unavailablef("the rental controller is not ready")
+	}
+	release, problem := m.fleet.owner.UseRental(machine)
+	if problem != nil {
+		return nil, problem
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			release()
+		}
+	}()
 	target, problem := rental.Resolver(m.layout, m.store)(machine)
 	if problem != nil {
 		return nil, problem
@@ -79,7 +92,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		m.claimed[machine] = claim.WorkerBootId
 		m.mu.Unlock()
 	}
-	result := &machineConnection{connection: connection, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
+	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
 		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
 		facts, problem := rental.PrepareFactsSource(client(m.context))(ctx, identity, ref)
@@ -197,6 +210,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		return readMachinePreparation(stream)
 	}
 
+	transferred = true
 	return result, nil
 }
 
@@ -331,7 +345,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		}
 		m.localPID = process.PID
 	}
-	result := &machineConnection{connection: connection, client: client, claim: claim, wireMinor: info.WireMinor}
+	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, wireMinor: info.WireMinor}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
 		facts, problem := m.resolver.installFacts(request.InstallID)
 		if problem != nil {
