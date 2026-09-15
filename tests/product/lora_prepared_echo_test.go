@@ -106,9 +106,8 @@ func TestLoRAPreparedEchoMustMatchBeforeAnyOffer(t *testing.T) {
 	}
 }
 
-// Published native55 and captured-default56 peers have no adapter implementation.
-// Their ordinary compatibility range must not authorize a paid LoRA preparation.
-func TestLoRARefusesNativeOnlyPeersBeforePreparation(t *testing.T) {
+// Pre-hard-cut peers cannot receive a LoRA preparation or inference offer.
+func TestLoRAOldPeersFailProtocolBeforePreparation(t *testing.T) {
 	for _, minor := range []uint32{55, 56} {
 		t.Run(fmt.Sprint(minor), func(t *testing.T) {
 			public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -125,12 +124,12 @@ func TestLoRARefusesNativeOnlyPeersBeforePreparation(t *testing.T) {
 			fatal(t, e)
 			found := false
 			for _, event := range events {
-				if event.Type == "request.failed" && event.Payload["error_type"] == "model_adapters_protocol_unsupported" {
+				if event.Type == "request.failed" && event.Payload["error_type"] == "worker.protocol_incompatible" {
 					found = true
 				}
 			}
 			if !found {
-				t.Fatalf("missing capability refusal: %v", events)
+				t.Fatalf("missing protocol refusal: %v", events)
 			}
 			pod.mu.Lock()
 			defer pod.mu.Unlock()
