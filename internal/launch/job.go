@@ -151,7 +151,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	if declared == nil {
 		return nil, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", f.Install.Package, function).
-			WithRemedy("it registers: %s", strings.Join(f.PackageInterface.Names(), ", ")).
+			WithRemedy("it registers: %s", strings.Join(f.PackageInterface.PublicNames(), ", ")).
 			WithNext("cozy package list --full")
 	}
 	runtimeBin, problem := hostruntime.Path(f.RuntimeCLI.Env)

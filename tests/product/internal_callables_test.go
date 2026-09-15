@@ -21,8 +21,11 @@ const internalCallablesInterface = `{"format":"cozy.package.interface/1","applic
 func TestInternalCallablesStayInExecutionInterface(t *testing.T) {
 	surface, problem := launch.DecodePackageInterface([]byte(internalCallablesInterface))
 	fatal(t, problem)
-	if !reflect.DeepEqual(surface.Names(), []string{"generate", "long_form"}) {
-		t.Fatal(surface.Names())
+	if !reflect.DeepEqual(surface.PublicNames(), []string{"generate", "long_form"}) {
+		t.Fatal(surface.PublicNames())
+	}
+	if !reflect.DeepEqual(surface.Names(), []string{"generate", "internal_job", "long_form", "segment"}) {
+		t.Fatal("execution capture lost internal names", surface.Names())
 	}
 	for _, name := range []string{"segment", "internal_job"} {
 		entry, problem := surface.Function(name)

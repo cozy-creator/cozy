@@ -722,7 +722,7 @@ func (d *PackageInterface) Function(name string) (*Entrypoint, *exit.Error) {
 		}
 	}
 	return nil, exit.New(exit.NotFound, "this release registers no function %q", name).
-		WithRemedy("it registers: %s", strings.Join(d.Names(), ", "))
+		WithRemedy("it registers: %s", strings.Join(d.PublicNames(), ", "))
 }
 
 // RequirePublic guards user-facing discovery and root submission. Managed child
@@ -735,16 +735,21 @@ func (e *Entrypoint) RequirePublic() *exit.Error {
 	return nil
 }
 
-// Names lists public callable names; internal registrations remain in the interface.
-func (d *PackageInterface) Names() []string {
+// Names lists all registered callables for execution and dependency capture.
+func (d *PackageInterface) Names() []string { return d.names(false) }
+
+// PublicNames lists only externally callable entrypoints and jobs.
+func (d *PackageInterface) PublicNames() []string { return d.names(true) }
+
+func (d *PackageInterface) names(publicOnly bool) []string {
 	out := []string{}
 	for _, e := range d.Entrypoints {
-		if !e.Internal {
+		if !publicOnly || !e.Internal {
 			out = append(out, e.Name)
 		}
 	}
 	for _, j := range d.Jobs {
-		if !j.Internal {
+		if !publicOnly || !j.Internal {
 			out = append(out, j.Name)
 		}
 	}
