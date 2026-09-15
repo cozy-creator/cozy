@@ -196,7 +196,7 @@ func TestSchema36MigrationKeepsAutomaticAssignments(t *testing.T) {
 	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='requests'`).Scan(&create))
 	create = strings.Replace(create, "  attention_kernel TEXT NOT NULL DEFAULT '',\n", "", 1)
 	create = strings.Replace(create, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)
-	_, err = db.Exec(`DROP TRIGGER machine_execution_no_local_attempt; DROP TABLE machine_executions; DROP TABLE IF EXISTS successful_work_releases; ALTER TABLE requests DROP COLUMN attention_kernel; ALTER TABLE requests DROP COLUMN requested_rental; PRAGMA user_version=36`)
+	_, err = db.Exec(`DROP TABLE capture_pins; DROP TRIGGER machine_execution_no_local_attempt; DROP TABLE machine_executions; DROP TABLE IF EXISTS successful_work_releases; ALTER TABLE requests DROP COLUMN attention_kernel; ALTER TABLE requests DROP COLUMN requested_rental; PRAGMA user_version=36`)
 	must(t, err)
 	_, err = db.Exec(`PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=? WHERE name='requests'; PRAGMA writable_schema=OFF`, create)
 	must(t, err)
