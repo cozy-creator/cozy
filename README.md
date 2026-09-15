@@ -191,7 +191,7 @@ cozy run paul/minimax-h3-tools/four-lane \
   --publish-to paul/minimax-h3 --rental-only --await
 
 cozy run org/quantize/convert --model.source=org/model@release/bf16 \
-  --in quantize.json --publish-to org/quantized --rental-only
+  --input quantize.json --publish-to org/quantized --rental-only
 ```
 
 `cozy package update-all` upgrades installed Tensorhub packages to newer published
@@ -199,6 +199,11 @@ releases, without downloading model weights. It keeps local/editable packages,
 development versions, and versions newer than the registry unchanged. Each package
 is reported as updated, current, failed, or skipped; a failure leaves its previous
 install active and does not stop other packages.
+
+`--input=request.json` reads the whole payload, including nested lists such as `shots`,
+from a JSON file. Inline arguments override file values; use `field:=<json>` for a
+nested inline value. `--in` remains an alias. `--input-tree` separately binds a job
+input directory.
 
 `--publish-to` retains each declared weight output as an owner-only immutable checkpoint;
 it does not create public lane pointers. `--source-profile slot=profile` narrows each foreign

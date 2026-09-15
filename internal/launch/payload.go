@@ -20,7 +20,7 @@ import (
 // bare-venv run: a positional PRIMARY filling the first declared field, `key=value`
 // scalars, `key=@file` local file contents encoded as one JSON string,
 // `key:=<json>` raw JSON for nested values, and
-// `--in <file>` supplying the whole payload with `key=value` merged on top.
+// `--input <file>` supplying the whole payload with `key=value` merged on top.
 //
 // TYPING IS THE DESCRIPTOR'S, not this module's. `steps=20` is an int because the field's
 // rendered schema says int, never because the string looked numeric — the difference shows
@@ -63,12 +63,12 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 	if infile != "" {
 		data, err := os.ReadFile(infile)
 		if err != nil {
-			return nil, RunKeys{}, exit.New(exit.NotFound, "--in %s: %s", infile, err).
-				WithRemedy("--in takes one JSON file holding the whole payload")
+			return nil, RunKeys{}, exit.New(exit.NotFound, "--input %s: %s", infile, err).
+				WithRemedy("--input takes one JSON file holding the whole payload")
 		}
 		var loaded map[string]json.RawMessage
 		if err := json.Unmarshal(data, &loaded); err != nil {
-			return nil, RunKeys{}, exit.New(exit.Validation, "--in %s does not hold one JSON object: %s", infile, err)
+			return nil, RunKeys{}, exit.New(exit.Validation, "--input %s does not hold one JSON object: %s", infile, err)
 		}
 		for k, v := range loaded {
 			document[k] = v

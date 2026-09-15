@@ -335,7 +335,7 @@ type RunExecuteCmd struct {
 	Input           []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
 	Out             string   `help:"Output directory." type:"path"`
 	Timeout         string   `help:"Request deadline."`
-	PayloadFile     string   `name:"in" help:"Read the whole payload from a JSON file, e.g. --in request.json." type:"path"`
+	PayloadFile     string   `name:"input" aliases:"in" help:"Read the whole payload from a JSON file, e.g. --input=request.json; inline fields override file values." type:"path"`
 	Assets          []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	AssetFidelity   []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
 	AttentionKernel string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend. Example: model/fl2va_dit=kitchen-int8. No fallback; Runtime validates hardware, compiled mode and parallelism."`
