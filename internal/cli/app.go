@@ -196,6 +196,9 @@ func normalizeRunArgs(args []string, application *kong.Node) []string {
 	for node := execute; node != nil; node = node.Parent {
 		for _, flag := range node.Flags {
 			valueFlags["--"+flag.Name] = !flag.IsBool() && !flag.IsCounter()
+			for _, alias := range flag.Aliases {
+				valueFlags["--"+alias] = !flag.IsBool() && !flag.IsCounter()
+			}
 			if flag.Short != 0 {
 				valueFlags["-"+string(flag.Short)] = !flag.IsBool() && !flag.IsCounter()
 			}
