@@ -153,19 +153,28 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			if problem == nil {
 				return m.store.AppendEvent(request, "machine.package_reused", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest})
 			}
-			if event == nil || event.Stage != pb.PrepareStage_PREPARE_STAGE_REFUSED || event.SafeCode != "local_package_reuse_unavailable" {
+			if event == nil || event.Stage != pb.PrepareStage_PREPARE_STAGE_REFUSED {
 				return problem
 			}
-			if uploaded {
-				// A prepared transfer is terminal and its wheel carriers may be gone.
-				// Repair missing installation bytes with a fresh, replayable transfer;
-				// preserve the original transfer's history and the execution's identity.
-				operation = baseOperation + ".repair-" + strconv.Itoa(transfer.Completed)
-				selected, problem = orchestrator.LocalPackageSelection(operation, revision)
-				if problem != nil {
-					return problem
+			switch event.SafeCode {
+			case "local_package_reuse_unavailable":
+				if uploaded {
+					// Prepared transfers are terminal; repair with a new recorded
+					// operation, leaving the previous transfer and root intact.
+					operation = baseOperation + ".repair-" + strconv.Itoa(transfer.Completed)
+					selected, problem = orchestrator.LocalPackageSelection(operation, revision)
+					if problem != nil {
+						return problem
+					}
+					uploaded = false
 				}
+			case "local_package_transfer_incomplete":
+				// An older client may have left a durable prefix before recording
+				// upload-start. Host has verified that every received header still
+				// belongs to this exact source and selected wheel inventory.
 				uploaded = false
+			default:
+				return problem
 			}
 		}
 		if !uploaded {
