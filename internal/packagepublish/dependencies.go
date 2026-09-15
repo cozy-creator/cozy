@@ -20,6 +20,7 @@ import (
 const (
 	MaxDependencyWheels     = 128
 	MaxDependencyWheelBytes = 512 << 20
+	MaxRegistryWheelBytes   = 2 << 30
 	maxWorkspaceAncestors   = 32
 	maxWorkspacePatterns    = 64
 	maxWorkspaceMembers     = 256
@@ -78,20 +79,19 @@ type dependencyCollector struct {
 	total    int64
 	count    int
 	registry bool
-	publish  bool
 	scanOnly bool
 }
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
 
-func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string, publish bool) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
+func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
 	canonical, problem := canonicalLocalPath(root)
 	if problem != nil {
 		return nil, false, nil, problem
 	}
 	collector := &dependencyCollector{
 		ctx: ctx, stage: stage, byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
-		stack: map[string]bool{canonical: true}, publish: publish,
+		stack: map[string]bool{canonical: true},
 	}
 	if name := normalizedProjectName(document.Project.Name); name != "" {
 		collector.byName[name] = dependencyRecord{source: canonical, version: document.Project.Version}
@@ -222,9 +222,6 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 			return duplicateDependency(name, prior, canonical, version)
 		}
 		newExtras := c.activateExtras(canonical, req.extras)
-		if c.publish && ImageOwnedDistribution(name) {
-			return nil
-		}
 		if len(newExtras) == 0 {
 			return nil
 		}
@@ -239,13 +236,11 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	c.count++
 	c.byName[name] = dependencyRecord{source: canonical, version: version}
 	newExtras := c.activateExtras(canonical, req.extras)
-	if !c.publish || !ImageOwnedDistribution(name) {
-		c.stack[canonical] = true
-		if problem := c.collectProject(canonical, document, newExtras, true); problem != nil {
-			return problem
-		}
-		delete(c.stack, canonical)
+	c.stack[canonical] = true
+	if problem := c.collectProject(canonical, document, newExtras, true); problem != nil {
+		return problem
 	}
+	delete(c.stack, canonical)
 
 	out := filepath.Join(c.stage, "dependencies", fmt.Sprintf("%02d-%s", len(c.wheels)+1, name))
 	if c.scanOnly {
@@ -358,11 +353,6 @@ func LocalDependencySelections(root string, extras ...string) (map[string]LocalD
 }
 
 func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Error {
-	// Publication keeps its existing platform-family custody path. Unpublished
-	// captures retain every supplied local dependency wheel, including frameworks.
-	if c.publish && ImageOwnedDistribution(identity.Distribution) {
-		return nil
-	}
 	if len(c.wheels) >= MaxDependencyWheels {
 		return tooManyDependencies()
 	}

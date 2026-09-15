@@ -110,7 +110,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 		if entry.Source.Registry == "https://pypi.org/simple" {
 			// Registry artifacts are fetched by Runtime's bounded storage; the
 			// private client upload byte bound applies only to local wheels.
-			if _, problem := registryWheelIdentityBound(name, entry.Version, candidate, 2<<30); problem != nil {
+			if _, problem := registryWheelIdentityBound(name, entry.Version, candidate, MaxRegistryWheelBytes); problem != nil {
 				return nil, nil, problem
 			}
 		} else {

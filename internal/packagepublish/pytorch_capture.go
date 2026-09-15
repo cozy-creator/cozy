@@ -26,7 +26,7 @@ func pytorchRegistryWheel(name, version, index string, wheels []registryWheel) (
 		return refuse()
 	}
 	for _, candidate := range wheels {
-		if candidate.Size < 0 || candidate.Size > 2<<30 {
+		if candidate.Size < 0 || candidate.Size > MaxRegistryWheelBytes {
 			return refuse()
 		}
 		object, err := url.Parse(candidate.URL)

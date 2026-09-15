@@ -5,6 +5,7 @@ package producttest
 // depending on one pure registry wheel.
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -52,11 +53,6 @@ func TestRegistryLockRowsReplaceTheProxiedDownload(t *testing.T) {
 	if _, problem := packagepublish.RegistryRowsFromLock([]byte(otherIndex), nil, ""); problem == nil ||
 		problem.Name != "registry_dependency_index_refused" {
 		t.Fatalf("unpinned index answered %v", problem)
-	}
-	rooted := strings.Replace(frozenPylock, `name = "annotated-doc"`, `name = "numpy"`, 1)
-	if _, problem := packagepublish.RegistryRowsFromLock([]byte(rooted), nil, ""); problem == nil ||
-		problem.Name != "registry_dependency_platform_root_present" {
-		t.Fatalf("platform root answered %v", problem)
 	}
 	shortHash := strings.Replace(frozenPylock,
 		"b09a2fe63e5e2249a4d0b5c086acc4372e1d44de2b76a4c72cebbdbef7231e67", "b09a", 1)
@@ -221,5 +217,48 @@ func TestSameOrgIndexRowsAreDeclaredForCustodyShare(t *testing.T) {
 	if _, problem := packagepublish.RegistryRowsFromLock([]byte(lookalike), nil, "paul"); problem == nil ||
 		problem.Name != "registry_dependency_index_refused" {
 		t.Fatalf("lookalike index path answered %v", problem)
+	}
+}
+
+func TestRegistryPublicationKeepsCompleteLargeFrameworkClosure(t *testing.T) {
+	lock := "lock-version = \"1.0\"\n"
+	for _, name := range []string{"torch", "nvidia-cublas-cu13", "numpy"} {
+		lock += fmt.Sprintf("[[packages]]\nname=%q\nversion=\"1.0\"\nindex=\"https://pypi.org/simple\"\nwheels=[{url=%q,size=1073741824,hashes={sha256=%q}}]\n", name, "https://files.pythonhosted.org/packages/"+strings.ReplaceAll(name, "-", "_")+"-1.0-py3-none-any.whl", strings.Repeat("a", 64))
+	}
+	rows, problem := packagepublish.RegistryRowsFromLock([]byte(lock), nil, "")
+	fatal(t, problem)
+	if len(rows) != 3 {
+		t.Fatalf("published framework closure was pruned: %+v", rows)
+	}
+	tooLarge := strings.Replace(lock, "size=1073741824", "size=2147483649", 1)
+	if _, problem := packagepublish.RegistryRowsFromLock([]byte(tooLarge), nil, ""); problem == nil || problem.Name != "registry_dependency_identity_invalid" {
+		t.Fatalf("unbounded public artifact admitted: %v", problem)
+	}
+	official := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(lock, "name=\"nvidia-cublas-cu13\"", "name=\"torchaudio\""), "nvidia_cublas_cu13-", "torchaudio-"), "name=\"numpy\"", "name=\"torchvision\"")
+	official = strings.ReplaceAll(official, "numpy-", "torchvision-")
+	official = strings.ReplaceAll(official, "https://pypi.org/simple", "https://download.pytorch.org/whl/cpu")
+	official = strings.ReplaceAll(official, "https://files.pythonhosted.org/packages/", "https://download-r2.pytorch.org/whl/cpu/")
+	rows, problem = packagepublish.RegistryRowsFromLock([]byte(official), nil, "")
+	fatal(t, problem)
+	for _, row := range rows {
+		if !strings.HasPrefix(row.URL, "https://download.pytorch.org/whl/cpu/") || row.Size != 1<<30 || row.SHA256 != strings.Repeat("a", 64) {
+			t.Fatalf("official artifact identity changed: %+v", row)
+		}
+	}
+}
+
+// Universal PyTorch locks contain separate macOS and Linux distributions. The
+// publication target must select the Linux branch without losing its closure.
+func TestRegistryPublicationSelectsTargetMarkers(t *testing.T) {
+	foreign := strings.Replace(frozenPylock, "created-by = \"uv\"", "", 1)
+	foreign = strings.TrimPrefix(foreign, "lock-version = \"1.0\"\n")
+	foreign = strings.ReplaceAll(foreign, "0.0.3", "0.0.2")
+	foreign = strings.Replace(foreign, "[[packages]]", "[[packages]]\nmarker=\"sys_platform == 'darwin'\"", 1)
+	foreign = strings.Replace(foreign, "py3-none-any", "cp312-cp312-macosx_14_0_arm64", 1)
+	local := strings.Replace(frozenPylock, "[[packages]]", "[[packages]]\nmarker=\"sys_platform == 'linux' and python_version == '3.12'\"", 1)
+	rows, problem := packagepublish.RegistryRowsFromLock([]byte(local+foreign), nil, "")
+	fatal(t, problem)
+	if len(rows) != 1 || rows[0].Version != "0.0.3" {
+		t.Fatalf("universal lock lost the selected target: %+v", rows)
 	}
 }

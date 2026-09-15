@@ -64,8 +64,8 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 		}
 	}
 	code, out := runCozy(t, root, append(append([]string{}, args...), "--rental=giriko")...)
-	if code == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "0.13.0") {
-		t.Fatalf("wrong runtime admitted: %d %s", code, out)
+	if code != 0 || !strings.Contains(out, `"requested_rental":"`+old+`"`) {
+		t.Fatalf("package-private Runtime was constrained by image inventory: %d %s", code, out)
 	}
 	// Replaying an accepted request preserves its selected identity after the rental
 	// ends; it does not need a fresh inventory read merely to retrieve history.
@@ -240,7 +240,7 @@ func TestRentalNewIsTheOnlyCreationCommand(t *testing.T) {
 	}
 }
 
-func TestAutomaticAndNamedRentalChoicesRespectExistingImage(t *testing.T) {
+func TestAutomaticAndNamedRentalChoicesAllowPrivateSDKVersions(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
 	h.runtimeVersions = map[string]string{"pr-oldruntime": "0.1.0"}
@@ -256,16 +256,16 @@ func TestAutomaticAndNamedRentalChoicesRespectExistingImage(t *testing.T) {
 	}
 	st.Close()
 	startDaemonProcess(t, root)
-	for _, arm := range []struct{ key, flag string }{{"automatic-runtime", "--rental-only"}, {"named-runtime", "--rental=isao"}} {
+	for _, arm := range []struct{ key, flag string }{{"automatic-runtime", "--rental-only"}, {"named-runtime", "--rental=giriko"}} {
 		_, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", arm.flag, "--json", "--idempotency-key", arm.key)
 		st, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 		fatal(t, problem)
 		row, problem := st.RequestByIdempotencyKey(arm.key)
 		fatal(t, problem)
-		if row == nil || row.Worker != "pr-newruntime" {
-			t.Fatalf("%s chose wrong rental: %+v %s", arm.key, row, out)
+		if row == nil || row.Worker != "pr-oldruntime" || strings.Contains(out, "rental.runtime_incompatible") {
+			t.Fatalf("%s constrained a package SDK to the worker image: %+v %s", arm.key, row, out)
 		}
-		if arm.key == "named-runtime" && row.RequestedRental != "pr-newruntime" {
+		if arm.key == "named-runtime" && row.RequestedRental != "pr-oldruntime" {
 			t.Fatal("explicit request lost durable affinity")
 		}
 		st.Close()
