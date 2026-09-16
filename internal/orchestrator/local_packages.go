@@ -72,9 +72,6 @@ func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
 	if problem != nil {
 		return problem
 	}
-	if problem := requireLocalPackageCapacity(s, len(revision.Files)); problem != nil {
-		return problem
-	}
 	// One local preparation at a time per pod: a run and the editable refresh converging
 	// the same revision must not each ask the pod to prepare over the other's placement.
 	w.localMu.Lock()
@@ -248,11 +245,11 @@ func localSelection(operationID string, revision localpackage.Revision) (
 	source, err := canonical.Raw(revision.SourceDigest)
 	if err != nil || operationID == "" || revision.Package == "" || revision.Release == "" ||
 		!validDigest(revision.Digest) || len(revision.Files) == 0 ||
-		len(revision.Files) > pb.MaxLocalPackageFiles {
+		len(revision.Files) > pb.MaxLocalPackageFiles || len(revision.DependencyRequirements) > pb.MaxLockedRequirementsBytes {
 		return nil, nil, exit.Named(exit.Structural, "local_package_revision_invalid",
 			"local package revision is incomplete")
 	}
-	selected := &pb.DesiredLocalPackageSet{OperationId: operationID,
+	selected := &pb.DesiredLocalPackageSet{OperationId: operationID, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
 		Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release,
 			SourceDigest: source}}
 	localDigest, _ := canonical.Raw(revision.Digest)
@@ -308,9 +305,6 @@ func (c *Orchestrator) transferLocalPackage(instanceID, operationID string,
 ) *exit.Error {
 	_, current, problem := c.localControl(instanceID)
 	if problem != nil {
-		return problem
-	}
-	if problem := requireLocalPackageCapacity(current, len(transfer.files)); problem != nil {
 		return problem
 	}
 	held, problem := c.bindLocalTransfer(instanceID, operationID, transfer, current)
@@ -676,9 +670,6 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 	if selected == nil {
 		return exit.Internalf("cannot issue an empty local package set")
 	}
-	if problem := requireLocalPackageCapacity(s, len(selected.Files)); problem != nil {
-		return problem
-	}
 	revision, err := canonical.Spell(selected.Package.GetLocalRevisionDigest())
 	if err != nil {
 		return exit.Internalf("cannot spell the local revision digest: %s", err)
@@ -785,7 +776,7 @@ func cloneLocalPackageSet(in *pb.DesiredLocalPackageSet) *pb.DesiredLocalPackage
 	if in == nil {
 		return nil
 	}
-	out := &pb.DesiredLocalPackageSet{OperationId: in.OperationId}
+	out := &pb.DesiredLocalPackageSet{OperationId: in.OperationId, DependencyRequirements: append([]byte(nil), in.DependencyRequirements...)}
 	if in.Package != nil {
 		out.Package = &pb.DevelopmentPackage{Package: in.Package.Package,
 			Release: in.Package.Release, SourceDigest: append([]byte(nil), in.Package.SourceDigest...),
@@ -805,27 +796,4 @@ func cloneUnpublishedPlacementSet(in *pb.DesiredPrivatePlacementSet) *pb.Desired
 		return nil
 	}
 	return proto.Clone(in).(*pb.DesiredPrivatePlacementSet)
-}
-
-// The Host advertises the intersection with its installed Runtime. ClaimAck alone
-// can describe a newer Runtime behind an older Host, so probe before sending bytes.
-func requireLocalPackageCapacity(s *session, files int) *exit.Error {
-	if files <= pb.LegacyMaxLocalPackageFiles {
-		return nil
-	}
-	if s == nil || s.host == nil {
-		return exit.Unavailablef("unpublished package capacity awaits the claimed Host")
-	}
-	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-	defer cancel()
-	info, err := s.host.ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
-	if err != nil {
-		return exit.Unavailablef("unpublished package capacity probe is unavailable")
-	}
-	if info == nil || info.WireMinor < pb.ExpandedLocalPackageFilesWireMinor {
-		return exit.Named(exit.Conflict, "local_package_worker_capacity_unsupported",
-			"unpublished package revision has %d wheels; this worker supports at most %d", files, pb.LegacyMaxLocalPackageFiles).
-			WithRemedy("select a worker with protocol minor %d or newer", pb.ExpandedLocalPackageFilesWireMinor)
-	}
-	return nil
 }

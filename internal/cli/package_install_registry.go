@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -218,7 +219,7 @@ func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 			seen[download.Path] = true
 			wheel := install.PublishedWheel{Digest: download.Digest,
 				Distribution: download.Distribution, Filename: download.Path,
-				ImportRoots: append([]string(nil), download.ImportRoots...),
+				ImportRoots: slices.Clone(download.ImportRoots),
 				Length:      download.Length,
 				Tags:        append([]string(nil), download.Tags...), Version: download.Version}
 			switch download.Kind {

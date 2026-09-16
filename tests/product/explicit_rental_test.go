@@ -64,8 +64,8 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 		}
 	}
 	code, out := runCozy(t, root, append(append([]string{}, args...), "--rental=giriko")...)
-	if code == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "0.13.0") {
-		t.Fatalf("wrong runtime admitted: %d %s", code, out)
+	if code != 0 || !strings.Contains(out, `"requested_rental":"`+old+`"`) {
+		t.Fatalf("package-private Runtime was constrained by image inventory: %d %s", code, out)
 	}
 	// Replaying an accepted request preserves its selected identity after the rental
 	// ends; it does not need a fresh inventory read merely to retrieve history.
@@ -240,7 +240,7 @@ func TestRentalNewIsTheOnlyCreationCommand(t *testing.T) {
 	}
 }
 
-func TestAutomaticAndNamedRentalChoicesRespectExistingImage(t *testing.T) {
+func TestAutomaticAndNamedRentalChoicesAllowPrivateSDKVersions(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
 	h.runtimeVersions = map[string]string{"pr-oldruntime": "0.1.0"}
@@ -256,16 +256,16 @@ func TestAutomaticAndNamedRentalChoicesRespectExistingImage(t *testing.T) {
 	}
 	st.Close()
 	startDaemonProcess(t, root)
-	for _, arm := range []struct{ key, flag string }{{"automatic-runtime", "--rental-only"}, {"named-runtime", "--rental=isao"}} {
+	for _, arm := range []struct{ key, flag string }{{"automatic-runtime", "--rental-only"}, {"named-runtime", "--rental=giriko"}} {
 		_, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", arm.flag, "--json", "--idempotency-key", arm.key)
 		st, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 		fatal(t, problem)
 		row, problem := st.RequestByIdempotencyKey(arm.key)
 		fatal(t, problem)
-		if row == nil || row.Worker != "pr-newruntime" {
-			t.Fatalf("%s chose wrong rental: %+v %s", arm.key, row, out)
+		if row == nil || row.Worker != "pr-oldruntime" || strings.Contains(out, "rental.runtime_incompatible") {
+			t.Fatalf("%s constrained a package SDK to the worker image: %+v %s", arm.key, row, out)
 		}
-		if arm.key == "named-runtime" && row.RequestedRental != "pr-newruntime" {
+		if arm.key == "named-runtime" && row.RequestedRental != "pr-oldruntime" {
 			t.Fatal("explicit request lost durable affinity")
 		}
 		st.Close()
@@ -283,7 +283,7 @@ func TestRentalInventoryAllowsPackageOwnedVersions(t *testing.T) {
 		t.Fatal(why)
 	}
 	for _, requirement := range []string{"cozy-runtime>=0.15.0", "Cozy_Runtime[media]>=0.15.0", "  cozy..runtime >=0.15.0"} {
-		if why := launch.InventoryMismatch(inventory, []string{requirement}, ""); !strings.Contains(why, "cozy-runtime 0.13.0") {
+		if why := launch.InventoryMismatch(inventory, []string{requirement}, ""); why != "" {
 			t.Fatalf("%s mismatch: %s", requirement, why)
 		}
 	}
@@ -297,11 +297,11 @@ func TestDevelopmentRentalInventoryLeavesMutablePairToWorker(t *testing.T) {
 	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13", true); why != "" {
 		t.Fatal(why)
 	}
-	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); !strings.Contains(why, runtimeDistribution) {
-		t.Fatalf("production image incorrectly exempted its Runtime: %s", why)
+	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); why != "" {
+		t.Fatalf("base Runtime constrained a package-private SDK: %s", why)
 	}
-	if why := launch.InventoryMismatch(inventory, []string{"torch>=3"}, "", true); !strings.Contains(why, "torch") {
-		t.Fatalf("development image ignored immutable Torch: %s", why)
+	if why := launch.InventoryMismatch(inventory, []string{"torch>=3"}, "", true); why != "" {
+		t.Fatalf("base Torch constrained a package-private version: %s", why)
 	}
 	if why := launch.InventoryMismatch(inventory, nil, ">=3.13", true); !strings.Contains(why, "Python") {
 		t.Fatalf("development image ignored Python: %s", why)
@@ -453,13 +453,13 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 	}
 }
 
-func TestRentalInventoryRefusesMalformedProtectedVersions(t *testing.T) {
+func TestRentalInventoryChecksPythonNotIncidentalDistributionVersions(t *testing.T) {
 	inventory := &pb.ImageInventory{Python: "broken", Distributions: []*pb.ImageDistribution{{Distribution: runtimeDistribution, Version: "broken"}}}
 	if why := launch.InventoryMismatch(inventory, nil, ">=3.12"); !strings.Contains(why, "invalid Python version") {
 		t.Fatal(why)
 	}
 	inventory.Python = "3.12.12"
-	if why := launch.InventoryMismatch(inventory, []string{"cozy-runtime>=0.15"}, ""); !strings.Contains(why, "invalid version for cozy-runtime") {
+	if why := launch.InventoryMismatch(inventory, []string{"cozy-runtime>=0.15"}, ""); why != "" {
 		t.Fatal(why)
 	}
 }

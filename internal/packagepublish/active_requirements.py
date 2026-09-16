@@ -28,6 +28,18 @@ def variables(node):
         return {token.value for token in node if isinstance(token, Variable)}
     return set().union(*(variables(item) for item in node if item not in ("and", "or")))
 
+if "markers" in request:
+    known = {"implementation_name", "implementation_version", "os_name", "platform_machine",
+             "platform_python_implementation", "python_full_version", "python_version", "sys_platform"}
+    selected = []
+    for raw in request["markers"]:
+        marker = Marker(raw) if raw else None
+        if marker and not variables(marker._markers).issubset(known):
+            raise ValueError("registry marker requires facts absent from the publication target")
+        selected.append(marker is None or marker.evaluate(environment))
+    json.dump({"markers": selected}, sys.stdout)
+    sys.exit(0)
+
 if "requirements" in request:
     active = set()
     for raw in request["requirements"]:
@@ -46,13 +58,6 @@ if "requirements" in request:
     sys.exit(0)
 
 metadata = {name: Parser().parsestr(raw) for name, raw in request["metadata"].items()}
-image = request["image"]
-
-
-def image_owned(name):
-    return name in image["distributions"] or any(name.startswith(p) for p in image["prefixes"])
-
-
 def bind_extra(node, extra):
     """Partially evaluate packaging 26.2's parsed tree, retaining target markers."""
     if isinstance(node, tuple):
@@ -100,9 +105,7 @@ while pending:
             requirement.marker = None if bound is True else Marker(bound)
         requirements.add(str(requirement))
         target = canonicalize_name(requirement.name)
-        if not image_owned(target) and (
-            requirement.marker is None or requirement.marker.evaluate(environment)
-        ):
+        if requirement.marker is None or requirement.marker.evaluate(environment):
             pending.extend((target, value) for value in ["", *sorted(requirement.extras)])
 
 json.dump({"requirements": sorted(requirements),

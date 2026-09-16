@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
-func TestPrivateBuildPrunesExplicitCUDAFamilies(t *testing.T) {
+func TestPublishedBuildRetainsExplicitCUDAFamilies(t *testing.T) {
 	project := t.TempDir()
 	metadata := `[project]
 name = "base-prefix-fixture"
@@ -44,10 +44,9 @@ def run(ctx: Context, payload: Request) -> Result:
 	if out, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("lock exact registry fixture: %v\n%s", err, out)
 	}
-	// These are explicit roots, so pruning torch cannot remove them. Only lock
-	// metadata is read; the 789 MB of CUDA wheels are never downloaded by Build.
+	// Build retains the complete lock metadata without downloading public wheels.
 	export := filepath.Join(t.TempDir(), "pylock.toml")
-	command = exec.Command("uv", "export", "--locked", "--no-dev", "--no-emit-project", "--format", "pylock.toml", "--output-file", export, "--project", project, "--prune", "torch")
+	command = exec.Command("uv", "export", "--locked", "--no-dev", "--no-emit-project", "--format", "pylock.toml", "--output-file", export, "--project", project)
 	if out, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("export fixture: %v\n%s", err, out)
 	}
@@ -64,13 +63,18 @@ def run(ctx: Context, payload: Request) -> Result:
 	if problem := pack.Build(t.Context()); problem != nil {
 		t.Fatalf("build: %s; remedy: %s", problem.Message, problem.Remedy)
 	}
-	if len(pack.Registry) != 1 || pack.Registry[0].Name != "packaging" || pack.Registry[0].Version != "26.3" || pack.Registry[0].Size != 129956 {
-		t.Fatalf("build omitted ordinary wheel or counted image-owned bytes: %+v", pack.Registry)
+	names := map[string]bool{}
+	var total int64
+	for _, row := range pack.Registry {
+		names[row.Name] = true
+		total += row.Size
 	}
-	for _, name := range []string{"torch", "nvidia-cublas", "cuda-toolkit"} {
-		declaration := []byte("lock-version=\"1.0\"\n[[packages]]\nname=\"" + name + "\"\nversion=\"1.0\"\n")
-		if _, problem := packagepublish.RegistryRowsFromLock(declaration, nil, ""); problem == nil || problem.Name != "registry_dependency_platform_root_present" {
-			t.Fatalf("external image-family declaration %s was not refused: %v", name, problem)
+	for _, name := range []string{"nvidia-cublas", "nvidia-cudnn-cu13", "cuda-toolkit", "packaging"} {
+		if !names[name] {
+			t.Fatalf("published closure omitted %s: %+v", name, pack.Registry)
 		}
+	}
+	if total <= packagepublish.MaxDependencyWheelBytes {
+		t.Fatalf("fixture did not exercise the independent public artifact bound: %d", total)
 	}
 }

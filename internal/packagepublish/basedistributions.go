@@ -11,8 +11,7 @@ import (
 // families, generated there from `base_observation._PROTECTED_IMPORT_ROOTS` and fenced
 // against it. It is vendored VERBATIM — the bytes, not a Go transcription of them — so
 // this client and the worker cannot hold two opinions about what the image provides.
-// A publish that pruned a name the worker does not own would strip a wheel the package
-// needs; a name the worker owns and this file misses is a wheel uploaded to be refused.
+// The roster classifies framework artifacts for discovery, never for omission.
 //
 // TestVendoredBaseDistributions compares these bytes against a cozy-runtime peer when
 // one is checked out, and says so by name when there is none.
@@ -28,18 +27,9 @@ type baseDistributions struct {
 	Prefixes      []string `json:"prefixes"`
 }
 
-// remoteBaseRoots is the worker image's own roster, DERIVED, never authored here.
-// A rental cannot replace these families or their declared native closure; other
-// libraries stay package-owned even when one image happens to carry a copy, and Runtime
-// compares the package's requirements against the actual selected base before installing.
-//
-// The `cuda-`/`nvidia-` prefix families are deliberately not enumerated: they arrive only
-// under torch, so `uv export --prune torch` already removes that whole subtree.
+// Framework families can be retained directly from their locked artifact facts
+// without downloading their large wheels for callable App discovery.
 var remoteBaseRoots = derivedBaseRoots()
-
-// remoteBasePrefixes is the roster's prefix families. Pruning never enumerates
-// them (they leave with torch), but publish-time image-owned rules (cl-084)
-// must recognize the whole family by name.
 var remoteBasePrefixes = derivedBasePrefixes()
 
 // ImageOwnedDistribution says whether a normalized distribution name is owned
@@ -101,13 +91,4 @@ func BaseDistributions() []string {
 // BaseDistributionsJSON is the vendored bytes, for the peer byte-comparison.
 func BaseDistributionsJSON() []byte {
 	return append([]byte(nil), baseDistributionsJSON...)
-}
-
-// PrunedDistributions is what `uv export --prune` strips from a publication: the whole
-// roster and nothing else. Pruning a family removes its transitive subtree too, which is
-// how the `cuda-`/`nvidia-` runtime wheels leave with torch.
-func PrunedDistributions() []string {
-	names := BaseDistributions()
-	sort.Strings(names)
-	return names
 }

@@ -79,14 +79,8 @@ func offeredSKUs() []hub.RentalSKU {
 	}
 }
 
-// TestReleaseRefusedBeforeRentalSpend is the PRE-SPEND filter: a release whose own stored
-// requirements the offered base profiles already contradict never reaches a paid ask.
-//
-// The two arms that bite in the real catalog are the version arms — a fleet-wide Torch
-// release and a fleet-wide Python ABI are exactly what the profile label names, and
-// neither is visible to the accelerator-class decision that used to be the whole filter.
-// The torch-free arm is defense in depth: the hub couples a torch-free profile to a
-// CPU-backend target, so it cannot appear on an accelerator product today.
+// Python/platform mismatches remain pre-spend refusals. A package may choose
+// a different Torch version or install it into a base that has no cached copy.
 func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -100,7 +94,7 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 			name:         "torch floor above the fleet",
 			requirements: []string{"cozy-runtime<1.0.0,>=0.0.34", "torch<3,>=2.14"},
 			skus:         offeredSKUs(),
-			wantMismatch: "this base carries torch 2.13.0",
+			wantSKU:      "rtx-4090",
 		},
 		{
 			name:           "interpreter above the fleet",
@@ -114,7 +108,7 @@ func TestReleaseRefusedBeforeRentalSpend(t *testing.T) {
 			requirements: []string{"torch<3,>=2.13"},
 			skus: []hub.RentalSKU{{Name: "rtx-4090", AcceleratorModel: "RTX 4090", AcceleratorCount: 1,
 				PriceUSDMicrosPerHour: 740_000, BaseWorkerProfile: "python3.12-cpu-linux-x86"}},
-			wantMismatch: "this base carries no Torch",
+			wantSKU: "rtx-4090",
 		},
 		{
 			name:         "the fleet satisfies the release",

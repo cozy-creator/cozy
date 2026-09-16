@@ -1,14 +1,5 @@
-// The worker-image roster drift guard.
-//
-// `internal/packagepublish/base-distributions.json` is cozy-runtime's file, copied. It
-// decides which distributions `uv export --prune` strips from a publication, so a name
-// this copy has and the worker does not strips a wheel the package needs, and a name the
-// worker has and this copy does not uploads a wheel the worker will refuse. Those two
-// lists WERE separately authored and had drifted by three names; this is what stops that
-// happening again.
-//
-// Same shape as vendored_test.go: the half that needs no peer always runs, and the peer
-// byte-comparison fails when it was asked for and cannot run. Nothing here skips.
+// The worker framework roster is vendored for artifact classification. Every
+// dependency remains in the package closure regardless of this classification.
 package producttest
 
 import (
@@ -44,16 +35,7 @@ func TestVendoredBaseDistributionsAreDerived(t *testing.T) {
 			t.Fatalf("the vendored roster repeats %q", names[i])
 		}
 	}
-	// The publish path must prune exactly the roster: no Go-side addition, no omission.
-	pruned := packagepublish.PrunedDistributions()
-	if len(pruned) != len(names) {
-		t.Fatalf("publish prunes %v, the roster is %v", pruned, names)
-	}
-	for i, name := range names {
-		if pruned[i] != name {
-			t.Fatalf("publish prunes %v, the roster is %v", pruned, names)
-		}
-	}
+
 }
 
 func TestVendoredBaseDistributionsMatchRuntime(t *testing.T) {

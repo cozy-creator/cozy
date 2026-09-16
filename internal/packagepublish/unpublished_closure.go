@@ -1,7 +1,7 @@
 package packagepublish
 
 // Unpublished package revisions carry the selected installed closure, including extras. Public
-// publication keeps its registry references and image-owned version policy.
+// publication retains its existing registry-custody path.
 
 import (
 	"context"
@@ -9,13 +9,13 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -63,7 +63,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 	}
 	expected := map[string]string{}
 	for name, version := range pins {
-		if name != project && !ImageOwnedDistribution(name) {
+		if name != project {
 			expected[name] = version
 		}
 	}
@@ -81,7 +81,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 	if len(raw) == 0 || int64(len(raw)) > maxLockBytes || toml.Unmarshal(raw, &lock) != nil || lock.Version != 1 {
 		return nil, nil, exit.Named(exit.Validation, "private_dependency_lock_invalid", "unpublished package revision requires its captured uv.lock")
 	}
-	selected := registryLock{LockVersion: "1.0"}
+	var rows []RegistryRow
 	matched := map[string]bool{}
 	for _, entry := range lock.Packages {
 		name := normalizedProjectName(entry.Name)
@@ -95,9 +95,6 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 		if expected[name] != entry.Version {
 			continue
 		}
-		if entry.Source.Registry != "https://pypi.org/simple" {
-			return nil, nil, exit.Named(exit.Validation, "private_dependency_origin_unsupported", "captured dependency %s is not a captured local wheel or public PyPI wheel", name)
-		}
 		row := registryPackage{Name: name, Version: entry.Version, Index: entry.Source.Registry}
 		for _, candidate := range entry.Wheels {
 			hash, ok := strings.CutPrefix(candidate.Hash, "sha256:")
@@ -106,7 +103,23 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 			}
 			row.Wheels = append(row.Wheels, registryWheel{URL: candidate.URL, Size: candidate.Size, Hashes: map[string]string{"sha256": hash}})
 		}
-		selected.Packages = append(selected.Packages, row)
+		candidate, problem := selectRegistryWheel(name, row)
+		if problem != nil {
+			return nil, nil, problem
+		}
+		if entry.Source.Registry == "https://pypi.org/simple" {
+			// Registry artifacts are fetched by Runtime's bounded storage; the
+			// private client upload byte bound applies only to local wheels.
+			if _, problem := registryWheelIdentityBound(name, entry.Version, candidate, MaxRegistryWheelBytes); problem != nil {
+				return nil, nil, problem
+			}
+		} else {
+			candidate, problem = pytorchRegistryWheel(name, entry.Version, entry.Source.Registry, row.Wheels)
+			if problem != nil {
+				return nil, nil, problem
+			}
+		}
+		rows = append(rows, RegistryRow{Name: name, Version: entry.Version, URL: candidate.URL, SHA256: candidate.Hashes["sha256"], Size: candidate.Size})
 		delete(expected, name)
 	}
 	for name := range pins {
@@ -122,17 +135,10 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 		sort.Strings(names)
 		return nil, nil, exit.Named(exit.Conflict, "private_dependency_lock_drift", "captured uv.lock has no exact wheel for installed dependencies: %s", strings.Join(names, ", "))
 	}
-	encoded, err := toml.Marshal(selected)
-	if err != nil {
-		return nil, nil, exit.Internalf("cannot encode captured dependency selection")
-	}
-	rows, problem := RegistryRowsFromLock(encoded, existing, "")
-	if problem != nil {
-		return nil, nil, problem
-	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 	requirements := make([]string, 0, len(pins)-1)
 	for name, version := range pins {
-		if name != project && !ImageOwnedDistribution(name) {
+		if name != project {
 			requirements = append(requirements, name+"=="+version)
 		}
 	}
@@ -140,7 +146,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 	return rows, requirements, nil
 }
 
-// CaptureUnpublishedClosure keeps wheel bytes entirely on the client-to-worker path.
+// CaptureUnpublishedClosure freezes public registry references while local wheel bytes stay private.
 func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string, extras []string, python string) *exit.Error {
 	raw, err := os.ReadFile(p.Files["uv.lock"])
 	if err != nil {
@@ -150,35 +156,10 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 	if problem != nil {
 		return problem
 	}
-	directory := filepath.Join(p.Root, "private-registry")
-	if err := os.Mkdir(directory, 0o700); err != nil {
-		return exit.Internalf("cannot stage captured registry wheels: %s", err)
-	}
-	client := &http.Client{CheckRedirect: func(request *http.Request, via []*http.Request) error {
-		if len(via) > 5 || request.URL.Scheme != "https" || request.URL.Host != "files.pythonhosted.org" {
-			return exit.New(exit.Validation, "captured registry download changed origin")
-		}
-		return nil
-	}}
-	for _, row := range rows {
-		address, _ := url.Parse(row.URL)
-		path := filepath.Join(directory, filepath.Base(address.Path))
-		if problem := fetchCapturedWheel(ctx, client, row, path); problem != nil {
-			return problem
-		}
-		p.DependencyWheels = append(p.DependencyWheels, DependencyWheel{Filename: filepath.Base(path), Path: path})
-	}
-	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
-	paths := []string{p.Wheel}
-	for _, dependency := range p.DependencyWheels {
-		paths = append(paths, dependency.Path)
-	}
-	selection, problem := ActiveWheelRequirements(ctx, p.Name, extras, paths, python)
-	if problem != nil {
-		return problem
-	}
-	requirements = append(requirements, selection.ImageRequirements()...)
+	p.DependencyRequirements = RegistryRequirements(rows)
+	requirements = append(requirements, "cozy-runtime>="+hostruntime.Floor)
 	sort.Strings(requirements)
+	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
 	if problem := wheel.PinDependencies(p.Wheel, sealed, requirements); problem != nil {
 		return problem
 	}
@@ -218,4 +199,18 @@ func fetchCapturedWheel(ctx context.Context, client *http.Client, row RegistryRo
 		return exit.New(exit.Conflict, "captured dependency metadata differs from its locked identity")
 	}
 	return nil
+}
+
+// RegistryRequirements preserves the selected public wheel URL and hash without
+// resolving again or uploading registry artifacts through the unpublished wheel lane.
+func RegistryRequirements(rows []RegistryRow) []byte {
+	lines := make([]string, 0, len(rows))
+	for _, row := range rows {
+		lines = append(lines, row.Name+" @ "+row.URL+" --hash=sha256:"+row.SHA256)
+	}
+	sort.Strings(lines)
+	if len(lines) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(lines, "\n") + "\n")
 }

@@ -4,7 +4,7 @@ package packagepublish
 // the pylock and every row still passes the exact discipline the download had —
 // the pinned index, the files.pythonhosted.org origin shape, the bounded
 // sha256/size identity, the platform-target wheel selection (th-107), the
-// platform-root refusal — but the bytes never move through this machine:
+// full selected dependency closure — but the bytes never move through this machine:
 // publish sends the rows and Tensorhub fetches, verifies with its own hash,
 // and stores content-addressed.
 
@@ -31,6 +31,7 @@ type registryLock struct {
 }
 
 type registryPackage struct {
+	Marker  string          `toml:"marker"`
 	Index   string          `toml:"index"`
 	Name    string          `toml:"name"`
 	Sdist   map[string]any  `toml:"sdist"`
@@ -63,9 +64,6 @@ func collectRegistryRows(ctx context.Context, project, stage, organization strin
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-default-groups", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project}
-	for _, name := range PrunedDistributions() {
-		args = append(args, "--prune", name)
-	}
 	command := exec.CommandContext(ctx, "uv", args...)
 	command.Env = config.Frozen().Tool("UV_PYTHON_DOWNLOADS=never")
 	output, err := command.CombinedOutput()
@@ -87,7 +85,7 @@ func collectRegistryRows(ctx context.Context, project, stage, organization strin
 		return nil, exit.Named(exit.Structural, "registry_dependency_export_invalid",
 			"uv export did not produce a non-empty pylock.toml at or below %d B", maxLockBytes)
 	}
-	return registryRowsFromLock(raw, existing, organization, true)
+	return RegistryRowsFromLock(raw, existing, organization)
 }
 
 // orgIndexNamespace answers the org namespace when raw is one hub org index —
@@ -106,22 +104,32 @@ func orgIndexNamespace(raw string) string {
 	return parts[2]
 }
 
+// RegistryRowsFromLock retains every selected dependency, including framework
+// and accelerator distributions. Tensorhub fetches public references directly.
 func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization string) ([]RegistryRow, *exit.Error) {
-	return registryRowsFromLock(raw, existing, organization, false)
-}
-
-// A locally exported lock may retain image-owned prefix families as direct
-// dependencies of captured interface wheels even after `uv --prune torch`.
-// Omit every canonical image family before selecting/counting its wheel. External
-// declarations must already be pruned and still refuse such rows.
-func registryRowsFromLock(raw []byte, existing []DependencyWheel, organization string, pruneBase bool) ([]RegistryRow, *exit.Error) {
 	var lock registryLock
 	if err := toml.Unmarshal(raw, &lock); err != nil || lock.LockVersion != "1.0" {
 		return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
 			"uv export produced an invalid PEP 751 pylock.toml")
 	}
+	var selected []bool
+	markers := make([]string, len(lock.Packages))
+	marked := false
+	for i, pkg := range lock.Packages {
+		markers[i] = pkg.Marker
+		marked = marked || pkg.Marker != ""
+	}
+	if marked {
+		selection, problem := readActiveRequirements(context.Background(), map[string]any{"markers": markers, "python": "3.12.0"})
+		if problem != nil {
+			return nil, problem
+		}
+		if len(selection.Markers) != len(lock.Packages) {
+			return nil, exit.New(exit.Validation, "registry marker selection is incomplete")
+		}
+		selected = selection.Markers
+	}
 	seen := make(map[string]exactDependency, len(existing)+len(lock.Packages))
-	var total int64
 	for _, dependency := range existing {
 		identity, problem := wheel.InspectIdentity(dependency.Path)
 		if problem != nil {
@@ -132,27 +140,23 @@ func registryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 			return nil, problem
 		}
 		seen[identity.Distribution] = exactDependency{digest: digest, version: identity.Version}
-		total += identity.Length
 	}
 	out := []RegistryRow{}
 	count := len(existing)
-	for _, pkg := range lock.Packages {
+	for i, pkg := range lock.Packages {
+		if selected != nil && !selected[i] {
+			continue
+		}
 		name := normalizedProjectName(pkg.Name)
 		if name == "" || strings.TrimSpace(pkg.Version) == "" {
 			return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
 				"pylock.toml contains a package without an exact name and version")
 		}
-		if ImageOwnedDistribution(name) {
-			if pruneBase {
-				continue
-			}
-			return nil, exit.Named(exit.Validation, "registry_dependency_platform_root_present",
-				"uv export retained platform-owned root %s", name)
-		}
-		orgRow := pkg.Index != "https://pypi.org/simple"
+		pytorchRow := strings.HasPrefix(pkg.Index, "https://download.pytorch.org/whl/")
+		orgRow := pkg.Index != "https://pypi.org/simple" && !pytorchRow
 		if orgRow && (organization == "" || orgIndexNamespace(pkg.Index) != organization) {
 			return nil, exit.Named(exit.Validation, "registry_dependency_index_refused",
-				"%s==%s is locked to neither the public PyPI index nor this package's own org index",
+				"%s==%s is locked to neither a supported public index nor this package's own org index",
 				name, pkg.Version)
 		}
 		candidate, problem := selectRegistryWheel(name, pkg)
@@ -164,7 +168,10 @@ func registryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 		// custody-shares the committed org-index claim into the release, and
 		// install serves it from the plan exactly like any registry wheel.
 		var digest string
-		if orgRow {
+		if pytorchRow {
+			candidate, problem = pytorchRegistryWheel(name, pkg.Version, pkg.Index, pkg.Wheels)
+			digest = candidate.Hashes["sha256"]
+		} else if orgRow {
 			digest, problem = orgIndexWheelIdentity(name, pkg.Version, organization, candidate)
 		} else {
 			digest, problem = registryWheelIdentity(name, pkg.Version, candidate)
@@ -184,11 +191,6 @@ func registryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 		if count >= MaxDependencyWheels {
 			return nil, tooManyDependencies()
 		}
-		if candidate.Size > MaxDependencyWheelBytes-total {
-			return nil, exit.Named(exit.Validation, "dependency_wheels_too_large",
-				"dependency wheels exceed %d B combined", MaxDependencyWheelBytes)
-		}
-		total += candidate.Size
 		count++
 		seen[name] = exactDependency{digest: "sha256:" + digest, version: pkg.Version}
 		out = append(out, RegistryRow{Name: name, SHA256: digest, Size: candidate.Size,
@@ -202,8 +204,12 @@ func registryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 // bounded sha256/size identity and the exact files.pythonhosted.org origin
 // shape. Tensorhub re-runs the same checks and then hashes what it fetched.
 func registryWheelIdentity(name, version string, selected registryWheel) (string, *exit.Error) {
+	return registryWheelIdentityBound(name, version, selected, MaxRegistryWheelBytes)
+}
+
+func registryWheelIdentityBound(name, version string, selected registryWheel, maxBytes int64) (string, *exit.Error) {
 	digest := selected.Hashes["sha256"]
-	if selected.Size <= 0 || selected.Size > MaxDependencyWheelBytes || len(digest) != 64 {
+	if selected.Size <= 0 || selected.Size > maxBytes || len(digest) != 64 {
 		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
 			"%s==%s has no bounded SHA-256 wheel identity", name, version)
 	}
@@ -236,7 +242,7 @@ func registryWheelIdentity(name, version string, selected registryWheel) (string
 // here and the hub's committed claim supplies the length at declare.
 func orgIndexWheelIdentity(name, version, organization string, selected registryWheel) (string, *exit.Error) {
 	digest := selected.Hashes["sha256"]
-	if len(digest) != 64 || strings.ToLower(digest) != digest || selected.Size < 0 {
+	if len(digest) != 64 || strings.ToLower(digest) != digest || selected.Size < 0 || selected.Size > MaxRegistryWheelBytes {
 		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
 			"%s==%s has no exact SHA-256 wheel identity", name, version)
 	}

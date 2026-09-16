@@ -107,7 +107,7 @@ func CaptureExecution(rootInstall string, root Revision,
 	for _, key := range keys {
 		revision := revisions[key]
 		verified, raw, problem := identity(revision.Package, revision.Release, revision.SourceDigest,
-			revision.PackageInterfaceDigest, revision.PackageInterfaceLength, revision.Files)
+			revision.PackageInterfaceDigest, revision.PackageInterfaceLength, revision.Files, revision.DependencyRequirements)
 		if problem != nil {
 			return ExecutionCapture{}, problem
 		}

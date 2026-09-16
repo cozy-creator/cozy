@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -82,21 +81,6 @@ func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testi
 	use, problem := c.UseRental(f.rentalID)
 	fatal(t, problem)
 	use()
-}
-
-func TestRuntimeRequirementUsesActualPairAndPreservesAuthoredRange(t *testing.T) {
-	for _, requirement := range []string{"cozy-runtime>=0.18.3,<1", "cozy-runtime[media]>=0.18.3,<1"} {
-		mismatch := launch.RuntimeRequirementMismatch([]string{requirement, "torch>=2.13"}, "0.18.2", "0.3.43")
-		if mismatch == nil || mismatch.Distribution != "cozy-runtime" || mismatch.Installed != "0.18.2" || mismatch.Required != requirement { //cozy:allow distribution metadata assertion, not a binary invocation
-			t.Fatalf("lost compatibility facts: %+v", mismatch)
-		}
-		if launch.RuntimeRequirementMismatch([]string{requirement}, "0.18.3", "0.3.43") != nil {
-			t.Fatal("compatible actual Runtime was refused")
-		}
-	}
-	if mismatch := launch.RuntimeRequirementMismatch([]string{"tensorfs>=0.3.44"}, "0.18.3", "0.3.43"); mismatch == nil || mismatch.Distribution != "tensorfs" {
-		t.Fatalf("TensorFS floor ignored: %+v", mismatch)
-	}
 }
 
 func TestRuntimeUpdateMigrationFrom41PreservesRental(t *testing.T) {

@@ -159,12 +159,23 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			return problem
 		}
 		paths := []string{result.CapturedProjectWheel}
+		var requirements []string
 		for _, dependency := range dependencyNames {
-			if dependency != name && !packagepublish.ImageOwnedDistribution(dependency) {
-				paths = append(paths, closure[dependency].Path)
+			if dependency == name {
+				continue
+			}
+			captured := closure[dependency]
+			if captured.RegistryRequirement != "" {
+				requirements = append(requirements, captured.RegistryRequirement)
+			} else {
+				paths = append(paths, captured.Path)
 			}
 		}
-		revision, problem := localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths)
+		var dependencyRequirements []byte
+		if len(requirements) > 0 {
+			dependencyRequirements = []byte(strings.Join(requirements, "\n") + "\n")
+		}
+		revision, problem := localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths, dependencyRequirements)
 		if problem != nil {
 			return problem
 		}

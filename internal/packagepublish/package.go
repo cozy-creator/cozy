@@ -34,18 +34,19 @@ var projectNameSeparator = regexp.MustCompile(`[-_.]+`)
 // Package is the local input to one begin/upload/finalize operation. Tensorhub
 // computes identities and package facts after the bytes arrive.
 type Package struct {
-	Files            map[string]string // source-relative path -> local path
-	PackageInterface string
-	Wheel            string
-	DependencyWheels []DependencyWheel
-	Vendored         []VendoredDependency // auto-vendored local deps, for the publish nudge (th-113)
-	Registry         []RegistryRow        // locked registry rows; Tensorhub fetches (cl-078)
-	Tree             string
-	Root             string // disposable wheel output, empty until Build
-	Name             string
-	Release          string
-	ScriptModels     map[string]string // plain-main default model refs; ordinary CLI overrides win
-	temporarySource  string            // generated single-file project, copied into a retained install
+	Files                  map[string]string // source-relative path -> local path
+	PackageInterface       string
+	Wheel                  string
+	DependencyWheels       []DependencyWheel
+	DependencyRequirements []byte
+	Vendored               []VendoredDependency // auto-vendored local deps, for the publish nudge (th-113)
+	Registry               []RegistryRow        // locked registry rows; Tensorhub fetches (cl-078)
+	Tree                   string
+	Root                   string // disposable wheel output, empty until Build
+	Name                   string
+	Release                string
+	ScriptModels           map[string]string // plain-main default model refs; ordinary CLI overrides win
+	temporarySource        string            // generated single-file project, copied into a retained install
 }
 
 type sourceIdentityFile struct {
@@ -107,7 +108,7 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 }
 
 // BuildForPublish also rejects lock rows available only on the author's machine.
-// Declared compatibility bounds are preserved; worker admission checks the image.
+// Declared compatibility bounds are preserved in the package metadata.
 func (p *Package) BuildForPublish(ctx context.Context) *exit.Error {
 	return p.build(ctx, true)
 }
@@ -136,7 +137,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 	p.Root = root
 	// Declared-metadata refusals and dependency staging run before the project
 	// wheel build, so a doomed publication is refused before the expensive work.
-	dependencies, needsRegistry, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root, publish)
+	dependencies, needsRegistry, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
