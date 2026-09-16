@@ -922,11 +922,21 @@ func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error
 		return nil, problem
 	}
 	out := make([]ModelRef, 0, len(request.Models))
-	for _, model := range request.Models {
-		if !model.Downloadable() {
-			continue
+	seen := map[string]bool{}
+	add := func(model ModelRef) {
+		key := model.Model + "\x00" + model.Release + "\x00" + model.Lane + "\x00" + model.Manifest
+		if model.Downloadable() && !seen[key] {
+			seen[key] = true
+			out = append(out, model)
 		}
-		out = append(out, model)
+	}
+	for _, model := range request.Models {
+		add(model)
+		// Zero-strength adapters are still validated/leased by Runtime and their
+		// immutable bytes are part of the declared disk closure.
+		for _, a := range model.Adapters {
+			add(ModelRef{Model: a.Model, Release: a.Release, Lane: a.Lane, Manifest: a.Manifest, HubCheckpoint: true})
+		}
 	}
 	return out, nil
 }

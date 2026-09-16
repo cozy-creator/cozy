@@ -98,6 +98,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 			return problem
 		}
 	}
+	if callable.Kind == "job" && len(ctx.Inv.Values["--lora"]) > 0 {
+		return exit.Usagef("--lora applies only to serving callables")
+	}
 	if callable.Kind == "job" && ctx.Inv.Value("--attention-kernel") != "" {
 		return exit.Usagef("--attention-kernel applies only to serving callables")
 	}
@@ -197,6 +200,10 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	loras, e := launch.ParseLoRAs(ep, ctx.Inv.Values["--lora"])
+	if e != nil {
+		return e
+	}
 	if !managedRental {
 		packagePublishStatus(ctx, "Execution target: local machine")
 	} else if selectedRental != "" {
@@ -206,6 +213,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	}
 	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models, managedRental)
 	if e != nil {
+		return e
+	}
+	if e = resolveInvocationLoRAs(ctx, target, models, loras, managedRental); e != nil {
 		return e
 	}
 	outputDirectory, e := requestedOutputDirectory(ctx)
