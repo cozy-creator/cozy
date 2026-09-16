@@ -183,7 +183,7 @@ def accept(root: Path) -> None:
         config,
         WorkerOptions(
             root=root / "worker",
-            python=str(root / "image/bin/python3"),
+            python=sys.executable,
             install_root=root / "installed",
             artifact_cache=root / "artifacts",
             tensorfs_root=root / "tensorfs",
