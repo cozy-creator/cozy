@@ -23,8 +23,21 @@ The Torch CUDA index must already be configured in the project (`uv` otherwise
 cannot resolve a `+cu130` release). Keep Torch as a locked public registry wheel;
 it need not be vendored into this source tree. The seed command writes only to
 the explicitly supplied native store and prints the manifest, release and lane.
-Make that tiny native model available through the normal model publication path
-before remote invocation. It does not upload or buy anything itself.
+Use the same native store configured for the ordinary Cozy CLI. With the printed
+manifest and length, create a fresh local alias and upload/publish it:
+
+```sh
+tfs local replace /absolute/path/to/native-store attention-kernel-benchmark \
+  MANIFEST MANIFEST LENGTH --observed absent
+cozy model upload local/attention-kernel-benchmark \
+  YOUR_ORG/attention-kernel-benchmark --await --json
+cozy model publish YOUR_ORG/attention-kernel-benchmark \
+  --release=1 --lane=bf16=CHECKPOINT
+```
+
+Here both `MANIFEST` arguments are the printed `sha256:...` value (the first is
+source identity), `LENGTH` is the printed manifest length, and `CHECKPOINT` is the
+upload result. Seeding and alias creation do not upload or buy anything.
 
 ```sh
 cozy package install . --editable --no-model-download

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -128,8 +129,18 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 			originalWheel = wheelBytes
 		}
 		runUV("lock", "--project", project, "--refresh-package", "attention-wheel-proof")
-		if code, out := runCozy(t, root, "package", "install", project, "--editable", "--no-model-download"); code != 0 {
-			t.Fatalf("install %s [%d]: %s", candidate, code, out)
+		for {
+			code, out := runCozy(t, root, "package", "install", project, "--editable", "--no-model-download")
+			if code != 0 && strings.Contains(out, "another Cozy writer holds") {
+				// The editable watcher may be capturing these same edited bytes.
+				// Retry explicit writer contention, never installation failures.
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			if code != 0 {
+				t.Fatalf("install %s [%d]: %s", candidate, code, out)
+			}
+			break
 		}
 		key := fmt.Sprintf("attention-wheel-%d", i)
 		code, out := runCozy(t, root, "run", localWeightlessRef+"/echo", "why=wheel-proof", "--idempotency-key="+key, "--await", "--json")
