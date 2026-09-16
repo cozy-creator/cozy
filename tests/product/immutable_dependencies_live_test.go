@@ -147,8 +147,8 @@ async def main(ctx):
 	must(t, err)
 	// Public wheel payloads share uv's owned cache inode. Sealing a generation
 	// must not chmod that inode through a hardlink and mutate sibling venvs.
-	if !os.SameFile(first, sdk) || sdk.Mode() != sdkBefore.Mode() {
-		t.Fatal("public NumPy payload was copied or its shared cache permissions changed")
+	if os.SameFile(first, sdk) || sdk.Mode() != sdkBefore.Mode() {
+		t.Fatal("retained NumPy aliases the mutable SDK or changed its permissions")
 	}
 	for _, path := range libraries {
 		current, err := os.Stat(path)
