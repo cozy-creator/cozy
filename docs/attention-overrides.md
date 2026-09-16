@@ -42,3 +42,45 @@ or a requirement to rent with `--development`. Existing local API credentials an
 worker authorization remain unchanged. It neither changes a shared default nor
 publishes a package policy. Package/model policy hooks are a separate Runtime
 authoring facility. Overrides currently apply to serving callables.
+
+## Optional prebuilt wheels on an existing rental
+
+Use ordinary Python dependencies to add an optional attention implementation to
+an unpublished package. The base worker image is the same in development and
+ordinary modes. Development controls SSH access; it does not select a kernel
+image, and SSH installation into the worker's global Python environment does not
+install a dependency into the package's isolated environment.
+
+Start with the package checkout you will benchmark and a compatible prebuilt
+wheel. Keep the wheel inside that checkout so its bytes are captured with the
+source. For example, after copying the wheel into `vendor/`:
+
+```sh
+uv add --no-sync ./vendor/cozy_kernel_flash_attn3-*.whl
+cozy package install . --editable --no-model-download
+cozy run local/my-package/generate --rental=my-rental --input=request.json \
+  kernel.attention=model/dit=flash-attn3 --await --json
+```
+
+Replace the package, callable, model/component scope, and wheel filename with the
+ones from your package. `uv add` writes the ordinary dependency and
+`[tool.uv.sources]` wheel path and updates `uv.lock`. Creator captures the exact
+wheel bytes and selected dependency closure; Runtime installs that closure in the
+package environment on the named rental. `--rental` selects an existing machine
+and never buys a replacement. This path requires Linux amd64 and CPython 3.12,
+plus wheels compatible with the package's Torch/CUDA dependencies and the target
+GPU. Do not infer hardware compatibility from successful local installation.
+
+A selected library extra can include the kernel wheel instead, using standard
+`my-library[kernel-extra]` dependency syntax. An unselected optional group does not
+install anything. Adding a wheel and selecting an attention backend are separate
+steps: a request override never downloads a missing kernel. Runtime validates the
+selected implementation and refuses unsupported combinations.
+
+For an A/B/A comparison, keep the request input and random seed fixed, run each
+backend with a fresh request identity, and record Runtime's selected backend and
+artifact provenance along with the outputs and elapsed time. When replacing a
+wheel, retain each original wheel and rerun `uv add` and the editable install to
+capture the new bytes. Never replace a captured wheel in place under `~/.cozy`.
+The same package version can have different captured source/dependency identities;
+reusing an idempotency key must never turn one computation into another.

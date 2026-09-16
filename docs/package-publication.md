@@ -31,8 +31,8 @@ lock rows — `(name, version, url, sha256, size)` — for Tensorhub to fetch it
 same pinned discipline; the bytes never move through this machine (cl-078). Native-only,
 source-only, direct URL, VCS, and alternate-index
 requirements are refused. Development dependency groups are ignored.
-Source custody is limited to 20,000 files and 512 MiB total; each source file is limited to 64 MiB
-and `uv.lock` to 16 MiB. The three required files must be non-empty.
+Source custody is limited to 20,000 files and 512 MiB total; ordinary source files are limited to 64 MiB,
+prebuilt dependency wheels to 512 MiB, and `uv.lock` to 16 MiB. The three required files must be non-empty.
 
 Creator omits only the remote platform families that a rental may not replace: Python, Torch,
 Runtime, TensorFS, and the small declared native platform closure shared by the supported Torch
