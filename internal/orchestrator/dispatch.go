@@ -259,6 +259,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 				"cannot digest the local package request identity: %s", err)
 		}
 	}
+	if s.Kind == "job" && hasModelAdapters(s.Models) {
+		return records.Request{}, nil, exit.Usagef("model adapters apply only to serving requests")
+	}
 	id := s.RequestID
 	if id == "" {
 		id = records.NewID("req")
@@ -1070,22 +1073,59 @@ func exactJobSelection(placement DesiredPlacement, req records.Request) bool {
 // are then facts for the row, not residency evidence.
 func selectionServes(requested, held []ModelRef) bool {
 	if len(requested) == 0 || len(held) == 0 {
-		return true
+		return !hasModelAdapters(requested)
 	}
-	holds := make(map[string]string, len(held))
+	holds := make(map[string]ModelRef, len(held))
 	for _, m := range held {
-		holds[m.Slot] = m.Manifest
+		holds[modelBindingSlot(m)] = m
 	}
 	for _, m := range requested {
-		manifest, ok := holds[m.Slot]
+		current, ok := holds[modelBindingSlot(m)]
 		if !ok {
+			if len(m.Adapters) > 0 {
+				return false
+			}
 			continue
 		}
-		if _, fits := rungHolding(m, manifest); !fits {
+		if !records.SameAdapters(m.Adapters, current.Adapters) {
+			return false
+		}
+		if _, fits := rungHolding(m, current.Manifest); !fits {
 			return false
 		}
 	}
 	return true
+}
+
+// Readiness and the final offer both require facts from the worker's actual
+// PlacementSet. A protocol minor or a copied request is not feature support.
+func requireAdapterEcho(requested, observed []ModelRef) *exit.Error {
+	if (hasModelAdapters(requested) || hasModelAdapters(observed)) && !selectionServes(requested, observed) {
+		return exit.Named(exit.Structural, "model_adapters_preparation_mismatch",
+			"worker preparation omitted or changed the requested LoRA stack")
+	}
+	return nil
+}
+
+func requireAdapterPlacementEcho(requested []ModelRef, placement DesiredPlacement) *exit.Error {
+	doc, err := canonical.Read(placement.PlacementSetBytes, &pb.PlacementSet{})
+	if err != nil {
+		return exit.Named(exit.Structural, "model_adapters_preparation_mismatch", "prepared model bindings are not readable")
+	}
+	for _, row := range doc.List("placements") {
+		if row.Str("bindings_digest") == placement.BindingsDigest &&
+			(placement.PlacementIDValue == "" || row.Str("placement_id") == placement.PlacementIDValue) {
+			return requireAdapterEcho(requested, placementModels(placement.Package, row))
+		}
+	}
+	return exit.Named(exit.Structural, "model_adapters_preparation_mismatch", "prepared model binding identity is absent")
+}
+
+func modelBindingSlot(model ModelRef) string {
+	if model.BindingPath != "" {
+		return model.BindingPath
+	}
+	return model.Slot
 }
 
 // rungHolding answers whether a held manifest is one the request's ref accepts: its own
@@ -1592,6 +1632,14 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			return 0, exit.Named(exit.Conflict, "serving.placement_evidence_absent", "serving dispatch needs the exact prepared model bindings")
 		}
 	}
+	if !req.IsJob() {
+		if problem := requireAdapterPlacementEcho(req.Models, servingPlacement); problem != nil {
+			return 0, problem
+		}
+	}
+	if hasModelAdapters(req.Models) && w.wireMinor < pb.ModelAdapterWireMinor {
+		return 0, exit.Named(exit.Structural, "model_adapters_protocol_unsupported", "model adapters require worker protocol minor %d or newer", pb.ModelAdapterWireMinor)
+	}
 	if req.AttentionKernel != "" && w.declaredInstance != "" && w.wireMinor < pb.AttentionKernelWireMinor {
 		return 0, exit.Named(exit.Unavailable, "attention_kernel_protocol_unsupported",
 			"worker protocol minor %d cannot carry attention-kernel requests; need minor %d",
@@ -1897,7 +1945,7 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 		// placement it prepares.
 		for _, slot := range append([]string{path}, model.SharedSlots...) {
 			out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: slot,
-				Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest})
+				Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, Adapters: downloadAdapters(model.Adapters)})
 		}
 	}
 	return out

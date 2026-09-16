@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -360,6 +361,14 @@ func selectedInstallKey(installID string, models []orchestrator.ModelRef) string
 		key.WriteString(row.Lane)
 		key.WriteByte(0)
 		key.WriteString(row.Manifest)
+		key.WriteByte(0)
+		key.WriteString(strconv.Itoa(len(row.Adapters)))
+		for _, adapter := range row.Adapters {
+			for _, part := range []string{adapter.Component, adapter.Model, adapter.Release, adapter.Lane, adapter.Manifest, adapter.SourceComponent, adapter.Scale} {
+				key.WriteByte(0)
+				key.WriteString(part)
+			}
+		}
 	}
 	return key.String()
 }
