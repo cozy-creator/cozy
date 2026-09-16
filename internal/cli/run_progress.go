@@ -72,7 +72,7 @@ func (p *RunProgress) interactive(e localapi.Event) {
 		if strings.HasPrefix(p.terminal.key, "stage:") {
 			return
 		}
-		rows = []string{"  running · waiting for stage updates"}
+		rows = []string{"  Waiting for a progress update"}
 	case "dispatched", "submitted", "metric", "log":
 		return
 	case "completed", "succeeded":
@@ -190,14 +190,17 @@ func phaseFieldsAt(e localapi.Event, started, at time.Time) map[string]any {
 
 func (p *RunProgress) stepRows(f stepFacts) []string {
 	line := "  " + f.label
-	if f.counted {
-		line += fmt.Sprintf(" %d/%d", f.current, f.total)
+	line += f.countLabel()
+	var rows []string
+	if f.scoped && f.counted {
+		rows = append(rows, line)
+		line = "   "
 	}
 	if f.hasStageFraction {
 		line += fmt.Sprintf(" %s %.0f%% stage", progressBar(f.stageFraction, 10), f.stageFraction*100)
 	}
 	line += f.timing()
-	rows := []string{line}
+	rows = append(rows, line)
 	if f.hasOverall {
 		overall := fmt.Sprintf("    overall %.0f%%", f.overallFraction*100)
 		if f.hasOverallETA {
@@ -206,6 +209,16 @@ func (p *RunProgress) stepRows(f stepFacts) []string {
 		rows = append(rows, overall)
 	}
 	return rows
+}
+
+func (f stepFacts) countLabel() string {
+	if !f.counted {
+		return ""
+	}
+	if f.scoped {
+		return fmt.Sprintf(" · step %d/%d", f.current, f.total)
+	}
+	return fmt.Sprintf(" %d/%d", f.current, f.total)
 }
 
 func (f stepFacts) timing() string {
