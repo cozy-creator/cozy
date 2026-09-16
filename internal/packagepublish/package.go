@@ -555,6 +555,10 @@ func boundedSourceTree(tree string, requiredFiles []string) (string, map[string]
 		limit := MaxSourceFileBytes
 		if rel == "uv.lock" {
 			limit = maxLockBytes
+		} else if strings.HasSuffix(strings.ToLower(name), ".whl") {
+			// Prebuilt dependencies retain the same bound whether they live
+			// inside the source tree or are captured from a local source path.
+			limit = MaxDependencyWheelBytes
 		}
 		if info.Size() > limit {
 			return exit.Named(exit.Validation, "package_source_file_too_large",
