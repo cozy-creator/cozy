@@ -877,7 +877,8 @@ func PhaseCell(life api.Lifecycle) string {
 		}
 		return "waiting: free worker slot"
 	}
-	activity := strings.ReplaceAll(life.Phase, "_", " ")
+	activity := preparationLabel(life.Phase)
+	activity = strings.ReplaceAll(activity, "_", " ")
 	switch life.Phase {
 	case orchestrator.PhaseAcquiring:
 		activity = "acquiring rental"
@@ -949,7 +950,7 @@ func progressValue(life api.Lifecycle) string {
 	// happening; the overall percent says how far along it is. A stage-scoped percent
 	// answers a question nobody asked of a list, and the remaining estimate moves
 	// faster than the row it sits in.
-	stage := life.ProgressStage
+	stage := stageLabel(life.ProgressStage)
 	if life.OverallFraction == nil {
 		if stage == "" {
 			return "-"
@@ -1317,6 +1318,7 @@ type RunProgress struct {
 	overallFraction float64
 	overallDelta    float64
 	overallSeconds  float64
+	overallScoped   bool
 
 	// The sparse lane's memory: which tenth of which stage was last appended, and when.
 	sparseStage   string
@@ -1367,6 +1369,7 @@ func (p *RunProgress) On(e localapi.Event) bool {
 		p.progressAttempt = e.Attempt
 		p.stepStage, p.stepSeconds, p.stepSamples = "", 0, 0
 		p.overallSeen, p.overallFraction, p.overallDelta, p.overallSeconds = false, 0, 0, 0
+		p.overallScoped = false
 	}
 	// A redirected human command has no status line to rewrite: it gets the sparse
 	// append lane. --full deliberately restores the complete diagnostic stream.
@@ -1444,9 +1447,7 @@ func (p *RunProgress) sparse(e localapi.Event) {
 	}
 	p.sparseStage, p.sparseDecile, p.sparseAt = facts.label, decile, p.now()
 	line := "  " + facts.label
-	if facts.counted {
-		line += fmt.Sprintf(" %d/%d", facts.current, facts.total)
-	}
+	line += facts.countLabel()
 	if facts.hasStageFraction {
 		line += fmt.Sprintf(" · %.0f%% stage", facts.stageFraction*100)
 	}
@@ -1480,6 +1481,7 @@ type stepFacts struct {
 	perStep          float64
 	overallRemaining time.Duration
 	hasOverallETA    bool
+	scoped           bool
 }
 
 // observe folds one progress payload into the per-stage step-time accumulator and
@@ -1508,7 +1510,8 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	if label == "" {
 		label = "running"
 	}
-	facts := stepFacts{label: label}
+	facts := stepFacts{label: label, scoped: strings.Contains(name, " / ")}
+	p.overallScoped = p.overallScoped || facts.scoped
 	if positionOK != totalOK || positionOK &&
 		(position < 0 || total <= 0 || position > total || math.Trunc(position) != position || math.Trunc(total) != total) {
 		return facts, false
@@ -1543,7 +1546,9 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 	}
 	if p.overallSeen {
 		facts.overallFraction, facts.hasOverall = p.overallFraction, true
-		if p.overallDelta > 0 && p.overallSeconds > 0 {
+		// A child range is work allocation, not a prediction that later children
+		// take the same time. Keep its measured step ETA scoped to that child.
+		if !p.overallScoped && p.overallDelta > 0 && p.overallSeconds > 0 {
 			facts.overallRemaining = time.Duration(
 				(1 - p.overallFraction) * p.overallSeconds / p.overallDelta * float64(time.Second))
 			facts.hasOverallETA = true
@@ -1586,6 +1591,18 @@ func progressBar(fraction float64, width int) string {
 }
 
 func stageLabel(name string) string {
+	parts := strings.Split(strings.TrimSpace(name), " / ")
+	if len(parts) > 1 {
+		video := strings.HasPrefix(parts[0], "Shot ")
+		for i, part := range parts {
+			if video && part == "denoise" {
+				parts[i] = "Generating video"
+			} else {
+				parts[i] = stageLabel(part)
+			}
+		}
+		return strings.Join(parts, " · ")
+	}
 	switch strings.TrimSpace(name) {
 	case "tokenize", "encode", "condition", "condition_text", "condition_media":
 		return "conditioning"
@@ -1596,7 +1613,24 @@ func stageLabel(name string) string {
 	case "encode_png", "encode_webp", "encode_outputs":
 		return "saving"
 	default:
-		return strings.TrimSpace(name)
+		return preparationLabel(strings.TrimSpace(name))
+	}
+}
+
+// These preparation operations inspect or fetch model inputs; none proves that
+// weights are loaded onto a GPU. Unknown author labels remain intact.
+func preparationLabel(name string) string {
+	switch name {
+	case "select_model_defaults":
+		return "Selecting model"
+	case "materialize_model_defaults":
+		return "Preparing model files"
+	case "prepare_model_binding", "prep_model_binding":
+		return "Checking model compatibility"
+	case "checkpoint_input_admission":
+		return "Checking model inputs"
+	default:
+		return name
 	}
 }
 
@@ -1648,7 +1682,7 @@ func progressLine(e localapi.Event, full bool) string {
 	case "dispatched":
 		return "  worker selected"
 	case "accepted":
-		return "  running"
+		return "  Waiting for a progress update"
 	case "requeued":
 		return "  retrying"
 	case "attempt_failed":
@@ -1686,7 +1720,7 @@ func humanProgress(value any) string {
 		return ""
 	}
 	stage, _ := fields["stage"].(string)
-	stage = strings.TrimSpace(stage)
+	stage = stageLabel(stage)
 	stageFraction, hasStage := number(fields["stage_fraction"])
 	if !hasStage {
 		position, hasPosition := number(fields["position"])
@@ -1776,7 +1810,7 @@ func HumanPhaseLine(value any) string {
 		return HumanWaitLine(map[string]any{"wait": name, "waiting_on": fields["machine"],
 			"waiting_for": fields["waiting_for"]})
 	}
-	line := "  " + strings.ReplaceAll(name, "_", " ")
+	line := "  " + strings.ReplaceAll(preparationLabel(name), "_", " ")
 	if machine, _ := fields["machine"].(string); machine != "" {
 		line += " on " + machine
 	}
@@ -1802,11 +1836,11 @@ func HumanPhaseLine(value any) string {
 
 func humanStage(value any) string {
 	if name, ok := value.(string); ok && strings.TrimSpace(name) != "" {
-		return "  " + strings.TrimSpace(name)
+		return "  " + stageLabel(name)
 	}
 	if fields, ok := value.(map[string]any); ok {
 		if name, ok := fields["name"].(string); ok && strings.TrimSpace(name) != "" {
-			return "  " + strings.TrimSpace(name)
+			return "  " + stageLabel(name)
 		}
 	}
 	return ""
