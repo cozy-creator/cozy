@@ -137,8 +137,8 @@ async def main(ctx):
 	}
 	sealed, problem := capturedwheel.Metadata(filepath.Join(inst.Dir, "wheels", filepath.Base(wheel)))
 	fatal(t, problem)
-	if !strings.Contains(string(sealed), "Requires-Dist: msgspec\n") || strings.Contains(string(sealed), "msgspec==") {
-		t.Fatalf("wheel changed authored image requirements: %s", sealed)
+	if !strings.Contains(string(sealed), "Requires-Dist: msgspec==") {
+		t.Fatalf("wheel did not seal its selected dependency version: %s", sealed)
 	}
 	retained := filepath.Join(inst.Dir, "original", filepath.Base(wheel))
 	raw, err := os.ReadFile(retained)
