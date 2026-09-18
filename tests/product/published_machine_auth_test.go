@@ -52,7 +52,7 @@ func TestPublishedRentalPreparationUsesPersistedMachineKey(t *testing.T) {
 				}
 				minted.Add(1)
 				_ = json.NewEncoder(w).Encode(map[string]any{"token_set": map[string]any{"access_token": token.Load().(string), "token_type": "Bearer", "expires_in": 3600}, "device_key": map[string]string{"id": "prepare-machine"}})
-			case "/v1/auth/delegated/token":
+			case "/v1/machine-authorizations":
 				if r.Header.Get("Authorization") != "Bearer "+token.Load().(string) || minted.Load() == 0 {
 					http.Error(w, "no machine authentication", 401)
 					return
