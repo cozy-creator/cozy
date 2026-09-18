@@ -20,7 +20,7 @@ type PublicationRepository struct {
 }
 
 // MachinePublicationGrantIntent is frozen in the client submission record before
-// its first AuthKit call. A retry reuses this exact value, including ID and expiry.
+// its first Hub authorization call. A retry reuses this exact value, including ID and expiry.
 // It contains public certificate/scope metadata, never a device key or token.
 type MachinePublicationGrantIntent struct {
 	AuthorizationID string                  `json:"authorization_id"`
@@ -86,7 +86,7 @@ func NormalizePublicationRepositories(repositories []string) ([]string, *exit.Er
 }
 
 // AuthorizeMachinePublication uses the client's ordinary AuthKit credential once.
-// Runtime later renews with its own certificate and the returned grant ID; the
+// Runtime later renews with its independent worker capability and the grant ID; the
 // initial short token is deliberately discarded here and never sent to Python.
 func (c *Client) AuthorizeMachinePublication(ctx context.Context, intent MachinePublicationGrantIntent) *exit.Error {
 	id, err := uuid.Parse(intent.AuthorizationID)
@@ -101,7 +101,7 @@ func (c *Client) AuthorizeMachinePublication(ctx context.Context, intent Machine
 		Token     string    `json:"token"`
 		ExpiresAt time.Time `json:"expires_at"`
 	}
-	problem := c.do(ctx, call{method: http.MethodPost, path: "/v1/auth/delegated/token", auth: true,
+	problem := c.do(ctx, call{method: http.MethodPost, path: "/v1/machine-authorizations", auth: true,
 		body: map[string]any{"ttl_seconds": ttl, "delegate_certificate_der_b64url": intent.CertificateDER,
 			"requested_grant": map[string]any{"authorization_id": intent.AuthorizationID, "rental_id": intent.RentalID,
 				"repositories": intent.Repositories, "permissions": intent.Permissions, "expires_at_unix": intent.ExpiresAtUnix}},
@@ -110,7 +110,7 @@ func (c *Client) AuthorizeMachinePublication(ctx context.Context, intent Machine
 		return problem
 	}
 	if out.Token == "" || out.ExpiresAt.IsZero() {
-		return exit.Named(exit.Conflict, "publication.authority_response_invalid", "AuthKit did not acknowledge the requested publication authority")
+		return exit.Named(exit.Conflict, "publication.authority_response_invalid", "Tensorhub did not acknowledge the requested publication authority")
 	}
 	return nil
 }

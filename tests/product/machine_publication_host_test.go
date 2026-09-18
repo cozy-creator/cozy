@@ -29,7 +29,7 @@ const machinePublicationCanary = "cl259-private-script-source-must-never-be-publ
 type machinePublicationHandoff struct {
 	APIOrigin    string `json:"api_origin"`
 	WorkerOrigin string `json:"worker_origin"`
-	CADER        string `json:"ca_der_base64url"`
+	WorkerToken  string `json:"worker_token"`
 	Access       string `json:"creator_access_token"`
 	RentalID     string `json:"rental_id"`
 	WorkerID     string `json:"worker_id"`
@@ -66,19 +66,20 @@ func bindMachinePublicationFixture(t *testing.T, layout home.Layout, host actual
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if handoff.RentalID != "rental-private-child-host" || handoff.WorkerID != "private-child-host" || handoff.Access == "" || handoff.CADER == "" || handoff.WorkerOrigin == "" || handoff.Destination != "machineproof/model" {
+	if handoff.RentalID != "rental-private-child-host" || handoff.WorkerID != "private-child-host" || handoff.Access == "" || len(handoff.WorkerToken) != 43 || handoff.WorkerOrigin == "" || handoff.Destination != "machineproof/model" {
 		t.Fatal("real Hub handoff differs from the actual Host identity or requested scope")
 	}
 	authority, err := exec.Command("docker", "exec", host.Container, "cat", "/run/cozy/bootstrap/machine-publication-authority.json").Output()
 	must(t, err)
 	var actual struct {
-		Version int    `json:"version"`
-		Origin  string `json:"origin"`
-		CA      string `json:"ca_der_base64url"`
+		Version     int    `json:"version"`
+		Origin      string `json:"origin"`
+		WorkerID    string `json:"worker_id"`
+		WorkerToken string `json:"worker_token"`
 	}
 	must(t, json.Unmarshal(authority, &actual))
-	if actual.Version != 1 || actual.Origin != handoff.WorkerOrigin || actual.CA != handoff.CADER {
-		t.Fatal("Host boot authority differs from its provisioned real Hub origin/CA")
+	if actual.Version != 2 || actual.Origin != handoff.WorkerOrigin || actual.WorkerID != handoff.WorkerID || actual.WorkerToken != handoff.WorkerToken {
+		t.Fatal("Host boot authority differs from its provisioned real Hub origin/worker capability")
 	}
 	origin, err := url.Parse(handoff.APIOrigin)
 	must(t, err)
@@ -88,7 +89,7 @@ func bindMachinePublicationFixture(t *testing.T, layout home.Layout, host actual
 	proxy := &httputil.ReverseProxy{Rewrite: func(request *httputil.ProxyRequest) { request.SetURL(origin) }}
 	provider := catalog.server.Config.Handler
 	catalog.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/v1/auth/delegated/token" {
+		if request.URL.Path == "/v1/machine-authorizations" {
 			proxy.ServeHTTP(w, request) // Real AuthKit authorization, never a test response.
 			return
 		}
