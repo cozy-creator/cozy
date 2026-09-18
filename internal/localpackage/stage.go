@@ -3,11 +3,13 @@
 package localpackage
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
@@ -39,6 +42,7 @@ type Revision struct {
 	PackageInterfaceLength                                         int64
 	Files                                                          []File
 	DependencyRequirements                                         []byte
+	PythonRequires, PythonVersion                                  string
 }
 
 func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Revision, *exit.Error) {
@@ -49,8 +53,15 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 		}
 		return Open(layout, install, string(raw))
 	}
-	if install.Platform != "linux/amd64" || !strings.HasPrefix(install.Python, "3.12.") {
-		return Revision{}, exit.Named(exit.Validation, "private_dependency_platform_unsupported", "unpublished worker revisions require a captured Linux amd64 Python 3.12 environment")
+	inventory, problem := hostruntime.PythonExecutors(ctx)
+	if problem != nil {
+		return Revision{}, problem
+	}
+	if _, problem := inventory.Select("", install.Python); problem != nil {
+		return Revision{}, problem
+	}
+	if install.Platform != "linux/amd64" {
+		return Revision{}, exit.Named(exit.Validation, "private_dependency_platform_unsupported", "unpublished worker revisions require a captured Linux amd64 environment")
 	}
 	if install.SourceKind != "local" || install.SourceRef == "" || install.SourceDigest == "" ||
 		!strings.HasPrefix(install.Package, "local/") {
@@ -157,6 +168,7 @@ func StageWheels(layout home.Layout, install records.PackageInstall, packageInte
 	if problem := copyPackageInterface(requirements, filepath.Join(stage, dependencyRequirementsFile)); problem != nil {
 		return Revision{}, problem
 	}
+	pythonRequires := ""
 	files := make([]File, 0, len(paths))
 	names := map[string]bool{}
 	for index, source := range paths {
@@ -171,6 +183,11 @@ func StageWheels(layout home.Layout, install records.PackageInstall, packageInte
 		kind := "dependency"
 		if index == 0 {
 			kind = "project"
+			var problem *exit.Error
+			pythonRequires, problem = wheelPythonRequires(source)
+			if problem != nil {
+				return Revision{}, problem
+			}
 		}
 		file, problem := copyWheel(source, wheelDir, kind)
 		if problem != nil {
@@ -179,7 +196,7 @@ func StageWheels(layout home.Layout, install records.PackageInstall, packageInte
 		files = append(files, file)
 	}
 	revision, revisionBytes, problem := identity(install.Package, install.Version, sourceDigest,
-		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files, requirements)
+		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files, requirements, pythonRequires, install.Python)
 	if problem != nil {
 		return Revision{}, problem
 	}
@@ -245,6 +262,11 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 			"local package revision digest is malformed")
 	}
 	root := filepath.Join(layout.LocalPackages, strings.TrimPrefix(digest, "sha256:"))
+	stored, readErr := os.ReadFile(filepath.Join(root, localRevisionFile))
+	var declared pb.LocalPackageRevision
+	if readErr == nil && canonical.Unmarshal(stored, &declared) == nil && install.Python != "" && declared.PythonVersion == "" {
+		return Revision{}, exit.Named(exit.Conflict, "local_package_recapture_required", "captured revision predates the explicit Python executor selection").WithRemedy("run the original source again to capture its supported Python environment")
+	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return Revision{}, exit.Named(exit.NotFound, "local_package_revision_absent", "local package revision %s is absent or incomplete", digest)
@@ -290,6 +312,7 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 		return Revision{}, exit.Named(exit.Structural, "local_package_revision_invalid",
 			"local package revision requires 1..%d wheels", maxFiles)
 	}
+	pythonRequires := ""
 	files := make([]File, 0, len(wheels))
 	projects := 0
 	for _, entry := range wheels {
@@ -306,6 +329,10 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 		if fact.Distribution == strings.TrimPrefix(install.Package, "local/") &&
 			fact.Version == install.Version {
 			kind, projects = "project", projects+1
+			pythonRequires, problem = wheelPythonRequires(path)
+			if problem != nil {
+				return Revision{}, problem
+			}
 		}
 		file, problem := measured(path, fact, kind)
 		if problem != nil {
@@ -318,7 +345,7 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 			"local package revision has %d project wheels", projects)
 	}
 	revision, revisionBytes, problem := identity(install.Package, install.Version, install.SourceDigest,
-		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files, requirements)
+		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files, requirements, pythonRequires, install.Python)
 	if problem != nil {
 		return Revision{}, problem
 	}
@@ -395,7 +422,7 @@ func measured(path string, fact wheel.Identity, kind string) (File, *exit.Error)
 }
 
 func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
-	packageInterfaceLength int64, files []File, requirements []byte,
+	packageInterfaceLength int64, files []File, requirements []byte, pythonRequires, pythonVersion string,
 ) (Revision, []byte, *exit.Error) {
 	rows := append([]File(nil), files...)
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Digest < rows[j].Digest })
@@ -433,7 +460,7 @@ func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
 	if len(requirements) > 0 {
 		requirementsRef = &pb.Ref{Digest: canonical.Digest(requirements), Length: uint64(len(requirements))}
 	}
-	revisionBytes, rawDigest, err := canonical.Identity(&pb.LocalPackageRevision{DependencyRequirements: requirementsRef, Package: packageName,
+	revisionBytes, rawDigest, err := canonical.Identity(&pb.LocalPackageRevision{PythonVersion: pythonVersion, PythonRequires: pythonRequires, DependencyRequirements: requirementsRef, Package: packageName,
 		Release: release, SourceDigest: source, PackageInterface: &pb.Ref{Digest: packageInterface,
 			Length: uint64(packageInterfaceLength)}, Files: refs})
 	if err != nil {
@@ -445,7 +472,7 @@ func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
 	}
 	return Revision{Package: packageName, Release: release, SourceDigest: sourceDigest,
 		Digest: digest, PackageInterfaceDigest: packageInterfaceDigest, PackageInterfaceLength: packageInterfaceLength,
-		Files: rows, DependencyRequirements: append([]byte(nil), requirements...)}, revisionBytes, nil
+		PythonVersion: pythonVersion, PythonRequires: pythonRequires, Files: rows, DependencyRequirements: append([]byte(nil), requirements...)}, revisionBytes, nil
 }
 
 func syncDirectory(path string) error {
@@ -455,4 +482,16 @@ func syncDirectory(path string) error {
 	}
 	defer directory.Close()
 	return directory.Sync()
+}
+
+func wheelPythonRequires(path string) (string, *exit.Error) {
+	raw, problem := wheel.Metadata(path)
+	if problem != nil {
+		return "", problem
+	}
+	headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw))).ReadMIMEHeader()
+	if err != nil || len(headers.Values("Requires-Python")) > 1 {
+		return "", exit.New(exit.Validation, "project wheel has invalid Requires-Python metadata")
+	}
+	return headers.Get("Requires-Python"), nil
 }

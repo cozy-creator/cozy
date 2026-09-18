@@ -39,7 +39,7 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 			SourceDigest: f.Install.SourceDigest,
 		},
 		Preparation: &orchestrator.LocalServingPreparation{
-			Published: f.Install.SourceKind == "tensorhub", Application: f.PackageInterface.Application,
+			PythonVersion: f.Install.Python, Published: f.Install.SourceKind == "tensorhub", Application: f.PackageInterface.Application,
 			ModelSlotPaths: slots, PackageInterfaceDigest: f.Install.PackageInterface,
 			LockedRequirements: filepath.Join(f.Install.Dir, "locked-requirements.txt"),
 		},

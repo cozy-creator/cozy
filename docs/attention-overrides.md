@@ -67,7 +67,7 @@ ones from your package. `uv add` writes the ordinary dependency and
 `[tool.uv.sources]` wheel path and updates `uv.lock`. Creator captures the exact
 wheel bytes and selected dependency closure; Runtime installs that closure in the
 package environment on the named rental. `--rental` selects an existing machine
-and never buys a replacement. This path requires Linux amd64 and CPython 3.12,
+and never buys a replacement. This path requires Linux amd64 and a CPython version in the Runtime supported window,
 plus wheels compatible with the package's Torch/CUDA dependencies and the target
 GPU. Do not infer hardware compatibility from successful local installation.
 

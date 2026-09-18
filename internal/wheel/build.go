@@ -22,6 +22,7 @@ type Request struct {
 	Context context.Context
 	Tree    string
 	OutDir  string
+	Python  string
 }
 
 type Result struct {
@@ -81,8 +82,12 @@ func Build(req Request) (*Result, *exit.Error) {
 
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
-	cmd := exec.CommandContext(ctx, "uv", "build", "--wheel", "--out-dir", out,
-		"--no-progress", root)
+	args := []string{"build", "--wheel", "--out-dir", out, "--no-progress"}
+	if req.Python != "" {
+		args = append(args, "--python", req.Python, "--no-python-downloads")
+	}
+	args = append(args, root)
+	cmd := exec.CommandContext(ctx, "uv", args...)
 	cmd.Env = config.Frozen().Tool()
 	cmd.WaitDelay = 250 * time.Millisecond
 	processtree.Prepare(cmd)

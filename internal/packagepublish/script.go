@@ -13,6 +13,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -58,6 +59,14 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 	}
 	if metadata.RequiresPython == "" {
 		metadata.RequiresPython = ">=3.12"
+	}
+	inventory, problem := hostruntime.PythonExecutors(ctx)
+	if problem != nil {
+		return nil, problem
+	}
+	selected, problem := inventory.Select(metadata.RequiresPython, "")
+	if problem != nil {
+		return nil, problem
 	}
 	// The worker's author surface is an ordinary dependency, captured in uv.lock.
 	hasRuntime := false
@@ -128,9 +137,8 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		"cozy_script_entry.py": []byte("from cozy_runtime.author import script_app\napp = script_app(\"cozy_script\")\n"),
 		"pyproject.toml":       project,
 		"package.toml":         []byte("[application]\nobject = \"" + ScriptApplication + "\"\n"),
-		// The current Runtime contract requires standard CPython 3.12. Keep
-		// uv's choice with the snapshot; incompatible script metadata refuses.
-		".python-version": []byte("3.12\n"),
+		// Keep the selected actual executor with the immutable script snapshot.
+		".python-version": []byte(selected.Version + "\n"),
 	} {
 		if err := os.WriteFile(filepath.Join(root, filename), contents, 0o600); err != nil {
 			return nil, exit.Internalf("cannot stage script project: %s", err)

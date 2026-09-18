@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -206,11 +208,18 @@ func handleLs(ctx *Context) *exit.Error {
 	}
 	l := output.List{
 		Name:      "packages",
-		Fields:    []string{"package", "version", "size", "dependencies"},
-		AllFields: []string{"package", "major", "version", "size", "dependencies", "placement_set", "install_id", "source", "synced", "verified", "installed"},
+		Fields:    []string{"package", "version", "python", "python_status", "size", "dependencies"},
+		AllFields: []string{"package", "major", "version", "python", "python_status", "size", "dependencies", "placement_set", "install_id", "source", "synced", "verified", "installed"},
 		Bytes:     []string{"size", "dependencies"},
 	}
+	inventory, pythonProblem := hostruntime.PythonExecutors(context.Background())
 	for _, inst := range rows {
+		pythonStatus := "supported"
+		if pythonProblem != nil {
+			pythonStatus = "unknown: " + pythonProblem.Message
+		} else if _, problem := inventory.Select("", inst.Python); problem != nil {
+			pythonStatus = "unusable: " + problem.Message
+		}
 		synced, e := syncedText(st, inst)
 		if e != nil {
 			return e
@@ -223,6 +232,7 @@ func handleLs(ctx *Context) *exit.Error {
 			"size":              output.Int(inst.BytesExcl),
 			"dependencies":      output.Int(inst.BytesShared),
 			"python":            inst.Python,
+			"python_status":     pythonStatus,
 			"uv":                inst.UV,
 			"cuda_extra":        orNone(inst.Extra),
 			"packages":          fmt.Sprintf("%d", inst.Packages),

@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -175,7 +176,11 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 // module or package. A backend left to guess a flat layout can emit a wheel holding
 // nothing but .dist-info; that wheel would fail on a rented pod, so it fails here.
 func projectWheel(ctx context.Context, tree, out, name, release string) (string, *exit.Error) {
-	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out})
+	python, problem := hostruntime.ProjectPython(ctx, tree)
+	if problem != nil {
+		return "", problem
+	}
+	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out, Python: python.Executable})
 	if problem != nil {
 		return "", problem
 	}

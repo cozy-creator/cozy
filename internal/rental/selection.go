@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Constraints is the published release's own Requirements/RequiresPython and the degrees
@@ -18,8 +19,10 @@ import (
 // base profile the release already contradicts, or whose WIDTH the package cannot shard
 // across, is not worth an hour's rent, because the pod would refuse it typed on arrival.
 type Constraints struct {
-	Requirements   []string
-	RequiresPython string
+	Requirements          []string
+	RequiresPython        string
+	PythonVersion         string
+	SupportedPythonMinors []string
 	// Degrees is the intersection of every model slot's `sequence_parallel.degrees` in the
 	// package interface — the author's statement of which group degrees the whole
 	// construction can be built at. Empty means the package declares none, which is most
@@ -168,9 +171,29 @@ func declaredDegrees(degrees []int) string {
 }
 
 func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
+	if len(sku.PythonInterpreters) > 0 {
+		policy := [][]string{}
+		if constraints.SupportedPythonMinors != nil {
+			policy = append(policy, constraints.SupportedPythonMinors)
+		}
+		_, reason := launch.InventoryPython(&pb.ImageInventory{Interpreters: sku.PythonInterpreters}, constraints.RequiresPython, constraints.PythonVersion, policy...)
+		if reason == "" {
+			return ""
+		}
+		return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + reason
+	}
 	profile, readable := launch.ParseBaseProfile(sku.BaseWorkerProfile)
 	if !readable {
 		return ""
+	}
+	if constraints.SupportedPythonMinors != nil {
+		supported := false
+		for _, minor := range constraints.SupportedPythonMinors {
+			supported = supported || profile.PythonABI == "cp"+strings.ReplaceAll(minor, ".", "")
+		}
+		if !supported {
+			return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": image Python is outside the supported window"
+		}
 	}
 	reason := launch.BaseMismatch(profile, constraints.Requirements, constraints.RequiresPython)
 	if reason == "" {

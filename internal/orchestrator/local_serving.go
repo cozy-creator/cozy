@@ -24,6 +24,8 @@ type localPreparedCode struct {
 // LocalServingPreparation names package metadata retained by the install. It is
 // launch configuration, not a guessed PlacementSet or an invocation binding.
 type LocalServingPreparation struct {
+	PythonVersion          string   `json:"python_version"`
+	PythonRequires         string   `json:"python_requires"`
 	Published              bool     `json:"published"`
 	Application            string   `json:"application"`
 	ModelSlotPaths         []string `json:"model_slot_paths"`
@@ -98,7 +100,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			return WorkerLaunchSpec{}, "", problem
 		}
 		result, rpcError = s.preparation.PreparePackageSet(s.ctx, &pb.PreparePackageSetRequest{
-			InstallRoot: root, DownloadDelegation: selected, Application: prep.Application,
+			PythonRequires: prep.PythonRequires, PythonVersion: prep.PythonVersion, InstallRoot: root, DownloadDelegation: selected, Application: prep.Application,
 			ModelSlotPaths: prep.ModelSlotPaths, LockedRequirements: locked,
 		})
 	} else {
@@ -123,7 +125,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			}
 			source, _ := canonical.Raw(revision.SourceDigest)
 			result, rpcError = s.preparation.PrepareLocalPackage(s.ctx, &pb.PrepareLocalPackageRequest{
-				InstallRoot: spec.InstallRoot, OperationId: operation,
+				PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, InstallRoot: spec.InstallRoot, OperationId: operation,
 				Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, SourceDigest: source, LocalRevisionDigest: digest},
 				Wheels:  files, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
 			})

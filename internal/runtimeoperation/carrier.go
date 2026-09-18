@@ -40,7 +40,7 @@ func Carrier(version, interfaceDigest string) (string, []byte, *exit.Error) {
 	dist := "cozy_runtime_operations-" + version + ".dist-info"
 	files := map[string][]byte{
 		dist + "/METADATA": []byte(fmt.Sprintf(
-			"Metadata-Version: 2.4\nName: %s\nVersion: %s\nRequires-Python: >=3.12,<3.13\n"+
+			"Metadata-Version: 2.4\nName: %s\nVersion: %s\nRequires-Python: >=3.12\n"+
 				"Requires-Dist: cozy-runtime>=%s,<1\nRequires-Dist: numpy>=1.26\n"+
 				"Cozy-Builtin: operations\nCozy-Builtin-Interface: %s\n",
 			Name, version, Floor, interfaceDigest)),

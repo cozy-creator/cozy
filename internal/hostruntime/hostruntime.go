@@ -32,7 +32,7 @@ var floor = pep440.MustParse(Floor)
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
 var hostRuntimeInstall = fmt.Sprintf(
-	"install a coherent cozy-runtime build for Python 3.12 supporting %s+minor.%d or newer, then retry",
+	"install a coherent cozy-runtime build supporting %s+minor.%d or newer, then retry",
 	wirePackage(), WireFloor)
 
 func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }

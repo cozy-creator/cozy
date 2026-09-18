@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -334,7 +335,10 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
 	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
 	// a machine that would be bought are held to the same declared degrees (cl-179).
-	constraints, _ := RentalConstraints(m.ctx, req)
+	constraints, constraintProblem := RentalConstraints(m.ctx, req)
+	if constraintProblem != nil {
+		return none, "", constraintProblem
+	}
 	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
@@ -1197,6 +1201,7 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 			return out, problem
 		}
 		out.Requirements, out.RequiresPython = selection.Requirements, selection.RequiresPython
+		out.PythonVersion = installed.Python
 		declared, _ = launch.ReadPackageInterface(launch.PackageInterfacePath(installed.Dir), installed.PackageInterface)
 	} else {
 		if req.Package == "" || req.Release == "" {
@@ -1218,6 +1223,14 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 		}
 		out.Requirements, out.RequiresPython = requirements, requiresPython
 		declared, _ = launch.DecodePackageInterface(detail.PackageInterface)
+	}
+	inventory, problem := hostruntime.PythonExecutors(context.Background())
+	if problem != nil {
+		return out, problem
+	}
+	out.SupportedPythonMinors = append([]string(nil), inventory.SupportedMinors...)
+	if _, problem := inventory.Select(out.RequiresPython, out.PythonVersion); problem != nil {
+		return out, problem
 	}
 	// Both sources apply the requested function's declared intersection. An unreadable
 	// interface declares no width, so wide products remain excluded rather than guessed.
@@ -1244,7 +1257,11 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	if problem != nil {
 		return problem
 	}
-	requirements, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, inventory.Python)
+	selected, reason := launch.InventoryPython(inventory, constraints.RequiresPython, constraints.PythonVersion, constraints.SupportedPythonMinors)
+	if reason != "" {
+		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
+	}
+	requirements, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, selected)
 	if problem != nil {
 		return problem
 	}

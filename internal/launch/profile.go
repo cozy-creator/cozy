@@ -2,8 +2,10 @@ package launch
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
@@ -76,15 +78,55 @@ func InventoryMismatch(inventory *pb.ImageInventory, _ []string, requiresPython 
 	if inventory == nil {
 		return "the rental image inventory is absent"
 	}
-	if requiresPython != "" {
-		current, err := pep440.Parse(inventory.Python)
-		bounds, boundsErr := pep440.NewSpecifiers(requiresPython)
-		if err != nil {
-			return "the rental image reports an invalid Python version"
+	_, reason := InventoryPython(inventory, requiresPython, "")
+	return reason
+}
+
+// InventoryPython selects among actual package executors. The legacy singleton
+// Python remains a fallback only for images without an executor advertisement.
+func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected string, supported ...[]string) (string, string) {
+	if inventory == nil {
+		return "", "the rental image inventory is absent"
+	}
+	specifier := strings.TrimSpace(requiresPython)
+	if specifier == "" {
+		specifier = ">=0"
+	}
+	bounds, err := pep440.NewSpecifiers(specifier)
+	if err != nil {
+		return "", "the package reports invalid Requires-Python " + requiresPython
+	}
+	candidates := append([]*pb.PythonInterpreter(nil), inventory.Interpreters...)
+	if len(candidates) == 0 {
+		candidates = []*pb.PythonInterpreter{{Version: inventory.Python}}
+	}
+	for _, candidate := range candidates {
+		if candidate == nil {
+			return "", "the rental image reports an invalid Python executor"
 		}
-		if boundsErr == nil && !bounds.Check(current) {
-			return "Python " + inventory.Python + " does not satisfy " + requiresPython
+		if _, err := pep440.Parse(candidate.Version); err != nil {
+			return "", "the rental image reports an invalid Python version"
 		}
 	}
-	return ""
+	sort.Slice(candidates, func(i, j int) bool {
+		a, _ := pep440.Parse(candidates[i].Version)
+		b, _ := pep440.Parse(candidates[j].Version)
+		return a.LessThan(b)
+	})
+	allowed := map[string]bool{}
+	if len(supported) > 0 {
+		for _, minor := range supported[0] {
+			allowed[minor] = true
+		}
+	}
+	for _, candidate := range candidates {
+		if len(supported) > 0 && !allowed[hostruntime.PythonMinor(candidate.Version)] {
+			continue
+		}
+		version, _ := pep440.Parse(candidate.Version)
+		if bounds.Check(version) && (selected == "" || candidate.Version == selected) {
+			return candidate.Version, ""
+		}
+	}
+	return "", "no available Python executor satisfies " + requiresPython + " (captured Python " + selected + ")"
 }

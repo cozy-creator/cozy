@@ -53,7 +53,7 @@ func capturedPins(closure string) (map[string]string, *exit.Error) {
 
 // CapturedRegistryRows selects only the installed closure from the captured uv.lock.
 // It does not guess selected extras from a second resolution or export all extras.
-func CapturedRegistryRows(raw []byte, closure, project, version string, existing []DependencyWheel) ([]RegistryRow, []string, *exit.Error) {
+func CapturedRegistryRows(raw []byte, closure, project, version string, existing []DependencyWheel, targetPython ...string) ([]RegistryRow, []string, *exit.Error) {
 	pins, problem := capturedPins(closure)
 	if problem != nil {
 		return nil, nil, problem
@@ -103,18 +103,18 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 			}
 			row.Wheels = append(row.Wheels, registryWheel{URL: candidate.URL, Size: candidate.Size, Hashes: map[string]string{"sha256": hash}})
 		}
-		candidate, problem := selectRegistryWheel(name, row)
+		candidate, problem := selectRegistryWheel(name, row, targetPython...)
 		if problem != nil {
 			return nil, nil, problem
 		}
 		if entry.Source.Registry == "https://pypi.org/simple" {
 			// Registry artifacts are fetched by Runtime's bounded storage; the
 			// private client upload byte bound applies only to local wheels.
-			if _, problem := registryWheelIdentityBound(name, entry.Version, candidate, MaxRegistryWheelBytes); problem != nil {
+			if _, problem := registryWheelIdentityBound(name, entry.Version, candidate, MaxRegistryWheelBytes, targetPython...); problem != nil {
 				return nil, nil, problem
 			}
 		} else {
-			candidate, problem = pytorchRegistryWheel(name, entry.Version, entry.Source.Registry, row.Wheels)
+			candidate, problem = pytorchRegistryWheel(name, entry.Version, entry.Source.Registry, row.Wheels, targetPython...)
 			if problem != nil {
 				return nil, nil, problem
 			}
@@ -152,7 +152,7 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 	if err != nil {
 		return exit.Named(exit.Validation, "private_dependency_lock_invalid", "captured uv.lock is unavailable")
 	}
-	rows, requirements, problem := CapturedRegistryRows(raw, closure, p.Name, p.Release, p.DependencyWheels)
+	rows, requirements, problem := CapturedRegistryRows(raw, closure, p.Name, p.Release, p.DependencyWheels, python)
 	if problem != nil {
 		return problem
 	}

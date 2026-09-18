@@ -20,6 +20,15 @@ install -m 0755 ./cozy ~/.local/bin/cozy
 cozy -v
 ```
 
+Packages use Runtime's explicit rolling window of CPython 3.12, 3.13, and 3.14.
+Creator chooses the lowest installed supported interpreter satisfying `Requires-Python`
+and an explicit project `.python-version`, when present. Install these interpreters with
+`uv python install 3.12 3.13 3.14`. The worker's control interpreter is independent of
+package executors; one worker can execute packages using different supported minors.
+Captured environments bind their exact Python version and native wheel ABI.
+`cozy package list` shows Python compatibility. A package outside the active window
+is unusable until upgraded; advancing the window is an explicit Runtime release change.
+
 Install the host Runtime with its supported Python interpreter:
 
 ```sh

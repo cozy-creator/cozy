@@ -130,9 +130,10 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 		call := &pb.PreparePackageSetCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
 			DownloadDelegation: append([]byte(nil), prep.downloadSet...),
 		},
-			Application:        facts.Application,
-			ModelSlotPaths:     append([]string(nil), facts.ModelSlotPaths...),
-			ImageInventory:     facts.ImageInventory,
+			Application:    facts.Application,
+			ModelSlotPaths: append([]string(nil), facts.ModelSlotPaths...),
+			ImageInventory: facts.ImageInventory,
+			PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion,
 			LockedRequirements: append([]byte(nil), facts.LockedRequirements...),
 		}
 		result := c.runHostPrepare(s, w, seq, prep.label,
