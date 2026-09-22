@@ -10,8 +10,10 @@ A durable Runtime acceptance receipt permits both detached local and remote
 execution to continue independently. Reconnection reads the same execution and
 workspace; it does not submit another execution or cancel the existing one.
 Preparation without acceptance, unfinished input transfer, pending execution
-control, and active work owned by a legacy local daemon child can still require
-the daemon. Normal shutdown names those dependencies and refuses.
+control, and legacy daemon-coordinated work can still require
+the daemon. A legacy remote attempt acceptance is not a machine-execution receipt
+and does not prove independence from Creator's child/effect broker. Normal shutdown
+names those dependencies and refuses.
 
 `cozy down --force` overrides that dependency guard and disconnects the client.
 It does not send request cancellation or rental deletion. Legacy local execution

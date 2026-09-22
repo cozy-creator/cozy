@@ -78,37 +78,23 @@ func (s *Store) ClientShutdownObligations() ([]Obligation, *exit.Error) {
 			accepted[link.RequestID] = true
 		}
 	}
-	// A retained row is custody, not proof of an executing daemon child. Keep
-	// unfinished handoffs guarded; remote accepted attempts can replay their
-	// supervisor ledger after reconnect without running another attempt.
-	attempts := map[string][]Obligation{}
+	// Inactive retained rows are custody, not executing daemon work. The
+	// MachineExecution receipt above is the independence authority: a legacy
+	// accepted attempt can still require Creator's child/effect broker.
+	liveAttempts := map[string]bool{}
 	for _, obligation := range all {
-		if obligation.Kind == "attempt" {
+		if obligation.Kind == "attempt" && obligation.State != "terminal" {
 			id, _, _ := strings.Cut(obligation.ID, "#")
-			attempts[id] = append(attempts[id], obligation)
+			liveAttempts[id] = true
 		}
 	}
 	for _, obligation := range all {
-		if obligation.Kind != "job" && obligation.Kind != "invocation" {
-			continue
-		}
-		live, remoteAccepted := false, len(attempts[obligation.ID]) > 0
-		for _, attempt := range attempts[obligation.ID] {
-			live = live || attempt.State != "terminal"
-			remoteAccepted = remoteAccepted && (attempt.State == "accepted" || attempt.State == "recovered_open" || attempt.State == "terminal")
-		}
-		if !live && (obligation.State == "paused" || obligation.State == "blocked" || obligation.State == "succeeded") {
+		if (obligation.Kind == "job" || obligation.Kind == "invocation") && !liveAttempts[obligation.ID] &&
+			(obligation.State == "paused" || obligation.State == "blocked" || obligation.State == "succeeded") {
 			accepted[obligation.ID] = true
-		} else if remoteAccepted {
-			row, problem := s.RequestRow(obligation.ID)
-			if problem != nil {
-				return nil, problem
-			}
-			if row != nil && row.Worker != "" {
-				accepted[obligation.ID] = true
-			}
 		}
 	}
+
 	var held []Obligation
 	for _, obligation := range all {
 		if obligation.Kind == "rental" || obligation.Kind == "output_export" && obligation.State == "pending" {

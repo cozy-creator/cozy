@@ -457,3 +457,39 @@ func TestMachineRestartOwedPolicySeparatesFailedIntentFromAcceptedOutcome(t *tes
 		t.Fatal("real accepted outcome could not reconcile")
 	}
 }
+
+func TestDaemonDownRequiresMachineReceiptForIndependentExecution(t *testing.T) {
+	for _, location := range []string{"local", "remote"} {
+		t.Run(location, func(t *testing.T) {
+			o := hostOwner(t, "shutdown-legacy-"+location)
+			rental := ""
+			if location == "remote" {
+				rental = "pr-legacy"
+			}
+			request := recordPrivateTransaction(t, o.store, "legacy-"+location, rental)
+			instance, session := "legacy-worker", "legacy-boot"
+			fatal(t, o.store.SpawnWorker(records.WorkerProcess{InstanceID: instance, Package: request.Package, WorkerID: location}))
+			ordinal, problem := o.store.Dispatch(records.Attempt{RequestID: request.ID, SessionID: session, InstanceID: instance, InvocationDigest: childDigest("7"), InvocationCanonical: []byte(`{}`)})
+			fatal(t, problem)
+			fatal(t, o.store.OfferDispatch(request.ID, ordinal, session))
+			fatal(t, o.store.Accepted(request.ID, ordinal, session))
+			before, problem := o.store.RequestRow(request.ID)
+			fatal(t, problem)
+			held, problem := o.c.PrepareClientShutdown(false)
+			fatal(t, problem)
+			if len(held) == 0 || !strings.Contains(strings.Join(held, " "), request.ID) {
+				t.Fatalf("legacy %s acceptance was mistaken for independence: %v", location, held)
+			}
+			held, problem = o.c.PrepareClientShutdown(true)
+			fatal(t, problem)
+			if len(held) != 0 {
+				t.Fatal("explicit force did not override the dependency guard")
+			}
+			after, problem := o.store.RequestRow(request.ID)
+			fatal(t, problem)
+			if after.State != before.State || after.Ordinal != before.Ordinal || after.BodyDigest != before.BodyDigest {
+				t.Fatal("force canceled or rewrote the legacy request")
+			}
+		})
+	}
+}
