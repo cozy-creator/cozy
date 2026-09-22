@@ -26,8 +26,11 @@ func snapshotSource(installDir string, local *LocalSource) (string, *exit.Error)
 	}
 	relocated := map[string]string{pack.Tree: root}
 	files := map[string]string{}
+	limits := map[string]int64{}
 	for name, from := range pack.Files {
-		files[filepath.Join(root, filepath.FromSlash(name))] = from
+		to := filepath.Join(root, filepath.FromSlash(name))
+		files[to] = from
+		limits[to] = packagepublish.SourceFileLimit(name)
 	}
 	for name, from := range dependencies {
 		to := filepath.Join(root, ".cozy-dependencies", name)
@@ -45,6 +48,7 @@ func snapshotSource(installDir string, local *LocalSource) (string, *exit.Error)
 				to = filepath.Join(to, filepath.Base(from))
 			}
 			files[to], relocated[from] = from, to
+			limits[to] = packagepublish.SourceFileLimit(filepath.Base(from))
 			continue
 		}
 		relocated[from] = to
@@ -53,14 +57,16 @@ func snapshotSource(installDir string, local *LocalSource) (string, *exit.Error)
 			return "", problem
 		}
 		for member, source := range members {
-			files[filepath.Join(to, filepath.FromSlash(member))] = source
+			destination := filepath.Join(to, filepath.FromSlash(member))
+			files[destination] = source
+			limits[destination] = packagepublish.SourceFileLimit(member)
 		}
 	}
 	for _, to := range packagepublish.Paths(files) {
 		if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
 			return "", exit.Internalf("cannot create invocation source snapshot: %s", err)
 		}
-		if problem := copySnapshotFile(files[to], to); problem != nil {
+		if problem := copySnapshotFile(files[to], to, limits[to]); problem != nil {
 			return "", problem
 		}
 	}
@@ -164,7 +170,7 @@ func relocateMetadata(path, oldRoot, newRoot string, relocated map[string]string
 	return nil
 }
 
-func copySnapshotFile(from, to string) *exit.Error {
+func copySnapshotFile(from, to string, limit int64) *exit.Error {
 	in, err := os.Open(from)
 	if err != nil {
 		return exit.Internalf("cannot read invocation source: %s", err)
@@ -174,10 +180,10 @@ func copySnapshotFile(from, to string) *exit.Error {
 	if err != nil {
 		return exit.Internalf("cannot create invocation source: %s", err)
 	}
-	n, copyErr := io.Copy(out, io.LimitReader(in, packagepublish.MaxSourceFileBytes+1))
+	n, copyErr := io.Copy(out, io.LimitReader(in, limit+1))
 	syncErr := out.Sync()
 	closeErr := out.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil || n > packagepublish.MaxSourceFileBytes {
+	if copyErr != nil || syncErr != nil || closeErr != nil || n > limit {
 		return exit.Named(exit.Conflict, "local_package_source_changed",
 			"cannot capture a bounded complete invocation source file")
 	}
