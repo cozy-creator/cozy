@@ -490,7 +490,7 @@ func wheelPythonRequires(path string) (string, *exit.Error) {
 		return "", problem
 	}
 	headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw))).ReadMIMEHeader()
-	if err != nil || len(headers.Values("Requires-Python")) > 1 {
+	if (err != nil && err != io.EOF) || len(headers.Values("Requires-Python")) > 1 {
 		return "", exit.New(exit.Validation, "project wheel has invalid Requires-Python metadata")
 	}
 	return headers.Get("Requires-Python"), nil
