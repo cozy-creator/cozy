@@ -56,7 +56,15 @@ func TestPythonLocalServeUsesReportedManagedRoot(t *testing.T) {
 	if runtime.GOOS != "linux" || *privateScriptRuntimeWheel == "" {
 		t.Skip("requires Linux process inspection and the exact Runtime wheel")
 	}
-	root := t.TempDir()
+	root, err := os.MkdirTemp("", "cz-pyroot-")
+	must(t, err)
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Log("local root proof retained", root)
+			return
+		}
+		must(t, removeAllForce(root))
+	})
 	inventoryCommand := exec.Command("cozy-runtime", "--json", "python-interpreters") //cozy:allow actual read-only CLI ownership report under the fixture home
 	inventoryCommand.Env = childEnv(t, root)
 	raw, err := inventoryCommand.Output()
