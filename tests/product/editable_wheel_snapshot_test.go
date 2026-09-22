@@ -51,6 +51,8 @@ func TestEditableSnapshotLargeWheelKeepsSourceIdentityFence(t *testing.T) {
 			must(t, err)
 			metadata := "[project]\nname='snapshot-root'\nversion='1.0'\nrequires-python='>=3.12'\ndependencies=['snapshot-dependency==1.0']\n[tool.uv.sources]\nsnapshot-dependency={path='" + filepath.ToSlash(rel) + "'}\n"
 			must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0o600))
+			must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject='snapshot_root:app'\n"), 0o600))
+			must(t, os.WriteFile(filepath.Join(project, "uv.lock"), []byte("version = 1\n"), 0o600))
 			pack, problem := packagepublish.PrepareLocalFrom(project)
 			fatal(t, problem)
 			defer pack.Close()
