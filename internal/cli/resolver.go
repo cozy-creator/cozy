@@ -947,5 +947,5 @@ func (r *Resolver) ValidateExecutionCapture(request records.Request) *exit.Error
 	if problem != nil {
 		return problem
 	}
-	return localpackage.RequireRuntimeFloor(revision, hostruntime.Floor)
+	return localpackage.RequireRuntimeFloor(revision, hostruntime.PackageFloor)
 }

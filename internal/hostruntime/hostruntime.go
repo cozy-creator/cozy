@@ -20,20 +20,24 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor is the first release with shared on-demand Python provisioning (python-ensure).
+// ToolFloor is the first release with shared on-demand Python provisioning (python-ensure).
 // WireFloor independently checks the installed execution ownership capability.
-const Floor = "0.18.14"
+const ToolFloor = "0.18.14"
+
+// PackageFloor is the existing package SDK contract. Controller provisioning
+// features do not raise requirements on captured package environments.
+const PackageFloor = "0.18.0"
 
 // WireFloor covers the native Context/TensorFS surface and published captures.
 // Root native inputs require their newer capability at the call site.
 const WireFloor uint32 = 54
 
-var floor = pep440.MustParse(Floor)
+var floor = pep440.MustParse(ToolFloor)
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
 var hostRuntimeInstall = fmt.Sprintf(
 	"install cozy-runtime %s or newer supporting %s+minor.%d or newer: uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=%s' — then retry",
-	Floor, wirePackage(), WireFloor, Floor)
+	ToolFloor, wirePackage(), WireFloor, ToolFloor)
 
 func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }
 
@@ -50,7 +54,7 @@ var hostRuntimeVerdicts = struct {
 // wire package at WireFloor or newer — the minor is additive, so a newer tool serves
 // an older daemon and an older tool cannot (cl-086's live run: a 0.0.29 tool (minor 16) under
 // a minor-22 daemon launched, never came READY, and the request sat `queued` with nothing
-// said). Floor also requires the static script and managed-operation metadata contract.
+// said). ToolFloor also requires the static script and managed-operation metadata contract.
 // It also requires Runtime-owned temporary image preparation (0.9.0).
 // Source-authored model default metadata requires 0.10.0.
 // The tool's own `version` verb is the fact, asked here.
@@ -124,7 +128,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
 			"cozy-runtime %s is release %s; this Cozy needs %s or newer to provision package Python through python-ensure",
-			path, answer.Distribution, Floor).
+			path, answer.Distribution, ToolFloor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
 	return nil
@@ -137,7 +141,7 @@ func unreadableHostRuntime(path, format string, args ...any) *exit.Error {
 }
 
 // Describe is the one reading of a package surface this host performs — at publish pre-flight,
-// at install, and for a job's descriptor — by the tool at or above Floor:
+// at install, and for a job's descriptor — by the tool at or above ToolFloor:
 // `cozy-runtime describe` parses the source under dir and imports nothing. It returns the
 // canonical PackageInterface bytes. `where` names the source when it is not under dir — an
 // installed release's module lives in its venv, so the venv's interpreter is named for the

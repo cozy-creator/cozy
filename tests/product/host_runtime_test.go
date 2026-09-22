@@ -38,7 +38,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 		t.Fatalf("an older host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyPath(t, root, path, "up"); code == 0 ||
-		!strings.Contains(out, "Try: install cozy-runtime "+hostruntime.Floor+" or newer "+install) {
+		!strings.Contains(out, "Try: install cozy-runtime "+hostruntime.ToolFloor+" or newer "+install) {
 		t.Fatalf("the human form of the refusal lost its remedy [exit %d]\n%s", code, out)
 	}
 	code, out = runCozyPath(t, root, path, "run", "fake/older/generate", "prompt=fox", "--json")
@@ -52,7 +52,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	code, out = runCozyPath(t, root, path, "up", "--json")
 	refusal = refusalOf(t, out)
 	if code == 0 || refusal.Code != "host_runtime_below_floor" ||
-		!strings.Contains(refusal.Message, "release 0.4.0; this Cozy needs "+hostruntime.Floor+" or newer") ||
+		!strings.Contains(refusal.Message, "release 0.4.0; this Cozy needs "+hostruntime.ToolFloor+" or newer") ||
 		!strings.Contains(refusal.Remedy, install) {
 		t.Fatalf("a host tool below the describe floor did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}

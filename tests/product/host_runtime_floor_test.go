@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"archive/zip"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 )
 
 func TestAdmissionRequiresPythonEnsureAndAcceptsSourceDevWheel(t *testing.T) {
@@ -40,5 +42,33 @@ func TestAdmissionRequiresPythonEnsureAndAcceptsSourceDevWheel(t *testing.T) {
 				t.Fatalf("missing early upgrade refusal: %+v", problem)
 			}
 		})
+	}
+}
+
+func TestNewControllerAcceptsExistingPackageSDKClosure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX stand-in tool")
+	}
+	tool := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow stand-in controller for package SDK compatibility
+	must(t, os.WriteFile(tool, []byte(stubRuntime(t, "0.18.14", 58)), 0700))
+	t.Setenv("PATH", filepath.Dir(tool))
+	_, problem := hostruntime.Path(nil)
+	fatal(t, problem)
+	// A real captured wheel may pin SDK18.13 while proving the established
+	// package API floor. Its requirements must survive a controller upgrade.
+	path := filepath.Join(t.TempDir(), "existing-1.0-py3-none-any.whl")
+	file, err := os.Create(path)
+	must(t, err)
+	archive := zip.NewWriter(file)
+	metadata, err := archive.Create("existing-1.0.dist-info/METADATA")
+	must(t, err)
+	_, err = metadata.Write([]byte("Metadata-Version: 2.4\nName: existing\nVersion: 1.0\nRequires-Dist: cozy-runtime==0.18.13\nRequires-Dist: cozy-runtime>=0.18.0\n\n"))
+	must(t, err)
+	must(t, archive.Close())
+	must(t, file.Close())
+	captured := localpackage.Revision{Files: []localpackage.File{{Kind: "project", Path: path}}}
+	fatal(t, localpackage.RequireRuntimeFloor(captured, hostruntime.PackageFloor))
+	if problem := localpackage.RequireRuntimeFloor(captured, hostruntime.ToolFloor); problem == nil {
+		t.Fatal("control: this old package must not claim the new controller API")
 	}
 }

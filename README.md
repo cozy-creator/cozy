@@ -41,6 +41,10 @@ uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=0.18
 cozy-runtime version
 ```
 
+Runtime 0.18.14 is the installed controller/tool minimum for Python provisioning.
+Package SDK dependencies keep their declared compatible ranges and the existing
+0.18.0 package minimum; upgrading the controller does not rewrite captured closures.
+
 Keep `--python 3.12` when reinstalling or upgrading. uv
 [ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
 so an unqualified tool installation can select a newer interpreter that Runtime cannot use.
