@@ -130,3 +130,49 @@ func TestPublishedRentalPythonUsesRemoteInventory(t *testing.T) {
 		}
 	}
 }
+
+func TestRentalPythonProvisioningKeepsExactCaptureAndInventorySeparate(t *testing.T) {
+	for _, tc := range []struct {
+		name, version, requires string
+		minors                  []string
+		want                    bool
+	}{
+		{"missing exact patch", "3.13.7", ">=3.13,<3.14", []string{"3.12", "3.13", "3.14"}, true},
+		{"missing capability", "3.13.7", ">=3.13", nil, false},
+		{"outside window", "3.15.1", ">=3.13", []string{"3.12", "3.13", "3.14"}, false},
+		{"conflicting bound", "3.13.7", ">=3.14", []string{"3.13"}, false},
+		{"range without capture", "", ">=3.13", []string{"3.13"}, false},
+		{"prerelease is not provisionable", "3.13.7rc1", ">=3.13", []string{"3.13"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installed := []*pb.PythonInterpreter{{Version: "3.12.12", Abi: "cp312"}}
+			sku := hub.RentalSKU{Name: "cpu", AcceleratorModel: "CPU", PythonInterpreters: installed, PythonProvisionableMinors: tc.minors}
+			choices := rental.Purchases([]hub.RentalSKU{sku}, nil, false, true, rental.Constraints{RequiresPython: tc.requires, PythonVersion: tc.version})
+			if len(choices) != 1 || (choices[0].Verdict == "") != tc.want {
+				t.Fatalf("%+v", choices)
+			}
+			if len(sku.PythonInterpreters) != 1 || sku.PythonInterpreters[0].Version != "3.12.12" {
+				t.Fatal("provisioning capability mutated installed inventory")
+			}
+		})
+	}
+	raw := json.RawMessage(`{"format":"tensorhub.image_inventory/1","profile":"python3.12-cpu-linux-x86","python":"3.12.12","interpreters":[{"version":"3.12.12","abi":"cp312"}],"provisionable_minors":["3.12","3.13","3.14"],"distributions":[]}`)
+	inventory, err := rental.ImageInventory(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.Interpreters) != 1 {
+		t.Fatal("capability became an installed executor")
+	}
+	if !launch.ProvisionablePython(rental.ImagePythonCapabilities(raw), ">=3.13", "3.13.7") {
+		t.Fatal("rental reuse lost provisioning capability")
+	}
+}
+
+func TestRentalPythonProvisioningDoesNotHideInvalidInstalledABI(t *testing.T) {
+	sku := hub.RentalSKU{Name: "cpu", AcceleratorModel: "CPU", PythonInterpreters: []*pb.PythonInterpreter{{Version: "3.13.7", Abi: "cp313t"}}, PythonProvisionableMinors: []string{"3.13"}}
+	choices := rental.Purchases([]hub.RentalSKU{sku}, nil, false, true, rental.Constraints{RequiresPython: ">=3.13", PythonVersion: "3.13.7"})
+	if len(choices) != 1 || choices[0].Verdict == "" {
+		t.Fatalf("invalid inventory admitted: %+v", choices)
+	}
+}

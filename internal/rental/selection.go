@@ -171,13 +171,13 @@ func declaredDegrees(degrees []int) string {
 }
 
 func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
-	if len(sku.PythonInterpreters) > 0 {
+	if len(sku.PythonInterpreters) > 0 || len(sku.PythonProvisionableMinors) > 0 {
 		policy := [][]string{}
 		if constraints.SupportedPythonMinors != nil {
 			policy = append(policy, constraints.SupportedPythonMinors)
 		}
 		_, reason := launch.InventoryPython(&pb.ImageInventory{Interpreters: sku.PythonInterpreters}, constraints.RequiresPython, constraints.PythonVersion, policy...)
-		if reason == "" {
+		if reason == "" || strings.HasPrefix(reason, "no available Python executor") && launch.ProvisionablePython(sku.PythonProvisionableMinors, constraints.RequiresPython, constraints.PythonVersion, policy...) {
 			return ""
 		}
 		return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + reason

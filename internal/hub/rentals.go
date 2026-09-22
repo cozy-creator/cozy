@@ -375,11 +375,12 @@ type RentalSKU struct {
 	// requirements the label already contradicts is refused before the paid ask. It is
 	// deliberately NOT validated: a spelling this client cannot read means one fewer
 	// pre-spend check, never an unrentable catalog.
-	PythonInterpreters []*pb.PythonInterpreter `json:"python_interpreters"`
-	BaseWorkerProfile  string                  `json:"base_worker_profile"`
-	ComputeCapability  string                  `json:"compute_capability"`
-	VRAMGB             int64                   `json:"vram_gb"`
-	MinimumRAMPerGPUGB int64                   `json:"minimum_ram_per_gpu_gb"`
+	PythonProvisionableMinors []string                `json:"python_provisionable_minors"`
+	PythonInterpreters        []*pb.PythonInterpreter `json:"python_interpreters"`
+	BaseWorkerProfile         string                  `json:"base_worker_profile"`
+	ComputeCapability         string                  `json:"compute_capability"`
+	VRAMGB                    int64                   `json:"vram_gb"`
+	MinimumRAMPerGPUGB        int64                   `json:"minimum_ram_per_gpu_gb"`
 	// PriceUSDMicrosPerHour is the GPU list rate — the unit the hub's offer
 	// matching and replan cap run on, and the accepted quote this client locks.
 	PriceUSDMicrosPerHour int64 `json:"price_usd_micros_per_hour"`

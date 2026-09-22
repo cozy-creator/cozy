@@ -21,12 +21,17 @@ cozy -v
 ```
 
 Packages use Runtime's explicit rolling window of CPython 3.12, 3.13, and 3.14.
-Creator chooses the lowest installed supported interpreter satisfying `Requires-Python`
-and an explicit project `.python-version`, when present. Install these interpreters with
-`uv python install 3.12 3.13 3.14`. The worker's control interpreter is independent of
-package executors; one worker can execute packages using different supported minors.
-Captured environments bind their exact Python version and native wheel ABI.
-`cozy package list` shows Python compatibility. A package outside the active window
+Creator asks Runtime to select or install an interpreter satisfying `Requires-Python`
+and an explicit project `.python-version`, when present. Local execution and rented
+workers use the same Runtime provisioning policy. Production images preseed Python
+3.12; other supported interpreters are installed on demand when the image explicitly
+advertises that capability. The worker's control interpreter is independent of package
+executors; one worker can execute packages using different supported minors.
+Captured environments retain their exact Python patch, native wheel ABI, and dependency
+closure, including Torch. Provisioning capability is reported separately from installed
+interpreters; it does not substitute a different captured patch or dependency version.
+`cozy package list` distinguishes supported installed Python from Python that can be
+provisioned on demand. A package outside the active window
 is unusable until upgraded; advancing the window is an explicit Runtime release change.
 
 Install the host Runtime with its supported Python interpreter:

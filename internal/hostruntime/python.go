@@ -1,6 +1,7 @@
 package hostruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -19,9 +20,10 @@ import (
 // PythonInventory reads the installed Runtime's versioned policy and actual
 // executors. The control interpreter does not determine package compatibility.
 type PythonInventory struct {
-	Format          string              `json:"format"`
-	SupportedMinors []string            `json:"supported_minors"`
-	Interpreters    []PythonInterpreter `json:"interpreters"`
+	Format              string              `json:"format"`
+	ProvisionableMinors []string            `json:"provisionable_minors"`
+	SupportedMinors     []string            `json:"supported_minors"`
+	Interpreters        []PythonInterpreter `json:"interpreters"`
 }
 type PythonInterpreter struct {
 	Executable string `json:"executable"`
@@ -116,9 +118,56 @@ func ProjectPython(ctx context.Context, directory string) (PythonInterpreter, *e
 	} else if !os.IsNotExist(err) {
 		return PythonInterpreter{}, exit.New(exit.Validation, "cannot read project Python selection")
 	}
-	inventory, problem := PythonExecutors(ctx)
+	return EnsurePython(ctx, document.Project.RequiresPython, explicit)
+}
+
+// EnsurePython delegates selection and missing-interpreter provisioning to the
+// same Runtime policy used on rented workers. Exact captured patches stay exact.
+func EnsurePython(ctx context.Context, requires, explicit string) (PythonInterpreter, *exit.Error) {
+	env := config.Frozen().Tool()
+	bin, problem := Path(env)
 	if problem != nil {
 		return PythonInterpreter{}, problem
 	}
-	return inventory.Select(document.Project.RequiresPython, explicit)
+	if strings.TrimSpace(requires) == "" {
+		requires = ">=0"
+	}
+	args := []string{"--json", "python-ensure", requires}
+	if explicit != "" {
+		args = append(args, explicit)
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return PythonInterpreter{}, exit.Named(exit.Deadline, "python_provision_deadline", "Python preparation deadline exceeded")
+	}
+	if ctx.Err() != nil {
+		return PythonInterpreter{}, exit.Named(exit.Canceled, "python_provision_canceled", "Python preparation canceled: %s", ctx.Err())
+	}
+	if cmd.ProcessState == nil {
+		return PythonInterpreter{}, exit.New(exit.Structural, "cannot prepare package Python: %s", err)
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 0 {
+		// Runtime may report provisioning progress before its final typed refusal.
+		refusal := strings.TrimSpace(stderr.String())
+		for _, line := range strings.Split(refusal, "\n") {
+			var doc struct {
+				Error json.RawMessage `json:"error"`
+			}
+			if json.Unmarshal([]byte(line), &doc) == nil && len(doc.Error) > 0 {
+				refusal = line
+			}
+		}
+		return PythonInterpreter{}, RuntimeExit(code, "python-ensure", "python_provision_failed", stdout.String(), refusal)
+	}
+	var selected PythonInterpreter
+	if stdout.Len() > 1<<20 || json.Unmarshal(stdout.Bytes(), &selected) != nil || !filepath.IsAbs(selected.Executable) || selected.ABI != "cp"+strings.ReplaceAll(PythonMinor(selected.Version), ".", "") {
+		return PythonInterpreter{}, exit.Named(exit.Structural, "python_provision_invalid", "Runtime returned an invalid prepared Python interpreter")
+	}
+	// Validate the returned identity without duplicating Runtime's version window.
+	inventory := PythonInventory{SupportedMinors: []string{PythonMinor(selected.Version)}, Interpreters: []PythonInterpreter{selected}}
+	return inventory.Select(requires, explicit)
 }

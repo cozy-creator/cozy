@@ -53,11 +53,7 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 		}
 		return Open(layout, install, string(raw))
 	}
-	inventory, problem := hostruntime.PythonExecutors(ctx)
-	if problem != nil {
-		return Revision{}, problem
-	}
-	if _, problem := inventory.Select("", install.Python); problem != nil {
+	if _, problem := hostruntime.EnsurePython(ctx, "", install.Python); problem != nil {
 		return Revision{}, problem
 	}
 	if install.Platform != "linux/amd64" {

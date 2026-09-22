@@ -60,11 +60,7 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 	if metadata.RequiresPython == "" {
 		metadata.RequiresPython = ">=3.12"
 	}
-	inventory, problem := hostruntime.PythonExecutors(ctx)
-	if problem != nil {
-		return nil, problem
-	}
-	selected, problem := inventory.Select(metadata.RequiresPython, "")
+	selected, problem := hostruntime.EnsurePython(ctx, metadata.RequiresPython, "")
 	if problem != nil {
 		return nil, problem
 	}

@@ -1,12 +1,11 @@
-# Runtime source peer for the LoRA cohort
+# Runtime source peer for on-demand Python provisioning
 
 CI builds the exact Runtime commit named by COZY_RUNTIME_SOURCE with the existing
-read-only checkout and source-addressed CPU wheel recipe. It installs the explicit
-model-execution and lora extras, which declare released PEFT/TorchAO dependencies.
-No changed development bytes are presented as the public0.18.2 wheel and no PyPI
-publication is required for this qualification.
+read-only checkout and source-addressed CPU wheel recipe. The peer provides
+`python-ensure` and the separate `provisionable_minors` inventory capability used
+by Creator's package preparation and rental admission.
 
-Current peer includes the consolidated modern generic-LoRA/PEFT feature and exact
-protocolb6e56391. It preserves current Runtime attention and preparation scope fixes.
-The complete four-repository source cohort must qualify before coordinated delivery.
-This source pin does not update the shared workstation CLI or rented workers.
+The wheel retains the source commit in its build identity. No changed development
+bytes are presented as a public release, and no PyPI publication is needed for this
+qualification. The coordinated Runtime, Hub, and Creator changes must qualify before
+delivery. This pin does not update the shared workstation CLI or rented workers.

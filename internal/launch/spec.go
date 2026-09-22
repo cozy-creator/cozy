@@ -53,11 +53,7 @@ func EnvironmentPython(inst records.PackageInstall) (string, *exit.Error) {
 // asked (Job), so a host that never asks one needs none.
 func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	if inst.Python != "" {
-		inventory, problem := hostruntime.PythonExecutors(context.Background())
-		if problem != nil {
-			return nil, problem
-		}
-		if _, problem := inventory.Select("", inst.Python); problem != nil {
+		if _, problem := hostruntime.EnsurePython(context.Background(), "", inst.Python); problem != nil {
 			return nil, problem
 		}
 	}
