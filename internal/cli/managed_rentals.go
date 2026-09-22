@@ -1251,7 +1251,11 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	if problem != nil {
 		return problem
 	}
-	selected, reason := launch.InventoryPython(inventory, constraints.RequiresPython, constraints.PythonVersion, constraints.SupportedPythonMinors)
+	policy := [][]string{}
+	if constraints.SupportedPythonMinors != nil {
+		policy = append(policy, constraints.SupportedPythonMinors)
+	}
+	selected, reason := launch.InventoryPython(inventory, constraints.RequiresPython, constraints.PythonVersion, policy...)
 	if reason != "" {
 		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
 	}
