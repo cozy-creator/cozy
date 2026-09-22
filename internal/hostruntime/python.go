@@ -141,6 +141,9 @@ func EnsurePython(ctx context.Context, requires, explicit string) (PythonInterpr
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return PythonInterpreter{}, exit.Named(exit.Deadline, "python_provision_deadline", "Python preparation deadline exceeded")
+	}
 	if ctx.Err() != nil {
 		return PythonInterpreter{}, exit.Named(exit.Canceled, "python_provision_canceled", "Python preparation canceled: %s", ctx.Err())
 	}

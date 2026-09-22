@@ -137,7 +137,7 @@ func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected stri
 // ProvisionablePython admits an exact captured interpreter from an explicit
 // Runtime provisioning capability. It never adds a fictitious installed executor.
 func ProvisionablePython(minors []string, requires, selected string, supported ...[]string) bool {
-	if len(strings.Split(selected, ".")) != 3 {
+	if valid, _ := regexp.MatchString(`^3\.[1-9][0-9]*\.(0|[1-9][0-9]*)$`, selected); !valid {
 		return false
 	}
 	version, err := pep440.Parse(selected)
