@@ -563,14 +563,7 @@ func boundedSourceTree(tree string, requiredFiles []string) (string, map[string]
 		if err != nil || !info.Mode().IsRegular() {
 			return exit.Named(exit.Validation, "package_source_entry_invalid", "%s is not a regular file", rel)
 		}
-		limit := MaxSourceFileBytes
-		if rel == "uv.lock" {
-			limit = maxLockBytes
-		} else if strings.HasSuffix(strings.ToLower(name), ".whl") {
-			// Prebuilt dependencies retain the same bound whether they live
-			// inside the source tree or are captured from a local source path.
-			limit = MaxDependencyWheelBytes
-		}
+		limit := SourceFileLimit(rel)
 		if info.Size() > limit {
 			return exit.Named(exit.Validation, "package_source_file_too_large",
 				"%s is %d B; package source files may be at most %d B", rel, info.Size(), limit)
@@ -604,6 +597,18 @@ func boundedSourceTree(tree string, requiredFiles []string) (string, map[string]
 		}
 	}
 	return root, files, nil
+}
+
+// SourceFileLimit is the admission and snapshot bound for one source member.
+// Wheel dependencies retain their existing larger bound during invocation capture.
+func SourceFileLimit(name string) int64 {
+	if name == "uv.lock" {
+		return maxLockBytes
+	}
+	if strings.HasSuffix(strings.ToLower(name), ".whl") {
+		return MaxDependencyWheelBytes
+	}
+	return MaxSourceFileBytes
 }
 
 func refusedSourceFile(name string) bool {
