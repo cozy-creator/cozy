@@ -123,7 +123,7 @@ func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 	fatal(t, problem)
 	captured, problem := inventory.Select(">=3.12,<3.13", "")
 	fatal(t, problem)
-	version := runtimeFixtureVersion(t, "")
+	version := runtimeFixtureVersion(t, *privateScriptRuntimeWheel)
 	const current, old, earlierPython = "pr-11111111111111111111", "pr-22222222222222222222", "pr-33333333333333333333"
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, _ *hub.PackageReleaseDetail) {
 		mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -168,6 +168,11 @@ func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 def main(ctx):
     raise AssertionError("dry-run must not execute")
 `, version)
+	runtimeSource := ""
+	if runtimeWheel := *privateScriptRuntimeWheel; runtimeWheel != "" {
+		runtimeSource = fmt.Sprintf("# cozy-runtime = {path = %q}\n", runtimeWheel)
+	}
+	code = strings.Replace(code, "# ///\ndef", "# [tool.uv.sources]\n"+runtimeSource+"# ///\ndef", 1)
 	must(t, os.WriteFile(script, []byte(code), 0600))
 	status, out := runCozy(t, root, "run", script, "--rental=isao", "--dry-run", "--json", "--full")
 	if status != 0 || !strings.Contains(out, current) {
@@ -235,7 +240,7 @@ app.job(value)
 		if test.wheel {
 			source = "./wheels/marker_library-1.0-py3-none-any.whl"
 		}
-		extraCode = strings.Replace(extraCode, "# ///\ndef", "# [tool.uv.sources]\n# marker-library = {path = '"+source+"'}\n# ///\ndef", 1)
+		extraCode = strings.Replace(extraCode, "# [tool.uv.sources]\n", "# [tool.uv.sources]\n# marker-library = {path = '"+source+"'}\n", 1)
 		must(t, os.WriteFile(script, []byte(extraCode), 0600))
 		status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
 		if status != 0 {
