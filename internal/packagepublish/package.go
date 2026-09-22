@@ -159,7 +159,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 	registry := []RegistryRow{}
 	if needsRegistry {
 		organization := strings.TrimSpace(document.Tool.Cozy.Organization)
-		registry, problem = collectRegistryRows(ctx, p.Tree, root, organization, dependencies)
+		registry, problem = collectRegistryRows(ctx, p.Tree, root, organization, dependencies, python)
 		if problem != nil {
 			p.Close()
 			p.Root = ""

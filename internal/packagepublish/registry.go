@@ -61,10 +61,11 @@ type exactDependency struct {
 	version string
 }
 
-func collectRegistryRows(ctx context.Context, project, stage, organization string, existing []DependencyWheel) ([]RegistryRow, *exit.Error) {
+func collectRegistryRows(ctx context.Context, project, stage, organization string, existing []DependencyWheel, selected hostruntime.PythonInterpreter) ([]RegistryRow, *exit.Error) {
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-default-groups", "--no-emit-project", "--no-emit-local",
-		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project}
+		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project,
+		"--python", selected.Executable, "--no-python-downloads"}
 	command := exec.CommandContext(ctx, "uv", args...)
 	command.Env = config.Frozen().Tool("UV_PYTHON_DOWNLOADS=never")
 	output, err := command.CombinedOutput()
@@ -85,10 +86,6 @@ func collectRegistryRows(ctx context.Context, project, stage, organization strin
 	if err != nil || len(raw) == 0 || int64(len(raw)) > maxLockBytes {
 		return nil, exit.Named(exit.Structural, "registry_dependency_export_invalid",
 			"uv export did not produce a non-empty pylock.toml at or below %d B", maxLockBytes)
-	}
-	selected, problem := hostruntime.ProjectPython(ctx, project)
-	if problem != nil {
-		return nil, problem
 	}
 	return RegistryRowsFromLock(raw, existing, organization, selected.Version)
 }

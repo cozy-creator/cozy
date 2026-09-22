@@ -143,7 +143,8 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	// Export the committed registry closure without the rows the release's own wheels
 	// supply; those rows are re-added below as exact org-index pins.
 	args := []string{"export", "--frozen", "--no-dev", "--no-default-groups", "--no-emit-project",
-		"--format", "requirements.txt", "--output-file", exported, "--no-progress"}
+		"--format", "requirements.txt", "--output-file", exported, "--no-progress",
+		"--python", python.Executable, "--no-python-downloads"}
 	seen := map[string]bool{}
 	for _, wheel := range appended {
 		name := strings.TrimSpace(wheel.Distribution)
