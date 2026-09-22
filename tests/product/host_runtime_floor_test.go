@@ -1,4 +1,4 @@
-package hostruntime
+package producttest
 
 import (
 	"fmt"
@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
 func TestAdmissionRequiresPythonEnsureAndAcceptsSourceDevWheel(t *testing.T) {
@@ -21,12 +23,13 @@ func TestAdmissionRequiresPythonEnsureAndAcceptsSourceDevWheel(t *testing.T) {
 		{"0.18.14", true}, {"0.18.14+dev.h687ee141", true}, {"0.18.15", true},
 	} {
 		t.Run(test.version, func(t *testing.T) {
-			tool := filepath.Join(t.TempDir(), "runtime")
+			tool := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow stand-in Runtime command for host admission
 			script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '{\"distribution\":\"%s\",\"wire_protocol\":\"cozy.worker.v1+minor.58\"}'\n", test.version)
-			if err := os.WriteFile(tool, []byte(script), 0700); err != nil {
+			if err := os.WriteFile(tool, []byte(script), 0700); err != nil { //cozy:allow stand-in Runtime command for host admission
 				t.Fatal(err)
 			}
-			problem := admitHostRuntime(tool, nil)
+			t.Setenv("PATH", filepath.Dir(tool))
+			_, problem := hostruntime.Path(nil)
 			if test.admitted {
 				if problem != nil {
 					t.Fatal(problem)
