@@ -139,12 +139,16 @@ if [ "$1" = "--json" ] && [ "$2" = "version" ]; then
  printf '%%s\n' '{"distribution":"0.18.14","wire_protocol":"cozy.worker.v1+minor.%d"}'
  exit 0
 fi
+if [ "$1" = "--json" ] && [ "$2" = "python-interpreters" ]; then
+ printf '%%s\n' '{"format":"cozy.python-interpreters/1","managed_root":%q,"supported_minors":["3.12","3.13","3.14"],"interpreters":[]}'
+ exit 0
+fi
 if [ "$1" = "serve" ]; then
  printf '%%s\n' 'started' >> %q
  exit 1
 fi
 exit 2
-`, pb.WireMinor, marker)
+`, pb.WireMinor, filepath.Join(bin, "managed-python"), marker)
 	must(t, os.WriteFile(filepath.Join(bin, "cozy-runtime"), []byte(script), 0700)) //cozy:allow sentinel executable verifies that startup Resume does not start stopped work
 	must(t, os.WriteFile(filepath.Join(bin, "python"), []byte("#!/bin/sh\nexit 1\n"), 0700))
 	seed := func(root, state string) (*records.Store, records.Request) {
