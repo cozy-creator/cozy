@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-const interfaceGeneratorABI = "cozy.interface-generator/6"
+const interfaceGeneratorABI = "cozy.interface-generator/7"
 const interfaceGeneratorRuntimeFloor = "0.11.0"
 
 func GenerateInterfaceWheel(ctx context.Context, install records.PackageInstall, home string, env []string, implementation, source, sourceDigest, output string) (InterfaceWheel, *exit.Error) {
@@ -88,7 +88,7 @@ func (r RuntimeCLI) InterfaceWheel(ctx context.Context, interfacePath, distribut
 				return wheel, exit.Named(exit.Structural, "interface_generator_internal_unsupported", "internal callables require Runtime 0.18.3 or newer for interface generation")
 			}
 		}
-	} else if wheel.GeneratorABI != interfaceGeneratorABI {
+	} else if wheel.GeneratorABI != interfaceGeneratorABI && wheel.GeneratorABI != "cozy.interface-generator/6" {
 		return wheel, exit.Named(exit.Structural, "interface_generator_incompatible", "Runtime interface generator %q does not match Creator %q", wheel.GeneratorABI, interfaceGeneratorABI).
 			WithRemedy("update Creator and its host Runtime to the same supported cohort")
 	}
