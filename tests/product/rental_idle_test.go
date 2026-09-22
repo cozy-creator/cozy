@@ -234,13 +234,14 @@ func reservePort(t *testing.T) int {
 // release one rental — the way Tensorhub does: a DELETE moves the pod to `released`, and
 // every later read says so.
 type fakeRentalHub struct {
-	mu          sync.Mutex
-	rentals     map[string]map[string]any
-	inventories map[string]json.RawMessage
-	skus        []map[string]any
-	rent        func(map[string]any) map[string]any
-	released    map[string]int
-	server      *httptest.Server
+	mu              sync.Mutex
+	rentals         map[string]map[string]any
+	inventories     map[string]json.RawMessage
+	packageReleases map[string]any
+	skus            []map[string]any
+	rent            func(map[string]any) map[string]any
+	released        map[string]int
+	server          *httptest.Server
 	// publishes is whether this stand-in hub carries th-199's account listing.
 	publishes bool
 }
@@ -249,6 +250,16 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	t.Helper()
 	h := &fakeRentalHub{rentals: map[string]map[string]any{}, released: map[string]int{}, publishes: true}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/packages/{owner}/{name}/releases/{release}", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		release, ok := h.packageReleases[r.PathValue("owner")+"/"+r.PathValue("name")+"@"+r.PathValue("release")]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(release)
+	})
 	// Ordinary fixtures provide the real account census. Tests of an unavailable
 	// route must opt into that refusal explicitly.
 	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {

@@ -11,7 +11,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -1176,8 +1175,7 @@ func settledRequest(state string) bool {
 }
 
 // RentalConstraints reads the selected local install or published release's immutable
-// requirements and interface. Automatic selection preserves its advisory fallback
-// on unavailable facts; explicit rental selection requires them before submission.
+// requirements and interface. Missing facts refuse selection before spending.
 func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
 	var out rental.Constraints
 	var declared *launch.PackageInterface
@@ -1225,14 +1223,9 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 		out.PythonVersion = detail.PythonVersion
 		declared, _ = launch.DecodePackageInterface(detail.PackageInterface)
 	}
-	inventory, problem := hostruntime.PythonExecutors(context.Background())
-	if problem != nil {
-		return out, problem
-	}
-	out.SupportedPythonMinors = append([]string(nil), inventory.SupportedMinors...)
-	if _, problem := inventory.Select(out.RequiresPython, out.PythonVersion); problem != nil {
-		return out, problem
-	}
+	// Rental admission is about the remote inventory. A client may have no Runtime
+	// or a different installed Python set; local capture already bound its exact
+	// interpreter above and published releases carry their own immutable selection.
 	// Both sources apply the requested function's declared intersection. An unreadable
 	// interface declares no width, so wide products remain excluded rather than guessed.
 	if declared != nil {

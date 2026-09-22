@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -10,6 +11,9 @@ import (
 
 func TestInstalledAppFilterDoesNotPromoteCallerOrAmbientLibraries(t *testing.T) {
 	root := t.TempDir()
+	if output, err := exec.Command("uv", "venv", "--python", "3.12", root).CombinedOutput(); err != nil {
+		t.Fatalf("create real metadata environment: %s: %v", output, err)
+	}
 	python := filepath.Join(root, "bin", "python")
 	site := filepath.Join(root, "lib", "python3.12", "site-packages")
 	for _, name := range []string{"caller", "source-lib", "wheel-lib", "ambient"} {

@@ -1,14 +1,20 @@
 package producttest
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/cli"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -91,6 +97,36 @@ func TestRentalPythonAdmissionRefusesUnmeasuredOrWrongABI(t *testing.T) {
 		candidates := rental.Purchases([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", BaseWorkerProfile: "python3.13-cpu-linux-x86", PythonInterpreters: executors}}, nil, false, true, rental.Constraints{RequiresPython: ">=3.12", PythonVersion: "3.13.11"})
 		if len(candidates) != 1 || candidates[0].Verdict == "" {
 			t.Fatalf("unmeasured or mismatched executor admitted: %+v", executors)
+		}
+	}
+}
+
+// A published remote package is selectable without acquiring any local Python
+// interpreter. The actual remote inventory decides whether its captured ABI fits.
+func TestPublishedRentalPythonUsesRemoteInventory(t *testing.T) {
+	detail := rentalReleaseFacts()
+	detail.RequiresPython = ">=3.13,<3.14"
+	detail.PythonVersion = "3.13.11"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/packages/proof/remote-python/releases/1" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(detail)
+	}))
+	defer server.Close()
+	constraints, problem := cli.RentalConstraints(&cli.Context{Cfg: config.Config{Home: t.TempDir(), HubURL: server.URL}}, records.Request{Package: "proof/remote-python", Release: "1", Entrypoint: "job"})
+	fatal(t, problem)
+	if constraints.PythonVersion != "3.13.11" || constraints.RequiresPython != detail.RequiresPython {
+		t.Fatalf("release interpreter facts changed: %+v", constraints)
+	}
+	for _, tc := range []struct {
+		version, abi string
+		want         bool
+	}{{"3.13.11", "cp313", true}, {"3.12.12", "cp312", false}, {"3.13.12", "cp313", false}} {
+		choices := rental.Purchases([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, BaseWorkerProfile: "python3.12-cpu-linux-x86", PythonInterpreters: []*pb.PythonInterpreter{{Version: tc.version, Abi: tc.abi}}}}, nil, false, true, constraints)
+		if len(choices) != 1 || (choices[0].Verdict == "") != tc.want {
+			t.Fatalf("remote %s selected %v; want %v", tc.version, choices, tc.want)
 		}
 	}
 }
