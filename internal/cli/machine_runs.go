@@ -88,6 +88,10 @@ func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, reso
 
 func (m *machineRuns) Start(request records.Request) *exit.Error {
 	m.mu.Lock()
+	if m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return exit.Named(exit.Unavailable, "daemon.closing", "the client observer has disconnected")
+	}
 	if m.running[request.ID] {
 		m.mu.Unlock()
 		return nil
@@ -110,6 +114,13 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 			}
 			link, problem := m.store.MachineExecution(request.ID)
 			if problem != nil || link == nil {
+				return
+			}
+			if len(link.Receipt) == 0 && (records.Settled(current.State) || records.RetainedState(current.State)) &&
+				!(current.State == "canceled" && len(link.Submission) == 0) {
+				// Restart resumes observation, not withdrawn or failed execution
+				// intent. A receipt can reconcile a real outcome; absent one, do
+				// not turn a stopped request into a new Submit RPC.
 				return
 			}
 			if len(link.Receipt) == 0 {

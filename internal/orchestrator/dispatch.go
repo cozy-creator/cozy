@@ -389,7 +389,7 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		if c.opt.StartMachineExecution == nil {
 			return 0, exit.Unavailablef("this client cannot reconnect its Runtime-owned execution")
 		}
-		return 0, c.opt.StartMachineExecution(*current)
+		return 0, c.startMachineExecution(*current)
 	}
 	if current.State != "submitted" && current.State != "queued" {
 		return uint64(current.Ordinal), nil
@@ -573,10 +573,35 @@ func (c *Orchestrator) requeue(requestID, why string, charge bool) {
 // A worker that cannot become dispatchable is a TERMINAL condition for the request, not a
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
+// startMachineExecution admits the async observer before releasing the closing
+// fence. A delayed activation after HTTP admission may not cross a later down.
+func (c *Orchestrator) startMachineExecution(req records.Request) *exit.Error {
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return exit.Named(exit.Unavailable, "daemon.closing", "the daemon is closing; retained work will reconnect on startup")
+	}
+	token := "machine/" + req.ID
+	if c.starting[token] {
+		c.mu.Unlock()
+		return nil
+	}
+	c.starting[token] = true
+	c.mu.Unlock()
+	defer func() { c.mu.Lock(); delete(c.starting, token); c.mu.Unlock() }()
+	return c.opt.StartMachineExecution(req)
+}
+
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	c.mu.Lock()
+	closing := c.closing
+	c.mu.Unlock()
+	if closing {
+		return
+	}
 	if link, problem := c.opt.Store.MachineExecution(req.ID); problem != nil || link != nil {
 		if problem == nil && c.opt.StartMachineExecution != nil {
-			_ = c.opt.StartMachineExecution(req)
+			_ = c.startMachineExecution(req)
 		}
 		return
 	}
@@ -669,6 +694,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		}
 		guard := "rental/" + requestSlot(req)
 		c.mu.Lock()
+		if c.closing {
+			c.mu.Unlock()
+			return
+		}
 		rentalHolds := c.rentalHeld(req)
 		staging := c.starting[guard]
 		if !rentalHolds && !staging {
@@ -751,7 +780,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		slot = "rental-prepare/" + req.Worker
 	}
 	c.mu.Lock()
-	if c.starting[slot] {
+	if c.closing || c.starting[slot] {
 		for _, guard := range guards {
 			delete(c.starting, guard)
 		}
@@ -1999,6 +2028,9 @@ type offerTarget struct {
 func (c *Orchestrator) pick(req records.Request) (offerTarget, *exit.Error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closing {
+		return offerTarget{}, exit.Named(exit.Unavailable, "daemon.closing", "the daemon is closing; no attempt can be dispatched")
+	}
 	routed := c.route(req)
 	pick := routed.pick()
 	if pick == nil {

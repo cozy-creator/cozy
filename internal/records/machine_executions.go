@@ -79,7 +79,7 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 // error result is collected, and cancellation alone never proves native cleanup.
 const machineExecutionOwed = `(NOT ` + machineExecutionLost + ` AND (` + machineInputOwed + ` OR ` + machineModelRetentionOwed + ` OR ` + machineFileResultOwed + ` OR (NOT EXISTS(SELECT 1 FROM request_events released
  WHERE released.request_id=r.id AND released.type='machine.retention_released') AND (
- (length(e.receipt)=0 AND r.state!='refused' AND (length(e.submission)>0 OR r.state!='canceled')) OR
+ (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked') AND (length(e.submission)>0 OR r.state!='canceled')) OR
  (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))))`
 
 func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {

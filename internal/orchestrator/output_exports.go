@@ -18,7 +18,7 @@ import (
 // It never changes the execution terminal and never trusts a terminal path.
 func (c *Orchestrator) RetryOutputExport(requestID string) {
 	c.mu.Lock()
-	if c.outputExporting[requestID] {
+	if c.closing || c.outputExporting[requestID] {
 		c.mu.Unlock()
 		return
 	}

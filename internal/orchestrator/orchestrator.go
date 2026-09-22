@@ -793,6 +793,10 @@ func (c *Orchestrator) drain() {
 	c.drainMu.Lock()
 	defer c.drainMu.Unlock()
 	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return
+	}
 	queued := append([]string(nil), c.pending...)
 	c.mu.Unlock()
 	// A named rental is an explicit serial queue. If its head cannot dispatch yet

@@ -29,8 +29,8 @@ type UnloadResult struct {
 	Count   int                        `json:"count"`
 }
 
-// DownResult is the daemon-side half of `down [--all]`. ShuttingDown is true only
-// after every local invocation settled and every rental row/operation disappeared.
+// DownResult is the daemon-side half of client disconnect or explicit teardown.
+// Normal/forced disconnect preserves requests, Runtime executions and rentals.
 // Under --all, a false result tells the caller exactly what cancellation was requested
 // and which paid obligations must be ended through Tensorhub before retrying.
 type DownResult struct {
@@ -61,7 +61,8 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		All bool `json:"all"`
+		All   bool `json:"all"`
+		Force bool `json:"force"`
 	}
 	data, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -73,19 +74,36 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != io.EOF {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			`this route takes exactly {"all":true|false}`, "send one closed down request")
+			`this route takes {"all":true|false,"force":true|false}; flags are optional and mutually exclusive`, "send one closed down request")
 		return
 	}
 
-	active, rentals, problem := s.downBlockers(body.All)
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
+	if body.All && body.Force {
+		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "all and force are mutually exclusive", "choose disconnect or destructive teardown")
 		return
 	}
-	if !body.All && (len(active) > 0 || len(rentals) > 0) {
-		s.refuseTyped(w, r, exit.Named(exit.Conflict, "active_work",
-			"daemon shutdown refused: active %s", joinLifecycleIdentities(active, rentals)).
-			WithRemedy("cancel the named invocations/jobs and end the named rentals, or use explicit `cozy down --all`"))
+	if !body.All {
+		if s.shutdown == nil {
+			s.refuse(w, r, http.StatusConflict, "conflict", "this server was built with no shutdown hook", "")
+			return
+		}
+		held, problem := s.orchestrator.PrepareClientShutdown(body.Force)
+		if problem != nil {
+			s.refuseTyped(w, r, problem)
+			return
+		}
+		if len(held) > 0 {
+			s.refuseTyped(w, r, exit.Named(exit.Conflict, "active_work", "daemon shutdown refused: work requires this daemon online: %s", strings.Join(held, ", ")).WithRemedy("wait for the named work, or use `cozy down --force` to disconnect without canceling work or ending rentals"))
+			return
+		}
+		s.shuttingDown = true
+		s.ok(w, r, http.StatusAccepted, DownResult{ShuttingDown: true})
+		go s.shutdown()
+		return
+	}
+	active, rentals, problem := s.downBlockers()
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
 		return
 	}
 
@@ -131,7 +149,7 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 		}
 		// Re-read rather than trusting the pre-pass sample: what a client is told is still
 		// holding the daemon has to be what IS.
-		remaining, remainingRentals, problem := s.downBlockers(true)
+		remaining, remainingRentals, problem := s.downBlockers()
 		if problem != nil {
 			remaining, remainingRentals = active, rentals
 		}
@@ -193,15 +211,10 @@ func (s *Server) StopUnlessManaging(managing func() ([]string, *exit.Error)) ([]
 	return nil, nil
 }
 
-// downBlockers is the subset of the daemon's obligations `down` refuses on: the work it
-// can cancel and the paid pods it must see ended. An attempt awaiting its ack and an
-// export mid-copy are on their way to settlement and are drained by the close itself.
-func (s *Server) downBlockers(all bool) ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
-	read := s.store.ClientShutdownObligations
-	if all {
-		read = s.store.Obligations
-	}
-	obligations, problem := read()
+// downBlockers is the destructive --all census. Explicit client disconnect uses
+// PrepareClientShutdown instead, and never sends cancellation or rental release.
+func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
+	obligations, problem := s.store.Obligations()
 	if problem != nil {
 		return nil, nil, problem
 	}

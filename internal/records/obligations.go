@@ -1,18 +1,20 @@
 package records
 
-import "github.com/cozy-creator/cozy/internal/exit"
+import (
+	"github.com/cozy-creator/cozy/internal/exit"
+	"strings"
+)
 
-// Obligation is one durable fact whose next transition only a running daemon can make.
-// Kind is the vocabulary `cozy down` refuses in — invocation, job, rental,
-// rental_operation — plus the two it drains rather than refuses: attempt (a terminal
-// still owed its acknowledgement) and output_export (a --out copy in flight).
+// Obligation is a durable work or retention fact. Automatic idle management and
+// destructive teardown keep the complete set; explicit disconnect filters it to
+// work that still requires the client online.
 type Obligation struct {
 	Kind  string
 	ID    string
 	State string
 }
 
-// Obligations is every durable reason this daemon may not stop, read in ONE statement so
+// Obligations is the full automatic-management census, read in ONE statement so
 // no fence can see half of the picture. A rental counts until the hub proves it
 // gone or explicitly confirms that creation never happened. Failed provisioning
 // alone is not that proof. A rental operation counts until it is final, and only when no
@@ -70,17 +72,55 @@ func (s *Store) ClientShutdownObligations() ([]Obligation, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	accepted, machines := map[string]bool{}, map[string]bool{}
+	accepted := map[string]bool{}
 	for _, link := range links {
 		if len(link.Receipt) > 0 && len(link.PendingControl) == 0 && !link.CancelRequested {
 			accepted[link.RequestID] = true
-			machines[link.MachineID] = true
+		}
+	}
+	// A retained row is custody, not proof of an executing daemon child. Keep
+	// unfinished handoffs guarded; remote accepted attempts can replay their
+	// supervisor ledger after reconnect without running another attempt.
+	attempts := map[string][]Obligation{}
+	for _, obligation := range all {
+		if obligation.Kind == "attempt" {
+			id, _, _ := strings.Cut(obligation.ID, "#")
+			attempts[id] = append(attempts[id], obligation)
+		}
+	}
+	for _, obligation := range all {
+		if obligation.Kind != "job" && obligation.Kind != "invocation" {
+			continue
+		}
+		live, remoteAccepted := false, len(attempts[obligation.ID]) > 0
+		for _, attempt := range attempts[obligation.ID] {
+			live = live || attempt.State != "terminal"
+			remoteAccepted = remoteAccepted && (attempt.State == "accepted" || attempt.State == "recovered_open" || attempt.State == "terminal")
+		}
+		if !live && (obligation.State == "paused" || obligation.State == "blocked" || obligation.State == "succeeded") {
+			accepted[obligation.ID] = true
+		} else if remoteAccepted {
+			row, problem := s.RequestRow(obligation.ID)
+			if problem != nil {
+				return nil, problem
+			}
+			if row != nil && row.Worker != "" {
+				accepted[obligation.ID] = true
+			}
 		}
 	}
 	var held []Obligation
 	for _, obligation := range all {
-		if (obligation.Kind == "job" || obligation.Kind == "invocation") && accepted[obligation.ID] ||
-			obligation.Kind == "rental" && machines[obligation.ID] {
+		if obligation.Kind == "rental" || obligation.Kind == "output_export" && obligation.State == "pending" {
+			// An idle rental or deferred output contract owns durable resources,
+			// but no current client-side copy. Active exporters are fenced below.
+			continue
+		}
+		id := obligation.ID
+		if obligation.Kind == "attempt" {
+			id, _, _ = strings.Cut(id, "#")
+		}
+		if (obligation.Kind == "job" || obligation.Kind == "invocation" || obligation.Kind == "attempt") && accepted[id] {
 			continue
 		}
 		held = append(held, obligation)
@@ -88,6 +128,13 @@ func (s *Store) ClientShutdownObligations() ([]Obligation, *exit.Error) {
 	for _, link := range links {
 		if len(link.Receipt) > 0 && len(link.PendingControl) == 0 && !link.CancelRequested {
 			continue
+		}
+		row, problem := s.RequestRow(link.RequestID)
+		if problem != nil {
+			return nil, problem
+		}
+		if row != nil && (Settled(row.State) || row.State == "paused" || row.State == "blocked") && len(link.PendingControl) == 0 && !link.CancelRequested {
+			continue // retained custody alone does not require the client online
 		}
 		owed, problem := s.MachineExecutionOwesWork(link.RequestID)
 		if problem != nil {
