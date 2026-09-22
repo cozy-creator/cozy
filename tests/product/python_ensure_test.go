@@ -1,10 +1,12 @@
-package hostruntime
+package producttest
 
 import (
 	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
 func TestEnsurePythonUsesSharedRuntimeAndPreservesExactPatch(t *testing.T) {
@@ -21,7 +23,7 @@ printf '%s\n' '{"executable":"/managed/python3.13","version":"3.13.7","abi":"cp3
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", root)
-	selected, problem := EnsurePython(context.Background(), ">=3.13,<3.14", "3.13.7")
+	selected, problem := hostruntime.EnsurePython(context.Background(), ">=3.13,<3.14", "3.13.7")
 	if problem != nil || selected.Version != "3.13.7" {
 		t.Fatalf("%+v %v", selected, problem)
 	}
@@ -41,7 +43,7 @@ exit 9
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", root)
-	_, problem := EnsurePython(context.Background(), ">=3.13", "3.13.7")
+	_, problem := hostruntime.EnsurePython(context.Background(), ">=3.13", "3.13.7")
 	if problem == nil || problem.Name != "python_provision_failed" || problem.Message != "download unavailable" || problem.Remedy != "retry when online" {
 		t.Fatalf("%v", problem)
 	}
