@@ -280,6 +280,9 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	<-stop
 	close(quit)
+	// Disconnect uploads/observation immediately. Runtime owns accepted execution;
+	// canceling this client context never sends an execution-cancel command.
+	machines.cancel()
 	fmt.Fprintln(ctx.Out, "draining package processes…")
 	drain, cancelDrain := context.WithTimeout(context.Background(), orchestrator.StopGrace)
 	if err := httpServer.Shutdown(drain); err != nil {

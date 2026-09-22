@@ -535,8 +535,8 @@ shape; Creator never supplies a remote profile, CUDA choice, or precomputed Plac
 Each rental has one local Ed25519 Creator key and one separate media bearer. Both credentials are
 removed when the rental ends, and a lost Creator key requires a new rental.
 
-Rentals can continue billing until Tensorhub confirms their termination. `rental end` and
-`down --all` keep the Cozy daemon alive when remote absence cannot be confirmed.
+Rentals continue billing until Tensorhub confirms their termination. `cozy rental end`
+and `cozy down --all` request termination; normal or forced client disconnect does not.
 
 ## Release GPU memory or stop Cozy
 
@@ -544,12 +544,18 @@ These commands have deliberately different scopes:
 
 ```sh
 cozy unload       # stop idle local Runtime workers and release their GPU models
-cozy down         # stop locally; refuses while invocations or rentals are active
+cozy down         # disconnect; guards work that still needs this daemon online
+cozy down --force # disconnect anyway; never cancel jobs or end rentals
 cozy down --all   # cancel all work, end all rentals, then stop the daemon
 ```
 
-None of them deletes installed package or model bytes. A failed partial `down --all` leaves the
-daemon running so cancellation and paid-resource reconciliation can continue.
+None deletes installed package or model bytes. Normal and forced disconnect preserve
+retained paused/blocked/completed work and rental records. Accepted detached local and
+remote Runtime executions continue and reconnect on `cozy up`. Unfinished handoffs,
+controls, and daemon-owned execution can still block normal shutdown. `--force` may
+interrupt legacy daemon-owned local work; it uses existing recovery on restart.
+`--all` remains explicit cancellation and rental teardown. See
+[daemon shutdown](docs/daemon-shutdown.md).
 
 The daemon's own words — the orchestrator's frame-by-frame account — are in
 `$COZY_HOME/daemon.log`, rotated once at 32 MiB (`daemon.log.1`). `cozy daemon log` prints it;

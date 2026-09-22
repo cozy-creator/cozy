@@ -82,8 +82,12 @@ func handleUp(ctx *Context) *exit.Error {
 
 func handleDown(ctx *Context) *exit.Error {
 	all := ctx.Inv.Bool("--all")
+	force := ctx.Inv.Bool("--force")
 	state := daemon.Probe(ctx.Cfg)
 	if !state.Up {
+		if !all {
+			return emit(ctx, output.Record{Fields: []output.Field{{K: "daemon", V: "stopped"}, {K: "changed", V: false}}})
+		}
 		blockers, problem := offlineDownBlockers(ctx)
 		if problem != nil {
 			return problem
@@ -92,11 +96,6 @@ func handleDown(ctx *Context) *exit.Error {
 			return emit(ctx, output.Record{Fields: []output.Field{
 				{K: "daemon", V: "stopped"}, {K: "changed", V: false},
 			}})
-		}
-		if !all {
-			return exit.Named(exit.Conflict, "active_work",
-				"daemon shutdown refused: active %s", strings.Join(blockers, ", ")).
-				WithRemedy("cancel/end the named work, or use explicit `cozy down --all`")
 		}
 		state, _, problem = ensureDaemon(ctx)
 		if problem != nil {
@@ -109,7 +108,7 @@ func handleDown(ctx *Context) *exit.Error {
 		return problem
 	}
 	if !all {
-		result, problem := client.Down(false)
+		result, problem := client.Down(false, force)
 		if problem != nil {
 			return problem
 		}
@@ -147,7 +146,7 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 		refused = append(refused, line)
 	}
 	for {
-		result, problem := client.Down(true)
+		result, problem := client.Down(true, false)
 		if problem != nil {
 			// The daemon itself refused or is unreachable. Nothing further can be asked of
 			// it here, so report honestly rather than pretending a teardown happened.
@@ -289,7 +288,7 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 		return nil, problem
 	}
 	defer store.Close()
-	obligations, problem := store.ClientShutdownObligations()
+	obligations, problem := store.Obligations()
 	if problem != nil {
 		return nil, problem
 	}

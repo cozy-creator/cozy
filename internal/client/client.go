@@ -303,13 +303,18 @@ func (c *Client) Unload() (api.UnloadResult, *exit.Error) {
 	return out, e
 }
 
-// Down performs the daemon-side lifecycle fence. Under all=false, active work or
-// rentals refuse without mutation. Under all=true, the daemon requests cancellation
+// Down performs the daemon-side lifecycle fence. Normal disconnect refuses only
+// daemon-dependent work; force overrides that guard without cancellation. Under
+// all=true, the daemon requests cancellation
 // and returns the exact paid obligations the caller must terminate and confirm through
 // Tensorhub before retrying. ShuttingDown=true means cooperative down was accepted.
-func (c *Client) Down(all bool) (api.DownResult, *exit.Error) {
+func (c *Client) Down(all, force bool) (api.DownResult, *exit.Error) {
 	var out api.DownResult
-	e := c.call(http.MethodPost, "/v1/local/daemon/down", map[string]bool{"all": all}, &out)
+	body := map[string]bool{"all": all}
+	if force {
+		body["force"] = true
+	}
+	e := c.call(http.MethodPost, "/v1/local/daemon/down", body, &out)
 	return out, e
 }
 

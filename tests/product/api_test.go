@@ -168,7 +168,7 @@ func TestLocalAPIDoor(t *testing.T) {
 		t.Error("a rendered error contains the credential")
 	}
 
-	// Plain down is safe by default: one paid obligation refuses shutdown by exact id.
+	// An idle paid rental remains recorded across non-destructive client shutdown.
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
@@ -177,12 +177,14 @@ func TestLocalAPIDoor(t *testing.T) {
 		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
 		State: "ready", Hub: "https://hub.invalid",
 	}))
-	blocked := svc.call(t, "POST", "/v1/local/daemon/down", map[string]bool{"all": false})
-	if blocked.Status != http.StatusConflict || blocked.code() != "active_work" ||
-		!strings.Contains(string(blocked.Body), "rental-down-arm") {
-		t.Errorf("plain down did not name and preserve the rental: %s", blocked.brief())
+	stopped := svc.call(t, "POST", "/v1/local/daemon/down", map[string]bool{"all": false})
+	if stopped.Status != http.StatusAccepted || !strings.Contains(string(stopped.Body), `"shutting_down":true`) {
+		t.Errorf("plain down refused an idle rental: %s", stopped.brief())
 	}
-	_, problem = store.ForgetRental("rental-down-arm")
+	retained, problem := store.RentalRow("rental-down-arm")
 	fatal(t, problem)
+	if retained == nil || retained.State != "ready" {
+		t.Fatal("down changed or removed the rental")
+	}
 	store.Close()
 }

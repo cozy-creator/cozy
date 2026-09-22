@@ -528,11 +528,12 @@ func (c *UpCmd) Run(r *Runtime) error {
 }
 
 type DownCmd struct {
-	All bool `help:"Cancel all work, end all rentals, then stop Cozy."`
+	All   bool `help:"Cancel all work, end all rentals, then stop Cozy." xor:"down-mode"`
+	Force bool `help:"Disconnect without canceling work or ending rentals; daemon-owned local work may be interrupted." xor:"down-mode"`
 }
 
 func (c *DownCmd) Run(r *Runtime) error {
-	return r.call(handleDown, nil, bools("--all", c.All), nil, false)
+	return r.call(handleDown, nil, bools("--all", c.All, "--force", c.Force), nil, false)
 }
 
 // SSHInfo reads current provider mapping from Hub; it stores no endpoint locally.
