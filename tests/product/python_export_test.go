@@ -2,16 +2,20 @@ package producttest
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
@@ -67,7 +71,8 @@ esac
 exec %q "$@"
 `, python, log, uv)
 	must(t, os.WriteFile(filepath.Join(root, "uv"), []byte(wrapper), 0700)) //cozy:allow command-contract wrapper delegates to real uv
-	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))   //cozy:allow retain the original test PATH behind tool guards
+	// Test subprocesses need only these explicitly discovered tool directories.
+	t.Setenv("PATH", strings.Join([]string{root, filepath.Dir(uv), filepath.Dir(runtime), filepath.Dir(source), "/usr/bin", "/bin"}, string(os.PathListSeparator)))
 	return python, version, log
 }
 
@@ -110,8 +115,35 @@ only-include = ["operation.py"]
 	if len(active) != 1 || !strings.HasPrefix(active[0], "selected") {
 		t.Fatalf("target markers changed: %v", active)
 	}
+	wheelBytes, err := os.ReadFile(pack.Wheel)
+	must(t, err)
+	wheelHash := sha256.Sum256(wheelBytes)
+	index := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/python-export-proof/":
+			fmt.Fprintf(w, `<a href="/%s">wheel</a>`, filepath.Base(pack.Wheel))
+		case "/" + filepath.Base(pack.Wheel):
+			_, _ = w.Write(wheelBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer index.Close()
+	receipt, problem := install.MaterializePublishedEnvironment(pack.Tree, filepath.Join(t.TempDir(), "venv"), &install.PublishedSource{
+		IndexURL: index.URL, ProjectWheel: install.PublishedWheel{
+			Distribution: "python-export-proof", Version: "1.0.0", Filename: filepath.Base(pack.Wheel),
+			Digest: "sha256:" + hex.EncodeToString(wheelHash[:]), Length: int64(len(wheelBytes)),
+		},
+	})
+	fatal(t, problem)
+	if receipt.Python != version {
+		t.Fatalf("published environment changed Python: %+v", receipt)
+	}
 	raw, err := os.ReadFile(log)
 	must(t, err)
+	if strings.Count(string(raw), "export\n") != 2 {
+		t.Fatalf("both registry and published export must run: %s", raw)
+	}
 	for _, operation := range []string{"lock\n", "build\n", "export\n", "tree\n", "run\n"} {
 		if !strings.Contains(string(raw), operation) {
 			t.Fatalf("did not exercise %s: %s", operation, raw)
