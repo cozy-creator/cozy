@@ -638,6 +638,11 @@ def check_web_boundary():
             continue
         if any(part in {".git", "dist", "vendor"} for part in source.parts):
             continue
+        # CI checks out the exact Runtime peer to build its wheel. Its source
+        # vocabulary belongs to Runtime; require checkout metadata so an ordinary
+        # Creator directory with this name does not escape the fence.
+        if source.parts[0] == "runtime-peer" and pathlib.Path("runtime-peer/.git").exists():
+            continue
         if source.suffix not in {".go", ".md", ".html", ".sh", ".py", ".yaml", ".yml"}:
             continue
         text = source.read_text(errors="replace")
