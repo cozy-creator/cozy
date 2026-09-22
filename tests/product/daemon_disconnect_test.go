@@ -224,7 +224,19 @@ func TestDaemonDownReattachesAcceptedLocalRuntime(t *testing.T) {
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires the exact Runtime wheel used by CI")
 	}
-	root := t.TempDir()
+	// Runtime appends its executor socket below this root. Keep the fixture
+	// independent of the test function's long name and the kernel sun_path cap.
+	root, err := os.MkdirTemp("", "cozy-down-")
+	must(t, err)
+	claimScratch(root)
+	t.Cleanup(func() {
+		reapDaemonRoot(root)
+		if t.Failed() {
+			t.Log("disconnect evidence retained", root)
+		} else {
+			must(t, removeAllForce(root))
+		}
+	})
 	wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 	must(t, err)
 	script := filepath.Join(t.TempDir(), "disconnect.py")
@@ -274,6 +286,11 @@ def main():
 	status, out = runCozy(t, root, "run", "watch", request.ID, "--json")
 	if status != 0 {
 		t.Fatalf("reattach collection [%d]: %s", status, out)
+	}
+	currentProcess, err = os.ReadFile(filepath.Join(root, "runtime", "process.json"))
+	must(t, err)
+	if !bytes.Equal(runtimeProcess, currentProcess) {
+		t.Fatal("reattachment replaced the independently running Runtime")
 	}
 	after, problem := store.MachineExecution(request.ID)
 	fatal(t, problem)

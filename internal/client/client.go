@@ -310,7 +310,11 @@ func (c *Client) Unload() (api.UnloadResult, *exit.Error) {
 // Tensorhub before retrying. ShuttingDown=true means cooperative down was accepted.
 func (c *Client) Down(all, force bool) (api.DownResult, *exit.Error) {
 	var out api.DownResult
-	e := c.call(http.MethodPost, "/v1/local/daemon/down", map[string]bool{"all": all, "force": force}, &out)
+	body := map[string]bool{"all": all}
+	if force {
+		body["force"] = true
+	}
+	e := c.call(http.MethodPost, "/v1/local/daemon/down", body, &out)
 	return out, e
 }
 
