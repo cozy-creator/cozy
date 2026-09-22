@@ -219,6 +219,9 @@ func handleLs(ctx *Context) *exit.Error {
 			pythonStatus = "unknown: " + pythonProblem.Message
 		} else if _, problem := inventory.Select("", inst.Python); problem != nil {
 			pythonStatus = "unusable: " + problem.Message
+			if launch.ProvisionablePython(inventory.ProvisionableMinors, "", inst.Python, inventory.SupportedMinors) {
+				pythonStatus = "provisionable: installed on demand"
+			}
 		}
 		synced, e := syncedText(st, inst)
 		if e != nil {
