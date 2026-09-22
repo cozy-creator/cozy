@@ -1247,24 +1247,22 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	if err != nil {
 		return exit.Named(exit.Structural, "rental.image_inventory_invalid", "%s", err)
 	}
-	view, problem := client(ctx).Rental(call, id)
-	if problem != nil {
-		return problem
-	}
 	policy := [][]string{}
 	if constraints.SupportedPythonMinors != nil {
 		policy = append(policy, constraints.SupportedPythonMinors)
 	}
 	selected, reason := launch.InventoryPython(inventory, constraints.RequiresPython, constraints.PythonVersion, policy...)
+	if strings.HasPrefix(reason, "no available Python executor") && launch.ProvisionablePython(rental.ImagePythonCapabilities(raw), constraints.RequiresPython, constraints.PythonVersion, policy...) {
+		selected, reason = constraints.PythonVersion, ""
+	}
 	if reason != "" {
 		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
 	}
-	requirements, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, selected)
-	if problem != nil {
+	// Package distributions, including Torch, belong to the captured closure.
+	// Evaluate markers against the exact requested interpreter, even before it is installed.
+	if _, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, selected); problem != nil {
 		return problem
 	}
-	if reason := launch.InventoryMismatch(inventory, requirements, constraints.RequiresPython, view.Development); reason != "" {
-		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
-	}
+
 	return nil
 }

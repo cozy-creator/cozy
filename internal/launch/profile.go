@@ -97,7 +97,7 @@ func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected stri
 		return "", "the package reports invalid Requires-Python " + requiresPython
 	}
 	candidates := append([]*pb.PythonInterpreter(nil), inventory.Interpreters...)
-	if len(candidates) == 0 {
+	if len(candidates) == 0 && inventory.Python != "" {
 		candidates = []*pb.PythonInterpreter{{Version: inventory.Python}}
 	}
 	for _, candidate := range candidates {
@@ -132,4 +132,39 @@ func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected stri
 		}
 	}
 	return "", "no available Python executor satisfies " + requiresPython + " (captured Python " + selected + ")"
+}
+
+// ProvisionablePython admits an exact captured interpreter from an explicit
+// Runtime provisioning capability. It never adds a fictitious installed executor.
+func ProvisionablePython(minors []string, requires, selected string, supported ...[]string) bool {
+	if len(strings.Split(selected, ".")) != 3 {
+		return false
+	}
+	version, err := pep440.Parse(selected)
+	if err != nil {
+		return false
+	}
+	if strings.TrimSpace(requires) == "" {
+		requires = ">=0"
+	}
+	bounds, err := pep440.NewSpecifiers(requires)
+	if err != nil || !bounds.Check(version) {
+		return false
+	}
+	minor := hostruntime.PythonMinor(selected)
+	if len(supported) > 0 {
+		allowed := false
+		for _, value := range supported[0] {
+			allowed = allowed || value == minor
+		}
+		if !allowed {
+			return false
+		}
+	}
+	for _, value := range minors {
+		if value == minor {
+			return true
+		}
+	}
+	return false
 }

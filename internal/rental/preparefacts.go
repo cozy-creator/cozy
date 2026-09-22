@@ -111,11 +111,12 @@ func ImageInventory(raw json.RawMessage) (*pb.ImageInventory, error) {
 		return nil, fmt.Errorf("the rental's image has no registered inventory")
 	}
 	var doc struct {
-		Format        string                  `json:"format"`
-		Profile       string                  `json:"profile"`
-		Python        string                  `json:"python"`
-		Interpreters  []*pb.PythonInterpreter `json:"interpreters"`
-		Distributions []struct {
+		ProvisionableMinors []string                `json:"provisionable_minors"`
+		Format              string                  `json:"format"`
+		Profile             string                  `json:"profile"`
+		Python              string                  `json:"python"`
+		Interpreters        []*pb.PythonInterpreter `json:"interpreters"`
+		Distributions       []struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
 		} `json:"distributions"`
@@ -147,4 +148,16 @@ func ImageInventory(raw json.RawMessage) (*pb.ImageInventory, error) {
 			&pb.ImageDistribution{Distribution: row.Name, Version: row.Version})
 	}
 	return inventory, nil
+}
+
+// ImagePythonCapabilities returns the separately advertised provisioning policy;
+// ImageInventory validates the complete document before this field is consumed.
+func ImagePythonCapabilities(raw json.RawMessage) []string {
+	var doc struct {
+		Minors []string `json:"provisionable_minors"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return nil
+	}
+	return doc.Minors
 }
