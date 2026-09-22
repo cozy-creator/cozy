@@ -49,7 +49,7 @@ if [ "$2" = python-ensure ]; then
  exit 0
 fi
 exec %q "$@"
-`, hostruntime.Floor, selected, runtime)
+`, hostruntime.ToolFloor, selected, runtime)
 	must(t, os.WriteFile(filepath.Join(root, "cozy-runtime"), []byte(runtimeScript), 0700)) //cozy:allow stand-in Runtime selection delegates every other command to the real tool
 	log := filepath.Join(root, "uv-operations")
 	wrapper := fmt.Sprintf(`#!/bin/sh
