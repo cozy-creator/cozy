@@ -2,6 +2,7 @@ package install
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
 // EnvironmentReceipt is the environment record: exactly what produced this install's venv.
@@ -58,6 +60,10 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 			WithRemedy("a package release pins its whole closure; `uv sync --locked` has nothing to install without it")
 	}
 
+	python, problem := hostruntime.ProjectPython(context.Background(), sourceDir)
+	if problem != nil {
+		return nil, problem
+	}
 	env := &EnvironmentReceipt{
 		LockDigest: "sha256:" + lockDigest,
 		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
@@ -65,7 +71,7 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 	}
 	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
 
-	args := []string{"sync", "--locked", "--no-dev", "--no-default-groups", "--no-progress"}
+	args := []string{"sync", "--locked", "--no-dev", "--no-default-groups", "--no-progress", "--python", python.Executable}
 	if !editable {
 		args = append(args, "--no-editable")
 	}
@@ -116,6 +122,10 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	if published.IndexURL == "" {
 		return nil, exit.Internalf("published package source names no org index")
 	}
+	python, problem := hostruntime.ProjectPython(context.Background(), sourceDir)
+	if problem != nil {
+		return nil, problem
+	}
 	env := &EnvironmentReceipt{
 		LockDigest: "sha256:" + lockDigest,
 		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
@@ -123,7 +133,7 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	}
 	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_python_incompatible",
 		"the package Python requirement cannot select an interpreter",
-		"venv", "--no-progress", venvDir); problem != nil {
+		"venv", "--python", python.Executable, "--no-progress", venvDir); problem != nil {
 		return nil, problem
 	}
 	appended := append([]PublishedWheel{published.ProjectWheel}, published.Wheels...)

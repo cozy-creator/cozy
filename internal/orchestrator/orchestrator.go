@@ -128,10 +128,11 @@ type RentalPackageSetSource func([]*pb.DownloadPackageRef,
 // this rental. The pod host relays them verbatim to the Runtime's preparation,
 // which refuses a call without them.
 type PrepareFacts struct {
-	Application        string
-	ModelSlotPaths     []string
-	ImageInventory     *pb.ImageInventory
-	LockedRequirements []byte
+	PythonRequires, PythonVersion string
+	Application                   string
+	ModelSlotPaths                []string
+	ImageInventory                *pb.ImageInventory
+	LockedRequirements            []byte
 }
 
 // RentalPrepareFactsSource answers one package release's facts for one rental.

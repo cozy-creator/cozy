@@ -23,7 +23,7 @@ type CapturedDependency struct {
 
 // CaptureWheelDependencies retains the selected dependency bytes without
 // rebuilding the caller or inventing a source project for any wheel library.
-func CaptureWheelDependencies(ctx context.Context, tree, project, installed, stage string, selected map[string]map[string]string) (map[string]CapturedDependency, *exit.Error) {
+func CaptureWheelDependencies(ctx context.Context, tree, project, installed, stage string, selected map[string]map[string]string, targetPython ...string) (map[string]CapturedDependency, *exit.Error) {
 	metadata, problem := readProjectDocument(filepath.Join(tree, "pyproject.toml"))
 	if problem != nil {
 		return nil, problem
@@ -38,7 +38,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 			wanted[name] = version
 		}
 	}
-	existing, _, _, problem := collectLocalDependencies(ctx, tree, metadata, stage)
+	existing, _, _, problem := collectLocalDependencies(ctx, tree, metadata, stage, targetPython...)
 	if problem != nil {
 		return nil, problem
 	}
@@ -57,7 +57,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 	if err != nil {
 		return nil, exit.New(exit.Validation, "captured wheel dependencies have no uv.lock")
 	}
-	rows, _, problem := CapturedRegistryRows(raw, PinnedClosure(wanted), project, pins[project], existing)
+	rows, _, problem := CapturedRegistryRows(raw, PinnedClosure(wanted), project, pins[project], existing, targetPython...)
 	if problem != nil {
 		return nil, problem
 	}

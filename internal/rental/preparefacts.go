@@ -95,7 +95,7 @@ func PrepareFactsFromView(view hub.PrepareFactsView, pkg, release string,
 		return refuse("%s", err)
 	}
 	return orchestrator.PrepareFacts{
-		Application:        view.Application,
+		PythonRequires: view.PythonRequires, PythonVersion: view.PythonVersion, Application: view.Application,
 		ModelSlotPaths:     append([]string(nil), view.ModelSlotPaths...),
 		ImageInventory:     inventory,
 		LockedRequirements: []byte(view.LockedRequirements),
@@ -111,9 +111,10 @@ func ImageInventory(raw json.RawMessage) (*pb.ImageInventory, error) {
 		return nil, fmt.Errorf("the rental's image has no registered inventory")
 	}
 	var doc struct {
-		Format        string `json:"format"`
-		Profile       string `json:"profile"`
-		Python        string `json:"python"`
+		Format        string                  `json:"format"`
+		Profile       string                  `json:"profile"`
+		Python        string                  `json:"python"`
+		Interpreters  []*pb.PythonInterpreter `json:"interpreters"`
 		Distributions []struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
@@ -137,7 +138,7 @@ func ImageInventory(raw json.RawMessage) (*pb.ImageInventory, error) {
 		return nil, fmt.Errorf("image inventory's %d distributions exceed the wire bound %d",
 			len(doc.Distributions), pb.MaxImageInventoryDistributions)
 	}
-	inventory := &pb.ImageInventory{Profile: doc.Profile, Python: doc.Python}
+	inventory := &pb.ImageInventory{Profile: doc.Profile, Python: doc.Python, Interpreters: doc.Interpreters}
 	for _, row := range doc.Distributions {
 		if row.Name == "" || row.Version == "" {
 			return nil, fmt.Errorf("image inventory carries an unnamed or unversioned distribution")

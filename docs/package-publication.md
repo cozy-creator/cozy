@@ -118,3 +118,19 @@ Worker protocol `Private*` names, stable `private_*` error codes, persisted capt
 and historical database fields retain their serialized spellings for existing workers
 and requests. New code and explanations use the publication terminology. Private rentals
 and access controls continue to mean private access.
+
+## Selected Python interpreter
+
+Runtime owns the `cozy.python-interpreters/1` response: its supported execution
+window and measured standard CPython executors (executable, exact patch, ABI).
+Creator reads this ephemeral response; it is neither persisted as a document
+nor assigned a content digest. Public release finalization sends the selected
+`python_version` separately from the author's broad `Requires-Python` metadata.
+Hub retains that selection in the release environment and returns it in download
+plans and preparation facts. Before renting, Creator requires the captured
+version and ABI to appear in the SKU's measured executor inventory.
+
+The production image may advertise only Python 3.12. A local 3.13 or 3.14
+capture cannot rent that image; additional executors must already be present
+and advertised. Interface generator ABI 7 declares Python >=3.12, independently
+of the Runtime execution window.

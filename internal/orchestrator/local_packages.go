@@ -249,7 +249,7 @@ func localSelection(operationID string, revision localpackage.Revision) (
 		return nil, nil, exit.Named(exit.Structural, "local_package_revision_invalid",
 			"local package revision is incomplete")
 	}
-	selected := &pb.DesiredLocalPackageSet{OperationId: operationID, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
+	selected := &pb.DesiredLocalPackageSet{PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, OperationId: operationID, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
 		Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release,
 			SourceDigest: source}}
 	localDigest, _ := canonical.Raw(revision.Digest)
@@ -787,7 +787,7 @@ func cloneLocalPackageSet(in *pb.DesiredLocalPackageSet) *pb.DesiredLocalPackage
 	if in == nil {
 		return nil
 	}
-	out := &pb.DesiredLocalPackageSet{OperationId: in.OperationId, DependencyRequirements: append([]byte(nil), in.DependencyRequirements...)}
+	out := &pb.DesiredLocalPackageSet{PythonRequires: in.PythonRequires, PythonVersion: in.PythonVersion, OperationId: in.OperationId, DependencyRequirements: append([]byte(nil), in.DependencyRequirements...)}
 	if in.Package != nil {
 		out.Package = &pb.DevelopmentPackage{Package: in.Package.Package,
 			Release: in.Package.Release, SourceDigest: append([]byte(nil), in.Package.SourceDigest...),

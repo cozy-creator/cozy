@@ -83,6 +83,7 @@ type PackageReleaseDetail struct {
 	PackageInterface      json.RawMessage `json:"package_interface"`
 	ExecutionRequirements []string        `json:"requirements"`
 	RequiresPython        string          `json:"requires_python"`
+	PythonVersion         string          `json:"python_version"`
 }
 
 // Requirements returns the immutable execution dependencies from the exact
@@ -139,6 +140,7 @@ type PackageInstallDownload struct {
 }
 
 type PackageDownloadPlan struct {
+	PythonVersion    string                   `json:"python_version"`
 	Downloads        []PackageInstallDownload `json:"downloads"`
 	PackageConfig    ExactDocument            `json:"package_config"`
 	PackageInterface ExactDocument            `json:"package_interface"`
@@ -169,15 +171,19 @@ func (c *Client) DeclarePackageRelease(ctx context.Context, ref Ref, release str
 }
 
 func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release string,
-	publicationID string, registry []PackageRegistryRow, reason string,
+	publicationID string, registry []PackageRegistryRow, reason string, pythonVersion ...string,
 ) (PackageReleaseCommit, *exit.Error) {
 	if registry == nil {
 		registry = []PackageRegistryRow{}
 	}
+	body := map[string]any{"publication_id": publicationID, "registry": registry}
+	if len(pythonVersion) > 0 && pythonVersion[0] != "" {
+		body["python_version"] = pythonVersion[0]
+	}
 	var out PackageReleaseCommit
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packagePublishPath(ref, release) + "/finalize", auth: true, reason: reason,
-		body:    map[string]any{"publication_id": publicationID, "registry": registry},
+		body:    body,
 		patient: true, strict: true}, &out)
 	return out, e
 }

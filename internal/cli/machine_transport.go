@@ -107,7 +107,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		stream, err := host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
 			Claim: claim, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
 			Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
-			ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
+			PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion, ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
 		})
 		if err != nil {
 			return nil, machineTransport(err)
@@ -369,7 +369,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		prepared, err := preparation.PreparePackageSet(ctx, &pb.PreparePackageSetRequest{
 			InstallRoot: filepath.Join(root, "environments"), DownloadDelegation: downloads,
 			Application: facts.PackageInterface.Application, LockedRequirements: locked,
-			ModelSlotPaths: spec.Preparation.ModelSlotPaths,
+			PythonRequires: spec.Preparation.PythonRequires, PythonVersion: spec.Preparation.PythonVersion, ModelSlotPaths: spec.Preparation.ModelSlotPaths,
 		})
 		if err != nil {
 			return nil, machineTransport(err)
@@ -399,7 +399,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		if problem != nil {
 			return problem
 		}
-		request := &pb.PrepareLocalPackageRequest{OperationId: selected.OperationId, Package: selected.Package, DependencyRequirements: append([]byte(nil), selected.DependencyRequirements...), InstallRoot: filepath.Join(root, "environments")}
+		request := &pb.PrepareLocalPackageRequest{PythonRequires: selected.PythonRequires, PythonVersion: selected.PythonVersion, OperationId: selected.OperationId, Package: selected.Package, DependencyRequirements: append([]byte(nil), selected.DependencyRequirements...), InstallRoot: filepath.Join(root, "environments")}
 		if info.SupportsLocalInstallationReuse {
 			for _, file := range revision.Files {
 				digest, _ := canonical.Raw(file.Digest)

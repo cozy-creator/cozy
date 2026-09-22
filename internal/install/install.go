@@ -51,6 +51,7 @@ type LocalSource struct {
 }
 
 type PublishedSource struct {
+	PythonVersion string
 	Bytes         int64
 	Files         int
 	Package       string

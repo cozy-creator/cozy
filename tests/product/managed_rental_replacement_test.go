@@ -22,7 +22,7 @@ import (
 func replacementRequest(t *testing.T, store *records.Store, id, worker string) {
 	t.Helper()
 	_, _, problem := store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: "sha256:" + strings.Repeat("7", 64),
-		Package: "proof/source-producer", Entrypoint: "convert", Kind: "job", Rental: true, Worker: worker, Payload: []byte("{}"), Outputs: "[]", WeightsOutputs: "[]",
+		Package: "proof/source-producer", Release: "1", Entrypoint: "convert", Kind: "job", Rental: true, Worker: worker, Payload: []byte("{}"), Outputs: "[]", WeightsOutputs: "[]",
 		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Destination: "proof/model", Source: "hf://proof/source@" + strings.Repeat("1", 40), SourceSelection: "sha256:" + strings.Repeat("2", 64), SourceProfiles: map[string]string{"input": "source-profile"}, SourceFiles: []records.ModelTransferSourceFile{{Member: "index.json", SHA256: strings.Repeat("3", 64), Length: 2, Header: []byte("{}")}}, Outputs: []records.ModelTransferOutput{{Name: "model"}}}})
 	fatal(t, problem)
 }
@@ -116,6 +116,7 @@ func TestLostOnlyRentalReacquiresForTheSameSourceJob(t *testing.T) {
 	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	peer := newFakeRentalHub(t, port)
+	peer.packageReleases = map[string]any{"proof/source-producer@1": rentalReleaseFacts()}
 	peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1, "price_usd_micros_per_hour": 100000, "base_worker_profile": "python3.12-cpu-linux-x86"})
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)

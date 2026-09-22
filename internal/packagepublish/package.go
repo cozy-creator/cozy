@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -34,6 +35,7 @@ var projectNameSeparator = regexp.MustCompile(`[-_.]+`)
 // Package is the local input to one begin/upload/finalize operation. Tensorhub
 // computes identities and package facts after the bytes arrive.
 type Package struct {
+	PythonVersion          string
 	Files                  map[string]string // source-relative path -> local path
 	PackageInterface       string
 	Wheel                  string
@@ -130,6 +132,11 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 			return problem
 		}
 	}
+	python, problem := hostruntime.ProjectPython(ctx, p.Tree)
+	if problem != nil {
+		return problem
+	}
+	p.PythonVersion = python.Version
 	root, err := os.MkdirTemp("", "cozy-package-publish-")
 	if err != nil {
 		return exit.Internalf("cannot create package publication staging: %s", err)
@@ -137,7 +144,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 	p.Root = root
 	// Declared-metadata refusals and dependency staging run before the project
 	// wheel build, so a doomed publication is refused before the expensive work.
-	dependencies, needsRegistry, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root)
+	dependencies, needsRegistry, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root, python.Executable)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
@@ -175,7 +182,11 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 // module or package. A backend left to guess a flat layout can emit a wheel holding
 // nothing but .dist-info; that wheel would fail on a rented pod, so it fails here.
 func projectWheel(ctx context.Context, tree, out, name, release string) (string, *exit.Error) {
-	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out})
+	python, problem := hostruntime.ProjectPython(ctx, tree)
+	if problem != nil {
+		return "", problem
+	}
+	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out, Python: python.Executable})
 	if problem != nil {
 		return "", problem
 	}

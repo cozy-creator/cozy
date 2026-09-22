@@ -15,6 +15,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/rentalid"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The RENTAL routes (cl-015, on th-042's product surface). The hub owns the pod: it
@@ -374,10 +375,11 @@ type RentalSKU struct {
 	// requirements the label already contradicts is refused before the paid ask. It is
 	// deliberately NOT validated: a spelling this client cannot read means one fewer
 	// pre-spend check, never an unrentable catalog.
-	BaseWorkerProfile  string `json:"base_worker_profile"`
-	ComputeCapability  string `json:"compute_capability"`
-	VRAMGB             int64  `json:"vram_gb"`
-	MinimumRAMPerGPUGB int64  `json:"minimum_ram_per_gpu_gb"`
+	PythonInterpreters []*pb.PythonInterpreter `json:"python_interpreters"`
+	BaseWorkerProfile  string                  `json:"base_worker_profile"`
+	ComputeCapability  string                  `json:"compute_capability"`
+	VRAMGB             int64                   `json:"vram_gb"`
+	MinimumRAMPerGPUGB int64                   `json:"minimum_ram_per_gpu_gb"`
 	// PriceUSDMicrosPerHour is the GPU list rate — the unit the hub's offer
 	// matching and replan cap run on, and the accepted quote this client locks.
 	PriceUSDMicrosPerHour int64 `json:"price_usd_micros_per_hour"`
@@ -587,6 +589,8 @@ func (c *Client) Release(ctx context.Context, id, reason string) *exit.Error {
 // The inventory is the placed image's registered tensorhub.image_inventory/1
 // document, untouched by this client.
 type PrepareFactsView struct {
+	PythonRequires     string          `json:"python_requires"`
+	PythonVersion      string          `json:"python_version"`
 	Application        string          `json:"application"`
 	ModelSlotPaths     []string        `json:"model_slot_paths"`
 	ImageInventory     json.RawMessage `json:"image_inventory"`

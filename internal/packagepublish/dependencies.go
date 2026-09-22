@@ -14,6 +14,7 @@ import (
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -80,16 +81,23 @@ type dependencyCollector struct {
 	count    int
 	registry bool
 	scanOnly bool
+	python   string
+	root     string
 }
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
 
-func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
+func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string, targetPython ...string) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
 	canonical, problem := canonicalLocalPath(root)
 	if problem != nil {
 		return nil, false, nil, problem
 	}
+	python := ""
+	if len(targetPython) > 0 {
+		python = targetPython[0]
+	}
 	collector := &dependencyCollector{
+		python: python, root: root,
 		ctx: ctx, stage: stage, byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
 		stack: map[string]bool{canonical: true},
 	}
@@ -246,7 +254,14 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	if c.scanOnly {
 		return nil
 	}
-	built, problem := wheel.Build(wheel.Request{Context: c.ctx, Tree: canonical, OutDir: out})
+	if c.python == "" {
+		selected, problem := hostruntime.ProjectPython(c.ctx, c.root)
+		if problem != nil {
+			return problem
+		}
+		c.python = selected.Executable
+	}
+	built, problem := wheel.Build(wheel.Request{Context: c.ctx, Tree: canonical, OutDir: out, Python: c.python})
 	if problem != nil {
 		return problem
 	}

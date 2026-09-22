@@ -349,7 +349,9 @@ FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.package.", "cozy.runtime.", "t
                          "tensorfs.", "cozytensors")
 # Runtime owns this deterministic wheel generator ABI. Creator checks returned
 # metadata; it neither authors a new document nor defines the generator format.
-FOREIGN_ABI_TAGS = {"cozy.interface-generator/5", "cozy.interface-generator/6"}
+FOREIGN_ABI_TAGS = {"cozy.interface-generator/5", "cozy.interface-generator/6", "cozy.interface-generator/7"}
+# Runtime authors this ephemeral measured executor response; Creator only reads it.
+FOREIGN_DOCUMENT_KINDS = {"cozy.python-interpreters/1"}
 KIND_READERS: dict[str, set[str]] = {}
 # No trailing quote: a domain-separation tag is a PREFIX inside a longer literal — it ends
 # in `\x00` or `\n`, and requiring the close quote made both of this repo's tags invisible
@@ -365,7 +367,7 @@ def check_document_kinds():
         rel = p.as_posix()
         for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
             for kind in KIND_LITERAL.findall(line):
-                if kind.startswith(FOREIGN_KIND_PREFIXES) or kind in FOREIGN_ABI_TAGS:
+                if kind.startswith(FOREIGN_KIND_PREFIXES) or kind in FOREIGN_ABI_TAGS or kind in FOREIGN_DOCUMENT_KINDS:
                     continue
                 owner = DOCUMENT_KINDS.get(kind) or HMAC_DOMAINS.get(kind)
                 if owner is None:

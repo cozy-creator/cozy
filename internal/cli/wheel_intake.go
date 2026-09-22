@@ -57,7 +57,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	if err != nil {
 		return exit.Internalf("cannot capture selected callable wheels")
 	}
-	captured, problem := packagepublish.CaptureWheelDependencies(ctx, parent.Install.SourceRef, i.Package.Name, parent.Install.Closure, stage, graph)
+	captured, problem := packagepublish.CaptureWheelDependencies(ctx, parent.Install.SourceRef, i.Package.Name, parent.Install.Closure, stage, graph, parent.Install.Python)
 	if problem != nil {
 		return problem
 	}

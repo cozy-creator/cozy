@@ -334,7 +334,10 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
 	// ONE READING OF THE RELEASE for both halves of the decision: a machine already up and
 	// a machine that would be bought are held to the same declared degrees (cl-179).
-	constraints, _ := RentalConstraints(m.ctx, req)
+	constraints, constraintProblem := RentalConstraints(m.ctx, req)
+	if constraintProblem != nil {
+		return none, "", constraintProblem
+	}
 	attached, problem := m.attachedLocked(req, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
@@ -1172,8 +1175,7 @@ func settledRequest(state string) bool {
 }
 
 // RentalConstraints reads the selected local install or published release's immutable
-// requirements and interface. Automatic selection preserves its advisory fallback
-// on unavailable facts; explicit rental selection requires them before submission.
+// requirements and interface. Missing facts refuse selection before spending.
 func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *exit.Error) {
 	var out rental.Constraints
 	var declared *launch.PackageInterface
@@ -1197,6 +1199,7 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 			return out, problem
 		}
 		out.Requirements, out.RequiresPython = selection.Requirements, selection.RequiresPython
+		out.PythonVersion = installed.Python
 		declared, _ = launch.ReadPackageInterface(launch.PackageInterfacePath(installed.Dir), installed.PackageInterface)
 	} else {
 		if req.Package == "" || req.Release == "" {
@@ -1217,8 +1220,12 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
 		out.Requirements, out.RequiresPython = requirements, requiresPython
+		out.PythonVersion = detail.PythonVersion
 		declared, _ = launch.DecodePackageInterface(detail.PackageInterface)
 	}
+	// Rental admission is about the remote inventory. A client may have no Runtime
+	// or a different installed Python set; local capture already bound its exact
+	// interpreter above and published releases carry their own immutable selection.
 	// Both sources apply the requested function's declared intersection. An unreadable
 	// interface declares no width, so wide products remain excluded rather than guessed.
 	if declared != nil {
@@ -1244,7 +1251,15 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	if problem != nil {
 		return problem
 	}
-	requirements, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, inventory.Python)
+	policy := [][]string{}
+	if constraints.SupportedPythonMinors != nil {
+		policy = append(policy, constraints.SupportedPythonMinors)
+	}
+	selected, reason := launch.InventoryPython(inventory, constraints.RequiresPython, constraints.PythonVersion, policy...)
+	if reason != "" {
+		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
+	}
+	requirements, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, selected)
 	if problem != nil {
 		return problem
 	}

@@ -70,18 +70,13 @@ func CaptureIdentity(ctx context.Context, pack *packagepublish.Package) (*Captur
 	if !ok {
 		return input, nil
 	}
-	python := exec.CommandContext(ctx, "uv", "python", "find", "--system", "--no-python-downloads")
-	python.Dir, python.Env = current.Tree, env
-	raw, err := python.Output()
-	if err != nil {
-		return input, nil
+	selected, problem := hostruntime.ProjectPython(ctx, current.Tree)
+	if problem != nil {
+		return nil, problem
 	}
-	pythonPath := strings.TrimSpace(string(raw))
-	version := strings.TrimSpace(runOut(pythonPath, "-I", "-S", "-V"))
-	if !strings.HasPrefix(version, "Python 3.12.") {
-		return input, nil
-	}
-	input.Python, input.Extra = strings.TrimPrefix(version, "Python "), extra
+	pythonPath := selected.Executable
+	version := "Python " + selected.Version
+	input.Python, input.Extra = selected.Version, extra
 	uv, err := exec.LookPath("uv")
 	if err != nil {
 		return input, nil
@@ -115,7 +110,7 @@ func CaptureIdentity(ctx context.Context, pack *packagepublish.Package) (*Captur
 		}
 	}
 	sort.Strings(doc.Environment)
-	raw, _ = json.Marshal(doc)
+	raw, _ := json.Marshal(doc)
 	input.Key = captureDigest(raw)
 	return input, nil
 }
@@ -163,10 +158,10 @@ func CaptureSDKIdentity(command string) (string, bool) {
 	if version == "" {
 		version = metadata["version"]
 	}
-	if version != "3.12" && !strings.HasPrefix(version, "3.12.") {
+	if hostruntime.PythonMinor(version) == "" {
 		return "", false
 	}
-	site := filepath.Join(prefix, "lib", "python3.12", "site-packages")
+	site := filepath.Join(prefix, "lib", "python"+hostruntime.PythonMinor(version), "site-packages")
 	runtimes, err := filepath.Glob(filepath.Join(site, "cozy_runtime-*.dist-info"))
 	if err != nil || len(runtimes) != 1 {
 		return "", false

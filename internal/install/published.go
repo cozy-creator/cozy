@@ -70,6 +70,11 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 			return nil, empty, "", nil, exit.Internalf("cannot retain exact %s: %s", name, err)
 		}
 	}
+	if published.PythonVersion != "" {
+		if err := os.WriteFile(filepath.Join(sourceDir, ".python-version"), []byte(published.PythonVersion+"\n"), 0o400); err != nil {
+			return nil, empty, "", nil, exit.Internalf("cannot retain published Python selection: %s", err)
+		}
+	}
 	packageInterfacePath := launch.PackageInterfacePath(installDir)
 	if err := os.MkdirAll(filepath.Dir(packageInterfacePath), 0o700); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot create package interface directory: %s", err)

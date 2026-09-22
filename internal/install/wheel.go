@@ -38,7 +38,12 @@ func HasInstalledApplications(python, installed, project string, ignored map[str
 	if len(pins) == 0 {
 		return false, nil
 	}
-	site := filepath.Join(filepath.Dir(filepath.Dir(python)), "lib", "python3.12", "site-packages")
+	prefix := filepath.Dir(filepath.Dir(python))
+	version := pythonVersion(prefix)
+	if version == "" {
+		return false, exit.New(exit.Conflict, "selected Python environment metadata is unavailable")
+	}
+	site := filepath.Join(prefix, "lib", "python"+hostruntime.PythonMinor(version), "site-packages")
 	entries, err := os.ReadDir(site)
 	if err != nil {
 		return false, exit.New(exit.Conflict, "selected Python environment metadata is unavailable")

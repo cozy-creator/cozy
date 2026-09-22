@@ -21,6 +21,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -85,7 +86,11 @@ func collectRegistryRows(ctx context.Context, project, stage, organization strin
 		return nil, exit.Named(exit.Structural, "registry_dependency_export_invalid",
 			"uv export did not produce a non-empty pylock.toml at or below %d B", maxLockBytes)
 	}
-	return RegistryRowsFromLock(raw, existing, organization)
+	selected, problem := hostruntime.ProjectPython(ctx, project)
+	if problem != nil {
+		return nil, problem
+	}
+	return RegistryRowsFromLock(raw, existing, organization, selected.Version)
 }
 
 // orgIndexNamespace answers the org namespace when raw is one hub org index —
@@ -106,7 +111,7 @@ func orgIndexNamespace(raw string) string {
 
 // RegistryRowsFromLock retains every selected dependency, including framework
 // and accelerator distributions. Tensorhub fetches public references directly.
-func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization string) ([]RegistryRow, *exit.Error) {
+func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization string, targetPython ...string) ([]RegistryRow, *exit.Error) {
 	var lock registryLock
 	if err := toml.Unmarshal(raw, &lock); err != nil || lock.LockVersion != "1.0" {
 		return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
@@ -120,7 +125,7 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 		marked = marked || pkg.Marker != ""
 	}
 	if marked {
-		selection, problem := readActiveRequirements(context.Background(), map[string]any{"markers": markers, "python": "3.12.0"})
+		selection, problem := readActiveRequirements(context.Background(), map[string]any{"markers": markers, "python": selectedPythonVersion(targetPython)})
 		if problem != nil {
 			return nil, problem
 		}
@@ -159,7 +164,7 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 				"%s==%s is locked to neither a supported public index nor this package's own org index",
 				name, pkg.Version)
 		}
-		candidate, problem := selectRegistryWheel(name, pkg)
+		candidate, problem := selectRegistryWheel(name, pkg, targetPython...)
 		if problem != nil {
 			return nil, problem
 		}
@@ -169,12 +174,12 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 		// install serves it from the plan exactly like any registry wheel.
 		var digest string
 		if pytorchRow {
-			candidate, problem = pytorchRegistryWheel(name, pkg.Version, pkg.Index, pkg.Wheels)
+			candidate, problem = pytorchRegistryWheel(name, pkg.Version, pkg.Index, pkg.Wheels, targetPython...)
 			digest = candidate.Hashes["sha256"]
 		} else if orgRow {
-			digest, problem = orgIndexWheelIdentity(name, pkg.Version, organization, candidate)
+			digest, problem = orgIndexWheelIdentity(name, pkg.Version, organization, candidate, targetPython...)
 		} else {
-			digest, problem = registryWheelIdentity(name, pkg.Version, candidate)
+			digest, problem = registryWheelIdentity(name, pkg.Version, candidate, targetPython...)
 		}
 		if problem != nil {
 			return nil, problem
@@ -203,11 +208,11 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 // registryWheelIdentity is the whole per-row discipline, minus the transfer:
 // bounded sha256/size identity and the exact files.pythonhosted.org origin
 // shape. Tensorhub re-runs the same checks and then hashes what it fetched.
-func registryWheelIdentity(name, version string, selected registryWheel) (string, *exit.Error) {
-	return registryWheelIdentityBound(name, version, selected, MaxRegistryWheelBytes)
+func registryWheelIdentity(name, version string, selected registryWheel, targetPython ...string) (string, *exit.Error) {
+	return registryWheelIdentityBound(name, version, selected, MaxRegistryWheelBytes, targetPython...)
 }
 
-func registryWheelIdentityBound(name, version string, selected registryWheel, maxBytes int64) (string, *exit.Error) {
+func registryWheelIdentityBound(name, version string, selected registryWheel, maxBytes int64, targetPython ...string) (string, *exit.Error) {
 	digest := selected.Hashes["sha256"]
 	if selected.Size <= 0 || selected.Size > maxBytes || len(digest) != 64 {
 		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
@@ -228,7 +233,7 @@ func registryWheelIdentityBound(name, version string, selected registryWheel, ma
 		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
 			"%s==%s does not name one safe wheel basename", name, version)
 	}
-	if pure, score := classifyWheelFilename(filename); !pure && score < 0 {
+	if pure, score := classifyWheelFilename(filename, targetPython...); !pure && score < 0 {
 		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
 			"%s==%s does not name one wheel installable on the platform target", name, version)
 	}
@@ -240,7 +245,7 @@ func registryWheelIdentityBound(name, version string, selected registryWheel, ma
 // /v1/index/<org>/files/<sha256hex>/<filename>, whose path digest IS the
 // wheel's sha256. The index page advertises no size, so the lock's 0 is legal
 // here and the hub's committed claim supplies the length at declare.
-func orgIndexWheelIdentity(name, version, organization string, selected registryWheel) (string, *exit.Error) {
+func orgIndexWheelIdentity(name, version, organization string, selected registryWheel, targetPython ...string) (string, *exit.Error) {
 	digest := selected.Hashes["sha256"]
 	if len(digest) != 64 || strings.ToLower(digest) != digest || selected.Size < 0 || selected.Size > MaxRegistryWheelBytes {
 		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
@@ -268,29 +273,23 @@ func orgIndexWheelIdentity(name, version, organization string, selected registry
 		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
 			"%s==%s does not name one safe wheel basename", name, version)
 	}
-	if pure, score := classifyWheelFilename(filename); !pure && score < 0 {
+	if pure, score := classifyWheelFilename(filename, targetPython...); !pure && score < 0 {
 		return "", exit.Named(exit.Validation, "registry_dependency_wheel_invalid",
 			"%s==%s does not name one wheel installable on the platform target", name, version)
 	}
 	return digest, nil
 }
 
-// The fleet's ONE platform target (th-107): CPython 3.12 on linux x86_64,
-// manylinux capped at the oldest fleet libc (glibc 2.36, python:3.12-slim-
-// bookworm; the CUDA bases and dev machines carry 2.39). A pure py3-none-any
-// wheel is universal and stays first choice; a native wheel is selected only
-// when no pure wheel exists. Tensorhub re-runs the same admission on the
-// declared rows and on the fetched wheel's exact WHEEL metadata.
-const (
-	targetPythonMinor = 12
-	targetGlibcMinor  = 36
-)
+// Artifact selection uses the captured CPython minor on Linux x86_64 and
+// caps manylinux at the oldest fleet libc, glibc 2.36. Pure wheels remain the
+// first choice; native wheels must match the selected executor's ABI.
+const targetGlibcMinor = 36
 
 // selectRegistryWheel picks the lock row wheel to publish: the pure wheel when
 // one exists (URL tie-break for determinism), otherwise the best admissible
 // native wheel under standard PEP 425 preference — more specific python tag
 // wins, newest manylinux wins.
-func selectRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit.Error) {
+func selectRegistryWheel(name string, pkg registryPackage, targetPython ...string) (registryWheel, *exit.Error) {
 	var pure []registryWheel
 	best, bestScore := registryWheel{}, -1
 	for _, candidate := range pkg.Wheels {
@@ -302,7 +301,7 @@ func selectRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit
 		if err != nil {
 			continue
 		}
-		isPure, score := classifyWheelFilename(base)
+		isPure, score := classifyWheelFilename(base, targetPython...)
 		if isPure {
 			pure = append(pure, candidate)
 		}
@@ -318,7 +317,7 @@ func selectRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit
 		return best, nil
 	}
 	refusal, detail := "registry_dependency_platform_mismatch",
-		"has no py3-none-any or cp312 manylinux x86_64 wheel"
+		"has no manylinux x86_64 wheel for Python "+selectedPythonVersion(targetPython)
 	if len(pkg.Wheels) == 0 && pkg.Sdist != nil {
 		refusal, detail = "registry_dependency_source_only", "is available only as source"
 	}
@@ -330,9 +329,10 @@ func selectRegistryWheel(name string, pkg registryPackage) (registryWheel, *exit
 // classifyWheelFilename reads a PEP 427 wheel filename's compressed tag sets.
 // pure reports a universal py3-none-any wheel; score is the best admissible
 // native triple's rank (-1 when none): python/abi specificity dominates
-// (cp312-cp312 > cp3N-abi3 > cp312-none > py312 > py3 > older py3N), the
+// (exact CPython ABI, stable ABI, interpreter-specific then generic tags), the
 // manylinux glibc floor breaks ties.
-func classifyWheelFilename(filename string) (pure bool, score int) {
+func classifyWheelFilename(filename string, targetPython ...string) (pure bool, score int) {
+	targetMinor := selectedPythonMinor(targetPython)
 	score = -1
 	stem, found := strings.CutSuffix(strings.ToLower(filename), ".whl")
 	parts := strings.Split(stem, "-")
@@ -343,14 +343,14 @@ func classifyWheelFilename(filename string) (pure bool, score int) {
 		for _, abi := range strings.Split(parts[len(parts)-2], ".") {
 			for _, platform := range strings.Split(parts[len(parts)-1], ".") {
 				if platform == "any" {
-					pure = pure || abi == "none" && universalPythonTag(python)
+					pure = pure || abi == "none" && universalPythonTag(python, targetMinor)
 					continue
 				}
 				glibc, ok := manylinuxGlibcMinor(platform)
 				if !ok {
 					continue
 				}
-				if rank, ok := pythonABIRank(python, abi); ok && rank*1000+glibc > score {
+				if rank, ok := pythonABIRank(python, abi, targetMinor); ok && rank*1000+glibc > score {
 					score = rank*1000 + glibc
 				}
 			}
@@ -359,10 +359,11 @@ func classifyWheelFilename(filename string) (pure bool, score int) {
 	return pure, score
 }
 
-func pythonABIRank(python, abi string) (int, bool) {
+func pythonABIRank(python, abi string, targetPythonMinor int) (int, bool) {
+	targetABI := "cp3" + strconv.Itoa(targetPythonMinor)
 	switch abi {
-	case "cp312":
-		if python == "cp312" {
+	case targetABI:
+		if python == targetABI {
 			return 400, true
 		}
 	case "abi3":
@@ -371,7 +372,7 @@ func pythonABIRank(python, abi string) (int, bool) {
 		}
 	case "none":
 		switch {
-		case python == "cp312":
+		case python == targetABI:
 			return 200, true
 		case python == "py3":
 			return 112, true
@@ -388,9 +389,10 @@ func pythonABIRank(python, abi string) (int, bool) {
 }
 
 // universalPythonTag recognizes the python tags a pure any-platform wheel may
-// carry for CPython 3.12: py3, py3N at or below the target minor, or cp312.
-func universalPythonTag(python string) bool {
-	if python == "py3" || python == "cp312" {
+// carry for the selected interpreter: py3, older py3N, or the exact CPython tag.
+func universalPythonTag(python string, targetPythonMinor int) bool {
+	targetABI := "cp3" + strconv.Itoa(targetPythonMinor)
+	if python == "py3" || python == targetABI {
 		return true
 	}
 	minor, ok := pythonTagMinor(python, "py")
@@ -436,4 +438,24 @@ func manylinuxGlibcMinor(platform string) (int, bool) {
 		return 0, false
 	}
 	return minor, true
+}
+
+// Legacy callers default to 3.12; production capture always supplies its observed
+// interpreter. This is an artifact target, not the Runtime supported policy.
+func selectedPythonVersion(values []string) string {
+	if len(values) > 0 && values[0] != "" {
+		return values[0]
+	}
+	return "3.12.0"
+}
+func selectedPythonMinor(values []string) int {
+	parts := strings.Split(selectedPythonVersion(values), ".")
+	if len(parts) < 2 || parts[0] != "3" {
+		return -1
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return -1
+	}
+	return minor
 }

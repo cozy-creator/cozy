@@ -174,3 +174,15 @@ func TestSameSpecStorageAdderLeavesRankingUnchanged(t *testing.T) {
 		t.Fatalf("selected %+v; want l4 by total (703504 < 780000)", sku)
 	}
 }
+
+// rentalReleaseFacts supplies immutable facts for lifecycle fixtures that never
+// reach package preparation. The interface identity is still validated normally.
+func rentalReleaseFacts() hub.PackageReleaseDetail {
+	raw := []byte(`{"format":"cozy.package.interface/1"}`)
+	sum := sha256.Sum256(raw)
+	detail := hub.PackageReleaseDetail{PackageInterface: raw, ExecutionRequirements: []string{}, RequiresPython: ">=3.12"}
+	detail.Release.Release = "1"
+	detail.Release.PackageInterfaceDigest = "sha256:" + hex.EncodeToString(sum[:])
+	detail.Release.PackageInterfaceLength = int64(len(raw))
+	return detail
+}

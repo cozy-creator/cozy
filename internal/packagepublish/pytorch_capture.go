@@ -14,7 +14,7 @@ var pytorchIndexPath = regexp.MustCompile(`^/whl/(cpu|cu[0-9]{3}|rocm[0-9]+\.[0-
 
 // Official framework wheels retain their exact URL and hash in each private
 // environment. Runtime fetches them through bounded public artifact storage.
-func pytorchRegistryWheel(name, version, index string, wheels []registryWheel) (registryWheel, *exit.Error) {
+func pytorchRegistryWheel(name, version, index string, wheels []registryWheel, targetPython ...string) (registryWheel, *exit.Error) {
 	refuse := func() (registryWheel, *exit.Error) {
 		return registryWheel{}, exit.Named(exit.Conflict, "base_dependency_origin_unsupported", "base dependency %s has no exact supported official PyTorch wheel", name)
 	}
@@ -42,7 +42,7 @@ func pytorchRegistryWheel(name, version, index string, wheels []registryWheel) (
 			return registryWheel{}, exit.Named(exit.Conflict, "base_dependency_hash_invalid", "base dependency %s has no exact SHA-256 wheel hash", name)
 		}
 	}
-	selected, problem := selectRegistryWheel(name, registryPackage{Name: name, Version: version, Wheels: wheels})
+	selected, problem := selectRegistryWheel(name, registryPackage{Name: name, Version: version, Wheels: wheels}, targetPython...)
 	if problem != nil {
 		return registryWheel{}, problem
 	}

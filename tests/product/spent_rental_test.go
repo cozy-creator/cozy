@@ -34,6 +34,7 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			origin := fmt.Sprintf("http://127.0.0.1:%d", port)
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 			peer := newFakeRentalHub(t, port)
+			peer.packageReleases = map[string]any{"proof/source-producer@1": rentalReleaseFacts()}
 			peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1, "price_usd_micros_per_hour": 100000, "base_worker_profile": "python3.12-cpu-linux-x86"})
 			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)

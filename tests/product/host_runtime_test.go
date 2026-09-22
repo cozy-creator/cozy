@@ -24,7 +24,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtimes are POSIX shell scripts")
 	}
-	install := fmt.Sprintf("Python 3.12 supporting cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)
+	install := fmt.Sprintf("supporting cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)
 
 	// (a) An older minor cannot serve: `cozy up` refuses under the tool's own words, and
 	// `cozy run` — which starts the same daemon — answers the same code instead of queuing.
@@ -38,7 +38,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 		t.Fatalf("an older host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyPath(t, root, path, "up"); code == 0 ||
-		!strings.Contains(out, "Try: install a coherent cozy-runtime build for "+install) {
+		!strings.Contains(out, "Try: install a coherent cozy-runtime build "+install) {
 		t.Fatalf("the human form of the refusal lost its remedy [exit %d]\n%s", code, out)
 	}
 	code, out = runCozyPath(t, root, path, "run", "fake/older/generate", "prompt=fox", "--json")
