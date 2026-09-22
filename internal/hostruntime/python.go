@@ -20,6 +20,7 @@ import (
 // PythonInventory reads the installed Runtime's versioned policy and actual
 // executors. The control interpreter does not determine package compatibility.
 type PythonInventory struct {
+	ManagedRoot         string              `json:"managed_root"`
 	Format              string              `json:"format"`
 	ProvisionableMinors []string            `json:"provisionable_minors"`
 	SupportedMinors     []string            `json:"supported_minors"`
@@ -32,7 +33,7 @@ type PythonInterpreter struct {
 }
 
 func PythonExecutors(ctx context.Context) (PythonInventory, *exit.Error) {
-	env := config.Frozen().Tool()
+	env := pythonEnvironment()
 	bin, problem := Path(env)
 	if problem != nil {
 		return PythonInventory{}, problem
@@ -49,8 +50,8 @@ func PythonExecutors(ctx context.Context) (PythonInventory, *exit.Error) {
 	}
 	err = cmd.Wait()
 	var inventory PythonInventory
-	if err != nil || readErr != nil || len(raw) > 1<<20 || json.Unmarshal(raw, &inventory) != nil || len(inventory.SupportedMinors) == 0 || inventory.Format != "cozy.python-interpreters/1" {
-		return inventory, exit.Named(exit.Structural, "python_window_unavailable", "installed Runtime cannot report its supported Python executor window").WithRemedy("upgrade cozy-runtime and retry")
+	if err != nil || readErr != nil || len(raw) > 1<<20 || json.Unmarshal(raw, &inventory) != nil || !filepath.IsAbs(inventory.ManagedRoot) || len(inventory.SupportedMinors) == 0 || inventory.Format != "cozy.python-interpreters/1" {
+		return inventory, exit.Named(exit.Structural, "python_window_unavailable", "installed Runtime cannot report its supported Python executors and owned root").WithRemedy("upgrade cozy-runtime and retry")
 	}
 	return inventory, nil
 }
@@ -124,7 +125,7 @@ func ProjectPython(ctx context.Context, directory string) (PythonInterpreter, *e
 // EnsurePython delegates selection and missing-interpreter provisioning to the
 // same Runtime policy used on rented workers. Exact captured patches stay exact.
 func EnsurePython(ctx context.Context, requires, explicit string) (PythonInterpreter, *exit.Error) {
-	env := config.Frozen().Tool()
+	env := pythonEnvironment()
 	bin, problem := Path(env)
 	if problem != nil {
 		return PythonInterpreter{}, problem
@@ -170,4 +171,15 @@ func EnsurePython(ctx context.Context, requires, explicit string) (PythonInterpr
 	// Validate the returned identity without duplicating Runtime's version window.
 	inventory := PythonInventory{SupportedMinors: []string{PythonMinor(selected.Version)}, Interpreters: []PythonInterpreter{selected}}
 	return inventory.Select(requires, explicit)
+}
+
+// Python CLI tools and local serving belong to the same Creator home, even
+// though serve has a separate working-state home beneath it. Runtime owns the
+// interpreter subdirectory; Creator only supplies its configured product home.
+func pythonEnvironment() []string {
+	cfg := config.Frozen()
+	if cfg.Home == "" {
+		return cfg.Tool()
+	}
+	return cfg.Tool("COZY_HOME=" + cfg.Home)
 }
