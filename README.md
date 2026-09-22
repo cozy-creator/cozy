@@ -37,7 +37,7 @@ is unusable until upgraded; advancing the window is an explicit Runtime release 
 Install the host Runtime with its supported Python interpreter:
 
 ```sh
-uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]'
+uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=0.18.14'
 cozy-runtime version
 ```
 

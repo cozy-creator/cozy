@@ -20,9 +20,9 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Floor preserves the required static metadata and isolated preparation behavior.
+// Floor is the first release with shared on-demand Python provisioning (python-ensure).
 // WireFloor independently checks the installed execution ownership capability.
-const Floor = "0.18.0"
+const Floor = "0.18.14"
 
 // WireFloor covers the native Context/TensorFS surface and published captures.
 // Root native inputs require their newer capability at the call site.
@@ -32,8 +32,8 @@ var floor = pep440.MustParse(Floor)
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
 var hostRuntimeInstall = fmt.Sprintf(
-	"install a coherent cozy-runtime build supporting %s+minor.%d or newer, then retry",
-	wirePackage(), WireFloor)
+	"install cozy-runtime %s or newer supporting %s+minor.%d or newer: uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=%s' — then retry",
+	Floor, wirePackage(), WireFloor, Floor)
 
 func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }
 
@@ -123,7 +123,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
-			"cozy-runtime %s is release %s; this Cozy needs %s or newer to read the native Context/TensorFS package surface",
+			"cozy-runtime %s is release %s; this Cozy needs %s or newer to provision package Python through python-ensure",
 			path, answer.Distribution, Floor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
