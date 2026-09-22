@@ -48,7 +48,7 @@ func TestRuntimeFixtureRefusesMissingOrMutableProvenance(t *testing.T) {
 	for _, commit := range []string{"", "unknown", "HEAD", "v0.4.0", "not-a-commit!"} {
 		t.Run(fmt.Sprintf("commit_%q", commit), func(t *testing.T) {
 			bin := t.TempDir()
-			answer, err := json.Marshal(map[string]any{"distribution": hostruntime.Floor, "wire_protocol": fmt.Sprintf("cozy.worker.v1+minor.%d", pb.WireMinor), "commit": commit})
+			answer, err := json.Marshal(map[string]any{"distribution": hostruntime.ToolFloor, "wire_protocol": fmt.Sprintf("cozy.worker.v1+minor.%d", pb.WireMinor), "commit": commit})
 			must(t, err)
 			// An independently executable peer passes normal wire qualification but
 			// has no immutable source authority. The fixture must stop before Git/build.
@@ -67,7 +67,7 @@ func TestRuntimeFixtureRefusesMissingOrMutableProvenance(t *testing.T) {
 func runtimeFixtureVersion(t *testing.T, wheel string) string {
 	t.Helper()
 	if wheel == "" {
-		return hostruntime.Floor
+		return hostruntime.PackageFloor
 	}
 	parts := strings.Split(filepath.Base(wheel), "-")
 	if len(parts) < 3 || parts[0] != "cozy_runtime" || parts[1] == "" || !strings.HasSuffix(wheel, ".whl") {

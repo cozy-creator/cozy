@@ -1,7 +1,7 @@
 package producttest
 
 // cl-175 — package code is untrusted; analysis never executes it. Every reading of a package's
-// surface is THIS host's cozy-runtime (>= hostruntime.Floor) parsing source: at publish
+// surface is THIS host's cozy-runtime (>= hostruntime.ToolFloor) parsing source: at publish
 // pre-flight, at install, and for a job's descriptor id. So a package whose module imports
 // torch at the top installs and publishes on a host whose package environment has no torch —
 // the fixture's venv is `cozy-runtime[media]` and this test adds nothing to it. A second

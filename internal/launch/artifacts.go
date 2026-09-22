@@ -55,7 +55,7 @@ func InstallToolEnv(inst records.PackageInstall, env []string) []string {
 // RuntimeCLI invokes one cozy-runtime binary against a named local root. Every question this
 // host asks the runtime goes through here, so there is one place that knows how to invoke it
 // and one place that renders its refusals. A metadata question goes to THIS host's tool
-// (hostruntime.Path, at or above hostruntime.Floor): package code is untrusted and a reading of it
+// (hostruntime.Path, at or above hostruntime.ToolFloor): package code is untrusted and a reading of it
 // never imports it (cl-175). The install's own Runtime (Binary) is asked only for the
 // interface wheel its executor consumes.
 type RuntimeCLI struct {

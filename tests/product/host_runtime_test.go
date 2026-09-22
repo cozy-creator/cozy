@@ -38,7 +38,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 		t.Fatalf("an older host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozyPath(t, root, path, "up"); code == 0 ||
-		!strings.Contains(out, "Try: install a coherent cozy-runtime build "+install) {
+		!strings.Contains(out, "Try: install cozy-runtime "+hostruntime.ToolFloor+" or newer "+install) {
 		t.Fatalf("the human form of the refusal lost its remedy [exit %d]\n%s", code, out)
 	}
 	code, out = runCozyPath(t, root, path, "run", "fake/older/generate", "prompt=fox", "--json")
@@ -52,7 +52,7 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	code, out = runCozyPath(t, root, path, "up", "--json")
 	refusal = refusalOf(t, out)
 	if code == 0 || refusal.Code != "host_runtime_below_floor" ||
-		!strings.Contains(refusal.Message, "release 0.4.0; this Cozy needs "+hostruntime.Floor+" or newer") ||
+		!strings.Contains(refusal.Message, "release 0.4.0; this Cozy needs "+hostruntime.ToolFloor+" or newer") ||
 		!strings.Contains(refusal.Remedy, install) {
 		t.Fatalf("a host tool below the describe floor did not refuse `cozy up` by name [exit %d]\n%s", code, out)
 	}
@@ -120,7 +120,9 @@ func TestHostRuntimeNativeAPIFloor(t *testing.T) {
 	}{
 		{"old-api", "0.17.2", "host_runtime_below_floor", 54},
 		{"old-wire", "0.18.0", "host_runtime_wire_mismatch", 53},
-		{"native", "0.18.0", "", 54},
+		{"no-python-ensure", "0.18.13", "host_runtime_below_floor", 58},
+		{"native", "0.18.14", "", 58},
+		{"source-dev", "0.18.14+dev.h687ee141", "", 58},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			root, path := hostRuntimeRoot(t, "native-floor-"+arm.name, stubRuntime(t, arm.release, arm.minor))

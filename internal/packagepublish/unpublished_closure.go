@@ -157,7 +157,7 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 		return problem
 	}
 	p.DependencyRequirements = RegistryRequirements(rows)
-	requirements = append(requirements, "cozy-runtime>="+hostruntime.Floor)
+	requirements = append(requirements, "cozy-runtime>="+hostruntime.PackageFloor)
 	sort.Strings(requirements)
 	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
 	if problem := wheel.PinDependencies(p.Wheel, sealed, requirements); problem != nil {

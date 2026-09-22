@@ -128,7 +128,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 			exact = append(exact, name+"=="+dependency.Version)
 		}
 	}
-	exact = append(exact, "cozy-runtime>="+hostruntime.Floor)
+	exact = append(exact, "cozy-runtime>="+hostruntime.PackageFloor)
 	sort.Strings(exact)
 	executablePath := filepath.Join(dir, "wheels", filepath.Base(original))
 	if problem := wheel.PinDependencies(original, executablePath, exact); problem != nil {
