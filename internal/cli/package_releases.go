@@ -86,7 +86,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	problem = packagePublishStage(ctx, "Committing exact package release", func() *exit.Error {
 		var finalProblem *exit.Error
 		done, finalProblem = c.CommitPackageRelease(hctx, ref, release,
-			draft.PublicationID, registry, reason)
+			draft.PublicationID, registry, reason, pack.PythonVersion)
 		return finalProblem
 	})
 	if problem != nil {

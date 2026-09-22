@@ -90,7 +90,7 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 		}
 		defer modelScratch.Release()
 		bestEffortDefaultModels(hctx, ctx, modelScratch.Path,
-			&install.PublishedSource{Package: ref.String(), Release: release,
+			&install.PublishedSource{PythonVersion: plan.PythonVersion, Package: ref.String(), Release: release,
 				PackageConfig: packageConfig,
 				Selection:     install.Selection{PackageInterface: packageInterface}}, result)
 		return result, nil, nil
@@ -192,7 +192,7 @@ func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
 	}
 	published := &install.PublishedSource{
-		Package: ref.String(), Release: release,
+		PythonVersion: plan.PythonVersion, Package: ref.String(), Release: release,
 		PackageConfig: packageConfig,
 		Pyproject:     pyproject,
 		UVLock:        uvLock,

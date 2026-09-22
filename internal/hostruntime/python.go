@@ -89,7 +89,7 @@ func (inventory PythonInventory) Select(requires, explicit string) (PythonInterp
 	})
 	for _, candidate := range candidates {
 		version, e := pep440.Parse(candidate.Version)
-		if e != nil || !supported[PythonMinor(candidate.Version)] || !filepath.IsAbs(candidate.Executable) || !bounds.Check(version) {
+		if e != nil || !supported[PythonMinor(candidate.Version)] || !filepath.IsAbs(candidate.Executable) || candidate.ABI != "cp"+strings.ReplaceAll(PythonMinor(candidate.Version), ".", "") || !bounds.Check(version) {
 			continue
 		}
 		if explicit != "" && candidate.Version != explicit && PythonMinor(candidate.Version) != explicit {

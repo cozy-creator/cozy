@@ -9,7 +9,7 @@ jobs:
         tests: ['^Test[A-H]', '^Test[I-O]', '^Test[P-Q]', '^Test[R-Z]']
     env:
       UV_TORCH_BACKEND: cpu
-      COZY_RUNTIME_SOURCE: 0144ddb7bab32877db7f89edbac4aad3036a3d64
+      COZY_RUNTIME_SOURCE: 13442660bc500f62c0ba75116c3cb3da596773f2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -18,7 +18,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           version: '0.12.11'
-      - run: uv python install 3.12
+      - run: uv python install 3.12 3.13 3.14
       - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
       - name: Check out the exact Runtime execution peer
         uses: actions/checkout@v4

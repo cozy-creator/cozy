@@ -1222,6 +1222,7 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
 		out.Requirements, out.RequiresPython = requirements, requiresPython
+		out.PythonVersion = detail.PythonVersion
 		declared, _ = launch.DecodePackageInterface(detail.PackageInterface)
 	}
 	inventory, problem := hostruntime.PythonExecutors(context.Background())

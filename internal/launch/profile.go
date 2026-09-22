@@ -104,6 +104,9 @@ func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected stri
 		if candidate == nil {
 			return "", "the rental image reports an invalid Python executor"
 		}
+		if len(inventory.Interpreters) > 0 && candidate.Abi != "cp"+strings.ReplaceAll(hostruntime.PythonMinor(candidate.Version), ".", "") {
+			return "", "the rental image reports an incompatible Python ABI"
+		}
 		if _, err := pep440.Parse(candidate.Version); err != nil {
 			return "", "the rental image reports an invalid Python version"
 		}

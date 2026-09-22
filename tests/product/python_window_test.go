@@ -85,3 +85,12 @@ func TestRentalPythonAdmissionUsesAvailableExecutors(t *testing.T) {
 		t.Fatalf("multi-interpreter base rejected before rental: %+v", candidates)
 	}
 }
+
+func TestRentalPythonAdmissionRefusesUnmeasuredOrWrongABI(t *testing.T) {
+	for _, executors := range [][]*pb.PythonInterpreter{nil, {{Version: "3.13.11", Abi: "cp312"}}, {{Version: "3.13.11", Abi: "cp313t"}}} {
+		candidates := rental.Purchases([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", BaseWorkerProfile: "python3.13-cpu-linux-x86", PythonInterpreters: executors}}, nil, false, true, rental.Constraints{RequiresPython: ">=3.12", PythonVersion: "3.13.11"})
+		if len(candidates) != 1 || candidates[0].Verdict == "" {
+			t.Fatalf("unmeasured or mismatched executor admitted: %+v", executors)
+		}
+	}
+}

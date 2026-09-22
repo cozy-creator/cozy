@@ -182,6 +182,9 @@ func baseMismatch(sku hub.RentalSKU, constraints Constraints) string {
 		}
 		return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + reason
 	}
+	if constraints.PythonVersion != "" {
+		return orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": image does not report the captured Python executor"
+	}
 	profile, readable := launch.ParseBaseProfile(sku.BaseWorkerProfile)
 	if !readable {
 		return ""
