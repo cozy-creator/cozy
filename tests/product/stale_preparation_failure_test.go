@@ -21,6 +21,8 @@ import (
 
 // Hold the peer's preparation answer while another observation takes ownership of
 // the request. Its late refusal must not undo execution or destroy retained input.
+// Even an aborted dispatch advances the ordinal and supersedes the old preparation;
+// its new selection may fail later, but the old waiter cannot settle it.
 func TestLatePreparationFailureRespectsAttemptOwnership(t *testing.T) {
 	for _, phase := range []string{"queued", "dispatch_aborted", "accepted", "terminal", "closed"} {
 		t.Run(phase, func(t *testing.T) {
@@ -104,9 +106,13 @@ func TestLatePreparationFailureRespectsAttemptOwnership(t *testing.T) {
 			before, problem := o.store.RequestRow(id)
 			fatal(t, problem)
 			unblock()
+			completion := "preparation selection changed; discarding its result"
+			if phase == "queued" {
+				completion = "FAILED before any offer"
+			}
 			waitUntil(t, "late preparation waiter answered", func() bool {
 				body, _ := os.ReadFile(filepath.Join(o.root, "orchestrator.log"))
-				return strings.Contains(string(body), "FAILED before any offer") || strings.Contains(string(body), "preparation failure no longer applies")
+				return strings.Contains(string(body), id+" "+completion)
 			})
 			after, problem := o.store.RequestRow(id)
 			fatal(t, problem)
@@ -120,7 +126,7 @@ func TestLatePreparationFailureRespectsAttemptOwnership(t *testing.T) {
 					failures++
 				}
 			}
-			if phase == "queued" || phase == "dispatch_aborted" {
+			if phase == "queued" {
 				if after.State != "failed" || transfer.State != "failed" || failures != 1 || transfer.ErrorCode != "placement_config_refused" {
 					t.Fatalf("preoffer failure not atomic: request=%s transfer=%+v failures=%d", after.State, transfer, failures)
 				}
@@ -130,7 +136,7 @@ func TestLatePreparationFailureRespectsAttemptOwnership(t *testing.T) {
 				})
 			} else {
 				expectedTransfer := "pending"
-				if phase != "accepted" {
+				if phase == "terminal" || phase == "closed" {
 					expectedTransfer = "finalizing"
 				}
 				if after.State != before.State || transfer.State != expectedTransfer || failures != 0 || releases.Load() != 0 {
@@ -156,6 +162,48 @@ func TestLatePreparationFailureRespectsAttemptOwnership(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Aborted dispatch history is not an open execution. A preparation captured after
+// that abort can still fail the request, while the preceding selection cannot.
+func TestQueuedPreparationFailureAfterAbortedDispatch(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	const id = "job-preparation-after-abort"
+	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "worker-preparation-after-abort",
+		Package: "proof/producer", WorkerID: "worker", Devices: []string{"cpu"}}))
+	original, _, problem := store.Submit(records.Request{ID: id, IdemKey: id,
+		Package: "proof/producer", Entrypoint: "quantize", Kind: "job", Payload: []byte("{}"),
+		BodyDigest: "sha256:" + strings.Repeat("a", 64), ModelTransfer: outputPublicationSubmission().ModelTransfer})
+	fatal(t, problem)
+	ordinal, problem := store.Dispatch(records.Attempt{RequestID: id, SessionID: podBootID,
+		InstanceID: "worker-preparation-after-abort", InvocationDigest: "sha256:" + strings.Repeat("b", 64),
+		InvocationCanonical: []byte("{}")})
+	fatal(t, problem)
+	fatal(t, store.AbortDispatch(id, ordinal, podBootID, "no offer crossed"))
+	current, problem := store.RequestRow(id)
+	fatal(t, problem)
+	payload := map[string]any{"error_type": "placement_config_refused", "error": "current preparation refused"}
+	applied, problem := store.FailQueuedPreparation(original, payload)
+	fatal(t, problem)
+	if applied {
+		t.Fatal("pre-abort preparation settled the newer ordinal")
+	}
+	applied, problem = store.FailQueuedPreparation(*current, payload)
+	fatal(t, problem)
+	if !applied {
+		t.Fatal("current preparation could not settle an aborted dispatch")
+	}
+	row, problem := store.RequestRow(id)
+	fatal(t, problem)
+	transfer, problem := store.ModelTransferOf(id)
+	fatal(t, problem)
+	events, problem := store.EventsAfter(id, 0, 100)
+	fatal(t, problem)
+	if row.State != "failed" || row.Ordinal != ordinal || transfer.State != "failed" || transfer.ErrorCode != "placement_config_refused" || len(events) != 1 || events[0].Type != "request.failed" {
+		t.Fatalf("current failure not atomic: request=%+v transfer=%+v events=%+v", row, transfer, events)
 	}
 }
 
