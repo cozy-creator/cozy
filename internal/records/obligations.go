@@ -97,6 +97,12 @@ func (s *Store) ClientShutdownObligations() ([]Obligation, *exit.Error) {
 
 	var held []Obligation
 	for _, obligation := range all {
+		if obligation.Kind == "attempt" && obligation.State == "terminal" {
+			// The outcome is already durable. Its remaining acknowledgement is
+			// replayable after reconnect and does not require execution online.
+			// Active transfers and controls remain separate shutdown obligations.
+			continue
+		}
 		if obligation.Kind == "rental" || obligation.Kind == "output_export" && obligation.State == "pending" {
 			// An idle rental or deferred output contract owns durable resources,
 			// but no current client-side copy. Active exporters are fenced below.
