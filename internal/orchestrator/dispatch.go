@@ -881,6 +881,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				return true
 			}
 			if current == nil || (current.State != "queued" && current.State != "submitted") || current.Worker != req.Worker || current.Ordinal != req.Ordinal || current.ControlRevision != req.ControlRevision {
+				c.logf("%s preparation selection changed; discarding its result", req.ID)
 				done()
 				c.reviveQueue()
 				return true

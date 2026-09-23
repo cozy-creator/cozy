@@ -143,6 +143,9 @@ func TestStaleRentalResolutionCannotFailReplacement(t *testing.T) {
 	o.c.RecoverLostWork()
 	waitUntil(t, "the same request pins replacement", func() bool { row, _ := o.store.RequestRow(id); return row != nil && row.Worker == "rental-new" })
 	once.Do(func() { close(release) })
+	if _, ok := waitEvent(o, "preparation selection changed; discarding its result", 5*time.Second); !ok {
+		t.Fatal("old resolver result did not finish without settling the replacement")
+	}
 	if _, ok := waitEvent(o, "replacement is preparing", 5*time.Second); !ok {
 		t.Fatal("replacement did not retain the queue")
 	}

@@ -443,7 +443,7 @@ func (c *RentalUpdateCmd) Run(r *Runtime) error {
 }
 
 type RentalNewCmd struct {
-	Development    *bool    `help:"Use a maintenance-capable private worker (default); false selects an immutable worker."`
+	Development    *bool    `help:"Enable SSH maintenance access on the selected worker image (default); false disables it."`
 	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
 	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
