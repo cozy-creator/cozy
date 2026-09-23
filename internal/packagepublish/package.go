@@ -2,6 +2,8 @@
 package packagepublish
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +17,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
@@ -39,6 +42,7 @@ type Package struct {
 	Files                  map[string]string // source-relative path -> local path
 	PackageInterface       string
 	Wheel                  string
+	SourceArchive          string
 	DependencyWheels       []DependencyWheel
 	DependencyRequirements []byte
 	Vendored               []VendoredDependency // auto-vendored local deps, for the publish nudge (th-113)
@@ -172,9 +176,77 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 		p.Root = ""
 		return problem
 	}
-	p.Wheel, p.PackageInterface, p.DependencyWheels, p.Registry = project, packageInterface, dependencies, registry
+	sourceArchive := ""
+	if publish {
+		sourceArchive, err = sourceArchiveFile(root, p.Name, p.Release, p.Files)
+		if err != nil {
+			p.Close()
+			p.Root = ""
+			return exit.Named(exit.Structural, "package_source_archive_failed", "cannot create deterministic source archive: %v", err)
+		}
+	}
+	p.Wheel, p.SourceArchive, p.PackageInterface, p.DependencyWheels, p.Registry = project, sourceArchive, packageInterface, dependencies, registry
 	p.Vendored = vendored
 	return nil
+}
+
+// sourceArchiveFile writes one deterministic, regular-file-only source
+// distribution. It is the public inspection artifact; package metadata remains
+// uploaded separately so workers can consume exact bytes without unpacking it.
+func sourceArchiveFile(root, name, release string, files map[string]string) (string, error) {
+	path := filepath.Join(root, name+"-"+release+".tar.gz")
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", err
+	}
+	gz := gzip.NewWriter(out)
+	gz.Header.ModTime = time.Unix(0, 0)
+	gz.Header.Name = ""
+	tarWriter := tar.NewWriter(gz)
+	for _, relative := range Paths(files) {
+		input, err := os.Open(files[relative])
+		if err != nil {
+			_ = tarWriter.Close()
+			_ = gz.Close()
+			_ = out.Close()
+			return "", err
+		}
+		info, err := input.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			_ = input.Close()
+			_ = tarWriter.Close()
+			_ = gz.Close()
+			_ = out.Close()
+			if err == nil {
+				err = fmt.Errorf("%s is not a regular file", relative)
+			}
+			return "", err
+		}
+		header := &tar.Header{Name: filepath.ToSlash(relative), Mode: 0o644, Size: info.Size(), ModTime: time.Unix(0, 0), Typeflag: tar.TypeReg}
+		if err := tarWriter.WriteHeader(header); err == nil {
+			_, err = io.Copy(tarWriter, input)
+		}
+		_ = input.Close()
+		if err != nil {
+			_ = tarWriter.Close()
+			_ = gz.Close()
+			_ = out.Close()
+			return "", err
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		_ = gz.Close()
+		_ = out.Close()
+		return "", err
+	}
+	if err := gz.Close(); err != nil {
+		_ = out.Close()
+		return "", err
+	}
+	if err := out.Close(); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // projectWheel builds the tree's own wheel and refuses one a worker could not run:

@@ -147,15 +147,13 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	}, "package", "release", "status"))
 }
 
-// packageFiles measures the ordinary package file tree used for upload grants.
-// Registry dependencies remain external environment facts and are never uploaded.
+// packageFiles measures the PyPI-shaped release: one project wheel, one source
+// archive, exact install metadata, and any locally vendored dependency wheels.
+// Registry dependencies remain external lock facts and are never uploaded.
 func packageFiles(pack *packagepublish.Package) (
 	[]hub.PackageDeclaredFile, []hub.PackageRegistryRow, map[string]string, *exit.Error,
 ) {
 	locals := map[string]string{}
-	for path, local := range pack.Files {
-		locals[path] = local
-	}
 	add := func(path, local string) *exit.Error {
 		if _, exists := locals[path]; exists {
 			return exit.Named(exit.Conflict, "package_file_path_conflict",
@@ -168,8 +166,25 @@ func packageFiles(pack *packagepublish.Package) (
 	if problem := add(projectPath, pack.Wheel); problem != nil {
 		return nil, nil, nil, problem
 	}
+	if pack.SourceArchive == "" {
+		return nil, nil, nil, exit.Internalf("package build produced no source archive")
+	}
+	sourcePath := "artifacts/source/" + filepath.Base(pack.SourceArchive)
+	if problem := add(sourcePath, pack.SourceArchive); problem != nil {
+		return nil, nil, nil, problem
+	}
 	if problem := add("metadata/package-interface.json", pack.PackageInterface); problem != nil {
 		return nil, nil, nil, problem
+	}
+	for _, name := range []string{"package.toml", "pyproject.toml", "uv.lock"} {
+		local, ok := pack.Files[name]
+		if !ok {
+			return nil, nil, nil, exit.Named(exit.Structural, "package_source_required_file_missing",
+				"prepared package source has no %s", name)
+		}
+		if problem := add(name, local); problem != nil {
+			return nil, nil, nil, problem
+		}
 	}
 	for _, dependency := range pack.DependencyWheels {
 		path := "artifacts/dependencies/" + dependency.Filename

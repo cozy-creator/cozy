@@ -120,6 +120,14 @@ func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 	if !committed {
 		t.Fatal("CLI did not commit")
 	}
+	if _, ok := uploaded["artifacts/source/cozy-weightless-package-1.0.0.tar.gz"]; !ok {
+		t.Fatal("publication did not upload the deterministic source archive")
+	}
+	for name := range uploaded {
+		if strings.HasPrefix(name, "src/") || strings.HasSuffix(name, ".py") {
+			t.Fatalf("publication uploaded loose source file %q", name)
+		}
+	}
 	var metadata string
 	for name, body := range uploaded {
 		if !strings.HasPrefix(name, "artifacts/project/") {
