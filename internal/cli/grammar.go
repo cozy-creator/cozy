@@ -443,13 +443,12 @@ func (c *RentalUpdateCmd) Run(r *Runtime) error {
 }
 
 type RentalNewCmd struct {
-	Development      *bool    `help:"Use a maintenance-capable private worker (default); false selects an immutable worker."`
-	SSHPublicKey     string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
-	DevelopmentImage string   `name:"development-image" help:"Pin one registered developer image by sha256 digest for this rental."`
-	SKU              string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
-	Models           []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
-	IdempotencyKey   string   `help:"Stable paid-operation identity."`
-	Timeout          string   `help:"Caller wait deadline; does not release the rental."`
+	Development    *bool    `help:"Use a maintenance-capable private worker (default); false selects an immutable worker."`
+	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
+	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
+	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
+	IdempotencyKey string   `help:"Stable paid-operation identity."`
+	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
 }
 
 type RentalPruneCmd struct {
@@ -466,7 +465,7 @@ func (c *RentalNewCmd) Run(r *Runtime) error {
 		flags["--development"] = *c.Development
 	}
 	return r.call(handleRent, []string{c.SKU}, flags, values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey, "--development-image", c.DevelopmentImage), false)
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
 }
 
 type RentalEndCmd struct {
