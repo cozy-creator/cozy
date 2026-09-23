@@ -10,12 +10,24 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/pelletier/go-toml/v2"
 )
+
+// pythonEnsureCache avoids asking cozy-runtime to resolve the same project
+// interpreter more than once in one Creator process. Publication needs the
+// selected interpreter for dependency staging and wheel construction; both
+// phases use the same requirement. A cached entry is accepted only while its
+// executable still exists, so an external interpreter cleanup is observed on
+// the next call rather than turning into a stale success.
+var pythonEnsureCache = struct {
+	sync.Mutex
+	entries map[string]PythonInterpreter
+}{entries: map[string]PythonInterpreter{}}
 
 // PythonInventory reads the installed Runtime's versioned policy and actual
 // executors. The control interpreter does not determine package compatibility.
@@ -125,6 +137,12 @@ func ProjectPython(ctx context.Context, directory string) (PythonInterpreter, *e
 // EnsurePython delegates selection and missing-interpreter provisioning to the
 // same Runtime policy used on rented workers. Exact captured patches stay exact.
 func EnsurePython(ctx context.Context, requires, explicit string) (PythonInterpreter, *exit.Error) {
+	if err := ctx.Err(); err != nil {
+		if err == context.DeadlineExceeded {
+			return PythonInterpreter{}, exit.Named(exit.Deadline, "python_provision_deadline", "Python preparation deadline exceeded")
+		}
+		return PythonInterpreter{}, exit.Named(exit.Canceled, "python_provision_canceled", "Python preparation canceled: %s", err)
+	}
 	env := pythonEnvironment()
 	bin, problem := Path(env)
 	if problem != nil {
@@ -133,6 +151,16 @@ func EnsurePython(ctx context.Context, requires, explicit string) (PythonInterpr
 	if strings.TrimSpace(requires) == "" {
 		requires = ">=0"
 	}
+	cacheKey := requires + "\x00" + explicit
+	pythonEnsureCache.Lock()
+	if selected, ok := pythonEnsureCache.entries[cacheKey]; ok {
+		if info, statErr := os.Stat(selected.Executable); statErr == nil && info.Mode().IsRegular() {
+			pythonEnsureCache.Unlock()
+			return selected, nil
+		}
+		delete(pythonEnsureCache.entries, cacheKey)
+	}
+	pythonEnsureCache.Unlock()
 	args := []string{"--json", "python-ensure", requires}
 	if explicit != "" {
 		args = append(args, explicit)
@@ -170,7 +198,14 @@ func EnsurePython(ctx context.Context, requires, explicit string) (PythonInterpr
 	}
 	// Validate the returned identity without duplicating Runtime's version window.
 	inventory := PythonInventory{SupportedMinors: []string{PythonMinor(selected.Version)}, Interpreters: []PythonInterpreter{selected}}
-	return inventory.Select(requires, explicit)
+	selected, problem = inventory.Select(requires, explicit)
+	if problem != nil {
+		return PythonInterpreter{}, problem
+	}
+	pythonEnsureCache.Lock()
+	pythonEnsureCache.entries[cacheKey] = selected
+	pythonEnsureCache.Unlock()
+	return selected, nil
 }
 
 // Python CLI tools and local serving belong to the same Creator home, even

@@ -23,6 +23,8 @@ import (
 var immutablePackageVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 
 func handlePackagePublish(ctx *Context) *exit.Error {
+	publishStarted := time.Now()
+	timings := newPackagePublishTimings()
 	pack, problem := packagepublish.Prepare()
 	if problem != nil {
 		return problem
@@ -42,7 +44,9 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 
 	hctx, cancel := hub.LongContext()
 	defer cancel()
+	lookupStarted := time.Now()
 	detail, lookupProblem := c.PackageRelease(hctx, ref, release)
+	timings.measure("release_lookup", lookupStarted)
 	if lookupProblem == nil {
 		if detail.Release.Release != release {
 			return exit.Internalf("package lookup returned release %q, want %q",
@@ -58,32 +62,38 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	if lookupProblem.Code != exit.NotFound {
 		return lookupProblem
 	}
-	if problem := packagePublishStage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
+	if problem := timings.stage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
 		return pack.BuildForPublish(hctx)
 	}); problem != nil {
 		return problem
 	}
+	filesStarted := time.Now()
 	declared, registry, locals, problem := packageFiles(pack)
+	timings.measure("file_digesting", filesStarted)
 	if problem != nil {
 		return problem
 	}
 	packagePublishStatus(ctx, "Declaring %d files and %d registry rows...",
 		len(declared), len(registry))
+	declareStarted := time.Now()
 	draft, problem := c.DeclarePackageRelease(hctx, ref, release, declared, reason)
+	timings.measure("declaration", declareStarted)
 	if problem != nil {
 		return problem
 	}
 	if draft.PublicationID == "" {
 		return exit.Internalf("package declaration returned no publication id")
 	}
+	uploadStarted := time.Now()
 	var moved int64
 	moved, problem = uploadPackageFiles(hctx, declared, locals, draft.Files,
 		packageUploadCounter(ctx))
+	timings.measure("object_upload", uploadStarted)
 	if problem != nil {
 		return problem
 	}
 	var done hub.PackageReleaseCommit
-	problem = packagePublishStage(ctx, "Committing exact package release", func() *exit.Error {
+	problem = timings.stage(ctx, "Committing exact package release", func() *exit.Error {
 		var finalProblem *exit.Error
 		done, finalProblem = c.CommitPackageRelease(hctx, ref, release,
 			draft.PublicationID, registry, reason, pack.PythonVersion)
@@ -105,12 +115,14 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		return exit.Internalf("package commit returned publication id %q, want %q",
 			done.PublicationID, draft.PublicationID)
 	}
+	timings.finish(publishStarted)
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
 		{K: "status", V: "published"}, {K: "changed", V: true},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
+		{K: "timings", V: *timings},
 	}
-	record := compactRecord(fields, "package", "release", "status")
+	record := compactRecord(fields, "package", "release", "status", "timings")
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
