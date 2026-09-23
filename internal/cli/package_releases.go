@@ -159,7 +159,7 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	}, "package", "release", "status"))
 }
 
-// packageFiles measures the PyPI-shaped release: one project wheel, one source
+// packageFiles measures the PyPI-shaped release: one or more project wheels, one source
 // archive, exact install metadata, and any locally vendored dependency wheels.
 // Registry dependencies remain external lock facts and are never uploaded.
 func packageFiles(pack *packagepublish.Package) (
@@ -174,9 +174,18 @@ func packageFiles(pack *packagepublish.Package) (
 		locals[path] = local
 		return nil
 	}
-	projectPath := "artifacts/project/" + filepath.Base(pack.Wheel)
-	if problem := add(projectPath, pack.Wheel); problem != nil {
-		return nil, nil, nil, problem
+	projectWheels := pack.ProjectWheels
+	if len(projectWheels) == 0 && pack.Wheel != "" {
+		projectWheels = []string{pack.Wheel}
+	}
+	if len(projectWheels) == 0 {
+		return nil, nil, nil, exit.Internalf("package build produced no project wheels")
+	}
+	for _, wheel := range projectWheels {
+		projectPath := "artifacts/project/" + filepath.Base(wheel)
+		if problem := add(projectPath, wheel); problem != nil {
+			return nil, nil, nil, problem
+		}
 	}
 	if pack.SourceArchive == "" {
 		return nil, nil, nil, exit.Internalf("package build produced no source archive")

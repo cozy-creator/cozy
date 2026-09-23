@@ -40,6 +40,7 @@ type Package struct {
 	Files                  map[string]string // source-relative path -> local path
 	PackageInterface       string
 	Wheel                  string
+	ProjectWheels          []string
 	SourceArchive          string
 	DependencyWheels       []DependencyWheel
 	DependencyRequirements []byte
@@ -152,7 +153,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 		p.Root = ""
 		return problem
 	}
-	project, problem := projectWheel(ctx, p.Tree, root, p.Name, p.Release, python.Executable)
+	projects, problem := projectWheels(ctx, p.Tree, root, p.Name, p.Release, python.Executable)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
@@ -186,7 +187,9 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 		}
 		sourceArchive = archive.Path
 	}
-	p.Wheel, p.SourceArchive, p.PackageInterface, p.DependencyWheels, p.Registry = project, sourceArchive, packageInterface, dependencies, registry
+	p.ProjectWheels = projects
+	p.Wheel = projects[0]
+	p.SourceArchive, p.PackageInterface, p.DependencyWheels, p.Registry = sourceArchive, packageInterface, dependencies, registry
 	p.Vendored = vendored
 	return nil
 }
@@ -195,41 +198,55 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 // its identity must come from [project], and it must install at least one Python
 // module or package. A backend left to guess a flat layout can emit a wheel holding
 // nothing but .dist-info; that wheel would fail on a rented pod, so it fails here.
-func projectWheel(ctx context.Context, tree, out, name, release, python string) (string, *exit.Error) {
+func projectWheel(ctx context.Context, tree, out, name, release string, python string) (string, *exit.Error) {
+	paths, problem := projectWheels(ctx, tree, out, name, release, python)
+	if problem != nil {
+		return "", problem
+	}
+	return paths[0], nil
+}
+
+func projectWheels(ctx context.Context, tree, out, name, release string, python string) ([]string, *exit.Error) {
 	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out, Python: python})
 	if problem != nil {
-		return "", problem
+		return nil, problem
 	}
-	fact, problem := wheel.InspectIdentity(built.Path)
-	if problem != nil {
-		return "", problem
+	paths := built.Paths
+	if len(paths) == 0 {
+		paths = []string{built.Path}
 	}
-	if name != fact.Distribution || release != fact.Version {
-		return "", exit.Named(exit.Validation, "project_metadata_mismatch",
-			"pyproject.toml declares %s==%s but the built wheel declares %s==%s",
-			name, release, fact.Distribution, fact.Version).
-			WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
+	for _, path := range paths {
+		fact, problem := wheel.InspectIdentity(path)
+		if problem != nil {
+			return nil, problem
+		}
+		if name != fact.Distribution || release != fact.Version {
+			return nil, exit.Named(exit.Validation, "project_metadata_mismatch",
+				"pyproject.toml declares %s==%s but the built wheel declares %s==%s",
+				name, release, fact.Distribution, fact.Version).
+				WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
+		}
+		if problem := validateProjectWheelDependencies(path); problem != nil {
+			return nil, problem
+		}
+		contents, problem := wheel.InspectContents(path)
+		if problem != nil {
+			return nil, problem
+		}
+		if len(contents.ImportRoots) == 0 {
+			return nil, exit.Named(exit.Validation, "project_wheel_no_import_roots",
+				"the built wheel %s installs no Python module or package: %s",
+				fact.Filename, contents.Describe()).
+				WithRemedy("declare the project's modules or packages for its build backend in " +
+					"pyproject.toml (hatchling: `[tool.hatch.build.targets.wheel] only-include = [...]`; " +
+					"setuptools: `[tool.setuptools] py-modules = [...]`), then confirm `uv build --wheel` " +
+					"lists them in the wheel's RECORD")
+		}
+		if problem := applicationEntrypoint(tree, fact.Filename, contents); problem != nil {
+			return nil, problem
+		}
 	}
-	if problem := validateProjectWheelDependencies(built.Path); problem != nil {
-		return "", problem
-	}
-	contents, problem := wheel.InspectContents(built.Path)
-	if problem != nil {
-		return "", problem
-	}
-	if len(contents.ImportRoots) == 0 {
-		return "", exit.Named(exit.Validation, "project_wheel_no_import_roots",
-			"the built wheel %s installs no Python module or package: %s",
-			fact.Filename, contents.Describe()).
-			WithRemedy("declare the project's modules or packages for its build backend in " +
-				"pyproject.toml (hatchling: `[tool.hatch.build.targets.wheel] only-include = [...]`; " +
-				"setuptools: `[tool.setuptools] py-modules = [...]`), then confirm `uv build --wheel` " +
-				"lists them in the wheel's RECORD")
-	}
-	if problem := applicationEntrypoint(tree, fact.Filename, contents); problem != nil {
-		return "", problem
-	}
-	return built.Path, nil
+	return paths, nil
 }
 
 const applicationGroup = "cozy.application"
