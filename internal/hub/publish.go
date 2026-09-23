@@ -7,10 +7,15 @@ package hub
 // retains that checkpoint. Mutable release pointers are a separate call.
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -185,17 +190,153 @@ func (c *Client) RemoveCheckpoint(ctx context.Context, ref Ref, checkpointID, re
 	return nil
 }
 
+// modelFinalizationView is the durable asynchronous response returned by
+// Tensorhub after model finalization was moved off the request context. Result
+// is intentionally raw because it is the completed CheckpointPublication
+// document, while error is the hub's typed terminal refusal.
+type modelFinalizationView struct {
+	Operation string                    `json:"operation"`
+	State     string                    `json:"state"`
+	StatusURL string                    `json:"status_url"`
+	Result    json.RawMessage           `json:"result,omitempty"`
+	Error     *modelFinalizationFailure `json:"error,omitempty"`
+}
+
+type modelFinalizationFailure struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Remedy  string `json:"remedy,omitempty"`
+}
+
+// modelFinalizePollInterval is a variable so focused protocol tests can avoid
+// waiting on the production two-second retry interval. The caller context, not
+// a fixed wall clock, bounds the complete operation.
+var modelFinalizePollInterval = 2 * time.Second
+
+func decodeStrictJSON(raw []byte, out any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("response contains more than one JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func decodeModelFinalization(raw []byte) (CheckpointPublication, modelFinalizationView, *exit.Error) {
+	// Older hubs completed this request synchronously. Keep that response shape
+	// readable while all current hubs use the durable async envelope below.
+	var direct CheckpointPublication
+	if err := decodeStrictJSON(raw, &direct); err == nil && direct.PublishID != "" {
+		return direct, modelFinalizationView{State: "completed"}, nil
+	}
+	var view modelFinalizationView
+	if err := decodeStrictJSON(raw, &view); err != nil {
+		return CheckpointPublication{}, modelFinalizationView{}, exit.Named(exit.Internal,
+			"hub.unreadable_answer", "Tensorhub returned an invalid model finalization response: %s", err)
+	}
+	if view.Operation == "" || view.State == "" {
+		return CheckpointPublication{}, view, exit.Named(exit.Structural,
+			"hub.model_finalization_invalid", "Tensorhub returned incomplete model finalization state")
+	}
+	switch view.State {
+	case "queued", "running":
+		return CheckpointPublication{}, view, nil
+	case "completed":
+		if len(view.Result) == 0 {
+			return CheckpointPublication{}, view, exit.Named(exit.Structural,
+				"hub.model_finalization_invalid", "Tensorhub completed model finalization without a checkpoint result")
+		}
+		var checkpoint CheckpointPublication
+		if err := decodeStrictJSON(view.Result, &checkpoint); err != nil {
+			return CheckpointPublication{}, view, exit.Named(exit.Structural,
+				"hub.model_finalization_invalid", "Tensorhub returned an invalid model checkpoint result: %s", err)
+		}
+		return checkpoint, view, nil
+	case "failed":
+		if view.Error == nil || view.Error.Code == "" {
+			return CheckpointPublication{}, view, exit.Named(exit.Failed,
+				"publication.finalization_failed", "Tensorhub failed model finalization")
+		}
+		failure := exit.Named(exit.Failed, view.Error.Code, "%s", view.Error.Message)
+		if view.Error.Remedy != "" {
+			failure.WithRemedy("%s", view.Error.Remedy)
+		}
+		return CheckpointPublication{}, view, failure
+	default:
+		return CheckpointPublication{}, view, exit.Named(exit.Structural,
+			"hub.model_finalization_invalid", "Tensorhub returned unknown model finalization state %q", view.State)
+	}
+}
+
+func (c *Client) readModelFinalization(ctx context.Context, ref Ref, operation string) ([]byte, *exit.Error) {
+	var raw []byte
+	e := c.do(ctx, call{
+		method: http.MethodGet,
+		path:   publications(ref) + "/" + url.PathEscape(operation) + "/finalization",
+		auth:   true, responseBytes: 1 << 20, strict: true, raw: &raw,
+	}, nil)
+	return raw, e
+}
+
 func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation string,
 	request FinalizePublicationRequest, reason string,
 ) (CheckpointPublication, *exit.Error) {
-	var out CheckpointPublication
+	var raw []byte
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/finalize",
 		auth:   true, reason: reason, byBytes: true,
-		body: request, patient: true, strict: true,
-	}, &out)
-	return out, e
+		body: request, patient: true, raw: &raw,
+	}, nil)
+	if e != nil {
+		return CheckpointPublication{}, e
+	}
+	checkpoint, state, problem := decodeModelFinalization(raw)
+	if problem != nil {
+		return CheckpointPublication{}, problem
+	}
+	if state.Operation != "" && state.Operation != operation {
+		return CheckpointPublication{}, exit.Named(exit.Conflict,
+			"hub.model_finalization_mismatch", "Tensorhub returned model finalization for operation %q, expected %q", state.Operation, operation)
+	}
+	if state.State == "completed" {
+		return checkpoint, nil
+	}
+	for {
+		timer := time.NewTimer(modelFinalizePollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return CheckpointPublication{}, exit.New(exit.Canceled, "model finalization was canceled")
+		case <-timer.C:
+		}
+		callCtx, cancel := context.WithTimeout(ctx, Timeout)
+		raw, problem = c.readModelFinalization(callCtx, ref, operation)
+		cancel()
+		if problem != nil {
+			return CheckpointPublication{}, problem
+		}
+		checkpoint, state, problem = decodeModelFinalization(raw)
+		if problem != nil {
+			return CheckpointPublication{}, problem
+		}
+		if state.Operation != "" && state.Operation != operation {
+			return CheckpointPublication{}, exit.Named(exit.Conflict,
+				"hub.model_finalization_mismatch", "Tensorhub returned model finalization for operation %q, expected %q", state.Operation, operation)
+		}
+		if state.State == "completed" {
+			return checkpoint, nil
+		}
+	}
 }
 
 type ModelReleaseLane struct {
