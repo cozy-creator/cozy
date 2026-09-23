@@ -53,7 +53,7 @@ func WheelClosures(ctx context.Context, tree, python, installed, project, extra 
 			"installed callable wheel discovery requires uv %s's qualified graph schema", wheelGraphUV).
 			WithRemedy("install uv %s, then retry cozy run", wheelGraphUV)
 	}
-	command := exec.CommandContext(ctx, "uv", "tree", "--frozen", "--no-dev", "--no-default-groups", "--format", "json", "--python", python)
+	command := exec.CommandContext(ctx, "uv", "tree", "--frozen", "--no-dev", "--no-default-groups", "--format", "json", "--python", python, "--no-python-downloads")
 	command.Dir, command.Env = tree, config.Frozen().Tool()
 	var stderr strings.Builder
 	command.Stderr = &stderr

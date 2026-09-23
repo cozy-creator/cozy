@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -181,7 +182,12 @@ func (u *rentalRuntimeUpdates) transport(ctx context.Context, selection runtimeU
 	_ = json.Unmarshal(input, &fields)
 	fields["action"] = action
 	input, _ = json.Marshal(fields)
-	command := exec.CommandContext(ctx, "uv", "run", "--isolated", "--no-project", "--no-config", "--python", "3.12", "--with", "packaging==26.2", "python", "-I", "-c", runtimeUpdateTransport)
+	// This helper executes trusted maintenance code, not the package's Python.
+	python, problem := hostruntime.EnsurePython(ctx, ">=3.12", "")
+	if problem != nil {
+		return nil, problem
+	}
+	command := exec.CommandContext(ctx, "uv", "run", "--isolated", "--no-project", "--no-config", "--python", python.Executable, "--no-python-downloads", "--with", "packaging==26.2", "python", "-I", "-c", runtimeUpdateTransport)
 	command.Env = u.machines.context.Cfg.Tool()
 	command.Stdin = bytes.NewReader(input) //cozy:stdin-value bounded maintenance metadata, never user package code
 	log, err := os.OpenFile(filepath.Join(selection.Directory, "transport.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)

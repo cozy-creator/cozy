@@ -13,6 +13,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -170,7 +171,11 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		return fail(exit.Internalf("cannot retain captured interface metadata: %s", err))
 	}
-	command := exec.CommandContext(ctx, "uv", "lock", "--no-progress")
+	python, problem := hostruntime.ProjectPython(ctx, root)
+	if problem != nil {
+		return fail(problem)
+	}
+	command := exec.CommandContext(ctx, "uv", "lock", "--no-progress", "--python", python.Executable, "--no-python-downloads")
 	command.Dir = root
 	command.Env = config.Frozen().Tool()
 	var log strings.Builder
