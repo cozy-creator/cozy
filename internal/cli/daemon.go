@@ -141,10 +141,9 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
-	// Bound this CLI's readiness wait, never the owner's lifetime. A daemon may
-	// still be migrating or starting after we return; retrying observes it again.
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
+	// Readiness follows the live owner, not elapsed time: migrations and startup
+	// may legitimately take longer on a busy host. The caller can interrupt its
+	// wait without stopping the detached daemon; child exits still report failure.
 	for {
 		if state := daemon.Probe(ctx.Cfg); state.Up {
 			if state.OperatorOwned {
@@ -184,16 +183,12 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 		case result := <-done:
 			// A clean child exit is the idempotent "another owner" path. A probe
 			// can briefly hold that same flock, so re-elect if no owner remains.
-			// Keep the original deadline and never replace a live owner.
+			// Never replace a live owner.
 			childResult, child = &result, nil
 			if result.err == nil {
 				started, childResult = false, nil
 			}
 		case <-tick.C:
-		case <-timeout.C:
-			return daemon.State{}, false, exit.Named(exit.Unavailable, "daemon_startup_timeout",
-				"the Cozy daemon has not published a ready local API after 10 seconds").
-				WithRemedy("retry the command if startup is still progressing; inspect `cozy daemon log` if it is not")
 		}
 	}
 }

@@ -145,19 +145,72 @@ func TestDaemonHeldRecordNeverFallsBackToConfiguredPort(t *testing.T) {
 	}
 }
 
-func TestDaemonUnreadyOwnerWaitIsBounded(t *testing.T) {
-	layout, lock, pid, done := compatibilityOwner(t)
-	// A valid credential with no usable endpoint is a stalled startup, not an
-	// operator handoff. Each polling tick must consume the same deadline.
+func TestDaemonReadinessWaitFollowsOwnerBeyondTenSeconds(t *testing.T) {
+	layout, lock, pid, ownerDone := compatibilityOwner(t)
 	publishCompatibilityOwner(t, layout, lock, pid, "127.0.0.1:0", "")
-	output, err := compatibilityCLI(t, layout.Root, "run", "list", "--json")
-	if err == nil || !strings.Contains(output, "daemon_startup_timeout") {
-		t.Fatalf("missing bounded readiness refusal: %v %s", err, output)
+	command := exec.Command(cozyBin, "run", "list", "--json")
+	command.Env = childEnv(t, layout.Root)
+	must(t, command.Start())
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	t.Cleanup(func() { _ = command.Process.Kill() })
+	// Exercise the previous production deadline: the live owner is still
+	// initializing and must not become a failure merely because ten seconds pass.
+	select {
+	case err := <-done:
+		t.Fatalf("live startup returned before readiness: %v", err)
+	case <-time.After(11 * time.Second):
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/requests" {
+			_, _ = w.Write([]byte(`{"requests":[]}`))
+		}
+	}))
+	defer server.Close()
+	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
+	select {
+	case err := <-done:
+		must(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("CLI did not observe delayed readiness")
 	}
 	select {
-	case <-done:
-		t.Fatal("timeout stopped the owner")
+	case <-ownerDone:
+		t.Fatal("readiness wait stopped the owner")
 	default:
+	}
+}
+
+func TestDaemonReadinessWaitCanBeInterruptedWithoutStoppingOwner(t *testing.T) {
+	layout, lock, pid, ownerDone := compatibilityOwner(t)
+	publishCompatibilityOwner(t, layout, lock, pid, "127.0.0.1:0", "")
+	command := exec.Command(cozyBin, "up", "--json")
+	command.Env = childEnv(t, layout.Root)
+	must(t, command.Start())
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	t.Cleanup(func() { _ = command.Process.Kill() })
+	select {
+	case err := <-done:
+		t.Fatalf("unready owner did not keep caller waiting: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	must(t, command.Process.Signal(os.Interrupt))
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("interruption reported success before readiness")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("caller ignored interruption")
+	}
+	select {
+	case <-ownerDone:
+		t.Fatal("interrupting caller stopped the owner")
+	default:
+	}
+	if state := daemon.Probe(config.Config{Home: layout.Root}); !state.Up || state.PID != pid {
+		t.Fatalf("interruption changed owner: %+v", state)
 	}
 }
 
