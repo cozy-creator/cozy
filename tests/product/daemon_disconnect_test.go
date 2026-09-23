@@ -497,3 +497,50 @@ func TestDaemonDownRequiresMachineReceiptForIndependentExecution(t *testing.T) {
 		})
 	}
 }
+
+func TestDaemonDownPreservesUnacknowledgedTerminalReceipts(t *testing.T) {
+	root := t.TempDir()
+	startDaemonProcess(t, root)
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	before := map[string][]byte{}
+	for _, state := range []string{"failed", "succeeded"} {
+		request := recordPrivateTransaction(t, store, "terminal-disconnect-"+state, "pr-gone")
+		instance, session := "gone-worker-"+state, "gone-boot-"+state
+		fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: instance, Package: request.Package, WorkerID: "gone"}))
+		ordinal, problem := store.Dispatch(records.Attempt{RequestID: request.ID, SessionID: session, InstanceID: instance, InvocationDigest: childDigest("7"), InvocationCanonical: []byte(`{}`)})
+		fatal(t, problem)
+		fatal(t, store.OfferDispatch(request.ID, ordinal, session))
+		fatal(t, store.Accepted(request.ID, ordinal, session))
+		_, problem = store.AcceptTerminal(records.Terminal{RequestID: request.ID, Attempt: ordinal, SessionID: session, InvocationDigest: childDigest("7"), TerminalID: "out-" + state, TerminalDigest: childDigest("8"), Status: strings.ToUpper(state), RequestState: state, Body: []byte(`{"retained":"outcome"}`)})
+		fatal(t, problem)
+		attempt, problem := store.AttemptRow(request.ID, ordinal)
+		fatal(t, problem)
+		if attempt.State != "terminal" {
+			t.Fatal("fixture did not retain an unacknowledged outcome")
+		}
+		before[request.ID], _ = json.Marshal(attempt)
+	}
+	for cycle := 0; cycle < 2; cycle++ {
+		code, out := runCozy(t, root, "down", "--json")
+		if code != 0 {
+			t.Fatalf("terminal custody blocked down [%d]: %s", code, out)
+		}
+		for id, prior := range before {
+			attempt, problem := store.AttemptRow(id, 1)
+			fatal(t, problem)
+			after, err := json.Marshal(attempt)
+			must(t, err)
+			if !bytes.Equal(prior, after) {
+				t.Fatalf("disconnect acknowledged or changed terminal %s", id)
+			}
+		}
+		if cycle == 0 {
+			code, out = runCozy(t, root, "up", "--json")
+			if code != 0 {
+				t.Fatalf("reconnect [%d]: %s", code, out)
+			}
+		}
+	}
+}

@@ -2,7 +2,8 @@
 
 `cozy down` stops the Creator client daemon without canceling requests or ending
 rentals. Retained paused, blocked, and completed work does not require the client
-to stay online. Its records, outputs, and rental holds remain available after
+to stay online. Durable terminal receipts awaiting acknowledgement also survive disconnect.
+Its records, outputs, and rental holds remain available after
 `cozy up`. Remote rentals continue billing until explicitly ended with
 `cozy rental end` (or destructive `cozy down --all`).
 
