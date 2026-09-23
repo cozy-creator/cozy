@@ -1,4 +1,4 @@
-package hub
+package producttest
 
 import (
 	"encoding/json"
@@ -9,13 +9,14 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 func TestPackageReleaseFinalizeWaitsForQueuedCommit(t *testing.T) {
 	var statusCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		write := func(status int, value PackageReleaseCommit) {
+		write := func(status int, value hub.PackageReleaseCommit) {
 			raw, err := json.Marshal(value)
 			if err != nil {
 				t.Fatalf("encode response: %v", err)
@@ -40,21 +41,21 @@ func TestPackageReleaseFinalizeWaitsForQueuedCommit(t *testing.T) {
 			if body.PublicationID != "pub-1" || body.PythonVersion != "3.12.12" {
 				t.Fatalf("wrong finalize body: %+v", body)
 			}
-			write(http.StatusAccepted, PackageReleaseCommit{PublicationID: "pub-1", State: "queued", StatusURL: "/v1/packages/paul/demo/publish/1.0.0/status"})
+			write(http.StatusAccepted, hub.PackageReleaseCommit{PublicationID: "pub-1", State: "queued", StatusURL: "/v1/packages/paul/demo/publish/1.0.0/status"})
 		case "GET /v1/packages/paul/demo/publish/1.0.0/status":
 			if statusCalls.Add(1) == 1 {
-				write(http.StatusOK, PackageReleaseCommit{PublicationID: "pub-1", State: "verifying", StatusURL: "/v1/packages/paul/demo/publish/1.0.0/status"})
+				write(http.StatusOK, hub.PackageReleaseCommit{PublicationID: "pub-1", State: "verifying", StatusURL: "/v1/packages/paul/demo/publish/1.0.0/status"})
 				return
 			}
-			write(http.StatusOK, PackageReleaseCommit{PublicationID: "pub-1", State: "committed"})
+			write(http.StatusOK, hub.PackageReleaseCommit{PublicationID: "pub-1", State: "committed"})
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
-	client := New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "package-release-test")
-	ref := Ref{Org: "paul", Name: "demo"}
+	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "package-release-test")
+	ref := hub.Ref{Org: "paul", Name: "demo"}
 	initial, problem := client.CommitPackageRelease(t.Context(), ref, "1.0.0", "pub-1", nil, "publish demo", "3.12.12")
 	if problem != nil {
 		t.Fatalf("finalize: %s", problem)
@@ -73,22 +74,21 @@ func TestPackageReleaseFinalizeWaitsForQueuedCommit(t *testing.T) {
 
 func TestPackageReleaseStatusRendersTypedFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(PackageReleaseCommit{
+		_ = json.NewEncoder(w).Encode(hub.PackageReleaseCommit{
 			PublicationID: "pub-1", State: "failed",
-			Error: &PackageReleaseFailure{Code: "package_release.registry_fetch_failed", Message: "registry unavailable", Remedy: "retry later"},
+			Error: &hub.PackageReleaseFailure{Code: "package_release.registry_fetch_failed", Message: "registry unavailable", Remedy: "retry later"},
 		})
 	}))
 	defer server.Close()
-	client := New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "package-release-test")
-	status, problem := client.PackageReleaseStatus(t.Context(), Ref{Org: "paul", Name: "demo"}, "1.0.0")
+	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof")}, "package-release-test")
+	status, problem := client.PackageReleaseStatus(t.Context(), hub.Ref{Org: "paul", Name: "demo"}, "1.0.0")
 	if problem != nil {
 		t.Fatalf("status: %s", problem)
 	}
 	if status.State != "failed" {
 		t.Fatalf("unexpected status: %+v", status)
 	}
-	problem = status.failure()
-	if problem == nil || problem.ErrName() != "package_release.registry_fetch_failed" || problem.Remedy != "retry later" {
-		t.Fatalf("failure was not preserved: %#v", problem)
+	if status.Error == nil || status.Error.Code != "package_release.registry_fetch_failed" || status.Error.Remedy != "retry later" {
+		t.Fatalf("failure was not preserved: %#v", status.Error)
 	}
 }
