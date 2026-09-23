@@ -87,6 +87,12 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		var finalProblem *exit.Error
 		done, finalProblem = c.CommitPackageRelease(hctx, ref, release,
 			draft.PublicationID, registry, reason, pack.PythonVersion)
+		if finalProblem == nil && done.State != "committed" {
+			done, finalProblem = c.WaitPackageRelease(hctx, ref, release, done,
+				func(status hub.PackageReleaseCommit) {
+					packagePublishStatus(ctx, "Package finalization: %s", status.State)
+				})
+		}
 		return finalProblem
 	})
 	if problem != nil {

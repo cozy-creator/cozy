@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -56,8 +57,32 @@ type PackageReleaseDraft struct {
 }
 
 type PackageReleaseCommit struct {
-	PublicationID string `json:"publication_id"`
-	State         string `json:"state"`
+	PublicationID string                 `json:"publication_id"`
+	State         string                 `json:"state"`
+	StatusURL     string                 `json:"status_url,omitempty"`
+	Error         *PackageReleaseFailure `json:"error,omitempty"`
+}
+
+// PackageReleaseFailure is a durable terminal refusal reported by an
+// asynchronous finalizer. The status route deliberately answers HTTP 200 so a
+// caller can resume after losing the original finalize response and still see
+// the Hub's typed refusal.
+type PackageReleaseFailure struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Remedy  string `json:"remedy,omitempty"`
+}
+
+func (c PackageReleaseCommit) failure() *exit.Error {
+	if c.Error == nil || c.Error.Code == "" {
+		return exit.Named(exit.Failed, "package_release.failed",
+			"Tensorhub failed package finalization")
+	}
+	e := exit.Named(exit.Failed, c.Error.Code, "%s", c.Error.Message)
+	if c.Error.Remedy != "" {
+		e.WithRemedy("%s", c.Error.Remedy)
+	}
+	return e
 }
 
 type PackageReleaseYank struct {
@@ -186,6 +211,59 @@ func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release stri
 		body:    body,
 		patient: true, strict: true}, &out)
 	return out, e
+}
+
+// PackageReleaseStatus reads the short, authenticated status projection for a
+// queued finalization. It intentionally uses the canonical route instead of
+// trusting a server-provided absolute URL as a new origin.
+func (c *Client) PackageReleaseStatus(ctx context.Context, ref Ref, release string) (PackageReleaseCommit, *exit.Error) {
+	var out PackageReleaseCommit
+	e := c.do(ctx, call{method: http.MethodGet,
+		path: packagePublishPath(ref, release) + "/status", auth: true,
+		strict: true, responseBytes: 1 << 20}, &out)
+	return out, e
+}
+
+const packageFinalizePollInterval = 2 * time.Second
+
+// WaitPackageRelease follows a 202 finalization until the durable commit or
+// typed failure is visible. Each status call has a short header/body deadline;
+// the caller context, rather than a fixed wall clock, controls the whole wait.
+func (c *Client) WaitPackageRelease(ctx context.Context, ref Ref, release string,
+	initial PackageReleaseCommit, progress func(PackageReleaseCommit),
+) (PackageReleaseCommit, *exit.Error) {
+	state := initial
+	for {
+		if progress != nil {
+			progress(state)
+		}
+		if state.State == "committed" {
+			return state, nil
+		}
+		if state.State == "failed" {
+			return state, state.failure()
+		}
+		if state.State != "queued" && state.State != "verifying" && state.State != "retrying" {
+			return state, exit.Named(exit.Structural, "hub.package_release_invalid",
+				"Tensorhub returned unknown package finalization state %q", state.State)
+		}
+		timer := time.NewTimer(packageFinalizePollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return state, exit.New(exit.Canceled, "package finalization was canceled")
+		case <-timer.C:
+		}
+		callCtx, cancel := context.WithTimeout(ctx, Timeout)
+		var problem *exit.Error
+		state, problem = c.PackageReleaseStatus(callCtx, ref, release)
+		cancel()
+		if problem != nil {
+			return state, problem
+		}
+	}
 }
 
 type PackageDefectReport struct {
