@@ -302,6 +302,10 @@ func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation str
 	if problem != nil {
 		return CheckpointPublication{}, problem
 	}
+	if state.Operation != "" && state.Operation != operation {
+		return CheckpointPublication{}, exit.Named(exit.Conflict,
+			"hub.model_finalization_mismatch", "Tensorhub returned model finalization for operation %q, expected %q", state.Operation, operation)
+	}
 	if state.State == "completed" {
 		return checkpoint, nil
 	}
@@ -324,6 +328,10 @@ func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation str
 		checkpoint, state, problem = decodeModelFinalization(raw)
 		if problem != nil {
 			return CheckpointPublication{}, problem
+		}
+		if state.Operation != "" && state.Operation != operation {
+			return CheckpointPublication{}, exit.Named(exit.Conflict,
+				"hub.model_finalization_mismatch", "Tensorhub returned model finalization for operation %q, expected %q", state.Operation, operation)
 		}
 		if state.State == "completed" {
 			return checkpoint, nil
