@@ -223,7 +223,6 @@ func (w wireRental) rental() Rental {
 // here: Tensorhub resolves and selects them.
 type RentalDevelopment struct {
 	SSHPublicKey string `json:"ssh_public_key"`
-	ImageDigest  string `json:"image_digest,omitempty"`
 }
 
 type RentalRequest struct {
@@ -300,10 +299,6 @@ func RentalRequestBytes(name, sku, mediaTokenSHA256, creatorPublicKey string,
 	}
 	if development != nil && (len(development.SSHPublicKey) == 0 || len(development.SSHPublicKey) > 8192 || strings.TrimSpace(development.SSHPublicKey) != development.SSHPublicKey || strings.ContainsAny(development.SSHPublicKey, "\r\n\x00")) {
 		return nil, exit.Usagef("development requires one bounded SSH public-key line")
-	}
-	if development != nil && development.ImageDigest != "" &&
-		(!strings.HasPrefix(development.ImageDigest, "sha256:") || !bareSHA256Pattern.MatchString(strings.TrimPrefix(development.ImageDigest, "sha256:"))) {
-		return nil, exit.Usagef("development image must be a registered sha256:<64 lowercase hex> digest")
 	}
 	if workload.SourceBytes < 0 {
 		return nil, exit.Named(exit.Validation, "rental.planned_workload_invalid",

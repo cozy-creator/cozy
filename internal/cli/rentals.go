@@ -245,6 +245,12 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
 	deadline time.Time, managedRequestID string, phase acquisitionPhase, observed map[string]int64,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
+	observation := lifecycle
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		observation, cancel = context.WithDeadline(lifecycle, deadline)
+		defer cancel()
+	}
 	c := client(ctx)
 	existing, e := st.RentalOperation(operationKey)
 	if e != nil {
@@ -469,7 +475,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 				"rental operation %s is attached but rental %s has no local row", operationKey, remote.ID)
 		}
 		row = *stored
-	} else if e := st.RecordRental(row); e != nil {
+	} else if e := st.RecordRentalContext(observation, row); e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	observe := func(seen hub.Rental) *exit.Error {
@@ -489,7 +495,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		row.MediaAddress = seen.MediaAddress
 		row.ExpectedWorkerID, row.ExpectedWorkerBootID = seen.WorkerID, seen.WorkerBootID
 		copyRentalFailure(&row, seen)
-		if e := st.RecordRental(row); e != nil {
+		if e := st.RecordRentalContext(observation, row); e != nil {
 			return e
 		}
 		return st.AdvanceRentalOperation(operationKey, seen.ID, seen.State)

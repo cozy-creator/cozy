@@ -1,6 +1,7 @@
 package records
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -542,10 +543,24 @@ func RentalTerminalState(state string) bool { return rentalTerminalStates[state]
 // the provider's actual billed total — GPU plus storage adders — every later read serves
 // that figure, and this host's row and burn line must say it too, never a cached quote.
 func (s *Store) RecordRental(r Rental) *exit.Error {
-	tx, err := s.db.Begin()
+	return s.RecordRentalContext(context.Background(), r)
+}
+
+// RecordRentalContext preserves an accepted Hub observation through local writer
+// contention. Cancellation stops waiting; the pre-existing paid operation remains
+// available for reconciliation under its original idempotency key.
+func (s *Store) RecordRentalContext(ctx context.Context, r Rental) *exit.Error {
+	tx, release, err := s.beginRentalObservation(ctx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return exit.New(exit.Canceled, "recording rental %s: %s", r.ID, err)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return exit.New(exit.Deadline, "recording rental %s: %s", r.ID, err)
+		}
 		return exit.Internalf("cannot begin recording rental %s: %s", r.ID, err)
 	}
+	defer release()
 	defer tx.Rollback()
 	if problem := recordRental(tx, r); problem != nil {
 		return problem
