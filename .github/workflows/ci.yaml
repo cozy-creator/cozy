@@ -74,7 +74,8 @@ jobs:
               id
               cat /proc/self/cgroup
               packages=$(go list ./... | grep -v "^github.com/cozy-creator/cozy/tests/product$")
-              exec nice -n 19 bash -euc "go test $packages -run \"${{ matrix.tests }}\" -timeout 30m && go test ./tests/product -run \"${{ matrix.tests }}\" -timeout 30m -args -serving-cpu-fixture -script-runtime-wheel=\"$COZY_TEST_RUNTIME_WHEEL\" -child-runtime-wheel=\"$COZY_TEST_RUNTIME_WHEEL\""
+              nice -n 19 go test $packages -run "${{ matrix.tests }}" -timeout 30m
+              exec nice -n 19 go test ./tests/product -run "${{ matrix.tests }}" -timeout 30m -args -serving-cpu-fixture -script-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"
             '
       - run: python3 scripts/fence.py
 
