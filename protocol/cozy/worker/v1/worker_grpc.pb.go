@@ -193,6 +193,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	WorkerControl_GetMachineExecutionWorkspace_FullMethodName          = "/cozy.worker.v1.WorkerControl/GetMachineExecutionWorkspace"
 	WorkerControl_SubmitMachineExecution_FullMethodName                = "/cozy.worker.v1.WorkerControl/SubmitMachineExecution"
 	WorkerControl_GetMachineExecution_FullMethodName                   = "/cozy.worker.v1.WorkerControl/GetMachineExecution"
 	WorkerControl_ListMachineExecutionEvents_FullMethodName            = "/cozy.worker.v1.WorkerControl/ListMachineExecutionEvents"
@@ -209,6 +210,9 @@ const (
 //
 // The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
 type WorkerControlClient interface {
+	// MINOR59. Discover Runtime's durable journal lifetime before freezing a submit.
+	// Authenticated like the other machine calls; no continuing Control stream needed.
+	GetMachineExecutionWorkspace(ctx context.Context, in *MachineExecutionWorkspaceQuery, opts ...grpc.CallOption) (*MachineExecutionWorkspace, error)
 	// MINOR51. Runtime owns accepted work independently of the caller connection.
 	// These calls observe/control that authority; they do not establish a second
 	// RecordOwner or require a client coordinator inside the worker.
@@ -237,6 +241,16 @@ type workerControlClient struct {
 
 func NewWorkerControlClient(cc grpc.ClientConnInterface) WorkerControlClient {
 	return &workerControlClient{cc}
+}
+
+func (c *workerControlClient) GetMachineExecutionWorkspace(ctx context.Context, in *MachineExecutionWorkspaceQuery, opts ...grpc.CallOption) (*MachineExecutionWorkspace, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionWorkspace)
+	err := c.cc.Invoke(ctx, WorkerControl_GetMachineExecutionWorkspace_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *workerControlClient) SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error) {
@@ -337,6 +351,9 @@ type WorkerControl_WatchProgressClient = grpc.ServerStreamingClient[AttemptProgr
 //
 // The worker is the gRPC SERVER; the RecordOwner is the CLIENT.
 type WorkerControlServer interface {
+	// MINOR59. Discover Runtime's durable journal lifetime before freezing a submit.
+	// Authenticated like the other machine calls; no continuing Control stream needed.
+	GetMachineExecutionWorkspace(context.Context, *MachineExecutionWorkspaceQuery) (*MachineExecutionWorkspace, error)
 	// MINOR51. Runtime owns accepted work independently of the caller connection.
 	// These calls observe/control that authority; they do not establish a second
 	// RecordOwner or require a client coordinator inside the worker.
@@ -367,6 +384,9 @@ type WorkerControlServer interface {
 // pointer dereference when methods are called.
 type UnimplementedWorkerControlServer struct{}
 
+func (UnimplementedWorkerControlServer) GetMachineExecutionWorkspace(context.Context, *MachineExecutionWorkspaceQuery) (*MachineExecutionWorkspace, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMachineExecutionWorkspace not implemented")
+}
 func (UnimplementedWorkerControlServer) SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitMachineExecution not implemented")
 }
@@ -410,6 +430,24 @@ func RegisterWorkerControlServer(s grpc.ServiceRegistrar, srv WorkerControlServe
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&WorkerControl_ServiceDesc, srv)
+}
+
+func _WorkerControl_GetMachineExecutionWorkspace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionWorkspaceQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).GetMachineExecutionWorkspace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_GetMachineExecutionWorkspace_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).GetMachineExecutionWorkspace(ctx, req.(*MachineExecutionWorkspaceQuery))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _WorkerControl_SubmitMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -545,6 +583,10 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "cozy.worker.v1.WorkerControl",
 	HandlerType: (*WorkerControlServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetMachineExecutionWorkspace",
+			Handler:    _WorkerControl_GetMachineExecutionWorkspace_Handler,
+		},
 		{
 			MethodName: "SubmitMachineExecution",
 			Handler:    _WorkerControl_SubmitMachineExecution_Handler,
@@ -1886,6 +1928,7 @@ var RuntimeWeights_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	PodHost_GetMachineExecutionWorkspace_FullMethodName          = "/cozy.worker.v1.PodHost/GetMachineExecutionWorkspace"
 	PodHost_SubmitMachineExecution_FullMethodName                = "/cozy.worker.v1.PodHost/SubmitMachineExecution"
 	PodHost_GetMachineExecution_FullMethodName                   = "/cozy.worker.v1.PodHost/GetMachineExecution"
 	PodHost_ListMachineExecutionEvents_FullMethodName            = "/cozy.worker.v1.PodHost/ListMachineExecutionEvents"
@@ -1951,6 +1994,7 @@ const (
 // Locally PodHost is not a service: the daemon calls the same host functions in-process.
 // ---------------------------------------------------------------------------
 type PodHostClient interface {
+	GetMachineExecutionWorkspace(ctx context.Context, in *MachineExecutionWorkspaceQuery, opts ...grpc.CallOption) (*MachineExecutionWorkspace, error)
 	// Authenticated forwarding only. Runtime is the sole execution journal/owner.
 	SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error)
 	GetMachineExecution(ctx context.Context, in *MachineExecutionQuery, opts ...grpc.CallOption) (*MachineExecutionState, error)
@@ -1996,6 +2040,16 @@ type podHostClient struct {
 
 func NewPodHostClient(cc grpc.ClientConnInterface) PodHostClient {
 	return &podHostClient{cc}
+}
+
+func (c *podHostClient) GetMachineExecutionWorkspace(ctx context.Context, in *MachineExecutionWorkspaceQuery, opts ...grpc.CallOption) (*MachineExecutionWorkspace, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionWorkspace)
+	err := c.cc.Invoke(ctx, PodHost_GetMachineExecutionWorkspace_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *podHostClient) SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error) {
@@ -2427,6 +2481,7 @@ func (c *podHostClient) WeightsIntentReady(ctx context.Context, in *WeightsInten
 // Locally PodHost is not a service: the daemon calls the same host functions in-process.
 // ---------------------------------------------------------------------------
 type PodHostServer interface {
+	GetMachineExecutionWorkspace(context.Context, *MachineExecutionWorkspaceQuery) (*MachineExecutionWorkspace, error)
 	// Authenticated forwarding only. Runtime is the sole execution journal/owner.
 	SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error)
 	GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error)
@@ -2474,6 +2529,9 @@ type PodHostServer interface {
 // pointer dereference when methods are called.
 type UnimplementedPodHostServer struct{}
 
+func (UnimplementedPodHostServer) GetMachineExecutionWorkspace(context.Context, *MachineExecutionWorkspaceQuery) (*MachineExecutionWorkspace, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMachineExecutionWorkspace not implemented")
+}
 func (UnimplementedPodHostServer) SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitMachineExecution not implemented")
 }
@@ -2592,6 +2650,24 @@ func RegisterPodHostServer(s grpc.ServiceRegistrar, srv PodHostServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&PodHost_ServiceDesc, srv)
+}
+
+func _PodHost_GetMachineExecutionWorkspace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionWorkspaceQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).GetMachineExecutionWorkspace(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_GetMachineExecutionWorkspace_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).GetMachineExecutionWorkspace(ctx, req.(*MachineExecutionWorkspaceQuery))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _PodHost_SubmitMachineExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -3124,6 +3200,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "cozy.worker.v1.PodHost",
 	HandlerType: (*PodHostServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetMachineExecutionWorkspace",
+			Handler:    _PodHost_GetMachineExecutionWorkspace_Handler,
+		},
 		{
 			MethodName: "SubmitMachineExecution",
 			Handler:    _PodHost_SubmitMachineExecution_Handler,

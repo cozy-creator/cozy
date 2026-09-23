@@ -34,7 +34,8 @@ func machineObserverRecord(t *testing.T, store *records.Store) (records.Request,
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-owned-machine"))
 	capture, spec := []byte(`{"capture":"immutable"}`), []byte(`{"invocation":"immutable"}`)
 	submission := &pb.MachineExecutionSubmit{
-		SubmissionId: request.IdemKey, CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture),
+		ExpectedExecutionWorkspaceId: "persistent-workspace",
+		SubmissionId:                 request.IdemKey, CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture),
 		Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)},
 	}
 	fatal(t, store.RecordMachineSubmission(request.ID, submission))
@@ -364,7 +365,8 @@ func TestMachineCancellationBeforeTransmissionCreatesNoRemotePromise(t *testing.
 	}
 	capture, spec := []byte(`{}`), []byte(`{}`)
 	if problem := store.RecordMachineSubmission(request.ID, &pb.MachineExecutionSubmit{
-		SubmissionId: request.IdemKey, CaptureDigest: canonical.Digest(capture), CaptureCanonicalBytes: capture,
+		ExpectedExecutionWorkspaceId: "persistent-workspace",
+		SubmissionId:                 request.IdemKey, CaptureDigest: canonical.Digest(capture), CaptureCanonicalBytes: capture,
 		Offer: &pb.AttemptOffer{RequestId: request.ID, InvocationSpecDigest: canonical.Digest(spec), InvocationSpecCanonicalBytes: spec},
 	}); problem == nil {
 		t.Fatal("late preparation revived an already canceled unsent request")

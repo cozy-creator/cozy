@@ -16,15 +16,13 @@ service path. `WireMinor` is its additive compatibility level. Additive changes 
 minor; independently negotiated optional capabilities are documented by the canonical
 protocol and default to unsupported, without inferring support from a version range. A breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
-This integrated cohort pins the feature-preserving `61f9e3c` generated snapshot at wire 57.
-It includes machine execution and publication authority references, together with
-mixed-input and model-materialization recovery capabilities. Runtime-owned execution
-without publication requires actual worker minor 51; publication requires actual
-Runtime minor 52 and the exact accepted authority ID. Native Model result collection
-requires actual Runtime minor 53 and its hashed retained-model descriptors. Private dependency
-requirements travel with every complete unpublished closure and bind their exact bytes
-to the immutable local revision. This cohort requires the coordinated wire 57 Runtime,
-Creator and Host release.
+This cohort pins wire 59 with minimum 59. Machine submissions first discover the
+execution workspace through an authenticated RPC and persist that identity with
+the exact submission before transmission. Every replay retains the same workspace,
+even after a lost acceptance reply or client restart. A replacement journal refuses
+the submission; an older unresolved submission without a workspace identity cannot
+be safely upgraded by discovering a new one. Creator, Runtime, and Host must use
+the coordinated workspace-fenced protocol cohort.
 
 `SOURCE` pins the upstream commit and per-file digests, matching what tensorhub and
 cozy-runtime already carry, so a hand edit or a stale re-vendor is detectable from this
@@ -36,4 +34,4 @@ independent upstream-provenance or drift claim beyond `SOURCE`.
 
 This integration retains the qualified generic LoRA adapter protocol and the complete
 unpublished dependency requirement fields in one generated snapshot. Both families use
-wire 57 with minimum 57; no dependency compatibility path is negotiated.
+wire 59 with minimum 59; no dependency compatibility path is negotiated.

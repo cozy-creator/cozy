@@ -7,6 +7,9 @@ import (
 
 // The shared machine RPCs stay explicitly unsupported on these protocol fixtures.
 // Each peer embeds both services, so promoted default methods would be ambiguous.
+func (p *idleHoldPeer) GetMachineExecutionWorkspace(ctx context.Context, request *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
+	return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
+}
 func (p *idleHoldPeer) SubmitMachineExecution(ctx context.Context, request *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	return p.UnimplementedWorkerControlServer.SubmitMachineExecution(ctx, request)
 }
@@ -25,6 +28,9 @@ func (p *idleHoldPeer) CollectMachineExecution(ctx context.Context, request *pb.
 func (p *idleHoldPeer) AcknowledgeMachineExecutionCollection(ctx context.Context, request *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
 	return p.UnimplementedWorkerControlServer.AcknowledgeMachineExecutionCollection(ctx, request)
 }
+func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
+	return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
+}
 func (p *fakePod) SubmitMachineExecution(ctx context.Context, request *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	return p.UnimplementedWorkerControlServer.SubmitMachineExecution(ctx, request)
 }
@@ -42,6 +48,9 @@ func (p *fakePod) CollectMachineExecution(ctx context.Context, request *pb.Machi
 }
 func (p *fakePod) AcknowledgeMachineExecutionCollection(ctx context.Context, request *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
 	return p.UnimplementedWorkerControlServer.AcknowledgeMachineExecutionCollection(ctx, request)
+}
+func (p *standInPod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
+	return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
 }
 func (p *standInPod) SubmitMachineExecution(ctx context.Context, request *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	return p.UnimplementedWorkerControlServer.SubmitMachineExecution(ctx, request)

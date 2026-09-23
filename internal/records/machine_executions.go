@@ -173,6 +173,7 @@ func (s *Store) LinkMachineExecution(id, machine string) *exit.Error {
 func (s *Store) RecordMachineSubmission(id string, submission *pb.MachineExecutionSubmit) *exit.Error {
 	if submission == nil || submission.Offer == nil || submission.Offer.RequestId != id ||
 		submission.SubmissionId == "" || len(submission.SubmissionId) > 256 ||
+		submission.ExpectedExecutionWorkspaceId == "" || len(submission.ExpectedExecutionWorkspaceId) > 256 ||
 		len(submission.CaptureDigest) != 32 || !bytes.Equal(canonical.Digest(submission.CaptureCanonicalBytes), submission.CaptureDigest) ||
 		len(submission.Offer.InvocationSpecDigest) != 32 || !bytes.Equal(canonical.Digest(submission.Offer.InvocationSpecCanonicalBytes), submission.Offer.InvocationSpecDigest) {
 		return exit.New(exit.Validation, "machine submission identity is incomplete")
@@ -209,6 +210,7 @@ func (s *Store) AcceptMachineExecution(id string, receipt *pb.MachineExecutionRe
 	}
 	var submission pb.MachineExecutionSubmit
 	if proto.Unmarshal(link.Submission, &submission) != nil || submission.Offer == nil ||
+		receipt.ExecutionWorkspaceId != submission.ExpectedExecutionWorkspaceId ||
 		receipt.SubmissionId != submission.SubmissionId || !bytes.Equal(receipt.CaptureDigest, submission.CaptureDigest) ||
 		!bytes.Equal(receipt.InvocationSpecDigest, submission.Offer.InvocationSpecDigest) ||
 		receipt.PublicationAuthorizationId != submission.PublicationAuthorizationId {

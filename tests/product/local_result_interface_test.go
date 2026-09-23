@@ -40,7 +40,7 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-owned-machine"))
 	spec := []byte(`{"invocation":"immutable"}`)
-	fatal(t, store.RecordMachineSubmission(request.ID, &pb.MachineExecutionSubmit{SubmissionId: request.IdemKey, CaptureCanonicalBytes: capture, CaptureDigest: captureDigest, Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}))
+	fatal(t, store.RecordMachineSubmission(request.ID, &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "persistent-workspace", SubmissionId: request.IdemKey, CaptureCanonicalBytes: capture, CaptureDigest: captureDigest, Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}))
 	directory := filepath.Join(layout.LocalPackages, strings.TrimPrefix(spelled, "sha256:"))
 	must(t, os.MkdirAll(directory, 0700))
 	path := filepath.Join(directory, launch.PackageInterfaceFile)
