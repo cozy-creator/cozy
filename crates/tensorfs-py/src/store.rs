@@ -591,6 +591,43 @@ impl PyStore {
         tensorfs_core::IMPLEMENTATION_SHA256
     }
 
+    /// Rewrite only a CozyTensors header/manifest to add, replace, or drop model assets.
+    /// `copies` are `(name, source_path, media_type)` rows selected from the exact source
+    /// manifest; TensorFS reuses their ObjectRefs without reading payload bytes.
+    #[pyo3(signature = (manifest_id, manifest_length, copies=Vec::new(), drops=Vec::new()))]
+    fn update_model_assets<'p>(
+        &self,
+        py: Python<'p>,
+        manifest_id: &str,
+        manifest_length: u64,
+        copies: Vec<(String, String, String)>,
+        drops: Vec<String>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let source = obj_ref(py, manifest_id, manifest_length)?;
+        let mut edits = Vec::with_capacity(copies.len() + drops.len());
+        edits.extend(copies.into_iter().map(|(name, source_path, media_type)| {
+            tensorfs_core::asset_update::Edit::Copy {
+                name,
+                source_path,
+                media_type,
+            }
+        }));
+        edits.extend(
+            drops
+                .into_iter()
+                .map(|name| tensorfs_core::asset_update::Edit::Drop { name }),
+        );
+        let result = py
+            .detach(|| tensorfs_core::asset_update::update(&self.store, &source, &edits))
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("header_id", result.header.id())?;
+        out.set_item("header_length", result.header.length)?;
+        out.set_item("manifest_id", result.manifest.id())?;
+        out.set_item("manifest_length", result.manifest.length)?;
+        Ok(out)
+    }
+
     fn verify_checkpoint_source(
         &self,
         py: Python<'_>,

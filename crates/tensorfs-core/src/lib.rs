@@ -8,6 +8,7 @@
 // crates/tensorfs-core/src is the check that it stays that way.
 #![deny(unsafe_code)]
 
+pub mod asset_update;
 pub mod b64;
 mod cache_roots;
 pub mod canon;
