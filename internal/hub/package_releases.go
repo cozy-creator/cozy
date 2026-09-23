@@ -111,6 +111,14 @@ type PackageReleaseDetail struct {
 	PythonVersion         string          `json:"python_version"`
 }
 
+// PackageSourceArchive is the immutable source distribution retained for
+// public inspection. The URL is a short-lived object capability.
+type PackageSourceArchive struct {
+	Digest string `json:"digest"`
+	Length int64  `json:"length"`
+	URL    string `json:"url"`
+}
+
 // Requirements returns the immutable execution dependencies from the exact
 // package environment facts. Creator needs only this one release fact to choose
 // a CPU or accelerator product; it does not reinterpret model inputs as hardware requirements.
@@ -308,6 +316,14 @@ func (c *Client) PackageRelease(ctx context.Context, ref Ref,
 	var out PackageReleaseDetail
 	e := c.do(ctx, call{method: http.MethodGet, path: packageReleasePath(ref, release),
 		strict: true, responseBytes: 16 << 20}, &out)
+	return out, e
+}
+
+func (c *Client) PackageSourceArchive(ctx context.Context, ref Ref, release string) (PackageSourceArchive, *exit.Error) {
+	var out PackageSourceArchive
+	e := c.do(ctx, call{method: http.MethodGet,
+		path: packageReleasePath(ref, release) + "/source", strict: true,
+		responseBytes: 1 << 20}, &out)
 	return out, e
 }
 
