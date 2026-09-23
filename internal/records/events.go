@@ -139,23 +139,38 @@ func (s *Store) CancelQueuedRequest(requestID string, payload map[string]any) (b
 // event. After a 202 response, status and watch must never disagree about why activation
 // failed merely because one of two separate writes was lost.
 func (s *Store) FailQueuedRequest(requestID string, payload map[string]any) (bool, *exit.Error) {
+	return s.failQueuedRequest(requestID, nil, payload)
+}
+
+// FailQueuedPreparation settles only the selection that produced the failure.
+// Rental recovery or an explicit resume can replace it while preparation runs.
+func (s *Store) FailQueuedPreparation(expected Request, payload map[string]any) (bool, *exit.Error) {
+	return s.failQueuedRequest(expected.ID, &expected, payload)
+}
+
+func (s *Store) failQueuedRequest(requestID string, expected *Request, payload map[string]any) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, exit.Internalf("cannot begin queued failure: %s", err)
 	}
 	defer tx.Rollback()
-	var state string
+	var state, worker string
+	var ordinal int64
+	var revision uint64
 	var retain bool
 	var openAttempts int
-	if err := tx.QueryRow(`SELECT state,retain_work,(SELECT COUNT(*) FROM attempts WHERE request_id=r.id
+	if err := tx.QueryRow(`SELECT state,retain_work,worker,ordinal,control_revision,(SELECT COUNT(*) FROM attempts WHERE request_id=r.id
 		AND state IN ('preparing','offered','accepted','recovered_open','terminal'))
-		FROM requests r WHERE id=?`, requestID).Scan(&state, &retain, &openAttempts); err != nil {
+		FROM requests r WHERE id=?`, requestID).Scan(&state, &retain, &worker, &ordinal, &revision, &openAttempts); err != nil {
 		if err == sql.ErrNoRows {
 			return false, nil
 		}
 		return false, exit.Internalf("cannot read queued request %s: %s", requestID, err)
 	}
 	if state != "submitted" && state != "queued" {
+		return false, nil
+	}
+	if expected != nil && (worker != expected.Worker || ordinal != expected.Ordinal || revision != expected.ControlRevision) {
 		return false, nil
 	}
 	if openAttempts != 0 {

@@ -661,7 +661,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		}
 		if reason != "" {
 			if req.RetainWork || req.RequestedRental != "" {
-				c.failQueued(req.ID, exit.Named(exit.Conflict, "request.retained_rental_unavailable", "the retained rental cannot execute this transaction (%s)", reason), "")
+				c.failPreparation(req, exit.Named(exit.Conflict, "request.retained_rental_unavailable", "the retained rental cannot execute this transaction (%s)", reason), "")
 				return
 			}
 			attempts, problem := c.opt.Store.Attempts(req.ID)
@@ -688,7 +688,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		// serving its other tenants while the manifests land, and this request routes to
 		// it once its placement reports DISPATCHABLE.
 		if c.opt.RentalFleet == nil || c.opt.AcquireManagedRental == nil {
-			c.failQueued(req.ID, exit.Named(exit.Unavailable, "rental.acquisition_unavailable",
+			c.failPreparation(req, exit.Named(exit.Unavailable, "rental.acquisition_unavailable",
 				"this Cozy daemon cannot acquire managed rentals"), "")
 			return
 		}
@@ -719,7 +719,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if deferred, _ := c.deferUnavailable(req, problem); deferred {
 				return
 			}
-			c.failQueued(req.ID, problem, "")
+			c.failPreparation(req, problem, "")
 			return
 		}
 		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
@@ -739,7 +739,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if deferred {
 				return
 			}
-			c.failQueued(req.ID, problem, "")
+			c.failPreparation(req, problem, "")
 			return
 		}
 		if after != "" {
@@ -873,26 +873,37 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			}
 			c.mu.Unlock()
 		}
+		superseded := func() bool {
+			current, problem := c.opt.Store.RequestRow(req.ID)
+			if problem != nil {
+				done()
+				c.logf("%s cannot check its preparation selection: %s", req.ID, problem.Message)
+				return true
+			}
+			if current == nil || (current.State != "queued" && current.State != "submitted") || current.Worker != req.Worker || current.Ordinal != req.Ordinal || current.ControlRevision != req.ControlRevision {
+				done()
+				c.reviveQueue()
+				return true
+			}
+			return false
+		}
 		if req.Worker != "" && c.opt.RentalRuntimePreflight != nil {
 			problem := c.opt.RentalRuntimePreflight(context.Background(), req, req.Worker)
-			current, readProblem := c.opt.Store.RequestRow(req.ID)
-			if readProblem != nil || current == nil || (current.State != "queued" && current.State != "submitted") || current.Worker != req.Worker {
-				// Rental reconciliation can unpin this request while the remote
-				// compatibility observation is in flight. Its stale selection must
-				// never settle the request that is now awaiting replacement capacity.
-				done()
-				c.drain()
+			if superseded() {
 				return
 			}
 			if problem != nil {
 				done()
 				if deferred, _ := c.deferUnavailable(req, problem); !deferred {
-					c.failQueued(req.ID, problem, "")
+					c.failPreparation(req, problem, "")
 				}
 				return
 			}
 		}
 		spec, planID, e := c.resolveFor(req)
+		if superseded() {
+			return
+		}
 		if e != nil {
 			done()
 			if e.ErrName() == "device_envelope_held" {
@@ -902,7 +913,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				return
 			}
-			c.failQueued(req.ID, autoRentalGate(req, e), "")
+			c.failPreparation(req, autoRentalGate(req, e), "")
 			return
 		}
 		if planID != "" && planID != req.PlanID {
@@ -910,7 +921,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			// drain routes from, so the plan is durable before the queue is re-asked.
 			if e := c.opt.Store.BindRequestPlan(req.ID, planID); e != nil {
 				done()
-				c.failQueued(req.ID, e, "")
+				c.failPreparation(req, e, "")
 				return
 			}
 		}
@@ -918,6 +929,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			req.PlanID = planID
 		}
 		instance, change, e := c.EnsureWorker(spec)
+		if superseded() {
+			return
+		}
 		if e != nil {
 			done()
 			// A local device grant held by another package is CAPACITY PRESSURE, not a
@@ -933,11 +947,15 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if deferred, _ := c.deferUnavailable(req, e); deferred {
 				return
 			}
-			c.failQueued(req.ID, autoRentalGate(req, e), "")
+			c.failPreparation(req, autoRentalGate(req, e), "")
 			return
 		}
 		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
-		if e := c.EnsurePlacementReady(instance, req.PlanID, req.ID); e != nil {
+		e = c.EnsurePlacementReady(instance, req.PlanID, req.ID)
+		if superseded() {
+			return
+		}
+		if e != nil {
 			if c.opt.RentalRuntimeMismatch != nil && req.Worker != "" {
 				e = c.opt.RentalRuntimeMismatch(req, req.Worker, e)
 			}
@@ -959,7 +977,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				return
 			}
 			done()
-			c.failQueued(req.ID, autoRentalGate(req, e), instance)
+			c.failPreparation(req, autoRentalGate(req, e), instance)
 			return
 		}
 		c.mu.Lock()
@@ -1462,20 +1480,34 @@ func (c *Orchestrator) exactLocalTransferProducer(req records.Request, spec Work
 // no offer crossed to a worker, so there is no worker terminal to replay and the request
 // row is what settles. A closed dispatch_aborted row may remain as preparation history.
 func (c *Orchestrator) failQueued(requestID string, cause *exit.Error, workerToStop string) {
+	c.failQueuedSelection(requestID, nil, cause, workerToStop)
+}
+
+func (c *Orchestrator) failPreparation(expected records.Request, cause *exit.Error, workerToStop string) {
+	c.failQueuedSelection(expected.ID, &expected, cause, workerToStop)
+}
+
+func (c *Orchestrator) failQueuedSelection(requestID string, expected *records.Request, cause *exit.Error, workerToStop string) {
 	payload := map[string]any{"status": "FAILED", "cause": cause.ErrName(),
 		"error_type": cause.ErrName(), "error": cause.Message,
 		"outputs": []any{}, "requeuing": false}
 	// The preparation waiter can outlive an accepted attempt or its successful
 	// finalization. The store is the sole authority to fail queued work; neither
 	// cleanup nor worker/provider teardown may run before that transaction wins.
-	applied, problem := c.opt.Store.FailQueuedRequest(requestID, payload)
+	var applied bool
+	var problem *exit.Error
+	if expected == nil {
+		applied, problem = c.opt.Store.FailQueuedRequest(requestID, payload)
+	} else {
+		applied, problem = c.opt.Store.FailQueuedPreparation(*expected, payload)
+	}
 	if problem != nil {
 		if problem.Code == exit.Conflict {
 			c.logf("%s preparation failure no longer applies: %s", requestID, problem.Message)
 			return
 		}
 		c.logf("%s could not be settled: %s", requestID, problem.Message)
-		time.AfterFunc(2*time.Second, func() { c.failQueued(requestID, cause, workerToStop) })
+		time.AfterFunc(2*time.Second, func() { c.failQueuedSelection(requestID, expected, cause, workerToStop) })
 		return
 	}
 	if !applied {
