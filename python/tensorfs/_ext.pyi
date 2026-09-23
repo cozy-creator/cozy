@@ -489,7 +489,16 @@ class Store:
         manifest_id: str,
         manifest_length: int,
         copies: Sequence[tuple[str, str, str]] = ...,
+        inherits: Sequence[tuple[str, str]] = ...,
         drops: Sequence[str] = ...,
+    ) -> dict[str, str | int]: ...
+    def inherit_model_assets(
+        self,
+        target_manifest_id: str,
+        target_manifest_length: int,
+        source_manifest_id: str,
+        source_manifest_length: int,
+        names: Sequence[str] = ...,
     ) -> dict[str, str | int]: ...
     def objects(self) -> list[str]: ...
     def reap_holds(self) -> list[str]: ...

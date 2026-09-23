@@ -23,6 +23,9 @@ pub enum Edit {
         source_path: String,
         media_type: String,
     },
+    /// Inherit one already-committed asset from the source checkpoint header.
+    /// The asset declaration and segment ObjectRefs are copied verbatim; no payload is read.
+    Inherit { name: String, source_name: String },
     /// Remove an asset by its exact header name.  Missing names are harmless, making
     /// retries deterministic.
     Drop { name: String },
@@ -72,6 +75,7 @@ pub fn update(
         detail: "asset update source has no CozyTensors header".into(),
     })?;
     let mut header = checkpoint::load_header(store, header_ref)?;
+    let source_assets: BTreeMap<String, Asset> = header.assets.iter().cloned().collect();
     let closure = checkpoint::load_closure(store, &header)?;
 
     let mut assets: BTreeMap<String, Asset> = header.assets.drain(..).collect();
@@ -79,6 +83,13 @@ pub fn update(
         match edit {
             Edit::Drop { name } => {
                 assets.remove(name);
+            }
+            Edit::Inherit { name, source_name } => {
+                let asset = source_assets.get(source_name).ok_or_else(|| Refusal {
+                    code: Code::OBJECT_ABSENT,
+                    detail: format!("source asset {source_name:?} is absent"),
+                })?;
+                assets.insert(name.clone(), asset.clone());
             }
             Edit::Copy {
                 name,
@@ -122,6 +133,47 @@ pub fn update(
     header.validate(&closure)?;
     let header_object = checkpoint::put_doc(store, &header)?;
     let manifest = checkpoint::build_manifest(&header, &header_object, &closure)?;
+    let manifest_object = store.put_manifest(&manifest)?.obj;
+    Ok(ResultSnapshot {
+        header: header_object,
+        manifest: manifest_object,
+    })
+}
+
+/// Inherit selected runtime assets from one exact source checkpoint into another
+/// metadata-only derived checkpoint. Tensor and asset payloads are never opened.
+pub fn inherit(
+    store: &Store,
+    target_manifest: &ObjectRef,
+    source_manifest: &ObjectRef,
+    names: &[String],
+) -> Result<ResultSnapshot> {
+    let target = checkpoint::load_manifest(store, target_manifest)?;
+    let target_header_ref = target.header().ok_or_else(|| Refusal {
+        code: Code::ATTACHMENT_CARDINALITY,
+        detail: "asset inheritance target has no CozyTensors header".into(),
+    })?;
+    let source = checkpoint::load_manifest(store, source_manifest)?;
+    let source_header_ref = source.header().ok_or_else(|| Refusal {
+        code: Code::ATTACHMENT_CARDINALITY,
+        detail: "asset inheritance source has no CozyTensors header".into(),
+    })?;
+    let mut header = checkpoint::load_header(store, target_header_ref)?;
+    let source_header = checkpoint::load_header(store, source_header_ref)?;
+    let target_closure = checkpoint::load_closure(store, &header)?;
+    let source_assets: BTreeMap<String, Asset> = source_header.assets.into_iter().collect();
+    let mut assets: BTreeMap<String, Asset> = header.assets.drain(..).collect();
+    for name in names {
+        let asset = source_assets.get(name).ok_or_else(|| Refusal {
+            code: Code::OBJECT_ABSENT,
+            detail: format!("source asset {name:?} is absent"),
+        })?;
+        assets.insert(name.clone(), asset.clone());
+    }
+    header.assets = assets.into_iter().collect();
+    header.validate(&target_closure)?;
+    let header_object = checkpoint::put_doc(store, &header)?;
+    let manifest = checkpoint::build_manifest(&header, &header_object, &target_closure)?;
     let manifest_object = store.put_manifest(&manifest)?.obj;
     Ok(ResultSnapshot {
         header: header_object,
@@ -288,6 +340,65 @@ mod tests {
         .unwrap();
         assert_eq!(one.header, two.header);
         assert_eq!(one.manifest, two.manifest);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inherits_existing_asset_refs_without_payload_reads() {
+        let root = temp();
+        let store = Store::init(&root).unwrap();
+        let spec = registry::seeds().into_iter().next().unwrap().spec;
+        let payload = put(&store, b"tokenizer");
+        let header = Header {
+            configs: vec![],
+            assets: vec![(
+                "tokenizer/vocab.json".into(),
+                Asset {
+                    logical_sha256: payload.sha256.clone(),
+                    logical_length: payload.length,
+                    media_type: "application/json".into(),
+                    segments: vec![payload.clone()],
+                },
+            )],
+            encodings: vec![spec.clone()],
+            components: vec![(
+                "model".into(),
+                vec![(
+                    "w".into(),
+                    Tensor {
+                        dtype: Dtype::U8,
+                        shape: vec![1],
+                        encoding: spec.object_id(),
+                        parts: vec![(
+                            "value".into(),
+                            Part {
+                                dtype: Dtype::U8,
+                                shape: vec![1],
+                                body: Body::Inline(vec![0]),
+                            },
+                        )],
+                    },
+                )],
+            )],
+        };
+        let href = put(&store, &header.canonical_bytes().unwrap());
+        let source = Draft {
+            entries: vec![("model.cozytensors".into(), Entry::CozyTensors(href))],
+        }
+        .seal()
+        .unwrap();
+        let source_ref = store.put_manifest(&source).unwrap().obj;
+        let result = update(
+            &store,
+            &source_ref,
+            &[Edit::Inherit {
+                name: "tokenizer/vocab.json".into(),
+                source_name: "tokenizer/vocab.json".into(),
+            }],
+        )
+        .unwrap();
+        let output = checkpoint::load_header(&store, &result.header).unwrap();
+        assert_eq!(output.assets[0].1.segments, vec![payload]);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

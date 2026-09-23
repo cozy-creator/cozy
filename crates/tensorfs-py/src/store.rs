@@ -593,24 +593,28 @@ impl PyStore {
 
     /// Rewrite only a CozyTensors header/manifest to add, replace, or drop model assets.
     /// `copies` are `(name, source_path, media_type)` rows selected from the exact source
-    /// manifest; TensorFS reuses their ObjectRefs without reading payload bytes.
-    #[pyo3(signature = (manifest_id, manifest_length, copies=Vec::new(), drops=Vec::new()))]
+    /// manifest; `inherits` are `(name, source_name)` rows copied from the source header.
+    #[pyo3(signature = (manifest_id, manifest_length, copies=Vec::new(), inherits=Vec::new(), drops=Vec::new()))]
     fn update_model_assets<'p>(
         &self,
         py: Python<'p>,
         manifest_id: &str,
         manifest_length: u64,
         copies: Vec<(String, String, String)>,
+        inherits: Vec<(String, String)>,
         drops: Vec<String>,
     ) -> PyResult<Bound<'p, PyDict>> {
         let source = obj_ref(py, manifest_id, manifest_length)?;
-        let mut edits = Vec::with_capacity(copies.len() + drops.len());
+        let mut edits = Vec::with_capacity(copies.len() + inherits.len() + drops.len());
         edits.extend(copies.into_iter().map(|(name, source_path, media_type)| {
             tensorfs_core::asset_update::Edit::Copy {
                 name,
                 source_path,
                 media_type,
             }
+        }));
+        edits.extend(inherits.into_iter().map(|(name, source_name)| {
+            tensorfs_core::asset_update::Edit::Inherit { name, source_name }
         }));
         edits.extend(
             drops
@@ -619,6 +623,31 @@ impl PyStore {
         );
         let result = py
             .detach(|| tensorfs_core::asset_update::update(&self.store, &source, &edits))
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("header_id", result.header.id())?;
+        out.set_item("header_length", result.header.length)?;
+        out.set_item("manifest_id", result.manifest.id())?;
+        out.set_item("manifest_length", result.manifest.length)?;
+        Ok(out)
+    }
+
+    /// Inherit selected verified model assets from one checkpoint into another,
+    /// rewriting only the target header and manifest.
+    #[pyo3(signature = (target_manifest_id, target_manifest_length, source_manifest_id, source_manifest_length, names=Vec::new()))]
+    fn inherit_model_assets<'p>(
+        &self,
+        py: Python<'p>,
+        target_manifest_id: &str,
+        target_manifest_length: u64,
+        source_manifest_id: &str,
+        source_manifest_length: u64,
+        names: Vec<String>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let target = obj_ref(py, target_manifest_id, target_manifest_length)?;
+        let source = obj_ref(py, source_manifest_id, source_manifest_length)?;
+        let result = py
+            .detach(|| tensorfs_core::asset_update::inherit(&self.store, &target, &source, &names))
             .or_refuse(py)?;
         let out = PyDict::new(py);
         out.set_item("header_id", result.header.id())?;
