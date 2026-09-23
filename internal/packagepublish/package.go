@@ -154,7 +154,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 		p.Root = ""
 		return problem
 	}
-	project, problem := projectWheel(ctx, p.Tree, root, p.Name, p.Release)
+	project, problem := projectWheel(ctx, p.Tree, root, p.Name, p.Release, python.Executable)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
@@ -253,12 +253,8 @@ func sourceArchiveFile(root, name, release string, files map[string]string) (str
 // its identity must come from [project], and it must install at least one Python
 // module or package. A backend left to guess a flat layout can emit a wheel holding
 // nothing but .dist-info; that wheel would fail on a rented pod, so it fails here.
-func projectWheel(ctx context.Context, tree, out, name, release string) (string, *exit.Error) {
-	python, problem := hostruntime.ProjectPython(ctx, tree)
-	if problem != nil {
-		return "", problem
-	}
-	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out, Python: python.Executable})
+func projectWheel(ctx context.Context, tree, out, name, release, python string) (string, *exit.Error) {
+	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out, Python: python})
 	if problem != nil {
 		return "", problem
 	}
@@ -385,7 +381,11 @@ func VerifyProjectWheel(ctx context.Context, tree, name, release string) *exit.E
 		return exit.Internalf("cannot create project wheel staging: %s", err)
 	}
 	defer os.RemoveAll(out)
-	_, problem := projectWheel(ctx, tree, out, name, release)
+	python, problem := hostruntime.ProjectPython(ctx, tree)
+	if problem != nil {
+		return problem
+	}
+	_, problem = projectWheel(ctx, tree, out, name, release, python.Executable)
 	return problem
 }
 
