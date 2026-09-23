@@ -70,7 +70,13 @@ jobs:
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 \
             --setenv="COZY_TEST_RUNTIME_WHEEL=$COZY_TEST_RUNTIME_WHEEL" \
             --setenv=UV_TORCH_BACKEND=cpu \
-            /bin/bash -euc 'id; cat /proc/self/cgroup; exec nice -n 19 go test ./... -run "${{ matrix.tests }}" -timeout 30m -args -serving-cpu-fixture -script-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"'
+            /bin/bash -euc '
+              id
+              cat /proc/self/cgroup
+              packages=$(go list ./... | grep -v "^github.com/cozy-creator/cozy/tests/product$")
+              nice -n 19 go test $packages -run "${{ matrix.tests }}" -timeout 30m
+              exec nice -n 19 go test ./tests/product -run "${{ matrix.tests }}" -timeout 30m -args -serving-cpu-fixture -script-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"
+            '
       - run: python3 scripts/fence.py
 
   # Framework artifact classification uses the Runtime-owned generated roster.
