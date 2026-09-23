@@ -24,6 +24,7 @@ import (
 )
 
 type machineExecutionClient interface {
+	GetMachineExecutionWorkspace(context.Context, *pb.MachineExecutionWorkspaceQuery, ...grpc.CallOption) (*pb.MachineExecutionWorkspace, error)
 	SubmitMachineExecution(context.Context, *pb.MachineExecutionSubmit, ...grpc.CallOption) (*pb.MachineExecutionReceipt, error)
 	GetMachineExecution(context.Context, *pb.MachineExecutionQuery, ...grpc.CallOption) (*pb.MachineExecutionState, error)
 	ListMachineExecutionEvents(context.Context, *pb.MachineExecutionEventsQuery, ...grpc.CallOption) (*pb.MachineExecutionEventPage, error)
@@ -250,6 +251,9 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		return problem
 	}
 	defer connection.connection.Close()
+	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
+		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
+	}
 	if len(request.Models) > 0 {
 		if connection.wireMinor < pb.NativeRootInputsWireMinor {
 			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "durable root Model inputs require Runtime protocol 55")
@@ -264,6 +268,9 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if len(link.Submission) > 0 {
 		if err := proto.Unmarshal(link.Submission, submission); err != nil {
 			return exit.Internalf("recorded machine submission is unreadable: %s", err)
+		}
+		if submission.ExpectedExecutionWorkspaceId == "" {
+			return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; its acceptance cannot safely be retried")
 		}
 		if submission.PublicationAuthorizationId != "" && connection.wireMinor < 52 {
 			return exit.Named(exit.Structural, "publication.worker_upgrade_required", "the frozen publication authorization requires actual Runtime protocol 52")
@@ -314,7 +321,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		built.PublicationAuthorizationId = authorization
 		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.wireMinor)
-		if problem := m.store.RecordMachineSubmission(request.ID, built); problem != nil {
+		if problem := m.freezeMachineSubmission(m.ctx, connection, request.ID, built); problem != nil {
 			return problem
 		}
 		submission = built
@@ -325,16 +332,53 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if request.LocalPackageDigest == "" && connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
 		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires Runtime protocol 54")
 	}
+	if problem := m.sendMachineSubmission(m.ctx, connection, request.ID, submission); problem != nil {
+		return problem
+	}
+	return m.releaseMachineInputs(m.ctx, request, connection)
+}
+
+// freezeMachineSubmission persists authenticated journal identity with the exact
+// offer before any Submit RPC. Only a never-transmitted submission may discover it.
+func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, submission *pb.MachineExecutionSubmit) *exit.Error {
+	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
+		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
+	}
+	workspace, err := connection.client.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{Claim: connection.claim})
+	if err != nil {
+		return machineTransport(err)
+	}
+	if workspace == nil || workspace.WorkerId != connection.claim.WorkerId || workspace.WorkerBootId == "" ||
+		(connection.claim.WorkerBootId != "" && workspace.WorkerBootId != connection.claim.WorkerBootId) ||
+		workspace.ExecutionWorkspaceId == "" || len(workspace.ExecutionWorkspaceId) > 256 {
+		return exit.New(exit.Conflict, "machine returned an invalid execution workspace identity")
+	}
+	submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
+	return m.store.RecordMachineSubmission(requestID, submission)
+}
+
+func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, submission *pb.MachineExecutionSubmit) *exit.Error {
+	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
+		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
+	}
+	if submission.ExpectedExecutionWorkspaceId == "" {
+		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; its acceptance cannot safely be retried")
+	}
 	submission.Claim = connection.claim
 	submission.Offer.WorkerBootId = connection.claim.WorkerBootId
 	submission.Offer.RecordOwnerEpoch = connection.claim.RecordOwnerEpoch
 	var trailer metadata.MD
-	receipt, err := connection.client.SubmitMachineExecution(m.ctx, submission, grpc.Trailer(&trailer))
+	receipt, err := connection.client.SubmitMachineExecution(ctx, submission, grpc.Trailer(&trailer))
 	if err != nil {
+		for _, code := range trailer.Get("cozy-error-code") {
+			if code == "execution_workspace_changed" || code == "execution_workspace_required" {
+				return exit.Named(exit.Conflict, "machine_execution.workspace_changed", "execution workspace no longer matches the frozen submission; prior acceptance remains unresolved")
+			}
+		}
 		for _, code := range trailer.Get("cozy-error-code") {
 			if code == "execution_submission_refused" {
 				problem := machineTransport(err)
-				if recordProblem := m.store.RefuseMachineSubmission(request.ID, problem.ErrName(), problem.Message); recordProblem != nil {
+				if recordProblem := m.store.RefuseMachineSubmission(requestID, problem.ErrName(), problem.Message); recordProblem != nil {
 					return recordProblem
 				}
 				break
@@ -342,19 +386,19 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		return machineTransport(err)
 	}
-	if receipt.WorkerId != connection.claim.WorkerId || receipt.WorkerBootId == "" {
+	if receipt == nil || receipt.WorkerId != connection.claim.WorkerId || receipt.WorkerBootId == "" {
 		return exit.New(exit.Conflict, "execution was accepted by an unexpected worker")
 	}
-	if problem := m.store.AcceptMachineExecution(request.ID, receipt); problem != nil {
+	if problem := m.store.AcceptMachineExecution(requestID, receipt); problem != nil {
 		return problem
 	}
-	return m.releaseMachineInputs(m.ctx, request, connection)
+	return nil
 }
 
 func machineTransport(err error) *exit.Error {
 	code := status.Code(err)
 	if code == codes.Unimplemented {
-		return exit.Named(exit.Unavailable, "machine_execution.worker_upgrade_required", "worker does not implement Runtime-owned execution; worker protocol 51 is required")
+		return exit.Named(exit.Unavailable, "machine_execution.worker_upgrade_required", "worker does not implement workspace-fenced execution; worker protocol 59 is required")
 	}
 	if code == codes.Unavailable || code == codes.DeadlineExceeded || code == codes.Canceled || code == codes.ResourceExhausted || code == codes.Aborted {
 		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "machine execution observation is unavailable: %s", status.Convert(err).Message())

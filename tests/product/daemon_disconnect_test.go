@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
@@ -268,6 +269,13 @@ def main():
 	fatal(t, problem)
 	if before == nil || len(before.Receipt) == 0 || before.Collected {
 		t.Fatal("execution did not remain live through the receipt boundary")
+	}
+	var submission pb.MachineExecutionSubmit
+	var receipt pb.MachineExecutionReceipt
+	must(t, proto.Unmarshal(before.Submission, &submission))
+	must(t, proto.Unmarshal(before.Receipt, &receipt))
+	if submission.ExpectedExecutionWorkspaceId == "" || submission.ExpectedExecutionWorkspaceId != receipt.ExecutionWorkspaceId {
+		t.Fatal("ordinary CLI did not freeze the authenticated Runtime workspace before acceptance")
 	}
 	runtimeProcess, err := os.ReadFile(filepath.Join(root, "runtime", "process.json"))
 	must(t, err)
