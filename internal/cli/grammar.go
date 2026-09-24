@@ -182,10 +182,12 @@ func (c *PackageListCmd) Run(r *Runtime) error {
 	return r.call(handleLs, nil, nil, nil, false)
 }
 
-type PackagePublishCmd struct{}
+type PackagePublishCmd struct {
+	Wheel []string `name:"wheel" help:"Publish this prebuilt project wheel instead of building one; repeat for each Python/platform variant." type:"path"`
+}
 
 func (c *PackagePublishCmd) Run(r *Runtime) error {
-	return r.call(handlePackagePublish, nil, nil, nil, false)
+	return r.call(handlePackagePublish, nil, nil, map[string][]string{"--wheel": c.Wheel}, false)
 }
 
 type ModelCmd struct {
