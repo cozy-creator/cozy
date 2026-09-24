@@ -80,6 +80,11 @@ func TestRentalDetachReattachPreservesRunningAttempt(t *testing.T) {
 	instance, _, _, problem := o.c.EnsureRental(podRental)
 	fatal(t, problem)
 	fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "cozy/h3-package", Release: "1.0.7"}}, nil))
+	waitUntil(t, "the initial selection to reach the worker", func() bool {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		return len(pod.desired) == 1
+	})
 	waitUntil(t, "the first progress watch to fail", func() bool { return watches.Load() >= 1 })
 	_, _, problem = o.store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: childDigest("2"), Package: "cozy/h3-package", Entrypoint: "denoise", Kind: "job", Payload: []byte(`{}`), Worker: podRental, Rental: true})
 	fatal(t, problem)
