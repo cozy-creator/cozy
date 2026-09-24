@@ -267,7 +267,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	}
 	if existing != nil && (existing.State == "failed" || existing.State == "release_requested") {
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.release_required",
-			"rental operation %s is %s and still names rental %s", operationKey, existing.State, existing.RentalID).
+			"rental operation %s is %s and still names rental %s", operationKey, humanRentalState(existing.State), existing.RentalID).
 			WithRemedy("release the existing rental before starting another operation").
 			WithNext("cozy rental end " + existing.RentalID)
 	}
@@ -731,7 +731,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 			// A rental that is LEAVING is not one that is still coming up, and waiting on
 			// it is waiting for a state it will never reach.
 			return hub.Rental{}, exit.New(exit.Failed,
-				"rental %s is %s: %s", id, r.State, detailOr(r.Detail)).
+				"rental %s is %s: %s", id, humanRentalState(r.State), detailOr(r.Detail)).
 				WithRemedy("the rental is leaving or gone; rent again if you still need a pod").
 				WithNext("cozy rental new <machine-slug>")
 		case r.State == hub.RentalReady:
@@ -746,7 +746,7 @@ func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, i
 		// per poll would be a progress bar for someone else's work.
 		if ctx.Mode().Full && !ctx.Mode().JSON && r.Detail != "" && r.Detail != said {
 			said = r.Detail
-			fmt.Fprintf(ctx.Err, "  %s: %s\n", r.State, r.Detail)
+			fmt.Fprintf(ctx.Err, "  %s: %s\n", humanRentalState(r.State), r.Detail)
 		}
 		if timedOut := pastDeadline(id, r.State, deadline); timedOut != nil {
 			return hub.Rental{}, timedOut

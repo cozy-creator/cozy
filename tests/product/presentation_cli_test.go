@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -62,5 +63,21 @@ func TestRentalHumanDrainingPreservesWireState(t *testing.T) {
 	defer peer.mu.Unlock()
 	if peer.released["pr-draining"] != 0 {
 		t.Fatal("listing a draining rental issued a release")
+	}
+}
+
+func TestRentalConflictNamesDrainingOperation(t *testing.T) {
+	root, origin, stand := rentalEndRoot(t, "draining-conflict")
+	stand.publishListing()
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	_, _, problem = store.BeginRentalOperation(records.RentalOperation{Key: "draining-op", Hub: origin, Reason: "manual", HourlyRateUSDMicros: 100_000},
+		5_000_000, 0, func(string) ([]byte, string, *exit.Error) { return []byte(`{}`), "draining", nil }, nil)
+	fatal(t, problem)
+	fatal(t, store.AdvanceRentalOperation("draining-op", "pr-draining-op", "release_requested"))
+	code, output := runCozy(t, root, "rental", "new", "cpu", "--idempotency-key", "draining-op")
+	if code == 0 || !strings.Contains(output, "is draining and still names rental pr-draining-op") || strings.Contains(output, "release_requested") {
+		t.Fatalf("draining operation conflict was not stated in lifecycle terms: exit=%d %s", code, output)
 	}
 }

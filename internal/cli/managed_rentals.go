@@ -965,7 +965,7 @@ func (m *managedRentals) sayUnrecordedLocked() {
 	for _, seen := range m.unrecorded {
 		m.sayLocked("hub:"+seen.ID, fmt.Sprintf(
 			"rental %s (%s) is %s at %s and this host holds no record of it; activity is unknown to this controller",
-			seen.ID, seen.Name, seen.State, usdPerHour(seen.HourlyRateUSDMicros)))
+			seen.ID, seen.Name, humanRentalState(seen.State), usdPerHour(seen.HourlyRateUSDMicros)))
 	}
 }
 
