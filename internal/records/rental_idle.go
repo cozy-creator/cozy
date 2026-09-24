@@ -22,8 +22,12 @@ const rentalIdleDDL = `CREATE TABLE IF NOT EXISTS rental_idle (
 
 // RentalIdleRunCounts excludes retained terminal attempts and counts only work
 // assigned to this machine, including its explicitly purchased acquisition.
-func (s *Store) RentalIdleRunCounts(id, buyer string) (queued, running int, problem *exit.Error) {
-	err := s.db.QueryRow(`SELECT
+func (s *Store) RentalIdleRunCounts(id, buyer string) (int, int, *exit.Error) {
+	return rentalIdleRunCounts(s.db, id, buyer)
+}
+
+func rentalIdleRunCounts(reader rentalIdleReader, id, buyer string) (queued, running int, problem *exit.Error) {
+	err := reader.QueryRow(`SELECT
  COALESCE(SUM(CASE WHEN r.state IN ('submitted','queued','requeue_pending') THEN 1 ELSE 0 END),0),
  COALESCE(SUM(CASE WHEN r.state IN ('dispatching','finalizing','pausing','canceling') OR
  EXISTS(SELECT 1 FROM attempts a WHERE a.request_id=r.id AND a.state IN ('preparing','offered','accepted','recovered_open')) THEN 1 ELSE 0 END),0)
@@ -100,10 +104,14 @@ func (s *Store) RecordRentalWorkFinished(id string, at time.Time) *exit.Error {
 }
 
 func (s *Store) RentalIdleResetAt(row Rental) (time.Time, int, *exit.Error) {
+	return rentalIdleResetAt(s.db, row)
+}
+
+func rentalIdleResetAt(reader rentalIdleReader, row Rental) (time.Time, int, *exit.Error) {
 	var ack int64
 	var pending int
 	var worker, boot, finished, observed string
-	err := s.db.QueryRow(`SELECT worker_id,worker_boot_id,acknowledged_at_ms,work_finished_at,preparation_pending,receipt_observed_at FROM rental_idle WHERE rental_id=?`, row.ID).Scan(&worker, &boot, &ack, &finished, &pending, &observed)
+	err := reader.QueryRow(`SELECT worker_id,worker_boot_id,acknowledged_at_ms,work_finished_at,preparation_pending,receipt_observed_at FROM rental_idle WHERE rental_id=?`, row.ID).Scan(&worker, &boot, &ack, &finished, &pending, &observed)
 	if err == sql.ErrNoRows {
 		return time.Time{}, 0, nil
 	}
@@ -129,4 +137,110 @@ func (s *Store) RentalIdleResetAt(row Rental) (time.Time, int, *exit.Error) {
 		}
 	}
 	return at, pending, nil
+}
+
+type rentalIdleReader interface {
+	Query(string, ...any) (*sql.Rows, error)
+	QueryRow(string, ...any) *sql.Row
+}
+
+// RentalIdleState is one machine's work and clock facts. Unresolved preparation
+// is uncertainty after controller loss, not activity or a clock renewal.
+type RentalIdleState struct {
+	Queued, Running, PendingPreparation int
+	Since                               time.Time
+}
+
+func (i RentalIdleState) ReleaseAt() (time.Time, bool) {
+	if i.Queued > 0 || i.Running > 0 || i.PendingPreparation > 0 || i.Since.IsZero() {
+		return time.Time{}, false
+	}
+	return i.Since.Add(time.Duration(pb.RentalIdleTimeoutSeconds) * time.Second), true
+}
+func (i RentalIdleState) Due(at time.Time) bool {
+	deadline, ok := i.ReleaseAt()
+	return ok && !at.Before(deadline)
+}
+
+func (s *Store) RentalIdleObservation(row Rental) (RentalIdleState, *exit.Error) {
+	return rentalIdleObservation(s.db, row)
+}
+func rentalIdleObservation(reader rentalIdleReader, row Rental) (RentalIdleState, *exit.Error) {
+	var idle RentalIdleState
+	var problem *exit.Error
+	idle.Queued, idle.Running, problem = rentalIdleRunCounts(reader, row.ID, row.ManagedRequestID)
+	if problem != nil {
+		return idle, problem
+	}
+	if row.ReadyAt != "" {
+		idle.Since, _ = time.Parse(time.RFC3339Nano, row.ReadyAt)
+		if idle.Since.IsZero() {
+			return idle, exit.Internalf("rental %s has an invalid ready timestamp", row.ID)
+		}
+	}
+	last, found, problem := rentalLastSettlement(reader, row.ID)
+	if problem != nil {
+		return idle, problem
+	}
+	if found && last.SettledAt.After(idle.Since) {
+		idle.Since = last.SettledAt
+	}
+	at, pending, problem := rentalIdleResetAt(reader, row)
+	if problem != nil {
+		return idle, problem
+	}
+	idle.PendingPreparation = pending
+	if at.After(idle.Since) {
+		idle.Since = at
+	}
+	return idle, nil
+}
+
+// ClaimRentalIdleRelease atomically chooses expiry against request admission.
+// The single records writer either sees new pinned work, or commits the release
+// fence before any new pin/submission can enter. No network call occurs here.
+func (s *Store) ClaimRentalIdleRelease(id string, at time.Time) (bool, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot begin rental idle release: %s", err)
+	}
+	defer tx.Rollback()
+	row, err := scanRental(tx.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, id))
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, exit.Internalf("cannot read rental expiry candidate: %s", err)
+	}
+	if row.State == "release_requested" {
+		return true, nil
+	}
+	if row.State != "ready" {
+		return false, nil
+	}
+	idle, problem := rentalIdleObservation(tx, row)
+	if problem != nil {
+		return false, problem
+	}
+	if !idle.Due(at) {
+		return false, nil
+	}
+	if _, err := tx.Exec(`UPDATE rentals SET state='release_requested' WHERE id=?`, id); err != nil {
+		return false, exit.Internalf("cannot commit rental idle release: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot finish rental idle release: %s", err)
+	}
+	return true, nil
+}
+
+func refuseReleasedRental(reader rentalIdleReader, id string) *exit.Error {
+	var unavailable bool
+	if err := reader.QueryRow(`SELECT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed'))`, id).Scan(&unavailable); err != nil {
+		return exit.Internalf("cannot inspect rental work admission: %s", err)
+	}
+	if unavailable {
+		return exit.Named(exit.Conflict, "request.rental_unavailable", "the selected rental is being released or has ended")
+	}
+	return nil
 }

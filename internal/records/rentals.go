@@ -1028,7 +1028,11 @@ type RentalLastSettlement struct {
 }
 
 func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *exit.Error) {
-	rows, err := s.db.Query(`SELECT r.id,r.kind,r.created_at,
+	return rentalLastSettlement(s.db, id)
+}
+
+func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlement, bool, *exit.Error) {
+	rows, err := reader.Query(`SELECT r.id,r.kind,r.created_at,
 		COALESCE((SELECT a.closed_at FROM attempts a WHERE a.request_id=r.id
 		  AND a.state IN ('terminal','closed') AND a.closed_at<>''
 		  ORDER BY a.attempt DESC LIMIT 1),''),

@@ -753,18 +753,18 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 // Idle expiry intentionally ignores retained custody: paused/failed files are
 // not work. The capacity/purpose cleanup above retains its stronger custody gate.
 func (m *managedRentals) releaseIdleLocked(id string) (string, *exit.Error) {
+	claimed, problem := m.store.ClaimRentalIdleRelease(id, time.Now())
+	if problem != nil {
+		return "", problem
+	}
+	if !claimed {
+		return m.lineLocked()
+	}
 	row, problem := m.store.RentalRow(id)
 	if problem != nil {
 		return "", problem
 	}
 	if row == nil {
-		return m.lineLocked()
-	}
-	idle, problem := m.observeIdle(*row)
-	if problem != nil {
-		return "", problem
-	}
-	if !idle.Due(time.Now()) {
 		return m.lineLocked()
 	}
 	return m.releasePaidLocked(*row)

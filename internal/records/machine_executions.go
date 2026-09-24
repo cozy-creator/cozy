@@ -157,7 +157,7 @@ func (s *Store) LinkMachineExecution(id, machine string) *exit.Error {
 	if machine == "" || len(machine) > 256 {
 		return exit.New(exit.Validation, "machine execution requires one bounded machine identity")
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET machine_id=? WHERE request_id=? AND (machine_id='' OR machine_id=?)`, machine, id, machine)
+	result, err := s.db.Exec(`UPDATE machine_executions SET machine_id=? WHERE request_id=? AND (machine_id='' OR machine_id=?) AND NOT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed'))`, machine, id, machine, machine)
 	if err != nil {
 		return exit.Internalf("cannot record machine execution destination: %s", err)
 	}
@@ -184,7 +184,7 @@ func (s *Store) RecordMachineSubmission(id string, submission *pb.MachineExecuti
 	if err != nil || len(raw) > 8<<20 {
 		return exit.New(exit.Validation, "machine submission exceeds its bounded envelope")
 	}
-	result, err := s.db.Exec(`UPDATE machine_executions SET submission=? WHERE request_id=? AND machine_id!='' AND (length(submission)=0 OR submission=?) AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state!='canceled')`, raw, id, raw, id)
+	result, err := s.db.Exec(`UPDATE machine_executions SET submission=? WHERE request_id=? AND machine_id!='' AND (length(submission)=0 OR submission=?) AND EXISTS(SELECT 1 FROM requests WHERE id=? AND state!='canceled') AND NOT EXISTS(SELECT 1 FROM rentals WHERE id=machine_executions.machine_id AND state IN ('release_requested','released','failed'))`, raw, id, raw, id)
 	if err != nil {
 		return exit.Internalf("cannot retain machine submission: %s", err)
 	}

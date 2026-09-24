@@ -73,7 +73,7 @@ machine and an acknowledged explicit `cozy rental keepalive <name>` reset it. Re
 failed/paused files, connection traffic and unpinned fleet work do not. The pod independently
 enforces expiry while Creator is offline, using the existing Hub release route. Creator
 schedules its fallback from first local receipt observation, so clock skew cannot make
-it release before the acknowledged allowance; duplicate/older receipts do not renew it. a managed rental whose assigned requests are terminal, their output
+it release before the acknowledged allowance; duplicate/older receipts do not renew it. A managed rental whose assigned requests are terminal, their output
 bytes mirrored, and their outcome acknowledgements sent is released at once when its work was
 a job. `cozy rental end` releases one now.
 
