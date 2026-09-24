@@ -194,7 +194,7 @@ func TestRentalInventoryAPIKeepsUnknownActivityAndPrivateFieldsAbsent(t *testing
 	}))
 	defer hub.Close()
 	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: test\nrentals:\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: test\n"), 0600))
 	live := startDaemonProcess(t, root)
 	if code, output := runCozy(t, root, "rental", "list", "--json"); code != 0 || !strings.Contains(output, `"recorded":false`) {
 		t.Fatalf("real daemon inventory failed: %d %s", code, output)

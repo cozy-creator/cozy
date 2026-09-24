@@ -253,7 +253,7 @@ func TestRecordsRejectsNewerSchemaWithoutResetHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`PRAGMA user_version=43`); err != nil {
+	if _, err := db.Exec(`PRAGMA user_version=44`); err != nil {
 		db.Close()
 		t.Fatalf("stamp future schema: %v", err)
 	}

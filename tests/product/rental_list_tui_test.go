@@ -102,15 +102,15 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if busy == nil {
 		t.Fatalf("queued work did not blank the idle countdown\n%q", tty)
 	}
-	countdown := regexp.MustCompile(`(\d+)s / 4m`)
+	countdown := regexp.MustCompile(`(\d+)s / 15m`)
 	elapsed := countdown.FindAllStringSubmatchIndex(tty, -1)
 	if len(elapsed) < 2 {
-		t.Fatalf("the IDLE cell did not count elapsed over the 4m policy deadline\n%q", tty)
+		t.Fatalf("the IDLE cell did not count elapsed over the 15m policy deadline\n%q", tty)
 	}
 	first := tty[elapsed[0][2]:elapsed[0][3]]
 	last := tty[elapsed[len(elapsed)-1][2]:elapsed[len(elapsed)-1][3]]
 	if first == last {
-		t.Fatalf("the IDLE elapsed clock never moved: always %ss / 4m\n%q", first, tty)
+		t.Fatalf("the IDLE elapsed clock never moved: always %ss / 15m\n%q", first, tty)
 	}
 	if elapsed[len(elapsed)-1][0] < busy[0] {
 		t.Fatalf("the idle countdown did not resume after the work settled\n%q", tty)

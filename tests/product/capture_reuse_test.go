@@ -126,7 +126,7 @@ func TestCapturePinsMigrateAndPreserveOrdinaryInstallOwners(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 42 {
+	if version != 43 {
 		t.Fatalf("daemon did not migrate capture ownership: %d", version)
 	}
 	db.Close()
