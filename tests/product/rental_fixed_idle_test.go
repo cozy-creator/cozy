@@ -88,7 +88,7 @@ func TestRentalKeepaliveReceiptSurvivesReconnectAndRejectsInvalidAcknowledgment(
 	at := time.Now().UTC().Truncate(time.Millisecond)
 	row := idleRecord(t, store, "manual", at.Add(-time.Hour))
 	receipt := &pb.KeepRentalAliveResult{RequestId: "manual-1", WorkerId: row.ExpectedWorkerID, WorkerBootId: row.ExpectedWorkerBootID, AcknowledgedAtUnixMs: at.UnixMilli(), IdleDeadlineUnixMs: at.Add(900 * time.Second).UnixMilli()}
-	fatal(t, store.RecordRentalKeepalive(row.ID, receipt))
+	fatal(t, store.RecordRentalKeepalive(row.ID, receipt, at))
 	// Status/reconnect writes preserve both readiness and the acknowledged clock.
 	row.ReadyAt = at.Add(time.Hour).Format(time.RFC3339Nano)
 	fatal(t, store.RecordRental(row))
@@ -109,12 +109,12 @@ func TestRentalKeepaliveReceiptSurvivesReconnectAndRejectsInvalidAcknowledgment(
 		}
 	}
 	check(at.Add(900 * time.Second))
-	fatal(t, store.RecordRentalKeepalive(row.ID, receipt))
+	fatal(t, store.RecordRentalKeepalive(row.ID, receipt, at))
 	check(at.Add(900 * time.Second))
 	for _, mutate := range []func(*pb.KeepRentalAliveResult){func(r *pb.KeepRentalAliveResult) { r.WorkerId = "other" }, func(r *pb.KeepRentalAliveResult) { r.WorkerBootId = "other" }, func(r *pb.KeepRentalAliveResult) { r.IdleDeadlineUnixMs++ }, func(r *pb.KeepRentalAliveResult) { r.AcknowledgedAtUnixMs = 0 }, func(r *pb.KeepRentalAliveResult) { r.RequestId = "" }} {
 		invalid := proto.Clone(receipt).(*pb.KeepRentalAliveResult)
 		mutate(invalid)
-		if store.RecordRentalKeepalive(row.ID, invalid) == nil {
+		if store.RecordRentalKeepalive(row.ID, invalid, at.Add(time.Minute)) == nil {
 			t.Fatal("invalid worker acknowledgment renewed rental")
 		}
 		check(at.Add(900 * time.Second))
@@ -123,11 +123,11 @@ func TestRentalKeepaliveReceiptSurvivesReconnectAndRejectsInvalidAcknowledgment(
 	later.RequestId = "manual-2"
 	later.AcknowledgedAtUnixMs += 120000
 	later.IdleDeadlineUnixMs += 120000
-	fatal(t, store.RecordRentalKeepalive(row.ID, later))
+	fatal(t, store.RecordRentalKeepalive(row.ID, later, at.Add(120*time.Second)))
 	check(at.Add(1020 * time.Second))
 	row.State = "release_requested"
 	fatal(t, store.RecordRental(row))
-	if store.RecordRentalKeepalive(row.ID, later) == nil {
+	if store.RecordRentalKeepalive(row.ID, later, at.Add(120*time.Second)) == nil {
 		t.Fatal("ending rental renewed")
 	}
 }
@@ -262,5 +262,39 @@ func TestRentalIdleSchemaUpgradePreservesReadyAndRetainedWork(t *testing.T) {
 	fatal(t, problem)
 	if idle.PendingPreparation != 0 || !idle.Due(idle.Since.Add(900*time.Second)) {
 		t.Fatal("migration invented activity or changed idle period")
+	}
+}
+
+func TestRentalKeepaliveLocalDeadlineIgnoresHostClockSkew(t *testing.T) {
+	for _, skew := range []time.Duration{-8 * time.Hour, 8 * time.Hour} {
+		t.Run(skew.String(), func(t *testing.T) {
+			store, problem := records.Open(filepath.Join(t.TempDir(), "records.sqlite"))
+			fatal(t, problem)
+			defer store.Close()
+			received := time.Date(2026, 9, 24, 12, 0, 0, 123456789, time.UTC)
+			row := idleRecord(t, store, "skew", received.Add(-time.Hour))
+			ack := received.Add(skew).UnixMilli()
+			receipt := &pb.KeepRentalAliveResult{RequestId: "skew-1", WorkerId: row.ExpectedWorkerID, WorkerBootId: row.ExpectedWorkerBootID, AcknowledgedAtUnixMs: ack, IdleDeadlineUnixMs: ack + 900000}
+			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received))
+			check := func(want time.Time) {
+				t.Helper()
+				idle, p := rental.ObserveIdle(store, row)
+				fatal(t, p)
+				due, ok := idle.ReleaseAt()
+				if !ok || !due.Equal(want) {
+					t.Fatalf("local due=%s want=%s Host skew=%s", due, want, skew)
+				}
+			}
+			check(received.Add(900 * time.Second))
+			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received.Add(10*time.Minute)))
+			check(received.Add(900 * time.Second))
+			newer := proto.Clone(receipt).(*pb.KeepRentalAliveResult)
+			newer.RequestId = "skew-2"
+			newer.AcknowledgedAtUnixMs += 1000
+			newer.IdleDeadlineUnixMs += 1000
+			fatal(t, store.RecordRentalKeepalive(row.ID, newer, received.Add(time.Second)))
+			fatal(t, store.RecordRentalKeepalive(row.ID, receipt, received.Add(20*time.Minute)))
+			check(received.Add(901 * time.Second))
+		})
 	}
 }

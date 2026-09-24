@@ -71,7 +71,9 @@ cheapest idle rental first, otherwise buys the cheapest offered SKU. Every renta
 Creator-managed, has an immutable 900-second idle deadline. Only actual work on that
 machine and an acknowledged explicit `cozy rental keepalive <name>` reset it. Retained
 failed/paused files, connection traffic and unpinned fleet work do not. The pod independently
-enforces expiry while Creator is offline, using the existing Hub release route; a managed rental whose assigned requests are terminal, their output
+enforces expiry while Creator is offline, using the existing Hub release route. Creator
+schedules its fallback from first local receipt observation, so clock skew cannot make
+it release before the acknowledged allowance; duplicate/older receipts do not renew it. a managed rental whose assigned requests are terminal, their output
 bytes mirrored, and their outcome acknowledgements sent is released at once when its work was
 a job. `cozy rental end` releases one now.
 

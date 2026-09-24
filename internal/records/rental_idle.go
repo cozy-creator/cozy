@@ -15,6 +15,7 @@ const rentalIdleDDL = `CREATE TABLE IF NOT EXISTS rental_idle (
  request_id TEXT NOT NULL DEFAULT '',
  acknowledged_at_ms INTEGER NOT NULL DEFAULT 0,
  idle_deadline_ms INTEGER NOT NULL DEFAULT 0,
+ receipt_observed_at TEXT NOT NULL DEFAULT '',
  work_finished_at TEXT NOT NULL DEFAULT '',
  preparation_pending INTEGER NOT NULL DEFAULT 0
 )`
@@ -35,18 +36,19 @@ func (s *Store) RentalIdleRunCounts(id, buyer string) (queued, running int, prob
 }
 
 // RecordRentalKeepalive accepts only a full, identity-bound Host acknowledgment.
-// Older receipts never move the clock backward, and a replay cannot renew it.
-func (s *Store) RecordRentalKeepalive(id string, result *pb.KeepRentalAliveResult) *exit.Error {
-	if result == nil || result.RequestId == "" || len(result.RequestId) > pb.MaxRentalKeepaliveRequestIDBytes || result.WorkerId == "" || result.WorkerBootId == "" || result.AcknowledgedAtUnixMs <= 0 || result.IdleDeadlineUnixMs <= result.AcknowledgedAtUnixMs || result.IdleDeadlineUnixMs-result.AcknowledgedAtUnixMs != pb.RentalIdleTimeoutSeconds*1000 {
+// Creator schedules from the first local observation, not the Host clock.
+// Older receipts never move that clock backward, and a replay cannot renew it.
+func (s *Store) RecordRentalKeepalive(id string, result *pb.KeepRentalAliveResult, observedAt time.Time) *exit.Error {
+	if observedAt.IsZero() || result == nil || result.RequestId == "" || len(result.RequestId) > pb.MaxRentalKeepaliveRequestIDBytes || result.WorkerId == "" || result.WorkerBootId == "" || result.AcknowledgedAtUnixMs <= 0 || result.IdleDeadlineUnixMs <= result.AcknowledgedAtUnixMs || result.IdleDeadlineUnixMs-result.AcknowledgedAtUnixMs != pb.RentalIdleTimeoutSeconds*1000 {
 		return exit.New(exit.Conflict, "worker returned an invalid rental keepalive receipt")
 	}
-	updated, err := s.db.Exec(`INSERT INTO rental_idle(rental_id,worker_id,worker_boot_id,request_id,acknowledged_at_ms,idle_deadline_ms)
- SELECT id,expected_worker_id,expected_worker_boot_id,?,?,? FROM rentals
+	updated, err := s.db.Exec(`INSERT INTO rental_idle(rental_id,worker_id,worker_boot_id,request_id,acknowledged_at_ms,idle_deadline_ms,receipt_observed_at)
+ SELECT id,expected_worker_id,expected_worker_boot_id,?,?,?,? FROM rentals
  WHERE id=? AND state='ready' AND expected_worker_id=? AND expected_worker_boot_id=?
  ON CONFLICT(rental_id) DO UPDATE SET worker_id=excluded.worker_id,worker_boot_id=excluded.worker_boot_id,
- request_id=excluded.request_id,acknowledged_at_ms=excluded.acknowledged_at_ms,idle_deadline_ms=excluded.idle_deadline_ms
- WHERE excluded.acknowledged_at_ms>=rental_idle.acknowledged_at_ms AND
- (excluded.request_id!=rental_idle.request_id OR (excluded.acknowledged_at_ms=rental_idle.acknowledged_at_ms AND excluded.idle_deadline_ms=rental_idle.idle_deadline_ms))`, result.RequestId, result.AcknowledgedAtUnixMs, result.IdleDeadlineUnixMs, id, result.WorkerId, result.WorkerBootId)
+ request_id=excluded.request_id,acknowledged_at_ms=excluded.acknowledged_at_ms,idle_deadline_ms=excluded.idle_deadline_ms,receipt_observed_at=excluded.receipt_observed_at
+ WHERE excluded.acknowledged_at_ms>rental_idle.acknowledged_at_ms AND
+ excluded.request_id!=rental_idle.request_id`, result.RequestId, result.AcknowledgedAtUnixMs, result.IdleDeadlineUnixMs, observedAt.UTC().Format(time.RFC3339Nano), id, result.WorkerId, result.WorkerBootId)
 	if err != nil {
 		return exit.Internalf("cannot persist rental keepalive acknowledgment: %s", err)
 	}
@@ -100,8 +102,8 @@ func (s *Store) RecordRentalWorkFinished(id string, at time.Time) *exit.Error {
 func (s *Store) RentalIdleResetAt(row Rental) (time.Time, int, *exit.Error) {
 	var ack int64
 	var pending int
-	var worker, boot, finished string
-	err := s.db.QueryRow(`SELECT worker_id,worker_boot_id,acknowledged_at_ms,work_finished_at,preparation_pending FROM rental_idle WHERE rental_id=?`, row.ID).Scan(&worker, &boot, &ack, &finished, &pending)
+	var worker, boot, finished, observed string
+	err := s.db.QueryRow(`SELECT worker_id,worker_boot_id,acknowledged_at_ms,work_finished_at,preparation_pending,receipt_observed_at FROM rental_idle WHERE rental_id=?`, row.ID).Scan(&worker, &boot, &ack, &finished, &pending, &observed)
 	if err == sql.ErrNoRows {
 		return time.Time{}, 0, nil
 	}
@@ -110,7 +112,12 @@ func (s *Store) RentalIdleResetAt(row Rental) (time.Time, int, *exit.Error) {
 	}
 	var at time.Time
 	if ack > 0 && worker == row.ExpectedWorkerID && boot == row.ExpectedWorkerBootID {
-		at = time.UnixMilli(ack)
+		// Host timestamps are identity/order facts, never a laptop clock baseline.
+		// Scheduling from first receipt avoids early DELETE when clocks differ.
+		at, err = time.Parse(time.RFC3339Nano, observed)
+		if err != nil {
+			return time.Time{}, 0, exit.Internalf("invalid rental keepalive observation time: %s", err)
+		}
 	}
 	if finished != "" {
 		work, err := time.Parse(time.RFC3339Nano, finished)

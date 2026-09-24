@@ -62,7 +62,7 @@ func (m *managedRentals) keepalive(ctx context.Context, id, requestID string) (a
 	if problem != nil {
 		return out, problem
 	}
-	if problem = m.store.RecordRentalKeepalive(id, receipt); problem != nil {
+	if problem = m.store.RecordRentalKeepalive(id, receipt, time.Now()); problem != nil {
 		return out, problem
 	}
 	m.forgetIdleLocked(id)
