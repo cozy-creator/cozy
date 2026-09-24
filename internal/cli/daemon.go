@@ -157,7 +157,7 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 			// Missing/newer schema metadata never authorizes replacing a live owner.
 			if state.Addr != "" && credentialReady {
 				if _, problem := api.ClientCredential(layout); problem == nil && uiReady(state.Addr) {
-					if ctx.Cfg.HubURLSource == "flag" && state.Tensorhub != ctx.Cfg.HubURL {
+					if (state.Tensorhub != "" || ctx.Cfg.HubURLSource == "flag") && state.Tensorhub != ctx.Cfg.HubURL {
 						return daemon.State{}, false, exit.Named(exit.Conflict, "daemon.tensorhub_mismatch",
 							"this Cozy daemon uses Tensorhub %q; this command selected %q", state.Tensorhub, ctx.Cfg.HubURL).
 							WithRemedy("use the daemon's Tensorhub for runs; finish its work before restarting with the selected Tensorhub")

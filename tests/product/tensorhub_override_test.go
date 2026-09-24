@@ -95,3 +95,26 @@ func TestTensorhubFlagRefusesDifferentDaemonOrigin(t *testing.T) {
 		t.Fatalf("cross-Hub command submitted %d API calls", submitted.Load())
 	}
 }
+
+func TestTensorhubFlagStartsDaemonForSelectedOrigin(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: https://file-hub.invalid\nport: 0\n"), 0600))
+	cmd := exec.Command(cozyBin, "--tensorhub="+server.URL, "up", "--json")
+	// Missing local Runtime is allowed for a rental-only host. Keep this proof
+	// independent of whichever Python tools the developer has installed.
+	cmd.Env = childEnv(t, root, "PATH="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("daemon startup failed: %v %s", err, out)
+	}
+	state := daemon.Probe(config.Config{Home: root})
+	if !state.Up || state.Tensorhub != server.URL {
+		t.Fatalf("daemon lost override: %+v", state)
+	}
+	code, outText := runCozy(t, root, "run", "list", "--json")
+	if code == 0 || !strings.Contains(outText, "daemon.tensorhub_mismatch") {
+		t.Fatalf("following command silently crossed origins: %d %s", code, outText)
+	}
+}
