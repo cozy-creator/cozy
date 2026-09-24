@@ -165,7 +165,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 			return
 		}
 		revision := mediawire.ContractRev
-		_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &revision, AttemptScopedInputs: true})
+		_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &revision})
 	}))
 	media.TLS = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
 	media.StartTLS()

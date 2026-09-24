@@ -790,7 +790,7 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 		defer mediaWrites.Unlock()
 		switch {
 		case r.URL.Path == "/v1/health":
-			_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &rev, AttemptScopedInputs: true})
+			_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &rev})
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/attempts/") && strings.Contains(r.URL.Path, "/inputs/"):
 			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/attempts/"), "/inputs/")
 			if len(parts) != 2 || !reserved[parts[0]] {

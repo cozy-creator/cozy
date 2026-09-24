@@ -24,8 +24,8 @@ import (
 )
 
 var podMediaProofAddress = flag.String("pod-media-proof-addr", "", "disposable Tensorhub media receiver for cross-repository proof")
-var legacyPodMediaProofAddress = flag.String("legacy-pod-media-proof-addr", "", "disposable legacy Tensorhub media receiver for cross-repository proof")
 
+// inputMediaHealth may carry the retired `attempt_scoped_inputs` flag; the client must ignore it.
 func inputMediaHealth(w io.Writer, scoped *bool) {
 	revision := mediawire.ContractRev
 	_ = json.NewEncoder(w).Encode(struct {
@@ -41,7 +41,9 @@ func inputMediaClient(t *testing.T, address string, budget time.Duration) *media
 	return client
 }
 
-func TestMediaNegotiatesExistingAndScopedPeersBeforeBytes(t *testing.T) {
+// A pod publishing the retired `attempt_scoped_inputs` flag as true, false, or not at
+// all gets the same scoped upload route and explicit `output_count`.
+func TestMediaHealthFlagsNeverChangeTheRequestShape(t *testing.T) {
 	no, yes := false, true
 	for _, capability := range []*bool{nil, &no, &yes} {
 		name := "absent"
@@ -49,7 +51,6 @@ func TestMediaNegotiatesExistingAndScopedPeersBeforeBytes(t *testing.T) {
 			name = fmt.Sprint(*capability)
 		}
 		t.Run(name, func(t *testing.T) {
-			scoped := capability != nil && *capability
 			var writes atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet && r.URL.Path == "/v1/health" {
@@ -58,19 +59,16 @@ func TestMediaNegotiatesExistingAndScopedPeersBeforeBytes(t *testing.T) {
 				}
 				writes.Add(1)
 				if r.Method == http.MethodPost {
-					_, countPresent := r.URL.Query()["output_count"]
-					if countPresent != scoped || r.URL.Query().Get("max_bytes") != "1024" {
-						t.Errorf("wrong negotiated reservation: %s", r.URL)
+					if r.URL.Path != "/v1/outputs/attempt-7" ||
+						r.URL.Query().Get("output_count") != "3" ||
+						r.URL.Query().Get("max_bytes") != "1024" {
+						t.Errorf("health flag changed the reservation: %s", r.URL)
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/outputs/attempt-7"})
 					return
 				}
-				wantPath := "/v1/inputs/attempt-7-payload"
-				if scoped {
-					wantPath = "/v1/attempts/attempt-7/inputs/payload"
-				}
-				if r.Method != http.MethodPut || r.URL.Path != wantPath {
-					t.Errorf("wrong negotiated upload: %s %s", r.Method, r.URL.Path)
+				if r.Method != http.MethodPut || r.URL.Path != "/v1/attempts/attempt-7/inputs/payload" {
+					t.Errorf("health flag changed the upload: %s %s", r.Method, r.URL.Path)
 				}
 				body, err := io.ReadAll(r.Body)
 				if err != nil {
@@ -82,7 +80,7 @@ func TestMediaNegotiatesExistingAndScopedPeersBeforeBytes(t *testing.T) {
 			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
 			fatal(t, client.Health())
 			if writes.Load() != 0 {
-				t.Fatal("health moved bytes before negotiation")
+				t.Fatal("health moved bytes before the handshake settled")
 			}
 			_, problem := client.ReserveOutputs("attempt-7", 1024, 3)
 			fatal(t, problem)
@@ -97,6 +95,20 @@ func TestMediaNegotiatesExistingAndScopedPeersBeforeBytes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An unprobed client still sends the exact output count.
+func TestMediaReservationCarriesCountWithoutHealth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("output_count") != "0" {
+			t.Errorf("unprobed client omitted the output count: %s", r.URL)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/outputs/attempt-9"})
+	}))
+	defer server.Close()
+	client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+	_, problem := client.ReserveOutputs("attempt-9", 0, 0)
+	fatal(t, problem)
 }
 
 func TestScopedMediaFailureNeverFallsBackToUnscopedUpload(t *testing.T) {
@@ -206,29 +218,26 @@ func TestMediaInputRetryKeepsAttemptAndOriginalFile(t *testing.T) {
 }
 
 func TestMediaInputRequiresExactReceipt(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		for _, response := range []string{
-			`{"path":"/tmp/cozy/input","length":3}`,
-			`{"path":"/tmp/cozy/input","length":2,"digest":"sha256:incorrect"}`,
-		} {
-			t.Run(fmt.Sprintf("legacy=%t/%s", legacy, response), func(t *testing.T) {
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if r.URL.Path == "/v1/health" {
-						scoped := !legacy
-						inputMediaHealth(w, &scoped)
-						return
-					}
-					_, _ = io.Copy(io.Discard, r.Body)
-					_, _ = io.WriteString(w, response)
-				}))
-				defer server.Close()
-				client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-				fatal(t, client.Health())
-				if path, problem := client.PutInput("attempt-1", "payload", []byte("abc")); problem == nil || path != "" {
-					t.Fatalf("inexact receipt became input grant: %q, %v", path, problem)
+	for _, response := range []string{
+		`{"path":"/tmp/cozy/input","length":3}`,
+		`{"path":"/tmp/cozy/input","length":2,"digest":"sha256:incorrect"}`,
+	} {
+		t.Run(response, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/health" {
+					inputMediaHealth(w, nil)
+					return
 				}
-			})
-		}
+				_, _ = io.Copy(io.Discard, r.Body)
+				_, _ = io.WriteString(w, response)
+			}))
+			defer server.Close()
+			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+			fatal(t, client.Health())
+			if path, problem := client.PutInput("attempt-1", "payload", []byte("abc")); problem == nil || path != "" {
+				t.Fatalf("inexact receipt became input grant: %q, %v", path, problem)
+			}
+		})
 	}
 }
 
@@ -342,63 +351,3 @@ func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
 }
 
 func inputDigest(data []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(data)) }
-
-// Exercise the same client against the actual pre-scoped receiver used by
-// retained rentals. The fixed test credential and disposable loopback receiver
-// keep this proof separate from live pods and their files.
-func TestLegacyInputsAgainstPodMedia(t *testing.T) {
-	address := *legacyPodMediaProofAddress
-	if address == "" {
-		t.Skip("requires disposable old Tensorhub receiver at -legacy-pod-media-proof-addr")
-	}
-	client := inputMediaClient(t, address, 2*time.Second)
-	fatal(t, client.Health())
-	body := []byte("existing rental shared image")
-	original := filepath.Join(t.TempDir(), "original")
-	must(t, os.WriteFile(original, body, 0600))
-	before, err := os.Stat(original)
-	must(t, err)
-	slotA, slotB := media.Slot("legacy-a", 1), media.Slot("legacy-b", 1)
-	defer client.DropAttempt(slotA)
-	defer client.DropAttempt(slotB)
-	_, problem := client.ReserveOutputs(slotA, 4096, 3)
-	fatal(t, problem)
-	_, problem = client.ReserveOutputs(slotA, 4096, 3)
-	fatal(t, problem)
-	path, problem := client.PutInput(slotA, "payload", body)
-	fatal(t, problem)
-	_, problem = client.ReserveOutputs(slotB, 0, 0)
-	fatal(t, problem)
-	shared, problem := client.PutInputFile(slotB, "input-0", original, inputDigest(body), int64(len(body)))
-	fatal(t, problem)
-	if path != shared {
-		t.Fatalf("legacy receiver duplicated shared input: %q != %q", path, shared)
-	}
-	inode, err := os.Stat(path)
-	must(t, err)
-	retry, problem := client.PutInput(slotA, "payload", body)
-	fatal(t, problem)
-	reused, err := os.Stat(retry)
-	must(t, err)
-	if !os.SameFile(inode, reused) {
-		t.Fatal("legacy retry replaced cached inode")
-	}
-	fatal(t, client.DropAttempt(slotA))
-	fatal(t, client.DropAttempt(slotA))
-	got, err := os.ReadFile(shared)
-	must(t, err)
-	if !bytes.Equal(got, body) {
-		t.Fatal("legacy cleanup damaged another job's shared bytes")
-	}
-	fatal(t, client.DropAttempt(slotB))
-	got, err = os.ReadFile(shared)
-	must(t, err)
-	if !bytes.Equal(got, body) {
-		t.Fatal("legacy receiver unexpectedly reclaimed shared cache")
-	}
-	after, err := os.Stat(original)
-	must(t, err)
-	if !os.SameFile(before, after) {
-		t.Fatal("legacy upload changed borrowed original inode")
-	}
-}
