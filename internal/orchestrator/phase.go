@@ -164,9 +164,8 @@ type PhaseSample struct {
 // so carrying a download's rate into the preparation that follows it would report a number
 // about work that is over.
 //
-// Byte counters are held monotonic here rather than trusted: `transferred_bytes` is
-// declared monotonic within a call by the protocol, and a producer that violates that
-// must not be able to make this lane report a negative rate.
+// Counters are monotonic within one call. A worker can begin another fetch with
+// smaller counters; that resets the rate basis without resetting phase elapsed time.
 func (p *phases) observe(subject string, sample PhaseSample) {
 	if subject == "" || sample.Name == "" {
 		return
@@ -188,20 +187,15 @@ func (p *phases) observe(subject string, sample PhaseSample) {
 		state.rental = &rental
 	}
 	if sample.HasBytes {
-		if !state.hasBytes {
-			state.byteSince, state.initialMove = now, sample.Moved
-		}
 		moved := sample.Moved
-		if moved < state.moved {
-			moved = state.moved
+		if sample.Total > 0 {
+			moved = min(moved, sample.Total)
 		}
-		if sample.Total > 0 && moved > sample.Total {
-			moved = sample.Total
-		}
-		// The interval is only measured when there IS one. Two samples inside the same
-		// instant say nothing about a rate, and dividing by that gap would invent a
-		// number rather than measure one.
-		if state.hasBytes && now.After(state.prevAt) {
+		if !state.hasBytes || moved < state.prevMove {
+			// One worker can report a new fetch while retaining the same phase.
+			// Its initial counter is a new baseline, not newly received bytes.
+			state.byteSince, state.initialMove, state.rate = now, moved, 0
+		} else if now.After(state.prevAt) {
 			state.rate = float64(moved-state.prevMove) / now.Sub(state.prevAt).Seconds()
 		}
 		state.prevAt, state.prevMove = now, moved
@@ -229,7 +223,8 @@ func (p *phases) snapshot(subject string) (PhaseObservation, bool) {
 	}
 	out.Models = state.modelSnapshots(time.Now())
 	if state.hasBytes {
-		if elapsed := state.at.Sub(state.byteSince).Seconds(); elapsed > 0 && state.moved > state.initialMove {
+		out.At = state.prevAt // byte-less heartbeats cannot freshen old byte estimates
+		if elapsed := state.prevAt.Sub(state.byteSince).Seconds(); elapsed > 0 && state.moved > state.initialMove {
 			out.Average = float64(state.moved-state.initialMove) / elapsed
 		}
 	}

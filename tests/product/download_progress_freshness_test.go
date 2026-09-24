@@ -27,6 +27,11 @@ func TestDownloadETAExcludesAlreadyRetainedBytes(t *testing.T) {
 	if !estimated || remaining < interval/2 || remaining > interval*2 {
 		t.Fatalf("retained bytes distorted remaining time: remaining=%s interval=%s phase=%+v", remaining, interval, phase)
 	}
+	o.c.ObservePhase("resumed", orchestrator.PhaseSample{Name: "downloading"})
+	heartbeat, _ := o.c.PreparationPhase("resumed")
+	if !heartbeat.At.Equal(phase.At) || heartbeat.Moved != phase.Moved {
+		t.Fatalf("a byte-less heartbeat refreshed transfer evidence: before=%+v after=%+v", phase, heartbeat)
+	}
 	o.c.ObservePhase("resumed", sample)
 	quiet, _ := o.c.PreparationPhase("resumed")
 	if _, estimated := quiet.Remaining(); quiet.Rate != 0 || estimated {
@@ -37,6 +42,12 @@ func TestDownloadETAExcludesAlreadyRetainedBytes(t *testing.T) {
 	resumed, _ := o.c.PreparationPhase("resumed")
 	if _, estimated := resumed.Remaining(); resumed.Rate <= 0 || !estimated {
 		t.Fatalf("fresh progress did not restore measurement: %+v", resumed)
+	}
+	sample.Moved, sample.Total = 0, 50
+	o.c.ObservePhase("resumed", sample)
+	reset, _ := o.c.PreparationPhase("resumed")
+	if reset.Moved != 0 || reset.Total != 50 || reset.Rate != 0 || reset.Average != 0 {
+		t.Fatalf("a smaller fetch underflowed or reused old counters: %+v", reset)
 	}
 }
 
@@ -82,5 +93,29 @@ func TestAttachedDownloadAgesItsLastSample(t *testing.T) {
 		"moved_bytes": 46 << 30, "total_bytes": 100 << 30, "rate_bytes_per_second": 23 << 20}))
 	if got := buf.String()[before:]; !strings.Contains(got, "/s") || strings.Contains(got, "last update") {
 		t.Fatalf("fresh sample did not replace stale display: %q", got)
+	}
+}
+
+func TestAttachedDownloadAgesModelsIndependently(t *testing.T) {
+	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	t.Cleanup(p.Done)
+	model := map[string]any{"model": "paul/minimax-h3", "sample_age_ms": 9000,
+		"moved_bytes": 45 << 30, "total_bytes": 100 << 30, "rate_bytes_per_second": 55 << 20}
+	e := liveEvent("phase", map[string]any{"phase": "downloading", "sample_age_ms": 0,
+		"models": []any{model}})
+	e.At = time.Now().Add(-2 * time.Second).UTC().Format(time.RFC3339Nano)
+	p.On(e)
+	if got := buf.String(); !strings.Contains(got, "last update") || strings.Contains(got, "/s") {
+		t.Fatalf("model's nine-second sample failed to age beyond eleven seconds: %q", got)
+	}
+	if model["sample_age_ms"] != 9000 {
+		t.Fatalf("rendering mutated the original model observation: %+v", model)
+	}
+	before := len(buf.String())
+	model["sample_age_ms"] = 0
+	p.On(liveEvent("phase", map[string]any{"phase": "downloading", "sample_age_ms": 90000,
+		"models": []any{model}}))
+	if got := buf.String()[before:]; !strings.Contains(got, "/s") {
+		t.Fatalf("old aggregate counters hid a freshly reported model rate: %q", got)
 	}
 }
