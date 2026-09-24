@@ -316,6 +316,7 @@ Only a daemon holding the root lock may migrate an older database.
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
+| `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | prepare one exact published package release and optional model checkpoints on the claimed Host; repeats reuse Runtime's preparation ledger |
 | `POST /v1/local/rentals/{rental_id}/runtime-update` | local | yes | start or rejoin a durable per-rental Runtime update; the CLI may disconnect without canceling it |
 | `GET /v1/local/rentals/{rental_id}/runtime-update` | local | yes | read the selected update, phase, actual result, or reconciliation error |
 | `POST /v1/local/cache/prune` | local | yes | prune unused operation cache roots in this machine's Runtime workspace; report `removed_entries`, `reclaimed_bytes`, and `store_busy` |
