@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -212,9 +213,25 @@ var processConfig struct {
 
 // Load resolves and freezes configuration. The first call owns the process
 // snapshot; later calls return it.
-func Load() (Config, *exit.Error) {
+func Load() (Config, *exit.Error) { return LoadForTensorhub(nil) }
+
+// LoadForTensorhub freezes the explicit CLI location after file and environment
+// resolution. Subsequent Load consumers see the same origin, including builders.
+func LoadForTensorhub(override *string) (Config, *exit.Error) {
 	processConfig.once.Do(func() {
 		processConfig.cfg, processConfig.err = load()
+		if processConfig.err != nil || override == nil {
+			return
+		}
+		base := strings.TrimRight(strings.TrimSpace(*override), "/")
+		parsed, err := url.Parse(base)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			processConfig.err = exit.Named(exit.Validation, "config.tensorhub_url_invalid",
+				"--tensorhub must be an http or https base URL without credentials, query, or fragment")
+			return
+		}
+		processConfig.cfg.HubURL, processConfig.cfg.HubURLSource = base, "flag"
 	})
 	return processConfig.cfg, processConfig.err
 }

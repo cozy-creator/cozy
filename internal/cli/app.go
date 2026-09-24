@@ -141,7 +141,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return output.ShellCode(problem)
 	}
 
-	cfg, problem := config.Load()
+	cfg, problem := config.LoadForTensorhub(grammar.Tensorhub)
 	if problem != nil {
 		out := output.NewError(output.Config, problem.ErrName(), problem.Message)
 		if problem.Remedy != "" {

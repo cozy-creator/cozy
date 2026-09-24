@@ -157,6 +157,11 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 			// Missing/newer schema metadata never authorizes replacing a live owner.
 			if state.Addr != "" && credentialReady {
 				if _, problem := api.ClientCredential(layout); problem == nil && uiReady(state.Addr) {
+					if ctx.Cfg.HubURLSource == "flag" && state.Tensorhub != ctx.Cfg.HubURL {
+						return daemon.State{}, false, exit.Named(exit.Conflict, "daemon.tensorhub_mismatch",
+							"this Cozy daemon uses Tensorhub %q; this command selected %q", state.Tensorhub, ctx.Cfg.HubURL).
+							WithRemedy("use the daemon's Tensorhub for runs; finish its work before restarting with the selected Tensorhub")
+					}
 					changed := child != nil && state.PID == child.pid
 					if child != nil {
 						child.closeDiagnostics()
@@ -207,7 +212,7 @@ func startDaemon(ctx *Context) (*daemonChild, *exit.Error) {
 	}
 	command := exec.Command(self)
 	command.Args[0] = daemonProcessName
-	command.Env = ctx.Cfg.Child("COZY_HOME=" + ctx.Cfg.Home)
+	command.Env = ctx.Cfg.Child("COZY_HOME="+ctx.Cfg.Home, "TENSORHUB_URL="+ctx.Cfg.HubURL)
 	command.Stdout = discard
 	diagnostics, err := command.StderrPipe()
 	if err != nil {
