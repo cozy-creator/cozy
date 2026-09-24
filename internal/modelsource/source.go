@@ -43,6 +43,17 @@ func Parse(raw, cwd string) (Source, *exit.Error) {
 		return Source{}, exit.Usagef("model transfer requires a source")
 	}
 	switch {
+	case strings.HasPrefix(raw, "file:"):
+		// Transfers persist this identity and parse it again on the executing
+		// machine. It is exactly parseLocal's output, not a file:// URL.
+		source, problem := parseLocal(strings.TrimPrefix(raw, "file:"), cwd)
+		if problem != nil {
+			return Source{}, problem
+		}
+		if source.Canonical != raw {
+			return Source{}, badSource(raw, "local file identities require a canonical absolute path")
+		}
+		return source, nil
 	case strings.HasPrefix(raw, "hf://"):
 		return parseHFURI(raw)
 	case strings.HasPrefix(raw, "civitai://"):

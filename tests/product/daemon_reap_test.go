@@ -45,9 +45,11 @@ func TestDaemonLeavesARootThatNoLongerCarriesItsClaim(t *testing.T) {
 	case <-time.After(4 * time.Second):
 	}
 
-	// The root goes, exactly as `go test` removes a t.TempDir and as the next run of a
-	// fixed-root test wipes the one before it.
-	must(t, os.RemoveAll(root))
+	// Remove the claimed pathname atomically. Recursive deletion races the live
+	// daemon's startup writes and can itself fail before testing the lost claim.
+	retired := root + "-retired"
+	must(t, os.Rename(root, retired))
+	t.Cleanup(func() { _ = os.RemoveAll(retired) })
 	if code := awaitDaemonExit(t, live, 30*time.Second); code != 0 {
 		t.Fatalf("the daemon exited %d after its root went", code)
 	}
