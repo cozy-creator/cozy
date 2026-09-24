@@ -208,7 +208,7 @@ func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 		t.Fatalf("make schema-37 requests shape: %v", err)
 	}
 	if _, err := db.Exec(`DROP TRIGGER machine_execution_no_local_attempt; DROP TABLE machine_executions;
-		DROP TABLE IF EXISTS successful_work_releases; DROP TABLE rental_runtime_updates; DROP TABLE capture_pins; PRAGMA user_version=37`); err != nil {
+		DROP TABLE IF EXISTS successful_work_releases; DROP TABLE rental_idle; DROP TABLE rental_runtime_updates; DROP TABLE capture_pins; PRAGMA user_version=37`); err != nil {
 		db.Close()
 		t.Fatalf("stamp schema-37 database: %v", err)
 	}
