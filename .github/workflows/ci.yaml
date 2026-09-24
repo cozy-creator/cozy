@@ -183,6 +183,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.12.11'
       - run: scripts/release.sh --tag ci-$GITHUB_SHA
       - run: scripts/release.sh --tag ci-$GITHUB_SHA-next
       - run: |

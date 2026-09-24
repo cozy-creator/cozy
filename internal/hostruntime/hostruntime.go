@@ -34,10 +34,16 @@ const WireFloor uint32 = 54
 
 var floor = pep440.MustParse(ToolFloor)
 
+// InstallCommand installs this host's tools in one uv environment: cozy-runtime and the
+// TensorFS `tfs` its dependencies resolve. scripts/install.sh and install.ps1 run it.
+var InstallCommand = fmt.Sprintf(
+	"uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=%s'",
+	ToolFloor)
+
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
 var hostRuntimeInstall = fmt.Sprintf(
-	"install cozy-runtime %s or newer supporting %s+minor.%d or newer: uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=%s' — then retry",
-	ToolFloor, wirePackage(), WireFloor, ToolFloor)
+	"install cozy-runtime %s or newer supporting %s+minor.%d or newer: %s — then retry",
+	ToolFloor, wirePackage(), WireFloor, InstallCommand)
 
 func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }
 

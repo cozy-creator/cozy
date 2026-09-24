@@ -8,17 +8,29 @@ The command is `cozy`.
 
 ## Install
 
-Binary releases are not published yet. Building from source currently requires Go 1.26 or
-newer. Package installation also uses `uv`; model download and publication use the `tfs`
-executable from TensorFS.
+Binary releases are not published yet. Building requires Go 1.26 or newer and
+[uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```sh
 git clone https://github.com/cozy-creator/cozy.git
 cd cozy
 go build -o cozy .
-install -m 0755 ./cozy ~/.local/bin/cozy
-cozy -v
+scripts/install.sh --binary ./cozy     # Windows: scripts\install.ps1 -Binary .\cozy.exe
 ```
+
+The installer puts `cozy` in `~/.local/bin` and, in one uv tool environment, the host tools
+Cozy drives: `cozy-runtime` and TensorFS's `tfs`. A release asset installs the same way with
+`--asset <cozy-*.tar.gz>`, verified against its `SHA256SUMS` before anything is replaced.
+Rerun it to upgrade. The host-tool step alone is:
+
+```sh
+uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.14'
+```
+
+Keep `--python 3.12`: uv
+[ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
+so an unqualified install can select an interpreter Runtime cannot use. Runtime 0.18.14 is the
+controller minimum; packages keep their own declared ranges (0.18.0 minimum).
 
 Packages use Runtime's explicit rolling window of CPython 3.12, 3.13, and 3.14.
 Creator asks Runtime to select or install an interpreter satisfying `Requires-Python`
@@ -33,27 +45,6 @@ interpreters; it does not substitute a different captured patch or dependency ve
 `cozy package list` distinguishes supported installed Python from Python that can be
 provisioned on demand. A package outside the active window
 is unusable until upgraded; advancing the window is an explicit Runtime release change.
-
-Install the host Runtime with its supported Python interpreter:
-
-```sh
-uv tool install --force --python 3.12 'cozy-runtime[media,model-execution]>=0.18.14'
-cozy-runtime version
-```
-
-Runtime 0.18.14 is the installed controller/tool minimum for Python provisioning.
-Package SDK dependencies keep their declared compatible ranges and the existing
-0.18.0 package minimum; upgrading the controller does not rewrite captured closures.
-
-Keep `--python 3.12` when reinstalling or upgrading. uv
-[ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
-so an unqualified tool installation can select a newer interpreter that Runtime cannot use.
-
-On Windows, build `cozy.exe` and place it in a directory on `PATH`:
-
-```powershell
-go build -o cozy.exe .
-```
 
 ## Discover commands
 
