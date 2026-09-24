@@ -185,6 +185,9 @@ func phaseFieldsAt(e localapi.Event, started, at time.Time) map[string]any {
 	} else {
 		fields["elapsed_ms"] = float64(max(at.Sub(started), 0).Milliseconds())
 	}
+	if age, measured := number(fields["sample_age_ms"]); measured {
+		fields["sample_age_ms"] = age + float64(max(at.Sub(eventTime(e)), 0).Milliseconds())
+	}
 	return fields
 }
 
@@ -278,6 +281,12 @@ func phaseRows(fields map[string]any) []string {
 			if hasTotal && total > 0 {
 				row += " / " + output.Bytes(int64(total)) + " " + progressBar(moved/total, 10)
 			}
+		}
+		age, _ := number(model["sample_age_ms"])
+		phaseAge, _ := number(fields["sample_age_ms"])
+		if time.Duration(max(age, phaseAge))*time.Millisecond > orchestrator.PreparationRateMaxAge {
+			rows = append(rows, row+" · last update "+shortDuration(time.Duration(max(age, phaseAge))*time.Millisecond)+" ago")
+			continue
 		}
 		if rate, ok := number(model["rate_bytes_per_second"]); ok && rate > 0 {
 			row += " · " + output.Bytes(int64(rate)) + "/s"
