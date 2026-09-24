@@ -923,12 +923,11 @@ pub struct WalkOutcome {
 /// origin and the pull is unharmed, which is the property that lets a disposable cache be
 /// deleted at any moment without making a working grant fail.
 ///
-/// **The backfill is inline, and that placement is derived rather than convenient.** The
-/// bytes are in the page cache at exactly the instant admission commits them, so publishing
-/// them onward is the cheapest read of that object that will ever be available; a later
-/// pass would re-read from disk what this moment already holds in memory. It costs the
-/// first pod in a datacenter a bounded, optional mounted-filesystem backfill. Local
-/// completion does not wait for it or promise that a later pod will find a complete cache.
+/// Verified origin objects are offered to the existing bounded cache write pool.
+/// Saturation retains only declared object references; origin workers never wait
+/// for the cache. Once acquisition finishes, rejected offers are retried while
+/// cache copies make progress. The CLI drains accepted work and reports incomplete
+/// replication on cache failure. A failed pull does not promise a complete cache.
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_wanted(
     store: &Store,
@@ -960,6 +959,9 @@ pub(super) fn fetch_wanted_bounded(
     download_budget: Option<(u64, u64)>,
 ) -> Result<WalkOutcome> {
     let cache = store.repo_cache();
+    let backfill = cache.map(|cache| {
+        crate::repo_cache::BackfillBatch::new(cache.clone(), store, plan.wanted.len())
+    });
     // Nothing is checked up front any more, because there is no up-front set to check. The
     // invariant it proved — the grant set covers the wanted set exactly — is enforced per
     // mint instead: presign authorizes every digest it was asked or refuses, never a silent
@@ -1018,10 +1020,13 @@ pub(super) fn fetch_wanted_bounded(
                             ) < streams as u64
                         },
                     )?;
-                    if let (Some(kind), Some(cache)) = (kind, cache) {
+                    if let (Some(kind), Some(_cache)) = (kind, cache) {
                         // Local admission is complete. Optional replication must never
                         // occupy an origin slot or delay this object's completion report.
-                        cache.offer_backfill(store, kind, object);
+                        backfill
+                            .as_ref()
+                            .expect("bound cache has a backfill batch")
+                            .offer(kind, object);
                     }
                     Ok(Source::Origin(one))
                 });
@@ -1069,6 +1074,9 @@ pub(super) fn fetch_wanted_bounded(
     });
     if let Some(refusal) = first.lock().unwrap().take() {
         return Err(refusal);
+    }
+    if let Some(backfill) = backfill {
+        backfill.finish_offers();
     }
     Ok(WalkOutcome {
         fetched: fetched.load(Ordering::Relaxed),
@@ -1303,6 +1311,23 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         _ => plan.complete(request.store),
     })?;
     while_store_busy(|| record_locally(request.store, &closure))?;
+    // A previous process may have admitted these objects before its optional
+    // cache writes completed. Reconcile only this successfully proven closure's
+    // held set, including a fully local retry; never scan unrelated Store bytes.
+    // Failed pulls return above without waiting for this optional work.
+    if let Some(cache) = request.store.repo_cache() {
+        let backfill =
+            crate::repo_cache::BackfillBatch::new(cache.clone(), request.store, plan.held.len());
+        for object in &plan.held {
+            let kind = if plan.manifest.as_ref() == Some(object) {
+                CacheKind::Manifest
+            } else {
+                CacheKind::Blob
+            };
+            backfill.offer(kind, object);
+        }
+        backfill.finish_offers();
+    }
     Ok(report)
 }
 

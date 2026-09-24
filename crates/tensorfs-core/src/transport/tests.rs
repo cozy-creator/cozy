@@ -725,10 +725,114 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
         "the local Store answers before the cache does"
     );
     assert_eq!(readback.fetched, 0);
+    assert!(crate::repo_cache::finish_optional_backfills());
 
     for root in [cache_root, a, b] {
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[test]
+fn a_retry_reconciles_held_objects_before_a_replacement_uses_only_cache() {
+    let _serial = OPTIONAL_CACHE_PROOFS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _ = crate::repo_cache::finish_optional_backfills();
+    let root = temporary("repo-cache-interrupted-retry");
+    let cache_root = root.join("cache");
+    let a = root.join("pod-a");
+    let store_a = Store::init(&a)
+        .unwrap()
+        .bind_repo_cache(Some(&cache_root))
+        .unwrap();
+    // Optional cache unavailable during the first, eventually refused pull.
+    std::fs::write(&cache_root, b"mount unavailable").unwrap();
+    let checkpoint = Arc::new(checkpoint(6, 32 * 1024));
+    let declared: u64 = checkpoint
+        .bodies
+        .values()
+        .map(|body| body.len() as u64)
+        .sum();
+    let last = checkpoint.bodies.keys().max().unwrap().clone();
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fail = failing.clone();
+    let origin = hub_origin(checkpoint.clone(), move |digest, _| {
+        (digest == last && fail.load(Ordering::Acquire))
+            .then(|| status(404, b"interrupted acquisition"))
+    });
+    let policy = SourcePolicy::default();
+    let mut request = PullRequest::new(&store_a, &origin.base, "acme/model", &Anonymous, &policy);
+    request.streams = 1;
+    let refused = pull(&request).unwrap_err();
+    assert!(refused.detail.contains("404"));
+    assert!(!crate::repo_cache::finish_optional_backfills());
+    let (partial, _) = FetchPlan::of(
+        &store_a,
+        "held-after-refusal",
+        &checkpoint.manifest,
+        &checkpoint.objects,
+    )
+    .unwrap();
+    assert_eq!(partial.held.len(), 7);
+    assert_eq!(partial.wanted.len(), 1);
+    // A Store may contain unrelated private inputs: reconciliation must not copy them.
+    let unrelated = ObjectRef::of(b"not in the selected model closure");
+    store_a
+        .put_stream(
+            &mut b"not in the selected model closure".as_slice(),
+            Some(&unrelated),
+            &crate::store::Fault::default(),
+        )
+        .unwrap();
+    std::fs::remove_file(&cache_root).unwrap();
+    failing.store(false, Ordering::Release);
+    let retry = pull(&request).unwrap();
+    assert_eq!(retry.held, 7);
+    assert_eq!(retry.fetched, 1);
+    assert_eq!(retry.bytes_moved, partial.wanted_bytes());
+    assert!(crate::repo_cache::finish_optional_backfills());
+    wait_for_cache(&store_a, &checkpoint);
+    assert!(!store_a
+        .repo_cache()
+        .unwrap()
+        .path(crate::repo_cache::CacheKind::Blob, &unrelated.sha256)
+        .unwrap()
+        .exists());
+
+    // Even a retry with NOTHING missing must repair a lost optional cache.
+    std::fs::remove_dir_all(&cache_root).unwrap();
+    let calls_before_local_retry = origin.total_hits();
+    let local_retry = pull(&request).unwrap();
+    assert_eq!(local_retry.held, 8);
+    assert_eq!(local_retry.fetched, 0);
+    assert_eq!(local_retry.bytes_moved, 0);
+    assert_eq!(origin.total_hits() - calls_before_local_retry, 1);
+    assert!(crate::repo_cache::finish_optional_backfills());
+    wait_for_cache(&store_a, &checkpoint);
+    drop(store_a);
+    std::fs::remove_dir_all(a).unwrap();
+
+    let store_b = Store::init(&root.join("pod-b"))
+        .unwrap()
+        .bind_repo_cache(Some(&cache_root))
+        .unwrap();
+    let calls_before_b = origin.total_hits();
+    let warm = pull(&PullRequest::new(
+        &store_b,
+        &origin.base,
+        "acme/model",
+        &Anonymous,
+        &policy,
+    ))
+    .unwrap();
+    assert_eq!(warm.held, 0);
+    assert_eq!(warm.cached, 8);
+    assert_eq!(warm.bytes_cached, declared);
+    assert_eq!(warm.fetched, 0);
+    assert_eq!(warm.bytes_moved, 0);
+    assert_eq!(origin.total_hits() - calls_before_b, 1);
+    assert!(crate::repo_cache::finish_optional_backfills());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Cache weather is never authority. A cache that is not there, cannot be read, or holds
@@ -764,6 +868,8 @@ fn an_absent_or_corrupt_cache_degrades_to_the_ordinary_pull() {
         .bind_repo_cache(Some(&poisoned))
         .unwrap();
     pull(&request_for(&store_b, &origin.base, &policy)).unwrap();
+    wait_for_cache(&store_b, &checkpoint);
+    assert!(crate::repo_cache::finish_optional_backfills());
     let mut poisoned_files = 0;
     for entry in walk_files(&poisoned) {
         let length = std::fs::metadata(&entry).unwrap().len() as usize;
@@ -793,6 +899,7 @@ fn an_absent_or_corrupt_cache_degrades_to_the_ordinary_pull() {
         origin.total_hits() - before >= 6,
         "the fall-through must have actually gone to the origin"
     );
+    assert!(crate::repo_cache::finish_optional_backfills());
 
     for root in [absent, poisoned, a, b, c] {
         let _ = std::fs::remove_dir_all(root);
@@ -3976,6 +4083,9 @@ fn wait_for_cache(store: &Store, checkpoint: &Checkpoint) {
 fn nonregular_cache_entries_fall_back_to_origin_without_blocking() {
     use crate::repo_cache::{CacheKind, RepoObjectCache};
 
+    let _serial = OPTIONAL_CACHE_PROOFS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let root = temporary("nonregular-cache");
     let cache_root = root.join("cache");
     let cache = RepoObjectCache::new(&cache_root);
@@ -4054,7 +4164,10 @@ fn nonregular_cache_entries_fall_back_to_origin_without_blocking() {
     assert_eq!(result.cached, 7);
     assert_eq!(result.bytes_moved, blocked.length);
     assert_eq!(origin.hits(&format!("/obj/{}", blocked.sha256)), 1);
-    assert!(crate::repo_cache::finish_optional_backfills());
+    assert!(
+        !crate::repo_cache::finish_optional_backfills(),
+        "the unreadable cache entry remains incomplete"
+    );
     let warm = pull(&PullRequest::new(
         &store,
         &origin.base,
@@ -4065,6 +4178,7 @@ fn nonregular_cache_entries_fall_back_to_origin_without_blocking() {
     .unwrap();
     assert_eq!(warm.held, 8);
     assert_eq!(warm.bytes_moved, 0);
+    assert!(!crate::repo_cache::finish_optional_backfills());
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -102,32 +102,6 @@ impl RepoObjectCache {
         &self.root
     }
 
-    /// Offer optional replication after local acquisition. This reports no durability
-    /// and never waits for filesystem I/O or queue space. Ingest's explicit Mirror
-    /// retains its separate completion/watermark contract.
-    pub(crate) fn offer_backfill(
-        &self,
-        source: &Store,
-        kind: CacheKind,
-        object: &ObjectRef,
-    ) -> bool {
-        let pool = BACKFILLS.get_or_init(Backfills::start);
-        pool.activity.offered();
-        let sent = pool
-            .sender
-            .try_send(Backfill {
-                cache: self.clone(),
-                source: source.root().to_path_buf(),
-                kind,
-                object: object.clone(),
-            })
-            .is_ok();
-        if !sent {
-            pool.activity.finished();
-        }
-        sent
-    }
-
     /// The one cross-language layout contract. `digest` is bare lowercase SHA-256.
     pub fn path(&self, kind: CacheKind, digest: &str) -> Result<PathBuf> {
         let digest = hex64("repo cache object", digest)?;
@@ -296,6 +270,94 @@ impl RepoObjectCache {
     }
 }
 
+/// One pull retains only references rejected by the bounded optional write queue.
+/// Its maximum is the already-declared closure; no payload buffer or persistent
+/// queue is added, and origin workers never wait for cache I/O or queue space.
+pub(crate) struct BackfillBatch<'a> {
+    cache: RepoObjectCache,
+    source: PathBuf,
+    limit: usize,
+    missed: std::sync::Mutex<Vec<(CacheKind, ObjectRef)>>,
+    pool: &'a Backfills,
+}
+
+impl BackfillBatch<'static> {
+    pub(crate) fn new(cache: RepoObjectCache, source: &Store, limit: usize) -> Self {
+        Self::with_pool(
+            cache,
+            source,
+            limit,
+            BACKFILLS.get_or_init(Backfills::start),
+        )
+    }
+}
+
+impl<'a> BackfillBatch<'a> {
+    fn with_pool(
+        cache: RepoObjectCache,
+        source: &Store,
+        limit: usize,
+        pool: &'a Backfills,
+    ) -> Self {
+        Self {
+            cache,
+            source: source.root().to_path_buf(),
+            limit,
+            missed: std::sync::Mutex::new(Vec::new()),
+            pool,
+        }
+    }
+
+    fn work(&self, kind: CacheKind, object: &ObjectRef) -> Backfill {
+        Backfill {
+            cache: self.cache.clone(),
+            source: self.source.clone(),
+            kind,
+            object: object.clone(),
+        }
+    }
+
+    pub(crate) fn offer(&self, kind: CacheKind, object: &ObjectRef) {
+        if !self.pool.enqueue(self.work(kind, object), false) {
+            let mut missed = self.missed.lock().unwrap();
+            if missed.len() < self.limit {
+                missed.push((kind, object.clone()));
+            } else {
+                self.pool
+                    .activity
+                    .incomplete
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    /// After local acquisition, feed deferred references while cache copies make
+    /// real progress. A stalled cache abandons replication only, never the local
+    /// result or its origin workers. The CLI's existing drain reports completion.
+    pub(crate) fn finish_offers(&self) -> bool {
+        let missed = std::mem::take(&mut *self.missed.lock().unwrap());
+        for (kind, object) in missed {
+            if !self.pool.enqueue(self.work(kind, &object), true) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for BackfillBatch<'_> {
+    fn drop(&mut self) {
+        // A failed pull returns without waiting for optional cache I/O. Its
+        // rejected references must still make the later drain report incomplete.
+        if !self.missed.get_mut().unwrap().is_empty() {
+            self.pool
+                .activity
+                .incomplete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 // Reference-only memory policy for optional acquisition backfill, not a protocol bound.
 // Typical jobs are a few hundred bytes; even two 4 KiB paths per job stay near 1 MiB.
 const BACKFILL_QUEUE: usize = 128;
@@ -317,6 +379,7 @@ struct Backfills {
 struct BackfillActivity {
     pending: std::sync::Mutex<(usize, Ledger)>,
     changed: std::sync::Condvar,
+    incomplete: std::sync::atomic::AtomicBool,
 }
 
 impl BackfillActivity {
@@ -324,9 +387,11 @@ impl BackfillActivity {
         Self {
             pending: std::sync::Mutex::new((0, ledger)),
             changed: std::sync::Condvar::new(),
+            incomplete: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
+    #[cfg(test)]
     fn offered(&self) {
         let mut state = self
             .pending
@@ -336,6 +401,14 @@ impl BackfillActivity {
             state.1 = Ledger::with_resolution(state.1.sample());
         }
         state.0 += 1;
+    }
+
+    fn space_available(&self) {
+        let _state = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.changed.notify_all();
     }
 
     fn finished(&self) {
@@ -384,12 +457,65 @@ impl store::Progress for BackfillActivity {
 /// Before a short-lived CLI exits, give its existing optional write pool time to
 /// finish while real copy/verification progress continues. A stalled cache only
 /// ends this wait; it never changes the completed local fetch or joins its worker.
-/// Long-lived Store callers keep the original asynchronous behavior.
+/// Write failures and abandoned deferred work also return false, so a drained
+/// queue is not mistaken for successful replication. Long-lived Store callers
+/// keep the original asynchronous behavior.
 pub fn finish_optional_backfills() -> bool {
-    BACKFILLS.get().is_none_or(|pool| pool.activity.wait())
+    BACKFILLS.get().is_none_or(|pool| {
+        let drained = pool.activity.wait();
+        let incomplete = pool
+            .activity
+            .incomplete
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        drained && !incomplete
+    })
 }
 
 impl Backfills {
+    fn enqueue(&self, mut work: Backfill, wait: bool) -> bool {
+        let mut state = self
+            .activity
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            if state.0 == 0 {
+                state.1 = Ledger::with_resolution(state.1.sample());
+            }
+            state.0 += 1;
+            match self.sender.try_send(work) {
+                Ok(()) => return true,
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    state.0 -= 1; // rejected offers are not progress
+                    work = returned;
+                    if !wait {
+                        return false;
+                    }
+                    let patience = state.1.stillness().saturating_sub(state.1.still().silent);
+                    if patience.is_zero() {
+                        self.activity
+                            .incomplete
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        return false;
+                    }
+                    state = self
+                        .activity
+                        .changed
+                        .wait_timeout(state, patience)
+                        .unwrap_or_else(|error| error.into_inner())
+                        .0;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    state.0 -= 1;
+                    self.activity
+                        .incomplete
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return false;
+                }
+            }
+        }
+    }
+
     fn start() -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<Backfill>(BACKFILL_QUEUE);
         let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
@@ -410,22 +536,34 @@ impl Backfills {
                             Err(_) => return,
                         }
                     };
-                    // Reopen without a caller's progress observer. Queued work owns no GC
-                    // hold: a source reclaimed before it opens is simply a missed cache fill.
-                    // Once opened, the verified descriptor pins that inode through the copy.
-                    if let Ok(store) = Store::open(&work.source) {
-                        let store = store.observed(activity.clone());
-                        let _ = work.cache.backfill_observed(
-                            &store,
-                            work.kind,
-                            &work.object,
-                            Some(activity.as_ref()),
-                        );
-                    }
-                    activity.finished();
+                    activity.space_available();
+                    work.copy(&activity);
                 });
         }
         Self { sender, activity }
+    }
+}
+
+impl Backfill {
+    fn copy(self, activity: &std::sync::Arc<BackfillActivity>) {
+        // Reopening drops the caller's progress observer. The verified source
+        // descriptor pins its inode if GC unlinks it during the copy.
+        let copied = Store::open(&self.source).ok().and_then(|store| {
+            self.cache
+                .backfill_observed(
+                    &store.observed(activity.clone()),
+                    self.kind,
+                    &self.object,
+                    Some(activity.as_ref()),
+                )
+                .ok()
+        });
+        if !matches!(copied, Some(CacheWrite::Stored | CacheWrite::Present)) {
+            activity
+                .incomplete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        activity.finished();
     }
 }
 
@@ -1467,6 +1605,198 @@ mod repair_tests {
         );
         assert_eq!(fs::read(&path).unwrap(), b"wrong");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod acquisition_backfill_tests {
+    use super::*;
+    use std::sync::{atomic::Ordering, Arc, Mutex};
+
+    #[test]
+    fn an_abandoned_saturated_batch_reports_incomplete_after_accepted_work_drains() {
+        let root = std::env::temp_dir().join(format!(
+            "tfs-backfill-abandoned-{}",
+            store::now_nanos_unique()
+        ));
+        let source = Store::init(&root.join("source")).unwrap();
+        let bytes = b"local success survives another object's refusal";
+        let object = ObjectRef::of(bytes);
+        source
+            .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+            .unwrap();
+        let other_bytes = b"verified bytes whose cache offer is rejected";
+        let other = ObjectRef::of(other_bytes);
+        source
+            .put_stream(&mut other_bytes.as_slice(), Some(&other), &Fault::default())
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let activity = Arc::new(BackfillActivity::new(Ledger::new()));
+        let pool = Backfills {
+            sender,
+            activity: activity.clone(),
+        };
+        {
+            let batch = BackfillBatch::with_pool(
+                RepoObjectCache::new(root.join("cache")),
+                &source,
+                2,
+                &pool,
+            );
+            batch.offer(CacheKind::Blob, &object);
+            batch.offer(CacheKind::Blob, &other);
+            assert_eq!(batch.missed.lock().unwrap().len(), 1);
+            // This is the early-refusal path: no cache wait or finish_offers.
+        }
+        receiver.recv().unwrap().copy(&activity);
+        assert!(activity.wait());
+        assert!(activity.incomplete.load(Ordering::Acquire));
+        assert!(source.open_verified(&object.sha256).is_ok());
+        assert!(source.open_verified(&other.sha256).is_ok());
+        assert!(!RepoObjectCache::new(root.join("cache"))
+            .path(CacheKind::Blob, &other.sha256)
+            .unwrap()
+            .exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saturated_acquisition_backfill_reoffers_every_declared_object() {
+        for repair in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "tfs-backfill-saturation-{repair}-{}",
+                store::now_nanos_unique()
+            ));
+            let source = Store::init(&root.join("source")).unwrap();
+            let cache = RepoObjectCache::new(root.join("cache"));
+            let objects: Vec<ObjectRef> = (0..BACKFILL_QUEUE + 8)
+                .map(|index| {
+                    let bytes = vec![index as u8; 1024];
+                    let object = ObjectRef::of(&bytes);
+                    source
+                        .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+                        .unwrap();
+                    object
+                })
+                .collect();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(BACKFILL_QUEUE);
+            let activity = Arc::new(BackfillActivity::new(Ledger::new()));
+            let pool = Backfills {
+                sender,
+                activity: activity.clone(),
+            };
+            let batch = BackfillBatch::with_pool(cache.clone(), &source, objects.len(), &pool);
+            // No cache worker starts yet: queue saturation is causal, independent
+            // of filesystem throughput or how the test runner schedules threads.
+            for object in &objects {
+                batch.offer(CacheKind::Blob, object);
+            }
+            assert_eq!(batch.missed.lock().unwrap().len(), 8);
+            let receiver = Arc::new(Mutex::new(receiver));
+            let workers: Vec<_> = (0..STREAMS)
+                .map(|_| {
+                    let receiver = receiver.clone();
+                    let activity = activity.clone();
+                    std::thread::spawn(move || loop {
+                        let work = { receiver.lock().unwrap().recv() };
+                        let Ok(work) = work else { return };
+                        activity.space_available();
+                        work.copy(&activity);
+                    })
+                })
+                .collect();
+            if repair {
+                assert!(batch.finish_offers());
+            }
+            assert!(activity.wait());
+            assert!(!activity.incomplete.load(Ordering::Acquire));
+            drop(batch);
+            drop(pool);
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            // Destroy the first Store: replacement admission has only the cache.
+            drop(source);
+            fs::remove_dir_all(root.join("source")).unwrap();
+            let replacement = Store::init(&root.join("replacement")).unwrap();
+            let hits = objects
+                .iter()
+                .filter(|object| {
+                    cache.admit(&replacement, CacheKind::Blob, object).unwrap() == CacheRead::Hit
+                })
+                .count();
+            assert_eq!(
+                hits,
+                if repair {
+                    objects.len()
+                } else {
+                    BACKFILL_QUEUE
+                }
+            );
+            if repair {
+                for object in &objects {
+                    assert_eq!(
+                        replacement.open_verified(&object.sha256).unwrap().len(),
+                        object.length
+                    );
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn cache_failure_and_nonadvancing_full_queue_are_explicitly_incomplete() {
+        let root = std::env::temp_dir().join(format!(
+            "tfs-backfill-incomplete-{}",
+            store::now_nanos_unique()
+        ));
+        let source = Store::init(&root.join("source")).unwrap();
+        let bytes = b"verified local bytes remain usable";
+        let object = ObjectRef::of(bytes);
+        source
+            .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+            .unwrap();
+        fs::write(root.join("not-a-directory"), b"unavailable cache").unwrap();
+        let activity = Arc::new(BackfillActivity::new(Ledger::new()));
+        activity.offered();
+        Backfill {
+            cache: RepoObjectCache::new(root.join("not-a-directory")),
+            source: source.root().to_owned(),
+            kind: CacheKind::Blob,
+            object: object.clone(),
+        }
+        .copy(&activity);
+        assert!(activity.wait());
+        assert!(activity.incomplete.load(Ordering::Acquire));
+        assert!(source.open_verified(&object.sha256).is_ok());
+
+        let (sender, _blocked_receiver) = std::sync::mpsc::sync_channel(1);
+        let activity = Arc::new(BackfillActivity::new(Ledger::new()));
+        let pool = Backfills {
+            sender,
+            activity: activity.clone(),
+        };
+        let batch =
+            BackfillBatch::with_pool(RepoObjectCache::new(root.join("cache")), &source, 2, &pool);
+        batch.offer(CacheKind::Blob, &object);
+        batch.offer(CacheKind::Blob, &object);
+        let start = std::time::Instant::now();
+        let elapsed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock = elapsed.clone();
+        activity.pending.lock().unwrap().1 =
+            Ledger::with_clock(std::time::Duration::from_millis(10), move || {
+                start + std::time::Duration::from_millis(clock.load(Ordering::Acquire))
+            });
+        elapsed.store(1000, Ordering::Release);
+        assert!(
+            !batch.finish_offers(),
+            "retrying a full queue must not manufacture cache progress"
+        );
+        assert!(activity.incomplete.load(Ordering::Acquire));
+        assert_eq!(activity.pending.lock().unwrap().0, 1);
+        assert!(source.open_verified(&object.sha256).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }
