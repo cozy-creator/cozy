@@ -98,10 +98,8 @@ jobs:
   # manifest transfer, repository CAS, local alias replace/remove, and the typed refusal
   # arms — then run the whole frozen corpus back through the Python facade.
   #
-  # ONE target. cozy-runtime vendors exactly one wheel (manylinux x86_64) and no other
-  # tensorfs wheel exists in either consumer at any version. The old matrix built four,
-  # declared two of them un-runnable in its own comments, and archived them. Re-add a
-  # target the day a consumer names one.
+  # This is the deep proof, on the platform pods run. wheels.yaml builds and proves every
+  # published platform (Creator's installer names macOS) on its own runner.
   wheel:
     runs-on: ubuntu-latest
     steps:

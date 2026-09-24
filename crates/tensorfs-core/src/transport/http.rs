@@ -278,6 +278,32 @@ impl Wire {
     }
 }
 
+#[cfg(not(target_vendor = "apple"))]
+fn nonblocking_socket(
+    family: rustix::net::AddressFamily,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{self, SocketFlags, SocketType};
+    net::socket_with(
+        family,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        Some(net::ipproto::TCP),
+    )
+}
+
+/// Darwin's socket(2) takes no type flags; they are set before the fd is used.
+#[cfg(target_vendor = "apple")]
+fn nonblocking_socket(
+    family: rustix::net::AddressFamily,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::io::{fcntl_setfd, ioctl_fionbio, FdFlags};
+    use rustix::net::{self, SocketType};
+    let socket = net::socket(family, SocketType::STREAM, Some(net::ipproto::TCP))?;
+    fcntl_setfd(&socket, FdFlags::CLOEXEC)?;
+    ioctl_fionbio(&socket, true)?;
+    Ok(socket)
+}
+
 fn connect(
     checked: &CheckedUrl,
     deadline: Deadline,
@@ -286,7 +312,7 @@ fn connect(
     fail: Code,
 ) -> Result<TcpStream> {
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
-    use rustix::net::{self, AddressFamily, SocketFlags, SocketType};
+    use rustix::net::{self, AddressFamily};
     let mut last: Option<std::io::Error> = None;
     'addresses: for addr in &checked.addrs {
         ledger.check_running()?;
@@ -295,12 +321,7 @@ fn connect(
         } else {
             AddressFamily::INET6
         };
-        let socket = match net::socket_with(
-            family,
-            SocketType::STREAM,
-            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-            Some(net::ipproto::TCP),
-        ) {
+        let socket = match nonblocking_socket(family) {
             Ok(socket) => socket,
             Err(error) => {
                 last = Some(error.into());

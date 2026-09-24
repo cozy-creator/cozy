@@ -8,7 +8,34 @@ on:
       - 'v*'
 
 jobs:
+  # The tag must name the version the tree declares before anything is built.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # ci.yaml owns the Rust suite, the frozen vectors, and the deep wheel smoke on
+      # every push; the publish gate re-runs the version contract against the exact
+      # tagged tree rather than trusting that the tag points at a commit CI already saw.
+      - run: python3 scripts/version_contract.py source
+      - name: Version matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          if [ "$TAG" != "$VER" ]; then
+            echo "tag v$TAG != pyproject version $VER"; exit 1
+          fi
+
+  # Every platform's wheel, each built and proven on its own runner.
+  wheels:
+    needs: gate
+    uses: ./.github/workflows/wheels.yaml
+
   publish:
+    needs: wheels
     runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.
@@ -18,39 +45,11 @@ jobs:
       id-token: write  # PyPI trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/download-artifact@v4
         with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-
-      # ci.yaml owns the Rust suite, the frozen vectors, and the wheel smoke on
-      # every push; the publish gate re-runs the version contract against the
-      # exact tagged tree rather than trusting that the tag points at a commit
-      # CI already saw.
-      - run: python3 scripts/version_contract.py source
-
-      - name: Version matches tag
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          VER="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
-          if [ "$TAG" != "$VER" ]; then
-            echo "tag v$TAG != pyproject version $VER"; exit 1
-          fi
-
-      # The same pinned inputs as ci.yaml's `wheel` job: ONE manylinux x86_64
-      # abi3 wheel. cozy-runtime vendors exactly that wheel and no other
-      # tensorfs wheel exists in any consumer.
-      - name: Build wheel (manylinux x86_64 abi3)
-        uses: PyO3/maturin-action@v1
-        with:
-          target: x86_64
-          args: --release --locked --out dist
-          manylinux: auto
-          before-script-linux: |
-            cargo build --release --locked -p tensorfs-core --bin tfs
-            install -D -m 755 target/release/tfs wheel-data/scripts/tfs
-
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
       # The sdist carries sources only, never the staged binary; pyproject's `data`
       # option needs the directory to exist even for an sdist.
       - run: mkdir -p wheel-data/scripts
@@ -59,12 +58,7 @@ jobs:
         with:
           command: sdist
           args: --out dist
-
-      - name: Wheel version contract
-        run: |
-          for wheel in dist/*.whl; do
-            python3 scripts/version_contract.py wheel "$wheel"
-          done
-
+      # `needs: wheels` fails the release if any platform failed: every platform or none.
+      - run: ls -l dist
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1

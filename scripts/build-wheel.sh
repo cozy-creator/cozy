@@ -12,6 +12,7 @@
 # the final whole-wheel audit refuses a manylinux tag inferred only from the extension.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+py="${PYTHON:-python3}"
 
 out=target/wheels
 args=()
@@ -23,7 +24,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-python3 scripts/version_contract.py source
+"$py" scripts/version_contract.py source
 
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 nice -n 19 cargo build --release --locked -p tensorfs-core --bin tfs
@@ -36,10 +37,11 @@ case "$said" in
 esac
 
 rm -rf wheel-data
-install -D -m 755 target/release/tfs wheel-data/scripts/tfs
+mkdir -p wheel-data/scripts
+install -m 755 target/release/tfs wheel-data/scripts/tfs
 
-nice -n 19 maturin build --release --locked --out "$out" "${args[@]}"
+nice -n 19 maturin build --release --locked --out "$out" ${args[@]+"${args[@]}"}
 
 for wheel in "$out"/tensorfs-*.whl; do
-    python3 scripts/version_contract.py wheel "$wheel"
+    "$py" scripts/version_contract.py wheel "$wheel"
 done

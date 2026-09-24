@@ -761,7 +761,10 @@ fn publish_stream(
         let admitted = if let Some(previous) = repair {
             let current = unix::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
                 .map_err(|_| SoftFailure::Unavailable)?;
-            if current.st_dev != previous.dev() || current.st_ino != previous.ino() {
+            // st_dev is i32 on Darwin and u64 on Linux.
+            #[allow(clippy::unnecessary_cast)]
+            let device = current.st_dev as u64;
+            if device != previous.dev() || current.st_ino != previous.ino() {
                 false
             } else {
                 // Both racing successful repairs publish exactly the same verified object.

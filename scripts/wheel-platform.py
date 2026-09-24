@@ -6,7 +6,8 @@
 """Check the whole wheel's platform promise, including bundled executables.
 
 Maturin audits the extension; it does not infer the floor of a CLI staged through
-wheel-data. Auditwheel owns ELF/library/ISA policy and legacy manylinux aliases.
+wheel-data. Linux: auditwheel owns ELF/library/ISA policy and legacy manylinux aliases.
+macOS: every Mach-O must match the tag's architecture and deploy no later than its OS.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ import csv
 import hashlib
 import io
 import json
+import re
+import struct
 from pathlib import Path
 import subprocess
 import sys
@@ -28,8 +31,58 @@ from auditwheel.policy import WheelPolicies
 from auditwheel.wheeltools import get_wheel_architecture, get_wheel_libc
 
 
+ELF = b"\x7fELF"
+MACHO_64 = b"\xcf\xfa\xed\xfe"
+MACHO_FAT = (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+MACHO_CPU = {0x01000007: "x86_64", 0x0100000C: "arm64"}
+LC_VERSION_MIN_MACOSX = 0x24
+LC_BUILD_VERSION = 0x32
+
+
+def macho_floor(name: str, data: bytes) -> tuple[str, tuple[int, int]]:
+    if data[:4] in MACHO_FAT:
+        raise ValueError(f"{name} is a universal Mach-O; each wheel ships one architecture")
+    cpu, _, _, ncmds = struct.unpack_from("<iiII", data, 4)
+    offset, floor = 32, None
+    for _ in range(ncmds):
+        command, size = struct.unpack_from("<II", data, offset)
+        if command == LC_BUILD_VERSION:
+            (minos,) = struct.unpack_from("<I", data, offset + 12)
+            floor = (minos >> 16, (minos >> 8) & 0xFF)
+        elif command == LC_VERSION_MIN_MACOSX and floor is None:
+            (minos,) = struct.unpack_from("<I", data, offset + 8)
+            floor = (minos >> 16, (minos >> 8) & 0xFF)
+        offset += size
+    if cpu not in MACHO_CPU or floor is None:
+        raise ValueError(f"{name} names no known architecture and macOS deployment floor")
+    return MACHO_CPU[cpu], floor
+
+
+def check_native(wheel: Path, platforms: set[str], natives: dict[str, bytes]) -> str:
+    """macOS: the tag names one OS floor and one architecture for every binary."""
+    if not natives:
+        raise ValueError("wheel carries no native binary")
+    for platform in sorted(platforms):
+        macos = re.fullmatch(r"macosx_(\d+)_(\d+)_(x86_64|arm64)", platform)
+        if not macos:
+            raise ValueError(f"unsupported platform tag {platform}")
+        tagged = (int(macos[1]), int(macos[2]))
+        for name, data in natives.items():
+            if data[:4] not in (MACHO_64, *MACHO_FAT):
+                raise ValueError(f"{name} is not Mach-O in a {platform} wheel")
+            arch, floor = macho_floor(name, data)
+            if arch != macos[3] or floor > tagged:
+                raise ValueError(
+                    f"{wheel.name} advertises {platform}, but {name} is {arch} for macOS "
+                    f"{floor[0]}.{floor[1]}; set MACOSX_DEPLOYMENT_TARGET for cargo and maturin alike"
+                )
+    return ".".join(sorted(platforms))
+
+
 def check(wheel: Path) -> str:
     platforms = set(wheel.name.removesuffix(".whl").rsplit("-", 1)[1].split("."))
+    linux = all(p.startswith(("manylinux", "musllinux", "linux_")) for p in platforms)
+    natives: dict[str, bytes] = {}
     with zipfile.ZipFile(wheel) as archive:
         metadata = [name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")]
         if len(metadata) != 1:
@@ -43,8 +96,16 @@ def check(wheel: Path) -> str:
         recorded = {row[0] for row in csv.reader(io.StringIO(archive.read(records[0]).decode()))}
         for name in archive.namelist():
             with archive.open(name) as member:
-                if member.read(4) == b"\x7fELF" and name not in recorded:
-                    raise ValueError(f"bundled ELF {name} is absent from RECORD and auditwheel's inventory")
+                magic = member.read(4)
+            if magic == ELF and name not in recorded:
+                raise ValueError(f"bundled ELF {name} is absent from RECORD and auditwheel's inventory")
+            if magic in (ELF, MACHO_64, *MACHO_FAT):
+                if name not in recorded:
+                    raise ValueError(f"bundled binary {name} is absent from RECORD")
+                if not linux:
+                    natives[name] = archive.read(name)
+    if not linux:
+        return check_native(wheel, platforms, natives)
     inspected = subprocess.run(
         [sys.executable, "-m", "auditwheel", "show", "--json", str(wheel)],
         capture_output=True, text=True, check=True,
@@ -116,7 +177,7 @@ def main() -> None:
     parser.add_argument("--prove", type=Path, metavar="HOST_ELF")
     args = parser.parse_args()
     required = check(args.wheel)
-    print(f"wheel platform green: every bundled ELF satisfies the tags; required {required}")
+    print(f"wheel platform green: every bundled binary satisfies the tags; required {required}")
     if args.prove:
         prove(args.wheel, args.prove)
 
