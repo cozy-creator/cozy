@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,7 +27,10 @@ type Request struct {
 }
 
 type Result struct {
-	Path string
+	// Path is the first deterministic wheel for legacy callers. Paths carries
+	// the complete PEP 517 output set for publication.
+	Path  string
+	Paths []string
 }
 
 const (
@@ -140,14 +144,17 @@ func Build(req Request) (*Result, *exit.Error) {
 			WithRemedy("fix the project's pyproject.toml, build backend, or package layout, then run `uv build --wheel` locally")
 	}
 	wheels, err := filepath.Glob(filepath.Join(out, "*.whl"))
-	if err != nil || len(wheels) != 1 {
+	if err != nil || len(wheels) == 0 {
 		return nil, exit.Named(exit.Validation, "project_wheel_build_result_invalid",
-			"uv build emitted %d wheels; package publication requires exactly one", len(wheels))
+			"uv build emitted %d wheels; package publication requires at least one", len(wheels))
 	}
-	info, err = os.Stat(wheels[0])
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > MaxWheelBytes {
-		return nil, exit.Named(exit.Validation, "project_wheel_build_result_invalid",
-			"uv build output is not one regular wheel at or below %d B", MaxWheelBytes)
+	sort.Strings(wheels)
+	for _, path := range wheels {
+		info, err = os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > MaxWheelBytes {
+			return nil, exit.Named(exit.Validation, "project_wheel_build_result_invalid",
+				"uv build output contains a non-regular wheel or one above %d B", MaxWheelBytes)
+		}
 	}
-	return &Result{Path: wheels[0]}, nil
+	return &Result{Path: wheels[0], Paths: wheels}, nil
 }

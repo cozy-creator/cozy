@@ -327,11 +327,14 @@ func (c *Client) PackageSourceArchive(ctx context.Context, ref Ref, release stri
 	return out, e
 }
 
-func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) (PackageDownloadPlan, *exit.Error) {
+func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string, pythonVersion ...string) (PackageDownloadPlan, *exit.Error) {
 	var out PackageDownloadPlan
 	query := url.Values{}
 	if release != "" {
 		query.Set("release", release)
+	}
+	if len(pythonVersion) > 0 && pythonVersion[0] != "" {
+		query.Set("python_version", pythonVersion[0])
 	}
 	path := resourcePath("packages", ref) + "/download"
 	if len(query) != 0 {
