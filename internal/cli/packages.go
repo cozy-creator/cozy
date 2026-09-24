@@ -131,13 +131,17 @@ func runExample(inst records.PackageInstall) string {
 	if problem != nil {
 		return example
 	}
-	callables := append(append([]launch.Entrypoint{}, d.Entrypoints...), d.Jobs...)
-	if len(callables) == 0 {
+	names := d.PublicNames()
+	if len(names) == 0 {
+		return example
+	}
+	callable, problem := d.Function(names[0])
+	if problem != nil {
 		return example
 	}
 	// The ONE contract printer (launch.UsageLine) renders the hint, the `--describe`
 	// contract, and the submit refusal's remedy from the same PackageInterface facts.
-	return launch.UsageLine(inst.Package+"/"+callables[0].Name, &callables[0])
+	return launch.UsageLine(inst.Package+"/"+callable.Name, callable)
 }
 
 // Reclaim while the caller still owns the install writer. Reporting after model
