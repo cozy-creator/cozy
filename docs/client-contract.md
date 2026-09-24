@@ -177,7 +177,7 @@ remain live-only, and stage progress has its own denominator.
 ```json
 {"request_id": "req-…", "status": "completed", "package": "org/name",
  "function": "denoise", "attempt": 1, "attempts": 1, "overall_fraction": 1,
- "metrics": {"runtime_ms": 401, "handler_ms": 398, "peak_vram_bytes": 6…},
+ "metrics": {"runtime_ms": 401, "handler_ms": 398, "peak_device_memory_bytes": 6…},
  "result": {…the package's typed result…},
  "outputs": [{"output_id": "image", "media_id": "med-…", "url": "/v1/media/med-…",
               "mime_type": "image/png", "length": 11134, "digest": "sha256:…"}],

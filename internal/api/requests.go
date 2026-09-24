@@ -983,7 +983,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		"runtime_ms": metrics.Int("runtime_ms"), "queue_ms": metrics.Int("queue_ms"),
 		"handler_ms": metrics.Int("handler_ms"), "device_lease_ms": metrics.Int("device_lease_ms"),
 		"finalization_ms": metrics.Int("finalization_ms"),
-		"peak_vram_bytes": metrics.Int("peak_vram_bytes"),
+		"peak_device_memory_bytes": metrics.Int("peak_device_memory_bytes"),
 	}
 	if last.TerminalStatus != "SUCCEEDED" {
 		life.ErrorType, life.Error = last.TerminalCause, last.SafeMessage
