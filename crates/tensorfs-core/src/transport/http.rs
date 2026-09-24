@@ -214,10 +214,15 @@ impl Wire {
 
     /// One read attempt. `WouldBlock` is an empty sampling tick, surfaced for the caller
     /// to judge; 0 is end-of-stream.
-    fn read_step(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read_step(&mut self, buf: &mut [u8], ledger: &Ledger) -> std::io::Result<usize> {
         match self {
             Wire::Plain(sock) => sock.read(buf),
             Wire::Tls { sock, conn } => loop {
+                // Partial encrypted records can keep arriving without yielding
+                // plaintext or a socket timeout. Cancellation must still win.
+                ledger
+                    .check_running()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 while conn.wants_write() {
                     conn.write_tls(sock)?;
                 }
@@ -496,7 +501,15 @@ impl BodyReader<'_> {
                 None => self.ledger.sample(),
             };
             self.wire.set_read_timeout(tick);
-            match self.wire.read_step(buf) {
+            let waiting = Instant::now();
+            if self.judge == Judge::Stream {
+                self.ledger.network_read_begins();
+            }
+            let result = self.wire.read_step(buf, self.ledger);
+            if self.judge == Judge::Stream {
+                self.ledger.network_waited(waiting.elapsed());
+            }
+            match result {
                 Ok(n) => {
                     if n > 0 {
                         let now = Instant::now();
@@ -920,7 +933,7 @@ fn read_step_ticking(
             None => ledger.sample(),
         };
         wire.set_read_timeout(tick);
-        match wire.read_step(buf) {
+        match wire.read_step(buf, ledger) {
             Ok(n) => return Ok(n),
             Err(e) if would_block(&e) => {
                 stream_verdict(judge, ledger, advanced, "response head")?;

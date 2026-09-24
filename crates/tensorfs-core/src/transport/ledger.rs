@@ -32,7 +32,7 @@
 
 use crate::err::{refuse, Code, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How many objects are in flight by default. A MEASURED number, not a taste: #566b swept
@@ -135,12 +135,13 @@ pub struct Still {
 
 /// The one liveness ledger a pull shares across its streams.
 pub struct Ledger {
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
     sample: Duration,
-    worst_gap: Mutex<Duration>,
-    progress: Mutex<Progress>,
+    worst_gap: Arc<Mutex<Duration>>,
+    progress: Arc<Mutex<Progress>>,
+    attempt: Option<Arc<Attempt>>,
     #[cfg(test)]
-    clock: Option<Box<dyn Fn() -> Instant + Send + Sync>>,
+    clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
 }
 
 impl Ledger {
@@ -152,14 +153,15 @@ impl Ledger {
     /// in milliseconds and judge by exactly the production rule.
     pub fn with_resolution(sample: Duration) -> Ledger {
         Ledger {
-            cancelled: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
             sample: sample.max(Duration::from_millis(1)),
-            worst_gap: Mutex::new(Duration::ZERO),
-            progress: Mutex::new(Progress {
+            worst_gap: Arc::new(Mutex::new(Duration::ZERO)),
+            progress: Arc::new(Mutex::new(Progress {
                 moved: 0,
                 advanced: Instant::now(),
                 worst_still: Duration::ZERO,
-            }),
+            })),
+            attempt: None,
             #[cfg(test)]
             clock: None,
         }
@@ -172,7 +174,7 @@ impl Ledger {
     ) -> Self {
         let mut ledger = Self::with_resolution(sample);
         ledger.progress.lock().unwrap().advanced = clock();
-        ledger.clock = Some(Box::new(clock));
+        ledger.clock = Some(Arc::new(clock));
         ledger
     }
 
@@ -196,6 +198,12 @@ impl Ledger {
                 Code::TRANSFER_FAILED,
                 "the pull stopped after another object failed",
             )
+        } else if self
+            .attempt
+            .as_ref()
+            .is_some_and(|a| a.stopped.load(Ordering::Acquire))
+        {
+            refuse(Code::TRANSFER_FAILED, "this object attempt was stopped")
         } else {
             Ok(())
         }
@@ -232,6 +240,48 @@ impl Ledger {
     /// not whichever stream happens to ask.
     pub fn moved(&self, bytes: u64) {
         self.advance(bytes);
+        if let Some(attempt) = &self.attempt {
+            let mut data = attempt.data.lock().unwrap();
+            data.bytes = data.bytes.saturating_add(bytes);
+        }
+    }
+
+    pub(super) fn for_attempt(&self, attempt: Arc<Attempt>) -> Self {
+        Self {
+            cancelled: Arc::clone(&self.cancelled),
+            sample: self.sample,
+            worst_gap: Arc::clone(&self.worst_gap),
+            progress: Arc::clone(&self.progress),
+            attempt: Some(attempt),
+            #[cfg(test)]
+            clock: self.clock.clone(),
+        }
+    }
+
+    pub(super) fn start_attempt(&self) {
+        if let Some(attempt) = &self.attempt {
+            *attempt.data.lock().unwrap() = AttemptData::default();
+        }
+    }
+
+    pub(super) fn origin(&self, host: &str) {
+        if let Some(attempt) = &self.attempt {
+            attempt.data.lock().unwrap().origin = host.to_owned();
+        }
+    }
+
+    pub(super) fn network_read_begins(&self) {
+        if let Some(attempt) = &self.attempt {
+            attempt.data.lock().unwrap().waiting = true;
+        }
+    }
+
+    pub(super) fn network_waited(&self, elapsed: Duration) {
+        if let Some(attempt) = &self.attempt {
+            let mut data = attempt.data.lock().unwrap();
+            data.waited = data.waited.saturating_add(elapsed);
+            data.waiting = false;
+        }
     }
 
     /// A call this pull was waiting on came back. It moved no artifact bytes and says so,
@@ -290,4 +340,20 @@ impl Default for Ledger {
     fn default() -> Ledger {
         Ledger::new()
     }
+}
+
+/// One HTTP attempt's local stop and payload observations. Stopping a redundant
+/// attempt must never cancel the pull that already has a verified winner.
+#[derive(Default)]
+pub(super) struct Attempt {
+    pub stopped: AtomicBool,
+    pub data: Mutex<AttemptData>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct AttemptData {
+    pub bytes: u64,
+    pub waited: Duration,
+    pub origin: String,
+    pub waiting: bool,
 }

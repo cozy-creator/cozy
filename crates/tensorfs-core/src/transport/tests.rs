@@ -59,6 +59,8 @@ impl Request {
 enum Serve {
     /// Read the request, then hold the socket without sending response headers.
     StallHead,
+    /// A controlled real-socket exchange for cancellation races.
+    Script(Box<dyn FnOnce(&mut TcpStream) + Send>),
     /// Content-Length framed whole answer.
     Whole {
         status: u16,
@@ -148,6 +150,7 @@ fn handle(mut socket: TcpStream, dispatch: Dispatch, hits: Arc<Mutex<HashMap<Str
         .entry(request.path.clone())
         .or_insert(0) += 1;
     match dispatch(&request) {
+        Serve::Script(run) => run(&mut socket),
         Serve::StallHead => {
             let mut sink = [0u8; 16];
             let _ = socket.set_read_timeout(Some(Duration::from_secs(30)));
@@ -2674,7 +2677,7 @@ fn a_403_is_judged_by_the_leases_age_and_not_by_a_count() {
         wanted: &wanted,
         window: 1956,
         held: Mutex::new(BTreeMap::new()),
-        minting: Mutex::new(()),
+        minting: Default::default(),
     };
 
     // A lease whose declared life is more than half gone: the origin's refusal IS about
@@ -4424,4 +4427,673 @@ fn pull_cancellation_interrupts_a_pending_tcp_connection() {
     );
     assert!(started.elapsed() < Duration::from_millis(500));
     cancelling.join().unwrap();
+}
+
+#[test]
+fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress() {
+    for mode in [
+        "fresh_wins",
+        "corrupt_contender",
+        "oversized_contender",
+        "both_slow",
+        "small_metadata",
+        "slow_small_before_large",
+        "uniform_slow",
+        "no_reference",
+        "one_stream",
+        "two_streams",
+        "unspecified_budget",
+        "store_headroom",
+        "host_bytes",
+        "host_objects",
+    ] {
+        let root = temporary(&format!("speculation-{mode}"));
+        let mut store = Store::init(&root).unwrap();
+        let seed = vec![
+            b'a';
+            if mode == "small_metadata" {
+                256
+            } else {
+                64 * 1024
+            }
+        ];
+        let body = vec![b'b'; 64 * 1024];
+        let first = ObjectRef::of(&seed);
+        let second = ObjectRef::of(&body);
+        let tiny = ObjectRef::of(&vec![b't'; 256]);
+        let later = ObjectRef::of(&vec![b'd'; body.len()]);
+        let mut objects = vec![first.clone(), second.clone()];
+        let mut sequence = vec![(first.clone(), "/seed"), (second.clone(), "/object")];
+        if mode == "slow_small_before_large" {
+            objects.push(tiny.clone());
+            sequence.insert(0, (tiny, "/tiny"));
+        }
+        if mode == "both_slow" {
+            objects.push(later.clone());
+            sequence.push((later, "/after"));
+        }
+        if mode == "no_reference" {
+            store
+                .put_stream(&mut seed.as_slice(), Some(&first), &Default::default())
+                .unwrap();
+            sequence.retain(|(_, path)| *path != "/seed");
+        }
+        let (plan, _) = FetchPlan::of_objects(&store, "speculation", &objects).unwrap();
+        if mode == "no_reference" {
+            assert_eq!(plan.wanted.len(), 1);
+        }
+        if mode == "store_headroom" {
+            store = store.bind_disk_budget(Some(plan.wanted_bytes())).unwrap();
+        }
+        let allowance = match mode {
+            "host_bytes" => Some((plan.wanted_bytes(), 3)),
+            "host_objects" => Some((plan.wanted_bytes() + second.length, 2)),
+            "unspecified_budget" => None,
+            _ => Some((
+                plan.wanted_bytes() + second.length,
+                plan.wanted.len() as u64 + 1,
+            )),
+        };
+        let streams = match mode {
+            "one_stream" => 1,
+            "two_streams" => 2,
+            _ => 3,
+        };
+        let recovery = super::speculate::Recovery::new(&store, &plan, streams, allowance);
+        let chunk = Arc::new(AtomicUsize::new(256));
+        let source_chunk = Arc::clone(&chunk);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::clone(&calls);
+        let later_calls = Arc::new(AtomicUsize::new(0));
+        let later_requests = Arc::clone(&later_calls);
+        let source = origin(Arc::new(move |request| {
+            if request.path == "/tiny" {
+                return Serve::Drip {
+                    body: vec![b't'; 256],
+                    chunk: 32,
+                    gap: Duration::from_millis(10),
+                    ttfb: Duration::ZERO,
+                };
+            }
+            if request.path == "/seed" {
+                if mode == "uniform_slow" {
+                    return Serve::Drip {
+                        body: seed.clone(),
+                        chunk: 256,
+                        gap: Duration::from_millis(10),
+                        ttfb: Duration::ZERO,
+                    };
+                }
+                return status(200, &seed);
+            }
+            if request.path == "/after" {
+                later_requests.fetch_add(1, Ordering::SeqCst);
+                return Serve::Drip {
+                    body: vec![b'd'; body.len()],
+                    chunk: 256,
+                    gap: Duration::from_millis(10),
+                    ttfb: Duration::ZERO,
+                };
+            }
+            let at = requests.fetch_add(1, Ordering::SeqCst);
+            if at > 0 && matches!(mode, "fresh_wins" | "slow_small_before_large") {
+                return status(200, &body);
+            }
+            if at > 0 && mode == "corrupt_contender" {
+                return status(200, &vec![b'c'; body.len()]);
+            }
+            if at > 0 && mode == "oversized_contender" {
+                return status(200, &vec![b'c'; body.len() + 1]);
+            }
+            Serve::Drip {
+                body: body.clone(),
+                chunk: source_chunk.load(Ordering::Acquire),
+                gap: Duration::from_millis(if mode == "both_slow" && at > 0 {
+                    20
+                } else {
+                    10
+                }),
+                ttfb: Duration::ZERO,
+            }
+        }));
+        let policy = local_policy();
+        let ledger = Ledger::with_resolution(Duration::from_millis(20));
+        for (object, path) in sequence {
+            let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+            let url = format!("{}{path}", source.base);
+            let started = std::time::Instant::now();
+            let result = recovery
+                .fetch(
+                    &store,
+                    &grant,
+                    &|_, _| Ok(url.clone()),
+                    &policy,
+                    &Anonymous,
+                    Deadline::none(),
+                    &ledger,
+                    &|| false,
+                )
+                .unwrap_or_else(|e| panic!("{mode}: {e}"));
+            if path == "/seed"
+                && matches!(
+                    mode,
+                    "fresh_wins"
+                        | "corrupt_contender"
+                        | "oversized_contender"
+                        | "both_slow"
+                        | "slow_small_before_large"
+                )
+            {
+                // Make the fixture's slowdown relative to this host's measured
+                // successful span, including fsync, rather than racing CI load.
+                let degraded = (second.length as f64 * 0.01
+                    / (started.elapsed().as_secs_f64() * 64.0))
+                    as usize;
+                chunk.store(degraded.clamp(1, 256), Ordering::Release);
+            }
+            assert_eq!(result.admitted.object, object, "{mode}");
+            assert_eq!(
+                result.transferred, object.length,
+                "duplicate bytes are not admitted progress: {mode}"
+            );
+        }
+        let expected = if matches!(
+            mode,
+            "fresh_wins"
+                | "corrupt_contender"
+                | "oversized_contender"
+                | "both_slow"
+                | "slow_small_before_large"
+        ) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), expected, "{mode}");
+        if expected == 2 {
+            assert!(
+                ledger.still().moved > plan.wanted_bytes(),
+                "physical duplicate bytes stay separate: {mode}"
+            );
+        }
+        if mode == "both_slow" {
+            assert_eq!(
+                later_calls.load(Ordering::SeqCst),
+                1,
+                "unhelpful speculation must not repeat"
+            );
+        }
+        let (warm, _) = FetchPlan::of_objects(&store, "speculation", &objects).unwrap();
+        assert!(warm.wanted.is_empty(), "verified CAS survived: {mode}");
+        assert_eq!(store.occupancy().unwrap(), plan.declared_bytes(), "{mode}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn speculative_and_original_asks_share_one_retry_budget() {
+    let root = temporary("speculation-attempt-budget");
+    let store = Store::init(&root).unwrap();
+    let object = ObjectRef::of(b"shared retry budget");
+    let (plan, _) =
+        FetchPlan::of_objects(&store, "speculation-budget", std::slice::from_ref(&object)).unwrap();
+    let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+    let source = origin(Arc::new(|_| status(503, b"retry")));
+    let attempts = std::sync::atomic::AtomicU32::new(0);
+    let policy = local_policy();
+    let ledger = Ledger::new();
+    std::thread::scope(|scope| {
+        for retry in [true, false] {
+            let source = &source;
+            let policy = &policy;
+            let grant = &grant;
+            let store = &store;
+            let attempts = &attempts;
+            let ledger = &ledger;
+            scope.spawn(move || {
+                assert!(super::pull::fetch_with_attempts(
+                    store,
+                    grant,
+                    &|_, _| Ok(source.base.clone()),
+                    policy,
+                    &Anonymous,
+                    Deadline::none(),
+                    ledger,
+                    None,
+                    attempts,
+                    retry,
+                    None,
+                    super::pull::shared_client()
+                )
+                .is_err());
+            });
+        }
+    });
+    assert_eq!(source.total_hits(), super::FETCH_ATTEMPTS as usize);
+    assert!(store.record_valid(&object.sha256).is_err());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn speculative_winner_cancels_a_loser_refreshing_real_hub_authority() {
+    use super::pull::ObjectUrls;
+    use std::sync::atomic::AtomicBool;
+    let root = temporary("speculation-cancels-presign");
+    let store = Store::init(&root).unwrap();
+    let seed = vec![b'a'; 64 * 1024];
+    let bytes = vec![b'b'; 64 * 1024];
+    let seed_ref = ObjectRef::of(&seed);
+    let object = ObjectRef::of(&bytes);
+    let (plan, _) = FetchPlan::of_objects(
+        &store,
+        "speculation-authority",
+        &[seed_ref.clone(), object.clone()],
+    )
+    .unwrap();
+    let contender = Arc::new(AtomicBool::new(false));
+    let mint_started = Arc::new(AtomicBool::new(false));
+    let dispatch_contender = Arc::clone(&contender);
+    let dispatch_mint = Arc::clone(&mint_started);
+    let asks = Arc::new(AtomicUsize::new(0));
+    let dispatch_asks = Arc::clone(&asks);
+    let source = origin(Arc::new(move |request| {
+        match request.path.as_str() {
+            "/seed" => status(200, &seed),
+            "/v1/tensorfs/presign" => {
+                dispatch_mint.store(true, Ordering::Release);
+                Serve::StallHead
+            }
+            _ => {
+                let original = dispatch_asks.fetch_add(1, Ordering::SeqCst) == 0;
+                let contender = Arc::clone(&dispatch_contender);
+                let mint = Arc::clone(&dispatch_mint);
+                let bytes = bytes.clone();
+                Serve::Script(Box::new(move |socket| {
+                    let head =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
+                    if socket.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    if !original {
+                        contender.store(true, Ordering::Release);
+                    }
+                    let mut sent = 0;
+                    while sent < bytes.len() {
+                        if original && contender.load(Ordering::Acquire) {
+                            return;
+                        } // short body forces reauthorization
+                        let n = if !original && mint.load(Ordering::Acquire) {
+                            bytes.len() - sent
+                        } else if original {
+                            16
+                        } else {
+                            1024
+                        };
+                        if socket.write_all(&bytes[sent..sent + n]).is_err() {
+                            return;
+                        }
+                        sent += n;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }))
+            }
+        }
+    }));
+    let policy = local_policy();
+    let ledger = Ledger::with_resolution(Duration::from_millis(20));
+    let deadline = Deadline::after_seconds(Some(2.0));
+    let recovery = super::speculate::Recovery::new(
+        &store,
+        &plan,
+        3,
+        Some((
+            plan.wanted_bytes() + object.length,
+            plan.wanted.len() as u64 + 1,
+        )),
+    );
+    let seed_grant = DeliveryGrant::mint(&plan, &seed_ref).unwrap();
+    recovery
+        .fetch(
+            &store,
+            &seed_grant,
+            &|_, _| Ok(format!("{}/seed", source.base)),
+            &policy,
+            &Anonymous,
+            deadline,
+            &ledger,
+            &|| false,
+        )
+        .unwrap();
+    let client = super::http::Client::new();
+    let leases = super::pull::Leases {
+        client: &client,
+        base: &source.base,
+        credential: &Anonymous,
+        policy: &policy,
+        deadline,
+        ledger: &ledger,
+        wanted: &plan.wanted,
+        window: 1,
+        held: Mutex::new(Default::default()),
+        minting: Default::default(),
+    };
+    let at = plan.wanted.iter().position(|o| o == &object).unwrap();
+    let authorized = AtomicUsize::new(0);
+    let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+    let started = std::time::Instant::now();
+    let found = recovery
+        .fetch(
+            &store,
+            &grant,
+            &|stale, local| {
+                if authorized.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Ok(format!("{}/object", source.base))
+                } else {
+                    leases.url_for_while(at, &object, stale, local)
+                }
+            },
+            &policy,
+            &Anonymous,
+            deadline,
+            &ledger,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(found.admitted.object, object);
+    assert_eq!(asks.load(Ordering::SeqCst), 2);
+    assert!(
+        mint_started.load(Ordering::Acquire),
+        "loser never reached the real blocked presign"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "verified winner waited for the caller deadline"
+    );
+    ledger.check_running().unwrap();
+    assert!(store.record_valid(&object.sha256).is_ok());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn attempt_cancellation_interrupts_a_partial_tls_record() {
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = rustls::pki_types::CertificateDer::from(key.cert.der().to_vec());
+    let private = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der()).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![cert.clone()], private)
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (partial, receiving) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        let conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+        let mut stream = rustls::StreamOwned::new(conn, socket);
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..n]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n")
+            .unwrap();
+        stream.flush().unwrap();
+        stream.conn.writer().write_all(&[b'x'; 1024]).unwrap();
+        let mut encrypted = Vec::new();
+        while stream.conn.wants_write() {
+            stream.conn.write_tls(&mut encrypted).unwrap();
+        }
+        for (at, byte) in encrypted.iter().enumerate() {
+            if stream.sock.write_all(&[*byte]).is_err() {
+                break;
+            }
+            if at == 40 {
+                partial.send(()).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let root = Ledger::with_resolution(Duration::from_millis(100));
+    let attempt = Arc::new(super::ledger::Attempt::default());
+    let ledger = root.for_attempt(Arc::clone(&attempt));
+    let cancel = std::thread::spawn(move || {
+        receiving.recv_timeout(Duration::from_secs(2)).unwrap();
+        attempt.stopped.store(true, Ordering::Release);
+    });
+    let client = super::http::Client::with_extra_roots(&[cert]);
+    let policy = SourcePolicy {
+        allowed_hosts: vec!["localhost".into()],
+        allow_local: true,
+        max_redirects: 0,
+    };
+    let checked = policy
+        .check(&format!("https://localhost:{port}/object"))
+        .unwrap();
+    let response = super::http::request(
+        &client,
+        &checked,
+        "GET",
+        &[],
+        None,
+        Deadline::after_seconds(Some(2.0)),
+        &ledger,
+        super::http::Judge::Stream,
+        None,
+        Code::TRANSFER_FAILED,
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let refusal = response.read_capped(1024).unwrap_err();
+    assert!(
+        refusal.detail.contains("object attempt was stopped"),
+        "{refusal}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "partial TLS record hid cancellation"
+    );
+    root.check_running().unwrap();
+    cancel.join().unwrap();
+    peer.join().unwrap();
+}
+
+#[test]
+fn bounded_warm_tail_speculates_without_a_completed_speed_reference() {
+    use std::collections::BTreeMap;
+    for (count, uniform) in [(1, false), (2, false), (2, true)] {
+        let root = temporary(&format!("speculation-warm-tail-{count}-{uniform}"));
+        let store = Store::init(&root).unwrap();
+        let retained = ObjectRef::of(b"already verified");
+        store
+            .put_stream(
+                &mut b"already verified".as_slice(),
+                Some(&retained),
+                &Default::default(),
+            )
+            .unwrap();
+        let bodies: BTreeMap<String, Vec<u8>> = (0..count)
+            .map(|i| {
+                let body = vec![
+                    b'x' + i as u8;
+                    if count == 1 {
+                        64 * 1024 * 1024
+                    } else if i == 0 {
+                        64 * 1024
+                    } else {
+                        8 * 1024
+                    }
+                ];
+                (ObjectRef::of(&body).sha256, body)
+            })
+            .collect();
+        let mut objects: Vec<ObjectRef> = bodies.values().map(|b| ObjectRef::of(b)).collect();
+        objects.push(retained.clone());
+        let (plan, _) = FetchPlan::of_objects(&store, "warm-tail", &objects).unwrap();
+        assert_eq!(plan.wanted.len(), count);
+        let served = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
+        let calls = Arc::clone(&served);
+        let source = origin(Arc::new(move |request| {
+            let digest = request.path.trim_start_matches('/');
+            let body = &bodies[digest];
+            let mut calls = calls.lock().unwrap();
+            let count = calls.entry(digest.to_owned()).or_default();
+            *count += 1;
+            if *count == 1 || uniform {
+                Serve::Drip {
+                    body: body.clone(),
+                    chunk: if uniform { 256 } else { 1 },
+                    gap: Duration::from_millis(10),
+                    ttfb: Duration::ZERO,
+                }
+            } else {
+                status(200, body)
+            }
+        }));
+        let urls: BTreeMap<String, String> = plan
+            .wanted
+            .iter()
+            .map(|o| (o.sha256.clone(), format!("{}/{}", source.base, o.sha256)))
+            .collect();
+        let completed = Mutex::new(BTreeMap::<String, usize>::new());
+        let observer = |object: &ObjectRef, moved: u64, _: ObjectSource| {
+            assert_eq!(moved, object.length);
+            *completed
+                .lock()
+                .unwrap()
+                .entry(object.sha256.clone())
+                .or_default() += 1;
+        };
+        let ledger =
+            Ledger::with_resolution(Duration::from_millis(if count == 1 { 50 } else { 5 }));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sampled_peak = Arc::clone(&peak);
+        let sampling = Arc::clone(&live);
+        let temporary = root.join("tmp");
+        let monitor = std::thread::spawn(move || {
+            while sampling.load(Ordering::Acquire) {
+                let active = std::fs::read_dir(&temporary)
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with(crate::store::PUT_TEMP)
+                    })
+                    .count();
+                sampled_peak.fetch_max(active, Ordering::AcqRel);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let result = super::pull::fetch_wanted_bounded(
+            &store,
+            &plan,
+            &urls,
+            &local_policy(),
+            &Anonymous,
+            Deadline::after_seconds(Some(30.0)),
+            &ledger,
+            3,
+            Some(&observer),
+            Some((
+                plan.wanted_bytes() + plan.wanted.iter().map(|o| o.length).max().unwrap(),
+                count as u64 + 1,
+            )),
+        );
+        live.store(false, Ordering::Release);
+        monitor.join().unwrap();
+        let found = result.unwrap();
+        assert!(
+            (2..=3).contains(&peak.load(Ordering::Acquire)),
+            "one reserved contender must overlap without exceeding three writers"
+        );
+        assert_eq!(found.fetched, count as u64);
+        assert_eq!(
+            found.bytes_moved,
+            plan.wanted_bytes(),
+            "duplicate bytes cannot inflate admitted progress"
+        );
+        assert!(ledger.still().moved > found.bytes_moved);
+        assert!(served.lock().unwrap().values().all(|asks| if uniform {
+            (1..=2).contains(asks)
+        } else {
+            *asks == 2
+        }));
+        assert!(completed.lock().unwrap().values().all(|calls| *calls == 1));
+        assert!(store.record_valid(&retained.sha256).is_ok());
+        let (warm, _) = FetchPlan::of_objects(&store, "warm-tail", &objects).unwrap();
+        assert!(warm.wanted.is_empty());
+        assert_eq!(store.occupancy().unwrap(), plan.declared_bytes());
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn speculative_tail_does_not_reclassify_a_local_consumer_pause_as_network_delay() {
+    struct Pause {
+        once: std::sync::atomic::AtomicBool,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl crate::store::Progress for Pause {
+        fn moved(&self, _: u64) {
+            if !self.once.swap(true, Ordering::AcqRel) {
+                self.entered.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }
+        }
+        fn admitted(&self) {}
+    }
+    let root = temporary("speculation-local-consumer");
+    let (entered, paused) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel();
+    let store = Store::init(&root).unwrap().observed(Arc::new(Pause {
+        once: std::sync::atomic::AtomicBool::new(false),
+        entered,
+        resume: Mutex::new(resumed),
+    }));
+    let bytes = vec![b'z'; 128 * 1024];
+    let object = ObjectRef::of(&bytes);
+    let source = origin(Arc::new(move |_| status(200, &bytes)));
+    let (plan, _) =
+        FetchPlan::of_objects(&store, "local-consumer", std::slice::from_ref(&object)).unwrap();
+    let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+    let recovery = super::speculate::Recovery::new(&store, &plan, 3, Some((object.length * 2, 2)));
+    let hits = Arc::clone(&source.hits);
+    let control = std::thread::spawn(move || {
+        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(200)); // many observation ticks while no network read is pending
+        let during_pause = hits.lock().unwrap().values().sum::<usize>();
+        resume.send(()).unwrap();
+        during_pause
+    });
+    let ledger = Ledger::with_resolution(Duration::from_millis(20));
+    let result = recovery.fetch(
+        &store,
+        &grant,
+        &|_, _| Ok(source.base.clone()),
+        &local_policy(),
+        &Anonymous,
+        Deadline::after_seconds(Some(3.0)),
+        &ledger,
+        &|| true,
+    );
+    assert_eq!(
+        control.join().unwrap(),
+        1,
+        "local consumer pause launched an extra network request"
+    );
+    assert_eq!(result.unwrap().admitted.object, object);
+    assert_eq!(source.total_hits(), 1);
+    let _ = std::fs::remove_dir_all(root);
 }

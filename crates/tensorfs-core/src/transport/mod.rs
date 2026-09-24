@@ -40,6 +40,7 @@ pub(crate) mod prefix;
 mod pull;
 mod push;
 mod ranged;
+mod speculate;
 
 #[cfg(test)]
 mod tests;

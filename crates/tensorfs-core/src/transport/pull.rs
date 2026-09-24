@@ -68,8 +68,8 @@ use crate::transport::hub::{self, CredentialProvider};
 use crate::transport::ledger::{Deadline, Ledger, FETCH_ATTEMPTS, STALL_FACTOR, STREAMS};
 use crate::transport::policy::{self, SourcePolicy};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The object-store answers a re-ask is worth attempting for. Everything else is a fact
@@ -129,12 +129,27 @@ pub struct Fetched {
 struct Observed<'l, F> {
     inner: http::BodyReader<'l>,
     seen: u64,
+    limit: u64,
+    failure: Option<Refusal>,
     notify: F,
 }
 
 impl<F: FnMut(u64)> std::io::Read for Observed<'_, F> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let n = std::io::Read::read(&mut self.inner, out)?;
+        let remaining = self.limit.saturating_sub(self.seen);
+        let bounded = out
+            .len()
+            .min(remaining.saturating_add(1).min(usize::MAX as u64) as usize);
+        let n = std::io::Read::read(&mut self.inner, &mut out[..bounded])?;
+        if n as u64 > remaining {
+            let refusal = Refusal {
+                code: Code::LENGTH_MISMATCH,
+                detail: "object response exceeds its declared length".into(),
+            };
+            let error = std::io::Error::other(refusal.to_string());
+            self.failure = Some(refusal);
+            return Err(error); // never write an excess byte into the reserved temporary object
+        }
         if n > 0 {
             self.seen += n as u64;
             (self.notify)(self.seen);
@@ -196,9 +211,39 @@ pub fn fetch_authorized(
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
-    mut observer: Option<&mut dyn FetchObserver>,
+    observer: Option<&mut dyn FetchObserver>,
 ) -> Result<Fetched> {
-    let client = shared_client();
+    fetch_with_attempts(
+        store,
+        grant,
+        &|stale, _| authorize(stale),
+        policy,
+        credential,
+        deadline,
+        ledger,
+        observer,
+        &AtomicU32::new(0),
+        true,
+        None,
+        shared_client(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fetch_with_attempts(
+    store: &Store,
+    grant: &DeliveryGrant,
+    authorize: &dyn Fn(bool, &Ledger) -> Result<String>,
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    deadline: Deadline,
+    ledger: &Ledger,
+    mut observer: Option<&mut dyn FetchObserver>,
+    attempts: &AtomicU32,
+    retry: bool,
+    slots: Option<&super::speculate::Slots>,
+    client: &Client,
+) -> Result<Fetched> {
     let id = grant.object.id();
     let mut last_refusal: Option<Refusal> = None;
     let mut stalled_attempts = 0u32;
@@ -206,13 +251,20 @@ pub fn fetch_authorized(
     // the supplier decides whether re-authorizing is honest — it holds the lease and its
     // declared life, which is the only place that question can be answered.
     let mut stale: Option<u16> = None;
-    for attempt in 1..=FETCH_ATTEMPTS {
+    loop {
         ledger.check_running()?;
-        let last = attempt == FETCH_ATTEMPTS;
+        let attempt = match attempts.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < FETCH_ATTEMPTS).then_some(count + 1)
+        }) {
+            Ok(count) => count + 1,
+            Err(_) => break,
+        };
+        ledger.start_attempt();
+        let last = !retry || attempt == FETCH_ATTEMPTS;
         // A refused re-authorization must still name the origin's answer. It is the whole
         // diagnosis: "403, and re-minting was not honest" and "403, and the hub would not
         // mint" are different problems with different owners.
-        let url = match authorize(stale.is_some()) {
+        let mut url = match authorize(stale.is_some(), ledger) {
             Ok(url) => url,
             Err(refusal) => match stale {
                 Some(status) => {
@@ -229,6 +281,16 @@ pub fn fetch_authorized(
             },
         };
         stale = None;
+        // Grant preparation remains concurrent even when the object stream
+        // budget is occupied; a slow mint must not serialize healthy transfers.
+        let _slot = slots
+            .map(|slots| slots.acquire(ledger, deadline))
+            .transpose()?;
+        if _slot.as_ref().is_some_and(|slot| slot.waited) {
+            // The body permit can outlive a URL. Reconsult its authority after
+            // waiting; Leases reuses a fresh grant and remints an expired one.
+            url = authorize(false, ledger)?;
+        }
         // Every hop of this ask, recorded as it is walked and announced before the body is
         // read: an ask that dies in the middle still says which host answered it and how.
         let mut hops: Vec<(String, u16)> = Vec::new();
@@ -292,6 +354,8 @@ pub fn fetch_authorized(
         let mut body = Observed {
             inner: response.into_body(),
             seen: 0,
+            limit: grant.object.length,
+            failure: None,
             notify: |total| {
                 if let Some(watcher) = observer.as_mut() {
                     watcher.moved(total);
@@ -307,7 +371,11 @@ pub fn fetch_authorized(
             }
             Err(door) => {
                 let stalled = body.inner.stalled();
-                let refusal = body.inner.failure().unwrap_or(door);
+                let refusal = body
+                    .failure
+                    .take()
+                    .or_else(|| body.inner.failure())
+                    .unwrap_or(door);
                 if stalled {
                     stalled_attempts += 1;
                 }
@@ -397,6 +465,14 @@ pub(super) fn open_object<'l>(
         )?;
         let status = response.status;
         hop(&checked, status);
+        if status == 200 {
+            ledger.origin(&format!(
+                "{}://{}:{}",
+                if checked.https { "https" } else { "http" },
+                checked.host,
+                checked.port
+            ));
+        }
         if (300..400).contains(&status) {
             let Some(location) = response.header("location").map(str::to_string) else {
                 return refuse(Code::REDIRECT_REFUSED, "origin redirected with no Location");
@@ -510,6 +586,21 @@ pub trait ObjectUrls: Sync {
     /// that cannot must refuse, because handing back the dead URL would turn a re-ask into
     /// an infinite one.
     fn url_for(&self, at: usize, object: &ObjectRef, stale: bool) -> Result<String>;
+
+    /// Cooperative cancellation for an individual redundant attempt. Providers
+    /// that wait for remote authority must consult this ledger during that wait.
+    fn url_for_while(
+        &self,
+        at: usize,
+        object: &ObjectRef,
+        stale: bool,
+        ledger: &Ledger,
+    ) -> Result<String> {
+        ledger.check_running()?;
+        let result = self.url_for(at, object, stale);
+        ledger.check_running()?;
+        result
+    }
 }
 
 /// URLs already in hand: the shape a caller that did its own authorizing passes. Nothing
@@ -600,12 +691,53 @@ pub(super) struct Leases<'a> {
     /// constant compiled in here.
     pub(super) window: usize,
     pub(super) held: Mutex<BTreeMap<String, Lease>>,
-    pub(super) minting: Mutex<()>,
+    pub(super) minting: Minting,
+}
+
+#[derive(Default)]
+pub(super) struct Minting {
+    active: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl Minting {
+    fn acquire(&self, ledger: &Ledger, deadline: Deadline) -> Result<MintOwner<'_>> {
+        let mut active = self.active.lock().unwrap();
+        while *active {
+            ledger.check_running()?;
+            let tick = deadline
+                .remaining()?
+                .map_or(ledger.sample(), |left| left.min(ledger.sample()));
+            active = self.ready.wait_timeout(active, tick).unwrap().0;
+        }
+        ledger.check_running()?;
+        deadline.remaining()?;
+        *active = true;
+        Ok(MintOwner(self))
+    }
+}
+
+struct MintOwner<'a>(&'a Minting);
+impl Drop for MintOwner<'_> {
+    fn drop(&mut self) {
+        *self.0.active.lock().unwrap() = false;
+        self.0.ready.notify_all();
+    }
 }
 
 impl ObjectUrls for Leases<'_> {
     fn url_for(&self, at: usize, object: &ObjectRef, stale: bool) -> Result<String> {
-        self.ledger.check_running()?;
+        self.url_for_while(at, object, stale, self.ledger)
+    }
+
+    fn url_for_while(
+        &self,
+        at: usize,
+        object: &ObjectRef,
+        stale: bool,
+        ledger: &Ledger,
+    ) -> Result<String> {
+        ledger.check_running()?;
         if stale && !self.retire(&object.sha256)? {
             // The refused lease was NOT spent: the hub's own declared life still had more
             // than half of it left, so the origin's refusal is not about time and asking to
@@ -624,14 +756,14 @@ impl ObjectUrls for Leases<'_> {
         if let Some(url) = self.fresh(&object.sha256) {
             return Ok(url);
         }
-        let _minting = self.minting.lock().unwrap();
-        self.ledger.check_running()?;
+        let _minting = self.minting.acquire(ledger, self.deadline)?;
+        ledger.check_running()?;
         // Another stream may have minted this window while this one waited for the right
         // to call. Asking again before calling is what makes one window cost one call.
         if let Some(url) = self.fresh(&object.sha256) {
             return Ok(url);
         }
-        self.mint_from(at)?;
+        self.mint_from(at, ledger)?;
         if let Some(url) = self.fresh(&object.sha256) {
             return Ok(url);
         }
@@ -706,7 +838,7 @@ impl Leases<'_> {
     /// the verdict is reached HERE, holding `minting`: the fifteen streams parked on that
     /// mutex cannot observe anything, so the only thread that can end their wait is the one
     /// that owns it.
-    fn mint_from(&self, at: usize) -> Result<()> {
+    fn mint_from(&self, at: usize, ledger: &Ledger) -> Result<()> {
         let mut digests: Vec<String> = Vec::new();
         for object in &self.wanted[at..] {
             if digests.len() >= self.window {
@@ -727,7 +859,7 @@ impl Leases<'_> {
             self.credential,
             self.policy,
             self.deadline,
-            self.ledger,
+            ledger,
         )?;
         // Stamped when the ANSWER ARRIVES (tfs-102). It used to be stamped before the
         // call, "so the call's own latency is spent out of the lease it is fetching
@@ -809,12 +941,33 @@ pub fn fetch_wanted(
     streams: usize,
     on_object: Option<ObjectObserver<'_>>,
 ) -> Result<WalkOutcome> {
+    fetch_wanted_bounded(
+        store, plan, urls, policy, credential, deadline, ledger, streams, on_object, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fetch_wanted_bounded(
+    store: &Store,
+    plan: &FetchPlan,
+    urls: &dyn ObjectUrls,
+    policy: &SourcePolicy,
+    credential: &dyn CredentialProvider,
+    deadline: Deadline,
+    ledger: &Ledger,
+    streams: usize,
+    on_object: Option<ObjectObserver<'_>>,
+    download_budget: Option<(u64, u64)>,
+) -> Result<WalkOutcome> {
     let cache = store.repo_cache();
     // Nothing is checked up front any more, because there is no up-front set to check. The
     // invariant it proved — the grant set covers the wanted set exactly — is enforced per
     // mint instead: presign authorizes every digest it was asked or refuses, never a silent
     // subset, and a supplier with no URL for an object refuses in the same words.
-    let streams = streams.clamp(1, 128).min(plan.wanted.len().max(1));
+    let streams = streams.clamp(1, 128);
+    let recovery = super::speculate::Recovery::new(store, plan, streams, download_budget);
+    // Recovery reserves an object connection, not an authorization worker.
+    let workers = streams.min(plan.wanted.len().max(1));
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let fetched = AtomicU64::new(0);
@@ -823,7 +976,7 @@ pub fn fetch_wanted(
     let bytes_cached = AtomicU64::new(0);
     let first: Mutex<Option<Refusal>> = Mutex::new(None);
     std::thread::scope(|scope| {
-        for _ in 0..streams {
+        for _ in 0..workers {
             scope.spawn(|| loop {
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -832,7 +985,8 @@ pub fn fetch_wanted(
                 let Some(object) = plan.wanted.get(at) else {
                     return;
                 };
-                let authorize = |stale: bool| urls.url_for(at, object, stale);
+                let authorize =
+                    |stale: bool, ledger: &Ledger| urls.url_for_while(at, object, stale, ledger);
                 let outcome = DeliveryGrant::mint(plan, object).and_then(|grant| {
                     // The grant already knows which namespace this object lives in — it
                     // derives its own storage key from the same bit — so the cache is asked
@@ -850,8 +1004,19 @@ pub fn fetch_wanted(
                             return Ok(Source::Cache);
                         }
                     }
-                    let one = fetch_authorized(
-                        store, &grant, &authorize, policy, credential, deadline, ledger, None,
+                    let one = recovery.fetch(
+                        store,
+                        &grant,
+                        &authorize,
+                        policy,
+                        credential,
+                        deadline,
+                        ledger,
+                        &|| {
+                            (plan.wanted.len() as u64).saturating_sub(
+                                fetched.load(Ordering::Acquire) + cached.load(Ordering::Acquire),
+                            ) < streams as u64
+                        },
                     )?;
                     if let (Some(kind), Some(cache)) = (kind, cache) {
                         // Local admission is complete. Optional replication must never
@@ -1110,9 +1275,9 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
                 .presign_max_digests
                 .unwrap_or_else(|| window_without_a_declared_ceiling(request.streams)),
             held: Mutex::new(BTreeMap::new()),
-            minting: Mutex::new(()),
+            minting: Minting::default(),
         };
-        let walked = fetch_wanted(
+        let walked = fetch_wanted_bounded(
             request.store,
             &plan,
             &leases,
@@ -1122,6 +1287,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             &ledger,
             request.streams,
             request.on_object,
+            request.download_budget,
         )?;
         report.fetched = walked.fetched;
         report.bytes_moved = walked.bytes_moved;
@@ -1254,4 +1420,48 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
         &fault,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod mint_wait_tests {
+    use super::*;
+
+    #[test]
+    fn mint_owner_completion_wakes_waiters_and_attempt_stop_is_local() {
+        for cancel in [false, true] {
+            let mint = Minting::default();
+            let root = Ledger::with_resolution(if cancel {
+                Duration::from_millis(10)
+            } else {
+                Duration::from_secs(5)
+            });
+            let owner = mint.acquire(&root, Deadline::none()).unwrap();
+            let attempt = std::sync::Arc::new(super::super::ledger::Attempt::default());
+            let local = root.for_attempt(std::sync::Arc::clone(&attempt));
+            std::thread::scope(|scope| {
+                let (ready, waiting) = std::sync::mpsc::channel();
+                let (done, finished) = std::sync::mpsc::channel();
+                let mint = &mint;
+                let local = &local;
+                scope.spawn(move || {
+                    ready.send(()).unwrap();
+                    let result = mint.acquire(local, Deadline::none());
+                    done.send(result.is_ok()).unwrap();
+                });
+                waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+                let owner = if cancel {
+                    attempt.stopped.store(true, Ordering::Release);
+                    Some(owner)
+                } else {
+                    drop(owner);
+                    None
+                };
+                let result = finished.recv_timeout(Duration::from_millis(200));
+                drop(owner); // release even when the negative control times out
+                assert_eq!(result.unwrap(), !cancel);
+            });
+            root.check_running().unwrap();
+        }
+    }
 }
