@@ -126,7 +126,7 @@ func TestUnpublishedTransactionsShareRentalRetention(t *testing.T) {
 	hub := newFakeRentalHub(t, 0)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\n"+
-			"rentals:\n  idle_release_s: 1\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	daemon := startDaemonProcess(t, root)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -152,6 +152,12 @@ func TestUnpublishedTransactionsShareRentalRetention(t *testing.T) {
 			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hub.server.URL,
 			Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem"),
 			ManagedRequestID: buyer,
+			ReadyAt: func() string {
+				if buyer == "" {
+					return time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+				}
+				return time.Now().UTC().Format(time.RFC3339Nano)
+			}(),
 		}))
 	}
 	plant(retained, "otter", first.ID)
@@ -191,13 +197,13 @@ func TestUnpublishedTransactionsShareRentalRetention(t *testing.T) {
 }
 
 // Disabling automatic idle cleanup must not suppress an explicit transaction
-// abandonment. This failed against the real idle_release_s=0 development home.
+// abandonment. Explicit abandonment remains independent of the fixed idle grace.
 func TestPrivateCancellationReleasesManagedRentalWithIdleCleanupDisabled(t *testing.T) {
 	root := t.TempDir()
 	hub := newFakeRentalHub(t, 0)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\n"+
-			"rentals:\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	daemon := startDaemonProcess(t, root)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)

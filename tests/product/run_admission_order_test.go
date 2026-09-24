@@ -102,7 +102,7 @@ func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, 
 		"if [ \"$#\" -eq 0 ]; then printf 'CUDA Version: 13.0\\n'; else printf '%s\\n' "+
 		quote("0, "+gpu+", 8192, 8192, 580.82.09, 8.9")+"; fi\n"), 0700))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(fmt.Sprintf(
-		"tensorhub_url: %s\ntensorhub_token: ladder-test\ntfs: %s\nrentals:\n  max_hourly_spend_usd: 20\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n", server.URL, tensorfs)), 0600))
+		"tensorhub_url: %s\ntensorhub_token: ladder-test\ntfs: %s\nrentals:\n  max_hourly_spend_usd: 20\ndaemon:\n  idle_shutdown_s: 0\n", server.URL, tensorfs)), 0600))
 	installDir := filepath.Join(root, "installs", "inst-admission")
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installDir)), 0700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(installDir), iface, 0600))

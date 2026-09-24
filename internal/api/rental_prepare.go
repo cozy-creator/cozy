@@ -63,6 +63,17 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := r.PathValue("rental_id")
+	if s.rentalPreparation == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("rental preparation activity tracker is unavailable"))
+		return
+	}
+	finish, problem := s.rentalPreparation(id)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	confirmed := false
+	defer func() { finish(confirmed) }()
 	instance, _, _, problem := s.orchestrator.EnsureRentalContext(r.Context(), id)
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
@@ -84,6 +95,7 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, problem)
 		return
 	}
+	confirmed = true
 	s.ok(w, r, http.StatusOK, RentalPackagePrepareResult{Rental: id, Package: body.Package, Release: body.Release, Status: "prepared"})
 }
 

@@ -20,32 +20,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
-// The fleet, and its one reason to end a rental on its own. The owner's ruling: the main
-// guard against over-spend is Creator reaping unused pods, so a controller that dies must
-// not leave pods billing with no work being done. Every rental this daemon owns is under
-// that rule — one bought for a request and one asked for with `cozy rental new` alike —
-// because how a pod was acquired says nothing about whether it is doing anything.
-//
-// The observation is the decision: nothing queued for the pod, nothing running or owed on
-// it, and that has been true since a fact this host recorded — the close of its last
-// settled attempt, or the moment the hub first said `ready`. rentals.idle_release_s is only
-// how long that must stay true. Its default, five minutes, is a few cold acquisitions: on
-// the fleet proof a cold `--rental` answer took 34–56 s against 0.6 s warm, so an idle pod
-// is worth keeping for a handful of those and no longer. "Owed" includes the buy itself
-// (cl-113): a rental bought for a request is that request's debt from the moment the paid
-// row exists — through the whole boot — until the request settles or durably routes to
-// another machine, and the observation reads that debt from the rental row, never from
-// the memory of the goroutine that bought it.
-//
-// managedRentals is deliberately small: one mutex serializes the local fleet ceiling, reuse
-// decision, paid POST, and paid DELETE. The durable rental operation and request rows remain
-// the crash-recovery authority; nothing here is remembered that the records do not hold.
+// managedRentals serializes fleet admission, acknowledged keepalive and release.
+// Fixed idle expiry counts real work on each machine, never retained bytes or
+// an open controller connection. Durable records survive daemon restarts.
 type managedRentals struct {
-	mu     sync.Mutex
-	ctx    *Context
-	layout home.Layout
-	store  *records.Store
-	owner  *orchestrator.Orchestrator
+	mu        sync.Mutex
+	ctx       *Context
+	layout    home.Layout
+	store     *records.Store
+	owner     *orchestrator.Orchestrator
+	preparing map[string]int
 	// retryAt holds a rental whose release the hub refused or did not answer; said holds
 	// the last line printed about each rental, so the sweep speaks once per change.
 	retryAt map[string]time.Time
@@ -66,96 +50,8 @@ type managedRentals struct {
 	listingProblem *exit.Error
 }
 
-// idleReleaseRetry is how soon a release the hub did not confirm is asked again. A fifth
-// of the grace: shorter than the grace, or a transient fault would add another whole
-// grace of billing on top of the one the user accepted; not every sample, or a hub that
-// is down would be asked at the sweep's cadence while the fleet lock is held for each ask.
-func idleReleaseRetry(grace time.Duration) time.Duration { return grace / 5 }
-
-// rentalIdleness is the one observation the idle release and `cozy rental` share.
-type rentalIdleness struct {
-	Queued, Running int
-	// Owed marks a rental bought for a request that has not settled and has not been
-	// durably routed to another machine (cl-113). The debt starts at the buy — before
-	// the pod is ready, before dispatch pins — so a booting pod whose buyer is still
-	// queued is busy, not idle.
-	Owed bool
-	// Since is the newest fact this host holds about the pod doing anything: the close of
-	// its last settled request (including preparation), or, before any work, the moment this host
-	// recorded the hub's `ready`. Zero while the pod is still booting — RentedAt is when it
-	// was asked for, not when it began to exist — so a rental is never reaped mid-boot.
-	Since time.Time
-	// UnpinnedQueued is queued --rental work that is pinned to NO rental (cl-121). It is
-	// not this rental's work and may never be — that is exactly why it is counted here
-	// rather than against a machine: the pin is routing's output, so between a placement
-	// being STAGED and being DISPATCHABLE the request belongs to nobody, and the fleet
-	// used to read "belongs to nobody" as "nobody is busy" and release the warm machine
-	// it was waiting for. Releasing on this evidence is wrong in the expensive direction:
-	// a cold re-acquisition measured 178-271 s and re-downloaded 6.93 GB the released
-	// machine already held, against under a cent for the extra minute of keeping it.
-	UnpinnedQueued int
-	// Spent says the rental's reason is over without waiting: a managed rental exists for
-	// the request that bought it, and a job, or a request that never reached an attempt,
-	// leaves nothing warm worth keeping. A manual rental exists because the user asked;
-	// only idleness ends it.
-	Spent bool
-}
-
-func (i rentalIdleness) busy() bool {
-	return i.Queued > 0 || i.Running > 0 || i.Owed || i.UnpinnedQueued > 0
-}
-
-func observeRentalIdle(st *records.Store, row records.Rental) (rentalIdleness, *exit.Error) {
-	var idle rentalIdleness
-	var problem *exit.Error
-	if idle.Queued, idle.Running, problem = st.RentalRunCounts(row.ID); problem != nil {
-		return idle, problem
-	}
-	if row.ReadyAt != "" {
-		ready, err := time.Parse(time.RFC3339Nano, row.ReadyAt)
-		if err != nil {
-			return idle, exit.Internalf("rental %s has an invalid ready timestamp: %s", row.ID, err)
-		}
-		idle.Since = ready
-	}
-	last, found, problem := st.RentalLastSettlement(row.ID)
-	if problem != nil {
-		return idle, problem
-	}
-	if found && last.SettledAt.After(idle.Since) {
-		idle.Since = last.SettledAt
-	}
-	if idle.Spent, problem = orchestrator.RentalSpent(st, row); problem != nil {
-		return idle, problem
-	}
-	if idle.UnpinnedQueued, problem = st.QueuedUnpinnedRentalRequests(); problem != nil {
-		return idle, problem
-	}
-	if idle.Owed, problem = orchestrator.RentalOwedBy(st, row); problem != nil {
-		return idle, problem
-	}
-	if idle.Owed {
-		// The buyer has not settled: the rental's reason is live, not spent.
-		idle.Spent = false
-	}
-	return idle, nil
-}
-
-// releaseAt is when the idle release is due, or false while the rental is busy (queued,
-// running, or owed by the request that bought it), still booting, or exempt because
-// rentals.idle_release_s is zero. A rental whose ready_at is unset and which has never
-// settled an attempt has a zero Since and is therefore never idle-released: a pod is
-// never reaped mid-boot (th-105/cl-078) — a terminally failed acquisition ends through
-// the hub's own `failed` state and reconciliation, not through this clock.
-func (i rentalIdleness) releaseAt(grace time.Duration) (time.Time, bool) {
-	if grace <= 0 || i.busy() || i.Since.IsZero() {
-		return time.Time{}, false
-	}
-	if i.Spent {
-		return i.Since, true
-	}
-	return i.Since.Add(grace), true
-}
+// Failed provider release is retried without changing the idle deadline.
+const idleReleaseRetry = 3 * time.Minute
 
 // totals is the reconciled fleet count and hourly burn, for a caller that spells them itself.
 func (m *managedRentals) totals() (int, int64, *exit.Error) {
@@ -750,7 +646,7 @@ func (m *managedRentals) sweepLocked() {
 	for _, row := range rows {
 		if _, problem := m.observeLocked(row); problem != nil {
 			m.sayLocked(row.ID, fmt.Sprintf("rental %s release deferred: %s; retrying every %s",
-				row.ID, problem.Message, idleReleaseRetry(m.ctx.Cfg.RentalsIdleRelease)))
+				row.ID, problem.Message, idleReleaseRetry))
 		}
 	}
 }
@@ -767,11 +663,11 @@ func (m *managedRentals) observeLocked(row records.Rental) (string, *exit.Error)
 			row.ID, row.Hub, base))
 		return m.lineLocked()
 	}
-	idle, problem := observeRentalIdle(m.store, row)
+	idle, problem := m.observeIdle(row)
 	if problem != nil {
 		return "", problem
 	}
-	due, eligible := idle.releaseAt(m.ctx.Cfg.RentalsIdleRelease)
+	due, eligible := idle.ReleaseAt()
 	if !eligible {
 		delete(m.said, row.ID)
 		return m.lineLocked()
@@ -786,7 +682,7 @@ func (m *managedRentals) observeLocked(row records.Rental) (string, *exit.Error)
 		if m.retryAt == nil {
 			m.retryAt = map[string]time.Time{}
 		}
-		m.retryAt[row.ID] = time.Now().Add(idleReleaseRetry(m.ctx.Cfg.RentalsIdleRelease))
+		m.retryAt[row.ID] = time.Now().Add(idleReleaseRetry)
 		return "", problem
 	}
 	m.forgetIdleLocked(row.ID)
@@ -1271,4 +1167,46 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	}
 
 	return nil
+}
+
+// beginPreparation scopes actual explicit preparation, never a transport lifetime.
+func (m *managedRentals) beginPreparation(id string) (func(bool), *exit.Error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, problem := m.store.RentalRow(id)
+	if problem != nil {
+		return nil, problem
+	}
+	if m.closed || row == nil || row.State != "ready" {
+		return nil, exit.New(exit.Conflict, "preparation requires a current ready rental")
+	}
+	if problem := m.store.RecordRentalPreparationStarted(id); problem != nil {
+		return nil, problem
+	}
+	if m.preparing == nil {
+		m.preparing = map[string]int{}
+	}
+	m.preparing[id]++
+	var once sync.Once
+	return func(confirmed bool) {
+		once.Do(func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if confirmed {
+				if problem := m.store.RecordRentalWorkFinished(id, time.Now()); problem != nil {
+					fmt.Fprintln(m.ctx.Err, problem.Message)
+				}
+			}
+			m.preparing[id]--
+			if m.preparing[id] == 0 {
+				delete(m.preparing, id)
+			}
+		})
+	}, nil
+}
+
+func (m *managedRentals) observeIdle(row records.Rental) (rental.Idleness, *exit.Error) {
+	idle, problem := rental.ObserveIdle(m.store, row)
+	idle.Running += m.preparing[row.ID]
+	return idle, problem
 }

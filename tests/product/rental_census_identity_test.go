@@ -46,7 +46,7 @@ func TestRentalCensusRateControlsTransactionalAdmission(t *testing.T) {
 			peer.publishListing()
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\n"+
-					"rentals:\n  max_hourly_spend_usd: 0.15\n  idle_release_s: 0\n"+
+					"rentals:\n  max_hourly_spend_usd: 0.15\n"+
 					"daemon:\n  idle_shutdown_s: 0\n"), 0600))
 			peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1,
 				"price_usd_micros_per_hour": 100_000, "storage_usd_micros_per_hour": 10_000,

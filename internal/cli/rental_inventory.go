@@ -8,6 +8,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile bool) (api.RentalInventory, *exit.Error) {
@@ -32,7 +33,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 	default:
 		result.MachinesRunning, result.HourlySpendUSDMicros = count, burn
 	}
-	result.IdleReleaseSeconds = int64(fleet.ctx.Cfg.RentalsIdleRelease / time.Second)
+	result.IdleReleaseSeconds = int64(rental.IdleTimeout / time.Second)
 	rows, problem := st.Rentals()
 	if problem != nil {
 		return result, problem
@@ -44,7 +45,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 	attached := make(map[string]bool, len(rows))
 	for _, row := range rows {
 		attached[row.ID] = true
-		idle, problem := observeRentalIdle(st, row)
+		idle, problem := fleet.observeIdle(row)
 		if problem != nil {
 			return result, problem
 		}
@@ -62,7 +63,10 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 				ContainerState: row.Failure.ContainerState,
 			},
 		}
-		if due, eligible := idle.releaseAt(fleet.ctx.Cfg.RentalsIdleRelease); eligible {
+		if idle.PendingPreparation > fleet.preparing[row.ID] {
+			summary.Activity = nil
+		}
+		if due, eligible := idle.ReleaseAt(); eligible {
 			summary.Activity.IdleSince = idle.Since.UTC().Format(time.RFC3339)
 			summary.Activity.ReleaseDue = due.UTC().Format(time.RFC3339)
 		}

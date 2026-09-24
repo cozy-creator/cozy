@@ -185,7 +185,7 @@ func handleRent(ctx *Context) *exit.Error {
 	completed = true
 	ready := attachable
 	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release",
-		idleReleaseNote(ctx.Cfg.RentalsIdleRelease)}
+		idleReleaseNote()}
 	if line, problem := fleet.status(); problem == nil {
 		notes = append(notes, line)
 	}
@@ -918,7 +918,6 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 	inventory = inventory.Current()
 	count, burn := inventory.MachinesRunning, inventory.HourlySpendUSDMicros
 	rows, unrecorded := inventory.Rentals, inventory.Unrecorded
-	grace := time.Duration(inventory.IdleReleaseSeconds) * time.Second
 	list := output.List{
 		Name:   "rentals",
 		Fields: []string{"machine", "sku", "state", "$/hour", "uptime", "running", "queued", "idle"},
@@ -941,7 +940,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			"Current spend per hour: " + usdPerHourBare(burn)},
 		Aggregates: []output.Field{{K: "machines_running", V: jsonFact{count}},
 			{K: "hourly_spend_usd_micros", V: jsonFact{burn}}},
-		Trail: []string{idleShutdownNote(grace)},
+		Trail: []string{idleShutdownNote()},
 		Next:  []string{"cozy help rental"},
 	}
 	if problem := inventory.HubUnanswered; problem != nil {
@@ -1171,15 +1170,8 @@ func roughDuration(d time.Duration) string {
 }
 
 // idleShutdownNote is the one sentence the rental list owes: what ends an idle machine.
-func idleShutdownNote(grace time.Duration) string {
-	if grace <= 0 {
-		// The sentence used to read as a product stance. It is a CONFIG READOUT: the
-		// shipped default is 300 s, and this host has switched the policy off. Naming
-		// the setting is the difference between "that is how it works" and "that is how
-		// you set it up", and the reader is the person paying for the difference.
-		return "Idle machines are never shut down automatically (rentals.idle_release_s is 0)."
-	}
-	return "Idle machines shut down after " + plainDuration(grace) + "."
+func idleShutdownNote() string {
+	return "Idle machines shut down after 15 minutes. Use cozy rental keepalive <name> for one explicit reset."
 }
 
 // plainDuration spells a grace the way a person would: "5 minutes", "90 seconds", "2 hours".
@@ -1200,12 +1192,8 @@ func plural(n int, unit string) string {
 	return fmt.Sprintf("%d %ss", n, unit)
 }
 
-func idleReleaseNote(grace time.Duration) string {
-	if grace <= 0 {
-		return "rentals.idle_release_s is 0: a rental ends only through `cozy rental end`"
-	}
-	return fmt.Sprintf("the daemon ends a rental once nothing has been queued, running, or owed on it for %s "+
-		"(rentals.idle_release_s); running work on it is what keeps it", grace)
+func idleReleaseNote() string {
+	return "rentals end after 15 minutes without active work; cozy rental keepalive <name> explicitly resets that deadline"
 }
 
 // handleRentRelease is idempotent and ends only on provider ABSENCE: the hub reporting the

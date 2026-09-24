@@ -73,11 +73,6 @@ type Config struct {
 	LocalRateSource                string
 	RentalsMaxHourlySpendUSDMicros int64
 	RentalsMaxHourlySpendSource    string
-	// RentalsIdleRelease is how long a rented pod must have had no work — nothing queued
-	// for it, nothing running or owed on it — before the daemon ends it, manual or
-	// managed. A debounce over an observed fact, never the decision; zero leaves every
-	// rental to `cozy rental end`.
-	RentalsIdleRelease time.Duration
 	// Development rentals use the Hub's registered debug image and this owner's
 	// public SSH key. These defaults apply only when authoring a new acquisition.
 	RentalsDevelopment  bool
@@ -121,7 +116,6 @@ type values struct {
 	TensorFSRegistry         string `name:"tensorfs_registry"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
 	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
-	RentalsIdleReleaseS      int64  `name:"rentals_idle_release_s" default:"300"`
 	RentalsDevelopment       bool   `name:"rentals_development" default:"true"`
 	RentalsSSHPublicKey      string `name:"rentals_ssh_public_key"`
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
@@ -144,9 +138,6 @@ func (v *values) Validate() error {
 	}
 	if _, err := usdMicros(v.RentalsMaxHourlySpendUSD); err != nil {
 		return fmt.Errorf("rentals.max_hourly_spend_usd %q is not a non-negative USD amount with at most six decimal places", v.RentalsMaxHourlySpendUSD)
-	}
-	if v.RentalsIdleReleaseS < 0 {
-		return fmt.Errorf("rentals.idle_release_s must be non-negative; zero disables idle release")
 	}
 	if v.DaemonIdleShutdownS < 0 {
 		return fmt.Errorf("daemon.idle_shutdown_s must be non-negative; zero disables idle shutdown")
@@ -187,7 +178,7 @@ var fileKeys = map[string]bool{
 // nested spelling to the flat grammar name.
 var nestedFileKeys = map[string]map[string]string{
 	"rentals": {"max_hourly_spend_usd": "rentals_max_hourly_spend_usd",
-		"idle_release_s": "rentals_idle_release_s", "development": "rentals_development",
+		"development": "rentals_development",
 		"ssh_public_key": "rentals_ssh_public_key"},
 	"daemon":      {"idle_shutdown_s": "daemon_idle_shutdown_s"},
 	"maintenance": {"gc_cron": "maintenance_gc_cron"},
@@ -287,7 +278,6 @@ func load() (Config, *exit.Error) {
 		LocalRateSource:                sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
 		RentalsMaxHourlySpendUSDMicros: rentalCap,
 		RentalsMaxHourlySpendSource:    sourceOf("rentals_max_hourly_spend_usd", file, environment, "unset"),
-		RentalsIdleRelease:             time.Duration(input.RentalsIdleReleaseS) * time.Second,
 		RentalsDevelopment:             input.RentalsDevelopment,
 		RentalsSSHPublicKey:            strings.TrimSpace(input.RentalsSSHPublicKey),
 		DaemonIdleShutdown:             time.Duration(input.DaemonIdleShutdownS) * time.Second,

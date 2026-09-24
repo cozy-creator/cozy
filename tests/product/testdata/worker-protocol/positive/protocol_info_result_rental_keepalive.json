@@ -1,5 +1,5 @@
 {
   "minimum_wire_minor": 60,
-  "supports_mixed_model_inputs": true,
+  "supports_rental_keepalive": true,
   "wire_minor": 60
 }

@@ -427,13 +427,14 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
-	Update  RentalUpdateCmd  `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
-	Prepare RentalPrepareCmd `cmd:"" help:"Install one exact package release and prepare its model inputs on a rental."`
-	SSHInfo RentalSSHInfoCmd `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
-	List    RentalListCmd    `cmd:"" help:"List rented machines, live on a terminal."`
-	New     RentalNewCmd     `cmd:"" help:"Start a private rental, or list available machine types."`
-	End     RentalEndCmd     `cmd:"" help:"End a private rental and stop billing."`
-	Prune   RentalPruneCmd   `cmd:"" help:"Free unused cached operation results on a private rental."`
+	Keepalive RentalKeepaliveCmd `cmd:"" help:"Explicitly reset this rental's fixed 15-minute idle deadline once."`
+	Update    RentalUpdateCmd    `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
+	Prepare   RentalPrepareCmd   `cmd:"" help:"Install one exact package release and prepare its model inputs on a rental."`
+	SSHInfo   RentalSSHInfoCmd   `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
+	List      RentalListCmd      `cmd:"" help:"List rented machines, live on a terminal."`
+	New       RentalNewCmd       `cmd:"" help:"Start a private rental, or list available machine types."`
+	End       RentalEndCmd       `cmd:"" help:"End a private rental and stop billing."`
+	Prune     RentalPruneCmd     `cmd:"" help:"Free unused cached operation results on a private rental."`
 }
 
 type RentalPrepareCmd struct {
@@ -556,4 +557,12 @@ type RentalSSHInfoCmd struct {
 
 func (c *RentalSSHInfoCmd) Run(r *Runtime) error {
 	return r.call(handleRentalSSHInfo, []string{c.Rental}, nil, nil, false)
+}
+
+type RentalKeepaliveCmd struct {
+	Rental string `arg:"" help:"Existing rental name or id."`
+}
+
+func (c *RentalKeepaliveCmd) Run(r *Runtime) error {
+	return r.call(handleRentalKeepalive, []string{c.Rental}, nil, nil, true)
 }

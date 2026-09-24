@@ -58,6 +58,7 @@ const (
 // does. It verifies the owner's Ed25519 ClaimProof on both services against the control key
 // the rental's auth document would carry, records what crossed, and answers minimally.
 type fakePod struct {
+	keepalive        func(*pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error)
 	identity         string
 	noSeats          bool
 	mediaReservation func(int64, int) error
@@ -153,7 +154,7 @@ func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequ
 	if version == 0 {
 		version = pb.WireMinor
 	}
-	return &pb.ProtocolInfoResult{WireMinor: version, MinimumWireMinor: min(version, pb.MinCompatibleWireMinor)}, nil
+	return &pb.ProtocolInfoResult{WireMinor: version, MinimumWireMinor: min(version, pb.MinCompatibleWireMinor), SupportsRentalKeepalive: p.keepalive != nil}, nil
 }
 
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
@@ -1343,4 +1344,14 @@ func (p *fakePod) WatchProgress(open *pb.ProgressOpen, stream pb.WorkerControl_W
 	}
 	<-stream.Context().Done()
 	return nil
+}
+
+func (p *fakePod) KeepRentalAlive(ctx context.Context, request *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
+	if err := p.verifyClaim(request.Claim, false); err != nil {
+		return nil, err
+	}
+	if p.keepalive == nil {
+		return nil, status.Error(codes.Unimplemented, "keepalive unavailable")
+	}
+	return p.keepalive(request)
 }

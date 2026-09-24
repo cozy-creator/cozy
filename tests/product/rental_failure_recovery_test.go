@@ -45,7 +45,7 @@ func TestRentalFailureRecovery(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 1.00\n  idle_release_s: 600\n"+
+			"rentals:\n  max_hourly_spend_usd: 1.00\n"+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	logPath := filepath.Join(root, "daemon.log")
 

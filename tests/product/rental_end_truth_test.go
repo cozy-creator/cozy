@@ -51,7 +51,7 @@ func rentalEndRoot(t *testing.T, name string) (string, string, *fakeRentalHub) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 5.00\n  idle_release_s: 0\n"+
+			"rentals:\n  max_hourly_spend_usd: 5.00\n"+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	return root, hubURL, newFakeRentalHub(t, port)
 }

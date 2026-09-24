@@ -68,8 +68,10 @@ retail hourly rate locked into each rental. Every potentially billing manual or 
 rental counts until Tensorhub confirms release or absence. A new managed rental is allowed
 only when its locked rate fits under `rentals.max_hourly_spend_usd`. Creator reuses the
 cheapest idle rental first, otherwise buys the cheapest offered SKU. Every rental, manual or
-Creator-managed, is released once nothing has been queued, running, or owed on it for
-`rentals.idle_release_s`; a managed rental whose assigned requests are terminal, their output
+Creator-managed, has an immutable 900-second idle deadline. Only actual work on that
+machine and an acknowledged explicit `cozy rental keepalive <name>` reset it. Retained
+failed/paused files, connection traffic and unpinned fleet work do not. The pod independently
+enforces expiry while Creator is offline, using the existing Hub release route; a managed rental whose assigned requests are terminal, their output
 bytes mirrored, and their outcome acknowledgements sent is released at once when its work was
 a job. `cozy rental end` releases one now.
 

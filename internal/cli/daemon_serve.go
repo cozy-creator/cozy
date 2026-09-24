@@ -201,6 +201,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	server := api.New(api.Options{
 		RuntimeUpdate:     updates.Start,
+		RentalKeepalive:   fleet.keepalive,
+		RentalPreparation: fleet.beginPreparation,
 		MachineExecutions: machines,
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
@@ -233,12 +235,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
 	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Daemon)
-	if ctx.Cfg.RentalsIdleRelease > 0 {
-		fmt.Fprintf(ctx.Out, "  rentals: released after %s with nothing queued, running, or owed (rentals.idle_release_s)\n",
-			ctx.Cfg.RentalsIdleRelease)
-	} else {
-		fmt.Fprintln(ctx.Out, "  rentals: never idle-released (rentals.idle_release_s=0); each ends with cozy rental end")
-	}
+	fmt.Fprintln(ctx.Out, "  rentals: released after 15 minutes without active work; manual cozy rental keepalive resets once")
 	if ctx.Cfg.MaintenanceGCCron != "" {
 		fmt.Fprintf(ctx.Out, "  store gc: on the schedule %q (maintenance.gc_cron); cozy model remove and cozy model gc reclaim on demand\n",
 			ctx.Cfg.MaintenanceGCCron)

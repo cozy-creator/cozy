@@ -245,7 +245,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		fatal(t, problem)
 		machineName = request.Name
 	}
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: manual-restart-proof\nrentals:\n  max_hourly_spend_usd: 2\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: manual-restart-proof\nrentals:\n  max_hourly_spend_usd: 2\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	row := records.Rental{AcceleratorCount: 1, ID: podRental, State: "ready", Hub: hub.URL, MachineName: machineName,
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: listener.Addr().String(), MediaAddress: strings.TrimPrefix(media.URL, "https://"),
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
