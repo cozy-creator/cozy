@@ -93,6 +93,10 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		m.mu.Unlock()
 	}
 	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
+	result.modelDefaultOrigin = func(ctx context.Context) (string, *exit.Error) {
+		facts, problem := client(m.context).RentalImageInventory(ctx, identity.RentalID)
+		return facts.PublicOrigin, problem
+	}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
 		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
 		facts, problem := rental.PrepareFactsSource(client(m.context))(ctx, identity, ref)
@@ -209,6 +213,39 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			}
 		}
 		stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
+		if err != nil {
+			return machineTransport(err)
+		}
+		return readMachinePreparation(stream)
+	}
+
+	// Only inference supplies these exact inputs. Installing the captured code
+	// above remains independent of any model, including unused child defaults.
+	result.prepareModels = func(ctx context.Context, request records.Request, revision localpackage.Revision) *exit.Error {
+		models := orchestrator.PrivateRevisionModelRefs(request, revision.Package)
+		if len(models) == 0 {
+			return nil
+		}
+		transfer, problem := m.store.MachinePackageTransfer(request.ID, claim.WorkerBootId, revision.Digest)
+		if problem != nil {
+			return problem
+		}
+		operation := transfer.Operation
+		if operation == "" {
+			operation = machinePackageOperation(request.ID, revision)
+		}
+		downloads, problem := rental.DownloadSet(nil, models)
+		if problem != nil {
+			return problem
+		}
+		digest, err := canonical.Raw(revision.Digest)
+		if err != nil {
+			return exit.New(exit.Conflict, "private inference model preparation changed its revision")
+		}
+		selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, LocalRevisionDigest: digest, DownloadDelegation: downloads}
+		stream, err := host.PreparePrivatePlacement(ctx, &pb.PreparePrivatePlacementCall{
+			Claim: claim, SupportsModelMaterializationRecovery: true, PrivatePlacementSet: selected,
+		})
 		if err != nil {
 			return machineTransport(err)
 		}

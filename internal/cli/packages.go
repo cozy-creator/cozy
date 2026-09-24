@@ -173,14 +173,9 @@ func emitInstallResult(ctx *Context, res *install.Result, cleanup ...output.Fiel
 		{K: "closure", V: strings.ReplaceAll(inst.Closure, "\n", " ")},
 		{K: "package_interface", V: inst.PackageInterface},
 		{K: "placement_set", V: inst.PlacementSetDigest},
-		{K: "model_download", V: orNone(res.ModelStatus)},
-		{K: "model_download_error", V: res.ModelError},
 	}
 	if res.Idempotent {
 		keys := []string{"package", "version", "status"}
-		if res.ModelStatus != "" && res.ModelStatus != "none" {
-			keys = append(keys, "model_download")
-		}
 		rec := compactRecord(fields, keys...)
 		rec.Next = []string{runExample(inst)}
 		return emit(ctx, rec)
@@ -190,7 +185,7 @@ func emitInstallResult(ctx *Context, res *install.Result, cleanup ...output.Fiel
 		output.Field{K: "timings", V: timingsText(res.Timings)},
 	)
 	fields = append(fields, cleanup...)
-	rec := compactRecord(fields, "package", "version", "status", "disk", "model_download")
+	rec := compactRecord(fields, "package", "version", "status", "disk")
 	rec.Notes = append(rec.Notes, res.Warnings...)
 	rec.Next = []string{runExample(inst), "cozy package list"}
 	return emit(ctx, rec)

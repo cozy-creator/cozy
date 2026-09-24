@@ -40,7 +40,7 @@ source identity), `LENGTH` is the printed manifest length, and `CHECKPOINT` is t
 upload result. Seeding and alias creation do not upload or buy anything.
 
 ```sh
-cozy package install . --editable --no-model-download
+cozy package install . --editable
 cozy run local/attention-kernel-benchmark/generate \
   model.model=YOUR_ORG/attention-kernel-benchmark@1/bf16 \
   seed=91 tokens=512 iterations=10 --rental=YOUR_RENTAL \

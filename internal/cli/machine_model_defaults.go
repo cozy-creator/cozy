@@ -20,7 +20,7 @@ import (
 
 // Default selection is an intake fact. No tensor payload is acquired here, and
 // unavailable defaults leave both unused imports and explicit overrides usable.
-func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCapture, rental bool) (localpackage.ExecutionCapture, *exit.Error) {
+func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCapture, rental bool, publicOrigin string) (localpackage.ExecutionCapture, *exit.Error) {
 	document := &pb.MachineExecutionCapture{}
 	if err := canonical.Unmarshal(capture.Canonical, document); err != nil {
 		return capture, exit.New(exit.Conflict, "captured model defaults have no exact code inventory")
@@ -39,7 +39,7 @@ func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCap
 		if err != nil {
 			return capture, exit.New(exit.Conflict, "captured default revision changed")
 		}
-		r.captureDefaultRows(document, revision.Package, digest, iface, rental, "")
+		r.captureDefaultRows(document, revision.Package, digest, iface, rental, publicOrigin)
 	}
 	var err error
 	capture.Canonical, capture.Digest, err = canonical.Identity(document)

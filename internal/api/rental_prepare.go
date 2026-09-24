@@ -73,8 +73,14 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, exit.New(exit.Validation, "rental model preparation bindings are not downloadable checkpoint selections"))
 		return
 	}
-	if problem := s.orchestrator.ConvergePackageSet(instance,
-		[]*pb.DownloadPackageRef{{Package: body.Package, Release: body.Release}}, models); problem != nil {
+	release, problem := s.orchestrator.UseRental(id)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	defer release()
+	if problem := s.orchestrator.PrepareRentalPackage(r.Context(), instance,
+		&pb.DownloadPackageRef{Package: body.Package, Release: body.Release}, models); problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}

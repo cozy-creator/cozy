@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -19,11 +20,12 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// cl-274: the HTTP prefetch boundary admits a real writer after the real CLI
-// commits its install. Reporting must not require another mutation claim.
-func TestPublishedInstallReportsSuccessWithWriterDuringPrefetch(t *testing.T) {
+// Package installation is code/environment-only. Model weights are never
+// fetched as a side effect; callers use explicit rental preparation or the
+// exact inference request instead.
+func TestPublishedInstallDoesNotPrefetchModels(t *testing.T) {
 	plan, wheel := reportingRelease(t)
-	for _, mode := range []string{"new", "superseded", "retained", "unsafe-prior", "prefetch-failure", "before-install"} {
+	for _, mode := range []string{"new", "superseded", "retained", "unsafe-prior", "before-install"} {
 		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
 			layout, problem := home.Open(root)
@@ -51,11 +53,7 @@ func TestPublishedInstallReportsSuccessWithWriterDuringPrefetch(t *testing.T) {
 				restoreDirectoryWrites(filepath.Join(prior.Dir, "venv", "lib", "python3.12", "site-packages", "prior"))
 			})
 
-			type admission struct {
-				writer *install.Writer
-				err    error
-			}
-			admitted := make(chan admission, 1)
+			var modelRequests atomic.Int32
 			mux := http.NewServeMux()
 			mux.HandleFunc("POST /v1/packages/proof/install-reporting/download", func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(plan)
@@ -65,30 +63,8 @@ func TestPublishedInstallReportsSuccessWithWriterDuringPrefetch(t *testing.T) {
 			})
 			mux.HandleFunc("GET /project.whl/{name}", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(wheel) })
 			mux.HandleFunc("GET /v1/packages/proof/install-reporting/bindings", func(w http.ResponseWriter, _ *http.Request) {
-				st, problem := records.Open(layout.DB)
-				if problem != nil {
-					admitted <- admission{err: problem}
-					http.Error(w, problem.Message, 500)
-					return
-				}
-				_, active, problem := st.ActivePackage("proof/install-reporting")
-				st.Close()
-				if problem != nil || active == nil || active.Version != "1.0.1" {
-					admitted <- admission{err: fmt.Errorf("prefetch before commit: %+v, %v", active, problem)}
-					http.Error(w, "install not committed", 500)
-					return
-				}
-				writer, problem := install.Lock(layout)
-				var err error
-				if problem != nil {
-					err = problem
-				}
-				admitted <- admission{writer: writer, err: err}
-				if mode == "prefetch-failure" {
-					_, _ = w.Write([]byte(`{"bindings":[{"slot":"incomplete"}]}`))
-					return
-				}
-				_, _ = w.Write([]byte(`{"bindings":[]}`))
+				modelRequests.Add(1)
+				http.Error(w, "package install must not request model bindings", http.StatusInternalServerError)
 			})
 			server := httptest.NewServer(mux)
 			defer server.Close()
@@ -104,16 +80,8 @@ func TestPublishedInstallReportsSuccessWithWriterDuringPrefetch(t *testing.T) {
 					t.Fatalf("pre-install writer refusal lost: %d %s %s", code, stdout, stderr)
 				}
 			} else {
-				select {
-				case held := <-admitted:
-					if held.writer != nil {
-						defer held.writer.Unlock()
-					}
-					if held.err != nil {
-						t.Fatal(held.err)
-					}
-				default:
-					t.Fatalf("CLI never reached committed prefetch: %d %s %s", code, stdout, stderr)
+				if modelRequests.Load() != 0 {
+					t.Fatal("package installation requested model bindings")
 				}
 				if code != 0 || !strings.Contains(stdout, `"status":"installed"`) {
 					t.Fatalf("committed install reported failure: %d %s %s", code, stdout, stderr)
@@ -121,15 +89,14 @@ func TestPublishedInstallReportsSuccessWithWriterDuringPrefetch(t *testing.T) {
 				if mode == "unsafe-prior" && !strings.Contains(stdout, "cleanup of the prior version was deferred") {
 					t.Fatalf("cleanup refusal lost its warning: %s", stdout)
 				}
-				if mode == "prefetch-failure" && (!strings.Contains(stdout, `"model_download":"failed"`) ||
-					!strings.Contains(stdout, "package code is installed; default model prefetch failed")) {
-					t.Fatalf("prefetch refusal lost its warning: %s", stdout)
-				}
 				if mode == "retained" {
-					// The competing writer is still held. Replaying the exact install
+					writer, problem := install.Lock(layout)
+					fatal(t, problem)
+					defer writer.Unlock()
+					// With a competing writer held, replaying the exact install
 					// must remain read-only and must not force reclamation of its prior.
 					code, replay, stderr := runCozyStreams(t, root, "package", "install", "proof/install-reporting",
-						"--version=1.0.1", "--no-model-download", "--json", "--full")
+						"--version=1.0.1", "--json", "--full")
 					if code != 0 || !strings.Contains(replay, `"status":"already installed"`) || strings.Contains(replay, `"reclaimed"`) {
 						t.Fatalf("idempotent install needs no writer or cleanup: %d %s %s", code, replay, stderr)
 					}

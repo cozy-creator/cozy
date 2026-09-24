@@ -667,14 +667,19 @@ func (c *Client) RentalSKUStatus(ctx context.Context, name string) (RentalSKUSta
 	return out, nil
 }
 
+// RentalImageInventoryView names the assigned image and the Hub's public byte
+// endpoint. The endpoint is independent of the client's configured control URL.
+type RentalImageInventoryView struct {
+	ImageInventory json.RawMessage `json:"image_inventory"`
+	PublicOrigin   string          `json:"public_origin"`
+}
+
 // RentalImageInventory reads the image actually assigned to this rental.
-func (c *Client) RentalImageInventory(ctx context.Context, id string) (json.RawMessage, *exit.Error) {
+func (c *Client) RentalImageInventory(ctx context.Context, id string) (RentalImageInventoryView, *exit.Error) {
 	if problem := validateRentalID(id); problem != nil {
-		return nil, problem
+		return RentalImageInventoryView{}, problem
 	}
-	var out struct {
-		ImageInventory json.RawMessage `json:"image_inventory"`
-	}
+	var out RentalImageInventoryView
 	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals/" + url.PathEscape(id) + "/image-inventory", auth: true, responseBytes: maxPrepareFactsResponseBytes}, &out)
-	return out.ImageInventory, problem
+	return out, problem
 }

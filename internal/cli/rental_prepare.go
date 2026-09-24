@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -13,7 +14,19 @@ import (
 )
 
 func handleRentalPrepare(ctx *Context) *exit.Error {
-	rentalID := strings.TrimSpace(ctx.Inv.Args[0])
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return problem
+	}
+	row, problem := store.RentalByMachine(strings.TrimSpace(ctx.Inv.Args[0]))
+	store.Close()
+	if problem != nil {
+		return problem
+	}
+	if row == nil {
+		return exit.New(exit.NotFound, "no rental %q on this host", ctx.Inv.Args[0])
+	}
+	rentalID := row.ID
 	packageName := strings.TrimSpace(ctx.Inv.Args[1])
 	ref, problem := hub.ParseRef(packageName)
 	if problem != nil {
@@ -56,6 +69,9 @@ func handleRentalPrepare(ctx *Context) *exit.Error {
 	client, problem := localapi.Open(ctx.Cfg, state)
 	if problem != nil {
 		return problem
+	}
+	if !ctx.Mode().JSON {
+		fmt.Fprintf(ctx.Err, "Preparing %s on %s (%d explicitly selected models)...\n", ref.String(), row.MachineName, len(models))
 	}
 	result, problem := client.PrepareRentalPackage(rentalID, api.RentalPackagePrepareRequest{
 		Package: ref.String(), Release: version, Models: models,

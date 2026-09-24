@@ -268,7 +268,7 @@ p=pathlib.Path(sys.argv[2])/'weightless.py';p.write_text(p.read_text().replace('
 	hub.skus = append(hub.skus, map[string]any{"name": "h100", "accelerator_model": "NVIDIA H100", "accelerator_count": 1, "price_usd_micros_per_hour": 1, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86", "compute_capability": "9.0", "vram_gb": 80, "minimum_ram_per_gpu_gb": 1})
 	hub.mu.Unlock()
 	for until := time.Now().Add(time.Minute); ; {
-		status, text := run(cozyBin, newBin, "package", "install", "paul/minimax-h3", "--version=1.14.3", "--no-model-download", "--json")
+		status, text := run(cozyBin, newBin, "package", "install", "paul/minimax-h3", "--version=1.14.3", "--json")
 		if status == 0 {
 			break
 		}

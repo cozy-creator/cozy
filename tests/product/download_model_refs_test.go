@@ -33,3 +33,22 @@ func repeatHex(pair string, n int) string {
 	}
 	return out
 }
+
+func TestPrivateModelPreparationExcludesUnusedAndForeignDefaults(t *testing.T) {
+	exact := records.ModelRef{Package: "local/video", Slot: "model", BindingPath: "generate.models.model", Model: "proof/h3", Release: "1.0.0", Lane: "fp8", Manifest: "sha256:" + repeatHex("ab", 32)}
+	child := exact
+	child.Package, child.BindingPath = "local/unused-child", "compute.models.model"
+	unselected := records.ModelRef{Package: exact.Package, Slot: "later", Model: "proof/unused", Ladder: []records.ModelRung{{Lane: "fp8", Manifest: exact.Manifest}}}
+	request := records.Request{Package: exact.Package, Models: []records.ModelRef{child, unselected, exact}}
+	got := orchestrator.PrivateRevisionModelRefs(request, exact.Package)
+	if len(got) != 1 || got[0].Manifest != exact.Manifest || got[0].Slot != exact.BindingPath {
+		t.Fatalf("private preparation did not select only exact requested inputs: %+v", got)
+	}
+	if got := orchestrator.PrivateRevisionModelRefs(request, child.Package); len(got) != 0 {
+		t.Fatal("preparing imported code acquired an uninvoked child's default", got)
+	}
+	request.Models = nil
+	if got := orchestrator.PrivateRevisionModelRefs(request, exact.Package); len(got) != 0 {
+		t.Fatal("a code-only preparation acquired models", got)
+	}
+}

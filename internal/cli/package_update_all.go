@@ -88,7 +88,7 @@ func updateInstalledPackage(ctx *Context, prior records.PackageInstall) map[stri
 	row["to"] = latest
 	perPackage := *ctx
 	perPackage.Inv = &Invocation{Args: []string{prior.Package},
-		Bools: map[string]bool{"--no-model-download": true}, Values: values("--version", latest), Mode: ctx.Mode()}
+		Values: values("--version", latest), Mode: ctx.Mode()}
 	result, _, problem := installRegistryPackage(&perPackage, prior.ID)
 	if problem != nil {
 		return fail(problem)
