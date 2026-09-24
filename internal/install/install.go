@@ -86,28 +86,6 @@ type PublishedModel struct {
 	Reused         bool   `json:"-"`
 }
 
-// ModelPrefetchStatus is the concise user-facing result of optional post-install
-// acquisition. Exact identities remain in the package/Manifest authorities, not output.
-func ModelPrefetchStatus(models []PublishedModel) string {
-	if len(models) == 0 {
-		return "none"
-	}
-	reused := 0
-	for _, model := range models {
-		if model.Reused {
-			reused++
-		}
-	}
-	switch reused {
-	case 0:
-		return "downloaded"
-	case len(models):
-		return "reused locally"
-	default:
-		return "downloaded + local reuse"
-	}
-}
-
 // PublishedWheel is one exact release wheel FACT (wire 30): identity only, never a
 // local file. The bytes come from the indexes under the release's own hashes.
 type PublishedWheel struct {
@@ -203,10 +181,6 @@ type Result struct {
 	Warnings             []string
 	Files                int
 	Bytes                int64
-	// ModelStatus is post-commit Creator UX, not part of the install transaction.
-	// A failed optional prefetch therefore cannot roll this successful result back.
-	ModelStatus string
-	ModelError  string
 }
 
 // Run executes the whole transaction. Every refusal before Activate leaves the

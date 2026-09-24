@@ -34,20 +34,22 @@ type machineExecutionClient interface {
 }
 
 type machineConnection struct {
-	importInputTree   func(context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error)
-	connection        *machineClientConnection
-	client            machineExecutionClient
-	claim             *pb.Claim
-	prepare           func(context.Context, string, localpackage.Revision) *exit.Error
-	preparePublished  func(context.Context, records.Request) (*pb.DesiredPlacementSet, *exit.Error)
-	wireMinor         uint32
-	publicOrigin      string // renter-authenticated prepare facts name the public byte endpoint
-	certificateDigest []byte
-	retainModel       func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
-	releaseModel      func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
-	retainBytes       func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
-	releaseBytes      func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
-	readBytes         func(context.Context, *pb.NativeByteRetentionRequest, *pb.Ref) (machineByteStream, error)
+	importInputTree    func(context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error)
+	connection         *machineClientConnection
+	client             machineExecutionClient
+	claim              *pb.Claim
+	prepare            func(context.Context, string, localpackage.Revision) *exit.Error
+	prepareModels      func(context.Context, records.Request, localpackage.Revision) *exit.Error
+	modelDefaultOrigin func(context.Context) (string, *exit.Error)
+	preparePublished   func(context.Context, records.Request) (*pb.DesiredPlacementSet, *exit.Error)
+	wireMinor          uint32
+	publicOrigin       string // renter-authenticated Hub facts name the public byte endpoint
+	certificateDigest  []byte
+	retainModel        func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
+	releaseModel       func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
+	retainBytes        func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
+	releaseBytes       func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
+	readBytes          func(context.Context, *pb.NativeByteRetentionRequest, *pb.Ref) (machineByteStream, error)
 }
 
 type machineClientConnection struct {
@@ -75,7 +77,6 @@ type machineRuns struct {
 	fleet     *managedRentals
 	mu        sync.Mutex
 	running   map[string]bool
-	claimed   map[string]string
 	localMu   sync.Mutex
 	localPID  int
 	observers sync.Map // one collection/control lock per observed request
@@ -84,7 +85,7 @@ type machineRuns struct {
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals) *machineRuns {
 	background, cancel := context.WithCancel(context.Background())
-	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}, claimed: map[string]string{}}
+	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}}
 }
 
 func (m *machineRuns) Start(request records.Request) *exit.Error {
@@ -292,7 +293,14 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 				return problem
 			}
 			if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
-				capture, problem = m.resolver.captureMachineModelDefaults(capture, request.Rental)
+				origin := ""
+				if connection.modelDefaultOrigin != nil {
+					origin, problem = connection.modelDefaultOrigin(m.ctx)
+					if problem != nil {
+						return problem
+					}
+				}
+				capture, problem = m.resolver.captureMachineModelDefaults(capture, request.Rental, origin)
 				if problem != nil {
 					return problem
 				}
@@ -300,6 +308,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			for _, revision := range capture.Revisions {
 				if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
 					return problem
+				}
+				if connection.prepareModels != nil {
+					if problem := connection.prepareModels(m.ctx, request, revision); problem != nil {
+						return problem
+					}
 				}
 			}
 			prepared, problem := m.resolver.ResolveJobInstall(request.InstallID, request.Entrypoint)

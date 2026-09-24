@@ -73,7 +73,12 @@ func TestAcceptedModelCacheMissReensuresTheSameSelectionOnce(t *testing.T) {
 			observed = func(epoch uint64) {
 				waitUntil(t, "owner consumed unrelated miss report", func() bool { w := o.c.Worker(instance); return w != nil && w.AdmissionEpoch == epoch })
 			}
-			fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "cozy/h3-package", Release: "1.0.7"}}, nil))
+			// This is the published inference path: the exact checkpoint rides the
+			// package preparation selection. A missing repository therefore causes a
+			// deterministic re-prepare of the same model before dispatch can resume.
+			model := &pb.DownloadModelRef{Package: "cozy/h3-package", Slot: "tile.models.model",
+				Model: "proof/h3", Release: "1.0.0", Lane: "bf16", Manifest: childDigest("8")}
+			fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "cozy/h3-package", Release: "1.0.7"}}, []*pb.DownloadModelRef{model}))
 			select {
 			case <-second:
 			case <-time.After(5 * time.Second):
@@ -88,6 +93,13 @@ func TestAcceptedModelCacheMissReensuresTheSameSelectionOnce(t *testing.T) {
 			defer pod.mu.Unlock()
 			if len(pod.prepares) != 2 || !bytes.Equal(pod.prepares[0].PackageSet.DownloadDelegation, pod.prepares[1].PackageSet.DownloadDelegation) {
 				t.Fatal("re-ensure changed the selected inputs", len(pod.prepares))
+			}
+			for _, prepare := range pod.prepares {
+				document, err := canonical.Read(prepare.PackageSet.DownloadDelegation, &pb.DownloadDelegation{})
+				must(t, err)
+				if len(document.List("models")) != 1 || document.List("models")[0].Str("manifest") != model.Manifest {
+					t.Fatalf("model checkpoint was not carried into package preparation: %s", prepare.PackageSet.DownloadDelegation)
+				}
 			}
 			if desires.Load() != 2 {
 				t.Fatal("cache miss was unbounded", desires.Load())

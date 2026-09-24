@@ -2013,6 +2013,15 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 	return out
 }
 
+// DownloadModelRefs projects the exact model bindings captured for a published
+// request onto the worker's package preparation contract.  Keeping this
+// projection in the orchestrator ensures every preparation path (ordinary run,
+// explicit prefetch, and recovery) carries the same slot, manifest, and adapter
+// identity to Runtime.
+func DownloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
+	return downloadModelRefs(models)
+}
+
 func invocationOutputBindings(ids []string, weights []WeightsOutput, defaultMax uint64) []*pb.OutputBinding {
 	byID := map[string]WeightsOutput{}
 	for _, output := range weights {

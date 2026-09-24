@@ -1239,10 +1239,11 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints) *exit.Error {
 	call, cancel := hub.Context()
 	defer cancel()
-	raw, problem := client(ctx).RentalImageInventory(call, id)
+	facts, problem := client(ctx).RentalImageInventory(call, id)
 	if problem != nil {
 		return problem
 	}
+	raw := facts.ImageInventory
 	inventory, err := rental.ImageInventory(raw)
 	if err != nil {
 		return exit.Named(exit.Structural, "rental.image_inventory_invalid", "%s", err)

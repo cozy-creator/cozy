@@ -203,6 +203,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"GET /v1/local/rentals":                             s.listRentals,
 		"DELETE /v1/local/rentals/{rental_id}/claim":        s.detachRental,
 		"POST /v1/local/rentals/{rental_id}/prune":          s.pruneRental,
+		"POST /v1/local/rentals/{rental_id}/prepare":        s.prepareRentalPackage,
 		"POST /v1/local/rentals/{rental_id}/runtime-update": s.startRuntimeUpdate,
 		"GET /v1/local/rentals/{rental_id}/runtime-update":  s.readRuntimeUpdate,
 		"POST /v1/local/cache/prune":                        s.pruneCache,

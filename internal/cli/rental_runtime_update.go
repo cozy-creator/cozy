@@ -117,9 +117,6 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		if problem := m.store.SaveRuntimeUpdate(row); problem != nil {
 			fmt.Fprintln(m.context.Out, problem.Message)
 		}
-		m.mu.Lock()
-		delete(m.claimed, row.RentalID)
-		m.mu.Unlock()
 		m.fleet.owner.WakeQueue()
 	}()
 }

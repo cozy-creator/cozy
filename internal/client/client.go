@@ -266,6 +266,15 @@ func (c *Client) PruneRental(rentalID string) (api.RentalPruneResult, *exit.Erro
 	return result, problem
 }
 
+// PrepareRentalPackage asks the daemon to materialize one exact package release
+// (and optional model checkpoints) on the named rental.  The worker's desired
+// package set and preparation ledger make repeats idempotent.
+func (c *Client) PrepareRentalPackage(rentalID string, request api.RentalPackagePrepareRequest) (api.RentalPackagePrepareResult, *exit.Error) {
+	var result api.RentalPackagePrepareResult
+	problem := c.call("POST", "/v1/local/rentals/"+url.PathEscape(rentalID)+"/prepare", request, &result)
+	return result, problem
+}
+
 func (c *Client) UpdateRentalRuntime(rentalID string) (api.RuntimeUpdate, *exit.Error) {
 	var result api.RuntimeUpdate
 	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", map[string]any{}, &result)

@@ -57,7 +57,7 @@ source. For example, after copying the wheel into `vendor/`:
 
 ```sh
 uv add --no-sync ./vendor/cozy_kernel_flash_attn3-*.whl
-cozy package install . --editable --no-model-download
+cozy package install . --editable
 cozy run local/my-package/generate --rental=my-rental --input=request.json \
   kernel.attention=model/dit=flash-attn3 --await --json
 ```

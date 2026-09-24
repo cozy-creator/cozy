@@ -130,7 +130,7 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 		}
 		runUV("lock", "--project", project, "--refresh-package", "attention-wheel-proof")
 		for {
-			code, out := runCozy(t, root, "package", "install", project, "--editable", "--no-model-download")
+			code, out := runCozy(t, root, "package", "install", project, "--editable")
 			if code != 0 && strings.Contains(out, "another Cozy writer holds") {
 				// The editable watcher may be capturing these same edited bytes.
 				// Retry explicit writer contention, never installation failures.

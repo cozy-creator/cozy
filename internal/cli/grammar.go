@@ -130,10 +130,9 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref             string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
-	Version         string `help:"Install this release instead of the newest, e.g. 1.2.3."`
-	Editable        bool   `help:"Keep an explicit local directory live for development."`
-	NoModelDownload bool   `help:"Install package code without prefetching its configured default model."`
+	Ref      string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
+	Version  string `help:"Install this release instead of the newest, e.g. 1.2.3."`
+	Editable bool   `help:"Keep an explicit local directory live for development."`
 }
 
 type PackageUpdateAllCmd struct{}
@@ -156,8 +155,7 @@ func (c *PackageYankCmd) Run(r *Runtime) error {
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
-	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable,
-		"--no-model-download", c.NoModelDownload),
+	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable),
 		values("--version", c.Version), false)
 }
 
@@ -430,11 +428,24 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
 	Update  RentalUpdateCmd  `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
+	Prepare RentalPrepareCmd `cmd:"" help:"Install one exact package release and prepare its model inputs on a rental."`
 	SSHInfo RentalSSHInfoCmd `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List    RentalListCmd    `cmd:"" help:"List rented machines, live on a terminal."`
 	New     RentalNewCmd     `cmd:"" help:"Start a private rental, or list available machine types."`
 	End     RentalEndCmd     `cmd:"" help:"End a private rental and stop billing."`
 	Prune   RentalPruneCmd   `cmd:"" help:"Free unused cached operation results on a private rental."`
+}
+
+type RentalPrepareCmd struct {
+	Rental  string   `arg:"" name:"rental" help:"Existing rental machine name or id."`
+	Package string   `arg:"" name:"package" help:"Published package org/name."`
+	Version string   `help:"Exact package release, e.g. 1.2.3." required:""`
+	Models  []string `name:"model" help:"Exact model binding SLOT=org/model@release/lane; repeat for each slot."`
+}
+
+func (c *RentalPrepareCmd) Run(r *Runtime) error {
+	return r.call(handleRentalPrepare, []string{c.Rental, c.Package}, nil,
+		values("--version", c.Version, "--model", c.Models), false)
 }
 
 type RentalUpdateCmd struct {

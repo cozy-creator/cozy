@@ -3,11 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -67,7 +65,7 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 		return nil, nil, problem
 	}
 	release = plan.Release
-	existingLayout, existing, _, problem := open(ctx.Cfg, false)
+	_, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return nil, nil, problem
 	}
@@ -84,15 +82,6 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 		existingInstall.Package == ref.String() && existingInstall.Version == release {
 		defer existing.Close()
 		result := &install.Result{Install: *existingInstall, Idempotent: true}
-		modelScratch, problem := scratch.Temp(existingLayout.Tmp, "package-model-prefetch-")
-		if problem != nil {
-			return nil, nil, problem
-		}
-		defer modelScratch.Release()
-		bestEffortDefaultModels(hctx, ctx, modelScratch.Path,
-			&install.PublishedSource{PythonVersion: plan.PythonVersion, Package: ref.String(), Release: release,
-				PackageConfig: packageConfig,
-				Selection:     install.Selection{PackageInterface: packageInterface}}, result)
 		return result, nil, nil
 	}
 	existing.Close()
@@ -135,7 +124,6 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 	cleanup := reclaimInstallResult(layout, st, result)
 	st.Close()
 	writer.Unlock()
-	bestEffortDefaultModels(hctx, ctx, work.Path, published, result)
 	return result, cleanup, nil
 }
 
@@ -151,23 +139,6 @@ func requirePackageUpdatePin(st *records.Store, pkg, expected string) *exit.Erro
 		return exit.Named(exit.Conflict, "package.update_changed", "%s changed after the bulk update began; its current selection was preserved", pkg)
 	}
 	return nil
-}
-
-func bestEffortDefaultModels(hctx context.Context, ctx *Context, root string,
-	published *install.PublishedSource, result *install.Result,
-) {
-	if ctx.Inv.Bool("--no-model-download") {
-		result.ModelStatus = "skipped"
-		return
-	}
-	if problem := downloadPublishedPackageModels(hctx, ctx, root, published); problem != nil {
-		result.ModelStatus = "failed"
-		result.ModelError = problem.ErrName() + ": " + problem.Message
-		result.Warnings = append(result.Warnings,
-			"package code is installed; default model prefetch failed: "+problem.Message)
-		return
-	}
-	result.ModelStatus = install.ModelPrefetchStatus(published.Models)
 }
 
 func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
@@ -254,67 +225,6 @@ func exactPackageInstallDocument(name string, document hub.ExactDocument) (insta
 	}
 	return install.ExactDocument{Bytes: append([]byte(nil), document.CanonicalBytes...),
 		Digest: document.Digest, Length: document.Length}, nil
-}
-
-// downloadPublishedPackageModels uses the same owner-override/authored-default
-// selection as invocation, pinned to the rung this host's accelerator fits.
-func downloadPublishedPackageModels(ctx context.Context, cli *Context, root string,
-	published *install.PublishedSource,
-) *exit.Error {
-	packageInterface, problem := launch.DecodePackageInterface(published.Selection.PackageInterface.Bytes)
-	if problem != nil {
-		return problem
-	}
-	declared := map[string]launch.Slot{}
-	for _, callables := range [][]launch.Entrypoint{packageInterface.Entrypoints, packageInterface.Jobs} {
-		for i := range callables {
-			for _, slot := range callables[i].Models {
-				declared[slot.Path] = slot
-			}
-		}
-	}
-	ref, problem := hub.ParseRef(published.Package)
-	if problem != nil {
-		return problem
-	}
-	rows, problem := client(cli).PackageBindings(ctx, ref)
-	if problem != nil {
-		return problem
-	}
-	effective := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints, packageInterface.Jobs), rows)
-	bindings := make([]hub.PackageBindingRow, 0, len(effective))
-	for _, row := range effective {
-		bindings = append(bindings, row)
-	}
-	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Slot < bindings[j].Slot })
-	if len(bindings) == 0 {
-		return nil
-	}
-	if err := raiseOpenFileLimit(); err != nil {
-		return exit.Named(exit.Structural, "open_file_limit_unavailable",
-			"cannot raise the open-file limit for model leases: %s", err).
-			WithRemedy("allow Cozy to raise RLIMIT_NOFILE to this account's hard limit")
-	}
-	tool, _, problem := localTensorFS(cli)
-	if problem != nil {
-		return problem
-	}
-	hubClient := client(cli)
-	for index, binding := range bindings {
-		rung, problem := localRung(cli, binding.Ladder)
-		if problem != nil {
-			return problem
-		}
-		packagePublishStatus(cli, "Resolving model %s/%s...", binding.Ref(), rung.Lane)
-		selected, problem := acquirePublishedModel(ctx, cli, tool, hubClient,
-			binding.Ref(), rung.Lane, published.Package, declared[binding.Slot],
-			filepath.Join(root, "models", fmt.Sprintf("%03d", index)))
-		if problem != nil {
-			return problem
-		}
-		published.Models = append(published.Models, selected)
-	}
-	return nil
 }
 
 // acquirePublishedModel is LOCAL-FIRST. An exact TensorFS release row is sufficient

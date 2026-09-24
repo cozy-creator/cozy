@@ -64,12 +64,15 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		return nil, machineTransport(err)
 	}
 	host := pb.NewPodHostClient(connection)
-	proof, problem := rental.ClaimProof(m.layout)(identity, 1)
+	claim, problem := m.fleet.owner.RentalExecutionClaim(ctx, machine)
 	if problem != nil {
 		connection.Close()
 		return nil, problem
 	}
-	claim := &pb.Claim{RecordOwnerEpoch: 1, RecordOwnerId: "cozy-local-client", WorkerId: identity.WorkerID, WorkerBootId: identity.WorkerBootID, WireMinor: pb.WireMinor, Proof: proof}
+	if claim.WorkerId != identity.WorkerID || claim.WorkerBootId != identity.WorkerBootID {
+		connection.Close()
+		return nil, exit.New(exit.Conflict, "the rental control session changed its pinned worker identity")
+	}
 	probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
 	info, err := host.ProtocolInfo(probeContext, &pb.ProtocolInfoRequest{})
 	cancel()
@@ -80,19 +83,12 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		}
 		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "Runtime-owned execution requires worker protocol %d; this worker reports %d", pb.MinCompatibleWireMinor, info.GetWireMinor())
 	}
-	m.mu.Lock()
-	alreadyClaimed := m.claimed[machine] == claim.WorkerBootId
-	m.mu.Unlock()
-	if !alreadyClaimed {
-		if problem := authenticateMachine(ctx, pb.NewWorkerControlClient(connection), claim); problem != nil {
-			connection.Close()
-			return nil, problem
-		}
-		m.mu.Lock()
-		m.claimed[machine] = claim.WorkerBootId
-		m.mu.Unlock()
-	}
+
 	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
+	result.modelDefaultOrigin = func(ctx context.Context) (string, *exit.Error) {
+		facts, problem := client(m.context).RentalImageInventory(ctx, identity.RentalID)
+		return facts.PublicOrigin, problem
+	}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
 		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
 		facts, problem := rental.PrepareFactsSource(client(m.context))(ctx, identity, ref)
@@ -100,7 +96,12 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			return nil, problem
 		}
 		result.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
-		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, nil)
+		// Published rental preparation must carry the request's exact model
+		// bindings in the same desired download set as the package.  Previously
+		// this path sent only the package; Runtime could therefore install the
+		// environment successfully while its TensorFS lacked the checkpoint,
+		// producing a late REPOSITORY_ABSENT when execution admitted the model.
+		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, orchestrator.DownloadModelRefs(request.Models))
 		if problem != nil {
 			return nil, problem
 		}
@@ -204,6 +205,39 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			}
 		}
 		stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
+		if err != nil {
+			return machineTransport(err)
+		}
+		return readMachinePreparation(stream)
+	}
+
+	// Only inference supplies these exact inputs. Installing the captured code
+	// above remains independent of any model, including unused child defaults.
+	result.prepareModels = func(ctx context.Context, request records.Request, revision localpackage.Revision) *exit.Error {
+		models := orchestrator.PrivateRevisionModelRefs(request, revision.Package)
+		if len(models) == 0 {
+			return nil
+		}
+		transfer, problem := m.store.MachinePackageTransfer(request.ID, claim.WorkerBootId, revision.Digest)
+		if problem != nil {
+			return problem
+		}
+		operation := transfer.Operation
+		if operation == "" {
+			operation = machinePackageOperation(request.ID, revision)
+		}
+		downloads, problem := rental.DownloadSet(nil, models)
+		if problem != nil {
+			return problem
+		}
+		digest, err := canonical.Raw(revision.Digest)
+		if err != nil {
+			return exit.New(exit.Conflict, "private inference model preparation changed its revision")
+		}
+		selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, LocalRevisionDigest: digest, DownloadDelegation: downloads}
+		stream, err := host.PreparePrivatePlacement(ctx, &pb.PreparePrivatePlacementCall{
+			Claim: claim, SupportsModelMaterializationRecovery: true, PrivatePlacementSet: selected,
+		})
 		if err != nil {
 			return machineTransport(err)
 		}
