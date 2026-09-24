@@ -145,7 +145,7 @@ print(json.dumps({"format":"tensorhub.image_inventory/1","profile":"python3.12-c
 	if output, e := exec.Command(seed, "attach", root, metaPath).CombinedOutput(); e != nil {
 		t.Fatalf("old schema seed: %v %s", e, output)
 	}
-	cfg := "tensorhub_url: " + hub.server.URL + "\ntensorhub_token: rental-idle-test\nport: 0\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"
+	cfg := "tensorhub_url: " + hub.server.URL + "\ntensorhub_token: rental-idle-test\nport: 0\nrentals:\n  max_hourly_spend_usd: 1\ndaemon:\n  idle_shutdown_s: 0\n"
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(cfg), 0600))
 	oldBin := filepath.Join(proof, "old-runtime-bin")
 	newBin := filepath.Join(proof, "new-runtime-bin")

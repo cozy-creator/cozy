@@ -28,11 +28,11 @@ func TestHostRuntimeWireFence(t *testing.T) {
 
 	// (a) An older minor cannot serve: `cozy up` refuses under the tool's own words, and
 	// `cozy run` — which starts the same daemon — answers the same code instead of queuing.
-	root, path := hostRuntimeRoot(t, "older", stubRuntime(t, "0.0.29", pb.WireMinor-6))
+	root, path := hostRuntimeRoot(t, "older", stubRuntime(t, "0.0.29", hostruntime.WireFloor-1))
 	code, out := runCozyPath(t, root, path, "up", "--json")
 	refusal := refusalOf(t, out)
 	if code == 0 || refusal.Code != "host_runtime_wire_mismatch" ||
-		!strings.Contains(refusal.Message, fmt.Sprintf("release 0.0.29 and speaks cozy.worker.v1+minor.%d", pb.WireMinor-6)) ||
+		!strings.Contains(refusal.Message, fmt.Sprintf("release 0.0.29 and speaks cozy.worker.v1+minor.%d", hostruntime.WireFloor-1)) ||
 		!strings.Contains(refusal.Message, fmt.Sprintf("needs cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)) ||
 		!strings.Contains(refusal.Remedy, install) {
 		t.Fatalf("an older host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)

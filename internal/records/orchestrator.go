@@ -1044,7 +1044,7 @@ func (s *Store) PinRental(id, rentalID string, models []ModelRef) (bool, *exit.E
 	result, err := s.db.Exec(`UPDATE requests SET worker=?,
 		machine=COALESCE((SELECT machine_name FROM rentals WHERE id=?),machine)`+set+`
 		WHERE id=? AND rental=1 AND worker='' AND (requested_rental='' OR requested_rental=?) AND
-		state IN ('submitted','queued','requeue_pending')`, append(args, id, rentalID)...)
+		state IN ('submitted','queued','requeue_pending') AND NOT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed'))`, append(args, id, rentalID, rentalID)...)
 	if err != nil {
 		return false, exit.Internalf("cannot assign request %s to rental %s: %s", id, rentalID, err)
 	}
@@ -1054,6 +1054,9 @@ func (s *Store) PinRental(id, rentalID string, models []ModelRef) (bool, *exit.E
 	}
 	if changed == 1 {
 		return true, nil
+	}
+	if problem := refuseReleasedRental(s.db, rentalID); problem != nil {
+		return false, problem
 	}
 	row, problem := s.RequestRow(id)
 	if problem != nil {
@@ -1472,15 +1475,12 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 			return Request{}, false, problem
 		}
 	}
-	if r.RetainWork && r.Worker != "" {
-		var releasing bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM rentals WHERE id=? AND state IN ('release_requested','released','failed'))`, r.Worker).Scan(&releasing); err != nil {
-			return Request{}, false, exit.Internalf("cannot inspect request rental admission: %s", err)
-		}
-		if releasing {
-			return Request{}, false, exit.Named(exit.Conflict, "request.rental_unavailable", "the selected rental is being released or has ended")
+	if r.Rental && r.Worker != "" {
+		if problem := refuseReleasedRental(tx, r.Worker); problem != nil {
+			return Request{}, false, problem
 		}
 	}
+
 	machineRental := r.Worker
 	if machineRental == "" {
 		machineRental = r.RequestedRental
@@ -1649,8 +1649,13 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 	}
 	a.Attempt = ordinal
 	var request Request
-	if err := tx.QueryRow(`SELECT package,entrypoint,kind FROM requests WHERE id=?`, a.RequestID).Scan(&request.Package, &request.Entrypoint, &request.Kind); err != nil {
+	if err := tx.QueryRow(`SELECT package,entrypoint,kind,worker,rental FROM requests WHERE id=?`, a.RequestID).Scan(&request.Package, &request.Entrypoint, &request.Kind, &request.Worker, &request.Rental); err != nil {
 		return 0, exit.Internalf("cannot read serving dispatch subject: %s", err)
+	}
+	if request.Rental && request.Worker != "" {
+		if problem := refuseReleasedRental(tx, request.Worker); problem != nil {
+			return 0, problem
+		}
 	}
 	if _, problem := BoundServingPlacement(request, a); problem != nil {
 		return 0, problem

@@ -1017,34 +1017,6 @@ func (s *Store) RentalHasRetainedJob(id string) (bool, *exit.Error) {
 	return retained, nil
 }
 
-// QueuedUnpinnedRentalRequests counts the --rental requests that are QUEUED and pinned to
-// no rental at all (cl-121). They are the work `RentalRunCounts` cannot see: it counts
-// `requests WHERE worker=<rental>`, and an unpinned request belongs to no rental yet
-// BY DESIGN — the pin is routing's own output, so an unpinned request stays free to take
-// whichever rental frees up first (routing D6). The consequence was that queued work
-// counted toward nothing while a warm machine idled out from under it: `selectOrStart`
-// returns without pinning whenever some rental has the plan STAGED (`rentalHeld`), while
-// `route` will only dispatch, and so only pin, once that placement is DISPATCHABLE. Between
-// those two states the request is neither, and observed windows were 21 s and ~24 s — but
-// the fix must not depend on the window's length, because a placement that never becomes
-// dispatchable never closes it.
-//
-// The fleet reads this as a reason not to release ANY rental. That is deliberately
-// conservative — this request might have gone to a different machine — and the asymmetry
-// says why: an extra minute of a warm pod is under a cent, while releasing one out from
-// under queued work costs a full cold acquisition, measured at 178-271 s and a 6.93 GB
-// re-download of bytes that machine already held.
-func (s *Store) QueuedUnpinnedRentalRequests() (int, *exit.Error) {
-	var count int
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM requests
-		WHERE rental=1 AND worker='' AND state IN ('submitted','queued','requeue_pending')`).
-		Scan(&count)
-	if err != nil {
-		return 0, exit.Internalf("cannot count queued unpinned rental requests: %s", err)
-	}
-	return count, nil
-}
-
 // RentalLastSettlement includes preparation that settled before an attempt
 // existed. ClosedAt stays zero in that case; SettledAt comes from the atomic
 // terminal request event, so idle grace survives missed sweeps and restarts.
@@ -1056,15 +1028,19 @@ type RentalLastSettlement struct {
 }
 
 func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *exit.Error) {
-	rows, err := s.db.Query(`SELECT r.id,r.kind,r.created_at,
+	return rentalLastSettlement(s.db, id)
+}
+
+func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlement, bool, *exit.Error) {
+	rows, err := reader.Query(`SELECT r.id,r.kind,r.created_at,
 		COALESCE((SELECT a.closed_at FROM attempts a WHERE a.request_id=r.id
 		  AND a.state IN ('terminal','closed') AND a.closed_at<>''
 		  ORDER BY a.attempt DESC LIMIT 1),''),
 		COALESCE((SELECT e.at FROM request_events e WHERE e.request_id=r.id
-		  AND e.type IN ('request.completed','request.failed','request.canceled')
+		  AND e.type IN ('request.completed','request.failed','request.canceled','request.paused','request.blocked')
 		  ORDER BY e.seq DESC LIMIT 1),'')
 		FROM requests r WHERE r.worker=? AND r.rental=1
-		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')`, id)
+		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned','paused','blocked')`, id)
 	if err != nil {
 		return RentalLastSettlement{}, false, exit.Internalf(
 			"cannot read settlements for rental %s: %s", id, err)

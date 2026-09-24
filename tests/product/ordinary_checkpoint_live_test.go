@@ -164,7 +164,7 @@ func ordinaryScheduledCheckpoint(t *testing.T) {
 	if copied != 1 {
 		t.Fatal("expected one enrolled credential for the selected Hub")
 	}
-	must(t, os.WriteFile(filepath.Join(o.root, config.FileName), []byte("tensorhub_url: "+*publicationHub+"\nrentals:\n  max_hourly_spend_usd: 20\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(o.root, config.FileName), []byte("tensorhub_url: "+*publicationHub+"\nrentals:\n  max_hourly_spend_usd: 20\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	closeAPI := publicationControlAPI(t, o, func(options *api.Options) { options.Packages = resolver; options.Rentals = rental.Known(o.store) })
 	defer closeAPI()
 	results := make(chan string, 1)

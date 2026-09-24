@@ -229,8 +229,7 @@ func TestAHubWithNoListingIsNotAnEmptyFleet(t *testing.T) {
 
 // TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt is the idle ruling as behaviour.
 //
-// The daemon HAS an automatic shutdown — rentals.idle_release_s, five minutes by
-// default — and it applies to the machines this host owns. It must not apply here. A
+// The daemon HAS an automatic shutdown — a fixed fifteen minutes — and it applies to the machines this host owns. It must not apply here. A
 // rental the hub bills this account for that this host has no record of may be
 // another host's live machine: this daemon holds none of its credentials, cannot see
 // its work, and cannot tell an abandoned pod from one somebody is using. Ending it on
@@ -244,12 +243,11 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 	must(t, os.MkdirAll(root, 0o755))
 	port := reservePort(t)
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	// idle_release_s is DELIBERATELY on and short: the sweep is actively reaping idle
-	// machines throughout this arm, and the unrecorded one still survives it.
+	// An overdue owned witness proves the sweep ran; the unrecorded pod survives it.
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 10.00\n  idle_release_s: 2\n"+
+			"rentals:\n  max_hourly_spend_usd: 10.00\n"+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	logPath := filepath.Join(root, "daemon.log")
 
@@ -263,7 +261,8 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 	defer store.Close()
 	stand.add("rental-orphan-owned", "heron")
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
-		ID: "rental-orphan-owned", MachineName: "heron", SKU: "cpu", AcceleratorModel: "CPU",
+		ReadyAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano),
+		ID:      "rental-orphan-owned", MachineName: "heron", SKU: "cpu", AcceleratorModel: "CPU",
 		HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-orphan-owned.pem"),
 	}))

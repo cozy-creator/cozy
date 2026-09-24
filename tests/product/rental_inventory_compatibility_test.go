@@ -24,7 +24,7 @@ func TestRentalListUsesDaemonAPIWithoutOpeningSQLite(t *testing.T) {
 		case "/":
 		case "/v1/local/rentals":
 			reads.Add(1)
-			_, _ = w.Write([]byte(`{"machines_running":1,"hourly_spend_usd_micros":100000,"idle_release_s":0,"rentals":[{"rental_id":"retained","machine":"shelly","state":"ready","hourly_rate_usd_micros":100000,"accelerator_count":1,"activity":{"running":1,"queued":2}}],"unrecorded":[],"pending":[],"future_fact":"ignored"}`))
+			_, _ = w.Write([]byte(`{"machines_running":1,"hourly_spend_usd_micros":100000,"idle_release_s":900,"rentals":[{"rental_id":"retained","machine":"shelly","state":"ready","hourly_rate_usd_micros":100000,"accelerator_count":1,"activity":{"running":1,"queued":2}}],"unrecorded":[],"pending":[],"future_fact":"ignored"}`))
 		default:
 			t.Errorf("unexpected client route: %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -56,13 +56,13 @@ func TestRentalInventoryHumanDrainingKeepsRawStates(t *testing.T) {
 	layout, lock, pid, _ := compatibilityOwner(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v1/local/rentals" {
-			_, _ = w.Write([]byte(`{"machines_running":2,"hourly_spend_usd_micros":200000,"idle_release_s":240,"rentals":[],"unrecorded":[{"rental_id":"remote-id","machine":"remote-machine","state":"release_requested","hourly_rate_usd_micros":100000}],"pending":[{"machine":"pending-machine","state":"release_requested","operation":"pending-id","hourly_rate_usd_micros":100000}]}`))
+			_, _ = w.Write([]byte(`{"machines_running":2,"hourly_spend_usd_micros":200000,"idle_release_s":900,"rentals":[],"unrecorded":[{"rental_id":"remote-id","machine":"remote-machine","state":"release_requested","hourly_rate_usd_micros":100000}],"pending":[{"machine":"pending-machine","state":"release_requested","operation":"pending-id","hourly_rate_usd_micros":100000}]}`))
 		}
 	}))
 	defer server.Close()
 	publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
 	output, err := compatibilityCLI(t, layout.Root, "rental", "list", "--no-watch")
-	if err != nil || strings.Count(output, "draining") != 2 || strings.Contains(output, "release_requested") || !strings.Contains(output, "Idle machines shut down after 4 minutes") {
+	if err != nil || strings.Count(output, "draining") != 2 || strings.Contains(output, "release_requested") || !strings.Contains(output, "Idle machines shut down after 15 minutes") {
 		t.Fatalf("inventory lost human state or daemon-owned idle policy: %v %s", err, output)
 	}
 	output, err = compatibilityCLI(t, layout.Root, "rental", "list", "--json")
@@ -194,7 +194,7 @@ func TestRentalInventoryAPIKeepsUnknownActivityAndPrivateFieldsAbsent(t *testing
 	}))
 	defer hub.Close()
 	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: test\nrentals:\n  idle_release_s: 0\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: test\n"), 0600))
 	live := startDaemonProcess(t, root)
 	if code, output := runCozy(t, root, "rental", "list", "--json"); code != 0 || !strings.Contains(output, `"recorded":false`) {
 		t.Fatalf("real daemon inventory failed: %d %s", code, output)

@@ -100,7 +100,7 @@ func submitH3Reference(t *testing.T, release string) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: h3-contract-test\nrentals:\n  max_hourly_spend_usd: 20\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: h3-contract-test\nrentals:\n  max_hourly_spend_usd: 20\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	startDaemonProcess(t, root)
 	args := []string{"run", "paul/minimax-h3/reference_media_to_video", "model.model=paul/minimax-h3@1.0.0-rc.1/bf16-full",
 		"--in", payloadPath, "--asset", "references.0.image=" + image0, "--asset", "references.1.image=" + image1,

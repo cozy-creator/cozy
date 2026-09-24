@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -18,178 +19,47 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// TestRentalIdleRelease is the owner's ruling as behaviour: a rental this daemon owns is
-// ended once it has had no work for rentals.idle_release_s, however it was acquired; work
-// pinned to it — or the unsettled request it was bought for (cl-113) — is what keeps it;
-// and a release the hub did not confirm is asked again until it is. Every arm is the real daemon process on a real root, deciding from its real
-// records and releasing through the real hub client against a hub that answers the rental
-// routes; the grace is the one product knob.
+// The real daemon reaps an overdue owned rental through the Hub and leaves a
+// freshly ready one alive. Boundary timing is covered by the clock-driven tests.
 func TestRentalIdleRelease(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-idle")
-	must(t, os.RemoveAll(root))
-	must(t, os.MkdirAll(root, 0o755))
-	port := reservePort(t)
-	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
-		"tensorhub_url: "+hubURL+"\n"+
-			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 1.00\n  idle_release_s: 2\n"+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	logPath := filepath.Join(root, "daemon.log")
-
-	hub := newFakeRentalHub(t, port)
+	root := t.TempDir()
+	peer := newFakeRentalHub(t, 0)
+	peer.publishListing()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+peer.server.URL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	plant := func(id, machine string) {
-		t.Helper()
-		hub.add(id, machine)
-		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
-			ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
-			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
-			Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem"),
-		}))
+	for _, item := range []struct {
+		id, machine string
+		ready       time.Time
+	}{{"rental-idle-old", "heron", time.Now().Add(-16 * time.Minute)}, {"rental-idle-new", "otter", time.Now()}, {"rental-idle-retained", "curlew", time.Now().Add(-time.Hour)}} {
+		peer.add(item.id, item.machine)
+		fatal(t, store.RecordRental(records.Rental{ID: item.id, MachineName: item.machine, SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, State: "ready", Hub: peer.server.URL, Address: "127.0.0.1:1", CertPath: filepath.Join(root, item.id+".pem"), ReadyAt: item.ready.UTC().Format(time.RFC3339Nano)}))
 	}
-
-	// (a) A manual rental — no managing request, never ran anything — has an idle clock
-	// from the moment it was recorded ready, and goes once that clock passes the grace.
-	// The daemon says so once before, and once after.
-	plant("rental-idle-manual", "heron")
-	daemon := startDaemonProcess(t, root)
-	awaitRentalGone(t, store, "rental-idle-manual", 15*time.Second, logPath)
-	if hub.releases("rental-idle-manual") != 1 {
-		t.Fatalf("the hub saw %d release(s) of the manual rental, wanted 1\n%s",
-			hub.releases("rental-idle-manual"), tail(logPath))
+	retained := recordPrivateTransaction(t, store, "idle-expiry", "rental-idle-retained")
+	changed, problem := store.BlockRetainedWork(retained.ID, "fixture", "retained bytes are not active work")
+	fatal(t, problem)
+	if !changed {
+		t.Fatal("retained fixture did not settle")
 	}
-	log, _ := os.ReadFile(logPath)
-	if strings.Count(string(log), "rental rental-idle-manual (heron) idle since") != 1 ||
-		!strings.Contains(string(log), "rental rental-idle-manual (heron) released after") {
-		t.Fatalf("the idle release did not say why, exactly once\n%s", tail(logPath))
+	db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))
+	must(t, err)
+	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='request.blocked'`, time.Now().Add(-16*time.Minute).UTC().Format(time.RFC3339Nano), retained.ID)
+	must(t, err)
+	must(t, db.Close())
+	startDaemonProcess(t, root)
+	awaitRentalGone(t, store, "rental-idle-retained", 20*time.Second, filepath.Join(root, "daemon.log"))
+	if peer.releases("rental-idle-retained") != 1 {
+		t.Fatal("retained custody vetoed idle expiry")
 	}
-
-	// (b) Work pinned to a rental is what keeps it: a queued request holds the pod past
-	// several graces, the listing says so, and settling the request is what lets it go.
-	plant("rental-idle-busy", "otter")
-	if _, _, problem := store.Submit(records.Request{
-		ID: "req-rental-idle", IdemKey: "idem-rental-idle", BodyDigest: "sha256:" + strings.Repeat("ab", 32),
-		Package: "fake/idle", Entrypoint: "generate", Payload: []byte("{}"),
-		Rental: true, Worker: "rental-idle-busy",
-	}); problem != nil {
-		t.Fatal(problem.Message)
+	awaitRentalGone(t, store, "rental-idle-old", 20*time.Second, filepath.Join(root, "daemon.log"))
+	if peer.releases("rental-idle-old") != 1 || peer.releases("rental-idle-new") != 0 {
+		t.Fatal("fixed idle sweep released the wrong rental")
 	}
-	time.Sleep(6 * time.Second)
-	if row, problem := store.RentalRow("rental-idle-busy"); problem != nil || row == nil || row.State != "ready" {
-		t.Fatalf("a rental with a queued request was released: %+v %v\n%s", row, problem, tail(logPath))
-	}
-	if hub.releases("rental-idle-busy") != 0 {
-		t.Fatalf("the hub saw a release of a busy rental\n%s", tail(logPath))
-	}
-	busy := listedRental(t, root, "rental-idle-busy")
-	if busy.Machine != "otter" || busy.State != "ready" || busy.Running == nil || *busy.Running != 0 || busy.Queued == nil || *busy.Queued != 1 || busy.IdleSeconds != nil || busy.ReleaseDue != "" {
-		t.Fatalf("the listing does not show queued work holding the rental: %+v", busy)
-	}
-	if r := daemon.call(t, "POST", "/v1/requests/req-rental-idle/cancel", nil); r.Status != http.StatusOK {
-		t.Fatalf("cancel of the queued request: %s", r.brief())
-	}
-	awaitRentalGone(t, store, "rental-idle-busy", 15*time.Second, logPath)
-
-	// (b2) The buy itself is a debt (cl-113): a rental bought for a request is owed by
-	// that request from the moment the paid row exists — before dispatch pins, so the
-	// request row still says worker='' — and the sweep must not release it while its
-	// buyer is queued. On the code this arm was written against, the pod went the moment
-	// it was ready: Spent saw a managed rental with no settled attempt and reaped a
-	// healthy pod its buyer was still waiting for (observed live, pr-b192da1a).
-	hub.add("rental-idle-owed", "curlew")
-	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
-		ID: "rental-idle-owed", MachineName: "curlew", SKU: "cpu", AcceleratorModel: "CPU",
-		HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
-		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-idle-owed.pem"),
-		ManagedRequestID: "req-rental-owed",
-	}))
-	if _, _, problem := store.Submit(records.Request{
-		ID: "req-rental-owed", IdemKey: "idem-rental-owed", BodyDigest: "sha256:" + strings.Repeat("cd", 32),
-		Package: "fake/owed", Entrypoint: "generate", Payload: []byte("{}"),
-		Rental: true,
-	}); problem != nil {
-		t.Fatal(problem.Message)
-	}
-	time.Sleep(6 * time.Second)
-	if row, problem := store.RentalRow("rental-idle-owed"); problem != nil || row == nil || row.State != "ready" {
-		t.Fatalf("a rental owed by its still-queued buyer was released: %+v %v\n%s", row, problem, tail(logPath))
-	}
-	if hub.releases("rental-idle-owed") != 0 {
-		t.Fatalf("the hub saw a release of an owed rental\n%s", tail(logPath))
-	}
-	owed := listedRental(t, root, "rental-idle-owed")
-	if owed.State != "ready" || owed.Running == nil || *owed.Running != 0 || owed.Queued == nil || *owed.Queued != 0 || owed.IdleSeconds != nil || owed.ReleaseDue != "" {
-		t.Fatalf("the listing shows an idle countdown on an owed rental: %+v", owed)
-	}
-	if r := daemon.call(t, "POST", "/v1/requests/req-rental-owed/cancel", nil); r.Status != http.StatusOK {
-		t.Fatalf("cancel of the owing request: %s", r.brief())
-	}
-	awaitRentalGone(t, store, "rental-idle-owed", 15*time.Second, logPath)
-
-	// (b3) QUEUED WORK THAT IS PINNED TO NOBODY still holds the fleet (cl-121). The pin is
-	// routing's own output, so a --rental request belongs to no machine between the moment
-	// some rental has its plan STAGED (`rentalHeld`, which makes `selectOrStart` return
-	// without pinning) and the moment that placement is DISPATCHABLE (which is when `route`
-	// pins it). On the code this arm was written against, that request counted toward NO
-	// rental — `RentalRunCounts` counts `worker=<rental>` and `Owed` covers only the one
-	// buyer — so a warm machine idled out from under work that was waiting for it, and the
-	// next request paid a full cold acquisition (178-271 s and a 6.93 GB re-download of
-	// bytes the released machine already held). This rental neither bought the request nor
-	// holds its pin: that is the point, because releasing ANY machine on this evidence is
-	// wrong in the expensive direction.
-	plant("rental-idle-unpinned", "kestrel")
-	if _, _, problem := store.Submit(records.Request{
-		ID: "req-rental-unpinned", IdemKey: "idem-rental-unpinned",
-		BodyDigest: "sha256:" + strings.Repeat("ef", 32),
-		Package:    "fake/unpinned", Entrypoint: "generate", Payload: []byte("{}"),
-		Rental: true,
-	}); problem != nil {
-		t.Fatal(problem.Message)
-	}
-	time.Sleep(6 * time.Second)
-	if row, problem := store.RentalRow("rental-idle-unpinned"); problem != nil || row == nil ||
-		row.State != "ready" {
-		t.Fatalf("a rental was released while unpinned --rental work was queued: %+v %v\n%s",
-			row, problem, tail(logPath))
-	}
-	if hub.releases("rental-idle-unpinned") != 0 {
-		t.Fatalf("the hub saw a release while unpinned work was queued\n%s", tail(logPath))
-	}
-	// The listing has to agree with the mechanism: no work of its OWN (0 queued, 0 running)
-	// and no countdown, because the fleet is not idle even though this machine is.
-	unpinned := listedRental(t, root, "rental-idle-unpinned")
-	if unpinned.State != "ready" || unpinned.Running == nil || *unpinned.Running != 0 || unpinned.Queued == nil || *unpinned.Queued != 0 || unpinned.IdleSeconds != nil || unpinned.ReleaseDue != "" {
-		t.Fatalf("the listing shows an idle countdown while unpinned work is queued: %+v", unpinned)
-	}
-	// And settling the unpinned request is what lets it go: the hold is the WORK, never a
-	// permanent exemption.
-	if r := daemon.call(t, "POST", "/v1/requests/req-rental-unpinned/cancel", nil); r.Status != http.StatusOK {
-		t.Fatalf("cancel of the unpinned request: %s", r.brief())
-	}
-	awaitRentalGone(t, store, "rental-idle-unpinned", 15*time.Second, logPath)
-
-	// (c) A release the hub does not confirm is retried at the next observation, not left
-	// until a rental command or a restart: with the hub gone the daemon says so once, keeps
-	// asking, and the pod is released as soon as the hub answers again.
-	hub.close()
-	plant("rental-idle-retry", "puffin")
-	awaitLog(t, logPath, "rental rental-idle-retry release deferred:", 15*time.Second)
-	time.Sleep(3 * time.Second)
-	log, _ = os.ReadFile(logPath)
-	if n := strings.Count(string(log), "rental rental-idle-retry release deferred:"); n != 1 {
-		t.Fatalf("the deferred release was said %d times, wanted once\n%s", n, tail(logPath))
-	}
-	if row, problem := store.RentalRow("rental-idle-retry"); problem != nil || row == nil {
-		t.Fatalf("a rental the hub never confirmed released was forgotten: %+v %v", row, problem)
-	}
-	hub = newFakeRentalHub(t, port)
-	hub.add("rental-idle-retry", "puffin")
-	awaitRentalGone(t, store, "rental-idle-retry", 15*time.Second, logPath)
-	if hub.releases("rental-idle-retry") != 1 {
-		t.Fatalf("the returned hub saw %d release(s), wanted 1\n%s", hub.releases("rental-idle-retry"), tail(logPath))
+	fresh, problem := store.RentalRow("rental-idle-new")
+	fatal(t, problem)
+	if fresh == nil {
+		t.Fatal("fresh rental disappeared")
 	}
 }
 

@@ -505,19 +505,23 @@ their shared object closure and required disk headroom. This declares capacity n
 and models are prepared when requests run. Retrying the same idempotency key reuses the pinned
 set, including when `--model` is omitted on the retry.
 
-Every rental the daemon owns — bought for a request or started with `cozy rental new` — ends on
-its own once nothing has been queued, running, or owed on it for `rentals.idle_release_s`
-(default 300). Running work on it is what keeps it: the clock restarts at each settled attempt,
-and a rental that never ran anything counts from the moment Tensorhub first reported it `ready`,
-so a pod still booting is never ended. A managed rental whose job is done goes at once.
+Every rental has a fixed 15-minute idle shutdown. Active model preparation and work
+assigned to that machine keep it busy. The idle clock begins at readiness and starts
+again when real work settles. Paused or failed retained files, an open connection,
+status polling, and unassigned work elsewhere in the fleet do not keep it alive.
+Creator performs idle cleanup while connected; the pod independently enforces the
+same fixed policy and asks Tensorhub to release it even if Creator is offline.
 
-Running and queued counts describe work recorded by this controller. For rentals
-missing from its local history, activity is unknown: the table shows `—`, and JSON
-omits those counts. Another controller may be using those machines.
+`cozy rental keepalive <name>` explicitly resets that rental's deadline once, to
+15 minutes after the worker acknowledges it. The command reports the acknowledged
+deadline. There is no duration option, automatic renewal, or setting to disable
+shutdown. A failed or unanswered keepalive does not extend Creator's deadline.
 
-`cozy rental list` shows each machine's idle time and when it will be released; `cozy rental end`
-ends one now. A release Tensorhub does not confirm is retried until it does. Set
-`idle_release_s: 0` to leave every rental to `cozy rental end`.
+`cozy rental list` shows each known machine's idle time and release deadline;
+`cozy rental end <name>` ends one now. A release Tensorhub does not confirm is retried.
+Activity is unknown for machines absent from this controller's history and for an
+explicit preparation interrupted by controller restart; their pod guard still applies.
+A managed rental whose job is completed and collected may be released immediately.
 
 Rental creation sends only that private machine name, the SKU, and introduction credential material—never a package, model,
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
@@ -545,8 +549,10 @@ cozy down --all   # cancel all work, end all rentals, then stop the daemon
 ```
 
 None deletes installed package or model bytes. Normal and forced disconnect preserve
-retained paused/blocked/completed work and rental records. Accepted detached local and
-remote Runtime executions continue and reconnect on `cozy up`. Unfinished handoffs,
+retained paused/blocked/completed work and rental records. Idle rented machines still
+shut down after 15 minutes; `cozy rental keepalive <name>` explicitly resets that
+deadline once. Accepted detached local and remote Runtime executions continue and
+reconnect on `cozy up`. Unfinished handoffs,
 controls, and daemon-owned execution can still block normal shutdown. `--force` may
 interrupt legacy daemon-owned local work; it uses existing recovery on restart.
 `--all` remains explicit cancellation and rental teardown. See
@@ -600,7 +606,6 @@ port: 8818
 local_rate_micro_usd_per_hour: 250000
 rentals:
   max_hourly_spend_usd: 4.00
-  idle_release_s: 300
 daemon:
   idle_shutdown_s: 900
 maintenance:

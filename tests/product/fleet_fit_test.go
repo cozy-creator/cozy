@@ -41,7 +41,7 @@ func fleetRoot(t *testing.T, h *ladderHub, capUSD string) string {
 	t.Helper()
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: ladder-test\nrentals:\n  max_hourly_spend_usd: "+capUSD+"\n  idle_release_s: 0\n"+
+		"\ntensorhub_token: ladder-test\nrentals:\n  max_hourly_spend_usd: "+capUSD+"\n"+
 		"daemon:\n  idle_shutdown_s: 0\n"), 0600))
 	return root
 }

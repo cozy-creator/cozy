@@ -12,6 +12,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 func TestRentalSettlementOrdersWholeAndFractionalSeconds(t *testing.T) {
@@ -88,10 +89,10 @@ func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 			}()
 			port := reservePort(t)
 			origin := fmt.Sprintf("http://127.0.0.1:%d", port)
-			const grace = 5 * time.Second
+			const grace = rental.IdleTimeout
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\n"+
-					"rentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 5\n"+
+					"rentals:\n  max_hourly_spend_usd: 1\n"+
 					"daemon:\n  idle_shutdown_s: 0\n"), 0600))
 			peer := newFakeRentalHub(t, port)
 			peer.publishListing()
@@ -169,16 +170,15 @@ func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 				t.Fatalf("idle deadline=%q, want terminal event + grace %q (ready was an hour ago)", idle.ReleaseDue, want)
 			}
 			startDaemonProcess(t, root)
-			deadline := settled.Add(grace)
-			for time.Now().Before(deadline) {
-				if peer.releases(rentalID) != 0 {
-					t.Fatal("restarted daemon released before the new idle deadline")
-				}
-				time.Sleep(20 * time.Millisecond)
+			row, problem := store.RentalRow(rentalID)
+			fatal(t, problem)
+			observed, problem := rental.ObserveIdle(store, *row)
+			fatal(t, problem)
+			if observed.Due(settled.Add(grace-time.Nanosecond)) || !observed.Due(settled.Add(grace)) {
+				t.Fatal("restarted fixed deadline boundary is wrong")
 			}
-			awaitRentalGone(t, store, rentalID, 10*time.Second, filepath.Join(root, "daemon.log"))
-			if peer.releases(rentalID) != 1 {
-				t.Fatal("idle rental was not released exactly once")
+			if peer.releases(rentalID) != 0 {
+				t.Fatal("restarted daemon released before fixed deadline")
 			}
 			attempts, problem := store.Attempts(requestID)
 			fatal(t, problem)

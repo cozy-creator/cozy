@@ -80,9 +80,8 @@ func TestRentalInventoryOmitsEndedMachinesButPreservesRunHistory(t *testing.T) {
 	defer store.Close()
 	const rentalID, requestID = "rental-celty", "req-celty-history"
 	hub.add(rentalID, "celty")
-	hub.setState(rentalID, "failed", "authorization_exposure_exhausted")
 	fatal(t, store.RecordRental(records.Rental{ID: rentalID, MachineName: "celty",
-		State: "failed", Hub: hubURL, AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
+		State: "ready", Hub: hubURL, AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
 	_, _, problem = store.Submit(records.Request{ID: requestID, IdemKey: requestID,
 		BodyDigest: "sha256:" + strings.Repeat("ab", 32), Package: "fake/video", Entrypoint: "generate",
 		Payload: []byte("{}"), Rental: true, Worker: rentalID})
@@ -101,6 +100,13 @@ func TestRentalInventoryOmitsEndedMachinesButPreservesRunHistory(t *testing.T) {
 		Status: "SUCCEEDED", RequestState: "succeeded"})
 	fatal(t, problem)
 	fatal(t, store.Closed(requestID, attempt))
+	// This is retained history from before the rental ended, not fresh work
+	// admitted to an already failed machine.
+	hub.setState(rentalID, "failed", "authorization_exposure_exhausted")
+	ended, problem := store.RentalRow(rentalID)
+	fatal(t, problem)
+	ended.State = "failed"
+	fatal(t, store.RecordRental(*ended))
 	before, problem := store.RequestRow(requestID)
 	fatal(t, problem)
 	if before.Machine != "celty" {

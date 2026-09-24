@@ -28,7 +28,7 @@ func (h *fakeRentalHub) set(id, key string, value any) {
 // the fleet as a live board — MACHINE SKU STATE $/HOUR UPTIME RUNNING QUEUED IDLE, redrawn in
 // place every second — and the same verb piped or --json is one plain snapshot. The
 // board is watched through a real pseudo-terminal across planted transitions: the pod
-// acquiring, then ready with an idle countdown from the actual rentals.idle_release_s
+// acquiring, then ready with an idle countdown from the fixed fifteen-minute policy
 // policy, then held by queued work, then counting down again once the work settles.
 func TestRentalListLiveBoard(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-list-tui")
@@ -41,7 +41,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 1.00\n  idle_release_s: 240\n"), 0o600))
+			"rentals:\n  max_hourly_spend_usd: 1.00\n"), 0o600))
 
 	hub := newFakeRentalHub(t, port)
 	hub.add("rental-tui", "sparrow")
@@ -102,15 +102,15 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if busy == nil {
 		t.Fatalf("queued work did not blank the idle countdown\n%q", tty)
 	}
-	countdown := regexp.MustCompile(`(\d+)s / 4m`)
+	countdown := regexp.MustCompile(`(\d+)s / 15m`)
 	elapsed := countdown.FindAllStringSubmatchIndex(tty, -1)
 	if len(elapsed) < 2 {
-		t.Fatalf("the IDLE cell did not count elapsed over the 4m policy deadline\n%q", tty)
+		t.Fatalf("the IDLE cell did not count elapsed over the 15m policy deadline\n%q", tty)
 	}
 	first := tty[elapsed[0][2]:elapsed[0][3]]
 	last := tty[elapsed[len(elapsed)-1][2]:elapsed[len(elapsed)-1][3]]
 	if first == last {
-		t.Fatalf("the IDLE elapsed clock never moved: always %ss / 4m\n%q", first, tty)
+		t.Fatalf("the IDLE elapsed clock never moved: always %ss / 15m\n%q", first, tty)
 	}
 	if elapsed[len(elapsed)-1][0] < busy[0] {
 		t.Fatalf("the idle countdown did not resume after the work settled\n%q", tty)
@@ -125,7 +125,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	}
 	if !regexp.MustCompile(`MACHINE\s+SKU\s+STATE\s+\$/HOUR\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(listed) ||
 		!strings.Contains(listed, "Remote machines running: 1") ||
-		!strings.Contains(listed, "Idle machines shut down after 4 minutes.") {
+		!strings.Contains(listed, "Idle machines shut down after 15 minutes.") {
 		t.Fatalf("piped snapshot lost the ruled surface\n%s", listed)
 	}
 	// Bare `cozy rental` names the group's VERBS; it is not one of them. The live table

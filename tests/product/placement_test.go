@@ -152,7 +152,7 @@ func placementRoot(t *testing.T, h *ladderHub, prefer string) (string, string) {
 	t.Helper()
 	root := t.TempDir()
 	body := []byte("tensorhub_url: " + h.server.URL + "\ntensorhub_token: ladder-test\nrentals:\n  max_hourly_spend_usd: 20\n" +
-		"  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\nplacement:\n  prefer: " + prefer + "\n")
+		"daemon:\n  idle_shutdown_s: 0\nplacement:\n  prefer: " + prefer + "\n")
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), body, 0600))
 	sum := sha256.Sum256(body)
 	return root, hex.EncodeToString(sum[:])

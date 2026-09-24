@@ -78,7 +78,7 @@ func TestRentalRuntimeUpdateCLIBridge(t *testing.T) {
 	}))
 	defer server.Close()
 	fatal(t, rental.Attach(layout, store, records.Rental{AcceleratorCount: 1, ID: id, MachineName: "cpu-proof", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, State: "ready", Hub: server.URL, Address: f.Address, ExpectedWorkerID: f.WorkerID, ExpectedWorkerBootID: f.WorkerBootID}, string(cert), token, identity))
-	must(t, os.WriteFile(filepath.Join(f.Root, config.FileName), []byte(fmt.Sprintf("tensorhub_url: %s\ntensorhub_token: isolated-proof\nrentals:\n  ssh_public_key: %s.pub\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n", server.URL, f.SSHKey)), 0600))
+	must(t, os.WriteFile(filepath.Join(f.Root, config.FileName), []byte(fmt.Sprintf("tensorhub_url: %s\ntensorhub_token: isolated-proof\nrentals:\n  ssh_public_key: %s.pub\ndaemon:\n  idle_shutdown_s: 0\n", server.URL, f.SSHKey)), 0600))
 	command := func(args ...string) *exec.Cmd {
 		cmd := exec.Command(f.CLI, args...)
 		cmd.Env = childEnv(t, f.Root)

@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 42
+const schemaVersion = 43
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -117,7 +117,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 func init() {
 	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
-	schema = append(schema, capturePinsDDL, runtimeUpdatesDDL)
+	schema = append(schema, capturePinsDDL, runtimeUpdatesDDL, rentalIdleDDL)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -468,6 +468,11 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if sourceVersion < 42 {
 		if _, err := tx.Exec(runtimeUpdatesDDL); err != nil {
 			return exit.Internalf("cannot add rental Runtime update records: %s", err)
+		}
+	}
+	if sourceVersion < 43 {
+		if _, err := tx.Exec(rentalIdleDDL); err != nil {
+			return exit.Internalf("cannot add rental idle receipts: %s", err)
 		}
 	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
@@ -842,6 +847,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 43 && statement == rentalIdleDDL {
+			continue
+		}
 		if version < 42 && statement == runtimeUpdatesDDL {
 			continue
 		}

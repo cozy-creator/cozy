@@ -61,7 +61,7 @@ func proveUnavailableRentalListing(t *testing.T, unavailableStatus int) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: test\nrentals:\n  max_hourly_spend_usd: 10\n  idle_release_s: 0\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: test\nrentals:\n  max_hourly_spend_usd: 10\n"), 0600))
 	for _, known := range []bool{false, true} {
 		if known {
 			st, problem := records.Open(filepath.Join(root, "creator.sqlite"))

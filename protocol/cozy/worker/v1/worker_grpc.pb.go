@@ -1928,6 +1928,7 @@ var RuntimeWeights_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	PodHost_KeepRentalAlive_FullMethodName                       = "/cozy.worker.v1.PodHost/KeepRentalAlive"
 	PodHost_GetMachineExecutionWorkspace_FullMethodName          = "/cozy.worker.v1.PodHost/GetMachineExecutionWorkspace"
 	PodHost_SubmitMachineExecution_FullMethodName                = "/cozy.worker.v1.PodHost/SubmitMachineExecution"
 	PodHost_GetMachineExecution_FullMethodName                   = "/cozy.worker.v1.PodHost/GetMachineExecution"
@@ -1994,6 +1995,8 @@ const (
 // Locally PodHost is not a service: the daemon calls the same host functions in-process.
 // ---------------------------------------------------------------------------
 type PodHostClient interface {
+	// Explicit owner action only. Connection traffic and status reads do not renew idle time.
+	KeepRentalAlive(ctx context.Context, in *KeepRentalAliveRequest, opts ...grpc.CallOption) (*KeepRentalAliveResult, error)
 	GetMachineExecutionWorkspace(ctx context.Context, in *MachineExecutionWorkspaceQuery, opts ...grpc.CallOption) (*MachineExecutionWorkspace, error)
 	// Authenticated forwarding only. Runtime is the sole execution journal/owner.
 	SubmitMachineExecution(ctx context.Context, in *MachineExecutionSubmit, opts ...grpc.CallOption) (*MachineExecutionReceipt, error)
@@ -2040,6 +2043,16 @@ type podHostClient struct {
 
 func NewPodHostClient(cc grpc.ClientConnInterface) PodHostClient {
 	return &podHostClient{cc}
+}
+
+func (c *podHostClient) KeepRentalAlive(ctx context.Context, in *KeepRentalAliveRequest, opts ...grpc.CallOption) (*KeepRentalAliveResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(KeepRentalAliveResult)
+	err := c.cc.Invoke(ctx, PodHost_KeepRentalAlive_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *podHostClient) GetMachineExecutionWorkspace(ctx context.Context, in *MachineExecutionWorkspaceQuery, opts ...grpc.CallOption) (*MachineExecutionWorkspace, error) {
@@ -2481,6 +2494,8 @@ func (c *podHostClient) WeightsIntentReady(ctx context.Context, in *WeightsInten
 // Locally PodHost is not a service: the daemon calls the same host functions in-process.
 // ---------------------------------------------------------------------------
 type PodHostServer interface {
+	// Explicit owner action only. Connection traffic and status reads do not renew idle time.
+	KeepRentalAlive(context.Context, *KeepRentalAliveRequest) (*KeepRentalAliveResult, error)
 	GetMachineExecutionWorkspace(context.Context, *MachineExecutionWorkspaceQuery) (*MachineExecutionWorkspace, error)
 	// Authenticated forwarding only. Runtime is the sole execution journal/owner.
 	SubmitMachineExecution(context.Context, *MachineExecutionSubmit) (*MachineExecutionReceipt, error)
@@ -2529,6 +2544,9 @@ type PodHostServer interface {
 // pointer dereference when methods are called.
 type UnimplementedPodHostServer struct{}
 
+func (UnimplementedPodHostServer) KeepRentalAlive(context.Context, *KeepRentalAliveRequest) (*KeepRentalAliveResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method KeepRentalAlive not implemented")
+}
 func (UnimplementedPodHostServer) GetMachineExecutionWorkspace(context.Context, *MachineExecutionWorkspaceQuery) (*MachineExecutionWorkspace, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetMachineExecutionWorkspace not implemented")
 }
@@ -2650,6 +2668,24 @@ func RegisterPodHostServer(s grpc.ServiceRegistrar, srv PodHostServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&PodHost_ServiceDesc, srv)
+}
+
+func _PodHost_KeepRentalAlive_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(KeepRentalAliveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).KeepRentalAlive(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_KeepRentalAlive_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).KeepRentalAlive(ctx, req.(*KeepRentalAliveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _PodHost_GetMachineExecutionWorkspace_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -3200,6 +3236,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "cozy.worker.v1.PodHost",
 	HandlerType: (*PodHostServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "KeepRentalAlive",
+			Handler:    _PodHost_KeepRentalAlive_Handler,
+		},
 		{
 			MethodName: "GetMachineExecutionWorkspace",
 			Handler:    _PodHost_GetMachineExecutionWorkspace_Handler,

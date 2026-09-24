@@ -68,8 +68,12 @@ retail hourly rate locked into each rental. Every potentially billing manual or 
 rental counts until Tensorhub confirms release or absence. A new managed rental is allowed
 only when its locked rate fits under `rentals.max_hourly_spend_usd`. Creator reuses the
 cheapest idle rental first, otherwise buys the cheapest offered SKU. Every rental, manual or
-Creator-managed, is released once nothing has been queued, running, or owed on it for
-`rentals.idle_release_s`; a managed rental whose assigned requests are terminal, their output
+Creator-managed, has an immutable 900-second idle deadline. Only actual work on that
+machine and an acknowledged explicit `cozy rental keepalive <name>` reset it. Retained
+failed/paused files, connection traffic and unpinned fleet work do not. The pod independently
+enforces expiry while Creator is offline, using the existing Hub release route. Creator
+schedules its fallback from first local receipt observation, so clock skew cannot make
+it release before the acknowledged allowance; duplicate/older receipts do not renew it. A managed rental whose assigned requests are terminal, their output
 bytes mirrored, and their outcome acknowledgements sent is released at once when its work was
 a job. `cozy rental end` releases one now.
 
@@ -313,6 +317,7 @@ Only a daemon holding the root lock may migrate an older database.
 |---|---|---|---|
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | one attempt's kept triage bundle from its own row; 404 when none was kept |
 | `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, and activity; `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
+| `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | explicit acknowledged fixed fifteen-minute reset; request ID only |
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |

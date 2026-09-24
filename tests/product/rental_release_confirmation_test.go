@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -42,9 +41,6 @@ func TestManagedReleaseRequiresPositiveHubDestruction(t *testing.T) {
 			row, problem := store.RentalRow(id)
 			fatal(t, problem)
 			stand.add(id, row.MachineName)
-			raw, err := os.ReadFile(filepath.Join(root, config.FileName))
-			must(t, err)
-			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(strings.Replace(string(raw), "idle_release_s: 0", "idle_release_s: 1", 1)), 0600))
 			original := stand.server.Config.Handler
 			var asked atomic.Bool
 			stand.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +95,6 @@ func releaseConfirmationRecord(t *testing.T, root, hubURL, id string) (*records.
 	}, nil)
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(op.Key, id, "attached"))
-	fatal(t, store.RecordRental(records.Rental{ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, State: "ready", Hub: hubURL, Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem")}))
+	fatal(t, store.RecordRental(records.Rental{ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, State: "ready", ReadyAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), Hub: hubURL, Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem")}))
 	return store, op.Key
 }

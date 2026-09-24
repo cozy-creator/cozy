@@ -47,7 +47,7 @@ func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 			server := httptest.NewServer(mux)
 			t.Cleanup(server.Close)
 			root := t.TempDir()
-			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: release-proof\nrentals:\n  max_hourly_spend_usd: 1\n  idle_release_s: 0\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: release-proof\nrentals:\n  max_hourly_spend_usd: 1\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 			store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)
 			if installed {
