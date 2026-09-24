@@ -207,6 +207,7 @@ pub fn fetch_authorized(
     // declared life, which is the only place that question can be answered.
     let mut stale: Option<u16> = None;
     for attempt in 1..=FETCH_ATTEMPTS {
+        ledger.check_running()?;
         let last = attempt == FETCH_ATTEMPTS;
         // A refused re-authorization must still name the origin's answer. It is the whole
         // diagnosis: "403, and re-minting was not honest" and "403, and the hub would not
@@ -604,6 +605,7 @@ pub(super) struct Leases<'a> {
 
 impl ObjectUrls for Leases<'_> {
     fn url_for(&self, at: usize, object: &ObjectRef, stale: bool) -> Result<String> {
+        self.ledger.check_running()?;
         if stale && !self.retire(&object.sha256)? {
             // The refused lease was NOT spent: the hub's own declared life still had more
             // than half of it left, so the origin's refusal is not about time and asking to
@@ -623,6 +625,7 @@ impl ObjectUrls for Leases<'_> {
             return Ok(url);
         }
         let _minting = self.minting.lock().unwrap();
+        self.ledger.check_running()?;
         // Another stream may have minted this window while this one waited for the right
         // to call. Asking again before calling is what makes one window cost one call.
         if let Some(url) = self.fresh(&object.sha256) {
@@ -773,7 +776,7 @@ pub struct WalkOutcome {
 
 /// Walk `plan.wanted` with `streams` objects in flight. One is the serial walk and it
 /// stays reachable, because a link where concurrency does not help is a real link. The
-/// first refusal wins; streams already moving finish their object and stop.
+/// first refusal wins and cancels in-flight network waits. Verified objects remain local.
 ///
 /// **`cache` is the source order, and it is the whole reason a second pod is cheap.** The
 /// order is local Store, then the optional mounted cache, then the origin — the Store half
@@ -885,11 +888,14 @@ pub fn fetch_wanted(
                         }
                     }
                     Err(refusal) => {
-                        stop.store(true, Ordering::Relaxed);
                         let mut slot = first.lock().unwrap();
                         if slot.is_none() {
+                            // Keep the actual failure before waking peers, so their
+                            // cancellation errors cannot replace its diagnosis.
                             *slot = Some(refusal);
+                            ledger.cancel();
                         }
+                        stop.store(true, Ordering::Relaxed);
                         return;
                     }
                 }

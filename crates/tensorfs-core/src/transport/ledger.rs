@@ -31,6 +31,7 @@
 //! paid H100s sat at exactly zero for fifteen minutes with neither plane complaining.
 
 use crate::err::{refuse, Code, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -134,6 +135,7 @@ pub struct Still {
 
 /// The one liveness ledger a pull shares across its streams.
 pub struct Ledger {
+    cancelled: AtomicBool,
     sample: Duration,
     worst_gap: Mutex<Duration>,
     progress: Mutex<Progress>,
@@ -150,6 +152,7 @@ impl Ledger {
     /// in milliseconds and judge by exactly the production rule.
     pub fn with_resolution(sample: Duration) -> Ledger {
         Ledger {
+            cancelled: AtomicBool::new(false),
             sample: sample.max(Duration::from_millis(1)),
             worst_gap: Mutex::new(Duration::ZERO),
             progress: Mutex::new(Progress {
@@ -179,6 +182,23 @@ impl Ledger {
             return clock();
         }
         Instant::now()
+    }
+
+    /// A terminal object failure stops the whole pull, including already-open
+    /// HTTP streams. Completed objects remain admitted for the next pull.
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn check_running(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            refuse(
+                Code::TRANSFER_FAILED,
+                "the pull stopped after another object failed",
+            )
+        } else {
+            Ok(())
+        }
     }
 
     pub fn sample(&self) -> Duration {

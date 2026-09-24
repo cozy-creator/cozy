@@ -4094,3 +4094,334 @@ fn downloaded_cache_root_is_protected_then_evicted_and_refetched() {
     assert!(store.repository_path(&repository).exists());
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn failed_object_cancels_stalled_siblings_and_preserves_completed_bytes() {
+    use std::collections::BTreeMap;
+    let root = temporary("failed-sibling");
+    let store = Store::init(&root).unwrap();
+    let good_bytes = vec![b'g'; 4096];
+    let good = ObjectRef::of(&good_bytes);
+    let failed = ObjectRef::of(b"missing object");
+    let stalled = ObjectRef::of(b"unfinished object");
+    store
+        .put_stream(
+            &mut good_bytes.as_slice(),
+            Some(&good),
+            &crate::store::Fault::default(),
+        )
+        .unwrap();
+    let ledger = Arc::new(Ledger::with_resolution(Duration::from_millis(20)));
+    ledger.taught(Duration::from_secs(5));
+    let progress = Arc::clone(&ledger);
+    let failed_path = format!("/{}", failed.sha256);
+    let peer = origin(Arc::new(move |request| {
+        if request.path == failed_path {
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while progress.still().moved == 0 {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "peer fixture never started"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            return status(404, b"missing object");
+        }
+        Serve::Stall {
+            total: 17,
+            prefix: b"unfinished".to_vec(),
+        }
+    }));
+    let mut objects = vec![good.clone(), failed.clone(), stalled.clone()];
+    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    let (plan, _) = FetchPlan::of_objects(&store, "failed-sibling", &objects).unwrap();
+    let urls: BTreeMap<String, String> = objects
+        .iter()
+        .map(|object| {
+            (
+                object.sha256.clone(),
+                format!("{}/{}", peer.base, object.sha256),
+            )
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let refusal = super::pull::fetch_wanted(
+        &store,
+        &plan,
+        &urls,
+        &local_policy(),
+        &Anonymous,
+        Deadline::after_seconds(Some(3.0)),
+        &ledger,
+        2,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        refusal.detail.contains("404"),
+        "original refusal lost: {refusal}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "failed pull waited on its stalled sibling: {:?}",
+        started.elapsed()
+    );
+    assert!(store.record_valid(&good.sha256).is_ok());
+    assert!(store.record_valid(&stalled.sha256).is_err());
+    let (retry, _) = FetchPlan::of_objects(&store, "retry-failed-sibling", &objects).unwrap();
+    assert_eq!(retry.held, vec![good]);
+    assert_eq!(retry.wanted.len(), 2);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn complete_content_length_body_does_not_wait_for_connection_close() {
+    let root = temporary("complete-keepalive");
+    let store = Store::init(&root).unwrap();
+    let bytes = b"complete bounded body";
+    let object = ObjectRef::of(bytes);
+    let (plan, _) =
+        FetchPlan::of_objects(&store, "keepalive", std::slice::from_ref(&object)).unwrap();
+    let grant = DeliveryGrant::mint(&plan, &object).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (close_peer, hold_open) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        read_request(&mut socket).unwrap();
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            bytes.len()
+        )
+        .unwrap();
+        socket.write_all(bytes).unwrap();
+        // Keep TCP open until the complete Store admission returns. Disk fsync
+        // time is unrelated to HTTP framing and may exceed a test socket timer.
+        let _ = hold_open.recv();
+    });
+    let ledger = Ledger::with_resolution(Duration::from_millis(20));
+    let result = fetch_url(
+        &store,
+        &grant,
+        &format!("http://{address}/body"),
+        &local_policy(),
+        &Anonymous,
+        Deadline::after_seconds(Some(1.0)),
+        &ledger,
+        None,
+    );
+    close_peer.send(()).unwrap();
+    peer.join().unwrap();
+    let result = result.unwrap();
+    assert_eq!(result.admitted.object, object);
+    assert!(store.record_valid(&object.sha256).is_ok());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn slow_control_answer_does_not_teach_object_stream_patience() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        read_request(&mut socket).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            .unwrap();
+    });
+    let ledger = Ledger::with_resolution(Duration::from_millis(10));
+    let checked = local_policy()
+        .check(&format!("http://{address}/presign"))
+        .unwrap();
+    let response = super::http::request(
+        &super::http::Client::new(),
+        &checked,
+        "GET",
+        &[],
+        None,
+        Deadline::after_seconds(Some(1.0)),
+        &ledger,
+        super::http::Judge::Transfer,
+        None,
+        Code::HUB_UNREACHABLE,
+    )
+    .unwrap();
+    assert_eq!(response.read_capped(2).unwrap(), b"{}");
+    peer.join().unwrap();
+    assert_eq!(
+        ledger.patience(),
+        ledger.floor(),
+        "Hub latency inflated the unrelated object-stream timeout"
+    );
+}
+
+#[test]
+fn consumer_pause_does_not_teach_object_stream_patience() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (resume, paused) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        read_request(&mut socket).unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\na")
+            .unwrap();
+        paused.recv().unwrap();
+        socket.write_all(b"b").unwrap();
+    });
+    let ledger = Ledger::with_resolution(Duration::from_millis(10));
+    let checked = local_policy()
+        .check(&format!("http://{address}/object"))
+        .unwrap();
+    let mut body = super::http::request(
+        &super::http::Client::new(),
+        &checked,
+        "GET",
+        &[],
+        None,
+        Deadline::after_seconds(Some(1.0)),
+        &ledger,
+        super::http::Judge::Stream,
+        None,
+        Code::TRANSFER_FAILED,
+    )
+    .unwrap()
+    .into_body();
+    let mut byte = [0];
+    body.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"a");
+    // Simulate time spent hashing or writing between successive body reads.
+    std::thread::sleep(Duration::from_millis(200));
+    resume.send(()).unwrap();
+    body.read_exact(&mut byte).unwrap();
+    assert_eq!(&byte, b"b");
+    peer.join().unwrap();
+    assert!(
+        ledger.patience() < Duration::from_millis(200),
+        "consumer work inflated the unrelated object-stream timeout"
+    );
+}
+
+#[test]
+fn pull_cancellation_interrupts_tls_headers_and_partial_body_waits() {
+    for phase in ["tls", "headers", "body"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut input = [0u8; 8192];
+            if phase == "tls" {
+                assert!(socket.read(&mut input).unwrap() > 0);
+            } else {
+                read_request(&mut socket).unwrap();
+                if phase == "body" {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nx")
+                        .unwrap();
+                }
+            }
+            entered.send(()).unwrap();
+            while matches!(socket.read(&mut input),Ok(n) if n>0) {}
+        });
+        let ledger = Arc::new(Ledger::with_resolution(Duration::from_millis(20)));
+        ledger.taught(Duration::from_secs(5));
+        let abort = Arc::clone(&ledger);
+        let cancelling = std::thread::spawn(move || {
+            waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+            abort.cancel();
+        });
+        let scheme = if phase == "tls" { "https" } else { "http" };
+        let checked = local_policy()
+            .check(&format!("{scheme}://{address}/object"))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = super::http::request(
+            &super::http::Client::new(),
+            &checked,
+            "GET",
+            &[],
+            None,
+            Deadline::after_seconds(Some(1.0)),
+            &ledger,
+            super::http::Judge::Stream,
+            None,
+            Code::TRANSFER_FAILED,
+        );
+        let refusal = match result {
+            Ok(response) => response.read_capped(99).unwrap_err(),
+            Err(refusal) => refusal,
+        };
+        assert!(
+            refusal.detail.contains("another object failed"),
+            "{phase}: {refusal}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{phase} ignored pull cancellation"
+        );
+        cancelling.join().unwrap();
+        peer.join().unwrap();
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn pull_cancellation_interrupts_a_pending_tcp_connection() {
+    use rustix::net::{self, AddressFamily, SocketFlags, SocketType};
+    let socket = net::socket_with(
+        AddressFamily::INET,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        Some(net::ipproto::TCP),
+    )
+    .unwrap();
+    net::bind(
+        &socket,
+        &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0),
+    )
+    .unwrap();
+    net::listen(&socket, 0).unwrap();
+    let listener: TcpListener = socket.into();
+    let address = listener.local_addr().unwrap();
+    // Fill Linux's one-entry backlog and deliberately never accept it. A second
+    // connection must keep its same nonblocking socket while polling cancellation.
+    let _occupied = TcpStream::connect(address).unwrap();
+    let ledger = Arc::new(Ledger::with_resolution(Duration::from_millis(20)));
+    ledger.taught(Duration::from_secs(5));
+    let abort = Arc::clone(&ledger);
+    let cancelling = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        abort.cancel();
+    });
+    let checked = local_policy()
+        .check(&format!("http://{address}/object"))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let refusal = match super::http::request(
+        &super::http::Client::new(),
+        &checked,
+        "GET",
+        &[],
+        None,
+        Deadline::after_seconds(Some(1.0)),
+        &ledger,
+        super::http::Judge::Stream,
+        None,
+        Code::TRANSFER_FAILED,
+    ) {
+        Err(refusal) => refusal,
+        Ok(_) => panic!("full listener unexpectedly answered"),
+    };
+    assert!(
+        refusal.detail.contains("another object failed"),
+        "{refusal}"
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+    cancelling.join().unwrap();
+}

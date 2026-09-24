@@ -82,6 +82,7 @@ fn transfer_verdict(
     since: Instant,
     waiting_for: &str,
 ) -> Result<()> {
+    ledger.check_running()?;
     if judge != Judge::Transfer {
         return Ok(());
     }
@@ -131,6 +132,7 @@ fn transfer_verdict(
 /// its own window and advances only when transport bytes actually move; slow
 /// progress may span arbitrarily many windows without exhausting a wall budget.
 fn stream_verdict(judge: Judge, ledger: &Ledger, advanced: Instant, phase: &str) -> Result<()> {
+    ledger.check_running()?;
     if judge != Judge::Stream || advanced.elapsed() <= ledger.patience() {
         return Ok(());
     }
@@ -271,27 +273,86 @@ impl Wire {
     }
 }
 
-fn connect(checked: &CheckedUrl, deadline: Deadline, fail: Code) -> Result<TcpStream> {
+fn connect(
+    checked: &CheckedUrl,
+    deadline: Deadline,
+    ledger: &Ledger,
+    judge: Judge,
+    fail: Code,
+) -> Result<TcpStream> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::net::{self, AddressFamily, SocketFlags, SocketType};
     let mut last: Option<std::io::Error> = None;
-    for addr in &checked.addrs {
-        let attempt = match deadline.remaining()? {
-            Some(left) => TcpStream::connect_timeout(addr, left),
-            None => TcpStream::connect(addr),
+    'addresses: for addr in &checked.addrs {
+        ledger.check_running()?;
+        let family = if addr.is_ipv4() {
+            AddressFamily::INET
+        } else {
+            AddressFamily::INET6
         };
-        match attempt {
-            Ok(sock) => {
-                let _ = sock.set_nodelay(true);
-                return Ok(sock);
+        let socket = match net::socket_with(
+            family,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            Some(net::ipproto::TCP),
+        ) {
+            Ok(socket) => socket,
+            Err(error) => {
+                last = Some(error.into());
+                continue;
             }
-            Err(error) => last = Some(error),
+        };
+        let since = Instant::now();
+        match net::connect(&socket, addr) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::INPROGRESS) => loop {
+                // Poll one pending connection instead of restarting it at each
+                // sample. Cancellation and existing silence rules remain active
+                // without imposing a new total connection deadline.
+                transfer_verdict(judge, ledger, since, "a TCP connection")?;
+                stream_verdict(judge, ledger, since, "TCP connect")?;
+                let tick = deadline
+                    .remaining()?
+                    .map_or(ledger.sample(), |left| left.min(ledger.sample()));
+                let timeout = Timespec {
+                    tv_sec: tick.as_secs() as _,
+                    tv_nsec: tick.subsec_nanos() as _,
+                };
+                let mut descriptors = [PollFd::new(&socket, PollFlags::OUT)];
+                match poll(&mut descriptors, Some(&timeout)) {
+                    Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                    Ok(_) => match net::sockopt::socket_error(&socket) {
+                        Ok(Ok(())) => break,
+                        Ok(Err(error)) | Err(error) => {
+                            last = Some(error.into());
+                            continue 'addresses;
+                        }
+                    },
+                    Err(error) => {
+                        last = Some(error.into());
+                        continue 'addresses;
+                    }
+                }
+            },
+            Err(error) => {
+                last = Some(error.into());
+                continue;
+            }
         }
+        let socket: TcpStream = socket.into();
+        socket.set_nonblocking(false).map_err(|error| Refusal {
+            code: fail,
+            detail: format!("configure connected socket: {error}"),
+        })?;
+        let _ = socket.set_nodelay(true);
+        return Ok(socket);
     }
     refuse(
         fail,
         format!(
             "{}: no checked address accepted a connection ({})",
             checked.host,
-            last.map(|e| e.to_string()).unwrap_or_default()
+            last.map(|error| error.to_string()).unwrap_or_default()
         ),
     )
 }
@@ -425,7 +486,11 @@ impl BodyReader<'_> {
     /// One raw read off the wire under the sampling rule: the socket timeout is the
     /// RESOLUTION; the deadline and (when judged) the measured patience carry the verdict.
     fn step(&mut self, buf: &mut [u8]) -> Result<usize> {
+        // Time spent by the consumer hashing or writing the prior chunk is not
+        // network silence. This wait starts when it asks for another chunk.
+        self.advanced = Instant::now();
         loop {
+            self.ledger.check_running()?;
             let tick = match self.deadline.remaining()? {
                 Some(left) => left.min(self.ledger.sample()),
                 None => self.ledger.sample(),
@@ -435,7 +500,9 @@ impl BodyReader<'_> {
                 Ok(n) => {
                     if n > 0 {
                         let now = Instant::now();
-                        self.ledger.taught(now - self.advanced);
+                        if self.judge == Judge::Stream {
+                            self.ledger.taught(now - self.advanced);
+                        }
                         self.advanced = now;
                     }
                     return Ok(n);
@@ -645,8 +712,9 @@ pub fn request<'l>(
     write_silence: Option<Duration>,
     fail: Code,
 ) -> Result<Response<'l>> {
+    ledger.check_running()?;
     let opened = Instant::now();
-    let sock = connect(checked, deadline, fail)?;
+    let sock = connect(checked, deadline, ledger, judge, fail)?;
     let mut wire = if checked.https {
         let name = ServerName::try_from(checked.host.clone()).map_err(|_| Refusal {
             code: Code::SOURCE_NOT_ALLOWED,
@@ -697,7 +765,9 @@ pub fn request<'l>(
 
     let (status, response_headers, spill) =
         read_head(&mut wire, deadline, ledger, judge, opened, fail)?;
-    ledger.taught(opened.elapsed());
+    if judge == Judge::Stream {
+        ledger.taught(opened.elapsed());
+    }
     // A HEAD THAT ARRIVED IS PROGRESS. Without this, the second page of a paginated closure
     // would be judged from the start of the first, and a pull whose hub is merely slow
     // would condemn its own second call for the first call's honest latency.

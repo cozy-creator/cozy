@@ -11,7 +11,7 @@ path = "src/bin/tfs/main.rs"
 fs2 = "0.4"
 minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-rustix = { version = "1.1.4", default-features = false, features = ["fs", "std"] }
+rustix = { version = "1.1.4", default-features = false, features = ["fs", "std", "net", "event"] }
 # tfs-049: the ONE transport (src/transport/). rustls is the one TLS stack, used only
 # there; scripts/fence.py refuses it anywhere else so a second mover cannot grow.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
