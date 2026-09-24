@@ -64,12 +64,15 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		return nil, machineTransport(err)
 	}
 	host := pb.NewPodHostClient(connection)
-	proof, problem := rental.ClaimProof(m.layout)(identity, 1)
+	claim, problem := m.fleet.owner.RentalExecutionClaim(ctx, machine)
 	if problem != nil {
 		connection.Close()
 		return nil, problem
 	}
-	claim := &pb.Claim{RecordOwnerEpoch: 1, RecordOwnerId: "cozy-local-client", WorkerId: identity.WorkerID, WorkerBootId: identity.WorkerBootID, WireMinor: pb.WireMinor, Proof: proof}
+	if claim.WorkerId != identity.WorkerID || claim.WorkerBootId != identity.WorkerBootID {
+		connection.Close()
+		return nil, exit.New(exit.Conflict, "the rental control session changed its pinned worker identity")
+	}
 	probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
 	info, err := host.ProtocolInfo(probeContext, &pb.ProtocolInfoRequest{})
 	cancel()
@@ -80,18 +83,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		}
 		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "Runtime-owned execution requires worker protocol %d; this worker reports %d", pb.MinCompatibleWireMinor, info.GetWireMinor())
 	}
-	m.mu.Lock()
-	alreadyClaimed := m.claimed[machine] == claim.WorkerBootId
-	m.mu.Unlock()
-	if !alreadyClaimed {
-		if problem := authenticateMachine(ctx, pb.NewWorkerControlClient(connection), claim); problem != nil {
-			connection.Close()
-			return nil, problem
-		}
-		m.mu.Lock()
-		m.claimed[machine] = claim.WorkerBootId
-		m.mu.Unlock()
-	}
+
 	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
 	result.modelDefaultOrigin = func(ctx context.Context) (string, *exit.Error) {
 		facts, problem := client(m.context).RentalImageInventory(ctx, identity.RentalID)

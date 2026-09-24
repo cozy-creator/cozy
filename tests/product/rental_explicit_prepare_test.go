@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,7 +34,14 @@ func TestExplicitRentalPreparationWaitsForWorkerReceiptWithoutActivating(t *test
 					close(release)
 				}
 			}()
+			var claims atomic.Int32
 			pod := &fakePod{controlKey: public}
+			pod.onFrame = func(frame *pb.RecordOwnerFrame, _ func(*pb.WorkerFrame) error) (bool, error) {
+				if frame.GetClaim() != nil {
+					claims.Add(1)
+				}
+				return false, nil
+			}
 			pod.prepareEvent = func(event *pb.PrepareEvent) {
 				if event.Stage == pb.PrepareStage_PREPARE_STAGE_DOWNLOADING {
 					close(entered)
@@ -65,6 +73,19 @@ func TestExplicitRentalPreparationWaitsForWorkerReceiptWithoutActivating(t *test
 			case problem := <-result:
 				t.Fatal("reported preparation complete before worker receipt", problem)
 			case <-time.After(30 * time.Millisecond):
+			}
+			// Concurrent machine execution borrows authority instead of opening
+			// a second control stream and canceling this preparation's connection.
+			claim, problem := o.c.RentalExecutionClaim(context.Background(), podRental)
+			fatal(t, problem)
+			if claim.WorkerId != podWorkerID || claim.WorkerBootId != podBootID || claims.Load() != 1 {
+				t.Fatalf("execution replaced the active preparation claim: %+v, %d claims", claim, claims.Load())
+			}
+			claim.Proof = nil
+			other, problem := o.c.RentalExecutionClaim(context.Background(), podRental)
+			fatal(t, problem)
+			if len(other.Proof) == 0 || claims.Load() != 1 {
+				t.Fatal("borrowed claim mutated the owner or opened a control stream")
 			}
 			close(release)
 			select {

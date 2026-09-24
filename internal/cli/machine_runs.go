@@ -77,7 +77,6 @@ type machineRuns struct {
 	fleet     *managedRentals
 	mu        sync.Mutex
 	running   map[string]bool
-	claimed   map[string]string
 	localMu   sync.Mutex
 	localPID  int
 	observers sync.Map // one collection/control lock per observed request
@@ -86,7 +85,7 @@ type machineRuns struct {
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals) *machineRuns {
 	background, cancel := context.WithCancel(context.Background())
-	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}, claimed: map[string]string{}}
+	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}}
 }
 
 func (m *machineRuns) Start(request records.Request) *exit.Error {
