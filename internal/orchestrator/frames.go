@@ -766,7 +766,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			go c.reviveQueue()
 		}
 	} else if w != nil && w.spec.IsJob() && (r.GetJobCapacity().GetJobsAvailable() > 0 || r.GetJobCapacity().GetOrchestrationAvailable() > 0) {
+		// A free job seat may also end a pinned job's mode claim: re-ask the work parked behind it.
 		go c.drain()
+		go c.reviveQueue()
 	} else if workerTerminal {
 		// A FAILED axis or permanent desired-state refusal is the worker's answer, not a
 		// stall timer to begin. Re-ask the queued head immediately so it can replace a

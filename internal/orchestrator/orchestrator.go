@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -455,7 +456,7 @@ func (c *Orchestrator) RentalStanding(id string, job bool) (reason string, held 
 	}
 	serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
 		w.desiredUnpublishedPlacement != nil || len(w.observedRemote) > 0
-	if (job && serving || !job && w.spec.IsJob()) && !c.idleRentalWorkerLocked(w) {
+	if (job && serving || !job && w.spec.IsJob()) && (!c.idleRentalWorkerLocked(w) || c.modeClaimedLocked(w, job)) {
 		return ExcludedModeConflict, 0
 	}
 	if c.sessions[w.bootID] == nil {
@@ -480,6 +481,26 @@ func (c *Orchestrator) idleRentalWorkerLocked(w *worker) bool {
 	}
 	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
 	return problem == nil && len(attempts) == 0
+}
+
+// modeClaimedLocked is whether work pinned to this rental in its worker's current mode
+// holds that mode against a request of the other mode; `exempt` names that request and
+// the parent it may run under. A pin claims the mode from submission, before any attempt
+// or offer exists, until the request settles. Callers hold c.mu.
+func (c *Orchestrator) modeClaimedLocked(w *worker, job bool, exempt ...string) bool {
+	if w == nil || w.spec.Connection == nil || job == w.spec.IsJob() {
+		return false
+	}
+	pinned, problem := c.opt.Store.PinnedRentalWork(w.spec.Connection.RentalID)
+	if problem != nil {
+		return true
+	}
+	for _, request := range pinned {
+		if request.IsJob() == w.spec.IsJob() && !slices.Contains(exempt, request.ID) {
+			return true
+		}
+	}
+	return false
 }
 
 // Orchestrator is the Cozy daemon's scheduling role.
