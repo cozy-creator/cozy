@@ -100,7 +100,12 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			return nil, problem
 		}
 		result.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
-		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, nil)
+		// Published rental preparation must carry the request's exact model
+		// bindings in the same desired download set as the package.  Previously
+		// this path sent only the package; Runtime could therefore install the
+		// environment successfully while its TensorFS lacked the checkpoint,
+		// producing a late REPOSITORY_ABSENT when execution admitted the model.
+		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, orchestrator.DownloadModelRefs(request.Models))
 		if problem != nil {
 			return nil, problem
 		}
