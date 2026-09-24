@@ -136,7 +136,8 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 	instruction := modeltransfer.Instruction{Kind: kind, Destination: destination,
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
 		Producer: callable, Placement: placement, SourceProfiles: suppliedProfiles}
-	localOnly := localOnlyModelSource(instructionSource)
+	// The canonical file: identity is not a user filesystem spelling to parse again.
+	localOnly := preflightLocalOnly
 	if localOnly && (ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != "") {
 		return exit.Usagef("a local model source cannot run under --rental-only").
 			WithRemedy("omit --rental-only or use an addressable provider/Tensorhub source")
