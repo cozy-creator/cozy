@@ -985,6 +985,12 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	return c.ensureRentalContext(context.Background(), id)
 }
 
+// EnsureRentalContext lets a foreground preparation stop waiting for an
+// unavailable control session when its caller disconnects.
+func (c *Orchestrator) EnsureRentalContext(ctx context.Context, id string) (string, string, WorkerChange, *exit.Error) {
+	return c.ensureRentalContext(ctx, id)
+}
+
 func (c *Orchestrator) ensureRentalContext(ctx context.Context, id string) (string, string, WorkerChange, *exit.Error) {
 	if c.opt.Rentals == nil {
 		return "", "", ChangeNone, exit.Unavailablef("this Cozy daemon attaches no rented workers")

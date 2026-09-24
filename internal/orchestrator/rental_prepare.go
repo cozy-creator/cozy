@@ -15,7 +15,7 @@ func (c *Orchestrator) PrepareRentalPackage(ctx context.Context, instance string
 	if ref == nil || c.opt.RentalPackageSet == nil || c.opt.RentalPrepareFacts == nil {
 		return exit.New(exit.Unavailable, "rental preparation has no package download authority")
 	}
-	w, s, problem := c.localControl(instance)
+	w, s, problem := c.localControlContext(ctx, instance)
 	if problem != nil {
 		return problem
 	}

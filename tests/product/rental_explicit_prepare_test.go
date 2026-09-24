@@ -139,3 +139,69 @@ func TestRentalImageFactsAdvertisePublicModelOriginWithoutPackagePublication(t *
 		t.Fatal("rental byte origin was lost", facts, calls)
 	}
 }
+
+func TestRentalPreparationCanceledWhileControlSessionUnavailable(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	entered := make(chan struct{}, 1)
+	pod := &fakePod{controlKey: public}
+	pod.onFrame = func(frame *pb.RecordOwnerFrame, _ func(*pb.WorkerFrame) error) (bool, error) {
+		if frame.GetClaim() != nil {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			return true, nil // the remote peer never acknowledges this session
+		}
+		return false, nil
+	}
+	connection, _ := startFakePod(t, t.TempDir(), pod)
+	o := hostOwner(t, "canceled-preparation-control", rentalWiring(connection, private))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type answer struct {
+		instance string
+		problem  *exit.Error
+	}
+	ready := make(chan answer, 1)
+	go func() {
+		instance, _, _, problem := o.c.EnsureRentalContext(ctx, podRental)
+		ready <- answer{instance, problem}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("claim did not reach peer")
+	}
+	cancel()
+	var instance string
+	select {
+	case got := <-ready:
+		if got.problem == nil {
+			t.Fatal("canceled rental claim succeeded")
+		}
+		instance = got.instance
+	case <-time.After(time.Second):
+		t.Fatal("canceled rental claim kept waiting")
+	}
+	done := make(chan *exit.Error, 2)
+	go func() {
+		done <- o.c.PrepareRentalPackage(ctx, instance, &pb.DownloadPackageRef{Package: "proof/video", Release: "1.0.0"}, nil)
+	}()
+	go func() { _, problem := o.c.RentalExecutionClaim(ctx, podRental); done <- problem }()
+	for range 2 {
+		select {
+		case problem := <-done:
+			if problem == nil {
+				t.Fatal("canceled session wait succeeded")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("canceled preparation or execution claim kept waiting")
+		}
+	}
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	if len(pod.prepares) != 0 {
+		t.Fatal("canceled foreground command began preparation")
+	}
+}

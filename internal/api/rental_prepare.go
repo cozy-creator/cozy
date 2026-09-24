@@ -63,7 +63,7 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := r.PathValue("rental_id")
-	instance, _, _, problem := s.orchestrator.EnsureRental(id)
+	instance, _, _, problem := s.orchestrator.EnsureRentalContext(r.Context(), id)
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return

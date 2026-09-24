@@ -495,7 +495,14 @@ func transferFilesInOrder(transfer *localTransfer) []localTransferFile {
 }
 
 func (c *Orchestrator) localControl(instanceID string) (*worker, *session, *exit.Error) {
+	return c.localControlContext(context.Background(), instanceID)
+}
+
+func (c *Orchestrator) localControlContext(ctx context.Context, instanceID string) (*worker, *session, *exit.Error) {
 	for {
+		if ctx.Err() != nil {
+			return nil, nil, exit.Unavailablef("worker control wait canceled: %s", ctx.Err())
+		}
 		c.mu.Lock()
 		w := c.workers[instanceID]
 		var s *session
@@ -518,6 +525,8 @@ func (c *Orchestrator) localControl(instanceID string) (*worker, *session, *exit
 				"the rented worker exited during local package transfer")
 		}
 		select {
+		case <-ctx.Done():
+			return nil, nil, exit.Unavailablef("worker control wait canceled: %s", ctx.Err())
 		case <-c.done:
 			return nil, nil, exit.Unavailablef("the daemon stopped during local package transfer")
 		case <-time.After(20 * time.Millisecond):

@@ -90,7 +90,7 @@ func (c *Orchestrator) RentalExecutionClaim(ctx context.Context, id string) (*pb
 	if problem != nil {
 		return nil, problem
 	}
-	_, session, problem := c.localControl(instance)
+	_, session, problem := c.localControlContext(ctx, instance)
 	if problem != nil {
 		return nil, problem
 	}
