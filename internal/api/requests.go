@@ -755,6 +755,7 @@ type Lifecycle struct {
 	PhaseMovedBytes  *int64                               `json:"phase_moved_bytes,omitempty"`
 	PhaseTotalBytes  *int64                               `json:"phase_total_bytes,omitempty"`
 	PhaseRate        *float64                             `json:"phase_rate_bytes_per_second,omitempty"`
+	PhaseSampleAgeMS *int64                               `json:"phase_sample_age_ms,omitempty"`
 	PhaseRemainingMS *int64                               `json:"phase_remaining_ms,omitempty"`
 	ResponseURL      string                               `json:"response_url"`
 	Metrics          map[string]any                       `json:"metrics,omitempty"`
@@ -889,6 +890,10 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 			life.Phase, life.PhaseMachine = phase.Name, phase.Machine
 			life.PhaseDetail, life.RentalProgress = phase.Detail, phase.Rental
 			life.PhaseModels = phase.Models
+			if !phase.At.IsZero() {
+				age := phase.SampleAge().Milliseconds()
+				life.PhaseSampleAgeMS = &age
+			}
 			life.WaitingFor = phase.WaitingFor
 			if elapsed := phase.Elapsed(); elapsed > 0 {
 				ms := elapsed.Milliseconds()

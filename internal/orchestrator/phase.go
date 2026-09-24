@@ -1,34 +1,9 @@
 package orchestrator
 
-// THE PREPARATION PHASE LANE (cl-121).
-//
-// Everything a request does before its first attempt exists — choosing a machine, buying
-// one, waiting for it to boot, landing the model bytes on it, handing them to Runtime
-// preparation, loading the placement — projected as `queued` and nothing else. On the
-// night this was written a 210 GB pull sat at `queued` for two and a half hours with no
-// signal of any kind, and a person had to grep a daemon log to answer whether it was
-// alive.
-//
-// The observation is a PHASE plus whatever advancement that phase honestly has:
-//
-//   - A phase with byte counters carries them, and carries the RATE derived from them.
-//     Rate is the number that answers the operator's actual question. A pull that ran at
-//     70 MB/s for four minutes and then at 6 MB/s for two hours looks identical under a
-//     percentage bar and is obvious under a rate.
-//   - A phase with no counter carries only the instant it began. That is not a
-//     consolation prize: ENTERING a phase is itself an observation, and it is what splits
-//     an otherwise unsplittable wait into named pieces.
-//   - Nothing here is synthesized. There is no denominator where the producer declared
-//     none, no percentage assembled out of phase ordering, and no estimate that is not
-//     a division of two measured quantities.
-//
-// It is deliberately not a second word list. `wait.go`'s causes name what the QUEUE is
-// doing and stay exactly as they are; a phase REFINES one of them when a real observation
-// exists, and the coarse cause remains the answer when none does.
-//
-// Live-only, like the execution progress lane beside it (stream.go): a durable row per
-// sample would turn the lifecycle authority into a log sink, and a phase reading has no
-// authority over anything. Nothing here can settle, route, bill or cancel a request.
+// Preparation observations explain queued work before its execution attempt exists.
+// Producers supply phases and, when measured, byte counters. Rates and estimates
+// are derived from observed progress, excluding bytes retained before observation.
+// This is live display state; it never settles, routes, bills, or cancels work.
 
 import (
 	"sort"
@@ -68,10 +43,14 @@ const (
 	PhaseWarming = "warming"
 )
 
+// PreparationRateMaxAge bounds the freshness of displayed transfer estimates only.
+// It never cancels, fails, or otherwise changes execution.
+const PreparationRateMaxAge = 10 * time.Second
+
 // PhaseObservation is one subject's current phase as last observed.
 //
 // Rate and Average are both bytes per second and they are different measurements on
-// purpose. Average is the phase's whole run and is therefore what a remaining-time
+// purpose. Average covers progress since the first byte sample and is what a remaining-time
 // estimate divides by; Rate is the most recent interval alone and is therefore what shows
 // a link degrading while it degrades. Reporting one number for both jobs would make it
 // wrong for one of them.
@@ -114,11 +93,19 @@ func (p PhaseObservation) Elapsed() time.Duration {
 	return time.Since(p.Since)
 }
 
+// SampleAge is the age of the last actual producer observation.
+func (p PhaseObservation) SampleAge() time.Duration {
+	if p.At.IsZero() {
+		return 0
+	}
+	return max(time.Since(p.At), 0)
+}
+
 // Remaining is the measured estimate: bytes still owed divided by the rate this phase has
 // actually sustained. False whenever either quantity is missing, which is every phase
 // with no denominator and every phase before two samples have landed.
 func (p PhaseObservation) Remaining() (time.Duration, bool) {
-	if !p.HasBytes || p.Total == 0 || p.Moved >= p.Total || p.Average <= 0 {
+	if !p.HasBytes || p.Total == 0 || p.Moved >= p.Total || p.Average <= 0 || p.Rate <= 0 || p.SampleAge() > PreparationRateMaxAge {
 		return 0, false
 	}
 	seconds := float64(p.Total-p.Moved) / p.Average
@@ -131,19 +118,21 @@ func (p PhaseObservation) Remaining() (time.Duration, bool) {
 // phaseState is one subject's accumulator. `prev` is the immediately preceding sample and
 // exists only to measure the most recent interval.
 type phaseState struct {
-	name     string
-	since    time.Time
-	at       time.Time
-	machine  string
-	detail   string
-	rental   *RentalProgress
-	models   map[string]modelDownloadState
-	hasBytes bool
-	moved    uint64
-	total    uint64
-	prevAt   time.Time
-	prevMove uint64
-	rate     float64
+	name        string
+	since       time.Time
+	at          time.Time
+	machine     string
+	detail      string
+	rental      *RentalProgress
+	models      map[string]modelDownloadState
+	hasBytes    bool
+	moved       uint64
+	total       uint64
+	byteSince   time.Time
+	initialMove uint64
+	prevAt      time.Time
+	prevMove    uint64
+	rate        float64
 }
 
 // phases holds one observation per subject. A subject is a request id (the phases a
@@ -175,9 +164,8 @@ type PhaseSample struct {
 // so carrying a download's rate into the preparation that follows it would report a number
 // about work that is over.
 //
-// Byte counters are held monotonic here rather than trusted: `transferred_bytes` is
-// declared monotonic within a call by the protocol, and a producer that violates that
-// must not be able to make this lane report a negative rate.
+// Counters are monotonic within one call. A worker can begin another fetch with
+// smaller counters; that resets the rate basis without resetting phase elapsed time.
 func (p *phases) observe(subject string, sample PhaseSample) {
 	if subject == "" || sample.Name == "" {
 		return
@@ -200,16 +188,14 @@ func (p *phases) observe(subject string, sample PhaseSample) {
 	}
 	if sample.HasBytes {
 		moved := sample.Moved
-		if moved < state.moved {
-			moved = state.moved
+		if sample.Total > 0 {
+			moved = min(moved, sample.Total)
 		}
-		if sample.Total > 0 && moved > sample.Total {
-			moved = sample.Total
-		}
-		// The interval is only measured when there IS one. Two samples inside the same
-		// instant say nothing about a rate, and dividing by that gap would invent a
-		// number rather than measure one.
-		if state.hasBytes && now.After(state.prevAt) {
+		if !state.hasBytes || moved < state.prevMove {
+			// One worker can report a new fetch while retaining the same phase.
+			// Its initial counter is a new baseline, not newly received bytes.
+			state.byteSince, state.initialMove, state.rate = now, moved, 0
+		} else if now.After(state.prevAt) {
 			state.rate = float64(moved-state.prevMove) / now.Sub(state.prevAt).Seconds()
 		}
 		state.prevAt, state.prevMove = now, moved
@@ -235,11 +221,15 @@ func (p *phases) snapshot(subject string) (PhaseObservation, bool) {
 		rental := *state.rental
 		out.Rental = &rental
 	}
-	out.Models = state.modelSnapshots()
+	out.Models = state.modelSnapshots(time.Now())
 	if state.hasBytes {
-		if elapsed := state.at.Sub(state.since).Seconds(); elapsed > 0 {
-			out.Average = float64(state.moved) / elapsed
+		out.At = state.prevAt // byte-less heartbeats cannot freshen old byte estimates
+		if elapsed := state.prevAt.Sub(state.byteSince).Seconds(); elapsed > 0 && state.moved > state.initialMove {
+			out.Average = float64(state.moved-state.initialMove) / elapsed
 		}
+	}
+	if out.SampleAge() > PreparationRateMaxAge {
+		out.Rate, out.Average = 0, 0
 	}
 	return out, true
 }
@@ -300,6 +290,9 @@ func (p PhaseObservation) Frame(requestID string) Frame {
 // read a missing rate as zero, so a phase with no counters carries no counter keys at all.
 func (p PhaseObservation) wire() map[string]any {
 	out := map[string]any{"phase": p.Name}
+	if !p.At.IsZero() {
+		out["sample_age_ms"] = p.SampleAge().Milliseconds()
+	}
 	if p.Machine != "" {
 		out["machine"] = p.Machine
 	}
@@ -323,7 +316,7 @@ func (p PhaseObservation) wire() map[string]any {
 		if p.Total > 0 {
 			out["total_bytes"] = p.Total
 		}
-		if p.Rate > 0 {
+		if p.Rate > 0 && p.SampleAge() <= PreparationRateMaxAge {
 			out["rate_bytes_per_second"] = p.Rate
 		}
 		if remaining, ok := p.Remaining(); ok {
@@ -519,6 +512,7 @@ type ModelDownloadProgress struct {
 	CachedBytes uint64  `json:"cached_bytes,omitempty"`
 	Rate        float64 `json:"rate_bytes_per_second,omitempty"`
 	RemainingMS *int64  `json:"remaining_ms,omitempty"`
+	SampleAgeMS int64   `json:"sample_age_ms"`
 }
 
 type modelDownloadState struct {
@@ -538,19 +532,18 @@ func (p *phaseState) observeModels(samples []ModelDownloadProgress, now time.Tim
 		if sample.Model == "" || sample.Manifest == "" {
 			continue
 		}
+		sample.Rate, sample.RemainingMS = 0, nil
 		key := sample.Model + "\x00" + sample.Release + "\x00" + sample.Lane + "\x00" + sample.Manifest
 		moved := sample.OriginBytes + sample.CachedBytes
 		old, exists := p.models[key]
 		if !exists || moved < old.previous || sample.Moved < old.value.Moved {
 			old = modelDownloadState{since: now, previousAt: now, initial: moved, previous: moved}
 		}
-		if now.After(old.previousAt) && moved > old.previous {
+		if now.After(old.previousAt) {
 			sample.Rate = float64(moved-old.previous) / now.Sub(old.previousAt).Seconds()
-			old.previousAt, old.previous = now, moved
-		} else {
-			sample.Rate = old.value.Rate
 		}
-		if elapsed := now.Sub(old.since).Seconds(); elapsed > 0 && moved > old.initial && sample.Total > sample.Moved {
+		old.previousAt, old.previous = now, moved
+		if elapsed := now.Sub(old.since).Seconds(); elapsed > 0 && sample.Rate > 0 && moved > old.initial && sample.Total > sample.Moved {
 			average := float64(moved-old.initial) / elapsed
 			seconds := float64(sample.Total-sample.Moved) / average
 			if seconds > 0 && seconds < float64(time.Duration(1<<62)/time.Second) {
@@ -563,7 +556,7 @@ func (p *phaseState) observeModels(samples []ModelDownloadProgress, now time.Tim
 	}
 }
 
-func (p *phaseState) modelSnapshots() []ModelDownloadProgress {
+func (p *phaseState) modelSnapshots(now time.Time) []ModelDownloadProgress {
 	keys := make([]string, 0, len(p.models))
 	for key := range p.models {
 		keys = append(keys, key)
@@ -571,7 +564,13 @@ func (p *phaseState) modelSnapshots() []ModelDownloadProgress {
 	sort.Strings(keys)
 	out := make([]ModelDownloadProgress, 0, len(keys))
 	for _, key := range keys {
-		out = append(out, p.models[key].value)
+		state := p.models[key]
+		value := state.value
+		value.SampleAgeMS = max(now.Sub(state.previousAt), 0).Milliseconds()
+		if now.Sub(state.previousAt) > PreparationRateMaxAge {
+			value.Rate, value.RemainingMS = 0, nil
+		}
+		out = append(out, value)
 	}
 	return out
 }

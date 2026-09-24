@@ -724,7 +724,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
-			"phase_remaining_ms", "progress_stage", "stage_fraction", "overall_fraction",
+			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
 			"created_at"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
@@ -797,6 +797,9 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 			}
 			if life.PhaseTotalBytes != nil {
 				typed["phase_total_bytes"] = *life.PhaseTotalBytes
+			}
+			if life.PhaseSampleAgeMS != nil {
+				typed["phase_sample_age_ms"] = *life.PhaseSampleAgeMS
 			}
 			if life.PhaseRate != nil {
 				typed["phase_rate_bytes_per_second"] = *life.PhaseRate
@@ -912,6 +915,10 @@ func PhaseCell(life api.Lifecycle) string {
 			moved += " / " + output.Bytes(*life.PhaseTotalBytes)
 		}
 		parts = append(parts, moved)
+	}
+	if life.PhaseSampleAgeMS != nil && time.Duration(*life.PhaseSampleAgeMS)*time.Millisecond > orchestrator.PreparationRateMaxAge {
+		parts = append(parts, "last update "+shortDuration(time.Duration(*life.PhaseSampleAgeMS)*time.Millisecond)+" ago")
+		return strings.Join(parts, " · ")
 	}
 	if life.PhaseRate != nil {
 		parts = append(parts, output.Bytes(int64(*life.PhaseRate))+"/s")
@@ -1820,6 +1827,9 @@ func HumanPhaseLine(value any) string {
 		if total, ok := number(fields["total_bytes"]); ok && total > 0 {
 			line += " of " + output.Bytes(int64(total))
 		}
+	}
+	if age, ok := number(fields["sample_age_ms"]); ok && time.Duration(age)*time.Millisecond > orchestrator.PreparationRateMaxAge {
+		return line + " · last update " + shortDuration(time.Duration(age)*time.Millisecond) + " ago"
 	}
 	if rate, ok := number(fields["rate_bytes_per_second"]); ok && rate > 0 {
 		line += " · " + output.Bytes(int64(rate)) + "/s"

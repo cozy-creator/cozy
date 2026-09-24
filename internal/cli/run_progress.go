@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 	"unicode"
@@ -185,6 +186,23 @@ func phaseFieldsAt(e localapi.Event, started, at time.Time) map[string]any {
 	} else {
 		fields["elapsed_ms"] = float64(max(at.Sub(started), 0).Milliseconds())
 	}
+	if age, measured := number(fields["sample_age_ms"]); measured {
+		fields["sample_age_ms"] = age + float64(max(at.Sub(eventTime(e)), 0).Milliseconds())
+	}
+	if models, ok := fields["models"].([]any); ok {
+		aged := make([]any, len(models))
+		for i, raw := range models {
+			aged[i] = raw
+			if model, ok := raw.(map[string]any); ok {
+				copy := maps.Clone(model)
+				if age, measured := number(copy["sample_age_ms"]); measured {
+					copy["sample_age_ms"] = age + float64(max(at.Sub(eventTime(e)), 0).Milliseconds())
+				}
+				aged[i] = copy
+			}
+		}
+		fields["models"] = aged
+	}
 	return fields
 }
 
@@ -278,6 +296,14 @@ func phaseRows(fields map[string]any) []string {
 			if hasTotal && total > 0 {
 				row += " / " + output.Bytes(int64(total)) + " " + progressBar(moved/total, 10)
 			}
+		}
+		age, measured := number(model["sample_age_ms"])
+		if !measured {
+			age, _ = number(fields["sample_age_ms"])
+		}
+		if time.Duration(age)*time.Millisecond > orchestrator.PreparationRateMaxAge {
+			rows = append(rows, row+" · last update "+shortDuration(time.Duration(age)*time.Millisecond)+" ago")
+			continue
 		}
 		if rate, ok := number(model["rate_bytes_per_second"]); ok && rate > 0 {
 			row += " · " + output.Bytes(int64(rate)) + "/s"

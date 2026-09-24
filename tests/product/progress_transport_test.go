@@ -160,6 +160,13 @@ func TestPreparationSnapshotCarriesRentalAndSeparateModelProgress(t *testing.T) 
 	if frame.Value.Detail != "package@1" || len(frame.Value.Models) != 2 || frame.Value.Models[0].Moved != 9500 {
 		t.Fatalf("phase wire lost detail or model counters: %s", body)
 	}
+	// A heartbeat with unchanged byte counters is not evidence that the old
+	// transfer rate continues. Keep the bytes but withdraw its speed and ETA.
+	o.c.ObservePhase("model-stage", orchestrator.PhaseSample{Name: "downloading", Models: []orchestrator.ModelDownloadProgress{first}})
+	quiet, _ := o.c.PreparationPhase("model-stage")
+	if quiet.Models[0].Moved != first.Moved || quiet.Models[0].Rate != 0 || quiet.Models[0].RemainingMS != nil {
+		t.Fatalf("unchanged model bytes retained an old estimate: %+v", quiet.Models[0])
+	}
 	// A new native fetch may start at a smaller counter; it needs a fresh rate basis.
 	first.Moved, first.OriginBytes = 0, 0
 	o.c.ObservePhase("model-stage", orchestrator.PhaseSample{Name: "downloading", Models: []orchestrator.ModelDownloadProgress{first}})
