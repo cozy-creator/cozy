@@ -422,7 +422,7 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 		if progress != nil {
 			progress.stop()
 		}
-		return 0, c.transport(err)
+		return 0, TransportFailure(c.base, err)
 	}
 	defer resp.Body.Close()
 	if progress != nil {
@@ -448,7 +448,9 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 				"the hub at %s stopped sending its response body for %s", c.base, Timeout).
 				WithRemedy("retry; if it persists the hub is up but its response stream is stalled")
 		}
-		return resp.StatusCode, c.transport(err)
+		return resp.StatusCode, exit.Named(exit.Unavailable, "hub.response_interrupted",
+			"Tensorhub at %s broke off its response: %s", c.base, innermost(err)).
+			WithRemedy("retry; if it persists the hub or a proxy in front of it is dropping connections")
 	}
 	if resp.StatusCode >= 400 {
 		return resp.StatusCode, c.refusal(resp.StatusCode, raw)
@@ -484,19 +486,6 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 		}
 	}
 	return resp.StatusCode, nil
-}
-
-// transport maps a failure that never became an HTTP answer. Unreachable is 9;
-// a deadline is 10 — a hub that is up but stuck is a different problem.
-func (c *Client) transport(err error) *exit.Error {
-	var netErr net.Error
-	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "Client.Timeout") ||
-		(errors.As(err, &netErr) && netErr.Timeout()) {
-		return exit.New(exit.Deadline, "the hub at %s did not answer within %s", c.base, Timeout).
-			WithRemedy("retry; if it persists the hub is up but not serving")
-	}
-	return exit.Unavailablef("Tensorhub at %s is unavailable. Try again later.", c.base).
-		WithRemedy("Set TENSORHUB_URL to use a different Tensorhub.")
 }
 
 // refusal renders the hub's own typed envelope under a shared-matrix code. The hub's

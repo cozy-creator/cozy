@@ -24,6 +24,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -159,12 +160,12 @@ type Manager struct {
 }
 
 func New(cfg config.Config) *Manager {
-	hub := strings.TrimRight(strings.TrimSpace(cfg.HubURL), "/")
-	sum := sha256.Sum256([]byte(hub))
+	origin := strings.TrimRight(strings.TrimSpace(cfg.HubURL), "/")
+	sum := sha256.Sum256([]byte(origin))
 	return &Manager{
-		hub:  hub,
+		hub:  origin,
 		path: filepath.Join(cfg.Home, "auth", hex.EncodeToString(sum[:])+".json"),
-		http: &http.Client{Timeout: 10 * time.Second},
+		http: &http.Client{Timeout: hub.Timeout},
 		now:  time.Now,
 	}
 }
@@ -436,10 +437,7 @@ func (m *Manager) post(ctx context.Context, path string, body, out any) *exit.Er
 	request.Header.Set("User-Agent", "cozy-auth/1")
 	response, err := m.http.Do(request)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return exit.Named(exit.Deadline, "auth.deadline", "Tensorhub did not answer authentication in time")
-		}
-		return exit.Unavailablef("Tensorhub authentication is unavailable: %s", err)
+		return hub.TransportFailure(m.hub, err)
 	}
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxAnswer+1))

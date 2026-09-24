@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"slices"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 )
 
@@ -18,6 +19,9 @@ type RentalInventory struct {
 	Rentals              []RentalSummary `json:"rentals"`
 	Unrecorded           []RentalSummary `json:"unrecorded"`
 	Pending              []RentalSummary `json:"pending"`
+	// HubUnanswered is set when Tensorhub did not answer this read. Rows are then
+	// this host's last records and the totals are unknown, not zero.
+	HubUnanswered *exit.Error `json:"hub_unanswered,omitempty"`
 }
 
 // Current removes proven-absent rentals from the fleet projection without

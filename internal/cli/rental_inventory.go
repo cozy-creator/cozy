@@ -16,18 +16,22 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 	defer fleet.mu.Unlock()
 	var result api.RentalInventory
 	if reconcile {
-		if problem := fleet.reconcileLocked(); problem != nil {
+		if problem := fleet.reconcileLocked(); problem != nil && !hub.Unanswered(problem) {
 			return result, problem
 		}
 	}
 	// totalsLocked propagates a failed Hub census and refuses when the Hub has
-	// no listing route. Success therefore means the inventory can report totals;
-	// an unavailable account view never becomes an empty or partial success.
+	// no listing route. A Hub that did not answer at all yields this host's own
+	// records marked as such, never totals: the caller must still fail.
 	count, burn, problem := fleet.totalsLocked()
-	if problem != nil {
+	switch {
+	case hub.Unanswered(problem):
+		result.HubUnanswered = problem
+	case problem != nil:
 		return result, problem
+	default:
+		result.MachinesRunning, result.HourlySpendUSDMicros = count, burn
 	}
-	result.MachinesRunning, result.HourlySpendUSDMicros = count, burn
 	result.IdleReleaseSeconds = int64(fleet.ctx.Cfg.RentalsIdleRelease / time.Second)
 	rows, problem := st.Rentals()
 	if problem != nil {

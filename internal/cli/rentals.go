@@ -893,6 +893,10 @@ func handleRentalList(ctx *Context) *exit.Error {
 		if reconcile {
 			last = time.Now()
 		}
+		ctx.exitCode = 0
+		if inventory.HubUnanswered != nil {
+			ctx.exitCode = 1
+		}
 		list := renderRentalList(inventory)
 		if watching {
 			list.Next = nil
@@ -939,6 +943,17 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			{K: "hourly_spend_usd_micros", V: jsonFact{burn}}},
 		Trail: []string{idleShutdownNote(grace)},
 		Next:  []string{"cozy help rental"},
+	}
+	if problem := inventory.HubUnanswered; problem != nil {
+		list.Lead = []string{problem.Message,
+			"Showing this host's last local records, which may be out of date; " +
+				"account totals and machines this host never recorded are unknown."}
+		list.Aggregates = []output.Field{{K: "live", V: jsonFact{false}}, {K: "hub_error", V: jsonFact{projectError(problem)}}}
+		if problem.Remedy != "" {
+			list.Trail = append(list.Trail, "Try: "+problem.Remedy)
+		}
+	} else {
+		list.Aggregates = append(list.Aggregates, output.Field{K: "live", V: jsonFact{true}})
 	}
 	haveFailure := false
 	for _, r := range rows {
@@ -1089,6 +1104,11 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			"Paid asks with no attached machine: %d (a pod may be provisioning and billing under each)", unattached))
 		list.Aggregates = append(list.Aggregates,
 			output.Field{K: "unattached_rental_operations", V: jsonFact{unattached}})
+	}
+	if inventory.HubUnanswered != nil {
+		for _, row := range list.Rows {
+			row["state"] += " (unverified)"
+		}
 	}
 	return list
 }

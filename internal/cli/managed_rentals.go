@@ -917,6 +917,11 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 // that has no row.
 func (m *managedRentals) reconcileLocked() *exit.Error {
 	if problem := m.reconcileRowsLocked(); problem != nil {
+		if hub.Unanswered(problem) {
+			// The census is as unknown as the rows: a later cached read must not
+			// present the previous listing as current.
+			m.listed, m.listingProblem, m.unrecorded = false, problem, nil
+		}
 		return problem
 	}
 	m.reconcileListingLocked()
