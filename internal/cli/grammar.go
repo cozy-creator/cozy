@@ -3,9 +3,10 @@ package cli
 // CLI is the complete public command grammar. Kong derives parsing and help from
 // this tree; there is no parallel command manifest or string handler registry.
 type CLI struct {
-	JSON   bool     `help:"Emit JSON instead of human-readable output."`
-	Full   bool     `help:"Include complete values and all available fields."`
-	Fields []string `help:"Select result fields." sep:","`
+	Tensorhub *string  `help:"Use this Tensorhub URL for this command, overriding config and environment." placeholder:"URL"`
+	JSON      bool     `help:"Emit JSON instead of human-readable output."`
+	Full      bool     `help:"Include complete values and all available fields."`
+	Fields    []string `help:"Select result fields." sep:","`
 
 	Package PackageCmd `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
 	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`

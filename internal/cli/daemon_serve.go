@@ -101,6 +101,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	defer held.Release()
+	if e := held.PublishTensorhub(ctx.Cfg.HubURL); e != nil {
+		closeListeners()
+		return e
+	}
 
 	// The schema-22 migration folds each kept triage file into its attempt row; the
 	// retired-shape sweep below removes the directory afterwards.

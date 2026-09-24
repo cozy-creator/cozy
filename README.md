@@ -593,7 +593,7 @@ Nothing is kept on disk without a live reason; the daemon's start-time sweeps (`
 them) are only the backstop for a process that crashed and report `reclaimed 0` on a healthy box.
 
 Configuration is read once from `~/.cozy/config.yaml`, then credential/location environment
-variables override it:
+variables override it. `--tensorhub=URL` overrides both for one command:
 
 ```yaml
 tensorhub_url: https://tensorhub.example
@@ -617,6 +617,16 @@ loopback port when another process owns 8818. A configured nonzero port is stric
 explicitly asks the OS to select any available port.
 
 Without `tensorhub_url`, Cozy uses the standing local Tensorhub at `http://127.0.0.1:8819`.
+
+```sh
+cozy --tensorhub=https://tensorhub.com model search minimax
+cozy package publish --tensorhub=http://127.0.0.1:8819
+```
+
+The override does not rewrite `config.yaml`. Machine login records are scoped to the selected
+Tensorhub. A running daemon keeps its launch-time Tensorhub; a run selecting a different Hub
+is refused before submission. Finish that daemon's work before restarting it for another Hub.
+Catalog and publication commands can select another Hub without restarting the daemon.
 
 The YAML schema is strict: unknown keys, duplicate keys, undeclared nested structures, and multiple
 documents are refused. Cozy does not load a working-directory `.env` file.
