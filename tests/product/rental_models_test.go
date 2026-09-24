@@ -40,8 +40,8 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{{"name": "h200", "accelerator_model": "NVIDIA H200",
-			"accelerator_count": 1, "compute_capability": "9.0", "vram_gb": 141, "minimum_ram_per_gpu_gb": 128, "price_usd_micros_per_hour": 1_000_000,
-			"storage_usd_micros_per_hour": 100_000, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86"}})
+			"compute_capability": "9.0", "vram_gb": 141, "minimum_ram_per_gpu_gb": 128, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",
+			"widths": []map[string]any{{"accelerator_count": 1, "price_usd_micros_per_hour": 1_000_000, "storage_usd_micros_per_hour": 100_000}}}})
 	})
 	mux.HandleFunc("GET /v1/models/resolve", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()

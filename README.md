@@ -474,9 +474,13 @@ reuse; job workers are reclaimed at terminal.
 
 With Tensorhub configured, rent generic private capacity:
 
+`cozy rent` is an alias for `cozy rental`. An odd `--gpus` above 1 is allowed; the worker
+runs at the largest parallel degree the package supports and leaves the rest idle.
+
 ```sh
-cozy rental new                   # Cozy GPUs, VRAM, and retail hourly prices
+cozy rental new                   # Cozy GPUs, their GPU counts, VRAM, and hourly prices
 cozy rental new h100-sxm5-80gb     # prints e.g. otter
+cozy rental new h100-sxm5-80gb --gpus 2   # one machine with 2 GPUs; keep counts even
 cozy rental new h100-sxm5-80gb --model paul/minimax-h3@1.0.0/bf16
 cozy rental new h100-sxm5-80gb \
   --idempotency-key <unique-key>
@@ -691,5 +695,5 @@ Choose existing capacity explicitly with `cozy run org/package/function --rental
 (or its rental ID). This constraint survives retries and daemon restarts. If that
 rental becomes unavailable, the run fails or retains its work; it never buys a
 replacement or moves onto another machine. `--rental-only` retains automatic remote
-allocation. Create capacity with `cozy rental new <machine-slug>`, such as `cozy rental new h100-sxm5-80gb-x2`;
+allocation. Create capacity with `cozy rental new <machine-slug>`, such as `cozy rental new h100-sxm5-80gb --gpus 2`;
 `cozy rental new` alone lists the current catalog.

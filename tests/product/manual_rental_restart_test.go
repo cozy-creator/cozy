@@ -222,7 +222,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 						skus[i].ComputeCapability, skus[i].VRAMGB, skus[i].MinimumRAMPerGPUGB = "8.9", 24, 64
 					}
 				}
-				_ = json.NewEncoder(w).Encode(skus)
+				_ = json.NewEncoder(w).Encode(hubapi.RentalProducts(skus))
 				return
 			case "/v1/rentals/" + podRental:
 				_ = json.NewEncoder(w).Encode(rentalView)
@@ -237,7 +237,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		op, _, problem := store.BeginRentalOperation(records.RentalOperation{
 			Key: "manual-restart", Hub: hub.URL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 1,
 		}, 2_000_000, 0, func(name string) ([]byte, string, *exit.Error) {
-			body, problem := hubapi.RentalRequestBytes(name, "cpu", secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil)
+			body, problem := hubapi.RentalRequestBytes(name, "cpu", 1, secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil)
 			return body, fmt.Sprintf("sha256:%x", sha256.Sum256(body)), problem
 		}, nil)
 		fatal(t, problem)

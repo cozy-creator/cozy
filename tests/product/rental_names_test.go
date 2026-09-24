@@ -77,7 +77,7 @@ func TestRentalMachineNames(t *testing.T) {
 		op, replay, problem := store.BeginRentalOperation(records.RentalOperation{
 			Key: key, Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100_000,
 		}, fleetCap, 0, func(machineName string) ([]byte, string, *exit.Error) {
-			body, problem := hub.RentalRequestBytes(machineName, "cpu", strings.Repeat("ab", 32),
+			body, problem := hub.RentalRequestBytes(machineName, "cpu", 1, strings.Repeat("ab", 32),
 				"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil)
 			return body, "sha256:" + strings.Repeat("cd", 32), problem
 		}, nil)

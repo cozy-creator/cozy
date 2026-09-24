@@ -52,7 +52,7 @@ func proveUnavailableRentalListing(t *testing.T, unavailableStatus int) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`[{"name":"cpu","accelerator_model":"CPU","accelerator_count":1,"price_usd_micros_per_hour":100000}]`))
+		_, _ = w.Write([]byte(`[{"name":"cpu","accelerator_model":"CPU","widths":[{"accelerator_count":1,"price_usd_micros_per_hour":100000}]}]`))
 	})
 	mux.HandleFunc("POST /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		purchases.Add(1)

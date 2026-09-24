@@ -244,6 +244,9 @@ type PlacementCandidate struct {
 	Rental  string `json:"rental,omitempty"`
 	Machine string `json:"machine,omitempty"`
 	SKU     string `json:"sku"`
+	// GPUs is the machine's GPU count: the product width a buy asks for, or an attached
+	// rental's own.
+	GPUs int `json:"gpus"`
 	// Rung is the 1-based ladder rung the machine fell under — 0 under an explicit lane,
 	// which is not a rung — and Lane the lane it pins; Fit says how the device was sized
 	// against that lane (cl-168, cl-170).
@@ -254,7 +257,7 @@ type PlacementCandidate struct {
 	Ahead int `json:"ahead,omitempty"`
 	// RateUSDMicrosPerHour is what the renter pays: the live catalog's price plus storage.
 	RateUSDMicrosPerHour int64 `json:"rate_usd_micros_per_hour"`
-	// Measured says a throughput row exists for (lane, sku). TimeS, CostUSDMicros and
+	// Measured says a throughput row exists for (lane, sku, gpus). TimeS, CostUSDMicros and
 	// Score follow placement-economics.md and are zero on an unmeasured candidate.
 	Measured      bool    `json:"measured"`
 	TimeS         float64 `json:"time_s,omitempty"`
@@ -295,7 +298,15 @@ func (c PlacementCandidate) Name() string {
 	if c.Rental != "" {
 		return c.Rental
 	}
-	return c.SKU
+	return MachineLabel(c.SKU, c.GPUs)
+}
+
+// MachineLabel is how a product at a GPU count reads: `h100-sxm5-80gb`, `2x h100-sxm5-80gb`.
+func MachineLabel(sku string, gpus int) string {
+	if gpus > 1 {
+		return fmt.Sprintf("%dx %s", gpus, sku)
+	}
+	return sku
 }
 
 // Chosen is the candidate the decision placed the run on.
@@ -353,11 +364,12 @@ func (d PlacementDecision) Line() string {
 }
 
 // describe is the candidate as a line names it: `morgiana (h100-80, fp8)` for a rental,
-// `h100-80 (fp8)` for a product.
+// `h100-80 (fp8)` or `2x h100-80 (fp8)` for a product.
 func (c PlacementCandidate) describe() string {
-	name, detail := c.SKU, []string{}
+	sku := MachineLabel(c.SKU, c.GPUs)
+	name, detail := sku, []string{}
 	if c.Attached() {
-		name, detail = c.Name(), append(detail, c.SKU)
+		name, detail = c.Name(), append(detail, sku)
 	}
 	if c.Lane != "" {
 		detail = append(detail, c.Lane)

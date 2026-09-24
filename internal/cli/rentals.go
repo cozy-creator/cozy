@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -75,7 +76,7 @@ func handleRent(ctx *Context) *exit.Error {
 	skuName := strings.TrimSpace(ctx.Inv.Args[0])
 	if skuName == "" {
 		_, developmentSet := ctx.Inv.Bools["--development"]
-		if ctx.Inv.Value("--idempotency-key") != "" ||
+		if ctx.Inv.Value("--idempotency-key") != "" || ctx.Inv.Value("--gpus") != "" ||
 			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || developmentSet || ctx.Inv.Value("--ssh-public-key") != "" {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
@@ -88,7 +89,18 @@ func handleRent(ctx *Context) *exit.Error {
 		}
 		return emitRentalCatalog(ctx, skus)
 	}
+	gpus := 1
+	if v := ctx.Inv.Value("--gpus"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return exit.Usagef("--gpus %q is not a positive GPU count", v)
+		}
+		gpus = n
+	}
 	reason := "cozy rental new " + skuName
+	if gpus != 1 {
+		reason += " --gpus " + strconv.Itoa(gpus)
+	}
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
 	// rather than on a clock: a pod that is still booting is not a pod that has failed.
 	deadline := time.Time{}
@@ -121,13 +133,16 @@ func handleRent(ctx *Context) *exit.Error {
 		// Resuming it neither needs current stock nor admits a second purchase.
 		sku.PriceUSDMicrosPerHour = existing.HourlyRateUSDMicros
 	} else {
-		line, admitted, problem := fleet.admit(skuName)
+		line, admitted, problem := fleet.admit(skuName, gpus)
 		if problem != nil {
 			return problem
 		}
 		sku = admitted
 		if !ctx.Mode().JSON {
 			fmt.Fprintln(ctx.Err, line)
+			if note := oddGPUNote(gpus); note != "" {
+				fmt.Fprintln(ctx.Err, note)
+			}
 		}
 	}
 
@@ -153,7 +168,7 @@ func handleRent(ctx *Context) *exit.Error {
 		AcceleratorModel: sku.AcceleratorModel, AcceleratorCount: sku.AcceleratorCount,
 		HourlyRateUSDMicros: sku.PriceUSDMicrosPerHour})
 
-	row, attachable, replay, e := acquireRentalContext(watchCtx, ctx, l, st, skuName,
+	row, attachable, replay, e := acquireRentalContext(watchCtx, ctx, l, st, skuName, gpus,
 		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
 		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", progress.rentalAcquisition, rentalRates(fleet.unrecorded))
 	if e != nil {
@@ -192,6 +207,9 @@ func handleRent(ctx *Context) *exit.Error {
 	if replay {
 		notes = append(notes, "the existing rental operation resumed")
 	}
+	if note := oddGPUNote(gpus); note != "" {
+		notes = append(notes, note)
+	}
 	fields := []output.Field{
 		{K: "machine", V: row.MachineName},
 		{K: "rental", V: ready.ID},
@@ -199,6 +217,7 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "address", V: ready.Address},
 		{K: "media", V: ready.MediaAddress},
 		{K: "gpu", V: skuName},
+		{K: "gpus", V: gpus},
 		{K: "accelerator", V: ready.AcceleratorModel},
 		{K: "base_worker_image_digest", V: ready.BaseWorkerImageDigest},
 		{K: "base_worker_image_tag", V: ready.BaseWorkerImageTag},
@@ -220,11 +239,11 @@ func handleRent(ctx *Context) *exit.Error {
 // acquireRental is the one paid mutation used by both `cozy rental new` and
 // `cozy run --rental`. It returns only after the immutable retail rate and the
 // worker's authenticated attach projection are durable locally.
-func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName,
+func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName string, gpus int,
 	operationKey, reason string, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
 	deadline time.Time, managedRequestID string, phase acquisitionPhase, observed map[string]int64,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
-	return acquireRentalContext(context.Background(), ctx, l, st, skuName, operationKey,
+	return acquireRentalContext(context.Background(), ctx, l, st, skuName, gpus, operationKey,
 		reason, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros, deadline,
 		managedRequestID, phase, observed)
 }
@@ -241,7 +260,7 @@ type acquisitionPhase func(hub.Rental)
 // SKU's estimated storage adder (th-126): admission money only, totaled with
 // the quote against the fleet cap and never persisted as the rate.
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
-	st *records.Store, skuName, operationKey, reason string,
+	st *records.Store, skuName string, gpus int, operationKey, reason string,
 	hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
 	deadline time.Time, managedRequestID string, phase acquisitionPhase, observed map[string]int64,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
@@ -276,9 +295,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		if problem != nil {
 			return records.Rental{}, hub.Rental{}, false, problem
 		}
-		if request.SKU != skuName {
+		if request.SKU != skuName || request.AcceleratorCount != gpus {
 			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
-				"rental operation %s names SKU %s, not %s", operationKey, request.SKU, skuName)
+				"rental operation %s names %s, not %s", operationKey,
+				orchestrator.MachineLabel(request.SKU, request.AcceleratorCount), orchestrator.MachineLabel(skuName, gpus))
 		}
 	}
 	var workload hub.DeclaredWorkload
@@ -345,7 +365,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	}
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
-		body, e := hub.RentalRequestBytes(machineName, skuName, secret.HashHex(token),
+		body, e := hub.RentalRequestBytes(machineName, skuName, gpus, secret.HashHex(token),
 			creator.PublicKey(), workload, development)
 		if e != nil {
 			return nil, "", e
@@ -561,52 +581,72 @@ func finishRentalAttachment(l home.Layout, st *records.Store, row records.Rental
 }
 
 func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
-	// Cheapest first on the combined micros a renter actually pays — the rate the
-	// placement decision reads — tie-broken by name so equal-priced rows hold still
-	// between runs. The sort key is the column the table shows, never its
-	// formatted text.
-	ladder := append([]hub.RentalSKU(nil), skus...)
-	total := func(sku hub.RentalSKU) int64 {
-		return sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour
+	// One row per product, cheapest one-machine rate first on the combined micros a
+	// renter actually pays, tie-broken by name so equal-priced rows hold still between
+	// runs. Each GPU count is priced per machine beside it.
+	products := hub.RentalProducts(skus)
+	total := func(width hub.RentalWidth) int64 {
+		return width.PriceUSDMicrosPerHour + width.StorageUSDMicrosPerHour
 	}
-	sort.Slice(ladder, func(i, j int) bool {
-		if total(ladder[i]) != total(ladder[j]) {
-			return total(ladder[i]) < total(ladder[j])
+	sort.Slice(products, func(i, j int) bool {
+		a, b := total(products[i].Widths[0]), total(products[j].Widths[0])
+		if a != b {
+			return a < b
 		}
-		return ladder[i].Name < ladder[j].Name
+		return products[i].Name < products[j].Name
 	})
 	human := ctx.Mode().Human && !ctx.Mode().JSON
 	acceleratorColumn := "gpu"
 	if human {
 		acceleratorColumn = "accelerator"
 	}
-	rows := make([]map[string]string, 0, len(ladder))
-	for _, sku := range ladder {
-		// The displayed price includes both compute and storage. Structured output
-		// retains the components and the provider accelerator identity.
+	rows := make([]map[string]string, 0, len(products))
+	for _, product := range products {
+		prices := make([]string, 0, len(product.Widths))
+		gpuPrices := make([]string, 0, len(product.Widths))
+		storage := make([]string, 0, len(product.Widths))
+		for _, width := range product.Widths {
+			label := ""
+			if len(product.Widths) > 1 || width.AcceleratorCount != 1 {
+				label = fmt.Sprintf("%dx ", width.AcceleratorCount)
+			}
+			prices = append(prices, label+rentalPrice(total(width)))
+			gpuPrices = append(gpuPrices, label+rentalPrice(width.PriceUSDMicrosPerHour))
+			storage = append(storage, label+rentalPrice(width.StorageUSDMicrosPerHour))
+		}
 		rows = append(rows, map[string]string{
-			"name": sku.Name, acceleratorColumn: acceleratorLabel(sku.AcceleratorModel, sku.AcceleratorCount),
-			"accelerator model": sku.AcceleratorModel,
-			"accelerator count": strconv.Itoa(sku.AcceleratorCount),
-			"compute":           computeCapabilityText(sku.ComputeCapability),
-			"vram":              fmt.Sprintf("%d GB", sku.VRAMGB),
-			"gpu price":         rentalPrice(sku.PriceUSDMicrosPerHour),
-			"storage price":     rentalPrice(sku.StorageUSDMicrosPerHour),
-			"price":             rentalPrice(total(sku)),
+			"name": product.Name, acceleratorColumn: acceleratorName(product.AcceleratorModel),
+			"accelerator model": product.AcceleratorModel,
+			"gpus":              joinInts(product.Counts()),
+			"compute":           computeCapabilityText(product.ComputeCapability),
+			"vram":              fmt.Sprintf("%d GB", product.VRAMGB),
+			"gpu price":         strings.Join(gpuPrices, ", "),
+			"storage price":     strings.Join(storage, ", "),
+			"price":             strings.Join(prices, ", "),
 		})
 	}
 	doc := output.List{
 		Name:   "gpus",
-		Fields: []string{"name", acceleratorColumn, "compute", "vram", "price"},
-		AllFields: []string{"name", "gpu", "accelerator model", "accelerator count", "compute",
+		Fields: []string{"name", acceleratorColumn, "gpus", "compute", "vram", "price"},
+		AllFields: []string{"name", "gpu", "accelerator model", "gpus", "compute",
 			"vram", "gpu price", "storage price", "price"},
 		Rows: rows, Total: len(rows),
-		Next: []string{"cozy rental new <machine-slug>"},
+		Next: []string{"cozy rental new <machine-slug> [--gpus N]"},
 	}
 	if human {
 		doc.AllFields = doc.Fields
 	}
 	return emit(ctx, doc)
+}
+
+// oddGPUNote recommends an even count: sequence-parallel packages shard at even degrees,
+// so an odd count above one leaves a GPU the worker cannot use for parallelism.
+func oddGPUNote(gpus int) string {
+	if gpus < 2 || gpus%2 == 0 {
+		return ""
+	}
+	return fmt.Sprintf("note: %d GPUs is odd; keep to an even count for parallelism — the worker "+
+		"runs at the largest parallel degree the package supports that fits", gpus)
 }
 
 // acceleratorLabel is how a machine READS in the GPU column: its card, and — because a

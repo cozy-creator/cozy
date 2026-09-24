@@ -231,12 +231,15 @@ func TestRentalNewIsTheOnlyCreationCommand(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "<machine-slug>") || !strings.Contains(out, "h100-sxm5-80gb") {
 		t.Fatalf("rental new does not describe its machine slug: %d %s", code, out)
 	}
-	// The old root verb is removed, not a hidden second parser entry.
-	for _, args := range [][]string{{"rent"}, {"rent", "cpu", "--json"}} {
-		code, out = runCozy(t, root, args...)
-		if code == 0 || !strings.Contains(out, "unexpected argument rent") {
-			t.Fatalf("retired creation verb remains callable %v: %d %s", args, code, out)
-		}
+	// `cozy rent` is the rental group under another name (Paul, 2026-09-24), never a
+	// second creation verb: `rent <sku>` is refused, `rent new` is `rental new`.
+	code, out = runCozy(t, root, "rent", "cpu", "--json")
+	if code == 0 {
+		t.Fatalf("`cozy rent <sku>` became a creation shorthand: %s", out)
+	}
+	code, out = runCozy(t, root, "rent", "new", "--json")
+	if code != 0 || !strings.Contains(out, "cpu") {
+		t.Fatalf("`cozy rent new` is not `cozy rental new`: %d %s", code, out)
 	}
 }
 
@@ -363,12 +366,9 @@ func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
 
 func TestExplicitWideJobKeepsOrdinarySingleExecutorDirective(t *testing.T) {
 	row := records.Rental{ID: "chosen", State: "ready", Address: "fixture", CertPath: "fixture", AcceleratorModel: h100SXM, AcceleratorCount: 4}
-	for _, explicit := range []bool{false, true} {
-		candidate := orchestrator.PlacementCandidate{Rental: row.ID}
-		accepted := rental.Standing(&candidate, nil, row, 80, true, true, true, rental.Constraints{}, explicit)
-		if accepted != explicit {
-			t.Fatalf("explicit=%v: accepted=%v verdict=%s", explicit, accepted, candidate.Verdict)
-		}
+	candidate := orchestrator.PlacementCandidate{Rental: row.ID}
+	if !rental.Standing(&candidate, nil, row, 80, true, true, true) {
+		t.Fatalf("a paid four-card rental was refused for a job: verdict=%s", candidate.Verdict)
 	}
 	pod := &fakePod{serve: true, deviceCount: 4}
 	root := t.TempDir()

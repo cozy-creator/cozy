@@ -308,7 +308,7 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(h.skus)
+		_ = json.NewEncoder(w).Encode(catalogRows(h.skus))
 	})
 	mux.HandleFunc("POST /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
@@ -358,6 +358,34 @@ func (h *fakeRentalHub) publishListing() {
 
 // setSKUs is the fake hub's product catalog, the shape Tensorhub serves it:
 // GPU list price and the spec-derived storage adder, decomposed (th-126).
+// catalogRows groups flat per-count SKU maps into the hub's listing: one row per name,
+// its counts under `widths`.
+func catalogRows(skus []map[string]any) []map[string]any {
+	var out []map[string]any
+	index := map[any]int{}
+	for _, sku := range skus {
+		width := map[string]any{"accelerator_count": 1}
+		row := map[string]any{}
+		for key, value := range sku {
+			switch key {
+			case "accelerator_count", "price_usd_micros_per_hour", "storage_usd_micros_per_hour":
+				width[key] = value
+			default:
+				row[key] = value
+			}
+		}
+		i, seen := index[row["name"]]
+		if !seen {
+			i = len(out)
+			index[row["name"]] = i
+			row["widths"] = []map[string]any{}
+			out = append(out, row)
+		}
+		out[i]["widths"] = append(out[i]["widths"].([]map[string]any), width)
+	}
+	return out
+}
+
 func (h *fakeRentalHub) setSKUs(skus ...map[string]any) {
 	h.mu.Lock()
 	defer h.mu.Unlock()

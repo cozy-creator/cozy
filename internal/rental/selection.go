@@ -43,7 +43,7 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		if (sku.AcceleratorModel != "CPU") != needsAccelerator {
 			continue
 		}
-		c := orchestrator.PlacementCandidate{SKU: sku.Name,
+		c := orchestrator.PlacementCandidate{SKU: sku.Name, GPUs: sku.AcceleratorCount,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
 		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job)
 		if c.Verdict == "" {
@@ -125,11 +125,9 @@ func FitNote(need records.Residency, vramGB int64) string {
 	return fmt.Sprintf("%s %.1f GiB of %d GB", need.Fit, float64(need.Bytes)/(1<<30), vramGB)
 }
 
-// WidthUnusable keeps a machine WIDER than one card out of the decision unless this request
-// can actually use every card it would be billed for (cl-179). It holds a BUY and a REUSE
-// to the same rule: a wide pod already up is as unusable to a package that cannot shard as
-// one that has not been bought yet, and choosing it would fail the request typed at the
-// worker instead of placing it on a machine that works.
+// WidthUnusable keeps a BUY of a machine wider than one card out of the decision unless
+// this request can use every card it would be billed for (cl-179). A reuse is not held to
+// it: the worker runs a paid wide pod at the best declared degree that fits.
 //
 // A wide machine is not more capacity: every rank of a sequence-parallel group holds the
 // FULL weights, so width buys latency and never fit. The only thing that uses the extra
@@ -275,21 +273,16 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 // the request settled FAILED on a fleet that was simply still booting.
 func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	row records.Rental, vramGB int64, needsAccelerator, offered, job bool,
-	constraints Constraints, explicit bool,
 ) bool {
 	if needsAccelerator && row.AcceleratorModel == "CPU" {
 		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
 		return false
 	}
-	// A machine the user already has up is held to the same floor as a buy; the catalog's
-	// memory figure for its product is the fact (a product gone from the catalog this
-	// minute decides nothing). Its WIDTH is held to the same rule too, and read from the
-	// machine's own row rather than its product's: an attached rental is the authority on
-	// how many cards it has, and its SKU may have left the catalog (cl-179).
+	// A machine the user already has up is held to the same memory floor as a buy; the
+	// catalog's figure for its product is the fact (a product gone from the catalog this
+	// minute decides nothing). Its GPU count is not held to the package's degrees: the
+	// pod is already paid for, and the worker runs at the best declared degree that fits.
 	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job)
-	if c.Verdict == "" && !(explicit && job) {
-		c.Verdict = WidthUnusable(row.AcceleratorCount, job, constraints)
-	}
 	switch {
 	case c.Verdict != "":
 		return false
@@ -418,7 +411,7 @@ func Wait(candidates []orchestrator.PlacementCandidate, attaching int) {
 }
 
 // Measure reads each open candidate's expected time and cost from the row measured for
-// its (lane, sku) under the first slot's model release, and returns the rows used. An
+// its (lane, sku, gpus) under the first slot's model release, and returns the rows used. An
 // attached rental runs after the attempts ahead of it and bills this request only the
 // run; a purchase pays its prepare time and bills all of it (placement-economics.md).
 func Measure(candidates []orchestrator.PlacementCandidate, rows []hub.ModelThroughput,
@@ -433,7 +426,8 @@ func Measure(candidates []orchestrator.PlacementCandidate, rows []hub.ModelThrou
 			continue
 		}
 		for _, row := range rows {
-			if row.Release != models[0].Release || row.Lane != c.Models[0].Lane || row.SKU != c.SKU {
+			if row.Release != models[0].Release || row.Lane != c.Models[0].Lane || row.SKU != c.SKU ||
+				max(row.AcceleratorCount, 1) != max(c.GPUs, 1) {
 				continue
 			}
 			seconds, billed := row.MedianS+row.PrepareS, row.MedianS+row.PrepareS
@@ -453,7 +447,7 @@ func Measure(candidates []orchestrator.PlacementCandidate, rows []hub.ModelThrou
 
 func contains(rows []hub.ModelThroughput, row hub.ModelThroughput) bool {
 	for _, have := range rows {
-		if have.Lane == row.Lane && have.SKU == row.SKU {
+		if have.Lane == row.Lane && have.SKU == row.SKU && have.AcceleratorCount == row.AcceleratorCount {
 			return true
 		}
 	}
