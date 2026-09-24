@@ -551,7 +551,7 @@ func servePod(t *testing.T, pod *standInPod, certPath string) string {
 func standInMedia(t *testing.T) string {
 	t.Helper()
 	revision := mediawire.ContractRev
-	health, err := json.Marshal(mediawire.Health{Service: mediawire.Service, ContractRev: &revision, AttemptScopedInputs: true})
+	health, err := json.Marshal(mediawire.Health{Service: mediawire.Service, ContractRev: &revision})
 	must(t, err)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

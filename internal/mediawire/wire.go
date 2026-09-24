@@ -10,10 +10,9 @@ package mediawire
 const Service = "cozy-media"
 
 // ContractRev is the media plane's wire revision. BUMP IT whenever a route, an answer
-// field, or a published bound changes incompatibly. Both ends compare it before
-// any byte moves; a plane
-// answering a different revision — or none, which is a pod older than this check — is
-// refused at connect.
+// field, a required request parameter, or a published bound changes incompatibly.
+// Both ends compare it before any byte moves; a plane answering a different revision —
+// or none, which is a pod older than this check — is refused at connect.
 //
 // Rev 2 narrowed the health answer to the two fields that have a reader. Rev 1
 // also published `max_receipt_bytes`, `root`, `used_bytes`, `quota_bytes`,
@@ -30,11 +29,9 @@ const Service = "cozy-media"
 // recorded `bundle_absent` for every remote failure.
 const ContractRev = 3
 
-// Health is the GET /v1/health contract. Scoped input support is negotiated
-// separately so adding the safe upload route does not change the worker protocol
-// or prevent an older client from connecting to a receiver without reclamation.
+// Health is the GET /v1/health contract. `contract_rev` is the only negotiation on
+// this plane; route and request shapes belong to it, never to capability flags.
 type Health struct {
-	Service             string `json:"service"`
-	ContractRev         *int   `json:"contract_rev,omitempty"`
-	AttemptScopedInputs bool   `json:"attempt_scoped_inputs"`
+	Service     string `json:"service"`
+	ContractRev *int   `json:"contract_rev,omitempty"`
 }
