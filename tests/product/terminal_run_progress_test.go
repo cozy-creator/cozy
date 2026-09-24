@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -166,7 +168,15 @@ func TestRunListRetainsTerminalOverallProgress(t *testing.T) {
 				if test.status == pb.OutcomeStatus_OUTCOME_STATUS_FAILED {
 					cause, origin = pb.CauseCode_CAUSE_CODE_AUTHOR_EXCEPTION, pb.CauseOrigin_CAUSE_ORIGIN_AUTHOR
 				}
-				must(t, call.send(privateAttemptOutcome(call.offer, test.status, cause, origin)))
+				frame := privateAttemptOutcome(call.offer, test.status, cause, origin)
+				outcome := frame.GetAttemptOutcome()
+				var body pb.AttemptOutcomeBody
+				must(t, canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body))
+				body.Metrics = &pb.AttemptMetrics{PeakDeviceMemoryBytes: 7 << 30, RuntimeMs: 42310}
+				data, digest, err := canonical.Identity(&body)
+				must(t, err)
+				outcome.OutcomeCanonicalBytes, outcome.OutcomeDigest = data, digest
+				must(t, call.send(frame))
 			}
 			select {
 			case <-acked:
@@ -178,6 +188,15 @@ func TestRunListRetainsTerminalOverallProgress(t *testing.T) {
 				row := readList()
 				if row.Status == "in_progress" || row.StageFraction != nil || row.RemainingMS != nil {
 					t.Fatalf("terminal still exposes live telemetry: %+v", row)
+				}
+				if test.status != pb.OutcomeStatus_OUTCOME_STATUS_CANCELED {
+					reader, problem := localapi.Open(o.cfg, daemon.Probe(o.cfg))
+					fatal(t, problem)
+					detail, problem := reader.Request(id)
+					fatal(t, problem)
+					if detail.Metrics["peak_device_memory_bytes"] != float64(7<<30) || detail.Metrics["runtime_ms"] != float64(42310) {
+						t.Fatalf("API lost worker-reported terminal metrics: %+v", detail.Metrics)
+					}
 				}
 				if test.want == nil && row.OverallFraction != nil || test.want != nil && (row.OverallFraction == nil || *row.OverallFraction != *test.want) {
 					t.Fatalf("terminal overall=%v, want %v", row.OverallFraction, test.want)
