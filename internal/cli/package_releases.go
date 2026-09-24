@@ -63,7 +63,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		return lookupProblem
 	}
 	if problem := timings.stage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
-		return pack.BuildForPublish(hctx)
+		return pack.BuildForPublish(hctx, ctx.Inv.Values["--wheel"]...)
 	}); problem != nil {
 		return problem
 	}

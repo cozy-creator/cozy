@@ -114,11 +114,11 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 
 // BuildForPublish also rejects lock rows available only on the author's machine.
 // Declared compatibility bounds are preserved in the package metadata.
-func (p *Package) BuildForPublish(ctx context.Context) *exit.Error {
-	return p.build(ctx, true)
+func (p *Package) BuildForPublish(ctx context.Context, prebuiltWheels ...string) *exit.Error {
+	return p.build(ctx, true, prebuiltWheels...)
 }
 
-func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
+func (p *Package) build(ctx context.Context, publish bool, prebuiltWheels ...string) *exit.Error {
 	if p.Root != "" || p.Wheel != "" {
 		return exit.Internalf("package publication wheel staging was built more than once")
 	}
@@ -153,7 +153,7 @@ func (p *Package) build(ctx context.Context, publish bool) *exit.Error {
 		p.Root = ""
 		return problem
 	}
-	projects, problem := projectWheels(ctx, p.Tree, root, p.Name, p.Release, python.Executable)
+	projects, problem := projectWheels(ctx, p.Tree, root, p.Name, p.Release, python.Executable, prebuiltWheels...)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
@@ -206,14 +206,23 @@ func projectWheel(ctx context.Context, tree, out, name, release string, python s
 	return paths[0], nil
 }
 
-func projectWheels(ctx context.Context, tree, out, name, release string, python string) ([]string, *exit.Error) {
-	built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out, Python: python})
-	if problem != nil {
-		return nil, problem
-	}
-	paths := built.Paths
-	if len(paths) == 0 {
-		paths = []string{built.Path}
+func projectWheels(ctx context.Context, tree, out, name, release string, python string, prebuiltWheels ...string) ([]string, *exit.Error) {
+	var paths []string
+	if len(prebuiltWheels) != 0 {
+		var problem *exit.Error
+		paths, problem = stageProjectWheels(out, prebuiltWheels)
+		if problem != nil {
+			return nil, problem
+		}
+	} else {
+		built, problem := wheel.Build(wheel.Request{Context: ctx, Tree: tree, OutDir: out, Python: python})
+		if problem != nil {
+			return nil, problem
+		}
+		paths = built.Paths
+		if len(paths) == 0 {
+			paths = []string{built.Path}
+		}
 	}
 	for _, path := range paths {
 		fact, problem := wheel.InspectIdentity(path)

@@ -567,10 +567,11 @@ def check_manifest():
             bad.append(f"[grammar] retired command family remains: {retired}")
     if re.search(r"^\s*Reason\s+string\s+`", source, re.M) or '"--reason"' in source:
         bad.append("[grammar] public Cozy command retained caller-authored audit prose; decision #667 derives every audit reason")
-    if (
-        "type PackagePublishCmd struct{}" not in source
-        or "Package source tree." in source
-    ):
+    publish = re.search(r"type PackagePublishCmd struct\s*\{([^}]*)\}", source, re.S)
+    # Artifact inputs do not supply publication identity: owner/name/version
+    # still come exclusively from the account and project metadata.
+    publish_fields = re.findall(r"^\s*(\w+)\s+", publish.group(1), re.M) if publish else []
+    if not publish or set(publish_fields) - {"Wheel"} or "Package source tree." in source:
         bad.append("[grammar] package publish identity must come only from project metadata")
     derived_audits = {
         "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',

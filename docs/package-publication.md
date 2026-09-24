@@ -7,6 +7,22 @@ working tree is not required.
 cozy package publish
 ```
 
+To publish an existing wheel set from CI or a platform build matrix, repeat
+`--wheel` for each artifact:
+
+```sh
+cozy package publish --wheel dist/example-1.0.0-cp312-cp312-manylinux_2_28_x86_64.whl \
+  --wheel dist/example-1.0.0-cp313-cp313-manylinux_2_28_x86_64.whl
+```
+
+Supplying wheels skips the project wheel build. Cozy still builds the standard
+sdist from the current source tree and uploads its exact Runtime metadata.
+Every wheel must match the project's name, version, and application entry point.
+Tensorhub verifies each wheel's archive, RECORD, tags and common dependency
+metadata. It retains all variants in the package index and selects a compatible
+artifact for the requested executor. Unsupported Python/ABI/platform combinations
+refuse before installation.
+
 `pyproject.toml` is the publication authority:
 
 ```toml
@@ -27,9 +43,9 @@ recursively builds a separate non-editable wheel. Requested extras recursively a
 `[project.optional-dependencies]` groups. Cycles, conflicting normalized names, incompatible
 versions, more than 128 wheels, or more than 512 MiB of dependency wheels refuse before publication.
 For ordinary registry requirements, Cozy runs `uv export --locked` and sends the resulting
-lock rows — `(name, version, url, sha256, size)` — for Tensorhub to fetch itself under the
-same pinned discipline; the bytes never move through this machine (cl-078). Native-only,
-source-only, direct URL, VCS, and alternate-index
+lock rows — `(name, version, url, sha256, size)` — for Tensorhub to validate as metadata.
+Tensorhub does not download registry dependencies during publication. Source-only,
+direct URL, VCS, and alternate-index
 requirements are refused. Development dependency groups are ignored.
 Source custody is limited to 20,000 files and 512 MiB total; ordinary source files are limited to 64 MiB,
 prebuilt dependency wheels to 512 MiB, and `uv.lock` to 16 MiB. The three required files must be non-empty.
@@ -63,10 +79,11 @@ uploads unchanged. The same static reading, by the same host tool, is what insta
 with the committed release and what a job's descriptor id is read from (cl-175). Publication
 derives no checkpoint evidence, code topology, tensor requirements, or compatibility cache.
 
-The uploaded ordinary file tree contains the source paths, the project wheel at
-`artifacts/project/<wheel>`, genuinely bundled dependency wheels at
+The uploaded artifacts are a standard sdist at `artifacts/source/<sdist>.tar.gz`,
+one or more project wheels at `artifacts/project/<wheel>`, bundled dependency wheels at
 `artifacts/dependencies/<wheel>`, and `metadata/package-interface.json`. Registry wheels are
-external locked environment facts and are never re-uploaded.
+external locked environment facts and are never re-uploaded. `package.toml`,
+`pyproject.toml`, and `uv.lock` are also uploaded as exact runtime documents.
 
 Publication is one bounded digest-declared session:
 
@@ -79,7 +96,7 @@ Publication is one bounded digest-declared session:
 4. Cozy PUTs only the absent subjects; a 412 stands as success (the key already holds these
    exact bytes), so an unchanged republish uploads nothing.
 5. It finalizes with `{publication_id,registry:[...]}`. Tensorhub streams and re-hashes the
-   session's stored files, fetches registry wheels, validates the PackageInterface and wheel
+   session's stored files, validates registry metadata, the PackageInterface and wheel
    environment, and atomically commits the immutable release and ordinary file rows in Postgres.
    There is no package manifest, aggregate release digest, or committed marker object.
 
