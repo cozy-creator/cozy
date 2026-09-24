@@ -545,8 +545,10 @@ cozy down --all   # cancel all work, end all rentals, then stop the daemon
 ```
 
 None deletes installed package or model bytes. Normal and forced disconnect preserve
-retained paused/blocked/completed work and rental records. Accepted detached local and
-remote Runtime executions continue and reconnect on `cozy up`. Unfinished handoffs,
+retained paused/blocked/completed work and rental records. Idle rented machines still
+shut down after 15 minutes; `cozy rental keepalive <name>` explicitly resets that
+deadline once. Accepted detached local and remote Runtime executions continue and
+reconnect on `cozy up`. Unfinished handoffs,
 controls, and daemon-owned execution can still block normal shutdown. `--force` may
 interrupt legacy daemon-owned local work; it uses existing recovery on restart.
 `--all` remains explicit cancellation and rental teardown. See

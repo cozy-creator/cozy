@@ -325,7 +325,7 @@ type RunCmd struct {
 	RetryPublication RunRetryPublicationCmd `cmd:"" help:"Retry a blocked model publication without rerunning its producer."`
 	Execute          RunExecuteCmd          `cmd:"" default:"withargs" hidden:""`
 	Cancel           RunCancelCmd           `cmd:"" help:"Cancel a queued or running run."`
-	Pause            RunPauseCmd            `cmd:"" help:"Stop a private transaction while retaining its work and rental."`
+	Pause            RunPauseCmd            `cmd:"" help:"Pause a private transaction and retain its work. Rentals still shut down after 15 idle minutes; cozy rental keepalive <name> resets the deadline once."`
 	Resume           RunResumeCmd           `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List             RunListCmd             `cmd:"" help:"List current and past runs."`
 	Watch            RunWatchCmd            `cmd:"" help:"Watch one recorded run until it settles."`
