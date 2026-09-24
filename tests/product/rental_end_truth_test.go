@@ -106,7 +106,7 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 		HourlyRateUSDMicros: 100_000,
 	}, 5_000_000, 10_000, func(name string) ([]byte, string, *exit.Error) {
 		machine = name
-		body, problem := hub.RentalRequestBytes(name, "cpu", strings.Repeat("ab", 32),
+		body, problem := hub.RentalRequestBytes(name, "cpu", 1, strings.Repeat("ab", 32),
 			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil)
 		return body, "digest-" + name, problem
 	}, nil)
@@ -284,5 +284,48 @@ func TestAnAcceptedAskSurvivesAnUnusableCreateAnswer(t *testing.T) {
 	}
 	if n := stand.releases("pr-th198th198th198th19"); n != 1 {
 		t.Fatalf("the hub saw %d release(s) of the orphaned pod, wanted 1", n)
+	}
+}
+
+// TestRentAskCarriesTheChosenGPUCount: `cozy rent` is `cozy rental`, the card is named
+// once and the count rides as accelerator_count; an odd count is sent, with a note.
+func TestRentAskCarriesTheChosenGPUCount(t *testing.T) {
+	root, _, stand := rentalEndRoot(t, "rental-gpu-count")
+	stand.publishListing()
+	h100 := func(count int, price int64) map[string]any {
+		return map[string]any{"name": "h100-sxm5-80gb", "accelerator_model": "NVIDIA H100 80GB HBM3",
+			"accelerator_count": count, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",
+			"compute_capability": "9.0", "vram_gb": 80, "minimum_ram_per_gpu_gb": 64,
+			"price_usd_micros_per_hour": price, "storage_usd_micros_per_hour": 10_000}
+	}
+	stand.setSKUs(h100(1, 1_000_000), h100(2, 2_000_000), h100(3, 3_000_000))
+	var mu sync.Mutex
+	var asked map[string]any
+	stand.rent = func(request map[string]any) map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		asked = request
+		name, _ := request["name"].(string)
+		return map[string]any{"rental_id": "pr-gpucountgpucount0003", "name": name,
+			"state": "pending_acquisition", "hourly_rate_usd_micros": 3_000_000}
+	}
+	startDaemonProcess(t, root)
+
+	code, out := runCozy(t, root, "rent", "new", "h100-sxm5-80gb", "--gpus", "3")
+	mu.Lock()
+	defer mu.Unlock()
+	if asked == nil {
+		t.Fatalf("no rental ask reached the hub [exit %d]\n%s", code, out)
+	}
+	if asked["sku"] != "h100-sxm5-80gb" || asked["accelerator_count"] != float64(3) {
+		t.Fatalf("the ask was %v, want h100-sxm5-80gb at 3 GPUs", asked)
+	}
+	if !strings.Contains(out, "3 GPUs is odd; keep to an even count for parallelism") {
+		t.Fatalf("an odd GPU count carried no note [exit %d]\n%s", code, out)
+	}
+
+	code, out = runCozy(t, root, "rent", "new", "h100-sxm5-80gb", "--gpus", "4", "--json")
+	if code == 0 || !strings.Contains(out, "rental.sku_") {
+		t.Fatalf("an unpublished GPU count was not refused [exit %d]\n%s", code, out)
 	}
 }

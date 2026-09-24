@@ -75,7 +75,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	children, problem := resolver.UnpublishedChildModels(request)
 	fatal(t, problem)
 	models := append(slices.Clone(request.Models), children...)
-	sku := hub.RentalSKU{Name: "h100-sxm5-80gb-x2", AcceleratorModel: h100SXM,
+	sku := hub.RentalSKU{Name: "h100-sxm5-80gb", AcceleratorModel: h100SXM,
 		AcceleratorCount: 2, VRAMGB: 80}
 	constraints := rental.Constraints{Degrees: []int{2, 4}}
 	candidate := rental.Purchases([]hub.RentalSKU{sku}, models, true, false, constraints)[0]

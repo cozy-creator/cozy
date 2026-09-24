@@ -88,7 +88,7 @@ func TestRentalLadderRendersTotalAndStructuredBreakdown(t *testing.T) {
 			"price_usd_micros_per_hour": price, "storage_usd_micros_per_hour": storage}
 	}
 	// Both widths of the card share the one pod-disk adder (1536 GB × 139).
-	hub.setSKUs(sku("l4", 1, 490_000, 213_504), sku("l4-x4", 4, 1_960_000, 213_504))
+	hub.setSKUs(sku("l4", 1, 490_000, 213_504), sku("l4", 4, 1_960_000, 213_504))
 
 	// The ladder itself states ONE price per rung and it is the whole one — the figure
 	// that surprised Paul is the figure on the table.

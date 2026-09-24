@@ -37,7 +37,7 @@ func TestASKURefusalNamesWhichAbsenceItHit(t *testing.T) {
 	now := time.Date(2026, 9, 4, 7, 12, 33, 0, time.UTC)
 	lastSeen := time.Date(2026, 9, 4, 6, 48, 8, 0, time.UTC)
 
-	stockOut := cli.SKURefusal("rtx-a4000", refusalCatalog(),
+	stockOut := cli.SKURefusal("rtx-a4000", 1, refusalCatalog(),
 		&hub.RentalSKUStatus{Name: "rtx-a4000", Known: true, LastSeenAt: &lastSeen}, now)
 	if stockOut == nil {
 		t.Fatal("an unbuyable SKU was not refused")
@@ -54,14 +54,14 @@ func TestASKURefusalNamesWhichAbsenceItHit(t *testing.T) {
 	if got := strings.Join(stockOut.Next, "\n"); got != "cozy rental new rtx-a4000\ncozy rental new" {
 		t.Fatalf("stock-out suggestions = %q", got)
 	}
-	withoutHistory := cli.SKURefusal("rtx-a4000", refusalCatalog(),
+	withoutHistory := cli.SKURefusal("rtx-a4000", 1, refusalCatalog(),
 		&hub.RentalSKUStatus{Name: "rtx-a4000", Known: true}, now)
 	if withoutHistory.Message != "Sorry, but our GPU providers have no inventory for rtx-a4000 right now. "+
 		"Please try again later or rent a different GPU." {
 		t.Fatalf("stock-out without an observed date invents history: %s", withoutHistory.Message)
 	}
 
-	unknown := cli.SKURefusal("rtx-9090", refusalCatalog(),
+	unknown := cli.SKURefusal("rtx-9090", 1, refusalCatalog(),
 		&hub.RentalSKUStatus{Name: "rtx-9090"}, now)
 	if unknown == nil {
 		t.Fatal("an unknown SKU was not refused")
@@ -93,7 +93,7 @@ func TestASKURefusalNamesWhichAbsenceItHit(t *testing.T) {
 // never the refusal itself. A hub too old to serve the route must still produce
 // a refusal about the SKU.
 func TestARefusalSurvivesAHubThatCannotAnswer(t *testing.T) {
-	refusal := cli.SKURefusal("rtx-a4000", refusalCatalog(), nil, time.Now())
+	refusal := cli.SKURefusal("rtx-a4000", 1, refusalCatalog(), nil, time.Now())
 	if refusal == nil {
 		t.Fatal("no refusal when the hub could not be asked")
 	}
@@ -110,7 +110,7 @@ func TestARefusalSurvivesAHubThatCannotAnswer(t *testing.T) {
 }
 
 func TestRentalCLIExplainsBootFailureExclusions(t *testing.T) {
-	const sku = "h100-sxm5-80gb-x2"
+	const sku = "h100-sxm5-80gb"
 	retryAfter := time.Date(2026, 9, 15, 22, 5, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name, reason, code, want string
@@ -142,8 +142,11 @@ func TestRentalCLIExplainsBootFailureExclusions(t *testing.T) {
 				case "/v1/rental-skus":
 					_, _ = w.Write([]byte(`[]`))
 				case "/v1/rental-skus/" + sku:
+					if r.URL.Query().Get("accelerator_count") != "2" {
+						t.Errorf("status asked for %q GPUs, not the 2 requested", r.URL.RawQuery)
+					}
 					_ = json.NewEncoder(w).Encode(hub.RentalSKUStatus{
-						Name: sku, Known: true, Offered: tc.offered,
+						Name: sku, AcceleratorCount: 2, Known: true, Offered: tc.offered,
 						UnavailableReason: tc.reason, RetryAfter: tc.retryAfter,
 					})
 				default:
@@ -157,7 +160,7 @@ func TestRentalCLIExplainsBootFailureExclusions(t *testing.T) {
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				fmt.Sprintf("tensorhub_url: %s\ntensorhub_token: rental-refusal-test\n", server.URL)), 0o600))
 			for _, format := range []string{"human", "json"} {
-				args := []string{"rental", "new", sku}
+				args := []string{"rent", "new", sku, "--gpus", "2"}
 				if format == "json" {
 					args = append(args, "--json")
 				}

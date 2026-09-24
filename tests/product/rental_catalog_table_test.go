@@ -58,11 +58,14 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 			"tensorhub_token: rental-idle-test\n"+
 			"rentals:\n  max_hourly_spend_usd: 100.00\n"), 0o600))
 	hub := newFakeRentalHub(t, port)
-	gpu := func(name, model, capability string, vram, price int64) map[string]any {
+	gpuAt := func(name, model, capability string, vram, price int64, count int) map[string]any {
 		return map[string]any{"name": name, "accelerator_model": model,
-			"accelerator_count": 1, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",
+			"accelerator_count": count, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",
 			"compute_capability": capability, "vram_gb": vram, "minimum_ram_per_gpu_gb": 64,
 			"price_usd_micros_per_hour": price, "storage_usd_micros_per_hour": 41_700}
+	}
+	gpu := func(name, model, capability string, vram, price int64) map[string]any {
+		return gpuAt(name, model, capability, vram, price, 1)
 	}
 	cpu := func(name string, price int64) map[string]any {
 		return map[string]any{"name": name, "accelerator_model": "CPU",
@@ -81,6 +84,8 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		gpu("rtx-pro-6000", "NVIDIA RTX PRO 6000 Blackwell Server Edition", "12.0", 96, 1_790_000),
 		cpu("cpu", 70_000),
 		gpu("rtx-pro-6000-maxq", "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "12.0", 96, 1_590_000),
+		gpuAt("h100-sxm5-80gb", "NVIDIA H100 80GB HBM3", "9.0", 80, 5_380_000, 2),
+		gpu("h100-sxm5-80gb", "NVIDIA H100 80GB HBM3", "9.0", 80, 2_690_000),
 	)
 
 	code, out := runCozy(t, root, "rental", "new")
@@ -88,7 +93,7 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		t.Fatalf("cozy rental new [exit %d]:\n%s", code, out)
 	}
 	header, rows, order := catalogTable(t, out)
-	want := []string{"NAME", "ACCELERATOR", "COMPUTE", "VRAM", "PRICE"}
+	want := []string{"NAME", "ACCELERATOR", "GPUS", "COMPUTE", "VRAM", "PRICE"}
 	if strings.Join(header, "|") != strings.Join(want, "|") {
 		t.Fatalf("the ladder's columns are %v, not %v — these are GPUs, priced once\n%s",
 			header, want, out)
@@ -115,14 +120,18 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 
 	// A CPU product has no compute capability to state; "unknown" would say a lookup failed.
 	for _, name := range []string{"cpu", "cpu-torch"} {
-		if got := rows[name][2]; got != "-" {
+		if got := rows[name][3]; got != "-" {
 			t.Fatalf("the %s row's COMPUTE reads %q, not the house dash\n%s", name, got, out)
 		}
 	}
 
 	// ONE price, and it is the whole one: the components are not on this table.
-	if got := rows["rtx-a4000"][4]; got != "$0.29/hr" {
+	if got := rows["rtx-a4000"][5]; got != "$0.29/hr" {
 		t.Fatalf("the A4000's price reads %q, not the combined $0.29/hr\n%s", got, out)
+	}
+	// A card is listed ONCE, with each GPU count priced per machine beside it.
+	if got := rows["h100-sxm5-80gb"]; got[2] != "1, 2" || got[5] != "1x $2.73/hr, 2x $5.42/hr" {
+		t.Fatalf("the H100 row reads %q, want GPUS 1, 2 priced per machine\n%s", got, out)
 	}
 	// $0.07/hr is NOT checked here: rounded to the penny, the cpu SKU's COMBINED
 	// price ($0.07278) and its GPU component ($0.07) render identically, so the
@@ -145,7 +154,7 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 
 	// Cheapest first, on the price the table shows — and equal rungs hold still.
 	climb := []string{"cpu", "cpu-torch", "rtx-a4000", "rtx-pro-6000-maxq",
-		"rtx-pro-6000-blackwell", "rtx-pro-6000", "b200"}
+		"rtx-pro-6000-blackwell", "rtx-pro-6000", "h100-sxm5-80gb", "b200"}
 	if strings.Join(order, "|") != strings.Join(climb, "|") {
 		t.Fatalf("the ladder climbs %v, not cheapest-first %v\n%s", order, climb, out)
 	}
@@ -165,7 +174,7 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 		t.Fatalf("cozy rental new --full --json [exit %d]:\n%s", code, structured)
 	}
 	for _, kept := range []string{
-		`"gpu":`, `"accelerator model":`, `"accelerator count":`, `"gpu price":`, `"storage price":`,
+		`"gpu":`, `"accelerator model":`, `"gpus":`, `"gpu price":`, `"storage price":`,
 		"NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
 		"$1.69/hr", "$0.04/hr", "$1.73/hr",
 	} {

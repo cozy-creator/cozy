@@ -1,5 +1,7 @@
 package cli
 
+import "strconv"
+
 // CLI is the complete public command grammar. Kong derives parsing and help from
 // this tree; there is no parallel command manifest or string handler registry.
 type CLI struct {
@@ -12,7 +14,8 @@ type CLI struct {
 	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
 	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
 	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
-	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
+	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
+	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
 	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
 	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
@@ -460,6 +463,7 @@ type RentalNewCmd struct {
 	Development    *bool    `help:"Enable SSH maintenance access on the selected worker image (default); false disables it."`
 	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
 	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
+	GPUs           int      `name:"gpus" default:"1" help:"GPUs on the machine; any count the catalog lists. Keep to an even count for parallelism."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
 	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
@@ -478,8 +482,12 @@ func (c *RentalNewCmd) Run(r *Runtime) error {
 	if c.Development != nil {
 		flags["--development"] = *c.Development
 	}
+	gpus := ""
+	if c.GPUs != 1 {
+		gpus = strconv.Itoa(c.GPUs)
+	}
 	return r.call(handleRent, []string{c.SKU}, flags, values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
+		"--gpus", gpus, "--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
 }
 
 type RentalEndCmd struct {

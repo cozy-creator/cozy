@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -176,7 +177,13 @@ func (m *managedRentals) status() (string, *exit.Error) {
 	return m.lineLocked()
 }
 
-func (m *managedRentals) admit(skuName string) (string, hub.RentalSKU, *exit.Error) {
+// machineKey names one product at one GPU count.
+type machineKey struct {
+	name string
+	gpus int
+}
+
+func (m *managedRentals) admit(skuName string, gpus int) (string, hub.RentalSKU, *exit.Error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if problem := m.reconcileLocked(); problem != nil {
@@ -190,44 +197,44 @@ func (m *managedRentals) admit(skuName string) (string, hub.RentalSKU, *exit.Err
 	if problem != nil {
 		return "", hub.RentalSKU{}, problem
 	}
-	for _, sku := range skus {
-		if sku.Name == skuName {
-			return line, sku, m.admitLocked(sku)
-		}
+	if sku, found := hub.FindRentalSKU(skus, skuName, gpus); found {
+		return line, sku, m.admitLocked(sku)
 	}
-	// An explicit ask is HONOURED OR REFUSED, never widened to a neighbouring card —
-	// and the refusal has to say so out loud (cl-132), AND say which absence it hit
-	// (th-150).
-	return "", hub.RentalSKU{}, m.refuseSKULocked(skuName, skus)
+	// An explicit ask is HONOURED OR REFUSED, never widened to a neighbouring card or
+	// count — and the refusal has to say so out loud (cl-132), AND say which absence it
+	// hit (th-150).
+	return "", hub.RentalSKU{}, m.refuseSKULocked(skuName, gpus, skus)
 }
 
 // refuseSKULocked distinguishes unknown products, provider stock-outs, and
 // temporary boot-failure exclusions. Reading status never acquires a rental.
-func (m *managedRentals) refuseSKULocked(skuName string, skus []hub.RentalSKU) *exit.Error {
+func (m *managedRentals) refuseSKULocked(skuName string, gpus int, skus []hub.RentalSKU) *exit.Error {
 	hctx, cancel := hub.Context()
-	status, problem := client(m.ctx).RentalSKUStatus(hctx, skuName)
+	status, problem := client(m.ctx).RentalSKUStatus(hctx, skuName, gpus)
 	cancel()
 	if problem != nil {
-		// The lookup is an EXPLANATION, never the refusal itself: a hub too old
-		// to answer, or one that fails the read, must still get a refusal about
-		// the SKU rather than an error about the lookup.
-		return SKURefusal(skuName, skus, nil, time.Now())
+		// The lookup is an EXPLANATION, never the refusal itself: a hub that fails
+		// the read must still get a refusal about the SKU rather than an error
+		// about the lookup.
+		return SKURefusal(skuName, gpus, skus, nil, time.Now())
 	}
-	return SKURefusal(skuName, skus, &status, time.Now())
+	return SKURefusal(skuName, gpus, skus, &status, time.Now())
 }
 
-// SKURefusal composes the refusal for a name the live catalog does not carry.
-// `status` is the hub's answer about that name, or nil when it could not be
-// asked. It is a pure function of what was observed so that the words — which
-// are the entire deliverable of th-150 — can be asserted without a hub.
-func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatus,
+// SKURefusal composes the refusal for a (name, GPU count) the live catalog does not
+// carry. `status` is the hub's answer about that ask, or nil when it could not be asked.
+// It is a pure function of what was observed so that the words — which are the entire
+// deliverable of th-150 — can be asserted without a hub.
+func SKURefusal(skuName string, gpus int, skus []hub.RentalSKU, status *hub.RentalSKUStatus,
 	now time.Time,
 ) *exit.Error {
-	said := fmt.Sprintf("NOTHING was rented and no other machine was substituted for %q", skuName)
+	ask := orchestrator.MachineLabel(skuName, gpus)
+	retry := rentNewCommand(skuName, gpus)
+	said := fmt.Sprintf("NOTHING was rented and no other machine was substituted for %q", ask)
 	switch {
 	case status == nil:
 		return exit.Named(exit.Validation, "rental.sku_unavailable",
-			"no rental SKU %q is on offer right now — %s", skuName, said).
+			"no rental SKU %q is on offer right now — %s", ask, said).
 			WithRemedy("the catalog is live provider inventory, so a name absent now may "+
 				"return within minutes; `cozy rental new` alone lists what is offered "+
 				"this minute (currently %s)", offeredNames(skus)).
@@ -239,45 +246,71 @@ func SKURefusal(skuName string, skus []hub.RentalSKU, status *hub.RentalSKUStatu
 			WithNext("cozy rental new")
 	case status.Offered:
 		return exit.Named(exit.Capacity, "rental.sku_availability_changed",
-			"%s became available after the catalog was read. Please retry the rental request.", skuName).
-			WithNext("cozy rental new "+skuName, "cozy rental new")
+			"%s became available after the catalog was read. Please retry the rental request.", ask).
+			WithNext(retry, "cozy rental new")
 	}
-	message := fmt.Sprintf("Sorry, but our GPU providers have no inventory for %s right now.", skuName)
+	message := fmt.Sprintf("Sorry, but our GPU providers have no inventory for %s right now.", ask)
 	switch status.UnavailableReason {
 	case "cooldown":
-		message = fmt.Sprintf("%s is temporarily excluded after a recent boot failure.", skuName)
+		message = fmt.Sprintf("%s is temporarily excluded after a recent boot failure.", ask)
 		if status.RetryAfter != nil {
 			message += " Retry after " + status.RetryAfter.UTC().Format(time.RFC3339) + "."
 		} else {
 			message += " Please try again shortly."
 		}
 		return exit.Named(exit.Capacity, "rental.sku_cooldown", "%s", message).
-			WithNext("cozy rental new "+skuName, "cozy rental new")
+			WithNext(retry, "cozy rental new")
 	case "retry_in_progress":
 		return exit.Named(exit.Capacity, "rental.sku_retry_in_progress",
 			"%s is temporarily unavailable while one retry after a recent boot failure is in progress. "+
-				"Please try again once it finishes.", skuName).
-			WithNext("cozy rental new "+skuName, "cozy rental new")
+				"Please try again once it finishes.", ask).
+			WithNext(retry, "cozy rental new")
 	}
 	if status.LastSeenAt != nil {
-		message += fmt.Sprintf(" %s was last available at %s (%s ago).", skuName,
+		message += fmt.Sprintf(" %s was last available at %s (%s ago).", ask,
 			status.LastSeenAt.UTC().Format(time.RFC3339),
 			roughDuration(now.Sub(*status.LastSeenAt)))
 	}
+	next := []string{retry, "cozy rental new"}
+	if status.SKU != nil && len(status.SKU.Widths) > 0 {
+		message += fmt.Sprintf(" %s is offered now with %s GPU(s).", skuName, joinInts(status.SKU.Counts()))
+		next = []string{retry, rentNewCommand(skuName, status.SKU.Widths[0].AcceleratorCount)}
+	}
 	return exit.Named(exit.Capacity, "rental.sku_out_of_stock",
 		"%s Please try again later or rent a different GPU.", message).
-		WithNext("cozy rental new "+skuName, "cozy rental new")
+		WithNext(next...)
+}
+
+// rentNewCommand is the `cozy rental new` line for one product at one count.
+func rentNewCommand(skuName string, gpus int) string {
+	if gpus > 1 {
+		return fmt.Sprintf("cozy rental new %s --gpus %d", skuName, gpus)
+	}
+	return "cozy rental new " + skuName
+}
+
+func joinInts(values []int) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.Itoa(value))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // offeredNames is the live catalog as a reader can scan it, so a refusal shows the shape
 // of the market it was refused against rather than asserting a bare absence.
 func offeredNames(skus []hub.RentalSKU) string {
-	if len(skus) == 0 {
+	products := hub.RentalProducts(skus)
+	if len(products) == 0 {
 		return "none"
 	}
-	names := make([]string, 0, len(skus))
-	for _, sku := range skus {
-		names = append(names, sku.Name)
+	names := make([]string, 0, len(products))
+	for _, product := range products {
+		name := product.Name
+		if counts := product.Counts(); len(counts) > 1 || len(counts) == 1 && counts[0] != 1 {
+			name += " (" + joinInts(counts) + " GPUs)"
+		}
+		names = append(names, name)
 	}
 	sort.Strings(names)
 	if len(names) > 12 {
@@ -326,9 +359,9 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if problem != nil {
 		return none, "", problem
 	}
-	bySKU := make(map[string]hub.RentalSKU, len(skus))
+	bySKU := make(map[machineKey]hub.RentalSKU, len(skus))
 	for _, sku := range skus {
-		bySKU[sku.Name] = sku
+		bySKU[machineKey{sku.Name, sku.AcceleratorCount}] = sku
 	}
 	decision := orchestrator.PlacementDecision{Tier: m.ctx.Cfg.PlacementPrefer,
 		ConfigDigest: m.ctx.Cfg.Digest, Ladder: rental.Ladder(req.Models), Override: rental.Override(req.Models)}
@@ -352,7 +385,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		if c.Verdict != "" {
 			continue
 		}
-		if problem := m.admitLocked(bySKU[c.SKU]); problem != nil {
+		if problem := m.admitLocked(bySKU[machineKey{c.SKU, c.GPUs}]); problem != nil {
 			c.Verdict, capped = orchestrator.VerdictExcluded+problem.ErrName(), problem
 		}
 	}
@@ -391,13 +424,13 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		c := &decision.Candidates[i]
 		rentalID := c.Rental
 		if !c.Attached() {
-			row, problem := m.buyLocked(req, *c, bySKU[c.SKU])
+			row, problem := m.buyLocked(req, *c, bySKU[machineKey{c.SKU, c.GPUs}])
 			if problem != nil {
 				if problem.ErrName() != "rental.sku_out_of_stock" && problem.ErrName() != "rental.sku_unavailable" {
 					return none, "", problem
 				}
 				c.Verdict = orchestrator.VerdictNoStock
-				fmt.Fprintf(m.ctx.Out, "rentals: %s has no inventory; choosing again without it\n", c.SKU)
+				fmt.Fprintf(m.ctx.Out, "rentals: %s has no inventory; choosing again without it\n", c.Name())
 				continue
 			}
 			rentalID, decision.Bought = row.ID, true
@@ -434,7 +467,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 // cannot take this request, or, when it can, the attempts ahead of a new one. Nothing
 // is silently dropped (cl-132): a decision reporting no attached candidate while the
 // fleet holds two is the shape that read as waste live.
-func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hub.RentalSKU,
+func (m *managedRentals) attachedLocked(req records.Request, bySKU map[machineKey]hub.RentalSKU,
 	needsAccelerator bool, constraints rental.Constraints) ([]orchestrator.PlacementCandidate, *exit.Error) {
 	rows, problem := m.store.Rentals()
 	if problem != nil {
@@ -452,15 +485,15 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[string]hu
 			continue
 		}
 		c := orchestrator.PlacementCandidate{Rental: row.ID, Machine: row.MachineName, SKU: row.SKU,
-			RateUSDMicrosPerHour: row.HourlyRateUSDMicros}
-		sku, offered := bySKU[row.SKU]
+			GPUs: row.AcceleratorCount, RateUSDMicrosPerHour: row.HourlyRateUSDMicros}
+		sku, offered := bySKU[machineKey{row.SKU, row.AcceleratorCount}]
 		if offered {
 			c.RateUSDMicrosPerHour = sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour
 		}
 		// Everything decidable from the rental ROW is settled by the chooser, in the one
 		// order that keeps a transient state out of a permanent verdict (cl-185). What
 		// is left are the questions only this host can answer.
-		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints, req.RequestedRental == row.ID) {
+		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob()) {
 			if len(constraints.Requirements) > 0 || constraints.RequiresPython != "" {
 				if problem := rentalCompatibility(m.ctx, row.ID, constraints); problem != nil {
 					c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + problem.Message
@@ -545,14 +578,14 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	if problem := m.store.PinRequestModels(req.ID, c.Models); problem != nil {
 		return records.Rental{}, problem
 	}
-	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", sku.Name, skuRate(sku), pinText(c))
+	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", orchestrator.MachineLabel(sku.Name, sku.AcceleratorCount), skuRate(sku), pinText(c))
 	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
 	defer m.owner.ForgetPhase(req.ID)
 	operationKey, problem := m.store.ManagedRentalOperationKey(req.ID)
 	if problem != nil {
 		return records.Rental{}, problem
 	}
-	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name,
+	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name, sku.AcceleratorCount,
 		operationKey, rental.AcquisitionReason(req),
 		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
 		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,

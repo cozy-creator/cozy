@@ -77,7 +77,7 @@ func TestPlannedSourceBytesTotalsTheDeclaredIngest(t *testing.T) {
 // The wire arm: the declared workload must survive into the exact canonical
 // bytes the hub is sent and replays.
 func TestRentalRequestCarriesTheDeclaredWorkload(t *testing.T) {
-	body, problem := hub.RentalRequestBytes("twine", "h200", strings.Repeat("ab", 32),
+	body, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		hub.DeclaredWorkload{SourceBytes: h3SourceBytes}, nil)
 	fatal(t, problem)
@@ -106,7 +106,7 @@ func TestRentalRequestCarriesTheDeclaredWorkload(t *testing.T) {
 
 	// A serving rental declares nothing, and the field must stay OFF the wire so
 	// an undeclared rental is byte-identical to one authored before th-152.
-	serving, problem := hub.RentalRequestBytes("twine", "h200", strings.Repeat("ab", 32),
+	serving, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil)
 	fatal(t, problem)
 	if strings.Contains(string(serving), "planned_source_bytes") {
@@ -182,7 +182,7 @@ func TestRentalRequestCarriesTheDeclaredServingSet(t *testing.T) {
 		{Lane: "bf16", Manifest: "sha256:" + strings.Repeat("1", 64),
 			Model: "paul/minimax-h3", Release: "1.0.0"},
 	}
-	body, problem := hub.RentalRequestBytes("twine", "h200", strings.Repeat("ab", 32),
+	body, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		hub.DeclaredWorkload{ServingModels: declared}, nil)
 	fatal(t, problem)
@@ -220,7 +220,7 @@ func TestRentalRequestCarriesTheDeclaredServingSet(t *testing.T) {
 
 	// Undeclared stays OFF the wire, so deploying this cannot change the request
 	// digest of a rental authored before th-155 and invalidate its idempotency key.
-	serving, problem := hub.RentalRequestBytes("twine", "h200", strings.Repeat("ab", 32),
+	serving, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
 		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil)
 	fatal(t, problem)
 	if strings.Contains(string(serving), "serving_models") {
@@ -242,7 +242,7 @@ func TestAnIncompleteServingModelIsRefusedBeforeItIsSent(t *testing.T) {
 		{"no model", hub.ServingModel{Lane: "bf16", Release: "1.0.0",
 			Manifest: "sha256:" + strings.Repeat("1", 64)}},
 	} {
-		_, problem := hub.RentalRequestBytes("twine", "h200", strings.Repeat("ab", 32),
+		_, problem := hub.RentalRequestBytes("twine", "h200", 1, strings.Repeat("ab", 32),
 			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 			hub.DeclaredWorkload{ServingModels: []hub.ServingModel{arm.model}}, nil)
 		if problem == nil {

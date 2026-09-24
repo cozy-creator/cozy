@@ -18,6 +18,7 @@ type ModelThroughput struct {
 	Release           string    `json:"release"`
 	Lane              string    `json:"lane"`
 	SKU               string    `json:"sku"`
+	AcceleratorCount  int       `json:"accelerator_count"`
 	Workload          string    `json:"workload"`
 	PayloadSHA256     string    `json:"payload_sha256"`
 	Runs              int       `json:"runs"`

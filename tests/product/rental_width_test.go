@@ -237,22 +237,21 @@ func TestPodDeliveringFewerCardsThanPaidForIsRefused(t *testing.T) {
 // that uses a second card is a group of that degree, and only the package's author can say
 // the construction can be built at one. A wide product is therefore excluded from the
 // ladder unless the degree is declared, which keeps a typed worker refusal from costing an
-// hour's rent. The same rule holds a REUSE: `attachedLocked` puts every attached rental's
-// own width through `WidthUnusable`, because a wide pod already up is as unusable to a
-// package that cannot shard as one that has not been bought.
+// hour's rent. A REUSE is not held to it: the pod is paid for, and the worker runs it at
+// the largest declared degree that fits.
 func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T) {
 	skus := []hub.RentalSKU{
 		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 1,
 			VRAMGB: 80, PriceUSDMicrosPerHour: 3_490_000},
-		{Name: "h100-x2", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 2,
+		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 2,
 			VRAMGB: 80, PriceUSDMicrosPerHour: 6_980_000},
-		{Name: "h100-x4", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 4,
+		{Name: "h100", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 4,
 			VRAMGB: 80, PriceUSDMicrosPerHour: 13_960_000},
 	}
 	verdicts := func(constraints rental.Constraints, job bool) map[string]string {
 		out := map[string]string{}
 		for _, c := range rental.Purchases(skus, nil, true, job, constraints) {
-			out[c.SKU] = c.Verdict
+			out[orchestrator.MachineLabel(c.SKU, c.GPUs)] = c.Verdict
 		}
 		return out
 	}
@@ -261,7 +260,7 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 	if undeclared["h100"] != "" {
 		t.Fatalf("the one-card product was excluded: %q", undeclared["h100"])
 	}
-	for _, name := range []string{"h100-x2", "h100-x4"} {
+	for _, name := range []string{"2x h100", "4x h100"} {
 		if !strings.Contains(undeclared[name], "width_undeclared") ||
 			!strings.Contains(undeclared[name], "no sequence-parallel degree") {
 			t.Fatalf("%s verdict = %q, want a width refusal naming the missing degree",
@@ -271,7 +270,7 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 	// `@sequence_parallel(degrees=(2, 4))`: both widths become buyable, and the one-card
 	// product stays buyable beside them — a declared degree is a capability, not a demand.
 	declared := verdicts(rental.Constraints{Degrees: []int{2, 4}}, false)
-	for _, name := range []string{"h100", "h100-x2", "h100-x4"} {
+	for _, name := range []string{"h100", "2x h100", "4x h100"} {
 		if declared[name] != "" {
 			t.Fatalf("%s was excluded from a package declaring degrees 2 and 4: %q",
 				name, declared[name])
@@ -279,18 +278,18 @@ func TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree(t *testing.T)
 	}
 	// A degree the author did not declare stays out however wide the machine is.
 	partial := verdicts(rental.Constraints{Degrees: []int{2}}, false)
-	if partial["h100-x2"] != "" {
-		t.Fatalf("the declared width was excluded: %q", partial["h100-x2"])
+	if partial["2x h100"] != "" {
+		t.Fatalf("the declared width was excluded: %q", partial["2x h100"])
 	}
-	if !strings.Contains(partial["h100-x4"], "width_undeclared") ||
-		!strings.Contains(partial["h100-x4"], "degrees 2") {
-		t.Fatalf("h100-x4 verdict = %q, want a refusal naming the declared degrees",
-			partial["h100-x4"])
+	if !strings.Contains(partial["4x h100"], "width_undeclared") ||
+		!strings.Contains(partial["4x h100"], "degrees 2") {
+		t.Fatalf("4x h100 verdict = %q, want a refusal naming the declared degrees",
+			partial["4x h100"])
 	}
 	// A JOB shards nothing: one bounded attempt on a wide pod idles every card but one for
 	// the whole hour, whatever the package declares.
 	jobs := verdicts(rental.Constraints{Degrees: []int{2, 4}}, true)
-	for _, name := range []string{"h100-x2", "h100-x4"} {
+	for _, name := range []string{"2x h100", "4x h100"} {
 		if !strings.Contains(jobs[name], "width_undeclared") ||
 			!strings.Contains(jobs[name], "a job shards none of them") {
 			t.Fatalf("%s was buyable for a job: %q", name, jobs[name])
