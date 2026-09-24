@@ -315,6 +315,7 @@ Only a daemon holding the root lock may migrate an older database.
 |---|---|---|---|
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | one attempt's kept triage bundle from its own row; 404 when none was kept |
 | `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, and activity; `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
+| `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | explicit acknowledged fixed fifteen-minute reset; request ID only |
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |

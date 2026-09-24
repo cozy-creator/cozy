@@ -160,22 +160,26 @@ func TestInterruptedExplicitPreparationDefersOnlyCreatorExpiryWithoutRenewal(t *
 
 func TestRentalIdleConfigurationHasNoDurationOrDisableEscape(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("COZY_HOME", root)
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("{}\n"), 0600))
+	if code, out := runCozy(t, root, "help", "rental", "keepalive"); code != 0 {
+		t.Fatalf("ordinary fixed-policy CLI: %d %s", code, out)
+	}
 	for _, value := range []string{"0", "1", "900", "3600"} {
 		must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("rentals:\n  idle_release_s: "+value+"\n"), 0600))
-		if _, problem := config.Load(); problem == nil {
-			t.Fatalf("retired idle override %s was accepted", value)
+		if code, out := runCozy(t, root, "rental", "list", "--json"); code == 0 || !strings.Contains(out, "idle_release_s") {
+			t.Fatalf("retired override %s accepted or misdiagnosed: %d %s", value, code, out)
 		}
 	}
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("rentals_idle_release_s: 0\n"), 0600))
-	if _, problem := config.Load(); problem == nil {
-		t.Fatal("flat retired idle override was accepted")
+	if code, out := runCozy(t, root, "rental", "list", "--json"); code == 0 || !strings.Contains(out, "rentals_idle_release_s") {
+		t.Fatalf("flat retired override accepted: %d %s", code, out)
 	}
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("{}\n"), 0600))
 	t.Setenv("COZY_RENTALS_IDLE_RELEASE_S", "0")
 	t.Setenv("RENTALS_IDLE_RELEASE_S", "1")
-	_, problem = config.Load()
-	fatal(t, problem)
+	if code, out := runCozy(t, root, "help", "rental", "keepalive"); code != 0 {
+		t.Fatalf("fixed policy rejected ordinary environment: %d %s", code, out)
+	}
 	if rental.IdleTimeout != 900*time.Second {
 		t.Fatal("environment changed fixed deadline")
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -14,6 +15,10 @@ func (c *Orchestrator) KeepRentalAlive(ctx context.Context, id, requestID string
 	if requestID == "" || len(requestID) > pb.MaxRentalKeepaliveRequestIDBytes {
 		return nil, exit.New(exit.Validation, "keepalive requires a bounded request ID")
 	}
+	// This unary control acknowledgment uses the existing network-control bound.
+	// It never cancels application work or retries the user action automatically.
+	ctx, cancel := context.WithTimeout(ctx, hub.Timeout)
+	defer cancel()
 	instance, _, _, problem := c.ensureRentalContext(ctx, id)
 	if problem != nil {
 		return nil, problem

@@ -76,6 +76,7 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	defer func() { finish(confirmed) }()
 	instance, _, _, problem := s.orchestrator.EnsureRentalContext(r.Context(), id)
 	if problem != nil {
+		confirmed = problem.Code != exit.Unavailable && problem.Code != exit.Canceled
 		s.refuseTyped(w, r, problem)
 		return
 	}
@@ -86,12 +87,14 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	}
 	release, problem := s.orchestrator.UseRental(id)
 	if problem != nil {
+		confirmed = problem.Code != exit.Unavailable && problem.Code != exit.Canceled
 		s.refuseTyped(w, r, problem)
 		return
 	}
 	defer release()
 	if problem := s.orchestrator.PrepareRentalPackage(r.Context(), instance,
 		&pb.DownloadPackageRef{Package: body.Package, Release: body.Release}, models); problem != nil {
+		confirmed = problem.Code != exit.Unavailable && problem.Code != exit.Canceled
 		s.refuseTyped(w, r, problem)
 		return
 	}

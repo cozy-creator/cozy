@@ -598,7 +598,7 @@ const hubReconcileCadence = 10 * time.Second
 // watch is the idle release's own loop. It re-reads the records at pollCadence — the
 // resolution every rental verb already samples a rental at — and acts only on what they
 // say; the grace is the debounce, and a sample that finds nothing to do costs a few local
-// reads. It returns when quit closes, or at once when idle release is configured off.
+// reads. It returns when quit closes.
 
 func (m *managedRentals) watch(quit <-chan struct{}) {
 	tick := time.NewTicker(pollCadence)
@@ -677,13 +677,20 @@ func (m *managedRentals) observeLocked(row records.Rental) (string, *exit.Error)
 			row.ID, row.MachineName, idle.Since.UTC().Format("15:04:05"), due.UTC().Format("15:04:05")))
 		return m.lineLocked()
 	}
-	line, problem := m.releaseLocked(row.ID)
+	line, problem := m.releaseIdleLocked(row.ID)
 	if problem != nil {
 		if m.retryAt == nil {
 			m.retryAt = map[string]time.Time{}
 		}
 		m.retryAt[row.ID] = time.Now().Add(idleReleaseRetry)
 		return "", problem
+	}
+	remaining, problem := m.store.RentalRow(row.ID)
+	if problem != nil {
+		return "", problem
+	}
+	if remaining != nil {
+		return line, nil
 	}
 	m.forgetIdleLocked(row.ID)
 	fmt.Fprintf(m.ctx.Out, "rental %s (%s) released after %s idle\n",
@@ -740,6 +747,31 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 	if owed {
 		return m.lineLocked()
 	}
+	return m.releasePaidLocked(*row)
+}
+
+// Idle expiry intentionally ignores retained custody: paused/failed files are
+// not work. The capacity/purpose cleanup above retains its stronger custody gate.
+func (m *managedRentals) releaseIdleLocked(id string) (string, *exit.Error) {
+	row, problem := m.store.RentalRow(id)
+	if problem != nil {
+		return "", problem
+	}
+	if row == nil {
+		return m.lineLocked()
+	}
+	idle, problem := m.observeIdle(*row)
+	if problem != nil {
+		return "", problem
+	}
+	if !idle.Due(time.Now()) {
+		return m.lineLocked()
+	}
+	return m.releasePaidLocked(*row)
+}
+
+func (m *managedRentals) releasePaidLocked(row records.Rental) (string, *exit.Error) {
+	id := row.ID
 	operationKey, problem := m.store.RequestRentalRelease(id)
 	if problem != nil {
 		return "", problem
@@ -754,7 +786,7 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 	}
 	if !confirmed && row.State != hub.RentalReleaseRequested {
 		row.State = hub.RentalReleaseRequested
-		if problem := m.store.RecordRental(*row); problem != nil {
+		if problem := m.store.RecordRental(row); problem != nil {
 			return "", problem
 		}
 		if line, lineProblem := m.lineLocked(); lineProblem == nil {
@@ -781,8 +813,8 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 			confirmed = true
 		case observed == nil:
 			row.State = remote.State
-			copyRentalFailure(row, remote)
-			if update := m.store.RecordRental(*row); update != nil {
+			copyRentalFailure(&row, remote)
+			if update := m.store.RecordRental(row); update != nil {
 				return "", update
 			}
 			time.Sleep(pollCadence)
