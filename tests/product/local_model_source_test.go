@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -32,5 +33,15 @@ func TestLocalModelSourceStaysLocalAfterCanonicalization(t *testing.T) {
 	fatal(t, problem)
 	if transfer == nil || !transfer.LocalOnly || transfer.Source != "file:"+source {
 		t.Fatalf("local path lost its placement at submission: %+v", transfer)
+	}
+	parsed, problem := modelsource.Parse(transfer.Source, root)
+	fatal(t, problem)
+	if parsed.Kind != modelsource.LocalFile || parsed.Path != source {
+		t.Fatalf("executing machine cannot reopen the exact persisted source: %+v", parsed)
+	}
+	for _, spelling := range []string{"file:./fixture.safetensors", "file://" + source} {
+		if _, problem := modelsource.Parse(spelling, root); problem == nil {
+			t.Fatalf("noncanonical file identity accepted: %q", spelling)
+		}
 	}
 }
