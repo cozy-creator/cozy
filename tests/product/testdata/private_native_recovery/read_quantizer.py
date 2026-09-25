@@ -1,6 +1,6 @@
 """Read only the named qualification requests and their tiny native results."""
 from pathlib import Path
-import importlib.metadata,json,sqlite3,struct,sys
+import importlib.metadata,json,sqlite3,struct,sys,hashlib
 import tensorfs
 parents=sys.argv[1:]
 assert parents and all(p.startswith('job-') and p[4:].isalnum() for p in parents)
@@ -26,11 +26,10 @@ for parent in parents:
     parts=[p for p in store.walk_cozytensors(manifest) if p['kind']=='part']
     verified=[]
     for part in parts:
-     assert part['length']==2048,part
-     raw=bytearray(2048);lease.read_into(part['id'],2048,0,2048,raw)
-     values=struct.unpack('<512f',raw)
-     assert len(set(values))==1
-     verified.append({'id':part['id'],'bytes':2048,'values':512,'value':values[0]})
+     length=part['length'];assert 0<length<=2097152,part
+     raw=bytearray(length);lease.read_into(part['id'],length,0,length,raw)
+     digest='sha256:'+hashlib.sha256(raw).hexdigest();assert digest==part['id']
+     verified.append({'id':part['id'],'bytes':length,'sha256':digest})
     child['native']=verified
   children.append(child)
  result['parents'][parent]=children

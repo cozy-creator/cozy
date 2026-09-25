@@ -28,3 +28,17 @@ refusal becoming final; Runtime PR611 supplies the narrow retry policy fix.
 Explicit retry success is distinct from automatic retry qualification. The CPU
 updater interpreter prerequisite shipped as Creator PR672; no manual SDK overlay
 or fabricated cache row is used to claim the updater path.
+
+Private completion: explicit partial adoption and changed-callee rejection passed
+on Runtime0.18.24/TensorFS0.3.51. Commit-before-ACK and automatic partial recovery
+passed on the distinct24+PR611 native dev wheel; both encountered the real worker
+stale-admission refusal and automatically recovered. A forged output slot was
+refused before candidate execution. The genuine shared quantizer and its source
+execute [1,1] initially and [0,0] for the edited caller. Final ordinary prune removes
+two unused memo entries while preserving all six returned artifacts exactly.
+Silky was ended via normal CLI and the live list confirms no remaining rentals.
+
+All seven `verify_*.py EVIDENCE_DIRECTORY` checks pass for retained evidence under
+`outputs/memoization-private-recovery-20260925/` in the workspace. Full checkpoint,
+source/download conversion parity, broader authority/offline/capacity cases,
+trained quality, learned Eval and positive H3 generator-bank gates are separate.
