@@ -13,7 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 )
 
-func TestAdmissionRequiresPythonEnsureAndAcceptsSourceDevWheel(t *testing.T) {
+func TestAdmissionRequiresCallerCompilerAndAcceptsSourceDevWheel(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX stand-in tool")
 	}
@@ -21,8 +21,8 @@ func TestAdmissionRequiresPythonEnsureAndAcceptsSourceDevWheel(t *testing.T) {
 		version  string
 		admitted bool
 	}{
-		{"0.18.0", false}, {"0.18.13", false}, {"0.18.14rc1", false},
-		{"0.18.14", true}, {"0.18.14+dev.h687ee141", true}, {"0.18.15", true},
+		{"0.18.0", false}, {"0.18.14", false}, {"0.18.20", false}, {"0.18.21rc1", false},
+		{"0.18.21", true}, {"0.18.21+dev.h687ee141", true}, {"0.18.22", true},
 	} {
 		t.Run(test.version, func(t *testing.T) {
 			tool := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow stand-in Runtime command for host admission
@@ -38,7 +38,7 @@ func TestAdmissionRequiresPythonEnsureAndAcceptsSourceDevWheel(t *testing.T) {
 				}
 				return
 			}
-			if problem == nil || problem.Name != "host_runtime_below_floor" || !strings.Contains(problem.Error(), "python-ensure") || !strings.Contains(problem.Remedy, "cozy-runtime[media,model-execution]>=0.18.14") {
+			if problem == nil || problem.Name != "host_runtime_below_floor" || !strings.Contains(problem.Error(), "ABI 8 managed caller compilation") || !strings.Contains(problem.Remedy, "cozy-runtime[media,model-execution]>=0.18.21") {
 				t.Fatalf("missing early upgrade refusal: %+v", problem)
 			}
 		})
@@ -50,7 +50,7 @@ func TestNewControllerAcceptsExistingPackageSDKClosure(t *testing.T) {
 		t.Skip("POSIX stand-in tool")
 	}
 	tool := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow stand-in controller for package SDK compatibility
-	must(t, os.WriteFile(tool, []byte(stubRuntime(t, "0.18.14", 58)), 0700))
+	must(t, os.WriteFile(tool, []byte(stubRuntime(t, hostruntime.ToolFloor, 58)), 0700))
 	t.Setenv("PATH", filepath.Dir(tool))
 	_, problem := hostruntime.Path(nil)
 	fatal(t, problem)

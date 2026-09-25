@@ -121,8 +121,9 @@ func TestHostRuntimeNativeAPIFloor(t *testing.T) {
 		{"old-api", "0.17.2", "host_runtime_below_floor", 54},
 		{"old-wire", "0.18.0", "host_runtime_wire_mismatch", 53},
 		{"no-python-ensure", "0.18.13", "host_runtime_below_floor", 58},
-		{"native", "0.18.14", "", 58},
-		{"source-dev", "0.18.14+dev.h687ee141", "", 58},
+		{"old-caller-compiler", "0.18.20", "host_runtime_below_floor", pb.WireMinor},
+		{"native", hostruntime.ToolFloor, "", pb.WireMinor},
+		{"source-dev", hostruntime.ToolFloor + "+dev.h687ee141", "", pb.WireMinor},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			root, path := hostRuntimeRoot(t, "native-floor-"+arm.name, stubRuntime(t, arm.release, arm.minor))

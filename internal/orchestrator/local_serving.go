@@ -94,7 +94,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		}
 		root := spec.InstallRoot
 		if root == "" {
-			root = filepath.Dir(filepath.Dir(spec.EnvironmentPython))
+			return WorkerLaunchSpec{}, "", exit.New(exit.Structural, "published local preparation has no worker environment store")
 		}
 		if problem := requireAdapterDownloadPeer(s, selected); problem != nil {
 			return WorkerLaunchSpec{}, "", problem

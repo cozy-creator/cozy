@@ -24,13 +24,15 @@ Cozy drives: `cozy-runtime` and TensorFS's `tfs`. A release asset installs the s
 Rerun it to upgrade. The host-tool step alone is:
 
 ```sh
-uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.14'
+uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.21'
 ```
 
 Keep `--python 3.12`: uv
 [ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
-so an unqualified install can select an interpreter Runtime cannot use. Runtime 0.18.14 is the
-controller minimum; packages keep their own declared ranges (0.18.0 minimum).
+so an unqualified install can select an interpreter Runtime cannot use. Runtime 0.18.21 is the
+controller minimum for Python provisioning and ABI 8 caller compilation. Existing
+captured package environments keep their declared SDK ranges; new caller-capable
+publications require Runtime 0.18.21 in both the declaration and lock.
 
 Packages use Runtime's explicit rolling window of CPython 3.12, 3.13, and 3.14.
 Creator asks Runtime to select or install an interpreter satisfying `Requires-Python`

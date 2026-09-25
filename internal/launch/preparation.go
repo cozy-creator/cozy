@@ -45,7 +45,6 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 		},
 	}
 	if spec.Preparation.Published {
-		spec.InstallRoot = ""
 		spec.Placement.SourceDigest = ""
 	}
 	return spec, nil

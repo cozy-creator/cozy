@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/processtree"
@@ -90,7 +92,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		facts, problem := client(m.context).RentalImageInventory(ctx, identity.RentalID)
 		return facts.PublicOrigin, problem
 	}
-	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
+	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
 		facts, problem := rental.PrepareFactsSource(client(m.context))(ctx, identity, ref)
 		if problem != nil {
@@ -114,7 +116,11 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		return readMachinePreparedSet(stream)
+		ready, problem := readMachinePreparedSet(stream)
+		if problem != nil {
+			return nil, problem
+		}
+		return &publishedPreparation{ready, facts.LockedRequirements}, nil
 	}
 
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
@@ -386,7 +392,30 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		m.localPID = process.PID
 	}
 	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, wireMinor: info.WireMinor}
-	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
+	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
+		if request.InstallID == "" {
+			plan, iface, locked, requires, problem := m.publishedChildPreparation(ctx, request)
+			if problem != nil {
+				return nil, problem
+			}
+			slots := []string{}
+			for _, entry := range append(append([]launch.Entrypoint(nil), iface.Entrypoints...), iface.Jobs...) {
+				for _, model := range entry.Models {
+					slots = append(slots, model.Path)
+				}
+			}
+			sort.Strings(slots)
+			downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{{Package: request.Package, Release: request.Release}}, nil)
+			if problem != nil {
+				return nil, problem
+			}
+			prepared, err := preparation.PreparePackageSet(ctx, &pb.PreparePackageSetRequest{InstallRoot: filepath.Join(root, "environments"), DownloadDelegation: downloads, Application: iface.Application, LockedRequirements: locked, PythonRequires: requires, PythonVersion: plan.PythonVersion, ModelSlotPaths: slots})
+			if err != nil {
+				return nil, machineTransport(err)
+			}
+			return &publishedPreparation{prepared.PlacementSet, locked}, validateMachinePrepared(prepared.PlacementSet)
+		}
+
 		facts, problem := m.resolver.installFacts(request.InstallID)
 		if problem != nil {
 			return nil, problem
@@ -414,7 +443,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		return prepared.PlacementSet, validateMachinePrepared(prepared.PlacementSet)
+		return &publishedPreparation{prepared.PlacementSet, locked}, validateMachinePrepared(prepared.PlacementSet)
 	}
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
 		return preparation.WorkspaceRetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
