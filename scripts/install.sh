@@ -98,6 +98,7 @@ echo "was:      $WAS"
 echo "now:      $NOW"
 echo "runtime:  cozy-runtime $RUNTIME"
 echo "tfs:      $TFS"
+echo "complete: add 'source <(cozy completion bash)' to ~/.bashrc (zsh and fish: cozy completion --help)"
 for dir in "$BIN" "$TOOLS"; do
   case ":$PATH:" in *":$dir:"*) ;; *) echo "note:     add $dir to PATH" ;; esac
 done | uniq

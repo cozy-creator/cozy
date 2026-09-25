@@ -117,6 +117,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		}),
 		kong.ConfigureHelp(kong.HelpOptions{Compact: true, FlagsLast: true, WrapUpperBound: 100}),
 	)
+	if err == nil && len(args) > 0 && args[0] == completeVerb {
+		return complete(parser.Model, args[1:], stdout)
+	}
 	mode := presentationMode(stdout, wantsJSON)
 	if err != nil {
 		problem := output.NewError(output.Operational, "cli.grammar", err.Error())

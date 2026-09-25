@@ -71,20 +71,7 @@ func Open(root string) (Layout, *exit.Error) {
 	if err := os.Chmod(root, 0o700); err != nil {
 		return Layout{}, exit.Internalf("cannot protect the private local root %s: %s", root, err)
 	}
-	l := Layout{
-		Root:     root,
-		DB:       filepath.Join(root, "creator.sqlite"),
-		Installs: filepath.Join(root, "installs"),
-		Daemon:   filepath.Join(root, "daemon.lock"),
-		Workers:  filepath.Join(root, "workers"),
-		Outputs:  filepath.Join(root, "outputs"),
-		Tmp:      filepath.Join(root, "tmp"),
-	}
-	l.Lock = filepath.Join(l.Installs, ".lock")
-	l.Publications = filepath.Join(root, "publications")
-	l.Rentals = filepath.Join(root, "rentals")
-	l.LocalPackages = filepath.Join(root, "local-packages")
-	l.Log = filepath.Join(root, "daemon.log")
+	l := Paths(root)
 	// A prior root's records.db is the same database under its retired name. The rename
 	// runs here — cheap, idempotent, and before any open — so no second code path ever
 	// reads the old spelling. WAL/SHM siblings move with it or not at all: a database
@@ -100,6 +87,27 @@ func Open(root string) (Layout, *exit.Error) {
 		}
 	}
 	return l, nil
+}
+
+// Paths derives the layout from root without touching the filesystem. Only readers that
+// must not create or migrate anything (shell completion) use it directly; everything else
+// goes through Open.
+func Paths(root string) Layout {
+	l := Layout{
+		Root:     root,
+		DB:       filepath.Join(root, "creator.sqlite"),
+		Installs: filepath.Join(root, "installs"),
+		Daemon:   filepath.Join(root, "daemon.lock"),
+		Workers:  filepath.Join(root, "workers"),
+		Outputs:  filepath.Join(root, "outputs"),
+		Tmp:      filepath.Join(root, "tmp"),
+	}
+	l.Lock = filepath.Join(l.Installs, ".lock")
+	l.Publications = filepath.Join(root, "publications")
+	l.Rentals = filepath.Join(root, "rentals")
+	l.LocalPackages = filepath.Join(root, "local-packages")
+	l.Log = filepath.Join(root, "daemon.log")
+	return l
 }
 
 // DependencyCache is disposable immutable payload storage. Captured generations
