@@ -84,18 +84,19 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 		RootRevisionDigest: codeDigest,
 		PublishedRevisions: []*pb.PublishedPackageRevision{{Package: placement.GetPackage(), Environment: placement.Environment, PackageInterface: placement.PackageInterface}},
 	}
-	for _, callable := range append(append([]launch.Entrypoint(nil), iface.Jobs...), iface.Entrypoints...) {
-		if callable.Invocable == nil {
-			continue
-		}
-		capture.Bindings = append(capture.Bindings, &pb.MachineCallableBinding{
-			CallerRevisionDigest: codeDigest, CalleeRevisionDigest: codeDigest,
-			InterfaceDigest: placement.PackageInterface.Digest,
-			Module:          callable.Invocable.Module, Export: callable.Invocable.Export, Entrypoint: callable.Name,
-		})
+	addPublishedBindings(capture, codeDigest, codeDigest, iface, true)
+	if problem := m.capturePublishedDependencies(ctx, request, connection, capture); problem != nil {
+		return nil, problem
 	}
+
 	sort.Slice(capture.Bindings, func(i, j int) bool {
 		a, b := capture.Bindings[i], capture.Bindings[j]
+		if compared := bytes.Compare(a.CallerRevisionDigest, b.CallerRevisionDigest); compared != 0 {
+			return compared < 0
+		}
+		if compared := bytes.Compare(a.InterfaceDigest, b.InterfaceDigest); compared != 0 {
+			return compared < 0
+		}
 		if a.Module != b.Module {
 			return a.Module < b.Module
 		}

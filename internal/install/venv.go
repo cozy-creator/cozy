@@ -205,6 +205,19 @@ func writeLockedRequirements(exported, target, indexURL string,
 	if err != nil {
 		return exit.Internalf("cannot read the exported registry closure: %s", err)
 	}
+	body, problem := LockedRequirements(raw, indexURL, wheels)
+	if problem != nil {
+		return problem
+	}
+	if err := os.WriteFile(target, body, 0o600); err != nil {
+		return exit.Internalf("cannot retain the locked-requirements export: %s", err)
+	}
+	return nil
+}
+
+// LockedRequirements renders the same exact wheel inventory for an installed
+// package or a worker-local dependency; it never resolves names or versions.
+func LockedRequirements(raw []byte, indexURL string, wheels []PublishedWheel) ([]byte, *exit.Error) {
 	rows := map[string]string{}
 	pending := ""
 	for _, line := range strings.Split(string(raw), "\n") {
@@ -219,7 +232,7 @@ func writeLockedRequirements(exported, target, indexURL string,
 		}
 		name := normalizedRequirementName(row)
 		if name == "" || rows[name] != "" {
-			return exit.Internalf("the exported registry closure row %q is not one exact pin", row)
+			return nil, exit.Internalf("the exported registry closure row %q is not one exact pin", row)
 		}
 		rows[name] = strings.Join(strings.Fields(row), " ")
 	}
@@ -228,7 +241,7 @@ func writeLockedRequirements(exported, target, indexURL string,
 		name := normalizedRequirementName(wheel.Distribution)
 		if name == "" || wheel.Version == "" ||
 			!strings.HasPrefix(wheel.Digest, "sha256:") || rows[name] != "" || seen[name] {
-			return exit.Internalf("published wheel fact %q is incomplete or duplicated",
+			return nil, exit.Internalf("published wheel fact %q is incomplete or duplicated",
 				wheel.Distribution)
 		}
 		seen[name] = true
@@ -245,10 +258,7 @@ func writeLockedRequirements(exported, target, indexURL string,
 	for _, name := range names {
 		out.WriteString(rows[name] + "\n")
 	}
-	if err := os.WriteFile(target, []byte(out.String()), 0o600); err != nil {
-		return exit.Internalf("cannot retain the locked-requirements export: %s", err)
-	}
-	return nil
+	return []byte(out.String()), nil
 }
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*`)
