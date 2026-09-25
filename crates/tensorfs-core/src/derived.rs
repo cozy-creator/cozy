@@ -2050,6 +2050,7 @@ fn build_header(
         configs,
         assets: companion_files(declaration, sources)?
             .into_iter()
+            .filter(|(_, object)| object.length != 0)
             .map(|(path, object)| {
                 let asset = Asset {
                     logical_sha256: object.sha256.clone(),
