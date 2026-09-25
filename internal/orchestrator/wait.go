@@ -59,25 +59,11 @@ func (f waitFacts) decorate(payload map[string]any, req records.Request) map[str
 // Callers hold c.mu.
 func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) waitFacts {
 	if ahead := c.rentalQueueAhead(req); ahead != nil {
-		return waitFacts{cause: WaitQueueAhead, on: c.machineWord(rentalInstanceID(req.RequestedRental)),
+		return waitFacts{cause: WaitQueueAhead, on: c.machineWord(rentalInstanceID(scheduledVenue(req))),
 			waitingFor: ahead}
 	}
 	if r.pick() != nil {
 		return waitFacts{}
-	}
-	if len(r.claimed) > 0 {
-		facts := waitFacts{cause: WaitQueueAhead}
-		claims := c.claimsAhead(req.ID)
-		for _, id := range c.pending {
-			for _, lane := range r.lanes {
-				if claims[lane] == id {
-					facts.waitingFor = c.waitingRun(id)
-					facts.on = c.machineWord(lane.worker)
-					return facts
-				}
-			}
-		}
-		return facts
 	}
 	if len(r.blocked) > 0 {
 		blocked := r.blocked[0]
@@ -115,12 +101,13 @@ func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) wait
 	return waitFacts{cause: WaitWorkerStart}
 }
 
-// Named-rental FIFO also blocks requests whose placement is not ready yet. The
-// lane router cannot see that wait: it has no eligible lane to claim. Reuse the
-// actual drain's typed observation, provided its blocker is still queued ahead.
-// This adds no second FIFO policy or per-request database scan. Callers hold c.mu.
+// A rental's scheduler holds a request back for another one on the same rental: the
+// request whose additive desire is in flight, or an older one whose starvation bound is
+// spent. The lane router cannot see that wait. Reuse the scheduler's typed observation,
+// provided its blocker is still queued on the rental. Callers hold c.mu.
 func (c *Orchestrator) rentalQueueAhead(req records.Request) *WaitingRun {
-	if req.RequestedRental == "" || c.activeChild(req) {
+	venue := scheduledVenue(req)
+	if venue == "" {
 		return nil
 	}
 	parked := c.parked[req.ID]
@@ -128,22 +115,13 @@ func (c *Orchestrator) rentalQueueAhead(req records.Request) *WaitingRun {
 		return nil
 	}
 	blocker := parked.wait.waitingFor
-	ahead := false
-	for _, id := range c.pending {
-		if id == req.ID {
-			if !ahead {
-				return nil
-			}
-			prior, problem := c.opt.Store.RequestRow(blocker.RequestID)
-			if problem == nil && prior != nil && prior.RequestedRental == req.RequestedRental &&
-				(prior.State == "submitted" || prior.State == "queued") {
-				return blocker
-			}
-			return nil
-		}
-		if id == blocker.RequestID {
-			ahead = true
-		}
+	if !c.queued(blocker.RequestID) {
+		return nil
+	}
+	prior, problem := c.opt.Store.RequestRow(blocker.RequestID)
+	if problem == nil && prior != nil && scheduledVenue(*prior) == venue &&
+		(prior.State == "submitted" || prior.State == "queued") {
+		return blocker
 	}
 	return nil
 }

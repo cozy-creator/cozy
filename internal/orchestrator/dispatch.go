@@ -593,32 +593,46 @@ func (c *Orchestrator) startMachineExecution(req records.Request) *exit.Error {
 }
 
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	if current, problem := c.opt.Store.RequestRow(req.ID); problem == nil && current != nil &&
+		scheduledVenue(*current) != "" {
+		if link, problem := c.opt.Store.MachineExecution(req.ID); problem == nil && link == nil {
+			// A rental's serving queue prepares only through its scheduler (schedule.go).
+			go c.drain()
+			return
+		}
+	}
+	c.prepare(req)
+}
+
+// prepare is select-or-start's body: it answers whether it handed the request to a
+// preparation goroutine, which releases the rental's desire slot when it ends.
+func (c *Orchestrator) prepare(req records.Request) bool {
 	c.mu.Lock()
 	closing := c.closing
 	c.mu.Unlock()
 	if closing {
-		return
+		return false
 	}
 	if link, problem := c.opt.Store.MachineExecution(req.ID); problem != nil || link != nil {
 		if problem == nil && c.opt.StartMachineExecution != nil {
 			_ = c.startMachineExecution(req)
 		}
-		return
+		return false
 	}
 	current, problem := c.opt.Store.RequestRow(req.ID)
 	if problem != nil || current == nil || (current.State != "submitted" && current.State != "queued") {
-		return
+		return false
 	}
 	req = *current
 	previousRental := req.Worker
 	req, problem = c.reconsiderAutomaticRental(req)
 	if problem != nil {
 		c.logf("%s cannot reconsider its automatic rental: %s", req.ID, problem.Message)
-		return
+		return false
 	}
 	if previousRental != req.Worker {
 		go c.drain()
-		return
+		return false
 	}
 	// A queued pin can predate a client upgrade or the peer's first ClaimAck.
 	// Replan only work which has never been offered; keep old attempts/data intact.
@@ -634,7 +648,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			retained, problem := c.opt.Store.RentalHasRetainedJob(req.Worker)
 			if problem != nil {
 				c.logf("%s cannot assess retained rental job: %s", req.ID, problem.Message)
-				return
+				return false
 			}
 			// A retained client job may reuse its machine without discarding old
 			// bytes; its preparation still waits for active execution below. Legacy
@@ -646,13 +660,13 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			row, problem := c.opt.Store.RentalRow(req.Worker)
 			if problem != nil {
 				c.logf("%s cannot assess pinned rental: %s", req.ID, problem.Message)
-				return
+				return false
 			}
 			if row != nil {
 				spent, problem := RentalSpent(c.opt.Store, *row)
 				if problem != nil {
 					c.logf("%s cannot assess pinned rental purpose: %s", req.ID, problem.Message)
-					return
+					return false
 				}
 				if spent {
 					reason = ExcludedSpent
@@ -662,15 +676,15 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		if reason != "" {
 			if req.RetainWork || req.RequestedRental != "" {
 				c.failPreparation(req, exit.Named(exit.Conflict, "request.retained_rental_unavailable", "the retained rental cannot execute this transaction (%s)", reason), "")
-				return
+				return false
 			}
 			attempts, problem := c.opt.Store.Attempts(req.ID)
 			if problem != nil || len(attempts) != 0 {
-				return
+				return false
 			}
 			unpinned, problem := c.opt.Store.UnpinRentalWork(req.ID, req.Worker)
 			if problem != nil || !unpinned {
-				return
+				return false
 			}
 			c.logf("%s replans queued work from rental %s: %s", req.ID, req.Worker, reason)
 			req.Worker = ""
@@ -690,13 +704,13 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		if c.opt.RentalFleet == nil || c.opt.AcquireManagedRental == nil {
 			c.failPreparation(req, exit.Named(exit.Unavailable, "rental.acquisition_unavailable",
 				"this Cozy daemon cannot acquire managed rentals"), "")
-			return
+			return false
 		}
 		guard := "rental/" + requestSlot(req)
 		c.mu.Lock()
 		if c.closing {
 			c.mu.Unlock()
-			return
+			return false
 		}
 		rentalHolds := c.rentalHeld(req)
 		staging := c.starting[guard]
@@ -705,7 +719,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		}
 		c.mu.Unlock()
 		if rentalHolds || staging {
-			return
+			return false
 		}
 		guards = append(guards, guard)
 		unguard := func() {
@@ -717,10 +731,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		if problem != nil {
 			unguard()
 			if deferred, _ := c.deferUnavailable(req, problem); deferred {
-				return
+				return false
 			}
 			c.failPreparation(req, problem, "")
-			return
+			return false
 		}
 		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
 		// --rental is permission AND intent to spend (owner ruling 2026-09-03): local
@@ -737,10 +751,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 				c.logPlacement(req, decision)
 			}
 			if deferred {
-				return
+				return false
 			}
 			c.failPreparation(req, problem, "")
-			return
+			return false
 		}
 		if after != "" {
 			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": after})
@@ -753,7 +767,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			if c.parkFor(req, decision.Line()) {
 				c.logPlacement(req, decision)
 			}
-			return
+			return false
 		}
 		req.Worker = decision.RentalID
 		if decision.Models != nil {
@@ -776,16 +790,21 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	if req.IsJob() {
 		slot += "/job/" + req.Entrypoint
 	}
-	if req.Worker != "" {
-		slot = "rental-prepare/" + req.Worker
-	}
+	rental := req.Worker
 	c.mu.Lock()
-	if c.closing || c.starting[slot] {
+	// ONE DESIRE PER RENTAL: a preparation in flight there owns the rental's desired set
+	// until it ends, and its end re-asks the rental's scheduler.
+	busy := c.starting[slot]
+	if rental != "" {
+		// The scheduler may have reserved the slot for this very request.
+		busy = c.preparing[rental] || (c.desiring[rental] != "" && c.desiring[rental] != req.ID)
+	}
+	if c.closing || busy {
 		for _, guard := range guards {
 			delete(c.starting, guard)
 		}
 		c.mu.Unlock()
-		return
+		return false
 	}
 	stale := ""
 	for _, w := range c.workers {
@@ -830,7 +849,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 					delete(c.starting, guard)
 				}
 				c.mu.Unlock()
-				return
+				return false
 			}
 			if req.Worker != "" && w.spec.Connection != nil {
 				// The rental is the slot. A different package is an addition to this
@@ -848,8 +867,12 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			stale = w.instanceID
 		}
 	}
-	c.starting[slot] = true
-	guards = append(guards, slot)
+	if rental != "" {
+		c.desiring[rental], c.preparing[rental] = req.ID, true
+	} else {
+		c.starting[slot] = true
+		guards = append(guards, slot)
+	}
 	c.mu.Unlock()
 	if stale != "" {
 		c.logf("worker %s staged no plan for %s and is STALE; replacing it", stale, req.PlanID)
@@ -867,6 +890,10 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			c.mu.Lock()
 			if w := c.workers[rentalInstanceID(req.Worker)]; req.Worker != "" && w != nil && w.preparingRequest == req.ID {
 				w.preparingRequest, w.preparingReady = "", false
+			}
+			if rental != "" && c.desiring[rental] == req.ID {
+				delete(c.desiring, rental)
+				delete(c.preparing, rental)
 			}
 			for _, guard := range guards {
 				delete(c.starting, guard)
@@ -988,11 +1015,15 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		c.mu.Unlock()
 		c.drain()
 		done()
-		// The launch is over and the queue's world has changed: whatever is at the head now
-		// gets its own question asked, which is what closes the loop when this launch was
-		// for a plan the head does not need.
+		// The launch is over and the queue's world has changed: the rental's scheduler
+		// issues its next desire, and whatever is at the head elsewhere gets its own
+		// question asked.
+		if rental != "" {
+			c.drain()
+		}
 		c.reviveQueue()
 	}()
+	return true
 }
 
 func (c *Orchestrator) deferUnavailable(req records.Request, problem *exit.Error) (deferred, news bool) {
@@ -1331,8 +1362,12 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
 		}
 	}
-	if problem := c.claimRentalPreparation(instance, req); problem != nil {
-		return WorkerLaunchSpec{}, "", problem
+	// Published serving on a serving worker only adds to the rental's set: it claims
+	// nothing and fences nothing. Everything else owns the machine while it prepares.
+	if !c.ordinaryServing(instance, req) {
+		if problem := c.claimRentalPreparation(instance, req); problem != nil {
+			return WorkerLaunchSpec{}, "", problem
+		}
 	}
 	var jobPrepared *pb.DesiredPlacementSet
 	if req.InstallID != "" {
@@ -1457,7 +1492,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		}
 		return spec, req.PlanID, nil
 	}
-	spec, planID, e := c.ensureLogicalPackageReady(instance, req.Worker, logical)
+	spec, planID, e := c.ensureLogicalPackageReady(instance, req.Worker, logical, req.InstallID == "")
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
@@ -1486,6 +1521,10 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error, workerToS
 
 func (c *Orchestrator) failPreparation(expected records.Request, cause *exit.Error, workerToStop string) {
 	c.failQueuedSelection(expected.ID, &expected, cause, workerToStop)
+	if scheduledVenue(expected) != "" {
+		// The rental's desire ended with this request: its scheduler asks for the next.
+		go c.drain()
+	}
 }
 
 func (c *Orchestrator) failQueuedSelection(requestID string, expected *records.Request, cause *exit.Error, workerToStop string) {
@@ -2084,7 +2123,6 @@ func (c *Orchestrator) pick(req records.Request) (offerTarget, *exit.Error) {
 	w := pick.worker
 	target := offerTarget{worker: w, sess: c.sessions[w.bootID], admissionEpoch: w.admissionEpoch,
 		routed: routed}
-	c.overtaken(req.ID, laneKey{w.instanceID, pick.laneID})
 	if w.spec.IsJob() {
 		// RESERVE the seat this dispatch is about to consume. The worker's own next
 		// observed state is still the authority — this only stops ONE drain pass from

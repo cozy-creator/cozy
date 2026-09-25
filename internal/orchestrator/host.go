@@ -108,6 +108,21 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			c.logf("PodHost prepare %s#%d superseded by #%d between packages", prep.label, seq, superseded)
 			return
 		}
+		// ALREADY PREPARED ON THIS BOOT. The download set is a pure function of the
+		// selection and the Runtime's answer is a pure function of the download set and the
+		// pod's store, so re-asking re-verifies ~100 GB the pod already holds (measured
+		// ~2 min per repeat on an H3 rental) to author the same bytes.
+		c.mu.Lock()
+		held := w.preparedSets[downloadSetKey(prep.downloadSet)]
+		if w.preparedBoot != s.bootID {
+			held = nil
+		}
+		c.mu.Unlock()
+		if held != nil {
+			c.logf("PodHost prepare %s#%d: already prepared on boot %s; reusing its placement", prep.label, seq, s.bootID)
+			sets = append(sets, held)
+			continue
+		}
 		// MINOR 31 (xs-019): the call carries the hub-known release facts on
 		// fields 3-6; the pod host refuses one without them. They are fetched
 		// here, on the prepare's own goroutine, because the source is a network
@@ -145,6 +160,11 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 		if !c.settleHostPrepare(s, w, seq, prep.label, result) {
 			return
 		}
+		c.mu.Lock()
+		if w.preparedBoot == s.bootID && w.preparedSets != nil {
+			w.preparedSets[downloadSetKey(prep.downloadSet)] = result.set
+		}
+		c.mu.Unlock()
 		sets = append(sets, result.set)
 	}
 	united, err := unitePreparedPlacementSets(sets)
@@ -418,6 +438,7 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		w.jobsAvail, w.reportedJobs = 0, 0
 	}
 	w.setDigest, w.setBytes = digest, setBytes
+	w.rememberSet(s.bootID, digest, setBytes)
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,

@@ -141,6 +141,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	var lastRevision uint64
 	var lastSetDigest []byte
 	var lastPlacements []*pb.PlacementStatus
+	// THE MINOR-61 EXECUTOR. One long-lived process builds each binding's construction the
+	// first time an attempt enters it and keeps it; `loaded_binding_digests` reports them.
+	var loadedMu sync.Mutex
+	loaded := map[string]bool{}
 	// THE HELD OUTCOME (missing-output). cozy-runtime journals an outcome before sending it
 	// and, until the owner's ack names it, restates it as a held_attempts row pending ack
 	// on every report — it does not resend the frame on a live stream. This arm does
@@ -173,6 +177,16 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 		}
 		lastRevision, lastSetDigest, lastPlacements = revision, setDigest, placements
+		loadedMu.Lock()
+		for _, p := range placements {
+			p.LoadedBindingDigests = nil
+			for _, digest := range p.DispatchableBindingDigests {
+				if spelled, err := canonical.Spell(digest); err == nil && loaded[spelled] {
+					p.LoadedBindingDigests = append(p.LoadedBindingDigests, digest)
+				}
+			}
+		}
+		loadedMu.Unlock()
 		r.Placements = placements
 		heldMu.Lock()
 		if heldOutcome != nil {
@@ -339,6 +353,13 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				t.PlacementId = offer.PlacementId
 				outcome(t)
 				continue
+			}
+			if spec, err := canonical.Read(offer.InvocationSpecCanonicalBytes, &pb.InvocationSpec{}); err == nil {
+				if binding := spec.Sub("serving").Str("entrypoint_binding_digest"); binding != "" {
+					loadedMu.Lock()
+					loaded[binding] = true
+					loadedMu.Unlock()
+				}
 			}
 			accepted := &pb.AttemptAccepted{
 				RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
