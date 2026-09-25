@@ -893,17 +893,38 @@ func (s *Store) HeldRentalIDs() (map[string]bool, *exit.Error) {
 	return held, nil
 }
 
+// pinnedToRental is THE spelling of "this request is pinned to rental X": the scheduler
+// assigned it there (worker), or the caller selected X (`cozy run --rental`) and it is not
+// assigned yet (requested_rental; worker is empty until dispatch). Every "work on this
+// rental" question uses it, so counts, idle expiry, release and mode claims cannot drift.
+// Assignment only ever writes worker=requested_rental, so each row matches at most once.
+func pinnedToRental(alias, rentalID string) (string, []any) {
+	return "(" + alias + "worker=? OR " + alias + "requested_rental=?)", []any{rentalID, rentalID}
+}
+
 // RentalRunCounts is the work still pinned to one machine, in the ONE spelling of "still
 // owes work or a terminal": queued is every request waiting for the pod, running is every
 // request the pod is executing or finalizing plus every attempt whose terminal is still
 // owed. The idle release fences on both being zero.
 func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.Error) {
+	return s.rentalRunCounts(id, "")
+}
+
+// RentalQueueAhead is the queued work pinned to a rental other than `requestID` itself: a
+// request selected with --rental is already in that rental's queue while it is placed.
+func (s *Store) RentalQueueAhead(rentalID, requestID string) (int, *exit.Error) {
+	queued, _, problem := s.rentalRunCounts(rentalID, requestID)
+	return queued, problem
+}
+
+func (s *Store) rentalRunCounts(id, except string) (queued, running int, problem *exit.Error) {
+	pinned, args := pinnedToRental("", id)
 	err := s.db.QueryRow(`SELECT
 		COALESCE(SUM(CASE WHEN state IN ('submitted','queued','requeue_pending') THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN state IN ('dispatching','finalizing') OR EXISTS (
 		  SELECT 1 FROM attempts a WHERE a.request_id=requests.id
 		    AND a.state IN (`+openAttemptStates+`)) THEN 1 ELSE 0 END),0)
-		FROM requests WHERE worker=?`, id).Scan(&queued, &running)
+		FROM requests WHERE `+pinned+` AND id<>?`, append(args, except)...).Scan(&queued, &running)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot count runs for rented machine %s: %s", id, err)
 	}
@@ -945,6 +966,7 @@ func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlem
 	// Machine work completion is recorded with its inactive state projection.
 	// Its later request.completed event describes outcome collection, not more
 	// compute; prefer the work timestamp so collection/reconnect cannot renew idle.
+	pinned, args := pinnedToRental("r.", id)
 	rows, err := reader.Query(`SELECT r.id,r.kind,r.created_at,
 		COALESCE((SELECT a.closed_at FROM attempts a WHERE a.request_id=r.id
 		  AND a.state IN ('terminal','closed') AND a.closed_at<>''
@@ -952,8 +974,8 @@ func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlem
 		COALESCE((SELECT e.at FROM request_events e WHERE e.request_id=r.id
 		  AND e.type IN ('client.machine_work_finished','request.completed','request.failed','request.canceled','request.paused','request.blocked')
 		  ORDER BY (e.type='client.machine_work_finished') DESC,e.seq DESC LIMIT 1),'')
-		FROM requests r WHERE r.worker=? AND r.rental=1
-		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned','paused','blocked')`, id)
+		FROM requests r WHERE `+pinned+` AND r.rental=1
+		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned','paused','blocked')`, args...)
 	if err != nil {
 		return RentalLastSettlement{}, false, exit.Internalf(
 			"cannot read settlements for rental %s: %s", id, err)
@@ -1034,7 +1056,7 @@ func (s *Store) ForgetRental(id string) (bool, *exit.Error) {
 // what the daemon asks when that rental reaches a terminal failed state: the pin named a
 // machine, the machine is gone, and these rows are the work that went with it.
 //
-// It is deliberately the SAME predicate `RentalRunCounts` totals — `worker=<rental>` and an
+// It is deliberately the SAME predicate `RentalRunCounts` totals — `pinnedToRental` and an
 // active state — so the count an operator reads and the set recovery acts on can never
 // disagree. A rental shown as holding 1 running and 2 queued must be able to hand over
 // exactly those three rows.
@@ -1042,9 +1064,10 @@ func (s *Store) PinnedRentalWork(rentalID string) ([]Request, *exit.Error) {
 	if rentalID == "" {
 		return nil, nil
 	}
+	pinned, args := pinnedToRental("", rentalID)
 	rows, err := s.db.Query(`SELECT `+requestCols+` FROM requests
-		WHERE worker=? AND state IN (`+activeRequestStates+`)
-		ORDER BY created_at,id`, rentalID)
+		WHERE `+pinned+` AND state IN (`+activeRequestStates+`)
+		ORDER BY created_at,id`, args...)
 	if err != nil {
 		return nil, exit.Internalf("cannot list work pinned to rental %s: %s", rentalID, err)
 	}

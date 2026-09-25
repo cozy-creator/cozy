@@ -21,18 +21,19 @@ const rentalIdleDDL = `CREATE TABLE IF NOT EXISTS rental_idle (
 )`
 
 // RentalIdleRunCounts excludes retained terminal attempts and counts only work
-// assigned to this machine, including its explicitly purchased acquisition.
+// pinned to this machine, including its explicitly purchased acquisition.
 func (s *Store) RentalIdleRunCounts(id, buyer string) (int, int, *exit.Error) {
 	return rentalIdleRunCounts(s.db, id, buyer)
 }
 
 func rentalIdleRunCounts(reader rentalIdleReader, id, buyer string) (queued, running int, problem *exit.Error) {
+	pinned, args := pinnedToRental("r.", id)
 	err := reader.QueryRow(`SELECT
  COALESCE(SUM(CASE WHEN r.state IN ('submitted','queued','requeue_pending') THEN 1 ELSE 0 END),0),
  COALESCE(SUM(CASE WHEN r.state IN ('dispatching','finalizing','pausing','canceling') OR
  EXISTS(SELECT 1 FROM attempts a WHERE a.request_id=r.id AND a.state IN ('preparing','offered','accepted','recovered_open')) THEN 1 ELSE 0 END),0)
- FROM requests r WHERE r.worker=? OR
- (r.id=? AND r.worker='') OR EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=r.id AND e.machine_id=?)`, id, buyer, id).Scan(&queued, &running)
+ FROM requests r WHERE `+pinned+` OR
+ (r.id=? AND r.worker='') OR EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=r.id AND e.machine_id=?)`, append(args, buyer, id)...).Scan(&queued, &running)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot observe rental work: %s", err)
 	}

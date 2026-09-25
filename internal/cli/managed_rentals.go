@@ -405,7 +405,7 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[machineKe
 				c.Verdict = orchestrator.VerdictExcluded + reason
 			} else {
 				mode, held := m.owner.RentalStanding(row.ID, req.IsJob())
-				queued, _, problem := m.store.RentalRunCounts(row.ID)
+				queued, problem := m.store.RentalQueueAhead(row.ID, req.ID)
 				if problem != nil {
 					return nil, problem
 				}
