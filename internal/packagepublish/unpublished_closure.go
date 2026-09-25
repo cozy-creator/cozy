@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -203,19 +204,30 @@ func fetchCapturedWheel(ctx context.Context, client *http.Client, row RegistryRo
 	}
 	if row.captureLocally {
 		local := *client
-		local.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		// Hub file custody redirects to a presigned storage object. Only the
+		// redirect transport changes; the locked hash and bounded bytes below
+		// still decide whether the artifact is accepted.
+		local.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+			if len(via) > 5 || next.URL.Scheme != "https" || next.URL.Host == "" || next.URL.User != nil {
+				return fmt.Errorf("captured Hub wheel storage redirect is invalid")
+			}
+			return nil
+		}
 		client = &local
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return exit.Unavailablef("captured dependency %s download was interrupted", row.Name)
+		return exit.Named(exit.Unavailable, "private_dependency_download_failed", "captured dependency %s download or storage redirect failed", row.Name)
 	}
 	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return exit.Named(exit.Unavailable, "private_dependency_download_failed", "captured dependency %s download returned HTTP %d", row.Name, response.StatusCode)
+	}
 	bound := row.Size
 	if row.captureLocally && bound == 0 {
 		bound = MaxDependencyWheelBytes
 	}
-	if bound <= 0 || bound > MaxDependencyWheelBytes || response.StatusCode != http.StatusOK || response.ContentLength > bound || row.Size > 0 && response.ContentLength > 0 && response.ContentLength != row.Size {
+	if bound <= 0 || bound > MaxDependencyWheelBytes || response.ContentLength > bound || row.Size > 0 && response.ContentLength > 0 && response.ContentLength != row.Size {
 		return exit.Named(exit.Conflict, "private_dependency_download_changed", "captured dependency %s download differs from the captured wheel", row.Name)
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -226,7 +238,13 @@ func fetchCapturedWheel(ctx context.Context, client *http.Client, row RegistryRo
 	n, copyErr := io.Copy(io.MultiWriter(file, hash), io.LimitReader(response.Body, bound+1))
 	syncErr := file.Sync()
 	closeErr := file.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil || (n > bound || row.Size > 0 && n != row.Size) || hex.EncodeToString(hash.Sum(nil)) != row.SHA256 {
+	if copyErr != nil {
+		return exit.Named(exit.Unavailable, "private_dependency_download_failed", "captured dependency %s download was interrupted", row.Name)
+	}
+	if syncErr != nil || closeErr != nil {
+		return exit.Internalf("cannot retain captured dependency %s", row.Name)
+	}
+	if n > bound || row.Size > 0 && n != row.Size || hex.EncodeToString(hash.Sum(nil)) != row.SHA256 {
 		return exit.Named(exit.Conflict, "private_dependency_download_changed", "captured dependency %s bytes differ from the captured wheel", row.Name)
 	}
 	fact, problem := wheel.InspectIdentity(path)
