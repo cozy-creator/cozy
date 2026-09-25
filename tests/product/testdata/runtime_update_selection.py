@@ -152,6 +152,16 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exact artifact"):
             self.resolve()
 
+    def test_runtime_wire_is_read_from_the_selected_wheel(self):
+        for body, want in [
+            ("WIRE_MINOR = 61\nMIN_COMPATIBLE_WIRE_MINOR = 61\n", {"wire_minor": 61, "minimum_wire_minor": 61}),
+            ("WIRE_MINOR = 61\n", None), (None, None),
+        ]:
+            path = self.directory / f"wire-{len(str(body))}.whl"
+            with zipfile.ZipFile(path, "w") as wheel:
+                if body is not None:
+                    wheel.writestr("cozy/worker/v1/wire_version.py", '"""Generated."""\n\n' + body)
+            self.assertEqual(self.api["runtime_wire"]({"path": path}), want)
 
 if __name__ == "__main__":
     unittest.main()

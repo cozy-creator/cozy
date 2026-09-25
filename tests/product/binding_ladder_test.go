@@ -547,10 +547,10 @@ func TestAutoRentWalksTheLadderAndNeverBuysAShortCard(t *testing.T) {
 		t.Fatalf("the buy did not pin the H200's rung exactly, ladder kept: %+v", row.Models[0])
 	}
 	log := tail(filepath.Join(root, "daemon.log"))
-	for _, want := range []string{"renting h100-80", "(rung 1, lane fp8-adaln-pruned, fit components 51.5 GiB of 80 GB)",
+	for _, want := range []string{"renting h100-80", "(rung 1, lane fp8-adaln-pruned, fit components 51.5 GiB (working memory unmeasured) of 80 GB)",
 		"h100-80 has no inventory; choosing again without it",
 		"renting b200", "(rung 2, lane mxfp8-adaln-pruned, fit rung_asserted)",
-		"renting h200", "(rung 3, lane bf16-full, fit components 51.5 GiB of 141 GB)"} {
+		"renting h200", "(rung 3, lane bf16-full, fit components 51.5 GiB (working memory unmeasured) of 141 GB)"} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("daemon.log does not say %q:\n%s", want, log)
 		}
@@ -655,7 +655,7 @@ func candidateVerdicts(placement map[string]any) map[string]string {
 
 // cl-180. On 2026-09-08 `cozy run paul/minimax-h3-tools/attention-lane
 // --model.pruned=paul/minimax-h3@1.0.0-rc.2/fp8-adaln-pruned --rental-only` was sized
-// "fit components 48.0 GiB of 48 GB": the job reads the source HEADER, inherits 3,858
+// "fit components 48.0 GiB (working memory unmeasured) of 48 GB": the job reads the source HEADER, inherits 3,858
 // tensors by reference and writes 550 bytes, but the sizer held the card to the
 // components a SERVING construction of that lane would stage. The 24 GB card was
 // excluded, two rtx-6000-ada pods sat in `acquiring` for 22 and 24 minutes, and ~32 s of

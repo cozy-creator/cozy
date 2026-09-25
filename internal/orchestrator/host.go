@@ -136,6 +136,7 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			ImageInventory: facts.ImageInventory,
 			PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion,
 			LockedRequirements: append([]byte(nil), facts.LockedRequirements...),
+			PackageInterface:   append([]byte(nil), facts.PackageInterface...),
 		}
 		result := c.runHostPrepare(s, w, seq, prep.label,
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {

@@ -5,7 +5,6 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"os"
 	"path/filepath"
-	"sort"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -20,13 +19,7 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 	if problem != nil {
 		return orchestrator.WorkerLaunchSpec{}, problem
 	}
-	slots := []string{}
-	for _, entry := range append(append([]Entrypoint(nil), f.PackageInterface.Entrypoints...), f.PackageInterface.Jobs...) {
-		for _, model := range entry.Models {
-			slots = append(slots, model.Path)
-		}
-	}
-	sort.Strings(slots)
+	slots := f.PackageInterface.ModelSlotPaths()
 	spec := orchestrator.WorkerLaunchSpec{
 		Python: runtime, Args: []string{"serve"}, Dir: f.Install.Dir,
 		EnvironmentPython: f.environmentPython(),

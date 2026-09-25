@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/processtree"
@@ -112,6 +110,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			Claim: claim, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
 			Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
 			PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion, ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
+			PackageInterface: facts.PackageInterface,
 		})
 		if err != nil {
 			return nil, machineTransport(err)
@@ -398,18 +397,12 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 			if problem != nil {
 				return nil, problem
 			}
-			slots := []string{}
-			for _, entry := range append(append([]launch.Entrypoint(nil), iface.Entrypoints...), iface.Jobs...) {
-				for _, model := range entry.Models {
-					slots = append(slots, model.Path)
-				}
-			}
-			sort.Strings(slots)
+			slots := iface.ModelSlotPaths()
 			downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{{Package: request.Package, Release: request.Release}}, nil)
 			if problem != nil {
 				return nil, problem
 			}
-			prepared, err := preparation.PreparePackageSet(ctx, &pb.PreparePackageSetRequest{InstallRoot: filepath.Join(root, "environments"), DownloadDelegation: downloads, Application: iface.Application, LockedRequirements: locked, PythonRequires: requires, PythonVersion: plan.PythonVersion, ModelSlotPaths: slots})
+			prepared, err := preparation.PreparePackageSet(ctx, &pb.PreparePackageSetRequest{InstallRoot: filepath.Join(root, "environments"), DownloadDelegation: downloads, Application: iface.Application, LockedRequirements: locked, PythonRequires: requires, PythonVersion: plan.PythonVersion, ModelSlotPaths: slots, PackageInterface: iface.Raw})
 			if err != nil {
 				return nil, machineTransport(err)
 			}
@@ -439,6 +432,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 			InstallRoot: filepath.Join(root, "environments"), DownloadDelegation: downloads,
 			Application: facts.PackageInterface.Application, LockedRequirements: locked,
 			PythonRequires: spec.Preparation.PythonRequires, PythonVersion: spec.Preparation.PythonVersion, ModelSlotPaths: spec.Preparation.ModelSlotPaths,
+			PackageInterface: facts.PackageInterface.Raw,
 		})
 		if err != nil {
 			return nil, machineTransport(err)

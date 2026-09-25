@@ -6,6 +6,9 @@ package rental
 // The hub assembles them ONCE — packagerelease.PrepareFacts joined with the
 // rental's registered image row — and this side fetches that assembly verbatim
 // over the renter's authenticated edge rather than re-deriving any of it.
+// Wire 61 adds field 10: the release's PackageInterface bytes, read from the
+// release record and cross-checked against the assembled facts, so the Runtime
+// never describes a published package.
 
 import (
 	"bytes"
@@ -14,10 +17,12 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -66,8 +71,53 @@ func PrepareFactsSource(client *hub.Client) orchestrator.RentalPrepareFactsSourc
 		if problem != nil {
 			return orchestrator.PrepareFacts{}, problem
 		}
-		return PrepareFactsFromView(view, ref.Package, ref.Release)
+		facts, problem := PrepareFactsFromView(view, ref.Package, ref.Release)
+		if problem != nil {
+			return orchestrator.PrepareFacts{}, problem
+		}
+		pkg, problem := hub.ParseRef(ref.Package)
+		if problem != nil {
+			return orchestrator.PrepareFacts{}, problem
+		}
+		detail, problem := client.PackageRelease(ctx, pkg, ref.Release)
+		if problem != nil {
+			return orchestrator.PrepareFacts{}, problem
+		}
+		facts.PackageInterface, problem = ReleaseInterface(detail, facts, ref.Package, ref.Release)
+		if problem != nil {
+			return orchestrator.PrepareFacts{}, problem
+		}
+		return facts, nil
 	}
+}
+
+// ReleaseInterface returns the release's canonical PackageInterface bytes once
+// they are proven to be the release's exact interface and to agree with the
+// assembled facts: the same application and the same sorted model-slot paths.
+func ReleaseInterface(detail hub.PackageReleaseDetail, facts orchestrator.PrepareFacts,
+	pkg, release string) ([]byte, *exit.Error) {
+	refuse := func(format string, args ...any) ([]byte, *exit.Error) {
+		return nil, exit.Named(exit.Structural, "rental.package_interface_invalid",
+			"the hub's package interface for %s %s is unusable: %s",
+			pkg, release, fmt.Sprintf(format, args...))
+	}
+	if detail.Release.Release != release {
+		return refuse("the hub answered release %q", detail.Release.Release)
+	}
+	if _, _, problem := detail.Constraints(); problem != nil {
+		return refuse("%s", problem.Message)
+	}
+	iface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	if problem != nil {
+		return refuse("%s", problem.Message)
+	}
+	if iface.Application != facts.Application {
+		return refuse("application %q, the prepare facts name %q", iface.Application, facts.Application)
+	}
+	if slots := iface.ModelSlotPaths(); !slices.Equal(slots, facts.ModelSlotPaths) {
+		return refuse("model-slot paths %v, the prepare facts name %v", slots, facts.ModelSlotPaths)
+	}
+	return append([]byte(nil), iface.Raw...), nil
 }
 
 // PrepareFactsFromView admits the hub's answer onto the wire shape. Bounds are

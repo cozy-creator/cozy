@@ -28,6 +28,9 @@ type Constraints struct {
 	// construction can be built at. Empty means the package declares none, which is most
 	// packages and is why a wide product is excluded rather than chosen by default.
 	Degrees []int
+	// Working is the release entrypoint's measured working memory by models digest
+	// (proto-061 B). Nil or a missing digest is unmeasured.
+	Working records.WorkingPeaks
 }
 
 // Purchases is every product of the request's class as a placement candidate (cl-165),
@@ -45,7 +48,7 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		}
 		c := orchestrator.PlacementCandidate{SKU: sku.Name, GPUs: sku.AcceleratorCount,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
-		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job)
+		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job, constraints.Working)
 		if c.Verdict == "" {
 			c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
 		}
@@ -63,8 +66,12 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 // request, or a machine the catalog no longer sizes: nothing is compared. `job` says the
 // selection is a job's inputs, which are derive-only and never resident (cl-180); the
 // rung still selects the lane, and nothing is compared against memory.
+//
+// The need is the resident weights plus the largest working memory any earlier run of
+// this release entrypoint measured on the same pinned models (proto-061 B). Nothing is
+// predicted: an unmeasured selection is sized by its weights alone and says so.
 func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
-	vramGB int64, device, job bool) {
+	vramGB int64, device, job bool, working records.WorkingPeaks) {
 	var ok bool
 	if c.Models, c.Rung, ok = Pin(models, accelerator); !ok {
 		c.Verdict = orchestrator.VerdictNoRung
@@ -74,8 +81,24 @@ func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, acceler
 	if !device {
 		return
 	}
-	need := records.Resident(c.Models, accelerator, job)
+	need := WithWorking(records.Resident(c.Models, accelerator, job), working[records.ModelsDigest(c.Models)])
 	c.Fit, c.Verdict = FitNote(need, vramGB), Fit(need, vramGB, c.SKU)
+}
+
+// WithWorking adds a measured working peak to a resident figure. A rung-asserted fit
+// stays the owner's word; a derive-only job adds what its runs measured.
+func WithWorking(need records.Residency, peak records.WorkingPeak) records.Residency {
+	need.Weights = need.Bytes
+	if need.Fit == records.FitRungAsserted || peak.Runs == 0 {
+		return need
+	}
+	need.Working, need.WorkingRuns = peak.Bytes, peak.Runs
+	if peak.Bytes > math.MaxInt64-need.Bytes {
+		need.Bytes = math.MaxInt64
+	} else {
+		need.Bytes += peak.Bytes
+	}
+	return need
 }
 
 // Pin binds the selection to the rung fitting `accelerator`: the pinned refs, the first
@@ -112,18 +135,32 @@ func Fit(need records.Residency, vramGB int64, name string) string {
 	if need.Bytes <= vramGB<<30 {
 		return ""
 	}
+	why := need.Need
+	if need.WorkingRuns > 0 {
+		why = strings.TrimPrefix(why+"; ", "; ") + fmt.Sprintf("measured working %.1f GiB", gib(need.Working))
+	}
 	return fmt.Sprintf("%s%s: needs %.1f GiB resident (%s), %s has %d GB", orchestrator.VerdictExcluded,
-		orchestrator.ExcludedVRAMShort, float64(need.Bytes)/(1<<30), need.Need, name, vramGB)
+		orchestrator.ExcludedVRAMShort, gib(need.Bytes), why, name, vramGB)
 }
 
-// FitNote renders how the device was sized: the rule, and the figure compared when there
-// was one.
+// FitNote renders how the device was sized: the rule, the figures compared when there
+// were any, and whether working memory was measured.
 func FitNote(need records.Residency, vramGB int64) string {
 	if need.Bytes == 0 {
 		return need.Fit
 	}
-	return fmt.Sprintf("%s %.1f GiB of %d GB", need.Fit, float64(need.Bytes)/(1<<30), vramGB)
+	if need.WorkingRuns == 0 {
+		return fmt.Sprintf("%s %.1f GiB (working memory unmeasured) of %d GB", need.Fit, gib(need.Weights), vramGB)
+	}
+	weights := ""
+	if need.Fit != "" {
+		weights = fmt.Sprintf("%s %.1f GiB + ", need.Fit, gib(need.Weights))
+	}
+	return fmt.Sprintf("%smeasured working %.1f GiB (%d runs) of %d GB",
+		weights, gib(need.Working), need.WorkingRuns, vramGB)
 }
+
+func gib(bytes int64) float64 { return float64(bytes) / (1 << 30) }
 
 // WidthUnusable keeps a BUY of a machine wider than one card out of the decision unless
 // this request can use every card it would be billed for (cl-179). A reuse is not held to
@@ -273,6 +310,7 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 // the request settled FAILED on a fleet that was simply still booting.
 func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	row records.Rental, vramGB int64, needsAccelerator, offered, job bool,
+	working records.WorkingPeaks,
 ) bool {
 	if needsAccelerator && row.AcceleratorModel == "CPU" {
 		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
@@ -282,7 +320,7 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	// catalog's figure for its product is the fact (a product gone from the catalog this
 	// minute decides nothing). Its GPU count is not held to the package's degrees: the
 	// pod is already paid for, and the worker runs at the best declared degree that fits.
-	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job)
+	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job, working)
 	switch {
 	case c.Verdict != "":
 		return false

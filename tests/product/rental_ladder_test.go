@@ -171,19 +171,19 @@ func TestLadderWalkNeversBuysWhatTheLaneCannotFit(t *testing.T) {
 		t.Fatalf("B200 and H200 pin %q and %q; want mxfp8-adaln-pruned and bf16-full",
 			find(t, decision, "b200").Lane, find(t, decision, "h200").Lane)
 	}
-	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB of 80 GB")
-	sized(t, find(t, decision, "h100-nvl"), "components 51.5 GiB of 94 GB")
+	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB (working memory unmeasured) of 80 GB")
+	sized(t, find(t, decision, "h100-nvl"), "components 51.5 GiB (working memory unmeasured) of 94 GB")
 	// The mxfp8 lane publishes no component bytes: the owner's B200 rung is the fit, and
 	// the record says so rather than pretending a figure was compared.
 	sized(t, find(t, decision, "b200"), records.FitRungAsserted)
-	sized(t, find(t, decision, "h200"), "components 51.5 GiB of 141 GB")
+	sized(t, find(t, decision, "h200"), "components 51.5 GiB (working memory unmeasured) of 141 GB")
 	for _, name := range []string{"rtx-4090", "rtx-5090"} {
 		row := find(t, decision, name)
 		if row.Rung != 3 || row.Lane != "bf16-full" || !strings.HasPrefix(row.Verdict, textEncoderVerdict) {
 			t.Fatalf("%s recorded %+v; want rung 3 bf16-full %s", name, row, orchestrator.ExcludedVRAMShort)
 		}
 	}
-	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB of 24 GB")
+	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB (working memory unmeasured) of 24 GB")
 	absent(t, decision, "cpu")
 	if ladder := rental.Ladder(h3Ladder()); len(ladder) != 1 || ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" {
 		t.Fatalf("the record does not carry the ladder it walked: %v", ladder)
@@ -220,8 +220,8 @@ func TestExplicitLaneIsHeldToTheSameFloor(t *testing.T) {
 			t.Fatalf("%s recorded %q; want the need and the card's memory", name, row.Verdict)
 		}
 	}
-	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB of 24 GB")
-	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB of 80 GB")
+	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB (working memory unmeasured) of 24 GB")
+	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB (working memory unmeasured) of 80 GB")
 	rental.Conclude(decision, rental.Place("balanced", decision))
 	if find(t, decision, "h100-80").Verdict != orchestrator.VerdictChosen || find(t, decision, "h100-nvl").Verdict != orchestrator.VerdictUnmeasured {
 		t.Fatalf("h100-80 %q, h100-nvl %q; want h100-80 chosen with h100-nvl unmeasured",
@@ -270,7 +270,7 @@ func TestComponentFitHoldsTheOwnersRung(t *testing.T) {
 	if got := strings.Join(walk(decision), " "); got != "h200 b200" {
 		t.Fatalf("an unsized lane walked %q; want only the cards that hold 103 GiB whole", got)
 	}
-	sized(t, find(t, decision, "rtx-4090"), "lane_bytes 103.0 GiB of 24 GB")
+	sized(t, find(t, decision, "rtx-4090"), "lane_bytes 103.0 GiB (working memory unmeasured) of 24 GB")
 	// A rung-asserted slot needs no figure, and the floor never overrules it.
 	if verdict := rental.Fit(records.Residency{Fit: records.FitRungAsserted}, 24, "rtx-4090"); verdict != "" {
 		t.Fatalf("the floor overruled the owner's rung: %q", verdict)
@@ -306,9 +306,9 @@ func TestExplicitLaneIsNotARung(t *testing.T) {
 	// the catch-all bf16: fp8 is off the ladder there, so its 103 GiB are held to the card.
 	sized(t, find(t, decision, "h100-80"), records.FitRungAsserted)
 	sized(t, find(t, decision, "h100-nvl"), records.FitRungAsserted)
-	sized(t, find(t, decision, "b200"), "lane_bytes 103.0 GiB of 180 GB")
-	sized(t, find(t, decision, "h200"), "lane_bytes 103.0 GiB of 141 GB")
-	sized(t, find(t, decision, "rtx-4090"), "lane_bytes 103.0 GiB of 24 GB")
+	sized(t, find(t, decision, "b200"), "lane_bytes 103.0 GiB (working memory unmeasured) of 180 GB")
+	sized(t, find(t, decision, "h200"), "lane_bytes 103.0 GiB (working memory unmeasured) of 141 GB")
+	sized(t, find(t, decision, "rtx-4090"), "lane_bytes 103.0 GiB (working memory unmeasured) of 24 GB")
 	for _, name := range []string{"rtx-4090", "rtx-5090"} {
 		row := find(t, decision, name)
 		if row.Rung != 0 || !strings.HasPrefix(row.Verdict, "excluded:vram_short: needs 103.0 GiB resident (lane fp8-adaln-pruned), "+name+" has ") {
@@ -345,7 +345,7 @@ func TestExplicitLaneIsNotARung(t *testing.T) {
 	if verdict := find(t, decision, "h100-80").Verdict; !strings.HasPrefix(verdict, "excluded:vram_short: needs 103.0 GiB resident (lane fp8-adaln-pruned), h100-80 has 80 GB") {
 		t.Fatalf("with no ladder the H100 recorded %q", verdict)
 	}
-	sized(t, find(t, decision, "h100-80"), "lane_bytes 103.0 GiB of 80 GB")
+	sized(t, find(t, decision, "h100-80"), "lane_bytes 103.0 GiB (working memory unmeasured) of 80 GB")
 	if ladder := rental.Ladder([]records.ModelRef{explicit}); ladder != nil {
 		t.Fatalf("no ladder rendered as %v", ladder)
 	}
@@ -468,7 +468,7 @@ func TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung(t *testing.T) {
 }
 
 // cl-180. `attention-lane` (se-037) reads its source's HEADER, inherits every tensor by
-// reference and adds 550 bytes, and was sized "fit components 48.0 GiB of 48 GB" — the
+// reference and adds 550 bytes, and was sized "fit components 48.0 GiB (working memory unmeasured) of 48 GB" — the
 // components a SERVING construction of that lane would stage. cozy-runtime hands a JOB a
 // derive-only view of the Manifest and refuses load and component access on it, so no
 // component of a job's model is ever on the device, whatever the closure weighs. The
