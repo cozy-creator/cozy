@@ -255,6 +255,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
 		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
 	}
+	if request.Rental && connection.wireMinor < pb.RentalExecutionAdmissionWireMinor {
+		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
+			"this request uses detached execution, which requires Runtime protocol %d with typed execution lookup for safe idle shutdown; this worker reports %d. Update the rental Runtime; existing result collection remains compatible",
+			pb.RentalExecutionAdmissionWireMinor, connection.wireMinor)
+	}
 	if len(request.Models) > 0 {
 		if connection.wireMinor < pb.NativeRootInputsWireMinor {
 			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "durable root Model inputs require Runtime protocol 55")

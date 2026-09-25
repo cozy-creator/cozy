@@ -197,7 +197,7 @@ type standInPod struct {
 }
 
 func (p *standInPod) ProtocolInfo(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
-	return &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor}, nil
+	return &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor, SupportsRentalKeepalive: true}, nil
 }
 
 // claims counts the control streams this pod has accepted a Claim on. It is the owner's
