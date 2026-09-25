@@ -148,11 +148,6 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 			"rented model download cannot yet return an output to local TensorFS").
 			WithRemedy("run locally until the negotiated weights-read return plane is active")
 	}
-	if invocation == nil && effectiveRental {
-		return exit.Named(exit.Unavailable, "model_transfer.rented_pass_through_unavailable",
-			"rented standalone ingest does not yet select a TensorFS source profile").
-			WithRemedy("ingest locally, or invoke a typed job with cozy run and explicit model inputs")
-	}
 	if localOnly {
 		ctx.Inv.Bools["--rental"] = false
 		ctx.Inv.Bools["--rental-only"] = false
@@ -213,6 +208,31 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 				"source headers must be inspected before renting: %s", conversion.Undecided).
 				WithRemedy("retry after the provider can serve every selected source header")
 		}
+	}
+	// A standalone rented upload is the built-in pass-through producer. Its model
+	// slot has no package-declared source profile, so the header-only TensorFS
+	// preflight above intentionally asked TensorFS to classify the complete source
+	// carrier set. Carry that reviewed profile into the durable transfer intent;
+	// otherwise the remote owner would have no way to prepare the same source and
+	// would reject a command that was already proven convertible before rental.
+	if invocation == nil && effectiveRental && conversion.decided() {
+		profile := conversion.Plans["model"].Profile
+		if profile == "" {
+			return exit.Named(exit.Structural, "model_source.profile_missing",
+				"TensorFS planned the rented source without returning its reviewed profile")
+		}
+		plan.SourceProfiles = map[string]string{"model": profile}
+		// The initial provider resolution describes every repository member. The
+		// reviewed profile may select a strict subset (for example, one model
+		// family from a repository containing several indexes), so bind the same
+		// selected inventory and selection digest that the worker will refresh.
+		narrowed, problem := narrowPublishSource(ctx, source, []string{profile})
+		if problem != nil {
+			return problem
+		}
+		source = narrowed
+		plan.Source, plan.SourceSelection, plan.SourceLicense = source.Canonical, source.Selection, source.License
+		plan.SourceFiles, plan.InputLane = source.Exact, source.Lane
 	}
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
@@ -519,6 +539,47 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 	return publishSource{Canonical: selectedRef,
 		Selection: resolved.ManifestID, Lane: resolved.Lane,
 		Files: resolved.Objects, Bytes: resolved.Bytes}, nil
+}
+
+// narrowPublishSource applies a reviewed TensorFS source profile to a provider
+// resolution already used for header preflight. Keeping this in-memory avoids a
+// second provider resolution between the preflight and durable submission while
+// making the accepted source inventory match RefreshRemoteSource exactly.
+func narrowPublishSource(ctx *Context, source publishSource, profiles []string) (publishSource, *exit.Error) {
+	if source.Resolver == nil || len(profiles) == 0 {
+		return source, nil
+	}
+	tool, _, problem := localTensorFS(ctx)
+	if problem != nil {
+		return publishSource{}, problem
+	}
+	members, problem := tool.SourceProfileMembers(ctx.Cfg.TensorFSRegistry, profiles)
+	if problem != nil {
+		return publishSource{}, problem
+	}
+	selected, problem := source.Resolution.Select(members)
+	if problem != nil {
+		return publishSource{}, problem
+	}
+	accessByMember := make(map[string]sourceCapability, len(source.Access))
+	for _, access := range source.Access {
+		accessByMember[access.Member] = access
+	}
+	exact := make([]modeltransfer.SourceFile, 0, len(selected.Files))
+	access := make([]sourceCapability, 0, len(selected.Files))
+	for _, file := range selected.Files {
+		exact = append(exact, modeltransfer.SourceFile{Member: file.Member,
+			SHA256: file.SHA256, Length: file.Length})
+		capability, ok := accessByMember[file.Member]
+		if !ok {
+			return publishSource{}, exit.Named(exit.Conflict, "model_source.capability_missing",
+				"reviewed source profile selected %s without a provider capability", file.Member)
+		}
+		access = append(access, capability)
+	}
+	return publishSource{Canonical: selected.Canonical, Selection: "sha256:" + selected.SelectionSHA256,
+		License: selected.License, Lane: source.Lane, Files: len(selected.Files), Bytes: selected.Bytes,
+		Exact: exact, Access: access, Resolver: source.Resolver, Resolution: selected}, nil
 }
 
 func catalogModelSpelling(value string) bool {
