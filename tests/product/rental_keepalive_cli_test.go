@@ -25,12 +25,21 @@ import (
 // Ordinary CLI -> actual daemon/records -> signed TLS Host. Only explicit calls
 // reach the keepalive method; status, duplicate IDs, restart and failures cannot renew.
 func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
-	for _, failure := range []codes.Code{codes.OK, codes.Unavailable, codes.FailedPrecondition} {
-		t.Run(failure.String(), func(t *testing.T) { testRentalKeepaliveCLI(t, failure) })
+	for _, test := range []struct {
+		name      string
+		runtime   codes.Code
+		wrongBoot bool
+	}{
+		{"compatible", codes.OK, false},
+		{"runtime-unavailable", codes.Unavailable, false},
+		{"runtime-incompatible", codes.FailedPrecondition, false},
+		{"wrong-boot", codes.Unavailable, true},
+	} {
+		t.Run(test.name, func(t *testing.T) { testRentalKeepaliveCLI(t, test.runtime, test.wrongBoot) })
 	}
 }
 
-func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code) {
+func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code, wrongBoot bool) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -81,9 +90,27 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code) {
 	hub.rentals[podRental]["requested_accelerator_model"] = "fake-4090"
 	hub.mu.Unlock()
 	row := records.Rental{ID: podRental, MachineName: "keepalive", State: "ready", SKU: "cpu", AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: hub.server.URL, Address: connection.Addr, MediaAddress: connection.Media.Addr, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
+	if wrongBoot {
+		row.ExpectedWorkerBootID = "other-boot"
+	}
 	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token, identity))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	daemon := startDaemonProcess(t, root)
+	if wrongBoot {
+		code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json")
+		if code == 0 || !strings.Contains(out, "ClaimProof does not verify") {
+			t.Fatalf("wrong boot was not refused by Host authentication: %d %s", code, out)
+		}
+		mu.Lock()
+		mutations := calls
+		mu.Unlock()
+		reset, _, problem := store.RentalIdleResetAt(row)
+		fatal(t, problem)
+		if mutations != 0 || !reset.IsZero() {
+			t.Fatal("unauthenticated keepalive changed the idle clock")
+		}
+		return
+	}
 	command := func() string {
 		t.Helper()
 		code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json", "--full")
@@ -154,25 +181,6 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code) {
 			t.Fatal("unconfirmed acknowledgment reset local clock")
 		}
 	}
-	// A retained identity mismatch fails Host authentication before its mutation.
-	current, problem := store.RentalRow(podRental)
-	fatal(t, problem)
-	current.ExpectedWorkerBootID = "other-boot"
-	fatal(t, store.RecordRental(*current))
-	mu.Lock()
-	before = calls
-	mu.Unlock()
-	if code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json"); code == 0 {
-		t.Fatalf("wrong boot authenticated: %s", out)
-	}
-	mu.Lock()
-	after = calls
-	mu.Unlock()
-	if after != before {
-		t.Fatal("wrong boot reached Host mutation")
-	}
-	current.ExpectedWorkerBootID = podBootID
-	fatal(t, store.RecordRental(*current))
 	if runtimeFailure != codes.OK {
 		pod.mu.Lock()
 		admitted := len(pod.acks) + len(pod.desired) + len(pod.offers)
@@ -188,7 +196,7 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code) {
 	if code, _ := runCozy(t, root, "rental", "keepalive", "keepalive", "--duration", "0"); code == 0 {
 		t.Fatal("CLI duration override admitted")
 	}
-	current, problem = store.RentalRow(podRental)
+	current, problem := store.RentalRow(podRental)
 	fatal(t, problem)
 	current.State = "release_requested"
 	fatal(t, store.RecordRental(*current))
