@@ -848,6 +848,15 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			stale = w.instanceID
 		}
 	}
+	if ahead := c.rentalQueueAheadLocked(req); ahead != "" {
+		for _, guard := range guards {
+			delete(c.starting, guard)
+		}
+		c.mu.Unlock()
+		c.logf("%s: rental %s prepares nothing for it while %s is queued ahead; the queue re-asks it at the head",
+			req.ID, req.Worker, ahead)
+		return
+	}
 	c.starting[slot] = true
 	guards = append(guards, slot)
 	c.mu.Unlock()
@@ -993,6 +1002,40 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		// for a plan the head does not need.
 		c.reviveQueue()
 	}()
+}
+
+// rentalQueueAheadLocked names an earlier queued request on the same rental when this
+// serving request would change the rental's desired set. A named rental is a serial
+// queue: a later request's preparation must not restage the placement the requests
+// ahead of it are waiting to run on (run 868 restaged the pod under queued 864 and 865,
+// which then prepared their own selection back). A request the held placement already
+// serves changes nothing and passes; the head of the rental's queue always passes.
+// Callers hold c.mu.
+func (c *Orchestrator) rentalQueueAheadLocked(req records.Request) string {
+	if req.Worker == "" || req.IsJob() || req.InstallID != "" || c.activeChild(req) {
+		return ""
+	}
+	w := c.workers[rentalInstanceID(req.Worker)]
+	if w == nil || w.spec.Connection == nil {
+		return ""
+	}
+	if preparedPlacementServes(w, LogicalPackage{Package: req.Package, Release: req.Release,
+		Function: req.Entrypoint, Models: req.Models}) {
+		return ""
+	}
+	for _, id := range c.pending {
+		if id == req.ID {
+			return ""
+		}
+		row, problem := c.opt.Store.RequestRow(id)
+		if problem != nil || row == nil || (row.State != "submitted" && row.State != "queued") {
+			continue
+		}
+		if row.Worker == req.Worker || (row.Worker == "" && row.RequestedRental == req.Worker) {
+			return id
+		}
+	}
+	return ""
 }
 
 func (c *Orchestrator) deferUnavailable(req records.Request, problem *exit.Error) (deferred, news bool) {

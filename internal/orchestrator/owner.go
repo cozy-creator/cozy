@@ -806,7 +806,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		if changed {
 			return true // a concurrent caller already issued a newer selection
 		}
-		if e := c.issuePackageSet(s, w, packages, models); e != nil {
+		if e := c.issuePackageSet(s, w, packages, models, issueRestated); e != nil {
 			c.logf("rental %s package_set could not be issued: %s",
 				w.spec.Connection.RentalID, e.Message)
 		}

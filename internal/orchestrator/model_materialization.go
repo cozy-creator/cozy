@@ -59,7 +59,7 @@ func (c *Orchestrator) reensureModels(s *session, w *worker, revision uint64) {
 	if unpublished != nil {
 		problem = c.issueUnpublishedPlacementSet(s, w, unpublished)
 	} else if len(packages) > 0 {
-		problem = c.issuePackageSet(s, w, packages, models)
+		problem = c.issuePackageSet(s, w, packages, models, issueFresh)
 	} else {
 		problem = exit.Named(exit.Structural, "worker.model_materialization_input_unavailable", "worker reported absent model bytes without a downloadable model selection")
 	}
