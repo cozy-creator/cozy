@@ -150,16 +150,21 @@ func Tmp(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 			if len(update.Selection) == 0 {
 				continue
 			}
+			type localWheel struct {
+				Path string `json:"path"`
+			}
 			var selection struct {
-				LocalRuntime *struct {
-					Path string `json:"path"`
-				} `json:"local_runtime"`
+				LocalRuntime  *localWheel `json:"local_runtime"`
+				LocalTensorFS *localWheel `json:"local_tensorfs"`
 			}
 			if err := json.Unmarshal(update.Selection, &selection); err != nil {
 				return Swept{}, exit.Internalf("cannot read active Runtime update staging: %s", err)
 			}
-			if selection.LocalRuntime != nil {
-				relative, err := filepath.Rel(l.Tmp, selection.LocalRuntime.Path)
+			for _, wheel := range []*localWheel{selection.LocalRuntime, selection.LocalTensorFS} {
+				if wheel == nil {
+					continue
+				}
+				relative, err := filepath.Rel(l.Tmp, wheel.Path)
 				if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative) {
 					protected[strings.Split(relative, string(filepath.Separator))[0]] = true
 				}

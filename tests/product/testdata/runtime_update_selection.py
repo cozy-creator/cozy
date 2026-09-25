@@ -181,7 +181,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
                 self.api["main"]()
 
     def local(self, **kwargs):
-        row = self.release("cozy-runtime", kwargs.pop("version", "0.18.24+dev.h123"), **kwargs)
+        row = self.release(kwargs.pop("name", "cozy-runtime"), kwargs.pop("version", "0.18.24+dev.h123"), **kwargs)
         directory = self.directory / "frozen"
         directory.mkdir(exist_ok=True)
         path = directory / row["filename"]
@@ -205,6 +205,43 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         self.api["ssh"] = lambda arguments, command: json.dumps({"operation": "a" * 32, "state": "queued"})
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
             self.assertEqual(self.api["main"]()["update"]["state"], "queued")
+
+    def test_local_pair_keeps_installed_dev_tensorfs_without_network_and_recovers(self):
+        runtime = self.local(requirements=["tensorfs>=0.3.50,<0.4"])
+        self.observed["tensorfs"] = "0.3.54+dev.g9d02fc3"
+        tensorfs = self.local(name="tensorfs", version=self.observed["tensorfs"])
+        self.api["fetch"] = lambda *args: self.fail("explicit pair must not contact PyPI")
+        target, wheels = self.api["resolve"](self.observed, self.directory, runtime, tensorfs)
+        self.assertEqual(wheels[1]["version"], self.observed["tensorfs"])
+        self.assertEqual(wheels[1]["sha256"], tensorfs["digest"].removeprefix("sha256:"))
+        self.assertEqual(target["runtime_update"]["tensorfs"]["path"], tensorfs["path"])
+        for candidate in (runtime, tensorfs):
+            Path(candidate["path"]).unlink()
+        stage = "c" * 32
+        self.api["ssh"] = lambda arguments, command: json.dumps({"operation": stage, "state": "queued"})
+        for action in ("resume", "status"):
+            request = {"ssh_arguments": [], "action": action, "stage": stage,
+                       "selection": {"wheels": wheels}}
+            with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
+                self.assertEqual(self.api["main"]()["update"]["operation"], stage)
+
+    def test_local_tensorfs_refuses_wrong_identity_platform_and_constraints(self):
+        runtime = self.local(requirements=["tensorfs>=0.3.50,<0.4"])
+        for kwargs, error in [
+            ({"name": "cozy-runtime"}, "must be tensorfs"),
+            ({"metadata_name": "other-project"}, "metadata does not match"),
+            ({"tag": "py3-none-any"}, "native wheel"),
+            ({"tag": "cp312-cp312-manylinux_2_28_aarch64"}, "platform"),
+            ({"version": "0.3.48"}, "without downgrading"),
+            ({"version": "0.4.0"}, "incompatible"),
+            ({"requirements": ["cozy-runtime>=9"]}, "incompatible"),
+        ]:
+            with self.subTest(kwargs=kwargs):
+                tensorfs = self.local(**{"name": "tensorfs", "version": "0.3.54+dev.g9d02fc3", **kwargs})
+                with self.assertRaisesRegex(ValueError, error):
+                    self.api["resolve"](self.observed, self.directory, runtime, tensorfs)
+        with self.assertRaisesRegex(ValueError, "requires a local Runtime"):
+            self.api["resolve"](self.observed, self.directory, None, tensorfs)
 
     def test_local_metadata_platform_and_version_refusals(self):
         for kwargs, error in [

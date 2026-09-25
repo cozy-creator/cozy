@@ -460,12 +460,13 @@ func (c *RentalPrepareCmd) Run(r *Runtime) error {
 }
 
 type RentalUpdateCmd struct {
-	Rental       string `arg:"" predictor:"rental" help:"Existing rental name or id."`
-	RuntimeWheel string `name:"runtime-wheel" predictor:"file" help:"Development only: install this local native Runtime wheel on your private rental."`
+	Rental        string `arg:"" predictor:"rental" help:"Existing rental name or id."`
+	RuntimeWheel  string `name:"runtime-wheel" predictor:"file" help:"Development only: install this local native Runtime wheel on your private rental."`
+	TensorFSWheel string `name:"tensorfs-wheel" predictor:"file" help:"Development only: pair --runtime-wheel with this local native TensorFS wheel."`
 }
 
 func (c *RentalUpdateCmd) Run(r *Runtime) error {
-	return r.call(handleRentalUpdate, []string{c.Rental}, nil, values("--runtime-wheel", c.RuntimeWheel), false)
+	return r.call(handleRentalUpdate, []string{c.Rental}, nil, values("--runtime-wheel", c.RuntimeWheel, "--tensorfs-wheel", c.TensorFSWheel), false)
 }
 
 type RentalNewCmd struct {

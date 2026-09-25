@@ -18,20 +18,20 @@ func freezeRuntimeWheel(root, source string) (_ *runtimeUpdateWheel, _ *scratch.
 	const limit = 128 << 20
 	name := filepath.Base(source)
 	if !filepath.IsAbs(source) || !regexp.MustCompile(`^[A-Za-z0-9_.+-]+\.whl$`).MatchString(name) {
-		return nil, nil, exit.New(exit.Validation, "runtime_wheel must be an absolute local wheel path")
+		return nil, nil, exit.New(exit.Validation, "update wheel must be an absolute local wheel path")
 	}
 	info, err := os.Stat(source)
 	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
-		return nil, nil, exit.New(exit.Validation, "local Runtime wheel must be a regular file of at most 128 MiB")
+		return nil, nil, exit.New(exit.Validation, "local update wheel must be a regular file of at most 128 MiB")
 	}
 	input, err := os.Open(source)
 	if err != nil {
-		return nil, nil, exit.New(exit.Validation, "cannot read local Runtime wheel: %s", err)
+		return nil, nil, exit.New(exit.Validation, "cannot read local update wheel: %s", err)
 	}
 	defer input.Close()
 	info, err = input.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return nil, nil, exit.New(exit.Validation, "local Runtime wheel is not a regular file")
+		return nil, nil, exit.New(exit.Validation, "local update wheel is not a regular file")
 	}
 	stage, problem := scratch.Temp(root, "runtime-candidate-")
 	if problem != nil {
@@ -46,16 +46,16 @@ func freezeRuntimeWheel(root, source string) (_ *runtimeUpdateWheel, _ *scratch.
 	path := filepath.Join(directory, name)
 	output, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
-		return nil, nil, exit.Internalf("cannot retain local Runtime wheel: %s", err)
+		return nil, nil, exit.Internalf("cannot retain local update wheel: %s", err)
 	}
 	defer output.Close()
 	digest := sha256.New()
 	length, err := io.Copy(io.MultiWriter(output, digest), io.LimitReader(input, limit+1))
 	if err != nil || length != info.Size() || length <= 0 || length > limit {
-		return nil, nil, exit.New(exit.Validation, "local Runtime wheel changed size or could not be captured")
+		return nil, nil, exit.New(exit.Validation, "local update wheel changed size or could not be captured")
 	}
 	if err = output.Sync(); err != nil {
-		return nil, nil, exit.Internalf("cannot persist local Runtime wheel: %s", err)
+		return nil, nil, exit.Internalf("cannot persist local update wheel: %s", err)
 	}
 	for _, directory := range []string{directory, root} {
 		handle, err := os.Open(directory)

@@ -54,6 +54,7 @@ type runtimeUpdateTarget struct {
 
 type runtimeUpdateSelection struct {
 	LocalRuntime  *runtimeUpdateWheel `json:"local_runtime,omitempty"`
+	LocalTensorFS *runtimeUpdateWheel `json:"local_tensorfs,omitempty"`
 	Target        runtimeUpdateTarget `json:"target"`
 	Directory     string              `json:"directory"`
 	Stage         string              `json:"stage"`
@@ -64,14 +65,17 @@ type runtimeUpdateSelection struct {
 }
 
 func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
-	return u.start(id, "", options.RuntimeWheel)
+	return u.start(id, "", options.RuntimeWheel, options.TensorFSWheel)
 }
 
 func (u *rentalRuntimeUpdates) startForRequest(id, request string) (*records.RuntimeUpdate, *exit.Error) {
-	return u.start(id, request, "")
+	return u.start(id, request, "", "")
 }
 
-func (u *rentalRuntimeUpdates) start(id, request, wheelPath string) (*records.RuntimeUpdate, *exit.Error) {
+func (u *rentalRuntimeUpdates) start(id, request, wheelPath, tensorfsPath string) (*records.RuntimeUpdate, *exit.Error) {
+	if tensorfsPath != "" && wheelPath == "" {
+		return nil, exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
+	}
 	m := u.machines
 	row, problem := m.store.RentalRow(id)
 	if problem != nil {
@@ -95,26 +99,45 @@ func (u *rentalRuntimeUpdates) start(id, request, wheelPath string) (*records.Ru
 	if snapshot != nil {
 		defer snapshot.Release()
 	}
+	var tensorfs *runtimeUpdateWheel
+	var tensorfsSnapshot *scratch.Dir
+	if tensorfsPath != "" {
+		tensorfs, tensorfsSnapshot, problem = freezeRuntimeWheel(m.layout.Tmp, tensorfsPath)
+		if problem != nil {
+			return nil, problem
+		}
+		defer tensorfsSnapshot.Release()
+	}
 	if current != nil && current.Active() && candidate != nil {
 		var saved runtimeUpdateSelection
-		if json.Unmarshal(current.Selection, &saved) != nil || saved.LocalRuntime == nil || saved.LocalRuntime.Digest != candidate.Digest || saved.LocalRuntime.Filename != candidate.Filename {
-			return nil, exit.New(exit.Conflict, "this rental already has a different frozen Runtime update; resume it without --runtime-wheel")
+		if json.Unmarshal(current.Selection, &saved) != nil || !sameUpdateWheel(saved.LocalRuntime, candidate) || !sameUpdateWheel(saved.LocalTensorFS, tensorfs) {
+			return nil, exit.New(exit.Conflict, "this rental already has a different frozen Runtime update; resume it without wheel flags")
 		}
 	}
 	if current == nil || !current.Active() {
 		var selection json.RawMessage
 		if candidate != nil {
-			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate})
+			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate, LocalTensorFS: tensorfs})
 		}
 		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, request, selection)
 		if problem == nil && snapshot != nil {
 			snapshot.Detach()
+			if tensorfsSnapshot != nil {
+				tensorfsSnapshot.Detach()
+			}
 		}
 	}
 	if problem == nil {
 		u.run(*current)
 	}
 	return current, problem
+}
+
+func sameUpdateWheel(a, b *runtimeUpdateWheel) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Digest == b.Digest && a.Filename == b.Filename && a.Length == b.Length
 }
 
 func (u *rentalRuntimeUpdates) Resume() {
@@ -273,13 +296,13 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 		}
 	}
 	if len(selection.Selection) == 0 {
-		candidate := selection.LocalRuntime
+		candidate, tensorfs := selection.LocalRuntime, selection.LocalTensorFS
 		var problem *exit.Error
 		selection, problem = u.connectionSelection(ctx, *row)
 		if problem != nil {
 			return problem
 		}
-		selection.LocalRuntime = candidate
+		selection.LocalRuntime, selection.LocalTensorFS = candidate, tensorfs
 		selection.Selection, problem = u.transport(ctx, selection, "plan")
 		if problem != nil {
 			return problem
@@ -357,7 +380,18 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 			return exit.New(exit.Validation, "cannot resolve local Runtime wheel: %s", err)
 		}
 	}
-	result, problem := c.UpdateRentalRuntime(row.ID, api.RuntimeUpdateRequest{RuntimeWheel: wheelPath})
+	tensorfsPath := ctx.Inv.Value("--tensorfs-wheel")
+	if tensorfsPath != "" {
+		if wheelPath == "" {
+			return exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
+		}
+		var err error
+		tensorfsPath, err = filepath.Abs(tensorfsPath)
+		if err != nil {
+			return exit.New(exit.Validation, "cannot resolve local TensorFS wheel: %s", err)
+		}
+	}
+	result, problem := c.UpdateRentalRuntime(row.ID, api.RuntimeUpdateRequest{RuntimeWheel: wheelPath, TensorFSWheel: tensorfsPath})
 	if problem != nil {
 		return problem
 	}
