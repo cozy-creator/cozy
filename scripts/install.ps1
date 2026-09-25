@@ -28,7 +28,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$hostTools = @('tool', 'install', '--force', '--python', '3.12', '--with-executables-from', 'tensorfs', 'cozy-runtime[media,model-execution]>=0.18.21')
+$hostTools = @('tool', 'install', '--force', '--python', '3.12', '--with-executables-from', 'tensorfs', 'cozy-runtime[media,model-execution]>=0.18.24')
 
 if ([bool]$Asset -eq [bool]$Binary) { Write-Error "refusing: give exactly one of -Asset or -Binary"; exit 2 }
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {

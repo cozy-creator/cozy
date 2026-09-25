@@ -26,13 +26,14 @@ Rerun it to upgrade. For tab completion, add `source <(cozy completion bash)` to
 The host-tool step alone is:
 
 ```sh
-uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.21'
+uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.24'
 ```
 
 Keep `--python 3.12`: uv
 [ignores dependency Python upper bounds](https://docs.astral.sh/uv/pip/compatibility/#requires-python-upper-bounds),
-so an unqualified install can select an interpreter Runtime cannot use. Runtime 0.18.21 is the
-controller minimum for Python provisioning and ABI 8 caller compilation. Existing
+so an unqualified install can select an interpreter Runtime cannot use. Runtime 0.18.24 is the
+controller minimum for native model ingestion, rented builtin preparation and canonical
+media-result identities. Existing
 captured package environments keep their declared SDK ranges; new caller-capable
 publications require Runtime 0.18.21 in both the declaration and lock.
 
@@ -220,7 +221,8 @@ cozy run org/quantize/convert --model.source=org/model@release/bf16 \
 
 Rented uploads of complete Hugging Face repositories with a reviewed Runtime recipe use native
 download, TensorFS conversion, model-owned configuration/tokenizer preparation, and
-checkpoint upload automatically. Runtime 0.18.23 adds the Qwen Image 2.1 recipe above.
+checkpoint upload automatically. Runtime 0.18.24 supplies the Qwen Image 2.1 recipe
+and its qualified rented builtin admission.
 `--rental=<name>` uses that existing rental only. `--dry-run` checks conversion headers
 and verifies the bounded metadata files before any weights transfer or rental allocation.
 This complete-model metadata path currently requires `--rental=<name>` or `--rental-only`;

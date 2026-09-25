@@ -13,7 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 )
 
-func TestAdmissionRequiresCallerCompilerAndAcceptsSourceDevWheel(t *testing.T) {
+func TestAdmissionRequiresNativeIngestionRuntimeAndAcceptsSourceDevWheel(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX stand-in tool")
 	}
@@ -22,7 +22,8 @@ func TestAdmissionRequiresCallerCompilerAndAcceptsSourceDevWheel(t *testing.T) {
 		admitted bool
 	}{
 		{"0.18.0", false}, {"0.18.14", false}, {"0.18.20", false}, {"0.18.21rc1", false},
-		{"0.18.21", true}, {"0.18.21+dev.h687ee141", true}, {"0.18.22", true},
+		{"0.18.21", false}, {"0.18.22", false}, {"0.18.23", false},
+		{"0.18.24rc1", false}, {"0.18.24", true}, {"0.18.24+dev.h687ee141", true}, {"0.18.25", true},
 	} {
 		t.Run(test.version, func(t *testing.T) {
 			tool := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow stand-in Runtime command for host admission
@@ -38,7 +39,7 @@ func TestAdmissionRequiresCallerCompilerAndAcceptsSourceDevWheel(t *testing.T) {
 				}
 				return
 			}
-			if problem == nil || problem.Name != "host_runtime_below_floor" || !strings.Contains(problem.Error(), "ABI 8 managed caller compilation") || !strings.Contains(problem.Remedy, "cozy-runtime[media,model-execution]>=0.18.21") {
+			if problem == nil || problem.Name != "host_runtime_below_floor" || !strings.Contains(problem.Error(), "native model ingestion") || !strings.Contains(problem.Remedy, "cozy-runtime[media,model-execution]>=0.18.24") {
 				t.Fatalf("missing early upgrade refusal: %+v", problem)
 			}
 		})

@@ -20,10 +20,10 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// ToolFloor includes shared Python provisioning and the ABI 8 caller compiler used
-// by publication and private capture. Installers upgrade this tool before replacing Cozy.
+// ToolFloor includes native ingestion, rented builtin admission and canonical media
+// result identities. Installers upgrade this tool before replacing Cozy.
 // WireFloor independently checks the installed execution ownership capability.
-const ToolFloor = "0.18.21"
+const ToolFloor = "0.18.24"
 
 // PackageFloor is the existing package SDK contract. Controller provisioning
 // features do not raise requirements on captured package environments.
@@ -134,7 +134,7 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 	}
 	if release.LessThan(floor) {
 		return exit.Named(exit.Structural, "host_runtime_below_floor",
-			"cozy-runtime %s is release %s; this Cozy needs %s or newer for Python provisioning and ABI 8 managed caller compilation",
+			"cozy-runtime %s is release %s; this Cozy needs %s or newer for native model ingestion and managed result collection",
 			path, answer.Distribution, ToolFloor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
