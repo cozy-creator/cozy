@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -24,6 +25,12 @@ import (
 // Ordinary CLI -> actual daemon/records -> signed TLS Host. Only explicit calls
 // reach the keepalive method; status, duplicate IDs, restart and failures cannot renew.
 func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
+	for _, failure := range []codes.Code{codes.OK, codes.Unavailable, codes.FailedPrecondition} {
+		t.Run(failure.String(), func(t *testing.T) { testRentalKeepaliveCLI(t, failure) })
+	}
+}
+
+func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -35,23 +42,32 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
 	pod := &fakePod{controlKey: public}
+	if runtimeFailure != codes.OK {
+		pod.protocolInfo = func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+			return nil, status.Error(runtimeFailure, "Runtime is unavailable or incompatible")
+		}
+	}
 	var mu sync.Mutex
 	receipts := map[string]*pb.KeepRentalAliveResult{}
 	clock := time.Now().UTC().Truncate(time.Millisecond)
 	calls := 0
-	failed := false
+	failure := codes.OK
+	invalidDuration := false
 	pod.keepalive = func(request *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
-		if failed {
-			return nil, status.Error(codes.Unavailable, "unconfirmed reset")
+		if failure != codes.OK {
+			return nil, status.Error(failure, "unconfirmed reset")
 		}
 		if prior := receipts[request.RequestId]; prior != nil {
 			return proto.Clone(prior).(*pb.KeepRentalAliveResult), nil
 		}
 		clock = clock.Add(time.Second)
 		result := &pb.KeepRentalAliveResult{RequestId: request.RequestId, WorkerId: podWorkerID, WorkerBootId: podBootID, AcknowledgedAtUnixMs: clock.UnixMilli(), IdleDeadlineUnixMs: clock.Add(900 * time.Second).UnixMilli()}
+		if invalidDuration {
+			result.IdleDeadlineUnixMs++
+		}
 		receipts[request.RequestId] = result
 		return proto.Clone(result).(*pb.KeepRentalAliveResult), nil
 	}
@@ -110,22 +126,60 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 		t.Fatalf("status: %s", out)
 	}
 	daemon = crashAndRestartTransactionDaemon(t, daemon)
-	reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/claim", map[string]any{})
-	if reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
-		t.Fatalf("reconnect: %s", reply.brief())
+	if runtimeFailure != codes.Unavailable {
+		reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/claim", map[string]any{})
+		if runtimeFailure == codes.OK {
+			if reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
+				t.Fatalf("reconnect: %s", reply.brief())
+			}
+		} else if reply.Status == http.StatusOK {
+			t.Fatalf("Runtime admission accepted the incompatible peer: %s", reply.brief())
+		}
 	}
 	mu.Lock()
 	after := calls
-	failed = true
 	mu.Unlock()
 	if after != before || !baseline().Equal(renewed) {
 		t.Fatal("status or restart renewed the rental")
 	}
-	if code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json"); code == 0 || strings.Contains(out, `"release_due"`) {
-		t.Fatalf("failed acknowledgment claimed success: %d %s", code, out)
+	for _, mode := range []codes.Code{codes.Unavailable, codes.Unimplemented, codes.FailedPrecondition, codes.OK} {
+		mu.Lock()
+		failure = mode
+		invalidDuration = mode == codes.OK
+		mu.Unlock()
+		if code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json"); code == 0 || strings.Contains(out, `"release_due"`) {
+			t.Fatalf("failed/unsupported/expired/invalid acknowledgment claimed success: %d %s", code, out)
+		}
+		if !baseline().Equal(renewed) {
+			t.Fatal("unconfirmed acknowledgment reset local clock")
+		}
 	}
-	if !baseline().Equal(renewed) {
-		t.Fatal("failed acknowledgment reset local clock")
+	// A retained identity mismatch fails Host authentication before its mutation.
+	current, problem := store.RentalRow(podRental)
+	fatal(t, problem)
+	current.ExpectedWorkerBootID = "other-boot"
+	fatal(t, store.RecordRental(*current))
+	mu.Lock()
+	before = calls
+	mu.Unlock()
+	if code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json"); code == 0 {
+		t.Fatalf("wrong boot authenticated: %s", out)
+	}
+	mu.Lock()
+	after = calls
+	mu.Unlock()
+	if after != before {
+		t.Fatal("wrong boot reached Host mutation")
+	}
+	current.ExpectedWorkerBootID = podBootID
+	fatal(t, store.RecordRental(*current))
+	if runtimeFailure != codes.OK {
+		pod.mu.Lock()
+		admitted := len(pod.acks) + len(pod.desired) + len(pod.offers)
+		pod.mu.Unlock()
+		if admitted != 0 {
+			t.Fatal("manual keepalive admitted Runtime control or execution")
+		}
 	}
 	reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/keepalive", map[string]any{"request_id": "invalid-duration", "duration": 0})
 	if reply.Status == http.StatusOK {
@@ -134,7 +188,7 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	if code, _ := runCozy(t, root, "rental", "keepalive", "keepalive", "--duration", "0"); code == 0 {
 		t.Fatal("CLI duration override admitted")
 	}
-	current, problem := store.RentalRow(podRental)
+	current, problem = store.RentalRow(podRental)
 	fatal(t, problem)
 	current.State = "release_requested"
 	fatal(t, store.RecordRental(*current))
