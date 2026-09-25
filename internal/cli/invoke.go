@@ -276,7 +276,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return e
 	}
 	saved := exportedOutputs(life)
-	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
+	return renderRun(ctx, life, terminal, stopped, saved, submitted)
 }
 
 // invocationModelSpec is one slot's selection before the card is read: an explicit
@@ -1940,7 +1940,7 @@ const opaqueType = "application/octet-stream"
 // renderRun prints the run's answer and maps the terminal onto the SHARED matrix:
 // succeeded 0 · failed 11 · canceled 12 · deadline 10, from `exit.JobTerminal`.
 func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopped string,
-	saved []savedFile, submitted time.Duration, began time.Time) *exit.Error {
+	saved []savedFile, submitted time.Duration) *exit.Error {
 	status := localapi.StreamStatus(terminal)
 	if status == "" {
 		status = life.Status
@@ -2024,8 +2024,10 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	fields = append(fields,
 		output.Field{K: "queued", V: seconds(life.QueuedMS)},
 		output.Field{K: "execution", V: seconds(life.ExecutionMS)},
-		output.Field{K: "submit_ms", V: submitted.Milliseconds()},
-		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
+		output.Field{K: "submit_ms", V: submitted.Milliseconds()})
+	if wallMS, known := recordedRunWall(life.CreatedAt, terminal); known {
+		fields = append(fields, output.Field{K: "wall_ms", V: wallMS})
+	}
 
 	defaults := []string{"target", "status"}
 	if life.Machine != "" {

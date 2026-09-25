@@ -161,7 +161,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return problem
 	}
 	if terminal != nil || settled(state.Status) || state.Status == "paused" || state.Status == "blocked" {
-		return renderJobTerminal(ctx, state, terminal, began)
+		return renderJobTerminal(ctx, state, terminal)
 	}
 	return renderSubmittedJob(ctx, state, !handle.Replay)
 }
@@ -441,12 +441,10 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		}
 	default:
 	}
-	return renderJobTerminal(ctx, state, terminal, began)
+	return renderJobTerminal(ctx, state, terminal)
 }
 
-func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event,
-	began time.Time,
-) *exit.Error {
+func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event) *exit.Error {
 	if machine := state.MachineExecution; machine != nil && state.Status == "completed" && !machine.Collected {
 		return exit.Named(exit.Unavailable, "machine_execution.result_collection_pending", "run %s completed on its machine, but its result has not been collected: %s", state.JobID, machine.ObservationError)
 	}
@@ -478,8 +476,10 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		state.ErrorType, _ = terminal.Payload["error_type"].(string)
 		state.Error, _ = terminal.Payload["error"].(string)
 	}
-	fields := append(jobFields(ctx.Mode(), state, true),
-		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
+	fields := jobFields(ctx.Mode(), state, true)
+	if wallMS, known := recordedRunWall(state.CreatedAt, terminal); known {
+		fields = append(fields, output.Field{K: "wall_ms", V: wallMS})
+	}
 	defaults := []string{"job", "status"}
 	if state.OutputExport != nil {
 		defaults = append(defaults, "output_export")

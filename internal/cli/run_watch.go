@@ -67,7 +67,7 @@ func watchInvocation(ctx *Context, client *localclient.Client, id string) *exit.
 	if problem != nil {
 		return problem
 	}
-	return renderRun(ctx, life, terminal, "", exportedOutputs(life), 0, began)
+	return renderRun(ctx, life, terminal, "", exportedOutputs(life), 0)
 }
 
 func watchRunStream(ctx *Context, client *localclient.Client, id string,
@@ -111,4 +111,22 @@ func recordedRunStart(value string) time.Time {
 		return parsed
 	}
 	return time.Now()
+}
+
+// recordedRunWall is accepted-request time through its durable terminal event.
+// Reattaching or collecting/exporting outputs later cannot extend a completed run.
+// Missing timestamps are unknown, not an elapsed observer clock or a fabricated zero.
+func recordedRunWall(createdAt string, terminal *localclient.Event) (int64, bool) {
+	if terminal == nil || terminal.EventID <= 0 || !localclient.Terminal(terminal.Type) {
+		return 0, false
+	}
+	began, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return 0, false
+	}
+	ended, err := time.Parse(time.RFC3339Nano, terminal.At)
+	if err != nil || ended.Before(began) {
+		return 0, false
+	}
+	return ended.Sub(began).Milliseconds(), true
 }
