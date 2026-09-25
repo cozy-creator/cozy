@@ -19,6 +19,7 @@ import (
 // standard optional implementation wheel reaches the executing package and the
 // rented-worker capture unchanged. It does not qualify a GPU attention kernel.
 func TestAttentionWheelCLIExecutesCapturedABA(t *testing.T) {
+	integration(t)
 	root, err := os.MkdirTemp("", "cozy-attn-")
 	must(t, err)
 	t.Cleanup(func() {

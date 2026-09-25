@@ -16,6 +16,7 @@ import (
 // The ordinary CLI exports the complete native Tree, including nested and empty
 // files, before collection, and keeps independent custody after the user edits it.
 func TestOrdinaryScriptTreeResultExportsCompleteClosure(t *testing.T) {
+	integration(t)
 	if *privateScriptRuntimeWheel == "" {
 		t.Skip("requires an exact Runtime wheel")
 	}

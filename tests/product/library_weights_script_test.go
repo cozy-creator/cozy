@@ -17,6 +17,7 @@ import (
 // A real native Model input and TensorFS output stay in this attempt even when its
 // ordinary helper library also exports a managed callable. No worker is mocked.
 func TestPrivateLibraryScriptKeepsModelAndWeightsInItsOwnAttempt(t *testing.T) {
+	integration(t)
 	wheel := *privateChildRuntimeWheel
 	if wheel == "" {
 		t.Skip("requires the exact candidate Runtime wheel")

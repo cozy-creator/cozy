@@ -190,6 +190,7 @@ func TestCapturePinsMigrateAndPreserveOrdinaryInstallOwners(t *testing.T) {
 }
 
 func TestCompletedCaptureReusesUnchangedScriptAndMissesEditedDependency(t *testing.T) {
+	integration(t)
 	if *privateScriptRuntimeWheel == "" {
 		t.Skip("requires the exact candidate Runtime wheel")
 	}

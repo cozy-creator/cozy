@@ -15,6 +15,7 @@ import (
 // No package manifest, manual wheel build, install command or publication. Every
 // invocation enters through the user's cozy run and captures the edited library.
 func TestEditableInvocableLibraryTracksCodeWithoutPackageManifest(t *testing.T) {
+	integration(t)
 	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	project := t.TempDir()
 	control := filepath.Join(project, "control")
