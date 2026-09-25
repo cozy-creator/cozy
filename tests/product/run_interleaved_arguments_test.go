@@ -53,7 +53,7 @@ func TestRunDescribeAcceptsPayloadAfterOptions(t *testing.T) {
 
 // The real CLI's job dry-run prints the exact composed payload, making order and
 // literal-value preservation observable without executing Python or renting.
-func interleavedAssetsRoot(t *testing.T) string {
+func interleavedAssetsRoot(t *testing.T, extra ...map[string]any) string {
 	t.Helper()
 	var doc map[string]any
 	must(t, json.Unmarshal([]byte(declaredAssetsInterface), &doc))
@@ -62,6 +62,9 @@ func interleavedAssetsRoot(t *testing.T) string {
 	fields := job["request"].(map[string]any)["fields"].([]any)
 	for _, name := range []string{"steps", "seed"} {
 		fields = append(fields, map[string]any{"name": name, "type": "int", "wire": "optional"})
+	}
+	for _, field := range extra {
+		fields = append(fields, field)
 	}
 	job["request"].(map[string]any)["fields"] = fields
 	doc["jobs"], doc["entrypoints"] = []any{job}, []any{}
