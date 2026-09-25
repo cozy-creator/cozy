@@ -210,6 +210,14 @@ func TestRentalKeepaliveUsesCurrentSignedClaimAndRefusesUnconfirmedResult(t *tes
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	owner := hostOwner(t, "keepalive-claim", rentalWiring(connection, private))
+	if _, problem := owner.c.KeepRentalAlive(context.Background(), podRental, "unowned"); problem == nil || calls != 0 {
+		t.Fatal("keepalive accepted an unrecorded rental")
+	}
+	// No media credentials or Runtime/control session are needed for this Host action.
+	fatal(t, owner.store.RecordRental(records.Rental{ID: podRental, MachineName: "keepalive",
+		State: "ready", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1,
+		HourlyRateUSDMicros: 100000, Hub: "https://hub.invalid", Address: connection.Addr,
+		CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	result, problem := owner.c.KeepRentalAlive(context.Background(), podRental, "explicit-1")
 	fatal(t, problem)
 	if result.RequestId != "explicit-1" || calls != 1 {
