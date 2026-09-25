@@ -482,6 +482,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.setDigest, w.setBytes = rev, digest, setBytes
+	w.rememberSet(s.bootID, digest, setBytes)
 	w.desiredRefusal = nil
 	c.mu.Unlock()
 
@@ -651,6 +652,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 					environmentDigest: p.EnvironmentDigest,
 					materialization:   p.Materialization, serving: p.Serving,
 					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
+					loadedPlanIDs: map[string]bool{},
+					loadedKnown:   w.wireMinor >= pb.ExecutionLifecycleWireMinor,
+				}
+				for _, digest := range p.LoadedBindingDigests {
+					row.loadedPlanIDs[spellOf(digest)] = true
 				}
 				for _, fault := range p.Faults {
 					if fault != nil {
@@ -685,6 +691,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				}
 			}
 			w.observedRemote = observed
+			w.observeRemotePlacements()
 			w.planIDs = keysOf(dispatchable)
 			for planID := range materializable {
 				if !dispatchable[planID] {

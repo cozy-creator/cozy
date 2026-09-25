@@ -41,7 +41,7 @@ func TestPodPrepareTransportLossKeepsTheRentalRequestQueued(t *testing.T) {
 		defer pod.mu.Unlock()
 		return len(pod.prepares) == 1
 	})
-	if _, ok := waitEvent(o, "PARKED at queue position 1 (lanes none, overtaken 0 of 0, claims=true): PodHost prepare", 5*time.Second); !ok {
+	if _, ok := waitEvent(o, "PARKED at queue position 1 (lanes none, overtaken 0): PodHost prepare", 5*time.Second); !ok {
 		t.Fatal("the transport end did not release the request back to its queue")
 	}
 	if row, _ := o.store.RequestRow(requestID); row == nil || row.State == "failed" {

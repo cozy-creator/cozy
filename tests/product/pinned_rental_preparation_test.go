@@ -192,12 +192,14 @@ func TestWakeQueuePreservesUnassignedRequestedRentalAffinities(t *testing.T) {
 	mu.Lock()
 	recording = true
 	mu.Unlock()
+	// The wake hands each requested rental's queue to that rental's scheduler, which asks
+	// its own placement question asynchronously.
 	o.c.WakeQueue()
-	mu.Lock()
-	defer mu.Unlock()
-	if !seen["wanted-a"] || !seen["wanted-b"] {
-		t.Fatalf("wake omitted an independent requested rental: %v", seen)
-	}
+	waitUntil(t, "the wake asks every independent requested rental", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return seen["wanted-a"] && seen["wanted-b"]
+	})
 }
 
 func TestUnreadyRentalSelectionNamesTheRunHoldingCapacity(t *testing.T) {

@@ -438,6 +438,7 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		w.jobsAvail, w.reportedJobs = 0, 0
 	}
 	w.setDigest, w.setBytes = digest, setBytes
+	w.rememberSet(s.bootID, digest, setBytes)
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,

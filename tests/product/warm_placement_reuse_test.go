@@ -174,11 +174,11 @@ func runtimePreparedPlacement(t *testing.T) func([]byte, string, string) *pb.Pla
 	}
 }
 
-// A LATER REQUEST DOES NOT RESTAGE THE HEAD'S WARM PLACEMENT (run 868). The rental's one
-// seat is busy, an identical request waits for it at the head of the rental's queue, and a
-// turbo request queued behind it would change the selection. It prepares nothing — no
-// PodHost prepare, no desired revision — while the head is queued: that head runs next on
-// the placement already serving.
+// A LATER REQUEST ADDS TO THE HEAD'S WARM PLACEMENT, NEVER REPLACES IT (run 868). The
+// rental's one seat is busy, an identical request waits for it at the head of the rental's
+// queue, and a turbo request queued behind it needs a selection the rental does not hold.
+// It issues one additive desire — one prepare, one revision — and the set it grows still
+// binds the head's fl2va selection, so the head runs next on the placement it waits for.
 func TestQueuedDifferentSelectionWaitsBehindHeadOnWarmPlacement(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
@@ -218,9 +218,29 @@ func TestQueuedDifferentSelectionWaitsBehindHeadOnWarmPlacement(t *testing.T) {
 		t.Fatalf("the identical request did not queue behind the busy seat: %v", o.c.Events())
 	}
 	submit("later-turbo", "ref2va_turbo", turbo)
-	time.Sleep(3 * time.Second)
-	if prepares, desired, offers := counts(); prepares != 1 || desired != 1 || offers != 1 {
+	waitUntil(t, "the turbo selection's one additive desire", func() bool {
+		_, desired, _ := counts()
+		return desired == 2
+	})
+	time.Sleep(time.Second)
+	if prepares, desired, offers := counts(); prepares != 2 || desired != 2 || offers != 1 {
 		t.Fatalf("with the head queued on the warm placement the later request caused %d prepare(s), "+
-			"%d desired state(s) and %d offer(s); want 1, 1, 1", prepares, desired, offers)
+			"%d desired state(s) and %d offer(s); want 2, 2, 1", prepares, desired, offers)
+	}
+	pod.mu.Lock()
+	grown, err := canonical.Read(pod.desired[1].GetPlacementSet().PlacementSetCanonicalBytes, &pb.PlacementSet{})
+	pod.mu.Unlock()
+	must(t, err)
+	bound := map[string]bool{}
+	for _, placement := range grown.List("placements") {
+		for _, entrypoint := range placement.List("entrypoints") {
+			bound[entrypoint.Str("name")] = true
+		}
+	}
+	if !bound["fl2va"] || !bound["ref2va_turbo"] {
+		t.Fatalf("the turbo desire replaced the head's selection instead of adding to it: %v", bound)
+	}
+	if o.c.QueuePosition(head) == 0 {
+		t.Fatal("the queued head left the queue while the seat is busy")
 	}
 }

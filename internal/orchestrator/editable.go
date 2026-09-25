@@ -45,10 +45,20 @@ func (c *Orchestrator) PackageHolders(pkg string) ([]LocalHolder, []RentalHolder
 		rentalID := w.spec.Connection.RentalID
 		slot := pinnedPackage(pkg, rentalID)
 		holder := RentalHolder{RentalID: rentalID, InstanceID: w.instanceID}
+		// One row per placement: every entrypoint a report made routable shares it, and
+		// the editable refresh re-prepares a placement once.
+		first := map[string]DesiredPlacement{}
 		for _, placement := range w.remotePlacements {
-			if placement.Package == slot {
-				holder.Placements = append(holder.Placements, placement)
+			if placement.Package != slot {
+				continue
 			}
+			id := placement.PlacementIDValue
+			if held, seen := first[id]; !seen || placement.Entrypoints[0].Name < held.Entrypoints[0].Name {
+				first[id] = placement
+			}
+		}
+		for _, placement := range first {
+			holder.Placements = append(holder.Placements, placement)
 		}
 		if len(holder.Placements) > 0 {
 			sort.Slice(holder.Placements, func(i, j int) bool {
@@ -87,7 +97,7 @@ func (c *Orchestrator) PrepareRentalRevision(rentalID, operationID string,
 			return DesiredPlacement{}, problem
 		}
 	}
-	spec, _, problem := c.ensureLogicalPackageReady(instance, rentalID, logical)
+	spec, _, problem := c.ensureLogicalPackageReady(instance, rentalID, logical, false)
 	if problem != nil {
 		return DesiredPlacement{}, problem
 	}

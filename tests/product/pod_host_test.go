@@ -112,6 +112,8 @@ type fakePod struct {
 	// reobserve re-sends the serving report for the last desired state, as the Runtime's
 	// report cadence would after its seats change.
 	reobserve func() error
+	// runtime61 plays the minor-61 Runtime on the control stream (pod_runtime_test.go).
+	runtime61 *podRuntime
 	// deviceCount is the width this pod's ClaimAck reports — how many accelerators the
 	// worker actually found. Zero reports one card, which is what every pod was until
 	// wide products became buyable. A test sets it to say what the PROVIDER delivered,
@@ -307,6 +309,15 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 		}
 		if p.onFrame != nil {
 			handled, err := p.onFrame(frame, send)
+			if err != nil {
+				return err
+			}
+			if handled {
+				continue
+			}
+		}
+		if p.runtime61 != nil {
+			handled, err := p.runtime61.frame(p, frame, send)
 			if err != nil {
 				return err
 			}

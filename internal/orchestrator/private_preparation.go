@@ -36,13 +36,6 @@ func (c *Orchestrator) rentalPreparationAllowedLocked(w *worker, req records.Req
 	if problem != nil {
 		return problem
 	}
-	// Published serving adds immutable placements to the resident set and may
-	// share its existing serving slots. The captured job/executor replacement
-	// fence must not serialize those ordinary co-tenants. A CPU composition
-	// parent still owns the machine even after its first child began serving.
-	if c.ordinaryServingPreparation(w, req) {
-		return nil
-	}
 	if c.modeClaimedLocked(w, req.IsJob(), req.ID, req.ParentRequestID) {
 		return exit.Named(exit.Unavailable, "rental.mode_claimed", "rental preparation waits for work pinned to this rental's current mode")
 	}
@@ -76,12 +69,6 @@ func (c *Orchestrator) claimRentalPreparation(instance string, req records.Reque
 	if problem := c.rentalPreparationAllowedLocked(w, req); problem != nil {
 		return problem
 	}
-	// An ordinary serving prewarm may leave a useful immutable placement after
-	// its request is canceled. Do not attach that request's execution fence to
-	// later independent placement convergence on this worker.
-	if c.ordinaryServingPreparation(w, req) {
-		return nil
-	}
 	parent, problem := c.activeParentFor(req)
 	if problem != nil {
 		return problem
@@ -91,8 +78,15 @@ func (c *Orchestrator) claimRentalPreparation(instance string, req records.Reque
 	return nil
 }
 
-func (c *Orchestrator) ordinaryServingPreparation(w *worker, req records.Request) bool {
-	return req.ParentRequestID == "" && !req.IsJob() && req.InstallID == "" && !w.spec.IsJob() &&
+// ordinaryServing answers whether a request is published serving on a reconciled serving
+// worker no CPU composition parent owns: it adds immutable placements to the resident set
+// and shares its serving slots, so no execution fence applies to it.
+func (c *Orchestrator) ordinaryServing(instance string, req records.Request) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w := c.workers[instance]
+	return w != nil && !w.exited && !w.stopping && w.snapshotAcknowledged &&
+		req.ParentRequestID == "" && !req.IsJob() && req.InstallID == "" && !w.spec.IsJob() &&
 		w.orchestrationParent == nil && c.rentalParentAllows(w, req)
 }
 
