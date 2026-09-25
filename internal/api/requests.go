@@ -861,12 +861,14 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		if machine == "" {
 			machine = link.MachineID
 		}
-		return Lifecycle{Number: row.Number, Kind: "job", RequestID: row.ID, Status: state.Status,
+		life := Lifecycle{Number: row.Number, Kind: "job", RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS,
 			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, Outputs: state.Outputs,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution}
+		s.fillLifecycleProgress(&life, row)
+		return life
 	}
 	kind := "invocation"
 	if row.IsJob() {
@@ -917,24 +919,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 			}
 		}
 	}
-	if life.Status == "in_progress" {
-		if progress, ok := s.orchestrator.LatestProgress(row.ID, life.Attempt); ok {
-			life.ProgressStage = progress.Stage
-			life.StageFraction = progress.StageFraction
-			life.OverallFraction = progress.OverallFraction
-			life.Position = progress.Position
-			life.Total = progress.Total
-			life.StepMS = progress.StepMS
-			if progress.Estimated {
-				life.RemainingMS = &progress.RemainingMS
-			}
-		}
-	} else if life.Status == "completed" {
-		complete := 1.0
-		life.OverallFraction = &complete
-	} else if life.Status == "failed" || life.Status == "canceled" {
-		life.OverallFraction, _ = s.store.TerminalOverallFraction(row.ID, row.Ordinal)
-	}
+	s.fillLifecycleProgress(&life, row)
 	life.OutputExport = s.outputExportOf(row.ID)
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
@@ -982,7 +967,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	life.Metrics = map[string]any{
 		"runtime_ms": metrics.Int("runtime_ms"), "queue_ms": metrics.Int("queue_ms"),
 		"handler_ms": metrics.Int("handler_ms"), "device_lease_ms": metrics.Int("device_lease_ms"),
-		"finalization_ms": metrics.Int("finalization_ms"),
+		"finalization_ms":          metrics.Int("finalization_ms"),
 		"peak_device_memory_bytes": metrics.Int("peak_device_memory_bytes"),
 	}
 	if last.TerminalStatus != "SUCCEEDED" {
@@ -1166,4 +1151,43 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		"request_id": id, "attempt": last.Attempt, "status": "cancel_requested",
 		"note": "the attempt's own journaled terminal settles it; watch the event stream",
 	})
+}
+
+// All execution venues expose the same work coordinates. Machine observations
+// also retain their imported progress, so a new observer need not await a tick.
+func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
+	switch life.Status {
+	case "completed":
+		complete := 1.0
+		life.OverallFraction = &complete
+		return
+	case "in_progress":
+	case "failed", "canceled":
+		if life.MachineExecution == nil {
+			life.OverallFraction, _ = s.store.TerminalOverallFraction(row.ID, row.Ordinal)
+			return
+		}
+	default:
+		return
+	}
+	progress, ok := s.orchestrator.LatestProgress(row.ID, life.Attempt)
+	if !ok && life.MachineExecution != nil {
+		if value, problem := s.store.LatestMachineProgress(row.ID, int64(life.Attempt)); problem == nil {
+			progress, ok = orchestrator.DecodeProgressSnapshot(value)
+		}
+	}
+	if !ok {
+		return
+	}
+	life.OverallFraction = progress.OverallFraction
+	if life.Status == "in_progress" {
+		life.ProgressStage = progress.Stage
+		life.StageFraction = progress.StageFraction
+		life.Position = progress.Position
+		life.Total = progress.Total
+		life.StepMS = progress.StepMS
+		if progress.Estimated {
+			life.RemainingMS = &progress.RemainingMS
+		}
+	}
 }

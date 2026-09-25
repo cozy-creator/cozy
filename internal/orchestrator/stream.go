@@ -106,18 +106,10 @@ type ProgressSnapshot struct {
 }
 
 type progressAccumulator struct {
-	attempt          uint64
-	stage            string
-	stageFraction    float64
-	hasStageFraction bool
-	position         int64
-	total            int64
-	hasPosition      bool
-	overallFraction  float64
-	hasOverall       bool
-	overallDelta     float64
-	overallMSSum     float64
-	stepMS           float64
+	attempt uint64
+	progressCoordinate
+	overallDelta float64
+	overallMSSum float64
 }
 
 func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (ProgressSnapshot, bool) {
@@ -128,23 +120,7 @@ func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (Progres
 	if !ok || progress.attempt != attempt {
 		return ProgressSnapshot{}, false
 	}
-	snapshot := ProgressSnapshot{Stage: progress.stage}
-	if progress.stepMS > 0 {
-		step := progress.stepMS
-		snapshot.StepMS = &step
-	}
-	if progress.hasStageFraction {
-		value := progress.stageFraction
-		snapshot.StageFraction = &value
-	}
-	if progress.hasPosition {
-		position, total := progress.position, progress.total
-		snapshot.Position, snapshot.Total = &position, &total
-	}
-	if progress.hasOverall {
-		value := progress.overallFraction
-		snapshot.OverallFraction = &value
-	}
+	snapshot := progress.progressCoordinate.snapshot()
 	if progress.hasOverall && progress.overallDelta > 0 && progress.overallMSSum > 0 {
 		remaining := max(0.0, 1-progress.overallFraction)
 		snapshot.RemainingMS = int64(remaining * progress.overallMSSum / progress.overallDelta)
@@ -178,6 +154,34 @@ type progressCoordinate struct {
 	total            int64
 	hasPosition      bool
 	stepMS           float64
+}
+
+// DecodeProgressSnapshot applies the live progress contract to one already
+// retained machine sample. A single sample cannot establish a whole-job ETA.
+func DecodeProgressSnapshot(value any) (ProgressSnapshot, bool) {
+	coordinate, ok := progressCoordinates(value)
+	return coordinate.snapshot(), ok
+}
+
+func (progress progressCoordinate) snapshot() ProgressSnapshot {
+	snapshot := ProgressSnapshot{Stage: progress.stage}
+	if progress.stepMS > 0 {
+		step := progress.stepMS
+		snapshot.StepMS = &step
+	}
+	if progress.hasStageFraction {
+		value := progress.stageFraction
+		snapshot.StageFraction = &value
+	}
+	if progress.hasPosition {
+		position, total := progress.position, progress.total
+		snapshot.Position, snapshot.Total = &position, &total
+	}
+	if progress.hasOverall {
+		value := progress.overallFraction
+		snapshot.OverallFraction = &value
+	}
+	return snapshot
 }
 
 func finiteFraction(value any) (float64, bool) {

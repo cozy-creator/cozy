@@ -335,3 +335,25 @@ func (s *Store) LastEventSeq() (int64, *exit.Error) {
 	}
 	return seq.Int64, nil
 }
+
+// LatestMachineProgress reads the current attempt's already-imported Runtime
+// event page. It does not add another telemetry writer or new progress journal.
+func (s *Store) LatestMachineProgress(requestID string, attempt int64) (map[string]any, *exit.Error) {
+	var body string
+	err := s.db.QueryRow(`SELECT json_extract(payload,'$.payload') FROM request_events
+		WHERE request_id=? AND attempt=? AND type='machine.progress'
+		AND json_extract(payload,'$.type')='progress'
+		AND json_type(payload,'$.payload')='object'
+		ORDER BY seq DESC LIMIT 1`, requestID, attempt).Scan(&body)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read machine progress for %s: %s", requestID, err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal([]byte(body), &value); err != nil {
+		return nil, exit.Internalf("cannot decode machine progress for %s: %s", requestID, err)
+	}
+	return value, nil
+}
