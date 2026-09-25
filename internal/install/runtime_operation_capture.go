@@ -109,8 +109,8 @@ func validateRuntimeCapture(root string, capture launch.BuiltinPreparation) *exi
 	if problem != nil {
 		return problem
 	}
-	if surface.Application != runtimeoperation.Application || len(surface.Jobs) != 1 || surface.Jobs[0].Name != "quantize" {
-		return exit.New(exit.Conflict, "captured Runtime changed its fixed builtin")
+	if problem := launch.ValidateBuiltinOperations(surface); problem != nil {
+		return problem
 	}
 	if !strings.Contains("\n"+capture.Closure+"\n", "\ncozy-runtime=="+capture.RuntimeVersion+"\n") {
 		return exit.New(exit.Conflict, "captured Runtime omitted its actual distribution")
@@ -131,13 +131,13 @@ func HasRuntimeOperationsCapture(parent records.PackageInstall) (bool, *exit.Err
 
 // ResolveRuntimeOperations creates the ordinary binding only on an actual call.
 // The writer lock serializes concurrent calls and publishes one immutable choice.
-func ResolveRuntimeOperations(ctx context.Context, layout home.Layout, store *records.Store, parent records.PackageInstall, iface string) (*records.ChildBinding, *exit.Error) {
+func ResolveRuntimeOperations(ctx context.Context, layout home.Layout, store *records.Store, parent records.PackageInstall, iface, export string) (*records.ChildBinding, *exit.Error) {
 	writer, problem := Lock(layout)
 	if problem != nil {
 		return nil, problem
 	}
 	defer writer.Unlock()
-	held, problem := store.ChildBinding(parent.ID, iface, runtimeoperation.Module, "quantize")
+	held, problem := store.ChildBinding(parent.ID, iface, runtimeoperation.Module, export)
 	if problem != nil || held != nil {
 		return held, problem
 	}
@@ -150,13 +150,16 @@ func ResolveRuntimeOperations(ctx context.Context, layout home.Layout, store *re
 	if problem != nil {
 		return nil, problem
 	}
+	if job, problem := surface.Function(export); problem != nil || job.Invocable == nil || !runtimeoperation.Export(export) {
+		return nil, exit.New(exit.Conflict, "captured Runtime does not expose requested operation")
+	}
 	if surface.Digest != iface {
 		return nil, exit.Named(exit.Conflict, "child.builtin_changed", "call differs from its captured Runtime interface")
 	}
 	env := config.Frozen().Tool("COZY_HOME="+runtimeScratchHome(),
 		"COZY_DEPENDENCY_CACHE="+layout.DependencyCache())
 	tool := launch.CapturedBuiltinTool(root, capture.EnvironmentPython, env)
-	binding, _, problem := prepareRuntimeOperations(ctx, layout, store, tool, capture)
+	binding, _, problem := prepareRuntimeOperations(ctx, layout, store, tool, capture, export)
 	if problem != nil {
 		return nil, problem
 	}

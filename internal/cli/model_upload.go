@@ -62,6 +62,9 @@ func sourceProfileNames(profiles map[string]string) []string {
 }
 
 func handleModelUpload(ctx *Context) *exit.Error {
+	if handled, problem := nativeModelUpload(ctx); handled {
+		return problem
+	}
 	return handleModelTransfer(ctx, "model-upload")
 }
 
@@ -148,6 +151,11 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 			"rented model download cannot yet return an output to local TensorFS").
 			WithRemedy("run locally until the negotiated weights-read return plane is active")
 	}
+	if invocation == nil && effectiveRental {
+		return exit.Named(exit.Unavailable, "model_transfer.rented_recipe_unavailable",
+			"rented standalone ingest requires a reviewed complete-model recipe").
+			WithRemedy("use a supported full HF repository, or invoke a typed native ingestion script")
+	}
 	if localOnly {
 		ctx.Inv.Bools["--rental"] = false
 		ctx.Inv.Bools["--rental-only"] = false
@@ -209,31 +217,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 				WithRemedy("retry after the provider can serve every selected source header")
 		}
 	}
-	// A standalone rented upload is the built-in pass-through producer. Its model
-	// slot has no package-declared source profile, so the header-only TensorFS
-	// preflight above intentionally asked TensorFS to classify the complete source
-	// carrier set. Carry that reviewed profile into the durable transfer intent;
-	// otherwise the remote owner would have no way to prepare the same source and
-	// would reject a command that was already proven convertible before rental.
-	if invocation == nil && effectiveRental && conversion.decided() {
-		profile := conversion.Plans["model"].Profile
-		if profile == "" {
-			return exit.Named(exit.Structural, "model_source.profile_missing",
-				"TensorFS planned the rented source without returning its reviewed profile")
-		}
-		plan.SourceProfiles = map[string]string{"model": profile}
-		// The initial provider resolution describes every repository member. The
-		// reviewed profile may select a strict subset (for example, one model
-		// family from a repository containing several indexes), so bind the same
-		// selected inventory and selection digest that the worker will refresh.
-		narrowed, problem := narrowPublishSource(ctx, source, []string{profile})
-		if problem != nil {
-			return problem
-		}
-		source = narrowed
-		plan.Source, plan.SourceSelection, plan.SourceLicense = source.Canonical, source.Selection, source.License
-		plan.SourceFiles, plan.InputLane = source.Exact, source.Lane
-	}
+
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
 		if kind == "model-upload" && !privateOutputs {

@@ -276,21 +276,25 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelUploadCmd struct {
-	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
-	Ref            string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
-	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental         bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
-	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
-	DryRun         bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
-	Await          bool   `help:"Watch the accepted run until it settles."`
-	IdempotencyKey string `help:"Stable request identity for exact replay; otherwise start a new run."`
+	Source         string  `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Ref            string  `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
+	Lane           string  `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental         *string `predictor:"rental" help:"Use this existing rental name or id; never buy a replacement."`
+	RentalOnly     bool    `help:"Require a remote rental instead of local capacity."`
+	DryRun         bool    `help:"Resolve the exact transfer plan without moving bodies or spending."`
+	Await          bool    `help:"Watch the accepted run until it settles."`
+	IdempotencyKey string  `help:"Stable request identity for exact replay; otherwise start a new run."`
 }
 
 func (c *ModelUploadCmd) Run(r *Runtime) error {
+	rentalName, problem := rentalArgument(c.Rental)
+	if problem != nil {
+		return problem
+	}
 	return r.call(handleModelUpload, []string{c.Source, c.Ref}, bools(
-		"--rental", c.Rental, "--rental-only", c.RentalOnly,
+		"--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
-		values("--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
+		values("--rental", rentalName, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
 }
 
 type ModelPublishCmd struct {

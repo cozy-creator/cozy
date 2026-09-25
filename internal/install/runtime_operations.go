@@ -20,7 +20,7 @@ import (
 
 // prepareRuntimeOperations materializes only a previously captured builtin.
 // Neither the current host SDK nor the invoking family's closure participates.
-func prepareRuntimeOperations(ctx context.Context, layout home.Layout, store *records.Store, tool launch.RuntimeCLI, capture launch.BuiltinPreparation) (*records.ChildBinding, string, *exit.Error) {
+func prepareRuntimeOperations(ctx context.Context, layout home.Layout, store *records.Store, tool launch.RuntimeCLI, capture launch.BuiltinPreparation, export string) (*records.ChildBinding, string, *exit.Error) {
 	version := capture.RuntimeVersion
 	surface, problem := launch.DecodePackageInterface(capture.PackageInterface)
 	if problem != nil {
@@ -103,5 +103,5 @@ func prepareRuntimeOperations(ctx context.Context, layout home.Layout, store *re
 	if err := os.WriteFile(filepath.Join(dir, "private-revision"), []byte(revision.Digest), 0400); err != nil {
 		return nil, id, exit.Internalf("cannot retain builtin revision: %s", err)
 	}
-	return &records.ChildBinding{InterfaceDigest: surface.Digest, Module: runtimeoperation.Module, Export: "quantize", ChildInstallID: id, LocalRevisionDigest: revision.Digest, Entrypoint: "quantize"}, id, nil
+	return &records.ChildBinding{InterfaceDigest: surface.Digest, Module: runtimeoperation.Module, Export: export, ChildInstallID: id, LocalRevisionDigest: revision.Digest, Entrypoint: export}, id, nil
 }
