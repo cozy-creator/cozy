@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
 	"strings"
@@ -153,7 +155,14 @@ func TestActiveRentalJobCannotBeReplacedByServing(t *testing.T) {
 // Paul's contract: `cozy run ... rental=ABC` pins the job to ABC. A pinned job that is
 // still queued — no attempt, no offer yet — is already a claim on that rental's job mode,
 // so serving work must not flip the rental away from under it.
+// The pin claims the mode whether the scheduler assigned it (worker) or the caller
+// selected the rental with `cozy run --rental` and it is still unassigned.
 func TestQueuedPinnedJobKeepsRentalJobMode(t *testing.T) {
+	t.Run("assigned", func(t *testing.T) { queuedPinnedJobKeepsRentalJobMode(t, false) })
+	t.Run("requested", func(t *testing.T) { queuedPinnedJobKeepsRentalJobMode(t, true) })
+}
+
+func queuedPinnedJobKeepsRentalJobMode(t *testing.T, requested bool) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
@@ -203,7 +212,15 @@ func TestQueuedPinnedJobKeepsRentalJobMode(t *testing.T) {
 			OutcomeDigest: digest, OutcomeCanonicalBytes: body}, err
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
-	o := hostOwner(t, "queued-pinned-job", rentalWiring(connection, private))
+	// The managed fleet is present, as in the daemon; the selected rental already holds
+	// the job's placement, so it is never asked to buy or pin.
+	fleet := func(options *orchestrator.Options) {
+		options.RentalFleet = func() (string, *exit.Error) { return "", nil }
+		options.AcquireManagedRental = func(records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
+			return orchestrator.PlacementDecision{}, "", exit.Internalf("fleet asked to place work its rental already holds")
+		}
+	}
+	o := hostOwner(t, "queued-pinned-job", rentalWiring(connection, private), fleet)
 	job, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "pinned-job", Package: "cozy/h3-package",
 		Release: "1.0.7", Entrypoint: "four-lane", PlanID: "sha256:" + strings.Repeat("35", 32), Kind: "job", Org: "paul",
 		Payload: []byte("{}"), Worker: podRental, Rental: true, RentalRequired: true,
@@ -225,6 +242,23 @@ func TestQueuedPinnedJobKeepsRentalJobMode(t *testing.T) {
 	fatal(t, problem)
 	if len(rows) != 0 {
 		t.Fatalf("pinned job left the queue before its capacity: %d attempts", len(rows))
+	}
+	if requested {
+		// `cozy run --rental`: the rental already holds the job's placement, so the run
+		// waits for a seat with only requested_rental set, as live. The assigned job then
+		// leaves, and the unassigned one is the rental's only job-mode work.
+		selected, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "requested-job", Package: "cozy/h3-package",
+			Release: "1.0.7", Entrypoint: "four-lane", PlanID: "sha256:" + strings.Repeat("35", 32), Kind: "job", Org: "paul",
+			Payload: []byte("{}"), RequestedRental: podRental, Rental: true, RentalRequired: true,
+		})
+		fatal(t, problem)
+		fatal(t, o.c.CancelQueued(job, "test client"))
+		job = selected
+		row, problem := o.store.RequestRow(job)
+		fatal(t, problem)
+		if row == nil || row.Worker != "" || row.RequestedRental != podRental || (row.State != "submitted" && row.State != "queued") {
+			t.Fatalf("requested job is not queued unassigned: %+v", row)
+		}
 	}
 	if reason, _ := o.c.RentalStanding(podRental, false); reason != orchestrator.ExcludedModeConflict {
 		t.Fatalf("queued pinned job did not claim its rental's mode: %q", reason)
