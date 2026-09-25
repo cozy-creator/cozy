@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -49,9 +50,13 @@ type session struct {
 	// host is the pod's PodHost lane (proto-025), on the same pinned connection as the
 	// control stream; nil for a local worker, whose host is this daemon in-process. claim is
 	// the exact Claim this session presented, re-presented on every host call.
-	host        pb.PodHostClient
-	preparation pb.RuntimePreparationClient
-	claim       *pb.Claim
+	host             pb.PodHostClient
+	preparation      pb.RuntimePreparationClient
+	claim            *pb.Claim
+	outcomes         chan outcomeSettlement
+	completions      chan snapshotContinuation
+	completionMu     sync.RWMutex
+	completionClosed bool
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -333,6 +338,13 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			watchCancel()
 		}
 	}()
+	var settleDone func()
+	defer func() {
+		cancel()
+		if settleDone != nil {
+			settleDone()
+		}
+	}()
 
 	for {
 		frame, err := stream.Recv()
@@ -343,6 +355,9 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		switch m := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
 			ack := m.ClaimAck
+			if settleDone != nil {
+				return fmt.Errorf("worker repeated its claim acknowledgment")
+			}
 			if !ack.Accepted {
 				name := pb.ClaimRejection_name[int32(ack.Rejection)]
 				problem := exit.Named(exit.Conflict, "rental.worker_claim_refused",
@@ -353,6 +368,8 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				return fmt.Errorf("%s", problem.Message)
 			}
 			s.bootID, s.epoch = ack.WorkerBootId, ack.ControlStreamEpoch
+			// Set up owned work before onClaimAck publishes this session to callers.
+			settleDone = c.startOutcomeSettlement(s, w, int(ack.GetResources().GetDeviceCount()))
 			if e := c.onClaimAck(w, s, ack); e != nil {
 				return fmt.Errorf("%s", e.Message)
 			}
@@ -396,10 +413,17 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			c.onAccepted(s, a)
 		case *pb.WorkerFrame_AttemptOutcome:
 			t := m.AttemptOutcome
+			if s.outcomes == nil {
+				return fmt.Errorf("worker sent an outcome before its claim acknowledgment")
+			}
 			if c.fenced(s, t.RecordOwnerEpoch, t.ControlStreamEpoch, t.WorkerBootId) {
 				continue
 			}
-			c.onOutcome(s, t)
+			select {
+			case s.outcomes <- outcomeSettlement{outcome: t}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		case *pb.WorkerFrame_CheckpointRequest:
 			r := m.CheckpointRequest
 			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamEpoch, r.WorkerBootId) {

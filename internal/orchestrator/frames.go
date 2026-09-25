@@ -827,7 +827,13 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		c.logf("%s", verdict)
 	}
 	for _, held := range heldVerdicts {
-		c.settleRefusedOutcome(s, held.requestID, held.ordinal, held.outcome)
+		// A replay may be mirroring on the outcome lane. A report's earlier refusal
+		// verdict cannot overtake its verified custody and terminal commit.
+		select {
+		case s.outcomes <- outcomeSettlement{refusal: &held}:
+		case <-s.ctx.Done():
+			return
+		}
 	}
 	// A fault rides every ReportCadence until it clears; it is logged when it first
 	// appears and again only after it has been absent. The worker likewise puts its last
@@ -1259,13 +1265,6 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		c.logf("AttemptOutcome %s#%d is an exact replay of a closed outcome: re-acked, "+
 			"nothing applied twice", t.RequestId, ordinal)
 	}
-	if !requeuing && !retaining && req.State != "canceling" {
-		// Export settlement is deliberately separate from the execution terminal. A full
-		// destination does not rewrite success into failure, and an exact replay retries
-		// this durable row without mirroring worker bytes twice.
-		c.RetryOutputExport(t.RequestId)
-	}
-
 	// Weights decisions are independent frames, but the worker may reclaim after Ack. Send
 	// every persisted first-wins intent now and withhold Ack until their exact results land.
 	pending, e := c.sendPendingWeightsFinalizations(s, t.RequestId, int64(ordinal))
@@ -1285,6 +1284,9 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 // recovery. It is intentionally idempotent: cleanup and BeginRequeue both have durable
 // guards, so a replay cannot spend twice or delete a still-owned asset.
 func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, holder *worker) {
+	// The verified result and export obligation are already durable. Independent user
+	// export must not hold the worker's outcome credit or the next outcome's ack.
+	c.RetryOutputExport(req.ID)
 	if req.State == "finalizing" && req.ModelTransfer == nil && req.RetainsLocalOutputs() {
 		go c.finishClosedNativeRootResult(req.ID, attempt.Attempt)
 		return
@@ -1496,11 +1498,15 @@ func (c *Orchestrator) forgetRefusedOutcome(instanceID, requestID string, ordina
 // journaled here, in the attempt row, rather than on the wire.
 func (c *Orchestrator) settleRefusedOutcome(s *session, requestID string, ordinal uint64,
 	r refusedOutcome) {
+	attempt, problem := c.opt.Store.AttemptRow(requestID, int64(ordinal))
+	if problem != nil || attempt == nil || !openAttempt(attempt.State) {
+		return // an earlier replay on the same lane already settled this terminal
+	}
 	verdict := fmt.Sprintf("%s: %s", outcomeRefusedCause, r.reason)
 	c.logf("worker %s: outcome %s for %s#%d REFUSED — restated unchanged on %d consecutive "+
 		"reports and nothing here can honour it; the request fails %s",
 		s.instanceID, r.outcomeID, requestID, ordinal, StillFactor, verdict)
-	applied, e := c.opt.Store.AcceptTerminal(records.Terminal{
+	_, e := c.opt.Store.AcceptTerminal(records.Terminal{
 		RequestID: requestID, Attempt: int64(ordinal), SessionID: s.bootID,
 		InvocationDigest: r.spec, TerminalID: r.outcomeID, TerminalDigest: r.digest,
 		Status: "FAILED", Cause: outcomeRefusedCause, SafeMessage: r.reason, Body: r.body,
@@ -1515,9 +1521,6 @@ func (c *Orchestrator) settleRefusedOutcome(s *session, requestID string, ordina
 		return
 	}
 	c.settleDispatch(requestID, ordinal, r.consumed)
-	if applied {
-		c.RetryOutputExport(requestID)
-	}
 	c.ackSettledOutcome(s, requestID, ordinal)
 }
 

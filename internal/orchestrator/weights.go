@@ -411,7 +411,9 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		go c.finishModelTransferRequest(requestID, int64(ordinal))
 		return
 	}
-	c.afterAck(*req, *attempt, holder)
+	if s.completions == nil || !s.complete(snapshotContinuation{request: *req, attempt: *attempt}) {
+		c.afterAck(*req, *attempt, holder)
+	}
 }
 
 func weightsReceiptSummary(receipts []records.WeightsReceipt) string {

@@ -62,6 +62,7 @@ type fakePod struct {
 	identity         string
 	noSeats          bool
 	mediaReservation func(int64, int) error
+	mediaRequest     func(http.ResponseWriter, *http.Request) bool
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime   pb.RuntimePreparationClient
 	sourceRelease   func(context.Context, *pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
@@ -810,6 +811,9 @@ func startFakePod(t *testing.T, root string, pod *fakePod) (*orchestrator.Worker
 	var mediaWrites sync.Mutex
 	reserved := map[string]bool{}
 	mediaPlane := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if pod.mediaRequest != nil && pod.mediaRequest(w, r) {
+			return
+		}
 		mediaWrites.Lock()
 		defer mediaWrites.Unlock()
 		switch {
