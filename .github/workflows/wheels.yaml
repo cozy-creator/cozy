@@ -20,6 +20,9 @@ on:
       - ".github/workflows/wheels.yaml"
       - ".github/workflows/publish.yaml"
   workflow_call:
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   wheel:
@@ -76,8 +79,11 @@ jobs:
           for wheel in dist/*.whl; do
             bash scripts/wheel-proof.sh "$wheel" "${RUNNER_TEMP}/proof"
           done
-      - uses: actions/upload-artifact@v4
+      # Consumed only by publish.yaml in the same run.
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
           path: dist/*.whl
           if-no-files-found: error
+          retention-days: 3

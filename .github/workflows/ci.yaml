@@ -1,55 +1,89 @@
 name: ci
-# Everything in this file RUNS. It used to be build + ten grep-based fences and zero
-# tests, with the real verification — the Rust suite, the frozen vector corpus, the CBOR
-# format gate, the wheel smoke — left to whoever remembered to type it.
-on: [push, pull_request]
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  checks:
+  ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      # PINNED on purpose: `-D warnings` against a floating stable makes a Rust
-      # release a CI failure with no code change.
-      - uses: dtolnay/rust-toolchain@1.91.1
         with:
-          components: clippy, rustfmt
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-      - run: cargo build --workspace
-      - run: python3 scripts/rebank-h3.py --tfs target/debug/tfs
-      - run: python3 scripts/rebank-h3-pdd.py --tfs target/debug/tfs
-      - run: python3 scripts/rebank-sdxl.py --tfs target/debug/tfs
-      - run: python3 scripts/rebank-civitai-sdxl.py --tfs target/debug/tfs
-      - run: python3 scripts/rebank-instruments.py --tfs target/debug/tfs
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - name: Real privileged-broker and unprivileged Store-owner writers
+      # Compares the whole tree, docs included, so it runs on every change.
+      - run: python3 scripts/released_version.py
+      - id: changes
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v3
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - "**"
+              - "!**.md"
+              - "!docs/**"
+
+      # Pinned: `-D warnings` against a floating stable fails CI with no code change.
+      - if: steps.changes.outputs.code != 'false'
+        uses: dtolnay/rust-toolchain@1.91.1
+        with:
+          components: clippy, rustfmt
+      - if: steps.changes.outputs.code != 'false'
+        uses: astral-sh/setup-uv@v7
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/master' }}
+      # target/ is the host build; target/manylinux is the wheel's container build.
+      - if: steps.changes.outputs.code != 'false'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            . -> target/manylinux
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - if: steps.changes.outputs.code != 'false'
+        run: cargo fmt --check
+      - if: steps.changes.outputs.code != 'false'
+        run: |
+          set -eux
+          cargo build --workspace
+          for s in h3 h3-pdd sdxl civitai-sdxl instruments; do
+            python3 "scripts/rebank-$s.py" --tfs target/debug/tfs
+          done
+      - if: steps.changes.outputs.code != 'false'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - if: steps.changes.outputs.code != 'false'
+        run: cargo test --workspace
+      - name: Privileged-broker and unprivileged Store-owner writers
+        if: steps.changes.outputs.code != 'false'
         run: |
           for proof in target/debug/deps/store_boundaries-*; do
             if [ -f "$proof" ] && [ -x "$proof" ]; then
               sudo "$proof" --exact privileged_writer_preserves_the_store_owners_public_directories --nocapture
             fi
           done
-      - run: python3 scripts/fence.py
-      # This package ships `py.typed`, which tells every consumer's type checker that the
-      # facade and `_ext.pyi` are true. Nothing checked either until tfs-077, and the stub
-      # was `__getattr__ -> Any`: a promise asserted by a marker file and kept by nobody.
-      # The stub-vs-extension half needs a built wheel and runs in the `wheel` job.
-      - run: >-
-          uv run --no-project --python 3.12 --with mypy
-          mypy --strict --python-version 3.12 python/tensorfs
-      - run: python3 scripts/version_contract.py source
-      - run: cargo build --release --bin tfs
-      # A wheel is built once and runs on whatever the pod rents (tfs-068), so the SHA-256
-      # instructions must be reachable ONLY through the runtime-detected dispatch: an
-      # instruction emitted into an ordinary function is SIGILL on a host without them,
-      # which is a crash in `put` rather than a slow `put`. The check would fire the day
-      # someone adds `-C target-feature=+sha` to a build. `ring` carries its own detected
-      # implementation for TLS and is named because it is not ours.
-      - run: |
+      - if: steps.changes.outputs.code != 'false'
+        run: |
+          set -eux
+          python3 scripts/fence.py
+          uv run --no-project --python 3.12 --with mypy mypy --strict --python-version 3.12 python/tensorfs
+          python3 scripts/version_contract.py source
+
+      - if: steps.changes.outputs.code != 'false'
+        run: cargo build --release --bin tfs
+      # SHA-256 instructions may only live in the runtime-dispatched routine (tfs-068);
+      # anywhere else they SIGILL on a host without them. `ring` carries its own dispatch.
+      - name: SHA extensions only behind runtime dispatch
+        if: steps.changes.outputs.code != 'false'
+        run: |
           set -e
           out=$(objdump -d --no-show-raw-insn target/release/tfs \
             | awk '/^[0-9a-f]+ <.*>:$/ { s=$2 }
@@ -57,83 +91,48 @@ jobs:
           [ -n "$out" ] || { echo "no sha extension instructions: the routine was dropped"; exit 1; }
           bad=$(echo "$out" | grep -v 'sha2563x868compress' | grep -v 'ring_core' || true)
           [ -z "$bad" ] || { echo "sha instructions outside the dispatch:"; echo "$bad"; exit 1; }
-          echo "sha extension instructions live only in the runtime-dispatched routine"
-      # Which SHA-256 routine the suite above ran through. On a runner without the
-      # extensions the differential test compares the scalar routine with itself, and the
-      # log should say so rather than leave it to be assumed.
-      - run: |
           grep -qo sha_ni /proc/cpuinfo \
             && echo "runner HAS the sha extensions: both routines were exercised" \
             || echo "runner LACKS the sha extensions: only the scalar fallback was exercised"
-      - run: ./target/release/tfs vectors verify
-      - run: |
-          set -e
+      - name: Vectors, capability arms, decoder and CBOR conformance
+        if: steps.changes.outputs.code != 'false'
+        run: |
+          set -eux
+          tfs=target/release/tfs
+          "$tfs" vectors verify
           m=vectors/cases/machine
-          diff <(cat "$m/capability-admitted.json"; echo) <(./target/release/tfs capability \
-            --alias plain/1 x cpu --json)
-          diff <(cat "$m/capability-unqualified.json"; echo) <(./target/release/tfs capability \
-            --alias plain/1 x cuda.sm89 --json)
-      # Qualification: an unrecognised (encoding, device) pair is the ABSENCE of evidence,
-      # never permission. The admitted arm and the refused arm both run.
-      - run: ./target/release/tfs capability --alias plain/1 x cpu
-      - run: |
-          if ./target/release/tfs capability --alias plain/1 x cuda; then
+          diff <(cat "$m/capability-admitted.json"; echo) <("$tfs" capability --alias plain/1 x cpu --json)
+          diff <(cat "$m/capability-unqualified.json"; echo) <("$tfs" capability --alias plain/1 x cuda.sm89 --json)
+          "$tfs" capability --alias plain/1 x cpu
+          if "$tfs" capability --alias plain/1 x cuda; then
             echo "an unqualified device was admitted" >&2
             exit 1
           fi
-      # Every reference decoder in the harness, qualified bit-for-bit against the
-      # producer-mined vectors, and every deliberately-wrong arm required to FAIL.
-      - run: ./target/release/tfs conform
-      # The format gate: the production Rust codec and an independent Python codec over
-      # the same green/red corpus, both required to agree byte for byte.
-      - run: >-
-          uv run --python 3.12 --project conformance/cbor/python
-          python scripts/cbor-conformance.py --tfs target/release/tfs conform
-      - run: >-
-          uv run --python 3.12 --project conformance/cbor/python
-          python scripts/migration-smoke.py target/release/tfs
+          "$tfs" conform
+          uv run --python 3.12 --project conformance/cbor/python python scripts/cbor-conformance.py --tfs "$tfs" conform
+          uv run --python 3.12 --project conformance/cbor/python python scripts/migration-smoke.py "$tfs"
 
-  # THE end-to-end test: build the abi3 wheel, install it into a fresh venv, and drive a
-  # real store — lease, plan in the caller's traversal order, slot ring, digest, blob and
-  # manifest transfer, repository CAS, local alias replace/remove, and the typed refusal
-  # arms — then run the whole frozen corpus back through the Python facade.
-  #
-  # This is the deep proof, on the platform pods run. wheels.yaml builds and proves every
-  # published platform (Creator's installer names macOS) on its own runner.
-  wheel:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-      # The binary rides the wheel (tfs-051). It is built INSIDE the manylinux
-      # container so its glibc floor matches the extension module it ships beside.
-      - uses: PyO3/maturin-action@v1
+      # The CLI rides the wheel (tfs-051), built in the manylinux container so its glibc
+      # floor matches the extension beside it.
+      - if: steps.changes.outputs.code != 'false'
+        uses: PyO3/maturin-action@v1
         with:
           target: x86_64
-          args: --release --locked --out dist
+          args: --release --locked --target-dir target/manylinux --out dist
           manylinux: auto
           before-script-linux: |
-            cargo build --release --locked -p tensorfs-core --bin tfs
-            install -D -m 755 target/release/tfs wheel-data/scripts/tfs
-      - run: |
-          for wheel in dist/*.whl; do
-            python3 scripts/version_contract.py wheel "$wheel"
-          done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-linux-x86_64
-          path: dist
-      - run: |
-          bash scripts/wheel-smoke.sh "${RUNNER_TEMP}/smoke" python3.12 \
-            --skip-build --wheels "$PWD/dist"
-      - name: Scoped native writer across the storage-owner UID boundary
+            cargo build --release --locked --target-dir target/manylinux -p tensorfs-core --bin tfs
+            install -D -m 755 target/manylinux/release/tfs wheel-data/scripts/tfs
+      - name: Wheel end-to-end over a real store
+        if: steps.changes.outputs.code != 'false'
         run: |
+          set -eux
+          for wheel in dist/*.whl; do python3 scripts/version_contract.py wheel "$wheel"; done
+          bash scripts/wheel-smoke.sh "${RUNNER_TEMP}/smoke" python3.12 --skip-build --wheels "$PWD/dist"
           sudo "${RUNNER_TEMP}/smoke/venv/bin/python" scripts/scoped-derived.py --isolation
           sudo "${RUNNER_TEMP}/smoke/venv/bin/python" scripts/scoped-model-reader.py --isolation
-      - name: Optional PyTorch interface over the exact built wheel
+      - name: Optional PyTorch interface over the built wheel
+        if: steps.changes.outputs.code != 'false'
         env:
           CUDA_VISIBLE_DEVICES: ""
           UV_TORCH_BACKEND: cpu
@@ -143,26 +142,12 @@ jobs:
             uv pip install --python "${RUNNER_TEMP}/tensor-interface/bin/python" "$wheel[torch]" "torch==2.13.0"
           done
           "${RUNNER_TEMP}/tensor-interface/bin/python" scripts/torch-interface.py
-      # wheel-smoke builds a host CLI to create its fixture. Replacing only the
-      # portable wheel's CLI with that newer-host ELF must falsify its platform tag.
-      - run: |
+      # A newer-host CLI swapped into the portable wheel must falsify its platform tag.
+      - if: steps.changes.outputs.code != 'false'
+        run: |
           for wheel in dist/*.whl; do
             uv run --script scripts/wheel-platform.py "$wheel" --prove target/release/tfs
           done
-
-  # A RELEASED VERSION NUMBER NAMES ONE TREE, FOREVER (proto-036). `v*` is the whole
-  # release procedure — publish.yaml triggers on the tag push and there is no local
-  # publish — so the tags ARE the released set, and this refuses a tree that has drifted
-  # away from the number it still declares. Its own job, with the full history the
-  # comparison needs, so the heavy jobs keep their one-commit checkout.
-  released-version:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python3 scripts/released_version.py
+      # The container build leaves root-owned files the cache post-step must read and prune.
+      - if: always() && steps.changes.outputs.code != 'false'
+        run: sudo chown -R "$(id -u):$(id -g)" target
