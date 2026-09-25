@@ -24,7 +24,7 @@ func TestAuthoredModelDefaultPrecedence(t *testing.T) {
 			t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 			if mode == "authored" {
 				code, out := runCozy(t, root, "package", "bindings", ladderPackage)
-				if code != 0 || !strings.Contains(out, "No owner overrides") || strings.Contains(out, "cozy package bind ") {
+				if code != 0 || !strings.Contains(out, "default") || !strings.Contains(out, "H100="+ladderLane) || strings.Contains(out, "cozy package bind ") {
 					t.Fatalf("no-override view demands an unnecessary binding: %d %s", code, out)
 				}
 			}

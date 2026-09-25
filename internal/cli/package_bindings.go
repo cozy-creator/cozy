@@ -17,6 +17,9 @@ import (
 // Bind verifies the slot against the latest package interface and every lane
 // against the model release. Unbind removes the override so authored defaults apply.
 
+// handlePackageBindings shows every model slot one package release declares: the
+// release's authored default ladder beside the owner's override, and which one a run
+// uses. An override for a slot the release does not declare is listed too.
 func handlePackageBindings(ctx *Context) *exit.Error {
 	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
 	if problem != nil {
@@ -24,25 +27,92 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	rows, problem := client(ctx).PackageBindings(hctx, ref)
+	c := client(ctx)
+	rows, problem := c.PackageBindings(hctx, ref)
 	if problem != nil {
 		return problem
 	}
+	release := ""
+	if v := ctx.Inv.Values["--version"]; len(v) > 0 {
+		release = strings.TrimSpace(v[len(v)-1])
+	}
+	if release == "" {
+		card, problem := c.PackageCard(hctx, ref)
+		if problem != nil {
+			return problem
+		}
+		if release, problem = newestPackageRelease(card.Releases); problem != nil {
+			return problem
+		}
+	}
+	detail, problem := c.PackageRelease(hctx, ref, release)
+	if problem != nil {
+		return problem
+	}
+	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	if problem != nil {
+		return problem
+	}
+	overrides := make(map[string]hub.PackageBindingRow, len(rows))
+	for _, row := range rows {
+		overrides[row.Slot] = row
+	}
 	l := output.List{
 		Name:      "bindings",
-		Fields:    []string{"slot", "model", "release", "ladder", "revision"},
-		AllFields: []string{"slot", "model", "release", "ladder", "revision", "updated"},
+		Fields:    []string{"slot", "source", "model", "release", "ladder", "default"},
+		AllFields: []string{"slot", "source", "model", "release", "ladder", "default", "revision", "updated"},
+		Machine:   []string{"package_release"},
+		Lead:      []string{"Model slots of " + ref.String() + "@" + release + ":"},
 	}
+	add := func(slot, source string, effective *hub.PackageBindingRow, authored *hub.PackageBindingRow) {
+		row := map[string]string{"slot": slot, "source": source, "package_release": release}
+		if effective != nil {
+			row["model"], row["release"] = effective.Model, effective.Release
+			row["ladder"] = hub.LadderText(effective.Ladder)
+			if effective.Revision > 0 {
+				row["revision"], row["updated"] = output.Int(effective.Revision), effective.UpdatedAt
+			}
+		}
+		if authored != nil {
+			row["default"] = authored.Ref() + " " + hub.LadderText(authored.Ladder)
+		}
+		l.Rows = append(l.Rows, row)
+	}
+	declared, serving := map[string]bool{}, map[string]bool{}
+	for _, entrypoint := range packageInterface.Entrypoints {
+		for _, slot := range entrypoint.Models {
+			serving[slot.Path] = true
+		}
+	}
+	slots := declaredModelSlots(packageInterface.Entrypoints, packageInterface.Jobs)
+	sort.Slice(slots, func(i, j int) bool { return slots[i].Path < slots[j].Path })
+	for _, slot := range slots {
+		declared[slot.Path] = true
+		if override, bound := overrides[slot.Path]; bound {
+			add(slot.Path, "override", &override, slot.DefaultBinding)
+			continue
+		}
+		if slot.DefaultBinding != nil {
+			add(slot.Path, "default", slot.DefaultBinding, slot.DefaultBinding)
+			continue
+		}
+		add(slot.Path, "none", nil, nil)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Slot < rows[j].Slot })
 	for _, row := range rows {
-		l.Rows = append(l.Rows, map[string]string{
-			"slot": row.Slot, "model": row.Model, "release": row.Release,
-			"ladder": hub.LadderText(row.Ladder), "revision": output.Int(row.Revision),
-			"updated": row.UpdatedAt,
-		})
+		if !declared[row.Slot] {
+			add(row.Slot, "override (undeclared)", &row, nil)
+		}
 	}
 	if len(l.Rows) == 0 {
-		l.Notes = []string{"No owner overrides."}
-		l.Next = []string{"cozy run " + ref.String() + " --describe"}
+		l.Notes = []string{ref.String() + "@" + release + " declares no model slots."}
+	}
+	for _, row := range l.Rows {
+		// A job's model input may come from its caller; only a serving slot needs one.
+		if row["source"] == "none" && serving[row["slot"]] {
+			l.Next = []string{"cozy package bind " + ref.String() + " " + row["slot"] + " <org/model@release> --gpu <GPU>=<lane>"}
+			break
+		}
 	}
 	return emit(ctx, l)
 }
