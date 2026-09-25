@@ -15,7 +15,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
@@ -31,7 +30,6 @@ func TestRentalRuntimeUpdateCLIBridge(t *testing.T) {
 	}
 	var f struct {
 		Root, Address, SSHAddress, SSHKey, CertificatePath, IdentityPath, WorkerID, WorkerBootID, CLI, Output string
-		Target                                                                                                hub.RuntimeUpdateTarget
 	}
 	raw, err := os.ReadFile(*rentalUpdateBridge)
 	must(t, err)
@@ -59,7 +57,6 @@ func TestRentalRuntimeUpdateCLIBridge(t *testing.T) {
 	token, problem := rental.PendingMediaToken(layout, "isolated-update-cli")
 	fatal(t, problem)
 	remote := map[string]any{"rental_id": id, "name": "cpu-proof", "state": "ready", "development": true, "ssh_address": f.SSHAddress, "worker_address": f.Address, "media_address": "https://127.0.0.1:1", "cert_pem": string(cert), "worker_id": f.WorkerID, "worker_boot_id": f.WorkerBootID, "creator_public_key": identity.PublicKey(), "media_token_sha256": []string{strings.Repeat("a", 64)}, "requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 1}
-	f.Target.RentalID, f.Target.WorkerBootID = id, f.WorkerBootID
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "fixture forbids provider writes", 405)
@@ -70,8 +67,6 @@ func TestRentalRuntimeUpdateCLIBridge(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]any{remote})
 		case "/v1/rentals/" + id:
 			_ = json.NewEncoder(w).Encode(remote)
-		case "/v1/rentals/" + id + "/runtime-update-target":
-			_ = json.NewEncoder(w).Encode(f.Target)
 		default:
 			http.NotFound(w, r)
 		}
