@@ -66,6 +66,7 @@ jobs:
           restore-keys: |
             ci-${{ hashFiles('go.sum') }}-
             ci-
+      - run: python3 scripts/fence.py
       - run: go build ./... && go vet ./...
       - name: Cross-compile the shipped targets
         run: |
@@ -96,7 +97,6 @@ jobs:
             --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
             scripts/product-tests.sh "${args[@]}"
-      - run: python3 scripts/fence.py
       - name: Release artifacts install and upgrade
         if: env.FULL == 'true'
         run: |
