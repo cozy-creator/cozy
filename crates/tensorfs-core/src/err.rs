@@ -94,6 +94,7 @@ codes![
     OBJECT_CORRUPT,
     RANGE_BOUNDS,
     NOT_REGULAR_FILE,
+    PERMISSION_DENIED,
     IO_FAILED,
     // ingest
     PICKLE_REFUSED,

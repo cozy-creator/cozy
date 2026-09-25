@@ -545,6 +545,83 @@ fn privileged_writer_preserves_the_store_owners_public_directories() {
     );
     assert_eq!(mode(&manifest_path), 0o444);
 
+    // The managed Runtime (root) publishes a repository, then the ordinary Host
+    // (Store owner) reads it on the SAME Store. Every atomic replacement must
+    // preserve this handoff; directory ownership alone did not protect 0600 files.
+    use tensorfs_core::repository::{Mutation, ReleaseLane, RepositoryName};
+    let repo = RepositoryName::new("paul", "reference-image").unwrap();
+    store
+        .apply_repository(
+            None,
+            &Mutation::PutCheckpoint {
+                repo: repo.clone(),
+                manifest: admitted.obj.clone(),
+            },
+            &Fault::default(),
+        )
+        .unwrap();
+    let mut observed = Some(fs::read(store.repository_path(&repo)).unwrap());
+    for version in ["1.0.0", "1.0.1", "1.0.2"] {
+        store
+            .apply_repository(
+                observed.as_deref(),
+                &Mutation::UpdateRelease {
+                    expected_revision: 0,
+                    repo: repo.clone(),
+                    remove: vec![],
+                    set: vec![ReleaseLane {
+                        lane: "original".into(),
+                        manifest: admitted.obj.clone(),
+                    }],
+                    version: version.into(),
+                },
+                &Fault::default(),
+            )
+            .unwrap();
+        let path = store.repository_path(&repo);
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), mode(&path)),
+            (uid, uid, 0o600)
+        );
+        observed = Some(fs::read(&path).unwrap());
+        let rows = store_root.join("repo-list.jsonl");
+        ok(run(
+            &[
+                "repo",
+                "list",
+                store_root.to_str().unwrap(),
+                "--rows",
+                rows.to_str().unwrap(),
+            ],
+            uid,
+        ));
+        assert!(String::from_utf8(fs::read(rows).unwrap())
+            .unwrap()
+            .contains(version));
+    }
+    // An already-unreadable file is not silently repaired. Its typed native
+    // refusal lets the Host end this preparation instead of retrying forever.
+    let repo_path = store.repository_path(&repo);
+    chown(&repo_path, Some(0), Some(0)).unwrap();
+    let denied = run(
+        &[
+            "repo",
+            "list",
+            store_root.to_str().unwrap(),
+            "--rows",
+            store_root.join("denied.jsonl").to_str().unwrap(),
+        ],
+        uid,
+    );
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("PERMISSION_DENIED"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert_eq!(fs::metadata(&repo_path).unwrap().uid(), 0);
+
     // Unprivileged readers cannot become public writers. The shared lease door is
     // separate from all public CAS directories, which remain owner-write only.
     assert!(!run(

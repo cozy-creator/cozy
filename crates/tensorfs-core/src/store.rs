@@ -44,7 +44,7 @@ const EDQUOT: i32 = 69;
 
 /// An I/O failure, classified.
 ///
-/// **Out of space is a VERDICT and everything else is weather**, and the difference is the
+/// Out of space and denied access need an external change before retrying. The difference is the
 /// whole of tfs-064. Before it, a full container disk raised `IO_FAILED` — the same code as
 /// a bad sector or a revoked permission — so `pod-supervisor` classified it `Resumable` and
 /// the owner re-issued the fetch, which re-planned, re-asked, and failed at the same byte.
@@ -57,7 +57,11 @@ pub(crate) fn classify_io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
         };
     }
     Refusal {
-        code: Code::IO_FAILED,
+        code: if e.kind() == std::io::ErrorKind::PermissionDenied {
+            Code::PERMISSION_DENIED
+        } else {
+            Code::IO_FAILED
+        },
         detail: format!("{}: {e}", what.as_ref()),
     }
 }
@@ -680,17 +684,19 @@ impl Store {
     /// Public directory ownership follows the Store owner, not whichever trusted writer
     /// first touches a hash prefix. A privileged broker may write beside the Store owner;
     /// its new directories must not strand that owner behind root-owned 0755 prefixes.
+    /// Includes repository cache provenance, which the same trusted writers replace.
     /// Existing directories are checked, never silently repaired; payload modes/owners and
     /// operation-private roots are outside this policy.
-    fn prepare_public_directory(&self, path: &Path) -> Result<()> {
+    pub(crate) fn prepare_owned_directory(&self, path: &Path) -> Result<()> {
         let relative = path.strip_prefix(&self.root).map_err(|_| Refusal {
             code: Code::STORE_ERA,
             detail: "public directory is outside the Store".into(),
         })?;
         let mut parts = relative.components();
         let namespace = parts.next();
-        if !matches!(namespace, Some(std::path::Component::Normal(name))
+        if !(matches!(namespace, Some(std::path::Component::Normal(name))
             if name == "blobs" || name == "manifests" || name == "repos")
+            || relative.starts_with("tmp/cache-roots"))
             || parts
                 .clone()
                 .any(|part| !matches!(part, std::path::Component::Normal(_)))
@@ -748,6 +754,20 @@ impl Store {
             FileExt::unlock(&parent)
                 .map_err(|error| io("unlock Store directory admission", error))?;
             parent = child;
+        }
+        Ok(())
+    }
+
+    /// A newly-created repository metadata inode follows the trusted Store owner.
+    /// Never called on existing files, immutable payloads, or operation-private state.
+    pub(crate) fn assign_new_metadata_owner(&self, file: &File) -> Result<()> {
+        let owner = fs::metadata(&self.root).map_err(|error| io("stat Store owner", error))?;
+        let current = file
+            .metadata()
+            .map_err(|error| io("stat metadata owner", error))?;
+        if (current.uid(), current.gid()) != (owner.uid(), owner.gid()) {
+            fchown(file, Some(owner.uid()), Some(owner.gid()))
+                .map_err(|error| io("assign metadata to Store owner", error))?;
         }
         Ok(())
     }
@@ -899,7 +919,7 @@ impl Store {
             )?;
         }
         let path = self.manifest_path(&object.sha256);
-        self.prepare_public_directory(path.parent().unwrap())?;
+        self.prepare_owned_directory(path.parent().unwrap())?;
         if path.exists() {
             self.read_manifest(&object)?;
             return Ok(Put {
@@ -1088,7 +1108,7 @@ impl Store {
                     let bytes = repository.canonical_bytes();
                     if actual.as_deref() != Some(bytes.as_slice()) {
                         let directory = path_for_write.parent().unwrap();
-                        self.prepare_public_directory(directory)?;
+                        self.prepare_owned_directory(directory)?;
                         let temporary = directory.join(format!(
                             ".{}.{}.{}",
                             path_for_write.file_name().unwrap().to_string_lossy(),
@@ -1103,6 +1123,13 @@ impl Store {
                             .map_err(|error| io("create repository temp", error))?;
                         if let Err(error) = file.write_all(&bytes) {
                             return cleanup(&temporary, io("write repository", error));
+                        }
+                        // Repository metadata is private to the trusted Store owner. A
+                        // privileged Runtime may publish it before the unprivileged Host
+                        // next reads/replaces it; retain 0600 but assign the NEW inode to
+                        // the Store owner before it becomes visible at the repository key.
+                        if let Err(error) = self.assign_new_metadata_owner(&file) {
+                            return cleanup(&temporary, error);
                         }
                         if let Err(error) = file.sync_all() {
                             return cleanup(&temporary, io("fsync repository", error));
@@ -1296,7 +1323,7 @@ impl Store {
 
             let dst = self.object_path(&hex);
             let dir = dst.parent().unwrap().to_path_buf();
-            if let Err(error) = self.prepare_public_directory(&dir) {
+            if let Err(error) = self.prepare_owned_directory(&dir) {
                 return cleanup(&tmp, error);
             }
             // No-clobber admission: link() refuses to replace an installed object.

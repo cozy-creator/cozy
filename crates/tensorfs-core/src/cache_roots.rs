@@ -3,17 +3,15 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
-use crate::err::{Code, Refusal, Result};
+use crate::err::{Refusal, Result};
 use crate::repository::RepositoryName;
 use crate::store::Store;
 
 fn io(error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("cache root provenance: {error}"),
-    }
+    crate::store::classify_io("cache root provenance", error)
 }
 
 fn path(store: &Store, repo: &RepositoryName) -> PathBuf {
@@ -48,7 +46,7 @@ pub(crate) fn clear(store: &Store, repo: &RepositoryName) -> Result<()> {
 pub(crate) fn record(store: &Store, repo: &RepositoryName, body: &[u8]) -> Result<()> {
     let path = path(store, repo);
     let parent = path.parent().unwrap();
-    fs::create_dir_all(parent).map_err(io)?;
+    store.prepare_owned_directory(parent)?;
     let temporary = parent.join(format!(
         ".cache-root-{}-{}",
         repo.name,
@@ -58,10 +56,12 @@ pub(crate) fn record(store: &Store, repo: &RepositoryName, body: &[u8]) -> Resul
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&temporary)
             .map_err(io)?;
         file.write_all(crate::sha256::hex_digest(body).as_bytes())
             .map_err(io)?;
+        store.assign_new_metadata_owner(&file)?;
         file.sync_all().map_err(io)?;
         fs::rename(&temporary, &path).map_err(io)?;
         crate::store::fsync_dir(parent)
@@ -128,6 +128,7 @@ pub(crate) fn reap(store: &Store, limit: usize) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::catalog::WriterGuard;
+    use crate::err::Code;
     use crate::ids::{Doc, ObjectRef};
     use crate::manifest::{Draft, Entry};
     use crate::repository::{Mutation, Repository};

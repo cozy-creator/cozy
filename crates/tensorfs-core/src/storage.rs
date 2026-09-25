@@ -16,10 +16,7 @@ use crate::manifest::{Entry, Manifest};
 use crate::repository::{Checkpoint, Release, ReleaseLane, Repository, RepositoryName};
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
-    Refusal {
-        code: Code::IO_FAILED,
-        detail: format!("{}: {error}", what.as_ref()),
-    }
+    crate::store::classify_io(what, error)
 }
 
 pub fn blob_key(sha256: &str) -> Result<String> {
