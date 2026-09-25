@@ -14,8 +14,12 @@ the replaceable environment. Creator does not run inside the worker.
 
 1. Resolve the attached rental and pin its existing worker, boot, certificate and
    developer maintenance endpoint. Refuse a missing or ended rental.
-2. Resolve supported published wheels against the worker's actual interpreter and
-   platform. Verify archive digests. Keep heavy image distributions unchanged.
+2. Resolve latest stable published native Runtime and TensorFS wheels directly from
+   PyPI against the worker's actual interpreter and platform. TensorFS must satisfy
+   the selected Runtime wheel's dependency metadata. Verify archive identities,
+   lengths and SHA256 digests. No registered image or Hub update approval is needed.
+   Keep heavy image distributions unchanged; the worker performs its existing
+   offline dependency preflight before replacement.
 3. Record the exact selected pair and maintenance operation in Creator's SQLite.
    Withdraw only this rental from new preparation and dispatch. Active requests
    make the update wait or refuse; they are never interrupted.
@@ -60,3 +64,20 @@ repeated no-op, busy refusal, another rental remaining usable, invalid wheels,
 rollback, client disconnect, daemon restart and retained TensorFS state. Biao's
 observed failure was Runtime 0.18.2 against H3's >=0.18.3 requirement. The user ended
 that rental; no new paid rental is authorized for this work.
+
+## Independent release selection
+
+Image releases install a tested starting environment. They do not authorize or
+select later operator-requested Runtime updates. Creator resolves the public
+`cozy-runtime` and `tensorfs` projects for the observed worker platform, excludes
+prereleases, yanked files and universal-only substitutes, and never silently
+downgrades an installed distribution. It records the selected exact wheel URLs,
+versions, lengths and hashes before attempting replacement. Reconciliation uses
+that frozen selection even if a newer release appears meanwhile.
+
+The managed worker interpreter is `/opt/cozy/python/bin/python3`; maintenance
+commands do not depend on SSH's interactive PATH. The current wheel-pair symlink
+is a rollback cache, not a virtual environment. Worker dependency validation,
+native imports and post-update health remain authoritative. An incompatible
+heavy platform is an actionable preflight refusal, not permission to replace it.
+The immutable 900-second rental idle deadline is neither extended nor disabled.
