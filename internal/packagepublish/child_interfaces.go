@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
@@ -185,7 +186,24 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 			if problem := req.accepts(identity.Version); problem != nil {
 				return fail(problem)
 			}
-			requirements = append(requirements, raw)
+			version, err := pep440.Parse(identity.Version)
+			if err != nil {
+				return fail(exit.New(exit.Validation, "captured interface dependency has an invalid version"))
+			}
+			// The interface METADATA and exact source wheel retain the private
+			// pin. The generated project declaration must follow the same portable
+			// lower-bound policy as authored projects, without a local version tag.
+			floor := req.name
+			if len(req.extras) > 0 {
+				floor += "[" + strings.Join(req.extras, ",") + "]"
+			}
+			floor += ">=" + version.Public()
+			if _, marker, ok := strings.Cut(raw, ";"); ok {
+				floor += ";" + marker
+			}
+			if !slices.Contains(requirements, floor) {
+				requirements = append(requirements, floor)
+			}
 		}
 		// uv applies root source overrides only to direct requirements. A callable
 		// may be selected transitively, so declare its already-selected overlay here too.
