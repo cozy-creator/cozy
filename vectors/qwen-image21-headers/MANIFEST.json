@@ -79,5 +79,6 @@
     "transformer": 297,
     "text_encoder": 750,
     "vae": 238
-  }
+  },
+  "constructor_provenance": "Runtime QwenImage21 factory using Diffusers0.40.0 plus upstream4295ee3 model modules, Transformers5.17.0, Torch2.14.0; measured meta state_dict traversal; all1285 keys/shapes/dtypes agree with source headers"
 }
