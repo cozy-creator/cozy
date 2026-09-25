@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 43
+const schemaVersion = 44
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -117,7 +117,8 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 func init() {
 	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
-	schema = append(schema, capturePinsDDL, runtimeUpdatesDDL, rentalIdleDDL)
+	schema = append(schema, capturePinsDDL, runtimeUpdatesDDL, rentalIdleDDL,
+		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex)
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -473,6 +474,13 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if sourceVersion < 43 {
 		if _, err := tx.Exec(rentalIdleDDL); err != nil {
 			return exit.Internalf("cannot add rental idle receipts: %s", err)
+		}
+	}
+	if sourceVersion < 44 {
+		for _, statement := range []string{deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot add measured working memory: %s", err)
+			}
 		}
 	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
@@ -847,6 +855,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 44 && (statement == deviceMemoryMeasurementsDDL || statement == deviceMemoryMeasurementsIndex) {
+			continue
+		}
 		if version < 43 && statement == rentalIdleDDL {
 			continue
 		}

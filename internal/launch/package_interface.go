@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -744,6 +745,19 @@ func (e *Entrypoint) RequirePublic() *exit.Error {
 			WithRemedy("invoke a public function from this package")
 	}
 	return nil
+}
+
+// ModelSlotPaths is every entrypoint and job model-slot path, sorted unique: the
+// wire's model_slot_paths and the hub's prepare-facts rule.
+func (d *PackageInterface) ModelSlotPaths() []string {
+	paths := []string{}
+	for _, entry := range append(append([]Entrypoint(nil), d.Entrypoints...), d.Jobs...) {
+		for _, model := range entry.Models {
+			paths = append(paths, model.Path)
+		}
+	}
+	slices.Sort(paths)
+	return slices.Compact(paths)
 }
 
 // Names lists all registered callables for execution and dependency capture.

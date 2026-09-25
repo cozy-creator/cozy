@@ -263,6 +263,13 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			row.Result = selection.Selection
 			return nil
 		}
+		info, problem := orchestrator.RentalProtocolInfo(ctx, identity)
+		if problem != nil {
+			return problem
+		}
+		if problem := rental.RuntimeUpdateHost(planned.Target.RuntimeUpdate.Runtime.Version, info.WireMinor); problem != nil {
+			return problem
+		}
 		if problem := u.machines.store.SaveRuntimeUpdate(*row); problem != nil {
 			return problem
 		}

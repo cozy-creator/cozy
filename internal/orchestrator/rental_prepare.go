@@ -36,6 +36,7 @@ func (c *Orchestrator) PrepareRentalPackage(ctx context.Context, instance string
 		Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
 		ImageInventory: facts.ImageInventory, PythonRequires: facts.PythonRequires,
 		PythonVersion: facts.PythonVersion, LockedRequirements: facts.LockedRequirements,
+		PackageInterface: facts.PackageInterface,
 	}
 	result := c.runHostPrepare(s, w, 0, hostLabel("explicit_prepare", ref.Package),
 		func(context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {

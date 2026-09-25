@@ -367,7 +367,7 @@ func TestRequestedRentalIsSubmissionIdentity(t *testing.T) {
 func TestExplicitWideJobKeepsOrdinarySingleExecutorDirective(t *testing.T) {
 	row := records.Rental{ID: "chosen", State: "ready", Address: "fixture", CertPath: "fixture", AcceleratorModel: h100SXM, AcceleratorCount: 4}
 	candidate := orchestrator.PlacementCandidate{Rental: row.ID}
-	if !rental.Standing(&candidate, nil, row, 80, true, true, true) {
+	if !rental.Standing(&candidate, nil, row, 80, true, true, true, nil) {
 		t.Fatalf("a paid four-card rental was refused for a job: verdict=%s", candidate.Verdict)
 	}
 	pod := &fakePod{serve: true, deviceCount: 4}

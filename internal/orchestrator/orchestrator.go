@@ -125,7 +125,7 @@ type RentalPackageSetSource func([]*pb.DownloadPackageRef,
 	[]*pb.DownloadModelRef) ([]byte, *exit.Error)
 
 // PrepareFacts is the hub-known half of one PreparePackageSetCall: the release
-// facts (fields 3-6) the record owner fetched for this exact package release on
+// facts (fields 3-6, 10) the record owner fetched for this exact package release on
 // this rental. The pod host relays them verbatim to the Runtime's preparation,
 // which refuses a call without them.
 type PrepareFacts struct {
@@ -134,6 +134,8 @@ type PrepareFacts struct {
 	ModelSlotPaths                []string
 	ImageInventory                *pb.ImageInventory
 	LockedRequirements            []byte
+	// PackageInterface is the release's canonical PackageInterface/1 bytes (wire 61).
+	PackageInterface []byte
 }
 
 // RentalPrepareFactsSource answers one package release's facts for one rental.
