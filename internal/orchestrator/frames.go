@@ -1366,6 +1366,10 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 				}
 				holder.planIDs = plans
 			}
+			if holder != nil {
+				// Nothing prepared earlier on this boot answers for the absent bytes.
+				holder.preparedSets, holder.desiredDownloadSets = nil, nil
+			}
 			c.mu.Unlock()
 		}
 		why := attempt.TerminalStatus + "/" + attempt.TerminalCause
