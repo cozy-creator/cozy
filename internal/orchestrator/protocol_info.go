@@ -28,11 +28,36 @@ func probeWorkerProtocol(ctx context.Context, connection grpc.ClientConnInterfac
 		if status.Code(err) != codes.Unimplemented && status.Code(err) != codes.FailedPrecondition {
 			return exit.Unavailablef("worker protocol probe is temporarily unavailable")
 		}
-		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker has no compatible read-only protocol probe")
+		if status.Code(err) == codes.FailedPrecondition {
+			return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker protocol probe refused: %s", status.Convert(err).Message())
+		}
+		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker has no compatible read-only protocol probe; update the worker")
 	}
-	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor ||
-		info.WireMinor < pb.MinCompatibleWireMinor || pb.WireMinor < info.MinimumWireMinor {
-		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker and Creator protocol ranges do not overlap")
+	return ValidateWorkerProtocol(info, remote)
+}
+
+// ValidateWorkerProtocol checks the execution range independently of Host-only
+// features. A compatible Runtime need not implement the rental idle contract.
+func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental bool) *exit.Error {
+	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor {
+		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker reported an invalid supported protocol range; update the worker")
+	}
+	if info.WireMinor < pb.MinCompatibleWireMinor || pb.WireMinor < info.MinimumWireMinor {
+		return exit.Named(exit.Conflict, "worker.protocol_incompatible",
+			"Creator supports worker protocol %d–%d; this worker supports %d–%d. Update %s",
+			pb.MinCompatibleWireMinor, pb.WireMinor, info.MinimumWireMinor, info.WireMinor,
+			protocolUpgradeTarget(info))
+	}
+	if rental && !info.SupportsRentalKeepalive {
+		return exit.Named(exit.Conflict, "worker.rental_idle_guard_required",
+			"this rental Host does not support the mandatory 15-minute idle shutdown and manual keepalive; update the rental worker image")
 	}
 	return nil
+}
+
+func protocolUpgradeTarget(info *pb.ProtocolInfoResult) string {
+	if info.MinimumWireMinor > pb.WireMinor {
+		return "the local cozy-creator CLI"
+	}
+	return "the worker Runtime"
 }

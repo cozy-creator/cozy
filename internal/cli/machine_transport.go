@@ -76,12 +76,13 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
 	info, err := host.ProtocolInfo(probeContext, &pb.ProtocolInfoRequest{})
 	cancel()
-	if err != nil || info == nil || info.MinimumWireMinor == 0 || info.WireMinor < pb.MinCompatibleWireMinor || info.MinimumWireMinor > pb.WireMinor {
+	if err != nil {
 		connection.Close()
-		if err != nil {
-			return nil, machineTransport(err)
-		}
-		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "Runtime-owned execution requires worker protocol %d; this worker reports %d", pb.MinCompatibleWireMinor, info.GetWireMinor())
+		return nil, machineTransport(err)
+	}
+	if problem := orchestrator.ValidateWorkerProtocol(info, true); problem != nil {
+		connection.Close()
+		return nil, problem
 	}
 
 	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
@@ -367,12 +368,13 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 	ready, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	info, err := preparation.ProtocolInfo(ready, &pb.ProtocolInfoRequest{}, grpc.WaitForReady(true))
-	if err != nil || info == nil || info.MinimumWireMinor == 0 || info.WireMinor < pb.MinCompatibleWireMinor || info.MinimumWireMinor > pb.WireMinor {
+	if err != nil {
 		connection.Close()
-		if err != nil {
-			return nil, machineTransport(err)
-		}
-		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "local Runtime requires protocol %d; installed Runtime reports %d", pb.MinCompatibleWireMinor, info.GetWireMinor())
+		return nil, machineTransport(err)
+	}
+	if problem := orchestrator.ValidateWorkerProtocol(info, false); problem != nil {
+		connection.Close()
+		return nil, problem
 	}
 	client := pb.NewWorkerControlClient(connection)
 	claim := &pb.Claim{RecordOwnerEpoch: 1, RecordOwnerId: "cozy-local-client", WorkerId: workerID, WireMinor: pb.WireMinor, Proof: bootstrap}

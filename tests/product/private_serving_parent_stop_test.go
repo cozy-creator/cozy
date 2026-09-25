@@ -37,7 +37,7 @@ func stoppedServingParent(t *testing.T, stop string, mixed, supported bool) {
 	must(t, err)
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
 	pod.protocolInfo = func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
-		return &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor, SupportsMixedModelInputs: supported}, nil
+		return &pb.ProtocolInfoResult{WireMinor: pb.WireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor, SupportsMixedModelInputs: supported, SupportsRentalKeepalive: true}, nil
 	}
 	root := t.TempDir()
 	connection, _ := startFakePod(t, root, pod)
