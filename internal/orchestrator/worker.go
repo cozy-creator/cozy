@@ -735,9 +735,10 @@ func entrypointServes(row canonical.Doc, logical LogicalPackage) (string, bool) 
 			continue
 		}
 		slots := entrypoint.List("slots")
-		if len(slots) == 0 {
-			// A binding that names no slots has no selection of its own to disagree with;
-			// the placement's model rows are the evidence (selectionServes).
+		if len(slots) == 0 || len(logical.Models) == 0 {
+			// A binding that names no slots, or a request that names no models (the
+			// package's own defaults), has no selection to disagree with; the placement's
+			// model rows are the evidence (selectionServes).
 			return entrypoint.Str("entrypoint_binding_digest"),
 				selectionServes(logical.Models, placementModels(logical.Package, row))
 		}
@@ -1217,10 +1218,22 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			if observedSet {
 				// HOLDS = OBSERVED. Whatever placement the worker reports binding this
 				// selection serves it; a newer desire in flight retires nothing it holds.
-				var held bool
-				desired, planID, observed, held = observedServing(w, logical)
-				ready = held && observed.placementID != "" && observed.dispatchablePlanIDs[planID] &&
-					observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE
+				if placement, bound, status, held := observedServing(w, logical); held {
+					desired, planID, observed = placement, bound, status
+					ready = observed.placementID != "" && observed.dispatchablePlanIDs[planID] &&
+						observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE
+				} else if ready && current {
+					// The worker converged this owner's own desire and serves the function,
+					// but not under the requested selection: that is its answer.
+					problem := requireAdapterEcho(logical.Models, desired.Models)
+					if problem == nil {
+						problem = exit.Named(exit.Structural, "rental.selection_not_bound",
+							"the rented worker prepared %s without binding %s to the requested models",
+							logical.Package, logical.Function)
+					}
+					c.mu.Unlock()
+					return WorkerLaunchSpec{}, "", problem
+				}
 			}
 			if ready && desired.SourceDigest == "" &&
 				(!validDigest(observed.environmentDigest) ||
