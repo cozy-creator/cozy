@@ -53,6 +53,17 @@ fn py_platform_gate(py: Python<'_>, platform: &str) -> PyResult<()> {
     platform_gate(platform).map_err(|e| errors::to_py(py, &e))
 }
 
+/// Process-wide verify-once counters (proto-061); diff two snapshots around the work.
+#[pyfunction]
+fn stats(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+    let now = tensorfs_core::stats::snapshot();
+    let result = pyo3::types::PyDict::new(py);
+    result.set_item("catalog_opens", now.catalog_opens)?;
+    result.set_item("presence_passes", now.presence_passes)?;
+    result.set_item("repo_cache_verified_reads", now.repo_cache_verified_reads)?;
+    Ok(result)
+}
+
 #[pyfunction(name = "home", signature = (root = None))]
 fn py_home(py: Python<'_>, root: Option<std::path::PathBuf>) -> PyResult<String> {
     tensorfs_core::home::resolve(root.as_deref())
@@ -80,6 +91,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", python_distribution_version())?;
     m.add_function(wrap_pyfunction!(py_platform_gate, m)?)?;
     m.add_function(wrap_pyfunction!(py_home, m)?)?;
+    m.add_function(wrap_pyfunction!(stats, m)?)?;
 
     m.add_function(wrap_pyfunction!(docs::object_id, m)?)?;
     m.add_function(wrap_pyfunction!(docs::parse_header, m)?)?;

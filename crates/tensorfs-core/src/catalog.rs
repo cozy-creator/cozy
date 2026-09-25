@@ -139,6 +139,7 @@ fn connect(path: &Path) -> Result<Connection> {
         .unwrap_or_else(|error| error.into_inner())
         .entry(path.to_path_buf())
         .or_default() += 1;
+    crate::stats::catalog_opened();
     let connection = Connection::open(path).map_err(|error| sql("open catalog", error))?;
     connection
         .busy_timeout(BUSY_TIMEOUT)

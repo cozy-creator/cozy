@@ -84,6 +84,7 @@ from ._ext import (
     render,
     run_doc,
     seed_digests,
+    stats,
     transfer_object,
     transfer_manifest,
 )
@@ -259,6 +260,7 @@ __all__ = [
     "render",
     "run_doc",
     "seed_digests",
+    "stats",
     "transfer_object",
     "transfer_manifest",
 ]

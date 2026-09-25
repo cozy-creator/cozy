@@ -164,6 +164,7 @@ impl FetchPlan {
                 sorted.sort_by(|left, right| left.sha256.cmp(&right.sha256));
             }
         }
+        crate::stats::presence_pass();
         let mut held = Vec::new();
         let mut wanted = Vec::new();
         let mut why = Vec::new();
@@ -226,6 +227,7 @@ impl FetchPlan {
         store: &Store,
         walk: fn(&Store, &crate::manifest::Manifest) -> Result<crate::checkpoint::Walk>,
     ) -> Result<()> {
+        crate::stats::presence_pass();
         if let Some(manifest_ref) = &self.manifest {
             let manifest = store.read_manifest(manifest_ref)?;
             let reached = walk(store, &manifest)?;

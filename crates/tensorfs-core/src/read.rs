@@ -242,6 +242,7 @@ pub fn acquire_manifest(
     meta: &Meta,
     snap: &Manifest,
 ) -> Result<(ReadLease, Receipts)> {
+    crate::stats::presence_pass();
     let walk = checkpoint::walk(store, snap)?;
     let objects: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
     let hex = snap.manifest_id();
@@ -261,6 +262,7 @@ pub fn acquire_cozytensors(
     meta: &Meta,
     snap: &Manifest,
 ) -> Result<(ReadLease, Receipts)> {
+    crate::stats::presence_pass();
     let walk = checkpoint::walk_cozytensors(store, snap)?;
     let objects: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
     let hex = snap.manifest_id();

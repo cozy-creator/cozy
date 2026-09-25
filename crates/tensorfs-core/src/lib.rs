@@ -48,6 +48,7 @@ pub mod sha256;
 pub mod source_artifact;
 pub mod spec;
 pub mod staging;
+pub mod stats;
 pub mod storage;
 pub mod store;
 pub mod transport;

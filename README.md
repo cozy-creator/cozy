@@ -364,6 +364,8 @@ Blob admission hashes while streaming, installs with no-clobber semantics, and r
 rebuildable verification observation in SQLite. Each process loads those rows once per catalog
 into memory; a trust check is an `fstat` compared with the row's `(dev, ino, length, mtime)`,
 and a changed or unrecorded object is rehashed. `tfs scrub` is the only deliberate full rehash.
+`tensorfs.stats()` returns this process's `catalog_opens`, `presence_passes` (closure walks that
+prove every object resident) and `repo_cache_verified_reads`; diff two snapshots around a call.
 Manifests use the same digest/length identity but
 live under their typed namespace. A blob or Manifest that fails an exact rehash is removed from its
 authoritative path immediately; TensorFS retains no forensic copy. A writer holds an advisory lock

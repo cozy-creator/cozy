@@ -135,6 +135,7 @@ impl RepoObjectCache {
                     Ok(source) => source,
                     Err(error) => return Ok(read_status(error)),
                 };
+                crate::stats::repo_cache_verified_read();
                 match destination.put_stream(&mut source, Some(want), &Fault::default()) {
                     Ok(put) if put.admitted => Ok(CacheRead::Hit),
                     Ok(_) => match destination.open_verified(&want.sha256) {
@@ -186,6 +187,7 @@ impl RepoObjectCache {
             },
             detail: format!("{}: the cache cannot answer for it", want.id()),
         })?;
+        crate::stats::repo_cache_verified_read();
         let mut bytes = Vec::with_capacity(want.length as usize);
         file.read_to_end(&mut bytes)
             .map_err(|error| crate::err::Refusal {
@@ -652,6 +654,7 @@ fn open_exact(path: &Path, length: u64) -> std::result::Result<File, SoftFailure
 
 fn read_manifest(path: &Path, want: &ObjectRef) -> std::result::Result<Manifest, SoftFailure> {
     let mut file = open_exact(path, want.length)?;
+    crate::stats::repo_cache_verified_read();
     let max = Manifest::MAX_BYTES as u64;
     if want.length > max {
         return Err(SoftFailure::Corrupt);
@@ -688,6 +691,7 @@ fn verify_file(
     if metadata.len() != want.length {
         return Err(SoftFailure::Corrupt);
     }
+    crate::stats::repo_cache_verified_read();
     match kind {
         CacheKind::Blob => stream_exact(&mut file, &mut std::io::sink(), want, progress),
         CacheKind::Manifest => {

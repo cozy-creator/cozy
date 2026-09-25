@@ -785,6 +785,7 @@ impl Store {
                     let Ok(manifest) = self.read_manifest(&reference) else {
                         continue;
                     };
+                    crate::stats::presence_pass();
                     let Ok(walk) = crate::checkpoint::walk_cozytensors(self, &manifest) else {
                         continue;
                     };
