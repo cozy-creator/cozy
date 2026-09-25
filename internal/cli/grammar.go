@@ -93,7 +93,7 @@ type PackageCmd struct {
 
 	Bind     PackageBindCmd     `cmd:"" help:"Set an owner model override for one package slot."`
 	Unbind   PackageUnbindCmd   `cmd:"" help:"Remove an owner override and use the package default."`
-	Bindings PackageBindingsCmd `cmd:"" help:"Show the package owner's model overrides."`
+	Bindings PackageBindingsCmd `cmd:"" help:"Show each model slot's default ladder, owner override, and which one runs."`
 }
 
 type PackageBindCmd struct {
@@ -117,11 +117,12 @@ func (c *PackageUnbindCmd) Run(r *Runtime) error {
 }
 
 type PackageBindingsCmd struct {
-	Ref string `arg:"" name:"package" help:"Published package name (org/name)."`
+	Ref     string `arg:"" name:"package" help:"Published package name (org/name)."`
+	Version string `help:"Package release whose authored defaults to show instead of the newest, e.g. 1.2.3."`
 }
 
 func (c *PackageBindingsCmd) Run(r *Runtime) error {
-	return r.call(handlePackageBindings, []string{c.Ref}, nil, nil, false)
+	return r.call(handlePackageBindings, []string{c.Ref}, nil, values("--version", c.Version), false)
 }
 
 type PackageSearchCmd struct {
