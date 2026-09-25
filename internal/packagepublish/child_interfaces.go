@@ -103,6 +103,7 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 	if problem != nil {
 		return fail(problem)
 	}
+	metadataIndexes := metadata.Tool.UV.Index
 	requirements := append([]string(nil), metadata.Project.Dependencies...)
 	if len(extras) > 0 {
 		// A self-extra requirement lets uv evaluate the original optional
@@ -156,8 +157,8 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 		}
 		sources[name] = map[string]any{"path": path}
 		// Interface metadata carries the child's exact installed closure. Its
-		// private native wheels must also be direct requirements, or uv ignores
-		// their retained source overrides and tries to find dev versions on PyPI.
+		// explicitly sourced dependencies must also be direct requirements, or uv
+		// ignores their retained wheel/index overrides and falls back to PyPI.
 		metadata, problem := wheel.Metadata(path)
 		if problem != nil {
 			return fail(problem)
@@ -173,20 +174,40 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 			}
 			source, _ := sources[req.name].(map[string]any)
 			local, _ := source["path"].(string)
-			if !strings.HasSuffix(strings.ToLower(local), ".whl") || slices.Contains(requirements, raw) {
+			index, _ := source["index"].(string)
+			selectedVersion := ""
+			if strings.HasSuffix(strings.ToLower(local), ".whl") {
+				identity, problem := wheel.InspectIdentity(local)
+				if problem != nil {
+					return fail(problem)
+				}
+				if identity.Distribution != req.name {
+					return fail(exit.New(exit.Conflict, "captured interface dependency changed its distribution"))
+				}
+				selectedVersion = identity.Version
+			} else if index != "" {
+				// Index sources remain scoped to their authored explicit table. The
+				// captured interface's exact pin supplies the selected version; never
+				// invent a fallback index or loosen its immutable child requirement.
+				explicit := false
+				for _, declared := range metadataIndexes {
+					explicit = explicit || declared.Name == index && declared.Explicit
+				}
+				if !explicit {
+					continue
+				}
+				var exact bool
+				selectedVersion, exact = strings.CutPrefix(req.specifier.String(), "==")
+				if !exact || strings.ContainsAny(selectedVersion, ",*") {
+					return fail(exit.New(exit.Validation, "captured interface index dependency requires an exact selected version"))
+				}
+			} else {
 				continue
 			}
-			identity, problem := wheel.InspectIdentity(local)
-			if problem != nil {
+			if problem := req.accepts(selectedVersion); problem != nil {
 				return fail(problem)
 			}
-			if identity.Distribution != req.name {
-				return fail(exit.New(exit.Conflict, "captured interface dependency changed its distribution"))
-			}
-			if problem := req.accepts(identity.Version); problem != nil {
-				return fail(problem)
-			}
-			version, err := pep440.Parse(identity.Version)
+			version, err := pep440.Parse(selectedVersion)
 			if err != nil {
 				return fail(exit.New(exit.Validation, "captured interface dependency has an invalid version"))
 			}
