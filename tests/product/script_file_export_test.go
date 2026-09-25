@@ -50,14 +50,18 @@ func TestClientScriptExportsDeclaredFiles(t *testing.T) {
 			must(t, removeAllForce(root))
 		}
 	})
-	run := func(args ...string) map[string]any {
+	run := func(t *testing.T, args ...string) map[string]any {
 		t.Helper()
-		code, out := runCozyPath(t, root, path, append(args, "--json")...)
-		if code != 0 {
-			t.Fatalf("cozy %v [%d]: %s", args, code, out)
+		command := exec.Command(cozyBin, append(args, "--json")...)
+		command.Env = childEnv(t, root, "PATH="+path)
+		var stderr bytes.Buffer
+		command.Stderr = &stderr
+		out, err := command.Output()
+		if err != nil {
+			t.Fatalf("cozy %v: %v\n%s\n%s", args, err, out, stderr.String())
 		}
 		var result map[string]any
-		must(t, json.Unmarshal([]byte(out), &result))
+		must(t, json.Unmarshal(out, &result))
 		return result
 	}
 	project := filepath.Join(root, "project")
@@ -112,16 +116,18 @@ from cozy_runtime.author import AssetBound, FileAsset, Outputs
 def main(*,out:Outputs)->Annotated[FileAsset,AssetBound(max_bytes=1024,media_types=("text/plain",))]:
     return out.save_bytes(b"bounded client-script output\n",media_type="text/plain")
 `, "value", "text/plain", []byte("bounded client-script output\n")},
-		{"forwarded", `from file_producer import Report, produce
-async def main()->Report:
-    return await produce()
-`, "value.facts", "application/json", []byte("{\"ok\":true}\n")},
+		{"forwarded", `from typing import Annotated
+from cozy_runtime.author import AssetBound, FileAsset
+from file_producer import produce
+async def main()->Annotated[FileAsset,AssetBound(max_bytes=1024,media_types=("application/json",))]:
+    return (await produce()).facts
+`, "value", "application/json", []byte("{\"ok\":true}\n")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			script := filepath.Join(project, tc.name+".py")
 			must(t, os.WriteFile(script, []byte(header+tc.body), 0600))
 			directory := filepath.Join(root, "export-"+tc.name)
-			result := run("run", script, "--await", "--out", directory)
+			result := run(t, "run", script, "--await", "--out", directory)
 			saved, ok := result["saved"].([]any)
 			if !ok || len(saved) != 1 {
 				t.Fatalf("script omitted its exported file: %+v", result)
