@@ -16,13 +16,15 @@ service path. `WireMinor` is its additive compatibility level. Additive changes 
 minor; independently negotiated optional capabilities are documented by the canonical
 protocol and default to unsupported, without inferring support from a version range. A breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
-This cohort pins wire 59 with minimum 59. Machine submissions first discover the
-execution workspace through an authenticated RPC and persist that identity with
-the exact submission before transmission. Every replay retains the same workspace,
-even after a lost acceptance reply or client restart. A replacement journal refuses
-the submission; an older unresolved submission without a workspace identity cannot
-be safely upgraded by discovering a new one. Creator, Runtime, and Host must use
-the coordinated workspace-fenced protocol cohort.
+This cohort pins wire61 with minimum60. Ordinary peers negotiate an overlapping
+supported range; they do not need identical versions. New senders carry the release
+PackageInterface, while supported older senders may omit it and use Runtime's cached
+installed-interface derivation. The minor60 `CheckPackageSetCompatibility` RPC remains
+available for older Hosts until minor60 leaves the supported window.
+
+Machine submissions retain the workspace fence introduced at minor59: callers
+persist the authenticated execution-workspace identity with the exact submission,
+and a replacement journal refuses replay against a different workspace.
 
 `SOURCE` pins the upstream commit and per-file digests, matching what tensorhub and
 cozy-runtime already carry, so a hand edit or a stale re-vendor is detectable from this
@@ -33,5 +35,5 @@ byte-compares this complete generated set against upstream. That job is gated on
 independent upstream-provenance or drift claim beyond `SOURCE`.
 
 This integration retains the qualified generic LoRA adapter protocol and the complete
-unpublished dependency requirement fields in one generated snapshot. Both families use
-wire 59 with minimum 59; no dependency compatibility path is negotiated.
+unpublished dependency requirement fields in one generated snapshot. Both families remain part of the
+supported protocol; their feature gates are independent of the peer's current minor.
