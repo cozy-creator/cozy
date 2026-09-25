@@ -27,7 +27,7 @@ documented in `tensorfs/__init__.py`'s TypedDicts; the model-source path, which 
 that broke, is typed to its rows here.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from typing import Any, Literal, NotRequired, Self, TypedDict
 

@@ -53,7 +53,7 @@
 //! budget is the same budget, and the `Retryable`/`Expired` arms are the same arms. Ranged
 //! requests are not a way to reach a host the predicate never saw.
 //!
-//! Nothing is resolved once and reused. It is tempting — the probe already walked the
+//! Redirect targets are not cached. It is tempting — the probe already walked the
 //! chain, and an ask could start at the delivery URL and save a 302 — and that is exactly
 //! the trade tfs-060 was filed about: a per-request behaviour quietly demoted to a
 //! per-object one, correct on the day it ships and wrong the first time an origin changes
@@ -96,13 +96,10 @@ use std::sync::{Condvar, Mutex};
 /// nobody has measured it yet; when someone does, this constant is where the answer goes.
 pub const SOURCE_STREAMS: usize = 1;
 
-/// One ranged ask's slice, and the resume unit. MEASURED, not chosen: this crate's client
-/// sends `Connection: close`, so every ask pays a fresh TCP connect plus TLS handshake plus
-/// time-to-first-byte, which against HuggingFace's CDN measured 0.41 s. A part must
-/// therefore be large enough that 0.41 s is noise against its own transfer — at ~19 MB/s
-/// on one stream, 64 MiB transfers for 3.4 s and spends about a tenth of its time
-/// handshaking. Smaller parts resume finer and waste more link; that is the trade, and it
-/// is a parameter because the right number is a property of the LINK.
+/// One ranged ask's slice and resume unit. The original close-per-request client measured
+/// 0.41 s connect/TLS/first-byte cost against HuggingFace, motivating 64 MiB parts. Exact
+/// ranged GETs can now reuse a fully consumed, currently authorized connection, but that
+/// does not change this established resume unit or the per-request redirect checks.
 pub const PART_BYTES: u64 = 64 << 20;
 
 /// What `PART_BYTES` implies: an object smaller than two parts is one part, and one part is

@@ -1,5 +1,5 @@
 //! The one socket this crate opens (tfs-049). A deliberately small HTTP/1.1 client — GET,
-//! POST, PUT, `Connection: close`, Content-Length or chunked bodies, no compression, no
+//! POST, PUT, bounded reuse for exact ranged GETs, Content-Length or chunked bodies, no compression, no
 //! proxy, redirects surfaced to the caller rather than followed — written directly over
 //! `TcpStream`/rustls for exactly two properties no shelf client offers together:
 //!
@@ -33,7 +33,7 @@ use crate::transport::policy::CheckedUrl;
 use rustls::pki_types::{CertificateDer, ServerName};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const HEAD_MAX_BYTES: usize = 64 * 1024;
@@ -149,6 +149,56 @@ fn stream_verdict(judge: Judge, ledger: &Ledger, advanced: Instant, phase: &str)
 
 pub struct Client {
     tls: Arc<rustls::ClientConfig>,
+    idle: IdlePool,
+}
+
+type IdlePool = Arc<Mutex<Vec<Idle>>>;
+
+// This bounds retained descriptors, not in-flight transfers (the caller owns those).
+const MAX_IDLE: usize = 8;
+
+#[derive(PartialEq, Eq)]
+struct Scope {
+    https: bool,
+    host: String,
+    port: u16,
+    // Do not retain signed targets or credentials in an idle connection's key.
+    request: [u8; 32],
+}
+
+impl Scope {
+    fn ranged(checked: &CheckedUrl, headers: &[(String, String)]) -> Self {
+        let mut hash = crate::sha256::Sha256::new();
+        hash.update(&(checked.target.len() as u64).to_le_bytes());
+        hash.update(checked.target.as_bytes());
+        for (name, value) in headers
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("range"))
+        {
+            // Preserve duplicate-header ordering as well as values: an origin
+            // can assign different meaning to their first or last occurrence.
+            let name = name.to_ascii_lowercase();
+            hash.update(&(name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+            hash.update(&(value.len() as u64).to_le_bytes());
+            hash.update(value.as_bytes());
+        }
+        Self {
+            https: checked.https,
+            host: checked.host.clone(),
+            port: checked.port,
+            request: hash.finish(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "http_reuse_tests.rs"]
+mod reuse_tests;
+
+struct Idle {
+    scope: Scope,
+    wire: Wire,
 }
 
 impl Client {
@@ -173,7 +223,21 @@ impl Client {
         .with_no_client_auth();
         Client {
             tls: Arc::new(config),
+            idle: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn take(&self, scope: &Scope, checked: &CheckedUrl) -> Option<Wire> {
+        let mut idle = self.idle.lock().ok()?;
+        let at = idle.iter().position(|entry| entry.scope == *scope)?;
+        let mut entry = idle.remove(at);
+        // Every request has already rechecked its policy and DNS. An established
+        // socket is usable only while its exact peer remains in that checked set.
+        if !checked.addrs.contains(&entry.wire.sock().peer_addr().ok()?) || !entry.wire.idle_ready()
+        {
+            return None;
+        }
+        Some(entry.wire)
     }
 }
 
@@ -194,6 +258,23 @@ enum Wire {
 }
 
 impl Wire {
+    fn idle_ready(&mut self) -> bool {
+        // No unread application bytes or close-notify may cross response boundaries.
+        if let Wire::Tls { conn, .. } = self {
+            match conn.reader().read(&mut [0]) {
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                _ => return false,
+            }
+        }
+        let socket = self.sock();
+        if socket.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let clean =
+            matches!(socket.peek(&mut [0]), Err(error) if error.kind() == ErrorKind::WouldBlock);
+        socket.set_nonblocking(false).is_ok() && clean
+    }
+
     fn sock(&self) -> &TcpStream {
         match self {
             Wire::Plain(sock) => sock,
@@ -485,7 +566,8 @@ enum Framing {
 /// patience is a stall: the typed refusal is stashed here (a `Read` can only carry
 /// `io::Error`) and `failure()`/`stalled()` hand it back to the retry loop.
 pub struct BodyReader<'l> {
-    wire: Wire,
+    wire: Option<Wire>,
+    recycle: Option<Box<(IdlePool, Scope)>>,
     framing: Framing,
     raw: Vec<u8>,
     raw_at: usize,
@@ -499,6 +581,31 @@ pub struct BodyReader<'l> {
     failure: Option<Refusal>,
     stalled: bool,
     fail: Code,
+}
+
+impl Drop for BodyReader<'_> {
+    fn drop(&mut self) {
+        // Only a fully consumed, unambiguous Content-Length response is reusable.
+        // Dropped/failed bodies, chunked bodies and EOF-delimited replies close.
+        if !matches!(self.framing, Framing::Length { remaining: 0 }) || self.raw_len() != 0 {
+            return;
+        }
+        let Some(recycle) = self.recycle.take() else {
+            return;
+        };
+        let (pool, scope) = *recycle;
+        let Some(wire) = self.wire.take() else {
+            return;
+        };
+        let Ok(mut idle) = pool.lock() else {
+            return;
+        };
+        idle.retain(|entry| entry.scope != scope);
+        if idle.len() == MAX_IDLE {
+            idle.remove(0);
+        }
+        idle.push(Idle { scope, wire });
+    }
 }
 
 impl BodyReader<'_> {
@@ -521,12 +628,13 @@ impl BodyReader<'_> {
                 Some(left) => left.min(self.ledger.sample()),
                 None => self.ledger.sample(),
             };
-            self.wire.set_read_timeout(tick);
+            let wire = self.wire.as_mut().expect("body owns its wire");
+            wire.set_read_timeout(tick);
             let waiting = Instant::now();
             if self.judge == Judge::Stream {
                 self.ledger.network_read_begins();
             }
-            let result = self.wire.read_step(buf, self.ledger);
+            let result = wire.read_step(buf, self.ledger);
             if self.judge == Judge::Stream {
                 self.ledger.network_waited(waiting.elapsed());
             }
@@ -546,7 +654,12 @@ impl BodyReader<'_> {
                     let silent = self.advanced.elapsed();
                     if self.judge == Judge::Stream && silent > self.ledger.patience() {
                         self.stalled = true;
-                        let _ = self.wire.sock().shutdown(std::net::Shutdown::Both);
+                        let _ = self
+                            .wire
+                            .as_ref()
+                            .expect("body owns its wire")
+                            .sock()
+                            .shutdown(std::net::Shutdown::Both);
                         return refuse(
                             Code::TRANSFER_FAILED,
                             format!(
@@ -628,7 +741,13 @@ impl BodyReader<'_> {
     /// advances the pull without adding to the figure a refusal quotes, because a reader
     /// checking that figure against the transfer's own report must find the same number.
     pub fn read_refusing(&mut self, out: &mut [u8]) -> Result<usize> {
-        let n = self.read_framed(out)?;
+        let n = match self.read_framed(out) {
+            Ok(n) => n,
+            Err(error) => {
+                self.recycle = None;
+                return Err(error);
+            }
+        };
         if n > 0 {
             match self.judge {
                 Judge::Stream => self.ledger.moved(n as u64),
@@ -748,23 +867,41 @@ pub fn request<'l>(
 ) -> Result<Response<'l>> {
     ledger.check_running()?;
     let opened = Instant::now();
-    let sock = connect(checked, deadline, ledger, judge, fail)?;
-    let mut wire = if checked.https {
-        let name = ServerName::try_from(checked.host.clone()).map_err(|_| Refusal {
-            code: Code::SOURCE_NOT_ALLOWED,
-            detail: format!("{}: not a valid TLS server name", checked.host),
-        })?;
-        let conn =
-            rustls::ClientConnection::new(Arc::clone(&client.tls), name).map_err(|e| Refusal {
-                code: fail,
-                detail: format!("TLS setup: {e}"),
-            })?;
-        let mut sock = sock;
-        let mut conn = Box::new(conn);
-        tls_handshake(&mut sock, &mut conn, deadline, ledger, judge, opened, fail)?;
-        Wire::Tls { sock, conn }
+    // Retained-source ranges already own their retry/resume budget. Other GETs,
+    // metadata writes and uploads retain their existing one-connection behavior.
+    let scope = (method == "GET"
+        && body.is_none()
+        && headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("range"))
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("connection")))
+    .then(|| Scope::ranged(checked, headers));
+    let cached = scope.as_ref().and_then(|scope| client.take(scope, checked));
+    let mut wire = if let Some(wire) = cached {
+        wire
     } else {
-        Wire::Plain(sock)
+        let sock = connect(checked, deadline, ledger, judge, fail)?;
+        if checked.https {
+            let name = ServerName::try_from(checked.host.clone()).map_err(|_| Refusal {
+                code: Code::SOURCE_NOT_ALLOWED,
+                detail: format!("{}: not a valid TLS server name", checked.host),
+            })?;
+            let conn =
+                rustls::ClientConnection::new(Arc::clone(&client.tls), name).map_err(|e| {
+                    Refusal {
+                        code: fail,
+                        detail: format!("TLS setup: {e}"),
+                    }
+                })?;
+            let mut sock = sock;
+            let mut conn = Box::new(conn);
+            tls_handshake(&mut sock, &mut conn, deadline, ledger, judge, opened, fail)?;
+            Wire::Tls { sock, conn }
+        } else {
+            Wire::Plain(sock)
+        }
     };
 
     let default_port = if checked.https { 443 } else { 80 };
@@ -774,7 +911,11 @@ pub fn request<'l>(
     } else {
         head.push_str(&format!("host: {}:{}\r\n", checked.host, checked.port));
     }
-    head.push_str("connection: close\r\naccept-encoding: identity\r\n");
+    head.push_str(if scope.is_some() {
+        "connection: keep-alive\r\naccept-encoding: identity\r\n"
+    } else {
+        "connection: close\r\naccept-encoding: identity\r\n"
+    });
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -797,7 +938,7 @@ pub fn request<'l>(
         fail,
     )?;
 
-    let (status, response_headers, spill) =
+    let (status, response_headers, spill, http11) =
         read_head(&mut wire, deadline, ledger, judge, opened, fail)?;
     if judge == Judge::Stream {
         ledger.taught(opened.elapsed());
@@ -808,11 +949,29 @@ pub fn request<'l>(
     ledger.answered();
 
     let framing = framing_of(status, &response_headers, fail)?;
+    let reusable = http11
+        && status >= 200
+        && matches!(framing, Framing::Length { .. })
+        && response_headers
+            .iter()
+            .filter(|(name, _)| name == "content-length")
+            .count()
+            == 1
+        && !response_headers.iter().any(|(name, value)| {
+            name == "transfer-encoding"
+                || name == "connection"
+                    && value
+                        .split(',')
+                        .any(|part| part.trim().eq_ignore_ascii_case("close"))
+        });
     Ok(Response {
         status,
         headers: response_headers,
         body: BodyReader {
-            wire,
+            wire: Some(wire),
+            recycle: scope
+                .filter(|_| reusable)
+                .map(|scope| Box::new((Arc::clone(&client.idle), scope))),
             framing,
             raw: spill,
             raw_at: 0,
@@ -884,7 +1043,7 @@ fn write_all(
 }
 
 /// Status, headers (lowercased names), and body bytes read past the head.
-type Head = (u16, Vec<(String, String)>, Vec<u8>);
+type Head = (u16, Vec<(String, String)>, Vec<u8>, bool);
 
 fn read_head(
     wire: &mut Wire,
@@ -934,7 +1093,7 @@ fn read_head(
             headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
         }
     }
-    Ok((status, headers, spill))
+    Ok((status, headers, spill, status_line.starts_with("HTTP/1.1 ")))
 }
 
 fn read_step_ticking(
