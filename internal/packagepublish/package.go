@@ -450,7 +450,12 @@ type projectMetadata struct {
 			Organization string `toml:"organization"`
 		} `toml:"cozy"`
 		UV struct {
-			Sources   map[string]any `toml:"sources"`
+			Sources map[string]any `toml:"sources"`
+			Index   []struct {
+				Name     string `toml:"name"`
+				URL      string `toml:"url"`
+				Explicit bool   `toml:"explicit"`
+			} `toml:"index"`
 			Workspace struct {
 				Members []string `toml:"members"`
 				Exclude []string `toml:"exclude"`

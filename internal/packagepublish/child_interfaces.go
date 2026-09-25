@@ -175,7 +175,11 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 	if problem != nil {
 		return fail(problem)
 	}
-	command := exec.CommandContext(ctx, "uv", "lock", "--no-progress", "--python", python.Executable, "--no-python-downloads")
+	indexes, problem := selectedHubIndexes(root, false)
+	if problem != nil {
+		return fail(problem)
+	}
+	command := exec.CommandContext(ctx, "uv", append([]string{"lock", "--no-progress", "--python", python.Executable, "--no-python-downloads"}, indexes...)...)
 	command.Dir = root
 	command.Env = config.Frozen().Tool()
 	var log strings.Builder
