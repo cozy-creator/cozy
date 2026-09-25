@@ -198,7 +198,11 @@ func TestRentalRuntimeUpdateCLIFreezesLocalCandidate(t *testing.T) {
 	tensorfsSource := filepath.Join(t.TempDir(), "tensorfs-0.3.54+dev.g9d02fc3-cp312-abi3-manylinux_2_28_x86_64.whl")
 	must(t, os.WriteFile(tensorfsSource, content, 0600))
 	startDaemonProcess(t, f.layout.Root)
-	code, out := runCozy(t, f.layout.Root, "rental", "update", "proof", "--runtime-wheel", source, "--tensorfs-wheel", tensorfsSource, "--json")
+	code, out := runCozy(t, f.layout.Root, "rental", "update", "proof", "--tensorfs-wheel", tensorfsSource, "--json")
+	if code == 0 || !strings.Contains(out, "requires --runtime-wheel") {
+		t.Fatalf("unpaired TensorFS was admitted: %d %s", code, out)
+	}
+	code, out = runCozy(t, f.layout.Root, "rental", "update", "proof", "--runtime-wheel", source, "--tensorfs-wheel", tensorfsSource, "--json")
 	if code == 0 || !strings.Contains(out, "rental.runtime_update_failed") {
 		t.Fatalf("expected remote maintenance refusal after local capture: %d %s", code, out)
 	}
@@ -220,6 +224,12 @@ func TestRentalRuntimeUpdateCLIFreezesLocalCandidate(t *testing.T) {
 	must(t, json.Unmarshal(row.Selection, &selection))
 	if selection.LocalTensorFS.Path == tensorfsSource || selection.LocalTensorFS.Filename != filepath.Base(tensorfsSource) || selection.LocalTensorFS.Digest != fmt.Sprintf("sha256:%x", sha256.Sum256(content)) {
 		t.Fatalf("TensorFS candidate was not frozen: %+v", selection.LocalTensorFS)
+	}
+	must(t, os.WriteFile(tensorfsSource, []byte("replaced TensorFS build output"), 0600))
+	frozenTensorFS, err := os.ReadFile(selection.LocalTensorFS.Path)
+	must(t, err)
+	if !bytes.Equal(frozenTensorFS, content) {
+		t.Fatal("mutable caller path changed the recorded TensorFS candidate")
 	}
 	frozen := selection.LocalRuntime
 	if frozen.Path == source || frozen.Filename != filepath.Base(source) || frozen.Length != int64(len(content)) || frozen.Digest != fmt.Sprintf("sha256:%x", sha256.Sum256(content)) {
