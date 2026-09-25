@@ -635,7 +635,8 @@ pub fn run(store: &Store, drop: &[RepositoryName], options: RunOptions) -> Resul
                     sha256: row.sha256.clone(),
                     length: row.length,
                 };
-                match cache.backfill_store(store, kind, &object) {
+                // Demotion drops the local copy: prove the cached one first.
+                match cache.repair_store(store, kind, &object) {
                     Ok(CacheWrite::Stored) => {
                         report.demoted_objects += 1;
                         report.demoted_bytes = report.demoted_bytes.saturating_add(row.length);

@@ -1,8 +1,11 @@
 //! SQLite is a rebuildable projection and operation coordinator. Repository/manifests/blobs
 //! remain the authority; SQL is never consulted to decide GC liveness.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use fs2::FileExt;
@@ -114,6 +117,164 @@ fn verify_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn opened() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static OPENED: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    OPENED.get_or_init(Default::default)
+}
+
+/// Connections this process has opened to the catalog under `root`. The trust path's
+/// contract is one per catalog file per process; this makes it observable.
+pub fn connections_opened(root: &Path) -> u64 {
+    opened()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&Catalog::path(root))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn connect(path: &Path) -> Result<Connection> {
+    *opened()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(path.to_path_buf())
+        .or_default() += 1;
+    let connection = Connection::open(path).map_err(|error| sql("open catalog", error))?;
+    connection
+        .busy_timeout(BUSY_TIMEOUT)
+        .map_err(|error| sql("set catalog busy timeout", error))?;
+    connection
+        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
+        .map_err(|error| sql("configure catalog", error))?;
+    Ok(connection)
+}
+
+/// A connection to an existing catalog of exactly this schema.
+fn validated(path: &Path) -> Result<Connection> {
+    if !path.is_file() {
+        return refuse(
+            Code::DURABILITY_UNPROVEN,
+            format!(
+                "{} is absent; store is recovery-only until `tfs store rebuild`",
+                path.display()
+            ),
+        );
+    }
+    let connection = connect(path)?;
+    let version: u64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| sql("read catalog version", error))?;
+    if version != SCHEMA_VERSION {
+        return refuse(
+            Code::UNKNOWN_FORMAT,
+            format!("tensorfs.sqlite user_version {version} != {SCHEMA_VERSION}"),
+        );
+    }
+    verify_schema(&connection)?;
+    Ok(connection)
+}
+
+/// THE PROCESS'S TRUST INDEX: every `tensorfs_verified_blobs` row of one catalog, loaded
+/// with one query the first time any handle asks, then answered from memory.
+///
+/// A row is a cache fact bound to `(dev, ino, length, mtime)`; the caller still compares it
+/// with the object's `fstat`. A remembered row therefore stays sound after another process
+/// drops it: unchanged bytes under the same binding are the bytes that were hashed, and
+/// anything that changed them fails the comparison and pays its rehash. A miss asks the one
+/// kept connection, so rows written by other processes are seen; a replaced catalog file
+/// (rebuild) is reopened and reloaded. In-process writes and drops update the index directly.
+pub(crate) struct Trust {
+    path: PathBuf,
+    rows: RwLock<HashMap<String, crate::store::VRecord>>,
+    kept: Mutex<Option<Kept>>,
+}
+
+struct Kept {
+    identity: (u64, u64),
+    connection: Connection,
+}
+
+fn trust_index() -> &'static Mutex<HashMap<PathBuf, Weak<Trust>>> {
+    static INDEX: OnceLock<Mutex<HashMap<PathBuf, Weak<Trust>>>> = OnceLock::new();
+    INDEX.get_or_init(Default::default)
+}
+
+impl Trust {
+    /// The one index for the catalog under `root`, shared by every live handle in the
+    /// process. It, and its kept connection, end with the last handle.
+    pub(crate) fn of(root: &Path) -> Arc<Trust> {
+        let path = Catalog::path(root);
+        let mut index = trust_index()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(trust) = index.get(&path).and_then(Weak::upgrade) {
+            return trust;
+        }
+        index.retain(|_, trust| trust.strong_count() > 0);
+        let trust = Arc::new(Trust {
+            path: path.clone(),
+            rows: RwLock::default(),
+            kept: Mutex::default(),
+        });
+        index.insert(path, Arc::downgrade(&trust));
+        trust
+    }
+
+    fn live(path: &Path) -> Option<Arc<Trust>> {
+        trust_index()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(path)
+            .and_then(Weak::upgrade)
+    }
+
+    pub(crate) fn get(&self, sha256: &str) -> Option<crate::store::VRecord> {
+        if let Some(row) = self
+            .rows
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(sha256)
+        {
+            return Some(row.clone());
+        }
+        self.miss(sha256)
+    }
+
+    fn miss(&self, sha256: &str) -> Option<crate::store::VRecord> {
+        let mut kept = self.kept.lock().unwrap_or_else(|error| error.into_inner());
+        let metadata = fs::symlink_metadata(&self.path).ok()?;
+        let identity = (metadata.dev(), metadata.ino());
+        if let Some(open) = kept.as_ref().filter(|open| open.identity == identity) {
+            let row = verification_on(&open.connection, sha256).ok().flatten()?;
+            self.remember(&row);
+            return Some(row);
+        }
+        let connection = validated(&self.path).ok()?;
+        let rows = verifications_on(&connection).ok()?;
+        *kept = Some(Kept {
+            identity,
+            connection,
+        });
+        let mut index = self.rows.write().unwrap_or_else(|error| error.into_inner());
+        index.extend(rows.into_iter().map(|row| (row.sha256.clone(), row)));
+        index.get(sha256).cloned()
+    }
+
+    fn remember(&self, row: &crate::store::VRecord) {
+        self.rows
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(row.sha256.clone(), row.clone());
+    }
+
+    fn forget(&self, sha256: &str) {
+        self.rows
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(sha256);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Catalog {
     path: PathBuf,
@@ -201,40 +362,12 @@ impl Catalog {
 
     pub fn open(root: &Path) -> Result<Self> {
         let path = Self::path(root);
-        if !path.is_file() {
-            return refuse(
-                Code::DURABILITY_UNPROVEN,
-                format!(
-                    "{} is absent; store is recovery-only until `tfs store rebuild`",
-                    path.display()
-                ),
-            );
-        }
-        let catalog = Self { path };
-        let connection = catalog.connection()?;
-        let version: u64 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(|error| sql("read catalog version", error))?;
-        if version != SCHEMA_VERSION {
-            return refuse(
-                Code::UNKNOWN_FORMAT,
-                format!("tensorfs.sqlite user_version {version} != {SCHEMA_VERSION}"),
-            );
-        }
-        verify_schema(&connection)?;
-        Ok(catalog)
+        validated(&path)?;
+        Ok(Self { path })
     }
 
     fn connection(&self) -> Result<Connection> {
-        let connection =
-            Connection::open(&self.path).map_err(|error| sql("open catalog", error))?;
-        connection
-            .busy_timeout(BUSY_TIMEOUT)
-            .map_err(|error| sql("set catalog busy timeout", error))?;
-        connection
-            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
-            .map_err(|error| sql("configure catalog", error))?;
-        Ok(connection)
+        connect(&self.path)
     }
 
     fn initialize_schema(&self) -> Result<()> {
@@ -785,6 +918,9 @@ impl Catalog {
         transaction
             .commit()
             .map_err(|error| sql("commit blob admission", error))?;
+        if let (Some(row), Some(trust)) = (&verified, Trust::live(&self.path)) {
+            trust.remember(row);
+        }
         Ok(verified.is_some())
     }
 
@@ -881,49 +1017,17 @@ impl Catalog {
     }
 
     pub(crate) fn write_verification(&self, row: &crate::store::VRecord) -> Result<()> {
-        write_verification_on(&self.connection()?, row)
-    }
-
-    pub(crate) fn verification(&self, sha256: &str) -> Result<Option<crate::store::VRecord>> {
-        use rusqlite::OptionalExtension;
-        let row: Option<(u64, String, String, u64, u64)> = self
-            .connection()?
-            .query_row(
-                "SELECT length,dev,ino,mtime_s,mtime_ns
-                 FROM tensorfs_verified_blobs WHERE sha256=?1",
-                [sha256],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| sql("read blob verification", error))?;
-        row.map(|(length, dev, ino, mtime_s, mtime_ns)| {
-            Ok(crate::store::VRecord {
-                sha256: sha256.to_string(),
-                length,
-                dev: dev.parse().map_err(|_| Refusal {
-                    code: Code::IO_FAILED,
-                    detail: "invalid verification dev".into(),
-                })?,
-                ino: ino.parse().map_err(|_| Refusal {
-                    code: Code::IO_FAILED,
-                    detail: "invalid verification ino".into(),
-                })?,
-                mtime_s,
-                mtime_ns,
-            })
-        })
-        .transpose()
+        write_verification_on(&self.connection()?, row)?;
+        if let Some(trust) = Trust::live(&self.path) {
+            trust.remember(row);
+        }
+        Ok(())
     }
 
     pub(crate) fn drop_verification(&self, sha256: &str) {
+        if let Some(trust) = Trust::live(&self.path) {
+            trust.forget(sha256);
+        }
         if let Ok(connection) = self.connection() {
             let _ = connection.execute(
                 "DELETE FROM tensorfs_verified_blobs WHERE sha256=?1",
@@ -953,6 +1057,9 @@ impl Catalog {
                         [&sha256],
                     )
                     .map_err(|error| sql("prune verification row", error))?;
+                if let Some(trust) = Trust::live(&self.path) {
+                    trust.forget(&sha256);
+                }
                 pruned += 1;
             }
         }
@@ -999,6 +1106,61 @@ fn hold_on(connection: &Connection, operation: &str, key: &str, length: u64) -> 
             "the operation already holds this key at another length",
         )
     }
+}
+
+type VerificationRow = (String, u64, String, String, u64, u64);
+
+fn verification_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VerificationRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn vrecord(
+    (sha256, length, dev, ino, mtime_s, mtime_ns): VerificationRow,
+) -> Result<crate::store::VRecord> {
+    let invalid = |what: &str| Refusal {
+        code: Code::IO_FAILED,
+        detail: format!("invalid verification {what}"),
+    };
+    Ok(crate::store::VRecord {
+        sha256,
+        length,
+        dev: dev.parse().map_err(|_| invalid("dev"))?,
+        ino: ino.parse().map_err(|_| invalid("ino"))?,
+        mtime_s,
+        mtime_ns,
+    })
+}
+
+fn verification_on(connection: &Connection, sha256: &str) -> Result<Option<crate::store::VRecord>> {
+    use rusqlite::OptionalExtension;
+    connection
+        .prepare_cached(
+            "SELECT sha256,length,dev,ino,mtime_s,mtime_ns
+             FROM tensorfs_verified_blobs WHERE sha256=?1",
+        )
+        .and_then(|mut statement| statement.query_row([sha256], verification_row).optional())
+        .map_err(|error| sql("read blob verification", error))?
+        .map(vrecord)
+        .transpose()
+}
+
+fn verifications_on(connection: &Connection) -> Result<Vec<crate::store::VRecord>> {
+    let mut statement = connection
+        .prepare("SELECT sha256,length,dev,ino,mtime_s,mtime_ns FROM tensorfs_verified_blobs")
+        .map_err(|error| sql("prepare verification index", error))?;
+    let rows = statement
+        .query_map([], verification_row)
+        .map_err(|error| sql("read verification index", error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| sql("collect verification index", error))?;
+    rows.into_iter().map(vrecord).collect()
 }
 
 fn write_verification_on(connection: &Connection, row: &crate::store::VRecord) -> Result<()> {

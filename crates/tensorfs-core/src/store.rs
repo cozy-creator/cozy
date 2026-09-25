@@ -183,6 +183,8 @@ pub struct Store {
     /// handle was made. `None` is the default and means every operation behaves exactly as
     /// it did before tfs-064. See that constant.
     budget: Option<u64>,
+    /// This process's verified-blob index for the catalog, shared with every other handle.
+    trust: std::sync::Arc<crate::catalog::Trust>,
 }
 
 impl std::fmt::Debug for Store {
@@ -379,6 +381,7 @@ impl Store {
             progress: None,
             cache: read_repo_cache_binding(root),
             budget: read_disk_budget(root),
+            trust: crate::catalog::Trust::of(root),
         })
     }
 
@@ -1405,10 +1408,7 @@ impl Store {
     }
 
     fn record(&self, hex: &str) -> Option<VRecord> {
-        crate::catalog::Catalog::open(&self.root)
-            .and_then(|catalog| catalog.verification(hex))
-            .ok()
-            .flatten()
+        self.trust.get(hex)
     }
 
     fn drop_record(&self, hex: &str) {
@@ -1906,6 +1906,7 @@ fn open_validated(root: &Path) -> Result<Store> {
         progress: None,
         cache: read_repo_cache_binding(root),
         budget: read_disk_budget(root),
+        trust: crate::catalog::Trust::of(root),
     })
 }
 

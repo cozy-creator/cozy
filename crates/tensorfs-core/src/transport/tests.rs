@@ -732,8 +732,11 @@ fn a_second_pod_is_answered_by_the_cache_and_the_origin_serves_it_nothing() {
     }
 }
 
+/// Held objects are never offered to the cache: a warm pull reads and writes nothing on it.
+/// The cache is filled by pulls that fetched from the origin, which is where its bytes are
+/// hashed on the way in.
 #[test]
-fn a_retry_reconciles_held_objects_before_a_replacement_uses_only_cache() {
+fn only_origin_fetched_objects_are_backfilled() {
     let _serial = OPTIONAL_CACHE_PROOFS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -775,15 +778,6 @@ fn a_retry_reconciles_held_objects_before_a_replacement_uses_only_cache() {
     .unwrap();
     assert_eq!(partial.held.len(), 7);
     assert_eq!(partial.wanted.len(), 1);
-    // A Store may contain unrelated private inputs: reconciliation must not copy them.
-    let unrelated = ObjectRef::of(b"not in the selected model closure");
-    store_a
-        .put_stream(
-            &mut b"not in the selected model closure".as_slice(),
-            Some(&unrelated),
-            &crate::store::Fault::default(),
-        )
-        .unwrap();
     std::fs::remove_file(&cache_root).unwrap();
     failing.store(false, Ordering::Release);
     let retry = pull(&request).unwrap();
@@ -791,15 +785,19 @@ fn a_retry_reconciles_held_objects_before_a_replacement_uses_only_cache() {
     assert_eq!(retry.fetched, 1);
     assert_eq!(retry.bytes_moved, partial.wanted_bytes());
     assert!(crate::repo_cache::finish_optional_backfills());
-    wait_for_cache(&store_a, &checkpoint);
-    assert!(!store_a
-        .repo_cache()
-        .unwrap()
-        .path(crate::repo_cache::CacheKind::Blob, &unrelated.sha256)
-        .unwrap()
-        .exists());
+    let cache = store_a.repo_cache().unwrap().clone();
+    let on_cache = |object: &ObjectRef| {
+        let kind = if *object == checkpoint.manifest {
+            crate::repo_cache::CacheKind::Manifest
+        } else {
+            crate::repo_cache::CacheKind::Blob
+        };
+        cache.path(kind, &object.sha256).unwrap().exists()
+    };
+    assert!(partial.wanted.iter().all(on_cache));
+    assert!(!partial.held.iter().any(on_cache));
 
-    // Even a retry with NOTHING missing must repair a lost optional cache.
+    // A retry with nothing missing touches the cache not at all.
     std::fs::remove_dir_all(&cache_root).unwrap();
     let calls_before_local_retry = origin.total_hits();
     let local_retry = pull(&request).unwrap();
@@ -808,30 +806,86 @@ fn a_retry_reconciles_held_objects_before_a_replacement_uses_only_cache() {
     assert_eq!(local_retry.bytes_moved, 0);
     assert_eq!(origin.total_hits() - calls_before_local_retry, 1);
     assert!(crate::repo_cache::finish_optional_backfills());
-    wait_for_cache(&store_a, &checkpoint);
+    assert!(!cache_root.exists());
     drop(store_a);
     std::fs::remove_dir_all(a).unwrap();
 
+    // The next origin pull fills it, and the one after that is served from it.
     let store_b = Store::init(&root.join("pod-b"))
         .unwrap()
         .bind_repo_cache(Some(&cache_root))
         .unwrap();
-    let calls_before_b = origin.total_hits();
-    let warm = pull(&PullRequest::new(
-        &store_b,
-        &origin.base,
-        "acme/model",
-        &Anonymous,
-        &policy,
-    ))
-    .unwrap();
+    let cold = pull(&request_for(&store_b, &origin.base, &policy)).unwrap();
+    assert_eq!(cold.fetched, 8);
+    assert!(crate::repo_cache::finish_optional_backfills());
+    wait_for_cache(&store_b, &checkpoint);
+    let store_c = Store::init(&root.join("pod-c"))
+        .unwrap()
+        .bind_repo_cache(Some(&cache_root))
+        .unwrap();
+    let calls_before_c = origin.total_hits();
+    let warm = pull(&request_for(&store_c, &origin.base, &policy)).unwrap();
     assert_eq!(warm.held, 0);
     assert_eq!(warm.cached, 8);
     assert_eq!(warm.bytes_cached, declared);
     assert_eq!(warm.fetched, 0);
-    assert_eq!(warm.bytes_moved, 0);
-    assert_eq!(origin.total_hits() - calls_before_b, 1);
+    assert_eq!(origin.total_hits() - calls_before_c, 1);
     assert!(crate::repo_cache::finish_optional_backfills());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// proto-061: a warm fetch of a held closure is one closure call. The plan answers from the
+/// process's trust index, so no catalog is opened; nothing is re-walked, and no held object
+/// is offered to the cache, so no cached byte is read or hashed.
+#[test]
+fn a_warm_fetch_opens_no_catalog_and_reads_no_cached_byte() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = OPTIONAL_CACHE_PROOFS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let _ = crate::repo_cache::finish_optional_backfills();
+    let root = temporary("warm-held");
+    let cache_root = root.join("cache");
+    let pod = root.join("pod");
+    let checkpoint = Arc::new(checkpoint(200, 4096));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let store = Store::init(&pod)
+        .unwrap()
+        .bind_repo_cache(Some(&cache_root))
+        .unwrap();
+    let cold = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!(cold.fetched, 202);
+    wait_for_cache(&store, &checkpoint);
+    assert!(crate::repo_cache::finish_optional_backfills());
+
+    // Every cached object becomes unopenable: a backfill that looked at one would fail it
+    // and report the replication incomplete.
+    let cached = walk_files(&cache_root);
+    assert_eq!(cached.len(), 202);
+    for file in &cached {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let store = Store::open(&pod).unwrap();
+    let opened = crate::catalog::connections_opened(&pod);
+    let calls = origin.total_hits();
+    let warm = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!((warm.held, warm.fetched, warm.cached), (202, 0, 0));
+    assert_eq!(origin.total_hits() - calls, 1, "the closure question only");
+    assert_eq!(
+        crate::catalog::connections_opened(&pod) - opened,
+        0,
+        "trust checks must not open the catalog per object"
+    );
+    assert!(
+        crate::repo_cache::finish_optional_backfills(),
+        "a held object was offered to the cache"
+    );
+
+    for file in &cached {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -900,6 +954,8 @@ fn an_absent_or_corrupt_cache_degrades_to_the_ordinary_pull() {
         "the fall-through must have actually gone to the origin"
     );
     assert!(crate::repo_cache::finish_optional_backfills());
+    // The pull that read them corrupt replaced them on its way past.
+    wait_for_cache(&store_c, &checkpoint);
 
     for root in [absent, poisoned, a, b, c] {
         let _ = std::fs::remove_dir_all(root);
@@ -4178,7 +4234,10 @@ fn nonregular_cache_entries_fall_back_to_origin_without_blocking() {
     .unwrap();
     assert_eq!(warm.held, 8);
     assert_eq!(warm.bytes_moved, 0);
-    assert!(!crate::repo_cache::finish_optional_backfills());
+    assert!(
+        crate::repo_cache::finish_optional_backfills(),
+        "a warm pull offers no held object, so it cannot meet the FIFO again"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 

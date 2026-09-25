@@ -60,17 +60,10 @@ fn retained_tree_distinguishes_missing_corrupt_and_stale_verified_members() {
         .unwrap()
         .is_none());
 
-    // A restored byte-identical inode with no standing record must recover by verification.
+    // The restored inode is the one that was hashed: its record still stands.
     fs::rename(&saved, &blob).unwrap();
-    let db = rusqlite::Connection::open(dir.join("tensorfs.sqlite")).unwrap();
-    db.execute(
-        "DELETE FROM tensorfs_verified_blobs WHERE sha256=?1",
-        [&member.sha256],
-    )
-    .unwrap();
-    assert!(store.record_valid(&member.sha256).is_err());
-    source_artifact::retain(&store, &producer, &recipient).unwrap();
     assert!(store.record_valid(&member.sha256).is_ok());
+    source_artifact::retain(&store, &producer, &recipient).unwrap();
     assert!(!store.open_verified_reporting(&member.sha256).unwrap().1);
 
     // Replacing the inode with the exact same content invalidates metadata, not identity.

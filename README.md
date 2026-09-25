@@ -55,10 +55,13 @@ There is no SQLite file, repository projection, lease, operation, verification a
 in that cache. Every hit is checked against an exact SHA-256 and length while TensorFS copies it
 directly into the ordinary local Store. Missing, corrupt,
 read-only, full, and unavailable cache states are soft misses; the authenticated cloud source
-remains authoritative. Cloud-success backfill uses a hidden unique sibling, fsync, and an atomic
-no-clobber link, so concurrent writers converge and an interrupted write never has a final name.
-Backfill repairs a corrupt regular entry by fully verifying and syncing its replacement before
-an atomic rename. A competing correct final is verified and retained. Publication pins the
+remains authoritative. Only objects a pull fetched from the origin are backfilled; a held object
+is never offered. Backfill hashes while writing a hidden unique sibling, fsyncs, and links it
+without clobbering, so concurrent writers converge and an interrupted write never has a final
+name. That publication is the cache's integrity record: an exact-length blob at its name is
+present without being read. A pull that reads an entry corrupt, and `tfs reclaim run --demote`, which
+drops the local copy, re-verify instead and repair a corrupt regular entry by syncing its
+replacement before an atomic rename. Publication pins the
 configured cache root and opens each fanout directory without following symlinks; all temporary,
 link and rename operations stay relative to those directory descriptors. Symlink and nonregular
 entries remain unavailable. Repair grants no custody and adds no cache garbage collector.
@@ -358,7 +361,10 @@ tfs reap <root>
 ```
 
 Blob admission hashes while streaming, installs with no-clobber semantics, and records its
-rebuildable verification observation in SQLite. Manifests use the same digest/length identity but
+rebuildable verification observation in SQLite. Each process loads those rows once per catalog
+into memory; a trust check is an `fstat` compared with the row's `(dev, ino, length, mtime)`,
+and a changed or unrecorded object is rehashed. `tfs scrub` is the only deliberate full rehash.
+Manifests use the same digest/length identity but
 live under their typed namespace. A blob or Manifest that fails an exact rehash is removed from its
 authoritative path immediately; TensorFS retains no forensic copy. A writer holds an advisory lock
 on its admission temp for the temp's whole life; `tfs reap` removes only the temps whose lock the

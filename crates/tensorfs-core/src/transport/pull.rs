@@ -61,7 +61,7 @@
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::fetch::{DeliveryGrant, Destination, FetchPlan};
 use crate::ids::{Doc, ObjectRef};
-use crate::repo_cache::{CacheKind, CacheRead};
+use crate::repo_cache::{CacheKind, CacheRead, CacheTrust};
 use crate::store::Store;
 use crate::transport::http::{self, Client};
 use crate::transport::hub::{self, CredentialProvider};
@@ -1001,9 +1001,14 @@ pub(super) fn fetch_wanted_bounded(
                         Destination::Blob => Some(CacheKind::Blob),
                         Destination::Staging => None,
                     };
+                    let mut trust = CacheTrust::Name;
                     if let (Some(kind), Some(cache)) = (kind, cache) {
-                        if cache.admit(store, kind, object)? == CacheRead::Hit {
-                            return Ok(Source::Cache);
+                        match cache.admit(store, kind, object)? {
+                            CacheRead::Hit => return Ok(Source::Cache),
+                            // This read proved the cached bytes wrong: the backfill replaces
+                            // them instead of trusting the name.
+                            CacheRead::Corrupt => trust = CacheTrust::Rehash,
+                            CacheRead::Missing | CacheRead::Unavailable => {}
                         }
                     }
                     let one = recovery.fetch(
@@ -1026,7 +1031,7 @@ pub(super) fn fetch_wanted_bounded(
                         backfill
                             .as_ref()
                             .expect("bound cache has a backfill batch")
-                            .offer(kind, object);
+                            .offer(kind, object, trust);
                     }
                     Ok(Source::Origin(one))
                 });
@@ -1302,6 +1307,13 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         report.cached = walked.cached;
         report.bytes_cached = walked.bytes_cached;
     }
+    // Nothing moved and this Store already records the checkpoint, which it does only once
+    // the closure is local: the plan's presence pass was the whole proof, so there is no
+    // re-walk, no index write, and no cache offer. Held objects are never offered to the
+    // cache; it is filled by the pull that fetched them from the origin.
+    if plan.wanted.is_empty() && records_checkpoint(request.store, &closure) {
+        return Ok(report);
+    }
     // The proof and the index row both read and write the catalog, and a walk that has just
     // landed gigabytes must not be thrown away because the store was busy for a moment while
     // its own streams were closing. Same rule as the walk's: a contended local store is a
@@ -1311,24 +1323,48 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         _ => plan.complete(request.store),
     })?;
     while_store_busy(|| record_locally(request.store, &closure))?;
-    // A previous process may have admitted these objects before its optional
-    // cache writes completed. Reconcile only this successfully proven closure's
-    // held set, including a fully local retry; never scan unrelated Store bytes.
-    // Failed pulls return above without waiting for this optional work.
-    if let Some(cache) = request.store.repo_cache() {
-        let backfill =
-            crate::repo_cache::BackfillBatch::new(cache.clone(), request.store, plan.held.len());
-        for object in &plan.held {
-            let kind = if plan.manifest.as_ref() == Some(object) {
-                CacheKind::Manifest
-            } else {
-                CacheKind::Blob
-            };
-            backfill.offer(kind, object);
-        }
-        backfill.finish_offers();
-    }
     Ok(report)
+}
+
+/// The local index row already says what this pull would record.
+fn records_checkpoint(store: &Store, closure: &hub::Closure) -> bool {
+    let Some(repo) = closure
+        .model
+        .split_once('/')
+        .and_then(|(org, name)| crate::repository::RepositoryName::new(org, name).ok())
+    else {
+        return false;
+    };
+    let latest = std::fs::read(store.repository_path(&repo))
+        .ok()
+        .and_then(|bytes| crate::repository::Repository::parse(&bytes).ok());
+    holds_checkpoint(latest.as_ref(), closure) && holds_lane(latest.as_ref(), closure)
+}
+
+fn holds_checkpoint(
+    repository: Option<&crate::repository::Repository>,
+    closure: &hub::Closure,
+) -> bool {
+    repository.is_some_and(|repository| {
+        repository
+            .checkpoints
+            .iter()
+            .any(|entry| entry.manifest == closure.manifest)
+    })
+}
+
+fn holds_lane(repository: Option<&crate::repository::Repository>, closure: &hub::Closure) -> bool {
+    closure.lane.is_empty()
+        || repository.is_some_and(|repository| {
+            repository.releases.iter().any(|release| {
+                release.version == closure.release
+                    && !release.yanked
+                    && release
+                        .lanes
+                        .iter()
+                        .any(|lane| lane.lane == closure.lane && lane.manifest == closure.manifest)
+            })
+        })
 }
 
 /// Re-run while the LOCAL store answers `IO_FAILED`, which at this concurrency is dominated
@@ -1380,32 +1416,12 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
     let mut observed = std::fs::read(store.repository_path(&repo)).ok();
     let mut latest = observed.as_deref().map(Repository::parse).transpose()?;
 
-    let holds_checkpoint = |repository: Option<&Repository>| {
-        repository.is_some_and(|repository| {
-            repository
-                .checkpoints
-                .iter()
-                .any(|entry| entry.manifest == closure.manifest)
-        })
-    };
-    let holds_lane = |repository: Option<&Repository>| {
-        closure.lane.is_empty()
-            || repository.is_some_and(|repository| {
-                repository.releases.iter().any(|release| {
-                    release.version == closure.release
-                        && !release.yanked
-                        && release.lanes.iter().any(|lane| {
-                            lane.lane == closure.lane && lane.manifest == closure.manifest
-                        })
-                })
-            })
-    };
     // A warm pull records nothing, for the same reason it moves nothing: the row already
     // says what this pull would say.
-    if holds_checkpoint(latest.as_ref()) && holds_lane(latest.as_ref()) {
+    if holds_checkpoint(latest.as_ref(), closure) && holds_lane(latest.as_ref(), closure) {
         return Ok(());
     }
-    if !holds_checkpoint(latest.as_ref()) {
+    if !holds_checkpoint(latest.as_ref(), closure) {
         latest = store.apply_cached_repository(
             observed.as_deref(),
             &Mutation::PutCheckpoint {

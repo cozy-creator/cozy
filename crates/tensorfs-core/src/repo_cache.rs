@@ -201,14 +201,28 @@ impl RepoObjectCache {
         Ok(bytes)
     }
 
-    /// Best-effort publication from an already admitted local Store object.
+    /// Best-effort publication from an already admitted local Store object. A blob already
+    /// at its name with its exact length is [`CacheWrite::Present`] without reading it; see
+    /// [`CacheTrust::Name`].
     pub fn backfill_store(
         &self,
         source: &Store,
         kind: CacheKind,
         want: &ObjectRef,
     ) -> Result<CacheWrite> {
-        self.backfill_observed(source, kind, want, None)
+        self.backfill_observed(source, kind, want, CacheTrust::Name, None)
+    }
+
+    /// Publication that re-proves whatever the cache already holds and replaces it when it
+    /// is not the object. For a caller that just read it corrupt, or that is about to make
+    /// the cache the only local-network copy.
+    pub fn repair_store(
+        &self,
+        source: &Store,
+        kind: CacheKind,
+        want: &ObjectRef,
+    ) -> Result<CacheWrite> {
+        self.backfill_observed(source, kind, want, CacheTrust::Rehash, None)
     }
 
     fn backfill_observed(
@@ -216,6 +230,7 @@ impl RepoObjectCache {
         source: &Store,
         kind: CacheKind,
         want: &ObjectRef,
+        trust: CacheTrust,
         progress: Option<&dyn store::Progress>,
     ) -> Result<CacheWrite> {
         let destination = self.path(kind, &want.sha256)?;
@@ -230,7 +245,7 @@ impl RepoObjectCache {
                     Ok(metadata) if metadata.is_file() => metadata,
                     _ => return Ok(CacheWrite::Unavailable),
                 };
-                match verify_file(file, kind, want, progress) {
+                match present(file, kind, want, trust, progress) {
                     Ok(()) => return Ok(CacheWrite::Present),
                     Err(SoftFailure::Corrupt) => Some(metadata),
                     Err(_) => return Ok(CacheWrite::Unavailable),
@@ -260,7 +275,7 @@ impl RepoObjectCache {
         Ok(match result {
             Ok(true) => CacheWrite::Stored,
             Ok(false) => match open_at(&directory, name)
-                .and_then(|file| verify_file(file, kind, want, progress))
+                .and_then(|file| present(file, kind, want, trust, progress))
             {
                 Ok(()) => CacheWrite::Present,
                 Err(_) => CacheWrite::Unavailable,
@@ -270,6 +285,38 @@ impl RepoObjectCache {
     }
 }
 
+/// How a backfill decides the cache already holds an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTrust {
+    /// An exact-length regular file at a blob's digest name is present. That name is written
+    /// only by linking a temporary TensorFS hashed while writing it, and every reader hashes
+    /// again while copying out, so reading it back here would prove nothing new. Manifests
+    /// are small and are always checked.
+    Name,
+    /// Read and hash the cached bytes; replace them if they are not the object.
+    Rehash,
+}
+
+fn present(
+    file: File,
+    kind: CacheKind,
+    want: &ObjectRef,
+    trust: CacheTrust,
+    progress: Option<&dyn store::Progress>,
+) -> std::result::Result<(), SoftFailure> {
+    if kind == CacheKind::Manifest || trust == CacheTrust::Rehash {
+        return verify_file(file, kind, want, progress);
+    }
+    let metadata = file.metadata().map_err(|_| SoftFailure::Unavailable)?;
+    if !metadata.is_file() {
+        return Err(SoftFailure::Unavailable);
+    }
+    if metadata.len() != want.length {
+        return Err(SoftFailure::Corrupt);
+    }
+    Ok(())
+}
+
 /// One pull retains only references rejected by the bounded optional write queue.
 /// Its maximum is the already-declared closure; no payload buffer or persistent
 /// queue is added, and origin workers never wait for cache I/O or queue space.
@@ -277,7 +324,7 @@ pub(crate) struct BackfillBatch<'a> {
     cache: RepoObjectCache,
     source: PathBuf,
     limit: usize,
-    missed: std::sync::Mutex<Vec<(CacheKind, ObjectRef)>>,
+    missed: std::sync::Mutex<Vec<(CacheKind, ObjectRef, CacheTrust)>>,
     pool: &'a Backfills,
 }
 
@@ -308,20 +355,21 @@ impl<'a> BackfillBatch<'a> {
         }
     }
 
-    fn work(&self, kind: CacheKind, object: &ObjectRef) -> Backfill {
+    fn work(&self, kind: CacheKind, object: &ObjectRef, trust: CacheTrust) -> Backfill {
         Backfill {
             cache: self.cache.clone(),
             source: self.source.clone(),
             kind,
             object: object.clone(),
+            trust,
         }
     }
 
-    pub(crate) fn offer(&self, kind: CacheKind, object: &ObjectRef) {
-        if !self.pool.enqueue(self.work(kind, object), false) {
+    pub(crate) fn offer(&self, kind: CacheKind, object: &ObjectRef, trust: CacheTrust) {
+        if !self.pool.enqueue(self.work(kind, object, trust), false) {
             let mut missed = self.missed.lock().unwrap();
             if missed.len() < self.limit {
-                missed.push((kind, object.clone()));
+                missed.push((kind, object.clone(), trust));
             } else {
                 self.pool
                     .activity
@@ -336,8 +384,8 @@ impl<'a> BackfillBatch<'a> {
     /// result or its origin workers. The CLI's existing drain reports completion.
     pub(crate) fn finish_offers(&self) -> bool {
         let missed = std::mem::take(&mut *self.missed.lock().unwrap());
-        for (kind, object) in missed {
-            if !self.pool.enqueue(self.work(kind, &object), true) {
+        for (kind, object, trust) in missed {
+            if !self.pool.enqueue(self.work(kind, &object, trust), true) {
                 return false;
             }
         }
@@ -367,6 +415,7 @@ struct Backfill {
     source: PathBuf,
     kind: CacheKind,
     object: ObjectRef,
+    trust: CacheTrust,
 }
 
 static BACKFILLS: std::sync::OnceLock<Backfills> = std::sync::OnceLock::new();
@@ -554,6 +603,7 @@ impl Backfill {
                     &store.observed(activity.clone()),
                     self.kind,
                     &self.object,
+                    self.trust,
                     Some(activity.as_ref()),
                 )
                 .ok()
@@ -1527,7 +1577,13 @@ mod repair_tests {
         };
         assert_eq!(
             cache
-                .backfill_observed(&source, CacheKind::Blob, &object, Some(&swap))
+                .backfill_observed(
+                    &source,
+                    CacheKind::Blob,
+                    &object,
+                    CacheTrust::Rehash,
+                    Some(&swap)
+                )
                 .unwrap(),
             CacheWrite::Stored
         );
@@ -1567,7 +1623,13 @@ mod repair_tests {
         };
         assert_eq!(
             cache
-                .backfill_observed(&source, CacheKind::Blob, &object, Some(&swap))
+                .backfill_observed(
+                    &source,
+                    CacheKind::Blob,
+                    &object,
+                    CacheTrust::Rehash,
+                    Some(&swap)
+                )
                 .unwrap(),
             CacheWrite::Present
         );
@@ -1647,8 +1709,8 @@ mod acquisition_backfill_tests {
                 2,
                 &pool,
             );
-            batch.offer(CacheKind::Blob, &object);
-            batch.offer(CacheKind::Blob, &other);
+            batch.offer(CacheKind::Blob, &object, CacheTrust::Name);
+            batch.offer(CacheKind::Blob, &other, CacheTrust::Name);
             assert_eq!(batch.missed.lock().unwrap().len(), 1);
             // This is the early-refusal path: no cache wait or finish_offers.
         }
@@ -1693,7 +1755,7 @@ mod acquisition_backfill_tests {
             // No cache worker starts yet: queue saturation is causal, independent
             // of filesystem throughput or how the test runner schedules threads.
             for object in &objects {
-                batch.offer(CacheKind::Blob, object);
+                batch.offer(CacheKind::Blob, object, CacheTrust::Name);
             }
             assert_eq!(batch.missed.lock().unwrap().len(), 8);
             let receiver = Arc::new(Mutex::new(receiver));
@@ -1769,6 +1831,7 @@ mod acquisition_backfill_tests {
             source: source.root().to_owned(),
             kind: CacheKind::Blob,
             object: object.clone(),
+            trust: CacheTrust::Name,
         }
         .copy(&activity);
         assert!(activity.wait());
@@ -1783,8 +1846,8 @@ mod acquisition_backfill_tests {
         };
         let batch =
             BackfillBatch::with_pool(RepoObjectCache::new(root.join("cache")), &source, 2, &pool);
-        batch.offer(CacheKind::Blob, &object);
-        batch.offer(CacheKind::Blob, &object);
+        batch.offer(CacheKind::Blob, &object, CacheTrust::Name);
+        batch.offer(CacheKind::Blob, &object, CacheTrust::Name);
         let start = std::time::Instant::now();
         let elapsed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let clock = elapsed.clone();

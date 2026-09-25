@@ -224,6 +224,13 @@ fn missing_and_corrupt_cache_objects_fall_through_without_local_admission() {
         cache
             .backfill_store(&source, CacheKind::Blob, &wanted)
             .unwrap(),
+        CacheWrite::Present,
+        "an exact-length entry at the name is present without being read"
+    );
+    assert_eq!(
+        cache
+            .repair_store(&source, CacheKind::Blob, &wanted)
+            .unwrap(),
         CacheWrite::Stored,
         "verified local bytes atomically repair a corrupt regular cache entry"
     );
@@ -632,7 +639,7 @@ fn concurrent_repairs_publish_only_verified_complete_bytes() {
             thread::spawn(move || {
                 barrier.wait();
                 cache
-                    .backfill_store(&source, CacheKind::Blob, &object)
+                    .repair_store(&source, CacheKind::Blob, &object)
                     .unwrap()
             })
         })
@@ -646,7 +653,7 @@ fn concurrent_repairs_publish_only_verified_complete_bytes() {
     assert_eq!(fs::read(path).unwrap(), data);
     assert_eq!(
         cache
-            .backfill_store(&source, CacheKind::Blob, &object)
+            .repair_store(&source, CacheKind::Blob, &object)
             .unwrap(),
         CacheWrite::Present
     );
