@@ -56,7 +56,7 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 			if (problem == nil) != row.accepted {
 				t.Fatalf("wrong range result: %v", problem)
 			}
-			if row.unsafe && (problem == nil || problem.ErrName() != "worker.rental_idle_guard_required") {
+			if row.unsafe && (problem == nil || problem.ErrName() != "worker.rental_idle_guard_required" || !strings.Contains(problem.Message, "active-work reporting")) {
 				t.Fatalf("unsafe Host did not get a feature-specific refusal: %v", problem)
 			}
 			if !row.accepted && !row.unsafe && !row.absent && row.floor > 0 && row.floor <= row.minor {

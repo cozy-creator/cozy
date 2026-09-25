@@ -50,7 +50,7 @@ func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental bool) *exit.Erro
 	}
 	if rental && !info.SupportsRentalKeepalive {
 		return exit.Named(exit.Conflict, "worker.rental_idle_guard_required",
-			"this rental Host does not support the mandatory 15-minute idle shutdown and manual keepalive; update the rental worker image")
+			"this rental worker lacks the reliable active-work reporting or manual keepalive required by the mandatory 15-minute idle shutdown; update the rental worker image")
 	}
 	return nil
 }
