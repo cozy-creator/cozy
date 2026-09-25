@@ -23,6 +23,7 @@ func TestCompletedRunWatchUsesRecordedWallTime(t *testing.T) {
 		}{
 			{"delayed", "2020-01-02T03:04:05.100Z", "2020-01-02T03:05:07.445Z", true},
 			{"missing", "2020-01-02T03:04:05.100Z", "", false},
+			{"missing-start", "", "2020-01-02T03:05:07.445Z", false},
 			{"malformed", "2020-01-02T03:04:05.100Z", "not-a-timestamp", false},
 			{"reversed", "2020-01-02T03:05:07.445Z", "2020-01-02T03:04:05.100Z", false},
 		} {
@@ -40,7 +41,7 @@ func TestCompletedRunWatchUsesRecordedWallTime(t *testing.T) {
 						w.WriteHeader(http.StatusOK)
 					case "/v1/requests/1", "/v1/requests/" + id:
 						_ = json.NewEncoder(w).Encode(life)
-					case "/v1/jobs/" + id, "/v1/jobs/1":
+					case "/v1/local/jobs/" + id, "/v1/local/jobs/1":
 						_ = json.NewEncoder(w).Encode(job)
 					case "/v1/requests/" + id + "/events":
 						w.Header().Set("Content-Type", "text/event-stream")

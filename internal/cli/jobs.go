@@ -142,8 +142,13 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		if detached {
 			return renderSubmittedJob(ctx, state, !handle.Replay)
 		}
-		if settled(state.Status) || state.Status == "blocked" || state.Status == "paused" {
-			return renderJobTerminal(ctx, state, nil, began)
+		if settled(state.Status) {
+			// Even an immediately completed/replayed machine job has a durable
+			// terminal event. Read it for the same wall clock as later watches.
+			return followJob(ctx, c, handle.JobID, began)
+		}
+		if state.Status == "blocked" || state.Status == "paused" {
+			return renderJobTerminal(ctx, state, nil)
 		}
 		if !ctx.Inv.Bool("--follow") {
 			return renderSubmittedJob(ctx, state, !handle.Replay)
