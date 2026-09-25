@@ -95,14 +95,32 @@ func TestNativeCompositionCompletesWithClientOffline(t *testing.T) {
 		unblock()
 		barrier.Close()
 	}()
+	// The barrier belongs to the trusted test Runtime, not package Python. Package
+	// networking remains forbidden. Pause the real native source read for B;
+	// after Creator is offline, allow that read and C's subsequent read through.
+	wrapper := fmt.Sprintf(`#!%s
+import sys
+if "serve" in sys.argv:
+    import urllib.request
+    import tensorfs.derived as derived
+    native = derived.serve_derived
+    class ObservedWriter:
+        def __init__(self, writer): self.writer = writer
+        def __getattr__(self, name): return getattr(self.writer, name)
+        def source_read_into(self, *args):
+            with urllib.request.urlopen(%q, timeout=120) as response:
+                response.read()
+            return self.writer.source_read_into(*args)
+    def observed(writer, *args, **kwargs):
+        return native(ObservedWriter(writer), *args, **kwargs)
+    derived.serve_derived = observed
+from cozy_runtime.cli.main import main
+sys.exit(main())
+`, filepath.Join(control, "bin", "python"), barrier.URL)
+	must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), []byte(wrapper), 0700))
 	project := copyPrivateTensorProject(t, root, "")
-	candidate := filepath.Join(project, "candidate", "tensor_candidate.py")
-	source, err := os.ReadFile(candidate)
-	must(t, err)
-	source = []byte(strings.Replace(string(source), "    if factor == 0:", fmt.Sprintf("    if factor == 2:\n        import urllib.request\n        with urllib.request.urlopen(%q, timeout=120) as response:\n            response.read()\n    if factor == 0:", barrier.URL), 1))
-	must(t, os.WriteFile(candidate, source, 0600))
 	script := filepath.Join(project, "recipe.py")
-	source, err = os.ReadFile(script)
+	source, err := os.ReadFile(script)
 	must(t, err)
 	source = []byte(strings.Replace(string(source), "async def main():", "from cozy_runtime.author import ModelArtifact\n\nasync def main() -> ModelArtifact:", 1))
 	source = []byte(strings.Replace(string(source), "    await candidate(source=original, factor=0)", "    prepared = await candidate(source=original, factor=2)\n    return await candidate(source=prepared, factor=3)", 1))
@@ -143,6 +161,9 @@ func TestNativeCompositionCompletesWithClientOffline(t *testing.T) {
 	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer journal.Close()
+	journal.SetMaxOpenConns(1)
+	_, err = journal.Exec("PRAGMA busy_timeout=5000")
+	must(t, err)
 	var state string
 	var collected int
 	for deadline := time.Now().Add(2 * time.Minute); ; {
@@ -201,8 +222,8 @@ func TestNativeCompositionCompletesWithClientOffline(t *testing.T) {
 			t.Fatalf("edited caller recomputed/changed child %d: before=%+v after=%+v", i, offline[i], child)
 		}
 	}
-	if calls.Load() != 1 {
-		t.Fatalf("candidate producer executed %d times", calls.Load())
+	if calls.Load() != 2 {
+		t.Fatalf("native source reads occurred %d times; B and C each need exactly one", calls.Load())
 	}
 	evidence, err := json.MarshalIndent(map[string]any{"request": parent.ID, "offline_state": state, "offline_collected": collected, "children": offline, "edited_children": reused, "barrier_calls": calls.Load(), "native_read": string(verified)}, "", "  ")
 	must(t, err)

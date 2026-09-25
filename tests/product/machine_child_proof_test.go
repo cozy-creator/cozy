@@ -36,6 +36,9 @@ func machineChildren(t *testing.T, root string, store *records.Store, parentRef 
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
 	must(t, err)
 	defer db.Close()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec("PRAGMA busy_timeout=5000")
+	must(t, err)
 	rows, err := db.Query(`SELECT c.child_request,COALESCE(e.state,'succeeded'),hex(c.intent_digest),c.prepared,c.result,
  (SELECT count(*) FROM attempts a WHERE a.owner=c.owner AND a.request=c.child_request),
  COALESCE((SELECT a.outcome FROM attempts a WHERE a.owner=c.owner AND a.request=c.child_request ORDER BY ordinal DESC LIMIT 1),x'')
