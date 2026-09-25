@@ -196,7 +196,9 @@ def runtime_wire(row):
     return {"wire_minor": int(values["WIRE_MINOR"]), "minimum_wire_minor": int(values["MIN_COMPATIBLE_WIRE_MINOR"])}
 
 
-def resolve(observed, directory, local_runtime=None):
+def resolve(observed, directory, local_runtime=None, local_tensorfs=None):
+    if local_tensorfs is not None and local_runtime is None:
+        raise ValueError("Local TensorFS requires a local Runtime wheel")
     if local_runtime is None:
         runtime = published("cozy-runtime", observed)
     else:
@@ -211,7 +213,16 @@ def resolve(observed, directory, local_runtime=None):
     if any(requirement.url for requirement in tensorfs_requirements):
         raise ValueError("Runtime requires a non-index TensorFS artifact; publish a portable release")
     constraint = ",".join(str(requirement.specifier) for requirement in tensorfs_requirements)
-    tensorfs = published("tensorfs", observed, constraint)
+    if local_tensorfs is None:
+        tensorfs = published("tensorfs", observed, constraint)
+    else:
+        tensorfs = dict(local_tensorfs)
+        project, version, _, _ = parse_wheel_filename(tensorfs["filename"])
+        if project != "tensorfs" or version < Version(observed["tensorfs"]):
+            raise ValueError("Local TensorFS wheel must be tensorfs without downgrading the installed version")
+        if not SpecifierSet(constraint).contains(version, prereleases=True):
+            raise ValueError("Local TensorFS wheel is incompatible with the selected Runtime requirements")
+        tensorfs["version"] = str(version)
     tensorfs_wheel = wheel("tensorfs", tensorfs, observed["tags"], directory, True)
     for required in metadata(tensorfs_wheel, observed):
         if canonicalize_name(required.name) == "cozy-runtime" and (required.url or Version(runtime["version"]) not in required.specifier):
@@ -257,7 +268,7 @@ def main():
     directory = Path(request["directory"])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if request["action"] == "plan":
-        target, selection = resolve(observed, directory, request.get("local_runtime"))
+        target, selection = resolve(observed, directory, request.get("local_runtime"), request.get("local_tensorfs"))
         unchanged = (
             observed["runtime"]["distribution"] == target["runtime_update"]["runtime"]["version"]
             and observed["tensorfs"] == target["runtime_update"]["tensorfs"]["version"]

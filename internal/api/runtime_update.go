@@ -10,7 +10,8 @@ import (
 type RuntimeUpdate = records.RuntimeUpdate
 
 type RuntimeUpdateRequest struct {
-	RuntimeWheel string `json:"runtime_wheel,omitempty"`
+	RuntimeWheel  string `json:"runtime_wheel,omitempty"`
+	TensorFSWheel string `json:"tensorfs_wheel,omitempty"`
 }
 
 func (s *Server) startRuntimeUpdate(w http.ResponseWriter, r *http.Request) {
@@ -19,7 +20,7 @@ func (s *Server) startRuntimeUpdate(w http.ResponseWriter, r *http.Request) {
 	var body *RuntimeUpdateRequest
 	var trailing any
 	if decoder.Decode(&body) != nil || body == nil || decoder.Decode(&trailing) != io.EOF {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "Runtime update takes one object with an optional runtime_wheel path", "send {} for the public release")
+		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "Runtime update takes one object with optional runtime_wheel and tensorfs_wheel paths", "send {} for the public release")
 		return
 	}
 	if s.runtimeUpdate == nil {

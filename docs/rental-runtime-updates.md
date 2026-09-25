@@ -102,8 +102,12 @@ candidate must be a native `cozy-runtime` wheel compatible with the observed
 worker interpreter/platform and contain matching distribution metadata. Use a
 unique newer version, including the repository builder's content-addressed local
 version; replacing bytes under the currently installed version is refused.
-TensorFS still comes from the public index and must satisfy the candidate's
-requirements. Other installed platform dependencies remain unchanged and are
+TensorFS comes from the public index by default. To retain a tested development
+TensorFS build, also pass `--tensorfs-wheel /absolute/path/tensorfs-VERSION-PLATFORM.whl`.
+This option requires `--runtime-wheel`; both files are frozen and recovered as one
+operation without contacting PyPI. TensorFS must satisfy the selected Runtime
+requirements, support the worker platform, and must not downgrade the installed
+version. Reusing the same TensorFS version is allowed. Other installed platform dependencies remain unchanged and are
 checked by the existing offline worker preflight.
 
 The same authenticated owner-only local API, development-rental ownership check,
