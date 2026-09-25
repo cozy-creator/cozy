@@ -138,6 +138,61 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         self.assertEqual(calls[0], "/opt/cozy/python/bin/python3 /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected))
         self.assertEqual(calls[1], "/opt/cozy/python/bin/python3 /opt/cozy/dev/update.py status " + stage)
 
+    def local(self, **kwargs):
+        row = self.release("cozy-runtime", kwargs.pop("version", "0.18.24+dev.h123"), **kwargs)
+        directory = self.directory / "frozen"
+        directory.mkdir(exist_ok=True)
+        path = directory / row["filename"]
+        path.write_bytes(self.data[row["url"]])
+        return {"filename": row["filename"], "path": str(path),
+                "digest": "sha256:" + row["digests"]["sha256"], "length": row["size"]}
+
+    def test_local_candidate_keeps_exact_hash_and_public_tensorfs_dependency_selection(self):
+        local = self.local(requirements=["tensorfs>=0.3.51,<0.4"])
+        self.release("cozy-runtime", "9.0.0")
+        target, wheels = self.api["resolve"](self.observed, self.directory, local)
+        self.assertEqual([row["version"] for row in wheels], ["0.18.24+dev.h123", "0.3.51"])
+        self.assertEqual(wheels[0]["sha256"], local["digest"].removeprefix("sha256:"))
+        self.assertEqual(target["runtime_update"]["runtime"]["path"], local["path"])
+        self.assertNotIn("https://pypi.org/pypi/cozy-runtime/json", self.fetched)
+        Path(local["path"]).unlink()
+        # Recovery depends on the verified operation copy, not the source path.
+        request = {"ssh_arguments": [], "action": "resume", "stage": "a" * 32,
+                   "selection": {"wheels": wheels}}
+        self.api["fetch"] = lambda *args: self.fail("resume reselected a public wheel")
+        self.api["ssh"] = lambda arguments, command: json.dumps({"state": "queued"})
+        with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
+            self.assertEqual(self.api["main"]()["update"]["state"], "queued")
+
+    def test_local_metadata_platform_and_version_refusals(self):
+        for kwargs, error in [
+            ({"tag": "py3-none-any"}, "native wheel"),
+            ({"tag": "cp312-cp312-manylinux_2_28_aarch64"}, "platform"),
+            ({"metadata_name": "other-project"}, "metadata does not match"),
+            ({"requires_python": ">=3.13"}, "different worker Python"),
+            ({"version": "0.18.20"}, "distinct newer version"),
+            ({"version": "0.18.19"}, "distinct newer version"),
+        ]:
+            with self.subTest(kwargs=kwargs):
+                local = self.local(**kwargs)
+                with self.assertRaisesRegex(ValueError, error):
+                    self.api["resolve"](self.observed, self.directory, local)
+
+    def test_local_tampering_is_refused_before_transfer(self):
+        local = self.local()
+        Path(local["path"]).write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "digest verification"):
+            self.api["resolve"](self.observed, self.directory, local)
+        local = self.local()
+        _, wheels = self.api["resolve"](self.observed, self.directory, local)
+        Path(wheels[0]["path"]).write_bytes(b"changed after plan")
+        self.api["inspect"] = lambda arguments: self.observed
+        request = {"ssh_arguments": [], "action": "apply", "directory": str(self.directory),
+                   "stage": "a" * 32, "selection": {"wheels": wheels}}
+        with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
+            with self.assertRaisesRegex(ValueError, "changed after verification"):
+                self.api["main"]()
+
     def test_probe_does_not_rely_on_ssh_path(self):
         calls = []
         self.api["ssh"] = lambda arguments, command: calls.append(command) or '{}'

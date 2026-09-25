@@ -87,3 +87,33 @@ Python and supervisorctl with absolute paths, so older images with the original
 `/usr/local/bin:/usr/bin:/bin` child PATH can use this hot-update path without
 replacing the updater. Supervisord's host/updater processes inherit the managed
 Python PATH from the image entrypoint; they do not inherit the SSH session PATH.
+
+## Development candidate wheel
+
+The owner of a maintenance-capable development rental can run:
+
+```sh
+cozy rental update NAME --runtime-wheel /absolute/path/cozy_runtime-VERSION-PLATFORM.whl
+```
+
+Creator snapshots the bounded local file into its private staging directory and
+records its SHA256 and length atomically with the maintenance operation. The
+candidate must be a native `cozy-runtime` wheel compatible with the observed
+worker interpreter/platform and contain matching distribution metadata. Use a
+unique newer version, including the repository builder's content-addressed local
+version; replacing bytes under the currently installed version is refused.
+TensorFS still comes from the public index and must satisfy the candidate's
+requirements. Other installed platform dependencies remain unchanged and are
+checked by the existing offline worker preflight.
+
+The same authenticated owner-only local API, development-rental ownership check,
+signed idle hold, SFTP transfer, wheel hashes, guarded restart, durable recovery
+and rollback apply. This option neither registers an image nor publishes bytes.
+It is explicit development authority, never selected by automatic repair.
+
+If the CLI disconnects, run `cozy rental update NAME` again to resume the recorded
+operation without reopening the build output. Repeating the local option while
+an operation is active must name the same filename and bytes; a different
+candidate cannot replace an unfinished operation. A missing original build file
+does not prevent resume. After success, use a new version for another candidate;
+the default command continues to select public releases without downgrading.

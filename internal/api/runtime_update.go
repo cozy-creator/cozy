@@ -9,20 +9,24 @@ import (
 
 type RuntimeUpdate = records.RuntimeUpdate
 
+type RuntimeUpdateRequest struct {
+	RuntimeWheel string `json:"runtime_wheel,omitempty"`
+}
+
 func (s *Server) startRuntimeUpdate(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
 	decoder.DisallowUnknownFields()
-	var body *struct{}
+	var body *RuntimeUpdateRequest
 	var trailing any
 	if decoder.Decode(&body) != nil || body == nil || decoder.Decode(&trailing) != io.EOF {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "Runtime update takes one empty object", "send {}")
+		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "Runtime update takes one object with an optional runtime_wheel path", "send {} for the public release")
 		return
 	}
 	if s.runtimeUpdate == nil {
 		s.refuse(w, r, http.StatusServiceUnavailable, "runtime_update_unavailable", "this daemon cannot update private workers", "")
 		return
 	}
-	result, problem := s.runtimeUpdate(r.PathValue("rental_id"))
+	result, problem := s.runtimeUpdate(r.PathValue("rental_id"), *body)
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return

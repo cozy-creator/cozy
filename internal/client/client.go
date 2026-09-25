@@ -275,9 +275,9 @@ func (c *Client) PrepareRentalPackage(rentalID string, request api.RentalPackage
 	return result, problem
 }
 
-func (c *Client) UpdateRentalRuntime(rentalID string) (api.RuntimeUpdate, *exit.Error) {
+func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateRequest) (api.RuntimeUpdate, *exit.Error) {
 	var result api.RuntimeUpdate
-	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", map[string]any{}, &result)
+	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", request, &result)
 	return result, problem
 }
 

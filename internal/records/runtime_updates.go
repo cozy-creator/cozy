@@ -49,7 +49,10 @@ func (s *Store) RuntimeUpdate(rental string) (*RuntimeUpdate, *exit.Error) {
 	return &r, nil
 }
 
-func (s *Store) BeginRuntimeUpdate(rental, boot, request string) (*RuntimeUpdate, *exit.Error) {
+func (s *Store) BeginRuntimeUpdate(rental, boot, request string, selection json.RawMessage) (*RuntimeUpdate, *exit.Error) {
+	if len(selection) > 1<<20 || (len(selection) > 0 && !json.Valid(selection)) {
+		return nil, exit.New(exit.Validation, "invalid initial Runtime update selection")
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, exit.Internalf("cannot begin Runtime update: %s", err)
@@ -66,9 +69,9 @@ func (s *Store) BeginRuntimeUpdate(rental, boot, request string) (*RuntimeUpdate
 	if active {
 		return nil, exit.Named(exit.Unavailable, "rental.maintenance", "this rental already has an unfinished Runtime update")
 	}
-	r := RuntimeUpdate{RentalID: rental, ID: NewID("runtime-update"), RequestID: request, BootID: boot, State: "preparing", CreatedAt: now(), UpdatedAt: now()}
-	_, err = tx.Exec(`INSERT INTO rental_runtime_updates(rental_id,operation_id,request_id,worker_boot_id,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?)
-	 ON CONFLICT(rental_id) DO UPDATE SET operation_id=excluded.operation_id,request_id=excluded.request_id,worker_boot_id=excluded.worker_boot_id,state=excluded.state,selection=x'',result=x'',error='',created_at=excluded.created_at,updated_at=excluded.updated_at`, r.RentalID, r.ID, r.RequestID, r.BootID, r.State, r.CreatedAt, r.UpdatedAt)
+	r := RuntimeUpdate{RentalID: rental, ID: NewID("runtime-update"), RequestID: request, BootID: boot, State: "preparing", Selection: append([]byte{}, selection...), CreatedAt: now(), UpdatedAt: now()}
+	_, err = tx.Exec(`INSERT INTO rental_runtime_updates(rental_id,operation_id,request_id,worker_boot_id,state,selection,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)
+	 ON CONFLICT(rental_id) DO UPDATE SET operation_id=excluded.operation_id,request_id=excluded.request_id,worker_boot_id=excluded.worker_boot_id,state=excluded.state,selection=excluded.selection,result=x'',error='',created_at=excluded.created_at,updated_at=excluded.updated_at`, r.RentalID, r.ID, r.RequestID, r.BootID, r.State, r.Selection, r.CreatedAt, r.UpdatedAt)
 	if err != nil {
 		return nil, exit.Internalf("cannot record Runtime update: %s", err)
 	}

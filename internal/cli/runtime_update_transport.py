@@ -100,7 +100,12 @@ def wheel(name, selected, tags, directory, native):
         raise ValueError("Published wheel digest or length is invalid")
     path = directory / filename
     if not path.exists() or path.stat().st_size != selected["length"] or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-        data = fetch(selected["url"], selected["length"])
+        if selected.get("path"):
+            # The daemon has already frozen these exact bytes before journaling.
+            with Path(selected["path"]).open("rb") as source:
+                data = source.read(selected["length"] + 1)
+        else:
+            data = fetch(selected["url"], selected["length"])
         if len(data) != selected["length"] or hashlib.sha256(data).hexdigest() != digest:
             raise ValueError("Runtime update wheel failed published digest verification")
         temporary = path.with_suffix(".download")
@@ -168,8 +173,15 @@ def metadata(row, observed):
     return requirements
 
 
-def resolve(observed, directory):
-    runtime = published("cozy-runtime", observed)
+def resolve(observed, directory, local_runtime=None):
+    if local_runtime is None:
+        runtime = published("cozy-runtime", observed)
+    else:
+        runtime = dict(local_runtime)
+        project, version, _, _ = parse_wheel_filename(runtime["filename"])
+        if project != "cozy-runtime" or version <= Version(observed["runtime"]["distribution"]):
+            raise ValueError("Local Runtime wheel must be cozy-runtime with a distinct newer version")
+        runtime["version"] = str(version)
     runtime_wheel = wheel("cozy-runtime", runtime, observed["tags"], directory, True)
     requirements = metadata(runtime_wheel, observed)
     tensorfs_requirements = [requirement for requirement in requirements if canonicalize_name(requirement.name) == "tensorfs"]
@@ -213,7 +225,7 @@ def main():
     directory = Path(request["directory"])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if request["action"] == "plan":
-        target, selection = resolve(observed, directory)
+        target, selection = resolve(observed, directory, request.get("local_runtime"))
         unchanged = (
             observed["runtime"]["distribution"] == target["runtime_update"]["runtime"]["version"]
             and observed["tensorfs"] == target["runtime_update"]["tensorfs"]["version"]

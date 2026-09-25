@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -19,7 +20,7 @@ import (
 func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T) {
 	f := developmentFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
-	update, problem := f.store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "")
+	update, problem := f.store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "", nil)
 	fatal(t, problem)
 	update.Selection = []byte(`{"wheels":[]}`)
 	update.State = "updating"
@@ -106,7 +107,7 @@ func TestRuntimeUpdateMigrationFrom41PreservesRental(t *testing.T) {
 	if row == nil || row.ExpectedWorkerBootID != f.peer.bootID {
 		t.Fatalf("migration lost the pinned rental: %+v", row)
 	}
-	_, problem = store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "")
+	_, problem = store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "", nil)
 	fatal(t, problem)
 }
 
@@ -135,5 +136,22 @@ func TestRentalDependencyVerdictIsSharedByRootAndServingPreparation(t *testing.T
 	event.SafeCode, event.SafeDetail = "package_sdk_incompatible", string(raw)
 	if problem := orchestrator.RuntimeRequirementEvent(event); problem == nil || problem.ErrName() != "machine_execution.package_requirement" {
 		t.Fatalf("non-updatable distribution became Runtime update authority: %v", problem)
+	}
+}
+
+func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
+	f := developmentFixtureAt(t)
+	f.attach(t, "127.0.0.1:1")
+	selection := json.RawMessage(`{"local_runtime":{"path":"/owned/frozen/cozy_runtime.whl","digest":"sha256:exact","length":42}}`)
+	initial, problem := f.store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "", selection)
+	fatal(t, problem)
+	f.store.Close()
+	reopened, problem := records.Open(f.layout.DB)
+	fatal(t, problem)
+	defer reopened.Close()
+	recovered, problem := reopened.RuntimeUpdate(f.rentalID)
+	fatal(t, problem)
+	if recovered.ID != initial.ID || recovered.State != "preparing" || !bytes.Equal(recovered.Selection, selection) {
+		t.Fatalf("initial local candidate lost before remote planning: %+v", recovered)
 	}
 }

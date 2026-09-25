@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -35,6 +36,7 @@ type rentalRuntimeUpdates struct {
 }
 
 type runtimeUpdateWheel struct {
+	Path     string `json:"path,omitempty"`
 	Version  string `json:"version"`
 	Filename string `json:"filename"`
 	URL      string `json:"url"`
@@ -50,6 +52,7 @@ type runtimeUpdateTarget struct {
 }
 
 type runtimeUpdateSelection struct {
+	LocalRuntime  *runtimeUpdateWheel `json:"local_runtime,omitempty"`
 	Target        runtimeUpdateTarget `json:"target"`
 	Directory     string              `json:"directory"`
 	Stage         string              `json:"stage"`
@@ -59,11 +62,15 @@ type runtimeUpdateSelection struct {
 	Selection     json.RawMessage     `json:"selection,omitempty"`
 }
 
-func (u *rentalRuntimeUpdates) Start(id string) (*records.RuntimeUpdate, *exit.Error) {
-	return u.startForRequest(id, "")
+func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
+	return u.start(id, "", options.RuntimeWheel)
 }
 
 func (u *rentalRuntimeUpdates) startForRequest(id, request string) (*records.RuntimeUpdate, *exit.Error) {
+	return u.start(id, request, "")
+}
+
+func (u *rentalRuntimeUpdates) start(id, request, wheelPath string) (*records.RuntimeUpdate, *exit.Error) {
 	m := u.machines
 	row, problem := m.store.RentalRow(id)
 	if problem != nil {
@@ -76,8 +83,25 @@ func (u *rentalRuntimeUpdates) startForRequest(id, request string) (*records.Run
 	if problem != nil {
 		return nil, problem
 	}
+	var candidate *runtimeUpdateWheel
+	if wheelPath != "" {
+		candidate, problem = freezeRuntimeWheel(m.layout.Tmp, wheelPath)
+		if problem != nil {
+			return nil, problem
+		}
+	}
+	if current != nil && current.Active() && candidate != nil {
+		var saved runtimeUpdateSelection
+		if json.Unmarshal(current.Selection, &saved) != nil || saved.LocalRuntime == nil || saved.LocalRuntime.Digest != candidate.Digest || saved.LocalRuntime.Filename != candidate.Filename {
+			return nil, exit.New(exit.Conflict, "this rental already has a different frozen Runtime update; resume it without --runtime-wheel")
+		}
+	}
 	if current == nil || !current.Active() {
-		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, request)
+		var selection json.RawMessage
+		if candidate != nil {
+			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate})
+		}
+		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, request, selection)
 	}
 	if problem == nil {
 		u.run(*current)
@@ -239,12 +263,15 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			}
 			return u.reconcile(ctx, row, identity, selection)
 		}
-	} else {
+	}
+	if len(selection.Selection) == 0 {
+		candidate := selection.LocalRuntime
 		var problem *exit.Error
 		selection, problem = u.connectionSelection(ctx, *row)
 		if problem != nil {
 			return problem
 		}
+		selection.LocalRuntime = candidate
 		selection.Selection, problem = u.transport(ctx, selection, "plan")
 		if problem != nil {
 			return problem
@@ -254,7 +281,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			Target    runtimeUpdateTarget `json:"target"`
 		}
 		if json.Unmarshal(selection.Selection, &planned) != nil || planned.Target.RuntimeUpdate.Runtime.Version == "" || planned.Target.RuntimeUpdate.TensorFS.Version == "" {
-			return exit.New(exit.Structural, "Runtime update did not resolve a published wheel pair")
+			return exit.New(exit.Structural, "Runtime update did not resolve a verified wheel pair")
 		}
 		selection.Target = planned.Target
 		row.Selection, _ = json.Marshal(selection)
@@ -306,7 +333,15 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	result, problem := c.UpdateRentalRuntime(row.ID)
+	wheelPath := ctx.Inv.Value("--runtime-wheel")
+	if wheelPath != "" {
+		var err error
+		wheelPath, err = filepath.Abs(wheelPath)
+		if err != nil {
+			return exit.New(exit.Validation, "cannot resolve local Runtime wheel: %s", err)
+		}
+	}
+	result, problem := c.UpdateRentalRuntime(row.ID, api.RuntimeUpdateRequest{RuntimeWheel: wheelPath})
 	if problem != nil {
 		return problem
 	}
