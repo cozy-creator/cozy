@@ -64,10 +64,6 @@ func TestRentalHumanDrainingPreservesWireState(t *testing.T) {
 	if peer.released["pr-draining"] != 0 {
 		t.Fatal("listing a draining rental issued a release")
 	}
-	// This fixture never finishes draining, so `down --all` teardown would wait on it forever.
-	if code, output := runCozy(t, root, "down", "--force"); code != 0 {
-		t.Fatalf("down --force: exit=%d %s", code, output)
-	}
 }
 
 func TestRentalConflictNamesDrainingOperation(t *testing.T) {

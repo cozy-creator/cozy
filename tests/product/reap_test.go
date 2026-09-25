@@ -5,8 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,7 +17,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // ------------------------------------------------------------------ never leave a daemon
@@ -113,11 +110,7 @@ func reapDaemonRoot(root string) {
 		// The bound is on a post-mortem courtesy, not on the outcome: the kill below is
 		// what guarantees the daemon is gone, whatever `down` did or did not manage.
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		mode := "--all"
-		if !anyRentalHubAnswers(root) {
-			mode = "--force" // nothing can end those rentals; --all would retry until the bound
-		}
-		down := exec.CommandContext(ctx, cozyBin, "down", mode)
+		down := exec.CommandContext(ctx, cozyBin, "down", "--all")
 		cfg, _ := config.Load() // A configuration refusal cannot prevent the guaranteed reap below.
 		down.Env = cfg.Child("COZY_HOME="+root,
 			"TENSORFS_HOME="+filepath.Join(root, "tensorfs"))
@@ -139,35 +132,6 @@ func reapDaemonRoot(root string) {
 			fmt.Fprintf(os.Stderr, "cozy-daemon %d on %s survived SIGKILL\n", pid, root)
 		}
 	}
-}
-
-// anyRentalHubAnswers is false only when root records rentals and none of their hubs
-// accepts a connection: fixtures that closed their fake hub, or never had one.
-func anyRentalHubAnswers(root string) bool {
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	if problem != nil {
-		return true
-	}
-	defer store.Close()
-	rentals, problem := store.Rentals()
-	if problem != nil || len(rentals) == 0 {
-		return true
-	}
-	for _, r := range rentals {
-		u, err := url.Parse(r.Hub)
-		if err != nil || u.Host == "" {
-			continue
-		}
-		host := u.Host
-		if u.Port() == "" {
-			host = net.JoinHostPort(u.Hostname(), map[string]string{"http": "80"}[u.Scheme]+map[string]string{"https": "443"}[u.Scheme])
-		}
-		if c, err := net.DialTimeout("tcp", host, 2*time.Second); err == nil {
-			c.Close()
-			return true
-		}
-	}
-	return false
 }
 
 // Runtime intentionally survives the client's ordinary down. Test teardown owns
