@@ -22,7 +22,7 @@ from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 
 
-WORKER_PYTHON = "/opt/cozy/python/bin/python3"
+WORKER_PYTHONS = ("/opt/cozy/python/bin/python3", "/usr/local/bin/python3")
 
 PROBE = """import importlib.metadata as m, json, platform, subprocess, fcntl, sys
 from packaging.markers import default_environment
@@ -61,11 +61,21 @@ def ssh(arguments, command):
     return result.stdout
 
 
-def inspect(arguments):
+def worker_python(arguments):
+    # Both first-party image layouts have a fixed SDK interpreter. Do not use
+    # SSH's PATH, which can select an unrelated system Python without Runtime.
+    command = "for python in " + " ".join(WORKER_PYTHONS) + '; do if test -x "$python"; then printf "%s" "$python"; exit 0; fi; done; exit 1'
+    selected = ssh(arguments, command).strip()
+    if selected not in WORKER_PYTHONS:
+        raise ValueError("Worker maintenance did not select a supported SDK interpreter")
+    return selected
+
+
+def inspect(arguments, python=None):
     # The script is fixed application code, never a package callback or prompt.
     import shlex
 
-    return json.loads(ssh(arguments, WORKER_PYTHON + " -I -c " + shlex.quote(PROBE)))
+    return json.loads(ssh(arguments, (python or worker_python(arguments)) + " -I -c " + shlex.quote(PROBE)))
 
 
 def fetch(url, limit):
@@ -213,22 +223,23 @@ def main():
     request = json.load(sys.stdin)
     arguments = request["ssh_arguments"]
     action = request["action"]
+    python = worker_python(arguments)
     if action == "resume":
         stage = request["stage"]
         expected = [row["sha256"] for row in request["selection"]["wheels"]]
         if not re.fullmatch(r"[a-f0-9]{32}", stage) or len(expected) != 2 or any(not re.fullmatch(r"[a-f0-9]{64}", value) for value in expected):
             raise ValueError("Invalid recorded update identity")
-        return {"update": json.loads(ssh(arguments, WORKER_PYTHON + " /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected)))}
+        return {"update": json.loads(ssh(arguments, python + " /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected)))}
     if action == "status":
         stage = request["stage"]
         if not re.fullmatch(r"[a-f0-9]{32}", stage):
             raise ValueError("Invalid update operation identity")
-        update = json.loads(ssh(arguments, WORKER_PYTHON + " /opt/cozy/dev/update.py status " + stage))
+        update = json.loads(ssh(arguments, python + " /opt/cozy/dev/update.py status " + stage))
         result = {"update": update}
         if update.get("state") in {"succeeded", "rolled_back", "refused"}:
-            result["observed"] = inspect(arguments)
+            result["observed"] = inspect(arguments, python)
         return result
-    observed = inspect(arguments)
+    observed = inspect(arguments, python)
     if request["action"] == "inspect":
         return {"observed": observed}
     if observed.get("update_in_progress"):
@@ -264,7 +275,7 @@ def main():
     batch.write_text("\n".join(commands) + "\n")
     subprocess.run(["sftp", *request["sftp_arguments"], "-b", str(batch), request["host"]],
                    check=True, capture_output=True, text=True)
-    reply = ssh(arguments, WORKER_PYTHON + " /opt/cozy/dev/update.py apply " + stage + " " +
+    reply = ssh(arguments, python + " /opt/cozy/dev/update.py apply " + stage + " " +
                 " ".join(row["sha256"] for row in wheels))
     result = json.loads(reply.strip().splitlines()[-1])
     if result.get("operation") != stage or result.get("state") not in {
