@@ -22,6 +22,8 @@ type CLI struct {
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
 	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
 	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
+
+	Completion CompletionCmd `cmd:"" group:"Lifecycle" help:"Print a bash, zsh or fish tab-completion script."`
 }
 
 type DaemonCmd struct {
@@ -133,7 +135,7 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref      string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
+	Ref      string `arg:"" name:"package-or-directory" predictor:"dir-or-ref" help:"Published org/name or explicit directory such as . or ./project."`
 	Version  string `help:"Install this release instead of the newest, e.g. 1.2.3."`
 	Editable bool   `help:"Keep an explicit local directory live for development."`
 }
@@ -167,7 +169,7 @@ func (c *PackageRecoverCmd) Run(r *Runtime) error {
 }
 
 type PackageRemoveCmd struct {
-	Refs []string `arg:"" name:"package" help:"Installed package ref."`
+	Refs []string `arg:"" name:"package" predictor:"package" help:"Installed package ref."`
 }
 
 func (c *PackageRemoveCmd) Run(r *Runtime) error {
@@ -236,7 +238,7 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 }
 
 type ModelDownloadCmd struct {
-	Source         string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
 	Ref            string `arg:"" name:"model" help:"Local destination (local/name)."`
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
@@ -274,7 +276,7 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelUploadCmd struct {
-	Source         string `arg:"" name:"source" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
 	Ref            string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
@@ -335,20 +337,20 @@ type RunCmd struct {
 }
 
 type RunExecuteCmd struct {
-	Target          string   `arg:"" name:"target" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
+	Target          string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
 	Input           []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
-	Out             string   `help:"Output directory." type:"path"`
+	Out             string   `help:"Output directory." type:"path" predictor:"dir"`
 	Timeout         string   `help:"Request deadline."`
 	PayloadFile     string   `name:"input" aliases:"in" help:"Read the whole payload from a JSON file, e.g. --input=request.json; inline fields override file values." type:"path"`
-	Assets          []string `name:"asset" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
+	Assets          []string `name:"asset" predictor:"binding-file" help:"Attach a file or label=file to a declared Assets input; field-path=file binds a named payload asset."`
 	AssetFidelity   []string `name:"asset-fidelity" help:"Set a declared asset hint as label-or-index=auto|low|medium|high (repeatable)."`
 	LoRAs           []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
 	AttentionKernel string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend. Example: model/fl2va_dit=kitchen-int8. No fallback; Runtime validates hardware, compiled mode and parallelism."`
-	Rental          *string  `help:"Run only on this existing rental name or id; never buy a replacement."`
+	Rental          *string  `predictor:"rental" help:"Run only on this existing rental name or id; never buy a replacement."`
 	RentalOnly      bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey  string   `help:"Stable request identity for safe retries."`
 	Retry           string   `help:"Retry with current code while retaining compatible work from this prior run."`
-	Trees           []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
+	Trees           []string `name:"input-tree" predictor:"binding-dir" help:"Bind a job input tree as ref=directory."`
 	Org             string   `help:"Job publication organization (defaults to local)."`
 	PublishTo       string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
 	AllowPublish    []string `help:"Allow this rented transaction to publish only to org/model (repeatable)."`
@@ -408,7 +410,7 @@ func (c *RunCancelCmd) Run(r *Runtime) error {
 
 type RunListCmd struct {
 	State   string `help:"Filter by lifecycle state."`
-	Package string `help:"Filter by package."`
+	Package string `predictor:"package" help:"Filter by package."`
 	Limit   int    `help:"Maximum rows." default:"50"`
 	Watch   bool   `help:"Refresh continuously (requires a terminal)."`
 	NoWatch bool   `help:"Print one snapshot even in a terminal."`
@@ -441,7 +443,7 @@ type RentalCmd struct {
 }
 
 type RentalPrepareCmd struct {
-	Rental  string   `arg:"" name:"rental" help:"Existing rental machine name or id."`
+	Rental  string   `arg:"" name:"rental" predictor:"rental" help:"Existing rental machine name or id."`
 	Package string   `arg:"" name:"package" help:"Published package org/name."`
 	Version string   `help:"Exact package release, e.g. 1.2.3." required:""`
 	Models  []string `name:"model" help:"Exact model binding SLOT=org/model@release/lane; repeat for each slot."`
@@ -453,7 +455,7 @@ func (c *RentalPrepareCmd) Run(r *Runtime) error {
 }
 
 type RentalUpdateCmd struct {
-	Rental string `arg:"" help:"Existing rental name or id."`
+	Rental string `arg:"" predictor:"rental" help:"Existing rental name or id."`
 }
 
 func (c *RentalUpdateCmd) Run(r *Runtime) error {
@@ -462,7 +464,7 @@ func (c *RentalUpdateCmd) Run(r *Runtime) error {
 
 type RentalNewCmd struct {
 	Development    *bool    `help:"Enable SSH maintenance access on the selected worker image (default); false disables it."`
-	SSHPublicKey   string   `name:"ssh-public-key" help:"SSH public-key file for this development rental."`
+	SSHPublicKey   string   `name:"ssh-public-key" predictor:"file" help:"SSH public-key file for this development rental."`
 	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
 	GPUs           int      `name:"gpus" default:"1" help:"GPUs on the machine; any count the catalog lists. Keep to an even count for parallelism."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
@@ -471,7 +473,7 @@ type RentalNewCmd struct {
 }
 
 type RentalPruneCmd struct {
-	ID string `arg:"" name:"rental" help:"Rental machine name or id."`
+	ID string `arg:"" name:"rental" predictor:"rental" help:"Rental machine name or id."`
 }
 
 func (c *RentalPruneCmd) Run(r *Runtime) error {
@@ -492,7 +494,7 @@ func (c *RentalNewCmd) Run(r *Runtime) error {
 }
 
 type RentalEndCmd struct {
-	ID string `arg:"" name:"rental" help:"Private rental id."`
+	ID string `arg:"" name:"rental" predictor:"rental" help:"Private rental id."`
 }
 
 func (c *RentalEndCmd) Run(r *Runtime) error {
@@ -560,7 +562,7 @@ func (c *DownCmd) Run(r *Runtime) error {
 
 // SSHInfo reads current provider mapping from Hub; it stores no endpoint locally.
 type RentalSSHInfoCmd struct {
-	Rental string `arg:"" name:"rental" help:"Attached machine name or rental id."`
+	Rental string `arg:"" name:"rental" predictor:"rental" help:"Attached machine name or rental id."`
 }
 
 func (c *RentalSSHInfoCmd) Run(r *Runtime) error {
@@ -568,7 +570,7 @@ func (c *RentalSSHInfoCmd) Run(r *Runtime) error {
 }
 
 type RentalKeepaliveCmd struct {
-	Rental string `arg:"" help:"Existing rental name or id."`
+	Rental string `arg:"" predictor:"rental" help:"Existing rental name or id."`
 }
 
 func (c *RentalKeepaliveCmd) Run(r *Runtime) error {
