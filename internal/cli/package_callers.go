@@ -2,9 +2,7 @@ package cli
 
 import (
 	"context"
-	"os"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
@@ -36,23 +34,5 @@ func publishedCallableWheels(ctx context.Context, p *packagepublish.Package) ([]
 	if problem != nil {
 		return nil, problem
 	}
-	runtime := launch.RuntimeCLI{Bin: bin, Dir: p.Tree, Home: p.Root, Env: env}
-	output := make([]string, 0, len(projects))
-	for _, source := range projects {
-		body, err := os.ReadFile(source)
-		if err != nil {
-			return nil, exit.Internalf("cannot read callable project wheel: %s", err)
-		}
-		digest, _ := canonical.Spell(canonical.Digest(body))
-		stage, err := os.MkdirTemp(p.Root, "caller-")
-		if err != nil {
-			return nil, exit.Internalf("cannot stage callable project wheel: %s", err)
-		}
-		generated, problem := runtime.InterfaceWheel(ctx, surface, p.Name, p.Release, digest, source, digest, stage)
-		if problem != nil {
-			return nil, problem
-		}
-		output = append(output, generated.Path)
-	}
-	return output, nil
+	return launch.CallerInterfaceWheels(ctx, bin, p.Tree, p.Root, env, surface, p.Name, p.Release, projects)
 }

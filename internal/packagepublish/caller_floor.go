@@ -5,6 +5,7 @@ import (
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -25,7 +26,7 @@ func ValidateCallerRuntime(p *Package, floor string) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		if requirement.name != "cozy-runtime" || !requirement.hasSpec {
+		if requirement.name != hostruntime.Distribution || !requirement.hasSpec {
 			continue
 		}
 		for _, term := range strings.Split(requirement.specifier.String(), ",") {
@@ -51,7 +52,7 @@ func ValidateCallerRuntime(p *Package, floor string) *exit.Error {
 	}
 	locked := false
 	for _, row := range p.Registry {
-		if row.Name == "cozy-runtime" {
+		if row.Name == hostruntime.Distribution {
 			version, err := pep440.Parse(row.Version)
 			locked = err == nil && !version.LessThan(minimum)
 		}
@@ -61,7 +62,7 @@ func ValidateCallerRuntime(p *Package, floor string) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		if identity.Distribution == "cozy-runtime" {
+		if identity.Distribution == hostruntime.Distribution {
 			version, err := pep440.Parse(identity.Version)
 			locked = err == nil && !version.LessThan(minimum)
 		}

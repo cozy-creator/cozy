@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
@@ -18,7 +19,7 @@ func TestPublishedCallerRuntimeFloorIsDeclaredAndLocked(t *testing.T) {
 		{"old-declaration", "cozy-runtime>=0.18.20", "0.18.21", false},
 		{"old-lock", "cozy-runtime>=0.18.21", "0.18.20", false},
 		{"missing-lock", "cozy-runtime>=0.18.21", "", false},
-		{"missing-floor", "cozy-runtime", "0.18.21", false},
+		{"missing-floor", hostruntime.Distribution, "0.18.21", false},
 	} {
 		t.Run(example.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "pyproject.toml")
@@ -28,7 +29,7 @@ func TestPublishedCallerRuntimeFloorIsDeclaredAndLocked(t *testing.T) {
 			}
 			pack := &packagepublish.Package{Files: map[string]string{"pyproject.toml": path}}
 			if example.locked != "" {
-				pack.Registry = []packagepublish.RegistryRow{{Name: "cozy-runtime", Version: example.locked}}
+				pack.Registry = []packagepublish.RegistryRow{{Name: hostruntime.Distribution, Version: example.locked}}
 			}
 			problem := packagepublish.ValidateCallerRuntime(pack, "0.18.21")
 			if (problem == nil) != example.ok {
