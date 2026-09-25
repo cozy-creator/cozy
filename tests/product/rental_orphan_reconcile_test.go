@@ -294,7 +294,7 @@ func TestRentalListShowsOtherClientsMachinesBesideItsOwn(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
-		ID: own, MachineName: "loran", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1,
+		ID: own, MachineName: "loran", SKU: "h100-sxm5-80gb", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 2,
 		HourlyRateUSDMicros: 7_021_700, State: "ready", Hub: hubURL,
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, own+".pem"),
 	}))
@@ -302,6 +302,7 @@ func TestRentalListShowsOtherClientsMachinesBesideItsOwn(t *testing.T) {
 	orphan(stand, "pr-3c3c3c3c3c3c3c3conar", "onara", 1_637_399)
 	stand.set("pr-3c3c3c3c3c3c3c3conar", "state", "ready")
 	stand.set("pr-3c3c3c3c3c3c3c3conar", "requested_accelerator_model", "NVIDIA A100-SXM4-80GB")
+	stand.set("pr-3c3c3c3c3c3c3c3conar", "accelerator_count", 1)
 
 	code, out := runCozy(t, root, "rental", "list", "--no-watch")
 	if code != 0 {
@@ -310,13 +311,29 @@ func TestRentalListShowsOtherClientsMachinesBesideItsOwn(t *testing.T) {
 	if !strings.Contains(out, "Remote machines running: 2") || !strings.Contains(out, "Current spend per hour: $8.66") {
 		t.Fatalf("the header does not count both machines\n%s", out)
 	}
-	if !regexp.MustCompile(`(?m)^loran\s+cpu\s+ready\s+\$7\.02\s`).MatchString(out) {
+	if !regexp.MustCompile(`(?m)^MACHINE\s+SKU\s+GPUS\s+STATE\s`).MatchString(out) {
+		t.Fatalf("the GPUS column does not follow SKU\n%s", out)
+	}
+	if !regexp.MustCompile(`(?m)^loran\s+h100-sxm5-80gb\s+2\s+ready\s+\$7\.02\s`).MatchString(out) {
 		t.Fatalf("this host's own machine is not a plain row\n%s", out)
 	}
-	if !regexp.MustCompile(`(?m)^onara\s+NVIDIA A100-SXM4-80GB\s+ready \(other client\)\s+\$1\.64\s`).MatchString(out) {
+	if !regexp.MustCompile(`(?m)^onara\s+NVIDIA A100-SXM4-80GB\s+1\s+ready \(other client\)\s+\$1\.64\s`).MatchString(out) {
 		t.Fatalf("the other client's machine is not a marked row with its rate\n%s", out)
 	}
 	if rows := regexp.MustCompile(`(?m)^(loran|onara)\s`).FindAllString(out, -1); len(rows) != 2 {
 		t.Fatalf("the table has %d machine rows for a header of 2\n%s", len(rows), out)
+	}
+	code, out = runCozy(t, root, "rental", "list", "--json")
+	var document struct {
+		Rentals []map[string]any `json:"rentals"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &document) != nil || len(document.Rentals) != 2 {
+		t.Fatalf("rental list --json [%d]: %s", code, out)
+	}
+	for _, row := range document.Rentals {
+		want := map[string]float64{"loran": 2, "onara": 1}[row["machine"].(string)]
+		if row["gpus"] != want {
+			t.Fatalf("%s gpus = %v, want %v: %s", row["machine"], row["gpus"], want, out)
+		}
 	}
 }
