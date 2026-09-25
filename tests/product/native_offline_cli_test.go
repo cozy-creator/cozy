@@ -27,6 +27,9 @@ var nativeRecoveryHome = flag.String("native-recovery-home", "", "new isolated n
 // An observed barrier separates submission from production: B and C must finish
 // while Creator is demonstrably absent. All execution and collection use cozy.
 func TestNativeCompositionCompletesWithClientOffline(t *testing.T) {
+	if *privateChildRuntimeWheel == "" || *privateChildTensorFSWheel == "" {
+		t.Skip("requires exact Runtime and TensorFS wheels for the native recovery proof")
+	}
 	root := *nativeRecoveryHome
 	var err error
 	if root == "" {
@@ -117,7 +120,7 @@ if "serve" in sys.argv:
 from cozy_runtime.cli.main import main
 sys.exit(main())
 `, filepath.Join(control, "bin", "python"), barrier.URL)
-	must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), []byte(wrapper), 0700))
+	must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), []byte(wrapper), 0700)) //cozy:allow isolated Runtime fault instrumentation; all invocation still uses the ordinary CLI and worker protocol
 	project := copyPrivateTensorProject(t, root, "")
 	script := filepath.Join(project, "recipe.py")
 	source, err := os.ReadFile(script)
