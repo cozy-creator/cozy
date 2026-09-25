@@ -142,8 +142,13 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		if detached {
 			return renderSubmittedJob(ctx, state, !handle.Replay)
 		}
-		if settled(state.Status) || state.Status == "blocked" || state.Status == "paused" {
-			return renderJobTerminal(ctx, state, nil, began)
+		if settled(state.Status) {
+			// Even an immediately completed/replayed machine job has a durable
+			// terminal event. Read it for the same wall clock as later watches.
+			return followJob(ctx, c, handle.JobID, began)
+		}
+		if state.Status == "blocked" || state.Status == "paused" {
+			return renderJobTerminal(ctx, state, nil)
 		}
 		if !ctx.Inv.Bool("--follow") {
 			return renderSubmittedJob(ctx, state, !handle.Replay)
@@ -161,7 +166,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return problem
 	}
 	if terminal != nil || settled(state.Status) || state.Status == "paused" || state.Status == "blocked" {
-		return renderJobTerminal(ctx, state, terminal, began)
+		return renderJobTerminal(ctx, state, terminal)
 	}
 	return renderSubmittedJob(ctx, state, !handle.Replay)
 }
@@ -441,12 +446,10 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		}
 	default:
 	}
-	return renderJobTerminal(ctx, state, terminal, began)
+	return renderJobTerminal(ctx, state, terminal)
 }
 
-func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event,
-	began time.Time,
-) *exit.Error {
+func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event) *exit.Error {
 	if machine := state.MachineExecution; machine != nil && state.Status == "completed" && !machine.Collected {
 		return exit.Named(exit.Unavailable, "machine_execution.result_collection_pending", "run %s completed on its machine, but its result has not been collected: %s", state.JobID, machine.ObservationError)
 	}
@@ -478,8 +481,11 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		state.ErrorType, _ = terminal.Payload["error_type"].(string)
 		state.Error, _ = terminal.Payload["error"].(string)
 	}
-	fields := append(jobFields(ctx.Mode(), state, true),
-		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
+	fields := jobFields(ctx.Mode(), state, true)
+	wallMS, wallKnown := recordedRunWall(state.CreatedAt, terminal)
+	if wallKnown {
+		fields = append(fields, output.Field{K: "wall_ms", V: wallMS})
+	}
 	defaults := []string{"job", "status"}
 	if state.OutputExport != nil {
 		defaults = append(defaults, "output_export")
@@ -504,7 +510,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if modelSourceVerdict(state.ModelSources) {
 		defaults = append(defaults, "model_sources")
 	}
-	defaults = append(defaults, "wall_ms")
+	if wallKnown {
+		defaults = append(defaults, "wall_ms")
+	}
 	rec := compactRecord(fields, defaults...)
 	if export := state.OutputExport; export != nil && export.State == "failed" {
 		rec.Notes = append(rec.Notes, fmt.Sprintf("output export to %s failed (%s): %s; accepted output bytes remain in internal custody",

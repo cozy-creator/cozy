@@ -709,10 +709,17 @@ cozy model search flux --full
 ```
 
 A one-field list uses `- value` bullets; multiple selected fields become a compact table. The
-collection length is already its count. `omitted` appears only when a limit withheld rows, and
+collection length is already its count. Compact lists show at most 20 rows; `--full` shows
+all fetched rows. For `run list`, `--limit` controls how many rows are fetched (50 by default),
+not the compact display cap. `omitted` reports withheld rows, and
 diagnostic fields appear only under `--full` or an explicit `--fields` selection. Human errors
 state the problem and repair directly; `--json` retains the stable class, code, message, remedy,
 and contextual next action.
+
+Completed run `wall_ms` is the recorded request duration from creation to its durable
+terminal event. It excludes pre-submission capture and later result collection, export or
+viewing, and stays the same when `run watch` is repeated. Missing or invalid timestamps
+leave it absent. Queue and execution durations remain separate measurements.
 
 Shell exits are intentionally small: `0` success or idempotent no-op, `2` invocation/configuration
 error, and `1` operational failure.

@@ -61,8 +61,8 @@ func TestMachineExecutionActualHostInstallationReuse(t *testing.T) {
 			t.Fatalf("%s did not execute fresh code: %s", label, out)
 		}
 		tokens[result.Result.Value] = true
-		if delta := elapsed - result.WallMS; delta < -100 || delta > 2000 {
-			t.Fatalf("command timer omitted preparation: real=%dms reported=%dms", elapsed, result.WallMS)
+		if result.WallMS < 0 || result.WallMS > elapsed {
+			t.Fatalf("recorded request timer exceeds the observing command: real=%dms reported=%dms", elapsed, result.WallMS)
 		}
 		request, problem := store.RequestByIdempotencyKey(key)
 		fatal(t, problem)
@@ -71,6 +71,15 @@ func TestMachineExecutionActualHostInstallationReuse(t *testing.T) {
 		}
 		events, problem := store.EventsAfter(request.ID, 0, 1000)
 		fatal(t, problem)
+		terminalAt, problem := store.TerminalEventAt(request.ID)
+		fatal(t, problem)
+		started, err := time.Parse(time.RFC3339Nano, request.CreatedAt)
+		must(t, err)
+		ended, err := time.Parse(time.RFC3339Nano, terminalAt)
+		must(t, err)
+		if result.WallMS != ended.Sub(started).Milliseconds() {
+			t.Fatalf("initial awaited machine wall differs from durable timestamps: %s", out)
+		}
 		row := proof{Request: request.ID, ElapsedMS: elapsed, ReportedMS: result.WallMS}
 		for _, event := range events {
 			switch event.Type {
