@@ -1,0 +1,84 @@
+{
+  "source": "Qwen/Qwen-Image-2.1@790c92633540aa0cb11d9abf19eb46d861714758",
+  "profile": "hf/qwen/qwen-image-2.1/original/1",
+  "members": [
+    {
+      "member": "text_encoder/model-00001-of-00004.safetensors",
+      "header_file": "text_encoder/model-00001-of-00004.safetensors.header",
+      "header_sha256": "3e227514ccf96e69e14a2116307c08df6dffa5d868a586b713c6a50493311354",
+      "header_bytes": 49800,
+      "full_length": 4998056552,
+      "declared_source_sha256": "dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f"
+    },
+    {
+      "member": "text_encoder/model-00002-of-00004.safetensors",
+      "header_file": "text_encoder/model-00002-of-00004.safetensors.header",
+      "header_sha256": "a365d74643d37cd9946db99f7051660307c91600287153f49e99a29d0d73fb4e",
+      "header_bytes": 18528,
+      "full_length": 4915962464,
+      "declared_source_sha256": "9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42"
+    },
+    {
+      "member": "text_encoder/model-00003-of-00004.safetensors",
+      "header_file": "text_encoder/model-00003-of-00004.safetensors.header",
+      "header_sha256": "6b633cd04c819200ef9f1fc8d5fe8d5edff33149e77d50d4b436800692a848c0",
+      "header_bytes": 18560,
+      "full_length": 4915962496,
+      "declared_source_sha256": "8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e"
+    },
+    {
+      "member": "text_encoder/model-00004-of-00004.safetensors",
+      "header_file": "text_encoder/model-00004-of-00004.safetensors.header",
+      "header_sha256": "c78b6dcf694a5829202bbb746ea8b9227694aaf1f08d076f7be3e6c51ea7a3b7",
+      "header_bytes": 5208,
+      "full_length": 2704357976,
+      "declared_source_sha256": "5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd"
+    },
+    {
+      "member": "text_encoder/model.safetensors.index.json",
+      "header_file": "text_encoder/model.safetensors.index.json",
+      "header_sha256": "859146bff8db1d617fca8b457a5223edff963bb70076b3645f2189fe0540a147",
+      "header_bytes": 67795,
+      "full_length": 67795,
+      "declared_source_sha256": "859146bff8db1d617fca8b457a5223edff963bb70076b3645f2189fe0540a147"
+    },
+    {
+      "member": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+      "header_file": "transformer/diffusion_pytorch_model-00001-of-00002.safetensors.header",
+      "header_sha256": "f9faf1efe497876aa2c0453019dda4c63693ab1a7aef2d07f55d201865146620",
+      "header_bytes": 24792,
+      "full_length": 9968332504,
+      "declared_source_sha256": "9e6bc2d641e67bf277895ea8777141044a38f3edb7101bc469b2961dd7c36b4b"
+    },
+    {
+      "member": "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+      "header_file": "transformer/diffusion_pytorch_model-00002-of-00002.safetensors.header",
+      "header_sha256": "c8c70bfcf9da9cca68a1b68301c4e322f7da9789a785dfd465e2f54949e738e5",
+      "header_bytes": 10144,
+      "full_length": 4261951904,
+      "declared_source_sha256": "3aaf234dcbe128530479735854a346b5e3e66283b7c11db56f836bbd1c13ebaa"
+    },
+    {
+      "member": "transformer/diffusion_pytorch_model.safetensors.index.json",
+      "header_file": "transformer/diffusion_pytorch_model.safetensors.index.json",
+      "header_sha256": "17987f6623b1c814d0ef55a137d99142b7b3b040eb1bf241b5575dd35af803a2",
+      "header_bytes": 30283,
+      "full_length": 30283,
+      "declared_source_sha256": "17987f6623b1c814d0ef55a137d99142b7b3b040eb1bf241b5575dd35af803a2"
+    },
+    {
+      "member": "vae/diffusion_pytorch_model.safetensors",
+      "header_file": "vae/diffusion_pytorch_model.safetensors.header",
+      "header_sha256": "54cc62e5a7719b336a855d6e3871c464302db6f83f04d95caac8b2547b1a8e4d",
+      "header_bytes": 27896,
+      "full_length": 1350989512,
+      "declared_source_sha256": "a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417"
+    }
+  ],
+  "components": {
+    "transformer": 297,
+    "text_encoder": 750,
+    "vae": 238
+  },
+  "constructor_provenance": "Runtime QwenImage21 factory using Diffusers0.40.0 plus upstream4295ee3 model modules, Transformers5.17.0, Torch2.14.0; measured meta state_dict traversal; all1285 keys/shapes/dtypes agree with source headers"
+}
