@@ -29,7 +29,7 @@ def main(ctx):
 	code, stdout, stderr := runCozyStreams(t, root, "--json", "run", script, "--await", "--full")
 	var result map[string]any
 	if code != 0 || json.Unmarshal([]byte(stdout), &result) != nil || result["status"] != "completed" {
-		t.Fatalf("job did not return one final JSON document: code=%d stdout=%s stderr_bytes=%d", code, stdout, len(stderr))
+		t.Fatalf("job did not return one final JSON document: code=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)

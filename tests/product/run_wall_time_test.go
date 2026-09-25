@@ -63,10 +63,10 @@ func TestCompletedRunWatchUsesRecordedWallTime(t *testing.T) {
 				_, problem = api.Mint(layout)
 				fatal(t, problem)
 				for repeat := 0; repeat < 2; repeat++ {
-					code, out := runCozy(t, root, "run", "watch", "1", "--json", "--full")
+					code, out, errout := runCozyStreams(t, root, "run", "watch", "1", "--json", "--full")
 					var result map[string]any
 					if code != 0 || json.Unmarshal([]byte(out), &result) != nil {
-						t.Fatalf("watch [%d]: %s", code, out)
+						t.Fatalf("watch [%d]: %s %s", code, out, errout)
 					}
 					wall, present := result["wall_ms"]
 					if present != stamp.known || present && wall != float64(62345) {

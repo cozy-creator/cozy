@@ -482,7 +482,8 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		state.Error, _ = terminal.Payload["error"].(string)
 	}
 	fields := jobFields(ctx.Mode(), state, true)
-	if wallMS, known := recordedRunWall(state.CreatedAt, terminal); known {
+	wallMS, wallKnown := recordedRunWall(state.CreatedAt, terminal)
+	if wallKnown {
 		fields = append(fields, output.Field{K: "wall_ms", V: wallMS})
 	}
 	defaults := []string{"job", "status"}
@@ -509,7 +510,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if modelSourceVerdict(state.ModelSources) {
 		defaults = append(defaults, "model_sources")
 	}
-	defaults = append(defaults, "wall_ms")
+	if wallKnown {
+		defaults = append(defaults, "wall_ms")
+	}
 	rec := compactRecord(fields, defaults...)
 	if export := state.OutputExport; export != nil && export.State == "failed" {
 		rec.Notes = append(rec.Notes, fmt.Sprintf("output export to %s failed (%s): %s; accepted output bytes remain in internal custody",
