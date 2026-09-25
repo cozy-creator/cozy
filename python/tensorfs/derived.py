@@ -7,6 +7,8 @@ embedding owner; creating a Python object grants no access to a Store.
 
 from __future__ import annotations
 
+import base64
+
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -158,12 +160,13 @@ class Derivation:
     targets: Mapping[str, Target]
     configs: Mapping[str, Config]
     order: Sequence[tuple[str, str]]
+    files: Mapping[str, bytes] = field(default_factory=dict)
 
     def native_arguments(
         self,
         max_new_bytes: int,
     ) -> tuple[
-        dict[str, Any], dict[str, Any], dict[str, Any], list[tuple[str, str]], int
+        dict[str, Any], dict[str, Any], dict[str, Any], list[tuple[str, str]], int, dict[str, str]
     ]:
         """Marshal into Store.derived_declaration/estimate/begin, never validate twice."""
         targets: dict[str, Any] = {}
@@ -212,6 +215,7 @@ class Derivation:
             configs,
             list(self.order),
             max_new_bytes,
+            {name: base64.b64encode(data).decode("ascii") for name, data in self.files.items()},
         )
 
 

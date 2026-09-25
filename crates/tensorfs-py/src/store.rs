@@ -227,6 +227,7 @@ fn parse_declaration(
     configs: &Bound<'_, PyDict>,
     order: Vec<(String, String)>,
     max_new_bytes: u64,
+    files: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Declaration> {
     let mut source_rows = Vec::with_capacity(sources.len());
     for (alias, value) in sources.iter() {
@@ -375,7 +376,23 @@ fn parse_declaration(
             }
         }
     }
+    let mut companion_files = Vec::new();
+    if let Some(files) = files {
+        if files.len() > derived::MAX_COMPANION_FILES {
+            return tensorfs_core::err::refuse(
+                tensorfs_core::err::Code::COUNT_CAP,
+                "at most 16 companion files may be declared",
+            )
+            .or_refuse(py);
+        }
+        for (path, value) in files.iter() {
+            let path: String = path.extract()?;
+            let encoded: String = value.extract()?;
+            companion_files.push((path, derived::decode_file(&encoded).or_refuse(py)?));
+        }
+    }
     let mut declaration = Declaration {
+        files: companion_files,
         work_fingerprint: None,
         sources: source_rows,
         components,
@@ -2034,7 +2051,7 @@ impl PyStore {
 
     /// Canonical TensorFS declaration bytes for the current producer intent.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (sources, targets, configs, order, max_new_bytes, *, work_fingerprint))]
+    #[pyo3(signature = (sources, targets, configs, order, max_new_bytes, files=None, *, work_fingerprint))]
     fn derived_declaration<'p>(
         &self,
         py: Python<'p>,
@@ -2043,10 +2060,11 @@ impl PyStore {
         configs: &Bound<'_, PyDict>,
         order: Vec<(String, String)>,
         max_new_bytes: u64,
+        files: Option<&Bound<'_, PyDict>>,
         work_fingerprint: &str,
     ) -> PyResult<Bound<'p, PyBytes>> {
         let mut declaration =
-            parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+            parse_declaration(py, sources, targets, configs, order, max_new_bytes, files)?;
         declaration.work_fingerprint = Some(work_fingerprint.to_string());
         let bytes = declaration.canonical_work_bytes().or_refuse(py)?;
         Ok(PyBytes::new(py, &bytes))
@@ -2124,7 +2142,7 @@ impl PyStore {
     // PyO3 exposes these as six named boundary fields. Packing them into an opaque dict
     // would only move the arity into hand parsing and weaken the typed facade.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes, *, work_fingerprint, checkpoint=None))]
+    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes, files=None, *, work_fingerprint, checkpoint=None))]
     fn begin_derived(
         &self,
         py: Python<'_>,
@@ -2135,11 +2153,12 @@ impl PyStore {
         configs: &Bound<'_, PyDict>,
         order: Vec<(String, String)>,
         max_new_bytes: u64,
+        files: Option<&Bound<'_, PyDict>>,
         work_fingerprint: &str,
         checkpoint: Option<(String, u64)>,
     ) -> PyResult<PyDerivedWriter> {
         let mut declaration =
-            parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+            parse_declaration(py, sources, targets, configs, order, max_new_bytes, files)?;
         declaration.work_fingerprint = Some(work_fingerprint.to_string());
         let checkpoint = checkpoint
             .map(|(id, length)| obj_ref(py, &id, length))
@@ -2171,7 +2190,7 @@ impl PyStore {
 
     /// Remaining native additions before opening a writer or reserving capacity.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes, *, work_fingerprint, checkpoint=None))]
+    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes, files=None, *, work_fingerprint, checkpoint=None))]
     fn derived_write_estimate<'p>(
         &self,
         py: Python<'p>,
@@ -2182,11 +2201,12 @@ impl PyStore {
         configs: &Bound<'_, PyDict>,
         order: Vec<(String, String)>,
         max_new_bytes: u64,
+        files: Option<&Bound<'_, PyDict>>,
         work_fingerprint: &str,
         checkpoint: Option<(String, u64)>,
     ) -> PyResult<Bound<'p, PyDict>> {
         let mut declaration =
-            parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
+            parse_declaration(py, sources, targets, configs, order, max_new_bytes, files)?;
         declaration.work_fingerprint = Some(work_fingerprint.to_string());
         let checkpoint = checkpoint
             .map(|(id, length)| obj_ref(py, &id, length))
