@@ -940,11 +940,16 @@ func requestNumber(q interface{ QueryRow(string, ...any) *sql.Row }, row Request
 // drain re-reads the row before every route, so a plan learned only in memory never
 // reaches the route and the worker's DISPATCHABLE placement stays invisible to its own
 // request (found live: the queue re-prepared the same package on a busy pod).
+// Until its first attempt, a queued request may learn a newer binding for its
+// frozen logical selection. Once dispatch has recorded any attempt, even an
+// aborted or refused one, the binding remains immutable across retries.
 func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
 	if id == "" || planID == "" {
 		return exit.Internalf("cannot bind an empty request plan")
 	}
-	result, err := s.db.Exec(`UPDATE requests SET plan_id=? WHERE id=? AND (plan_id='' OR plan_id=?)`,
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=? WHERE id=? AND (
+		plan_id=? OR (state IN ('submitted','queued') AND ordinal=0 AND
+		NOT EXISTS (SELECT 1 FROM attempts WHERE request_id=requests.id)))`,
 		planID, id, planID)
 	if err != nil {
 		return exit.Internalf("cannot bind request %s plan: %s", id, err)

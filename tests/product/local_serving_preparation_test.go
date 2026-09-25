@@ -21,7 +21,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -29,6 +31,26 @@ import (
 
 var localServingFixtureDir = flag.String("serving-fixture-dir", "", "Fixture source directory for local serving preparation qualification")
 var servingCPUFixture = flag.Bool("serving-cpu-fixture", false, "Use CPU Torch for serving preparation qualification without claiming CUDA inference")
+
+// The local published path must retain the exact interface bytes, as the rental
+// and machine paths do. A digest alone cannot satisfy Runtime's wire-61 request.
+func TestLocalPreparationRetainsPublishedInterface(t *testing.T) {
+	bin := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(bin, "cozy-runtime"), []byte(stubRuntime(t, hostruntime.ToolFloor, pb.WireMinor)), 0700)) //cozy:allow a version-only test peer
+	t.Setenv("PATH", bin)
+	iface, problem := launch.DecodePackageInterface([]byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[]}`))
+	fatal(t, problem)
+	facts := launch.Facts{Install: records.PackageInstall{ID: "published", Package: "proof/model",
+		Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir(), PackageInterface: iface.Digest},
+		PackageInterface: iface}
+	spec, problem := facts.PreparationSpec([]string{"0"})
+	fatal(t, problem)
+	if spec.Preparation == nil || !spec.Preparation.Published ||
+		!bytes.Equal(spec.Preparation.PackageInterface, iface.Raw) ||
+		spec.Preparation.PackageInterfaceDigest != iface.Digest {
+		t.Fatalf("local launch lost published interface: %+v", spec.Preparation)
+	}
+}
 
 type servingSeed struct {
 	Manifest         string           `json:"manifest"`

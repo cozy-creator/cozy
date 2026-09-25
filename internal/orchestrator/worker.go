@@ -1197,10 +1197,9 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			if placementFailed {
 				placementFault = observed.fault
 			}
-			// The binding the pod authored for this function under the held selection.
-			// Runtime derives it from the whole placement's model ids, so extending the
-			// package's selection re-authors it: a plan this request bound against an
-			// earlier set is stale, never a reason to wait for a binding that is gone.
+			// Use the binding the pod authored for this function under the held
+			// selection. A queued request can carry an older worker's binding;
+			// its frozen logical selection decides whether the current one serves it.
 			serves := desiredPlacementServes(w, logical)
 			planID := logical.PlanID
 			for _, entrypoint := range desired.Entrypoints {
