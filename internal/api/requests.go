@@ -1156,34 +1156,38 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 // All execution venues expose the same work coordinates. Machine observations
 // also retain their imported progress, so a new observer need not await a tick.
 func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
+	switch life.Status {
+	case "completed":
+		complete := 1.0
+		life.OverallFraction = &complete
+		return
+	case "in_progress":
+	case "failed", "canceled":
+		if life.MachineExecution == nil {
+			life.OverallFraction, _ = s.store.TerminalOverallFraction(row.ID, row.Ordinal)
+			return
+		}
+	default:
+		return
+	}
 	progress, ok := s.orchestrator.LatestProgress(row.ID, life.Attempt)
 	if !ok && life.MachineExecution != nil {
 		if value, problem := s.store.LatestMachineProgress(row.ID, int64(life.Attempt)); problem == nil {
 			progress, ok = orchestrator.DecodeProgressSnapshot(value)
 		}
 	}
+	if !ok {
+		return
+	}
+	life.OverallFraction = progress.OverallFraction
 	if life.Status == "in_progress" {
-		if ok {
-			life.ProgressStage = progress.Stage
-			life.StageFraction = progress.StageFraction
-			life.OverallFraction = progress.OverallFraction
-			life.Position = progress.Position
-			life.Total = progress.Total
-			life.StepMS = progress.StepMS
-			if progress.Estimated {
-				life.RemainingMS = &progress.RemainingMS
-			}
-		}
-	} else if life.Status == "completed" {
-		complete := 1.0
-		life.OverallFraction = &complete
-	} else if life.Status == "failed" || life.Status == "canceled" {
-		if life.MachineExecution != nil {
-			if ok {
-				life.OverallFraction = progress.OverallFraction
-			}
-		} else {
-			life.OverallFraction, _ = s.store.TerminalOverallFraction(row.ID, row.Ordinal)
+		life.ProgressStage = progress.Stage
+		life.StageFraction = progress.StageFraction
+		life.Position = progress.Position
+		life.Total = progress.Total
+		life.StepMS = progress.StepMS
+		if progress.Estimated {
+			life.RemainingMS = &progress.RemainingMS
 		}
 	}
 }
