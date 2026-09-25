@@ -23,7 +23,7 @@ import (
 // device-key login first, the path `cozy rental list` failed on.
 func hubHome(t *testing.T, name, hubURL string) string {
 	t.Helper()
-	base := filepath.Join(os.TempDir(), "cozy-product-test")
+	base := scratchBase
 	must(t, os.MkdirAll(base, 0o755))
 	root, err := os.MkdirTemp(base, name+"-")
 	must(t, err)

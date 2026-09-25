@@ -37,7 +37,7 @@ import (
 // against a hub that answers the rental routes and can move a rental to `failed` the way
 // Tensorhub does.
 func TestRentalFailureRecovery(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-failure-recovery")
+	root := filepath.Join(scratchBase, "rental-failure-recovery")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	port := reservePort(t)
@@ -211,7 +211,7 @@ func TestRentalFailureRecovery(t *testing.T) {
 // publish `request.failed` over a run that succeeded, which the dispatch code calls the
 // worst failure class this system has.
 func TestRentalFailureKeepsARecordedTerminal(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-failure-terminal")
+	root := filepath.Join(scratchBase, "rental-failure-terminal")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

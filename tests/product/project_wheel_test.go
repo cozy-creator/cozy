@@ -28,7 +28,7 @@ import (
 const noImportRoots = "project_wheel_no_import_roots"
 
 func TestProjectWheelImportRoots(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "project-wheel")
+	root := filepath.Join(scratchBase, "project-wheel")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() {

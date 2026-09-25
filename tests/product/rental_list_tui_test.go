@@ -31,7 +31,7 @@ func (h *fakeRentalHub) set(id, key string, value any) {
 // acquiring, then ready with an idle countdown from the fixed fifteen-minute policy
 // policy, then held by queued work, then counting down again once the work settles.
 func TestRentalListLiveBoard(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-list-tui")
+	root := filepath.Join(scratchBase, "rental-list-tui")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	port := reservePort(t)

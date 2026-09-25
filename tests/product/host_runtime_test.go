@@ -153,7 +153,7 @@ func stubRuntime(t *testing.T, release string, minor uint32) string {
 // when script is empty), so the daemon can find nothing else by that name.
 func hostRuntimeRoot(t *testing.T, name, script string) (root, path string) {
 	t.Helper()
-	root = filepath.Join(os.TempDir(), "cozy-product-test", "host-runtime-"+name)
+	root = filepath.Join(scratchBase, "host-runtime-"+name)
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() {

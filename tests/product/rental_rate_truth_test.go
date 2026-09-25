@@ -18,7 +18,7 @@ import (
 // must say $0.72 — the listing's fleet reconcile adopts the hub's billed rate
 // into the local row, and the burn line runs on it, never the cached quote.
 func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-rate-truth")
+	root := filepath.Join(scratchBase, "rental-rate-truth")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	port := reservePort(t)
@@ -71,7 +71,7 @@ func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
 // billed ~$0.70 — the 1536 GB image spec adds 1536 × 139 micros/GB/h of
 // storage. Every displayed price must include both GPU and storage charges.
 func TestRentalLadderRendersTotalAndStructuredBreakdown(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-ladder")
+	root := filepath.Join(scratchBase, "rental-ladder")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	port := reservePort(t)
@@ -125,7 +125,7 @@ func TestRentalLadderRendersTotalAndStructuredBreakdown(t *testing.T) {
 // A confirmed pre-readiness container exit leaves the current fleet. Its
 // bounded structured diagnosis remains recorded and names an acquisition failure.
 func TestRentalListingShowsStructuredBootFailure(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-boot-failure")
+	root := filepath.Join(scratchBase, "rental-boot-failure")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _ = os.RemoveAll(root) })

@@ -17,7 +17,7 @@ import (
 // Status and attempt facts still distinguish a local queue from remote execution.
 // The recorded machine survives rental cleanup.
 func TestRunListMachineColumn(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "machine-column")
+	root := filepath.Join(scratchBase, "machine-column")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _ = os.RemoveAll(root) })

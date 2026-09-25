@@ -63,7 +63,7 @@ func scrolledThenExited(t *testing.T, board string, code int, tty string) {
 
 // TestRentalBoardEscExits is `cozy rental list` on a terminal.
 func TestRentalBoardEscExits(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-board-esc")
+	root := filepath.Join(scratchBase, "rental-board-esc")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
@@ -96,7 +96,7 @@ func TestRentalBoardEscExits(t *testing.T) {
 // TestRunBoardEscExits is `cozy run list` on a terminal — the second board over the same
 // input layer, exercised as its own verb rather than assumed from the first.
 func TestRunBoardEscExits(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "run-board-esc")
+	root := filepath.Join(scratchBase, "run-board-esc")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
