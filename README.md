@@ -494,7 +494,7 @@ GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator ne
 reads RunPod SKU names or provider prices. `cozy run` is local-only by default, while
 `--rental=<name-or-id>` uses only the selected existing rental. It does not permit a
 purchase or fallback onto another machine. `--rental-only` automatically reuses or acquires
-remote capacity under the configured fleet ceiling. Creator names every private rental
+remote capacity under Tensorhub's owner spend cap. Creator names every private rental
 with one memorable word, unique among this host's live rentals (a released word is drawn again);
 Tensorhub's identity for it is its `pr-…` id, which is what the provider-side pod is named after.
 The name carries no workload facts.
@@ -604,8 +604,6 @@ civitai_token: replace-with-your-token
 tfs: /usr/local/bin/tfs
 port: 8818
 local_rate_micro_usd_per_hour: 250000
-rentals:
-  max_hourly_spend_usd: 4.00
 daemon:
   idle_shutdown_s: 900
 maintenance:

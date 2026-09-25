@@ -55,8 +55,7 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 	port := reservePort(t)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		fmt.Sprintf("tensorhub_url: http://127.0.0.1:%d\n", port)+
-			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 100.00\n"), 0o600))
+			"tensorhub_token: rental-idle-test\n"), 0o600))
 	hub := newFakeRentalHub(t, port)
 	gpuAt := func(name, model, capability string, vram, price int64, count int) map[string]any {
 		return map[string]any{"name": name, "accelerator_model": model,

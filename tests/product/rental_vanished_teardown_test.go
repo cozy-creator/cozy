@@ -65,7 +65,7 @@ func TestVanishedRentalReleasesItsAttempt(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 1.00\n"+
+			""+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	logPath := filepath.Join(root, "daemon.log")
 	newFakeRentalHub(t, port)
@@ -133,7 +133,7 @@ func TestDownAllIsNotRefusable(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 1.00\n"+
+			""+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	hub := newFakeRentalHub(t, port)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))

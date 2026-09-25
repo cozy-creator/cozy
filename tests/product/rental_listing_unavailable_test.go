@@ -25,7 +25,7 @@ func proveUnavailableRentalListing(t *testing.T, unavailableStatus int) {
 	var unavailable atomic.Bool
 	unavailable.Store(true)
 	var purchases, releases atomic.Int32
-	var released atomic.Bool
+	var released, listed atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		if unavailable.Load() {
@@ -35,6 +35,10 @@ func proveUnavailableRentalListing(t *testing.T, unavailableStatus int) {
 			} else {
 				_, _ = w.Write([]byte("account rental census unavailable"))
 			}
+			return
+		}
+		if listed.Load() && !released.Load() {
+			_, _ = w.Write([]byte(`{"rentals":[{"rental_id":"pr-existing","name":"isao","state":"ready","requested_accelerator_model":"CPU","accelerator_count":1,"hourly_rate_usd_micros":100000}]}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"rentals":[]}`))
@@ -61,9 +65,10 @@ func proveUnavailableRentalListing(t *testing.T, unavailableStatus int) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: test\nrentals:\n  max_hourly_spend_usd: 10\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: test\n"), 0600))
 	for _, known := range []bool{false, true} {
 		if known {
+			listed.Store(true)
 			st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 			fatal(t, problem)
 			fatal(t, st.RecordRental(records.Rental{ID: "pr-existing", MachineName: "isao", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, State: "ready", Address: "127.0.0.1:1", CertPath: "fixture", Hub: server.URL}))
@@ -99,6 +104,7 @@ func proveUnavailableRentalListing(t *testing.T, unavailableStatus int) {
 	}
 	st, problem = records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
+	listed.Store(false)
 	_, problem = st.ForgetRental("pr-existing")
 	fatal(t, problem)
 	st.Close()

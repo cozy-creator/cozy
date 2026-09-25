@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -36,14 +35,13 @@ func fleetHub(t *testing.T) *ladderHub {
 	return h
 }
 
-// fleetRoot is ladderRoot under a fleet spend cap of `capUSD` per hour.
-func fleetRoot(t *testing.T, h *ladderHub, capUSD string) string {
+// fleetRoot is ladderRoot with the stand-in hub's owner spend cap at `capUSD` per hour.
+func fleetRoot(t *testing.T, h *ladderHub, capUSD float64) string {
 	t.Helper()
-	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: ladder-test\nrentals:\n  max_hourly_spend_usd: "+capUSD+"\n"+
-		"daemon:\n  idle_shutdown_s: 0\n"), 0600))
-	return root
+	h.mu.Lock()
+	h.spendCap = int64(capUSD * 1_000_000)
+	h.mu.Unlock()
+	return ladderRoot(t, h)
 }
 
 // plantH100 records one H100 rental the fleet holds, with the media bearer and creator key
@@ -96,11 +94,11 @@ func lastPlacement(t *testing.T, store *records.Store, requestID string) map[str
 }
 
 // The 00:25:31Z arm: two attached idle H100s, the explicit rc.1 lane, every purchase over
-// the cap. The owner's rung names the card and the lane, so the lane fits; the cheaper-named
+// the hub's cap (never asked: an attached machine fits). The owner's rung names the card and the lane, so the lane fits; the cheaper-named
 // idle machine is reused, the record is written, nothing is bought.
 func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 	h := fleetHub(t)
-	root := fleetRoot(t, h, "5")
+	root := fleetRoot(t, h, 5)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -118,8 +116,8 @@ func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 	}
 	placement := lastPlacement(t, store, row.ID)
 	verdicts, fits := candidateVerdicts(placement), candidateFits(placement)
-	if verdicts["guchuko"] != "chosen" || verdicts["lumachina"] != "unmeasured" || verdicts["h100-80"] != fleetCapVerdict ||
-		verdicts["h200"] != fleetCapVerdict || verdicts["rtx-4090"] != fourKShort {
+	if verdicts["guchuko"] != "chosen" || verdicts["lumachina"] != "unmeasured" || verdicts["h100-80"] == "chosen" ||
+		verdicts["h200"] == "chosen" || verdicts["rtx-4090"] != fourKShort {
 		t.Fatalf("verdicts %v", verdicts)
 	}
 	if fits["guchuko"] != "rung_asserted" || fits["lumachina"] != "rung_asserted" || fits["h100-80"] != "rung_asserted" ||
@@ -140,7 +138,7 @@ func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 // takes the attaching one — idle — once it attaches, over the busy one.
 func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *testing.T) {
 	h := fleetHub(t)
-	root := fleetRoot(t, h, "5")
+	root := fleetRoot(t, h, 5)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -157,7 +155,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *t
 	placement := lastPlacement(t, store, first.ID)
 	verdicts := candidateVerdicts(placement)
 	if verdicts["guchuko"] != "excluded:attaching: lumachina" || verdicts["lumachina"] != "attaching" ||
-		verdicts["h100-80"] != fleetCapVerdict || verdicts["h200"] != fleetCapVerdict || verdicts["b200"] != fleetCapVerdict ||
+		verdicts["h100-80"] == "chosen" || verdicts["h200"] == "chosen" || verdicts["b200"] == "chosen" ||
 		placement["line"] != "placement: wait for lumachina (h100-80, fp8-adaln-pruned) to attach — balanced" {
 		held, _ := store.RequestRow("req-held")
 		t.Fatalf("the wait record: %v; held request: %+v\n%s", placement, held, tail(filepath.Join(root, "daemon.log")))
@@ -215,7 +213,7 @@ func TestExplicitLaneWaitsForTheAttachingRentalOverQueueingBehindTheBusyOne(t *t
 // request fails with the cap error, and the record says why each candidate was passed.
 func TestExplicitLaneFailsOnTheCapOnlyWhenNoRentalFits(t *testing.T) {
 	h := fleetHub(t)
-	root := fleetRoot(t, h, "1")
+	root := fleetRoot(t, h, 1)
 	cert := filepath.Join(root, "hairu.pem")
 	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -241,7 +239,7 @@ func TestExplicitLaneFailsOnTheCapOnlyWhenNoRentalFits(t *testing.T) {
 		verdicts["h200"] != fleetCapVerdict || placement["line"] != "placement: nothing chosen" {
 		t.Fatalf("the refusal record: %v", placement)
 	}
-	if asks := h.postedSKUs(); len(asks) != 0 {
-		t.Fatalf("a refused run reached a paid ask: %v", asks)
+	if rentals, problem := store.Rentals(); problem != nil || len(rentals) != 1 {
+		t.Fatalf("a refused run bought a rental: %v %v", rentals, problem)
 	}
 }

@@ -71,8 +71,7 @@ func TestRentalBoardEscExits(t *testing.T) {
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
-			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 10.00\n"), 0o600))
+			"tensorhub_token: rental-idle-test\n"), 0o600))
 	hub := newFakeRentalHub(t, port)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)

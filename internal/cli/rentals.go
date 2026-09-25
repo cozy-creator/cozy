@@ -169,8 +169,7 @@ func handleRent(ctx *Context) *exit.Error {
 		HourlyRateUSDMicros: sku.PriceUSDMicrosPerHour})
 
 	row, attachable, replay, e := acquireRentalContext(watchCtx, ctx, l, st, skuName, gpus,
-		operationKey, reason, sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
-		ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", progress.rentalAcquisition, rentalRates(fleet.unrecorded))
+		operationKey, reason, sku.PriceUSDMicrosPerHour, deadline, "", progress.rentalAcquisition)
 	if e != nil {
 		if e.Code == exit.Canceled && watchCtx.Err() != nil && !ctx.Mode().JSON {
 			detached = true
@@ -240,12 +239,11 @@ func handleRent(ctx *Context) *exit.Error {
 // `cozy run --rental`. It returns only after the immutable retail rate and the
 // worker's authenticated attach projection are durable locally.
 func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName string, gpus int,
-	operationKey, reason string, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
-	deadline time.Time, managedRequestID string, phase acquisitionPhase, observed map[string]int64,
+	operationKey, reason string, hourlyRateUSDMicros int64,
+	deadline time.Time, managedRequestID string, phase acquisitionPhase,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	return acquireRentalContext(context.Background(), ctx, l, st, skuName, gpus, operationKey,
-		reason, hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros, deadline,
-		managedRequestID, phase, observed)
+		reason, hourlyRateUSDMicros, deadline, managedRequestID, phase)
 }
 
 // acquisitionPhase reports one readiness observation to whoever is waiting on this
@@ -256,13 +254,11 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName strin
 type acquisitionPhase func(hub.Rental)
 
 // hourlyRateUSDMicros is the LOCKED accepted quote — the hub's GPU list rate,
-// the figure the fresh-acceptance guard compares. storageUSDMicros is the
-// SKU's estimated storage adder (th-126): admission money only, totaled with
-// the quote against the fleet cap and never persisted as the rate.
+// the figure the fresh-acceptance guard compares. Spend admission is the hub's:
+// it refuses a rental past the owner's fleet cap before buying anything.
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
-	st *records.Store, skuName string, gpus int, operationKey, reason string,
-	hourlyRateUSDMicros, storageUSDMicros, fleetCapUSDMicros int64,
-	deadline time.Time, managedRequestID string, phase acquisitionPhase, observed map[string]int64,
+	st *records.Store, skuName string, gpus int, operationKey, reason string, hourlyRateUSDMicros int64,
+	deadline time.Time, managedRequestID string, phase acquisitionPhase,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	observation := lifecycle
 	if !deadline.IsZero() {
@@ -375,7 +371,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
 		Key: operationKey, Hub: c.Base(), Reason: reason, HourlyRateUSDMicros: hourlyRateUSDMicros,
 		ManagedRequestID: managedRequestID,
-	}, fleetCapUSDMicros, storageUSDMicros, author, observed)
+	}, author)
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
@@ -420,7 +416,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 				WithNext("cozy rental end "+either(remote.ID, machineName), "cozy rental")
 		}
 		if e.Code == exit.Credential || e.Code == exit.Validation ||
-			e.Code == exit.NotFound || e.Code == exit.Conflict {
+			e.Code == exit.NotFound || e.Code == exit.Conflict || e.Code == exit.Capacity {
 			if advanced := st.AdvanceRentalOperation(operationKey, "", "rejected"); advanced != nil {
 				return records.Rental{}, hub.Rental{}, false, advanced
 			}

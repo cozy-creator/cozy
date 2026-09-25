@@ -277,7 +277,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// orchestrator records the row, queues it and makes the worker resident; several jobs
 	// submitted at once queue against ONE worker and drain in submission order
 	// (owner directive, decisions #394 / cr-019).
-	recorded, fresh, e := s.recordSubmission(spec, existing == nil)
+	recorded, fresh, e := s.recordSubmission(spec)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return

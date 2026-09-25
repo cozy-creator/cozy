@@ -55,6 +55,9 @@ type ladderHub struct {
 	// half of what killed run 412 (cl-185); a fixed market cannot express it.
 	market          []hub.RentalSKU
 	runtimeVersions map[string]string
+	// spendCap stands in for Tensorhub's owner fleet cap: a paid ask whose SKU
+	// total would take the live rentals' burn past it is refused, buying nothing.
+	spendCap int64
 }
 
 const (
@@ -264,6 +267,11 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		h.posts = append(h.posts, raw)
+		if h.spendCap > 0 && h.liveBurnLocked()+h.skuTotalLocked(request.SKU) > h.spendCap {
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = w.Write([]byte(`{"error":{"code":"rental.fleet_spend_cap","message":"` + request.SKU + ` would exceed the owner hourly spend cap"}}`))
+			return
+		}
 		if h.soldOut[request.SKU] {
 			w.WriteHeader(http.StatusConflict)
 			_, _ = w.Write([]byte(`{"error":{"code":"rental.sku_out_of_stock","message":"` + request.SKU + ` has no provider inventory right now"}}`))
@@ -299,6 +307,31 @@ func (h *ladderHub) bind(row hub.PackageBindingRow) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.bindings = []hub.PackageBindingRow{row}
+}
+
+func (h *ladderHub) liveBurnLocked() int64 {
+	var burn int64
+	for _, row := range h.rentals {
+		if state := row["state"]; state == "released" || state == "failed" {
+			continue
+		}
+		switch rate := row["hourly_rate_usd_micros"].(type) {
+		case int:
+			burn += int64(rate)
+		case int64:
+			burn += rate
+		}
+	}
+	return burn
+}
+
+func (h *ladderHub) skuTotalLocked(name string) int64 {
+	for _, sku := range h.market {
+		if sku.Name == name {
+			return sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour
+		}
+	}
+	return 0
 }
 
 func (h *ladderHub) postedSKUs() []string {
@@ -345,7 +378,7 @@ func ladderRoot(t *testing.T, h *ladderHub) string {
 	t.Helper()
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+h.server.URL+
-		"\ntensorhub_token: ladder-test\nrentals:\n  max_hourly_spend_usd: 20\n"+
+		"\ntensorhub_token: ladder-test\n"+
 		"daemon:\n  idle_shutdown_s: 0\n"), 0600))
 	return root
 }

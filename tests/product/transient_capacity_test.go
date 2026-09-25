@@ -65,7 +65,7 @@ func plantRental(t *testing.T, root string, h *ladderHub, store *records.Store,
 func TestAFleetStillComingUpIsWaitedForAndNeverRefused(t *testing.T) {
 	h := fleetHub(t)
 	h.sell()
-	root := fleetRoot(t, h, "20")
+	root := fleetRoot(t, h, 20)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -111,7 +111,7 @@ func TestAFleetStillComingUpIsWaitedForAndNeverRefused(t *testing.T) {
 func TestAnEmptyCatalogBesideADeadFleetWaitsAndSaysWhichIsWhich(t *testing.T) {
 	h := fleetHub(t)
 	h.sell()
-	root := fleetRoot(t, h, "20")
+	root := fleetRoot(t, h, 20)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -148,7 +148,7 @@ func TestAMarketNoRungNamesStillFailsTerminally(t *testing.T) {
 	h := fleetHub(t)
 	h.bind(hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0-rc.2",
 		Ladder: []hub.BindingRung{{GPU: "MI300X", Lane: "fp8-adaln-pruned"}}, Revision: 4})
-	root := fleetRoot(t, h, "20")
+	root := fleetRoot(t, h, 20)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -184,7 +184,7 @@ func TestAnIdleAttachedMachineOutranksWaitingForOneComingUp(t *testing.T) {
 	// candidate does not compete with a measured one (placement-economics.md).
 	h.throughput = []hub.ModelThroughput{{Release: "1.0.0-rc.1", Lane: "fp8-adaln-pruned",
 		SKU: "h200", MedianS: 10, PrepareS: 10}}
-	root := fleetRoot(t, h, "20")
+	root := fleetRoot(t, h, 20)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()

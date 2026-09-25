@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,10 +68,8 @@ type Config struct {
 	// the reviewed registry embedded by the installed TensorFS binary.
 	TensorFSRegistry string
 
-	LocalRateMicroUSDPerHour       int64
-	LocalRateSource                string
-	RentalsMaxHourlySpendUSDMicros int64
-	RentalsMaxHourlySpendSource    string
+	LocalRateMicroUSDPerHour int64
+	LocalRateSource          string
 	// Development rentals use the Hub's registered debug image and this owner's
 	// public SSH key. These defaults apply only when authoring a new acquisition.
 	RentalsDevelopment  bool
@@ -115,7 +112,6 @@ type values struct {
 	TensorFSRoot             string `name:"tensorfs_root"`
 	TensorFSRegistry         string `name:"tensorfs_registry"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
-	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
 	RentalsDevelopment       bool   `name:"rentals_development" default:"true"`
 	RentalsSSHPublicKey      string `name:"rentals_ssh_public_key"`
 	DaemonIdleShutdownS      int64  `name:"daemon_idle_shutdown_s" default:"900"`
@@ -135,9 +131,6 @@ func (v *values) Validate() error {
 	}
 	if v.LocalRateMicroUSDPerHour < 0 {
 		return fmt.Errorf("local_rate_micro_usd_per_hour must be non-negative")
-	}
-	if _, err := usdMicros(v.RentalsMaxHourlySpendUSD); err != nil {
-		return fmt.Errorf("rentals.max_hourly_spend_usd %q is not a non-negative USD amount with at most six decimal places", v.RentalsMaxHourlySpendUSD)
 	}
 	if v.DaemonIdleShutdownS < 0 {
 		return fmt.Errorf("daemon.idle_shutdown_s must be non-negative; zero disables idle shutdown")
@@ -177,8 +170,7 @@ var fileKeys = map[string]bool{
 // nestedFileKeys are the one-level sections config.yaml admits, each mapping its
 // nested spelling to the flat grammar name.
 var nestedFileKeys = map[string]map[string]string{
-	"rentals": {"max_hourly_spend_usd": "rentals_max_hourly_spend_usd",
-		"development": "rentals_development",
+	"rentals": {"development": "rentals_development",
 		"ssh_public_key": "rentals_ssh_public_key"},
 	"daemon":      {"idle_shutdown_s": "daemon_idle_shutdown_s"},
 	"maintenance": {"gc_cron": "maintenance_gc_cron"},
@@ -244,11 +236,6 @@ func load() (Config, *exit.Error) {
 		return Config{}, exit.Usagef("configuration is invalid: %s", err).
 			WithRemedy("check %s and the admitted COZY_/TENSORHUB_ environment values", filepath.Join(home, FileName))
 	}
-	rentalCap, err := usdMicros(input.RentalsMaxHourlySpendUSD)
-	if err != nil {
-		return Config{}, exit.Usagef("configuration is invalid: %s", err)
-	}
-
 	hubToken := secret.New(input.HubToken)
 	huggingFaceToken := secret.New(input.HuggingFaceToken)
 	civitaiToken := secret.New(input.CivitaiToken)
@@ -257,35 +244,33 @@ func load() (Config, *exit.Error) {
 		return Config{}, problem
 	}
 	c := Config{
-		Home:                           home,
-		Port:                           input.Port,
-		PortSource:                     sourceOf("port", file, environment, "default"),
-		Yield:                          input.Yield,
-		HubURL:                         strings.TrimRight(strings.TrimSpace(input.HubURL), "/"),
-		HubToken:                       hubToken,
-		HubURLSource:                   sourceOf("tensorhub_url", file, environment, "default"),
-		HubTokenSource:                 sourceOf("tensorhub_token", file, environment, "unset"),
-		HuggingFaceToken:               huggingFaceToken,
-		HuggingFaceTokenSource:         sourceOf("huggingface_token", file, environment, "unset"),
-		CivitaiToken:                   civitaiToken,
-		CivitaiTokenSource:             sourceOf("civitai_token", file, environment, "unset"),
-		Tfs:                            strings.TrimSpace(input.Tfs),
-		TfsSource:                      sourceOf("tfs", file, environment, "default"),
-		TensorFSRoot:                   tensorFSRoot,
-		TensorFSRootSource:             sourceOf("tensorfs_root", file, environment, "default"),
-		TensorFSRegistry:               strings.TrimSpace(input.TensorFSRegistry),
-		LocalRateMicroUSDPerHour:       input.LocalRateMicroUSDPerHour,
-		LocalRateSource:                sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
-		RentalsMaxHourlySpendUSDMicros: rentalCap,
-		RentalsMaxHourlySpendSource:    sourceOf("rentals_max_hourly_spend_usd", file, environment, "unset"),
-		RentalsDevelopment:             input.RentalsDevelopment,
-		RentalsSSHPublicKey:            strings.TrimSpace(input.RentalsSSHPublicKey),
-		DaemonIdleShutdown:             time.Duration(input.DaemonIdleShutdownS) * time.Second,
-		MaintenanceGCCron:              strings.TrimSpace(input.MaintenanceGCCron),
-		PlacementPrefer:                input.PlacementPrefer,
-		Digest:                         digest,
-		Bootstrap:                      secret.New(input.Bootstrap),
-		inherited:                      inherited,
+		Home:                     home,
+		Port:                     input.Port,
+		PortSource:               sourceOf("port", file, environment, "default"),
+		Yield:                    input.Yield,
+		HubURL:                   strings.TrimRight(strings.TrimSpace(input.HubURL), "/"),
+		HubToken:                 hubToken,
+		HubURLSource:             sourceOf("tensorhub_url", file, environment, "default"),
+		HubTokenSource:           sourceOf("tensorhub_token", file, environment, "unset"),
+		HuggingFaceToken:         huggingFaceToken,
+		HuggingFaceTokenSource:   sourceOf("huggingface_token", file, environment, "unset"),
+		CivitaiToken:             civitaiToken,
+		CivitaiTokenSource:       sourceOf("civitai_token", file, environment, "unset"),
+		Tfs:                      strings.TrimSpace(input.Tfs),
+		TfsSource:                sourceOf("tfs", file, environment, "default"),
+		TensorFSRoot:             tensorFSRoot,
+		TensorFSRootSource:       sourceOf("tensorfs_root", file, environment, "default"),
+		TensorFSRegistry:         strings.TrimSpace(input.TensorFSRegistry),
+		LocalRateMicroUSDPerHour: input.LocalRateMicroUSDPerHour,
+		LocalRateSource:          sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
+		RentalsDevelopment:       input.RentalsDevelopment,
+		RentalsSSHPublicKey:      strings.TrimSpace(input.RentalsSSHPublicKey),
+		DaemonIdleShutdown:       time.Duration(input.DaemonIdleShutdownS) * time.Second,
+		MaintenanceGCCron:        strings.TrimSpace(input.MaintenanceGCCron),
+		PlacementPrefer:          input.PlacementPrefer,
+		Digest:                   digest,
+		Bootstrap:                secret.New(input.Bootstrap),
+		inherited:                inherited,
 	}
 	if !hubToken.Present() {
 		c.HubTokenSource = "unset"
@@ -514,30 +499,6 @@ func strictYAML(reader io.Reader) (*resolver, error) {
 		values[key.Value] = value.Value
 	}
 	return &resolver{values: values}, nil
-}
-
-func usdMicros(value string) (int64, error) {
-	value = strings.TrimSpace(value)
-	whole, fraction, decimal := strings.Cut(value, ".")
-	if whole == "" || strings.Contains(fraction, ".") || len(fraction) > 6 || decimal && fraction == "" {
-		return 0, fmt.Errorf("invalid USD amount %q", value)
-	}
-	for _, part := range []string{whole, fraction} {
-		for _, character := range part {
-			if character < '0' || character > '9' {
-				return 0, fmt.Errorf("invalid USD amount %q", value)
-			}
-		}
-	}
-	micros := strings.TrimLeft(whole+fraction+strings.Repeat("0", 6-len(fraction)), "0")
-	if micros == "" {
-		return 0, nil
-	}
-	amount, err := strconv.ParseInt(micros, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid USD amount %q", value)
-	}
-	return amount, nil
 }
 
 // Child constructs a child process's complete environment. Imposed values win

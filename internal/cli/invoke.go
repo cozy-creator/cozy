@@ -142,12 +142,6 @@ func validateRunPlacement(ctx *Context) *exit.Error {
 	if ctx.Inv.Value("--rental") != "" && (ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only")) {
 		return exit.Usagef("a named --rental cannot be combined with --rental-only")
 	}
-	managedRental := ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only")
-	if managedRental && ctx.Cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
-		return exit.Named(exit.Usage, "rental.spend_cap_required",
-			"rented execution requires a positive rentals.max_hourly_spend_usd in %s", filepath.Join(ctx.Cfg.Home, "config.yaml")).
-			WithRemedy("set the fleet-wide hourly ceiling before authorizing rental spend")
-	}
 	return nil
 }
 

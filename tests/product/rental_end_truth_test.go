@@ -51,7 +51,7 @@ func rentalEndRoot(t *testing.T, name string) (string, string, *fakeRentalHub) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 5.00\n"+
+			""+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	return root, hubURL, newFakeRentalHub(t, port)
 }
@@ -104,12 +104,12 @@ func TestEndingAReleasedRentalIsAnHonestNoOp(t *testing.T) {
 	op, _, problem := store.BeginRentalOperation(records.RentalOperation{
 		Key: "idempotent-proof", Hub: hubURL, Reason: "cozy rental new cpu",
 		HourlyRateUSDMicros: 100_000,
-	}, 5_000_000, 10_000, func(name string) ([]byte, string, *exit.Error) {
+	}, func(name string) ([]byte, string, *exit.Error) {
 		machine = name
 		body, problem := hub.RentalRequestBytes(name, "cpu", 1, strings.Repeat("ab", 32),
 			base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil)
 		return body, "digest-" + name, problem
-	}, nil)
+	})
 
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(op.Key, id, "attached"))

@@ -18,7 +18,7 @@ func configureDevelopmentRental(t *testing.T, root string) {
 	path := filepath.Join(root, config.FileName)
 	raw, err := os.ReadFile(path)
 	must(t, err)
-	raw = bytes.Replace(raw, []byte("rentals:\n"), []byte("rentals:\n  development: true\n  ssh_public_key: operator.pub\n"), 1)
+	raw = append(raw, []byte("rentals:\n  development: true\n  ssh_public_key: operator.pub\n")...)
 	must(t, os.WriteFile(path, raw, 0600))
 }
 

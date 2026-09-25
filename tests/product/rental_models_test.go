@@ -87,7 +87,7 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: rental-models-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 20.00\n"+
+			""+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	const sshKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea fixture"
 	keyPath := filepath.Join(root, "operator.pub")

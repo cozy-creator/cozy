@@ -21,8 +21,8 @@ func TestRentalObservationWaitsForWriterWithoutAnotherPaidOperation(t *testing.T
 	fatal(t, problem)
 	defer store.Close()
 	var authored int
-	op, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "accepted-once", Hub: "http://hub.example", HourlyRateUSDMicros: 1}, 10, 0,
-		func(machine string) ([]byte, string, *exit.Error) { authored++; return replacementAuthor(machine) }, nil)
+	op, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "accepted-once", Hub: "http://hub.example", HourlyRateUSDMicros: 1},
+		func(machine string) ([]byte, string, *exit.Error) { authored++; return replacementAuthor(machine) })
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(op.Key, "pr-observed", "acquiring"))
 	writer, err := sql.Open("sqlite", path+"?_txlock=immediate")
@@ -218,7 +218,7 @@ func assertRentalObservationRestoredBusyWait(t *testing.T, store *records.Store,
 	defer tx.Rollback()
 	done := make(chan *exit.Error, 1)
 	go func() {
-		_, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "after-observation", Hub: "http://hub.example", HourlyRateUSDMicros: 1}, 10, 0, replacementAuthor, nil)
+		_, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "after-observation", Hub: "http://hub.example", HourlyRateUSDMicros: 1}, replacementAuthor)
 		done <- problem
 	}()
 	select {

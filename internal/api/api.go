@@ -173,14 +173,7 @@ func (s *Server) activateRecorded(request records.Request) {
 // recordSubmission is the complete shutdown race boundary. Descriptor resolution and
 // payload validation happen before it; provider work happens after it. The lock protects
 // only the durable row insertion against `down`'s final active-work snapshot.
-func (s *Server) recordSubmission(spec orchestrator.Submission,
-	newRequest bool,
-) (records.Request, bool, *exit.Error) {
-	if newRequest && spec.Rental && s.cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
-		return records.Request{}, false, exit.Named(exit.Validation,
-			"rental.spend_cap_required",
-			"rented execution requires a positive rentals.max_hourly_spend_usd")
-	}
+func (s *Server) recordSubmission(spec orchestrator.Submission) (records.Request, bool, *exit.Error) {
 	s.shutdownAdmission.RLock()
 	defer s.shutdownAdmission.RUnlock()
 	if s.shuttingDown {

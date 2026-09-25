@@ -346,7 +346,6 @@ func TestDaemonDownFencesConcurrentMachineIntake(t *testing.T) {
 			}()
 			var starts atomic.Int32
 			o := hostOwner(t, "shutdown-intake", func(options *orchestrator.Options) {
-				options.Cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
 				options.StartMachineExecution = func(records.Request) *exit.Error {
 					starts.Add(1)
 					if !beforeCommit {
@@ -356,7 +355,6 @@ func TestDaemonDownFencesConcurrentMachineIntake(t *testing.T) {
 					return nil
 				}
 			})
-			o.cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
 			fatal(t, o.store.RecordRental(records.Rental{ID: "pr-shutdown-race", MachineName: "heron", AcceleratorModel: "CPU", AcceleratorCount: 1, State: "ready", HourlyRateUSDMicros: 1, Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1"}))
 			const token = "shutdown-intake-fixture"
 			resolver := shutdownRaceResolver{}

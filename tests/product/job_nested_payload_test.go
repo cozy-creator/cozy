@@ -22,8 +22,7 @@ func (nestedPayloadResolver) ResolveRemoteJob(pkg, release, function string, mod
 }
 
 func TestJobNestedPayloadIsCanonicalBeforeIdentity(t *testing.T) {
-	o := hostOwner(t, "nested-job-payload", func(options *orchestrator.Options) { options.Cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000 })
-	o.cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
+	o := hostOwner(t, "nested-job-payload")
 	fatal(t, o.store.RecordRental(records.Rental{ID: "nested-rental", MachineName: "nested-host", SKU: "cpu", AcceleratorModel: "CPU", State: "ready", Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1", AcceleratorCount: 1, HourlyRateUSDMicros: 1}))
 	const bearer = "nested-payload-test"
 	handler, problem := api.New(api.Options{Orchestrator: o.c, Cfg: o.cfg, Creds: api.Credentials{CLI: secret.New(bearer)}, Addr: "127.0.0.1:11111", Web: http.NotFoundHandler(), Packages: nestedPayloadResolver{}, MachineExecutions: publishedRouteObserver{}}).Handler()
