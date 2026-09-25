@@ -650,6 +650,21 @@ func oddGPUNote(gpus int) string {
 // beside the card rather than in a column of its own: `4x NVIDIA H100 80GB HBM3` is one
 // machine with four cards, and the VRAM figure next to it stays the ONE-CARD figure,
 // which is the number that decides fit (every rank of a group holds the full weights).
+// gpuCount is the rental's recorded GPU count; a CPU rental or an unreported count has none.
+func gpuCount(model string, count int) (int, bool) {
+	if count <= 0 || strings.EqualFold(strings.TrimSpace(model), "cpu") {
+		return 0, false
+	}
+	return count, true
+}
+
+func gpuCell(model string, count int) string {
+	if gpus, ok := gpuCount(model, count); ok {
+		return strconv.Itoa(gpus)
+	}
+	return "—"
+}
+
 func acceleratorLabel(model string, count int) string {
 	name := acceleratorName(model)
 	if count > 1 {
@@ -956,16 +971,16 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 	rows, unrecorded := inventory.Rentals, inventory.Unrecorded
 	list := output.List{
 		Name:   "rentals",
-		Fields: []string{"machine", "sku", "state", "$/hour", "uptime", "running", "queued", "idle"},
-		AllFields: []string{"machine", "sku", "state", "$/hour", "failure", "uptime", "running", "queued", "idle",
+		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "uptime", "running", "queued", "idle"},
+		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "failure", "uptime", "running", "queued", "idle",
 			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
 			"idle_since", "release_due", "image", "provider", "provider resource",
 			"provider host", "provider state", "container state"},
 		// The machine document carries the underlying facts, never the table's
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
-		TypedFields: []string{"machine", "sku", "state", "rental_id", "rented_at",
+		TypedFields: []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at"},
-		TypedAllFields: []string{"machine", "sku", "state", "rental_id", "bought_for",
+		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
 			"hourly_rate_usd_micros", "failure_code", "base_worker_image_digest",
@@ -1005,7 +1020,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			idleText = idleClock(time.Since(since)) + " / " + idleClock(due.Sub(since))
 		}
 		list.Rows = append(list.Rows, map[string]string{
-			"machine": r.MachineName, "sku": orNone(r.SKU),
+			"machine": r.MachineName, "sku": orNone(r.SKU), "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
 			"state": humanRentalState(r.State), "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(activity.Running), "queued": strconv.Itoa(activity.Queued),
 			"idle":   idleText,
@@ -1025,6 +1040,9 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			"running": activity.Running, "queued": activity.Queued,
 			"hourly_rate_usd_micros": r.HourlyRateUSDMicros,
 			"accelerator_count":      r.AcceleratorCount,
+		}
+		if gpus, ok := gpuCount(r.AcceleratorModel, r.AcceleratorCount); ok {
+			typed["gpus"] = gpus
 		}
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
@@ -1047,8 +1065,8 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		list.TypedRows = append(list.TypedRows, typed)
 	}
 	if haveFailure {
-		list.Fields = []string{"machine", "sku", "state", "$/hour", "failure", "uptime", "running", "queued", "idle"}
-		list.TypedFields = []string{"machine", "sku", "state", "rental_id", "rented_at",
+		list.Fields = []string{"machine", "sku", "gpus", "state", "$/hour", "failure", "uptime", "running", "queued", "idle"}
+		list.TypedFields = []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at", "failure_code"}
 	}
 	// THE HUB'S HALF (cl-199, on th-199). Everything above is what this host FILED, and
@@ -1063,9 +1081,12 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			// bought. The card is what the SKU column exists to tell a reader — the
 			// difference between an H100 and a 4090 is the difference between $3.19 and
 			// $0.74 an hour — so the cell carries the card rather than a dash.
-			"machine": seen.MachineName,
-			"sku":     orNone(acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount)),
-			"state":   humanRentalState(seen.State),
+			"machine": either(seen.MachineName, seen.ID),
+			"sku":     orNone(acceleratorName(seen.AcceleratorModel)),
+			"gpus":    gpuCell(seen.AcceleratorModel, seen.AcceleratorCount),
+			// Billed to this account, attached to another Creator home: its work is not
+			// observable here, which the RUNNING/QUEUED dashes also say.
+			"state":   humanRentalState(seen.State) + " (other client)",
 			"failure": "—", "uptime": rentalUptime(seen.RentedAt),
 			"running": "—", "queued": "—", "idle": "—",
 			"rental": seen.ID, "bought for": "—",
@@ -1080,6 +1101,9 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			"machine": seen.MachineName, "state": seen.State, "rental_id": seen.ID,
 			"hourly_rate_usd_micros": seen.HourlyRateUSDMicros,
 			"accelerator_count":      seen.AcceleratorCount, "recorded": false,
+		}
+		if gpus, ok := gpuCount(seen.AcceleratorModel, seen.AcceleratorCount); ok {
+			typed["gpus"] = gpus
 		}
 		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,
 			"address": seen.Address, "media_address": seen.MediaAddress,
@@ -1110,7 +1134,8 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 	for _, op := range inventory.Pending {
 		machine := op.MachineName
 		list.Rows = append(list.Rows, map[string]string{
-			"machine": machine, "sku": orNone(op.SKU), "state": humanRentalState(op.State),
+			"machine": machine, "sku": orNone(op.SKU), "gpus": gpuCell(op.AcceleratorModel, op.AcceleratorCount),
+			"state":   humanRentalState(op.State),
 			"failure": "—", "uptime": rentalUptime(op.RentedAt), "running": "0", "queued": "0",
 			"idle": "—", "rental": orNone(op.ID), "bought for": orNone(op.BoughtFor),
 			"accelerator": "—", "address": "", "media": "", "hub": op.Hub,

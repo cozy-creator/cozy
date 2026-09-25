@@ -82,7 +82,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 			t.Fatalf("live board did not emit terminal restoration %q\n%q", control, tty)
 		}
 	}
-	if !regexp.MustCompile(`MACHINE\s+SKU\s+STATE\s+\$/HOUR\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(tty) {
+	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(tty) {
 		t.Fatalf("the board does not carry the ruled columns\n%q", tty)
 	}
 	if strings.Count(tty, "\x1b[H\x1b[J") < 5 {
@@ -92,12 +92,12 @@ func TestRentalListLiveBoard(t *testing.T) {
 		!strings.Contains(tty, "Current spend per hour: $0.1") {
 		t.Fatalf("the board lost the fleet spend header\n%q", tty)
 	}
-	acquiring := regexp.MustCompile(`sparrow\s+cpu\s+acquiring`).FindStringIndex(tty)
-	ready := regexp.MustCompile(`sparrow\s+cpu\s+ready`).FindStringIndex(tty)
+	acquiring := regexp.MustCompile(`sparrow\s+cpu\s+—\s+acquiring`).FindStringIndex(tty)
+	ready := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready`).FindStringIndex(tty)
 	if acquiring == nil || ready == nil || acquiring[0] >= ready[0] {
 		t.Fatalf("the board did not redraw acquiring→ready in order\n%q", tty)
 	}
-	busy := regexp.MustCompile(`sparrow\s+cpu\s+ready\s+\$0\.10\s+\S+\s+0\s+1\s+-`).FindStringIndex(tty)
+	busy := regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+\S+\s+0\s+1\s+-`).FindStringIndex(tty)
 	if busy == nil {
 		t.Fatalf("queued work did not blank the idle countdown\n%q", tty)
 	}
@@ -122,7 +122,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if code != 0 || strings.ContainsAny(listed, "\r\x1b") {
 		t.Fatalf("piped snapshot carries terminal control bytes [exit %d]\n%q", code, listed)
 	}
-	if !regexp.MustCompile(`MACHINE\s+SKU\s+STATE\s+\$/HOUR\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(listed) ||
+	if !regexp.MustCompile(`MACHINE\s+SKU\s+GPUS\s+STATE\s+\$/HOUR\s+UPTIME\s+RUNNING\s+QUEUED\s+IDLE`).MatchString(listed) ||
 		!strings.Contains(listed, "Remote machines running: 1") ||
 		!strings.Contains(listed, "Idle machines shut down after 15 minutes.") {
 		t.Fatalf("piped snapshot lost the ruled surface\n%s", listed)
