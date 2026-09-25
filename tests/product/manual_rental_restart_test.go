@@ -237,7 +237,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		op, _, problem := store.BeginRentalOperation(records.RentalOperation{
 			Key: "manual-restart", Hub: hub.URL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 1,
 		}, func(name string) ([]byte, string, *exit.Error) {
-			body, problem := hubapi.RentalRequestBytes(name, "cpu", 1, secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil)
+			body, problem := hubapi.RentalRequestBytes(name, "cpu", 1, secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil, "")
 			return body, fmt.Sprintf("sha256:%x", sha256.Sum256(body)), problem
 		})
 		fatal(t, problem)

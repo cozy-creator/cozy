@@ -504,12 +504,16 @@ cozy rental new h100-sxm5-80gb --gpus 2   # one machine with 2 GPUs; keep counts
 cozy rental new h100-sxm5-80gb --model paul/minimax-h3@1.0.0/bf16
 cozy rental new h100-sxm5-80gb \
   --idempotency-key <unique-key>
+cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candidate image
 
 cozy rental list                   # current rented machines, live on a terminal
 cozy run org/package/generate --rental=otter prompt="moonlit lake"
 cozy rental end otter
 ```
 
+A GPU machine boots the hub's current `cuda` image and the `cpu` machine its current `cpu-torch`
+image. `--image` boots one other image registered with the hub instead (tag, digest, or kind), for
+testing a candidate without changing any default; `cozy rental list --json` shows each rental's image.
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
 reads RunPod SKU names or provider prices. `cozy run` is local-only by default, while
 `--rental=<name-or-id>` uses only the selected existing rental. It does not permit a

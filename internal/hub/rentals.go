@@ -222,8 +222,8 @@ func (w wireRental) rental() Rental {
 }
 
 // RentalRequest is the closed provider-neutral product intent. Provider,
-// datacenter, offer, image, cache volume, disk, and ports do not have fields
-// here: Tensorhub resolves and selects them.
+// datacenter, offer, cache volume, disk, and ports do not have fields here:
+// Tensorhub resolves and selects them.
 type RentalDevelopment struct {
 	SSHPublicKey string `json:"ssh_public_key"`
 }
@@ -235,6 +235,9 @@ type RentalRequest struct {
 	AcceleratorCount int                `json:"accelerator_count"`
 	MediaTokenSHA256 string             `json:"media_token_sha256"`
 	CreatorPublicKey string             `json:"creator_public_key"`
+	// Image names one worker image registered with the hub (digest, tag, or
+	// kind) in place of the machine's default; empty boots the default.
+	Image string `json:"image,omitempty"`
 	// PlannedSourceBytes declares the workload this pod is being bought FOR, so
 	// the hub can size its container disk to the job instead of to one constant
 	// baked into the worker image (th-152). Omitted for a serving rental, whose
@@ -290,7 +293,7 @@ const maxServingModels = 32
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
 func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPublicKey string,
-	workload DeclaredWorkload, development *RentalDevelopment,
+	workload DeclaredWorkload, development *RentalDevelopment, image string,
 ) ([]byte, *exit.Error) {
 	req := RentalRequest{
 		Development:        development,
@@ -301,6 +304,10 @@ func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPub
 		CreatorPublicKey:   strings.TrimSpace(creatorPublicKey),
 		PlannedSourceBytes: workload.SourceBytes,
 		ServingModels:      canonicalServingModels(workload.ServingModels),
+		Image:              image,
+	}
+	if len(image) > 512 || strings.TrimSpace(image) != image || strings.ContainsAny(image, " \t\r\n\x00") {
+		return nil, exit.Usagef("--image names one registered worker image by digest, tag, or kind")
 	}
 	if development != nil && (len(development.SSHPublicKey) == 0 || len(development.SSHPublicKey) > 8192 || strings.TrimSpace(development.SSHPublicKey) != development.SSHPublicKey || strings.ContainsAny(development.SSHPublicKey, "\r\n\x00")) {
 		return nil, exit.Usagef("development requires one bounded SSH public-key line")
@@ -350,7 +357,7 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 	}
 	canonical, problem := RentalRequestBytes(req.Name, req.SKU, req.AcceleratorCount, req.MediaTokenSHA256,
 		req.CreatorPublicKey, DeclaredWorkload{SourceBytes: req.PlannedSourceBytes,
-			ServingModels: req.ServingModels}, req.Development)
+			ServingModels: req.ServingModels}, req.Development, req.Image)
 	if problem != nil || !bytes.Equal(canonical, raw) {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
 			"persisted rental intent is not its exact canonical request")

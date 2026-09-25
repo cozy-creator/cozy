@@ -160,3 +160,22 @@ func handleRentalSSHInfo(ctx *Context) *exit.Error {
 	}
 	return emit(ctx, compactRecord([]output.Field{{K: "rental", V: row.ID}, {K: "machine", V: row.MachineName}, {K: "ssh_address", V: remote.SSHAddress}, {K: "host", V: host}, {K: "port", V: number}, {K: "user", V: "root"}, {K: "worker_boot_id", V: remote.WorkerBootID}}, "machine", "ssh_address"))
 }
+
+// rentalImage is the registered worker image `--image` names in place of the
+// machine's default. A recorded acquisition keeps the image it was asked with.
+func rentalImage(ctx *Context, existing *records.RentalOperation) (string, *exit.Error) {
+	image := strings.TrimSpace(ctx.Inv.Value("--image"))
+	if existing == nil {
+		return image, nil
+	}
+	req, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
+	if problem != nil {
+		return "", problem
+	}
+	if image != "" && image != req.Image {
+		return "", exit.Named(exit.Conflict, "rental.idempotency_conflict",
+			"rental operation already names worker image %q", req.Image).
+			WithRemedy("resume without --image or use a new operation key")
+	}
+	return req.Image, nil
+}

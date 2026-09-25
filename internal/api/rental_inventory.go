@@ -40,24 +40,27 @@ func (inventory RentalInventory) Current() RentalInventory {
 }
 
 type RentalSummary struct {
-	ID                  string            `json:"rental_id"`
-	MachineName         string            `json:"machine"`
-	SKU                 string            `json:"sku,omitempty"`
-	State               string            `json:"state"`
-	AcceleratorModel    string            `json:"accelerator,omitempty"`
-	AcceleratorCount    int               `json:"accelerator_count"`
-	HourlyRateUSDMicros int64             `json:"hourly_rate_usd_micros"`
-	Address             string            `json:"address,omitempty"`
-	MediaAddress        string            `json:"media_address,omitempty"`
-	Hub                 string            `json:"hub,omitempty"`
-	RentedAt            string            `json:"rented_at,omitempty"`
-	ReadyAt             string            `json:"ready_at,omitempty"`
-	BoughtFor           string            `json:"bought_for,omitempty"`
-	Activity            *RentalActivity   `json:"activity,omitempty"`
-	Operation           string            `json:"operation,omitempty"`
-	ProviderState       string            `json:"provider_state,omitempty"`
-	ContainerState      string            `json:"container_state,omitempty"`
-	Failure             hub.RentalFailure `json:"failure"`
+	ID                  string          `json:"rental_id"`
+	MachineName         string          `json:"machine"`
+	SKU                 string          `json:"sku,omitempty"`
+	State               string          `json:"state"`
+	AcceleratorModel    string          `json:"accelerator,omitempty"`
+	AcceleratorCount    int             `json:"accelerator_count"`
+	HourlyRateUSDMicros int64           `json:"hourly_rate_usd_micros"`
+	Address             string          `json:"address,omitempty"`
+	MediaAddress        string          `json:"media_address,omitempty"`
+	Hub                 string          `json:"hub,omitempty"`
+	RentedAt            string          `json:"rented_at,omitempty"`
+	ReadyAt             string          `json:"ready_at,omitempty"`
+	BoughtFor           string          `json:"bought_for,omitempty"`
+	Activity            *RentalActivity `json:"activity,omitempty"`
+	Operation           string          `json:"operation,omitempty"`
+	ProviderState       string          `json:"provider_state,omitempty"`
+	ContainerState      string          `json:"container_state,omitempty"`
+	// The worker image the hub froze for this rental, from its live listing.
+	BaseWorkerImageDigest string            `json:"base_worker_image_digest,omitempty"`
+	BaseWorkerImageTag    string            `json:"base_worker_image_tag,omitempty"`
+	Failure               hub.RentalFailure `json:"failure"`
 }
 
 // Activity is absent for machines known only to the Hub: this daemon cannot

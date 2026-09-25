@@ -42,6 +42,10 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 	if problem != nil {
 		return result, problem
 	}
+	live := make(map[string]hub.Rental, len(fleet.live))
+	for _, seen := range fleet.live {
+		live[seen.ID] = seen
+	}
 	attached := make(map[string]bool, len(rows))
 	for _, row := range rows {
 		attached[row.ID] = true
@@ -62,6 +66,8 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 				ProviderHostID: row.Failure.ProviderHostID, ProviderState: row.Failure.ProviderState,
 				ContainerState: row.Failure.ContainerState,
 			},
+			BaseWorkerImageDigest: live[row.ID].BaseWorkerImageDigest,
+			BaseWorkerImageTag:    live[row.ID].BaseWorkerImageTag,
 		}
 		if idle.PendingPreparation > fleet.preparing[row.ID] {
 			summary.Activity = nil
@@ -81,6 +87,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 			HourlyRateUSDMicros: seen.HourlyRateUSDMicros, Address: seen.Address,
 			MediaAddress: seen.MediaAddress, Hub: fleet.ctx.Cfg.HubURL, RentedAt: seen.CreatedAt,
 			ProviderState: seen.ProviderState, ContainerState: seen.ContainerState,
+			BaseWorkerImageDigest: seen.BaseWorkerImageDigest, BaseWorkerImageTag: seen.BaseWorkerImageTag,
 		})
 	}
 	open, problem := st.ActiveRentalOperations()
