@@ -115,7 +115,13 @@ fn companion_intent_resumes_and_published_checkpoint_checks_out_real_files() {
 #[test]
 fn ordinary_companions_survive_derivation_without_copying_tensor_backing_files() {
     let (store, meta, id) = fixture();
-    let writer = begin(&store, &meta, &id, 1, declaration(), None).unwrap();
+    let mut source_declaration = declaration();
+    // Same exact ObjectRef as the tensor: the named asset role must survive deduplication.
+    source_declaration
+        .files
+        .push(("Tensor-shaped.txt".into(), vec![0x31; 2048]));
+    source_declaration.max_new_bytes += 2048;
+    let writer = begin(&store, &meta, &id, 1, source_declaration, None).unwrap();
     let part = write_weight(&store, &meta, &id);
     let source = commit(&store, &meta, &id, 1).unwrap();
     release(&meta, writer);
@@ -156,7 +162,12 @@ fn ordinary_companions_survive_derivation_without_copying_tensor_backing_files()
             .iter()
             .map(|(n, _)| n.as_str())
             .collect::<Vec<_>>(),
-        ["LICENSE", "Notice", "model.cozytensors"]
+        [
+            "LICENSE",
+            "Notice",
+            "Tensor-shaped.txt",
+            "model.cozytensors"
+        ]
     );
     assert!(derived.added_objects.is_empty());
     let header = checkpoint::load_header(&store, &derived.header).unwrap();

@@ -29,7 +29,8 @@ file. Streaming larger assets is outside this bounded metadata API.
 
 TensorFS inherits existing ordinary companions by exact reference from source
 checkpoints. Header/tensor backing objects listed redundantly as ordinary source
-files are excluded. Equal multi-source names and contents deduplicate; differing
+files are excluded unless that same path is a declared header asset with matching content.
+An explicit asset role survives byte deduplication with tensor data. Equal multi-source names and contents deduplicate; differing
 contents at one name require an explicitly declared replacement. Tensor parts retain
 the same references. The source manifest remains the authority for the inherited
 file set; no global cache path or network lookup enters the derivation.

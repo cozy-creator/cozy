@@ -959,7 +959,15 @@ fn companion_files(
         backing.insert((source.fact.header.sha256.clone(), source.fact.header.length));
         for (path, entry) in source.manifest.entries() {
             let Entry::File(object) = entry else { continue };
-            if backing.contains(&(object.sha256.clone(), object.length))
+            // A named asset is an explicit semantic role, even when CAS deduplication
+            // makes its bytes identical to a tensor part. Only unindexed backing aliases
+            // disappear from the derived manifest.
+            let named_asset = source.header.assets.iter().any(|(name, asset)| {
+                name == path
+                    && asset.logical_sha256 == object.sha256
+                    && asset.logical_length == object.length
+            });
+            if (backing.contains(&(object.sha256.clone(), object.length)) && !named_asset)
                 || explicit.contains(path.as_str())
             {
                 continue;
