@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,8 @@ class PublishedRuntimeUpdates(unittest.TestCase):
     def setUp(self):
         self.module = runpy.run_path(str(MODULE))
         self.api = self.module["resolve"].__globals__
+        self.discover_python = self.api["worker_python"]
+        self.api["worker_python"] = lambda arguments: "/opt/cozy/python/bin/python3"
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
@@ -111,7 +114,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
             self.resolve()
 
     def test_plan_records_verified_pair_and_unchanged_readback(self):
-        self.api["inspect"] = lambda arguments: self.observed
+        self.api["inspect"] = lambda arguments, python=None: self.observed
         request = {"ssh_arguments": [], "action": "plan", "directory": str(self.directory)}
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
             plan = self.api["main"]()
@@ -186,12 +189,33 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         local = self.local()
         _, wheels = self.api["resolve"](self.observed, self.directory, local)
         Path(wheels[0]["path"]).write_bytes(b"changed after plan")
-        self.api["inspect"] = lambda arguments: self.observed
+        self.api["inspect"] = lambda arguments, python=None: self.observed
         request = {"ssh_arguments": [], "action": "apply", "directory": str(self.directory),
                    "stage": "a" * 32, "selection": {"wheels": wheels}}
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
             with self.assertRaisesRegex(ValueError, "changed after verification"):
                 self.api["main"]()
+
+    def test_python_selection_supports_both_fixed_image_layouts(self):
+        previous = self.directory / "previous-python"
+        current = self.directory / "current-python"
+        current.write_text("#!/bin/sh\nexit 0\n")
+        current.chmod(0o700)
+        self.api["WORKER_PYTHONS"] = (str(previous), str(current))
+        self.api["ssh"] = lambda arguments, command: subprocess.check_output(
+            ["/bin/sh", "-c", command], text=True
+        )
+        self.assertEqual(self.discover_python([]), str(current))
+        previous.write_text("#!/bin/sh\nexit 0\n")
+        previous.chmod(0o700)
+        self.assertEqual(self.discover_python([]), str(previous))
+        previous.chmod(0o600)
+        self.assertEqual(self.discover_python([]), str(current))
+
+    def test_python_selection_rejects_an_unexpected_response(self):
+        self.api["ssh"] = lambda arguments, command: "/tmp/untrusted-python"
+        with self.assertRaisesRegex(ValueError, "supported SDK interpreter"):
+            self.discover_python([])
 
     def test_probe_does_not_rely_on_ssh_path(self):
         calls = []
