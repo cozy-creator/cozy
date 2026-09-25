@@ -175,6 +175,9 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 	if problem != nil {
 		return fail(problem)
 	}
+	if problem := selectCapturedHubIndexes(root); problem != nil {
+		return fail(problem)
+	}
 	command := exec.CommandContext(ctx, "uv", "lock", "--no-progress", "--python", python.Executable, "--no-python-downloads")
 	command.Dir = root
 	command.Env = config.Frozen().Tool()

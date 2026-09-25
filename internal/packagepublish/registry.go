@@ -62,11 +62,15 @@ type exactDependency struct {
 }
 
 func collectRegistryRows(ctx context.Context, project, stage, organization string, existing []DependencyWheel, selected hostruntime.PythonInterpreter) ([]RegistryRow, *exit.Error) {
+	indexes, problem := selectedHubIndexes(project, true)
+	if problem != nil {
+		return nil, problem
+	}
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-default-groups", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project,
 		"--python", selected.Executable, "--no-python-downloads"}
-	command := exec.CommandContext(ctx, "uv", args...)
+	command := exec.CommandContext(ctx, "uv", append(args, indexes...)...)
 	command.Env = config.Frozen().Tool("UV_PYTHON_DOWNLOADS=never")
 	output, err := command.CombinedOutput()
 	if err != nil {

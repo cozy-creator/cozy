@@ -151,3 +151,48 @@ The production image may advertise only Python 3.12. A local 3.13 or 3.14
 capture cannot rent that image; additional executors must already be present
 and advertised. Interface generator ABI 7 declares Python >=3.12, independently
 of the Runtime execution window.
+
+### Selecting a development Tensorhub index
+
+Keep ordinary uv metadata pointed at the canonical organization index:
+
+```toml
+[tool.cozy]
+organization = "paul"
+
+[tool.uv.sources]
+qwen-image-2 = { index = "tensorhub-paul" }
+
+[[tool.uv.index]]
+name = "tensorhub-paul"
+url = "https://tensorhub.com/v1/index/paul/simple/"
+explicit = true
+```
+
+For a development Hub, copy the project into an owned staging directory. In that
+copy, change only the organization index URL to
+`http://127.0.0.1:8819/v1/index/paul/simple/`, retaining `explicit = true` and all
+other settings. Run ordinary `uv lock` in the copy, review the resulting lock, and
+copy that reviewed `uv.lock` back to the authored project. Then run:
+
+```sh
+cozy package publish --tensorhub=http://127.0.0.1:8819
+```
+
+Do not use `uv lock --index name=url` for this preparation: qualified uv versions
+replace the index settings and lose `explicit = true`. The owned-copy workflow
+preserves the boundary between named dependencies and the public default index.
+
+Standard uv records the selected index and exact artifact URLs/hashes in `uv.lock`;
+the pyproject stays canonical, while the lock honestly identifies the selected Hub.
+Publication passes the matching named-index override to `uv export --locked` and
+refuses a different-Hub or stale lock. It never silently relocks or rewrites either
+file. Moving to production requires explicitly locking against production and
+reviewing that change. No separate Cozy lock command is needed.
+
+Only explicitly named canonical Tensorhub indexes for the project's own declared
+organization are overridden. PyPI, other organizations, and third-party indexes
+retain their existing behavior and validation. For owned editable-package or client-script captures, Cozy changes only the
+recognized URL in the owned pyproject before locking, preserving `explicit` and
+other index settings; authored files remain unchanged. Index selection does not expand the child environment allowlist
+or forward Hub credentials to uv.

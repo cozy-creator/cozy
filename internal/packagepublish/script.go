@@ -140,6 +140,9 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 			return nil, exit.Internalf("cannot stage script project: %s", err)
 		}
 	}
+	if problem := selectCapturedHubIndexes(root); problem != nil {
+		return nil, problem
+	}
 	cmd := exec.CommandContext(ctx, "uv", "lock", "--no-progress", "--python", selected.Executable, "--no-python-downloads")
 	cmd.Dir, cmd.Env = root, config.Frozen().Tool()
 	var output strings.Builder
