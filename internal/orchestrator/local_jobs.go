@@ -54,7 +54,7 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 		return nil, result.fault
 	}
 	if result.refusal != "" {
-		return nil, exit.Named(exit.Structural, "worker.prepare_refused", "unpublished package job preparation refused: %s", result.refusal)
+		return nil, exit.Named(exit.Structural, "worker.prepare_refused", "unpublished package job preparation refused: %s", result.refusal).WithCause(result.code)
 	}
 	if result.err != nil || result.set == nil {
 		return nil, exit.Unavailablef("unpublished package job preparation ended before its exact result")
@@ -84,7 +84,7 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 			return nil, result.fault
 		}
 		if result.refusal != "" {
-			return nil, exit.Named(exit.Structural, "worker.prepare_refused", "unpublished package job model preparation refused: %s", result.refusal)
+			return nil, exit.Named(exit.Structural, "worker.prepare_refused", "unpublished package job model preparation refused: %s", result.refusal).WithCause(result.code)
 		}
 		if result.err != nil || result.set == nil {
 			return nil, exit.Unavailablef("unpublished package job model preparation ended before its exact result")

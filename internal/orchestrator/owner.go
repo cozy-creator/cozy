@@ -198,8 +198,7 @@ func (c *Orchestrator) refusePendingDesiredState(w *worker, err error) bool {
 	}
 	detail := refusalDetail(err)
 	w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
-		"worker rejected desired revision %d before applying it: %s",
-		w.revision, detail)
+		"%s (the worker refused desired revision %d before applying it)", detail, w.revision)
 	revision := w.revision
 	c.mu.Unlock()
 	c.logf("worker %s: desired revision %d REFUSED before it was applied: %s",

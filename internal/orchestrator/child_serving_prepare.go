@@ -87,7 +87,7 @@ func (c *Orchestrator) prepareChildServing(instance string, req records.Request,
 				return result.fault
 			}
 			if result.refusal != "" {
-				return exit.Named(exit.Structural, "worker.prepare_refused", "%s", result.refusal)
+				return exit.Named(exit.Structural, "worker.prepare_refused", "%s", result.refusal).WithCause(result.code)
 			}
 			return exit.Unavailablef("child model preparation awaits its exact result")
 		}

@@ -38,11 +38,12 @@ const (
 
 // Error is the stable, machine-readable failure carried by a Result.
 type Error struct {
-	Class   Class    `json:"class"`
-	Code    string   `json:"code"`
-	Message string   `json:"message"`
-	Remedy  string   `json:"remedy,omitempty"`
-	Next    []string `json:"-"`
+	Class   Class          `json:"class"`
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Remedy  string         `json:"remedy,omitempty"`
+	Details map[string]any `json:"details,omitempty"`
+	Next    []string       `json:"-"`
 }
 
 func (e *Error) Error() string {

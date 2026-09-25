@@ -708,19 +708,19 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		return output.List{}, problem
 	}
 	list := output.List{
-		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution"},
+		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution", "reason"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
 			"progress", "phase", "progress_stage", "stage_fraction", "overall_fraction",
-			"position", "total", "queued", "execution", "attempts", "created"},
+			"position", "total", "queued", "execution", "attempts", "created", "reason"},
 		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
-			"remaining_ms", "execution_ms"},
+			"remaining_ms", "execution_ms", "error_type", "error_code", "error"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
-			"created_at"},
+			"created_at", "error_type", "error_code", "error", "triage"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
 		// human table never does — the human word is the MACHINE column (cl-107).
@@ -758,6 +758,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 			"queued":           seconds(life.QueuedMS),
 			"execution":        seconds(life.ExecutionMS),
 			"attempts":         strconv.Itoa(life.Attempts), "created": life.CreatedAt,
+			"reason": failureReason(life),
 		})
 		typed := map[string]any{
 			"number": life.Number, "id": life.RequestID, "kind": kind,
@@ -805,6 +806,15 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		if life.CanceledBy != "" {
 			typed["canceled_by"] = life.CanceledBy
 		}
+		for key, value := range map[string]string{"error_type": life.ErrorType,
+			"error_code": life.ErrorCode, "error": life.Error} {
+			if value != "" {
+				typed[key] = value
+			}
+		}
+		if life.Triage != nil {
+			typed["triage"] = life.Triage
+		}
 		// Stage, position and ETA describe live execution. Terminal rows retain only
 		// the API's overall fraction: completed=1, otherwise the last measured value.
 		if life.Status == "in_progress" {
@@ -840,6 +850,21 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	}
 	return list, nil
 }
+
+// failureReason is the list cell for a run that ended without its result: the recorded
+// cause, cut to one line. `cozy run watch <number>` shows it whole.
+func failureReason(life api.Lifecycle) string {
+	if life.Error == "" || life.Status == "completed" || life.Status == "in_progress" || life.Status == "queued" {
+		return ""
+	}
+	reason := strings.Join(strings.Fields(life.Error), " ")
+	if runes := []rune(reason); len(runes) > failureReasonCell {
+		reason = string(runes[:failureReasonCell-1]) + "…"
+	}
+	return reason
+}
+
+const failureReasonCell = 72
 
 func fractionValue(value *float64) string {
 	if value == nil {
@@ -2027,14 +2052,16 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		humanStatus = humanCancellationStatus(life.CanceledBy)
 	}
 	e := exit.Named(code, status, "request %s ended %s", life.RequestID, humanStatus)
-	errType, why := life.ErrorType, life.Error
+	errType, errCode, why := life.ErrorType, life.ErrorCode, life.Error
 	if why == "" && terminal != nil {
 		// A request that failed BEFORE ANY ATTEMPT has no attempt row to carry a cause —
 		// an unplaceable pin, a credential the orchestrator refused to read, a worker that
 		// could not be started. Its reason exists on the terminal EVENT and nowhere else,
 		// and dropping it left the client with "ended failed" and no way to learn why.
-		errType, why = eventText(terminal, "error_type"), eventText(terminal, "error")
+		errType, errCode, why = eventText(terminal, "error_type"), eventText(terminal, "error_code"), eventText(terminal, "error")
 	}
+	e.Cause = errCode
+	e.Details = failureDetails(ctx, life, errType, errCode, why, terminal)
 	if why != "" {
 		e.Message = fmt.Sprintf("request %s ended %s: %s — %s",
 			life.RequestID, humanStatus, errType, why)
@@ -2050,6 +2077,52 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		e.WithRemedy("%s", triageRemedy(ctx, life.Triage, terminal))
 	}
 	return e
+}
+
+// failureDetails is the whole recorded failure for machine readers: the run, its typed
+// cause, and the triage bundle itself when one was kept.
+func failureDetails(ctx *Context, life api.Lifecycle, errType, errCode, why string,
+	terminal *localapi.Event,
+) map[string]any {
+	details := map[string]any{"number": life.Number, "request_id": life.RequestID, "status": life.Status}
+	for key, value := range map[string]string{"error_type": errType, "error_code": errCode,
+		"error": why, "canceled_by": life.CanceledBy, "machine": life.Machine} {
+		if value != "" {
+			details[key] = value
+		}
+	}
+	if life.Triage == nil {
+		return details
+	}
+	triage := map[string]any{"subject_id": life.Triage.SubjectID, "attempt_key": life.Triage.AttemptKey,
+		"kept": life.Triage.Kept, "length": life.Triage.Length}
+	details["triage"] = triage
+	if !life.Triage.Kept {
+		if fault := eventText(terminal, "triage_fault"); fault != "" {
+			triage["fault"] = fault
+		}
+		return details
+	}
+	if !ctx.Mode().JSON {
+		return details // the human remedy quotes the bundle's traceback instead
+	}
+	c, problem := dial(ctx)
+	if problem != nil {
+		triage["unreadable"] = problem.Message
+		return details
+	}
+	data, problem := c.Triage(life.Triage.AttemptKey)
+	if problem != nil {
+		triage["unreadable"] = problem.Message
+		return details
+	}
+	var bundle any
+	if err := json.Unmarshal(data, &bundle); err != nil {
+		triage["unreadable"] = "triage bundle is not JSON: " + err.Error()
+		return details
+	}
+	triage["bundle"] = bundle
+	return details
 }
 
 // triageRemedy names the one document that explains a failed attempt, and says so when

@@ -45,7 +45,7 @@ func (c *Orchestrator) PrepareRentalPackage(ctx context.Context, instance string
 		return result.fault
 	}
 	if result.refusal != "" {
-		return exit.Named(exit.Structural, "worker.prepare_refused", "%s", result.refusal)
+		return exit.Named(exit.Structural, "worker.prepare_refused", "%s", result.refusal).WithCause(result.code)
 	}
 	if result.err != nil {
 		return exit.Unavailablef("worker model preparation was interrupted: %s; repeat the same preparation to resume", result.err)

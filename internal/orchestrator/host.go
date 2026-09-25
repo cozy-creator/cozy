@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -157,10 +158,11 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 // hostPrepareResult is one preparation's end: the exact prepared set, the host's typed
 // refusal text, an inadmissible-document fault, or a transport end without a verdict.
 type hostPrepareResult struct {
-	set     *pb.DesiredPlacementSet
-	refusal string
-	fault   *exit.Error
-	err     error
+	set *pb.DesiredPlacementSet
+	// refusal is "<code>: <detail>"; code alone is the host's stable refusal code.
+	refusal, code string
+	fault         *exit.Error
+	err           error
 }
 
 // runHostPrepare opens one prepare stream and consumes it to its end, returning the
@@ -206,7 +208,7 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 			if event.SafeCode == "package_environment_dependency_base_conflict" {
 				return hostPrepareResult{fault: exit.Named(exit.Structural, "machine_execution.runtime_requirement", "%s", event.SafeDetail)}
 			}
-			return hostPrepareResult{refusal: event.SafeCode + ": " + event.SafeDetail}
+			return hostPrepareResult{refusal: event.SafeCode + ": " + event.SafeDetail, code: event.SafeCode}
 		case pb.PrepareStage_PREPARE_STAGE_PREPARED:
 			prepared := event.PlacementSet
 			if prepared == nil || !bytes.Equal(canonical.Digest(prepared.PlacementSetCanonicalBytes),
@@ -231,7 +233,7 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 func (c *Orchestrator) settleHostPrepare(s *session, w *worker, seq uint64, label string, result hostPrepareResult) bool {
 	switch {
 	case result.refusal != "":
-		c.hostPrepareRefused(s, w, seq, label, result.refusal)
+		c.hostPrepareRefused(s, w, seq, label, result.code, result.refusal)
 	case result.fault != nil:
 		c.setDesiredRefusal(w, seq, result.fault)
 	case result.err != nil:
@@ -242,6 +244,16 @@ func (c *Orchestrator) settleHostPrepare(s *session, w *worker, seq uint64, labe
 	}
 	return false
 }
+
+// runtimeErrorCode is a Runtime's own stable code for a failed call (`cozy-error-code`).
+func runtimeErrorCode(trailer metadata.MD) string {
+	if codes := trailer.Get("cozy-error-code"); len(codes) == 1 && safeCodeRE.MatchString(codes[0]) {
+		return codes[0]
+	}
+	return ""
+}
+
+var safeCodeRE = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
 
 // classifyPrepareEnd sorts a prepare stream's end into "no verdict, the reconnect re-issues"
 // and the host's typed verdict on this desire.
@@ -272,7 +284,8 @@ func classifyPrepareEnd(err error) hostPrepareResult {
 		// strand a paid pod on a network blip.
 		return hostPrepareResult{err: err}
 	default:
-		return hostPrepareResult{refusal: status.Convert(err).Message()}
+		answer := status.Convert(err)
+		return hostPrepareResult{refusal: fmt.Sprintf("%s (%s)", answer.Message(), answer.Code())}
 	}
 }
 
@@ -284,7 +297,7 @@ func classifyPrepareEnd(err error) hostPrepareResult {
 // credential aged out mid-transfer. The credential is deleted (owner ruling 2026-09-03),
 // so a download can no longer become unauthorized by running long, and the exception has
 // nothing left to except.
-func (c *Orchestrator) hostPrepareRefused(_ *session, w *worker, seq uint64, _, detail string) {
+func (c *Orchestrator) hostPrepareRefused(_ *session, w *worker, seq uint64, _, code, detail string) {
 	if len(detail) > 1024 {
 		detail = detail[:1024] + "…"
 	}
@@ -298,7 +311,7 @@ func (c *Orchestrator) hostPrepareRefused(_ *session, w *worker, seq uint64, _, 
 	}
 	revision := w.revision
 	w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
-		"worker rejected desired revision %d before applying it: %s", revision, detail)
+		"%s (the worker refused desired revision %d before applying it)", detail, revision).WithCause(code)
 	c.mu.Unlock()
 	c.logf("worker %s: desired revision %d REFUSED before it was applied: %s",
 		w.instanceID, revision, detail)

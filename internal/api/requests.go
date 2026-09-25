@@ -749,7 +749,10 @@ type Lifecycle struct {
 	ResponseURL      string                               `json:"response_url"`
 	Metrics          map[string]any                       `json:"metrics,omitempty"`
 	ErrorType        string                               `json:"error_type,omitempty"`
-	Error            string                               `json:"error,omitempty"`
+	// ErrorCode is the originating component's stable code (for example a pod's
+	// `insufficient_storage`) when the failure did not originate in Creator.
+	ErrorCode string `json:"error_code,omitempty"`
+	Error     string `json:"error,omitempty"`
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this daemon canceled on request.
@@ -844,6 +847,18 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) lifecycleOf(row records.Request) Lifecycle {
+	life := s.lifecycleFacts(row)
+	if life.Error == "" && (life.Status == "failed" || life.Status == "blocked") {
+		if errType, errCode, errText, problem := s.store.SettledFailure(row.ID); problem == nil {
+			life.ErrorType, life.ErrorCode, life.Error = errType, errCode, errText
+		} else {
+			life.ErrorType, life.Error = problem.ErrName(), problem.Message
+		}
+	}
+	return life
+}
+
+func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 	if link, problem := s.store.MachineExecution(row.ID); problem == nil && link != nil {
 		state := s.machineJobState(row, link)
 		machine := row.Machine

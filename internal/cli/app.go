@@ -346,6 +346,15 @@ func projectError(err error) *output.Error {
 	if problem.Remedy != "" {
 		out.WithRemedy(problem.Remedy)
 	}
+	out.Details = problem.Details
+	if problem.Cause != "" {
+		if out.Details == nil {
+			out.Details = map[string]any{}
+		}
+		if _, ok := out.Details["error_code"]; !ok {
+			out.Details["error_code"] = problem.Cause
+		}
+	}
 	return out.WithNext(problem.Next...)
 }
 
