@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"net/url"
 	"sort"
 	"strings"
 
@@ -14,82 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"github.com/pelletier/go-toml/v2"
 )
-
-type publishedDependency struct {
-	name, version string
-	digests       map[string]bool
-}
-
-// Only wheels actually selected in the parent's immutable plan can authorize
-// children. A same-named PyPI library is not a Tensorhub package dependency.
-func publishedDependencies(pkg string, plan hub.PackageDownloadPlan, locked []byte) ([]publishedDependency, *exit.Error) {
-	ref, problem := hub.ParseRef(pkg)
-	if problem != nil {
-		return nil, problem
-	}
-	document, problem := exactPackageInstallDocument("uv.lock", plan.UVLock)
-	if problem != nil {
-		return nil, problem
-	}
-	var lock struct {
-		Packages []struct {
-			Name    string `toml:"name"`
-			Version string `toml:"version"`
-			Source  struct {
-				Registry string `toml:"registry"`
-			} `toml:"source"`
-			Wheels []struct {
-				Hash string `toml:"hash"`
-			} `toml:"wheels"`
-		} `toml:"package"`
-	}
-	if err := toml.Unmarshal(document.Bytes, &lock); err != nil {
-		return nil, exit.New(exit.Structural, "published dependency lock is invalid")
-	}
-	selectedRows := map[string][]string{}
-	for _, line := range strings.Split(string(locked), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 || strings.HasPrefix(fields[0], "-") {
-			continue
-		}
-		selectedRows[fields[0]] = fields[1:]
-	}
-	selected := map[string]publishedDependency{}
-	for _, row := range lock.Packages {
-		index, err := url.Parse(row.Source.Registry)
-		if err != nil || index.User != nil || index.RawQuery != "" || index.Fragment != "" || (index.Scheme != "https" && index.Scheme != "http") || strings.Trim(index.Path, "/") != "v1/index/"+ref.Org+"/simple" {
-			continue
-		}
-		hashes := selectedRows[row.Name+"=="+row.Version]
-		if len(hashes) == 0 {
-			continue
-		}
-		allowed := map[string]bool{}
-		for _, wheel := range row.Wheels {
-			for _, hash := range hashes {
-				if hash == "--hash="+wheel.Hash {
-					allowed[wheel.Hash] = true
-				}
-			}
-		}
-		if len(allowed) == 0 {
-			return nil, exit.New(exit.Conflict, "published callable dependency differs from its locked wheel")
-		}
-		if _, duplicate := selected[row.Name]; duplicate {
-			return nil, exit.New(exit.Conflict, "published callable dependency is ambiguous")
-		}
-		selected[row.Name] = publishedDependency{ref.Org + "/" + row.Name, row.Version, allowed}
-
-	}
-	out := make([]publishedDependency, 0, len(selected))
-	for _, row := range selected {
-		out = append(out, row)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
-	return out, nil
-}
 
 func publishedPlanInterface(plan hub.PackageDownloadPlan) (*launch.PackageInterface, *exit.Error) {
 	document, problem := exactPackageInstallDocument("package interface", plan.PackageInterface)
@@ -132,28 +56,32 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 		visiting[key] = true
 		defer delete(visiting, key)
 		parent := nodes[key]
-		dependencies, problem := publishedDependencies(strings.SplitN(key, "@", 2)[0], parent.plan, parent.locked)
+		document, problem := exactPackageInstallDocument("uv.lock", parent.plan.UVLock)
+		if problem != nil {
+			return problem
+		}
+		dependencies, problem := install.PublishedDependencies(strings.SplitN(key, "@", 2)[0], document.Bytes, parent.locked)
 		if problem != nil {
 			return problem
 		}
 		for _, dependency := range dependencies {
-			childKey := dependency.name + "@" + dependency.version
+			childKey := dependency.Package + "@" + dependency.Version
 			child, known := nodes[childKey]
 			if !known {
-				ref, problem := hub.ParseRef(dependency.name)
+				ref, problem := hub.ParseRef(dependency.Package)
 				if problem != nil {
 					return problem
 				}
-				plan, problem := m.resolver.catalog.PackageDownloads(ctx, ref, dependency.version)
+				plan, problem := m.resolver.catalog.PackageDownloads(ctx, ref, dependency.Version)
 				if problem != nil {
 					return problem
 				}
-				if plan.Release != dependency.version {
+				if plan.Release != dependency.Version {
 					return exit.New(exit.Conflict, "published child release changed")
 				}
 				matched := false
 				for _, wheel := range plan.Downloads {
-					if wheel.Kind == "project_wheel" && dependency.digests[wheel.Digest] && wheel.Version == dependency.version {
+					if wheel.Kind == "project_wheel" && dependency.Digests[wheel.Digest] && wheel.Version == dependency.Version {
 						matched = true
 					}
 				}
@@ -165,7 +93,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 					return problem
 				}
 				sub := request
-				sub.Package, sub.Release, sub.InstallID = dependency.name, dependency.version, ""
+				sub.Package, sub.Release, sub.InstallID = dependency.Package, dependency.Version, ""
 				sub.Models = nil
 				prepared, problem := connection.preparePublished(ctx, sub)
 				if problem != nil {
@@ -176,7 +104,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 					return exit.New(exit.Conflict, "published child preparation needs one exact placement")
 				}
 				placement := set.Placements[0]
-				if placement.GetPackage().GetPackage() != dependency.name || placement.GetPackage().GetRelease() != dependency.version || placement.Environment == nil || placement.PackageInterface == nil || !bytes.Equal(placement.PackageInterface.Digest, canonical.Digest(iface.Raw)) {
+				if placement.GetPackage().GetPackage() != dependency.Package || placement.GetPackage().GetRelease() != dependency.Version || placement.Environment == nil || placement.PackageInterface == nil || !bytes.Equal(placement.PackageInterface.Digest, canonical.Digest(iface.Raw)) {
 					return exit.New(exit.Conflict, "published child preparation changed its exact release")
 				}
 				_, digest, err := canonical.Identity(placement.Environment)
@@ -193,7 +121,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 			} else {
 				matched := false
 				for _, wheel := range child.plan.Downloads {
-					if wheel.Kind == "project_wheel" && dependency.digests[wheel.Digest] {
+					if wheel.Kind == "project_wheel" && dependency.Digests[wheel.Digest] {
 						matched = true
 					}
 				}
