@@ -229,7 +229,15 @@ def main():
         expected = [row["sha256"] for row in request["selection"]["wheels"]]
         if not re.fullmatch(r"[a-f0-9]{32}", stage) or len(expected) != 2 or any(not re.fullmatch(r"[a-f0-9]{64}", value) for value in expected):
             raise ValueError("Invalid recorded update identity")
-        return {"update": json.loads(ssh(arguments, python + " /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected)))}
+        observed_update = json.loads(ssh(arguments, python + " /opt/cozy/dev/update.py status " + stage))
+        if observed_update.get("operation") != stage:
+            raise ValueError("Worker update status does not match the recorded operation")
+        if observed_update.get("state") != "missing":
+            return {"update": json.loads(ssh(arguments, python + " /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected)))}
+        # Transfer may have ended before enqueue. No accepted operation exists,
+        # so replay the same frozen, hash-checked pair through ordinary apply.
+        # Never reselect releases, or overwrite staging owned by a live updater.
+        request = {**request, "action": "apply"}
     if action == "status":
         stage = request["stage"]
         if not re.fullmatch(r"[a-f0-9]{32}", stage):
@@ -273,8 +281,12 @@ def main():
         commands.append(f'put "{quoted}" {remote}/{path.name}')
     batch = directory / "transfer.batch"
     batch.write_text("\n".join(commands) + "\n")
-    subprocess.run(["sftp", *request["sftp_arguments"], "-b", str(batch), request["host"]],
-                   check=True, capture_output=True, text=True)
+    try:
+        subprocess.run(["sftp", *request["sftp_arguments"], "-b", str(batch), request["host"]],
+                       check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        print(error.stderr, file=sys.stderr)
+        raise
     reply = ssh(arguments, python + " /opt/cozy/dev/update.py apply " + stage + " " +
                 " ".join(row["sha256"] for row in wheels))
     result = json.loads(reply.strip().splitlines()[-1])

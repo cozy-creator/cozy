@@ -138,8 +138,47 @@ class PublishedRuntimeUpdates(unittest.TestCase):
             with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
                 result = self.api["main"]()
             self.assertEqual(result["update"]["operation"], stage)
-        self.assertEqual(calls[0], "/opt/cozy/python/bin/python3 /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected))
-        self.assertEqual(calls[1], "/opt/cozy/python/bin/python3 /opt/cozy/dev/update.py status " + stage)
+        self.assertEqual(calls[0], "/opt/cozy/python/bin/python3 /opt/cozy/dev/update.py status " + stage)
+        self.assertEqual(calls[1], "/opt/cozy/python/bin/python3 /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected))
+        self.assertEqual(calls[2], calls[0])
+
+    def test_missing_update_retransfers_only_the_frozen_verified_pair(self):
+        _, wheels = self.resolve()
+        stage = "b" * 32
+        calls = []
+        self.api["inspect"] = lambda arguments, python=None: self.observed
+        self.api["fetch"] = lambda *args: self.fail("recovery must not select another release")
+        def remote(arguments, command):
+            calls.append(command)
+            return json.dumps({"operation": stage, "state": "missing" if " status " in command else "queued"})
+        self.api["ssh"] = remote
+        request = {"ssh_arguments": [], "sftp_arguments": [], "host": "fixture",
+                   "action": "resume", "stage": stage, "directory": str(self.directory),
+                   "selection": {"wheels": wheels}}
+        with patch.object(sys, "stdin", io.StringIO(json.dumps(request))), patch.object(subprocess, "run") as transfer:
+            result = self.api["main"]()
+        self.assertEqual(result["update"]["state"], "queued")
+        transfer.assert_called_once()
+        batch = (self.directory / "transfer.batch").read_text()
+        for row in wheels:
+            self.assertIn(str(row["path"]), batch)
+            self.assertIn(stage + "/" + row["file"], batch)
+            self.assertIn(row["sha256"], calls[-1])
+        # A failed transfer cannot make changed local bytes admissible on retry.
+        Path(wheels[0]["path"]).write_bytes(b"changed")
+        with patch.object(sys, "stdin", io.StringIO(json.dumps(request))), patch.object(subprocess, "run") as transfer:
+            with self.assertRaisesRegex(ValueError, "changed after verification"):
+                self.api["main"]()
+            transfer.assert_not_called()
+
+    def test_resume_never_retransfers_when_status_names_another_operation(self):
+        _, wheels = self.resolve()
+        self.api["ssh"] = lambda arguments, command: json.dumps({"operation": "b" * 32, "state": "missing"})
+        request = {"ssh_arguments": [], "action": "resume", "stage": "a" * 32,
+                   "selection": {"wheels": wheels}}
+        with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
+            with self.assertRaisesRegex(ValueError, "recorded operation"):
+                self.api["main"]()
 
     def local(self, **kwargs):
         row = self.release("cozy-runtime", kwargs.pop("version", "0.18.24+dev.h123"), **kwargs)
@@ -163,7 +202,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         request = {"ssh_arguments": [], "action": "resume", "stage": "a" * 32,
                    "selection": {"wheels": wheels}}
         self.api["fetch"] = lambda *args: self.fail("resume reselected a public wheel")
-        self.api["ssh"] = lambda arguments, command: json.dumps({"state": "queued"})
+        self.api["ssh"] = lambda arguments, command: json.dumps({"operation": "a" * 32, "state": "queued"})
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
             self.assertEqual(self.api["main"]()["update"]["state"], "queued")
 
