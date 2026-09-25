@@ -22,5 +22,8 @@ func (r RuntimeCLI) ModelIngestionPlan(ctx context.Context, repository, revision
 		Recipe *ModelIngestionRecipe `json:"recipe"`
 	}
 	problem := r.callContext(ctx, &answer, "model-ingestion-plan", repository, revision)
+	if problem != nil && problem.Code == exit.Usage {
+		return nil, problem.WithRemedy("install cozy-runtime 0.18.23 or newer for native model ingestion")
+	}
 	return answer.Recipe, problem
 }

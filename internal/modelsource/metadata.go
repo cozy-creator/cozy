@@ -33,10 +33,10 @@ func (r *Resolver) VerifyMetadata(ctx context.Context, source Source, files map[
 				return exit.New(exit.Validation, "model metadata member is not contained")
 			}
 		}
-		total += expected.Length
-		if total > 64<<20 {
+		if expected.Length > (64<<20)-total {
 			return exit.New(exit.Validation, "model metadata exceeds 64 MiB")
 		}
+		total += expected.Length
 		names = append(names, name)
 	}
 	sort.Strings(names)

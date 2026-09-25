@@ -13,6 +13,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
@@ -35,6 +37,20 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	}
 	if ctx.Inv.Value("--lane") != "" {
 		return true, exit.Usagef("--lane selects only a Tensorhub model release")
+	}
+	if name := ctx.Inv.Value("--rental"); name != "" {
+		_, store, problem := rentalStores(ctx)
+		if problem != nil {
+			return true, problem
+		}
+		selected, problem := rental.Resolve(store, name)
+		store.Close()
+		if problem != nil {
+			return true, problem
+		}
+		if selected.Row == nil || records.RentalTerminalState(selected.Row.State) {
+			return true, exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
+		}
 	}
 	destination, problem := hub.ParseRef(ctx.Inv.Args[1])
 	if problem != nil {

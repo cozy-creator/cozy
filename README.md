@@ -204,6 +204,9 @@ conversion. The destination owner must match the account shown by `cozy auth`:
 ```sh
 cozy model upload local/model org/model
 
+cozy model upload hf://Qwen/Qwen-Image-2.1@790c92633540aa0cb11d9abf19eb46d861714758 \
+  org/model --rental=otter --await
+
 cozy run paul/minimax-h3-tools/four-lane \
   --model.dits=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
   --model.shared=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
@@ -214,6 +217,15 @@ cozy run paul/minimax-h3-tools/four-lane \
 cozy run org/quantize/convert --model.source=org/model@release/bf16 \
   --input quantize.json --publish-to org/quantized --rental-only
 ```
+
+Complete Hugging Face repositories with a reviewed Runtime ingestion recipe use native
+download, TensorFS conversion, model-owned configuration/tokenizer preparation, and
+checkpoint upload automatically. Runtime 0.18.23 adds the Qwen Image 2.1 recipe above.
+`--rental=<name>` uses that existing rental only. `--dry-run` checks conversion headers
+and verifies the bounded metadata files before any weights transfer or rental allocation.
+The resulting checkpoint has no release label; publish a release separately with
+`cozy model publish`. Other sources retain their existing local transfer path, and
+unreviewed rented full-model ingestion refuses before allocating capacity.
 
 `cozy package update-all` upgrades installed Tensorhub packages to newer published
 releases, without downloading model weights. It keeps local/editable packages,

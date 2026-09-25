@@ -201,7 +201,7 @@ type ModelCmd struct {
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories and reclaim their bytes."`
 	GC       ModelGCCmd       `cmd:"" name:"gc" help:"Reclaim the bytes no local model references."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
-	Upload   ModelUploadCmd   `cmd:"" help:"Acquire a source, optionally run one producer job, and retain owner-only checkpoints."`
+	Upload   ModelUploadCmd   `cmd:"" help:"Ingest a model with its required metadata and upload an owner-only checkpoint."`
 	Publish  ModelPublishCmd  `cmd:"" help:"Update a release's mutable lane pointers."`
 	Retarget ModelRetargetCmd `cmd:"" help:"Move one existing release lane to another retained checkpoint."`
 	Yank     ModelYankCmd     `cmd:"" help:"Yank a model release."`
@@ -281,7 +281,7 @@ type ModelUploadCmd struct {
 	Lane           string  `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         *string `predictor:"rental" help:"Use this existing rental name or id; never buy a replacement."`
 	RentalOnly     bool    `help:"Require a remote rental instead of local capacity."`
-	DryRun         bool    `help:"Resolve the exact transfer plan without moving bodies or spending."`
+	DryRun         bool    `help:"Check conversion and metadata without transferring weights or renting."`
 	Await          bool    `help:"Watch the accepted run until it settles."`
 	IdempotencyKey string  `help:"Stable request identity for exact replay; otherwise start a new run."`
 }
