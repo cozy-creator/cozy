@@ -53,7 +53,7 @@ type session struct {
 	host             pb.PodHostClient
 	preparation      pb.RuntimePreparationClient
 	claim            *pb.Claim
-	outcomes         chan *pb.AttemptOutcome
+	outcomes         chan outcomeSettlement
 	completions      chan snapshotContinuation
 	completionMu     sync.RWMutex
 	completionClosed bool
@@ -420,7 +420,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			select {
-			case s.outcomes <- t:
+			case s.outcomes <- outcomeSettlement{outcome: t}:
 			case <-ctx.Done():
 				return ctx.Err()
 			}

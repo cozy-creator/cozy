@@ -827,7 +827,13 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		c.logf("%s", verdict)
 	}
 	for _, held := range heldVerdicts {
-		c.settleRefusedOutcome(s, held.requestID, held.ordinal, held.outcome)
+		// A replay may be mirroring on the outcome lane. A report's earlier refusal
+		// verdict cannot overtake its verified custody and terminal commit.
+		select {
+		case s.outcomes <- outcomeSettlement{refusal: &held}:
+		case <-s.ctx.Done():
+			return
+		}
 	}
 	// A fault rides every ReportCadence until it clears; it is logged when it first
 	// appears and again only after it has been absent. The worker likewise puts its last
@@ -1492,6 +1498,10 @@ func (c *Orchestrator) forgetRefusedOutcome(instanceID, requestID string, ordina
 // journaled here, in the attempt row, rather than on the wire.
 func (c *Orchestrator) settleRefusedOutcome(s *session, requestID string, ordinal uint64,
 	r refusedOutcome) {
+	attempt, problem := c.opt.Store.AttemptRow(requestID, int64(ordinal))
+	if problem != nil || attempt == nil || !openAttempt(attempt.State) {
+		return // an earlier replay on the same lane already settled this terminal
+	}
 	verdict := fmt.Sprintf("%s: %s", outcomeRefusedCause, r.reason)
 	c.logf("worker %s: outcome %s for %s#%d REFUSED — restated unchanged on %d consecutive "+
 		"reports and nothing here can honour it; the request fails %s",

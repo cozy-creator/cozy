@@ -2,6 +2,11 @@ package orchestrator
 
 import pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 
+type outcomeSettlement struct {
+	outcome *pb.AttemptOutcome
+	refusal *heldVerdict
+}
+
 // A device lane can hold two admitted requests and one released outcome; the job
 // seat is independent. Bound owner work by that cohort, rather than starting a
 // goroutine per terminal. An outcome still waits for verified local custody and
@@ -10,7 +15,7 @@ func (c *Orchestrator) startOutcomeSettlement(s *session, w *worker, devices int
 	// Never allocate beyond this session's existing control-frame window, even if
 	// a peer reports an impossible device count. A full window applies backpressure.
 	depth := min(3*max(devices, 1)+1, cap(s.out))
-	s.outcomes = make(chan *pb.AttemptOutcome, depth)
+	s.outcomes = make(chan outcomeSettlement, depth)
 	s.completions = make(chan snapshotContinuation, depth)
 	outcomesDone, completionsDone := make(chan struct{}), make(chan struct{})
 	go func() {
@@ -21,8 +26,12 @@ func (c *Orchestrator) startOutcomeSettlement(s *session, w *worker, devices int
 	}()
 	go func() {
 		defer close(outcomesDone)
-		for outcome := range s.outcomes {
-			c.onOutcome(s, outcome)
+		for item := range s.outcomes {
+			if item.outcome != nil {
+				c.onOutcome(s, item.outcome)
+			} else if held := item.refusal; held != nil {
+				c.settleRefusedOutcome(s, held.requestID, held.ordinal, held.outcome)
+			}
 		}
 	}()
 	return func() {
