@@ -41,7 +41,7 @@ func PublishedDependencies(pkg string, lockBytes, locked []byte) ([]PublishedDep
 	selectedRows := map[string][]string{}
 	for _, line := range strings.Split(string(locked), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 2 || strings.HasPrefix(fields[0], "-") {
+		if len(fields) < 2 || strings.HasPrefix(fields[0], "-") || strings.HasPrefix(fields[0], "#") {
 			continue
 		}
 		key := fields[0]
