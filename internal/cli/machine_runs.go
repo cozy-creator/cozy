@@ -33,6 +33,11 @@ type machineExecutionClient interface {
 	AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck, ...grpc.CallOption) (*pb.MachineExecutionState, error)
 }
 
+type publishedPreparation struct {
+	*pb.DesiredPlacementSet
+	LockedRequirements []byte
+}
+
 type machineConnection struct {
 	importInputTree    func(context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error)
 	connection         *machineClientConnection
@@ -41,7 +46,7 @@ type machineConnection struct {
 	prepare            func(context.Context, string, localpackage.Revision) *exit.Error
 	prepareModels      func(context.Context, records.Request, localpackage.Revision) *exit.Error
 	modelDefaultOrigin func(context.Context) (string, *exit.Error)
-	preparePublished   func(context.Context, records.Request) (*pb.DesiredPlacementSet, *exit.Error)
+	preparePublished   func(context.Context, records.Request) (*publishedPreparation, *exit.Error)
 	wireMinor          uint32
 	publicOrigin       string // renter-authenticated Hub facts name the public byte endpoint
 	certificateDigest  []byte

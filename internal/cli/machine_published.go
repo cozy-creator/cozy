@@ -85,7 +85,7 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 		PublishedRevisions: []*pb.PublishedPackageRevision{{Package: placement.GetPackage(), Environment: placement.Environment, PackageInterface: placement.PackageInterface}},
 	}
 	addPublishedBindings(capture, codeDigest, codeDigest, iface, true)
-	if problem := m.capturePublishedDependencies(ctx, request, connection, capture); problem != nil {
+	if problem := m.capturePublishedDependencies(ctx, request, connection, capture, prepared.LockedRequirements); problem != nil {
 		return nil, problem
 	}
 

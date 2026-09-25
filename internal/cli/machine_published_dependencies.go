@@ -17,11 +17,14 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-type publishedDependency struct{ name, version, digest string }
+type publishedDependency struct {
+	name, version string
+	digests       map[string]bool
+}
 
 // Only wheels actually selected in the parent's immutable plan can authorize
 // children. A same-named PyPI library is not a Tensorhub package dependency.
-func publishedDependencies(pkg string, plan hub.PackageDownloadPlan) ([]publishedDependency, *exit.Error) {
+func publishedDependencies(pkg string, plan hub.PackageDownloadPlan, locked []byte) ([]publishedDependency, *exit.Error) {
 	ref, problem := hub.ParseRef(pkg)
 	if problem != nil {
 		return nil, problem
@@ -45,30 +48,40 @@ func publishedDependencies(pkg string, plan hub.PackageDownloadPlan) ([]publishe
 	if err := toml.Unmarshal(document.Bytes, &lock); err != nil {
 		return nil, exit.New(exit.Structural, "published dependency lock is invalid")
 	}
+	selectedRows := map[string][]string{}
+	for _, line := range strings.Split(string(locked), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || strings.HasPrefix(fields[0], "-") {
+			continue
+		}
+		selectedRows[fields[0]] = fields[1:]
+	}
 	selected := map[string]publishedDependency{}
 	for _, row := range lock.Packages {
 		index, err := url.Parse(row.Source.Registry)
 		if err != nil || index.User != nil || index.RawQuery != "" || index.Fragment != "" || (index.Scheme != "https" && index.Scheme != "http") || strings.Trim(index.Path, "/") != "v1/index/"+ref.Org+"/simple" {
 			continue
 		}
-		for _, wheel := range plan.Downloads {
-			if wheel.Kind != "dependency_wheel" || wheel.Distribution != row.Name || wheel.Version != row.Version {
-				continue
-			}
-			found := false
-			for _, locked := range row.Wheels {
-				if locked.Hash == wheel.Digest {
-					found = true
+		hashes := selectedRows[row.Name+"=="+row.Version]
+		if len(hashes) == 0 {
+			continue
+		}
+		allowed := map[string]bool{}
+		for _, wheel := range row.Wheels {
+			for _, hash := range hashes {
+				if hash == "--hash="+wheel.Hash {
+					allowed[wheel.Hash] = true
 				}
 			}
-			if !found {
-				return nil, exit.New(exit.Conflict, "published callable dependency differs from its locked wheel")
-			}
-			if _, duplicate := selected[row.Name]; duplicate {
-				return nil, exit.New(exit.Conflict, "published callable dependency is ambiguous")
-			}
-			selected[row.Name] = publishedDependency{ref.Org + "/" + row.Name, row.Version, wheel.Digest}
 		}
+		if len(allowed) == 0 {
+			return nil, exit.New(exit.Conflict, "published callable dependency differs from its locked wheel")
+		}
+		if _, duplicate := selected[row.Name]; duplicate {
+			return nil, exit.New(exit.Conflict, "published callable dependency is ambiguous")
+		}
+		selected[row.Name] = publishedDependency{ref.Org + "/" + row.Name, row.Version, allowed}
+
 	}
 	out := make([]publishedDependency, 0, len(selected))
 	for _, row := range selected {
@@ -88,11 +101,12 @@ func publishedPlanInterface(plan hub.PackageDownloadPlan) (*launch.PackageInterf
 
 // dependencies joins exact committed callee wheels before the machine accepts
 // execution. Subsequent child scheduling needs no client or catalog lookup.
-func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request records.Request, connection *machineConnection, capture *pb.MachineExecutionCapture) *exit.Error {
+func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request records.Request, connection *machineConnection, capture *pb.MachineExecutionCapture, rootLocked []byte) *exit.Error {
 	type node struct {
 		digest []byte
 		plan   hub.PackageDownloadPlan
 		iface  *launch.PackageInterface
+		locked []byte
 	}
 	nodes := map[string]node{}
 	visiting := map[string]bool{}
@@ -109,7 +123,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 	if problem != nil {
 		return problem
 	}
-	nodes[rootKey] = node{capture.RootRevisionDigest, rootPlan, rootInterface}
+	nodes[rootKey] = node{capture.RootRevisionDigest, rootPlan, rootInterface, rootLocked}
 	var walk func(string, int) *exit.Error
 	walk = func(key string, depth int) *exit.Error {
 		if depth > 16 || len(nodes) > 128 || visiting[key] {
@@ -118,7 +132,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 		visiting[key] = true
 		defer delete(visiting, key)
 		parent := nodes[key]
-		dependencies, problem := publishedDependencies(strings.SplitN(key, "@", 2)[0], parent.plan)
+		dependencies, problem := publishedDependencies(strings.SplitN(key, "@", 2)[0], parent.plan, parent.locked)
 		if problem != nil {
 			return problem
 		}
@@ -139,7 +153,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 				}
 				matched := false
 				for _, wheel := range plan.Downloads {
-					if wheel.Kind == "project_wheel" && wheel.Digest == dependency.digest && wheel.Version == dependency.version {
+					if wheel.Kind == "project_wheel" && dependency.digests[wheel.Digest] && wheel.Version == dependency.version {
 						matched = true
 					}
 				}
@@ -169,7 +183,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 				if err != nil || !bytes.Equal(digest, placement.EnvironmentDigest) {
 					return exit.New(exit.Conflict, "published child environment changed")
 				}
-				child = node{digest, plan, iface}
+				child = node{digest, plan, iface, prepared.LockedRequirements}
 				nodes[childKey] = child
 				capture.PublishedRevisions = append(capture.PublishedRevisions, &pb.PublishedPackageRevision{Package: placement.GetPackage(), Environment: placement.Environment, PackageInterface: placement.PackageInterface})
 				addPublishedBindings(capture, digest, digest, iface, true)
@@ -179,7 +193,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 			} else {
 				matched := false
 				for _, wheel := range child.plan.Downloads {
-					if wheel.Kind == "project_wheel" && wheel.Digest == dependency.digest {
+					if wheel.Kind == "project_wheel" && dependency.digests[wheel.Digest] {
 						matched = true
 					}
 				}
@@ -237,11 +251,27 @@ func (m *machineRuns) publishedChildPreparation(ctx context.Context, request rec
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
-	wheels := make([]install.PublishedWheel, 0, len(plan.Downloads))
-	for _, row := range plan.Downloads {
-		wheels = append(wheels, install.PublishedWheel{Distribution: row.Distribution, Version: row.Version, Digest: row.Digest})
+	config, problem := exactPackageInstallDocument("package.toml", plan.PackageConfig)
+	if problem != nil {
+		return nil, nil, nil, "", problem
 	}
-	locked, problem := install.LockedRequirements(nil, strings.TrimRight(m.context.Cfg.HubURL, "/")+"/v1/index/"+ref.Org+"/simple/", wheels)
+	ifaceDoc, problem := exactPackageInstallDocument("package interface", plan.PackageInterface)
+	if problem != nil {
+		return nil, nil, nil, "", problem
+	}
+	pyproject, problem := exactPackageInstallDocument("pyproject.toml", plan.Pyproject)
+	if problem != nil {
+		return nil, nil, nil, "", problem
+	}
+	uvLock, problem := exactPackageInstallDocument("uv.lock", plan.UVLock)
+	if problem != nil {
+		return nil, nil, nil, "", problem
+	}
+	source, problem := packageInstallPlanFacts(m.context, ref, request.Release, plan, config, ifaceDoc, pyproject, uvLock)
+	if problem != nil {
+		return nil, nil, nil, "", problem
+	}
+	locked, problem := install.PublishedRequirements(ctx, source)
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}

@@ -31,3 +31,23 @@ Existing publications without generated caller exports remain directly runnable;
 cross-package imports require a new caller-capable publication. There is no implicit
 proxy compatibility path for old wheels. An implementation match requires exact
 wheel bytes, not a name, a mutable latest release, or a matching interface alone.
+
+ABI 8 publication requires an authored `cozy-runtime>=0.18.21` lower bound and an
+actual locked Runtime at least 0.18.21. A newer lock alone cannot hide an older
+advertised floor. Publication refuses before upload with the exact required floor;
+it does not silently rewrite an author's lock. The same compiled SDK wheel can be
+captured again by a private script after its generated source is verified.
+
+Real local Creator CLI qualification used two test publications in the local Hub,
+with both `COZY_HOME` and `TENSORFS_HOME` isolated. The parent returned 21 from its
+locked child 0.1.0 and preserved the child's ordinary helper result 12. Direct
+serving from that same 0.1.0 wheel returned 24. After child 0.1.1 changed its
+multiplier, same-package managed calls returned 36 while the unchanged parent's
+exact dependency still returned 21. Switching those retained package placements
+also exercised the Runtime readiness guard: a previous warm placement must not
+allow an offer before the selected replacement is dispatchable.
+
+The fixture publications used development Runtime code reporting 0.18.20 before
+this early floor validation was added; they are test artifacts, not a supported
+production release cohort. Runtime 0.18.21 and the updated first-party package
+locks are mandatory deployment gates.

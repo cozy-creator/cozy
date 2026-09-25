@@ -29,6 +29,9 @@ func publishedCallableWheels(ctx context.Context, p *packagepublish.Package) ([]
 	if !callable {
 		return projects, nil
 	}
+	if problem := packagepublish.ValidateCallerRuntime(p, "0.18.21"); problem != nil {
+		return nil, problem
+	}
 	env := config.Frozen().Tool()
 	bin, problem := hostruntime.Path(env)
 	if problem != nil {

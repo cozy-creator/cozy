@@ -92,7 +92,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		facts, problem := client(m.context).RentalImageInventory(ctx, identity.RentalID)
 		return facts.PublicOrigin, problem
 	}
-	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
+	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
 		facts, problem := rental.PrepareFactsSource(client(m.context))(ctx, identity, ref)
 		if problem != nil {
@@ -116,7 +116,11 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		return readMachinePreparedSet(stream)
+		ready, problem := readMachinePreparedSet(stream)
+		if problem != nil {
+			return nil, problem
+		}
+		return &publishedPreparation{ready, facts.LockedRequirements}, nil
 	}
 
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
@@ -388,7 +392,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		m.localPID = process.PID
 	}
 	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, wireMinor: info.WireMinor}
-	result.preparePublished = func(ctx context.Context, request records.Request) (*pb.DesiredPlacementSet, *exit.Error) {
+	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 		if request.InstallID == "" {
 			plan, iface, locked, requires, problem := m.publishedChildPreparation(ctx, request)
 			if problem != nil {
@@ -409,7 +413,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 			if err != nil {
 				return nil, machineTransport(err)
 			}
-			return prepared.PlacementSet, validateMachinePrepared(prepared.PlacementSet)
+			return &publishedPreparation{prepared.PlacementSet, locked}, validateMachinePrepared(prepared.PlacementSet)
 		}
 
 		facts, problem := m.resolver.installFacts(request.InstallID)
@@ -439,7 +443,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		return prepared.PlacementSet, validateMachinePrepared(prepared.PlacementSet)
+		return &publishedPreparation{prepared.PlacementSet, locked}, validateMachinePrepared(prepared.PlacementSet)
 	}
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
 		return preparation.WorkspaceRetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})

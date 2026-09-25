@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // EnvironmentReceipt is the environment record: exactly what produced this install's venv.
@@ -136,32 +137,13 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 		"venv", "--python", python.Executable, "--no-progress", venvDir); problem != nil {
 		return nil, problem
 	}
-	appended := append([]PublishedWheel{published.ProjectWheel}, published.Wheels...)
-	appended = append(appended, published.LocalWheels...)
-	exported := filepath.Join(filepath.Dir(venvDir), ".locked-requirements-export.txt")
-	defer os.Remove(exported)
-	// Export the committed registry closure without the rows the release's own wheels
-	// supply; those rows are re-added below as exact org-index pins.
-	args := []string{"export", "--frozen", "--no-dev", "--no-default-groups", "--no-emit-project",
-		"--format", "requirements.txt", "--output-file", exported, "--no-progress",
-		"--python", python.Executable, "--no-python-downloads"}
-	seen := map[string]bool{}
-	for _, wheel := range appended {
-		name := strings.TrimSpace(wheel.Distribution)
-		if name == "" || seen[name] {
-			continue
-		}
-		seen[name] = true
-		args = append(args, "--no-emit-package", name)
-	}
-	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
-		"the published lock cannot export its exact registry closure", args...); problem != nil {
+	body, problem := exportPublishedRequirements(sourceDir, published, python.Executable)
+	if problem != nil {
 		return nil, problem
 	}
 	requirements := filepath.Join(filepath.Dir(venvDir), "locked-requirements.txt")
-	if problem := writeLockedRequirements(exported, requirements,
-		published.IndexURL, appended); problem != nil {
-		return nil, problem
+	if err := os.WriteFile(requirements, body, 0o600); err != nil {
+		return nil, exit.Internalf("cannot retain locked requirements: %s", err)
 	}
 	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
 		"the exact locked closure is incompatible with the selected Python environment",
@@ -180,6 +162,65 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 		return nil, exit.New(exit.Structural, "installed environment has no exact Python/distribution metadata")
 	}
 	return env, nil
+}
+
+// PublishedRequirements prepares a dependency on the worker without installing a
+// second execution environment in Creator or changing an active package pin.
+func PublishedRequirements(ctx context.Context, published *PublishedSource) ([]byte, *exit.Error) {
+	if problem := validatePublished(records.PackageInstall{Package: published.Package, Version: published.Release}, published); problem != nil {
+		return nil, problem
+	}
+	root, err := os.MkdirTemp("", "cozy-published-requirements-")
+	if err != nil {
+		return nil, exit.Internalf("cannot stage published requirements: %s", err)
+	}
+	defer os.RemoveAll(root)
+	for name, document := range map[string]ExactDocument{"pyproject.toml": published.Pyproject, "uv.lock": published.UVLock} {
+		if err := os.WriteFile(filepath.Join(root, name), document.Bytes, 0o600); err != nil {
+			return nil, exit.Internalf("cannot retain published metadata: %s", err)
+		}
+	}
+	python, problem := hostruntime.ProjectPython(ctx, root)
+	if problem != nil {
+		return nil, problem
+	}
+	return exportPublishedRequirements(root, published, python.Executable)
+}
+
+func exportPublishedRequirements(sourceDir string, published *PublishedSource, python string) ([]byte, *exit.Error) {
+	appended := append([]PublishedWheel{published.ProjectWheel}, published.Wheels...)
+	appended = append(appended, published.LocalWheels...)
+	temporary, err := os.CreateTemp("", "cozy-locked-export-")
+	if err != nil {
+		return nil, exit.Internalf("cannot stage locked requirements: %s", err)
+	}
+	exported := temporary.Name()
+	temporary.Close()
+	defer os.Remove(exported)
+	// Export the committed registry closure without the rows the release's own wheels
+	// supply; those rows are re-added below as exact org-index pins.
+	args := []string{"export", "--frozen", "--no-dev", "--no-default-groups", "--no-emit-project",
+		"--format", "requirements.txt", "--output-file", exported, "--no-progress",
+		"--python", python, "--no-python-downloads"}
+	seen := map[string]bool{}
+	for _, wheel := range appended {
+		name := strings.TrimSpace(wheel.Distribution)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		args = append(args, "--no-emit-package", name)
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
+		"the published lock cannot export its exact registry closure", args...); problem != nil {
+		return nil, problem
+	}
+
+	raw, err := os.ReadFile(exported)
+	if err != nil {
+		return nil, exit.Internalf("cannot read locked requirements: %s", err)
+	}
+	return LockedRequirements(raw, published.IndexURL, appended)
 }
 
 // runtimeScratchHome is the COZY_HOME every install-time cozy-runtime invocation gets:
