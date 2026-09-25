@@ -513,20 +513,9 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 // files exports nothing and records no obligation.
 func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
 	paths := launch.AssetPaths(entrypoint.Result)
-	if out.Kind == "job" {
-		media := paths[:0]
-		for _, path := range paths {
-			if spec, ok := launch.ResultAssetSpec(entrypoint, path); ok &&
-				(spec.Kind == "image" || spec.Kind == "video" || spec.Kind == "audio" || spec.Kind == "tree") {
-				media = append(media, path)
-			}
-		}
-		paths = media
-		if len(paths) == 0 {
-			return nil
-		}
-	}
-	if len(paths) == 0 && len(out.Outputs) == 0 {
+	// Jobs export every declared asset, including generic files. Native model
+	// artifacts and weight outputs remain separate and have no asset paths.
+	if len(paths) == 0 && (out.Kind == "job" || len(out.Outputs) == 0) {
 		return nil
 	}
 	intent := &records.OutputExportIntent{Directory: out.OutputDirectory}
