@@ -43,6 +43,9 @@ func (c *Orchestrator) rentalPreparationAllowedLocked(w *worker, req records.Req
 	if c.ordinaryServingPreparation(w, req) {
 		return nil
 	}
+	if c.modeClaimedLocked(w, req.IsJob(), req.ID, req.ParentRequestID) {
+		return exit.Named(exit.Unavailable, "rental.mode_claimed", "rental preparation waits for work pinned to this rental's current mode")
+	}
 	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
 	if problem != nil {
 		return problem

@@ -376,14 +376,18 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		}
 	}
 	if w.spec.IsJob() {
-		ownedChild := false
-		if w.preparingRequest != "" && w.orchestrationParent != nil {
+		ownedChild, actingJob, actingParent := false, false, ""
+		if w.preparingRequest != "" {
 			request, problem := c.opt.Store.RequestRow(w.preparingRequest)
-			ownedChild = problem == nil && request != nil && request.ParentRequestID != "" &&
-				c.rentalPreparationAllowedLocked(w, *request) == nil
+			if problem == nil && request != nil {
+				actingJob, actingParent = request.IsJob(), request.ParentRequestID
+			}
+			ownedChild = w.orchestrationParent != nil && problem == nil && request != nil &&
+				request.ParentRequestID != "" && c.rentalPreparationAllowedLocked(w, *request) == nil
 		}
 		retained, problem := c.opt.Store.RentalHasRetainedJob(w.spec.Connection.RentalID)
-		if !ownedChild && (problem != nil || retained || !c.idleRentalWorkerLocked(w)) {
+		if !ownedChild && (problem != nil || retained || !c.idleRentalWorkerLocked(w) ||
+			c.modeClaimedLocked(w, actingJob, w.preparingRequest, actingParent)) {
 			c.mu.Unlock()
 			c.setDesiredUnavailable(w, seq, exit.Unavailablef("rented worker is finishing its current job before changing mode"))
 			return
