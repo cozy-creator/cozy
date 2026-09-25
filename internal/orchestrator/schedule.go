@@ -60,27 +60,27 @@ func logicalOf(req records.Request) LogicalPackage {
 		NeedsAccelerator: req.NeedsAccelerator}
 }
 
-// classifyLocked reads one request against what the rental's worker reports holding.
-// Callers hold c.mu.
-func (c *Orchestrator) classifyLocked(w *worker, req records.Request) (scheduleClass, string) {
+// classifyLocked reads one request against what the rental's worker reports holding: the
+// class, the binding the worker authored, and the placement it holds. Callers hold c.mu.
+func (c *Orchestrator) classifyLocked(w *worker, req records.Request) (scheduleClass, string, string) {
 	if w != nil && !w.exited && !w.stopping && w.spec.IsJob() &&
 		(!c.idleRentalWorkerLocked(w) || c.modeClaimedLocked(w, false)) {
-		return classModeHeld, ""
+		return classModeHeld, "", ""
 	}
 	if w == nil || w.exited || w.stopping || w.spec.IsJob() || !w.supportsCurrentProtocol() ||
 		c.sessions[w.bootID] == nil {
-		return classNeedsDesire, ""
+		return classNeedsDesire, "", ""
 	}
-	_, planID, observed, held := observedServing(w, logicalOf(req))
+	placement, planID, observed, held := observedServing(w, logicalOf(req))
 	switch {
 	case !held:
-		return classNeedsDesire, ""
+		return classNeedsDesire, "", ""
 	case observed.serving != pb.ServingState_SERVING_STATE_DISPATCHABLE || !observed.dispatchablePlanIDs[planID]:
-		return classWarming, planID
+		return classWarming, planID, placement.PlacementIDValue
 	case observed.loaded(planID):
-		return classLoaded, planID
+		return classLoaded, planID, placement.PlacementIDValue
 	}
-	return classDispatchable, planID
+	return classDispatchable, planID, placement.PlacementIDValue
 }
 
 // schedule runs one rental's queue, oldest first within each class. Called by drain,
@@ -90,9 +90,10 @@ func (c *Orchestrator) schedule(venue string, queue []scheduled) {
 	w := c.workers[rentalInstanceID(venue)]
 	classes := make([]scheduleClass, len(queue))
 	plans := make([]string, len(queue))
+	placements := make([]string, len(queue))
 	claimant := -1
 	for i, entry := range queue {
-		classes[i], plans[i] = c.classifyLocked(w, entry.req)
+		classes[i], plans[i], placements[i] = c.classifyLocked(w, entry.req)
 		if p := c.parked[entry.req.ID]; claimant < 0 && p != nil && p.overtaken >= starvationBound {
 			claimant = i
 		}
@@ -101,6 +102,10 @@ func (c *Orchestrator) schedule(venue string, queue []scheduled) {
 
 	tried := make([]bool, len(queue))
 	sent := make([]bool, len(queue))
+	// seatless marks a pick whose lane had no room; full is those lanes. A seat that frees
+	// on one mid-pass is the next pass's, for its oldest pick.
+	seatless := make([]bool, len(queue))
+	full := map[string]bool{}
 	for {
 		pick := -1
 		for _, class := range []scheduleClass{classLoaded, classDispatchable} {
@@ -117,12 +122,17 @@ func (c *Orchestrator) schedule(venue string, queue []scheduled) {
 		if pick < 0 {
 			break
 		}
-		if !c.rentalHasRoom(venue) {
-			// Every request here draws on this worker's seats. With none free the pass
-			// ends: a seat that frees mid-pass is the next pass's, for its oldest pick.
+		laneID, room, open := c.rentalRoom(venue, placements[pick])
+		if !open {
+			// The worker admits nothing: every request here draws on its seats.
 			break
 		}
 		tried[pick] = true
+		if room <= 0 || full[laneID] {
+			// The placement's lane admits no more; a pick on another lane may still run.
+			seatless[pick], full[laneID] = true, true
+			continue
+		}
 		req := queue[pick].req
 		if plans[pick] != req.PlanID {
 			// The worker authored this function's binding under the placement it holds.
@@ -148,7 +158,7 @@ func (c *Orchestrator) schedule(venue string, queue []scheduled) {
 		var starved []string
 		c.mu.Lock()
 		for i := 0; i < pick; i++ {
-			if sent[i] {
+			if sent[i] || seatless[i] {
 				continue
 			}
 			id := queue[i].req.ID
@@ -202,7 +212,7 @@ func (c *Orchestrator) schedule(venue string, queue []scheduled) {
 	}
 
 	for i, entry := range queue {
-		if tried[i] {
+		if tried[i] && !seatless[i] {
 			continue
 		}
 		req := entry.req
@@ -233,11 +243,18 @@ func (c *Orchestrator) schedule(venue string, queue []scheduled) {
 	}
 }
 
-func (c *Orchestrator) rentalHasRoom(venue string) bool {
+// rentalRoom reads the room an offer for this placement would draw on: the placement's
+// lane when the worker reports lanes, else the worker-level window. `open` is false when
+// the worker admits nothing at all.
+func (c *Orchestrator) rentalRoom(venue, placementID string) (laneID string, room int, open bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	w := c.workers[rentalInstanceID(venue)]
-	return w != nil && w.admissible() && w.seats.slots > 0
+	if w == nil || !w.admissible() {
+		return "", 0, false
+	}
+	laneID, room, _, _ = w.roomFor(placementID)
+	return laneID, room, true
 }
 
 func (c *Orchestrator) releaseDesire(venue, requestID string) {
