@@ -61,12 +61,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 	if problem != nil {
 		return nil, problem
 	}
-	client := &http.Client{CheckRedirect: func(request *http.Request, via []*http.Request) error {
-		if len(via) > 5 || request.URL.Scheme != "https" || request.URL.Host != "files.pythonhosted.org" {
-			return fmt.Errorf("captured wheel download changed origin")
-		}
-		return nil
-	}}
+	client := capturedWheelClient()
 	out := map[string]CapturedDependency{}
 	for _, dependency := range existing {
 		captured, problem := CaptureDependency(dependency.Path)
@@ -83,7 +78,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 		captured := CapturedDependency{Name: row.Name, Version: row.Version, Requirement: requirement, RegistryRequirement: requirement}
 		// Inspect ordinary dependency wheels for callable App exports. Large
 		// framework artifacts already have their selected identity in uv.lock.
-		if !ImageOwnedDistribution(row.Name) {
+		if !ImageOwnedDistribution(row.Name) || row.captureLocally {
 			address, _ := url.Parse(row.URL)
 			path := filepath.Join(stage, filepath.Base(address.Path))
 			if row.Size > MaxDependencyWheelBytes {
@@ -97,7 +92,9 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 			if problem != nil {
 				return nil, problem
 			}
-			captured.RegistryRequirement = requirement
+			if !row.captureLocally {
+				captured.RegistryRequirement = requirement
+			}
 		}
 		out[row.Name] = captured
 	}
@@ -124,4 +121,13 @@ func CaptureDependency(path string) (CapturedDependency, *exit.Error) {
 	address := (&url.URL{Scheme: "file", Path: path}).String()
 	return CapturedDependency{Name: identity.Distribution, Version: identity.Version, Path: path, Digest: digest,
 		Requirement: identity.Distribution + " @ " + address + " --hash=" + digest, Application: len(entries) == 1}, nil
+}
+
+func capturedWheelClient() *http.Client {
+	return &http.Client{CheckRedirect: func(request *http.Request, via []*http.Request) error {
+		if len(via) > 5 || request.URL.Scheme != "https" || request.URL.Host != "files.pythonhosted.org" {
+			return fmt.Errorf("captured wheel download changed origin")
+		}
+		return nil
+	}}
 }
