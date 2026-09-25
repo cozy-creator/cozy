@@ -18,7 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
-// nativeModelUpload is the ordinary private-script path for complete model recipes.
+// nativeModelUpload is the ordinary local-script path for complete model recipes.
 // Local files, existing checkpoints and unregistered families retain their transfer path.
 func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	// Native checkpoint effects currently use the rental's explicit publication

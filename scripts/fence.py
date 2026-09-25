@@ -349,7 +349,8 @@ FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.package.", "cozy.runtime.", "t
                          "tensorfs.", "cozytensors")
 # Runtime owns this deterministic wheel generator ABI. Creator checks returned
 # metadata; it neither authors a new document nor defines the generator format.
-FOREIGN_ABI_TAGS = {"cozy.interface-generator/5", "cozy.interface-generator/6", "cozy.interface-generator/7"}
+FOREIGN_ABI_TAGS = {"cozy.interface-generator/5", "cozy.interface-generator/6", "cozy.interface-generator/7",
+                    "cozy.interface-generator/8"}
 # Runtime authors this ephemeral measured executor response; Creator only reads it.
 FOREIGN_DOCUMENT_KINDS = {"cozy.python-interpreters/1"}
 KIND_READERS: dict[str, set[str]] = {}

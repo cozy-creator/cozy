@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -51,8 +52,10 @@ func TestMultipleOfInvalidSchemaRefusesEarly(t *testing.T) {
 	}
 }
 
+var referenceImageInterface = flag.String("reference-image-interface", "", "current reference-image package-interface.json")
+
 func TestMultipleOfActualReferenceImageInterface(t *testing.T) {
-	path := os.Getenv("COZY_TEST_QWEN_INTERFACE")
+	path := *referenceImageInterface
 	if path == "" {
 		t.Skip("requires the current reference-image interface")
 	}

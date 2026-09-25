@@ -112,3 +112,27 @@ func (r RuntimeCLI) InterfaceWheel(ctx context.Context, interfacePath, distribut
 	}
 	return wheel, nil
 }
+
+// CallerInterfaceWheels generates one managed-caller wheel per project wheel with the
+// host's Runtime, staged under home.
+func CallerInterfaceWheels(ctx context.Context, bin, dir, home string, env []string, surface, name, release string, projects []string) ([]string, *exit.Error) {
+	runtime := RuntimeCLI{Bin: bin, Dir: dir, Home: home, Env: env}
+	output := make([]string, 0, len(projects))
+	for _, source := range projects {
+		body, err := os.ReadFile(source)
+		if err != nil {
+			return nil, exit.Internalf("cannot read callable project wheel: %s", err)
+		}
+		digest, _ := canonical.Spell(canonical.Digest(body))
+		stage, err := os.MkdirTemp(home, "caller-")
+		if err != nil {
+			return nil, exit.Internalf("cannot stage callable project wheel: %s", err)
+		}
+		generated, problem := runtime.InterfaceWheel(ctx, surface, name, release, digest, source, digest, stage)
+		if problem != nil {
+			return nil, problem
+		}
+		output = append(output, generated.Path)
+	}
+	return output, nil
+}

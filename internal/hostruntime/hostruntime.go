@@ -23,6 +23,9 @@ import (
 // ToolFloor includes native ingestion, rented builtin admission and canonical media
 // result identities. Installers upgrade this tool before replacing Cozy.
 // WireFloor independently checks the installed execution ownership capability.
+// Distribution is the Runtime's Python distribution and executable name.
+const Distribution = "cozy-runtime"
+
 const ToolFloor = "0.18.24"
 
 // PackageFloor is the existing package SDK contract. Controller provisioning
@@ -66,7 +69,7 @@ var hostRuntimeVerdicts = struct {
 // Source-authored model default metadata requires 0.10.0.
 // The tool's own `version` verb is the fact, asked here.
 func Path(env []string) (string, *exit.Error) {
-	path, err := exec.LookPath("cozy-runtime")
+	path, err := exec.LookPath(Distribution)
 	if err != nil {
 		return "", exit.Named(exit.Structural, "host_runtime_missing",
 			"this host has no cozy-runtime command on PATH").
