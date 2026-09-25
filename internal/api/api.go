@@ -85,7 +85,7 @@ type Server struct {
 	rentalInventory   func(bool) (RentalInventory, *exit.Error)
 	rentalKeepalive   func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
 	rentalPreparation func(string) (func(bool), *exit.Error)
-	runtimeUpdate     func(string) (*records.RuntimeUpdate, *exit.Error)
+	runtimeUpdate     func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
 
 	// shutdown asks the process that owns this server to drain and stop — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
@@ -140,7 +140,7 @@ type Options struct {
 	RentalInventory   func(bool) (RentalInventory, *exit.Error)
 	RentalKeepalive   func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
 	RentalPreparation func(string) (func(bool), *exit.Error)
-	RuntimeUpdate     func(string) (*records.RuntimeUpdate, *exit.Error)
+	RuntimeUpdate     func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
 	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
 }

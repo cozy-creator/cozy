@@ -10,6 +10,7 @@ package reclaim
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -137,10 +138,38 @@ func Tmp(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 		}
 		return Swept{}, exit.Internalf("cannot scan the tmp root %s: %s", l.Tmp, err)
 	}
+	protected := map[string]bool{"locks": true}
+	if st != nil {
+		updates, problem := st.ActiveRuntimeUpdates()
+		if problem != nil {
+			return Swept{}, problem
+		}
+		for _, update := range updates {
+			// Public and local updates share this stage, including the pre-plan window.
+			protected["runtime-updates"] = true
+			if len(update.Selection) == 0 {
+				continue
+			}
+			var selection struct {
+				LocalRuntime *struct {
+					Path string `json:"path"`
+				} `json:"local_runtime"`
+			}
+			if err := json.Unmarshal(update.Selection, &selection); err != nil {
+				return Swept{}, exit.Internalf("cannot read active Runtime update staging: %s", err)
+			}
+			if selection.LocalRuntime != nil {
+				relative, err := filepath.Rel(l.Tmp, selection.LocalRuntime.Path)
+				if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative) {
+					protected[strings.Split(relative, string(filepath.Separator))[0]] = true
+				}
+			}
+		}
+	}
 	var swept Swept
 	var first *exit.Error
 	for _, entry := range entries {
-		if entry.Name() == "locks" {
+		if protected[entry.Name()] {
 			continue
 		}
 		swept.Scanned++
