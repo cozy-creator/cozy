@@ -223,28 +223,32 @@ func TestWorkingMemoryLedgerSizesTheNextSelection(t *testing.T) {
 }
 
 // `cozy rental update` reads the pinned PodHost's protocol range over the real TLS
-// probe and refuses Runtime >= 0.18.25 behind a host below wire 61.
+// probe and refuses a Runtime whose declared wire minimum that host does not reach.
 func TestRuntimeUpdateRefusesRuntimeAheadOfHost(t *testing.T) {
 	for _, test := range []struct {
-		host    uint32
-		target  string
-		refused bool
+		host   uint32
+		target *rental.RuntimeWire
+		code   string
 	}{
-		{60, "0.18.25", true}, {60, "0.18.25rc1", true}, {60, "0.19.0", true}, {60, "1.0.0", true},
-		{60, "0.18.24", false}, {60, "0.18.24.post1", false}, {60, "0.17.99", false},
-		{61, "0.18.25", false}, {61, "0.19.0", false},
+		{60, &rental.RuntimeWire{WireMinor: 61, MinimumWireMinor: 61}, "rental.runtime_update_host_too_old"},
+		{60, &rental.RuntimeWire{WireMinor: 61, MinimumWireMinor: 60}, ""},
+		{61, &rental.RuntimeWire{WireMinor: 61, MinimumWireMinor: 61}, ""},
+		{61, &rental.RuntimeWire{WireMinor: 62, MinimumWireMinor: 62}, "rental.runtime_update_host_too_old"},
+		{61, nil, "rental.runtime_update_wire_unknown"},
+		{61, &rental.RuntimeWire{WireMinor: 60, MinimumWireMinor: 61}, "rental.runtime_update_wire_unknown"},
 	} {
 		public, _, err := ed25519.GenerateKey(rand.Reader)
 		must(t, err)
 		connection, _ := startFakePod(t, t.TempDir(), &fakePod{controlKey: public, wireMinor: test.host})
 		info, problem := orchestrator.RentalProtocolInfo(context.Background(), connection)
 		fatal(t, problem)
-		problem = rental.RuntimeUpdateHost(test.target, info.WireMinor)
-		if refused := problem != nil; refused != test.refused {
-			t.Fatalf("host %d target %s: refused=%v (%v), want %v", test.host, test.target, refused, problem, test.refused)
+		problem = rental.RuntimeUpdateHost("0.18.99", test.target, info.WireMinor)
+		got := ""
+		if problem != nil {
+			got = problem.ErrName()
 		}
-		if problem != nil && problem.ErrName() != "rental.runtime_update_host_too_old" {
-			t.Fatalf("host %d target %s: %s", test.host, test.target, problem.ErrName())
+		if got != test.code {
+			t.Fatalf("host %d target %+v: %v, want %q", test.host, test.target, problem, test.code)
 		}
 	}
 }
