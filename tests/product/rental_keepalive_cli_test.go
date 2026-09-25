@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -24,6 +25,21 @@ import (
 // Ordinary CLI -> actual daemon/records -> signed TLS Host. Only explicit calls
 // reach the keepalive method; status, duplicate IDs, restart and failures cannot renew.
 func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		runtime   codes.Code
+		wrongBoot bool
+	}{
+		{"compatible", codes.OK, false},
+		{"runtime-unavailable", codes.Unavailable, false},
+		{"runtime-incompatible", codes.FailedPrecondition, false},
+		{"wrong-boot", codes.Unavailable, true},
+	} {
+		t.Run(test.name, func(t *testing.T) { testRentalKeepaliveCLI(t, test.runtime, test.wrongBoot) })
+	}
+}
+
+func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code, wrongBoot bool) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -35,23 +51,32 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
 	pod := &fakePod{controlKey: public}
+	if runtimeFailure != codes.OK {
+		pod.protocolInfo = func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+			return nil, status.Error(runtimeFailure, "Runtime is unavailable or incompatible")
+		}
+	}
 	var mu sync.Mutex
 	receipts := map[string]*pb.KeepRentalAliveResult{}
 	clock := time.Now().UTC().Truncate(time.Millisecond)
 	calls := 0
-	failed := false
+	failure := codes.OK
+	invalidDuration := false
 	pod.keepalive = func(request *pb.KeepRentalAliveRequest) (*pb.KeepRentalAliveResult, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
-		if failed {
-			return nil, status.Error(codes.Unavailable, "unconfirmed reset")
+		if failure != codes.OK {
+			return nil, status.Error(failure, "unconfirmed reset")
 		}
 		if prior := receipts[request.RequestId]; prior != nil {
 			return proto.Clone(prior).(*pb.KeepRentalAliveResult), nil
 		}
 		clock = clock.Add(time.Second)
 		result := &pb.KeepRentalAliveResult{RequestId: request.RequestId, WorkerId: podWorkerID, WorkerBootId: podBootID, AcknowledgedAtUnixMs: clock.UnixMilli(), IdleDeadlineUnixMs: clock.Add(900 * time.Second).UnixMilli()}
+		if invalidDuration {
+			result.IdleDeadlineUnixMs++
+		}
 		receipts[request.RequestId] = result
 		return proto.Clone(result).(*pb.KeepRentalAliveResult), nil
 	}
@@ -65,9 +90,27 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 	hub.rentals[podRental]["requested_accelerator_model"] = "fake-4090"
 	hub.mu.Unlock()
 	row := records.Rental{ID: podRental, MachineName: "keepalive", State: "ready", SKU: "cpu", AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, Hub: hub.server.URL, Address: connection.Addr, MediaAddress: connection.Media.Addr, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
+	if wrongBoot {
+		row.ExpectedWorkerBootID = "other-boot"
+	}
 	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token, identity))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	daemon := startDaemonProcess(t, root)
+	if wrongBoot {
+		code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json")
+		if code == 0 || !strings.Contains(out, "ClaimProof does not verify") {
+			t.Fatalf("wrong boot was not refused by Host authentication: %d %s", code, out)
+		}
+		mu.Lock()
+		mutations := calls
+		mu.Unlock()
+		reset, _, problem := store.RentalIdleResetAt(row)
+		fatal(t, problem)
+		if mutations != 0 || !reset.IsZero() {
+			t.Fatal("unauthenticated keepalive changed the idle clock")
+		}
+		return
+	}
 	command := func() string {
 		t.Helper()
 		code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json", "--full")
@@ -110,22 +153,41 @@ func TestRentalKeepaliveCLIResetsOnlyAfterAcknowledgment(t *testing.T) {
 		t.Fatalf("status: %s", out)
 	}
 	daemon = crashAndRestartTransactionDaemon(t, daemon)
-	reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/claim", map[string]any{})
-	if reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
-		t.Fatalf("reconnect: %s", reply.brief())
+	if runtimeFailure != codes.Unavailable {
+		reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/claim", map[string]any{})
+		if runtimeFailure == codes.OK {
+			if reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
+				t.Fatalf("reconnect: %s", reply.brief())
+			}
+		} else if reply.Status == http.StatusOK {
+			t.Fatalf("Runtime admission accepted the incompatible peer: %s", reply.brief())
+		}
 	}
 	mu.Lock()
 	after := calls
-	failed = true
 	mu.Unlock()
 	if after != before || !baseline().Equal(renewed) {
 		t.Fatal("status or restart renewed the rental")
 	}
-	if code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json"); code == 0 || strings.Contains(out, `"release_due"`) {
-		t.Fatalf("failed acknowledgment claimed success: %d %s", code, out)
+	for _, mode := range []codes.Code{codes.Unavailable, codes.Unimplemented, codes.FailedPrecondition, codes.OK} {
+		mu.Lock()
+		failure = mode
+		invalidDuration = mode == codes.OK
+		mu.Unlock()
+		if code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json"); code == 0 || strings.Contains(out, `"release_due"`) {
+			t.Fatalf("failed/unsupported/expired/invalid acknowledgment claimed success: %d %s", code, out)
+		}
+		if !baseline().Equal(renewed) {
+			t.Fatal("unconfirmed acknowledgment reset local clock")
+		}
 	}
-	if !baseline().Equal(renewed) {
-		t.Fatal("failed acknowledgment reset local clock")
+	if runtimeFailure != codes.OK {
+		pod.mu.Lock()
+		admitted := len(pod.acks) + len(pod.desired) + len(pod.offers)
+		pod.mu.Unlock()
+		if admitted != 0 {
+			t.Fatal("manual keepalive admitted Runtime control or execution")
+		}
 	}
 	reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/keepalive", map[string]any{"request_id": "invalid-duration", "duration": 0})
 	if reply.Status == http.StatusOK {

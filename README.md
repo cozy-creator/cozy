@@ -534,6 +534,9 @@ same fixed policy and asks Tensorhub to release it even if Creator is offline.
 15 minutes after the worker acknowledges it. The command reports the acknowledged
 deadline. There is no duration option, automatic renewal, or setting to disable
 shutdown. A failed or unanswered keepalive does not extend Creator's deadline.
+Keepalive authenticates directly to the pinned rental Host, so it also works while
+Runtime is unavailable or incompatible during repair. It does not admit execution
+or open a new control claim.
 
 `cozy rental list` shows each known machine's idle time and release deadline;
 `cozy rental end <name>` ends one now. A release Tensorhub does not confirm is retried.
