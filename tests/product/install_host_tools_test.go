@@ -45,7 +45,7 @@ func TestInstallerWritesShellCompletion(t *testing.T) {
 	// network download. The stubs answer exactly what install.sh reads back.
 	for name, body := range map[string]string{
 		filepath.Join(stub, "uv"):            "case \"$1 $2\" in 'tool dir') echo " + tools + " ;; esac\n",
-		filepath.Join(tools, "cozy-runtime"): "echo 'distribution: 0.0.0'\n",
+		filepath.Join(tools, "cozy-runtime"): "echo 'distribution: 0.0.0'\n", //cozy:allow stand-in Runtime the installer reads its version from
 		filepath.Join(tools, "tfs"):          "echo 'tfs 0.0.0'\n",
 	} {
 		must(t, os.WriteFile(name, []byte("#!/bin/sh\n"+body), 0o755))
@@ -68,7 +68,7 @@ func TestInstallerWritesShellCompletion(t *testing.T) {
 	install := exec.Command("/usr/bin/nice", "-n", "19", "bash", "../../scripts/install.sh",
 		"--binary", cozyBin, "--prefix", filepath.Join(home, "prefix"))
 	install.Env = []string{"HOME=" + home, "XDG_DATA_HOME=" + data, "XDG_CONFIG_HOME=" + conf,
-		"PATH=" + stub + ":" + os.Getenv("PATH")}
+		"PATH=" + stub + ":/usr/local/bin:/usr/bin:/bin"}
 	out, err := install.CombinedOutput()
 	if err != nil {
 		t.Fatalf("install: %v\n%s", err, out)
