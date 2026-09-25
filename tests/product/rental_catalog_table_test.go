@@ -48,7 +48,7 @@ func catalogTable(t *testing.T, out string) ([]string, map[string][]string, []st
 // missing; there is ONE price and it is the whole one; and the rungs climb cheapest
 // first.
 func TestRentalLadderReadsAsAGPUList(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-ladder-reading")
+	root := filepath.Join(scratchBase, "rental-ladder-reading")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _ = os.RemoveAll(root) })

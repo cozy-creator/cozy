@@ -80,7 +80,7 @@ func TestManualRentalDeclaresExactModelsAndReplaysPinnedBytes(t *testing.T) {
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
-	base := filepath.Join(os.TempDir(), "cozy-product-test")
+	base := scratchBase
 	must(t, os.MkdirAll(base, 0o755))
 	root, err := os.MkdirTemp(base, "manual-models-")
 	must(t, err)

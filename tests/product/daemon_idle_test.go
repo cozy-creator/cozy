@@ -18,7 +18,7 @@ import (
 // rental it owns or a request it owes is on the books. Every arm is the real daemon
 // process on a real root reading its real records; the debounce is the one product knob.
 func TestDaemonIdleShutdown(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "daemon-idle")
+	root := filepath.Join(scratchBase, "daemon-idle")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName),

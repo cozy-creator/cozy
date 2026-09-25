@@ -24,7 +24,7 @@ import (
 )
 
 func TestStaticDescribeNeverImportsPackageCode(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "static-describe")
+	root := filepath.Join(scratchBase, "static-describe")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() {

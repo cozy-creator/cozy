@@ -15,7 +15,7 @@ import (
 // Live (2026-09-02, paul/marco-polo): it printed the list's empty state, "No packages
 // found." with changed: false, while deleting the install directory.
 func TestPackageRemoveReportsSweptInstall(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "package-remove")
+	root := filepath.Join(scratchBase, "package-remove")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() {

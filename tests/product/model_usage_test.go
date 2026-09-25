@@ -28,7 +28,7 @@ const plainEncoding = `{"logical_dtypes":["bf16","bool","f16","f32","f64","f8_e4
 // integers plus `unique`, and the store footer appears only once a blob is unreferenced.
 // The expected numbers come from `tfs manifest walk`, a second TensorFS surface.
 func TestModelListShowsEachModelsBytesAndWhatItShares(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "model-usage")
+	root := filepath.Join(scratchBase, "model-usage")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _ = os.RemoveAll(root) })

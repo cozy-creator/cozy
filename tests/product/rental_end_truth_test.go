@@ -41,7 +41,7 @@ import (
 // rentalEndRoot writes one product root pointed at a stand-in hub.
 func rentalEndRoot(t *testing.T, name string) (string, string, *fakeRentalHub) {
 	t.Helper()
-	base := filepath.Join(os.TempDir(), "cozy-product-test")
+	base := scratchBase
 	must(t, os.MkdirAll(base, 0o755))
 	root, err := os.MkdirTemp(base, name+"-")
 	must(t, err)

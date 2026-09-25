@@ -37,6 +37,10 @@ func integration(t *testing.T) {
 // The two binaries the suite drives as real processes, built once by TestMain.
 var cozyBin, fakeWorkerBin string
 
+// scratchBase is this process's own scratch root. Named roots live under it, so two
+// concurrent runs of the same test never share a COZY_HOME or its database.
+var scratchBase string
+
 func TestMain(m *testing.M) {
 	// The reaper is this same binary under another argv (see reap_test.go). It must be
 	// recognised before anything else happens: it builds nothing and runs no test.
@@ -60,6 +64,10 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	claimScratch(dir)
+	if scratchBase, err = os.MkdirTemp("", "cozy-product-test-"); err != nil {
+		panic(err)
+	}
+	claimScratch(scratchBase)
 	// The suite must never reach the user's ~/.tensorfs: config freezes on its first
 	// in-process Load, so the isolated TensorFS home is pinned before any test runs.
 	if err := os.Setenv("TENSORFS_HOME", filepath.Join(dir, "tensorfs")); err != nil {
@@ -84,6 +92,7 @@ func TestMain(m *testing.M) {
 	}
 	stopDaemonReaper()
 	_ = os.RemoveAll(dir)
+	_ = removeAllForce(scratchBase)
 	os.Exit(code)
 }
 
@@ -106,7 +115,7 @@ type owner struct {
 // before Open, for the wiring a particular product path needs (the rental callbacks, say).
 func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *owner {
 	t.Helper()
-	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
+	root := filepath.Join(scratchBase, name)
 	must(t, removeAllForce(root))
 	must(t, os.MkdirAll(root, 0o755))
 	claimScratch(root)

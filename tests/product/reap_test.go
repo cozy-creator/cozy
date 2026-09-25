@@ -40,7 +40,7 @@ import (
 //     This is the only layer that survives a signal the test binary cannot handle.
 //
 // Reaping is scoped to roots THIS process registered, never to a pattern like
-// "/tmp/cozy-product-test/*": several suites run concurrently on a shared box, and a
+// "/tmp/cozy-product-test-*/*": several suites run concurrently on a shared box, and a
 // pattern sweep would end another run's daemon in the middle of its test.
 
 const reapMode = "--cozy-test-reap="

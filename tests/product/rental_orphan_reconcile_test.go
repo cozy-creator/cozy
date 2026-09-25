@@ -235,7 +235,7 @@ func TestAHubWithNoListingIsNotAnEmptyFleet(t *testing.T) {
 // So the daemon's answer is an ALARM, not a reaper: it says the machine, its rate and
 // its unknown activity, once, and leaves control with the person paying.
 func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-orphan-daemon")
+	root := filepath.Join(scratchBase, "rental-orphan-daemon")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	port := reservePort(t)

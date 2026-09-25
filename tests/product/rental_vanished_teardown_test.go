@@ -57,7 +57,7 @@ func plantLostAttempt(t *testing.T, store *records.Store, root, requestID, renta
 // fact — which matters, because the thing that would otherwise have to answer is the thing
 // that vanished.
 func TestVanishedRentalReleasesItsAttempt(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-vanished")
+	root := filepath.Join(scratchBase, "rental-vanished")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	port := reservePort(t)
@@ -125,7 +125,7 @@ func TestVanishedRentalReleasesItsAttempt(t *testing.T) {
 // stopped with a signal. Cancelling an attempt normally means telling its worker to stop;
 // when the worker is gone there is nobody to tell, and teardown may not wait on it.
 func TestDownAllIsNotRefusable(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "down-all-wedged")
+	root := filepath.Join(scratchBase, "down-all-wedged")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	port := reservePort(t)
