@@ -1,9 +1,12 @@
 package packagepublish
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"net/textproto"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -151,6 +154,39 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 			return fail(exit.New(exit.Conflict, "captured interface replacement changed its distribution"))
 		}
 		sources[name] = map[string]any{"path": path}
+		// Interface metadata carries the child's exact installed closure. Its
+		// private native wheels must also be direct requirements, or uv ignores
+		// their retained source overrides and tries to find dev versions on PyPI.
+		metadata, problem := wheel.Metadata(path)
+		if problem != nil {
+			return fail(problem)
+		}
+		headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(metadata))).ReadMIMEHeader()
+		if err != nil && err != io.EOF {
+			return fail(exit.New(exit.Validation, "captured interface wheel metadata is malformed"))
+		}
+		for _, raw := range headers.Values("Requires-Dist") {
+			req, problem := parseRequirement(raw)
+			if problem != nil {
+				return fail(problem)
+			}
+			source, _ := sources[req.name].(map[string]any)
+			local, _ := source["path"].(string)
+			if !strings.HasSuffix(strings.ToLower(local), ".whl") || slices.Contains(requirements, raw) {
+				continue
+			}
+			identity, problem := wheel.InspectIdentity(local)
+			if problem != nil {
+				return fail(problem)
+			}
+			if identity.Distribution != req.name {
+				return fail(exit.New(exit.Conflict, "captured interface dependency changed its distribution"))
+			}
+			if problem := req.accepts(identity.Version); problem != nil {
+				return fail(problem)
+			}
+			requirements = append(requirements, raw)
+		}
 		// uv applies root source overrides only to direct requirements. A callable
 		// may be selected transitively, so declare its already-selected overlay here too.
 		// Otherwise bindings advertise its exports while uv installs the original.
