@@ -165,9 +165,13 @@ class Derivation:
     def native_arguments(
         self,
         max_new_bytes: int,
-    ) -> tuple[
-        dict[str, Any], dict[str, Any], dict[str, Any], list[tuple[str, str]], int, dict[str, str]
-    ]:
+    ) -> (
+        tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[tuple[str, str]], int]
+        | tuple[
+            dict[str, Any], dict[str, Any], dict[str, Any], list[tuple[str, str]], int,
+            dict[str, str],
+        ]
+    ):
         """Marshal into Store.derived_declaration/estimate/begin, never validate twice."""
         targets: dict[str, Any] = {}
         for name, target in self.targets.items():
@@ -206,7 +210,7 @@ class Derivation:
             if config.source or config.source_config:
                 value.update(source=config.source, source_config=config.source_config)
             configs[name] = value
-        return (
+        arguments = (
             {
                 name: (source.manifest, source.length)
                 for name, source in self.sources.items()
@@ -215,6 +219,11 @@ class Derivation:
             configs,
             list(self.order),
             max_new_bytes,
+        )
+        if not self.files:
+            return arguments
+        return (
+            *arguments,
             {name: base64.b64encode(data).decode("ascii") for name, data in self.files.items()},
         )
 

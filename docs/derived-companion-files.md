@@ -12,6 +12,9 @@ Derivation(
 )
 ```
 
+The optional transport argument is omitted when `files` is empty, preserving existing
+ordinary derivation calls. Nonempty files require TensorFS 0.3.51 and Runtime 0.18.21.
+
 These bytes are part of the locked work declaration. Changing them changes the
 work identity and cannot adopt progress recorded for another declaration. TensorFS
 writes ordinary CAS blobs at commit and returns actual named `Entry::File` entries
