@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -87,14 +88,21 @@ only-include=["file_producer.py"]
 	must(t, os.WriteFile(filepath.Join(producer, "package.toml"), []byte("[application]\nobject=\"file_producer:app\"\n"), 0600))
 	must(t, os.WriteFile(filepath.Join(producer, "file_producer.py"), []byte(`from typing import Annotated
 import msgspec
-from cozy_runtime.author import App, AssetBound, Context, FileAsset, Outputs, invocable
+from cozy_runtime.author import App, AssetBound, Context, FileAsset, ImageAsset, Outputs, invocable
+from PIL import Image
 class Report(msgspec.Struct, frozen=True):
     facts: Annotated[FileAsset, AssetBound(max_bytes=1024, media_types=("application/json",))]
 @invocable(memoize=True)
 async def produce(ctx:Context, *, out:Outputs)->Report:
     return Report(out.save_bytes(b'{"ok":true}\n',media_type="application/json"))
+class ImageReport(msgspec.Struct, frozen=True):
+    image: Annotated[ImageAsset, AssetBound(max_bytes=4096, max_decoded_bytes=768, media_types=("image/png",))]
+@invocable(memoize=True)
+async def produce_image(ctx:Context, *, out:Outputs)->ImageReport:
+    return ImageReport(out.save_image(Image.new("RGB", (16,16), (10,20,30)), format="png"))
 app=App()
 app.job(produce)
+app.job(produce_image)
 `), 0600))
 	header := fmt.Sprintf(`# /// script
 # requires-python=">=3.12,<3.13"
@@ -116,6 +124,12 @@ from cozy_runtime.author import AssetBound, FileAsset, Outputs
 def main(*,out:Outputs)->Annotated[FileAsset,AssetBound(max_bytes=1024,media_types=("text/plain",))]:
     return out.save_bytes(b"bounded client-script output\n",media_type="text/plain")
 `, "value", "text/plain", []byte("bounded client-script output\n")},
+		{"forwarded-image", `from typing import Annotated
+from cozy_runtime.author import AssetBound, ImageAsset
+from file_producer import produce_image
+async def main()->Annotated[ImageAsset,AssetBound(max_bytes=4096,max_decoded_bytes=768,media_types=("image/png",))]:
+    return (await produce_image()).image
+`, "value", "image/png", nil},
 		{"forwarded", `from typing import Annotated
 from cozy_runtime.author import AssetBound, FileAsset
 from file_producer import produce
@@ -139,7 +153,17 @@ async def main()->Annotated[FileAsset,AssetBound(max_bytes=1024,media_types=("ap
 			}
 			data, err := os.ReadFile(target)
 			must(t, err)
-			if !bytes.Equal(data, tc.data) {
+			if tc.media == "image/png" {
+				image, err := png.Decode(bytes.NewReader(data))
+				must(t, err)
+				if image.Bounds().Dx() != 16 || image.Bounds().Dy() != 16 {
+					t.Fatal("wrong forwarded image dimensions")
+				}
+				red, green, blue, _ := image.At(0, 0).RGBA()
+				if red != 10*257 || green != 20*257 || blue != 30*257 {
+					t.Fatal("wrong forwarded image pixels")
+				}
+			} else if !bytes.Equal(data, tc.data) {
 				t.Fatalf("wrong file bytes: %q", data)
 			}
 			digest := sha256.Sum256(data)
@@ -171,4 +195,27 @@ async def main()->Annotated[FileAsset,AssetBound(max_bytes=1024,media_types=("ap
 			}
 		})
 	}
+
+	t.Run("oversized-forwarded-image", func(t *testing.T) {
+		script := filepath.Join(project, "oversized-image.py")
+		body := `from typing import Annotated
+from cozy_runtime.author import AssetBound, ImageAsset
+from file_producer import produce_image
+async def main()->Annotated[ImageAsset,AssetBound(max_bytes=4096,max_decoded_bytes=767,media_types=("image/png",))]:
+    return (await produce_image()).image
+`
+		must(t, os.WriteFile(script, []byte(header+body), 0600))
+		directory := filepath.Join(root, "export-oversized-image")
+		command := exec.Command(cozyBin, "run", script, "--await", "--out", directory, "--json")
+		command.Env = childEnv(t, root, "PATH="+path)
+		output, err := command.CombinedOutput()
+		if err == nil || !strings.Contains(string(output), "captured decoded bound") {
+			t.Fatalf("oversized image was not refused at collection: %v %s", err, output)
+		}
+		files, err := filepath.Glob(filepath.Join(directory, "*.png"))
+		must(t, err)
+		if len(files) != 0 {
+			t.Fatal("oversized image was exported before bound validation")
+		}
+	})
 }

@@ -49,8 +49,17 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 	if problem != nil {
 		return false, problem
 	}
+	var recoveredDecodedBound int64
 	if problem := launch.ValidateMachineResult(schema, body.Result); problem != nil {
-		return false, problem
+		projected, maximum, known := launch.Runtime023PNGResultSchema(schema, body.Result,
+			body.GetObservation().GetEnvironment().GetRuntimeVersion())
+		if !known {
+			return false, problem
+		}
+		if problem := launch.ValidateMachineResult(projected, body.Result); problem != nil {
+			return false, problem
+		}
+		recoveredDecodedBound = maximum
 	}
 	inline := body.Result.InlineResult
 	var result any
@@ -114,6 +123,14 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 			}
 		} else if problem := verifyMachineResultCopy(file); problem != nil {
 			return false, problem
+		}
+		if recoveredDecodedBound > 0 {
+			if file.Source.OutputID != "value" || file.Source.MimeType != "image/png" {
+				return false, exit.New(exit.Conflict, "recovered image result changed its declared kind")
+			}
+			if problem := resultfiles.VerifyPNGDecodedBound(file.Output.Path, recoveredDecodedBound); problem != nil {
+				return false, problem
+			}
 		}
 		if file.State != "released" {
 			released, err := connection.releaseBytes(ctx, fileRetentionRequest(file))
