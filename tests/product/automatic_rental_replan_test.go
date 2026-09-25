@@ -74,10 +74,11 @@ func TestAutomaticQueuedRentalUsesAnotherReadyPeer(t *testing.T) {
 			})
 			free.mu.Lock()
 			free.noSeats = false
+			reobserve := free.reobserve
 			free.mu.Unlock()
 			freeInstance, _, _, problem := o.c.EnsureRental(freeConnection.RentalID)
 			fatal(t, problem)
-			fatal(t, o.c.ConvergePackageSet(freeInstance, []*pb.DownloadPackageRef{{Package: pkg, Release: "1.0.0"}}, nil))
+			must(t, reobserve())
 			waitUntil(t, "the alternative advertises a free seat", func() bool { return o.c.Worker(freeInstance).AvailableSlots == 1 })
 			requested := ""
 			if explicit {

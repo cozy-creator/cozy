@@ -416,7 +416,11 @@ type worker struct {
 	// retire package A's serving placement. A package-interface-falsifying refusal is
 	// relayed to the hub (cl-078/th-106); defectReported latches per revision so one
 	// falsification files one report.
-	desiredDownloadSets    map[string][]byte
+	desiredDownloadSets map[string][]byte
+	// preparedSets holds the pod host's PREPARED answer for each download set it prepared
+	// on boot preparedBoot and the rental still desires, keyed by downloadSetKey.
+	preparedSets           map[string]*pb.DesiredPlacementSet
+	preparedBoot           string
 	defectReportedRevision uint64
 	desiredMu              sync.Mutex
 	// A rental is one machine and may host several package environments. Keep the
@@ -1076,22 +1080,28 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			if placementFailed {
 				placementFault = observed.fault
 			}
+			// The binding the pod authored for this function under the held selection.
+			// Runtime derives it from the whole placement's model ids, so extending the
+			// package's selection re-authors it: a plan this request bound against an
+			// earlier set is stale, never a reason to wait for a binding that is gone.
+			serves := preparedPlacementServes(w, logical)
 			planID := logical.PlanID
-			if planID == "" {
-				// Runtime authored each binding beside its callable name. Other
-				// dispatchable entrypoints cannot identify this request's function.
-				for _, entrypoint := range desired.Entrypoints {
-					if entrypoint.Name == logical.Function {
-						planID = entrypoint.Digest
-						break
-					}
+			for _, entrypoint := range desired.Entrypoints {
+				if entrypoint.Name == logical.Function && (planID == "" || serves) {
+					planID = entrypoint.Digest
+					break
 				}
 			}
+			// A newer desire in flight does not retire a placement that already binds this
+			// request's exact selection and is serving: the pod keeps it serving until
+			// the incoming set is staged, and waiting would idle the warm placement
+			// behind a restage it does not need.
+			current := w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
 			ready := found && planID != "" && observed.dispatchablePlanIDs[planID] &&
 				observed.placementID != "" &&
 				observed.placementSetDigest == desired.PlacementSetDigest &&
 				observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
-				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
+				(current || serves)
 			if ready && desired.SourceDigest == "" &&
 				(!validDigest(observed.environmentDigest) ||
 					observed.environmentDigest != desired.EnvironmentDigest) {
