@@ -1063,9 +1063,11 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			// bought. The card is what the SKU column exists to tell a reader — the
 			// difference between an H100 and a 4090 is the difference between $3.19 and
 			// $0.74 an hour — so the cell carries the card rather than a dash.
-			"machine": seen.MachineName,
+			"machine": either(seen.MachineName, seen.ID),
 			"sku":     orNone(acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount)),
-			"state":   humanRentalState(seen.State),
+			// Billed to this account, attached to another Creator home: its work is not
+			// observable here, which the RUNNING/QUEUED dashes also say.
+			"state":   humanRentalState(seen.State) + " (other client)",
 			"failure": "—", "uptime": rentalUptime(seen.RentedAt),
 			"running": "—", "queued": "—", "idle": "—",
 			"rental": seen.ID, "bought for": "—",
