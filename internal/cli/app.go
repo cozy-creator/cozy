@@ -45,6 +45,7 @@ func (i *Invocation) Value(name string) string {
 // frozen configuration; they never parse argv or read ambient configuration.
 type Context struct {
 	exitCode       int       // a completed aggregate can report partial failures without a second document
+	teardown       bool      // `down --all`: hand each rental to its hub once; never wait on one
 	commandStarted time.Time // includes capture and resolution before a request exists
 	Inv            *Invocation
 	Out            io.Writer

@@ -209,6 +209,7 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 				}
 			}
 			if len(refused) > 0 {
+				ctx.exitCode = 1
 				fields = append(fields, output.Field{K: "not_closed_cleanly", V: len(refused)})
 				for _, line := range refused {
 					fmt.Fprintf(ctx.Err, "  %s\n", line)
@@ -231,6 +232,7 @@ func endRentalSilently(ctx *Context, id string) *exit.Error {
 		return problem
 	}
 	sub := *ctx
+	sub.teardown = true
 	sub.Out = io.Discard
 	sub.Inv = &Invocation{Args: []string{id}, Bools: map[string]bool{},
 		Values: map[string][]string{}, Mode: ctx.Mode()}
