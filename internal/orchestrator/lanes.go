@@ -11,11 +11,12 @@ import (
 )
 
 // DEVICE LANES (proto-024, wire minor 22). The serialized resource inside one worker is a
-// LANE — a set of envelope-local device ordinals with ONE attempt seat — and a worker may
-// have several. An offer for placement P draws only from P's lane, so the worker-level
-// `available_attempt_slots` (provably Σ lanes) over-advertises on a multi-lane worker: two
-// seats on two lanes are ONE seat for a placement on either. This owner therefore keeps a
-// seat ledger per lane beside the worker-level one and reserves against both. A worker that
+// LANE — a set of envelope-local device ordinals — and a worker may have several. A lane's
+// `available_attempt_slots` is how many more offers it will admit to its queue now (the
+// device seat plus the staged one behind it, proto-061 G); this owner reads the count and
+// never assumes it. An offer for placement P draws only from P's lane, so the worker-level
+// count (provably Σ lanes) over-advertises on a multi-lane worker. This owner therefore
+// keeps a seat ledger per lane beside the worker-level one and reserves against both. A worker that
 // reports no lanes — a minor-21 runtime, a job worker — is exactly the worker-level ledger,
 // which is byte for byte the behaviour before lanes were on the wire.
 //
@@ -77,14 +78,14 @@ func (s *seatLedger) settle(consumed bool) {
 	s.observe(s.reported)
 }
 
-// lane is one reported DeviceLane with this owner's ledger over its seat.
+// lane is one reported DeviceLane with this owner's ledger over its admission seats.
 type lane struct {
 	id           string
 	ordinals     []uint32
 	placementIDs []string
 	seats        seatLedger
 	// held is how many attempts the worker last reported on this lane, in every state
-	// from admission to ack — the queue ahead of a new offer (route.go).
+	// from admission (QUEUED) to ack — the queue ahead of a new offer (route.go).
 	held int
 	// resident is the worker's last word on which placements hold device bytes on this
 	// lane (`resident_placement_ids`, proto-026): the fact `cost` prices a fill by. A set,
@@ -274,7 +275,7 @@ func devicesOf(l *lane, envelope []string) []string {
 	return out
 }
 
-// LaneFacts is one lane as this owner reads it: the worker's ordinals and free seat, and
+// LaneFacts is one lane as this owner reads it: the worker's ordinals and free seats, and
 // the granted device names those ordinals index.
 type LaneFacts struct {
 	LaneID               string   `json:"lane_id"`

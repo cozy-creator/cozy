@@ -285,8 +285,9 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			return problem
 		}
 		var planned struct {
-			Unchanged bool                `json:"unchanged"`
-			Target    runtimeUpdateTarget `json:"target"`
+			Unchanged   bool                `json:"unchanged"`
+			Target      runtimeUpdateTarget `json:"target"`
+			RuntimeWire *rental.RuntimeWire `json:"runtime_wire"`
 		}
 		if json.Unmarshal(selection.Selection, &planned) != nil || planned.Target.RuntimeUpdate.Runtime.Version == "" || planned.Target.RuntimeUpdate.TensorFS.Version == "" {
 			return exit.New(exit.Structural, "Runtime update did not resolve a verified wheel pair")
@@ -297,6 +298,13 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			row.State = "succeeded"
 			row.Result = selection.Selection
 			return nil
+		}
+		info, problem := orchestrator.RentalProtocolInfo(ctx, identity)
+		if problem != nil {
+			return problem
+		}
+		if problem := rental.RuntimeUpdateHost(planned.Target.RuntimeUpdate.Runtime.Version, planned.RuntimeWire, info.WireMinor); problem != nil {
+			return problem
 		}
 		if problem := u.machines.store.SaveRuntimeUpdate(*row); problem != nil {
 			return problem

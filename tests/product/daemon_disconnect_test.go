@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -137,7 +138,7 @@ func TestDaemonRestartDoesNotSubmitStoppedMachineExecutions(t *testing.T) {
 	marker := filepath.Join(bin, "runtime-started")
 	script := fmt.Sprintf(`#!/bin/sh
 if [ "$1" = "--json" ] && [ "$2" = "version" ]; then
- printf '%%s\n' '{"distribution":"0.18.14","wire_protocol":"cozy.worker.v1+minor.%d"}'
+ printf '%%s\n' '{"distribution":"%s","wire_protocol":"cozy.worker.v1+minor.%d"}'
  exit 0
 fi
 if [ "$1" = "--json" ] && [ "$2" = "python-interpreters" ]; then
@@ -149,7 +150,7 @@ if [ "$1" = "serve" ]; then
  exit 1
 fi
 exit 2
-`, pb.WireMinor, filepath.Join(bin, "managed-python"), marker)
+`, hostruntime.ToolFloor, pb.WireMinor, filepath.Join(bin, "managed-python"), marker)
 	must(t, os.WriteFile(filepath.Join(bin, "cozy-runtime"), []byte(script), 0700)) //cozy:allow sentinel executable verifies that startup Resume does not start stopped work
 	must(t, os.WriteFile(filepath.Join(bin, "python"), []byte("#!/bin/sh\nexit 1\n"), 0700))
 	seed := func(root, state string) (*records.Store, records.Request) {
@@ -226,6 +227,7 @@ exit 2
 }
 
 func TestDaemonDownReattachesAcceptedLocalRuntime(t *testing.T) {
+	integration(t)
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires the exact Runtime wheel used by CI")
 	}
@@ -247,7 +249,7 @@ func TestDaemonDownReattachesAcceptedLocalRuntime(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "disconnect.py")
 	code := fmt.Sprintf(`# /// script
 # requires-python = ">=3.12,<3.13"
-# dependencies = ["cozy-runtime>=0.18.14"]
+# dependencies = ["cozy-runtime>=0.18.21"]
 # [tool.uv.sources]
 # cozy-runtime = {path = %q}
 # ///

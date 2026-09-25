@@ -15,6 +15,7 @@ import (
 // Ordinary scripts receive large native files/trees and forward them without
 // inlining bytes, publishing code, or requiring a prior run identifier.
 func TestOrdinaryScriptByteResultsAndMemoReuse(t *testing.T) {
+	integration(t)
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires an exact Runtime wheel with native child custody")
 	}

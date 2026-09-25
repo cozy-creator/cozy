@@ -125,7 +125,7 @@ type RentalPackageSetSource func([]*pb.DownloadPackageRef,
 	[]*pb.DownloadModelRef) ([]byte, *exit.Error)
 
 // PrepareFacts is the hub-known half of one PreparePackageSetCall: the release
-// facts (fields 3-6) the record owner fetched for this exact package release on
+// facts (fields 3-6, 10) the record owner fetched for this exact package release on
 // this rental. The pod host relays them verbatim to the Runtime's preparation,
 // which refuses a call without them.
 type PrepareFacts struct {
@@ -134,6 +134,8 @@ type PrepareFacts struct {
 	ModelSlotPaths                []string
 	ImageInventory                *pb.ImageInventory
 	LockedRequirements            []byte
+	// PackageInterface is the release's canonical PackageInterface/1 bytes (wire 61).
+	PackageInterface []byte
 }
 
 // RentalPrepareFactsSource answers one package release's facts for one rental.
@@ -537,9 +539,12 @@ type Orchestrator struct {
 	// a request that quietly stops existing because a worker was still loading.
 	pending []string
 	// parked is what the drain knows about each queued request it skipped, by id
-	// (route.go `parking`): the lanes it competes for and the overtake budget that turns
-	// into a claim. An entry lives exactly as long as its request is in `pending`.
+	// (route.go `parking`). An entry lives exactly as long as its request is in `pending`.
 	parked map[string]*parking
+	// desiring names, per rental, the one request whose preparation is in flight there.
+	// A rental takes one additive desire at a time; schedule issues the next when it ends.
+	desiring  map[string]string
+	preparing map[string]bool // the rental's desire is running, not only reserved
 	// closing is set by Close: a worker stopped during shutdown must not make the queue
 	// ask for a replacement, because the daemon that would run it is going away.
 	closing bool
@@ -610,6 +615,8 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		outputExporting:      map[string]bool{},
 		starting:             map[string]bool{},
 		parked:               map[string]*parking{},
+		desiring:             map[string]string{},
+		preparing:            map[string]bool{},
 		ensuring:             map[string]chan struct{}{},
 		rentalUses:           map[string]int{},
 		rentalMaintenance:    map[string]bool{},
@@ -805,19 +812,12 @@ func (c *Orchestrator) enqueue(requestID string) bool {
 // reports DISPATCHABLE (or job capacity), which is the only event that can change the
 // answer.
 //
-// EVERY QUEUED REQUEST IS ASKED AGAINST ITS OWN CANDIDATES (cl-099). The queue is one
-// FIFO over requests whose candidate lanes differ — a request pinned to a rental, a
-// local one, a job whose model transfer is still materializing on the pod — and a head
-// that cannot go now must not stop a request behind it whose lane is idle. Found live on
-// the owner's box: a `--rental` job sat an hour in source materialization at the head and
-// a local `paul/anima/generate` with the 4070 idle waited eight minutes behind it until
-// its own timeout. So: a request with no dispatchable candidate right now PARKS — keeps
-// its ordinal and position — and the next is tried. FIFO stays the law where two requests
-// compete for one lane: a parked request is overtaken on its lanes at most its position
-// worth of times, then claims them (`parking`), and `route` skips a claimed lane for
-// everything behind the claimant.
+// EVERY QUEUED REQUEST IS ASKED AGAINST ITS OWN CANDIDATES (cl-099): a request with no
+// dispatchable candidate right now PARKS — keeps its ordinal and position — and the next
+// is tried. Published serving work on a rental is not walked here: each rental's queue is
+// handed to its own scheduler (schedule.go), which runs what is loaded first.
 //
-// ONE DRAIN AT A TIME. A worker's report and `selectOrStart`'s own post-launch drain both
+// ONE DRAIN AT A TIME. A worker's report and a preparation's own post-launch drain both
 // fire within milliseconds of the same fact, and two concurrent drains read the same queue
 // snapshot: the durable ordinal law is what refuses the duplicate, but doing the work
 // twice and relying on a refusal is not a design. The lock makes the second drain read a
@@ -832,11 +832,8 @@ func (c *Orchestrator) drain() {
 	}
 	queued := append([]string(nil), c.pending...)
 	c.mu.Unlock()
-	// A named rental is an explicit serial queue. If its head cannot dispatch yet
-	// (for example because its selected lane is still warming), later requests on
-	// that same rental must not overtake it merely because they select a different
-	// already-ready lane. Automatic requests remain work-conserving across rentals.
-	blockedRentals := map[string]*WaitingRun{}
+	var venues []string
+	rentals := map[string][]scheduled{}
 	for position, id := range queued {
 		req, e := c.opt.Store.RequestRow(id)
 		if e != nil || req == nil {
@@ -847,9 +844,17 @@ func (c *Orchestrator) drain() {
 			c.forget(id)
 			continue
 		}
-		if rentalID := req.RequestedRental; rentalID != "" && blockedRentals[rentalID] != nil && !c.activeChild(*req) {
-			c.park(*req, position, waitFacts{cause: WaitQueueAhead, waitingFor: blockedRentals[rentalID]},
-				"an earlier request is waiting on this rental")
+		if req.Worker != "" && req.RequestedRental == "" {
+			// An automatic pin may yield to another rental that already serves it.
+			if moved, problem := c.reconsiderAutomaticRental(*req); problem == nil {
+				req = &moved
+			}
+		}
+		if venue := scheduledVenue(*req); venue != "" {
+			if rentals[venue] == nil {
+				venues = append(venues, venue)
+			}
+			rentals[venue] = append(rentals[venue], scheduled{req: *req, position: position})
 			continue
 		}
 		if req.ModelTransfer != nil {
@@ -874,9 +879,6 @@ func (c *Orchestrator) drain() {
 			// `dispatch` refuses AFTER `pick` succeeded and the only branch here was
 			// `continue`.
 			if e.Code == exit.Unavailable || e.Code == exit.Conflict {
-				if req.RequestedRental != "" {
-					blockedRentals[req.RequestedRental] = &WaitingRun{Number: req.Number, RequestID: req.ID}
-				}
 				c.park(*req, position, waitFacts{}, e.Message)
 				continue
 			}
@@ -886,14 +888,17 @@ func (c *Orchestrator) drain() {
 		c.forget(id)
 		c.logf("%s left the dispatch queue as attempt %d", id, attempt)
 	}
+	for _, venue := range venues {
+		c.schedule(venue, rentals[venue])
+	}
 }
 
-// park records that the drain skipped a queued request and why. The lanes it competes
-// for are read fresh every time (a worker may have appeared); the budget is fixed at the
-// first parking. Only a CHANGE is logged and emitted (`request.parked`): the drain runs
-// on every worker report, and a parked request that is still parked is not news.
-// A caller that knows the blocking condition passes it; an empty waitFacts means "a
-// capacity refusal" and the condition is read from the same routing that names the lanes.
+// park records that the drain skipped a queued request and why. The lanes it is eligible
+// for are read fresh every time (a worker may have appeared). Only a CHANGE is logged and
+// emitted (`request.parked`): the drain runs on every worker report, and a parked request
+// that is still parked is not news. A caller that knows the blocking condition passes it;
+// an empty waitFacts means "a capacity refusal" and the condition is read from the same
+// routing that names the lanes.
 func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, reason string) bool {
 	c.mu.Lock()
 	if !c.queued(req.ID) {
@@ -902,7 +907,7 @@ func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, 
 	}
 	p := c.parked[req.ID]
 	if p == nil {
-		p = &parking{budget: position}
+		p = &parking{}
 		c.parked[req.ID] = p
 	}
 	r := c.route(req)
@@ -917,23 +922,22 @@ func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, 
 	if facts.waitingFor != nil {
 		blocking = facts.waitingFor.RequestID
 	}
-	state := fmt.Sprintf("%s|%s|%s|%s|%t|%s", reason, facts.cause, facts.on, laneStrings(lanes), p.claims(), blocking)
+	state := fmt.Sprintf("%s|%s|%s|%s|%s", reason, facts.cause, facts.on, laneStrings(lanes), blocking)
 	changed := state != p.logged
 	p.logged = state
-	overtaken, budget, claims := p.overtaken, p.budget, p.claims()
+	overtaken := p.overtaken
 	c.mu.Unlock()
 	if !changed {
 		return false
 	}
-	c.logf("%s PARKED at queue position %d (lanes %s, overtaken %d of %d, claims=%t): %s",
-		req.ID, position+1, orNone(laneStrings(lanes)), overtaken, budget, claims, reason)
+	c.logf("%s PARKED at queue position %d (lanes %s, overtaken %d): %s",
+		req.ID, position+1, orNone(laneStrings(lanes)), overtaken, reason)
 	rows := make([]string, 0, len(lanes))
 	for _, l := range lanes {
 		rows = append(rows, l.String())
 	}
 	c.emit(req.ID, "request.parked", 0, facts.decorate(map[string]any{
-		"reason": reason, "position": position + 1, "lanes": rows,
-		"overtaken": overtaken, "budget": budget, "claims": claims,
+		"reason": reason, "position": position + 1, "lanes": rows, "overtaken": overtaken,
 	}, req))
 	return true
 }
@@ -1040,22 +1044,12 @@ func (c *Orchestrator) QueueState(requestID string) (position, depth int) {
 	return position, depth
 }
 
-// reviveQueue re-asks select-or-start for the HEAD of the dispatch queue — the head per
-// MACHINE. It runs when the answer to "does the capacity this request needs exist?" has
-// just changed: a worker's process went, or a launch finished.
-//
-// It exists because `selectOrStart` returns early twice over — while a launch is in
-// FLIGHT, and while any worker for the slot is resident — and neither early return leaves
-// anything behind to ask again. cl-004's live run met both: six queued jobs sat forever
-// behind a launch that was for a DIFFERENT plan, and again behind a worker that had been
-// `kill -9`ed moments after they queued.
-//
-// ONE HEAD PER MACHINE. Reviving every waiting request would let two requests needing
-// different plans on one card stop each other's worker in turn, so on each machine only
-// the first request queued for it is asked. A request pinned to a rental and a local one
-// do not share a card (cl-099): the first of each pin is revived, and neither waits on
-// the other's residency. Nothing is dispatched here — `drain` is still the one placement
-// path.
+// reviveQueue re-asks the queue's residency question after the capacity it depends on
+// changed: a worker's process went, a launch finished, a request left. Published serving
+// work on a rental belongs to its rental's scheduler, so one drain re-asks every rental.
+// Everything else asks select-or-start for the HEAD per machine: reviving every waiting
+// request would let two requests needing different plans on one card stop each other's
+// worker in turn. Nothing is dispatched here — `drain` is still the one placement path.
 func (c *Orchestrator) reviveQueue() {
 	c.mu.Lock()
 	closing, queued := c.closing, append([]string(nil), c.pending...)
@@ -1064,9 +1058,14 @@ func (c *Orchestrator) reviveQueue() {
 		return
 	}
 	asked := map[string]bool{}
+	scheduling := false
 	for _, id := range queued {
 		req, e := c.opt.Store.RequestRow(id)
 		if e != nil || req == nil {
+			continue
+		}
+		if scheduledVenue(*req) != "" {
+			scheduling = true
 			continue
 		}
 		machine := req.Worker
@@ -1078,6 +1077,9 @@ func (c *Orchestrator) reviveQueue() {
 		}
 		asked[machine] = true
 		c.selectOrStart(*req)
+	}
+	if scheduling {
+		go c.drain()
 	}
 }
 

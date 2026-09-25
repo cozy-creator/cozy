@@ -53,6 +53,7 @@ printf '%%s\n' '%s'
 }
 
 func TestPythonLocalServeUsesReportedManagedRoot(t *testing.T) {
+	integration(t)
 	if runtime.GOOS != "linux" || *privateScriptRuntimeWheel == "" {
 		t.Skip("requires Linux process inspection and the exact Runtime wheel")
 	}

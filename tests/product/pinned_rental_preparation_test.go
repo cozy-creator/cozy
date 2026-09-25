@@ -94,13 +94,20 @@ func TestPreparationScopesExplicitRentalsIndependently(t *testing.T) {
 			})
 			second := submit("second", b.RentalID)
 			third := submit("same-rental-follower", a.RentalID)
-			mu.Lock()
-			aCount, bCount := acquisitions[a.RentalID], acquisitions[b.RentalID]
-			mu.Unlock()
 			wantB := 0
 			if explicit {
 				wantB = 1
+				// Each requested rental's scheduler asks its placement question asynchronously.
+				waitUntil(t, "the second rental's own placement question", func() bool {
+					mu.Lock()
+					defer mu.Unlock()
+					return acquisitions[b.RentalID] == 1
+				})
 			}
+			time.Sleep(200 * time.Millisecond)
+			mu.Lock()
+			aCount, bCount := acquisitions[a.RentalID], acquisitions[b.RentalID]
+			mu.Unlock()
 			if aCount != 1 || bCount != wantB {
 				t.Fatalf("preparation selections: first=%d second=%d; want1/%d while first is held", aCount, bCount, wantB)
 			}
@@ -192,12 +199,14 @@ func TestWakeQueuePreservesUnassignedRequestedRentalAffinities(t *testing.T) {
 	mu.Lock()
 	recording = true
 	mu.Unlock()
+	// The wake hands each requested rental's queue to that rental's scheduler, which asks
+	// its own placement question asynchronously.
 	o.c.WakeQueue()
-	mu.Lock()
-	defer mu.Unlock()
-	if !seen["wanted-a"] || !seen["wanted-b"] {
-		t.Fatalf("wake omitted an independent requested rental: %v", seen)
-	}
+	waitUntil(t, "the wake asks every independent requested rental", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return seen["wanted-a"] && seen["wanted-b"]
+	})
 }
 
 func TestUnreadyRentalSelectionNamesTheRunHoldingCapacity(t *testing.T) {
@@ -279,9 +288,18 @@ func TestForeignStagedRentalDoesNotSuppressExplicitPreparation(t *testing.T) {
 		Package: "proof/staged", Release: "1.0.0", Entrypoint: "tile", PlanID: podPlanID("proof/staged"),
 		Payload: []byte(`{"size":16}`), RequestedRental: "wanted-independent", Rental: true, RentalRequired: true})
 	fatal(t, problem)
-	mu.Lock()
-	defer mu.Unlock()
-	if selected != "wanted-independent" {
-		t.Fatal("a staged binding on a different rental suppressed explicit preparation")
+	// The requested rental's scheduler asks its placement question asynchronously.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := selected
+		mu.Unlock()
+		if got == "wanted-independent" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a staged binding on a different rental suppressed explicit preparation")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

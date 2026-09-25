@@ -103,35 +103,91 @@ func (c *Orchestrator) ConvergePackageSet(instanceID string, packages []*pb.Down
 		packages, models = mergePackageSet(w.desiredPackages, w.desiredModels, packages, models)
 	}
 	c.mu.Unlock()
-	return c.issuePackageSet(s, w, packages, models)
+	return c.issuePackageSet(s, w, packages, models, issueMerged)
 }
 
+// packageSetIssue says why a package_set desire is issued, which decides what an earlier
+// preparation on this boot may answer for it.
+type packageSetIssue int
+
+const (
+	// issueMerged is a request's selection merged into the rental's set. A set identical to
+	// the one already desired issues nothing: the ready wait runs on the current revision.
+	issueMerged packageSetIssue = iota
+	// issueRestated re-sends the journaled set on a new control stream. Each package whose
+	// download set was prepared on this boot is answered by that preparation.
+	issueRestated
+	// issueFresh is the worker's own report that prepared bytes are absent. Every package
+	// is prepared again; nothing earlier answers for it.
+	issueFresh
+)
+
+// mergePackageSet adds a request's selection to the rental's desired logical set. The
+// unit is the SLOT, not the package: every entrypoint of one package binds its models
+// under its own slot paths, so a request for another entrypoint EXTENDS the package's
+// selection and the one placement the pod prepares binds both. Replacing the package's
+// whole selection instead retired the warm placement the queue was about to use and
+// restaged it for the next request — two entrypoints alternating on one rental prepared
+// ~100 GB each turn for zero new bytes. A slot the request names takes the request's
+// model (the cl-114 re-stage), and a new package release drops the old release's rows.
 func mergePackageSet(currentPackages []*pb.DownloadPackageRef, currentModels []*pb.DownloadModelRef,
 	requestedPackages []*pb.DownloadPackageRef, requestedModels []*pb.DownloadModelRef,
 ) ([]*pb.DownloadPackageRef, []*pb.DownloadModelRef) {
-	replaced := make(map[string]bool, len(requestedPackages))
+	requested := make(map[string]string, len(requestedPackages))
 	for _, row := range requestedPackages {
 		if row != nil {
-			replaced[row.Package] = true
+			requested[row.Package] = row.Release
 		}
 	}
+	current := make(map[string]string, len(currentPackages))
 	packages := make([]*pb.DownloadPackageRef, 0, len(currentPackages)+len(requestedPackages))
 	for _, row := range currentPackages {
-		if row != nil && !replaced[row.Package] {
+		if row == nil {
+			continue
+		}
+		current[row.Package] = row.Release
+		if _, named := requested[row.Package]; !named {
 			packages = append(packages, row)
 		}
 	}
 	for _, row := range requestedPackages {
 		if row != nil {
 			packages = append(packages, row)
+		}
+	}
+	slots := make(map[string]bool, len(requestedModels))
+	perPackage := map[string]int{}
+	for _, row := range requestedModels {
+		if row != nil {
+			slots[row.Package+"\x00"+row.Slot] = true
+			perPackage[row.Package]++
 		}
 	}
 	models := make([]*pb.DownloadModelRef, 0, len(currentModels)+len(requestedModels))
 	for _, row := range currentModels {
-		if row != nil && !replaced[row.Package] {
-			models = append(models, row)
+		if row == nil {
+			continue
 		}
+		release, named := requested[row.Package]
+		if named && (current[row.Package] != release || slots[row.Package+"\x00"+row.Slot]) {
+			continue
+		}
+		models = append(models, row)
 	}
+	// A download set names at most 32 models. A package whose union would exceed that
+	// keeps only the request's selection rather than refusing the request.
+	kept := map[string]int{}
+	for _, row := range models {
+		kept[row.Package]++
+	}
+	trimmed := models[:0]
+	for _, row := range models {
+		if _, named := requested[row.Package]; named && kept[row.Package]+perPackage[row.Package] > 32 {
+			continue
+		}
+		trimmed = append(trimmed, row)
+	}
+	models = trimmed
 	for _, row := range requestedModels {
 		if row != nil {
 			models = append(models, row)
@@ -161,7 +217,7 @@ func mergePackageSet(currentPackages []*pb.DownloadPackageRef, currentModels []*
 // document can change while its content does not -- there is no signature and no expiry
 // to go stale (owner ruling 2026-09-03).
 func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.DownloadPackageRef,
-	models []*pb.DownloadModelRef) *exit.Error {
+	models []*pb.DownloadModelRef, why packageSetIssue) *exit.Error {
 	if c.opt.RentalPackageSet == nil {
 		return exit.Named(exit.Unavailable, "rental.package_set_signer_missing",
 			"this Cozy daemon has no package_set signer")
@@ -203,15 +259,61 @@ func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.Dow
 			downloadSet: append([]byte(nil), body...),
 		})
 	}
+	label := hostLabel("package_set", fmt.Sprintf("%d packages, %d models", len(packages), len(models)))
 	c.mu.Lock()
+	if why == issueMerged && w.desiredRefusal == nil && w.revision > 0 && !w.spec.IsJob() &&
+		w.desiredLocal == nil && w.desiredUnpublishedPlacement == nil &&
+		!remoteMaterializationFailed(w) && sameDownloadSets(w.desiredDownloadSets, sets) {
+		c.mu.Unlock()
+		c.logf("PodHost %s: the rental already desires exactly this selection; nothing to prepare", label)
+		return nil
+	}
 	w.desiredPackages = clonePackageRefs(packages)
 	w.desiredModels = cloneModelRefs(models)
 	w.desiredDownloadSets = sets
 	w.desiredLocal = nil
 	w.desiredUnpublishedPlacement = nil
+	// A preparation answers only for a download set the rental still desires: one the
+	// set dropped may have been collected on the pod since.
+	if w.preparedBoot != s.bootID {
+		w.preparedSets, w.preparedBoot = map[string]*pb.DesiredPlacementSet{}, s.bootID
+	}
+	wanted := make(map[string]bool, len(sets))
+	for _, body := range sets {
+		wanted[downloadSetKey(body)] = true
+	}
+	for key := range w.preparedSets {
+		if !wanted[key] || why == issueFresh {
+			delete(w.preparedSets, key)
+		}
+	}
 	c.mu.Unlock()
-	return c.issuePackagePrepares(s, w,
-		hostLabel("package_set", fmt.Sprintf("%d packages, %d models", len(packages), len(models))), prepares)
+	return c.issuePackagePrepares(s, w, label, prepares)
+}
+
+// remoteMaterializationFailed answers whether the worker latched a materialization failure
+// on a placement it holds; only a new desired revision asks it to try again.
+func remoteMaterializationFailed(w *worker) bool {
+	for _, observed := range w.observedRemote {
+		if observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED {
+			return true
+		}
+	}
+	return false
+}
+
+func downloadSetKey(body []byte) string { return string(canonical.Digest(body)) }
+
+func sameDownloadSets(held, wanted map[string][]byte) bool {
+	if len(held) != len(wanted) {
+		return false
+	}
+	for name, body := range wanted {
+		if !bytes.Equal(held[name], body) {
+			return false
+		}
+	}
+	return true
 }
 
 // packageSelection is one package's slice of the desired logical set: its ref and the
@@ -380,6 +482,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.setDigest, w.setBytes = rev, digest, setBytes
+	w.rememberSet(s.bootID, digest, setBytes)
 	w.desiredRefusal = nil
 	c.mu.Unlock()
 
@@ -413,7 +516,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 //
 // The rule is one line because the width is a property of the machine, not of a request: a
 // model-bearing placement on a K-device envelope is pinned to ALL K ordinals, which fuses
-// one group lane of degree K advertising ONE seat. There is nothing to choose. The renter
+// one group lane of degree K. There is nothing to choose. The renter
 // bought K cards; the package declares which degrees it can shard at; the worker joins the
 // two and refuses `device_group_unsupported` when they disagree, which is a typed refusal
 // against a machine that is already paid for rather than a silent success that idles K-1
@@ -549,6 +652,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 					environmentDigest: p.EnvironmentDigest,
 					materialization:   p.Materialization, serving: p.Serving,
 					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
+					loadedPlanIDs: map[string]bool{},
+					loadedKnown:   w.wireMinor >= pb.ExecutionLifecycleWireMinor,
+				}
+				for _, digest := range p.LoadedBindingDigests {
+					row.loadedPlanIDs[spellOf(digest)] = true
 				}
 				for _, fault := range p.Faults {
 					if fault != nil {
@@ -583,6 +691,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				}
 			}
 			w.observedRemote = observed
+			w.observeRemotePlacements()
 			w.planIDs = keysOf(dispatchable)
 			for planID := range materializable {
 				if !dispatchable[planID] {
@@ -1256,6 +1365,10 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 					}
 				}
 				holder.planIDs = plans
+			}
+			if holder != nil {
+				// Nothing prepared earlier on this boot answers for the absent bytes.
+				holder.preparedSets, holder.desiredDownloadSets = nil, nil
 			}
 			c.mu.Unlock()
 		}

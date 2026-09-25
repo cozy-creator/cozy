@@ -25,6 +25,15 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
+// integration marks a test that builds real Python and Runtime environments. `-short`
+// (the pull-request gate) skips it; the nightly and `integration`-labelled runs do not.
+func integration(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("integration: builds real Runtime environments; runs nightly")
+	}
+}
+
 // The two binaries the suite drives as real processes, built once by TestMain.
 var cozyBin, fakeWorkerBin string
 

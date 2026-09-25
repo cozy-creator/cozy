@@ -19,6 +19,7 @@ var privateScriptRuntimeWheel = flag.String("script-runtime-wheel", "", "Exact R
 // pyproject stay unchanged. The corrected run must use the edited library while
 // preserving the failed run's source and execution history.
 func TestPrivateScriptCapturesEditableDependencyAndRetries(t *testing.T) {
+	integration(t)
 	root, err := os.MkdirTemp("", "cozy-script-proof-")
 	must(t, err)
 	t.Cleanup(func() {
@@ -160,6 +161,7 @@ def second():
 // Real private installation, generated descriptor, Worker attempt and output spool.
 // No App, request/result DTO or service shim is supplied by the client script.
 func TestPrivateScriptTypedOutputsUseNormalAttempt(t *testing.T) {
+	integration(t)
 	if *privateScriptRuntimeWheel == "" {
 		t.Skip("requires the exact candidate Runtime wheel")
 	}
@@ -223,6 +225,7 @@ def main(*, out: Outputs, tel: Telemetry) -> Annotated[ImageAsset, AssetBound(me
 // The model class lives in a captured editable library, outside the script tree.
 // Both modules refuse execution; only the static source reader can describe it.
 func TestPrivateScriptDescribesCapturedModelWithoutImports(t *testing.T) {
+	integration(t)
 	root, err := os.MkdirTemp("", "cozy-script-model-description-")
 	must(t, err)
 	t.Cleanup(func() {

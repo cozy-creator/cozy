@@ -36,9 +36,10 @@ func TestQueueWaitCauses(t *testing.T) {
 		t.Fatal("the cold request did not settle on this package-less host")
 	}
 
-	// ARM 2 — slot_busy and queue_ahead, on the lanes worker whose placement draws ONE
-	// seat: A holds it, B waits on the slot, C waits in line behind B.
-	spec := fakeSpec("wait-lanes", "10,11", "--arm", "lanes")
+	// ARM 2 — slot_busy and queue_ahead, on the lanes worker whose placement draws TWO
+	// seats: A runs, S is staged behind it, B waits on the slot, C waits in line behind B.
+	gate := t.TempDir()
+	spec := fakeSpec("wait-lanes", "10,11", "--arm", "lanes", "--gate", gate)
 	instance, _, e := o.c.EnsureWorker(spec)
 	fatal(t, e)
 	planID := planIDOf(t, spec)
@@ -47,6 +48,10 @@ func TestQueueWaitCauses(t *testing.T) {
 		map[string]any{"n": 1}))
 	fatal(t, e)
 	fatal(t, o.c.AwaitAccepted(requestA, attemptA, 15*time.Second))
+	requestS, _, e := o.c.Submit(submission(planID, "fake/wait-lanes", "wait-lanes-s",
+		map[string]any{"n": 0}))
+	fatal(t, e)
+	fatal(t, o.c.AwaitAccepted(requestS, 1, 15*time.Second))
 	// Preparation may leave an old warming observation. Once an existing placement
 	// is busy, current capacity is the wait, even for a newly attached watcher.
 	o.c.ObservePhase(instance, orchestrator.PhaseSample{Name: orchestrator.PhaseWarming})
@@ -55,7 +60,7 @@ func TestQueueWaitCauses(t *testing.T) {
 	fatal(t, e)
 	queuedB := awaitDurable(t, o, requestB, "request.queued")
 	if queuedB.Payload["wait"] != "slot_busy" {
-		t.Errorf("B's queued wait = %v, want slot_busy while A holds the only seat", queuedB.Payload["wait"])
+		t.Errorf("B's queued wait = %v, want slot_busy while A and S hold the lane", queuedB.Payload["wait"])
 	}
 	blockingA, problem := o.store.RequestByReference(requestA)
 	fatal(t, problem)
@@ -88,8 +93,11 @@ func TestQueueWaitCauses(t *testing.T) {
 	if reason, _ := parkedB.Payload["reason"].(string); !strings.Contains(reason, "DISPATCHABLE") {
 		t.Errorf("B's parked reason lost the raw diagnostic: %q", reason)
 	}
-	// FIFO settles all three; the fake attempts end on their own "no GPU" outcome.
-	for _, id := range []string{requestA, requestB, requestC} {
+	// FIFO settles all four; the fake attempts end on their own "no GPU" outcome.
+	for _, id := range []string{requestA, requestS, requestB, requestC} {
+		releaseGate(t, gate, id)
+	}
+	for _, id := range []string{requestA, requestS, requestB, requestC} {
 		if _, e := o.c.AwaitSettled(id, 30*time.Second); e == nil || !strings.Contains(e.Message, "no GPU") {
 			t.Fatalf("%s did not settle on its own outcome: %s", id, briefly(e))
 		}

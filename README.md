@@ -21,8 +21,8 @@ scripts/install.sh --binary ./cozy     # Windows: scripts\install.ps1 -Binary .\
 The installer puts `cozy` in `~/.local/bin` and, in one uv tool environment, the host tools
 Cozy drives: `cozy-runtime` and TensorFS's `tfs`. A release asset installs the same way with
 `--asset <cozy-*.tar.gz>`, verified against its `SHA256SUMS` before anything is replaced.
-Rerun it to upgrade. For tab completion, add `source <(cozy completion bash)` to `~/.bashrc`
-(`~/.zshrc` after `compinit`: `source <(cozy completion zsh)`; fish: `cozy completion fish | source`).
+Rerun it to upgrade. Tab completion is installed automatically for bash and fish, and for zsh when
+`~/.local/share/zsh/site-functions` is on `fpath`; otherwise add `source <(cozy completion zsh)` to `~/.zshrc` after `compinit`.
 The host-tool step alone is:
 
 ```sh

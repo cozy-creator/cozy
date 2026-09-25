@@ -23,6 +23,7 @@ var privateChildRuntimeWheel = flag.String("child-runtime-wheel", "", "exact Run
 // This uses the actual Creator binary, installed interface wheels, independent
 // package executors and typed broker. No control peer or executor is simulated.
 func TestUnpublishedChildCompositionReusesLocalWorkspace(t *testing.T) {
+	integration(t)
 	runtimeVersion := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	runtimeInstall := "cozy-runtime==" + runtimeVersion
 	runtimeSource := ""

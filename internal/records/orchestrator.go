@@ -715,6 +715,11 @@ type Residency struct {
 	// Need names each slot's figure: `condition_text: text_encoder`, the largest single
 	// component when the slot declares no component_use, or `lane <lane>` for whole-lane bytes.
 	Need string
+	// Weights is the resident figure alone; Bytes adds the measured Working peak over
+	// WorkingRuns runs. WorkingRuns == 0 means working memory is unmeasured.
+	Weights     int64
+	Working     int64
+	WorkingRuns int
 }
 
 // Resident sizes the pinned selection against ONE accelerator, at every rental width
@@ -1959,6 +1964,9 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 		}
 	}
 	if problem := recordByteOutputsTx(tx, t); problem != nil {
+		return false, problem
+	}
+	if problem := recordDeviceMemoryTx(tx, t); problem != nil {
 		return false, problem
 	}
 	visible := now()

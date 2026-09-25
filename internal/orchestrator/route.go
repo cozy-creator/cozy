@@ -20,13 +20,14 @@ import (
 //
 // held(l) is the attempt-equivalents already ahead on the lane: every attempt the worker
 // holds on it (QUEUED, RUNNING, outcome pending ack) plus this owner's own offers the worker
-// has not answered yet. cost(l) is the fill the attempt pays on arrival, priced off the
-// lane's reported `resident_placement_ids`: 0 when the placement's weights are on the
-// device, 1 on an idle lane (one fill, nobody displaced), 2 when it displaces a resident
-// tenant (that tenant's refill is owed later). A lane whose residency is not on the wire
-// prices one fill — unknown is one fill. The constants are attempt-equivalents and live
-// here, never in config or env (#1312). Nothing here is a timer: `age_ms` rides the
-// decision log for the audit and ranks nothing.
+// has not answered yet. cost(l) is the load the attempt pays on arrival, priced per BINDING:
+// 0 when the live executor already holds the entrypoint's construction
+// (`loaded_binding_digests`), else 1 on an idle lane and 2 when the lane holds another
+// tenant. Ties break on the known load time, the request's model bytes at 20 GB/s. A
+// worker older than minor 61 reports no loaded set; its DISPATCHABLE placement holds its
+// one construction, priced by the lane's `resident_placement_ids`. The constants are
+// attempt-equivalents and live here, never in config or env (#1312). Nothing here is a
+// timer: `age_ms` rides the decision log for the audit and ranks nothing.
 //
 // WHICH WORKERS ARE ASKED is the request's permission (D6): local lanes unless
 // `--rental-only`; every attached rental's lanes with `--rental`, local winning ties; a
@@ -38,6 +39,8 @@ const (
 	costResident = 0
 	costFill     = 1
 	costDisplace = 2
+	// loadBytesPerMS is page cache to device: 20 GB/s.
+	loadBytesPerMS = 20_000_000
 )
 
 // candidate is one (worker, lane) with room for this request, scored.
@@ -48,6 +51,7 @@ type candidate struct {
 	held        int
 	cost        int
 	score       int
+	loadMS      int64
 	ageMS       int64
 	// resident is the lane's reported resident set; manifestsMissing is how many of the
 	// request's model manifests the worker's store does not hold (a DISPATCHABLE
@@ -59,15 +63,15 @@ type candidate struct {
 func (k candidate) local() bool { return k.worker.spec.Connection == nil }
 
 func (k candidate) String() string {
-	return fmt.Sprintf("%s/%s held=%d cost=%d score=%d resident=%v missing=%d age_ms=%d",
-		k.worker.instanceID, orNone(k.laneID), k.held, k.cost, k.score, k.resident,
+	return fmt.Sprintf("%s/%s held=%d cost=%d score=%d load_ms=%d resident=%v missing=%d age_ms=%d",
+		k.worker.instanceID, orNone(k.laneID), k.held, k.cost, k.score, k.loadMS, k.resident,
 		k.manifestsMissing, k.ageMS)
 }
 
 func (k candidate) event() map[string]any {
 	out := map[string]any{
 		"worker": k.worker.instanceID, "lane": k.laneID, "placement": k.placementID,
-		"held": k.held, "cost": k.cost, "score": k.score, "age_ms": k.ageMS,
+		"held": k.held, "cost": k.cost, "score": k.score, "load_ms": k.loadMS, "age_ms": k.ageMS,
 		"resident": k.resident, "manifests_missing": k.manifestsMissing,
 	}
 	if !k.local() {
@@ -76,19 +80,35 @@ func (k candidate) event() map[string]any {
 	return out
 }
 
-// costOn prices the fill an attempt for `placementID` pays on `laneID` (§3.1).
-func (w *worker) costOn(laneID, placementID string) (int, []string) {
+// costOn prices the load an attempt for `planID` on `placementID` pays on `laneID`
+// (§3.1): nothing when its construction is loaded, else one load of its known bytes.
+func (w *worker) costOn(laneID, placementID, planID string, models []records.ModelRef) (int, int64, []string) {
 	l := w.lanes.get(laneID)
-	if l == nil {
-		return costFill, nil
+	var resident []string
+	if l != nil {
+		resident = l.residentIDs()
 	}
-	switch {
-	case l.resident[placementID]:
-		return costResident, l.residentIDs()
-	case len(l.resident) == 0:
-		return costFill, nil
+	observed, remote := w.observedRemote[placementID]
+	if remote && observed.loadedKnown {
+		if observed.loaded(planID) {
+			return costResident, 0, resident
+		}
+	} else if l != nil && l.resident[placementID] {
+		return costResident, 0, resident
 	}
-	return costDisplace, l.residentIDs()
+	var bytes int64
+	for _, model := range models {
+		bytes += model.Bytes
+	}
+	cost := costFill
+	if l != nil {
+		for id := range l.resident {
+			if id != placementID {
+				cost = costDisplace
+			}
+		}
+	}
+	return cost, bytes / loadBytesPerMS, resident
 }
 
 // missingManifests counts the request's model manifests the worker's verified store does
@@ -103,53 +123,30 @@ func (w *worker) missingManifests(models []records.ModelRef) int {
 	return missing
 }
 
-// laneKey names one (worker, lane) two requests compete for; lane "" is the worker-level
-// window of a worker reporting no lanes, and matches every lane on that worker.
+// laneKey names one (worker, lane); lane "" is the worker-level window of a worker
+// reporting no lanes.
 type laneKey struct{ worker, lane string }
 
 func (k laneKey) String() string { return k.worker + "/" + orNone(k.lane) }
 
-func (k laneKey) covers(o laneKey) bool {
-	return k.worker == o.worker && (k.lane == "" || o.lane == "" || k.lane == o.lane)
-}
-
-// parking is what the queue knows about a request it skipped (cl-099): the lanes it is
-// eligible for — the lanes it competes on — how many later requests were dispatched onto
-// one of them past it, and the budget for that: its position in the queue when it first
-// parked (gpu-hot D6 mirrored — an attempt admitted behind k others is overtaken at most
-// k times; a request parked at the head is overtaken by nobody). Once the budget is spent
-// the request CLAIMS its lanes: `route` skips them for everything behind it, so
-// head-of-line blocking exists only among requests that compete for one lane and is
-// bounded there by twice the FIFO wait. `logged` is the last reason emitted, so a drain
-// that finds nothing changed says nothing.
+// parking is what the queue knows about a request it skipped: the lanes it is eligible for,
+// how many later requests on its rental were dispatched past it (schedule's starvation
+// bound), and the last wait it logged, so a drain that finds nothing changed says nothing.
 type parking struct {
 	lanes     []laneKey
 	overtaken int
-	budget    int
 	logged    string
 	wait      waitFacts // the queue's last typed wait, never parsed from logged text
 }
 
-func (p *parking) claims() bool { return p.overtaken >= p.budget }
-
-func (p *parking) competes(k laneKey) bool {
-	for _, l := range p.lanes {
-		if l.covers(k) {
-			return true
-		}
-	}
-	return false
-}
-
 // routing is one decision: every candidate with room, best first; the workers that
-// would have been candidates but had no room, with why; every lane the request is
-// eligible for (with or without room), and the lanes an earlier parked request claims.
+// would have been candidates but had no room, with why; and every lane the request is
+// eligible for (with or without room).
 type routing struct {
 	candidates []candidate
 	parked     []string
 	blocked    []laneKey
 	lanes      []laneKey
-	claimed    []string
 	// pinned is the rental this decision pinned the request to (dispatch), or "".
 	pinned string
 }
@@ -167,9 +164,6 @@ func (r routing) event() map[string]any {
 		rows = append(rows, k.event())
 	}
 	out := map[string]any{"candidates": rows}
-	if len(r.claimed) > 0 {
-		out["claimed"] = r.claimed
-	}
 	if pick := r.pick(); pick != nil {
 		row := map[string]any{"worker": pick.worker.instanceID, "lane": pick.laneID}
 		if !pick.local() {
@@ -196,7 +190,6 @@ func (r routing) String() string {
 func (c *Orchestrator) route(req records.Request) routing {
 	planID := req.PlanID
 	now := time.Now()
-	claims := c.claimsAhead(req.ID)
 	var out routing
 	for _, w := range c.workers {
 		if w.preparingRequest != "" && (!w.preparingReady || w.preparingRequest != req.ID) {
@@ -207,7 +200,7 @@ func (c *Orchestrator) route(req records.Request) routing {
 			continue
 		}
 		placementID := w.placementFor(slot, planID)
-		laneID, room, held, why := w.roomFor(placementID, planID)
+		laneID, room, held, why := w.roomFor(placementID)
 		lane := laneKey{w.instanceID, laneID}
 		out.lanes = append(out.lanes, lane)
 		if room <= 0 {
@@ -215,13 +208,9 @@ func (c *Orchestrator) route(req records.Request) routing {
 			out.blocked = append(out.blocked, lane)
 			continue
 		}
-		if by, claimed := claims[lane]; claimed && room < 2 {
-			out.claimed = append(out.claimed, lane.String()+" by "+by)
-			continue
-		}
 		k := candidate{worker: w, laneID: laneID, placementID: placementID, held: held,
 			manifestsMissing: w.missingManifests(req.Models)}
-		k.cost, k.resident = w.costOn(laneID, placementID)
+		k.cost, k.loadMS, k.resident = w.costOn(laneID, placementID, planID, req.Models)
 		k.score = k.held + k.cost
 		if !w.lastReport.IsZero() {
 			k.ageMS = now.Sub(w.lastReport).Milliseconds()
@@ -236,6 +225,9 @@ func (c *Orchestrator) route(req records.Request) routing {
 		if (a.cost == costResident) != (b.cost == costResident) {
 			return a.cost == costResident
 		}
+		if a.loadMS != b.loadMS {
+			return a.loadMS < b.loadMS
+		}
 		if a.local() != b.local() {
 			return a.local()
 		}
@@ -246,62 +238,7 @@ func (c *Orchestrator) route(req records.Request) routing {
 	})
 	sort.Strings(out.parked)
 	sort.Slice(out.blocked, func(i, j int) bool { return out.blocked[i].String() < out.blocked[j].String() })
-	sort.Strings(out.claimed)
 	return out
-}
-
-// claimsAhead is every lane claimed by a parked request queued ahead of this one (a
-// request not in the queue is behind everything in it), keyed by the lane it would
-// take. Callers hold c.mu.
-func (c *Orchestrator) claimsAhead(requestID string) map[laneKey]string {
-	claims := map[laneKey]string{}
-	current, _ := c.opt.Store.RequestRow(requestID)
-	inherited := current != nil && c.activeChild(*current)
-	for _, id := range c.pending {
-		if id == requestID {
-			break
-		}
-		unrelated := false
-		if inherited {
-			prior, problem := c.opt.Store.RequestRow(id)
-			unrelated = problem == nil && prior != nil && prior.ParentRequestID != current.ParentRequestID
-		}
-		p := c.parked[id]
-		if p == nil || !p.claims() {
-			continue
-		}
-		for _, w := range c.workers {
-			if unrelated && w.instanceID == rentalInstanceID(current.Worker) {
-				continue
-			}
-			for _, lane := range w.laneKeys() {
-				if p.competes(lane) {
-					claims[lane] = id
-				}
-			}
-		}
-	}
-	return claims
-}
-
-// overtaken records one dispatch onto `lane` past every parked request queued ahead of
-// the dispatched one that competes for it. A budget spent here is a claim from the next
-// routing on. Callers hold c.mu.
-func (c *Orchestrator) overtaken(requestID string, lane laneKey) {
-	for _, id := range c.pending {
-		if id == requestID {
-			return
-		}
-		p := c.parked[id]
-		if p == nil || !p.competes(lane) {
-			continue
-		}
-		p.overtaken++
-		if p.overtaken == p.budget {
-			c.logf("%s was overtaken %d time(s) on its lane(s) by %s, its budget; it claims %s",
-				id, p.overtaken, requestID, laneStrings(p.lanes))
-		}
-	}
 }
 
 func laneStrings(lanes []laneKey) string {
@@ -310,20 +247,6 @@ func laneStrings(lanes []laneKey) string {
 		parts = append(parts, l.String())
 	}
 	return strings.Join(parts, ",")
-}
-
-// laneKeys is every lane a dispatch to this worker can draw from: its reported lanes,
-// or the worker-level window when it reports none.
-func (w *worker) laneKeys() []laneKey {
-	if !w.lanes.present() {
-		return []laneKey{{w.instanceID, ""}}
-	}
-	out := make([]laneKey, 0, len(w.lanes.lanes))
-	for id := range w.lanes.lanes {
-		out = append(out, laneKey{w.instanceID, id})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].lane < out[j].lane })
-	return out
 }
 
 // eligible is the placement half of the match: a live claimed worker whose placement
@@ -381,11 +304,13 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 
 // roomFor is the capacity half, per worker kind (#486c generalized by proto-024): the
 // worker's fence is OPEN, a worker-level seat is free, and — when the worker reports
-// lanes — the placement's own lane has a free seat. It answers the lane the reservation
+// lanes — the placement's own lane still admits an offer to its queue (a running attempt
+// and a staged one behind it, proto-061 G; never assumed, always the reported count).
+// It answers the lane the reservation
 // draws from ("" for the worker-level window), the room on it net of this owner's
 // unanswered reservations, the attempts already held ahead of a new one, and a reason
 // when the room is zero.
-func (w *worker) roomFor(placementID, planID string) (laneID string, room, held int, why string) {
+func (w *worker) roomFor(placementID string) (laneID string, room, held int, why string) {
 	if w.spec.IsJob() {
 		if w.jobsAvail <= 0 {
 			return "", 0, 0, "no job capacity"
@@ -431,10 +356,6 @@ func (r routing) noCapacity(req records.Request) *exit.Error {
 		asked = "no attached rental"
 	case req.Rental:
 		asked = "no local worker or attached rental"
-	}
-	if len(r.claimed) > 0 {
-		return exit.Unavailablef("every lane with room for %s in %s is claimed by a request "+
-			"queued ahead of it (%s)", planID, slot, strings.Join(r.claimed, "; "))
 	}
 	if len(r.parked) > 0 {
 		return exit.Unavailablef(

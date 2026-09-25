@@ -416,7 +416,11 @@ type worker struct {
 	// retire package A's serving placement. A package-interface-falsifying refusal is
 	// relayed to the hub (cl-078/th-106); defectReported latches per revision so one
 	// falsification files one report.
-	desiredDownloadSets    map[string][]byte
+	desiredDownloadSets map[string][]byte
+	// preparedSets holds the pod host's PREPARED answer for each download set it prepared
+	// on boot preparedBoot and the rental still desires, keyed by downloadSetKey.
+	preparedSets           map[string]*pb.DesiredPlacementSet
+	preparedBoot           string
 	defectReportedRevision uint64
 	desiredMu              sync.Mutex
 	// A rental is one machine and may host several package environments. Keep the
@@ -424,6 +428,11 @@ type worker struct {
 	// package B joins the same desired set.
 	remotePlacements map[string]DesiredPlacement
 	observedRemote   map[string]remotePlacementObservation
+	// sentSets are the canonical PlacementSet bytes this owner sent on the live boot, by
+	// spelled digest. The worker reports the digest each placement was accepted under;
+	// these are the bytes that digest names, so "holds" is read off what is resident.
+	sentSets     map[string][]byte
+	sentSetsBoot string
 	// desiredLocal is the exact command-scoped local wheel inventory. It survives
 	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
 	desiredLocal *pb.DesiredLocalPackageSet
@@ -570,7 +579,19 @@ type remotePlacementObservation struct {
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
 	knownPlanIDs        map[string]bool
-	fault               *pb.Fault
+	// loadedPlanIDs are the bindings whose construction the live executor holds
+	// (minor 61). loadedKnown is false for an older worker, whose DISPATCHABLE
+	// placement holds its one construction: every dispatchable binding is loaded.
+	loadedPlanIDs map[string]bool
+	loadedKnown   bool
+	fault         *pb.Fault
+}
+
+func (o remotePlacementObservation) loaded(planID string) bool {
+	if !o.loadedKnown {
+		return o.dispatchablePlanIDs[planID]
+	}
+	return o.loadedPlanIDs[planID]
 }
 
 // dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).
@@ -637,16 +658,25 @@ func (w *worker) remoteStaged(packageName, planID, release, localRevision string
 }
 
 func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, bool, *exit.Error) {
-	if len(w.setBytes) == 0 || len(w.setDigest) == 0 {
-		return DesiredPlacement{}, false, nil
+	placement, _, found, problem := placementRow(w.setBytes, spellOf(w.setDigest), pkg, release, "")
+	return placement, found, problem
+}
+
+// placementRow reads the placement for a package release out of one PlacementSet's bytes
+// — the one named `placementID` when it is given — with the row it came from.
+func placementRow(setBytes []byte, digest, pkg, release, placementID string) (DesiredPlacement, canonical.Doc, bool, *exit.Error) {
+	if len(setBytes) == 0 || digest == "" {
+		return DesiredPlacement{}, nil, false, nil
 	}
-	doc, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
+	doc, err := canonical.Read(setBytes, &pb.PlacementSet{})
 	if err != nil {
-		return DesiredPlacement{}, false, exit.Named(exit.Structural,
+		return DesiredPlacement{}, nil, false, exit.Named(exit.Structural,
 			"rental.placement_set_invalid", "prepared PlacementSet is not canonical: %s", err)
 	}
-	digest := spellOf(w.setDigest)
 	for _, row := range doc.List("placements") {
+		if placementID != "" && row.Str("placement_id") != placementID {
+			continue
+		}
 		selected := row.Sub("package")
 		development := row.Sub("development")
 		if development.Str("package") != "" {
@@ -659,7 +689,7 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 			Models:           placementModels(pkg, row),
 			PlacementIDValue: row.Str("placement_id"), PlacementSetDigest: digest,
 			BindingsDigest:    row.Str("bindings_digest"),
-			PlacementSetBytes: append([]byte(nil), w.setBytes...),
+			PlacementSetBytes: append([]byte(nil), setBytes...),
 			EnvironmentDigest: row.Str("environment_digest")}
 		if development.Str("package") != "" {
 			placement.SourceDigest = development.Str("source_digest")
@@ -667,83 +697,170 @@ func preparedRemotePlacement(w *worker, pkg, release string) (DesiredPlacement, 
 		}
 		if placement.PlacementIDValue == "" || !validDigest(placement.BindingsDigest) ||
 			(placement.SourceDigest == "" && placement.EnvironmentDigest == "") {
-			return DesiredPlacement{}, false, exit.Named(exit.Structural,
+			return DesiredPlacement{}, nil, false, exit.Named(exit.Structural,
 				"rental.placement_incomplete", "prepared placement for %s@%s is incomplete", pkg, release)
 		}
 		seen := make(map[string]bool)
 		for _, entrypoint := range row.List("entrypoints") {
 			name, binding := entrypoint.Str("name"), entrypoint.Str("entrypoint_binding_digest")
 			if name == "" || seen[name] || !validDigest(binding) {
-				return DesiredPlacement{}, false, exit.Named(exit.Structural,
+				return DesiredPlacement{}, nil, false, exit.Named(exit.Structural,
 					"rental.entrypoint_binding_invalid", "prepared placement has an invalid or repeated callable binding")
 			}
 			seen[name] = true
 			placement.Entrypoints = append(placement.Entrypoints, Entrypoint{Name: name, Digest: binding})
 		}
-		return placement, true, nil
+		return placement, row, true, nil
 	}
-	return DesiredPlacement{}, false, nil
+	return DesiredPlacement{}, nil, false, nil
 }
 
-// preparedPlacementServes answers whether the set this rental last converged to already
-// binds the request's function to the request's exact models (h3a-018): the placement for
-// the package release names the function, and every slot the pod bound for it references
-// the manifest the request pins for that slot. A request that is served by what the pod
-// holds issues no package prepare — the prepare it would issue authors the same bytes and
-// costs the pod a full materialization (28 s measured, for zero new bytes) — and reaches
-// dispatch through the ordinary ready wait. A refused or failed desire is never "held".
+// entrypointServes answers whether a placement row binds the request's function to its
+// exact selection (h3a-018): every slot the pod bound for the function references a
+// manifest the request accepts for that slot — its pin, or a rung of its ladder — under
+// the same adapters. It answers the binding the pod authored for the function.
+func entrypointServes(row canonical.Doc, logical LogicalPackage) (string, bool) {
+	requested := make(map[string]ModelRef, len(logical.Models))
+	for _, model := range logical.Models {
+		requested[model.Slot] = model
+	}
+	manifests := map[string]string{}
+	modelRows := map[string]canonical.Doc{}
+	for _, model := range row.List("models") {
+		manifests[model.Str("id")] = model.Sub("manifest").Str("digest")
+		modelRows[model.Str("id")] = model
+	}
+	for _, entrypoint := range row.List("entrypoints") {
+		if entrypoint.Str("name") != logical.Function {
+			continue
+		}
+		slots := entrypoint.List("slots")
+		if len(slots) == 0 || len(logical.Models) == 0 {
+			// A binding that names no slots, or a request that names no models (the
+			// package's own defaults), has no selection to disagree with; the placement's
+			// model rows are the evidence (selectionServes).
+			return entrypoint.Str("entrypoint_binding_digest"),
+				selectionServes(logical.Models, placementModels(logical.Package, row))
+		}
+		if len(slots) != len(requested) {
+			return "", false
+		}
+		for _, slot := range slots {
+			model, ok := requested[logical.Function+".models."+slot.Str("slot")]
+			held := manifests[slot.Str("reference_model_id")]
+			if !ok || held == "" {
+				return "", false
+			}
+			if _, fits := rungHolding(model, held); !fits ||
+				!records.SameAdapters(model.Adapters, placementAdapters(slot, modelRows)) {
+				return "", false
+			}
+		}
+		return entrypoint.Str("entrypoint_binding_digest"), true
+	}
+	return "", false
+}
+
+// preparedPlacementServes answers whether a placement the rental REPORTS already binds the
+// request's function to its exact selection. A request it serves issues no package
+// prepare — the prepare would author the same bytes and cost the pod a full
+// materialization (28 s measured, for zero new bytes) — and waits for, or takes, that
+// placement. What this owner last sent is not what the worker holds.
 func preparedPlacementServes(w *worker, logical LogicalPackage) bool {
+	_, _, _, held := observedServing(w, logical)
+	return held
+}
+
+// desiredPlacementServes answers whether the set this owner last desired binds the
+// function to the request's exact pinned models; a captured revision's readiness reads it.
+func desiredPlacementServes(w *worker, logical LogicalPackage) bool {
 	if w == nil || w.refusal != nil || w.desiredRefusal != nil || len(logical.Models) == 0 {
 		return false
 	}
-	desired, found, problem := preparedRemotePlacement(w, logical.Package, logical.Release)
-	if problem != nil || !found {
-		return false
-	}
-	if observed, ok := w.observedRemote[desired.PlacementIDValue]; ok &&
-		observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED {
-		return false
-	}
-	doc, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
-	if err != nil {
-		return false
-	}
-	pinned := make(map[string]ModelRef, len(logical.Models))
 	for _, model := range logical.Models {
 		if !model.Pinned() {
 			return false
 		}
-		pinned[model.Slot] = model
 	}
-	for _, row := range doc.List("placements") {
-		if row.Str("placement_id") != desired.PlacementIDValue {
+	placement, row, found, problem := placementRow(w.setBytes, spellOf(w.setDigest),
+		logical.Package, logical.Release, "")
+	if problem != nil || !found {
+		return false
+	}
+	if observed, ok := w.observedRemote[placement.PlacementIDValue]; ok &&
+		observed.materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED {
+		return false
+	}
+	_, ok := entrypointServes(row, logical)
+	return ok
+}
+
+// setBytesFor returns the canonical PlacementSet bytes this owner sent under a spelled
+// digest on the worker's live boot.
+func (w *worker) setBytesFor(digest string) []byte {
+	if digest == "" {
+		return nil
+	}
+	if len(w.setDigest) > 0 && spellOf(w.setDigest) == digest {
+		return w.setBytes
+	}
+	return w.sentSets[digest]
+}
+
+// rememberSet keeps the bytes of a set sent on this boot, so a report naming it can be
+// read. Callers hold c.mu.
+func (w *worker) rememberSet(boot string, digest, body []byte) {
+	if w.sentSetsBoot != boot || w.sentSets == nil {
+		w.sentSets, w.sentSetsBoot = map[string][]byte{}, boot
+	}
+	w.sentSets[spellOf(digest)] = append([]byte(nil), body...)
+}
+
+// observeRemotePlacements makes every placement the worker reports DISPATCHABLE routable
+// under each binding it authored, and forgets set bytes no placement is held under.
+// Callers hold c.mu.
+func (w *worker) observeRemotePlacements() {
+	rentalID := w.spec.Connection.RentalID
+	keep := map[string]bool{spellOf(w.setDigest): true, spellOf(w.acceptedSetDigest): true}
+	for id, observed := range w.observedRemote {
+		keep[observed.placementSetDigest] = true
+		if observed.serving != pb.ServingState_SERVING_STATE_DISPATCHABLE {
 			continue
 		}
-		manifests := map[string]string{}
-		modelRows := map[string]canonical.Doc{}
-		for _, model := range row.List("models") {
-			manifests[model.Str("id")] = model.Sub("manifest").Str("digest")
-			modelRows[model.Str("id")] = model
+		doc, err := canonical.Read(w.setBytesFor(observed.placementSetDigest), &pb.PlacementSet{})
+		if err != nil {
+			continue
 		}
-		for _, entrypoint := range row.List("entrypoints") {
-			if entrypoint.Str("name") != logical.Function {
+		for _, row := range doc.List("placements") {
+			if row.Str("placement_id") != id {
 				continue
 			}
-			slots := entrypoint.List("slots")
-			if len(slots) != len(pinned) {
-				return false
+			selected := row.Sub("package")
+			if row.Sub("development").Str("package") != "" {
+				selected = row.Sub("development")
 			}
-			for _, slot := range slots {
-				path := logical.Function + ".models." + slot.Str("slot")
-				held := manifests[slot.Str("reference_model_id")]
-				if held == "" || pinned[path].Manifest != held || !records.SameAdapters(pinned[path].Adapters, placementAdapters(slot, modelRows)) {
-					return false
+			placement, _, found, problem := placementRow(w.setBytesFor(observed.placementSetDigest),
+				observed.placementSetDigest, selected.Str("package"), selected.Str("release"), id)
+			if problem != nil || !found {
+				continue
+			}
+			slot := pinnedPackage(placement.Package, rentalID)
+			for _, entrypoint := range placement.Entrypoints {
+				if !observed.dispatchablePlanIDs[entrypoint.Digest] {
+					continue
 				}
+				routed := placement
+				routed.Package = slot
+				routed.Entrypoints = []Entrypoint{entrypoint}
+				w.remotePlacements[remotePlanKey(slot, entrypoint.Digest)] = routed
 			}
-			return true
 		}
 	}
-	return false
+	for digest := range w.sentSets {
+		if !keep[digest] {
+			delete(w.sentSets, digest)
+		}
+	}
 }
 
 // admissible answers the worker-level half. CLOSED is STRUCTURAL (pre-snapshot-barrier,
@@ -1053,8 +1170,12 @@ func (c *Orchestrator) ensureWorkerClaimedContext(ctx context.Context, instanceI
 	}
 }
 
+// ensureLogicalPackageReady waits until the rental serves the logical package. A published
+// selection (`observed`) is ready when a placement the worker reports binds it and is
+// DISPATCHABLE for its binding, whichever desire staged it; a captured revision is ready
+// on the placement this owner last desired.
 func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
-	logical LogicalPackage) (WorkerLaunchSpec, string, *exit.Error) {
+	logical LogicalPackage, observedSet bool) (WorkerLaunchSpec, string, *exit.Error) {
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
@@ -1076,22 +1197,44 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			if placementFailed {
 				placementFault = observed.fault
 			}
+			// The binding the pod authored for this function under the held selection.
+			// Runtime derives it from the whole placement's model ids, so extending the
+			// package's selection re-authors it: a plan this request bound against an
+			// earlier set is stale, never a reason to wait for a binding that is gone.
+			serves := desiredPlacementServes(w, logical)
 			planID := logical.PlanID
-			if planID == "" {
-				// Runtime authored each binding beside its callable name. Other
-				// dispatchable entrypoints cannot identify this request's function.
-				for _, entrypoint := range desired.Entrypoints {
-					if entrypoint.Name == logical.Function {
-						planID = entrypoint.Digest
-						break
-					}
+			for _, entrypoint := range desired.Entrypoints {
+				if entrypoint.Name == logical.Function && (planID == "" || serves) {
+					planID = entrypoint.Digest
+					break
 				}
 			}
+			current := w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
 			ready := found && planID != "" && observed.dispatchablePlanIDs[planID] &&
 				observed.placementID != "" &&
 				observed.placementSetDigest == desired.PlacementSetDigest &&
 				observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
-				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
+				(current || serves)
+			if observedSet {
+				// HOLDS = OBSERVED. Whatever placement the worker reports binding this
+				// selection serves it; a newer desire in flight retires nothing it holds.
+				if placement, bound, status, held := observedServing(w, logical); held {
+					desired, planID, observed = placement, bound, status
+					ready = observed.placementID != "" && observed.dispatchablePlanIDs[planID] &&
+						observed.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE
+				} else if ready && current {
+					// The worker converged this owner's own desire and serves the function,
+					// but not under the requested selection: that is its answer.
+					problem := requireAdapterEcho(logical.Models, desired.Models)
+					if problem == nil {
+						problem = exit.Named(exit.Structural, "rental.selection_not_bound",
+							"the rented worker prepared %s without binding %s to the requested models",
+							logical.Package, logical.Function)
+					}
+					c.mu.Unlock()
+					return WorkerLaunchSpec{}, "", problem
+				}
+			}
 			if ready && desired.SourceDigest == "" &&
 				(!validDigest(observed.environmentDigest) ||
 					observed.environmentDigest != desired.EnvironmentDigest) {
@@ -1915,8 +2058,8 @@ type WorkerFacts struct {
 	AvailableSlots int    `json:"available_attempt_slots"`
 	// HeldAttempts is what the worker last reported holding, admission to ack.
 	HeldAttempts int `json:"held_attempts"`
-	// Lanes is the worker's own account of its serialized resources (proto-024): one seat
-	// each, ordinals into the granted Devices. Empty for a worker that reports none.
+	// Lanes is the worker's own account of its serialized resources (proto-024), each with
+	// the seats it still admits, ordinals into the granted Devices. Empty for a worker that reports none.
 	// PlacementLane is the lane this slot's placement is on, "" until the worker says.
 	Lanes         []LaneFacts `json:"lanes,omitempty"`
 	PlacementLane string      `json:"placement_lane,omitempty"`

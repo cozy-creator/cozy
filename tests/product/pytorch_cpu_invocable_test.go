@@ -15,6 +15,7 @@ import (
 
 // A real official-index framework is part of local capture, not a private overlay.
 func TestOfficialCPUPyTorchInvocableUsesExactCapturedFramework(t *testing.T) {
+	integration(t)
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires exact Runtime execution peer")
 	}

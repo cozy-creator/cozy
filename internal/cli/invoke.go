@@ -2052,14 +2052,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		humanStatus = humanCancellationStatus(life.CanceledBy)
 	}
 	e := exit.Named(code, status, "request %s ended %s", life.RequestID, humanStatus)
+	// ONE SOURCE: the daemon's lifecycle, which `cozy run list` reads too. A failure before
+	// any attempt is filled there from its settled event, so list and watch cannot disagree.
 	errType, errCode, why := life.ErrorType, life.ErrorCode, life.Error
-	if why == "" && terminal != nil {
-		// A request that failed BEFORE ANY ATTEMPT has no attempt row to carry a cause —
-		// an unplaceable pin, a credential the orchestrator refused to read, a worker that
-		// could not be started. Its reason exists on the terminal EVENT and nowhere else,
-		// and dropping it left the client with "ended failed" and no way to learn why.
-		errType, errCode, why = eventText(terminal, "error_type"), eventText(terminal, "error_code"), eventText(terminal, "error")
-	}
 	e.Cause = errCode
 	e.Details = failureDetails(ctx, life, errType, errCode, why, terminal)
 	if why != "" {

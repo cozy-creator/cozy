@@ -16,6 +16,7 @@ import (
 
 // Exercise the real CLI, daemon, Runtime, accepted publication and exporter.
 func TestTopLevelJobMediaExportsAndTextDoesNotCreateDirectory(t *testing.T) {
+	integration(t)
 	if *privateScriptRuntimeWheel == "" {
 		t.Skip("requires an exact published Runtime wheel")
 	}

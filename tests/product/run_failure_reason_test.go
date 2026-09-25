@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -150,5 +151,57 @@ func TestFailedRunWatchCarriesItsTriageBundle(t *testing.T) {
 	if details.Error != "ValueError: bad latent shape" || details.Triage.SubjectID != "trb-watch" ||
 		!details.Triage.Kept || !strings.HasSuffix(details.Triage.Bundle.Terminal.Traceback, "bad latent shape") {
 		t.Fatalf("run watch --json lost the triage bundle: %s", out)
+	}
+}
+
+// A pre-attempt failure recorded by an older daemon (no error_code, the old message
+// shape; run 862) shows the same reason in `run list` as in `run watch`.
+func TestRecordedLegacyFailureReasonIsTheSameInListAndWatch(t *testing.T) {
+	o := hostOwner(t, "legacy-failure-reason")
+	id := "req-legacy-862"
+	if _, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: "idem-" + id,
+		BodyDigest: "sha256:" + sixtyFour("9"), Package: "paul/minimax-h3", Entrypoint: "fl2va",
+		Payload: []byte("{}"), Outputs: "video"}); problem != nil {
+		t.Fatal(problem)
+	}
+	legacy := "worker rejected desired revision 2 before applying it: runtime_compatibility_failed: " +
+		"runtime compatibility check: rpc error: code = Internal desc = StorageRefusal: supervisor refused Runtime disk write"
+	applied, problem := o.store.FailQueuedRequest(id, map[string]any{"status": "FAILED",
+		"cause": "worker.desired_state_refused", "error_type": "worker.desired_state_refused",
+		"error": legacy, "outputs": []any{}, "requeuing": false})
+	fatal(t, problem)
+	if !applied {
+		t.Fatal("the legacy failure was not recorded")
+	}
+	defer publicationControlAPI(t, o)()
+
+	code, out := runCozy(t, o.root, "run", "list", "--no-watch")
+	if code != 0 || !regexp.MustCompile(`(?m)^\d+\s+paul/minimax-h3/fl2va\s.*failed\s.*worker rejected desired revision 2 before applying it: runtime_compatib…$`).MatchString(out) {
+		t.Fatalf("the list REASON lost the recorded failure [%d]:\n%s", code, out)
+	}
+	code, out = runCozy(t, o.root, "run", "list", "--json")
+	var listed struct {
+		Invocations []struct {
+			Number    int64  `json:"number"`
+			ErrorType string `json:"error_type"`
+			Error     string `json:"error"`
+		} `json:"invocations"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || len(listed.Invocations) != 1 {
+		t.Fatalf("run list --json [%d]: %s", code, out)
+	}
+	run := listed.Invocations[0]
+	if run.ErrorType != "worker.desired_state_refused" || run.Error != legacy {
+		t.Fatalf("listed failure is not the recorded one: %+v", run)
+	}
+	code, out = runCozy(t, o.root, "run", "watch", strconv.FormatInt(run.Number, 10), "--json")
+	var watched struct {
+		Error struct {
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if code == 0 || json.Unmarshal([]byte(out), &watched) != nil ||
+		watched.Error.Details["error"] != run.Error || watched.Error.Details["error_type"] != run.ErrorType {
+		t.Fatalf("run watch disagrees with run list [%d]: %s", code, out)
 	}
 }

@@ -81,8 +81,8 @@ func TestExplicitLaneWaitsForTheAttachingRentalAndNeverBuysAround(t *testing.T) 
 		verdicts["h100-80"] != "excluded:attaching: yumichika" || verdicts["b200"] != "excluded:attaching: yumichika" {
 		t.Fatalf("verdicts %v", verdicts)
 	}
-	if fits["yumichika"] != "rung_asserted" || fits["rtx-4090"] != "lane_bytes 103.0 GiB of 24 GB" ||
-		fits["b200"] != "lane_bytes 103.0 GiB of 180 GB" {
+	if fits["yumichika"] != "rung_asserted" || fits["rtx-4090"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 24 GB" ||
+		fits["b200"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 180 GB" {
 		t.Fatalf("fits %v", fits)
 	}
 	if placement["override"] != "fp8-adaln-pruned" || placement["rental"] != nil || placement["bought"] != false ||
@@ -186,7 +186,7 @@ func TestExplicitLaneReusesTheFittingRentalOverTheCheaperShortOne(t *testing.T) 
 		verdicts["h100-80"] != "unmeasured" {
 		t.Fatalf("verdicts %v", verdicts)
 	}
-	if fits["yumichika"] != "rung_asserted" || fits["hairu"] != "lane_bytes 103.0 GiB of 24 GB" {
+	if fits["yumichika"] != "rung_asserted" || fits["hairu"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 24 GB" {
 		t.Fatalf("fits %v", fits)
 	}
 	if placement["override"] != "fp8-adaln-pruned" || placement["rental"] != "pr-yumichika" ||

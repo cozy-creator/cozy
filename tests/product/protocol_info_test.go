@@ -24,8 +24,8 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 		absent, accepted bool
 		unsafe           bool
 	}{
-		{"wire59", 59, 59, false, true, false},
-		{"unsafe rental Host", 59, 59, false, false, true},
+		{"floor", pb.MinCompatibleWireMinor, pb.MinCompatibleWireMinor, false, true, false},
+		{"unsafe rental Host", pb.MinCompatibleWireMinor, pb.MinCompatibleWireMinor, false, false, true},
 		{"current", pb.WireMinor, pb.MinCompatibleWireMinor, false, true, false},
 		{"additive", pb.WireMinor + 1, pb.MinCompatibleWireMinor, false, true, false},
 		{"old", pb.MinCompatibleWireMinor - 1, 1, false, false, false},
@@ -79,9 +79,9 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 }
 
 func TestLocalRuntimeSkewDoesNotRequireRentalFeatures(t *testing.T) {
-	info := &pb.ProtocolInfoResult{WireMinor: 59, MinimumWireMinor: 59}
+	info := &pb.ProtocolInfoResult{WireMinor: pb.MinCompatibleWireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor}
 	if problem := orchestrator.ValidateWorkerProtocol(info, false); problem != nil {
-		t.Fatalf("local Runtime59 required a Host-only feature: %v", problem)
+		t.Fatalf("local floor Runtime required a Host-only feature: %v", problem)
 	}
 	if problem := orchestrator.ValidateWorkerProtocol(info, true); problem == nil || problem.ErrName() != "worker.rental_idle_guard_required" {
 		t.Fatalf("an old rental Host bypassed its mandatory idle guard: %v", problem)

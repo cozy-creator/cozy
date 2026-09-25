@@ -172,7 +172,7 @@ func startPublishedMachineHost(t *testing.T, configure ...func(*fakeRentalHub)) 
 				}
 				_, distribution, _ := strings.Cut(fixture.Package, "/")
 				locked := fmt.Sprintf("--index-url https://pypi.org/simple\n%s @ %s --hash=%s\n", distribution, wheelURL, wheelDigest)
-				_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: iface.Application, ModelSlotPaths: []string{}, ImageInventory: h.inventories["rental-private-child-host"], LockedRequirements: locked})
+				_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: iface.Application, ModelSlotPaths: iface.ModelSlotPaths(), ImageInventory: h.inventories["rental-private-child-host"], LockedRequirements: locked})
 			case "/wheels/" + filepath.Base(fixture.Wheel):
 				w.Header().Set("Content-Type", "application/octet-stream")
 				_, _ = w.Write(wheel)

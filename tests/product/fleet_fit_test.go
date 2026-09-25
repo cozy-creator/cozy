@@ -121,7 +121,7 @@ func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 		t.Fatalf("verdicts %v", verdicts)
 	}
 	if fits["guchuko"] != "rung_asserted" || fits["lumachina"] != "rung_asserted" || fits["h100-80"] != "rung_asserted" ||
-		fits["h200"] != "lane_bytes 103.0 GiB of 141 GB" {
+		fits["h200"] != "lane_bytes 103.0 GiB (working memory unmeasured) of 141 GB" {
 		t.Fatalf("fits %v", fits)
 	}
 	if ladder, _ := placement["ladder"].([]any); len(ladder) != 1 || ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" ||

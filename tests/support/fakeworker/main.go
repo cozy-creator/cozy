@@ -35,8 +35,10 @@ var (
 	stealRequest = flag.String("request", "", "the steal arm's victim request")
 	stealAttempt = flag.Uint64("attempt", 1, "the steal arm's victim ordinal")
 	stealSpec    = flag.String("spec", "", "the steal arm's victim invocation digest, hex")
-	_            = flag.String("devices", "", "")
-	_            = flag.String("grace", "", "")
+	// --gate holds each lanes-arm attempt on its device until <gate>/<request id> exists.
+	gateDir = flag.String("gate", "", "the lanes arm's device-release gate directory")
+	_       = flag.String("devices", "", "")
+	_       = flag.String("grace", "", "")
 )
 
 func main() { os.Exit(run()) }

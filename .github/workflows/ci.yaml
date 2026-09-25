@@ -1,196 +1,117 @@
 name: ci
-on: [push, pull_request]
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths: ['**', '!**.md', 'README.md', 'docs/exit-matrix.md', 'docs/client-contract.md', 'docs/package-publication.md']
+  push:
+    branches: [master]
+    paths: ['**', '!**.md', 'README.md', 'docs/exit-matrix.md', 'docs/client-contract.md', 'docs/package-publication.md']
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name == 'schedule' }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CGO_ENABLED: '0'
+  UV_TORCH_BACKEND: cpu
+  # Pull requests and master pushes skip integration(t) tests and release acceptance;
+  # nightly, dispatch and PRs labelled `integration` run everything.
+  FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'integration') }}
+
 jobs:
-  checks:
+  nightly:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        tests: ['^Test[A-H]', '^Test[I-O]', '^Test[P-Q]', '^Test[R-Z]']
-    env:
-      UV_TORCH_BACKEND: cpu
-      COZY_RUNTIME_SOURCE: b2f95ff276e816e46638bf68d5dac1194438084e
+    outputs:
+      new: ${{ steps.last.outputs.new }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - id: last
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh run list -R "$GITHUB_REPOSITORY" -w ci -e schedule -s success -L 1 --json headSha -q '.[0].headSha')
+          echo "new=$([ "$last" != "$GITHUB_SHA" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: nightly
+    if: >-
+      !cancelled() && (needs.nightly.result == 'skipped' || needs.nightly.outputs.new == 'true') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'integration')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: stable
-      - uses: astral-sh/setup-uv@v5
+          go-version-file: go.mod
+          cache: false
+      - uses: astral-sh/setup-uv@v6
         with:
           version: '0.12.11'
-      - run: uv python install 3.12 3.13 3.14
-      - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
-      - name: Check out the exact Runtime execution peer
-        uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
         with:
-          repository: cozy-creator/cozy-runtime
-          ref: ${{ env.COZY_RUNTIME_SOURCE }}
-          path: runtime-peer
-          ssh-key: ${{ secrets.COZY_RUNTIME_READ_KEY }}
-          persist-credentials: false
-      - name: Build and install the source-addressed CPU worker
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/uv
+          key: ci-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            ci-${{ hashFiles('go.sum') }}-
+            ci-
+      - run: python3 scripts/fence.py
+      - run: go build ./... && go vet ./...
+      - name: Cross-compile the shipped targets
         run: |
-          wheel="$(python3 scripts/build-runtime-peer.py runtime-peer "$COZY_RUNTIME_SOURCE" "$RUNNER_TEMP/runtime-peer")"
-          uv tool install --force --python 3.12 "$wheel[model-execution]"
+          for target in darwin/arm64 darwin/amd64 windows/amd64 linux/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null .
+          done
+      # The released Runtime at exactly the floor this Cozy enforces (hostruntime.ToolFloor).
+      - name: Runtime and Python
+        run: |
+          floor=$(sed -n 's/^const ToolFloor = "\(.*\)"$/\1/p' internal/hostruntime/hostruntime.go)
+          read -r url sha < <(curl -fsS "https://pypi.org/pypi/cozy-runtime/$floor/json" |
+            jq -r '.urls[] | select(.filename | endswith("py3-none-any.whl")) | "\(.url) \(.digests.sha256)"')
+          wheel="$RUNNER_TEMP/${url##*/}"
+          curl -fsSLo "$wheel" "$url"
+          echo "$sha  $wheel" | sha256sum -c
+          uv python install 3.12 3.13 3.14
+          uv tool install --python 3.12 "$wheel[model-execution]"
           uv tool dir --bin >> "$GITHUB_PATH"
-          echo "COZY_TEST_RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
-          cat "$RUNNER_TEMP/runtime-peer/manifest.json"
-      - name: Retain Runtime test provenance
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-test-provenance-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/runtime-peer/manifest.json
-      # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
-      # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
-      # what keeps a C dependency from arriving unnoticed and silently ending the
-      # cross-compiles cl-013's `release` job depends on.
-      - run: CGO_ENABLED=0 go build ./...
-      - run: go vet ./...
-      # THE SUITE (decisions.md #661, reapplying #634 for this repo). `tests/product` starts
-      # the real system — the real orchestrator, an auto-started Cozy daemon process, and
-      # `tests/support/fakeworker`, a second independent implementation of the worker protocol —
-      # and observes what it does. Nothing in it is a mock. The tests that need a peer this
-      # runner does not have (a cozy-runtime checkout) SKIP by name rather than passing
-      # vacuously.
-      #
-      # worker-protocol's frozen corpus is no longer one of them. It is vendored at
-      # tests/product/testdata/worker-protocol under its own digest manifest, so the
-      # cross-language identity fence and both vendored-tree guards run HERE, with no token
-      # and no sibling checkout. `vendored-protocol` below adds upstream provenance on top;
-      # it is a ceiling, not the floor.
-      - name: Test with a delegated executor cgroup
+          echo "RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
+      # The runner's service cgroup is not delegated; Runtime's executor containment needs its own subtree.
+      - name: Product tests
         run: |
-          # Hosted runner services do not delegate their cgroup to the runner.
-          # Give the unprivileged suite its own subtree; Runtime still enforces
-          # the normal executor containment contract.
+          args=(-j 3 -serving-cpu-fixture
+            -script-runtime-wheel="$RUNTIME_WHEEL" -child-runtime-wheel="$RUNTIME_WHEEL")
+          [ "$FULL" = true ] || args+=(-test.short)
           sudo systemd-run --wait --pipe --collect \
             --unit="cozy-product-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --uid="$(id -u)" --gid="$(id -g)" \
-            --property=Delegate=yes --working-directory="$PWD" \
-            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 \
-            --setenv="COZY_TEST_RUNTIME_WHEEL=$COZY_TEST_RUNTIME_WHEEL" \
-            --setenv=UV_TORCH_BACKEND=cpu \
-            /bin/bash -euc '
-              id
-              cat /proc/self/cgroup
-              packages=$(go list ./... | grep -v "^github.com/cozy-creator/cozy/tests/product$")
-              nice -n 19 go test $packages -run "${{ matrix.tests }}" -timeout 30m
-              exec nice -n 19 go test ./tests/product -run "${{ matrix.tests }}" -timeout 30m -args -serving-cpu-fixture -script-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL" -child-runtime-wheel="$COZY_TEST_RUNTIME_WHEEL"
-            '
-      - run: python3 scripts/fence.py
-
-  # Framework artifact classification uses the Runtime-owned generated roster.
-  # Public and private package closures both retain every selected distribution.
-  runtime-roster:
-    runs-on: ubuntu-latest
-    env:
-      COZY_RUNTIME_TOKEN: ${{ secrets.COZY_RUNTIME_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: cozy
-      - name: Check out the runtime peer
-        if: env.COZY_RUNTIME_TOKEN != ''
-        uses: actions/checkout@v4
-        with:
-          repository: cozy-creator/cozy-runtime-v2
-          path: cozy-runtime
-          token: ${{ env.COZY_RUNTIME_TOKEN }}
-      - uses: actions/setup-go@v5
-        if: env.COZY_RUNTIME_TOKEN != ''
-        with:
-          go-version: stable
-      - name: Compare the vendored roster and authored defaults against cozy-runtime
-        if: env.COZY_RUNTIME_TOKEN != ''
-        working-directory: cozy
+            --uid="$(id -u)" --gid="$(id -g)" --property=Delegate=yes --working-directory="$PWD" \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv=CGO_ENABLED=0 --setenv=UV_TORCH_BACKEND=cpu \
+            scripts/product-tests.sh "${args[@]}"
+      - name: Release artifacts install and upgrade
+        if: env.FULL == 'true'
         run: |
-          nice -n 19 go test ./tests/product/ -run 'TestVendoredBaseDistributions|TestAuthoredDefaultsMatchRuntimeCorpus' -v -timeout 5m \
-            -cozy-runtime-repo="$GITHUB_WORKSPACE/cozy-runtime" \
-            -require-cozy-runtime-peer
-      - name: Report unarmed roster comparison
-        if: env.COZY_RUNTIME_TOKEN == ''
-        run: |
-          echo '::warning::COZY_RUNTIME_TOKEN is absent, so the vendored base-distributions.json was not byte-compared against cozy-runtime. This is a missing ceiling, not a missing floor: the always-armed half ran in `checks` and proves framework classification is derived from the vendored roster.'
-
-  # THE VENDORED-BINDING CHECK. `protocol/` is copied, never imported as a module, so
-  # worker-protocol regenerates from its own .proto with its pinned toolchain and
-  # byte-compares against what is vendored here. Exact source custody belongs at build
-  # time; live peers use the protobuf package major and additive wire minor.
-  #
-  # It tracks worker-protocol's master deliberately. A pinned ref would only ever prove
-  # that nobody edited this directory by hand; comparing master also surfaces generated
-  # contract updates for review in this consumer. It is a source-custody check, not a live
-  # compatibility gate.
-  vendored-protocol:
-    runs-on: ubuntu-latest
-    env:
-      WORKER_PROTOCOL_TOKEN: ${{ secrets.WORKER_PROTOCOL_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: cozy
-      # GITHUB_TOKEN is repository-scoped and cannot read a private sibling. When an explicit
-      # read token exists, additionally compare against worker-protocol master so drift arrives
-      # at build time. Its absence is reported, never disguised as a failed code check.
-      - name: Check out current worker protocol
-        if: env.WORKER_PROTOCOL_TOKEN != ''
-        uses: actions/checkout@v4
-        with:
-          repository: cozy-creator/worker-protocol-v2
-          path: worker-protocol
-          token: ${{ env.WORKER_PROTOCOL_TOKEN }}
-      - uses: actions/setup-go@v5
-        if: env.WORKER_PROTOCOL_TOKEN != ''
-        with:
-          go-version: stable
-      - uses: astral-sh/setup-uv@v5
-        if: env.WORKER_PROTOCOL_TOKEN != ''
-      - name: Compare against current peer
-        if: env.WORKER_PROTOCOL_TOKEN != ''
-        run: worker-protocol/scripts/vendored-diff.sh cozy/protocol/cozy/worker/v1
-      # The peer half of the vendored guard, for BOTH vendored trees: the generated bindings
-      # and the frozen canonical corpus. vendored-diff.sh above proves the bindings match a
-      # REGENERATION; this proves both trees are the bytes of the commit their SOURCE names,
-      # and says so loudly when upstream has frozen a newer one. -require-worker-protocol-peer
-      # turns an unwired checkout into a failure rather than a pass — a skip is how a whole
-      # wire minor of skew went unnoticed.
-      #
-      # The cross-language identity fence itself is NOT here any more. The corpus is vendored
-      # at cozy/tests/product/testdata/worker-protocol, so TestCanonicalDocuments runs in the
-      # ordinary `checks` job with no token at all. This job adds provenance on top of it.
-      - name: Vendored provenance and drift
-        if: env.WORKER_PROTOCOL_TOKEN != ''
-        working-directory: cozy
-        run: |
-          nice -n 19 go test ./tests/product/ -run 'TestVendor|TestWireMinor|TestCorpus' -v -timeout 5m \
-            -worker-protocol-repo="$GITHUB_WORKSPACE/worker-protocol" \
-            -require-worker-protocol-peer
-      - name: Report unarmed peer drift check
-        if: env.WORKER_PROTOCOL_TOKEN == ''
-        run: |
-          echo '::warning::WORKER_PROTOCOL_TOKEN is absent; private-upstream provenance and drift were not queried. This is a missing ceiling, not a missing floor: the always-armed half ran in `checks` with no token — SOURCE digests and exact file lists over both vendored trees, compiled WireMinor against the recorded wire_minor and the frozen corpus, and the full TestCanonicalDocuments cross-language identity fence against the vendored corpus.'
-
-  # cl-013's SHIPPED GUARD. A green `checks` is a fact about the source tree; this job is a
-  # fact about the artifact a user would install. They are separate evidence axes and a
-  # master-only green may not stand in for this one.
-  #
-  # Package execution is covered by tests/product/TestProductPath when a cozy-runtime peer
-  # exists. This job stays about the shipped CLI asset: build, verify, install, run, upgrade.
-  release:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-      - uses: astral-sh/setup-uv@v5
-        with:
-          version: '0.12.11'
-      - run: scripts/release.sh --tag ci-$GITHUB_SHA
-      - run: scripts/release.sh --tag ci-$GITHUB_SHA-next
-      - run: |
-          scripts/accept.sh \
-            --dist "dist/ci-$GITHUB_SHA" \
-            --asset "cozy-ci-$GITHUB_SHA-linux-amd64.tar.gz" \
+          scripts/release.sh --tag "ci-$GITHUB_SHA"
+          scripts/release.sh --tag "ci-$GITHUB_SHA-next"
+          scripts/accept.sh --dist "dist/ci-$GITHUB_SHA" --asset "cozy-ci-$GITHUB_SHA-linux-amd64.tar.gz" \
             --upgrade "dist/ci-$GITHUB_SHA-next/cozy-ci-$GITHUB_SHA-next-linux-amd64.tar.gz" \
             --prefix "$RUNNER_TEMP/prefix" --home "$RUNNER_TEMP/cozy-home"
+      - if: github.ref == 'refs/heads/master'
+        run: uv cache prune --ci
+      - if: github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/uv
+          key: ci-${{ hashFiles('go.sum') }}-${{ github.sha }}

@@ -173,6 +173,19 @@ def metadata(row, observed):
     return requirements
 
 
+def runtime_wire(row):
+    # The selected Runtime's own declared cozy.worker.v1 range, read from its wheel.
+    with zipfile.ZipFile(row["path"]) as archive:
+        try:
+            text = archive.read("cozy/worker/v1/wire_version.py").decode()
+        except KeyError:
+            return None
+    values = dict(re.findall(r"^(WIRE_MINOR|MIN_COMPATIBLE_WIRE_MINOR) = (\d+)$", text, re.M))
+    if set(values) != {"WIRE_MINOR", "MIN_COMPATIBLE_WIRE_MINOR"}:
+        return None
+    return {"wire_minor": int(values["WIRE_MINOR"]), "minimum_wire_minor": int(values["MIN_COMPATIBLE_WIRE_MINOR"])}
+
+
 def resolve(observed, directory, local_runtime=None):
     if local_runtime is None:
         runtime = published("cozy-runtime", observed)
@@ -230,7 +243,8 @@ def main():
             observed["runtime"]["distribution"] == target["runtime_update"]["runtime"]["version"]
             and observed["tensorfs"] == target["runtime_update"]["tensorfs"]["version"]
         )
-        return {"observed": observed, "target": target, "wheels": selection, "unchanged": unchanged}
+        return {"observed": observed, "target": target, "wheels": selection, "unchanged": unchanged,
+                "runtime_wire": runtime_wire(selection[0])}
     if request["action"] != "apply":
         raise ValueError("Unknown Runtime update operation")
     stage = request["stage"]

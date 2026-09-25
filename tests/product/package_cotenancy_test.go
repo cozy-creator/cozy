@@ -75,8 +75,9 @@ func placementsOf(t *testing.T, d *pb.DesiredWorkerState) map[string]string {
 
 // TestCoTenantPackagesPreparePerPackage: two published weightless packages routed onto
 // ONE rental — run 146's co-tenancy shape — both prepare and both dispatch. Every
-// download set the pod sees names exactly one package; the package already serving keeps
-// its exact download-set bytes and placement_id when the second joins (the Runtime seeds
+// download set the pod sees names exactly one package; the package already serving is
+// not prepared again and keeps its exact download-set bytes and placement_id when the
+// second joins (the Runtime seeds
 // placement_id from those bytes, so re-authoring different ones would restage a
 // serving placement); and the final full-replace set carries both placements.
 func TestCoTenantPackagesPreparePerPackage(t *testing.T) {
@@ -136,8 +137,9 @@ func TestCoTenantPackagesPreparePerPackage(t *testing.T) {
 	pod.mu.Lock()
 	defer pod.mu.Unlock()
 	sets := assertOnePackagePerPrepare(t, pod.prepares)
-	if len(sets["acme/alpha"]) < 2 || len(sets["acme/beta"]) < 1 {
-		t.Fatalf("prepares per package alpha=%d beta=%d; want alpha prepared again when beta joined",
+	if len(sets["acme/alpha"]) != 1 || len(sets["acme/beta"]) != 1 {
+		t.Fatalf("prepares per package alpha=%d beta=%d; want each prepared once — alpha's "+
+			"unchanged download set was already prepared on this boot when beta joined",
 			len(sets["acme/alpha"]), len(sets["acme/beta"]))
 	}
 	for pkg, issued := range sets {

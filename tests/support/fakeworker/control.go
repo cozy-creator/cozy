@@ -21,6 +21,10 @@ import (
 // reportCadence is cozy-runtime's ObservedWorkerState period (REPORT_SECONDS).
 const reportCadence = 2 * time.Second
 
+// laneDepth is cozy-runtime's LANE_RUNNING + LANE_STAGED: the attempts one lane admits
+// before a device release.
+const laneDepth = 2
+
 type fakeControl struct {
 	pb.UnimplementedWorkerControlServer
 	say       func(string, ...any)
@@ -118,36 +122,77 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	f.snapshotSent.Store(true)
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
-	// THE LANES ARM (proto-024). Two device lanes over ordinals 0 and 1, ONE seat each,
-	// and every placement on lane-0 — so the worker-level count is 2 (the sum, exactly as
-	// the wire promises) while a placement can draw only ONE seat. An owner that reads the
-	// sum offers two attempts to one placement and gets the second refused
-	// CAUSE_CODE_NO_CAPACITY, journaled; an owner that reads lanes never offers it.
+	// THE LANES ARM (proto-024, proto-061 G). Two device lanes over ordinals 0 and 1 and
+	// every placement on lane-0. Each lane admits laneDepth attempts before device release
+	// — the RUNNING one and ONE staged behind it, reported QUEUED until it enters the
+	// device on the running one's release — so the worker-level count is the sum over
+	// lanes while a placement draws only on lane-0's. An owner that reads the sum
+	// over-offers lane-0 and gets the extra offer refused CAUSE_CODE_NO_CAPACITY,
+	// journaled; an owner that reads lanes never offers it.
 	lanes := f.arm == "lanes"
 	var laneMu sync.Mutex
-	laneHeld := map[string]int{}  // lane id -> seats held by a live or unacked attempt
-	seatOf := map[string]string{} // "request#attempt" -> the lane whose seat it holds
+	laneQueue := map[string][]*pb.AttemptOffer{} // lane id -> pre-release attempts; head RUNNING
+	pendingAck := map[string]*pb.HeldAttempt{}   // "request#attempt" -> released, outcome unacked
 	laneOf := func(string) string { return "lane-0" }
 	laneRows := func() []*pb.DeviceLane {
 		laneMu.Lock()
 		defer laneMu.Unlock()
 		return []*pb.DeviceLane{
 			{LaneId: "lane-0", DeviceOrdinals: []uint32{0},
-				AvailableAttemptSlots: uint32(max(0, 1-laneHeld["lane-0"]))},
+				AvailableAttemptSlots: uint32(max(0, laneDepth-len(laneQueue["lane-0"])))},
 			{LaneId: "lane-1", DeviceOrdinals: []uint32{1},
-				AvailableAttemptSlots: uint32(max(0, 1-laneHeld["lane-1"]))},
+				AvailableAttemptSlots: uint32(max(0, laneDepth-len(laneQueue["lane-1"])))},
 		}
+	}
+	laneHeldRows := func() []*pb.HeldAttempt {
+		laneMu.Lock()
+		defer laneMu.Unlock()
+		var out []*pb.HeldAttempt
+		for _, laneID := range []string{"lane-0", "lane-1"} {
+			for i, offer := range laneQueue[laneID] {
+				row := &pb.HeldAttempt{RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
+					Kind: pb.AttemptKind_ATTEMPT_KIND_SERVING, State: pb.AttemptState_ATTEMPT_STATE_QUEUED,
+					InvocationSpecDigest: offer.InvocationSpecDigest, PlacementId: offer.PlacementId,
+					LaneId: laneID, QueuePosition: uint32(max(0, i-1))}
+				if i == 0 {
+					row.State, row.ExecutorEpoch, row.QueuePosition = pb.AttemptState_ATTEMPT_STATE_RUNNING, 1, 0
+				}
+				out = append(out, row)
+			}
+		}
+		keys := make([]string, 0, len(pendingAck))
+		for k := range pendingAck {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			out = append(out, pendingAck[k])
+		}
+		return out
+	}
+	outcome := func(t *pb.AttemptOutcome) {
+		env(func(e, g uint64, b string) {
+			t.RecordOwnerEpoch, t.ControlStreamEpoch, t.WorkerBootId = e, g, b
+		})
+		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: t}})
 	}
 	var lastRevision uint64
 	var lastSetDigest []byte
 	var lastPlacements []*pb.PlacementStatus
+	// THE MINOR-61 EXECUTOR. One long-lived process builds each binding's construction the
+	// first time an attempt enters it and keeps it; `loaded_binding_digests` reports them.
+	var loadedMu sync.Mutex
+	loaded := map[string]bool{}
 	// THE HELD OUTCOME (missing-output). cozy-runtime journals an outcome before sending it
 	// and, until the owner's ack names it, restates it as a held_attempts row pending ack
 	// on every report — it does not resend the frame on a live stream. This arm does
 	// exactly that, so an owner that refuses the outcome sees what a real worker shows it.
 	var heldMu sync.Mutex
 	var heldOutcome *pb.HeldAttempt
+	var reportMu sync.Mutex
 	observedMany := func(revision uint64, setDigest []byte, placements []*pb.PlacementStatus) {
+		reportMu.Lock()
+		defer reportMu.Unlock()
 		availableSlots := uint32(2)
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
@@ -173,19 +218,82 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 		}
 		lastRevision, lastSetDigest, lastPlacements = revision, setDigest, placements
+		loadedMu.Lock()
+		for _, p := range placements {
+			p.LoadedBindingDigests = nil
+			for _, digest := range p.DispatchableBindingDigests {
+				if spelled, err := canonical.Spell(digest); err == nil && loaded[spelled] {
+					p.LoadedBindingDigests = append(p.LoadedBindingDigests, digest)
+				}
+			}
+		}
+		loadedMu.Unlock()
 		r.Placements = placements
 		heldMu.Lock()
 		if heldOutcome != nil {
 			r.HeldAttempts = []*pb.HeldAttempt{heldOutcome}
 		}
 		heldMu.Unlock()
+		if lanes {
+			r.HeldAttempts = append(r.HeldAttempts, laneHeldRows()...)
+		}
 		env(func(e, g uint64, b string) {
 			r.RecordOwnerEpoch, r.ControlStreamEpoch, r.WorkerBootId = e, g, b
 		})
 		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: r}})
 		if lanes {
-			f.say("ObservedWorkerState slots=%d lanes=%d", r.AvailableAttemptSlots, len(r.Lanes))
+			f.say("ObservedWorkerState slots=%d lanes=%d held=%d", r.AvailableAttemptSlots,
+				len(r.Lanes), len(r.HeldAttempts))
 		}
+	}
+	report := func() {
+		reportMu.Lock()
+		revision, setDigest, placements := lastRevision, lastSetDigest, lastPlacements
+		reportMu.Unlock()
+		observedMany(revision, setDigest, placements)
+	}
+	// run holds one lane's head on the device until the test's gate names it (or a moment
+	// passes, ungated), then releases the device: the outcome is sent, the attempt waits
+	// for its ack, and the staged attempt behind it enters the device.
+	var run func(laneID string, offer *pb.AttemptOffer)
+	run = func(laneID string, offer *pb.AttemptOffer) {
+		f.say("%s#%d entered the device on %s", offer.RequestId, offer.AttemptOrdinal, laneID)
+		if *gateDir == "" {
+			time.Sleep(1500 * time.Millisecond)
+		} else {
+			for {
+				if _, err := os.Stat(filepath.Join(*gateDir, offer.RequestId)); err == nil {
+					break
+				}
+				if stream.Context().Err() != nil {
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+		t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
+			offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_FAILED,
+			"the fake worker has no GPU")
+		t.PlacementId = offer.PlacementId
+		laneMu.Lock()
+		laneQueue[laneID] = laneQueue[laneID][1:]
+		pendingAck[fmt.Sprintf("%s#%d", offer.RequestId, offer.AttemptOrdinal)] = &pb.HeldAttempt{
+			RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
+			Kind: pb.AttemptKind_ATTEMPT_KIND_SERVING, State: pb.AttemptState_ATTEMPT_STATE_OUTCOME_PENDING_ACK,
+			InvocationSpecDigest: offer.InvocationSpecDigest, PlacementId: offer.PlacementId,
+			ExecutorEpoch: 1, LaneId: laneID, OutcomeId: t.OutcomeId, OutcomeDigest: t.OutcomeDigest,
+		}
+		var next *pb.AttemptOffer
+		if len(laneQueue[laneID]) > 0 {
+			next = laneQueue[laneID][0]
+		}
+		laneMu.Unlock()
+		f.say("%s#%d released %s's device", offer.RequestId, offer.AttemptOrdinal, laneID)
+		outcome(t)
+		if next != nil {
+			go run(laneID, next)
+		}
+		report()
 	}
 	placementStatus := func(placementID string, setDigest []byte, planIDs []string,
 		environmentDigest string,
@@ -203,12 +311,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			DispatchableBindingDigests: bindingDigests, PlacementSetDigest: setDigest,
 			EnvironmentDigest: environmentDigest,
 		}
-	}
-	outcome := func(t *pb.AttemptOutcome) {
-		env(func(e, g uint64, b string) {
-			t.RecordOwnerEpoch, t.ControlStreamEpoch, t.WorkerBootId = e, g, b
-		})
-		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: t}})
 	}
 
 	var dropAck *pb.AttemptOutcome
@@ -302,16 +404,17 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				outcome(t)
 				continue
 			}
+			var enters bool // the offer is the lane's head: it enters the device at once
 			if lanes {
-				// THE SEAT IS THE LANE'S. A second offer against a placement whose lane is
-				// full is refused exactly as a saturated window is: a journaled outcome,
+				// THE SEAT IS THE LANE'S. An offer against a placement whose lane admits no
+				// more is refused exactly as a saturated window is: a journaled outcome,
 				// pre-execution, never silence and never a hold.
 				laneID := laneOf(offer.PlacementId)
 				laneMu.Lock()
-				full := laneHeld[laneID] >= 1
+				full := len(laneQueue[laneID]) >= laneDepth
 				if !full {
-					laneHeld[laneID]++
-					seatOf[fmt.Sprintf("%s#%d", offer.RequestId, offer.AttemptOrdinal)] = laneID
+					laneQueue[laneID] = append(laneQueue[laneID], offer)
+					enters = len(laneQueue[laneID]) == 1
 				}
 				laneMu.Unlock()
 				if full {
@@ -326,7 +429,8 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 					outcome(t)
 					continue
 				}
-				f.say("lane %s seat taken by %s#%d", laneID, offer.RequestId, offer.AttemptOrdinal)
+				f.say("lane %s seat taken by %s#%d (queued=%t)", laneID, offer.RequestId,
+					offer.AttemptOrdinal, !enters)
 			}
 			// THE GRANT RULE the real worker applies (cozy-runtime grants.py): the spec's
 			// input-id set and the grant's must agree exactly, and a SERVING spec carries
@@ -340,6 +444,13 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				outcome(t)
 				continue
 			}
+			if spec, err := canonical.Read(offer.InvocationSpecCanonicalBytes, &pb.InvocationSpec{}); err == nil {
+				if binding := spec.Sub("serving").Str("entrypoint_binding_digest"); binding != "" {
+					loadedMu.Lock()
+					loaded[binding] = true
+					loadedMu.Unlock()
+				}
+			}
 			accepted := &pb.AttemptAccepted{
 				RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
 				InvocationSpecDigest: offer.InvocationSpecDigest,
@@ -351,16 +462,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: accepted}})
 			switch f.arm {
 			case "lanes":
-				// The attempt runs for a moment and ends; the seat stays held until the
-				// ack, which is when the worker's next observed state frees it.
-				go func(offer *pb.AttemptOffer) {
-					time.Sleep(1500 * time.Millisecond)
-					t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
-						offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_FAILED,
-						"the fake worker has no GPU")
-					t.PlacementId = offer.PlacementId
-					outcome(t)
-				}(offer)
+				if enters {
+					go run(laneOf(offer.PlacementId), offer)
+				}
+				report()
 			case "badterminal":
 				f.badOutcomes(outcome, offer)
 			case "output":
@@ -410,15 +515,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			heldMu.Unlock()
 			if lanes {
-				// Only an attempt that HELD a seat returns one: a refused offer took none.
+				// The ack drops the held outcome; the seat freed at device release.
 				laneMu.Lock()
-				seat := fmt.Sprintf("%s#%d", a.RequestId, a.AttemptOrdinal)
-				if laneID, held := seatOf[seat]; held {
-					laneHeld[laneID] = max(0, laneHeld[laneID]-1)
-					delete(seatOf, seat)
-				}
+				delete(pendingAck, fmt.Sprintf("%s#%d", a.RequestId, a.AttemptOrdinal))
 				laneMu.Unlock()
-				observedMany(lastRevision, lastSetDigest, lastPlacements)
+				report()
 			}
 			if f.arm == "badterminal" {
 				time.Sleep(500 * time.Millisecond)

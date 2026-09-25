@@ -249,7 +249,7 @@ func TestRentalIdleSchemaUpgradePreservesReadyAndRetainedWork(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	_, err = db.Exec(`DROP TABLE rental_idle; PRAGMA user_version=42`)
+	_, err = db.Exec(`DROP TABLE device_memory_measurements; DROP TABLE rental_idle; PRAGMA user_version=42`)
 	must(t, err)
 	must(t, db.Close())
 	store, problem = records.Open(path)

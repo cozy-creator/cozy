@@ -1,5 +1,5 @@
 {
-  "minimum_wire_minor": 59,
+  "minimum_wire_minor": 60,
   "supports_rental_keepalive": true,
-  "wire_minor": 60
+  "wire_minor": 61
 }

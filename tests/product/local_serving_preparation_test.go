@@ -185,6 +185,7 @@ func preparationEvents(t *testing.T, path string) []servingPreparationEvent {
 // Model initialization is observed in the real worker preparation RPC; the test
 // never supplies a constructed component list to the owner or Runtime.
 func TestLocalServingPreparationOwnsInitializationAndComponentOrder(t *testing.T) {
+	integration(t)
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires the exact cl178 Runtime candidate wheel")
 	}
