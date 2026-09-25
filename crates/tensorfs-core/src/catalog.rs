@@ -241,24 +241,58 @@ impl Trust {
         self.miss(sha256)
     }
 
+    /// Validate the catalog on the kept connection: the handle's one open, which also loads
+    /// the index. A live connection to the same catalog file is already validated.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let mut kept = self.kept.lock().unwrap_or_else(|error| error.into_inner());
+        self.load(&mut kept).map(|_| ())
+    }
+
     fn miss(&self, sha256: &str) -> Option<crate::store::VRecord> {
         let mut kept = self.kept.lock().unwrap_or_else(|error| error.into_inner());
-        let metadata = fs::symlink_metadata(&self.path).ok()?;
-        let identity = (metadata.dev(), metadata.ino());
-        if let Some(open) = kept.as_ref().filter(|open| open.identity == identity) {
-            let row = verification_on(&open.connection, sha256).ok().flatten()?;
-            self.remember(&row);
-            return Some(row);
+        if self.load(&mut kept).ok()? {
+            return self
+                .rows
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(sha256)
+                .cloned();
         }
-        let connection = validated(&self.path).ok()?;
-        let rows = verifications_on(&connection).ok()?;
+        let open = kept.as_ref()?;
+        let row = verification_on(&open.connection, sha256).ok().flatten()?;
+        self.remember(&row);
+        Some(row)
+    }
+
+    /// Keep a validated connection to the current catalog file, loading every row when it is
+    /// newly opened. Returns whether it was (re)opened.
+    fn load(&self, kept: &mut Option<Kept>) -> Result<bool> {
+        let identity = fs::symlink_metadata(&self.path)
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+            .ok();
+        if kept
+            .as_ref()
+            .is_some_and(|open| Some(open.identity) == identity)
+        {
+            return Ok(false);
+        }
+        let connection = validated(&self.path)?;
+        let Some(identity) = identity else {
+            return refuse(
+                Code::DURABILITY_UNPROVEN,
+                format!("{} changed while it was opened", self.path.display()),
+            );
+        };
+        let rows = verifications_on(&connection)?;
         *kept = Some(Kept {
             identity,
             connection,
         });
-        let mut index = self.rows.write().unwrap_or_else(|error| error.into_inner());
-        index.extend(rows.into_iter().map(|row| (row.sha256.clone(), row)));
-        index.get(sha256).cloned()
+        self.rows
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .extend(rows.into_iter().map(|row| (row.sha256.clone(), row)));
+        Ok(true)
     }
 
     fn remember(&self, row: &crate::store::VRecord) {

@@ -337,8 +337,9 @@ impl Store {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(io("stat TensorFS catalog", error)),
             }
-            crate::catalog::Catalog::open(root)?;
-            open_validated(root)
+            let store = open_validated(root)?;
+            store.trust.validate()?;
+            Ok(store)
         }
     }
 
@@ -411,6 +412,10 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn trust(&self) -> &crate::catalog::Trust {
+        &self.trust
     }
 
     /// The mounted immutable object cache this Store is bound to, or `None`.

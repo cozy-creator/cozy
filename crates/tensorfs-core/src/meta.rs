@@ -59,7 +59,7 @@ pub struct Meta {
 
 impl Meta {
     pub fn open(store: &Store) -> Result<Self> {
-        crate::catalog::Catalog::open(store.root())?;
+        store.trust().validate()?;
         let lease_dir = store.root().join("tmp/leases");
         fs::create_dir_all(&lease_dir).map_err(|error| io("mkdir lease markers", error))?;
         let writer_dir = store.root().join("tmp/writers");

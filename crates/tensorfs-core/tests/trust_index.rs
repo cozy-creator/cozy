@@ -134,3 +134,24 @@ fn trust_checks_load_the_catalog_once_and_bad_bytes_are_still_caught() {
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(scratch).unwrap();
 }
+
+#[test]
+fn a_new_handle_validates_and_trusts_on_one_connection() {
+    let root = temporary("handle");
+    let scratch = temporary("handle-scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    Store::init(&root).unwrap();
+    let object = put_elsewhere(&root, &scratch, &body(7));
+
+    // What the Python `Store.open`/`Store.ensure` do: open, validate, then trust reads.
+    let opened = connections_opened(&root);
+    let store = Store::ensure(&root).unwrap();
+    tensorfs_core::meta::Meta::open(&store).unwrap();
+    for _ in 0..3 {
+        store.record_valid(&object.sha256).unwrap();
+    }
+    assert_eq!(connections_opened(&root) - opened, 1);
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(scratch).unwrap();
+}
