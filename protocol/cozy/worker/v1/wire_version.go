@@ -20,6 +20,6 @@ const RentalExecutionAdmissionWireMinor uint32 = 60
 const RentalKeepaliveWireMinor uint32 = 60
 const RentalIdleTimeoutSeconds int64 = 900
 
-// ExecutionLifecycleWireMinor carries the release package interface on prepare (required for published sets).
+// ExecutionLifecycleWireMinor carries the release package interface on prepare; older senders derive it once.
 const ExecutionLifecycleWireMinor uint32 = 61
 const MaxRentalKeepaliveRequestIDBytes = 128

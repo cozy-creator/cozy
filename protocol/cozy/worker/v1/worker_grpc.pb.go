@@ -172,8 +172,11 @@
 // WorkerSnapshotBody remain; the orchestrator still routes on them.
 //
 // THE EXECUTION LIFECYCLE (proto-061, minor 61; additive, floor 60, absent = unknown). Published
-// preparation carries the hub release's PackageInterface/1 bytes, so no describe or
-// compatibility process runs per switch; `CheckPackageSetCompatibility` is DELETED. Placement
+// new preparation senders carry the hub release's PackageInterface/1 bytes, so no describe or
+// compatibility process runs per switch. The minor-60 CheckPackageSetCompatibility RPC remains
+// available while minor60 is supported; its validation shares the exact preparation cache.
+// Older senders may omit the interface; Runtime derives and caches it once per installed code.
+// Placement
 // identity is the package release alone, stable as models are added. DISPATCHABLE means the
 // executor started and imported the package; models load on demand, and
 // `PlacementStatus.loaded_binding_digests` reports the constructions built in the live executor.
@@ -651,6 +654,7 @@ const (
 	RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady"
 	RuntimePreparation_ImportWorkspace_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportWorkspace"
 	RuntimePreparation_ActivateWorkspaceImport_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/ActivateWorkspaceImport"
+	RuntimePreparation_CheckPackageSetCompatibility_FullMethodName     = "/cozy.worker.v1.RuntimePreparation/CheckPackageSetCompatibility"
 	RuntimePreparation_PreparePackageSet_FullMethodName                = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
 	RuntimePreparation_PrepareModelSource_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
 	RuntimePreparation_ReleaseModelSource_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/ReleaseModelSource"
@@ -698,6 +702,8 @@ type RuntimePreparationClient interface {
 	// never forwarded from PodHost or exposed as an author-controlled cache write.
 	ImportWorkspace(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[WorkspaceImportFrame, WorkspaceImportResult], error)
 	ActivateWorkspaceImport(ctx context.Context, in *WorkspaceActivationCall, opts ...grpc.CallOption) (*WorkspaceImportResult, error)
+	// Retained for supported minor-60 Hosts. May retire only after minor60 leaves WIRE_MINIMUM.
+	CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
 	ReleaseModelSource(ctx context.Context, in *ReleaseModelSourceRequest, opts ...grpc.CallOption) (*ReleaseModelSourceResult, error)
@@ -885,6 +891,16 @@ func (c *runtimePreparationClient) ActivateWorkspaceImport(ctx context.Context, 
 	return out, nil
 }
 
+func (c *runtimePreparationClient) CheckPackageSetCompatibility(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*CheckPackageSetCompatibilityResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckPackageSetCompatibilityResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_CheckPackageSetCompatibility_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *runtimePreparationClient) PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PreparePackageSetResult)
@@ -1038,6 +1054,8 @@ type RuntimePreparationServer interface {
 	// never forwarded from PodHost or exposed as an author-controlled cache write.
 	ImportWorkspace(grpc.ClientStreamingServer[WorkspaceImportFrame, WorkspaceImportResult]) error
 	ActivateWorkspaceImport(context.Context, *WorkspaceActivationCall) (*WorkspaceImportResult, error)
+	// Retained for supported minor-60 Hosts. May retire only after minor60 leaves WIRE_MINIMUM.
+	CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error)
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
 	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
 	ReleaseModelSource(context.Context, *ReleaseModelSourceRequest) (*ReleaseModelSourceResult, error)
@@ -1104,6 +1122,9 @@ func (UnimplementedRuntimePreparationServer) ImportWorkspace(grpc.ClientStreamin
 }
 func (UnimplementedRuntimePreparationServer) ActivateWorkspaceImport(context.Context, *WorkspaceActivationCall) (*WorkspaceImportResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ActivateWorkspaceImport not implemented")
+}
+func (UnimplementedRuntimePreparationServer) CheckPackageSetCompatibility(context.Context, *PreparePackageSetRequest) (*CheckPackageSetCompatibilityResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckPackageSetCompatibility not implemented")
 }
 func (UnimplementedRuntimePreparationServer) PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
@@ -1403,6 +1424,24 @@ func _RuntimePreparation_ActivateWorkspaceImport_Handler(srv interface{}, ctx co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimePreparation_CheckPackageSetCompatibility_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreparePackageSetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).CheckPackageSetCompatibility(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_CheckPackageSetCompatibility_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).CheckPackageSetCompatibility(ctx, req.(*PreparePackageSetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _RuntimePreparation_PreparePackageSet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PreparePackageSetRequest)
 	if err := dec(in); err != nil {
@@ -1673,6 +1712,10 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ActivateWorkspaceImport",
 			Handler:    _RuntimePreparation_ActivateWorkspaceImport_Handler,
+		},
+		{
+			MethodName: "CheckPackageSetCompatibility",
+			Handler:    _RuntimePreparation_CheckPackageSetCompatibility_Handler,
 		},
 		{
 			MethodName: "PreparePackageSet",
