@@ -49,11 +49,13 @@ type registryWheel struct {
 // RegistryRow is one locked registry dependency for Tensorhub to fetch itself:
 // exactly the pylock facts, nothing derived.
 type RegistryRow struct {
-	Name    string `json:"name"`
-	SHA256  string `json:"sha256"`
-	Size    int64  `json:"size"`
-	URL     string `json:"url"`
-	Version string `json:"version"`
+	// Captured Hub bytes travel with private revisions, never as worker-local URLs.
+	captureLocally bool
+	Name           string `json:"name"`
+	SHA256         string `json:"sha256"`
+	Size           int64  `json:"size"`
+	URL            string `json:"url"`
+	Version        string `json:"version"`
 }
 
 type exactDependency struct {

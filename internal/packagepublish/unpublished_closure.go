@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -107,19 +108,30 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 		if problem != nil {
 			return nil, nil, problem
 		}
+		captureLocally := false
 		if entry.Source.Registry == "https://pypi.org/simple" {
 			// Registry artifacts are fetched by Runtime's bounded storage; the
 			// private client upload byte bound applies only to local wheels.
 			if _, problem := registryWheelIdentityBound(name, entry.Version, candidate, MaxRegistryWheelBytes, targetPython...); problem != nil {
 				return nil, nil, problem
 			}
+		} else if organization := orgIndexNamespace(entry.Source.Registry); organization != "" {
+			index, _ := url.Parse(entry.Source.Registry)
+			object, err := url.Parse(candidate.URL)
+			if err != nil || index.Host == "" || object.Scheme != index.Scheme || object.Host != index.Host {
+				return nil, nil, exit.Named(exit.Validation, "registry_dependency_origin_refused", "captured Hub wheel differs from its locked index origin")
+			}
+			if _, problem := orgIndexWheelIdentity(name, entry.Version, organization, candidate, targetPython...); problem != nil {
+				return nil, nil, problem
+			}
+			captureLocally = true
 		} else {
 			candidate, problem = pytorchRegistryWheel(name, entry.Version, entry.Source.Registry, row.Wheels, targetPython...)
 			if problem != nil {
 				return nil, nil, problem
 			}
 		}
-		rows = append(rows, RegistryRow{Name: name, Version: entry.Version, URL: candidate.URL, SHA256: candidate.Hashes["sha256"], Size: candidate.Size})
+		rows = append(rows, RegistryRow{captureLocally: captureLocally, Name: name, Version: entry.Version, URL: candidate.URL, SHA256: candidate.Hashes["sha256"], Size: candidate.Size})
 		delete(expected, name)
 	}
 	for name := range pins {
@@ -156,7 +168,24 @@ func (p *Package) CaptureUnpublishedClosure(ctx context.Context, closure string,
 	if problem != nil {
 		return problem
 	}
-	p.DependencyRequirements = RegistryRequirements(rows)
+	public := rows[:0]
+	for _, row := range rows {
+		if !row.captureLocally {
+			public = append(public, row)
+			continue
+		}
+		address, _ := url.Parse(row.URL)
+		directory := filepath.Join(p.Root, "captured-hub-wheels")
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			return exit.Internalf("cannot stage captured Hub wheels: %s", err)
+		}
+		path := filepath.Join(directory, filepath.Base(address.Path))
+		if problem := fetchCapturedWheel(ctx, capturedWheelClient(), row, path); problem != nil {
+			return problem
+		}
+		p.DependencyWheels = append(p.DependencyWheels, DependencyWheel{Filename: filepath.Base(path), Path: path})
+	}
+	p.DependencyRequirements = RegistryRequirements(public)
 	requirements = append(requirements, "cozy-runtime>="+hostruntime.PackageFloor)
 	sort.Strings(requirements)
 	sealed := filepath.Join(p.Root, "private-project", filepath.Base(p.Wheel))
@@ -172,12 +201,21 @@ func fetchCapturedWheel(ctx context.Context, client *http.Client, row RegistryRo
 	if err != nil {
 		return exit.New(exit.Validation, "captured dependency download request is invalid")
 	}
+	if row.captureLocally {
+		local := *client
+		local.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		client = &local
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return exit.Unavailablef("captured dependency %s download was interrupted", row.Name)
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || response.ContentLength > 0 && response.ContentLength != row.Size {
+	bound := row.Size
+	if row.captureLocally && bound == 0 {
+		bound = MaxDependencyWheelBytes
+	}
+	if bound <= 0 || bound > MaxDependencyWheelBytes || response.StatusCode != http.StatusOK || response.ContentLength > bound || row.Size > 0 && response.ContentLength > 0 && response.ContentLength != row.Size {
 		return exit.Named(exit.Conflict, "private_dependency_download_changed", "captured dependency %s download differs from the captured wheel", row.Name)
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -185,10 +223,10 @@ func fetchCapturedWheel(ctx context.Context, client *http.Client, row RegistryRo
 		return exit.Internalf("cannot stage captured dependency %s", row.Name)
 	}
 	hash := sha256.New()
-	n, copyErr := io.Copy(io.MultiWriter(file, hash), io.LimitReader(response.Body, row.Size+1))
+	n, copyErr := io.Copy(io.MultiWriter(file, hash), io.LimitReader(response.Body, bound+1))
 	syncErr := file.Sync()
 	closeErr := file.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil || n != row.Size || hex.EncodeToString(hash.Sum(nil)) != row.SHA256 {
+	if copyErr != nil || syncErr != nil || closeErr != nil || (n > bound || row.Size > 0 && n != row.Size) || hex.EncodeToString(hash.Sum(nil)) != row.SHA256 {
 		return exit.Named(exit.Conflict, "private_dependency_download_changed", "captured dependency %s bytes differ from the captured wheel", row.Name)
 	}
 	fact, problem := wheel.InspectIdentity(path)
