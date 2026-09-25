@@ -20,7 +20,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -35,14 +34,29 @@ type rentalRuntimeUpdates struct {
 	running  sync.Map
 }
 
+type runtimeUpdateWheel struct {
+	Version  string `json:"version"`
+	Filename string `json:"filename"`
+	URL      string `json:"url"`
+	Digest   string `json:"digest"`
+	Length   int64  `json:"length"`
+}
+
+type runtimeUpdateTarget struct {
+	RuntimeUpdate struct {
+		Runtime  runtimeUpdateWheel `json:"runtime"`
+		TensorFS runtimeUpdateWheel `json:"tensorfs"`
+	} `json:"runtime_update"`
+}
+
 type runtimeUpdateSelection struct {
-	Target        hub.RuntimeUpdateTarget `json:"target"`
-	Directory     string                  `json:"directory"`
-	Stage         string                  `json:"stage"`
-	Host          string                  `json:"host"`
-	SSHArguments  []string                `json:"ssh_arguments"`
-	SFTPArguments []string                `json:"sftp_arguments"`
-	Selection     json.RawMessage         `json:"selection,omitempty"`
+	Target        runtimeUpdateTarget `json:"target"`
+	Directory     string              `json:"directory"`
+	Stage         string              `json:"stage"`
+	Host          string              `json:"host"`
+	SSHArguments  []string            `json:"ssh_arguments"`
+	SFTPArguments []string            `json:"sftp_arguments"`
+	Selection     json.RawMessage     `json:"selection,omitempty"`
 }
 
 func (u *rentalRuntimeUpdates) Start(id string) (*records.RuntimeUpdate, *exit.Error) {
@@ -227,7 +241,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 		}
 	} else {
 		var problem *exit.Error
-		selection, problem = u.selection(ctx, *row)
+		selection, problem = u.connectionSelection(ctx, *row)
 		if problem != nil {
 			return problem
 		}
@@ -236,15 +250,19 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			return problem
 		}
 		var planned struct {
-			Unchanged bool `json:"unchanged"`
+			Unchanged bool                `json:"unchanged"`
+			Target    runtimeUpdateTarget `json:"target"`
 		}
-		_ = json.Unmarshal(selection.Selection, &planned)
+		if json.Unmarshal(selection.Selection, &planned) != nil || planned.Target.RuntimeUpdate.Runtime.Version == "" || planned.Target.RuntimeUpdate.TensorFS.Version == "" {
+			return exit.New(exit.Structural, "Runtime update did not resolve a published wheel pair")
+		}
+		selection.Target = planned.Target
+		row.Selection, _ = json.Marshal(selection)
 		if planned.Unchanged {
 			row.State = "succeeded"
 			row.Result = selection.Selection
 			return nil
 		}
-		row.Selection, _ = json.Marshal(selection)
 		if problem := u.machines.store.SaveRuntimeUpdate(*row); problem != nil {
 			return problem
 		}
@@ -295,7 +313,7 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	lastState := ""
 	for result.Active() {
 		if !ctx.Mode().JSON && lastState != result.State {
-			messages := map[string]string{"preparing": "Checking Runtime and the approved update", "updating": "Updating Runtime", "reconciling": "Checking the worker after an interrupted update"}
+			messages := map[string]string{"preparing": "Checking Runtime and published updates", "updating": "Updating Runtime", "reconciling": "Checking the worker after an interrupted update"}
 			if message := messages[result.State]; message != "" {
 				fmt.Fprintf(ctx.Err, "%s: %s...\n", row.MachineName, message)
 			}
@@ -426,20 +444,4 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 		}
 	}
 	return exit.New(exit.Canceled, "Runtime update observation interrupted")
-}
-
-func (u *rentalRuntimeUpdates) selection(ctx context.Context, row records.RuntimeUpdate) (runtimeUpdateSelection, *exit.Error) {
-	selected, problem := u.connectionSelection(ctx, row)
-	if problem != nil {
-		return selected, problem
-	}
-	target, problem := client(u.machines.context).RentalRuntimeUpdateTarget(ctx, row.RentalID)
-	if problem != nil {
-		return selected, problem
-	}
-	if target.WorkerBootID != row.BootID {
-		return selected, exit.New(exit.Conflict, "approved Runtime update refers to another worker boot")
-	}
-	selected.Target = target
-	return selected, nil
 }

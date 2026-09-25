@@ -4,20 +4,28 @@ Only first-party Runtime/TensorFS distributions are downloaded. The worker's
 existing root updater owns validation, replacement and rollback.
 """
 
+import email.parser
 import hashlib
 import json
 from pathlib import Path
 import re
 import subprocess
 import sys
+import zipfile
 import urllib.parse
 import urllib.request
 
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.tags import parse_tag
-from packaging.utils import parse_wheel_filename
+from packaging.utils import canonicalize_name, parse_wheel_filename
+from packaging.version import InvalidVersion, Version
 
 
-PROBE = """import importlib.metadata as m, json, platform, subprocess, fcntl
+WORKER_PYTHON = "/opt/cozy/python/bin/python3"
+
+PROBE = """import importlib.metadata as m, json, platform, subprocess, fcntl, sys
+from packaging.markers import default_environment
 from packaging.tags import sys_tags
 from pathlib import Path
 lock=Path('/var/lib/cozy/dev/update.lock')
@@ -28,32 +36,36 @@ if lock.exists():
    fcntl.flock(stream,fcntl.LOCK_UN)
   except BlockingIOError:
    print(json.dumps({'update_in_progress':True})); raise SystemExit(0)
-runtime=json.loads(subprocess.check_output(['cozy-runtime','version','--json'],text=True))
+runtime=json.loads(subprocess.check_output([str(Path(sys.executable).parent/'cozy-runtime'),'version','--json'],text=True))
 base=Path('/var/lib/cozy/dev/base.json')
 current=Path('/var/lib/cozy/dev/current')
 updater=Path('/opt/cozy/dev/update.py')
-capability_probe=subprocess.run(['python3',str(updater),'capabilities'],text=True,capture_output=True) if updater.is_file() else None
+capability_probe=subprocess.run([sys.executable,str(updater),'capabilities'],text=True,capture_output=True) if updater.is_file() else None
 capabilities=json.loads(capability_probe.stdout) if capability_probe and capability_probe.returncode == 0 else {}
 try: torch_version=m.version('torch')
 except m.PackageNotFoundError: torch_version=''
 print(json.dumps({'runtime':runtime,'tensorfs':m.version('tensorfs'),'python':platform.python_version(),
  'tags':[str(t) for t in sys_tags()], 'updater':base.is_file() and updater.is_file(), 'durable_updates':capabilities.get('durable_updates',False),
  'selection':str(current.resolve()) if current.exists() else '',
- 'torch':torch_version}))
+ 'torch':torch_version, 'markers':default_environment()}))
 """
 
 
 def ssh(arguments, command):
-    return subprocess.run(
-        ["ssh", *arguments, command], capture_output=True, text=True, check=True
-    ).stdout
+    result = subprocess.run(
+        ["ssh", *arguments, command], capture_output=True, text=True
+    )
+    if result.returncode:
+        print(result.stderr, file=sys.stderr)
+        raise ValueError(f"Worker maintenance failed (SSH exit {result.returncode}): {result.stderr.strip()[-1024:]}")
+    return result.stdout
 
 
 def inspect(arguments):
     # The script is fixed application code, never a package callback or prompt.
     import shlex
 
-    return json.loads(ssh(arguments, "python3 -I -c " + shlex.quote(PROBE)))
+    return json.loads(ssh(arguments, WORKER_PYTHON + " -I -c " + shlex.quote(PROBE)))
 
 
 def fetch(url, limit):
@@ -62,7 +74,11 @@ def fetch(url, limit):
         "pypi.org", "files.pythonhosted.org"
     }:
         raise ValueError("Runtime update artifact URL is outside the first-party release index")
+    if parsed.username or parsed.password or parsed.port or parsed.query or parsed.fragment:
+        raise ValueError("Runtime update URL must identify one public release artifact")
     with urllib.request.urlopen(url, timeout=60) as response:
+        if response.geturl() != url:
+            raise ValueError("Runtime update release URL unexpectedly redirected")
         data = response.read(limit + 1)
     if len(data) > limit:
         raise ValueError("Runtime update artifact exceeds its download bound")
@@ -72,26 +88,100 @@ def fetch(url, limit):
 def wheel(name, selected, tags, directory, native):
     version, filename = selected["version"], selected["filename"]
     if name not in {"cozy-runtime", "tensorfs"} or not re.fullmatch(r"[A-Za-z0-9_.+-]+\.whl", filename):
-        raise ValueError("Invalid approved Runtime update wheel")
+        raise ValueError("Invalid published Runtime update wheel")
     project, release, _, wheel_tags = parse_wheel_filename(filename)
     supported = {tag for text in tags for tag in parse_tag(text)}
     if project != name or str(release) != version or not supported.intersection(wheel_tags):
-        raise ValueError(f"Approved {name} {version} does not support this worker's platform")
+        raise ValueError(f"Published {name} {version} does not support this worker's platform")
     if native and all(tag.platform == "any" for tag in wheel_tags):
-        raise ValueError("The worker requires a native wheel from the approved image")
+        raise ValueError("The worker requires a published native wheel")
     digest = selected["digest"].removeprefix("sha256:")
     if not re.fullmatch(r"[a-f0-9]{64}", digest) or not 0 < selected["length"] <= 128 << 20:
-        raise ValueError("Approved wheel digest or length is invalid")
+        raise ValueError("Published wheel digest or length is invalid")
     path = directory / filename
-    if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+    if not path.exists() or path.stat().st_size != selected["length"] or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
         data = fetch(selected["url"], selected["length"])
         if len(data) != selected["length"] or hashlib.sha256(data).hexdigest() != digest:
-            raise ValueError("Runtime update wheel failed approved digest verification")
+            raise ValueError("Runtime update wheel failed published digest verification")
         temporary = path.with_suffix(".download")
         temporary.write_bytes(data)
         temporary.replace(path)
     return {"distribution": name, "version": version, "file": filename,
             "path": str(path), "sha256": digest}
+
+
+
+def published(name, observed, constraint=""):
+    """Choose the newest non-yanked native release for this exact interpreter."""
+    document = json.loads(fetch(f"https://pypi.org/pypi/{name}/json", 32 << 20))
+    supported = [tag for text in observed["tags"] for tag in parse_tag(text)]
+    rank = {tag: index for index, tag in enumerate(supported)}
+    installed = observed["runtime"]["distribution"] if name == "cozy-runtime" else observed["tensorfs"]
+    candidates = []
+    for release, files in document["releases"].items():
+        try:
+            version = Version(release)
+        except InvalidVersion:
+            continue
+        if version.is_prerelease or version.is_devrelease or version < Version(installed):
+            continue
+        if version not in SpecifierSet(constraint):
+            continue
+        for row in files:
+            if row.get("yanked") or row.get("packagetype") != "bdist_wheel":
+                continue
+            project, artifact_version, _, tags = parse_wheel_filename(row["filename"])
+            matches = set(rank).intersection(tags)
+            if (project != name or artifact_version != version or not matches
+                or all(tag.platform == "any" for tag in tags)
+                or Version(observed["python"]) not in SpecifierSet(row.get("requires_python") or "")):
+                continue
+            candidates.append((version, -min(rank[tag] for tag in matches), row))
+    if not candidates:
+        raise ValueError(f"No published native {name}{constraint} wheel supports this worker's Python {observed['python']} and platform without downgrading {installed}")
+    version, _, row = max(candidates, key=lambda value: (value[0], value[1], value[2]["filename"]))
+    filename = row["filename"]
+    location = urllib.parse.urlparse(row["url"])
+    if location.hostname != "files.pythonhosted.org" or location.path.rsplit("/", 1)[-1] != filename:
+        raise ValueError("Published wheel URL does not identify its exact artifact")
+    return {"version": str(version), "filename": filename, "url": row["url"],
+            "digest": "sha256:" + row["digests"]["sha256"], "length": row["size"]}
+
+
+def metadata(row, observed):
+    # A wheel filename is not authority for the distribution contained inside it.
+    with zipfile.ZipFile(row["path"]) as archive:
+        files = [item for item in archive.infolist()
+                 if item.filename.count("/") == 1 and item.filename.endswith(".dist-info/METADATA")]
+        if len(files) != 1 or files[0].file_size > 1 << 20:
+            raise ValueError("Published wheel must contain one bounded METADATA")
+        info = email.parser.BytesParser().parsebytes(archive.read(files[0]))
+    if canonicalize_name(info.get("Name", "")) != row["distribution"] or info.get("Version") != row["version"]:
+        raise ValueError("Published wheel metadata does not match its selected distribution/version")
+    if Version(observed["python"]) not in SpecifierSet(info.get("Requires-Python", "")):
+        raise ValueError("Published wheel metadata requires a different worker Python")
+    requirements = []
+    for value in info.get_all("Requires-Dist", []):
+        required = Requirement(value)
+        if required.marker is None or any(required.marker.evaluate({**observed["markers"], "extra": extra}) for extra in ("", "model-execution")):
+            requirements.append(required)
+    return requirements
+
+
+def resolve(observed, directory):
+    runtime = published("cozy-runtime", observed)
+    runtime_wheel = wheel("cozy-runtime", runtime, observed["tags"], directory, True)
+    requirements = metadata(runtime_wheel, observed)
+    tensorfs_requirements = [requirement for requirement in requirements if canonicalize_name(requirement.name) == "tensorfs"]
+    if any(requirement.url for requirement in tensorfs_requirements):
+        raise ValueError("Runtime requires a non-index TensorFS artifact; publish a portable release")
+    constraint = ",".join(str(requirement.specifier) for requirement in tensorfs_requirements)
+    tensorfs = published("tensorfs", observed, constraint)
+    tensorfs_wheel = wheel("tensorfs", tensorfs, observed["tags"], directory, True)
+    for required in metadata(tensorfs_wheel, observed):
+        if canonicalize_name(required.name) == "cozy-runtime" and (required.url or Version(runtime["version"]) not in required.specifier):
+            raise ValueError(f"Published TensorFS {tensorfs['version']} requires {required}; selected Runtime {runtime['version']} is incompatible")
+    return {"runtime_update": {"runtime": runtime, "tensorfs": tensorfs}}, [runtime_wheel, tensorfs_wheel]
 
 
 def main():
@@ -103,12 +193,12 @@ def main():
         expected = [row["sha256"] for row in request["selection"]["wheels"]]
         if not re.fullmatch(r"[a-f0-9]{32}", stage) or len(expected) != 2 or any(not re.fullmatch(r"[a-f0-9]{64}", value) for value in expected):
             raise ValueError("Invalid recorded update identity")
-        return {"update": json.loads(ssh(arguments, "python3 /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected)))}
+        return {"update": json.loads(ssh(arguments, WORKER_PYTHON + " /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected)))}
     if action == "status":
         stage = request["stage"]
         if not re.fullmatch(r"[a-f0-9]{32}", stage):
             raise ValueError("Invalid update operation identity")
-        update = json.loads(ssh(arguments, "python3 /opt/cozy/dev/update.py status " + stage))
+        update = json.loads(ssh(arguments, WORKER_PYTHON + " /opt/cozy/dev/update.py status " + stage))
         result = {"update": update}
         if update.get("state") in {"succeeded", "rolled_back", "refused"}:
             result["observed"] = inspect(arguments)
@@ -118,18 +208,17 @@ def main():
         return {"observed": observed}
     if observed.get("update_in_progress"):
         raise ValueError("The worker is already applying a Runtime update")
-    if request["action"] == "plan" and observed["runtime"]["distribution"] == request["target"]["runtime_update"]["runtime"]["version"] and observed["tensorfs"] == request["target"]["runtime_update"]["tensorfs"]["version"]:
-        return {"observed": observed, "unchanged": True}
     if not observed["updater"] or not observed.get("durable_updates", False) or not observed["runtime"].get("supports_guarded_restart", False):
         raise ValueError("This worker image does not support safe Runtime updates; select a current maintenance-capable private image")
     directory = Path(request["directory"])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if request["action"] == "plan":
-        selection = []
-        for name in ("cozy-runtime", "tensorfs"):
-            selection.append(wheel(name, request["target"]["runtime_update"]["runtime" if name == "cozy-runtime" else "tensorfs"], observed["tags"],
-                                   directory, name == "tensorfs" or bool(observed["torch"])))
-        return {"observed": observed, "wheels": selection}
+        target, selection = resolve(observed, directory)
+        unchanged = (
+            observed["runtime"]["distribution"] == target["runtime_update"]["runtime"]["version"]
+            and observed["tensorfs"] == target["runtime_update"]["tensorfs"]["version"]
+        )
+        return {"observed": observed, "target": target, "wheels": selection, "unchanged": unchanged}
     if request["action"] != "apply":
         raise ValueError("Unknown Runtime update operation")
     stage = request["stage"]
@@ -149,7 +238,7 @@ def main():
     batch.write_text("\n".join(commands) + "\n")
     subprocess.run(["sftp", *request["sftp_arguments"], "-b", str(batch), request["host"]],
                    check=True, capture_output=True, text=True)
-    reply = ssh(arguments, "python3 /opt/cozy/dev/update.py apply " + stage + " " +
+    reply = ssh(arguments, WORKER_PYTHON + " /opt/cozy/dev/update.py apply " + stage + " " +
                 " ".join(row["sha256"] for row in wheels))
     result = json.loads(reply.strip().splitlines()[-1])
     if result.get("operation") != stage or result.get("state") not in {
@@ -163,7 +252,7 @@ def main():
 if __name__ == "__main__":
     try:
         print(json.dumps(main(), sort_keys=True))
-    except (ValueError, OSError, subprocess.SubprocessError, KeyError) as error:
+    except (ValueError, OSError, subprocess.SubprocessError, KeyError, zipfile.BadZipFile) as error:
         # Keep SSH/native tracebacks out of ordinary end-user output. The CLI
         # retains the complete subprocess diagnostics in this update's log.
         print(json.dumps({"error": str(error)}))
