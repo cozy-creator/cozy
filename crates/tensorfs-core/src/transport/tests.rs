@@ -617,6 +617,86 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// proto-061 A: a digest-pinned warm ask the local release index already answers costs
+/// zero hub calls; a moved pointer or an untrusted object sends the ask back to the hub.
+#[test]
+fn a_pinned_warm_pull_asks_the_hub_nothing_and_a_moved_pointer_asks_again() {
+    let root = temporary("pinned-warm");
+    let store = Store::init(&root).unwrap();
+    let first = Arc::new(checkpoint(4, 16 * 1024));
+    let second = Arc::new(checkpoint(5, 16 * 1024));
+    let hub_first = hub_origin(Arc::clone(&first), |_, _| None);
+    let hub_second = hub_origin(Arc::clone(&second), |_, _| None);
+    let policy = SourcePolicy::default();
+    let pinned = |c: &Checkpoint| format!("acme/model@r1@sha256:{}", c.manifest.sha256);
+    let ask = |base: &str, refspec: &str| {
+        let mut request = PullRequest::new(&store, base, refspec, &Anonymous, &policy);
+        request.lane = "public";
+        request.sample_seconds = 0.025;
+        pull(&request).unwrap()
+    };
+    let first_ref = pinned(&first);
+    let cold = ask(&hub_first.base, &first_ref);
+    assert_eq!(cold.fetched, 6);
+
+    let before = hub_first.total_hits();
+    let warm = ask(&hub_first.base, &first_ref);
+    assert_eq!(
+        hub_first.total_hits(),
+        before,
+        "a pinned warm pull reached the hub"
+    );
+    assert_eq!((warm.held, warm.fetched, warm.bytes_moved), (6, 0, 0));
+    assert_eq!(warm.bytes_total, cold.bytes_total);
+    assert_eq!(warm.manifest, first.manifest.id());
+    assert_eq!(
+        (warm.release.as_str(), warm.lane.as_str()),
+        ("r1", "public")
+    );
+
+    // Unpinned: the ref names a release pointer the hub owns.
+    let before = hub_first.hits("/v1/tensorfs/closure");
+    let unpinned = {
+        let mut request = PullRequest::new(
+            &store,
+            &hub_first.base,
+            "acme/model@r1",
+            &Anonymous,
+            &policy,
+        );
+        request.lane = "public";
+        pull(&request).unwrap()
+    };
+    assert_eq!(unpinned.fetched, 0);
+    assert_eq!(hub_first.hits("/v1/tensorfs/closure") - before, 1);
+
+    // The pointer moved to `second`: the index maps r1/public to `first`, so ask the hub.
+    let moved = ask(&hub_second.base, &pinned(&second));
+    assert_eq!(hub_second.hits("/v1/tensorfs/closure"), 1);
+    assert!(moved.fetched > 0);
+    // The index now maps r1/public to `second`; a pin on `first` is no longer local.
+    let before = hub_first.hits("/v1/tensorfs/closure");
+    ask(&hub_first.base, &first_ref);
+    assert_eq!(hub_first.hits("/v1/tensorfs/closure") - before, 1);
+
+    // Back on `first` and local again; an object the store no longer holds is not trusted,
+    // so the hub is asked and exactly that object is refetched.
+    let before = hub_first.total_hits();
+    ask(&hub_first.base, &first_ref);
+    assert_eq!(hub_first.total_hits(), before);
+    let blob = first
+        .objects
+        .iter()
+        .find(|o| o.length == 16 * 1024)
+        .unwrap();
+    std::fs::remove_file(store.object_path(&blob.sha256)).unwrap();
+    let before = hub_first.hits("/v1/tensorfs/closure");
+    let healed = ask(&hub_first.base, &first_ref);
+    assert_eq!(healed.fetched, 1);
+    assert_eq!(hub_first.hits("/v1/tensorfs/closure") - before, 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// THE SECOND POD IS THE WHOLE POINT, and this is the arm that proves the cache FIRES
 /// rather than merely that it is configured.
 ///

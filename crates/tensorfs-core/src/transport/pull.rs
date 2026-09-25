@@ -1186,7 +1186,8 @@ pub struct PullReport {
 ///
 /// A warm store asks the hub one question (`closure`) and moves nothing: no presign call is
 /// made when `wanted` is empty, and a URL is never minted for an object the walk does not
-/// go on to fetch.
+/// go on to fetch. A digest-pinned ask whose release lane the local index already maps to
+/// that manifest, over a closure this Store trusts, asks the hub nothing at all.
 pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     let ledger = Ledger::with_resolution(std::time::Duration::from_secs_f64(
         request.sample_seconds.clamp(0.001, 3600.0),
@@ -1202,6 +1203,18 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     if policy::is_loopback_origin(request.base) {
         policy.allow_local = true;
     }
+    // A digest-pinned ask for a release lane this Store already records, over a closure
+    // it already trusts, has nothing to learn from the hub (proto-061 A).
+    if let Some(closure) = pinned_local_closure(request) {
+        if let Ok((plan, report)) = plan_against_store(request, &closure) {
+            if plan.wanted.is_empty() {
+                if let Some(observer) = request.on_plan {
+                    observer(&plan);
+                }
+                return Ok(report);
+            }
+        }
+    }
     let client = shared_client();
     // The WHOLE closure, however many pages the hub takes to say it. A closure that fits
     // one page is one call, which is every model we own today; nothing about the walk
@@ -1216,12 +1229,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         request.deadline,
         &ledger,
     )?;
-    let session = if request.session.is_empty() {
-        format!("pull-{}", &closure.manifest.sha256[..12])
-    } else {
-        request.session.to_string()
-    };
-    let (plan, why) = FetchPlan::of(request.store, &session, &closure.manifest, &closure.objects)?;
+    let (plan, mut report) = plan_against_store(request, &closure)?;
     if let Some((bytes, objects)) = request.download_budget {
         let wanted_bytes = plan.wanted_bytes();
         let wanted_objects = plan.wanted.len() as u64;
@@ -1238,25 +1246,6 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     if let Some(observer) = request.on_plan {
         observer(&plan);
     }
-    let mut report = PullReport {
-        refspec: request.refspec.to_string(),
-        model: closure.model.clone(),
-        release: closure.release.clone(),
-        lane: closure.lane.clone(),
-        manifest: closure.manifest.id(),
-        session: session.clone(),
-        streams: request.streams,
-        declared: (plan.held.len() + plan.wanted.len()) as u64,
-        held: plan.held.len() as u64,
-        bytes_held: plan.held_bytes(),
-        bytes_total: plan.declared_bytes(),
-        presence: why
-            .iter()
-            .map(|(object, presence)| (object.id(), presence.as_str()))
-            .collect(),
-        stamps: closure.stamps.clone(),
-        ..Default::default()
-    };
     // THE ADMISSION GATE, and it stands here for two reasons (tfs-064).
     //
     // It is BEFORE the walk, so a pull that cannot fit costs a closure call and no bytes —
@@ -1324,6 +1313,91 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     })?;
     while_store_busy(|| record_locally(request.store, &closure))?;
     Ok(report)
+}
+
+/// Split `closure` against the store and build the report a pull that moves nothing returns.
+fn plan_against_store(
+    request: &PullRequest<'_>,
+    closure: &hub::Closure,
+) -> Result<(FetchPlan, PullReport)> {
+    let session = if request.session.is_empty() {
+        format!("pull-{}", &closure.manifest.sha256[..12])
+    } else {
+        request.session.to_string()
+    };
+    let (plan, why) = FetchPlan::of(request.store, &session, &closure.manifest, &closure.objects)?;
+    let report = PullReport {
+        refspec: request.refspec.to_string(),
+        model: closure.model.clone(),
+        release: closure.release.clone(),
+        lane: closure.lane.clone(),
+        manifest: closure.manifest.id(),
+        session,
+        streams: request.streams,
+        declared: (plan.held.len() + plan.wanted.len()) as u64,
+        held: plan.held.len() as u64,
+        bytes_held: plan.held_bytes(),
+        bytes_total: plan.declared_bytes(),
+        presence: why
+            .iter()
+            .map(|(object, presence)| (object.id(), presence.as_str()))
+            .collect(),
+        stamps: closure.stamps.clone(),
+        ..Default::default()
+    };
+    Ok((plan, report))
+}
+
+/// The closure this Store can answer for itself: the refspec is `org/name@release@sha256:<hex>`,
+/// a lane is named, and the local release index maps (model, release, lane) to exactly that
+/// manifest. Anything else — an unpinned ref, a moved pointer, a manifest or header this
+/// Store cannot read — is a question for the hub.
+fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
+    let mut parts = request.refspec.split('@');
+    let (model, release, digest) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || release.is_empty() || request.lane.is_empty() {
+        return None;
+    }
+    let pinned = digest.strip_prefix("sha256:")?;
+    let (org, name) = model.split_once('/')?;
+    let repo = crate::repository::RepositoryName::new(org, name).ok()?;
+    let bytes = std::fs::read(request.store.repository_path(&repo)).ok()?;
+    let repository = crate::repository::Repository::parse(&bytes).ok()?;
+    let manifest = repository
+        .releases
+        .iter()
+        .find(|entry| entry.version == release && !entry.yanked)?
+        .lanes
+        .iter()
+        .find(|lane| lane.lane == request.lane && lane.manifest.sha256 == pinned)?
+        .manifest
+        .clone();
+    if !repository
+        .checkpoints
+        .iter()
+        .any(|entry| entry.manifest == manifest)
+    {
+        return None;
+    }
+    let document = request.store.read_manifest(&manifest).ok()?;
+    let walked = crate::checkpoint::walk_cozytensors(request.store, &document).ok()?;
+    let objects: Vec<ObjectRef> = walked
+        .distinct()
+        .into_iter()
+        .filter(|object| object.sha256 != manifest.sha256)
+        .cloned()
+        .collect();
+    Some(hub::Closure {
+        model: model.to_string(),
+        release: release.to_string(),
+        lane: request.lane.to_string(),
+        scope: "runtime".to_string(),
+        manifest,
+        objects,
+        stamps: Vec::new(),
+        complete: true,
+        presign_max_digests: None,
+    })
 }
 
 /// The local index row already says what this pull would record.
