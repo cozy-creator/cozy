@@ -62,8 +62,8 @@ image/access contract; shared worker image policy remains independent.
 Use the ordinary Creator CLI against local Host fixtures for successful update,
 repeated no-op, busy refusal, another rental remaining usable, invalid wheels,
 rollback, client disconnect, daemon restart and retained TensorFS state. Biao's
-observed failure was Runtime 0.18.2 against H3's >=0.18.3 requirement. The user ended
-that rental; no new paid rental is authorized for this work.
+observed failure was Runtime 0.18.2 against H3's >=0.18.3 requirement. Real rental
+qualification uses an explicitly owned rental and the ordinary Creator CLI.
 
 ## Independent release selection
 
@@ -81,3 +81,9 @@ is a rollback cache, not a virtual environment. Worker dependency validation,
 native imports and post-update health remain authoritative. An incompatible
 heavy platform is an actionable preflight refusal, not permission to replace it.
 The immutable 900-second rental idle deadline is neither extended nor disabled.
+
+The CUDA image installs `uv` at `/usr/local/bin/uv`. Its existing updater invokes
+Python and supervisorctl with absolute paths, so older images with the original
+`/usr/local/bin:/usr/bin:/bin` child PATH can use this hot-update path without
+replacing the updater. Supervisord's host/updater processes inherit the managed
+Python PATH from the image entrypoint; they do not inherit the SSH session PATH.
