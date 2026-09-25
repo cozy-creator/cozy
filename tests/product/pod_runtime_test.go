@@ -377,43 +377,90 @@ func TestWarmFirstRunsLoadedWorkWhileHeadPrepares(t *testing.T) {
 	}
 }
 
-// STAGED ON THE RENTAL'S LANE (proto-061 G). While the first request runs, the second is
-// offered to the same lane and admitted QUEUED behind it; a third waits for the lane, not
-// for the worker-level sum, which still advertises lane-1's idle seats.
-func TestSecondRequestStagedOnRentalLane(t *testing.T) {
+// Five queued calls share one preparation and fill the rental's two-seat lane.
+// Each next call is offered while its predecessor still runs. The exact binding
+// comes from the pod's prepared and observed set, including when submission held
+// an obsolete plan. This is scheduling coverage; real Runtime/GPU qualification
+// must additionally prove the cold construction and generated results.
+func TestFiveQueuedRequestsReuseObservedRentalBinding(t *testing.T) {
 	q := newH3Queue(t, "staged-rental", 2, 0, false)
 	q.runtime.mu.Lock()
 	q.runtime.lanes = true
 	q.runtime.mu.Unlock()
-	first := q.submit("fl2va", fl2vaModels)
-	warm := q.offer(1)
-	second := q.submit("fl2va", fl2vaModels)
-	if next := q.offer(2); next.RequestId != second || next.PlacementId != warm.PlacementId {
-		t.Fatalf("offer 2 went to %s on %s; want %s staged on %s", next.RequestId, next.PlacementId,
-			second, warm.PlacementId)
+	requests := make([]string, 5)
+	for i := range requests {
+		id, _, problem := q.o.c.Submit(orchestrator.Submission{
+			IdemKey: fmt.Sprintf("queued-%d", i), Package: h3Package, Entrypoint: "fl2va",
+			Release: "1.0.0", Payload: []byte(`{"prompt":"a fox"}`),
+			PlanID: "sha256:" + strings.Repeat("f", 64),
+			Worker: podRental, Rental: true, RentalRequired: true, Models: fl2vaModels,
+		})
+		fatal(t, problem)
+		requests[i] = id
 	}
-	q.runtime.mu.Lock()
-	running := q.runtime.running[first] != nil
-	q.runtime.mu.Unlock()
-	if !running {
-		t.Fatalf("%s is no longer running; the second offer did not overlap it", first)
+	first, second := q.offer(1), q.offer(2)
+	if first.RequestId != requests[0] || second.RequestId != requests[1] {
+		t.Fatalf("first two offers %s, %s; queued order %v", first.RequestId, second.RequestId, requests)
 	}
-	third := q.submit("fl2va", fl2vaModels)
-	parked := awaitDurable(t, q.o, third, "request.parked")
+	awaitDurable(t, q.o, requests[2], "request.parked")
 	if _, _, offered := q.counts(); len(offered) != 2 {
-		t.Fatalf("offers %v while lane-0 holds a running and a staged attempt; parked: %v",
-			offered, parked.Payload)
+		t.Fatalf("offers %v while lane-0 holds two requests; lane-1 cannot admit this placement", offered)
 	}
-	q.runtime.finish(t, q.pod, first)
-	if next := q.offer(3); next.RequestId != third || next.PlacementId != warm.PlacementId {
-		t.Fatalf("offer 3 went to %s on %s; want %s on %s", next.RequestId, next.PlacementId,
-			third, warm.PlacementId)
+
+	for i, id := range requests {
+		// The next request is already admitted before the current one finishes.
+		if i+1 < len(requests) {
+			next := q.offer(i + 2)
+			if next.RequestId != requests[i+1] || next.PlacementId != first.PlacementId {
+				t.Fatalf("offer %d = %s on %s; want %s on %s", i+2, next.RequestId,
+					next.PlacementId, requests[i+1], first.PlacementId)
+			}
+		}
+		q.runtime.mu.Lock()
+		held := q.runtime.running[id] != nil
+		q.runtime.mu.Unlock()
+		if !held {
+			t.Fatalf("%s ended before its successor was offered", id)
+		}
+		q.runtime.finish(t, q.pod, id)
 	}
-	q.runtime.finish(t, q.pod, second)
-	q.runtime.finish(t, q.pod, third)
-	for _, id := range []string{first, second, third} {
+	for _, id := range requests {
 		if _, e := q.o.c.AwaitSettled(id, 30*time.Second); e != nil {
 			t.Fatalf("%s did not settle: %s", id, briefly(e))
+		}
+	}
+	if prepares, desired, offered := q.counts(); prepares != 1 || desired != 1 || len(offered) != 5 {
+		t.Fatalf("five warm calls made %d prepares, %d desired sets and %d offers", prepares, desired, len(offered))
+	}
+	q.pod.mu.Lock()
+	prepared := append([]byte(nil), q.pod.preparedSet...)
+	offers := append([]*pb.AttemptOffer(nil), q.pod.offers...)
+	q.pod.mu.Unlock()
+	set, err := canonical.Read(prepared, &pb.PlacementSet{})
+	must(t, err)
+	placement := set.List("placements")[0]
+	var binding string
+	for _, entry := range placement.List("entrypoints") {
+		if entry.Str("name") == "fl2va" {
+			binding = entry.Str("entrypoint_binding_digest")
+		}
+	}
+	if binding == "" {
+		t.Fatal("pod prepared no fl2va binding")
+	}
+	for _, offer := range offers {
+		spec, err := canonical.Read(offer.InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
+		must(t, err)
+		serving := spec.Sub("serving")
+		if serving.Str("entrypoint_binding_digest") != binding || serving.Str("attempt_binding_id") != binding ||
+			serving.Str("bindings_digest") != placement.Str("bindings_digest") ||
+			offer.PlacementId != placement.Str("placement_id") {
+			t.Fatalf("%s offered different identities than the pod prepared: %v", offer.RequestId, serving)
+		}
+		row, problem := q.o.store.RequestRow(offer.RequestId)
+		fatal(t, problem)
+		if row == nil || row.PlanID != binding {
+			t.Fatalf("%s did not retain the observed binding: %+v", offer.RequestId, row)
 		}
 	}
 }

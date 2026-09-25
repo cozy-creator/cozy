@@ -32,6 +32,7 @@ type LocalServingPreparation struct {
 	Application            string   `json:"application"`
 	ModelSlotPaths         []string `json:"model_slot_paths"`
 	PackageInterfaceDigest string   `json:"package_interface_digest"`
+	PackageInterface       []byte   `json:"package_interface"`
 	LockedRequirements     string   `json:"locked_requirements"`
 }
 
@@ -105,6 +106,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		result, rpcError = s.preparation.PreparePackageSet(s.ctx, &pb.PreparePackageSetRequest{
 			PythonRequires: prep.PythonRequires, PythonVersion: prep.PythonVersion, InstallRoot: root, DownloadDelegation: selected, Application: prep.Application,
 			ModelSlotPaths: prep.ModelSlotPaths, LockedRequirements: locked,
+			PackageInterface: append([]byte(nil), prep.PackageInterface...),
 		})
 	} else {
 		revision, problem := c.opt.Packages.LocalRevision(req.InstallID, req.LocalPackageDigest)
@@ -199,8 +201,8 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	if problem != nil {
 		return WorkerLaunchSpec{}, "", problem
 	}
-	if req.PlanID != "" && req.PlanID != plan {
-		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "plan_mismatch", "worker constructed a different binding than the requested plan")
+	if problem := c.opt.Store.BindRequestPlan(req.ID, plan); problem != nil {
+		return WorkerLaunchSpec{}, "", problem
 	}
 	if err := os.MkdirAll(spec.ArtifactCache, 0o700); err != nil {
 		return WorkerLaunchSpec{}, "", exit.Internalf("cannot create prepared placement cache: %s", err)
