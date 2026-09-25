@@ -14,3 +14,17 @@ Finite proof order: private compatible partial recovery; changed-callee partial
 rejection; native committed/unacknowledged recovery; completed caller reuse; exact
 native readback and independent retention. Broader source/quantizer, Eval, effects,
 and H3 gates remain separate until their recorded assertions pass.
+
+Retained first proof: `dae87667` supplies the original candidate arithmetic.
+The final candidate adds1 without changing package0.1.0, for the incompatible
+partial control. Evidence snapshots retain before/after source hashes.
+`verify_partial.py EVIDENCE_DIRECTORY` and `verify_changed.py EVIDENCE_DIRECTORY`
+check the recorded normal global CLI runs and native events. Expected controls
+are source/a/b written once with explicit partial adoption, and a/a/b written
+across the incompatible partial followed by the changed implementation.
+
+Actual private Runtime24 automatic recovery exposed a transient queued admission
+refusal becoming final; Runtime PR611 supplies the narrow retry policy fix.
+Explicit retry success is distinct from automatic retry qualification. The CPU
+updater interpreter prerequisite shipped as Creator PR672; no manual SDK overlay
+or fabricated cache row is used to claim the updater path.

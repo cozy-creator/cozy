@@ -37,7 +37,7 @@ async def compute(ctx: Context, *, source: Source, factor: int) -> ModelArtifact
         completed = set(writer.completed_parts())
         for name in ("a", "b"):
             if ("model", name, "value") not in completed:
-                writer.add_part("model", name, "value", io.BytesIO(struct.pack("<512f", *(value * factor for value in values))))
+                writer.add_part("model", name, "value", io.BytesIO(struct.pack("<512f", *(value * factor + 1 for value in values))))
                 writer.checkpoint()
         return ctx.adopt_model(writer.commit())
 

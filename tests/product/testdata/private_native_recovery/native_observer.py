@@ -1,6 +1,6 @@
 """Trusted, owned-worker fault observer; never imported by submitted package code.
 
-The operator supplies a private directory in COZY_RECOVERY_OBSERVER. An arm.json
+The operator supplies a private directory to install(). An arm.json
 file selects one native fault. Observations and a durable claimed marker precede
 the fault, so a Runtime restart cannot inject the same fault twice. No workspace
 or TensorFS state is edited. Remove the launcher instrumentation after proof.
@@ -9,13 +9,14 @@ or TensorFS state is edited. Remove the launcher instrumentation after proof.
 import json
 import os
 import signal
+import sqlite3
 from pathlib import Path
 
 
-def install():
+def install(directory):
     import tensorfs.derived as derived
 
-    root = Path(os.environ["COZY_RECOVERY_OBSERVER"])
+    root = Path(directory)
     original = derived.serve_derived
 
     def event(kind, **fields):
@@ -36,6 +37,19 @@ def install():
         # matching allows a source stage to pass before candidate checkpointing.
         if arm.get("operation") and arm["operation"] != operation:
             return
+        if kind == "receipt_before_ack":
+            # A read-only independent connection observes the durable Runtime
+            # intent before its receipt callback. No journal state is injected.
+            with sqlite3.connect(
+                "file:/var/lib/tensorfs/.cozy-workspace/journal.sqlite3?mode=ro", uri=True
+            ) as database:
+                database.row_factory = sqlite3.Row
+                row = database.execute(
+                    "SELECT id,request,state,length(receipt) AS receipt_bytes "
+                    "FROM weights WHERE id=?", (facts["transaction_id"],)
+                ).fetchone()
+                event("pre_fault_workspace", operation=operation,
+                      row=dict(row) if row is not None else None)
         marker = root / (arm["id"] + ".claimed")
         try:
             with marker.open("x") as stream:
