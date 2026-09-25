@@ -29,6 +29,7 @@ explicit=true
 // Real CPU tensor jobs exercise immutable dependency capture without pretending
 // that a CPU runner qualifies CUDA serving. Both independent scripts run via CLI.
 func TestEditedScriptsReuseImmutableDependencies(t *testing.T) {
+	integration(t)
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires exact Runtime wheel")
 	}

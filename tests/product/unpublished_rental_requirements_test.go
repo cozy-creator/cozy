@@ -119,6 +119,7 @@ func TestRentalRequirementsIncludeTheWholeSelectedClosure(t *testing.T) {
 // This exercises actual script capture and named-rental admission through the
 // normal CLI. The HTTP peer supplies inventory only; it never buys a machine.
 func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
+	integration(t)
 	inventory, problem := hostruntime.PythonExecutors(context.Background())
 	fatal(t, problem)
 	captured, problem := inventory.Select(">=3.12,<3.13", "")

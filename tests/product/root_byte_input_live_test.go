@@ -15,6 +15,7 @@ import (
 )
 
 func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testing.T) {
+	integration(t)
 	if *privateChildRuntimeWheel == "" {
 		t.Skip("requires exact Runtime wire55 input intake")
 	}

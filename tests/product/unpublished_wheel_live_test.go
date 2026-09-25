@@ -20,6 +20,7 @@ import (
 // Every invocation uses the actual cozy CLI. A successful import alone does not
 // test worker dispatch, native custody, or independently edited caller reuse.
 func TestUnpublishedWheelCompositionTracksExecutableNotCaller(t *testing.T) {
+	integration(t)
 	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	parsed, err := pep440.Parse(version)
 	must(t, err)

@@ -17,6 +17,7 @@ import (
 // The same A/B author files used by the real rental proof run here through the
 // ordinary local CLI. No Docker, PodHost replacement, native ACK or cache is faked.
 func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
+	integration(t)
 	control := filepath.Join(t.TempDir(), "control")
 	uv := func(args ...string) {
 		t.Helper()

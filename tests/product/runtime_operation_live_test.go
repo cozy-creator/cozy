@@ -17,6 +17,7 @@ import (
 // capture its fixed builtin, execute real native quantization, and give a fresh
 // edited caller custody of the memoized result before its independent readback.
 func TestRuntimeBuiltinQuantizeSurvivesCallerEdit(t *testing.T) {
+	integration(t)
 	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	runtimeInstall, runtimeSource := "cozy-runtime=="+version, ""
 	if *privateChildRuntimeWheel != "" {

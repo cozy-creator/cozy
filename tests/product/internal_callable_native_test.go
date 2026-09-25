@@ -16,6 +16,7 @@ import (
 // This is an ordinary local CLI invocation with real Runtime child execution.
 // Supply the candidate wheel while its author surface is awaiting publication.
 func TestInternalCallableNativeParentExecutesItsOwnChild(t *testing.T) {
+	integration(t)
 	wheel := *privateScriptRuntimeWheel
 	if wheel == "" {
 		t.Skip("requires the Runtime internal-callable candidate wheel")

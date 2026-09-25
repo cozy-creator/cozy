@@ -10,6 +10,7 @@ import (
 )
 
 func TestAwaitedJobJSONSeparatesEventsAndResult(t *testing.T) {
+	integration(t)
 	root, err := os.MkdirTemp("", "cozy-job-json-")
 	must(t, err)
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })

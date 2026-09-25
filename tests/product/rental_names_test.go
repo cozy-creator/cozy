@@ -24,14 +24,27 @@ func TestRentalMachineNames(t *testing.T) {
 	if len(words) < 5000 || !sort.StringsAreSorted(words) {
 		t.Fatalf("the vocabulary holds %d words", len(words))
 	}
-	for i, word := range words {
+	// One substitution shares a wildcard key; one insertion deletes to the other word.
+	present, wildcard := map[string]bool{}, map[string]string{}
+	for _, word := range words {
 		if !rentalid.ValidMachineName(word) || strings.Contains(word, "-") {
 			t.Fatalf("%q is not one plain machine word", word)
 		}
-		for _, other := range words[i+1:] {
-			if other == word || oneLetterApart(word, other) {
-				t.Fatalf("%q and %q would be confused when typed from memory", word, other)
+		if present[word] {
+			t.Fatalf("%q appears twice", word)
+		}
+		present[word] = true
+	}
+	for _, word := range words {
+		for i := range word {
+			if present[word[:i]+word[i+1:]] {
+				t.Fatalf("%q and %q would be confused when typed from memory", word, word[:i]+word[i+1:])
 			}
+			key := word[:i] + "*" + word[i+1:]
+			if other, seen := wildcard[key]; seen {
+				t.Fatalf("%q and %q would be confused when typed from memory", other, word)
+			}
+			wildcard[key] = word
 		}
 	}
 
@@ -68,7 +81,14 @@ func TestRentalMachineNames(t *testing.T) {
 		}
 	}
 
-	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
+	// Exhausting the vocabulary records one rental per word; tmpfs keeps those thousands
+	// of commits from being thousands of disk syncs.
+	dir := t.TempDir()
+	if shm, err := os.MkdirTemp("/dev/shm", "cozy-names-"); err == nil {
+		dir = shm
+		t.Cleanup(func() { _ = os.RemoveAll(shm) })
+	}
+	store, problem := records.Open(filepath.Join(dir, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 	const hubURL, fleetCap = "https://hub.invalid", int64(1_000_000_000_000)
@@ -163,27 +183,4 @@ func TestRentalMachineNames(t *testing.T) {
 	if _, err := rentalid.NewMachineName(all); !errors.Is(err, rentalid.ErrNoFreeMachineName) {
 		t.Fatalf("draw over an exhausted vocabulary: %v", err)
 	}
-}
-
-func oneLetterApart(a, b string) bool {
-	if len(a) == len(b) {
-		differ := 0
-		for i := range a {
-			if a[i] != b[i] {
-				differ++
-			}
-		}
-		return differ == 1
-	}
-	if len(a) > len(b) {
-		a, b = b, a
-	}
-	if len(b)-len(a) != 1 {
-		return false
-	}
-	i := 0
-	for i < len(a) && a[i] == b[i] {
-		i++
-	}
-	return a[i:] == b[i+1:]
 }

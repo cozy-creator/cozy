@@ -75,6 +75,7 @@ func TestCapturePublicationExcludesTerminalCleanupAcrossProcesses(t *testing.T) 
 }
 
 func TestCaptureReaderHandoffReleasesWriterBeforeAwait(t *testing.T) {
+	integration(t)
 	if *privateScriptRuntimeWheel == "" {
 		t.Skip("requires the exact candidate Runtime wheel")
 	}
