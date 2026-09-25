@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -24,7 +25,9 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 		}
 	}
 	uv("venv", control, "--python", "3.12")
-	runtime := "cozy-runtime==" + runtimeFixtureVersion(t, *privateChildRuntimeWheel)
+	// This environment runs Creator's provisioning commands. The authored
+	// packages keep their independent SDK floor in copyPrivateTensorProject.
+	runtime := "cozy-runtime>=" + hostruntime.ToolFloor
 	if *privateChildRuntimeWheel != "" {
 		runtime = *privateChildRuntimeWheel
 	}
@@ -147,7 +150,7 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			continue
 		}
 		if children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[0].Revision != originalA.Revision || string(children[0].Result) != string(originalA.Result) {
-			t.Fatalf("cycle %d recomputed or changed A: %+v", cycle, children[0])
+			t.Fatalf("cycle %d recomputed or changed A: original=%+v actual=%+v", cycle, originalA, children[0])
 		}
 		if cycle < 3 {
 			if children[1].Executions != 1 {
