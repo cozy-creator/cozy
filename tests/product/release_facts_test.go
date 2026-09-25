@@ -117,7 +117,7 @@ func TestWorkingMemoryLedgerSizesTheNextSelection(t *testing.T) {
 	offered := make(chan func(*pb.WorkerFrame) error, 1)
 	offers := make(chan *pb.AttemptOffer, 1)
 	acked := make(chan struct{}, 4)
-	pod := &fakePod{controlKey: public, serve: true}
+	pod := &fakePod{controlKey: public, serve: true, slots: 8}
 	pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
 		if offer := frame.GetAttemptOffer(); offer != nil {
 			err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: &pb.AttemptAccepted{

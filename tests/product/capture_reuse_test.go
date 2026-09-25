@@ -109,7 +109,7 @@ func TestCapturePinsMigrateAndPreserveOrdinaryInstallOwners(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", layout.DB)
 	must(t, err)
-	_, err = db.Exec(`DROP TABLE rental_idle; DROP TABLE rental_runtime_updates; DROP TABLE capture_pins; PRAGMA user_version=40`)
+	_, err = db.Exec(`DROP TABLE device_memory_measurements; DROP TABLE rental_idle; DROP TABLE rental_runtime_updates; DROP TABLE capture_pins; PRAGMA user_version=40`)
 	must(t, err)
 	if ordinary, problem := records.Open(layout.DB); problem == nil || problem.ErrName() != "records_schema_upgrade_required" {
 		if ordinary != nil {

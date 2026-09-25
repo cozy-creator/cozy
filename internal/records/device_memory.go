@@ -111,9 +111,11 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 	if t.Status != "SUCCEEDED" || len(t.Body) == 0 {
 		return nil
 	}
+	// The orchestrator verified the worker's body before this transaction; a body
+	// that is not AttemptOutcomeBody/1 (a synthesized close) carries no measurement.
 	var body pb.AttemptOutcomeBody
-	if err := canonical.Unmarshal(t.Body, &body); err != nil {
-		return exit.Internalf("cannot read the metrics of %s#%d: %s", t.RequestID, t.Attempt, err)
+	if canonical.Unmarshal(t.Body, &body) != nil {
+		return nil
 	}
 	peak := body.GetMetrics().GetWorkingPeakDeviceBytes()
 	if peak == 0 {
