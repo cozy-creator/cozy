@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
@@ -25,9 +26,12 @@ import (
 // Runtime prepares a real unpublished wheel; Creator consumes those exact bytes
 // and emits its real remote InvocationSpec; Runtime judges that emitted document.
 func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
-	runtime := "cozy-runtime==" + runtimeFixtureVersion(t, *privateChildRuntimeWheel)
+	// The control interpreter is the host tool, so without a candidate wheel it is the
+	// enforced tool floor; the package-SDK floor predates the revision fields it reads.
+	version := hostruntime.ToolFloor
+	runtime := "cozy-runtime==" + version
 	if *privateChildRuntimeWheel != "" {
-		runtime = *privateChildRuntimeWheel
+		version, runtime = runtimeFixtureVersion(t, *privateChildRuntimeWheel), *privateChildRuntimeWheel
 	}
 	root := t.TempDir()
 	// Runtime seals installed generations read-only; only this test's owned tree
@@ -48,7 +52,7 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 	// Its child must not inherit the control interpreter's site-packages.
 	sdkProject := filepath.Join(root, "sdk-project")
 	must(t, os.Mkdir(sdkProject, 0700))
-	sdkMetadata := fmt.Sprintf("[project]\nname=\"private-sdk-fixture\"\nversion=\"1.0\"\nrequires-python=\">=3.12,<3.13\"\ndependencies=[%s]\n", strconv.Quote("cozy-runtime=="+runtimeFixtureVersion(t, *privateChildRuntimeWheel)))
+	sdkMetadata := fmt.Sprintf("[project]\nname=\"private-sdk-fixture\"\nversion=\"1.0\"\nrequires-python=\">=3.12,<3.13\"\ndependencies=[%s]\n", strconv.Quote("cozy-runtime=="+version))
 	if *privateChildRuntimeWheel != "" {
 		sdkMetadata += "[tool.uv.sources]\ncozy-runtime={path=" + strconv.Quote(runtime) + "}\n"
 	}
