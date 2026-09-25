@@ -660,6 +660,9 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 	if !ok {
 		return nil, declared(ep, key)
 	}
+	if value, handled, problem := typedUnion(ep, key, rendered, raw); handled {
+		return value, problem
+	}
 	kind, _ := typeOf(rendered)
 	switch kind {
 	case "scalar:int":
@@ -700,6 +703,63 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 	return nil, exit.New(exit.Validation,
 		"%s.%s is not a scalar and `key=value` cannot spell one", ep.Name, key).
 		WithRemedy("carry it as `%s:=<json>`; asset fields use `--asset <field-path>=<file>`", key)
+}
+
+// typedUnion spells a bare token for a union such as `int | None`. A branch with an
+// unambiguous JSON spelling (int, float, bool, null, a non-string literal) wins over a
+// string branch, so `seed=7000` is 7000 and `seed=null` is null; a token no typed branch
+// reads falls to a string branch when one is declared. `key:=<json>` stays the raw form.
+func typedUnion(ep *Entrypoint, key string, rendered json.RawMessage, raw string) (json.RawMessage, bool, *exit.Error) {
+	var schema struct {
+		Union []json.RawMessage `json:"union"`
+	}
+	if json.Unmarshal(rendered, &schema) != nil || len(schema.Union) == 0 {
+		return nil, false, nil
+	}
+	// Only scalar and literal branches have a bare spelling; an asset, tree or model
+	// branch is granted by its own flag and never by a string that happens to fit.
+	scalars := make([]json.RawMessage, 0, len(schema.Union))
+	for _, branch := range schema.Union {
+		if kind, _ := typeOf(branch); strings.HasPrefix(kind, "scalar:") || kind == "literal" {
+			scalars = append(scalars, branch)
+		}
+	}
+	matches := func(value any) bool {
+		for _, branch := range scalars {
+			if validateRenderedInto(branch, value, key, nil) == nil {
+				return true
+			}
+		}
+		return false
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if json.Valid([]byte(raw)) && decoder.Decode(&value) == nil {
+		if _, isString := value.(string); !isString && matches(value) {
+			return json.RawMessage(raw), true, nil
+		}
+	}
+	if matches(raw) {
+		encoded, _ := json.Marshal(raw)
+		return encoded, true, nil
+	}
+	return nil, true, exit.New(exit.Validation,
+		"%s.%s is declared %s and %q is not one", ep.Name, key, spellUnion(schema.Union), raw).
+		WithRemedy("structured values are `%s:=<json>`; asset fields use `--asset <field-path>=<file>`", key)
+}
+
+func spellUnion(branches []json.RawMessage) string {
+	names := make([]string, 0, len(branches))
+	for _, branch := range branches {
+		var scalar string
+		if json.Unmarshal(branch, &scalar) == nil {
+			names = append(names, scalar)
+			continue
+		}
+		names = append(names, string(branch))
+	}
+	return strings.Join(names, "|")
 }
 
 func typedLiteral(ep *Entrypoint, key string, rendered json.RawMessage, raw string) (json.RawMessage, *exit.Error) {
