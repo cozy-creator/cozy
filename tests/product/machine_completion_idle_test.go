@@ -102,6 +102,19 @@ func TestMachineInactiveStateBookkeepingDoesNotRenewIdleGrace(t *testing.T) {
 				t.Fatalf("%s did not start fresh idle grace: %+v", finishedState, idle)
 			}
 			baseline := idle.Since
+			if finishedState == "failed" {
+				// A remote retry can start and fail between client observations.
+				// The new attempt proves new work even though the state is unchanged.
+				state.Generation++
+				state.AttemptOrdinal++
+				fatal(t, store.ObserveMachineExecution(request.ID, state, &pb.MachineExecutionEventPage{}))
+				idle, problem = rental.ObserveIdle(store, row)
+				fatal(t, problem)
+				if !idle.Since.After(baseline) {
+					t.Fatal("a completed new retry attempt did not start fresh idle grace")
+				}
+				baseline = idle.Since
+			}
 			// Canceling/releasing an already inactive result is bookkeeping, not work.
 			state.Generation++
 			state.State = "canceled"
