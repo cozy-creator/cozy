@@ -137,7 +137,7 @@ func modelUploadScript(repository, revision, destination string) []byte {
 	quote := func(value string) string { raw, _ := json.Marshal(value); return string(raw) }
 	return []byte(fmt.Sprintf(`# /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime>=0.18.23,<1", "tensorfs>=0.3.51,<0.4"]
+# dependencies = ["cozy-runtime>=0.18.24,<1", "tensorfs>=0.3.51,<0.4"]
 # ///
 from cozy_runtime.author.sources import ingest_huggingface
 from cozy_runtime.author.publication import upload_checkpoint
