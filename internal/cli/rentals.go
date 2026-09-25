@@ -77,7 +77,8 @@ func handleRent(ctx *Context) *exit.Error {
 	if skuName == "" {
 		_, developmentSet := ctx.Inv.Bools["--development"]
 		if ctx.Inv.Value("--idempotency-key") != "" || ctx.Inv.Value("--gpus") != "" ||
-			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || developmentSet || ctx.Inv.Value("--ssh-public-key") != "" {
+			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || developmentSet || ctx.Inv.Value("--ssh-public-key") != "" ||
+			ctx.Inv.Value("--image") != "" {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
 		}
@@ -302,6 +303,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
+	image, e := rentalImage(ctx, existing)
+	if e != nil {
+		return records.Rental{}, hub.Rental{}, false, e
+	}
 	if managedRequestID == "" {
 		workload.ServingModels, e = manualRentalModels(ctx, existing)
 		if e != nil {
@@ -362,7 +367,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
 		body, e := hub.RentalRequestBytes(machineName, skuName, gpus, secret.HashHex(token),
-			creator.PublicKey(), workload, development)
+			creator.PublicKey(), workload, development, image)
 		if e != nil {
 			return nil, "", e
 		}
@@ -979,11 +984,11 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		// The machine document carries the underlying facts, never the table's
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
 		TypedFields: []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
-			"running", "queued", "idle_s", "release_due_at"},
+			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest"},
 		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
-			"hourly_rate_usd_micros", "failure_code", "base_worker_image_digest",
+			"hourly_rate_usd_micros", "failure_code", "base_worker_image_digest", "base_worker_image_tag",
 			"provider", "provider_resource_id", "provider_host_id", "provider_state",
 			"container_state"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
@@ -1030,7 +1035,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			"media":       r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt), "ready": orNone(stamp(r.ReadyAt)),
 			"idle_since": idleSince, "release_due": releaseDue,
-			"image": r.Failure.BaseWorkerImageDigest, "provider": r.Failure.Provider,
+			"image": either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": r.Failure.Provider,
 			"provider resource": r.Failure.ProviderResourceID, "provider host": r.Failure.ProviderHostID,
 			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
 			"$/hour": rentalHourlyRate(r.HourlyRateUSDMicros),
@@ -1047,7 +1052,9 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
-			"idle_since_at": idleSince, "release_due_at": releaseDue} {
+			"idle_since_at": idleSince, "release_due_at": releaseDue,
+			"base_worker_image_digest": either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest),
+			"base_worker_image_tag":    r.BaseWorkerImageTag} {
 			if value != "" {
 				typed[key] = value
 			}
@@ -1058,7 +1065,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		if r.Failure.Code != "" {
 			haveFailure = true
 			typed["failure_code"] = r.Failure.Code
-			typed["base_worker_image_digest"], typed["provider"] = r.Failure.BaseWorkerImageDigest, r.Failure.Provider
+			typed["provider"] = r.Failure.Provider
 			typed["provider_resource_id"], typed["provider_host_id"] = r.Failure.ProviderResourceID, r.Failure.ProviderHostID
 			typed["provider_state"], typed["container_state"] = r.Failure.ProviderState, r.Failure.ContainerState
 		}
@@ -1067,7 +1074,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 	if haveFailure {
 		list.Fields = []string{"machine", "sku", "gpus", "state", "$/hour", "failure", "uptime", "running", "queued", "idle"}
 		list.TypedFields = []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
-			"running", "queued", "idle_s", "release_due_at", "failure_code"}
+			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest", "failure_code"}
 	}
 	// THE HUB'S HALF (cl-199, on th-199). Everything above is what this host FILED, and
 	// the incident of 2026-09-07 is the gap between that and what the account is
@@ -1093,7 +1100,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			"accelerator": acceleratorLabel(seen.AcceleratorModel, seen.AcceleratorCount),
 			"address":     seen.Address, "media": seen.MediaAddress, "hub": seen.Hub,
 			"rented": orNone(seen.RentedAt), "ready": "—", "idle_since": "", "release_due": "",
-			"image": "", "provider": "", "provider resource": "", "provider host": "",
+			"image": either(seen.BaseWorkerImageTag, seen.BaseWorkerImageDigest), "provider": "", "provider resource": "", "provider host": "",
 			"provider state": seen.ProviderState, "container state": seen.ContainerState,
 			"$/hour": rentalHourlyRate(seen.HourlyRateUSDMicros),
 		})
@@ -1107,7 +1114,8 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		}
 		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,
 			"address": seen.Address, "media_address": seen.MediaAddress,
-			"hub": seen.Hub, "rented_at": seen.RentedAt} {
+			"hub": seen.Hub, "rented_at": seen.RentedAt,
+			"base_worker_image_digest": seen.BaseWorkerImageDigest, "base_worker_image_tag": seen.BaseWorkerImageTag} {
 			if value != "" {
 				typed[key] = value
 			}

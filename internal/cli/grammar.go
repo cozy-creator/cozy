@@ -471,6 +471,7 @@ func (c *RentalUpdateCmd) Run(r *Runtime) error {
 type RentalNewCmd struct {
 	Development    *bool    `help:"Enable SSH maintenance access on the selected worker image (default); false disables it."`
 	SSHPublicKey   string   `name:"ssh-public-key" predictor:"file" help:"SSH public-key file for this development rental."`
+	Image          string   `name:"image" help:"Boot this hub-registered worker image (tag, digest, or kind: cuda, cpu-torch, cpu) instead of the machine's default."`
 	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
 	GPUs           int      `name:"gpus" default:"1" help:"GPUs on the machine; any count the catalog lists. Keep to an even count for parallelism."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
@@ -496,7 +497,7 @@ func (c *RentalNewCmd) Run(r *Runtime) error {
 		gpus = strconv.Itoa(c.GPUs)
 	}
 	return r.call(handleRent, []string{c.SKU}, flags, values(
-		"--gpus", gpus, "--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey), false)
+		"--gpus", gpus, "--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey, "--image", c.Image), false)
 }
 
 type RentalEndCmd struct {
