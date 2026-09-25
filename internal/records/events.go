@@ -326,6 +326,30 @@ func (s *Store) CancelAttribution(requestID string) (actor, errType, errText str
 	return actor, errType, errText, nil
 }
 
+// SettledFailure is the typed cause journaled with a request's failed or blocked settlement.
+// A failure before any attempt (a refused desired state, an unplaceable pin) has no attempt
+// row to carry it; this event is its only durable record.
+func (s *Store) SettledFailure(requestID string) (errType, errCode, errText string, problem *exit.Error) {
+	var body string
+	err := s.db.QueryRow(`SELECT payload FROM request_events
+		WHERE request_id=? AND type IN ('request.failed','request.blocked')
+		ORDER BY seq DESC LIMIT 1`, requestID).Scan(&body)
+	if err == sql.ErrNoRows {
+		return "", "", "", nil
+	}
+	if err != nil {
+		return "", "", "", exit.Internalf("cannot read the settled failure of %s: %s", requestID, err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return "", "", "", exit.Internalf("the settled failure of %s is unreadable: %s", requestID, err)
+	}
+	errType, _ = payload["error_type"].(string)
+	errCode, _ = payload["error_code"].(string)
+	errText, _ = payload["error"].(string)
+	return errType, errCode, errText, nil
+}
+
 // LastEventSeq is the current head of the stream. A client that wants only what happens
 // NEXT opens at the head instead of replaying history.
 func (s *Store) LastEventSeq() (int64, *exit.Error) {

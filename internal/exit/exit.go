@@ -95,6 +95,11 @@ type Error struct {
 	Message string   `json:"message"`
 	Remedy  string   `json:"remedy,omitempty"`
 	Next    []string `json:"next,omitempty"`
+	// Cause is the stable code of the component that originated the failure (a pod's
+	// `insufficient_storage`, a Runtime's `wheel_download_failed`) when that is not Creator.
+	Cause string `json:"cause,omitempty"`
+	// Details are the structured facts behind Message, for machine readers.
+	Details map[string]any `json:"details,omitempty"`
 }
 
 func (e *Error) Error() string { return fmt.Sprintf("error(%s): %s", e.ErrName(), e.Message) }
@@ -118,6 +123,12 @@ func Named(code Code, name, format string, args ...any) *Error {
 
 func (e *Error) WithRemedy(format string, args ...any) *Error {
 	e.Remedy = fmt.Sprintf(format, args...)
+	return e
+}
+
+// WithCause records the originating component's stable code.
+func (e *Error) WithCause(code string) *Error {
+	e.Cause = code
 	return e
 }
 

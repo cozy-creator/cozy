@@ -13,6 +13,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -81,6 +83,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	prep := spec.Preparation
 	var result *pb.PreparePackageSetResult
 	var rpcError error
+	var trailer metadata.MD
 	var preparedCode *localPreparedCode
 	c.ObservePhase(instance, PhaseSample{Name: PhasePreparing, Detail: req.Package})
 	if prep.Published {
@@ -128,7 +131,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 				PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, InstallRoot: spec.InstallRoot, OperationId: operation,
 				Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, SourceDigest: source, LocalRevisionDigest: digest},
 				Wheels:  files, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
-			})
+			}, grpc.Trailer(&trailer))
 			if rpcError == nil && result != nil && baseProblem == nil {
 				preparedCode = &localPreparedCode{operation: operation, revision: revision.Digest, base: base, result: proto.Clone(result).(*pb.PreparePackageSetResult)}
 			}
@@ -158,7 +161,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			if problem := requireAdapterPeer(s, hasModelAdapters(req.Models)); problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
-			result, rpcError = s.preparation.PreparePrivatePlacement(s.ctx, call)
+			result, rpcError = s.preparation.PreparePrivatePlacement(s.ctx, call, grpc.Trailer(&trailer))
 		}
 	}
 	if rpcError != nil {
@@ -166,7 +169,8 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		if ended.err != nil {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef("local worker preparation interrupted: %s", ended.err)
 		}
-		return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "worker.prepare_refused", "local worker preparation refused: %s", ended.refusal)
+		return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "worker.prepare_refused", "local worker preparation refused: %s", ended.refusal).
+			WithCause(runtimeErrorCode(trailer))
 	}
 	if result == nil || result.PlacementSet == nil {
 		return WorkerLaunchSpec{}, "", exit.Internalf("local worker preparation returned no placement")

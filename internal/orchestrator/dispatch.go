@@ -1492,6 +1492,9 @@ func (c *Orchestrator) failQueuedSelection(requestID string, expected *records.R
 	payload := map[string]any{"status": "FAILED", "cause": cause.ErrName(),
 		"error_type": cause.ErrName(), "error": cause.Message,
 		"outputs": []any{}, "requeuing": false}
+	if cause.Cause != "" {
+		payload["error_code"] = cause.Cause
+	}
 	// The preparation waiter can outlive an accepted attempt or its successful
 	// finalization. The store is the sole authority to fail queued work; neither
 	// cleanup nor worker/provider teardown may run before that transaction wins.
