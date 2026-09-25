@@ -262,6 +262,15 @@ func observedMachineRequestState(value string) string {
 	}
 }
 
+func machineWorkActive(state string) bool {
+	switch state {
+	case "queued", "retrying", "running", "pausing", "canceling":
+		return true
+	default:
+		return false
+	}
+}
+
 // ObserveMachineExecution commits one authenticated page and its cursor together.
 // Request rows and event ordinals are projections; the attempts table stays empty.
 func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionState, page *pb.MachineExecutionEventPage) *exit.Error {
@@ -360,6 +369,16 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 		}
 		if _, err := tx.Exec(`UPDATE requests SET retain_work=0 WHERE id=?`, id); err != nil {
 			return exit.Internalf("cannot project Runtime retention release: %s", err)
+		}
+	}
+	// Finish the local idle clock atomically with dropping the active request
+	// projection. Outcome collection happens later and must not leave an idle
+	// release window or renew this clock on repeated terminal observations.
+	if !machineWorkActive(state.State) && (len(link.ObservedState) == 0 ||
+		machineWorkActive(previous.State) || state.AttemptOrdinal > previous.AttemptOrdinal) {
+		if err := appendEventTx(tx, id, "client.machine_work_finished", int64(state.AttemptOrdinal),
+			map[string]any{"machine_execution": true, "state": state.State}); err != nil {
+			return exit.Internalf("cannot record machine work completion: %s", err)
 		}
 	}
 	if previous.State != state.State && (state.State == "paused" || state.State == "canceled") {
