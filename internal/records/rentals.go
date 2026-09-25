@@ -1032,13 +1032,16 @@ func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *ex
 }
 
 func rentalLastSettlement(reader rentalIdleReader, id string) (RentalLastSettlement, bool, *exit.Error) {
+	// Machine work completion is recorded with its inactive state projection.
+	// Its later request.completed event describes outcome collection, not more
+	// compute; prefer the work timestamp so collection/reconnect cannot renew idle.
 	rows, err := reader.Query(`SELECT r.id,r.kind,r.created_at,
 		COALESCE((SELECT a.closed_at FROM attempts a WHERE a.request_id=r.id
 		  AND a.state IN ('terminal','closed') AND a.closed_at<>''
 		  ORDER BY a.attempt DESC LIMIT 1),''),
 		COALESCE((SELECT e.at FROM request_events e WHERE e.request_id=r.id
-		  AND e.type IN ('request.completed','request.failed','request.canceled','request.paused','request.blocked')
-		  ORDER BY e.seq DESC LIMIT 1),'')
+		  AND e.type IN ('client.machine_work_finished','request.completed','request.failed','request.canceled','request.paused','request.blocked')
+		  ORDER BY (e.type='client.machine_work_finished') DESC,e.seq DESC LIMIT 1),'')
 		FROM requests r WHERE r.worker=? AND r.rental=1
 		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned','paused','blocked')`, id)
 	if err != nil {
