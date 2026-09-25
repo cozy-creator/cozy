@@ -218,12 +218,14 @@ cozy run org/quantize/convert --model.source=org/model@release/bf16 \
   --input quantize.json --publish-to org/quantized --rental-only
 ```
 
-Complete Hugging Face repositories with a reviewed Runtime ingestion recipe use native
+Rented uploads of complete Hugging Face repositories with a reviewed Runtime recipe use native
 download, TensorFS conversion, model-owned configuration/tokenizer preparation, and
 checkpoint upload automatically. Runtime 0.18.23 adds the Qwen Image 2.1 recipe above.
 `--rental=<name>` uses that existing rental only. `--dry-run` checks conversion headers
 and verifies the bounded metadata files before any weights transfer or rental allocation.
-The resulting checkpoint has no release label; publish a release separately with
+This complete-model metadata path currently requires `--rental=<name>` or `--rental-only`;
+local uploads retain the existing transfer publisher. The resulting checkpoint has no
+release label; publish a release separately with
 `cozy model publish`. Other sources retain their existing local transfer path, and
 unreviewed rented full-model ingestion refuses before allocating capacity.
 

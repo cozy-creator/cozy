@@ -21,6 +21,11 @@ import (
 // nativeModelUpload is the ordinary private-script path for complete model recipes.
 // Local files, existing checkpoints and unregistered families retain their transfer path.
 func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
+	// Native checkpoint effects currently use the rental's explicit publication
+	// grant. Local upload keeps the existing owner-side transfer publisher.
+	if !rentalRequested(ctx) {
+		return false, nil
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return true, exit.Internalf("cannot resolve working directory: %s", err)
