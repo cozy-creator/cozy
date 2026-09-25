@@ -47,18 +47,10 @@ func (r RuntimeCLI) BuiltinOperations(ctx context.Context) (*PackageInterface, *
 	if problem != nil {
 		return nil, problem
 	}
-	if surface.Application != runtimeoperation.Application || len(surface.Entrypoints) != 0 || len(surface.Jobs) != 1 {
-		return nil, exit.New(exit.Conflict, "Runtime operations descriptor changed its fixed App")
+	if problem := ValidateBuiltinOperations(surface); problem != nil {
+		return nil, problem
 	}
-	job := surface.Jobs[0]
-	if job.Name != "quantize" || job.Invocable == nil || !job.Invocable.Memoize || job.Invocable.Module != runtimeoperation.Module || job.Invocable.Export != "quantize" || job.Publishes || len(job.WeightsOutputs) != 1 || job.WeightsOutputs[0].OutputID != "model" || job.WeightsOutputs[0].MaxBytes == 0 {
-		return nil, exit.New(exit.Conflict, "Runtime operations descriptor changed its fixed callable")
-	}
-	for _, capability := range job.Invocable.Capabilities {
-		if capability == "egress" || capability == "secrets" {
-			return nil, exit.New(exit.Conflict, "Runtime quantization cannot carry external effect capabilities")
-		}
-	}
+
 	return surface, nil
 }
 
@@ -73,4 +65,27 @@ func (r RuntimeCLI) CaptureBuiltin(ctx context.Context, wheel, output string) (B
 	var result BuiltinPreparation
 	problem := r.callContext(ctx, &result, "builtin-capture", "operations", "--wheel", wheel, "--out", output)
 	return result, problem
+}
+
+// ValidateBuiltinOperations accepts the closed export set carried by each captured SDK.
+func ValidateBuiltinOperations(surface *PackageInterface) *exit.Error {
+	if surface.Application != runtimeoperation.Application || len(surface.Entrypoints) != 0 || len(surface.Jobs) < 1 || len(surface.Jobs) > 2 {
+		return exit.New(exit.Conflict, "Runtime operations descriptor changed its fixed App")
+	}
+	seen := map[string]bool{}
+	for _, job := range surface.Jobs {
+		if !runtimeoperation.Export(job.Name) || seen[job.Name] || job.Invocable == nil || !job.Invocable.Memoize || job.Invocable.Module != runtimeoperation.Module || job.Invocable.Export != job.Name || job.Publishes || len(job.WeightsOutputs) != 1 || job.WeightsOutputs[0].OutputID != "model" || job.WeightsOutputs[0].MaxBytes == 0 {
+			return exit.New(exit.Conflict, "Runtime operations descriptor changed its fixed callable")
+		}
+		seen[job.Name] = true
+		for _, capability := range job.Invocable.Capabilities {
+			if capability == "egress" || capability == "secrets" {
+				return exit.New(exit.Conflict, "Runtime derivations cannot carry external effect capabilities")
+			}
+		}
+	}
+	if !seen["quantize"] {
+		return exit.New(exit.Conflict, "Runtime operations omitted quantize")
+	}
+	return nil
 }

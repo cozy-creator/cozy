@@ -86,3 +86,6 @@ func Carrier(version, interfaceDigest string) (string, []byte, *exit.Error) {
 	}
 	return strings.ReplaceAll(Name, "-", "_") + "-" + version + "-py3-none-any.whl", result.Bytes(), nil
 }
+
+// Export names the fixed Runtime managed derivation surface.
+func Export(name string) bool { return name == "quantize" || name == "prepare_model" }

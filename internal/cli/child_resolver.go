@@ -25,7 +25,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 	if problem != nil {
 		return out, "", problem
 	}
-	if binding == nil && module == runtimeoperation.Module && export == "quantize" {
+	if binding == nil && module == runtimeoperation.Module && runtimeoperation.Export(export) {
 		parentInstall, problem := r.store.Install(parent.InstallID)
 		if problem != nil || parentInstall == nil {
 			return out, "", exit.New(exit.Conflict, "builtin caller install is unavailable")
@@ -34,7 +34,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 		if problem != nil {
 			return out, "", problem
 		}
-		binding, problem = install.ResolveRuntimeOperations(context.Background(), layout, r.store, *parentInstall, iface)
+		binding, problem = install.ResolveRuntimeOperations(context.Background(), layout, r.store, *parentInstall, iface, export)
 		if problem != nil {
 			return out, "", problem
 		}
