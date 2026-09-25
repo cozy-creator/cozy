@@ -92,6 +92,9 @@ func (r RuntimeCLI) InterfaceWheel(ctx context.Context, interfacePath, distribut
 		return wheel, exit.Named(exit.Structural, "interface_generator_incompatible", "Runtime interface generator %q does not match Creator %q", wheel.GeneratorABI, interfaceGeneratorABI).
 			WithRemedy("update Creator and its host Runtime to the same supported cohort")
 	}
+	if wheel.Filename != filepath.Base(source) {
+		return wheel, exit.New(exit.Validation, "interface generator changed the implementation wheel filename or platform tags")
+	}
 	if filepath.Base(wheel.Filename) != wheel.Filename || filepath.Clean(wheel.Path) != filepath.Join(output, wheel.Filename) || wheel.Length <= 0 || wheel.Length > 256<<20 {
 		return wheel, exit.New(exit.Validation, "interface generator returned an invalid bounded artifact")
 	}

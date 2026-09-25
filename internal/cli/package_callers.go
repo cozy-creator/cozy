@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"os"
-	"path/filepath"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -52,9 +51,6 @@ func publishedCallableWheels(ctx context.Context, p *packagepublish.Package) ([]
 		generated, problem := runtime.InterfaceWheel(ctx, surface, p.Name, p.Release, digest, source, digest, stage)
 		if problem != nil {
 			return nil, problem
-		}
-		if filepath.Base(source) != generated.Filename {
-			return nil, exit.New(exit.Validation, "callable publication changed its wheel platform")
 		}
 		output = append(output, generated.Path)
 	}
