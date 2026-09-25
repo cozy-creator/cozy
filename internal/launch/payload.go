@@ -407,7 +407,7 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 				"request field %s has length %d; its maximum is %d", path, length, *maximum)
 		}
 	}
-	if field.Constraints.GT != nil || field.Constraints.GE != nil || field.Constraints.LE != nil {
+	if field.Constraints.GT != nil || field.Constraints.GE != nil || field.Constraints.LE != nil || field.Constraints.MultipleOf != nil {
 		number, ok := value.(json.Number)
 		if !ok {
 			return exit.Named(exit.Structural, "package_interface_constraint_unknown",
@@ -416,6 +416,15 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 		parsed, err := strconv.ParseFloat(number.String(), 64)
 		if err != nil {
 			return exit.New(exit.Validation, "request field %s is not a finite number", path)
+		}
+		if multiple := field.Constraints.MultipleOf; multiple != nil {
+			matches, err := matchesMultipleOf(number, *multiple)
+			if err != nil {
+				return exit.Named(exit.Structural, "package_interface_constraint_invalid", "request field %s: %s", path, err)
+			}
+			if !matches {
+				return exit.New(exit.Validation, "request field %s is %s; it must be a multiple of %s", path, number.String(), multiple.String())
+			}
 		}
 		if minimum := field.Constraints.GE; minimum != nil && parsed < *minimum {
 			return exit.New(exit.Validation,

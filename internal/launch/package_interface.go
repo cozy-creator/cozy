@@ -201,12 +201,13 @@ func (f *Field) UnmarshalJSON(data []byte) error {
 }
 
 type FieldConstraints struct {
-	MinLength *int64   `json:"min_length"`
-	MaxLength *int64   `json:"max_length"`
-	GT        *float64 `json:"gt"`
-	GE        *float64 `json:"ge"`
-	LE        *float64 `json:"le"`
-	Unknown   []string `json:"-"`
+	MultipleOf *json.Number `json:"multiple_of"`
+	MinLength  *int64       `json:"min_length"`
+	MaxLength  *int64       `json:"max_length"`
+	GT         *float64     `json:"gt"`
+	GE         *float64     `json:"ge"`
+	LE         *float64     `json:"le"`
+	Unknown    []string     `json:"-"`
 }
 
 func (c *FieldConstraints) UnmarshalJSON(data []byte) error {
@@ -216,9 +217,14 @@ func (c *FieldConstraints) UnmarshalJSON(data []byte) error {
 	}
 	for key := range raw {
 		switch key {
-		case "min_length", "max_length", "gt", "ge", "le":
+		case "min_length", "max_length", "gt", "ge", "le", "multiple_of":
 		default:
 			c.Unknown = append(c.Unknown, key)
+		}
+	}
+	if value, present := raw["multiple_of"]; present {
+		if err := validateMultipleOfJSON(value); err != nil {
+			return err
 		}
 	}
 	sort.Strings(c.Unknown)
@@ -437,9 +443,14 @@ func validateStructRaw(raw json.RawMessage) error {
 			}
 		}
 		if constraints := field["constraints"]; constraints != nil {
-			if _, err := exactKeys(constraints, nil,
-				[]string{"ge", "gt", "le", "max_length", "min_length"}); err != nil {
+			values, err := exactKeys(constraints, nil, []string{"ge", "gt", "le", "max_length", "min_length", "multiple_of"})
+			if err != nil {
 				return err
+			}
+			if value, present := values["multiple_of"]; present {
+				if err := validateMultipleOfJSON(value); err != nil {
+					return err
+				}
 			}
 		}
 	}
