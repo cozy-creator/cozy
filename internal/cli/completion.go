@@ -27,7 +27,7 @@ const completeVerb = "__complete"
 
 // CompletionCmd prints the script that wires a shell's <TAB> to completeVerb.
 type CompletionCmd struct {
-	Shell string `arg:"" name:"shell" enum:"bash,zsh,fish" help:"bash (~/.bashrc: source <(cozy completion bash)), zsh (~/.zshrc, after compinit: source <(cozy completion zsh)) or fish (config.fish: cozy completion fish | source)."`
+	Shell string `arg:"" name:"shell" enum:"bash,zsh,fish" help:"bash, zsh or fish. The installer writes bash and fish completion where those shells autoload it; zsh: source <(cozy completion zsh) in ~/.zshrc after compinit."`
 }
 
 func (c *CompletionCmd) Run(r *Runtime) error {
@@ -44,7 +44,8 @@ _cozy() {
 }
 complete -F _cozy cozy
 `,
-	"zsh": `# cozy zsh completion: source <(cozy completion zsh), after compinit
+	"zsh": `#compdef cozy
+# cozy zsh completion: _cozy on $fpath, or source <(cozy completion zsh) after compinit
 _cozy() {
 	local -a spaced bare
 	local c
@@ -55,7 +56,7 @@ _cozy() {
 	(( $#spaced )) && compadd -U -Q -- "${spaced[@]}"
 	(( $#bare )) && compadd -U -Q -S '' -- "${bare[@]}"
 }
-compdef _cozy cozy
+if [[ $funcstack[1] == _cozy ]]; then _cozy "$@"; else compdef _cozy cozy; fi
 `,
 	"fish": `# cozy fish completion: cozy completion fish | source
 complete -c cozy -f -a '(command cozy ` + completeVerb + ` fish (commandline -cp) 2>/dev/null)'
