@@ -1358,7 +1358,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	if machine == "" {
 		machine = subject
 	}
-	w := releaseWatch{ctx: ctx, c: c, id: id, machine: machine, rctx: rctx}
+	w := releaseWatch{ctx: ctx, c: c, id: id, machine: machine, rctx: rctx, teardown: ctx.teardown}
 
 	seen, verdict, e := w.observe()
 	if e != nil {
@@ -1422,6 +1422,10 @@ func handleRentRelease(ctx *Context) *exit.Error {
 			return w.finish(l, st, operationKey, row != nil, true, known.Operation,
 				"the hub destroyed the pod")
 		}
+		if w.teardown {
+			return w.kept(exit.Named(exit.Conflict, "rental.release_pending",
+				"%s accepted the release of rental %s but has not confirmed the pod destroyed", c.Base(), id))
+		}
 		select {
 		case <-rctx.Done():
 			return w.interrupted()
@@ -1483,6 +1487,10 @@ type releaseWatch struct {
 	machine string
 	rctx    context.Context
 	said    string
+	// teardown is `down --all`: a transport fault is reported instead of retried, and a
+	// release the hub has accepted is left to the hub instead of watched to completion,
+	// so one rental can never hold the teardown of the rest.
+	teardown bool
 }
 
 // rentalVerdict is what the hub said about the id it was asked, and the three answers are
@@ -1512,7 +1520,7 @@ func (w *releaseWatch) observe() (hub.Rental, rentalVerdict, *exit.Error) {
 			return r, rentalLive, nil
 		case e.Code == exit.NotFound:
 			return hub.Rental{}, rentalAbsent, nil
-		case !transient(e):
+		case !transient(e) || w.teardown:
 			return hub.Rental{}, rentalLive, w.kept(e)
 		}
 		w.say("hub", e.Message+"; retrying")
@@ -1539,7 +1547,7 @@ func (w *releaseWatch) request() *exit.Error {
 			return nil
 		case e.Code == exit.NotFound:
 			return w.kept(rentalReleaseUnconfirmed(w.id))
-		case !transient(e):
+		case !transient(e) || w.teardown:
 			return w.kept(e)
 		}
 		w.say("hub", e.Message+"; retrying")
