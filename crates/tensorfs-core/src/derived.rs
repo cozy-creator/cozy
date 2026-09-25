@@ -16,17 +16,17 @@ pub use adoption::adopt_checkpoint;
 use progress::read as read_progress;
 pub use retention::{release_retention, retain_result, RetainedResult};
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::checkpoint::{self, build_manifest};
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::header::{Body, Closure, Header, Part, Tensor};
+use crate::header::{Asset, Body, Closure, Header, Part, Tensor};
 use crate::ids::{ascii_name, prefixed, ObjectRef};
 use crate::limits;
-use crate::manifest::Manifest;
+use crate::manifest::{Draft, Entry, Manifest};
 use crate::meta::{Hold, Meta};
 use crate::read::{self, ReadLease};
 use crate::store::Store;
@@ -179,6 +179,8 @@ pub struct Declaration {
     pub sources: Vec<Source>,
     pub components: Vec<ComponentDeclaration>,
     pub configs: Vec<ConfigDeclaration>,
+    /// Bounded immutable ordinary companion files, locked into the work intent.
+    pub files: Vec<(String, Vec<u8>)>,
     pub order: Vec<(String, String)>,
     pub max_new_bytes: u64,
 }
@@ -244,6 +246,8 @@ impl Declaration {
                 "max_new_bytes is outside the canonical integer range",
             );
         }
+
+        validate_files(&mut self.files)?;
 
         for source in &self.sources {
             name("source alias", &source.alias)?;
@@ -499,8 +503,8 @@ impl Declaration {
     }
 
     fn planned_additions(&self) -> Result<(u64, usize)> {
-        let mut bytes = 0u64;
-        let mut objects = 0usize;
+        let mut bytes: u64 = self.files.iter().map(|(_, data)| data.len() as u64).sum();
+        let mut objects = self.files.len();
         for component in &self.components {
             for tensor in &component.add {
                 for part in &tensor.parts {
@@ -550,6 +554,15 @@ impl Declaration {
     fn from_value(v: &Value) -> Result<Declaration> {
         let mut f = Fields::new("DerivedDeclaration", v)?;
         let max_new_bytes = f.req_uint("max_new_bytes")?;
+        let mut files = Vec::new();
+        if let Some(value) = f.opt("files") {
+            for (path, value) in as_obj("DerivedDeclaration", "files", value)? {
+                files.push((
+                    path.clone(),
+                    decode_file(as_str("companion", "data", value)?)?,
+                ));
+            }
+        }
         let work_fingerprint = f
             .opt("work_fingerprint")
             .map(|value| {
@@ -696,6 +709,7 @@ impl Declaration {
             sources,
             components,
             configs,
+            files,
             order,
             max_new_bytes,
         })
@@ -848,11 +862,137 @@ impl Declaration {
                 ),
             ),
         ];
+        if !self.files.is_empty() {
+            fields.push((
+                "files",
+                Value::map(
+                    self.files
+                        .iter()
+                        .map(|(path, data)| (path.clone(), Value::str(crate::b64::encode(data))))
+                        .collect(),
+                ),
+            ));
+        }
         if let Some(fingerprint) = &self.work_fingerprint {
             fields.push(("work_fingerprint", Value::str(fingerprint.clone())));
         }
         Value::obj(fields)
     }
+}
+
+/// Companion documents are intentionally small; their bytes live in the immutable intent.
+pub const MAX_COMPANION_FILES: usize = 16;
+pub const MAX_COMPANION_BYTES: usize = 64 << 10;
+/// Leaves declaration space below Runtime's one-MiB transport ceiling after base64.
+pub const MAX_COMPANION_TOTAL_BYTES: usize = 512 << 10;
+
+pub fn decode_file(encoded: &str) -> Result<Vec<u8>> {
+    if encoded.len() > MAX_COMPANION_BYTES.div_ceil(3) * 4 {
+        return refuse(Code::SIZE_CAP, "companion file exceeds 64 KiB");
+    }
+    let data = crate::b64::decode(encoded)?;
+    if data.len() > MAX_COMPANION_BYTES {
+        return refuse(Code::SIZE_CAP, "companion file exceeds 64 KiB");
+    }
+    Ok(data)
+}
+
+fn validate_files(files: &mut [(String, Vec<u8>)]) -> Result<()> {
+    if files.len() > MAX_COMPANION_FILES {
+        return refuse(
+            Code::COUNT_CAP,
+            "at most 16 companion files may be declared",
+        );
+    }
+    if files.iter().map(|(_, data)| data.len()).sum::<usize>() > MAX_COMPANION_TOTAL_BYTES {
+        return refuse(Code::SIZE_CAP, "companion files exceed 512 KiB in total");
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut paths = vec!["model.cozytensors".to_string()];
+    for (path, data) in files.iter() {
+        crate::manifest::check_path(path)?;
+        if data.len() > MAX_COMPANION_BYTES {
+            return refuse(Code::SIZE_CAP, "companion file exceeds 64 KiB");
+        }
+        paths.push(path.clone());
+    }
+    validate_companion_paths(&mut paths)
+}
+
+fn validate_companion_paths(paths: &mut [String]) -> Result<()> {
+    paths.sort();
+    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+        return refuse(
+            Code::PATH_ILLEGAL,
+            "companion paths collide with checkpoint or other files",
+        );
+    }
+    let names: HashSet<_> = paths.iter().map(String::as_str).collect();
+    for path in paths.iter() {
+        for (at, _) in path.match_indices('/') {
+            if names.contains(&path[..at]) {
+                return refuse(Code::PATH_ILLEGAL, "companion path traverses another file");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn companion_files(
+    declaration: &Declaration,
+    sources: &[SourceData],
+) -> Result<BTreeMap<String, ObjectRef>> {
+    let mut files = BTreeMap::new();
+    let explicit: HashSet<_> = declaration
+        .files
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect();
+    for source in sources {
+        let mut backing: HashSet<_> = source
+            .header
+            .tensors()
+            .flat_map(|(_, _, tensor)| tensor.parts.iter())
+            .flat_map(|(_, part)| part.segments())
+            .map(|o| (o.sha256.clone(), o.length))
+            .collect();
+        backing.insert((source.fact.header.sha256.clone(), source.fact.header.length));
+        for (path, entry) in source.manifest.entries() {
+            let Entry::File(object) = entry else { continue };
+            // A named asset is an explicit semantic role, even when CAS deduplication
+            // makes its bytes identical to a tensor part. Only unindexed backing aliases
+            // disappear from the derived manifest.
+            let named_asset = source.header.assets.iter().any(|(name, asset)| {
+                name == path
+                    && asset.logical_sha256 == object.sha256
+                    && asset.logical_length == object.length
+            });
+            if (backing.contains(&(object.sha256.clone(), object.length)) && !named_asset)
+                || explicit.contains(path.as_str())
+            {
+                continue;
+            }
+            if let Some(previous) = files.insert(path.clone(), object.clone()) {
+                if previous != *object {
+                    return refuse(Code::TRANSACTION_CONFLICT,
+                        format!("sources disagree on companion {path:?}; explicitly declare replacement bytes"));
+                }
+            }
+        }
+    }
+    files.extend(
+        declaration
+            .files
+            .iter()
+            .map(|(path, data)| (path.clone(), ObjectRef::of(data))),
+    );
+    let mut paths: Vec<_> = files
+        .keys()
+        .cloned()
+        .chain(std::iter::once("model.cozytensors".into()))
+        .collect();
+    validate_companion_paths(&mut paths)?;
+    Ok(files)
 }
 
 fn selected_components(declaration: &Declaration, source_alias: &str) -> Vec<String> {
@@ -1916,7 +2056,19 @@ fn build_header(
     configs.sort_by(|a, b| a.0.cmp(&b.0));
     let header = Header {
         configs,
-        assets: Vec::new(),
+        assets: companion_files(declaration, sources)?
+            .into_iter()
+            .filter(|(_, object)| object.length != 0)
+            .map(|(path, object)| {
+                let asset = Asset {
+                    logical_sha256: object.sha256.clone(),
+                    logical_length: object.length,
+                    media_type: "application/octet-stream".into(),
+                    segments: vec![object],
+                };
+                (path, asset)
+            })
+            .collect(),
         encodings,
         components,
     };
@@ -1972,6 +2124,7 @@ fn inspect_retained_source(
 ) -> Result<SourceInspection> {
     let alias = "source".to_string();
     let mut declaration = Declaration {
+        files: Vec::new(),
         work_fingerprint: None,
         sources: vec![Source {
             alias: alias.clone(),
@@ -2927,6 +3080,23 @@ pub fn add_config<R: Read>(
         config,
     });
     row.normalize();
+    let declaration = declaration(row)?;
+    let (planned, _) = declaration.planned_additions()?;
+    let config_bytes: u64 = row
+        .added_configs
+        .iter()
+        .map(|c| c.config.len() as u64)
+        .sum();
+    if !declaration.files.is_empty()
+        && planned
+            .checked_add(config_bytes)
+            .is_none_or(|n| n > declaration.max_new_bytes)
+    {
+        return refuse(
+            Code::QUOTA_EXHAUSTED,
+            "configs and companion/tensor additions exceed output grant",
+        );
+    }
     txn.commit()?;
     Ok(())
 }
@@ -2997,6 +3167,16 @@ fn added_objects(row: &TransactionRow) -> Vec<ObjectRef> {
         .iter()
         .flat_map(|added| added.part.segments().iter().cloned())
         .collect();
+    if matches!(row.state, TransactionState::Committed(_)) {
+        if let Ok(declaration) = declaration(row) {
+            objects.extend(
+                declaration
+                    .files
+                    .iter()
+                    .map(|(_, data)| ObjectRef::of(data)),
+            );
+        }
+    }
     objects.sort_by(|a, b| (&a.sha256, a.length).cmp(&(&b.sha256, b.length)));
     objects.dedup();
     objects
@@ -3070,7 +3250,22 @@ pub fn commit(
     )?;
     admit_registry(store, &registry_adoptions)?;
     let header_ref = checkpoint::put_doc(store, &header)?;
-    let manifest = build_manifest(&header, &header_ref, &closure)?;
+    let mut manifest = Draft::of(&build_manifest(&header, &header_ref, &closure)?);
+    for (_, data) in &declaration.files {
+        let expected = ObjectRef::of(data);
+        store.put_stream(
+            &mut &data[..],
+            Some(&expected),
+            &crate::store::Fault::default(),
+        )?;
+    }
+    manifest.entries.extend(
+        companion_files(&declaration, &sources)?
+            .into_iter()
+            .map(|(path, object)| (path, Entry::File(object))),
+    );
+    manifest.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let manifest = manifest.seal()?;
     let manifest_ref = store.put_manifest(&manifest)?.obj;
     store.read_manifest(&manifest_ref)?;
     let walk = checkpoint::walk(store, &manifest)?;
@@ -3382,6 +3577,7 @@ mod tests {
             .spec
             .object_id();
         Declaration {
+            files: Vec::new(),
             work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
             sources: Vec::new(),
             components: vec![ComponentDeclaration {
@@ -3410,6 +3606,7 @@ mod tests {
 
     fn inherited_declaration(manifest: ObjectRef) -> Declaration {
         Declaration {
+            files: Vec::new(),
             work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
             sources: vec![Source {
                 alias: "source".into(),
@@ -4021,6 +4218,7 @@ mod tests {
             &transaction,
             1,
             Declaration {
+                files: Vec::new(),
                 work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
                 sources: vec![Source {
                     alias: "source".into(),
@@ -4056,3 +4254,6 @@ mod resume_tests;
 
 #[cfg(test)]
 mod graft_tests;
+
+#[cfg(test)]
+mod companion_tests;

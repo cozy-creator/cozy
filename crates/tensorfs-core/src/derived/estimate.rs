@@ -77,6 +77,12 @@ pub fn estimate_write(
             })
             .collect();
         let mut result = WriteEstimate::default();
+        for (_, data) in &declaration.files {
+            let length = data.len() as u64;
+            result.payload_bytes += length;
+            result.largest_part_bytes = result.largest_part_bytes.max(length);
+            result.parts += 1;
+        }
         for component in &declaration.components {
             for tensor in &component.add {
                 for part in &tensor.parts {

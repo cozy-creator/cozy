@@ -7,9 +7,13 @@ import tempfile
 from pathlib import Path
 
 import tensorfs
+from tensorfs.derived import Derivation
 
 
 def main():
+    # The optional feature does not change ordinary derivation transport to existing hosts.
+    assert len(Derivation({}, {}, {}, []).native_arguments(4096)) == 5
+    assert len(Derivation({}, {}, {}, [], files={"Notice": b"Attribution"}).native_arguments(4096)) == 6
     plain = next(digest for alias, digest in tensorfs.seed_digests() if alias == "plain/1")
     fp8 = next(digest for alias, digest in tensorfs.seed_digests() if alias == "fp8-rowwise/1")
     targets = {"model": {"drop": [], "add": {
