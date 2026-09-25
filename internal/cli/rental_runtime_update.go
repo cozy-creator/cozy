@@ -25,6 +25,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
 //go:embed runtime_update_transport.py
@@ -84,11 +85,15 @@ func (u *rentalRuntimeUpdates) start(id, request, wheelPath string) (*records.Ru
 		return nil, problem
 	}
 	var candidate *runtimeUpdateWheel
+	var snapshot *scratch.Dir
 	if wheelPath != "" {
-		candidate, problem = freezeRuntimeWheel(m.layout.Tmp, wheelPath)
+		candidate, snapshot, problem = freezeRuntimeWheel(m.layout.Tmp, wheelPath)
 		if problem != nil {
 			return nil, problem
 		}
+	}
+	if snapshot != nil {
+		defer snapshot.Release()
 	}
 	if current != nil && current.Active() && candidate != nil {
 		var saved runtimeUpdateSelection
@@ -102,6 +107,9 @@ func (u *rentalRuntimeUpdates) start(id, request, wheelPath string) (*records.Ru
 			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate})
 		}
 		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, request, selection)
+		if problem == nil && snapshot != nil {
+			snapshot.Detach()
+		}
 	}
 	if problem == nil {
 		u.run(*current)

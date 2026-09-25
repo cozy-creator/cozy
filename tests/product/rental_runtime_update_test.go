@@ -3,18 +3,22 @@ package producttest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc/metadata"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T) {
@@ -142,7 +146,14 @@ func TestRentalDependencyVerdictIsSharedByRootAndServingPreparation(t *testing.T
 func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 	f := developmentFixtureAt(t)
 	f.attach(t, "127.0.0.1:1")
-	selection := json.RawMessage(`{"local_runtime":{"path":"/owned/frozen/cozy_runtime.whl","digest":"sha256:exact","length":42}}`)
+	candidate := filepath.Join(f.layout.Tmp, "runtime-candidate-proof", "cozy_runtime.whl")
+	planned := filepath.Join(f.layout.Tmp, "runtime-updates", "operation", "cozy_runtime.whl")
+	for _, path := range []string{candidate, planned} {
+		must(t, os.MkdirAll(filepath.Dir(path), 0700))
+		must(t, os.WriteFile(path, []byte("exact frozen candidate"), 0600))
+	}
+	selection, err := json.Marshal(map[string]any{"local_runtime": map[string]any{"path": candidate, "digest": "sha256:exact", "length": 22}})
+	must(t, err)
 	initial, problem := f.store.BeginRuntimeUpdate(f.rentalID, f.peer.bootID, "", selection)
 	fatal(t, problem)
 	f.store.Close()
@@ -151,7 +162,73 @@ func TestRuntimeUpdateInitialCandidateSurvivesBeforePlan(t *testing.T) {
 	defer reopened.Close()
 	recovered, problem := reopened.RuntimeUpdate(f.rentalID)
 	fatal(t, problem)
+	_, problem = reclaim.Tmp(f.layout, reopened)
+	fatal(t, problem)
+	for _, path := range []string{candidate, planned} {
+		data, err := os.ReadFile(path)
+		must(t, err)
+		if string(data) != "exact frozen candidate" {
+			t.Fatal("restart sweep lost active update bytes")
+		}
+	}
 	if recovered.ID != initial.ID || recovered.State != "preparing" || !bytes.Equal(recovered.Selection, selection) {
 		t.Fatalf("initial local candidate lost before remote planning: %+v", recovered)
+	}
+	recovered.State = "failed"
+	fatal(t, reopened.SaveRuntimeUpdate(*recovered))
+	_, problem = reclaim.Tmp(f.layout, reopened)
+	fatal(t, problem)
+	for _, path := range []string{candidate, planned} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("settled update scratch retained: %s: %v", path, err)
+		}
+	}
+}
+
+// The real CLI/daemon snapshots before any remote maintenance. The independent
+// peer is deliberately unavailable: this test needs no worker or wheel install.
+func TestRentalRuntimeUpdateCLIFreezesLocalCandidate(t *testing.T) {
+	f := developmentFixtureAt(t)
+	f.attach(t, "127.0.0.1:1")
+	must(t, os.WriteFile(filepath.Join(f.layout.Root, "config.yaml"), []byte("tensorhub_url: http://127.0.0.1:1\ntensorhub_token: local-update-proof\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+	source := filepath.Join(t.TempDir(), "cozy_runtime-0.18.25.dev1-cp312-abi3-manylinux_2_28_x86_64.whl")
+	content := []byte("bounded immutable candidate bytes; metadata checked during planning")
+	must(t, os.WriteFile(source, content, 0600))
+	startDaemonProcess(t, f.layout.Root)
+	code, out := runCozy(t, f.layout.Root, "rental", "update", "proof", "--runtime-wheel", source, "--json")
+	if code == 0 || !strings.Contains(out, "rental.runtime_update_failed") {
+		t.Fatalf("expected remote maintenance refusal after local capture: %d %s", code, out)
+	}
+	row, problem := f.store.RuntimeUpdate(f.rentalID)
+	fatal(t, problem)
+	if row == nil {
+		t.Fatal("candidate accepted without a durable row")
+	}
+	var selection struct {
+		LocalRuntime struct {
+			Path, Filename, Digest string
+			Length                 int64
+		} `json:"local_runtime"`
+	}
+	must(t, json.Unmarshal(row.Selection, &selection))
+	frozen := selection.LocalRuntime
+	if frozen.Path == source || frozen.Filename != filepath.Base(source) || frozen.Length != int64(len(content)) || frozen.Digest != fmt.Sprintf("sha256:%x", sha256.Sum256(content)) {
+		t.Fatalf("candidate was not frozen with its exact identity: %+v", frozen)
+	}
+	must(t, os.WriteFile(source, []byte("replaced build output"), 0600))
+	actual, err := os.ReadFile(frozen.Path)
+	must(t, err)
+	if !bytes.Equal(actual, content) {
+		t.Fatal("mutable caller path changed the recorded candidate")
+	}
+	info, err := os.Stat(frozen.Path)
+	must(t, err)
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("snapshot mode %o", info.Mode().Perm())
+	}
+	// The Kong path is independently checked without starting another maintenance.
+	code, out = runCozy(t, f.layout.Root, "rental", "update", "--help")
+	if code != 0 || !strings.Contains(out, "--runtime-wheel") {
+		t.Fatalf("local wheel flag missing: %d %s", code, out)
 	}
 }
