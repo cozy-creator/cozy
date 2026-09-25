@@ -118,7 +118,6 @@ func ordinaryScheduledCheckpoint(t *testing.T) {
 	configure := func(options *orchestrator.Options) {
 		rentalWiring(connection, signer)(options)
 		options.Cfg.HubURL = *publicationHub
-		options.Cfg.RentalsMaxHourlySpendUSDMicros = 20_000_000
 		resolver = cli.NewResolver(options.Store, options.Cfg, nil)
 		options.Packages = resolver
 		options.ModelTransfers = cli.NewModelTransferOwner(options.Cfg, options.Store, options.Log, auth)
@@ -140,7 +139,6 @@ func ordinaryScheduledCheckpoint(t *testing.T) {
 	}
 	o := hostOwner(t, "ordinary-checkpoint-"+records.NewID("proof"), configure)
 	o.cfg.HubURL = *publicationHub
-	o.cfg.RentalsMaxHourlySpendUSDMicros = 20_000_000
 	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "ordinary-proof", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, State: "ready", Hub: *publicationHub, Address: bridge.Address, CertPath: certificate, ExpectedWorkerID: bridge.WorkerID, ExpectedWorkerBootID: bridge.WorkerBootID}))
 	// Copy only the enrolled credential for this exact Hub into the isolated CLI
 	// home; neither private key nor bearer enters the worker or the test output.
@@ -164,7 +162,7 @@ func ordinaryScheduledCheckpoint(t *testing.T) {
 	if copied != 1 {
 		t.Fatal("expected one enrolled credential for the selected Hub")
 	}
-	must(t, os.WriteFile(filepath.Join(o.root, config.FileName), []byte("tensorhub_url: "+*publicationHub+"\nrentals:\n  max_hourly_spend_usd: 20\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(o.root, config.FileName), []byte("tensorhub_url: "+*publicationHub+"\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	closeAPI := publicationControlAPI(t, o, func(options *api.Options) { options.Packages = resolver; options.Rentals = rental.Known(o.store) })
 	defer closeAPI()
 	results := make(chan string, 1)

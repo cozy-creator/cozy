@@ -236,16 +236,16 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	if strings.HasPrefix(mode, "interrupted") {
 		op, _, problem := store.BeginRentalOperation(records.RentalOperation{
 			Key: "manual-restart", Hub: hub.URL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 1,
-		}, 2_000_000, 0, func(name string) ([]byte, string, *exit.Error) {
+		}, func(name string) ([]byte, string, *exit.Error) {
 			body, problem := hubapi.RentalRequestBytes(name, "cpu", 1, secret.HashHex(token), identity.PublicKey(), hubapi.DeclaredWorkload{}, nil)
 			return body, fmt.Sprintf("sha256:%x", sha256.Sum256(body)), problem
-		}, nil)
+		})
 		fatal(t, problem)
 		request, problem := hubapi.ParseRentalRequestBytes(op.RequestBody)
 		fatal(t, problem)
 		machineName = request.Name
 	}
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: manual-restart-proof\nrentals:\n  max_hourly_spend_usd: 2\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.URL+"\ntensorhub_token: manual-restart-proof\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	row := records.Rental{AcceleratorCount: 1, ID: podRental, State: "ready", Hub: hub.URL, MachineName: machineName,
 		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 1, Address: listener.Addr().String(), MediaAddress: strings.TrimPrefix(media.URL, "https://"),
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}

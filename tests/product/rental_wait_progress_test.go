@@ -21,8 +21,8 @@ func rentalWaitEvents(at time.Time, machine, spend string) []localapi.Event {
 }
 
 func TestRentalWaitProgressDeduplicatesAlternatingNotices(t *testing.T) {
-	const spend = "rentals: 4 remote machines running · $7.08/hour of $50.00/hour"
-	const changedSpend = "rentals: 5 remote machines running · $9.97/hour of $50.00/hour"
+	const spend = "rentals: 4 remote machines running · $7.08/hour"
+	const changedSpend = "rentals: 5 remote machines running · $9.97/hour"
 	for _, terminal := range []bool{false, true} {
 		t.Run(map[bool]string{false: "redirected", true: "terminal"}[terminal], func(t *testing.T) {
 			p, buf := progressSink(output.Mode{Human: true, Color: terminal}, false)

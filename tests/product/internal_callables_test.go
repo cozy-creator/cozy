@@ -65,7 +65,7 @@ func TestInternalCallablesAreAbsentFromCLIAndRefuseDirectRun(t *testing.T) {
 	t.Cleanup(server.Close)
 	root := t.TempDir()
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--json") })
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 20\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
 	code, out := runCozy(t, root, "run", "proof/internal", "--rental-only", "--json", "--full")
 	if code != 0 || strings.Contains(out, `"segment"`) || strings.Contains(out, "internal_job") || !strings.Contains(out, "long_form") || !strings.Contains(out, "generate") {
 		t.Fatalf("public list: %d %s", code, out)

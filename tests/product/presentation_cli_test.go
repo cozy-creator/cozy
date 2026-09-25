@@ -72,8 +72,7 @@ func TestRentalConflictNamesDrainingOperation(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	_, _, problem = store.BeginRentalOperation(records.RentalOperation{Key: "draining-op", Hub: origin, Reason: "manual", HourlyRateUSDMicros: 100_000},
-		5_000_000, 0, func(string) ([]byte, string, *exit.Error) { return []byte(`{}`), "draining", nil }, nil)
+	_, _, problem = store.BeginRentalOperation(records.RentalOperation{Key: "draining-op", Hub: origin, Reason: "manual", HourlyRateUSDMicros: 100_000}, func(string) ([]byte, string, *exit.Error) { return []byte(`{}`), "draining", nil })
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation("draining-op", "pr-draining-op", "release_requested"))
 	code, output := runCozy(t, root, "rental", "new", "cpu", "--idempotency-key", "draining-op")

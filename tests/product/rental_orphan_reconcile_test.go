@@ -158,10 +158,9 @@ func TestEndingAnUnrecordedMachineByItsHubNameReleasesIt(t *testing.T) {
 	}
 }
 
-// TestUnrecordedSpendRefusesTheNextPurchase is the ceiling that replaces an automatic
-// shutdown nobody should want for a machine this host cannot prove it owns. The cap
-// is a SPEND cap; a cap computed from local rows admitted six pods it should have
-// refused, so the burn it compares against is the account's, not the filing cabinet's.
+// TestUnrecordedSpendRefusesTheNextPurchase: the hub's owner cap counts every live
+// rental it bills, recorded on this host or not, and Creator relays its refusal
+// without ending a machine on its own.
 func TestUnrecordedSpendRefusesTheNextPurchase(t *testing.T) {
 	root, stand := orphanHub(t, "rental-orphan-cap")
 	orphan(stand, "pr-3333333333333333sem", "semiu", 3_190_000)
@@ -172,18 +171,16 @@ func TestUnrecordedSpendRefusesTheNextPurchase(t *testing.T) {
 		"minimum_ram_per_gpu_gb": 64, "price_usd_micros_per_hour": 3_190_000,
 		"storage_usd_micros_per_hour": 30_000,
 	})
+	stand.mu.Lock()
+	stand.spendCap = 5_000_000
+	stand.mu.Unlock()
 
-	// The root's ceiling is $5.00/hour and the account is already burning $6.38 of it.
 	code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--json")
 	if code == 0 {
 		t.Fatalf("a purchase was admitted over a ceiling the account has already breached\n%s", out)
 	}
 	if !strings.Contains(out, "rental.fleet_spend_cap") {
 		t.Fatalf("the refusal is not the spend ceiling: %s", out)
-	}
-	if !strings.Contains(out, "$5.00/hour account limit; current spend is $6.38/hour") ||
-		!strings.Contains(out, "cozy rental list") {
-		t.Fatalf("the ceiling refusal does not explain account spend and its limit: %s", out)
 	}
 	if strings.Contains(out, "holds no record") || strings.Contains(out, "recorded only at the hub") {
 		t.Fatalf("the ceiling refusal exposes controller bookkeeping: %s", out)
@@ -247,7 +244,6 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 10.00\n"+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	logPath := filepath.Join(root, "daemon.log")
 

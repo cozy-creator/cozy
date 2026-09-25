@@ -33,10 +33,7 @@ func (r *publishedTreeResolver) ResolveRemoteJob(pkg, release, function string, 
 }
 
 func TestPublishedPrivateTreeUsesResolvedSchemaAndImmutableSnapshot(t *testing.T) {
-	o := hostOwner(t, "published-tree-input", func(options *orchestrator.Options) {
-		options.Cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
-	})
-	o.cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
+	o := hostOwner(t, "published-tree-input")
 	fatal(t, o.store.RecordRental(records.Rental{ID: "rental-tree", MachineName: "tree-host", SKU: "cpu", AcceleratorModel: "CPU", State: "ready", Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1", AcceleratorCount: 1, HourlyRateUSDMicros: 1}))
 	resolver := &publishedTreeResolver{entry: treeArgumentEntry(t)}
 	const bearer = "published-tree-input-fixture"

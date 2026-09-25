@@ -92,7 +92,7 @@ func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 			const grace = rental.IdleTimeout
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\n"+
-					"rentals:\n  max_hourly_spend_usd: 1\n"+
+					""+
 					"daemon:\n  idle_shutdown_s: 0\n"), 0600))
 			peer := newFakeRentalHub(t, port)
 			peer.publishListing()

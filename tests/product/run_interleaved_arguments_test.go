@@ -89,7 +89,7 @@ func interleavedAssetsRoot(t *testing.T) string {
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 20\n"), 0600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
 	return root
 }
 

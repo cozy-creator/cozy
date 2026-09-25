@@ -46,7 +46,10 @@ type managedRentals struct {
 	// owns nothing, and the difference has to reach the reader: a board that silently
 	// falls back to local records is exactly the board that showed an empty fleet
 	// while six H100s billed.
-	unrecorded     []hub.Rental
+	unrecorded []hub.Rental
+	// live is every rental the last listing says this account holds, recorded or
+	// not: the fleet count and burn are the hub's, never a local sum.
+	live           []hub.Rental
 	listed         bool
 	listingProblem *exit.Error
 }
@@ -94,7 +97,7 @@ func (m *managedRentals) admit(skuName string, gpus int) (string, hub.RentalSKU,
 		return "", hub.RentalSKU{}, problem
 	}
 	if sku, found := hub.FindRentalSKU(skus, skuName, gpus); found {
-		return line, sku, m.admitLocked(sku)
+		return line, sku, nil
 	}
 	// An explicit ask is HONOURED OR REFUSED, never widened to a neighbouring card or
 	// count — and the refusal has to say so out loud (cl-132), AND say which absence it
@@ -276,15 +279,6 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		purchases = rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), constraints)
 	}
 	var capped *exit.Error
-	for i := range purchases {
-		c := &purchases[i]
-		if c.Verdict != "" {
-			continue
-		}
-		if problem := m.admitLocked(bySKU[machineKey{c.SKU, c.GPUs}]); problem != nil {
-			c.Verdict, capped = orchestrator.VerdictExcluded+problem.ErrName(), problem
-		}
-	}
 	decision.Candidates = append(attached, purchases...)
 	rows, problem := m.throughputLocked(req)
 	if problem != nil {
@@ -321,6 +315,11 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		rentalID := c.Rental
 		if !c.Attached() {
 			row, problem := m.buyLocked(req, *c, bySKU[machineKey{c.SKU, c.GPUs}])
+			if problem != nil && problem.ErrName() == "rental.fleet_spend_cap" {
+				// The hub's cap refused this product; a cheaper one may still fit.
+				c.Verdict, capped = orchestrator.VerdictExcluded+problem.ErrName(), problem
+				continue
+			}
 			if problem != nil {
 				if problem.ErrName() != "rental.sku_out_of_stock" && problem.ErrName() != "rental.sku_unavailable" {
 					return none, "", problem
@@ -483,8 +482,7 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	}
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name, sku.AcceleratorCount,
 		operationKey, rental.AcquisitionReason(req),
-		sku.PriceUSDMicrosPerHour, sku.StorageUSDMicrosPerHour,
-		m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID,
+		sku.PriceUSDMicrosPerHour, time.Time{}, req.ID,
 		func(seen hub.Rental) {
 			// A failure carried by a rental that is BACK in pending_acquisition is the
 			// hub saying "that one did not work; I am buying again". The detail names
@@ -511,7 +509,7 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 						BaseWorkerProfile:     seen.BaseWorkerProfile,
 					}})
 			}
-		}, rentalRates(m.unrecorded))
+		})
 	return row, problem
 }
 
@@ -528,28 +526,6 @@ func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {
 	hctx, cancel := hub.Context()
 	defer cancel()
 	return client(m.ctx).RentalSKUs(hctx)
-}
-
-func (m *managedRentals) admitLocked(sku hub.RentalSKU) *exit.Error {
-	cap := m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros
-	if cap <= 0 {
-		return exit.Named(exit.Usage, "rental.spend_cap_required",
-			"rentals.max_hourly_spend_usd must be positive before Creator rents a pod")
-	}
-	_, burn, problem := m.totalsLocked()
-	if problem != nil {
-		return problem
-	}
-	// The cap is a SPEND cap and burn is billed-truth money (th-120), so the
-	// figure admitted is the estimated TOTAL the pod will bill — the GPU rate
-	// plus the SKU's storage adder — never the GPU rate alone (th-126).
-	if burn > cap || sku.PriceUSDMicrosPerHour+sku.StorageUSDMicrosPerHour > cap-burn {
-		return exit.Named(exit.Capacity, "rental.fleet_spend_cap",
-			"rental %s at %s would exceed the %s account limit; current spend is %s",
-			sku.Name, skuRate(sku), usdPerHour(cap), usdPerHour(burn)).WithRemedy(
-			"inspect `cozy rental list` to manage existing rentals, or raise rentals.max_hourly_spend_usd")
-	}
-	return nil
 }
 
 // release is the settlement hook: the orchestrator calls it as each request pinned to a
@@ -881,7 +857,7 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 		if hub.Unanswered(problem) {
 			// The census is as unknown as the rows: a later cached read must not
 			// present the previous listing as current.
-			m.listed, m.listingProblem, m.unrecorded = false, problem, nil
+			m.listed, m.listingProblem, m.unrecorded, m.live = false, problem, nil, nil
 		}
 		return problem
 	}
@@ -896,7 +872,7 @@ func (m *managedRentals) reconcileListingLocked() {
 	hctx, cancel := hub.Context()
 	remote, listed, problem := client(m.ctx).Rentals(hctx)
 	cancel()
-	m.listed, m.listingProblem, m.unrecorded = listed, problem, nil
+	m.listed, m.listingProblem, m.unrecorded, m.live = listed, problem, nil, nil
 	if problem != nil || !listed {
 		return
 	}
@@ -907,9 +883,10 @@ func (m *managedRentals) reconcileListingLocked() {
 		row, rowProblem := m.store.RentalRow(seen.ID)
 		if rowProblem != nil {
 			m.listingProblem = rowProblem
-			m.unrecorded = nil
+			m.unrecorded, m.live = nil, nil
 			return
 		}
+		m.live = append(m.live, seen)
 		if row != nil && strings.TrimRight(row.Hub, "/") == client(m.ctx).Base() {
 			continue
 		}
@@ -1056,16 +1033,12 @@ func (m *managedRentals) lineLocked() (string, *exit.Error) {
 	if count != 1 {
 		machine = "machines"
 	}
-	line := fmt.Sprintf("rentals: %d remote %s running · %s of %s",
-		count, machine, usdPerHour(burn), usdPerHour(m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros))
+	line := fmt.Sprintf("rentals: %d remote %s running · %s", count, machine, usdPerHour(burn))
 	return line, nil
 }
 
-// totalsLocked is what THE ACCOUNT is paying, not what this host filed. The
-// unrecorded half counts, and it counts in the spend admission as well as on the
-// board: on 2026-09-07 six pods at $3.19/hour billed against a $10/hour ceiling
-// that admitted every one of them, because the ceiling was computed from local rows
-// and none of the six had one. A cap that cannot see half the spend is not a cap.
+// totalsLocked is what THE ACCOUNT is paying, as the hub lists it: every live
+// rental, recorded here or not (cl-199).
 func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 	if m.listingProblem != nil {
 		return 0, 0, m.listingProblem
@@ -1075,25 +1048,15 @@ func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
 			"account rental census unavailable: this hub publishes no rental listing").
 			WithRemedy("restore the Hub account-listing route before reading totals or acquiring a rental")
 	}
-	return m.store.RentalFleetTotals(client(m.ctx).Base(), rentalRates(m.unrecorded))
-}
-
-func rentalRates(rows []hub.Rental) map[string]int64 {
-	rates := make(map[string]int64, len(rows))
-	for _, row := range rows {
-		rates[row.ID] = row.HourlyRateUSDMicros
-	}
-	return rates
-}
-
-func (m *managedRentals) unrecordedTotalsLocked() (int, int64) {
 	var burn int64
-	for _, seen := range m.unrecorded {
-		if seen.HourlyRateUSDMicros > 0 {
-			burn += seen.HourlyRateUSDMicros
+	for _, seen := range m.live {
+		if seen.HourlyRateUSDMicros <= 0 {
+			return 0, 0, exit.Named(exit.Unavailable, "rental.rate_unknown",
+				"rental %s has no observed rate; account spend is unknown", seen.ID)
 		}
+		burn += seen.HourlyRateUSDMicros
 	}
-	return len(m.unrecorded), burn
+	return len(m.live), burn, nil
 }
 
 func usdPerHour(micros int64) string {

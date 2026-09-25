@@ -540,6 +540,8 @@ func statusCode(status int) exit.Code {
 		return exit.NotFound
 	case status == http.StatusConflict:
 		return exit.Conflict
+	case status == http.StatusPaymentRequired:
+		return exit.Capacity
 	case status == http.StatusRequestTimeout, status == http.StatusGatewayTimeout:
 		return exit.Deadline
 	case status == http.StatusTooManyRequests:

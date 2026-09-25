@@ -40,8 +40,7 @@ func TestRentalListLiveBoard(t *testing.T) {
 	// the policy the config actually states, never from a spelled-out five minutes.
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
-			"tensorhub_token: rental-idle-test\n"+
-			"rentals:\n  max_hourly_spend_usd: 1.00\n"), 0o600))
+			"tensorhub_token: rental-idle-test\n"), 0o600))
 
 	hub := newFakeRentalHub(t, port)
 	hub.add("rental-tui", "sparrow")

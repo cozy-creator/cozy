@@ -193,7 +193,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	spec.BodyDigest = digest
 
-	recorded, fresh, e := s.recordSubmission(spec, existing == nil)
+	recorded, fresh, e := s.recordSubmission(spec)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return

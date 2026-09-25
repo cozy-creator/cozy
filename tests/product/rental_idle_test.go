@@ -110,8 +110,11 @@ type fakeRentalHub struct {
 	packageReleases map[string]any
 	skus            []map[string]any
 	rent            func(map[string]any) map[string]any
-	released        map[string]int
-	server          *httptest.Server
+	// spendCap stands in for Tensorhub's owner fleet cap: a paid ask whose SKU
+	// total would take the live rentals' burn past it is refused, buying nothing.
+	spendCap int64
+	released map[string]int
+	server   *httptest.Server
 	// publishes is whether this stand-in hub carries th-199's account listing.
 	publishes bool
 }
@@ -183,13 +186,23 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	mux.HandleFunc("POST /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		if h.rent == nil || r.Header.Get("Authorization") != "Bearer rental-idle-test" {
+		if r.Header.Get("Authorization") != "Bearer rental-idle-test" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		var request map[string]any
 		if json.NewDecoder(r.Body).Decode(&request) != nil {
 			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if h.spendCap > 0 && h.liveBurnLocked()+h.skuTotalLocked(request["sku"]) > h.spendCap {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = w.Write([]byte(`{"error":{"code":"rental.fleet_spend_cap","message":"the rental would exceed the owner hourly spend cap"}}`))
+			return
+		}
+		if h.rent == nil {
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		row := h.rent(request)
@@ -217,6 +230,37 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	h.server.Start()
 	t.Cleanup(h.close)
 	return h
+}
+
+func micros(value any) int64 {
+	switch v := value.(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	}
+	return 0
+}
+
+func (h *fakeRentalHub) liveBurnLocked() int64 {
+	var burn int64
+	for _, row := range h.rentals {
+		if state := row["state"]; state != "released" && state != "failed" {
+			burn += micros(row["hourly_rate_usd_micros"])
+		}
+	}
+	return burn
+}
+
+func (h *fakeRentalHub) skuTotalLocked(name any) int64 {
+	for _, sku := range h.skus {
+		if sku["name"] == name {
+			return micros(sku["price_usd_micros_per_hour"]) + micros(sku["storage_usd_micros_per_hour"])
+		}
+	}
+	return 0
 }
 
 // publishListing enables the account listing for tests that control availability.

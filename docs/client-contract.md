@@ -63,11 +63,11 @@ immutable constraint participates in submission identity and survives child call
 and restarts. It cannot be unpinned or replaced after loss. `worker` remains the scheduler's
 current assignment. Default execution is local-only.
 
-Creator reconciles every locally known rental with Tensorhub and sums the immutable Cozy
-retail hourly rate locked into each rental. Every potentially billing manual or managed
-rental counts until Tensorhub confirms release or absence. A new managed rental is allowed
-only when its locked rate fits under `rentals.max_hourly_spend_usd`. Creator reuses the
-cheapest idle rental first, otherwise buys the cheapest offered SKU. Every rental, manual or
+Spend admission is Tensorhub's: it opens a rental only while the owner's live rentals plus
+the new one's GPU quote and storage estimate fit `rental.max_owner_hourly_spend_usd_micros`,
+checked atomically, and refuses otherwise with `rental.fleet_spend_cap`. Creator reuses the
+cheapest idle rental first, otherwise buys the cheapest offered SKU; a product the cap
+refuses is excluded and the next one tried. Every rental, manual or
 Creator-managed, has an immutable 900-second idle deadline. Only actual work on that
 machine and an acknowledged explicit `cozy rental keepalive <name>` reset it. Retained
 failed/paused files, connection traffic and unpinned fleet work do not. The pod independently

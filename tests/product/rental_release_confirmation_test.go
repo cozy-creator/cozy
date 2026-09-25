@@ -88,11 +88,11 @@ func releaseConfirmationRecord(t *testing.T, root, hubURL, id string) (*records.
 	fatal(t, problem)
 	t.Cleanup(func() { store.Close() })
 	machine := ""
-	op, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "release-confirmation", Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100000}, 5000000, 10000, func(name string) ([]byte, string, *exit.Error) {
+	op, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "release-confirmation", Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100000}, func(name string) ([]byte, string, *exit.Error) {
 		machine = name
 		body, e := hub.RentalRequestBytes(name, "cpu", 1, strings.Repeat("ab", 32), base64.RawURLEncoding.EncodeToString(make([]byte, 32)), hub.DeclaredWorkload{}, nil)
 		return body, "digest-" + name, e
-	}, nil)
+	})
 	fatal(t, problem)
 	fatal(t, store.AdvanceRentalOperation(op.Key, id, "attached"))
 	fatal(t, store.RecordRental(records.Rental{ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, State: "ready", ReadyAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), Hub: hubURL, Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem")}))

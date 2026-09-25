@@ -231,7 +231,7 @@ func TestRentalProvenanceSurvivesToTheRecord(t *testing.T) {
 		_, _, problem := store.BeginRentalOperation(records.RentalOperation{
 			Key: key, Hub: "http://127.0.0.1:8819", Reason: reason,
 			HourlyRateUSDMicros: 740_000, State: "pending",
-		}, 10_000_000, 213_504, author, nil)
+		}, author)
 
 		if problem != nil {
 			t.Fatalf("cannot begin rental operation %s: %v", key, problem)

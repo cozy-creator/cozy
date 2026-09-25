@@ -76,11 +76,11 @@ func TestRentalMachineNames(t *testing.T) {
 		t.Helper()
 		op, replay, problem := store.BeginRentalOperation(records.RentalOperation{
 			Key: key, Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100_000,
-		}, fleetCap, 0, func(machineName string) ([]byte, string, *exit.Error) {
+		}, func(machineName string) ([]byte, string, *exit.Error) {
 			body, problem := hub.RentalRequestBytes(machineName, "cpu", 1, strings.Repeat("ab", 32),
 				"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", hub.DeclaredWorkload{}, nil)
 			return body, "sha256:" + strings.Repeat("cd", 32), problem
-		}, nil)
+		})
 
 		fatal(t, problem)
 		if replay {
@@ -148,10 +148,10 @@ func TestRentalMachineNames(t *testing.T) {
 	}
 	_, _, problem = store.BeginRentalOperation(records.RentalOperation{
 		Key: "op-exhausted", Hub: hubURL, Reason: "cozy rental new cpu", HourlyRateUSDMicros: 100_000,
-	}, fleetCap, 0, func(string) ([]byte, string, *exit.Error) {
+	}, func(string) ([]byte, string, *exit.Error) {
 		t.Fatal("a request was authored with no free word")
 		return nil, "", nil
-	}, nil)
+	})
 
 	if problem == nil || problem.Name != "rental.machine_names_exhausted" {
 		t.Fatalf("an exhausted vocabulary did not refuse: %v", problem)

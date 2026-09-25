@@ -74,10 +74,7 @@ func (publishedRouteObserver) Control(context.Context, records.Request, string) 
 }
 
 func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
-	o := hostOwner(t, "published-machine-routing", func(options *orchestrator.Options) {
-		options.Cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
-	})
-	o.cfg.RentalsMaxHourlySpendUSDMicros = 1_000_000
+	o := hostOwner(t, "published-machine-routing")
 	_, problem := o.store.Activate(records.PackageInstall{ID: "published-local-install", Package: "alice/ops", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir(), PackageInterface: childDigest("8"), SourceDigest: childDigest("7"), Platform: "linux-x86_64"})
 	fatal(t, problem)
 	fatal(t, o.store.RecordRental(records.Rental{ID: "rental-pinned", MachineName: "otter", SKU: "cpu", AcceleratorModel: "CPU", State: "ready", Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1", AcceleratorCount: 1, HourlyRateUSDMicros: 1}))
