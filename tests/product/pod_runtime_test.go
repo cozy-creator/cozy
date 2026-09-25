@@ -28,8 +28,13 @@ type podRuntime struct {
 	// hold keeps a desired state recorded but unaccepted, as a Runtime still staging it
 	// reports the set it already holds.
 	hold func(*pb.DesiredWorkerState) bool
+	// lanes reports proto-061 G's lanes: every placement on lane-0, which admits the pod's
+	// slots before a device release — the head RUNNING, the rest QUEUED behind it — and an
+	// idle lane-1 with as many, so the worker-level sum over-advertises lane-0.
+	lanes bool
 
 	mu       sync.Mutex
+	order    []string // running, in admission order
 	accepted *pb.DesiredWorkerState
 	loaded   map[string]bool
 	running  map[string]*pb.AttemptOffer
@@ -60,17 +65,19 @@ func (r *podRuntime) frame(p *fakePod, frame *pb.RecordOwnerFrame, send func(*pb
 		return true, r.report(p)
 	case *pb.RecordOwnerFrame_AttemptOffer:
 		offer := m.AttemptOffer
-		p.mu.Lock()
-		p.offers = append(p.offers, offer)
-		p.mu.Unlock()
 		spec, err := canonical.Read(offer.InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
 		if err != nil {
 			return true, err
 		}
 		r.mu.Lock()
 		r.running[offer.RequestId] = offer
+		r.order = append(r.order, offer.RequestId)
 		r.loaded[spec.Sub("serving").Str("entrypoint_binding_digest")] = true
 		r.mu.Unlock()
+		// Counted only once it runs: a test that waits for offer n may finish it at once.
+		p.mu.Lock()
+		p.offers = append(p.offers, offer)
+		p.mu.Unlock()
 		if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: &pb.AttemptAccepted{
 			RecordOwnerEpoch: offer.RecordOwnerEpoch, ControlStreamEpoch: offer.ControlStreamEpoch,
 			WorkerBootId: offer.WorkerBootId, RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
@@ -113,12 +120,32 @@ func (r *podRuntime) report(p *fakePod) error {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	for _, id := range ids {
+	if r.lanes {
+		ids = r.order
+		lane0 := &pb.DeviceLane{LaneId: "lane-0", DeviceOrdinals: []uint32{0},
+			AvailableAttemptSlots: state.AvailableAttemptSlots}
+		for _, placement := range state.Placements {
+			placement.DeviceLaneId = "lane-0"
+			lane0.PlacementIds = append(lane0.PlacementIds, placement.PlacementId)
+		}
+		state.Lanes = []*pb.DeviceLane{lane0,
+			{LaneId: "lane-1", DeviceOrdinals: []uint32{1}, AvailableAttemptSlots: slots}}
+		state.AvailableAttemptSlots += slots
+	}
+	for i, id := range ids {
 		offer := r.running[id]
-		state.HeldAttempts = append(state.HeldAttempts, &pb.HeldAttempt{RequestId: offer.RequestId,
+		row := &pb.HeldAttempt{RequestId: offer.RequestId,
 			AttemptOrdinal: offer.AttemptOrdinal, Kind: pb.AttemptKind_ATTEMPT_KIND_SERVING,
 			State: pb.AttemptState_ATTEMPT_STATE_RUNNING, InvocationSpecDigest: offer.InvocationSpecDigest,
-			PlacementId: offer.PlacementId, ExecutorEpoch: 1})
+			PlacementId: offer.PlacementId, ExecutorEpoch: 1}
+		if r.lanes {
+			row.LaneId = "lane-0"
+			if i > 0 {
+				row.State, row.ExecutorEpoch = pb.AttemptState_ATTEMPT_STATE_QUEUED, 0
+				row.QueuePosition = uint32(i - 1)
+			}
+		}
+		state.HeldAttempts = append(state.HeldAttempts, row)
 	}
 	return r.send(frame)
 }
@@ -129,6 +156,12 @@ func (r *podRuntime) finish(t *testing.T, p *fakePod, requestID string) {
 	r.mu.Lock()
 	offer := r.running[requestID]
 	delete(r.running, requestID)
+	for i, id := range r.order {
+		if id == requestID {
+			r.order = append(r.order[:i:i], r.order[i+1:]...)
+			break
+		}
+	}
 	send := r.send
 	r.mu.Unlock()
 	if offer == nil {
@@ -341,6 +374,47 @@ func TestWarmFirstRunsLoadedWorkWhileHeadPrepares(t *testing.T) {
 	}
 	if prepares, _, _ := q.counts(); prepares != 2 {
 		t.Fatalf("%d prepares; want one per selection (fl2va, turbo) and none for repeats", prepares)
+	}
+}
+
+// STAGED ON THE RENTAL'S LANE (proto-061 G). While the first request runs, the second is
+// offered to the same lane and admitted QUEUED behind it; a third waits for the lane, not
+// for the worker-level sum, which still advertises lane-1's idle seats.
+func TestSecondRequestStagedOnRentalLane(t *testing.T) {
+	q := newH3Queue(t, "staged-rental", 2, 0, false)
+	q.runtime.mu.Lock()
+	q.runtime.lanes = true
+	q.runtime.mu.Unlock()
+	first := q.submit("fl2va", fl2vaModels)
+	warm := q.offer(1)
+	second := q.submit("fl2va", fl2vaModels)
+	if next := q.offer(2); next.RequestId != second || next.PlacementId != warm.PlacementId {
+		t.Fatalf("offer 2 went to %s on %s; want %s staged on %s", next.RequestId, next.PlacementId,
+			second, warm.PlacementId)
+	}
+	q.runtime.mu.Lock()
+	running := q.runtime.running[first] != nil
+	q.runtime.mu.Unlock()
+	if !running {
+		t.Fatalf("%s is no longer running; the second offer did not overlap it", first)
+	}
+	third := q.submit("fl2va", fl2vaModels)
+	parked := awaitDurable(t, q.o, third, "request.parked")
+	if _, _, offered := q.counts(); len(offered) != 2 {
+		t.Fatalf("offers %v while lane-0 holds a running and a staged attempt; parked: %v",
+			offered, parked.Payload)
+	}
+	q.runtime.finish(t, q.pod, first)
+	if next := q.offer(3); next.RequestId != third || next.PlacementId != warm.PlacementId {
+		t.Fatalf("offer 3 went to %s on %s; want %s on %s", next.RequestId, next.PlacementId,
+			third, warm.PlacementId)
+	}
+	q.runtime.finish(t, q.pod, second)
+	q.runtime.finish(t, q.pod, third)
+	for _, id := range []string{first, second, third} {
+		if _, e := q.o.c.AwaitSettled(id, 30*time.Second); e != nil {
+			t.Fatalf("%s did not settle: %s", id, briefly(e))
+		}
 	}
 }
 

@@ -516,7 +516,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 //
 // The rule is one line because the width is a property of the machine, not of a request: a
 // model-bearing placement on a K-device envelope is pinned to ALL K ordinals, which fuses
-// one group lane of degree K advertising ONE seat. There is nothing to choose. The renter
+// one group lane of degree K. There is nothing to choose. The renter
 // bought K cards; the package declares which degrees it can shard at; the worker joins the
 // two and refuses `device_group_unsupported` when they disagree, which is a typed refusal
 // against a machine that is already paid for rather than a silent success that idles K-1

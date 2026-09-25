@@ -200,7 +200,7 @@ func (c *Orchestrator) route(req records.Request) routing {
 			continue
 		}
 		placementID := w.placementFor(slot, planID)
-		laneID, room, held, why := w.roomFor(placementID, planID)
+		laneID, room, held, why := w.roomFor(placementID)
 		lane := laneKey{w.instanceID, laneID}
 		out.lanes = append(out.lanes, lane)
 		if room <= 0 {
@@ -304,11 +304,13 @@ func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (
 
 // roomFor is the capacity half, per worker kind (#486c generalized by proto-024): the
 // worker's fence is OPEN, a worker-level seat is free, and — when the worker reports
-// lanes — the placement's own lane has a free seat. It answers the lane the reservation
+// lanes — the placement's own lane still admits an offer to its queue (a running attempt
+// and a staged one behind it, proto-061 G; never assumed, always the reported count).
+// It answers the lane the reservation
 // draws from ("" for the worker-level window), the room on it net of this owner's
 // unanswered reservations, the attempts already held ahead of a new one, and a reason
 // when the room is zero.
-func (w *worker) roomFor(placementID, planID string) (laneID string, room, held int, why string) {
+func (w *worker) roomFor(placementID string) (laneID string, room, held int, why string) {
 	if w.spec.IsJob() {
 		if w.jobsAvail <= 0 {
 			return "", 0, 0, "no job capacity"

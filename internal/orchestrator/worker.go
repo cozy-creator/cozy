@@ -2058,8 +2058,8 @@ type WorkerFacts struct {
 	AvailableSlots int    `json:"available_attempt_slots"`
 	// HeldAttempts is what the worker last reported holding, admission to ack.
 	HeldAttempts int `json:"held_attempts"`
-	// Lanes is the worker's own account of its serialized resources (proto-024): one seat
-	// each, ordinals into the granted Devices. Empty for a worker that reports none.
+	// Lanes is the worker's own account of its serialized resources (proto-024), each with
+	// the seats it still admits, ordinals into the granted Devices. Empty for a worker that reports none.
 	// PlacementLane is the lane this slot's placement is on, "" until the worker says.
 	Lanes         []LaneFacts `json:"lanes,omitempty"`
 	PlacementLane string      `json:"placement_lane,omitempty"`
