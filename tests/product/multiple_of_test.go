@@ -3,6 +3,7 @@ package producttest
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -10,7 +11,7 @@ import (
 )
 
 func multipleOfInterface(kind, multiple string) []byte {
-	return []byte(fmt.Sprintf(`{"application":"example:app","entrypoints":[{"name":"generate","models":[],"request":{"fields":[{"name":"value","type":%q,"constraints":{"multiple_of":%s}}]},"result":{"fields":[]}}],"jobs":[]}`, kind, multiple))
+	return []byte(fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"example:app","entrypoints":[{"name":"generate","models":[],"request":{"fields":[{"name":"value","type":%q,"constraints":{"multiple_of":%s}}]},"result":{"fields":[]}}],"jobs":[]}`, kind, multiple))
 }
 
 func TestMultipleOfInterfaceAndExactPayload(t *testing.T) {
@@ -46,6 +47,26 @@ func TestMultipleOfInvalidSchemaRefusesEarly(t *testing.T) {
 	for _, value := range []string{"0", "-32", "null", `"32"`, "1e400"} {
 		if _, problem := launch.DecodePackageInterface(multipleOfInterface("int", value)); problem == nil {
 			t.Fatalf("invalid multiple_of %s accepted", value)
+		}
+	}
+}
+
+func TestMultipleOfActualReferenceImageInterface(t *testing.T) {
+	path := os.Getenv("COZY_TEST_QWEN_INTERFACE")
+	if path == "" {
+		t.Skip("requires the current reference-image interface")
+	}
+	raw, err := os.ReadFile(path)
+	must(t, err)
+	surface, problem := launch.DecodePackageInterface(raw)
+	fatal(t, problem)
+	entry, problem := surface.Function("generate")
+	fatal(t, problem)
+	for _, width := range []int{1024, 1025} {
+		payload := json.RawMessage(fmt.Sprintf(`{"prompt":"A character on white","width":%d,"height":1024}`, width))
+		problem = launch.ValidatePayload("paul/reference-image", entry, payload)
+		if (problem == nil) != (width == 1024) {
+			t.Fatalf("width=%d problem=%v", width, problem)
 		}
 	}
 }
