@@ -19,6 +19,7 @@ import (
 // Both script-owned and forwarded child files must reach the requested directory.
 // The actual CLI/Runtime/native receipts are used; no file or outcome is seeded.
 func TestClientScriptExportsDeclaredFiles(t *testing.T) {
+	integration(t)
 	if *privateScriptRuntimeWheel == "" {
 		t.Skip("requires an exact Runtime wheel")
 	}
