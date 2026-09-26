@@ -22,6 +22,8 @@ use crate::sha256::{self, Sha256};
 use crate::store::{self, Fault, Store};
 use crate::transport::Ledger;
 
+mod identity;
+
 /// The two immutable repository object namespaces a cache may contain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKind {
@@ -236,6 +238,13 @@ impl RepoObjectCache {
         progress: Option<&dyn store::Progress>,
     ) -> Result<CacheWrite> {
         let destination = self.path(kind, &want.sha256)?;
+        // The privileged Runtime and unprivileged Host share one Store owner.
+        // NFS may squash root, so only this synchronous cache operation borrows
+        // that owner's filesystem identity; the Runtime's process IDs stay put.
+        let _identity = match identity::CacheIdentity::for_store(source) {
+            Ok(identity) => identity,
+            Err(_) => return Ok(CacheWrite::Unavailable),
+        };
         let directory = match cache_parent(&self.root, &destination) {
             Ok(directory) => directory,
             Err(_) => return Ok(CacheWrite::Unavailable),
