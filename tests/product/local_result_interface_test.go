@@ -27,16 +27,16 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	fatal(t, problem)
 	entry, problem := surface.Function("main")
 	fatal(t, problem)
-	ifaceDigest, err := canonical.Raw(surface.Digest)
+	ifaceDigest, err := canonical.Raw(assessmentDigest(surface.Raw))
 	must(t, err)
 	revision := &pb.LocalPackageRevision{Package: "local/example", Release: "1.0.0", SourceDigest: canonical.Digest([]byte("source")), PackageInterface: &pb.Ref{Digest: ifaceDigest, Length: uint64(len(raw))}}
 	_, revisionDigest, err := canonical.Identity(revision)
 	must(t, err)
 	spelled, err := canonical.Spell(revisionDigest)
 	must(t, err)
-	capture, captureDigest, err := canonical.Identity(&pb.MachineExecutionCapture{RootRevisionDigest: revisionDigest, Revisions: []*pb.LocalPackageRevision{revision}})
+	capture, captureDigest, err := canonical.Identity(&pb.MachineExecutionCapture{RootInstallationId: revisionDigest, Revisions: []*pb.LocalPackageRevision{revision}})
 	must(t, err)
-	request, _, problem := store.Submit(records.Request{ID: "job-local-result", IdemKey: "local-result", Package: revision.Package, Release: revision.Release, Entrypoint: "main", Kind: "job", PlanID: entry.DescriptorID, Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true, LocalPackageDigest: spelled})
+	request, _, problem := store.Submit(records.Request{ID: "job-local-result", IdemKey: "local-result", Package: revision.Package, Release: revision.Release, Entrypoint: "main", Kind: "job", PlanID: entry.DescriptorID, Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true, LocalInstallationID: spelled})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, "pr-owned-machine"))
 	spec := []byte(`{"invocation":"immutable"}`)
@@ -51,7 +51,7 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Join(replacement, "documents"), 0700))
 	replacementPath := launch.PackageInterfacePath(replacement)
 	must(t, os.WriteFile(replacementPath, []byte(`{}`), 0600))
-	_, problem = store.Activate(records.PackageInstall{ID: "replacement", Package: request.Package, Major: 1, Version: "1.0.1", Dir: replacement, PackageInterface: surface.Digest})
+	_, problem = store.Activate(records.PackageInstall{ID: "replacement", Package: request.Package, Major: 1, Version: "1.0.1", Dir: replacement})
 	fatal(t, problem)
 	must(t, os.Remove(path))
 	resolver := cli.NewResolver(store, config.Config{Home: root, HubURL: "http://127.0.0.1:1"}, nil)
@@ -71,7 +71,7 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	if bound != 200000 {
 		t.Fatal("source cleanup lost the captured result contract")
 	}
-	request.LocalPackageDigest = childDigest("9")
+	request.LocalInstallationID = childDigest("9")
 	if _, problem := resolver.CapturedByteOutputBound(request, "clip", "video/mp4"); problem == nil {
 		t.Fatal("another local root reused this result contract")
 	}

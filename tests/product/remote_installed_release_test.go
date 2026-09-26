@@ -36,7 +36,7 @@ func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 			mux.HandleFunc("GET /v1/packages/proof/releases/releases/{release}", func(w http.ResponseWriter, r *http.Request) {
 				var detail hub.PackageReleaseDetail
 				detail.Release.Release = r.PathValue("release")
-				detail.Release.PackageInterfaceDigest = parsed.Digest
+				detail.Release.PackageInterfaceDigest = assessmentDigest(parsed.Raw)
 				detail.Release.PackageInterfaceLength = int64(len(iface))
 				detail.PackageInterface = iface
 				detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
@@ -55,8 +55,8 @@ func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 				must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(dir)), 0700))
 				must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0600))
 				_, problem = store.Activate(records.PackageInstall{ID: "inst-pinned", Package: "proof/releases", Major: 2,
-					Version: "2.9.0", SourceKind: "tensorhub", Dir: dir, PackageInterface: parsed.Digest,
-					SourceDigest: "sha256:" + strings.Repeat("4", 64), Platform: "linux-x86"})
+					Version: "2.9.0", SourceKind: "tensorhub", Dir: dir,
+					Platform: "linux-x86"})
 				fatal(t, problem)
 			}
 			store.Close()

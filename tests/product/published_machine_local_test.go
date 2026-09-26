@@ -75,7 +75,7 @@ func TestPublishedMachineActualLocalAndNewRootAfterRestart(t *testing.T) {
 	fatal(t, problem)
 	_, problem = store.Activate(records.PackageInstall{ID: "published-local-proof", Package: fixture.Package, Major: 1,
 		Version: fixture.Release, SourceKind: "tensorhub", SourceRef: fixture.Package + "@" + fixture.Release,
-		Dir: installDir, PackageInterface: iface.Digest, SourceDigest: wheelDigest, Platform: "linux-x86_64",
+		Dir: installDir, Platform: "linux-x86_64",
 		Runtime: runtimeFixtureVersion(t, *privateChildRuntimeWheel), Closure: "cozy-runtime>=0.17.2"})
 	fatal(t, problem)
 	defer store.Close()
@@ -91,7 +91,7 @@ func TestPublishedMachineActualLocalAndNewRootAfterRestart(t *testing.T) {
 		}
 		request, problem := store.RequestByIdempotencyKey(key)
 		fatal(t, problem)
-		if request == nil || request.State != "succeeded" || request.LocalPackageDigest != "" || request.Release != fixture.Release || request.Rental {
+		if request == nil || request.State != "succeeded" || request.LocalInstallationID != "" || request.Release != fixture.Release || request.Rental {
 			t.Fatalf("published local request changed origin: %+v", request)
 		}
 		link, problem := store.MachineExecution(request.ID)
@@ -110,7 +110,7 @@ func TestPublishedMachineActualLocalAndNewRootAfterRestart(t *testing.T) {
 		must(t, err)
 		current, err := canonical.Spell(identity)
 		must(t, err)
-		if !bytes.Equal(identity, capture.RootRevisionDigest) || submitted.PreparedState.GetJob().BuildId != current || (build != "" && current != build) {
+		if !bytes.Equal(identity, capture.RootInstallationId) || submitted.PreparedState.GetJob().InstallationId != current || (build != "" && current != build) {
 			t.Fatal("local published Environment identity changed")
 		}
 		build = current

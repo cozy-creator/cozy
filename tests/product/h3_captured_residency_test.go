@@ -62,13 +62,13 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	must(t, err)
 	raw, err = canonical.NormalizeJCS(raw)
 	must(t, err)
-	installed.PackageInterface = assessmentDigest(raw)
+
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0o700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), raw, 0o444))
 	fatal(t, store.RecordInstall(installed))
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID,
-		ChildInstallID: installed.ID, InterfaceDigest: installed.PackageInterface,
-		Module: "h3", Export: "segment", Entrypoint: "segment"}}))
+		ChildInstallID: installed.ID,
+		Module:         "h3", Export: "segment", Entrypoint: "segment"}}))
 	resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.URL}, nil)
 	request := records.Request{InstallID: installed.ID, Package: installed.Package,
 		Entrypoint: "fl2va", Kind: "serving", NeedsAccelerator: true, Models: selected.Models}

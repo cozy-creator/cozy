@@ -67,7 +67,7 @@ func TestNewControllerAcceptsExistingPackageSDKClosure(t *testing.T) {
 	must(t, err)
 	must(t, archive.Close())
 	must(t, file.Close())
-	captured := localpackage.Revision{Files: []localpackage.File{{Kind: "project", Path: path}}}
+	captured := localpackage.Installation{Files: []localpackage.File{{Kind: "project", Path: path}}}
 	fatal(t, localpackage.RequireRuntimeFloor(captured, hostruntime.PackageFloor))
 	if problem := localpackage.RequireRuntimeFloor(captured, hostruntime.ToolFloor); problem == nil {
 		t.Fatal("control: this old package must not claim the new controller API")

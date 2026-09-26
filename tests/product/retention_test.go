@@ -117,8 +117,8 @@ func cleanupTestInstall(l home.Layout, id, version string) records.PackageInstal
 	return records.PackageInstall{
 		ID: id, Package: "cozy/example", Major: 1, Version: version,
 		SourceKind: "tensorhub", SourceRef: "cozy/example@" + version,
-		SourceDigest: "sha256:" + id + id + id + id, Verified: true,
-		Dir: l.InstallDir(id),
+		Verified: true,
+		Dir:      l.InstallDir(id),
 	}
 }
 

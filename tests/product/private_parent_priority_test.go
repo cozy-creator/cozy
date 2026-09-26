@@ -41,11 +41,11 @@ func activeParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T, pinned bool
 	fatal(t, owner.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "otter", State: "ready", SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000,
 		Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	install := records.PackageInstall{ID: "parent-priority", Package: revision.Package, Major: 1, Version: revision.Release,
-		SourceKind: "local", SourceRef: filepath.Join(owner.root, "checkout"), SourceDigest: revision.SourceDigest,
+		SourceKind: "local", SourceRef: filepath.Join(owner.root, "checkout"),
 		Dir: filepath.Join(owner.root, "installs", "parent"), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, problem := owner.store.Activate(install)
 	fatal(t, problem)
-	fatal(t, owner.store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: install.ID, ChildInstallID: install.ID, InterfaceDigest: childDigest("b"), Module: "helper", Export: "compute", Entrypoint: "compute"}}))
+	fatal(t, owner.store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: install.ID, ChildInstallID: install.ID, Module: "helper", Export: "compute", Entrypoint: "compute"}}))
 	intent, err := canonical.NormalizeJCS([]byte(`{"interface_digest":"` + childDigest("b") + `","module":"helper","export":"compute","request":{}}`))
 	must(t, err)
 	var offers atomic.Int32
@@ -75,11 +75,10 @@ func activeParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T, pinned bool
 			return false, err
 		}
 		if offers.Add(1) == 1 {
-			iface, _ := canonical.Raw(childDigest("b"))
 			return false, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ChildCallRequest{ChildCallRequest: &pb.ChildCallRequest{
 				RecordOwnerEpoch: offer.RecordOwnerEpoch, ControlStreamEpoch: offer.ControlStreamEpoch, WorkerBootId: offer.WorkerBootId,
 				ParentRequestId: offer.RequestId, ParentAttemptOrdinal: offer.AttemptOrdinal, ParentInvocationSpecDigest: offer.InvocationSpecDigest,
-				InterfaceDigest: iface, IntentDigest: canonical.Digest(intent), Module: "helper", Export: "compute", RequestCanonicalBytes: []byte(`{}`)}}})
+				IntentDigest: canonical.Digest(intent), Module: "helper", Export: "compute", RequestCanonicalBytes: []byte(`{}`)}}})
 		}
 		childOffers <- proto.Clone(offer).(*pb.AttemptOffer)
 		select {
@@ -95,7 +94,7 @@ func activeParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T, pinned bool
 		}
 		t.Helper()
 		request, _, problem := owner.c.Submit(orchestrator.Submission{IdemKey: id, Package: revision.Package, Entrypoint: "prepare", PlanID: childDigest("4"),
-			Release: revision.Release, LocalPackageDigest: revision.Digest, Payload: []byte(`{}`), Worker: worker, RequestedRental: worker,
+			Release: revision.Release, LocalInstallationID: revision.ID, Payload: []byte(`{}`), Worker: worker, RequestedRental: worker,
 			InstallID: install.ID, Rental: true, RentalRequired: true, Kind: "job", RetainWork: true})
 		fatal(t, problem)
 		return request

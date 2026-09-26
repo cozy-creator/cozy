@@ -56,7 +56,7 @@ func TestPublishedPrivateTreeUsesResolvedSchemaAndImmutableSnapshot(t *testing.T
 	}
 	row, problem := o.store.RequestByIdempotencyKey("prefix")
 	fatal(t, problem)
-	if row == nil || len(row.Assets) != 1 || row.Assets[0].Snapshot == nil || row.LocalPackageDigest != "" || len(row.Trees) != 0 || resolver.calls != 1 {
+	if row == nil || len(row.Assets) != 1 || row.Assets[0].Snapshot == nil || row.LocalInstallationID != "" || len(row.Trees) != 0 || resolver.calls != 1 {
 		t.Fatalf("published Tree did not use exactly one resolved native intake: row=%+v metadata_reads=%d", row, resolver.calls)
 	}
 	link, problem := o.store.MachineExecution(row.ID)
@@ -113,7 +113,7 @@ func TestPublishedOptionalTreeDirectoryActualHost(t *testing.T) {
 		}
 		request, problem := store.RequestByIdempotencyKey(key)
 		fatal(t, problem)
-		if request == nil || request.LocalPackageDigest != "" {
+		if request == nil || request.LocalInstallationID != "" {
 			t.Fatal("Tree input changed published code identity")
 		}
 		if !present {

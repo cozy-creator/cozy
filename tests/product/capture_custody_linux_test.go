@@ -34,7 +34,7 @@ func TestCapturePublicationExcludesTerminalCleanupAcrossProcesses(t *testing.T) 
 	must(t, os.MkdirAll(root, 0700))
 	must(t, os.WriteFile(filepath.Join(root, "revision.json"), raw, 0600))
 	_, _, problem := o.store.Submit(records.Request{ID: "finishing-old", IdemKey: "finishing-old", BodyDigest: revision,
-		Package: "local/restored", Entrypoint: "main", Payload: []byte(`{}`), LocalPackageDigest: revision})
+		Package: "local/restored", Entrypoint: "main", Payload: []byte(`{}`), LocalInstallationID: revision})
 	fatal(t, problem)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -65,11 +65,11 @@ func TestCapturePublicationExcludesTerminalCleanupAcrossProcesses(t *testing.T) 
 	inst := records.PackageInstall{ID: "restored-install", Package: "local/restored", Dir: o.l.InstallDir("restored-install"), Version: "1.0.0"}
 	fatal(t, o.store.RecordInstall(inst))
 	_, _, problem = o.store.Submit(records.Request{ID: "accepted-new", IdemKey: "accepted-new", BodyDigest: revision,
-		Package: "local/restored", InstallID: inst.ID, Entrypoint: "main", Payload: []byte(`{}`), LocalPackageDigest: revision})
+		Package: "local/restored", InstallID: inst.ID, Entrypoint: "main", Payload: []byte(`{}`), LocalInstallationID: revision})
 	fatal(t, problem)
 	must(t, input.Close())
 	must(t, child.Wait())
-	fatal(t, localpackage.DropDigestUnowned(o.l, o.store, revision))
+	fatal(t, localpackage.DropUnowned(o.l, o.store, revision))
 	if _, err := os.Stat(root); err != nil {
 		t.Fatal("accepted request failed to take custody after writer release", err)
 	}

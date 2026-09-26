@@ -90,7 +90,7 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 	metadata, err := os.ReadFile(filepath.Join(root, "revision.json"))
 	must(t, err)
 	must(t, json.Unmarshal(metadata, &receipt))
-	revision := localpackage.Revision{
+	revision := localpackage.Installation{
 		Package: receipt.Package, Release: receipt.Release, SourceDigest: receipt.SourceDigest,
 		Digest: receipt.Digest, PackageInterfaceDigest: receipt.PackageInterfaceDigest,
 		PackageInterfaceLength: receipt.PackageInterfaceLength, Files: receipt.Files,
@@ -103,7 +103,7 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 		if err := pod.verifyClaim(call.Claim, false); err != nil {
 			return err
 		}
-		if spellOfBytes(call.LocalPackageSet.Package.LocalRevisionDigest) != revision.Digest {
+		if spellOfBytes(call.LocalPackageSet.Package.InstallationId) != revision.ID {
 			t.Error("Creator changed the Runtime-measured revision")
 		}
 		pod.mu.Lock()
@@ -120,14 +120,14 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 		opt.Packages = localLauncher{revision: revision}
 	})
 	install := records.PackageInstall{ID: "inst-native-environment", Package: revision.Package, Major: 1,
-		Version: revision.Release, SourceKind: "local", SourceRef: root, SourceDigest: revision.SourceDigest,
+		Version: revision.Release, SourceKind: "local", SourceRef: root,
 		Dir: filepath.Join(o.root, "installs", "fixture"), Python: python, Platform: "linux-x86"}
 	_, problem := o.store.Activate(install)
 	fatal(t, problem)
 	requestID, _, problem := o.c.Submit(orchestrator.Submission{
 		IdemKey: "native-private-environment", Package: revision.Package, Entrypoint: "tile",
 		PlanID:  placement.List("entrypoints")[0].Str("entrypoint_binding_digest"),
-		Release: revision.Release, LocalPackageDigest: revision.Digest,
+		Release: revision.Release, LocalInstallationID: revision.ID,
 		Payload: []byte(`{"size":48}`), Worker: podRental, InstallID: install.ID,
 		Rental: true, RentalRequired: true,
 	})

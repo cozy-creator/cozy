@@ -84,7 +84,7 @@ func (r *uploadReceiver) LocalPackageUpload(stream grpc.BidiStreamingServer[pb.L
 		if offset == h.File.Length {
 			state = pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED
 		}
-		return &pb.LocalPackageFileStatus{OperationId: h.OperationId, SourceDigest: h.SourceDigest,
+		return &pb.LocalPackageFileStatus{OperationId: h.OperationId,
 			Digest: h.File.Digest, Filename: h.File.Filename, Length: h.File.Length,
 			ReceivedBytes: offset, State: state}
 	}
@@ -210,8 +210,8 @@ func uploadFixture(t *testing.T, length int) ([]byte, string, *pb.LocalPackageUp
 	}
 	digest := sha256.Sum256(data)
 	return data, path, &pb.LocalPackageUploadHeader{Claim: &pb.Claim{WorkerBootId: "boot"},
-		OperationId: "operation", SourceDigest: bytes.Repeat([]byte{3}, 32),
-		File: &pb.LocalPackageFileRef{Digest: digest[:], Filename: "example-1.0-py3-none-any.whl", Length: uint64(length)}}
+		OperationId: "operation",
+		File:        &pb.LocalPackageFileRef{Digest: digest[:], Filename: "example-1.0-py3-none-any.whl", Length: uint64(length)}}
 }
 
 func TestUploadPipelinesFourDurableChunksAndNeverMutatesSentMessages(t *testing.T) {
@@ -316,14 +316,14 @@ func TestUploadPreservesRefusalsAndRejectsChangedAcknowledgements(t *testing.T) 
 		}
 	})
 	changes := map[string]func(*pb.LocalPackageFileStatus){
-		"operation": func(a *pb.LocalPackageFileStatus) { a.OperationId = "other" },
-		"source":    func(a *pb.LocalPackageFileStatus) { a.SourceDigest = bytes.Repeat([]byte{8}, 32) },
-		"digest":    func(a *pb.LocalPackageFileStatus) { a.Digest = bytes.Repeat([]byte{8}, 32) },
-		"filename":  func(a *pb.LocalPackageFileStatus) { a.Filename = "other.whl" },
-		"length":    func(a *pb.LocalPackageFileStatus) { a.Length++ },
-		"offset":    func(a *pb.LocalPackageFileStatus) { a.ReceivedBytes++ },
-		"duplicate": func(a *pb.LocalPackageFileStatus) { a.ReceivedBytes = 0 },
-		"skipped":   func(a *pb.LocalPackageFileStatus) { a.ReceivedBytes += 1 << 20 },
+		"operation":       func(a *pb.LocalPackageFileStatus) { a.OperationId = "other" },
+		"source filename": func(a *pb.LocalPackageFileStatus) { a.Filename = "../foreign.whl" },
+		"digest":          func(a *pb.LocalPackageFileStatus) { a.Digest = bytes.Repeat([]byte{8}, 32) },
+		"filename":        func(a *pb.LocalPackageFileStatus) { a.Filename = "other.whl" },
+		"length":          func(a *pb.LocalPackageFileStatus) { a.Length++ },
+		"offset":          func(a *pb.LocalPackageFileStatus) { a.ReceivedBytes++ },
+		"duplicate":       func(a *pb.LocalPackageFileStatus) { a.ReceivedBytes = 0 },
+		"skipped":         func(a *pb.LocalPackageFileStatus) { a.ReceivedBytes += 1 << 20 },
 		"beyond sent": func(a *pb.LocalPackageFileStatus) {
 			a.ReceivedBytes = a.Length
 			a.State = pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED
@@ -356,12 +356,12 @@ func TestUploadPreservesRefusalsAndRejectsChangedAcknowledgements(t *testing.T) 
 
 func TestUploadRequiresCompleteInitialIdentityAndFinalVerification(t *testing.T) {
 	for name, change := range map[string]func(*pb.LocalPackageFileStatus){
-		"operation": func(a *pb.LocalPackageFileStatus) { a.OperationId = "other" },
-		"source":    func(a *pb.LocalPackageFileStatus) { a.SourceDigest = nil },
-		"digest":    func(a *pb.LocalPackageFileStatus) { a.Digest = nil },
-		"filename":  func(a *pb.LocalPackageFileStatus) { a.Filename = "other.whl" },
-		"length":    func(a *pb.LocalPackageFileStatus) { a.Length++ },
-		"offset":    func(a *pb.LocalPackageFileStatus) { a.ReceivedBytes = a.Length + 1 },
+		"operation":         func(a *pb.LocalPackageFileStatus) { a.OperationId = "other" },
+		"missing operation": func(a *pb.LocalPackageFileStatus) { a.OperationId = "" },
+		"digest":            func(a *pb.LocalPackageFileStatus) { a.Digest = nil },
+		"filename":          func(a *pb.LocalPackageFileStatus) { a.Filename = "other.whl" },
+		"length":            func(a *pb.LocalPackageFileStatus) { a.Length++ },
+		"offset":            func(a *pb.LocalPackageFileStatus) { a.ReceivedBytes = a.Length + 1 },
 		"incomplete": func(a *pb.LocalPackageFileStatus) {
 			a.State = pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED
 		},
@@ -411,7 +411,7 @@ func (r *blockedUploadReceiver) LocalPackageUpload(stream grpc.BidiStreamingServ
 	}
 	if !r.beforeInitial {
 		h := frame.GetHeader()
-		if err := stream.Send(&pb.LocalPackageFileStatus{OperationId: h.OperationId, SourceDigest: h.SourceDigest,
+		if err := stream.Send(&pb.LocalPackageFileStatus{OperationId: h.OperationId,
 			Digest: h.File.Digest, Filename: h.File.Filename, Length: h.File.Length,
 			State: pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_RECEIVING}); err != nil {
 			return err
@@ -524,7 +524,7 @@ func TestLocalWheelRequestCancellationInterruptsBlockedUpload(t *testing.T) {
 		return true, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_LocalPackageAbortStatus{LocalPackageAbortStatus: &pb.LocalPackageAbortStatus{
 			RecordOwnerEpoch: abort.RecordOwnerEpoch, ControlStreamEpoch: abort.ControlStreamEpoch,
 			WorkerBootId: abort.WorkerBootId, OperationId: abort.OperationId,
-			SourceDigest: abort.SourceDigest, LocalRevisionDigest: abort.LocalRevisionDigest,
+
 			Outcome: pb.LocalPackageAbortOutcome_LOCAL_PACKAGE_ABORT_OUTCOME_ABANDONED,
 		}}})
 	}}

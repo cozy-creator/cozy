@@ -35,7 +35,7 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 			development, wheel := row.Sub("development"), row.Sub("development").Sub("project_wheel")
 			wheelPath, err := filepath.Abs(filepath.Join(root, wheel.Str("filename")))
 			must(t, err)
-			revision := localpackage.Revision{
+			revision := localpackage.Installation{
 				Package: development.Str("package"), Release: development.Str("release"),
 				SourceDigest: development.Str("source_digest"), Digest: development.Str("local_revision_digest"),
 				PackageInterfaceDigest: row.Sub("package_interface").Str("digest"),
@@ -50,7 +50,7 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 				if err := pod.verifyClaim(call.Claim, false); err != nil {
 					return err
 				}
-				if spell, _ := canonical.Spell(call.LocalPackageSet.Package.LocalRevisionDigest); spell != revision.Digest {
+				if spell, _ := canonical.Spell(call.LocalPackageSet.Package.InstallationId); spell != revision.ID {
 					t.Errorf("preparation changed captured revision: %s", spell)
 				}
 				return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, PlacementSet: code})
@@ -89,7 +89,7 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 			if !bytes.Equal(stage.desired.GetPlacementSet().PlacementSetCanonicalBytes, code.PlacementSetCanonicalBytes) {
 				t.Fatal("Creator changed prepared code bytes")
 			}
-			wanted := revision.Digest
+			wanted := revision.ID
 			if condition == "wrong_revision" {
 				wanted = childDigest("a")
 			}
@@ -136,7 +136,7 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 			}
 			select {
 			case call := <-entered:
-				if spell, _ := canonical.Spell(call.PrivatePlacementSet.LocalRevisionDigest); spell != revision.Digest {
+				if spell, _ := canonical.Spell(call.PrivatePlacementSet.InstallationId); spell != revision.ID {
 					t.Fatal("model preparation changed revision")
 				}
 			case <-time.After(3 * time.Second):

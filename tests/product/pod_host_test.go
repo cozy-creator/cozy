@@ -197,7 +197,7 @@ func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame
 			Materialization: pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
 			Serving:         pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorEpoch: 1,
 			PlacementSetDigest: set.PlacementSetDigest,
-			EnvironmentDigest:  placement.Str("environment_digest"),
+			InstallationId:     placement.Str("installation_id"),
 		}
 		for _, entrypoint := range placement.List("entrypoints") {
 			if digest, err := canonical.Raw(entrypoint.Str("entrypoint_binding_digest")); err == nil {
@@ -497,7 +497,7 @@ func (p *fakePod) LocalPackageUpload(stream grpc.BidiStreamingServer[pb.LocalPac
 	if file.Length == 0 || file.Length > 512<<20 {
 		return status.Error(codes.InvalidArgument, "file size")
 	}
-	state := &pb.LocalPackageFileStatus{OperationId: header.OperationId, SourceDigest: header.SourceDigest,
+	state := &pb.LocalPackageFileStatus{OperationId: header.OperationId,
 		Digest: file.Digest, Filename: file.Filename, Length: file.Length,
 		State: pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_RECEIVING}
 	if err := stream.Send(state); err != nil {
@@ -571,15 +571,12 @@ func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream g
 		PlacementId: "package-" + selected.OperationId,
 		PackageMode: &pb.Placement_Development{Development: &pb.DevelopmentPackage{
 			Package: selected.Package.Package, Release: selected.Package.Release,
-			SourceDigest: selected.Package.SourceDigest, LocalRevisionDigest: selected.Package.LocalRevisionDigest,
-			ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: project.Digest, Length: project.Length},
-				Distribution: "weightless", Version: selected.Package.Release, Filename: project.Filename,
-				ImportRoots: []string{"weightless"}, Tags: []string{"py3-none-any"}}}},
-		EnvironmentDigest: bytes.Repeat([]byte{0x23}, 32),
-		PackageInterface:  &pb.Ref{Digest: bytes.Repeat([]byte{0x24}, 32), Length: 2048},
-		BindingsDigest:    bytes.Repeat([]byte{0x25}, 32),
-		Entrypoints:       entrypoints,
-		Environment:       &pb.Environment{},
+			InstallationId: selected.Package.InstallationId,
+		}},
+		InstallationId:   selected.Package.InstallationId,
+		PackageInterface: fixturePackageInterface,
+		BindingsDigest:   bytes.Repeat([]byte{0x25}, 32),
+		Entrypoints:      entrypoints,
 	}
 	sealPodBindings(placement)
 	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{placement}})
@@ -734,12 +731,10 @@ func podPlacement(downloadSet []byte, name, release, distribution string) *pb.Pl
 		PlacementId: "package-" + hex.EncodeToString(seed[:])[:24],
 		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{
 			Package: name, Release: release}},
-		EnvironmentDigest: sha256Of([]byte("environment:" + name)),
-		PackageInterface:  &pb.Ref{Digest: sha256Of([]byte("interface:" + name)), Length: 2048},
-		BindingsDigest:    sha256Of([]byte("bindings:" + name)),
-		Entrypoints:       []*pb.Entrypoint{podEntrypoint("tile")},
-		Environment: &pb.Environment{LockedRequirements: &pb.Ref{
-			Digest: sha256Of([]byte("locked:" + name)), Length: 1024}},
+		InstallationId:   "fixture-" + hex.EncodeToString(seed[:])[:24],
+		PackageInterface: fixturePackageInterface,
+		BindingsDigest:   sha256Of([]byte("bindings:" + name)),
+		Entrypoints:      []*pb.Entrypoint{podEntrypoint("tile")},
 	}
 }
 
@@ -1050,23 +1045,23 @@ func TestPodHostRefusesUnverifiedHostDocument(t *testing.T) {
 // sealed revision the request's install names. Everything local is out of scope on a pod.
 type localLauncher struct {
 	orchestrator.Launcher
-	revision localpackage.Revision
+	revision localpackage.Installation
 }
 
 // Wire-peer controls use declared synthetic revisions; actual CLI tests exercise
 // the real resolver's sealed metadata gate.
 func (l localLauncher) ValidateExecutionCapture(records.Request) *exit.Error { return nil }
 
-func (l localLauncher) LocalRevision(installID, digest string) (localpackage.Revision, *exit.Error) {
-	if digest != l.revision.Digest {
-		return localpackage.Revision{}, exit.New(exit.NotFound, "no local revision %s", digest)
+func (l localLauncher) LocalInstallation(installID, digest string) (localpackage.Installation, *exit.Error) {
+	if digest != l.revision.ID {
+		return localpackage.Installation{}, exit.New(exit.NotFound, "no local revision %s", digest)
 	}
 	return l.revision, nil
 }
 
 // stageLocalRevision writes one project wheel and one dependency wheel under the root
 // and seals them the way `localpackage.Stage` does: files sorted by digest, one project.
-func stageLocalRevision(t *testing.T, root string) localpackage.Revision {
+func stageLocalRevision(t *testing.T, root string) localpackage.Installation {
 	t.Helper()
 	write := func(name string, body []byte) localpackage.File {
 		path := filepath.Join(root, name)
@@ -1082,28 +1077,26 @@ func stageLocalRevision(t *testing.T, root string) localpackage.Revision {
 		write("weightless-1.0.0-py3-none-any.whl", bytes.Repeat([]byte("project wheel bytes\n"), 180)),
 		write("helper-0.3.0-py3-none-any.whl", bytes.Repeat([]byte("dependency wheel bytes\n"), 90)),
 	}
-	if files[1].Digest < files[0].Digest {
+	if files[1].Filename < files[0].Filename {
 		files[0], files[1] = files[1], files[0]
 	}
-	return localpackage.Revision{Package: "local/weightless", Release: "1.0.0",
-		SourceDigest: "sha256:" + strings.Repeat("31", 32), Digest: "sha256:" + strings.Repeat("32", 32),
-		PackageInterfaceDigest: "sha256:" + strings.Repeat("33", 32), PackageInterfaceLength: 512, Files: files}
+	return localpackage.Installation{ID: "fixture-install", Package: "local/weightless", Release: "1.0.0", PackageInterface: fixturePackageInterface, Files: files, SourceArchive: "source.tar"}
 }
 
 // submitPrivateRental records the editable install the request names and queues the
 // rental-bound request, exactly as `cozy run local/... --rental-only` does.
-func submitPrivateRental(t *testing.T, o *owner, revision localpackage.Revision, idem string) string {
+func submitPrivateRental(t *testing.T, o *owner, revision localpackage.Installation, idem string) string {
 	t.Helper()
-	install := records.PackageInstall{ID: "inst-" + idem, Package: revision.Package, Major: 1, Version: revision.Release,
-		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"), SourceDigest: revision.SourceDigest,
+	install := records.PackageInstall{ID: revision.ID, Package: revision.Package, Major: 1, Version: revision.Release,
+		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"),
 		Dir: filepath.Join(o.root, "installs", idem), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, e := o.store.Activate(install)
 	fatal(t, e)
 	planID := podPlanID(revision.Package)
 	requestID, _, e := o.c.Submit(orchestrator.Submission{
 		IdemKey: idem, Package: revision.Package, Entrypoint: "tile", PlanID: planID,
-		Release:            revision.Release,
-		LocalPackageDigest: revision.Digest, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
+		Release:             revision.Release,
+		LocalInstallationID: revision.ID, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
 		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true,
 	})
 	fatal(t, e)
@@ -1319,9 +1312,9 @@ func TestPodHostJobDirectiveNamesTheStagedBuild(t *testing.T) {
 		t.Fatalf("the pod staged its job plans under no build identity")
 	}
 	directive := pod.jobDirectives[0]
-	if directive.BuildId != pod.stagedJobBuild {
+	if directive.InstallationId != pod.stagedJobBuild {
 		t.Fatalf("the JobDirective names build %q; the pod staged its job plan under %q",
-			directive.BuildId, pod.stagedJobBuild)
+			directive.InstallationId, pod.stagedJobBuild)
 	}
 	if directive.JobDescriptorId != planID {
 		t.Fatalf("the JobDirective names descriptor %q, not the requested %q",
@@ -1331,7 +1324,7 @@ func TestPodHostJobDirectiveNamesTheStagedBuild(t *testing.T) {
 		t.Fatalf("the JobDirective does not reclaim on terminal")
 	}
 	setDigest, _ := canonical.Spell(pod.preparedDig)
-	if directive.BuildId == setDigest {
+	if directive.InstallationId == setDigest {
 		t.Fatalf("the JobDirective names the PlacementSet digest, which the worker never staged under")
 	}
 }

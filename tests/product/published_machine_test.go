@@ -33,20 +33,20 @@ func TestPublishedMachineJobPreservesEnvironmentBuildIdentity(t *testing.T) {
 	must(t, err)
 	buildID, err := canonical.Spell(code)
 	must(t, err)
-	raw, digest, err := canonical.Identity(&pb.MachineExecutionCapture{RootRevisionDigest: code,
+	raw, digest, err := canonical.Identity(&pb.MachineExecutionCapture{RootInstallationId: code,
 		PublishedRevisions: []*pb.PublishedPackageRevision{{Package: &pb.PackageSelection{Package: "alice/ops", Release: "1.0.0"}, Environment: environment, PackageInterface: &pb.Ref{Digest: bytes.Repeat([]byte{8}, 32), Length: 200}}},
 	})
 	must(t, err)
 	request := records.Request{ID: "published-root", IdemKey: "published-root", Kind: "job", Package: "alice/ops", Release: "1.0.0", PlanID: childDigest("9"), Payload: []byte(`{}`), Org: "local"}
-	plan := &orchestrator.JobPlan{Function: "main", DescriptorID: request.PlanID, BuildID: buildID}
+	plan := &orchestrator.JobPlan{Function: "main", DescriptorID: request.PlanID, InstallationID: buildID}
 	submitted, problem := orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan, nil)
 	fatal(t, problem)
 	var spec pb.InvocationSpec
 	must(t, canonical.Unmarshal(submitted.Offer.InvocationSpecCanonicalBytes, &spec))
-	if spec.GetJob().BuildId != buildID || submitted.PreparedState.GetJob().BuildId != buildID || request.LocalPackageDigest != "" {
+	if spec.GetJob().InstallationId != buildID || submitted.PreparedState.GetJob().InstallationId != buildID || request.LocalInstallationID != "" {
 		t.Fatal("published code acquired a private revision identity")
 	}
-	plan.BuildID = childDigest("a")
+	plan.InstallationID = childDigest("a")
 	if _, problem := orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan, nil); problem == nil {
 		t.Fatal("a different prepared build was accepted")
 	}
@@ -75,7 +75,7 @@ func (publishedRouteObserver) Control(context.Context, records.Request, string) 
 
 func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
 	o := hostOwner(t, "published-machine-routing")
-	_, problem := o.store.Activate(records.PackageInstall{ID: "published-local-install", Package: "alice/ops", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir(), PackageInterface: childDigest("8"), SourceDigest: childDigest("7"), Platform: "linux-x86_64"})
+	_, problem := o.store.Activate(records.PackageInstall{ID: "published-local-install", Package: "alice/ops", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir(), Platform: "linux-x86_64"})
 	fatal(t, problem)
 	fatal(t, o.store.RecordRental(records.Rental{ID: "rental-pinned", MachineName: "otter", SKU: "cpu", AcceleratorModel: "CPU", State: "ready", Hub: "http://127.0.0.1:1", Address: "127.0.0.1:1", AcceleratorCount: 1, HourlyRateUSDMicros: 1}))
 	const bearer = "published-machine-routing-fixture"
@@ -108,7 +108,7 @@ func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
 		fatal(t, problem)
 		link, problem := o.store.MachineExecution(row.ID)
 		fatal(t, problem)
-		if (link != nil) != (arm == "pinned" || arm == "local") || row.LocalPackageDigest != "" {
+		if (link != nil) != (arm == "pinned" || arm == "local") || row.LocalInstallationID != "" {
 			t.Fatalf("%s changed published routing or code origin", arm)
 		}
 	}
@@ -159,7 +159,7 @@ func startPublishedMachineHost(t *testing.T, configure ...func(*fakeRentalHub)) 
 			case "/v1/packages/" + fixture.Package + "/releases/" + fixture.Release:
 				var detail hub.PackageReleaseDetail
 				detail.Release.Release = fixture.Release
-				detail.Release.PackageInterfaceDigest = iface.Digest
+				detail.Release.PackageInterfaceDigest = assessmentDigest(iface.Raw)
 				detail.Release.PackageInterfaceLength = int64(len(iface.Raw))
 				detail.PackageInterface = iface.Raw
 				detail.ExecutionRequirements = []string{"cozy-runtime>=0.17.2"}
@@ -203,7 +203,7 @@ func TestPublishedMachineActualHostAndNewRootAfterRestart(t *testing.T) {
 		}
 		request, problem := store.RequestByIdempotencyKey(key)
 		fatal(t, problem)
-		if request == nil || request.State != "succeeded" || request.LocalPackageDigest != "" || request.Release != fixture.Release {
+		if request == nil || request.State != "succeeded" || request.LocalInstallationID != "" || request.Release != fixture.Release {
 			t.Fatalf("published request changed origin or failed: %+v", request)
 		}
 		link, problem := store.MachineExecution(request.ID)
@@ -222,7 +222,7 @@ func TestPublishedMachineActualHostAndNewRootAfterRestart(t *testing.T) {
 		must(t, err)
 		current, err := canonical.Spell(identity)
 		must(t, err)
-		if !bytes.Equal(identity, capture.RootRevisionDigest) || submitted.PreparedState.GetJob().BuildId != current || (build != "" && current != build) {
+		if !bytes.Equal(identity, capture.RootInstallationId) || submitted.PreparedState.GetJob().InstallationId != current || (build != "" && current != build) {
 			t.Fatal("published build identity changed across re-preparation")
 		}
 		build = current

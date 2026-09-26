@@ -28,12 +28,12 @@ func TestBuiltinAvailabilityDoesNotStripAnOrdinaryJobsGPU(t *testing.T) {
 			parent.Closure = "cozy-runtime==0.16.8\ntorch==2.13.0"
 			raw, err := canonical.NormalizeJCS([]byte(`{"format":"cozy.package.interface/1","application":"` + application + `","entrypoints":[],"jobs":[{"name":"run","models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false}]}`))
 			must(t, err)
-			parent.PackageInterface, _ = canonical.Spell(canonical.Digest(raw))
+
 			must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(parent.Dir)), 0700))
 			must(t, os.WriteFile(launch.PackageInterfacePath(parent.Dir), raw, 0400))
 			fatal(t, store.RecordInstall(parent))
 			fatal(t, store.RecordInstall(child))
-			fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: parent.ID, ChildInstallID: child.ID, InterfaceDigest: childDigest("a"), LocalRevisionDigest: childDigest("b"), Module: runtimeoperation.Module, Export: "quantize", Entrypoint: "quantize"}}))
+			fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: parent.ID, ChildInstallID: child.ID, Module: runtimeoperation.Module, Export: "quantize", Entrypoint: "quantize"}}))
 			resolver := cli.NewResolver(store, config.Config{Home: layout.Root}, nil)
 			jobs, problem := resolver.JobsInstall(parent.ID)
 			fatal(t, problem)

@@ -34,7 +34,7 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	var detail hub.PackageReleaseDetail
 	detail.PackageInterface = iface
 	detail.Release.Release = "1.0.0"
-	detail.Release.PackageInterfaceDigest = contract.Digest
+	detail.Release.PackageInterfaceDigest = assessmentDigest(contract.Raw)
 	detail.Release.PackageInterfaceLength = int64(len(iface))
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
 	var mu sync.Mutex

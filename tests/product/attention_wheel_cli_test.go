@@ -95,7 +95,7 @@ only-include = ["attention_wheel_proof.py"]
 		}
 	}
 	var originalWheel []byte
-	var revisions []localpackage.Revision
+	var revisions []localpackage.Installation
 	for i, candidate := range []string{"A", "B", "A"} {
 		if i == 2 {
 			must(t, os.WriteFile(wheelPath, originalWheel, 0600))
@@ -182,9 +182,9 @@ with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as target:
 			t.Fatal("rented-worker capture omitted the candidate wheel")
 		}
 		revisions = append(revisions, revision)
-		t.Logf("candidate=%s request=%s pin=%s revision=%s", candidate, request.ID, request.AttentionKernel, revision.Digest)
+		t.Logf("candidate=%s request=%s pin=%s revision=%s", candidate, request.ID, request.AttentionKernel, revision.ID)
 	}
-	if revisions[0].Digest == revisions[1].Digest || revisions[0].Digest != revisions[2].Digest {
-		t.Fatalf("same-version A/B/A bytes lost their capture identity: %s %s %s", revisions[0].Digest, revisions[1].Digest, revisions[2].Digest)
+	if revisions[0].ID == revisions[1].ID || revisions[0].ID != revisions[2].ID {
+		t.Fatalf("same-version A/B/A bytes lost their capture identity: %s %s %s", revisions[0].ID, revisions[1].ID, revisions[2].ID)
 	}
 }

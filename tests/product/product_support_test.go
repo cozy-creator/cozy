@@ -187,10 +187,9 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 		PlacementId: "plc-fake-" + name,
 		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{
 			Package: "fake/" + name, Release: "1.0.0"}},
-		EnvironmentDigest: canonical.Digest(environmentBytes),
-		PackageInterface:  ref("fake-interface"), BindingsDigest: canonical.Digest(bindingsBytes),
+		InstallationId:   canonical.Digest(environmentBytes),
+		PackageInterface: ref("fake-interface"), BindingsDigest: canonical.Digest(bindingsBytes),
 		Entrypoints: []*pb.Entrypoint{{Name: "fake", EntrypointBindingDigest: entrypointDigest}},
-		Environment: &pb.Environment{},
 	}}})
 	setID := spelled(setDigest)
 	placement, problem := orchestrator.PlacementFromExact("fake/"+name, "", setID,
