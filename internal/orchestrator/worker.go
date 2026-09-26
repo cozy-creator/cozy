@@ -419,7 +419,6 @@ type worker struct {
 	// localMu serializes ConvergeLocalPackage on this worker. It is never held by the
 	// control stream's receive loop, whose reports the holder waits on.
 	localMu   sync.Mutex
-	localCode *localPreparedCode // guarded by localMu; valid only for this live worker/base
 	// hostPrepareSeq numbers the logical desires issued through PodHost (proto-025); a
 	// prepare that completes for an older number sends nothing.
 	hostPrepareSeq uint64

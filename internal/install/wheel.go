@@ -115,7 +115,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	}
 	fail := func(problem *exit.Error) (*Result, *exit.Error) { _ = os.RemoveAll(dir); return nil, problem }
 	root, ok := dependencies[project]
-	if !ok || root.Path == "" || root.ID == "" || !root.Application {
+	if !ok || root.Path == "" || root.Digest == "" || !root.Application {
 		return fail(exit.New(exit.Validation, "captured wheel install requires its exact App wheel"))
 	}
 	original, problem := retainOriginalWheel(dir, root)
@@ -154,7 +154,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 		requirements = append(requirements, dependency.Requirement)
 		item := identity{Name: name, Version: dependency.Version, Wheel: dependency.Digest}
 		if name == project {
-			item.OriginalWheel = root.ID
+			item.OriginalWheel = root.Digest
 		}
 		if dependency.Path == "" {
 			item.BaseRequirement = dependency.Requirement
@@ -167,7 +167,6 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if err != nil {
 		return fail(exit.Internalf("cannot identify captured wheel closure"))
 	}
-	digest, _ := canonical.Spell(canonical.Digest(raw))
 	if err := os.WriteFile(filepath.Join(dir, "wheel-capture.json"), raw, 0o400); err != nil {
 		return fail(exit.Internalf("cannot retain captured wheel capture identity"))
 	}

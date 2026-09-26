@@ -113,10 +113,6 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		return nil, empty, "", nil, exit.Named(exit.Structural, "package_interface_invalid",
 			"the release commits an invalid package interface: %s", problem.Message)
 	}
-	if packageInterface.Digest != published.Selection.PackageInterface.Digest {
-		return nil, empty, "", nil, exit.Named(exit.Structural, "package_interface_invalid",
-			"the release package interface does not match its committed digest")
-	}
 	// Installing code is not permission to run its imports or constructors.
 	// Serving selections are prepared by the claimed worker before activation.
 	return packageInterface, empty, runtimeBin, environment, nil

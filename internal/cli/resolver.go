@@ -394,10 +394,6 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if packageInterface.Digest != detail.Release.PackageInterfaceDigest {
-		return empty, nil, exit.Named(exit.Conflict, "rental.package_interface_digest_mismatch",
-			"Tensorhub package interface bytes do not match their release fact")
-	}
 	entrypoint, problem := packageInterface.Function(function)
 	if problem != nil {
 		return empty, nil, problem
@@ -515,7 +511,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, function string,
 		return empty, nil, problem
 	}
 	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
-	if problem != nil || packageInterface.Digest != detail.Release.PackageInterfaceDigest {
+	if problem != nil {
 		return empty, nil, exit.Named(exit.Conflict, "rental.package_interface_digest_mismatch",
 			"Tensorhub package interface bytes do not match their release fact")
 	}

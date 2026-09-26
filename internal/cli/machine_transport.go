@@ -27,10 +27,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
 func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConnection, *exit.Error) {
@@ -115,11 +113,11 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		ready, problem := readMachinePreparedSet(stream)
+		event, problem := readMachinePreparationEvent(stream)
 		if problem != nil {
 			return nil, problem
 		}
-		return &publishedPreparation{ready, facts.LockedRequirements}, nil
+		return &publishedPreparation{DesiredPlacementSet: event.PlacementSet, InstalledPackage: event.InstalledPackage, LockedRequirements: facts.LockedRequirements}, nil
 	}
 
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
@@ -367,7 +365,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 			if err != nil {
 				return nil, machineTransport(err)
 			}
-			return &publishedPreparation{prepared.PlacementSet, locked}, validateMachinePrepared(prepared.PlacementSet)
+			return &publishedPreparation{DesiredPlacementSet: prepared.PlacementSet, InstalledPackage: prepared.InstalledPackage, LockedRequirements: locked}, validateMachinePrepared(prepared.PlacementSet)
 		}
 
 		facts, problem := m.resolver.installFacts(request.InstallID)
@@ -398,7 +396,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		return &publishedPreparation{prepared.PlacementSet, locked}, validateMachinePrepared(prepared.PlacementSet)
+		return &publishedPreparation{DesiredPlacementSet: prepared.PlacementSet, InstalledPackage: prepared.InstalledPackage, LockedRequirements: locked}, validateMachinePrepared(prepared.PlacementSet)
 	}
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
 		return preparation.WorkspaceRetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
