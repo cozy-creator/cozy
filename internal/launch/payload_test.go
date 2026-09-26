@@ -52,6 +52,20 @@ func TestParsePayloadInputModelEnvelopePreservesOrder(t *testing.T) {
 	}
 }
 
+func TestParsePayloadInlineOverlayShorthandRepeatsInOrder(t *testing.T) {
+	_, keys, problem := ParsePayload(overlayEntrypoint(), []string{
+		`base_model.lora=org/a@1,weight=0.5`,
+		`model.base_model.lora=org/b@1,weight=-0.25`,
+	}, "")
+	if problem != nil {
+		t.Fatalf("ParsePayload refused: %v", problem)
+	}
+	got := keys.Overlays["generate.models.base_model"]
+	if len(got) != 2 || got[0].Ref != "org/a@1" || got[1].Ref != "org/b@1" {
+		t.Fatalf("shorthand order = %#v", got)
+	}
+}
+
 func TestParsePayloadRejectsInvalidOverlayWeight(t *testing.T) {
 	_, _, problem := ParsePayload(overlayEntrypoint(), []string{
 		`model.base_model.lora=org/style@1,weight=nan`,
