@@ -28,6 +28,7 @@ type childIntake struct {
 	ownedPackage      bool
 	prepared          *install.Result
 	remoteEnvironment *records.PackageInstall
+	remoteCapture     bool
 }
 
 func (i *childIntake) Finish(parentInstall string) *exit.Error {
@@ -67,6 +68,7 @@ func (i *childIntake) Install() (*install.Result, *exit.Error) {
 	}
 	result, problem := install.Run(i.layout, i.store, install.Request{Ref: install.Ref{Package: "local/" + i.Package.Name}, Snapshot: true,
 		RemoteEnvironment: i.remoteEnvironment,
+		RemoteCapture:     i.remoteCapture,
 		Local:             &install.LocalSource{Bytes: size, Files: files, Package: "local/" + i.Package.Name, Release: i.Package.Release, Tree: i.Package.Tree}})
 	if problem == nil {
 		i.prepared = result
@@ -88,7 +90,8 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 	}
 	stack[pack.Tree] = true
 	defer delete(stack, pack.Tree)
-	intake := &childIntake{Package: pack, layout: layout, store: store, remoteEnvironment: remote}
+	intake := &childIntake{Package: pack, layout: layout, store: store, remoteEnvironment: remote,
+		remoteCapture: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || ctx.Inv.Value("--rental") != ""}
 	fail := func(problem *exit.Error) (*childIntake, *exit.Error) { intake.Close(); return nil, problem }
 	dependencies, problem := packagepublish.LocalDependencySelections(pack.Tree)
 	if problem != nil {
