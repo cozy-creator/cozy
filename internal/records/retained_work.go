@@ -47,11 +47,17 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 	retained, stopped := prior.RetainWork, prior.State == "paused" || prior.State == "blocked" || prior.State == "succeeded" && retainedResult
 	if request.MachineExecutionObserver {
 		var machineRetained bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND length(e.receipt)>0 AND length(e.pending_control)=0 AND e.cancel_requested=0 AND `+machineExecutionOwed+`)`, prior.ID).Scan(&machineRetained); err != nil {
+		// Preparation can block before any submission exists. Its retained client
+		// intent is retryable without inventing Runtime custody; a sent submission
+		// with a missing receipt must still reconcile possible acceptance first.
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id
+			WHERE r.id=? AND length(e.pending_control)=0 AND e.cancel_requested=0 AND (
+			(length(e.receipt)>0 AND `+machineExecutionOwed+`) OR
+			(r.state='blocked' AND r.retain_work=1 AND length(e.submission)=0 AND length(e.receipt)=0 AND NOT `+machineExecutionLost+`)))`, prior.ID).Scan(&machineRetained); err != nil {
 			return exit.Internalf("cannot inspect predecessor machine custody: %s", err)
 		}
 		retained = machineRetained
-		stopped = machineRetained && (prior.State == "failed" || prior.State == "paused" || prior.State == "succeeded")
+		stopped = machineRetained && (prior.State == "failed" || prior.State == "paused" || prior.State == "blocked" || prior.State == "succeeded")
 	}
 	if !request.RetainWork || request.Kind != "job" || !retained || !prior.IsJob() || !stopped {
 		return exit.Named(exit.Conflict, "request.retry_refused", "retry predecessor %s must retain stopped work; current state %s", prior.ID, prior.State)
