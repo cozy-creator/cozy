@@ -71,7 +71,7 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 	}()
 	var intake *childIntake
 	var result *install.Result
-	problem = packagePublishStage(ctx, "Preparing local script environment", func() *exit.Error {
+	problem = packagePublishStage(ctx, "Capturing local package and dependencies", func() *exit.Error {
 		var problem *exit.Error
 		intake, problem = prepareChildIntake(ctx, pack, layout, store)
 		if problem != nil {
