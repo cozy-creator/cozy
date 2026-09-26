@@ -118,7 +118,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 		// Root defaults are recorded by the caller after the entire binding inventory exists.
 		for key, node := range nodes {
 			if key != rootKey {
-				m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.installationID, node.iface, request.Rental, connection.publicOrigin)
+				m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.installationID, node.iface, request, connection.publicOrigin)
 			}
 		}
 	}
@@ -136,12 +136,12 @@ func addPublishedBindings(capture *pb.MachineExecutionCapture, caller, callee st
 
 // The worker installs a published child directly. This does not change the
 // user's active local package pin or create a client-side inference environment.
-func (m *machineRuns) publishedChildPreparation(ctx context.Context, request records.Request) (*hub.PackageDownloadPlan, *launch.PackageInterface, []byte, string, *exit.Error) {
+func (r *Resolver) publishedChildPreparation(ctx context.Context, command *Context, request records.Request) (*hub.PackageDownloadPlan, *launch.PackageInterface, []byte, string, *exit.Error) {
 	ref, problem := hub.ParseRef(request.Package)
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
-	plan, problem := m.resolver.catalog.PackageDownloads(ctx, ref, request.Release)
+	plan, problem := r.catalog.PackageDownloads(ctx, ref, request.Release)
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
@@ -165,7 +165,7 @@ func (m *machineRuns) publishedChildPreparation(ctx context.Context, request rec
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
-	source, problem := packageInstallPlanFacts(m.context, ref, request.Release, plan, config, ifaceDoc, pyproject, uvLock)
+	source, problem := packageInstallPlanFacts(command, ref, request.Release, plan, config, ifaceDoc, pyproject, uvLock)
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
@@ -173,7 +173,7 @@ func (m *machineRuns) publishedChildPreparation(ctx context.Context, request rec
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
-	detail, problem := m.resolver.catalog.PackageRelease(ctx, ref, request.Release)
+	detail, problem := r.catalog.PackageRelease(ctx, ref, request.Release)
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}

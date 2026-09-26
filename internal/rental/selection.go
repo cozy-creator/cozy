@@ -48,9 +48,19 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 		}
 		c := orchestrator.PlacementCandidate{SKU: sku.Name, GPUs: sku.AcceleratorCount,
 			RateUSDMicrosPerHour: sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour}
-		Size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job, constraints.Working)
+		size(&c, models, sku.AcceleratorModel, sku.VRAMGB, needsAccelerator, job, constraints.Working, true)
 		if c.Verdict == "" {
-			c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
+			requested := 0
+			for _, model := range c.Models {
+				requested = max(requested, model.GPUs)
+			}
+			if requested > 0 {
+				if requested != sku.AcceleratorCount {
+					c.Verdict = orchestrator.VerdictNoRung
+				}
+			} else {
+				c.Verdict = WidthUnusable(sku.AcceleratorCount, job, constraints)
+			}
 		}
 		if c.Verdict == "" {
 			c.Verdict = baseMismatch(sku, constraints)
@@ -73,8 +83,13 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 // Other selections retain the legacy weights-plus-working estimate.
 func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
 	vramGB int64, device, job bool, working records.WorkingPeaks) {
+	size(c, models, accelerator, vramGB, device, job, working, false)
+}
+
+func size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
+	vramGB int64, device, job bool, working records.WorkingPeaks, purchase bool) {
 	var ok bool
-	if c.Models, c.Rung, ok = Pin(models, accelerator); !ok {
+	if c.Models, c.Rung, ok = pin(models, accelerator, c.GPUs, purchase); !ok {
 		c.Verdict = orchestrator.VerdictNoRung
 		return
 	}
@@ -116,18 +131,25 @@ func WithWorking(need records.Residency, peak records.WorkingPeak) records.Resid
 	return need
 }
 
-// Pin binds the selection to the rung fitting `accelerator`: the pinned refs, the first
-// slot's 1-based rung — 0 when that slot pinned its own lane, which is not a rung
-// (cl-170) — and whether every slot fits. An empty selection fits anywhere.
-func Pin(models []records.ModelRef, accelerator string) ([]records.ModelRef, int, bool) {
+// Pin selects exact execution groups that fit an existing machine. Rung is the
+// worst selected authored preference, so a singleton child cannot hide another
+// child's fallback. Explicitly pinned selections contribute no ladder rank.
+func Pin(models []records.ModelRef, accelerator string, count int) ([]records.ModelRef, int, bool) {
+	return pin(models, accelerator, count, false)
+}
+
+func pin(models []records.ModelRef, accelerator string, count int, purchase bool) ([]records.ModelRef, int, bool) {
 	rung := 0
 	pinned := make([]records.ModelRef, 0, len(models))
-	for i, model := range models {
-		fitted, index, ok := model.RungFor(accelerator)
+	for _, model := range models {
+		fitted, index, ok := model.RungFor(accelerator, count)
+		if purchase {
+			fitted, index, ok = model.PurchaseRung(accelerator, count)
+		}
 		if !ok {
 			return nil, 0, false
 		}
-		if i == 0 && !model.Pinned() {
+		if !model.Pinned() && index+1 > rung {
 			rung = index + 1
 		}
 		pinned = append(pinned, model.Pin(fitted))

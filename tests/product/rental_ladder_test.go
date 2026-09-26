@@ -397,17 +397,17 @@ func TestRungMatchingIsTheAcceleratorSubsequence(t *testing.T) {
 		}
 	}
 	models := h3Ladder()
-	rung, index, ok := models[0].RungFor("NVIDIA GeForce RTX 5090")
+	rung, index, ok := models[0].RungFor("NVIDIA GeForce RTX 5090", 1)
 	if !ok || index != 2 || rung.Lane != "bf16-full" {
 		t.Fatalf("a 5090 fits rung %d %+v; want the catch-all bf16-full", index, rung)
 	}
-	pinned, first, fits := rental.Pin(models, "NVIDIA H100 NVL")
+	pinned, first, fits := rental.Pin(models, "NVIDIA H100 NVL", 1)
 	if !fits || first != 1 || !pinned[0].Pinned() || pinned[0].Lane != "fp8-adaln-pruned" || len(pinned[0].Ladder) != 3 ||
 		pinned[0].ComponentBytes["text_encoder"] != textEncoderNeed || len(pinned[0].ComponentUse) != len(h3ComponentUse()) {
 		t.Fatalf("pinning to an H100 NVL gave %+v (rung %d, fits %t)", pinned, first, fits)
 	}
 	models[0].Ladder = models[0].Ladder[:1]
-	if _, _, fits := rental.Pin(models, "NVIDIA H200"); fits {
+	if _, _, fits := rental.Pin(models, "NVIDIA H200", 1); fits {
 		t.Fatal("an H200 fits an H100-only ladder")
 	}
 }
@@ -437,7 +437,7 @@ func TestRentalPinCarriesTheLaneAndARejectedBuyFreesTheNextRung(t *testing.T) {
 		row.Models[0].ComponentUse["sample_fl2va"][0] != "fl2va_dit" {
 		t.Fatalf("the unpinned ladder and its sizing facts did not survive the row: %+v", row.Models)
 	}
-	pinned, _, _ := rental.Pin(h3Ladder(), "NVIDIA H100 80GB HBM3")
+	pinned, _, _ := rental.Pin(h3Ladder(), "NVIDIA H100 80GB HBM3", 1)
 	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "pr-ladder-h100", MachineName: "ladder-h100",
 		SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3", HourlyRateUSDMicros: 2_490_000,
 		State: "ready", Hub: "http://hub.example"}))

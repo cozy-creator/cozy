@@ -9,7 +9,6 @@ import (
 	pep440 "github.com/aquasecurity/go-pep440-version"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -110,27 +109,25 @@ func laneOf(ref hub.Ref, selected *hub.ModelReleaseSummary, lane string) (hub.Mo
 		orNone(strings.Join(names, ", ")))
 }
 
-// localAccelerator is the host's NVIDIA device as the ladder matches it, "" without one.
-func localAccelerator(cfg config.Config) string {
-	inventory := hostgpu.Probe(cfg)
-	if len(inventory.GPUs) == 0 {
-		return ""
-	}
-	return inventory.GPUs[0].Model
-}
-
 // localRung chooses a GPU-specific preference when present, otherwise the first
 // declared lane. The ladder is not a local hardware allowlist: Runtime still
 // checks actual encoding support, construction compatibility and memory capacity.
 func localRung(ctx *Context, ladder []hub.BindingRung) (hub.BindingRung, *exit.Error) {
-	accelerator := localAccelerator(ctx.Cfg)
+	inventory := hostgpu.Probe(ctx.Cfg)
+	accelerator := ""
+	if len(inventory.GPUs) > 0 {
+		accelerator = inventory.GPUs[0].Model
+	}
 	for _, rung := range ladder {
-		if records.RungMatches(rung.GPU, accelerator) {
+		if records.RungMatches(rung.GPU, accelerator) && rung.GPUs <= len(inventory.GPUs) {
 			return rung, nil
 		}
 	}
-	if len(ladder) > 0 {
+	if len(ladder) > 0 && ladder[0].GPUs == 0 {
 		return ladder[0], nil
+	}
+	if len(ladder) > 0 {
+		return hub.BindingRung{}, exit.Named(exit.Validation, "model_gpu_group_unavailable", "no authored group fits the local inventory of %d GPUs (%s)", len(inventory.GPUs), orNone(accelerator))
 	}
 	return hub.BindingRung{}, exit.Named(exit.Validation, "model_ladder_empty",
 		"the model binding has no default lanes").
@@ -168,6 +165,9 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 	}
 	rungs := make([]records.ModelRung, 0, len(spec.Binding.Ladder))
 	for _, rung := range spec.Binding.Ladder {
+		if !slot.AllowsGPUCount(rung.GPUs) {
+			return empty, exit.Named(exit.Validation, "package_model_default_invalid", "%s does not support %d GPUs", slot.Path, rung.GPUs)
+		}
 		lane, problem := laneOf(ref, selected, rung.Lane)
 		if problem != nil {
 			return empty, rebind(problem, packageName, slot.Path)
@@ -179,7 +179,7 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 			return empty, exit.Named(exit.Conflict, "rental.model_manifest_invalid",
 				"Tensorhub returned an invalid manifest for %s@%s/%s", ref.String(), selected.Release, rung.Lane)
 		}
-		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, Lane: rung.Lane,
+		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane,
 			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
 	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(), CatalogRepository: ref.String(),

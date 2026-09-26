@@ -359,6 +359,7 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 			return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
 		}
 		lane := spec.Lane
+		count := 0
 		if !spec.Explicit {
 			// GPU-specific defaults take precedence; an unlisted local GPU uses the
 			// first declared lane and still goes through ordinary Runtime admission.
@@ -366,7 +367,7 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 			if problem != nil {
 				return nil, problem
 			}
-			lane = rung.Lane
+			lane, count = rung.Lane, rung.GPUs
 		}
 		model, problem := acquirePublishedModel(hctx, ctx, tool, client(ctx), spec.Ref,
 			lane, target.Package, slot,
@@ -374,7 +375,7 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 		if problem != nil {
 			return nil, problem
 		}
-		out = append(out, orchestrator.ModelRef{Package: target.Package, Slot: spec.Slot,
+		out = append(out, orchestrator.ModelRef{Package: target.Package, Slot: spec.Slot, GPUs: count,
 			Model: model.Model, CatalogRepository: model.Model, Release: model.Release, Lane: model.Lane,
 			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
 	}
@@ -624,7 +625,7 @@ func assertedRungs(binding *hub.PackageBindingRow, ref hub.Ref, selected *hub.Mo
 		if problem != nil {
 			continue
 		}
-		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, Lane: rung.Lane,
+		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane,
 			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
 	return rungs
