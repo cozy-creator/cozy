@@ -30,7 +30,7 @@ func must(err error) {
 	}
 }
 func main() {
-	keyBytes, err := io.ReadAll(os.Stdin)
+	keyBytes, err := io.ReadAll(os.Stdin) //cozy:stdin-value test identity is supplied privately, never prompted or placed in argv
 	must(err)
 	block, _ := pem.Decode(keyBytes)
 	if block == nil {
