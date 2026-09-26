@@ -46,6 +46,15 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, model := range body.Models {
+		if !model.Downloadable() {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model installation requires a downloadable Hub checkpoint"))
+			return
+		}
+		if body.Package == "" && (model.Package != "" || model.Slot != "" || model.BindingPath != "" || len(model.SharedSlots) > 0) {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "standalone model installation does not accept application slots"))
+			return
+		}
+
 		if model.Model == "" || model.Manifest == "" || body.Package != "" && (model.Package != body.Package || model.Slot == "") {
 			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model installation requires exact model selections and matching package slots when a package is supplied"))
 			return
@@ -60,6 +69,20 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	id := r.PathValue("rental_id")
+	machine, problem := s.store.RentalRow(id)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	if machine == nil {
+		s.refuseTyped(w, r, exit.New(exit.NotFound, "rental %s is not recorded on this host", id))
+		return
+	}
+	if strings.TrimRight(machine.Hub, "/") != strings.TrimRight(s.cfg.HubURL, "/") {
+		s.refuseTyped(w, r, exit.Named(exit.Conflict, "rental.tensorhub_mismatch", "installation rental belongs to a different Tensorhub"))
+		return
+	}
+
 	if s.rentalInstall == nil {
 		s.refuseTyped(w, r, exit.Unavailablef("rental installation queue is unavailable"))
 		return

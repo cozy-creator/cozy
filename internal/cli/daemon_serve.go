@@ -169,7 +169,19 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	fleet.owner = c
 	installContext, cancelInstalls := context.WithCancel(context.Background())
+	installationHub := strings.TrimRight(ctx.Cfg.HubURL, "/")
 	installs := rental.NewInstallQueue(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
+		machine, problem := st.RentalRow(row.RentalID)
+		if problem != nil {
+			return problem
+		}
+		if machine == nil {
+			return exit.Named(exit.Unavailable, "rental.ended", "installation rental no longer exists")
+		}
+		if strings.TrimRight(machine.Hub, "/") != installationHub {
+			return exit.Named(exit.Conflict, "rental.tensorhub_mismatch", "installation belongs to a different Tensorhub")
+		}
+
 		instance, _, _, problem := c.EnsureRentalContext(ctx, row.RentalID)
 		if problem != nil {
 			return problem
@@ -179,6 +191,13 @@ func serveDaemon(ctx *Context) *exit.Error {
 			return problem
 		}
 		defer release()
+		claim, problem := c.RentalExecutionClaim(ctx, row.RentalID)
+		if problem != nil {
+			return problem
+		}
+		if claim.WorkerBootId != row.WorkerBootID {
+			return exit.Named(exit.Conflict, "rental.worker_boot_changed", "installation worker identity changed before preparation")
+		}
 		models := orchestrator.DownloadModelRefs(row.Selection.Models)
 		if len(models) != len(row.Selection.Models) {
 			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
@@ -190,8 +209,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}, ctx.Out)
 	fleet.installs = installs
 	installsStopped := make(chan struct{})
-	go func() { defer close(installsStopped); installs.Run(installContext) }()
-	defer func() { cancelInstalls(); <-installsStopped }()
+	defer cancelInstalls()
 
 	killed, forgotten, e := c.Reconcile()
 	if e != nil {
@@ -244,6 +262,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	updates.Resume()
 	machines.Resume()
+	go func() { defer close(installsStopped); installs.Run(installContext) }()
+	defer func() { cancelInstalls(); <-installsStopped }()
 
 	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
 		addr, strings.Join(bound, "+"), socket)
