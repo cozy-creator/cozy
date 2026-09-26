@@ -157,3 +157,40 @@ func TestRentalModelDownloadQueuesExactSelectionWhileBooting(t *testing.T) {
 		t.Fatalf("missing queue receipt: %s", out.String())
 	}
 }
+
+func TestRentalModelLatestUsesVersionOrderWithoutDates(t *testing.T) {
+	for _, versions := range [][]string{{"2.0.0", "10.0.0"}, {"2.0.0rc2", "2.0.0rc10"}} {
+		t.Run(versions[1], func(t *testing.T) {
+			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				lane := hub.ModelLaneSummary{Lane: "fp8-pruned", ManifestID: "sha256:" + strings.Repeat("c", 64), Bytes: 1}
+				json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "paul", Name: "minimax-h3"}, Releases: []hub.ModelReleaseSummary{
+					{ReleaseSummary: hub.ReleaseSummary{Release: versions[0]}, Lanes: []hub.ModelLaneSummary{lane}},
+					{ReleaseSummary: hub.ReleaseSummary{Release: versions[1]}, Lanes: []hub.ModelLaneSummary{lane}},
+				}})
+			}))
+			defer peer.Close()
+			var grammar cli.CLI
+			var out, diagnostic bytes.Buffer
+			parser, err := kong.New(&grammar, kong.Writers(&out, &diagnostic))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := parser.Parse([]string{"model", "download", "paul/minimax-h3#fp8-pruned", "--rental=kirukiru", "--dry-run"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = parsed.Run(&cli.Runtime{Cfg: config.Config{Home: t.TempDir(), HubURL: peer.URL}, Out: &out, Err: &diagnostic, Mode: output.Mode{JSON: true}}); err != nil {
+				t.Fatal(err)
+			}
+			var result struct {
+				Release string `json:"release"`
+			}
+			if err = json.Unmarshal(out.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Release != versions[1] {
+				t.Fatalf("selected %q, want %q: %s", result.Release, versions[1], out.String())
+			}
+		})
+	}
+}
