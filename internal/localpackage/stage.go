@@ -54,7 +54,11 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 		return Installation{}, problem
 	}
 	defer os.RemoveAll(stage)
-	pack, problem := packagepublish.SnapshotSource(install.SourceRef, filepath.Join(stage, "source"))
+	project := install.ProjectDir
+	if project == "" {
+		project = install.SourceRef
+	}
+	pack, problem := packagepublish.SnapshotSource(project, filepath.Join(stage, "source"))
 	if problem != nil {
 		return Installation{}, problem
 	}
