@@ -23,6 +23,21 @@ import (
 type ImagePreparer func(source string, kind AssetsKind) (string, *exit.Error)
 
 func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []string, prepare ImagePreparer) (json.RawMessage, []records.AssetBinding, *exit.Error) {
+	// JSON filenames join the ordinary --asset path before any fingerprinting or grants.
+	// Clear only these local spellings so setAssetRef can insert their verified identity.
+	var embedded []string
+	var problem *exit.Error
+	payload, problem = mapAssetFilenames(ep, payload, func(path, source string) (any, *exit.Error) {
+		if strings.Contains(source, "://") {
+			return nil, exit.New(exit.Validation, "%s needs a local asset filename, not a URL", path)
+		}
+		embedded = append(embedded, path+"="+source)
+		return nil, nil
+	})
+	if problem != nil {
+		return nil, nil, problem
+	}
+	specs = append(embedded, specs...)
 	if len(specs) == 0 && len(fidelities) == 0 && ep.Assets == nil {
 		return payload, nil, nil
 	}
