@@ -68,8 +68,9 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 // rung still selects the lane, and nothing is compared against memory.
 //
 // Component-staged selections with exact workload/manifest/SKU evidence use the
-// larger of resident weights and the observed total allocator peak. Otherwise the
-// legacy weights-plus-working estimate applies; unmeasured selections say so.
+// larger of resident weights and the observed total allocator peak. Without exact
+// total evidence they use declared residency and report the missing measurement.
+// Other selections retain the legacy weights-plus-working estimate.
 func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
 	vramGB int64, device, job bool, working records.WorkingPeaks) {
 	var ok bool
@@ -94,9 +95,13 @@ func WithWorking(need records.Residency, peak records.WorkingPeak) records.Resid
 	}
 	// A total allocator peak already includes the weights resident in its scope.
 	// Adding the largest unrelated scope's weights would invent co-residency.
-	if need.Fit == records.FitComponents && peak.TotalRuns > 0 && peak.TotalBytes > 0 {
-		need.ObservedTotal, need.ObservedTotalRuns = peak.TotalBytes, peak.TotalRuns
-		need.Bytes = max(need.Bytes, peak.TotalBytes)
+	if need.Fit == records.FitComponents {
+		if peak.TotalRuns > 0 && peak.TotalBytes > 0 {
+			need.ObservedTotal, need.ObservedTotalRuns = peak.TotalBytes, peak.TotalRuns
+			need.Bytes = max(need.Bytes, peak.TotalBytes)
+		}
+		// Legacy working peaks have no co-resident scope. Preserve them as raw
+		// evidence, but do not manufacture a larger staged execution from them.
 		return need
 	}
 	if peak.Runs == 0 {
@@ -164,6 +169,9 @@ func FitNote(need records.Residency, vramGB int64) string {
 	if need.ObservedTotalRuns > 0 {
 		return fmt.Sprintf("max(%s %.1f GiB, measured total %.1f GiB from %d exact runs) = %.1f GiB of %d GB",
 			need.Fit, gib(need.Weights), gib(need.ObservedTotal), need.ObservedTotalRuns, gib(need.Bytes), vramGB)
+	}
+	if need.Fit == records.FitComponents && need.ObservedTotalRuns == 0 {
+		return fmt.Sprintf("%s %.1f GiB (total memory unmeasured for this exact workload/SKU) of %d GB", need.Fit, gib(need.Weights), vramGB)
 	}
 	if need.WorkingRuns == 0 {
 		return fmt.Sprintf("%s %.1f GiB (working memory unmeasured) of %d GB", need.Fit, gib(need.Weights), vramGB)
