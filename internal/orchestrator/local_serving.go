@@ -15,25 +15,18 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/proto"
 )
-
-type localPreparedCode struct {
-	operation, revision, base string
-	result                    *pb.PreparePackageSetResult
-}
 
 // LocalServingPreparation names package metadata retained by the install. It is
 // launch configuration, not a guessed PlacementSet or an invocation binding.
 type LocalServingPreparation struct {
-	PythonVersion          string   `json:"python_version"`
-	PythonRequires         string   `json:"python_requires"`
-	Published              bool     `json:"published"`
-	Application            string   `json:"application"`
-	ModelSlotPaths         []string `json:"model_slot_paths"`
-	PackageInterfaceDigest string   `json:"package_interface_digest"`
-	PackageInterface       []byte   `json:"package_interface"`
-	LockedRequirements     string   `json:"locked_requirements"`
+	PythonVersion      string   `json:"python_version"`
+	PythonRequires     string   `json:"python_requires"`
+	Published          bool     `json:"published"`
+	Application        string   `json:"application"`
+	ModelSlotPaths     []string `json:"model_slot_paths"`
+	PackageInterface   []byte   `json:"package_interface"`
+	LockedRequirements string   `json:"locked_requirements"`
 }
 
 // prepareLocalServing uses the same Runtime preparation messages as the rental
@@ -71,7 +64,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		PlanID: req.PlanID, Models: req.Models, Outputs: splitOutputs(req.Outputs)}
 	c.mu.Lock()
 	already := w.spec.Placement.PlacementSetDigest != "" && selectionServes(req.Models, w.spec.Placement.Models) &&
-		(req.LocalPackageDigest == "" || req.LocalPackageDigest == w.spec.Placement.LocalRevisionDigest) && w.desiredRefusal == nil
+		(req.LocalInstallationID == "" || req.LocalInstallationID == w.spec.Placement.InstallID) && w.desiredRefusal == nil
 	preparedSpec := w.spec
 	c.mu.Unlock()
 	if already && req.ParentRequestID == "" {
@@ -85,7 +78,6 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	var result *pb.PreparePackageSetResult
 	var rpcError error
 	var trailer metadata.MD
-	var preparedCode *localPreparedCode
 	c.ObservePhase(instance, PhaseSample{Name: PhasePreparing, Detail: req.Package})
 	if prep.Published {
 		locked, err := os.ReadFile(prep.LockedRequirements)
@@ -109,37 +101,25 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			PackageInterface: append([]byte(nil), prep.PackageInterface...),
 		})
 	} else {
-		revision, problem := c.opt.Packages.LocalRevision(req.InstallID, req.LocalPackageDigest)
+		revision, problem := c.opt.Packages.LocalInstallation(req.InstallID, req.LocalInstallationID)
 		if problem != nil {
 			return WorkerLaunchSpec{}, "", problem
 		}
-		if revision.Package != req.Package || revision.Release != logical.Release || revision.PackageInterfaceDigest != prep.PackageInterfaceDigest {
-			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "local_package_revision_changed", "local serving revision differs from its install")
+		if revision.Package != req.Package || revision.Release != logical.Release {
+			return WorkerLaunchSpec{}, "", exit.New(exit.Conflict, "local installation differs from selected package")
 		}
-		digest, _ := canonical.Raw(revision.Digest)
 		operation := req.ID
-		base, baseProblem := numericalEnvironment(s)
-		if prior := w.localCode; baseProblem == nil && prior != nil && prior.base == base && prior.revision == revision.Digest {
-			operation = prior.operation
-			result = proto.Clone(prior.result).(*pb.PreparePackageSetResult)
-			c.logf("%s reuses prepared code operation %s", req.ID, operation)
-		} else {
-			files, problem := stageLocalPreparationWheels(spec.InstallRoot, operation, revision)
-			if problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-			source, _ := canonical.Raw(revision.SourceDigest)
-			result, rpcError = s.preparation.PrepareLocalPackage(s.ctx, &pb.PrepareLocalPackageRequest{
-				PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, InstallRoot: spec.InstallRoot, OperationId: operation,
-				Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, SourceDigest: source, LocalRevisionDigest: digest},
-				Wheels:  files, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
-			}, grpc.Trailer(&trailer))
-			if rpcError == nil && result != nil && baseProblem == nil {
-				preparedCode = &localPreparedCode{operation: operation, revision: revision.Digest, base: base, result: proto.Clone(result).(*pb.PreparePackageSetResult)}
-			}
+		files, problem := stageLocalPreparationFiles(spec.InstallRoot, operation, revision)
+		if problem != nil {
+			return WorkerLaunchSpec{}, "", problem
 		}
+		result, rpcError = s.preparation.PrepareLocalPackage(s.ctx, &pb.PrepareLocalPackageRequest{
+			PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, InstallRoot: spec.InstallRoot, OperationId: operation,
+			Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, InstallationId: revision.ID},
+			Files:   files, SourceArchive: revision.SourceArchive, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
+		}, grpc.Trailer(&trailer))
 		if rpcError == nil && len(req.Models) > 0 {
-			call := &pb.PreparePrivatePlacementRequest{OperationId: operation, LocalRevisionDigest: digest, Claim: s.claim}
+			call := &pb.PreparePrivatePlacementRequest{OperationId: operation, InstallationId: revision.ID, Claim: s.claim}
 			if req.ParentRequestID != "" {
 				call.NativeModels, problem = c.nativeServingModels(req)
 			}
@@ -185,15 +165,11 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	if err != nil || len(doc.List("placements")) != 1 {
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "worker.prepare_document_invalid", "local worker returned an invalid placement")
 	}
-	row := doc.List("placements")[0]
-	if row.Sub("package_interface").Str("digest") != prep.PackageInterfaceDigest {
-		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "package_interface_mismatch", "worker package interface differs from retained install")
-	}
 	desired, problem := PlacementFromExact(req.Package, req.InstallID, spellOf(set.PlacementSetDigest), set.PlacementSetCanonicalBytes, map[string][]string{req.Entrypoint: logical.Outputs})
 	if problem != nil {
 		return WorkerLaunchSpec{}, "", problem
 	}
-	if desired.Release != logical.Release || (!prep.Published && desired.LocalRevisionDigest != req.LocalPackageDigest) ||
+	if desired.Release != logical.Release || (!prep.Published && desired.InstallID != req.LocalInstallationID) ||
 		(len(req.Models) > 0 && len(desired.Models) == 0) || !selectionServes(req.Models, desired.Models) {
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "local_preparation_selection_changed", "worker placement differs from accepted code or model selections")
 	}
@@ -216,11 +192,6 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	}
 	if current == nil || (current.State != "queued" && current.State != "submitted") {
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "request.execution_stopped", "request stopped during local model preparation")
-	}
-	if preparedCode != nil {
-		if base, problem := numericalEnvironment(s); problem == nil && base == preparedCode.base {
-			w.localCode = preparedCode
-		}
 	}
 	revision := c.nextRevision()
 	c.mu.Lock()
@@ -278,39 +249,45 @@ func localDownloadSelection(models []ModelRef, packages []*pb.DownloadPackageRef
 	return raw, nil
 }
 
-func stageLocalPreparationWheels(root, operation string, revision localpackage.Revision) ([]*pb.LocalPackageWheel, *exit.Error) {
-	directory := filepath.Join(root, ".stage", operation, "wheels")
+func stageLocalPreparationFiles(root, operation string, revision localpackage.Installation) ([]*pb.LocalPackageFile, *exit.Error) {
+	directory := filepath.Join(root, ".stage", operation, "files")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return nil, exit.Internalf("cannot stage local package wheels: %s", err)
+		return nil, exit.Internalf("cannot stage local package files: %s", err)
 	}
-	rows := make([]*pb.LocalPackageWheel, 0, len(revision.Files))
+	rows := make([]*pb.LocalPackageFile, 0, len(revision.Files))
 	for _, file := range revision.Files {
 		destination := filepath.Join(directory, file.Filename)
 		if filepath.Base(file.Filename) != file.Filename {
-			return nil, exit.New(exit.Validation, "invalid staged wheel name")
+			return nil, exit.New(exit.Validation, "invalid staged file name")
 		}
-		if problem := copyLocalPreparationWheel(file.Path, destination); problem != nil {
+		if problem := copyLocalPreparationFile(file.Path, destination); problem != nil {
 			return nil, problem
 		}
-		digest, err := canonical.Raw(file.Digest)
-		if err != nil {
-			return nil, exit.New(exit.Validation, "invalid staged wheel identity")
+		var digest []byte
+		if file.Digest != "" {
+			var err error
+			digest, err = canonical.Raw(file.Digest)
+			if err != nil {
+				return nil, exit.New(exit.Validation, "invalid staged wheel integrity")
+			}
+		} else if file.Filename != revision.SourceArchive {
+			return nil, exit.New(exit.Validation, "only private source may omit a wheel checksum")
 		}
-		rows = append(rows, &pb.LocalPackageWheel{Digest: digest, Filename: file.Filename, Length: uint64(file.Length), Path: destination})
+		rows = append(rows, &pb.LocalPackageFile{Digest: digest, Filename: file.Filename, Length: uint64(file.Length), Path: destination})
 	}
-	sort.Slice(rows, func(i, j int) bool { return bytes.Compare(rows[i].Digest, rows[j].Digest) < 0 })
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Filename < rows[j].Filename })
 	return rows, nil
 }
 
-func copyLocalPreparationWheel(source, destination string) *exit.Error {
+func copyLocalPreparationFile(source, destination string) *exit.Error {
 	input, err := os.Open(source)
 	if err != nil {
-		return exit.Internalf("cannot read sealed local wheel: %s", err)
+		return exit.Internalf("cannot read local installation file: %s", err)
 	}
 	defer input.Close()
-	output, err := os.CreateTemp(filepath.Dir(destination), ".wheel-")
+	output, err := os.CreateTemp(filepath.Dir(destination), ".file-")
 	if err != nil {
-		return exit.Internalf("cannot stage sealed local wheel: %s", err)
+		return exit.Internalf("cannot stage local installation file: %s", err)
 	}
 	temporary := output.Name()
 	defer os.Remove(temporary)
@@ -323,7 +300,7 @@ func copyLocalPreparationWheel(source, destination string) *exit.Error {
 		err = closed
 	}
 	if err != nil {
-		return exit.Internalf("cannot retain sealed local wheel: %s", err)
+		return exit.Internalf("cannot retain local installation file: %s", err)
 	}
 	if err := os.Rename(temporary, destination); err != nil {
 		return exit.Internalf("cannot commit staged local wheel: %s", err)

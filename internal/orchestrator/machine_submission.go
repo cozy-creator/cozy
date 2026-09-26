@@ -22,9 +22,9 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	if err != nil {
 		return nil, exit.New(exit.Conflict, "machine job has no canonical execution capture")
 	}
-	buildID := rootCapture.Str("root_revision_digest")
-	if _, err := canonical.Raw(buildID); err != nil || (request.LocalPackageDigest != "" && request.LocalPackageDigest != buildID) || (request.LocalPackageDigest == "" && plan.BuildID != buildID) {
-		return nil, exit.New(exit.Conflict, "machine job changed its captured code identity")
+	installationID := rootCapture.Str("root_installation_id")
+	if _, err := canonical.Raw(buildID); err != nil || (request.LocalInstallationID != "" && request.LocalInstallationID != buildID) || (request.LocalInstallationID == "" && plan.InstallationID != buildID) {
+		return nil, exit.New(exit.Conflict, "machine job changed its selected installation")
 	}
 	if request.Trees != "" || request.ModelTransfer != nil {
 		return nil, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; execution was not submitted")
@@ -68,26 +68,26 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	payloadDigest := spellOf(canonical.Digest(request.Payload))
 	publication := &pb.PublicationContract{GrantId: home.ScratchRepo(request.Org, request.ID), Outputs: outputs}
 	spec := &pb.InvocationSpec{
-		DeadlineUnixMs: request.DeadlineUnixMS,
-		PayloadDigest:  payloadDigest, Inputs: inputBindings(request, payloadDigest), Outputs: outputs,
+		DeadlineUnixMs: request.DeadlineUnixMS, InstallationId: installationID,
+		PayloadDigest: payloadDigest, Inputs: inputBindings(request, payloadDigest), Outputs: outputs,
 		AttentionKernel: request.AttentionKernel,
-		Spec:            &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{BuildId: buildID, JobDescriptorId: request.PlanID, PublicationContract: publication}},
+		Spec:            &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{InstallationId: buildID, JobDescriptorId: request.PlanID, PublicationContract: publication}},
 	}
 	raw, digest, err := canonical.Identity(spec)
 	if err != nil {
 		return nil, exit.Internalf("cannot encode machine invocation: %s", err)
 	}
 	root := *plan
-	root.BuildID, root.OrchestrationParent, root.FrozenDirective = buildID, nil, nil
+	root.InstallationID, root.OrchestrationParent, root.FrozenDirective = buildID, nil, nil
 	// The frozen capture also contains self-serving exports which need not have
 	// separate install binding rows. Apply the same composition-parent rule to
 	// those actual capabilities, rather than inferring a GPU from package imports.
 	hasCallees, isCallee := false, false
 	for _, binding := range rootCapture.List("bindings") {
-		if binding.Str("caller_revision_digest") == buildID {
+		if binding.Str("caller_installation_id") == installationID {
 			hasCallees = true
 		}
-		if binding.Str("callee_revision_digest") == buildID && binding.Str("entrypoint") == request.Entrypoint {
+		if binding.Str("callee_installation_id") == installationID && binding.Str("entrypoint") == request.Entrypoint {
 			isCallee = true
 		}
 	}
