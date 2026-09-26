@@ -74,7 +74,9 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	if err != nil {
 		return Installation{}, exit.Internalf("cannot read installed interface: %s", err)
 	}
-	result := Installation{ID: install.ID, Package: install.Package, Release: install.Version, PackageInterface: surface, SourceArchive: "source.tar", PythonVersion: install.Python,
+	// Source is portable across compatible interpreters. The client-observed
+	// Python patch is provenance, not a requirement for the receiving worker.
+	result := Installation{ID: install.ID, Package: install.Package, Release: install.Version, PackageInterface: surface, SourceArchive: "source.tar", PythonRequires: pack.PythonRequires,
 		Files: []File{{Filename: "source.tar", Kind: "source", Length: length}}}
 	return retain(layout, stage, result)
 }
