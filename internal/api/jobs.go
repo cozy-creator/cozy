@@ -301,7 +301,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	handle := JobHandle{
 		MachineExecution: spec.MachineExecutionObserver,
-		Number:           recorded.Number, JobID: jobID, Status: contractStatus(recorded.State), Attempt: attempt,
+		Number:           recorded.Number, JobID: jobID, Status: s.publicStatusOf(recorded), Attempt: attempt,
 		Package: recorded.Package, Function: recorded.Entrypoint,
 		Repo:      publicationRepo,
 		StatusURL: "/v1/local/jobs/" + jobID,
@@ -744,6 +744,8 @@ type JobState struct {
 	ReusedFrom       string                `json:"reused_from,omitempty"`
 	RetainWork       bool                  `json:"retain_work,omitempty"`
 	Retaining        bool                  `json:"retaining,omitempty"`
+	RetryAvailable   bool                  `json:"retry_available,omitempty"`
+	StoppedEventID   int64                 `json:"stopped_event_id,omitempty"`
 	RetryOf          string                `json:"retry_of,omitempty"`
 	ReuseScope       string                `json:"reuse_scope,omitempty"`
 	Number           int64                 `json:"number"`
@@ -910,15 +912,19 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		retaining = row.RetainWork
 	}
 	state := JobState{
-		RetainWork: row.RetainWork,
-		Retaining:  retaining,
-		RetryOf:    row.RetryOf, ReuseScope: row.ReuseScope,
-		Number: row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
+		RetainWork:     row.RetainWork,
+		Retaining:      retaining,
+		RetryAvailable: s.store.RetainedRetryAvailable(row),
+		RetryOf:        row.RetryOf, ReuseScope: row.ReuseScope,
+		Number: row.Number, JobID: row.ID, Status: s.publicStatusOf(row), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		Requeues: row.Requeues, RetryBudget: orchestrator.MaxRequeues,
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
 		EventsURL:    "/v1/requests/" + row.ID + "/events",
 		OutputExport: s.outputExportOf(row.ID),
+	}
+	if row.State == "blocked" && state.Status == "failed" {
+		state.StoppedEventID = s.store.StoppedEventID(row)
 	}
 	if row.State == "blocked" || row.State == "failed" {
 		state.ErrorType, _, state.Error, _ = s.store.SettledFailure(row.ID)
@@ -1062,6 +1068,9 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		}
 	}
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
+	if terminalAt == "" && state.StoppedEventID != 0 {
+		terminalAt = s.store.StoppedEventAt(row)
+	}
 	state.QueuedMS = queuedMS(row, attempts, terminalAt)
 	state.ExecutionMS = executionMS(row, attempts, terminalAt)
 	if frame, ok := s.orchestrator.LatestFrame(row.ID); ok {

@@ -651,7 +651,7 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if before.Kind == "job" {
 		return handleJobCancel(ctx)
 	}
-	if invocationSettled(before.Status) {
+	if invocationSettled(before.Status) && !before.Retaining {
 		fields := append(invocationFields(before), output.Field{K: "changed", V: false})
 		return emit(ctx, compactRecord(fields, "number", "target", "status", "changed"))
 	}
@@ -746,13 +746,13 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"position", "total", "queued", "execution", "attempts", "created", "reason"},
 		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
-			"remaining_ms", "execution_ms", "error_type", "error_code", "error"},
+			"remaining_ms", "execution_ms", "error_type", "error_code", "error", "retaining", "retry_available"},
 		TypedAllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "requested_rental", "requested_machine",
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
-			"created_at", "error_type", "error_code", "error", "triage"},
+			"created_at", "error_type", "error_code", "error", "triage", "retaining", "retry_available"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
 		// human table never does — the human word is the MACHINE column (cl-107).
@@ -797,6 +797,12 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
 			"status": life.Status, "queued_ms": life.QueuedMS, "execution_ms": life.ExecutionMS,
 			"attempts": life.Attempts, "created_at": life.CreatedAt,
+		}
+		if life.Retaining {
+			typed["retaining"] = true
+		}
+		if life.RetryAvailable {
+			typed["retry_available"] = true
 		}
 		if life.RentalID != "" {
 			typed["rental_id"] = life.RentalID
@@ -1312,7 +1318,23 @@ func watch(ctx *Context, c *localapi.Client, requestID string,
 	}()
 
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
-	terminal, e := c.WatchContext(watchCtx, requestID, 0, lines.On)
+	var manualStop *localapi.Event
+	terminal, e := c.WatchContext(watchCtx, requestID, 0, func(event localapi.Event) bool {
+		if event.Type == "request.blocked" {
+			state, problem := c.Request(requestID)
+			if problem == nil && state.Status == "failed" && state.StoppedEventID == event.EventID {
+				projected := publicFailureEvent(event)
+				lines.On(projected)
+				manualStop = &projected
+				return false
+			}
+			return true
+		}
+		return lines.On(event)
+	})
+	if terminal == nil {
+		terminal = manualStop
+	}
 	lines.Done()
 	select {
 	case problem := <-cancelFailed:

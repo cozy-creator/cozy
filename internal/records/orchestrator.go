@@ -1215,19 +1215,27 @@ func (s *Store) Requests(state, packageName string, limit int) ([]Request, *exit
 // RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy run list` reads jobs
 // and the request listing reads serving rows — one table, one reader, two questions.
 func (s *Store) RequestsOfKind(kind, state, packageName string, limit int) ([]Request, *exit.Error) {
-	return s.requestsBefore(kind, state, packageName, limit, 0)
+	return s.requestsBefore(kind, state, packageName, limit, 0, false)
 }
 
 // RequestsBefore reads a bounded history page, excluding the supplied run number.
 func (s *Store) RequestsBefore(state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
-	return s.requestsBefore("", state, packageName, limit, before)
+	return s.requestsBefore("", state, packageName, limit, before, false)
 }
 
-func (s *Store) requestsBefore(kind, state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
+func (s *Store) PublicRequestsBefore(state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
+	return s.requestsBefore("", state, packageName, limit, before, true)
+}
+
+func (s *Store) requestsBefore(kind, state, packageName string, limit int, before int64, public bool) ([]Request, *exit.Error) {
 	// Number only narrow index facts across history; load payloads and other
 	// request documents only for the bounded selected page.
+	selectedState := "state"
+	if public {
+		selectedState = publicRunStatusSQL()
+	}
 	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
-		id,created_at,kind,state,package FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
+  id,created_at,kind,` + selectedState + ` AS state,package FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
 	where := []string{}
 	args := []any{}
 	if before > 0 {

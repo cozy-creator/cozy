@@ -54,13 +54,17 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		view.ObservationError = retentionProblem.Message
 	}
 	state := JobState{
-		Number: row.Number, JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
+		Number: row.Number, JobID: row.ID, Status: s.publicStatusOf(row), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal), Attempts: int(row.Ordinal),
 		RetainWork: row.RetainWork, Retaining: retaining,
-		CreatedAt: row.CreatedAt, EventsURL: "/v1/requests/" + row.ID + "/events", Outputs: []MediaRef{},
+		RetryAvailable: s.store.RetainedRetryAvailable(row),
+		CreatedAt:      row.CreatedAt, EventsURL: "/v1/requests/" + row.ID + "/events", Outputs: []MediaRef{},
 		MachineExecution: view,
 	}
 	state.OutputExport = s.outputExportOf(row.ID)
+	if row.State == "blocked" && state.Status == "failed" {
+		state.StoppedEventID = s.store.StoppedEventID(row)
+	}
 	if row.State == "failed" || row.State == "blocked" {
 		state.ErrorType, _, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
@@ -70,10 +74,11 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		}
 	}
 	if !view.Accepted {
-		state.Stage = "waiting for durable machine acceptance"
-		if len(link.Submission) > 0 && state.Status == "blocked" {
-			state.Status = "queued"
-			state.Stage = "reconciling durable machine acceptance"
+		if state.Status == "queued" {
+			state.Stage = "waiting for durable machine acceptance"
+			if len(link.Submission) > 0 {
+				state.Stage = "reconciling durable machine acceptance"
+			}
 		}
 		if events, problem := s.store.EventsAfter(row.ID, 0, 256); problem == nil {
 			for _, event := range events {
@@ -109,6 +114,20 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	if intervals, problem := s.store.MachineExecutionIntervals(row.ID); problem != nil {
 		view.ObservationError = problem.Message
 	} else {
+		if state.StoppedEventID != 0 {
+			current, present := max(row.Ordinal, 1), false
+			for i := range intervals {
+				if intervals[i].Attempt == current {
+					present = true
+					if intervals[i].FinishedAt == "" {
+						intervals[i].FinishedAt = s.store.StoppedEventAt(row)
+					}
+				}
+			}
+			if !present {
+				intervals = append(intervals, records.MachineExecutionInterval{Attempt: current, FinishedAt: s.store.StoppedEventAt(row)})
+			}
+		}
 		state.ExecutionMS = machineExecutionMS(row, link, intervals, terminal, time.Now().UnixMilli())
 	}
 	return state
