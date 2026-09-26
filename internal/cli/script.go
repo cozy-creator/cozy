@@ -112,18 +112,28 @@ func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInter
 	}
 	defer store.Close()
 	current, problem := exactInvocationInstall(ctx, target)
+	writer.Unlock()
 	if problem != nil {
-		writer.Unlock()
 		return Target{}, nil, problem
 	}
-	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(current.Dir))
+	project := current.ProjectDir
+	if project == "" {
+		project = current.SourceRef
+	}
+	pack, problem := packagepublish.PrepareLocalFrom(project)
 	if problem != nil {
-		writer.Unlock()
 		return Target{}, nil, problem
 	}
-	target.Package, target.InstallID, target.Release = current.Package, current.ID, current.Version
-	target.Snapshot, target.releaseCapture = true, writer.Unlock
-	return target, surface, nil
+	defer pack.Close()
+	// An editable install records its own exports. A job also needs the App
+	// dependency graph, including raw source dependencies such as Qwen, so use
+	// the same intake that a one-off client script uses before accepting it.
+	frozen, surface, problem := snapshotTarget(ctx, pack)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	frozen.Function = target.Function
+	return frozen, surface, nil
 }
 
 func reclaimSnapshot(ctx *Context, target Target) {
