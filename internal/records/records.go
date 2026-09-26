@@ -1573,7 +1573,12 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM pins WHERE install_id=?)
 		OR EXISTS(SELECT 1 FROM requests WHERE install_id=? AND (state IN (`+activeRequestStates+`) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
 		OR EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=? AND parent_install_id!=child_install_id)
-		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`, id, id, id, id).Scan(&held); err != nil {
+		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')
+		OR EXISTS(SELECT 1 FROM installs candidate
+			WHERE candidate.id=? AND candidate.source_kind='local'
+			AND NOT EXISTS(SELECT 1 FROM installs newer
+				WHERE newer.source_kind='local' AND newer.package=candidate.package AND newer.version=candidate.version
+				AND (newer.created_at > candidate.created_at OR (newer.created_at = candidate.created_at AND newer.id > candidate.id))))`, id, id, id, id, id).Scan(&held); err != nil {
 		return false, exit.New(exit.Conflict, "cannot inspect install %s gc ownership: %s", id, err)
 	}
 	if held {
