@@ -249,6 +249,13 @@ from a JSON file. Inline arguments override file values; use `field:=<json>` for
 nested inline value. `--in` remains an alias. `--input-tree` separately binds a job
 input directory.
 
+Schema-declared media fields in a JSON request can contain local filenames, for example
+`"image": "./characters/hero.png"` inside `references`. Relative paths resolve beside
+the JSON file; absolute paths and `~/` also work. Creator verifies and transfers them
+through the same asset bindings as `--asset references.0.image=/path/to/hero.png`.
+Ordinary description/prompt strings are never interpreted as files. Supplying the same
+field in JSON and with `--asset` is an error. These inputs accept local files, not URLs.
+
 `--publish-to` retains each declared weight output as an owner-only immutable checkpoint;
 it does not create public lane pointers. `--source-profile slot=profile` narrows each foreign
 input to a reviewed TensorFS profile. Currently every foreign input must name the same

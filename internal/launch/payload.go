@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -69,6 +70,27 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		var loaded map[string]json.RawMessage
 		if err := json.Unmarshal(data, &loaded); err != nil {
 			return nil, RunKeys{}, exit.New(exit.Validation, "--input %s does not hold one JSON object: %s", infile, err)
+		}
+		// Only declared media fields are filenames; ordinary prompt strings are untouched.
+		data, problem := mapAssetFilenames(ep, data, func(path, source string) (any, *exit.Error) {
+			if strings.Contains(source, "://") {
+				// Defer refusal until after inline overrides replace file values.
+				return source, nil
+			}
+			if filepath.IsAbs(source) || source == "~" || strings.HasPrefix(source, "~/") {
+				return source, nil
+			}
+			absolute, err := filepath.Abs(filepath.Join(filepath.Dir(infile), source))
+			if err != nil {
+				return nil, exit.New(exit.Validation, "cannot resolve %s: %s", path, err)
+			}
+			return absolute, nil
+		})
+		if problem != nil {
+			return nil, RunKeys{}, problem
+		}
+		if err := json.Unmarshal(data, &loaded); err != nil {
+			return nil, RunKeys{}, exit.Internalf("cannot read normalized JSON inputs: %s", err)
 		}
 		for k, v := range loaded {
 			document[k] = v
