@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -108,6 +110,10 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 // CaptureRemoteWheel retains the same exact wheel/interface facts while leaving
 // environment construction to the selected worker.
 func CaptureRemoteWheel(ctx context.Context, layout home.Layout, store *records.Store, project, pythonVersion string, extras []string, dependencies map[string]packagepublish.CapturedDependency, surface *launch.PackageInterface, selected packagepublish.RequirementSelection) (*Result, *exit.Error) {
+	version, err := pep440.Parse(dependencies[hostruntime.Distribution].Version)
+	if err != nil || version.LessThan(pep440.MustParse(hostruntime.PackageFloor)) {
+		return nil, exit.New(exit.Validation, "captured callable closure lacks the required Runtime version")
+	}
 	return captureWheel(ctx, layout, store, "", project, extras, dependencies, surface, pythonVersion, &selected)
 }
 
