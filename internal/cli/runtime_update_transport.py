@@ -175,33 +175,6 @@ def index_file(value: object) -> IndexFile:
 
 WORKER_PYTHONS = ("/opt/cozy/python/bin/python3", "/usr/local/bin/python3")
 
-PROBE = """import importlib.metadata as m, json, platform, subprocess, fcntl, sys
-from packaging.markers import default_environment
-from packaging.tags import sys_tags
-from pathlib import Path
-lock=Path('/var/lib/cozy/dev/update.lock')
-if lock.exists():
- with lock.open('rb') as stream:
-  try:
-   fcntl.flock(stream,fcntl.LOCK_EX|fcntl.LOCK_NB)
-   fcntl.flock(stream,fcntl.LOCK_UN)
-  except BlockingIOError:
-   print(json.dumps({'update_in_progress':True})); raise SystemExit(0)
-runtime=json.loads(subprocess.check_output([str(Path(sys.executable).parent/'cozy-runtime'),'version','--json'],text=True))
-base=Path('/var/lib/cozy/dev/base.json')
-current=Path('/var/lib/cozy/dev/current')
-updater=Path('/opt/cozy/dev/update.py')
-capability_probe=subprocess.run([sys.executable,str(updater),'capabilities'],text=True,capture_output=True) if updater.is_file() else None
-capabilities=json.loads(capability_probe.stdout) if capability_probe and capability_probe.returncode == 0 else {}
-try: torch_version=m.version('torch')
-except m.PackageNotFoundError: torch_version=''
-print(json.dumps({'runtime':runtime,'tensorfs':m.version('tensorfs'),'python':platform.python_version(),
- 'tags':[str(t) for t in sys_tags()], 'updater':base.is_file() and updater.is_file(), 'durable_updates':capabilities.get('durable_updates',False),
- 'selection':str(current.resolve()) if current.exists() else '',
- 'torch':torch_version, 'markers':default_environment()}))
-"""
-
-
 def ssh(arguments: Sequence[str], command: str) -> str:
     result = subprocess.run(
         ["ssh", *arguments, command], capture_output=True, text=True
@@ -222,11 +195,11 @@ def worker_python(arguments: Sequence[str]) -> str:
     return selected
 
 
-def inspect(arguments: Sequence[str], python: str | None = None) -> JSONObject:
+def inspect(arguments: Sequence[str], probe: str, python: str | None = None) -> JSONObject:
     # The script is fixed application code, never a package callback or prompt.
     import shlex
 
-    return mapping(json.loads(ssh(arguments, (python or worker_python(arguments)) + " -I -c " + shlex.quote(PROBE))))
+    return mapping(json.loads(ssh(arguments, (python or worker_python(arguments)) + " -I -c " + shlex.quote(probe))))
 
 
 def fetch(url: str, limit: int) -> bytes:
@@ -393,6 +366,7 @@ def main() -> JSONObject:
     request = mapping(json.load(sys.stdin))
     arguments = strings(request["ssh_arguments"])
     action = text(request["action"])
+    probe = text(request["probe"])
     python = worker_python(arguments)
     if action == "resume":
         stage = text(request["stage"])
@@ -415,9 +389,9 @@ def main() -> JSONObject:
         update = mapping(json.loads(ssh(arguments, python + " /opt/cozy/dev/update.py status " + stage)))
         result: JSONObject = {"update": update}
         if update.get("state") in {"succeeded", "rolled_back", "refused"}:
-            result["observed"] = inspect(arguments, python)
+            result["observed"] = inspect(arguments, probe, python)
         return result
-    observed_document = inspect(arguments, python)
+    observed_document = inspect(arguments, probe, python)
     if request["action"] == "inspect":
         return {"observed": observed_document}
     if observed_document.get("update_in_progress"):
