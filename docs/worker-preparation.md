@@ -24,7 +24,6 @@ Download a model directly into the rental's TensorFS store with a model selector
 ```sh
 cozy model download paul/minimax-h3#fp8-pruned --rental=kirukiru
 cozy model download paul/minimax-h3@1.0.0-rc.2/fp8-pruned --rental=kirukiru
-cozy rental installs kirukiru
 ```
 
 `#fp8-pruned` selects that lane from the newest eligible release containing it.
@@ -42,9 +41,7 @@ kept queued; the daemon delivers its accepted installs in order once its worker
 is ready. The CLI may disconnect, and a restarted daemon resumes the same exact
 selection without re-resolving latest or buying another rental.
 
-`cozy rental installs <name-or-id>` reports queued, installing, succeeded, or
-failed, with typed failure details. Use the returned rental ID to read retained
-history after a rental has ended. Completion requires a verified Host receipt;
+The queue is managed in the background. Completion requires a verified Host receipt;
 acceptance is not completion. Failed boot, rental termination, or a changed
 worker identity ends the install with a typed failure. Interrupted transfers
 reuse the worker's retained download progress when Creator reconnects. The queue

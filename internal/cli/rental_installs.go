@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"strings"
 
 	localapi "github.com/cozy-creator/cozy/internal/client"
@@ -52,43 +51,7 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 	if len(selection.Models) == 0 {
 		record.Notes = append(record.Notes, "no model weights were requested")
 	}
-	record.Next = []string{"cozy rental installs " + rentalID}
 	return emit(ctx, record)
-}
-
-func handleRentalInstalls(ctx *Context) *exit.Error {
-	name := strings.TrimSpace(ctx.Inv.Args[0])
-	_, store, problem := rentalStores(ctx)
-	if problem != nil {
-		return problem
-	}
-	row, problem := store.RentalByMachine(name)
-	store.Close()
-	if problem != nil {
-		return problem
-	}
-	id := name
-	if row != nil {
-		id = row.ID
-	}
-	state, _, problem := ensureDaemon(ctx)
-	if problem != nil {
-		return problem
-	}
-	client, problem := localapi.Open(ctx.Cfg, state)
-	if problem != nil {
-		return problem
-	}
-	rows, problem := client.RentalInstalls(id)
-	if problem != nil {
-		return problem
-	}
-	list := output.List{Name: "installs", Fields: []string{"id", "status", "target", "error"}, AllFields: []string{"id", "rental", "status", "target", "package", "release", "models", "error_code", "error"}, Rows: []map[string]string{}, TypedRows: []map[string]any{}, Total: len(rows)}
-	for _, row := range rows {
-		list.Rows = append(list.Rows, map[string]string{"id": row.ID, "rental": row.RentalID, "status": row.State, "target": rentalInstallTarget(row.Selection), "package": row.Selection.Package, "release": row.Selection.Release, "models": fmt.Sprint(len(row.Selection.Models)), "error_code": row.ErrorCode, "error": row.Error})
-		list.TypedRows = append(list.TypedRows, map[string]any{"id": row.ID, "rental": row.RentalID, "status": row.State, "target": rentalInstallTarget(row.Selection), "package": row.Selection.Package, "release": row.Selection.Release, "models": row.Selection.Models, "error_code": row.ErrorCode, "error": row.Error})
-	}
-	return emit(ctx, list)
 }
 
 func rentalInstallTarget(selection records.RentalInstallSelection) string {

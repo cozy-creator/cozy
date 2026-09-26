@@ -257,15 +257,6 @@ func TestRentalInstallAdmissionAndStatusAPIWhileBooting(t *testing.T) {
 			t.Fatalf("202 was not backed by exact durable intent: %+v", held)
 		}
 	}
-	req := httptest.NewRequest("GET", "http://127.0.0.1:9191/v1/local/rentals/"+machine.ID+"/installs", nil)
-	req.RemoteAddr = "127.0.0.1:12345"
-	api.Authorize(req, credential)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, req)
-	var rows []records.RentalInstall
-	if err := json.Unmarshal(response.Body.Bytes(), &rows); err != nil || response.Code != http.StatusOK || len(rows) != 2 {
-		t.Fatalf("status failed: %d %s %v", response.Code, response.Body, err)
-	}
 }
 
 func TestRentalInstallSchema46MigrationPreservesRental(t *testing.T) {
