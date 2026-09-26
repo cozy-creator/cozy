@@ -72,7 +72,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 44
+const schemaVersion = 45
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -483,6 +483,22 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			}
 		}
 	}
+	if sourceVersion == 44 {
+		// Rebuild with the canonical DDL because schema verification compares exact
+		// released table text. Copy every legacy calibration; unknown totals stay zero.
+		const columns = "request_id,attempt,package,release,entrypoint,models_digest,shape_cell,sku,working_peak_bytes,measured_at"
+		for _, statement := range []string{
+			`ALTER TABLE device_memory_measurements RENAME TO device_memory_measurements_prior45`,
+			deviceMemoryMeasurementsDDL,
+			`INSERT INTO device_memory_measurements(` + columns + `) SELECT ` + columns + ` FROM device_memory_measurements_prior45`,
+			`DROP TABLE device_memory_measurements_prior45`,
+			deviceMemoryMeasurementsIndex,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot preserve device memory measurements: %s", err)
+			}
+		}
+	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
 		if _, err := tx.Exec(statement); err != nil {
 			return exit.Internalf("cannot restore request indexes in %s: %s", path, err)
@@ -855,6 +871,11 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version == 44 && statement == deviceMemoryMeasurementsDDL {
+			for _, column := range []string{" total_peak_bytes INTEGER NOT NULL DEFAULT 0,\n", " request_digest TEXT NOT NULL DEFAULT '',\n", " exact_models_digest TEXT NOT NULL DEFAULT '',\n", " gpu_count INTEGER NOT NULL DEFAULT 0,\n"} {
+				statement = strings.Replace(statement, column, "", 1)
+			}
+		}
 		if version < 44 && (statement == deviceMemoryMeasurementsDDL || statement == deviceMemoryMeasurementsIndex) {
 			continue
 		}

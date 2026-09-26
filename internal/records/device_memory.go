@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -15,8 +17,8 @@ import (
 )
 
 // device_memory_measurements is the measured working-memory ledger (proto-061 B):
-// one row per succeeded attempt whose outcome reported working_peak_device_bytes,
-// the device memory the call used above what was resident when it entered the device.
+// one row per succeeded attempt reporting working or total allocator memory.
+// Working bytes are above the residency baseline; total bytes include that residency.
 // Rows outlive their request; nothing references them.
 const deviceMemoryMeasurementsDDL = `CREATE TABLE IF NOT EXISTS device_memory_measurements (
  request_id TEXT NOT NULL,
@@ -28,6 +30,10 @@ const deviceMemoryMeasurementsDDL = `CREATE TABLE IF NOT EXISTS device_memory_me
  shape_cell TEXT NOT NULL DEFAULT '',
  sku TEXT NOT NULL DEFAULT '',
  working_peak_bytes INTEGER NOT NULL,
+ total_peak_bytes INTEGER NOT NULL DEFAULT 0,
+ request_digest TEXT NOT NULL DEFAULT '',
+ exact_models_digest TEXT NOT NULL DEFAULT '',
+ gpu_count INTEGER NOT NULL DEFAULT 0,
  measured_at TEXT NOT NULL,
  PRIMARY KEY(request_id, attempt)
 )`
@@ -40,11 +46,114 @@ const deviceMemoryMeasurementsIndex = `CREATE INDEX IF NOT EXISTS device_memory_
 type WorkingPeak struct {
 	Bytes int64
 	Runs  int
+	// Total is eligible only after exact request, manifest, SKU and width matching.
+	TotalBytes int64
+	TotalRuns  int
 }
 
 // WorkingPeaks is one (package, release, entrypoint)'s measurements keyed by
-// ModelsDigest.
+// ModelsDigest, with separately prefixed exact model/SKU/width total observations.
 type WorkingPeaks map[string]WorkingPeak
+
+// For returns legacy working evidence plus any exactly matched total observation.
+// A different lane manifest, adapter, SKU or width cannot lower the legacy estimate.
+func (peaks WorkingPeaks) For(models []ModelRef, sku string, width int) WorkingPeak {
+	peak := peaks[ModelsDigest(models)]
+	if key := totalPeakKey(exactModelsDigest(models), sku, width); key != "" {
+		total := peaks[key]
+		peak.TotalBytes, peak.TotalRuns = total.TotalBytes, total.TotalRuns
+	}
+	return peak
+}
+
+func totalPeakKey(models, sku string, width int) string {
+	if models == "" || sku == "" || sku == "local" || width <= 0 {
+		return ""
+	}
+	return "total:" + models + ":" + sku + ":" + strconv.Itoa(width)
+}
+
+func measurementDigest(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	digest, _ := canonical.Spell(canonical.Digest(raw))
+	return digest
+}
+
+func exactMemoryDigest(digest string) bool {
+	raw, err := canonical.Raw(digest)
+	spelled, _ := canonical.Spell(raw)
+	return err == nil && spelled == digest
+}
+
+// exactModelsDigest includes manifests and ordered adapter semantics. Catalog names
+// alone are insufficient for private checkpoints. Sizing and ladder observations
+// are excluded so pinning a candidate produces the same execution identity.
+func exactModelsDigest(models []ModelRef) string {
+	rows := make([]string, 0, len(models))
+	for _, model := range models {
+		if !exactMemoryDigest(model.Manifest) {
+			return ""
+		}
+		adapters := append([]ModelAdapterRef(nil), model.Adapters...)
+		for i := range adapters {
+			if !exactMemoryDigest(adapters[i].Manifest) {
+				return ""
+			}
+			adapters[i].Bytes = 0
+		}
+		slot := model.BindingPath
+		if slot == "" {
+			slot = model.Slot
+		}
+		rows = append(rows, measurementDigest(struct {
+			Package, Slot, Model, Release, Lane, Manifest string
+			Adapters                                      []ModelAdapterRef
+		}{model.Package, slot, model.Model, model.Release, model.Lane, model.Manifest, adapters}))
+	}
+	slices.Sort(rows)
+	return measurementDigest(rows)
+}
+
+// exactMemoryRequest names the workload independently of candidate model pinning.
+// The sealed local delivery covers the complete transported package closure. A
+// published request must already carry its immutable environment identity; a cold
+// request without one retains the legacy estimate. Never replace either with a
+// mutable install name, a package version, or a fingerprint that omits delivery.
+func exactMemoryRequest(req Request) string {
+	delivery := req.LocalPackageDigest
+	if delivery == "" {
+		delivery = req.EnvironmentDigest
+	}
+	if !exactMemoryDigest(delivery) {
+		return ""
+	}
+	payload, err := canonical.NormalizeJCS(req.Payload)
+	if err != nil {
+		return ""
+	}
+	assets := append([]AssetBinding(nil), req.Assets...)
+	for i := range assets {
+		asset := &assets[i]
+		if !exactMemoryDigest(asset.Digest) {
+			return ""
+		}
+		asset.LocalPath = ""
+		if asset.Snapshot != nil {
+			snapshot := *asset.Snapshot
+			snapshot.Path = ""
+			asset.Snapshot = &snapshot
+		}
+	}
+	return measurementDigest(struct {
+		Package, Release, Entrypoint, Kind, Plan, Delivery, Kernel, Trees string
+		Payload                                                           json.RawMessage
+		Assets                                                            []AssetBinding
+	}{req.Package, req.Release, req.Entrypoint, req.Kind, req.PlanID, delivery,
+		req.AttentionKernel, req.Trees, payload, assets})
+}
 
 // ModelsDigest names a pinned model selection: every slot's model, release and
 // lane, and its adapters, independent of order. Sizing facts (bytes, ladders) are
@@ -84,7 +193,7 @@ func (s *Store) WorkingPeaks(req Request) (WorkingPeaks, *exit.Error) {
 	pkg, release, entrypoint := measurementSubject(req)
 	rows, err := s.db.Query(`SELECT models_digest, MAX(working_peak_bytes), COUNT(*)
  FROM device_memory_measurements WHERE package=? AND release=? AND entrypoint=?
- GROUP BY models_digest`, pkg, release, entrypoint)
+ AND working_peak_bytes > 0 GROUP BY models_digest`, pkg, release, entrypoint)
 	if err != nil {
 		return nil, exit.Internalf("cannot read measured working memory for %s: %s", pkg, err)
 	}
@@ -101,12 +210,40 @@ func (s *Store) WorkingPeaks(req Request) (WorkingPeaks, *exit.Error) {
 	if err := rows.Err(); err != nil {
 		return nil, exit.Internalf("cannot read measured working memory for %s: %s", pkg, err)
 	}
+	// The store owns one connection: release the legacy query before reading totals.
+	rows.Close()
+	request := exactMemoryRequest(req)
+	if request == "" {
+		return out, nil
+	}
+	totals, err := s.db.Query(`SELECT exact_models_digest,sku,gpu_count,MAX(total_peak_bytes),COUNT(*)
+ FROM device_memory_measurements WHERE package=? AND release=? AND entrypoint=?
+ AND request_digest=? AND total_peak_bytes>0 AND total_peak_bytes>=working_peak_bytes
+ GROUP BY exact_models_digest,sku,gpu_count`, pkg, release, entrypoint, request)
+	if err != nil {
+		return nil, exit.Internalf("cannot read measured total memory for %s: %s", pkg, err)
+	}
+	defer totals.Close()
+	for totals.Next() {
+		var models, sku string
+		var width int
+		var peak WorkingPeak
+		if err := totals.Scan(&models, &sku, &width, &peak.TotalBytes, &peak.TotalRuns); err != nil {
+			return nil, exit.Internalf("cannot read measured total memory for %s: %s", pkg, err)
+		}
+		if key := totalPeakKey(models, sku, width); key != "" {
+			out[key] = peak
+		}
+	}
+	if err := totals.Err(); err != nil {
+		return nil, exit.Internalf("cannot read measured total memory for %s: %s", pkg, err)
+	}
 	return out, nil
 }
 
 // recordDeviceMemoryTx files a succeeded attempt's working-memory measurement in
-// the terminal's own transaction. An outcome without field 14 (wire < 61, or a
-// CPU run) records nothing.
+// the terminal's own transaction, retaining the total allocator peak from that same
+// attested outcome. Missing metrics never become measured zero memory.
 func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 	if t.Status != "SUCCEEDED" || len(t.Body) == 0 {
 		return nil
@@ -118,19 +255,21 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 		return nil
 	}
 	peak := body.GetMetrics().GetWorkingPeakDeviceBytes()
-	if peak == 0 {
+	total := body.GetMetrics().GetPeakDeviceMemoryBytes()
+	if peak == 0 && total == 0 {
 		return nil
 	}
-	if peak > math.MaxInt64 {
-		return exit.New(exit.Structural, "%s#%d reported an impossible working peak %d", t.RequestID, t.Attempt, peak)
+	if peak > math.MaxInt64 || total > math.MaxInt64 {
+		return exit.New(exit.Structural, "%s#%d reported impossible memory peaks %d/%d", t.RequestID, t.Attempt, peak, total)
 	}
 	req, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, t.RequestID))
 	if err != nil {
 		return exit.Internalf("cannot read request %s for its measurement: %s", t.RequestID, err)
 	}
 	sku := "local"
+	var width int
 	if req.Worker != "" {
-		err := tx.QueryRow(`SELECT sku FROM rentals WHERE id=?`, req.Worker).Scan(&sku)
+		err := tx.QueryRow(`SELECT sku,accelerator_count FROM rentals WHERE id=?`, req.Worker).Scan(&sku, &width)
 		if errors.Is(err, sql.ErrNoRows) {
 			sku = ""
 		} else if err != nil {
@@ -139,9 +278,11 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 	}
 	pkg, release, entrypoint := measurementSubject(req)
 	if _, err := tx.Exec(`INSERT INTO device_memory_measurements(request_id,attempt,package,release,
- entrypoint,models_digest,shape_cell,sku,working_peak_bytes,measured_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+ entrypoint,models_digest,shape_cell,sku,working_peak_bytes,measured_at,
+ total_peak_bytes,request_digest,exact_models_digest,gpu_count) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(request_id,attempt) DO NOTHING`, t.RequestID, t.Attempt, pkg, release, entrypoint,
-		ModelsDigest(req.Models), body.GetMetrics().GetShapeCell(), sku, int64(peak), now()); err != nil {
+		ModelsDigest(req.Models), body.GetMetrics().GetShapeCell(), sku, int64(peak), now(),
+		int64(total), exactMemoryRequest(req), exactModelsDigest(req.Models), width); err != nil {
 		return exit.Internalf("cannot record the working memory of %s#%d: %s", t.RequestID, t.Attempt, err)
 	}
 	return nil
