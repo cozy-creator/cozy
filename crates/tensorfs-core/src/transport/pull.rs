@@ -1189,6 +1189,9 @@ pub struct PullReport {
 /// go on to fetch. A digest-pinned ask whose release lane the local index already maps to
 /// that manifest, over a closure this Store trusts, asks the hub nothing at all.
 pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
+    // Keep the presence proof, transfer and retained repository in one GC-safe span.
+    // The shared native writer fence permits concurrent pulls; GC refuses STORE_BUSY.
+    let _retention = crate::catalog::WriterGuard::acquire(request.store.root())?;
     let ledger = Ledger::with_resolution(std::time::Duration::from_secs_f64(
         request.sample_seconds.clamp(0.001, 3600.0),
     ));
@@ -1473,8 +1476,8 @@ fn while_store_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
 /// measured 135 MB proof store planned its entire contents for deletion after a successful
 /// fetch.
 ///
-/// Record the checkpoint and lane in one transaction. A concurrent identical pull may
-/// satisfy this exact intent; a different update retains the repository CAS refusal.
+/// Record the verified checkpoint and lane in one transaction. Concurrent additions to
+/// other lanes merge; a conflicting change to this lane retains its refusal.
 fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
     use crate::repository::{Mutation, ReleaseLane, Repository, RepositoryName};
 

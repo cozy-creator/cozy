@@ -620,6 +620,88 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
 /// proto-061 A: a digest-pinned warm ask the local release index already answers costs
 /// zero hub calls; a moved pointer or an untrusted object sends the ask back to the hub.
 #[test]
+fn audit_pinned_warm_pull_retains_objects_through_result() {
+    let root = temporary("audit-warm-gc");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(4, 16 * 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let pinned = format!("acme/model@r1@sha256:{}", checkpoint.manifest.sha256);
+    let mut request = PullRequest::new(&store, &origin.base, &pinned, &Anonymous, &policy);
+    request.lane = "public";
+    pull(&request).unwrap();
+    let collect = |_: &crate::fetch::FetchPlan| {
+        // Real native cache eviction at the verified-presence/return boundary.
+        match crate::gc::collect_cached(&root, &[]) {
+            Ok(_) => {}
+            Err(error) => assert_eq!(error.code, Code::STORE_BUSY),
+        }
+    };
+    request.on_plan = Some(&collect);
+    let warm = pull(&request).unwrap();
+    assert_eq!(warm.fetched, 0);
+    assert!(
+        store.read_manifest(&checkpoint.manifest).is_ok(),
+        "warm pull returned success after GC deleted its checkpoint"
+    );
+    assert!(
+        crate::gc::collect_cached(&root, &[])
+            .unwrap()
+            .reclaimed_bytes
+            > 0,
+        "completed pull must release its native guard so GC can progress"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn runtime_only_pull_refuses_before_retaining_incomplete_snapshot() {
+    let root = temporary("audit-runtime-sibling");
+    let store = Store::init(&root).unwrap();
+    let mut checkpoint = checkpoint(4, 16 * 1024);
+    let original = checkpoint
+        .bodies
+        .remove(&checkpoint.manifest.sha256)
+        .unwrap();
+    let parsed = crate::manifest::Manifest::parse(&original).unwrap();
+    let sibling = ObjectRef::of(b"unselected source snapshot readme");
+    let manifest = Draft {
+        entries: vec![
+            ("README.md".into(), Entry::File(sibling.clone())),
+            (
+                "model.cozytensors".into(),
+                Entry::CozyTensors(parsed.header().unwrap().clone()),
+            ),
+        ],
+    }
+    .seal()
+    .unwrap();
+    let bytes = manifest.canonical_bytes();
+    checkpoint.manifest = ObjectRef::of(&bytes);
+    checkpoint
+        .bodies
+        .insert(checkpoint.manifest.sha256.clone(), bytes);
+    // The real Hub response declares scope=runtime and only selected tensor objects.
+    let origin = hub_origin(Arc::new(checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let result = pull(&PullRequest::new(
+        &store,
+        &origin.base,
+        "acme/model",
+        &Anonymous,
+        &policy,
+    ));
+    // Runtime-only Hub closures and repository retention currently disagree about
+    // ordinary siblings. Keep the refusal before recording a root that GC cannot read.
+    assert_eq!(result.unwrap_err().code, Code::OBJECT_ABSENT);
+    assert!(!store.contains(&sibling.sha256));
+    let repo = crate::repository::RepositoryName::new("acme", "model").unwrap();
+    assert!(!store.repository_path(&repo).exists());
+    assert!(crate::gc::collect(&root, false).unwrap().reclaimed_bytes > 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn a_pinned_warm_pull_asks_the_hub_nothing_and_a_moved_pointer_asks_again() {
     let root = temporary("pinned-warm");
     let store = Store::init(&root).unwrap();

@@ -1730,6 +1730,31 @@ mod tests {
     }
 
     #[test]
+    fn audit_cached_pulls_to_independent_lanes_converge() {
+        let root = temporary("audit-independent-lanes");
+        let (store, repo, manifest) = fixture(&root);
+        let first = pull_mutations(&repo, &manifest, 0);
+        let second = vec![
+            Mutation::PutCheckpoint {
+                repo: repo.clone(),
+                manifest: manifest.clone(),
+            },
+            release_mutation(&repo, "1.0.0", "cuda", &manifest, 0),
+        ];
+        // Both pulls saw absence; their different lane additions are compatible.
+        store
+            .apply_cached_repository(None, &first, &Fault::default())
+            .unwrap();
+        store
+            .apply_cached_repository(None, &second, &Fault::default())
+            .unwrap();
+        let repository =
+            Repository::parse(&fs::read(store.repository_path(&repo)).unwrap()).unwrap();
+        assert_eq!(repository.releases[0].lanes.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cached_pull_concurrent_identical_converges_but_different_manifest_conflicts() {
         for identical in [true, false] {
             let root = temporary(if identical {
