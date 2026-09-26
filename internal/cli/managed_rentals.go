@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1127,12 +1126,7 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 		if problem != nil || installed == nil {
 			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)
 		}
-		python, problem := launch.EnvironmentPython(*installed)
-		if problem != nil {
-			return rental.Constraints{}, problem
-		}
-		selection, problem := install.ExecutionRequirements(context.Background(), filepath.Dir(filepath.Dir(python)),
-			strings.TrimPrefix(installed.Package, "local/"), strings.Fields(installed.Extra))
+		selection, problem := install.InstalledRequirements(context.Background(), *installed)
 		if problem != nil {
 			return out, problem
 		}

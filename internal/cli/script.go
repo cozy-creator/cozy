@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
@@ -57,7 +58,7 @@ func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) 
 
 // snapshotTarget uses the ordinary installer while keeping the user's editable
 // pin unchanged. Both the program and its environment are owned by the run.
-func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch.PackageInterface, *exit.Error) {
+func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*records.PackageInstall) (Target, *launch.PackageInterface, *exit.Error) {
 	layout, store, writer, problem := open(ctx.Cfg, true)
 	if problem != nil {
 		return Target{}, nil, problem
@@ -69,11 +70,25 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 			writer.Unlock()
 		}
 	}()
+	if err := os.MkdirAll(layout.Tmp, 0700); err != nil {
+		return Target{}, nil, exit.Internalf("cannot create invocation staging: %s", err)
+	}
+	stage, err := os.MkdirTemp(layout.Tmp, "invocation-source-")
+	if err != nil {
+		return Target{}, nil, exit.Internalf("cannot stage invocation source: %s", err)
+	}
+	defer os.RemoveAll(stage)
+	frozen, problem := packagepublish.SnapshotSource(pack.Tree, filepath.Join(stage, "source"))
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	defer frozen.Close()
+	pack = frozen
 	var intake *childIntake
 	var result *install.Result
-	problem = packagePublishStage(ctx, "Preparing local script environment", func() *exit.Error {
+	problem = packagePublishStage(ctx, "Capturing invocation source and dependencies", func() *exit.Error {
 		var problem *exit.Error
-		intake, problem = prepareChildIntake(ctx, pack, layout, store)
+		intake, problem = prepareChildIntake(ctx, pack, layout, store, remote...)
 		if problem != nil {
 			return problem
 		}
@@ -117,6 +132,9 @@ func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInter
 		return Target{}, nil, problem
 	}
 	project := current.ProjectDir
+	if current.SourceKind == "local" && current.SourceRef != "" {
+		project = current.SourceRef
+	}
 	if project == "" {
 		project = current.SourceRef
 	}
@@ -128,7 +146,11 @@ func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInter
 	// An editable install records its own exports. A job also needs the App
 	// dependency graph, including raw source dependencies such as Qwen, so use
 	// the same intake that a one-off client script uses before accepting it.
-	frozen, surface, problem := snapshotTarget(ctx, pack)
+	var reusable *records.PackageInstall
+	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != "" {
+		reusable = current
+	}
+	frozen, surface, problem := snapshotTarget(ctx, pack, reusable)
 	if problem != nil {
 		return Target{}, nil, problem
 	}

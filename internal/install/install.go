@@ -7,6 +7,7 @@ package install
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -35,6 +36,9 @@ type Request struct {
 	Snapshot  bool
 	Local     *LocalSource
 	Published *PublishedSource
+	// RemoteEnvironment is read only while capturing a remote-only invocation.
+	// Source/interface/requirements custody is independent when Run returns.
+	RemoteEnvironment *records.PackageInstall
 }
 
 // LocalSource is one author-controlled directory after Creator's bounded source
@@ -169,7 +173,8 @@ type Timing struct {
 }
 
 type Result struct {
-	Install records.PackageInstall
+	RemoteSnapshot bool
+	Install        records.PackageInstall
 	// CapturedProjectWheel is the metadata-sealed executable of a captured App
 	// wheel. Its original archive remains under this install's original/ directory.
 	CapturedProjectWheel string
@@ -186,6 +191,9 @@ type Result struct {
 func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if req.Snapshot && req.Local == nil {
 		return nil, exit.Internalf("an invocation snapshot requires local package source")
+	}
+	if req.RemoteEnvironment != nil && !req.Snapshot {
+		return nil, exit.Internalf("environment reuse requires a remote invocation snapshot")
 	}
 	if (req.Published == nil) == (req.Local == nil) {
 		return nil, exit.Usagef("`cozy package install` needs exactly one package source").
@@ -322,12 +330,18 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 
 	// ---- environment: the first code-executing step, on verified source only ----
 	venvDir := filepath.Join(installDir, "venv")
+	metadataVenv := venvDir
 	var env *EnvironmentReceipt
 	var packageInterface *launch.PackageInterface
 	var placement ExactDocument
 	var err *exit.Error
 	if req.Published != nil {
 		packageInterface, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
+	} else if prior := req.RemoteEnvironment; prior != nil && prior.Package == inst.Package && reusableSnapshotEnvironment(*prior, sourceDir) {
+		metadataVenv = filepath.Join(prior.Dir, "venv")
+		env = &EnvironmentReceipt{Python: prior.Python, UV: prior.UV, Platform: prior.Platform,
+			Extra: prior.Extra, Packages: prior.Packages, Closure: prior.Closure}
+		res.RemoteSnapshot = true
 	} else {
 		env, err = materializeEnvironment(sourceDir, venvDir, !req.Snapshot)
 	}
@@ -343,9 +357,20 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	// ---- package interface: retain the published document or statically read the
 	// editable source. Model placement is prepared only when a worker is requested.
 	if req.Local != nil {
-		packageInterface, e = readDevelopmentInterface(venvDir, sourceDir)
+		packageInterface, e = readDevelopmentInterface(metadataVenv, sourceDir)
 		if e != nil {
 			return guard(e)
+		}
+		metadataInstall := inst
+		if res.RemoteSnapshot {
+			metadataInstall = *req.RemoteEnvironment
+		}
+		selected, problem := InstalledRequirements(context.Background(), metadataInstall)
+		if problem != nil {
+			return guard(problem)
+		}
+		if problem := retainExecutionRequirements(installDir, selected); problem != nil {
+			return guard(problem)
 		}
 	}
 	packageInterfacePath := launch.PackageInterfacePath(installDir)

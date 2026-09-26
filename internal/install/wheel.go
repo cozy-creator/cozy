@@ -102,6 +102,16 @@ func ReadInstalledInterface(ctx context.Context, python, distribution string) (*
 // CaptureWheel installs an exact wheel closure into an independent captured
 // environment. It runs no resolver and records no fake source project or pin.
 func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store, parentPython, project string, extras []string, dependencies map[string]packagepublish.CapturedDependency, surface *launch.PackageInterface) (*Result, *exit.Error) {
+	return captureWheel(ctx, layout, store, parentPython, project, extras, dependencies, surface, "", nil)
+}
+
+// CaptureRemoteWheel retains the same exact wheel/interface facts while leaving
+// environment construction to the selected worker.
+func CaptureRemoteWheel(ctx context.Context, layout home.Layout, store *records.Store, project, pythonVersion string, extras []string, dependencies map[string]packagepublish.CapturedDependency, surface *launch.PackageInterface, selected packagepublish.RequirementSelection) (*Result, *exit.Error) {
+	return captureWheel(ctx, layout, store, "", project, extras, dependencies, surface, pythonVersion, &selected)
+}
+
+func captureWheel(ctx context.Context, layout home.Layout, store *records.Store, parentPython, project string, extras []string, dependencies map[string]packagepublish.CapturedDependency, surface *launch.PackageInterface, remoteVersion string, selected *packagepublish.RequirementSelection) (*Result, *exit.Error) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		return nil, exit.New(exit.Validation, "unpublished callable wheels require Linux amd64")
 	}
@@ -175,19 +185,27 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 		return fail(exit.Internalf("cannot retain captured wheel requirements"))
 	}
 	venv := filepath.Join(dir, "venv")
-	env := config.Frozen().Tool()
-	if problem := runUV(dir, env, "private_wheel_python_refused", "cannot select captured wheel Python", "venv", "--python", parentPython, "--no-project", venv); problem != nil {
+	count, installed, version := len(pins), packagepublish.PinnedClosure(pins), remoteVersion
+	if remoteVersion == "" {
+		env := config.Frozen().Tool()
+		if problem := runUV(dir, env, "private_wheel_python_refused", "cannot select captured wheel Python", "venv", "--python", parentPython, "--no-project", venv); problem != nil {
+			return fail(problem)
+		}
+		if problem := runUV(dir, env, "private_wheel_install_refused", "cannot install exact captured wheel closure", "pip", "install", "--no-deps", "--require-hashes", "--python", home.VenvPython(venv), "--requirements", lockPath); problem != nil {
+			return fail(problem)
+		}
+		if problem := runUV(dir, env, "private_wheel_requirements_refused", "captured wheel requirements are not satisfied", "pip", "check", "--python", home.VenvPython(venv)); problem != nil {
+			return fail(problem)
+		}
+		count, installed = closure(venv)
+		if installed != packagepublish.PinnedClosure(pins) {
+			return fail(exit.New(exit.Conflict, "installed callable wheel environment differs from its exact selected closure"))
+		}
+		version = pythonVersion(venv)
+	} else if selected == nil {
+		return fail(exit.Internalf("remote wheel capture requires selected dependency declarations"))
+	} else if problem := retainExecutionRequirements(dir, *selected); problem != nil {
 		return fail(problem)
-	}
-	if problem := runUV(dir, env, "private_wheel_install_refused", "cannot install exact captured wheel closure", "pip", "install", "--no-deps", "--require-hashes", "--python", home.VenvPython(venv), "--requirements", lockPath); problem != nil {
-		return fail(problem)
-	}
-	if problem := runUV(dir, env, "private_wheel_requirements_refused", "captured wheel requirements are not satisfied", "pip", "check", "--python", home.VenvPython(venv)); problem != nil {
-		return fail(problem)
-	}
-	count, installed := closure(venv)
-	if installed != packagepublish.PinnedClosure(pins) {
-		return fail(exit.New(exit.Conflict, "installed callable wheel environment differs from its exact selected closure"))
 	}
 	path := launch.PackageInterfacePath(dir)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -202,7 +220,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	}
 	inst := records.PackageInstall{ID: id, Package: "local/" + project, Version: root.Version, Major: major,
 		SourceKind: "wheel", SourceRef: dir, ProjectDir: dir, Dir: dir,
-		Python: pythonVersion(venv), UV: toolVersion("uv", "--version"),
+		Python: version, UV: toolVersion("uv", "--version"),
 		Platform: "linux/amd64", Packages: count, Closure: installed}
 	inst.BytesExcl, inst.BytesShared = Disk(dir)
 	if problem := store.RecordInstall(inst); problem != nil {
@@ -211,7 +229,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	if problem := CaptureSelfBindings(store, inst, surface); problem != nil {
 		return nil, problem
 	}
-	return &Result{Install: inst, CapturedProjectWheel: executablePath}, nil
+	return &Result{Install: inst, CapturedProjectWheel: executablePath, RemoteSnapshot: remoteVersion != ""}, nil
 }
 
 func capturedWheelNames(dependencies map[string]packagepublish.CapturedDependency) []string {
