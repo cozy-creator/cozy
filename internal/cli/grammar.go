@@ -416,7 +416,7 @@ func (c *RunCancelCmd) Run(r *Runtime) error {
 type RunListCmd struct {
 	State   string `help:"Filter by lifecycle state."`
 	Package string `predictor:"package" help:"Filter by package."`
-	Limit   int    `help:"Maximum rows." default:"50"`
+	Limit   int    `help:"Maximum runs; 0 shows all retained history." default:"0"`
 	Watch   bool   `help:"Refresh continuously (requires a terminal)."`
 	NoWatch bool   `help:"Print one snapshot even in a terminal."`
 }

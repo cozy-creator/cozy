@@ -673,11 +673,11 @@ func handleRunList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	limit := 50
+	limit := 0
 	if raw := ctx.Inv.Value("--limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > 500 {
-			return exit.Usagef("--limit %q is not between 1 and 500", raw)
+		if err != nil || parsed < 0 {
+			return exit.Usagef("--limit %q must be zero (all history) or a positive number", raw)
 		}
 		limit = parsed
 	}
@@ -702,12 +702,33 @@ func handleRunList(ctx *Context) *exit.Error {
 
 func runList(requestCtx context.Context, client *localapi.Client, state, packageName string, limit int) (output.List, *exit.Error) {
 	pkg := strings.TrimSpace(packageName)
-	rows, problem := client.Requests(requestCtx, state, pkg, limit)
-	if problem != nil {
-		return output.List{}, problem
+	var rows []api.Lifecycle
+	var before int64
+	for {
+		pageSize := 500
+		if limit > 0 {
+			pageSize = min(pageSize, limit-len(rows))
+		}
+		page, problem := client.RequestsBefore(requestCtx, state, pkg, pageSize, before)
+		if problem != nil {
+			return output.List{}, problem
+		}
+		if len(page) == 0 {
+			break
+		}
+		next := page[len(page)-1].Number
+		if next < 1 || (before > 0 && next >= before) {
+			return output.List{}, exit.New(exit.Conflict, "run history pagination did not advance; restart the Cozy daemon to load the current API")
+		}
+		rows = append(rows, page...)
+		if len(page) < pageSize || (limit > 0 && len(rows) >= limit) {
+			break
+		}
+		before = next
 	}
 	list := output.List{
-		Name: "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution", "reason"},
+		Uncapped: true,
+		Name:     "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution", "reason"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
 			"progress", "phase", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "queued", "execution", "attempts", "created", "reason"},

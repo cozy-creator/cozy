@@ -1009,6 +1009,15 @@ func (s *Server) machineOf(row records.Request, attempted bool) string {
 
 func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 	limit := 50
+	var before int64
+	if raw := r.URL.Query().Get("before"); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value < 1 {
+			s.refuse(w, r, http.StatusBadRequest, "invalid_before", "before must be a positive run number", "use the oldest run number from the preceding page")
+			return
+		}
+		before = value
+	}
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
 			limit = n
@@ -1034,7 +1043,7 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 			"unknown status filter", "any | queued | in_progress | completed | failed | canceled")
 		return
 	}
-	rows, e := s.store.Requests(state, strings.TrimSpace(r.URL.Query().Get("package")), limit)
+	rows, e := s.store.RequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), limit, before)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return

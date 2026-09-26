@@ -39,6 +39,8 @@ type List struct {
 	Fields    []string
 	AllFields []string
 	Rows      []map[string]string
+	// Uncapped preserves an explicitly paginated inventory's rows in snapshot output.
+	Uncapped bool
 	// TypedFields, TypedAllFields, and TypedRows optionally provide the logical
 	// machine document separately from the terminal table. A table cell may be a
 	// formatted duration, percentage, or dash; JSON/TOON must instead carry the
@@ -169,7 +171,7 @@ func (l List) Emit(w io.Writer, mode Mode) error {
 		}
 	}
 	shown := l.Rows
-	if !mode.Full && len(shown) > rowCap {
+	if !mode.Full && !l.Uncapped && len(shown) > rowCap {
 		shown = shown[:rowCap]
 	}
 	document := map[string]any{}
