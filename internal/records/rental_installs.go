@@ -94,13 +94,6 @@ func (s *Store) BeginRentalInstall(rental string, selection RentalInstallSelecti
 	if prior != nil {
 		return prior, nil
 	}
-	var count int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM rental_installs WHERE rental_id=? AND state IN ('queued','installing')`, rental).Scan(&count); err != nil {
-		return nil, exit.Internalf("cannot inspect rental installation queue: %s", err)
-	}
-	if count >= 256 {
-		return nil, exit.New(exit.Unavailable, "rental %s already has 256 pending installations", rental)
-	}
 	r := RentalInstall{ID: NewID("rental-install"), RentalID: rental, State: "queued", Selection: selection, CreatedAt: now(), UpdatedAt: now()}
 	if _, err := tx.Exec(`INSERT INTO rental_installs(id,rental_id,state,selection,created_at,updated_at) VALUES(?,?,?,?,?,?)`, r.ID, r.RentalID, r.State, raw, r.CreatedAt, r.UpdatedAt); err != nil {
 		return nil, exit.Internalf("cannot record rental installation: %s", err)
@@ -134,7 +127,7 @@ func (s *Store) RentalInstalls(rental string, activeOnly bool) ([]RentalInstall,
 	if activeOnly {
 		query += ` ORDER BY created_at,id`
 	} else {
-		query += ` ORDER BY created_at DESC,id DESC LIMIT 200`
+		query += ` ORDER BY created_at DESC,id DESC`
 	}
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
