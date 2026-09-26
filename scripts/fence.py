@@ -49,6 +49,7 @@ word inside help text or a doc comment is never a violation. Doors, both greppab
   //cozy:stdin-value  this line reads stdin as a VALUE (e.g. --token-stdin), never a prompt
 """
 import os, pathlib, re, sys
+from collections.abc import Iterator
 
 SCAN = ["go.mod", "main.go", "cmd/**/*.go", "internal/**/*.go", "tests/**/*.go"]
 
@@ -245,7 +246,7 @@ def strip_go(src: str) -> str:
     return "".join(out)
 
 
-def go_raw_literals(src: str):
+def go_raw_literals(src: str) -> Iterator[tuple[int, str]]:
     """Yield (start_line, text) for every backtick raw-string literal in Go source."""
     i, n, line = 0, len(src), 1
     while i < n:
@@ -278,7 +279,7 @@ def go_raw_literals(src: str):
             i += 1
 
 
-def check_embedded():
+def check_embedded() -> list[str]:
     """(cl-028) Multi-line script literals in Go source scan like source, not like prose."""
     bad = []
     for p in files():
@@ -303,7 +304,7 @@ def check_embedded():
     return bad
 
 
-def check_scripts():
+def check_scripts() -> list[str]:
     """(cl-028) scripts/*.py are in the SCAN set, with the explicit fixture allows."""
     bad = []
     for p in sorted(pathlib.Path(".").glob(PY_SCAN)):
@@ -319,14 +320,14 @@ def check_scripts():
     return bad
 
 
-def files():
+def files() -> Iterator[pathlib.Path]:
     for glob in SCAN:
         for p in sorted(pathlib.Path(".").glob(glob)):
             if p.is_file():
                 yield p
 
 
-def check_test_boundary():
+def check_test_boundary() -> list[str]:
     """(#661) Go verification has one home: the product suite in tests/product."""
     bad = []
     for p in sorted(pathlib.Path(".").rglob("*_test.go")):
@@ -337,7 +338,7 @@ def check_test_boundary():
     return bad
 
 
-DOCUMENT_KINDS = {}
+DOCUMENT_KINDS: dict[str, str] = {}
 # HMAC domain-separation tags are security protocol constants, not document formats. A peer repo
 # reproduces these exact bytes, so they remain single-owner fenced without inflating the document
 # count.
@@ -360,7 +361,7 @@ KIND_READERS: dict[str, set[str]] = {}
 KIND_LITERAL = re.compile(r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.[A-Za-z0-9_.-]+/\d+)')
 
 
-def check_document_kinds():
+def check_document_kinds() -> list[str]:
     bad = []
     for p in files():
         if p.suffix != ".go":
@@ -381,7 +382,7 @@ def check_document_kinds():
     return bad
 
 
-def check_media_contract():
+def check_media_contract() -> list[str]:
     """(cl-031) The media plane's contract fields are DECLARED once, not spelled twice."""
     home = pathlib.Path(MEDIA_CONTRACT_HOME)
     if not home.exists():
@@ -405,7 +406,7 @@ def check_media_contract():
     return bad
 
 
-def check_unpublished_vocabulary():
+def check_unpublished_vocabulary() -> list[str]:
     """Publication state is not a privacy or access-control mode."""
     bad = []
     retired = re.compile(r"\bprivate[ -](?:package|job|script|wheel|revision|callable)\b", re.I)
@@ -418,7 +419,7 @@ def check_unpublished_vocabulary():
     return bad
 
 
-def check_sources():
+def check_sources() -> list[str]:
     bad = []
     for p in files():
         raw = p.read_text(errors="ignore")
@@ -525,7 +526,7 @@ def check_sources():
     return bad
 
 
-def check_secret_flags():
+def check_secret_flags() -> list[str]:
     """No Kong field may turn a credential into an argv value (cl-011)."""
     src_path = pathlib.Path("internal/cli/grammar.go")
     if not src_path.exists():
@@ -545,7 +546,7 @@ def check_secret_flags():
 VERSION_SPELLINGS = ("--version", "-v", "-V")
 
 
-def check_manifest():
+def check_manifest() -> list[str]:
     """Kong is the sole grammar and carries exactly the launch command tree."""
     src_path = pathlib.Path("internal/cli/grammar.go")
     if not src_path.exists():
@@ -601,7 +602,7 @@ def check_manifest():
     return bad
 
 
-def check_web_boundary():
+def check_web_boundary() -> list[str]:
     """cl-045: one embedded stub, bounded pathless uploads; cl-096: the daemon's ONE log.
 
     cl-045 refused any persistent daemon log. cl-096 (owner, 2026-09-02) reverses that with
@@ -662,7 +663,7 @@ RENDER_SRC = "internal/output/output.go"
 RENDER_STDERR = re.compile(r"Fprint(?:f|ln)?\(\s*(?:[A-Za-z_.]*\.)?[Ss]tderr\b")
 
 
-def check_render_streams():
+def check_render_streams() -> list[str]:
     """(AXI 6) The one output layer writes one stream. Errors are structured output the
     agent consumes, so they leave on stdout beside the data; a stderr writer here is the
     regression where `cozy ls nonexistent` gave a stdout-capturing agent an empty buffer."""
@@ -678,7 +679,7 @@ def check_render_streams():
     return bad
 
 
-def check_output_shape():
+def check_output_shape() -> list[str]:
     """cl-046: success is domain data, never generic renderer metadata."""
     output = pathlib.Path("internal/output/output.go").read_text()
     views = pathlib.Path("internal/output/views.go").read_text()
@@ -695,7 +696,7 @@ def check_output_shape():
     return bad
 
 
-def parse_doc_matrix(path: pathlib.Path):
+def parse_doc_matrix(path: pathlib.Path) -> list[tuple[int, str, str]]:
     rows = []
     for line in path.read_text().splitlines():
         m = re.match(r"^\|\s*(\d+)\s*\|\s*([a-z_]+)\s*\|\s*(.+?)\s*\|$", line.strip())
@@ -704,18 +705,18 @@ def parse_doc_matrix(path: pathlib.Path):
     return rows
 
 
-def parse_go_matrix(path: pathlib.Path):
+def parse_go_matrix(path: pathlib.Path) -> tuple[list[tuple[int, str, str]], str | None]:
     src = path.read_text()
     consts = dict(re.findall(r"^\t([A-Za-z]+)\s+Code = (\d+)$", src, re.M))
     rows = []
     for name, label, meaning in re.findall(r'^\t\{([A-Za-z]+), "([a-z_]+)", "(.*)"\},$', src, re.M):
         if name not in consts:
-            return None, f"matrix entry {label} uses undeclared constant {name}"
+            return [], f"matrix entry {label} uses undeclared constant {name}"
         rows.append((int(consts[name]), label, meaning.replace('\\"', '"')))
     return rows, None
 
 
-def check_matrix():
+def check_matrix() -> list[str]:
     doc, go = pathlib.Path("docs/exit-matrix.md"), pathlib.Path("internal/exit/exit.go")
     if not doc.exists() or not go.exists():
         return [f"[matrix] missing {doc if not doc.exists() else go}"]
@@ -734,7 +735,7 @@ def check_matrix():
     return bad
 
 
-def parse_doc_routes(path: pathlib.Path):
+def parse_doc_routes(path: pathlib.Path) -> list[tuple[str, str, str]]:
     """Route rows out of the contract document's two tables."""
     rows = []
     for line in path.read_text().splitlines():
@@ -744,7 +745,7 @@ def parse_doc_routes(path: pathlib.Path):
     return rows
 
 
-def parse_go_routes(path: pathlib.Path):
+def parse_go_routes(path: pathlib.Path) -> list[tuple[str, str, str]]:
     rows = []
     for method, route_path, scope in re.findall(
         r'^\t\{"([A-Z]+)", "([^"]+)", (Core|Local),', path.read_text(), re.M
@@ -753,7 +754,7 @@ def parse_go_routes(path: pathlib.Path):
     return rows
 
 
-def check_contract():
+def check_contract() -> list[str]:
     """The route table and Cozy's contract document expose the same route inventory.
 
     This fence checks method, path, scope, and order. Payload and behavior conformance are
@@ -775,7 +776,7 @@ def check_contract():
     return bad
 
 
-def check_video_boundary():
+def check_video_boundary() -> list[str]:
     """The retired pre-launch workflow/video plane does not survive the CLI hardcut."""
     bad = []
     for retired in ("internal/video", "internal/workflow", "internal/api/videos.go",
@@ -786,7 +787,7 @@ def check_video_boundary():
     return bad
 
 
-def check_typed_resources():
+def check_typed_resources() -> list[str]:
     """The product surface names package and model directly; no generic compatibility door."""
     bad = []
     product_files = [
@@ -854,7 +855,7 @@ def check_typed_resources():
     return bad
 
 
-def check_python_seat():
+def check_python_seat() -> list[str]:
     """Published local execution uses the release's own uv-selected Python environment."""
     path = pathlib.Path("internal/install/published.go")
     text = path.read_text()

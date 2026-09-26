@@ -31,6 +31,9 @@ import (
 //go:embed runtime_update_transport.py
 var runtimeUpdateTransport string
 
+//go:embed runtime_update_probe.py
+var runtimeUpdateProbe string
+
 type rentalRuntimeUpdates struct {
 	machines *machineRuns
 	running  sync.Map
@@ -247,6 +250,9 @@ func (u *rentalRuntimeUpdates) transport(ctx context.Context, selection runtimeU
 	var fields map[string]any
 	_ = json.Unmarshal(input, &fields)
 	fields["action"] = action
+	// The probe is fixed first-party source, kept in its own file so the same
+	// strict type check covers code executed on the worker as well as the client.
+	fields["probe"] = runtimeUpdateProbe
 	input, _ = json.Marshal(fields)
 	// This helper executes trusted maintenance code, not the package's Python.
 	python, problem := hostruntime.EnsurePython(ctx, ">=3.12", "")

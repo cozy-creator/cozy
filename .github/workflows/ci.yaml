@@ -27,6 +27,17 @@ env:
   FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'integration') }}
 
 jobs:
+  python-types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - name: Install typed Python helper contracts
+        run: |
+          uv venv --python 3.12
+          uv pip install --python .venv/bin/python packaging 'cozy-runtime>=0.18.28' 'cozy-eval>=0.7.2' 'tensorfs>=0.3.54'
+      - run: sh scripts/typecheck.sh
+
   nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
