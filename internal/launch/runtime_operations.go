@@ -20,14 +20,11 @@ func BuiltinOperationsTool(root, scratch string, env []string) (RuntimeCLI, *exi
 }
 
 type BuiltinPreparation struct {
-	EnvironmentPython    string          `json:"environment_python"`
-	EnvironmentDigest    string          `json:"environment_digest"`
-	ContentDigest        string          `json:"content_digest"`
-	ReceiptDigest        string          `json:"receipt_digest"`
-	ImplementationDigest string          `json:"implementation_digest"`
-	Closure              string          `json:"closure"`
-	RuntimeVersion       string          `json:"runtime_version"`
-	PackageInterface     json.RawMessage `json:"package_interface"`
+	EnvironmentPython string          `json:"environment_python"`
+	InstallationID    string          `json:"installation_id"`
+	Closure           string          `json:"closure"`
+	RuntimeVersion    string          `json:"runtime_version"`
+	PackageInterface  json.RawMessage `json:"package_interface"`
 }
 
 func (r RuntimeCLI) RuntimeVersion(ctx context.Context) (string, *exit.Error) {
@@ -54,16 +51,16 @@ func (r RuntimeCLI) BuiltinOperations(ctx context.Context) (*PackageInterface, *
 	return surface, nil
 }
 
-func (r RuntimeCLI) PrepareBuiltin(ctx context.Context, wheel, output string) (BuiltinPreparation, *exit.Error) {
+func (r RuntimeCLI) PrepareBuiltin(ctx context.Context, output string) (BuiltinPreparation, *exit.Error) {
 	var result BuiltinPreparation
-	problem := r.callContext(ctx, &result, "builtin-prepare", "operations", "--wheel", wheel, "--out", output)
+	problem := r.callContext(ctx, &result, "builtin-prepare", "operations", "--out", output)
 	return result, problem
 }
 
 // CaptureBuiltin keeps a base snapshot without resolving optional numerical dependencies.
-func (r RuntimeCLI) CaptureBuiltin(ctx context.Context, wheel, output string) (BuiltinPreparation, *exit.Error) {
+func (r RuntimeCLI) CaptureBuiltin(ctx context.Context, output string) (BuiltinPreparation, *exit.Error) {
 	var result BuiltinPreparation
-	problem := r.callContext(ctx, &result, "builtin-capture", "operations", "--wheel", wheel, "--out", output)
+	problem := r.callContext(ctx, &result, "builtin-capture", "operations", "--out", output)
 	return result, problem
 }
 

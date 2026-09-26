@@ -1,11 +1,11 @@
 package workerprotov1
 
 // WireMinor is the current release of cozy.worker.v1. Ordinary additive changes preserve the floor.
-// The floor is minor60; minor61 execution-lifecycle fields are additive (absent = unknown).
-const WireMinor uint32 = 61
+// Minor62 is the coordinated package-installation hard cut. Future additive changes preserve skew.
+const WireMinor uint32 = 62
 
 // MinCompatibleWireMinor is checked before Claim/preparation side effects.
-const MinCompatibleWireMinor uint32 = 60
+const MinCompatibleWireMinor uint32 = 62
 
 const AttentionKernelWireMinor uint32 = 49
 const RuntimeRevisionWireMinor uint32 = 49

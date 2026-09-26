@@ -1,0 +1,6 @@
+:∫)	boot-9f21*	job-01HQX0: át¡XaÙë·HØ∆->v3ßPΩ–SõE-áãxy'BÚ
+ át¡XaÙë·HØ∆->v3ßPΩ–SõE-áãxy';
+https://hub.cozy.art	k-2026-08 ÿ·ç‘*Rü∂‡éÎBÅÀèÈ˘∏https://files.cozy.art/t/abc ÿ·ç‘*#
+payload.prompt/in/1/prompt.json*-
+payload.adapters[0]/in/1/lora.cozytensors2
+video/out/1/video.mp4JÇ{"deadline_unix_ms":1787003600000,"format":"cozy.worker.v1.InvocationSpec/1","installation_id":"install-quantize-v3","job":{"installation_id":"install-quantize-v3","job_descriptor_id":"cb6505fab67e829e97510e00096d179e28d42c0b8c8b3cce44739b272836d43e","publication_contract":{"grant_id":"f523e7a0e0b76dd6873d11be89f7bb35089017c440010cf2fd68e83e6b3b3cfb","outputs":[{"max_bytes":42949672960,"mime_type":"application/x-cozytensors","output_id":"model"}]}},"outputs":[{"max_bytes":42949672960,"mime_type":"application/x-cozytensors","output_id":"model"}],"payload_digest":"sha256:ab6a3c7d2a06a9dc19eb9aad45e23e7f82945bc083a49281fea57c71b8c513b8"}`

@@ -1,0 +1,12 @@
+{
+  "outcome_ack": {
+    "attempt_ordinal": "1",
+    "control_stream_epoch": "7",
+    "invocation_spec_digest": "nTFrlnUATXR1upLNS1V3fjyh5NJ8CagKEdErviyZEL0=",
+    "outcome_digest": "4hOx30I9t7J/mYDVQ+tqPk1vS++upQ4MZWmIhivccdg=",
+    "outcome_id": "out-9a01",
+    "record_owner_epoch": "41",
+    "request_id": "req-01J8Z",
+    "worker_boot_id": "boot-9f21"
+  }
+}

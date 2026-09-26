@@ -1,0 +1,12 @@
+{
+  "weights_transaction": {
+    "attempt_ordinal": "1",
+    "invocation_spec_digest": "sha256:8774c15861f491e148afc62d3e761e33a750bdd053029b452d871a168b787927",
+    "output_slot": "model",
+    "request_id": "job-01HQX",
+    "state": "WEIGHTS_TRANSACTION_STATE_INTENT",
+    "tensorfs_declaration_digest": "+nItxs9UXk1MCYMGxWcFwMVLSOulojV4FTrw4x8pZm0=",
+    "weights_transaction_id": "sha256:e5f8e5571ae52f071dd1b586ad320e82f73afbb03302ac9b65273bccaa7407fb",
+    "writer_epoch": "1"
+  }
+}

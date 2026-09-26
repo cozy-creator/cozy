@@ -1,0 +1,13 @@
+{
+  "child_call_result": {
+    "child_request_id": "private-child",
+    "control_stream_epoch": "7",
+    "intent_digest": "XRzH5SZ6Xj8Sq9US+cKK7bt9xSYlh6FoX6oJWl5BE3A=",
+    "parent_attempt_ordinal": "2",
+    "parent_invocation_spec_digest": "nTFrlnUATXR1upLNS1V3fjyh5NJ8CagKEdErviyZEL0=",
+    "parent_request_id": "private-parent",
+    "record_owner_epoch": "41",
+    "state": "CHILD_CALL_STATE_PENDING",
+    "worker_boot_id": "boot-9f21"
+  }
+}

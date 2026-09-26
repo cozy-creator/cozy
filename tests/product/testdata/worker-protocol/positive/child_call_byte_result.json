@@ -30,7 +30,7 @@
     ],
     "child_request_id": "private-child",
     "control_stream_epoch": "7",
-    "intent_digest": "Bl1XJaQGEecTq9OH92grHme+Q3c/J8bFcT/oj4MsR+I=",
+    "intent_digest": "XRzH5SZ6Xj8Sq9US+cKK7bt9xSYlh6FoX6oJWl5BE3A=",
     "observation": {
       "capture": {
         "content_digest": "npZ7kanYmDN7egkxBFPMeKypmesdWLybHVw3X/PoHxM=",
@@ -44,7 +44,7 @@
       }
     },
     "parent_attempt_ordinal": "2",
-    "parent_invocation_spec_digest": "qp8l2Dqs8QrnAvvs2/I3ltGNCoaS0/nGFEkUviOp59E=",
+    "parent_invocation_spec_digest": "nTFrlnUATXR1upLNS1V3fjyh5NJ8CagKEdErviyZEL0=",
     "parent_request_id": "private-parent",
     "record_owner_epoch": "41",
     "result_canonical_bytes": "eyJyZXBvcnQiOnsiZGlnZXN0Ijoic2hhMjU2OmVhMjcwNDYzMDM2ZWM1MWE3ZTFkMTdjZTU5M2EwZTI4YThmODgzMTllYmRlZDcwNzg2MDcwMDkwZGE2YTE0ZmIiLCJsZW5ndGgiOjY1NTM3LCJtaW1lX3R5cGUiOiJhcHBsaWNhdGlvbi9qc29uIn19",

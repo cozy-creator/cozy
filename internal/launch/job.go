@@ -66,12 +66,6 @@ type JobFacts struct {
 // keeping a job worker warm after it finishes. Warm persistence is a serving concern and
 // stays one.
 func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerLaunchSpec, *JobFacts, *exit.Error) {
-	if f.Install.SourceKind == "local" && (f.Install.ProjectDir == "" ||
-		filepath.Clean(f.Install.SourceRef) != filepath.Join(f.Install.Dir, "source")) {
-		return orchestrator.WorkerLaunchSpec{}, nil, exit.Named(exit.Structural,
-			"job_snapshot_required", "local jobs require a captured source revision").
-			WithRemedy("run the local job through `cozy run` to capture its source and dependencies")
-	}
 	facts, e := f.Job(function)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
@@ -83,31 +77,26 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
-	placement, buildID, e := f.JobCodeIdentity()
+	placement, installationID, e := f.JobInstallationID()
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
 	environmentPython := f.environmentPython()
-	environmentContent := placement.EnvironmentDigest
-	if environmentContent == "" {
-		environmentContent = f.Install.LockDigest
-	}
 	placement.Jobs = []*orchestrator.JobPlan{{
 		Function:       facts.Name,
 		DescriptorID:   facts.DescriptorID,
-		BuildID:        buildID,
+		InstallationID: installationID,
 		Outputs:        facts.Outputs,
 		WeightsOutputs: facts.WeightsOutputs,
 		// The record's key set is CLOSED at both ends: `plan.py::JobBinding.read`
 		// refuses an unknown key, exactly as the binding record's reader does.
 		Record: map[string]any{
 			"job_descriptor_id":           facts.DescriptorID,
-			"build_id":                    buildID,
+			"installation_id":             installationID,
 			"application":                 f.PackageInterface.Application,
 			"package_interface":           PackageInterfacePath(f.Install.Dir),
 			"python":                      environmentPython,
-			"environment_content_digest":  environmentContent,
 			"job":                         facts.Name,
 			"publishes":                   facts.Publishes,
 			"emits_media":                 false,
@@ -154,22 +143,9 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 			WithRemedy("it registers: %s", strings.Join(f.PackageInterface.PublicNames(), ", ")).
 			WithNext("cozy package list --full")
 	}
-	runtimeBin, problem := hostruntime.Path(f.RuntimeCLI.Env)
-	if problem != nil {
-		return nil, problem
-	}
-	var said struct {
-		DescriptorID string `json:"job_descriptor_id"`
-	}
-	runtime := f.RuntimeCLI
-	runtime.Bin = runtimeBin
-	if e := runtime.call(&said, "describe", function); e != nil {
-		return nil, e
-	}
-	if said.DescriptorID == "" {
+	if declared.DescriptorID == "" {
 		return nil, exit.Named(exit.Structural, "job_descriptor_id_absent",
-			"`cozy-runtime describe %s` named no job_descriptor_id", function).
-			WithRemedy("the id is the runtime's own derivation (cr-016); a release pinning an older runtime cannot be dispatched by it")
+			"installed job %s has no descriptor identity", function)
 	}
 	assets := AssetPaths(declared.Result)
 	if len(assets) > 0 && len(declared.WeightsOutputs) > 0 {
@@ -186,7 +162,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		outputs = append(outputs, output.OutputID)
 	}
 	facts := &JobFacts{
-		Name: function, Request: declared.Request, Result: declared.Result, Assets: declared.Assets, DescriptorID: said.DescriptorID, Outputs: outputs,
+		Name: function, Request: declared.Request, Result: declared.Result, Assets: declared.Assets, DescriptorID: declared.DescriptorID, Outputs: outputs,
 		Internal:         declared.Internal,
 		WeightsOutputs:   weightsOutputs,
 		Publishes:        declared.Publishes,

@@ -1,9 +1,6 @@
 package launch
 
 import (
-	"github.com/cozy-creator/cozy/internal/canonical"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"os"
 	"path/filepath"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -29,48 +26,24 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 		TensorFSRoot:  config.Frozen().TensorFSRoot,
 		Placement: orchestrator.DesiredPlacement{
 			Package: f.Install.Package, InstallID: f.Install.ID, Release: f.Install.Version,
-			SourceDigest: f.Install.SourceDigest,
 		},
 		Preparation: &orchestrator.LocalServingPreparation{
 			PythonVersion: f.Install.Python, Published: f.Install.SourceKind == "tensorhub", Application: f.PackageInterface.Application,
-			ModelSlotPaths: slots, PackageInterfaceDigest: f.Install.PackageInterface,
+			ModelSlotPaths:     slots,
 			PackageInterface:   append([]byte(nil), f.PackageInterface.Raw...),
 			LockedRequirements: filepath.Join(f.Install.Dir, "locked-requirements.txt"),
 		},
 	}
-	if spec.Preparation.Published {
-		spec.Placement.SourceDigest = ""
-	}
 	return spec, nil
 }
 
-// JobCodeIdentity is the already-retained code identity. Jobs do not require a
-// serving placement, and no component order is inferred here.
-func (f *Facts) JobCodeIdentity() (orchestrator.DesiredPlacement, string, *exit.Error) {
+// JobInstallationID selects an installed resource. It does not identify package
+// bytes or participate in operation computation identity.
+func (f *Facts) JobInstallationID() (orchestrator.DesiredPlacement, string, *exit.Error) {
 	if f.Install.PlacementSetDigest != "" {
 		placement, problem := f.Placement()
-		if problem != nil {
-			return placement, "", problem
-		}
-		build, problem := orchestrator.JobBuildID(placement.PlacementSetBytes, f.Install.Package)
-		return placement, build, problem
+		return placement, placement.InstallID, problem
 	}
 	placement := orchestrator.DesiredPlacement{Package: f.Install.Package, InstallID: f.Install.ID, Release: f.Install.Version}
-	if f.Install.SourceKind == "local" || f.Install.SourceKind == "wheel" {
-		placement.SourceDigest = f.Install.SourceDigest
-		return placement, placement.SourceDigest, nil
-	}
-	locked, err := os.ReadFile(filepath.Join(f.Install.Dir, "locked-requirements.txt"))
-	if err != nil {
-		return placement, "", exit.Internalf("cannot read retained package code identity: %s", err)
-	}
-	_, digest, err := canonical.Identity(&pb.Environment{LockedRequirements: &pb.Ref{Digest: canonical.Digest(locked), Length: uint64(len(locked))}})
-	if err != nil {
-		return placement, "", exit.Internalf("cannot identify retained package environment: %s", err)
-	}
-	placement.EnvironmentDigest, err = canonical.Spell(digest)
-	if err != nil {
-		return placement, "", exit.Internalf("cannot spell package environment: %s", err)
-	}
-	return placement, placement.EnvironmentDigest, nil
+	return placement, f.Install.ID, nil
 }

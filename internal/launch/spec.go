@@ -44,7 +44,7 @@ func EnvironmentPython(inst records.PackageInstall) (string, *exit.Error) {
 	if inst.SourceKind != "wheel" {
 		return "", exit.New(exit.Conflict, "Runtime builtin is not a captured metadata carrier")
 	}
-	return runtimeoperation.ReadEnvironment(inst.Dir, inst.LockDigest, inst.PackageInterface, inst.SourceDigest)
+	return runtimeoperation.ReadEnvironment(inst.Dir)
 }
 
 // Read gathers an install's facts: where its source is, the surface it proved at install,
@@ -58,7 +58,7 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 		}
 	}
 	source := SourceDir(inst)
-	d, e := ReadPackageInterface(PackageInterfacePath(inst.Dir), inst.PackageInterface)
+	d, e := ReadPackageInterface(PackageInterfacePath(inst.Dir))
 	if e != nil {
 		return nil, e
 	}
