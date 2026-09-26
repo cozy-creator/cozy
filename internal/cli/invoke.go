@@ -136,8 +136,8 @@ func handleRunExecute(ctx *Context) *exit.Error {
 }
 
 func validateRunPlacement(ctx *Context) *exit.Error {
-	if ctx.Inv.Bool("--rent-new") && (ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != "" || ctx.Inv.Value("--retry") != "") {
-		return exit.Usagef("--rent-new cannot be combined with --rental, --rental-only, or --retry")
+	if ctx.Inv.Bool("--rent-new") && (ctx.Inv.Bool("--rental") || ctx.Inv.Value("--rental") != "" || ctx.Inv.Value("--retry") != "") {
+		return exit.Usagef("--rent-new cannot be combined with a named --rental or retained --retry")
 	}
 	if ctx.Inv.Bool("--rental") && ctx.Inv.Bool("--rental-only") {
 		return exit.Usagef("--rental and --rental-only are mutually exclusive")

@@ -10,4 +10,6 @@ not buy an extra machine for the same request. Replacement after a proved lost
 rental continues through the existing durable acquisition lifecycle.
 
 `--rental NAME` selects an existing rental; `--rental-only` allows any suitable
-remote rental, including one already running. Neither combines with `--rent-new`.
+remote rental, including one already running. `--rent-new` implies remote-only
+placement and accepts the redundant `--rental-only` flag. A named rental or
+retained `--retry` cannot request a fresh machine.
