@@ -3434,6 +3434,31 @@ pub fn fetch_complete_cozytensors(py: Python<'_>, store: &PyStore, plan: &[u8]) 
     Ok(plan.declared_bytes())
 }
 
+/// A thread-safe native stop signal; cancel never waits for a Python callback.
+#[pyclass(name = "PullCancellation", module = "tensorfs._ext")]
+pub struct PyPullCancellation {
+    token: tensorfs_core::transport::PullCancellation,
+}
+
+#[pymethods]
+impl PyPullCancellation {
+    #[new]
+    fn new() -> Self {
+        Self {
+            token: tensorfs_core::transport::PullCancellation::default(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    #[getter]
+    fn cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
 /// The ONE transport, from Python (tfs-050): ask for a repo, get a store that has it.
 /// cozy-runtime sheds its own downloader (cr-090); this call IS the mover — closure,
 /// plan against the real store, the 16-way walk presigning `wanted` as it reaches it, and
@@ -3447,7 +3472,7 @@ pub fn fetch_complete_cozytensors(py: Python<'_>, store: &PyStore, plan: &[u8]) 
 #[pyfunction]
 #[pyo3(signature = (store, hub, refspec, *, lane=String::new(), credential=String::new(),
        timeout=None, session=String::new(), streams=tensorfs_core::transport::STREAMS,
-       allowed_hosts=Vec::new(), allow_local=false, sample_seconds=None))]
+       allowed_hosts=Vec::new(), allow_local=false, sample_seconds=None, cancellation=None, progress=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pull<'p>(
     py: Python<'p>,
@@ -3462,8 +3487,46 @@ pub fn pull<'p>(
     allowed_hosts: Vec<String>,
     allow_local: bool,
     sample_seconds: Option<f64>,
+    cancellation: Option<PyRef<'_, PyPullCancellation>>,
+    progress: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'p, PyDict>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tensorfs_core::transport;
+    let cancellation = cancellation
+        .map(|value| value.token.clone())
+        .unwrap_or_default();
+    let raised: Mutex<Option<PyErr>> = Mutex::new(None);
+    let available = AtomicU64::new(0);
+    let total = AtomicU64::new(0);
+    let report_progress = |baseline: Option<(u64, u64)>, admitted: u64| {
+        // Acquire Python only around the callback, never around transfer I/O.
+        Python::attach(|py| {
+            if let Some((held, declared)) = baseline {
+                available.store(held, Ordering::Relaxed);
+                total.store(declared, Ordering::Relaxed);
+            }
+            let now = available.fetch_add(admitted, Ordering::Relaxed) + admitted;
+            if let Some(callback) = &progress {
+                if let Err(error) = callback
+                    .bind(py)
+                    .call1((now, total.load(Ordering::Relaxed)))
+                {
+                    let mut first = raised.lock().unwrap();
+                    if first.is_none() {
+                        *first = Some(error);
+                    }
+                    cancellation.cancel();
+                }
+            }
+        });
+    };
+    let on_plan = |plan: &tensorfs_core::fetch::FetchPlan| {
+        report_progress(Some((plan.held_bytes(), plan.declared_bytes())), 0)
+    };
+    let on_object =
+        |object: &tensorfs_core::ids::ObjectRef, _moved: u64, _source: transport::ObjectSource| {
+            report_progress(None, object.length)
+        };
     let hub_host = transport::base_host(hub).or_refuse(py)?;
     let scoped = transport::credential_from_spec(&credential, vec![hub_host]).or_refuse(py)?;
     let policy = transport::SourcePolicy {
@@ -3471,20 +3534,26 @@ pub fn pull<'p>(
         allow_local,
         max_redirects: 0,
     };
-    let report = py
-        .detach(|| {
-            let mut request =
-                transport::PullRequest::new(&store.store, hub, refspec, &scoped, &policy);
-            request.lane = &lane;
-            request.session = &session;
-            request.streams = streams;
-            request.deadline = transport::Deadline::after_seconds(timeout);
-            if let Some(sample) = sample_seconds {
-                request.sample_seconds = sample;
-            }
-            transport::pull(&request)
-        })
-        .or_refuse(py)?;
+    let report = py.detach(|| {
+        let mut request = transport::PullRequest::new(&store.store, hub, refspec, &scoped, &policy);
+        request.cancellation = Some(cancellation.clone());
+        if progress.is_some() {
+            request.on_plan = Some(&on_plan);
+            request.on_object = Some(&on_object);
+        }
+        request.lane = &lane;
+        request.session = &session;
+        request.streams = streams;
+        request.deadline = transport::Deadline::after_seconds(timeout);
+        if let Some(sample) = sample_seconds {
+            request.sample_seconds = sample;
+        }
+        transport::pull(&request)
+    });
+    if let Some(error) = raised.lock().unwrap().take() {
+        return Err(error);
+    }
+    let report = report.or_refuse(py)?;
     let result = PyDict::new(py);
     result.set_item("ref", &report.refspec)?;
     result.set_item("model", &report.model)?;

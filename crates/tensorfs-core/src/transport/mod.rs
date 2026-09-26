@@ -52,7 +52,8 @@ pub use hub::{
     HostToken, Presigned, ScopedHeaders,
 };
 pub use ledger::{
-    Deadline, Ledger, FETCH_ATTEMPTS, SAMPLE_SECONDS, STALL_FACTOR, STILL_SAMPLES, STREAMS,
+    Deadline, Ledger, PullCancellation, FETCH_ATTEMPTS, SAMPLE_SECONDS, STALL_FACTOR,
+    STILL_SAMPLES, STREAMS,
 };
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{

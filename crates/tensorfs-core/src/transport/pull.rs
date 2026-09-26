@@ -1112,6 +1112,7 @@ impl Source {
 /// One pull, described before it runs. `sample_seconds` is the ledger's RESOLUTION —
 /// configuration, never a verdict; the default is the runtime's one sampling cadence.
 pub struct PullRequest<'a> {
+    pub cancellation: Option<super::PullCancellation>,
     pub store: &'a Store,
     pub base: &'a str,
     pub refspec: &'a str,
@@ -1140,6 +1141,7 @@ impl<'a> PullRequest<'a> {
         policy: &'a SourcePolicy,
     ) -> PullRequest<'a> {
         PullRequest {
+            cancellation: None,
             store,
             base,
             refspec,
@@ -1195,10 +1197,14 @@ pub struct PullReport {
 pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     // Keep the presence proof, transfer and retained repository in one GC-safe span.
     // The shared native writer fence permits concurrent pulls; GC refuses STORE_BUSY.
-    let _retention = crate::catalog::WriterGuard::acquire(request.store.root())?;
-    let ledger = Ledger::with_resolution(std::time::Duration::from_secs_f64(
+    let mut ledger = Ledger::with_resolution(std::time::Duration::from_secs_f64(
         request.sample_seconds.clamp(0.001, 3600.0),
     ));
+    if let Some(cancellation) = &request.cancellation {
+        ledger = ledger.with_cancellation(cancellation.clone());
+    }
+    ledger.check_running()?;
+    let _retention = crate::catalog::WriterGuard::acquire(request.store.root())?;
     // Naming a hub base IS declaring it, and a loopback hub declares a local deployment —
     // the port of pull.py's `local_hub` carve-out. The policy itself stays the caller's.
     let mut policy = request.policy.clone();
@@ -1218,6 +1224,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
                 if let Some(observer) = request.on_plan {
                     observer(&plan);
                 }
+                ledger.check_running()?;
                 return Ok(report);
             }
         }
@@ -1253,6 +1260,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     if let Some(observer) = request.on_plan {
         observer(&plan);
     }
+    ledger.check_running()?;
     // THE ADMISSION GATE, and it stands here for two reasons (tfs-064).
     //
     // It is BEFORE the walk, so a pull that cannot fit costs a closure call and no bytes —
@@ -1304,6 +1312,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         report.cached = walked.cached;
         report.bytes_cached = walked.bytes_cached;
     }
+    ledger.check_running()?;
     // Nothing moved and this Store already records the checkpoint, which it does only once
     // the closure is local: the plan's presence pass was the whole proof, so there is no
     // re-walk, no index write, and no cache offer. Held objects are never offered to the

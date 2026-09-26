@@ -133,8 +133,23 @@ pub struct Still {
     pub silent: Duration,
 }
 
+/// One caller's cooperative stop signal. Clones name the same pull intent;
+/// a resumed operation uses a new token and retains existing Store bytes.
+#[derive(Clone, Default)]
+pub struct PullCancellation(Arc<AtomicBool>);
+
+impl PullCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// The one liveness ledger a pull shares across its streams.
 pub struct Ledger {
+    caller_cancellation: Option<PullCancellation>,
     cancelled: Arc<AtomicBool>,
     sample: Duration,
     worst_gap: Arc<Mutex<Duration>>,
@@ -153,6 +168,7 @@ impl Ledger {
     /// in milliseconds and judge by exactly the production rule.
     pub fn with_resolution(sample: Duration) -> Ledger {
         Ledger {
+            caller_cancellation: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             sample: sample.max(Duration::from_millis(1)),
             worst_gap: Arc::new(Mutex::new(Duration::ZERO)),
@@ -165,6 +181,11 @@ impl Ledger {
             #[cfg(test)]
             clock: None,
         }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: PullCancellation) -> Self {
+        self.caller_cancellation = Some(cancellation);
+        self
     }
 
     #[cfg(test)]
@@ -193,7 +214,16 @@ impl Ledger {
     }
 
     pub(crate) fn check_running(&self) -> Result<()> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self
+            .caller_cancellation
+            .as_ref()
+            .is_some_and(PullCancellation::is_cancelled)
+        {
+            refuse(
+                Code::TRANSFER_FAILED,
+                "the pull was cancelled by its caller",
+            )
+        } else if self.cancelled.load(Ordering::Acquire) {
             refuse(
                 Code::TRANSFER_FAILED,
                 "the pull stopped after another object failed",
@@ -248,6 +278,7 @@ impl Ledger {
 
     pub(super) fn for_attempt(&self, attempt: Arc<Attempt>) -> Self {
         Self {
+            caller_cancellation: self.caller_cancellation.clone(),
             cancelled: Arc::clone(&self.cancelled),
             sample: self.sample,
             worst_gap: Arc::clone(&self.worst_gap),

@@ -117,6 +117,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(store::fetch_admit, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_complete, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_complete_cozytensors, m)?)?;
+    m.add_class::<store::PyPullCancellation>()?;
     m.add_function(wrap_pyfunction!(store::pull, m)?)?;
     m.add_class::<store::PyRepoObjectCache>()?;
     m.add_class::<store::PyStore>()?;
