@@ -227,7 +227,7 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 	if state.RetainWork {
 		if state.Status == "paused" {
 			rec.Next = append(rec.Next, "cozy run resume "+reference)
-		} else if state.Status == "blocked" {
+		} else if state.Status == "blocked" && state.ErrorType != "request.state_lost" {
 			rec.Next = append(rec.Next, "cozy run <updated-script-or-package> --retry "+reference)
 		} else if state.Status != "pausing" {
 			rec.Next = append(rec.Next, "cozy run pause "+reference)
@@ -547,7 +547,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		humanStatus = humanCancellationStatus(state.CanceledBy)
 	}
 	err := exit.Named(code, status, "job %s ended %s", state.JobID, humanStatus)
-	if status == "blocked" {
+	if status == "blocked" && state.ErrorType != "request.state_lost" {
 		err.WithNext("cozy run <updated-script-or-package> --retry " + runReference(state.Number, state.JobID))
 	}
 	if state.Error != "" {
