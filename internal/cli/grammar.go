@@ -417,14 +417,18 @@ func (c *RunCancelCmd) Run(r *Runtime) error {
 type RunListCmd struct {
 	State   string `help:"Filter by lifecycle state."`
 	Package string `predictor:"package" help:"Filter by package."`
-	Limit   int    `help:"Maximum runs; 0 shows all retained history." default:"0"`
+	Limit   *int   `help:"Maximum runs; snapshots default to 50, 0 reads all history. Live lists load more while scrolling."`
 	Watch   bool   `help:"Refresh continuously (requires a terminal)."`
 	NoWatch bool   `help:"Print one snapshot even in a terminal."`
 }
 
 func (c *RunListCmd) Run(r *Runtime) error {
+	limit := ""
+	if c.Limit != nil {
+		limit = strconv.Itoa(*c.Limit)
+	}
 	return r.call(handleRunList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch), values(
-		"--state", c.State, "--package", c.Package, "--limit", intText(c.Limit)), true)
+		"--state", c.State, "--package", c.Package, "--limit", limit), true)
 }
 
 type RunWatchCmd struct {
