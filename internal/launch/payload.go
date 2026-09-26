@@ -47,6 +47,10 @@ var KernelAxes = []string{"attention"}
 type RunKeys struct {
 	// Models is the declared slot path -> ref the caller pinned.
 	Models map[string]string
+	// Overlays is the declared slot path -> ordered generic adapter overlays. The
+	// Runtime/package compatibility declaration resolves components and bounds later;
+	// the CLI only canonicalizes syntax and decimal weights here.
+	Overlays map[string][]ModelOverlay
 	// AttentionKernel rides the InvocationSpec to the worker; empty leaves the runtime's own
 	// selection alone, which is what every ordinary run does.
 	AttentionKernel string
@@ -60,6 +64,7 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 	json.RawMessage, RunKeys, *exit.Error,
 ) {
 	document := map[string]json.RawMessage{}
+	keys := RunKeys{Models: map[string]string{}, Overlays: map[string][]ModelOverlay{}}
 
 	if infile != "" {
 		data, err := os.ReadFile(infile)
@@ -92,15 +97,26 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		if err := json.Unmarshal(data, &loaded); err != nil {
 			return nil, RunKeys{}, exit.Internalf("cannot read normalized JSON inputs: %s", err)
 		}
+		if raw, ok := loaded["models"]; ok {
+			if problem := parseModelEnvelope(ep, raw, &keys); problem != nil {
+				return nil, RunKeys{}, problem
+			}
+			delete(loaded, "models")
+		}
 		for k, v := range loaded {
 			document[k] = v
 		}
 	}
 
-	keys := RunKeys{Models: map[string]string{}}
 	var positional []string
 	for _, term := range terms {
 		if strings.HasPrefix(term, "model.") && strings.Contains(term, "=") {
+			if strings.Contains(term, ".lora:=") || strings.HasSuffix(strings.SplitN(term, "=", 2)[0], ".lora") {
+				if problem := parseModelOverlayTerm(ep, term, &keys); problem != nil {
+					return nil, RunKeys{}, problem
+				}
+				continue
+			}
 			slotPath, ref, e := modelOverrideTerm(ep, term)
 			if e != nil {
 				return nil, RunKeys{}, e
@@ -109,6 +125,15 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 				return nil, RunKeys{}, exit.Usagef("model slot %s was bound more than once", slotPath)
 			}
 			keys.Models[slotPath] = ref
+			continue
+		}
+		// Model-binding overlays are reserved even without the historical `model.`
+		// prefix. Dotted payload fields are not legal, so this spelling cannot shadow a
+		// request field and keeps `base_model.lora:=…` useful in shell scripts.
+		if strings.Contains(term, ".lora=") {
+			if problem := parseModelOverlayTerm(ep, term, &keys); problem != nil {
+				return nil, RunKeys{}, problem
+			}
 			continue
 		}
 		if strings.HasPrefix(term, "kernel.") {
@@ -212,6 +237,123 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		return nil, RunKeys{}, exit.Internalf("cannot render the payload: %s", err)
 	}
 	return data, keys, nil
+}
+
+// ModelOverlay is the canonical ordered adapter selection carried beside one model
+// slot. The ref is resolved to an exact manifest only after the slot's compatibility
+// declaration has accepted it; the parser deliberately does not treat a digest as a
+// compatibility claim. Weight is a canonical decimal string so request identity does
+// not depend on JSON number formatting.
+type ModelOverlay struct {
+	Ref       string `json:"ref"`
+	Weight    string `json:"weight"`
+	Component string `json:"component,omitempty"`
+}
+
+func (o *ModelOverlay) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Ref       string          `json:"ref"`
+		Weight    json.RawMessage `json:"weight"`
+		Component string          `json:"component,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	weight := string(raw.Weight)
+	if len(raw.Weight) > 0 && raw.Weight[0] == '"' {
+		if err := json.Unmarshal(raw.Weight, &weight); err != nil {
+			return err
+		}
+	}
+	o.Ref, o.Weight, o.Component = raw.Ref, weight, raw.Component
+	return nil
+}
+
+func parseModelEnvelope(ep *Entrypoint, raw json.RawMessage, keys *RunKeys) *exit.Error {
+	var envelope map[string]struct {
+		Ref  string         `json:"ref"`
+		LoRA []ModelOverlay `json:"lora"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil || envelope == nil {
+		return exit.Named(exit.Usage, "model_binding_invalid", "models must be an object keyed by model slot").
+			WithRemedy(`use {"models":{"slot":{"ref":"org/model@release","lora":[{"ref":"org/adapter@release","weight":0.8}]}}}`)
+	}
+	for asked, value := range envelope {
+		slot, problem := modelOverrideSlot(ep, asked)
+		if problem != nil {
+			return problem
+		}
+		if value.Ref != "" {
+			if _, exists := keys.Models[slot.Path]; exists {
+				return exit.Usagef("model slot %s was bound more than once", slot.Path)
+			}
+			keys.Models[slot.Path] = value.Ref
+		}
+		for _, overlay := range value.LoRA {
+			if problem := appendModelOverlay(ep, slot.Path, overlay, keys); problem != nil {
+				return problem
+			}
+		}
+	}
+	return nil
+}
+
+func parseModelOverlayTerm(ep *Entrypoint, term string, keys *RunKeys) *exit.Error {
+	key, raw, ok := strings.Cut(term, ":=")
+	if !ok {
+		key, raw, ok = strings.Cut(term, "=")
+	}
+	if !ok || !strings.HasSuffix(key, ".lora") {
+		return exit.Named(exit.Usage, "model_overlay_invalid", "%s is not a model overlay", term).
+			WithRemedy("use model.<slot>.lora:=<json-list> or model.<slot>.lora=<ref>,weight=<number>")
+	}
+	asked := strings.TrimSuffix(strings.TrimPrefix(key, "model."), ".lora")
+	slot, problem := modelOverrideSlot(ep, asked)
+	if problem != nil {
+		return problem
+	}
+	if strings.HasPrefix(raw, "[") {
+		var overlays []ModelOverlay
+		if err := json.Unmarshal([]byte(raw), &overlays); err != nil {
+			return exit.Named(exit.Usage, "model_overlay_invalid", "%s is not a JSON overlay list: %s", key, err)
+		}
+		for _, overlay := range overlays {
+			if problem := appendModelOverlay(ep, slot.Path, overlay, keys); problem != nil {
+				return problem
+			}
+		}
+		return nil
+	}
+	ref, weight := raw, "1"
+	parts := strings.Split(raw, ",")
+	if len(parts) > 0 {
+		ref = parts[0]
+	}
+	for _, part := range parts[1:] {
+		name, value, found := strings.Cut(part, "=")
+		if !found || name != "weight" || value == "" {
+			return exit.Usagef("%s shorthand expects <ref>,weight=<number>", key)
+		}
+		weight = value
+	}
+	return appendModelOverlay(ep, slot.Path, ModelOverlay{Ref: ref, Weight: weight}, keys)
+}
+
+func appendModelOverlay(ep *Entrypoint, slotPath string, overlay ModelOverlay, keys *RunKeys) *exit.Error {
+	if strings.TrimSpace(overlay.Ref) == "" {
+		return exit.Usagef("model overlay for %s has an empty ref", slotPath)
+	}
+	weight := overlay.Weight
+	if weight == "" {
+		return exit.Usagef("model overlay for %s requires numeric weight", slotPath)
+	}
+	canonical, problem := CanonicalLoRAScale(weight)
+	if problem != nil {
+		return problem
+	}
+	overlay.Ref, overlay.Weight = strings.TrimSpace(overlay.Ref), canonical
+	keys.Overlays[slotPath] = append(keys.Overlays[slotPath], overlay)
+	return nil
 }
 
 // kernelOverrideTerm claims one `kernel.`-prefixed argv term for the execution-path override
