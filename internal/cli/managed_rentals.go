@@ -16,7 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
@@ -1184,19 +1183,13 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	if constraints.SupportedPythonMinors != nil {
 		policy = append(policy, constraints.SupportedPythonMinors)
 	}
-	selected, reason := launch.InventoryPython(inventory, constraints.RequiresPython, constraints.PythonVersion, policy...)
+	_, reason := launch.InventoryPython(inventory, constraints.RequiresPython, constraints.PythonVersion, policy...)
 	if strings.HasPrefix(reason, "no available Python executor") && launch.ProvisionablePython(rental.ImagePythonCapabilities(raw), constraints.RequiresPython, constraints.PythonVersion, policy...) {
-		selected, reason = constraints.PythonVersion, ""
+		reason = ""
 	}
 	if reason != "" {
 		return exit.Named(exit.Conflict, "rental.dependency_mismatch", "rental %s: %s", id, reason)
 	}
-	// Package distributions, including Torch, belong to the captured closure.
-	// Evaluate markers against the exact requested interpreter, even before it is installed.
-	if _, problem := packagepublish.EvaluateRequirements(call, constraints.Requirements, selected); problem != nil {
-		return problem
-	}
-
 	return nil
 }
 
