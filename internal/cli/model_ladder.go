@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
+
+	pep440 "github.com/aquasecurity/go-pep440-version"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -42,7 +43,6 @@ func modelReleaseCardForLane(ctx context.Context, c *hub.Client, ref hub.Ref, re
 			"Tensorhub returned model %s while resolving %s", card.Model.Ref(), ref.String())
 	}
 	if release == "" {
-		var newest time.Time
 		for _, candidate := range card.Releases {
 			if candidate.Yanked || candidate.YankedAt != "" {
 				continue
@@ -56,9 +56,8 @@ func modelReleaseCardForLane(ctx context.Context, c *hub.Client, ref hub.Ref, re
 			if !containsLane {
 				continue
 			}
-			cut, _ := time.Parse(time.RFC3339Nano, candidate.CutAt)
-			if release == "" || cut.After(newest) || cut.Equal(newest) && candidate.Release > release {
-				release, newest = candidate.Release, cut
+			if release == "" || newerModelRelease(candidate.Release, release) {
+				release = candidate.Release
 			}
 		}
 	}
@@ -71,6 +70,18 @@ func modelReleaseCardForLane(ctx context.Context, c *hub.Client, ref hub.Ref, re
 	return card, nil, exit.Named(exit.NotFound, "model.release_not_found",
 		"model %s has no available release %q (releases: %s)",
 		ref.String(), release, orNone(strings.Join(availableReleases(card), ", ")))
+}
+
+// Model cards do not carry creation times for native TensorFS releases. Use
+// the existing version parser for numeric and prerelease precedence; model labels
+// outside its version grammar retain their historical lexical ordering.
+func newerModelRelease(candidate, current string) bool {
+	next, nextErr := pep440.Parse(candidate)
+	prior, priorErr := pep440.Parse(current)
+	if nextErr == nil && priorErr == nil {
+		return next.GreaterThan(prior)
+	}
+	return candidate > current
 }
 
 func availableReleases(card hub.ModelCard) []string {
