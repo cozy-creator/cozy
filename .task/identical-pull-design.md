@@ -1,0 +1,9 @@
+# Concurrent identical pull repository recording
+
+Run 1091 completed two downloads for the same Qwen checkpoint. The first repository publication succeeded; a second completed transfer refused REPOSITORY_CONFLICT shortly afterward. A subsequent warm pull succeeded.
+
+`transport::pull::record_locally` reads repository bytes, writes a checkpoint, then writes the release lane using two independent `Store::apply_cached_repository` calls. `catalog::WriterGuard` is a shared recovery/liveness marker, not writer serialization. Each durable write is actually serialized by `Catalog::commit_repository`'s SQLite BEGIN IMMEDIATE. A peer may publish between observation and either CAS.
+
+Plan: publish a verified pull's checkpoint and optional lane as one repository transaction. Re-read under SQLite writer coordination. A stale cached pull may converge only when the committed repository already contains its exact checkpoint and exact active release lane. Preserve the committed document's unrelated fields. Different manifests, aliases, yanked releases, repository identity mismatches, malformed data, and unsatisfied stale intent remain refusals. Ordinary public repository CAS stays strict. Keep manifest/blob verification outside the SQLite writer transaction because it may update verification records.
+
+Focused native tests will force two identical observations and concurrent recording; cover incompatible manifests for one release/lane, unrelated metadata preservation, malformed repository data, and unchanged strict public CAS. No broad local CI or build. Remote test execution and deployment remain root-coordinated gates.
