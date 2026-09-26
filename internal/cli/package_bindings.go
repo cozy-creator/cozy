@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -286,7 +287,16 @@ func parseLadder(raw []string) ([]hub.BindingRung, *exit.Error) {
 		if !ok {
 			return nil, exit.Usagef("--gpu %q is not <GPU>=<lane>", spec)
 		}
-		ladder = append(ladder, hub.BindingRung{GPU: gpu, Lane: lane})
+		count := 0
+		if prefix, model, found := strings.Cut(gpu, "x"); found {
+			if parsed, err := strconv.Atoi(prefix); err == nil {
+				if parsed < 1 || parsed > 16 {
+					return nil, exit.Usagef("GPU count must be 1 through 16")
+				}
+				count, gpu = parsed, model
+			}
+		}
+		ladder = append(ladder, hub.BindingRung{GPU: gpu, GPUs: count, Lane: lane})
 	}
 	if problem := hub.ValidateLadder(ladder); problem != nil {
 		return nil, problem

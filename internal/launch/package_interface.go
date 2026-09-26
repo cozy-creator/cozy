@@ -112,6 +112,7 @@ type Slot struct {
 // This immutable metadata is a fallback; it is never a mutable Hub binding row.
 type ModelDefaultRung struct {
 	GPU  string `json:"gpu"`
+	GPUs int    `json:"gpus,omitempty"`
 	Lane string `json:"lane"`
 }
 
@@ -336,11 +337,18 @@ func validateClosedPackageInterface(data []byte) error {
 							return fmt.Errorf("default_ladder must contain 1 through 32 rungs")
 						}
 						for _, rung := range rungs {
-							fields, err := exactKeys(rung, []string{"gpu", "lane"}, nil)
+							fields, err := exactKeys(rung, []string{"gpu", "lane"}, []string{"gpus"})
 							if err != nil {
 								return err
 							}
-							for _, field := range fields {
+							for name, field := range fields {
+								if name == "gpus" {
+									var count int
+									if json.Unmarshal(field, &count) != nil || count < 1 || count > 16 {
+										return fmt.Errorf("default_ladder gpus must be an integer from 1 through 16")
+									}
+									continue
+								}
 								var value string
 								if json.Unmarshal(field, &value) != nil || value == "" {
 									return fmt.Errorf("default_ladder GPU patterns and lane references must be nonempty strings")
@@ -879,4 +887,9 @@ func (e *Entrypoint) RequestFields() []string {
 		out = append(out, f.Name)
 	}
 	return out
+}
+
+// AllowsGPUCount checks an explicit execution group against the authored model capability.
+func (s Slot) AllowsGPUCount(count int) bool {
+	return count >= 0 && count <= 16 && (count <= 1 || s.sequenceParallelDegrees()[count])
 }

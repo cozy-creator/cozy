@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -371,10 +372,16 @@ type PackageBindingRow struct {
 // and is allowed only as the last rung.
 type BindingRung struct {
 	GPU  string `json:"gpu"`
+	GPUs int    `json:"gpus,omitempty"`
 	Lane string `json:"lane"`
 }
 
-func (r BindingRung) String() string { return r.GPU + "=" + r.Lane }
+func (r BindingRung) String() string {
+	if r.GPUs > 0 {
+		return fmt.Sprintf("%dx%s=%s", r.GPUs, r.GPU, r.Lane)
+	}
+	return r.GPU + "=" + r.Lane
+}
 
 // Ref renders the row as its org/model@release spelling.
 func (b PackageBindingRow) Ref() string { return b.Model + "@" + b.Release }
@@ -395,6 +402,9 @@ func ValidateLadder(ladder []BindingRung) *exit.Error {
 		return exit.Usagef("a binding needs at least one --gpu <GPU>=<lane> rung")
 	}
 	for i, rung := range ladder {
+		if rung.GPUs < 0 || rung.GPUs > 16 {
+			return exit.Usagef("rung %d GPU count must be 1 through 16 when supplied", i+1)
+		}
 		if len(rung.GPU) == 0 || len(rung.GPU) > 64 || strings.TrimSpace(rung.GPU) != rung.GPU ||
 			(rung.GPU != "*" && strings.IndexFunc(rung.GPU, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }) < 0) ||
 			strings.TrimSpace(rung.Lane) == "" || strings.ContainsAny(rung.Lane, " \t") {

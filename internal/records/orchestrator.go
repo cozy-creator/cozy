@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"math"
 	"slices"
@@ -576,6 +577,8 @@ type AssetBinding struct {
 // spelling before it rents anything, records this row with the request, and sends it
 // only to the attached worker in the desired download set.
 type ModelRef struct {
+	Callable string            `json:"callable,omitempty"` // independently scheduled captured callable, qualified by package
+	GPUs     int               `json:"gpus,omitempty"`     // exact selected execution group, zero is unspecified
 	Adapters []ModelAdapterRef `json:"adapters,omitempty"`
 	Package  string            `json:"package"`
 	Slot     string            `json:"slot"`
@@ -652,8 +655,9 @@ func SameAdapters(a, b []ModelAdapterRef) bool {
 	return true
 }
 
-// ModelRung is one (gpu, lane) fit resolved against the model card.
+// ModelRung is one GPU class, execution group and lane resolved against the model card.
 type ModelRung struct {
+	GPUs           int              `json:"gpus,omitempty"`
 	GPU            string           `json:"gpu"`
 	Lane           string           `json:"lane"`
 	Manifest       string           `json:"manifest"`
@@ -661,7 +665,12 @@ type ModelRung struct {
 	ComponentBytes map[string]int64 `json:"component_bytes,omitempty"`
 }
 
-func (r ModelRung) String() string { return r.GPU + "=" + r.Lane }
+func (r ModelRung) String() string {
+	if r.GPUs > 0 {
+		return fmt.Sprintf("%dx%s=%s", r.GPUs, r.GPU, r.Lane)
+	}
+	return r.GPU + "=" + r.Lane
+}
 
 // Pinned says the ref names one exact manifest; an unpinned ref still carries its ladder.
 func (m ModelRef) Pinned() bool { return m.Manifest != "" }
@@ -669,13 +678,31 @@ func (m ModelRef) Pinned() bool { return m.Manifest != "" }
 // RungFor is the first rung whose gpu pattern fits `accelerator` and its index; a pinned
 // ref fits every machine as itself (index 0). An empty accelerator — a host without an
 // NVIDIA device — fits only the "*" rung.
-func (m ModelRef) RungFor(accelerator string) (ModelRung, int, bool) {
+func (m ModelRef) RungFor(accelerator string, count int) (ModelRung, int, bool) {
 	if m.Pinned() {
-		return ModelRung{GPU: "*", Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes,
-			ComponentBytes: m.ComponentBytes}, 0, true
+		return ModelRung{GPU: "*", GPUs: m.GPUs, Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes,
+			ComponentBytes: m.ComponentBytes}, 0, m.GPUs <= count
 	}
 	for i, rung := range m.Ladder {
-		if RungMatches(rung.GPU, accelerator) {
+		if RungMatches(rung.GPU, accelerator) && rung.GPUs <= count {
+			return rung, i, true
+		}
+	}
+	return ModelRung{}, -1, false
+}
+
+// PurchaseRung only buys a wider machine when that exact group is authored.
+func (m ModelRef) PurchaseRung(accelerator string, count int) (ModelRung, int, bool) {
+	if m.Pinned() {
+		return m.RungFor(accelerator, count)
+	}
+	for i, rung := range m.Ladder {
+		if rung.GPUs == count && RungMatches(rung.GPU, accelerator) {
+			return rung, i, true
+		}
+	}
+	for i, rung := range m.Ladder {
+		if rung.GPUs <= 1 && RungMatches(rung.GPU, accelerator) {
 			return rung, i, true
 		}
 	}
@@ -684,6 +711,7 @@ func (m ModelRef) RungFor(accelerator string) (ModelRung, int, bool) {
 
 // Pin returns the ref bound to one rung, its ladder kept.
 func (m ModelRef) Pin(rung ModelRung) ModelRef {
+	m.GPUs = rung.GPUs
 	m.Lane, m.Manifest, m.Bytes, m.ComponentBytes = rung.Lane, rung.Manifest, rung.Bytes, rung.ComponentBytes
 	return m
 }
@@ -735,7 +763,8 @@ type Residency struct {
 // the components it names), or the largest single component when the slot declares none;
 // with no component bytes, the owner's rung for this accelerator and lane asserts the fit
 // with no figure, and failing that the lane's whole bytes stand in. Summed over slots,
-// because a placement holds every slot at once.
+// because one callable holds its slots at once. Independently scheduled captured
+// callables use their maximum resident group, not the sum across the workflow.
 //
 // `job` sizes the SAME selection as a job's inputs instead, and there the answer is
 // nothing: cozy-runtime hands a job a derive-only view of the Manifest and refuses load
@@ -743,6 +772,25 @@ type Residency struct {
 // closure is. Sizing one by the components a SERVING construction would stage is a figure
 // about a different run (cl-180).
 func Resident(models []ModelRef, accelerator string, job bool) Residency {
+	groups := map[string][]ModelRef{}
+	for _, model := range models {
+		groups[model.Callable] = append(groups[model.Callable], model)
+	}
+	if len(groups) > 1 || (len(groups) == 1 && len(groups[""]) == 0) {
+		var peak Residency
+		// Callable groups execute independently; slots inside each group are simultaneous.
+		for _, key := range slices.Sorted(maps.Keys(groups)) {
+			current := residentTogether(groups[key], accelerator, false)
+			if current.Bytes > peak.Bytes || peak.Fit == "" {
+				peak = current
+			}
+		}
+		return peak
+	}
+	return residentTogether(models, accelerator, job)
+}
+
+func residentTogether(models []ModelRef, accelerator string, job bool) Residency {
 	var out Residency
 	var fits, needs []string
 	for _, model := range models {

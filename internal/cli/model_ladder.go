@@ -123,13 +123,14 @@ func localAccelerator(cfg config.Config) string {
 // declared lane. The ladder is not a local hardware allowlist: Runtime still
 // checks actual encoding support, construction compatibility and memory capacity.
 func localRung(ctx *Context, ladder []hub.BindingRung) (hub.BindingRung, *exit.Error) {
+	inventory := hostgpu.Probe(ctx.Cfg)
 	accelerator := localAccelerator(ctx.Cfg)
 	for _, rung := range ladder {
-		if records.RungMatches(rung.GPU, accelerator) {
+		if records.RungMatches(rung.GPU, accelerator) && rung.GPUs <= len(inventory.GPUs) {
 			return rung, nil
 		}
 	}
-	if len(ladder) > 0 {
+	if len(ladder) > 0 && ladder[0].GPUs == 0 {
 		return ladder[0], nil
 	}
 	return hub.BindingRung{}, exit.Named(exit.Validation, "model_ladder_empty",
@@ -168,6 +169,9 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 	}
 	rungs := make([]records.ModelRung, 0, len(spec.Binding.Ladder))
 	for _, rung := range spec.Binding.Ladder {
+		if !slot.AllowsGPUCount(rung.GPUs) {
+			return empty, exit.Named(exit.Validation, "package_model_default_invalid", "%s does not support %d GPUs", slot.Path, rung.GPUs)
+		}
 		lane, problem := laneOf(ref, selected, rung.Lane)
 		if problem != nil {
 			return empty, rebind(problem, packageName, slot.Path)
@@ -179,7 +183,7 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 			return empty, exit.Named(exit.Conflict, "rental.model_manifest_invalid",
 				"Tensorhub returned an invalid manifest for %s@%s/%s", ref.String(), selected.Release, rung.Lane)
 		}
-		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, Lane: rung.Lane,
+		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane,
 			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
 	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(), CatalogRepository: ref.String(),

@@ -6,6 +6,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -33,14 +34,14 @@ import (
 // `accelerator` — the machine the child will run on, which for a rental composition is the
 // parent's own pod. An empty accelerator is the host without an NVIDIA device and matches
 // only a "*" rung, exactly as a local run of the callee would.
-func (r *Resolver) childModelSelection(pkg, entrypoint string, slot launch.Slot, accelerator string) (orchestrator.ModelRef, *exit.Error) {
+func (r *Resolver) childModelSelection(pkg, entrypoint string, slot launch.Slot, accelerator string, count int) (orchestrator.ModelRef, *exit.Error) {
 	out, problem := r.childModelLadder(pkg, entrypoint, slot)
 	if problem != nil {
 		return orchestrator.ModelRef{}, problem
 	}
 	// The child runs on ONE known machine, so its rung is decided here rather than left
 	// unpinned for a placement decision the child never enters — it inherits its parent's.
-	fitted, _, ok := out.RungFor(accelerator)
+	fitted, _, ok := out.RungFor(accelerator, count)
 	if !ok {
 		return orchestrator.ModelRef{}, exit.Named(exit.Conflict, "child.model_rung_absent",
 			"%s model %s has no lane declared for %s (ladder: %s)",
@@ -101,6 +102,9 @@ func (r *Resolver) childModelLadder(pkg, entrypoint string, slot launch.Slot) (o
 	}
 	rungs := make([]records.ModelRung, 0, len(binding.Ladder))
 	for _, rung := range binding.Ladder {
+		if !slot.AllowsGPUCount(rung.GPUs) {
+			return empty, exit.Named(exit.Validation, "package_model_default_invalid", "%s does not support %d GPUs", slot.Path, rung.GPUs)
+		}
 		lane, problem := laneOf(ref, selected, rung.Lane)
 		if problem != nil {
 			return empty, problem
@@ -112,7 +116,7 @@ func (r *Resolver) childModelLadder(pkg, entrypoint string, slot launch.Slot) (o
 			return empty, exit.Named(exit.Conflict, "child.model_manifest_invalid",
 				"Tensorhub returned an invalid manifest for %s@%s/%s", ref.String(), selected.Release, rung.Lane)
 		}
-		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, Lane: rung.Lane,
+		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane,
 			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
 	return orchestrator.ModelRef{Package: pkg, Slot: slot.Param, BindingPath: slot.Path,
@@ -156,22 +160,22 @@ func (r *Resolver) childSlotBinding(pkg, entrypoint string, slot launch.Slot) (h
 // childAccelerator is the machine a captured child of this parent will run on. A rental
 // composition keeps parent and child on one pod, so the parent's own paid accelerator is
 // the child's; a local parent's child runs on this host's device.
-func (r *Resolver) childAccelerator(parent records.Request) (string, *exit.Error) {
+func (r *Resolver) childAccelerator(parent records.Request) (string, int, *exit.Error) {
 	if parent.Worker == "" {
-		return localAccelerator(r.cfg), nil
+		return localAccelerator(r.cfg), len(hostgpu.Probe(r.cfg).GPUs), nil
 	}
 	row, problem := r.store.RentalRow(parent.Worker)
 	if problem != nil {
-		return "", problem
+		return "", 0, problem
 	}
 	if row == nil {
-		return "", exit.Named(exit.Conflict, "child.parent_machine_absent",
+		return "", 0, exit.Named(exit.Conflict, "child.parent_machine_absent",
 			"the parent's machine is no longer recorded")
 	}
 	if records.CPUAccelerator(row.AcceleratorModel) {
-		return "", nil
+		return "", 0, nil
 	}
-	return row.AcceleratorModel, nil
+	return row.AcceleratorModel, row.AcceleratorCount, nil
 }
 
 // UnpublishedChildModels supplies captured defaults for a CPU request's rental choice.
@@ -179,7 +183,7 @@ func (r *Resolver) childAccelerator(parent records.Request) (string, *exit.Error
 // callable capture does not mean those children are invoked or resident alongside it.
 // As with PrivateRentalNeedsAccelerator, only CPU orchestration needs the traversal.
 func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.ModelRef, *exit.Error) {
-	if request.NeedsAccelerator || request.InstallID == "" {
+	if (request.NeedsAccelerator && len(request.Models) > 0) || request.InstallID == "" {
 		return nil, nil
 	}
 	var out []records.ModelRef
@@ -223,6 +227,7 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 				}
 				// Qualified so a shot's slot cannot collide with the parent's own.
 				selected.Slot = binding.Entrypoint + "/" + slot.Param
+				selected.Callable = child.Package + "/" + binding.Entrypoint
 				out = append(out, selected)
 			}
 			queue = append(queue, binding.ChildInstallID)

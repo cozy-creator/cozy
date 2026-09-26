@@ -108,6 +108,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 	}
 	models := make([]orchestrator.ModelRef, 0, len(job.Models))
 	accelerator, machineRead := "", false
+	count := 0
 	for _, slot := range job.Models {
 		if _, present := arguments[slot.Param]; job.Kind == "entrypoint" && !present {
 			return out, "", exit.Named(exit.Conflict, "child.model_unbound", "serving model arguments differ from declared slots")
@@ -121,13 +122,13 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 			// owner's binding or the callee's authored default (cl-210). The caller named
 			// its own callable, never a model.
 			if !machineRead {
-				accelerator, problem = r.childAccelerator(parent)
+				accelerator, count, problem = r.childAccelerator(parent)
 				if problem != nil {
 					return out, "", problem
 				}
 				machineRead = true
 			}
-			selected, problem := r.childModelSelection(install.Package, binding.Entrypoint, slot, accelerator)
+			selected, problem := r.childModelSelection(install.Package, binding.Entrypoint, slot, accelerator, count)
 			if problem != nil {
 				return out, "", problem
 			}
