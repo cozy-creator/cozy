@@ -99,16 +99,15 @@ func TestRentalRequirementsIncludeTheWholeSelectedClosure(t *testing.T) {
 	}}
 	selection, problem := install.ExecutionRequirements(context.Background(), venv, "project", nil)
 	fatal(t, problem)
-	requirements, problem := packagepublish.EvaluateRequirements(context.Background(), selection.Requirements, inventory.Python)
-	fatal(t, problem)
+	requirements := selection.Requirements
 	joined := strings.Join(requirements, "\n")
 	for _, required := range []string{"cuda-bindings==13.3.1", "numpy<2.6,>=2.5", "torch<3,>=2.13"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("selected subtree omitted %s: %v", required, requirements)
 		}
 	}
-	if strings.Contains(joined, "torch>=3") || strings.Contains(joined, "torch>=99") {
-		t.Fatal("inactive or development dependency entered selected closure")
+	if !strings.Contains(joined, `sys_platform == "win32"`) || strings.Contains(joined, "torch>=99") {
+		t.Fatal("target marker was lost or development dependency entered selected closure")
 	}
 	if why := launch.InventoryMismatch(inventory, requirements, ""); why != "" {
 		t.Fatalf("private dependency versions constrained base image: %s", why)

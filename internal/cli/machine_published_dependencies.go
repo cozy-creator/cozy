@@ -169,7 +169,7 @@ func (m *machineRuns) publishedChildPreparation(ctx context.Context, request rec
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
-	locked, problem := install.PublishedRequirements(ctx, source)
+	locked, problem := install.PublishedRequirements(source)
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}

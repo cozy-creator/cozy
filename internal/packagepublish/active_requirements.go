@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"io"
 	"os/exec"
-	"strings"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -54,18 +53,6 @@ func ActiveRequirements(ctx context.Context, project string, extras []string, me
 	}
 	return readActiveRequirements(ctx, map[string]any{"project": project, "extras": extras,
 		"metadata": metadata, "python": python})
-}
-
-func EvaluateRequirements(ctx context.Context, requirements []string, python string) ([]string, *exit.Error) {
-	marked := false
-	for _, requirement := range requirements {
-		marked = marked || strings.Contains(requirement, ";")
-	}
-	if !marked {
-		return requirements, nil
-	}
-	selection, problem := readActiveRequirements(ctx, map[string]any{"requirements": requirements, "python": python})
-	return selection.Requirements, problem
 }
 
 func readActiveRequirements(ctx context.Context, input map[string]any) (RequirementSelection, *exit.Error) {

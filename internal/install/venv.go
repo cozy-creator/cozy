@@ -134,7 +134,7 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 		"venv", "--python", python.Executable, "--no-progress", venvDir); problem != nil {
 		return nil, problem
 	}
-	body, problem := exportPublishedRequirements(sourceDir, published, python.Executable)
+	body, problem := exportPublishedRequirements(sourceDir, published)
 	if problem != nil {
 		return nil, problem
 	}
@@ -163,7 +163,7 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 
 // PublishedRequirements prepares a dependency on the worker without installing a
 // second execution environment in Creator or changing an active package pin.
-func PublishedRequirements(ctx context.Context, published *PublishedSource) ([]byte, *exit.Error) {
+func PublishedRequirements(published *PublishedSource) ([]byte, *exit.Error) {
 	if problem := validatePublished(records.PackageInstall{Package: published.Package, Version: published.Release}, published); problem != nil {
 		return nil, problem
 	}
@@ -177,14 +177,10 @@ func PublishedRequirements(ctx context.Context, published *PublishedSource) ([]b
 			return nil, exit.Internalf("cannot retain published metadata: %s", err)
 		}
 	}
-	python, problem := hostruntime.ProjectPython(ctx, root)
-	if problem != nil {
-		return nil, problem
-	}
-	return exportPublishedRequirements(root, published, python.Executable)
+	return exportPublishedRequirements(root, published)
 }
 
-func exportPublishedRequirements(sourceDir string, published *PublishedSource, python string) ([]byte, *exit.Error) {
+func exportPublishedRequirements(sourceDir string, published *PublishedSource) ([]byte, *exit.Error) {
 	appended := append([]PublishedWheel{published.ProjectWheel}, published.Wheels...)
 	appended = append(appended, published.LocalWheels...)
 	temporary, err := os.CreateTemp("", "cozy-locked-export-")
@@ -198,7 +194,7 @@ func exportPublishedRequirements(sourceDir string, published *PublishedSource, p
 	// supply; those rows are re-added below as exact org-index pins.
 	args := []string{"export", "--frozen", "--no-dev", "--no-default-groups", "--no-emit-project",
 		"--format", "requirements.txt", "--output-file", exported, "--no-progress",
-		"--python", python, "--no-python-downloads"}
+		"--no-python-downloads"}
 	seen := map[string]bool{}
 	for _, wheel := range appended {
 		name := strings.TrimSpace(wheel.Distribution)

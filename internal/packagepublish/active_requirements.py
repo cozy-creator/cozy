@@ -76,23 +76,6 @@ if "markers" in request:
     json.dump({"markers": selected}, sys.stdout)
     sys.exit(0)
 
-if "requirements" in request:
-    active = set()
-    for raw in strings(request["requirements"]):
-        requirement = Requirement(raw)
-        known = {"implementation_name", "implementation_version", "os_name", "platform_machine",
-                 "platform_python_implementation", "python_full_version", "python_version", "sys_platform"}
-        if requirement.marker and not variables(requirement.marker._markers).issubset(known):
-            # Inventory carries no kernel release or selected public-package extra.
-            # Keep those markers for worker admission rather than inventing a value.
-            active.add(str(requirement))
-            continue
-        if requirement.marker is None or requirement.marker.evaluate(environment):
-            requirement.marker = None
-            active.add(str(requirement))
-    json.dump({"requirements": sorted(active), "extras": {}}, sys.stdout)
-    sys.exit(0)
-
 metadata = {name: Parser().parsestr(text(raw)) for name, raw in mapping(request["metadata"]).items()}
 def bind_extra(node: MarkerList | MarkerAtom, extra: str) -> str | bool:
     """Partially evaluate packaging 26.2's parsed tree, retaining target markers."""
