@@ -1473,9 +1473,8 @@ fn while_store_busy<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
 /// measured 135 MB proof store planned its entire contents for deletion after a successful
 /// fetch.
 ///
-/// Both mutations are idempotent, which is what a warm re-fetch needs: an identical
-/// checkpoint returns the repository unchanged, and re-setting a lane to the manifest it
-/// already names is a no-op the revision fence accepts because the revision is read fresh.
+/// Record the checkpoint and lane in one transaction. A concurrent identical pull may
+/// satisfy this exact intent; a different update retains the repository CAS refusal.
 fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
     use crate::repository::{Mutation, ReleaseLane, Repository, RepositoryName};
 
@@ -1486,43 +1485,33 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
         );
     };
     let repo = RepositoryName::new(org, name)?;
-    let fault = crate::store::Fault::default();
-    let mut observed = std::fs::read(store.repository_path(&repo)).ok();
-    let mut latest = observed.as_deref().map(Repository::parse).transpose()?;
-
-    // A warm pull records nothing, for the same reason it moves nothing: the row already
-    // says what this pull would say.
+    let path = store.repository_path(&repo);
+    let observed = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(crate::store::classify_io("read pull repository", error)),
+    };
+    let latest = observed.as_deref().map(Repository::parse).transpose()?;
     if holds_checkpoint(latest.as_ref(), closure) && holds_lane(latest.as_ref(), closure) {
         return Ok(());
     }
-    if !holds_checkpoint(latest.as_ref(), closure) {
-        latest = store.apply_cached_repository(
-            observed.as_deref(),
-            &Mutation::PutCheckpoint {
-                repo: repo.clone(),
-                manifest: closure.manifest.clone(),
-            },
-            &fault,
-        )?;
-        observed = latest.as_ref().map(Doc::canonical_bytes);
-    }
-    // A closure that named no lane still gets its checkpoint, which is what keeps the
-    // objects live; there is simply no release row to point at them.
-    if closure.lane.is_empty() {
-        return Ok(());
-    }
-    let expected_revision = latest
-        .as_ref()
-        .and_then(|repository| {
-            repository
-                .releases
-                .iter()
-                .find(|release| release.version == closure.release)
-        })
-        .map_or(0, |release| release.revision);
-    store.apply_cached_repository(
-        observed.as_deref(),
-        &Mutation::UpdateRelease {
+    // Keep the full intent even when the observed checkpoint is already present: a stale
+    // commit may converge only if both the exact checkpoint and requested lane survive.
+    let mut mutations = vec![Mutation::PutCheckpoint {
+        repo: repo.clone(),
+        manifest: closure.manifest.clone(),
+    }];
+    if !closure.lane.is_empty() {
+        let expected_revision = latest
+            .as_ref()
+            .and_then(|repository| {
+                repository
+                    .releases
+                    .iter()
+                    .find(|release| release.version == closure.release)
+            })
+            .map_or(0, |release| release.revision);
+        mutations.push(Mutation::UpdateRelease {
             expected_revision,
             repo,
             remove: Vec::new(),
@@ -1531,9 +1520,9 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
                 manifest: closure.manifest.clone(),
             }],
             version: closure.release.clone(),
-        },
-        &fault,
-    )?;
+        });
+    }
+    store.apply_cached_repository(observed.as_deref(), &mutations, &crate::store::Fault::default())?;
     Ok(())
 }
 

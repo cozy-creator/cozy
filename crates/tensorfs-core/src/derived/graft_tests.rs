@@ -222,10 +222,10 @@ fn pressure_keeps_cached_inputs_of_a_paused_derive_until_explicit_abandon() {
         let recorded = store
             .apply_cached_repository(
                 None,
-                &Mutation::PutCheckpoint {
+                &[Mutation::PutCheckpoint {
                     repo: repo.clone(),
                     manifest: receipt.manifest.clone(),
-                },
+                }],
                 &Default::default(),
             )
             .unwrap()

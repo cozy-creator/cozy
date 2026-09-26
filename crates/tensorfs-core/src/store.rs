@@ -28,6 +28,35 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{hex64, Doc, ObjectRef};
 use crate::sha256::{self, Sha256};
 
+/// A stale cache commit can succeed only when every requested addition is already true.
+/// Other mutation kinds retain strict CAS, including local aliases and removals.
+fn cached_repository_satisfies(
+    repository: &crate::repository::Repository,
+    mutations: &[crate::repository::Mutation],
+) -> bool {
+    use crate::repository::Mutation;
+    !mutations.is_empty()
+        && mutations.iter().all(|mutation| {
+            if &repository.repo != mutation.repo() || repository.repo.org == "local" {
+                return false;
+            }
+            match mutation {
+                Mutation::PutCheckpoint { manifest, .. } => repository
+                    .checkpoints
+                    .iter()
+                    .any(|checkpoint| &checkpoint.manifest == manifest),
+                Mutation::UpdateRelease { version, set, remove, .. } if remove.is_empty() => {
+                    repository.releases.iter().any(|release| {
+                        &release.version == version
+                            && !release.yanked
+                            && set.iter().all(|lane| release.lanes.contains(lane))
+                    })
+                }
+                _ => false,
+            }
+        })
+}
+
 pub(crate) const BUF: usize = 1 << 20;
 
 #[cfg(target_os = "linux")]
@@ -977,18 +1006,19 @@ impl Store {
         fault: &Fault,
     ) -> Result<Option<crate::repository::Repository>> {
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
-        self.apply_repository_locked(observed, mutation, fault, false)
+        self.apply_repository_locked(observed, std::slice::from_ref(mutation), fault, false)
     }
 
-    /// Only the verified Hub transport may extend disposable cache ownership.
+    /// Record one verified pull's checkpoint and optional release lane atomically. Only
+    /// this cache door may accept a stale observation whose exact intent is already held.
     pub(crate) fn apply_cached_repository(
         &self,
         observed: Option<&[u8]>,
-        mutation: &crate::repository::Mutation,
+        mutations: &[crate::repository::Mutation],
         fault: &Fault,
     ) -> Result<Option<crate::repository::Repository>> {
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
-        self.apply_repository_locked(observed, mutation, fault, true)
+        self.apply_repository_locked(observed, mutations, fault, true)
     }
 
     pub(crate) fn remove_cached_repository(
@@ -1002,7 +1032,7 @@ impl Store {
         }
         self.apply_repository_locked(
             Some(observed),
-            &crate::repository::Mutation::DeleteRepository { repo: repo.clone() },
+            &[crate::repository::Mutation::DeleteRepository { repo: repo.clone() }],
             &Fault::default(),
             false,
         )?;
@@ -1012,45 +1042,37 @@ impl Store {
     fn apply_repository_locked(
         &self,
         observed: Option<&[u8]>,
-        mutation: &crate::repository::Mutation,
+        mutations: &[crate::repository::Mutation],
         fault: &Fault,
         cache: bool,
     ) -> Result<Option<crate::repository::Repository>> {
+        let Some(first) = mutations.first() else {
+            return refuse(Code::REPOSITORY_CONFLICT, "repository commit has no mutations");
+        };
+        let repo = first.repo();
+        if mutations.iter().any(|mutation| mutation.repo() != repo) {
+            return refuse(Code::REPOSITORY_CONFLICT, "repository commit spans repositories");
+        }
         let catalog = crate::catalog::Catalog::open(&self.root)?;
-        let path = self.repository_path(mutation.repo());
+        let path = self.repository_path(repo);
         let current = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(io(format!("read {}", path.display()), error)),
         };
-        if current.as_deref() != observed {
+        if !cache && current.as_deref() != observed {
             return refuse(
                 Code::REPOSITORY_CONFLICT,
                 "repository bytes changed since the caller observed them",
             );
         }
-        match mutation {
-            crate::repository::Mutation::PutCheckpoint { manifest, .. }
-            | crate::repository::Mutation::ReplaceLocal { manifest, .. } => {
-                let parsed = self.read_manifest(manifest)?;
-                for (_, entry) in parsed.entries() {
-                    let object = entry.blob();
-                    let file = self.open_verified(&object.sha256)?;
-                    if file.len() != object.length {
-                        return refuse(
-                            Code::LENGTH_MISMATCH,
-                            format!("{} length differs from manifest", object.id()),
-                        );
-                    }
-                }
-                if let Some(header_ref) = parsed.header() {
-                    crate::checkpoint::load_header(self, header_ref)?;
-                    crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
-                }
-            }
-            crate::repository::Mutation::UpdateRelease { set, .. } => {
-                for lane in set {
-                    let parsed = self.read_manifest(&lane.manifest)?;
+        // Validation may write verification records; finish it before BEGIN IMMEDIATE.
+        let mut replacement = observed.map(crate::repository::Repository::parse).transpose()?;
+        for mutation in mutations {
+            match mutation {
+                crate::repository::Mutation::PutCheckpoint { manifest, .. }
+                | crate::repository::Mutation::ReplaceLocal { manifest, .. } => {
+                    let parsed = self.read_manifest(manifest)?;
                     for (_, entry) in parsed.entries() {
                         let object = entry.blob();
                         let file = self.open_verified(&object.sha256)?;
@@ -1066,21 +1088,50 @@ impl Store {
                         crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
                     }
                 }
+                crate::repository::Mutation::UpdateRelease { set, .. } => {
+                    for lane in set {
+                        let parsed = self.read_manifest(&lane.manifest)?;
+                        for (_, entry) in parsed.entries() {
+                            let object = entry.blob();
+                            let file = self.open_verified(&object.sha256)?;
+                            if file.len() != object.length {
+                                return refuse(
+                                    Code::LENGTH_MISMATCH,
+                                    format!("{} length differs from manifest", object.id()),
+                                );
+                            }
+                        }
+                        if let Some(header_ref) = parsed.header() {
+                            crate::checkpoint::load_header(self, header_ref)?;
+                            crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
+                        }
+                    }
+                }
+                crate::repository::Mutation::RemoveCheckpoint { .. }
+                | crate::repository::Mutation::YankRelease { .. }
+                | crate::repository::Mutation::DeleteRepository { .. } => {}
             }
-            crate::repository::Mutation::RemoveCheckpoint { .. }
-            | crate::repository::Mutation::YankRelease { .. }
-            | crate::repository::Mutation::DeleteRepository { .. } => {}
+            // A published checkpoint has additional immutable facts. Reuse its exact
+            // manifest without trying to replace those facts with PutCheckpoint defaults.
+            if cache
+                && matches!(mutation, crate::repository::Mutation::PutCheckpoint { .. })
+                && replacement.as_ref().is_some_and(|repository| {
+                    cached_repository_satisfies(repository, std::slice::from_ref(mutation))
+                })
+            {
+                continue;
+            }
+            let bytes = replacement.as_ref().map(Doc::canonical_bytes);
+            replacement = crate::repository::apply(bytes.as_deref(), mutation)?;
         }
-        let replacement = crate::repository::apply(observed, mutation)?;
         if let Some(repository) = &replacement {
             for checkpoint in &repository.checkpoints {
                 self.read_manifest(&checkpoint.manifest)?;
             }
         }
-        let org = mutation.repo().org.clone();
-        let name = mutation.repo().name.clone();
-        let expected = current;
-        let replacement_for_write = replacement.clone();
+        let org = repo.org.clone();
+        let name = repo.name.clone();
+        let expected = observed;
         let path_for_write = path.clone();
         catalog.commit_repository(&org, &name, || {
             let actual = match fs::read(&path_for_write) {
@@ -1088,7 +1139,22 @@ impl Store {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(io("read repository under coordination", error)),
             };
-            if actual != expected {
+            if actual.as_deref() != expected {
+                if cache {
+                    let latest = actual
+                        .as_deref()
+                        .map(crate::repository::Repository::parse)
+                        .transpose()?;
+                    if latest.as_ref().is_some_and(|repository| {
+                        cached_repository_satisfies(repository, mutations)
+                    }) {
+                        // Another pull recorded the same result. Keep every current field
+                        // and ownership receipt; never replay stale mutations over it.
+                        replacement = latest;
+                        return crate::storage::Census::open_metadata(&self.root)?
+                            .projection_for(&org, &name);
+                    }
+                }
                 return refuse(
                     Code::REPOSITORY_CONFLICT,
                     "repository changed while acquiring SQLite coordination",
@@ -1099,11 +1165,11 @@ impl Store {
             let cache_owned = cache
                 && match actual.as_deref() {
                     None => true,
-                    Some(bytes) => crate::cache_roots::matches(self, mutation.repo(), bytes)?,
+                    Some(bytes) => crate::cache_roots::matches(self, repo, bytes)?,
                 };
-            crate::cache_roots::clear(self, mutation.repo())?;
+            crate::cache_roots::clear(self, repo)?;
             fault.hit("repo-before-replace");
-            match &replacement_for_write {
+            match &replacement {
                 Some(repository) => {
                     let bytes = repository.canonical_bytes();
                     if actual.as_deref() != Some(bytes.as_slice()) {
@@ -1149,10 +1215,10 @@ impl Store {
             }
             fault.hit("repo-after-replace");
             if cache_owned {
-                if let Some(repository) = &replacement_for_write {
+                if let Some(repository) = &replacement {
                     crate::cache_roots::record(
                         self,
-                        mutation.repo(),
+                        repo,
                         &repository.canonical_bytes(),
                     )?;
                 }
