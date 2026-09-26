@@ -1224,8 +1224,10 @@ func (s *Store) RequestsBefore(state, packageName string, limit int, before int6
 }
 
 func (s *Store) requestsBefore(kind, state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
-	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number, ` +
-		requestCols + ` FROM requests) SELECT * FROM numbered`
+	// Number only narrow index facts across history; load payloads and other
+	// request documents only for the bounded selected page.
+	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
+		id,created_at,kind,state,package FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
 	where := []string{}
 	args := []any{}
 	if before > 0 {
@@ -1247,7 +1249,8 @@ func (s *Store) requestsBefore(kind, state, packageName string, limit int, befor
 	if len(where) > 0 {
 		query += ` WHERE ` + strings.Join(where, " AND ")
 	}
-	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?) SELECT page.number, ` + requestCols +
+		` FROM requests JOIN page ON requests.id=page.page_request_id ORDER BY page.number DESC`
 	args = append(args, limit)
 	rows, err := s.db.Query(query, args...)
 	if err != nil {

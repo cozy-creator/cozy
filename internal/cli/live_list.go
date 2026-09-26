@@ -35,6 +35,21 @@ const (
 func watchList(ctx *Context, anchor string,
 	fetch func(context.Context) (output.List, *exit.Error),
 ) *exit.Error {
+	return watchListPages(ctx, anchor, func(call context.Context, _, _ int) (listSnapshot, *exit.Error) {
+		list, problem := fetch(call)
+		return listSnapshot{list: list}, problem
+	}, nil)
+}
+
+type listSnapshot struct {
+	list output.List
+	more bool
+}
+
+func watchListPages(ctx *Context, anchor string,
+	fetch func(context.Context, int, int) (listSnapshot, *exit.Error),
+	more func(context.Context) (listSnapshot, *exit.Error),
+) *exit.Error {
 	navigation := make(chan listNavigation, 32)
 	watchCtx, restoreInput, mouse, problem := liveWatchContext(ctx, context.Background(), navigation)
 	if problem != nil {
@@ -65,20 +80,38 @@ func watchList(ctx *Context, anchor string,
 		}
 		return nil
 	}
-	refresh := func() *exit.Error {
-		list, problem := fetch(watchCtx)
-		if problem != nil {
-			return problem
-		}
-		if err := viewport.update(list, ctx.Mode()); err != nil {
-			return exit.As(err)
-		}
-		return draw()
+	type fetched struct {
+		snapshot listSnapshot
+		problem  *exit.Error
 	}
-	if problem := refresh(); problem != nil {
-		if watchCtx.Err() != nil {
-			return nil
+	answers := make(chan fetched, 1)
+	loading := false
+	load := func(fetch func(context.Context) (listSnapshot, *exit.Error)) {
+		if loading {
+			return
 		}
+		loading, viewport.loading = true, true
+		go func() {
+			snapshot, problem := fetch(watchCtx)
+			select {
+			case answers <- fetched{snapshot, problem}:
+			case <-watchCtx.Done():
+			}
+		}()
+	}
+	refresh := func() {
+		top := viewport.top
+		_, _, visible := viewport.layout(terminalHeight(ctx.Out), ctx.Mode().Full)
+		load(func(call context.Context) (listSnapshot, *exit.Error) { return fetch(call, top, visible) })
+	}
+	loadMore := func() {
+		_, _, visible := viewport.layout(terminalHeight(ctx.Out), ctx.Mode().Full)
+		if more != nil && viewport.more && viewport.top+visible >= len(viewport.list.Rows)-5 {
+			load(more)
+		}
+	}
+	refresh()
+	if problem := draw(); problem != nil {
 		return problem
 	}
 	ticker := time.NewTicker(time.Second)
@@ -91,6 +124,7 @@ func watchList(ctx *Context, anchor string,
 			return nil
 		case move := <-navigation:
 			viewport.move(move, terminalHeight(ctx.Out), ctx.Mode().Full)
+			loadMore()
 			if problem := draw(); problem != nil {
 				return problem
 			}
@@ -99,24 +133,37 @@ func watchList(ctx *Context, anchor string,
 				if problem := draw(); problem != nil {
 					return problem
 				}
+				loadMore()
 			}
 		case <-ticker.C:
-			if problem := refresh(); problem != nil {
+			refresh()
+		case answer := <-answers:
+			loading, viewport.loading = false, false
+			if problem := answer.problem; problem != nil {
 				if watchCtx.Err() != nil {
 					return nil
 				}
 				return problem
 			}
+			viewport.more = answer.snapshot.more
+			if err := viewport.update(answer.snapshot.list, ctx.Mode()); err != nil {
+				return exit.As(err)
+			}
+			if problem := draw(); problem != nil {
+				return problem
+			}
+			loadMore()
 		}
 	}
 }
 
 type listViewport struct {
-	anchor      string
-	list        output.List
-	table       output.Table
-	top         int
-	anchorValue string
+	anchor        string
+	list          output.List
+	table         output.Table
+	top           int
+	anchorValue   string
+	more, loading bool
 }
 
 func (v *listViewport) update(list output.List, mode output.Mode) error {
@@ -195,8 +242,14 @@ func (v *listViewport) frame(width, height int, full bool) string {
 	location := "no rows"
 	if end > v.top {
 		location = fmt.Sprintf("rows %d-%d/%d", v.top+1, end, len(v.list.Rows))
+		if v.more {
+			location += "+"
+		}
 	} else if len(v.list.Rows) > 0 {
 		location = fmt.Sprintf("%d rows · enlarge terminal", len(v.list.Rows))
+	}
+	if v.loading {
+		location += " · loading"
 	}
 	lines := append(append([]string(nil), lead...), v.table.Header)
 	lines = append(lines, v.table.Rows[v.top:end]...)

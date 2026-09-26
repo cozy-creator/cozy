@@ -698,6 +698,9 @@ func handleRunList(ctx *Context) *exit.Error {
 	if watching {
 		return watchRunList(ctx, client, limit)
 	}
+	if ctx.Inv.Value("--limit") == "" {
+		limit = 50
+	}
 	list, problem := runList(context.Background(), client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
 	if problem != nil {
 		return problem
@@ -731,6 +734,10 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 		}
 		before = next
 	}
+	return runListRows(rows), nil
+}
+
+func runListRows(rows []api.Lifecycle) output.List {
 	list := output.List{
 		Uncapped: true,
 		Name:     "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution", "reason"},
@@ -873,7 +880,7 @@ func runList(requestCtx context.Context, client *localapi.Client, state, package
 	for _, state := range keys {
 		list.Aggregates = append(list.Aggregates, output.Field{K: state, V: states[state]})
 	}
-	return list, nil
+	return list
 }
 
 // failureReason is the list cell for a run that ended without its result: the recorded
@@ -1016,9 +1023,8 @@ func progressValue(life api.Lifecycle) string {
 }
 
 func watchRunList(ctx *Context, client *localapi.Client, limit int) *exit.Error {
-	return watchList(ctx, "id", func(watchCtx context.Context) (output.List, *exit.Error) {
-		return runList(watchCtx, client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
-	})
+	history := runHistory{client: client, state: ctx.Inv.Value("--state"), packageName: ctx.Inv.Value("--package"), limit: limit, more: true}
+	return watchListPages(ctx, "id", history.refresh, history.next)
 }
 
 func invocationFields(life api.Lifecycle) []output.Field {
