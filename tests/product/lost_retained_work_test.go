@@ -153,3 +153,34 @@ func TestLostRetainedWorkListAndWatchSkipHistoricalBlockedEvent(t *testing.T) {
 		t.Fatal("watch correction changed the historical execution end")
 	}
 }
+
+func TestConfirmedRentalLossFailsLiveRetainedWorkWithoutReplacement(t *testing.T) {
+	o := hostOwner(t, "live-retained-loss")
+	request := recordPrivateTransaction(t, o.store, "live", "confirmed-gone")
+	fatal(t, o.store.SpawnWorker(records.WorkerProcess{InstanceID: "lost-worker", Package: request.Package, WorkerID: "worker", Devices: []string{"cpu"}}))
+	ordinal, problem := o.store.Dispatch(records.Attempt{RequestID: request.ID, SessionID: "session", InstanceID: "lost-worker", InvocationDigest: childDigest("2"), InvocationCanonical: []byte(`{}`)})
+	fatal(t, problem)
+	fatal(t, o.store.OfferDispatch(request.ID, ordinal, "session"))
+	fatal(t, o.store.Accepted(request.ID, ordinal, "session"))
+	changed, problem := o.store.FailLostRetainedWork(request.ID, request.Worker, "lost")
+	fatal(t, problem)
+	if changed {
+		t.Fatal("loss projection bypassed an open attempt")
+	}
+	o.c.RecoverLostWork()
+	after, problem := o.store.RequestRow(request.ID)
+	fatal(t, problem)
+	if after.State != "failed" || after.RetainWork || after.Worker != request.Worker || after.Requeues != 0 {
+		t.Fatalf("confirmed loss retained or rerouted work: %+v", after)
+	}
+	attempts, problem := o.store.Attempts(request.ID)
+	fatal(t, problem)
+	if len(attempts) != 1 || attempts[0].TerminalStatus != "ABANDONED" || attempts[0].TerminalCause != "EXECUTION_CONTEXT_LOST" {
+		t.Fatalf("lost attempt fact changed: %+v", attempts)
+	}
+	code, _, detail, problem := o.store.SettledFailure(request.ID)
+	fatal(t, problem)
+	if code != "request.state_lost" || detail != records.LostRetainedWorkMessage {
+		t.Fatalf("permanent loss lacks its actionable reason: %s %s", code, detail)
+	}
+}
