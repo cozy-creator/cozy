@@ -11,6 +11,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
+// runEventObserver is deliberately narrower than *client.Client. A watch is an
+// observation lease: closing its context may close the SSE connection, but it
+// must not make cancellation available to the watcher implementation. The only
+// cancellation surface remains the explicit `cozy run cancel` command (or the
+// caller-authored --timeout path in invoke.go).
+type runEventObserver interface {
+	Request(string) (api.Lifecycle, *exit.Error)
+	WatchContext(context.Context, string, int64, func(localclient.Event) bool) (*localclient.Event, *exit.Error)
+}
+
 // handleRunWatch is the one reattachment surface for every durable run kind.
 // A watcher never cancels work; explicit cancellation belongs to run cancel.
 func handleRunWatch(ctx *Context) *exit.Error {
@@ -70,7 +80,7 @@ func watchInvocation(ctx *Context, client *localclient.Client, id string) *exit.
 	return renderRun(ctx, life, terminal, "", exportedOutputs(life), 0)
 }
 
-func watchRunStream(ctx *Context, client *localclient.Client, id string,
+func watchRunStream(ctx *Context, client runEventObserver, id string,
 	began time.Time,
 ) (*localclient.Event, bool, *exit.Error) {
 	watchCtx, stop := context.WithCancel(context.Background())
