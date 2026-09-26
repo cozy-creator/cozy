@@ -138,7 +138,7 @@ def published(name, observed, constraint=""):
             version = Version(release)
         except InvalidVersion:
             continue
-        if version.is_prerelease or version.is_devrelease or version < Version(installed):
+        if version.is_prerelease or version.is_devrelease or Version(version.public) < Version(Version(installed).public):
             continue
         if version not in SpecifierSet(constraint):
             continue
@@ -204,8 +204,10 @@ def resolve(observed, directory, local_runtime=None, local_tensorfs=None):
     else:
         runtime = dict(local_runtime)
         project, version, _, _ = parse_wheel_filename(runtime["filename"])
-        if project != "cozy-runtime" or version <= Version(observed["runtime"]["distribution"]):
-            raise ValueError("Local Runtime wheel must be cozy-runtime with a distinct newer version")
+        # Local build labels identify artifacts, not chronological releases.
+        # Replacing a development build of the same public release is valid.
+        if project != "cozy-runtime" or Version(version.public) < Version(Version(observed["runtime"]["distribution"]).public):
+            raise ValueError("Local Runtime wheel must be cozy-runtime without downgrading its public release")
         runtime["version"] = str(version)
     runtime_wheel = wheel("cozy-runtime", runtime, observed["tags"], directory, True)
     requirements = metadata(runtime_wheel, observed)
@@ -218,7 +220,7 @@ def resolve(observed, directory, local_runtime=None, local_tensorfs=None):
     else:
         tensorfs = dict(local_tensorfs)
         project, version, _, _ = parse_wheel_filename(tensorfs["filename"])
-        if project != "tensorfs" or version < Version(observed["tensorfs"]):
+        if project != "tensorfs" or Version(version.public) < Version(Version(observed["tensorfs"]).public):
             raise ValueError("Local TensorFS wheel must be tensorfs without downgrading the installed version")
         if not SpecifierSet(constraint).contains(version, prereleases=True):
             raise ValueError("Local TensorFS wheel is incompatible with the selected Runtime requirements")
