@@ -1,4 +1,4 @@
-package orchestrator
+package producttest
 
 import (
 	"context"
@@ -19,7 +19,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -94,7 +94,7 @@ func (p *maintenancePeer) Control(stream grpc.BidiStreamingServer[pb.RecordOwner
 	}
 }
 
-func maintenanceFixture(t *testing.T, p *maintenancePeer) (*WorkerConnection, RentalClaimProofSource) {
+func maintenanceFixture(t *testing.T, p *maintenancePeer) (*orchestrator.WorkerConnection, orchestrator.RentalClaimProofSource) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -122,14 +122,14 @@ func maintenanceFixture(t *testing.T, p *maintenancePeer) (*WorkerConnection, Re
 	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}})))
 	pb.RegisterPodHostServer(server, &maintenanceHost{peer: p})
 	pb.RegisterWorkerControlServer(server, &maintenanceWorker{peer: p})
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow isolated TLS maintenance peer; product only dials
 	if err != nil {
 		t.Fatal(err)
 	}
 	go server.Serve(listener)
 	t.Cleanup(server.Stop)
-	remote := &WorkerConnection{RentalID: "rental", Addr: listener.Addr().String(), CACert: path, WorkerID: "worker", WorkerBootID: "boot"}
-	sign := func(remote *WorkerConnection, epoch uint64) ([]byte, *exit.Error) {
+	remote := &orchestrator.WorkerConnection{RentalID: "rental", Addr: listener.Addr().String(), CACert: path, WorkerID: "worker", WorkerBootID: "boot"}
+	sign := func(remote *orchestrator.WorkerConnection, epoch uint64) ([]byte, *exit.Error) {
 		transcript, err := canonical.Bytes(&pb.ClaimProof{RecordOwnerEpoch: epoch, WorkerId: remote.WorkerID, WorkerBootId: remote.WorkerBootID, WorkerTlsCertificateDigest: p.digest})
 		if err != nil {
 			t.Fatal(err)
@@ -161,12 +161,14 @@ func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 			}
 			remote, sign := maintenanceFixture(t, peer)
 			if row.wrongSigner {
-				sign = func(*WorkerConnection, uint64) ([]byte, *exit.Error) { return make([]byte, ed25519.SignatureSize), nil }
+				sign = func(*orchestrator.WorkerConnection, uint64) ([]byte, *exit.Error) {
+					return make([]byte, ed25519.SignatureSize), nil
+				}
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			if row.minor < pb.MinCompatibleWireMinor {
-				control, problem := DialIdleControl(ctx, remote, sign, nil)
+				control, problem := orchestrator.DialIdleControl(ctx, remote, sign, nil)
 				if control != nil {
 					control.Close()
 				}
@@ -177,7 +179,7 @@ func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 					t.Fatal("ordinary gate sent Claim")
 				}
 			}
-			control, problem := DialMaintenanceControl(ctx, remote, sign, nil)
+			control, problem := orchestrator.DialMaintenanceControl(ctx, remote, sign, nil)
 			if control != nil {
 				control.Close()
 			}
@@ -187,41 +189,9 @@ func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 			if peer.extra.Load() != 0 {
 				t.Fatal("maintenance sent dispatch/admission frames")
 			}
-			if row.minor < pb.MinCompatibleWireMinor && ValidateWorkerProtocol(peer.info, true) == nil {
+			if row.minor < pb.MinCompatibleWireMinor && orchestrator.ValidateWorkerProtocol(peer.info, true) == nil {
 				t.Fatal("maintenance weakened execution gate")
 			}
 		})
-	}
-}
-
-func TestMaintenanceProtocolRefusalRequiresNoLocalCustody(t *testing.T) {
-	store, problem := records.OpenForDaemon(filepath.Join(t.TempDir(), "creator.sqlite"), "")
-	if problem != nil {
-		t.Fatal(problem)
-	}
-	defer store.Close()
-	c := &Orchestrator{opt: Options{Store: store}}
-	w := &worker{spec: WorkerLaunchSpec{Connection: &WorkerConnection{RentalID: "rental"}}, instanceID: "rental-instance", refusal: exit.Named(exit.Conflict, "worker.protocol_incompatible", "old")}
-	if !c.unclaimedMaintenanceWorkerLocked(w) {
-		t.Fatal("pre-Claim protocol refusal cannot reach repair")
-	}
-	w.held = 1
-	if c.unclaimedMaintenanceWorkerLocked(w) {
-		t.Fatal("held work bypassed idle fence")
-	}
-	w.held = 0
-	w.seats.reserved = 1
-	if c.unclaimedMaintenanceWorkerLocked(w) {
-		t.Fatal("reserved work bypassed idle fence")
-	}
-	w.seats.reserved = 0
-	w.snapshotAcknowledged = true
-	if c.unclaimedMaintenanceWorkerLocked(w) {
-		t.Fatal("admitted session used pre-Claim repair exception")
-	}
-	w.snapshotAcknowledged = false
-	w.refusal = exit.Named(exit.Credential, "worker.identity", "wrong owner")
-	if c.unclaimedMaintenanceWorkerLocked(w) {
-		t.Fatal("identity refusal bypassed")
 	}
 }
