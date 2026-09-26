@@ -199,7 +199,7 @@ type ModelCmd struct {
 	Info     ModelInfoCmd     `cmd:"" help:"Show all releases, lane sizes, and exact checkpoint refs."`
 	Search   ModelSearchCmd   `cmd:"" help:"Search models, showing each model's latest available release."`
 	Family   ModelFamilyCmd   `cmd:"" help:"Set a model repository's discovery family."`
-	Download ModelDownloadCmd `cmd:"" help:"Acquire a source, optionally run one producer job, and retain it locally."`
+	Download ModelDownloadCmd `cmd:"" help:"Download a model into a local destination or an owned rental store."`
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories and reclaim their bytes."`
 	GC       ModelGCCmd       `cmd:"" name:"gc" help:"Reclaim the bytes no local model references."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
@@ -240,7 +240,7 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 }
 
 type ModelDownloadCmd struct {
-	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Provider source, Tensorhub model (#lane or @release/lane), local alias, or explicit local file."`
 	Ref            string `arg:"" optional:"" name:"model" help:"Local destination (local/name)."`
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         string `help:"Download directly into this owned rental (no local destination)."`
@@ -278,7 +278,7 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelUploadCmd struct {
-	Source         string  `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Source         string  `arg:"" name:"source" predictor:"file-or-ref" help:"Provider source, Tensorhub model (#lane or @release/lane), local alias, or explicit local file."`
 	Ref            string  `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
 	Lane           string  `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         *string `predictor:"rental" help:"Use this existing rental name or id; never buy a replacement."`
