@@ -221,10 +221,17 @@ func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 // authority. Kind distinguishes their execution expectation without creating a
 // second public inventory.
 func (c *Client) Requests(ctx context.Context, status, packageName string, limit int) ([]api.Lifecycle, *exit.Error) {
+	return c.RequestsBefore(ctx, status, packageName, limit, 0)
+}
+
+func (c *Client) RequestsBefore(ctx context.Context, status, packageName string, limit int, before int64) ([]api.Lifecycle, *exit.Error) {
 	var out struct {
 		Requests []api.Lifecycle `json:"requests"`
 	}
 	path := fmt.Sprintf("/v1/requests?limit=%d", limit)
+	if before > 0 {
+		path += fmt.Sprintf("&before=%d", before)
+	}
 	if status != "" {
 		path += "&status=" + url.QueryEscape(status)
 	}

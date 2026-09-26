@@ -1155,10 +1155,23 @@ func (s *Store) Requests(state, packageName string, limit int) ([]Request, *exit
 // RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy run list` reads jobs
 // and the request listing reads serving rows — one table, one reader, two questions.
 func (s *Store) RequestsOfKind(kind, state, packageName string, limit int) ([]Request, *exit.Error) {
+	return s.requestsBefore(kind, state, packageName, limit, 0)
+}
+
+// RequestsBefore reads a bounded history page, excluding the supplied run number.
+func (s *Store) RequestsBefore(state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
+	return s.requestsBefore("", state, packageName, limit, before)
+}
+
+func (s *Store) requestsBefore(kind, state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
 	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number, ` +
 		requestCols + ` FROM requests) SELECT * FROM numbered`
 	where := []string{}
 	args := []any{}
+	if before > 0 {
+		where = append(where, `number<?`)
+		args = append(args, before)
+	}
 	if kind != "" {
 		where = append(where, `kind=?`)
 		args = append(args, kind)
