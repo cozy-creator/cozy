@@ -23,12 +23,16 @@ import (
 // Fixed idle expiry counts real work on each machine, never retained bytes or
 // an open controller connection. Durable records survive daemon restarts.
 type managedRentals struct {
-	mu       sync.Mutex
-	ctx      *Context
-	layout   home.Layout
-	store    *records.Store
-	owner    *orchestrator.Orchestrator
-	installs *rental.InstallQueue
+	mu     sync.Mutex
+	ctx    *Context
+	layout home.Layout
+	store  *records.Store
+	owner  *orchestrator.Orchestrator
+	// wakeQueue is installed by daemon setup. A rental becoming attachable is
+	// an external capacity edge: queued machine executions must be re-asked
+	// immediately rather than waiting for the next poll or a new CLI request.
+	wakeQueue func()
+	installs  *rental.InstallQueue
 	// retryAt holds a rental whose release the hub refused or did not answer; said holds
 	// the last line printed about each rental, so the sweep speaks once per change.
 	retryAt map[string]time.Time
@@ -860,6 +864,19 @@ func (m *managedRentals) releasePaidLocked(row records.Rental) (string, *exit.Er
 	return m.lineLocked()
 }
 
+func localRentalAttachable(row records.Rental) bool {
+	return records.RentalReadyState(row.State) && row.Address != "" && row.CertPath != ""
+}
+
+// wakeQueueAsync re-enters the orchestrator outside the fleet lock. The rental
+// reconciler runs while holding m.mu; waking synchronously would let placement
+// call back into the fleet and deadlock.
+func (m *managedRentals) wakeQueueAsync() {
+	if m.wakeQueue != nil {
+		go m.wakeQueue()
+	}
+}
+
 // reconcileLocked converges this host's rental rows with the hub, and then asks the
 // hub the question this host cannot answer from its own rows at all: what else does
 // this account own? The two directions are not the same read and only one of them
@@ -1000,12 +1017,22 @@ func (m *managedRentals) reconcileRowsLocked() *exit.Error {
 				// owner/queue work runs while this goroutine holds the fleet lock.
 				m.owner.ResumeRentalControl(row.ID)
 			}
+			// The rental just crossed acquiring -> attachable. Re-ask pinned
+			// machine executions now; they may have been parked before restart.
+			m.wakeQueueAsync()
 			continue
 		}
+		wasAttachable := localRentalAttachable(row)
 		row.State = remote.State
 		copyRentalFailure(&row, remote)
 		if problem := m.store.RecordRental(row); problem != nil {
 			return problem
+		}
+		if remote.Attachable() && !wasAttachable {
+			// Reconcile changed the durable local rental to attachable. Wake
+			// machineRuns after releasing the fleet lock so a pinned request
+			// retries its existing execution without a second submission.
+			m.wakeQueueAsync()
 		}
 		m.detachLostRentalLocked(row)
 	}

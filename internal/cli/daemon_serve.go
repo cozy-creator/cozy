@@ -168,6 +168,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	fleet.owner = c
+	// Rental readiness is a queue-capacity edge. The fleet reconciler wakes
+	// pinned machine executions as soon as the hub publishes an attachable
+	// worker, including after a daemon restart.
+	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
 	installationHub := strings.TrimRight(ctx.Cfg.HubURL, "/")
 	installs := rental.NewInstallQueue(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
