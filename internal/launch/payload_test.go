@@ -1,0 +1,71 @@
+package launch
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func overlayEntrypoint() *Entrypoint {
+	return &Entrypoint{
+		Name:   "generate",
+		Models: []Slot{{Path: "generate.models.base_model", Param: "base_model"}},
+	}
+}
+
+func TestParsePayloadCanonicalWeightedOverlayList(t *testing.T) {
+	payload, keys, problem := ParsePayload(overlayEntrypoint(), []string{
+		`model.base_model=org/base@1.0`,
+		`model.base_model.lora:=[{"ref":"org/style-a@1","weight":0.5},{"ref":"org/style-b@2","weight":-0.25}]`,
+	}, "")
+	if problem != nil {
+		t.Fatalf("ParsePayload refused: %v", problem)
+	}
+	if string(payload) != "{}" {
+		t.Fatalf("payload = %s, want empty request payload", payload)
+	}
+	if got := keys.Models["generate.models.base_model"]; got != "org/base@1.0" {
+		t.Fatalf("base ref = %q", got)
+	}
+	got := keys.Overlays["generate.models.base_model"]
+	if len(got) != 2 || got[0].Ref != "org/style-a@1" || got[0].Weight != "0.5" || got[1].Weight != "-0.25" {
+		t.Fatalf("overlays = %#v", got)
+	}
+}
+
+func TestParsePayloadInputModelEnvelopePreservesOrder(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "request.json")
+	if err := os.WriteFile(path, []byte(`{"prompt":"hello","models":{"base_model":{"ref":"org/base@1","lora":[{"ref":"org/a@1","weight":1},{"ref":"org/b@1","weight":"0.75"}]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, keys, problem := ParsePayload(overlayEntrypoint(), nil, path)
+	if problem != nil {
+		t.Fatalf("ParsePayload refused: %v", problem)
+	}
+	if string(payload) != `{"prompt":"hello"}` {
+		t.Fatalf("payload = %s", payload)
+	}
+	got := keys.Overlays["generate.models.base_model"]
+	if len(got) != 2 || got[0].Ref != "org/a@1" || got[0].Weight != "1" || got[1].Weight != "0.75" {
+		t.Fatalf("ordered overlays = %#v", got)
+	}
+}
+
+func TestParsePayloadRejectsInvalidOverlayWeight(t *testing.T) {
+	_, _, problem := ParsePayload(overlayEntrypoint(), []string{
+		`model.base_model.lora=org/style@1,weight=nan`,
+	}, "")
+	if problem == nil || problem.ErrName() != "usage" {
+		t.Fatalf("problem = %#v, want usage refusal", problem)
+	}
+}
+
+func TestParsePayloadRejectsUnknownOverlaySlot(t *testing.T) {
+	_, _, problem := ParsePayload(overlayEntrypoint(), []string{
+		`model.other.lora=org/style@1,weight=0.5`,
+	}, "")
+	if problem == nil || problem.ErrName() != "model_slot_unknown" {
+		t.Fatalf("problem = %#v, want model_slot_unknown", problem)
+	}
+}

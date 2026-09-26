@@ -172,6 +172,12 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if len(overrides.Overlays) > 0 {
+		return exit.Named(exit.Validation, "model_overlay_compatibility_unavailable",
+			"%s declares no generic adapter compatibility metadata for the requested model slot",
+			target.Function).
+			WithRemedy("use the component-explicit --lora model-parameter:component=reference[,strength] form until this slot publishes adapter compatibility")
+	}
 	if pin := ctx.Inv.Value("--attention-kernel"); pin != "" {
 		if overrides.AttentionKernel != "" {
 			return exit.Usagef("attention kernel was pinned more than once")
