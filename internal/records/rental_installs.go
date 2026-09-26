@@ -114,22 +114,8 @@ func RentalInstallStateProblem(rental, state string) *exit.Error {
 	return nil
 }
 
-func (s *Store) RentalInstalls(rental string, activeOnly bool) ([]RentalInstall, *exit.Error) {
-	where, args := "1=1", []any{}
-	if rental != "" {
-		where += " AND rental_id=?"
-		args = append(args, rental)
-	}
-	if activeOnly {
-		where += " AND state IN ('queued','installing')"
-	}
-	query := `SELECT ` + rentalInstallCols + ` FROM rental_installs WHERE ` + where
-	if activeOnly {
-		query += ` ORDER BY created_at,id`
-	} else {
-		query += ` ORDER BY created_at DESC,id DESC`
-	}
-	rows, err := s.db.Query(query, args...)
+func (s *Store) PendingRentalInstalls() ([]RentalInstall, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + rentalInstallCols + ` FROM rental_installs WHERE state IN ('queued','installing') ORDER BY created_at,id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list rental installations: %s", err)
 	}

@@ -68,7 +68,7 @@ func (q *InstallQueue) Run(ctx context.Context) {
 				q.Wake()
 			}
 		case <-q.wake:
-			rows, problem := q.store.RentalInstalls("", true)
+			rows, problem := q.store.PendingRentalInstalls()
 			if problem != nil {
 				q.report(problem)
 				continue
