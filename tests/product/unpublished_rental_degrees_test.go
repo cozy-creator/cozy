@@ -38,6 +38,7 @@ func TestUnpublishedRentalPreservesSelectedFunctionDegrees(t *testing.T) {
 		want           []int
 	}{
 		{"actual H3 serving", "fl2va", []int{2, 4}},
+		{"captured wheel selection", "fl2va", []int{2, 4}},
 		{"undeclared selected slot", "fl2va", nil},
 		{"independent slot intersection", "fl2va", []int{4}},
 		{"job remains ungrouped", "segment", nil},
@@ -67,6 +68,10 @@ func TestUnpublishedRentalPreservesSelectedFunctionDegrees(t *testing.T) {
 			must(t, err)
 			installed := cleanupTestInstall(layout, fmt.Sprintf("%016x", index+1), "1.14.2")
 			installed.Package = "local/minimax-h3"
+			installed.SourceKind, installed.Python = "local", "3.12.99"
+			if arm.name == "captured wheel selection" {
+				installed.SourceKind = "wheel"
+			}
 			must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0700))
 			must(t, os.Symlink(venv, filepath.Join(installed.Dir, "venv")))
 			must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), body, 0444))
@@ -79,6 +84,13 @@ func TestUnpublishedRentalPreservesSelectedFunctionDegrees(t *testing.T) {
 			}
 			if constraints.RequiresPython != ">=3.12,<3.13" {
 				t.Fatalf("Python requirements lost during degree extraction: %+v", constraints)
+			}
+			wantPython := ""
+			if installed.SourceKind == "wheel" {
+				wantPython = installed.Python
+			}
+			if constraints.PythonVersion != wantPython {
+				t.Fatalf("%s capture carried Python %q, want %q", installed.SourceKind, constraints.PythonVersion, wantPython)
 			}
 			for _, width := range []int{2, 4, 8} {
 				verdict := rental.WidthUnusable(width, arm.function == "segment", constraints)

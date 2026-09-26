@@ -33,6 +33,7 @@ var projectNameSeparator = regexp.MustCompile(`[-_.]+`)
 // computes identities and package facts after the bytes arrive.
 type Package struct {
 	PythonVersion          string
+	PythonRequires         string
 	Files                  map[string]string // source-relative path -> local path
 	PackageInterface       string
 	Wheel                  string
@@ -89,6 +90,7 @@ func prepareFrom(projectDir string) (*Package, *exit.Error) {
 	return &Package{
 		Files: files, Tree: tree,
 		Name: normalizedProjectName(metadata.Name), Release: metadata.Version,
+		PythonRequires: document.Project.RequiresPython,
 	}, nil
 }
 
@@ -376,6 +378,7 @@ type projectMetadata struct {
 	Project struct {
 		Name                 string                       `toml:"name"`
 		Version              string                       `toml:"version"`
+		RequiresPython       string                       `toml:"requires-python"`
 		Dependencies         []string                     `toml:"dependencies"`
 		OptionalDependencies map[string][]string          `toml:"optional-dependencies"`
 		EntryPoints          map[string]map[string]string `toml:"entry-points"`
