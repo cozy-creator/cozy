@@ -10,7 +10,7 @@ import (
 // preparation or purchases capacity. Explicit affinity and any attempted or
 // retained work stay with their existing owner.
 func (c *Orchestrator) reconsiderAutomaticRental(req records.Request) (records.Request, *exit.Error) {
-	if !req.Rental || req.Worker == "" || req.RequestedRental != "" || req.RetainWork || req.Ordinal != 0 || req.LocalPackageUploadedBootID != "" {
+	if req.RentNew || !req.Rental || req.Worker == "" || req.RequestedRental != "" || req.RetainWork || req.Ordinal != 0 || req.LocalPackageUploadedBootID != "" {
 		return req, nil
 	}
 	c.mu.Lock()

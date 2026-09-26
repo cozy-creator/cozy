@@ -136,6 +136,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 }
 
 func validateRunPlacement(ctx *Context) *exit.Error {
+	if ctx.Inv.Bool("--rent-new") && (ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != "" || ctx.Inv.Value("--retry") != "") {
+		return exit.Usagef("--rent-new cannot be combined with --rental, --rental-only, or --retry")
+	}
 	if ctx.Inv.Bool("--rental") && ctx.Inv.Bool("--rental-only") {
 		return exit.Usagef("--rental and --rental-only are mutually exclusive")
 	}
@@ -146,7 +149,7 @@ func validateRunPlacement(ctx *Context) *exit.Error {
 }
 
 func rentalRequested(ctx *Context) bool {
-	return ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != ""
+	return ctx.Inv.Bool("--rent-new") || ctx.Inv.Bool("--rental") || ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != ""
 }
 
 func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
@@ -227,7 +230,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, Rental: managedRental,
-		RentalRequired:  ctx.Inv.Bool("--rental-only") || selectedRental != "",
+		RentalRequired:  ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "",
+		RentNew:         ctx.Inv.Bool("--rent-new"),
 		RequestedRental: selectedRental,
 		Models:          models,
 		OutputDirectory: outputDirectory,

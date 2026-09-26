@@ -69,7 +69,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 47
+const schemaVersion = 48
 
 // Retained only to recognize and migrate released schemas 41 through 45.
 const priorCapturePinsDDL = `
@@ -509,6 +509,8 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 					selected[index] = "CASE WHEN local_package_digest<>'' THEN COALESCE(install_id,'') ELSE '' END"
 				case "installation_id":
 					selected[index] = "''"
+				case "rent_new":
+					selected[index] = "0"
 				}
 			}
 			statements = append(statements,
@@ -536,6 +538,19 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 				if _, err := tx.Exec(statement); err != nil {
 					return exit.Internalf("cannot migrate accepted installation bindings: %s", err)
 				}
+			}
+		}
+	}
+	if sourceVersion >= 46 && sourceVersion < 48 {
+		columns := strings.Replace(requestCols, "COALESCE(install_id,'')", "install_id", 1)
+		selected := strings.Replace(columns, ",rent_new", ",0", 1)
+		for _, statement := range []string{
+			`ALTER TABLE requests RENAME TO requests_prior48`, requestsDDL,
+			`INSERT INTO requests(` + columns + `) SELECT ` + selected + ` FROM requests_prior48`,
+			`DROP TABLE requests_prior48`,
+		} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot preserve fresh rental intent: %s", err)
 			}
 		}
 	}
@@ -839,6 +854,10 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		destinationColumns += ",child_artifacts"
 		selectColumns += ",child_artifacts"
 	}
+	if sourceVersion >= 48 {
+		destinationColumns += ",rent_new"
+		selectColumns += ",rent_new"
+	}
 	if sourceVersion >= 37 {
 		destinationColumns += ",requested_rental"
 		selectColumns += ",requested_rental"
@@ -1034,6 +1053,9 @@ func priorStatements(version int) []string {
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
+		}
+		if requestStatement && version < 48 {
+			stmt = strings.Replace(stmt, "  rent_new INTEGER NOT NULL DEFAULT 0 CHECK(rent_new IN (0,1)),\n", "", 1)
 		}
 		if requestStatement && version < 37 {
 			stmt = strings.Replace(stmt, ",\n  requested_rental TEXT NOT NULL DEFAULT ''", "", 1)

@@ -47,6 +47,7 @@ type JobSubmission struct {
 	InstallID       string                 `json:"install_id,omitempty"`
 	Release         string                 `json:"release,omitempty"`
 	Rental          bool                   `json:"rental,omitempty"`
+	RentNew         bool                   `json:"rent_new,omitempty"`
 	RentalRequired  bool                   `json:"rental_required,omitempty"`
 	RetainWork      bool                   `json:"retain_work,omitempty"`
 	RetryOf         string                 `json:"retry_of,omitempty"`
@@ -201,7 +202,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if sub.Rental || sub.RentalRequired {
+		if sub.Rental || sub.RentalRequired || sub.RentNew {
 			unlock := localpackage.Guard()
 			defer unlock()
 		}
@@ -387,17 +388,20 @@ func replayJobSubmission(sub JobSubmission,
 		LocalInstallationID: recorded.LocalInstallationID,
 		PlanID:              recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
-		Rental: sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
-		RequestedRental: sub.RequestedRental,
-		Models:          models, ModelTransfer: transfer, ProducerParams: params}, nil
+		Rental: sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
+		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
+		Models: models, ModelTransfer: transfer, ProducerParams: params}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
 // `job_descriptor_id` is resolved HERE, from the installed package's own PackageInterface —
 // a client never names a digest, exactly as it never names a binding plan id.
 func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
+	if sub.RentNew && sub.Worker != "" {
+		return orchestrator.Submission{}, nil, exit.Usagef("a fresh rental cannot name an existing worker")
+	}
 	if sub.ModelTransfer != nil && sub.Package == "" && sub.Function == "" {
-		if sub.Rental || sub.RentalRequired {
+		if sub.Rental || sub.RentalRequired || sub.RentNew {
 			return orchestrator.Submission{}, nil, exit.Named(exit.Unavailable,
 				"model_transfer.rented_pass_through_unavailable",
 				"rented pass-through has no typed TensorFS source profiles")
@@ -410,9 +414,9 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org), Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
 		Release: sub.Release, OutputDirectory: sub.OutputDirectory,
-		Rental: sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
-		RequestedRental: sub.RequestedRental,
-		Worker:          sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
+		Rental: sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
+		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
+		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 		ModelTransfer: sub.ModelTransfer,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
@@ -698,6 +702,9 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if spec.Rental {
 		doc["rental"] = true
 		doc["release"] = spec.Release
+	}
+	if spec.RentNew {
+		doc["rent_new"] = true
 	}
 	if spec.RentalRequired {
 		doc["rental_required"] = true
