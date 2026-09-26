@@ -22,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
@@ -167,6 +168,31 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	fleet.owner = c
+	installContext, cancelInstalls := context.WithCancel(context.Background())
+	installs := rental.NewInstallQueue(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
+		instance, _, _, problem := c.EnsureRentalContext(ctx, row.RentalID)
+		if problem != nil {
+			return problem
+		}
+		release, problem := c.UseRental(row.RentalID)
+		if problem != nil {
+			return problem
+		}
+		defer release()
+		models := orchestrator.DownloadModelRefs(row.Selection.Models)
+		if len(models) != len(row.Selection.Models) {
+			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
+		}
+		if row.Selection.Package == "" {
+			return c.PrepareRentalModels(ctx, instance, models)
+		}
+		return c.PrepareRentalPackage(ctx, instance, &pb.DownloadPackageRef{Package: row.Selection.Package, Release: row.Selection.Release}, models)
+	}, ctx.Out)
+	fleet.installs = installs
+	installsStopped := make(chan struct{})
+	go func() { defer close(installsStopped); installs.Run(installContext) }()
+	defer func() { cancelInstalls(); <-installsStopped }()
+
 	killed, forgotten, e := c.Reconcile()
 	if e != nil {
 		closeListeners()
@@ -202,7 +228,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	server := api.New(api.Options{
 		RuntimeUpdate:     updates.Start,
 		RentalKeepalive:   fleet.keepalive,
-		RentalPreparation: fleet.beginPreparation,
+		RentalInstall:     installs.Accept,
 		MachineExecutions: machines,
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
@@ -281,6 +307,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	<-stop
 	close(quit)
+	cancelInstalls()
+	<-installsStopped
 	// Disconnect uploads/observation immediately. Runtime owns accepted execution;
 	// canceling this client context never sends an execution-cancel command.
 	machines.cancel()

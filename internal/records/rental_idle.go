@@ -37,7 +37,12 @@ func rentalIdleRunCounts(reader rentalIdleReader, id, buyer string) (queued, run
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot observe rental work: %s", err)
 	}
-	return queued, running, nil
+	var queuedInstalls, runningInstalls int
+	err = reader.QueryRow(`SELECT COALESCE(SUM(state='queued'),0),COALESCE(SUM(state='installing'),0) FROM rental_installs WHERE rental_id=? AND state IN ('queued','installing')`, id).Scan(&queuedInstalls, &runningInstalls)
+	if err != nil {
+		return 0, 0, exit.Internalf("cannot observe queued rental installations: %s", err)
+	}
+	return queued + queuedInstalls, running + runningInstalls, nil
 }
 
 // RecordRentalKeepalive accepts only a full, identity-bound Host acknowledgment.

@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func handleRentalPrepare(ctx *Context) *exit.Error {
@@ -48,7 +48,7 @@ func handleRentalPrepare(ctx *Context) *exit.Error {
 		}
 		models = append(models, selected)
 	}
-	return prepareRentalPackage(ctx, ctx.Inv.Args[0], ref.String(), version, models)
+	return enqueueRentalInstall(ctx, ctx.Inv.Args[0], records.RentalInstallSelection{Package: ref.String(), Release: version, Models: models})
 }
 
 func handleRentalPackageInstall(ctx *Context) *exit.Error {
@@ -57,10 +57,10 @@ func handleRentalPackageInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	// No model bindings are resolved or forwarded by package installation.
-	return prepareRentalPackage(ctx, ctx.Inv.Value("--rental"), ref.String(), plan.Release, nil)
+	return enqueueRentalInstall(ctx, ctx.Inv.Value("--rental"), records.RentalInstallSelection{Package: ref.String(), Release: plan.Release})
 }
 
-func prepareRentalPackage(ctx *Context, rentalName, packageName, version string, models []orchestrator.ModelRef) *exit.Error {
+func enqueueRentalInstall(ctx *Context, rentalName string, selection records.RentalInstallSelection) *exit.Error {
 	_, store, problem := rentalStores(ctx)
 	if problem != nil {
 		return problem
@@ -83,22 +83,51 @@ func prepareRentalPackage(ctx *Context, rentalName, packageName, version string,
 	if problem != nil {
 		return problem
 	}
-	if !ctx.Mode().JSON {
-		fmt.Fprintf(ctx.Err, "Preparing %s on %s (%d explicitly selected models)...\n", packageName, row.MachineName, len(models))
-	}
-	result, problem := client.PrepareRentalPackage(rentalID, api.RentalPackagePrepareRequest{
-		Package: packageName, Release: version, Models: models,
-	})
+	result, problem := client.PrepareRentalPackage(rentalID, selection)
 	if problem != nil {
 		return problem
 	}
-	fields := []output.Field{{K: "rental", V: result.Rental}, {K: "package", V: result.Package},
-		{K: "release", V: result.Release}, {K: "status", V: result.Status}, {K: "models", V: len(models)}}
-	record := compactRecord(fields, "rental", "package", "release", "status")
-	record.Notes = []string{"the worker retained this package; repeating this command reuses preparation"}
-	if len(models) == 0 {
+	fields := []output.Field{{K: "id", V: result.ID}, {K: "rental", V: result.RentalID}, {K: "status", V: result.State}, {K: "package", V: result.Selection.Package}, {K: "release", V: result.Selection.Release}, {K: "models", V: result.Selection.Models}}
+	record := compactRecord(fields, "id", "rental", "status", "package", "release")
+	record.Notes = []string{"installation accepted; Creator will deliver it when this rental is ready"}
+	if len(selection.Models) == 0 {
 		record.Notes = append(record.Notes, "no model weights were requested")
 	}
-	record.Next = []string{"cozy run " + packageName + "/<function> --rental=" + rentalID}
+	record.Next = []string{"cozy rental installs " + rentalID}
 	return emit(ctx, record)
+}
+
+func handleRentalInstalls(ctx *Context) *exit.Error {
+	name := strings.TrimSpace(ctx.Inv.Args[0])
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return problem
+	}
+	row, problem := store.RentalByMachine(name)
+	store.Close()
+	if problem != nil {
+		return problem
+	}
+	id := name
+	if row != nil {
+		id = row.ID
+	}
+	state, _, problem := ensureDaemon(ctx)
+	if problem != nil {
+		return problem
+	}
+	client, problem := localapi.Open(ctx.Cfg, state)
+	if problem != nil {
+		return problem
+	}
+	rows, problem := client.RentalInstalls(id)
+	if problem != nil {
+		return problem
+	}
+	list := output.List{Name: "installs", Fields: []string{"id", "status", "package", "release", "error"}, AllFields: []string{"id", "rental", "status", "package", "release", "models", "error_code", "error"}, Rows: []map[string]string{}, TypedRows: []map[string]any{}, Total: len(rows)}
+	for _, row := range rows {
+		list.Rows = append(list.Rows, map[string]string{"id": row.ID, "rental": row.RentalID, "status": row.State, "package": row.Selection.Package, "release": row.Selection.Release, "models": fmt.Sprint(len(row.Selection.Models)), "error_code": row.ErrorCode, "error": row.Error})
+		list.TypedRows = append(list.TypedRows, map[string]any{"id": row.ID, "rental": row.RentalID, "status": row.State, "package": row.Selection.Package, "release": row.Selection.Release, "models": row.Selection.Models, "error_code": row.ErrorCode, "error": row.Error})
+	}
+	return emit(ctx, list)
 }
