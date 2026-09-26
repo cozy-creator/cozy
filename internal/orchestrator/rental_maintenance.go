@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -46,6 +47,26 @@ func (c *Orchestrator) MaintainRental(ctx context.Context, id string,
 ) *exit.Error {
 	if id == "" || update == nil || c.opt.Rentals == nil {
 		return exit.New(exit.Validation, "maintenance requires one attached rental and an updater")
+	}
+	// ClaimAck can precede the snapshot and the first observed-state tick. That
+	// missing observation is not evidence of active work. Let the existing
+	// authenticated connection finish reporting before applying the idle fence.
+	for {
+		c.mu.Lock()
+		w := c.workers[rentalInstanceID(id)]
+		waiting := !c.closing && w != nil && !w.exited && !w.stopping &&
+			(!w.snapshotAcknowledged || w.lastReport.IsZero())
+		c.mu.Unlock()
+		if !waiting {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return exit.Unavailablef("Runtime update stopped while waiting for the worker's current activity report")
+		case <-c.done:
+			return exit.Unavailablef("the daemon stopped while waiting for the worker's current activity report")
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	c.mu.Lock()
 	if c.closing || c.rentalMaintenance[id] || c.rentalUses[id] != 0 || c.ensuring[rentalInstanceID(id)] != nil {
