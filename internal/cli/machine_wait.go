@@ -12,7 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// Even an invocation without --await waits for the machine's durable receipt.
+// An explicit --await follows the machine's durable receipt before its events.
 // A signal detaches only this caller; it does not manufacture machine acceptance
 // or send an implicit execution cancellation.
 func waitMachineAcceptance(ctx *Context, client *localapi.Client, handle api.JobHandle) (api.JobState, bool, *exit.Error) {

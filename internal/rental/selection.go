@@ -541,14 +541,41 @@ func contains(rows []hub.ModelThroughput, row hub.ModelThroughput) bool {
 // Place is the tier's choice among the open candidates and returns its index, or -1
 // when none is open: `fast` the least time, `cheap` the least cost, `balanced` the least
 // (time / best time) × (cost / best cost) — a candidate worse on both axes cannot win
-// any tier. Ties break by rung, attached over purchase, attempts ahead, rate, name.
+// any tier among the first available authored counted purchase rung. Later counted
+// purchase rungs are reconsidered after that rung is refused. Existing rentals and
+// uncounted ladders retain their scoring. Ties break by rung, attachment, queue, rate, name.
 // Unmeasured candidates count only when nothing is measured, attached first and then by
 // rung, the fewest attempts ahead and rate — the ladder's own order, an idle machine
 // before a busy one (cl-174). Every measured candidate's score is written.
+// countedPurchase carries an authored count anywhere in its retained ladder,
+// including a later wildcard fallback whose own count is omitted.
+func countedPurchase(candidate orchestrator.PlacementCandidate) bool {
+	if candidate.Attached() || candidate.Rung == 0 {
+		return false
+	}
+	for _, model := range candidate.Models {
+		for _, rung := range model.Ladder {
+			if rung.GPUs > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func Place(tier string, candidates []orchestrator.PlacementCandidate) int {
+	preferred := 0
+	for _, candidate := range candidates {
+		if candidate.Verdict == "" && countedPurchase(candidate) && (preferred == 0 || candidate.Rung < preferred) {
+			preferred = candidate.Rung
+		}
+	}
+	eligible := func(candidate orchestrator.PlacementCandidate) bool {
+		return candidate.Verdict == "" && (!countedPurchase(candidate) || candidate.Rung == preferred)
+	}
 	bestTime, bestCost := math.Inf(1), math.Inf(1)
 	for _, c := range candidates {
-		if c.Verdict == "" && c.Measured {
+		if eligible(c) && c.Measured {
 			bestTime, bestCost = min(bestTime, c.TimeS), min(bestCost, float64(c.CostUSDMicros))
 		}
 	}
@@ -556,7 +583,7 @@ func Place(tier string, candidates []orchestrator.PlacementCandidate) int {
 	winner := -1
 	for i := range candidates {
 		c := &candidates[i]
-		if c.Verdict != "" || c.Measured != measured {
+		if !eligible(*c) || c.Measured != measured {
 			continue
 		}
 		if measured {
@@ -615,6 +642,8 @@ func Conclude(candidates []orchestrator.PlacementCandidate, winner int) {
 			continue
 		}
 		switch {
+		case countedPurchase(*chosen) && countedPurchase(*c) && c.Rung > chosen.Rung:
+			c.Verdict = "later_preference"
 		case !c.Measured:
 			c.Verdict = orchestrator.VerdictUnmeasured
 		case c.TimeS > chosen.TimeS:
