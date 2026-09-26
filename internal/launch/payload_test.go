@@ -61,6 +61,15 @@ func TestParsePayloadRejectsInvalidOverlayWeight(t *testing.T) {
 	}
 }
 
+func TestParsePayloadRequiresCanonicalOverlayWeight(t *testing.T) {
+	_, _, problem := ParsePayload(overlayEntrypoint(), []string{
+		`model.base_model.lora:=[{"ref":"org/style@1"}]`,
+	}, "")
+	if problem == nil || problem.ErrName() != "usage" {
+		t.Fatalf("problem = %#v, want missing-weight usage refusal", problem)
+	}
+}
+
 func TestParsePayloadRejectsUnknownOverlaySlot(t *testing.T) {
 	_, _, problem := ParsePayload(overlayEntrypoint(), []string{
 		`model.other.lora=org/style@1,weight=0.5`,

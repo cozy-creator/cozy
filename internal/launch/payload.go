@@ -345,7 +345,7 @@ func appendModelOverlay(ep *Entrypoint, slotPath string, overlay ModelOverlay, k
 	}
 	weight := overlay.Weight
 	if weight == "" {
-		weight = "1"
+		return exit.Usagef("model overlay for %s requires numeric weight", slotPath)
 	}
 	canonical, problem := CanonicalLoRAScale(weight)
 	if problem != nil {
