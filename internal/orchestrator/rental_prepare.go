@@ -56,3 +56,35 @@ func (c *Orchestrator) PrepareRentalPackage(ctx context.Context, instance string
 	}
 	return nil
 }
+
+// PrepareRentalModels fills the worker's managed TensorFS store without installing
+// code or creating an inference placement. The Host verifies each full closure.
+func (c *Orchestrator) PrepareRentalModels(ctx context.Context, instance string, models []*pb.DownloadModelRef) *exit.Error {
+	if len(models) == 0 || c.opt.RentalPackageSet == nil {
+		return exit.Usagef("model preparation requires exact model selections")
+	}
+	w, s, problem := c.localControlContext(ctx, instance)
+	if problem != nil {
+		return problem
+	}
+	downloads, problem := c.opt.RentalPackageSet(nil, models)
+	if problem != nil {
+		return problem
+	}
+	if problem := requireAdapterDownloadPeer(s, downloads); problem != nil {
+		return problem
+	}
+	result := c.runHostPrepare(s, w, 0, "explicit_model_download", func(context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
+		return s.host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{Claim: s.claim, SupportsModelMaterializationRecovery: true, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads}})
+	})
+	if result.fault != nil {
+		return result.fault
+	}
+	if result.refusal != "" {
+		return exit.Named(exit.Structural, "worker.prepare_refused", "%s", result.refusal).WithCause(result.code)
+	}
+	if result.err != nil || result.set == nil {
+		return exit.Unavailablef("worker model download ended without its verified receipt; the queued selection will retry")
+	}
+	return nil
+}

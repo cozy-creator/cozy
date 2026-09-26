@@ -240,9 +240,9 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 
 type ModelDownloadCmd struct {
 	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
-	Ref            string `arg:"" name:"model" help:"Local destination (local/name)."`
+	Ref            string `arg:"" optional:"" name:"model" help:"Local destination (local/name)."`
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental         bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
+	Rental         string `help:"Download directly into this owned rental (no local destination)."`
 	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
 	DryRun         bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
 	Await          bool   `help:"Watch the accepted run until it settles."`
@@ -251,9 +251,9 @@ type ModelDownloadCmd struct {
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
 	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
-		"--rental", c.Rental, "--rental-only", c.RentalOnly,
+		"--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
-		values("--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
+		values("--rental", c.Rental, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
 }
 
 type ModelRemoveCmd struct {
@@ -437,6 +437,7 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
+	Installs  RentalInstallsCmd  `cmd:"" help:"Show queued package installs and model downloads on a rental."`
 	Keepalive RentalKeepaliveCmd `cmd:"" help:"Explicitly reset this rental's fixed 15-minute idle deadline once."`
 	Update    RentalUpdateCmd    `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
 	Prepare   RentalPrepareCmd   `cmd:"" help:"Install one exact package release and prepare its model inputs on a rental."`
@@ -583,4 +584,12 @@ type RentalKeepaliveCmd struct {
 
 func (c *RentalKeepaliveCmd) Run(r *Runtime) error {
 	return r.call(handleRentalKeepalive, []string{c.Rental}, nil, nil, true)
+}
+
+type RentalInstallsCmd struct {
+	Rental string `arg:"" name:"rental" predictor:"rental" help:"Existing rental machine name or id."`
+}
+
+func (c *RentalInstallsCmd) Run(r *Runtime) error {
+	return r.call(handleRentalInstalls, []string{c.Rental}, nil, nil, false)
 }

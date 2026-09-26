@@ -14,7 +14,7 @@ func ValidModelLabel(value string) bool { return modelLabelPattern.MatchString(v
 
 // ParseModelRef reads the ONE model-ref grammar (cl-109):
 //
-//	org/model[@release[/lane]][#sha256:<hex>]
+//	org/model[@release[/lane]][#lane|#sha256:<hex>]
 //
 // It serves the `model.<param>=` run key and `package bind` alike; a lane narrows to
 // one encoding and a manifest to one exact release artifact.
@@ -28,10 +28,16 @@ func ParseModelRef(raw string) (model, release, lane, manifest string, problem *
 		if digest == "" {
 			return "", "", "", "", exit.Usagef("%q carries an empty manifest", raw)
 		}
-		if _, err := canonical.Raw(digest); err != nil {
-			return "", "", "", "", exit.Usagef("%q is not a sha256 model manifest", digest)
+		if strings.HasPrefix(digest, "sha256:") {
+			if _, err := canonical.Raw(digest); err != nil {
+				return "", "", "", "", exit.Usagef("%q is not a sha256 model manifest", digest)
+			}
+			manifest = digest
+		} else if ValidModelLabel(digest) {
+			lane = digest
+		} else {
+			return "", "", "", "", exit.Usagef("%q is not a model lane", digest)
 		}
-		manifest = digest
 	}
 	if strings.Count(rest, "@") > 1 {
 		return "", "", "", "", exit.Usagef("%q carries more than one release", rest)
@@ -42,9 +48,16 @@ func ParseModelRef(raw string) (model, release, lane, manifest string, problem *
 	}
 	if pinned {
 		var sliced bool
-		release, lane, sliced = strings.Cut(versioned, "/")
+		var explicitLane string
+		release, explicitLane, sliced = strings.Cut(versioned, "/")
+		if sliced {
+			if lane != "" && lane != explicitLane {
+				return "", "", "", "", exit.Usagef("%q selects conflicting lanes", raw)
+			}
+			lane = explicitLane
+		}
 		if release == "" || sliced && lane == "" || strings.ContainsAny(lane, " \t") {
-			return "", "", "", "", exit.Usagef("%q is not org/model[@release[/lane]][#sha256:<hex>]", raw)
+			return "", "", "", "", exit.Usagef("%q is not org/model[@release[/lane]][#lane|#sha256:<hex>]", raw)
 		}
 	}
 	return model, release, lane, manifest, nil

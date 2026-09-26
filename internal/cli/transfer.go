@@ -9,6 +9,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -229,4 +230,23 @@ func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, quiet bool) 
 	}
 	removed.Aggregates = append(removed.Aggregates, reclaimFields(report)...)
 	return emit(ctx, removed)
+}
+
+// handleRentalModelDownload freezes a catalog selection before durable acceptance.
+func handleRentalModelDownload(ctx *Context) *exit.Error {
+	if len(ctx.Inv.Args) > 1 && strings.TrimSpace(ctx.Inv.Args[1]) != "" {
+		return exit.Usagef("--rental downloads into the worker store and takes no local destination")
+	}
+	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--await") || ctx.Inv.Value("--idempotency-key") != "" {
+		return exit.Usagef("named-rental model download does not accept --rental-only, --await, or --idempotency-key")
+	}
+	model, problem := resolveRemoteModel(ctx, "", launch.Slot{}, ctx.Inv.Args[0], ctx.Inv.Value("--lane"), nil)
+	if problem != nil {
+		return problem
+	}
+	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}}
+	if ctx.Inv.Bool("--dry-run") {
+		return emit(ctx, compactRecord([]output.Field{{K: "rental", V: ctx.Inv.Value("--rental")}, {K: "model", V: model.Model}, {K: "release", V: model.Release}, {K: "lane", V: model.Lane}, {K: "manifest", V: model.Manifest}, {K: "status", V: "planned"}}, "rental", "model", "release", "lane", "manifest", "status"))
+	}
+	return enqueueRentalInstall(ctx, ctx.Inv.Value("--rental"), selection)
 }
