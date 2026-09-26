@@ -789,7 +789,7 @@ func Resident(models []ModelRef, accelerator string, job bool) Residency {
 		var peak Residency
 		// Callable groups execute independently; slots inside each group are simultaneous.
 		for _, key := range slices.Sorted(maps.Keys(groups)) {
-			current := residentTogether(groups[key], accelerator, false)
+			current := residentTogether(groups[key], accelerator, job && key == "")
 			if current.Bytes > peak.Bytes || peak.Fit == "" {
 				peak = current
 			}

@@ -11,7 +11,7 @@ import (
 // A CPU workflow needs capacity for its children; their group counts are combined
 // by placement's maximum, since each child reserves its own execution group.
 func (r *Resolver) PublishedChildModels(command *Context, request records.Request) ([]records.ModelRef, *exit.Error) {
-	if len(request.Models) > 0 {
+	if request.NeedsAccelerator && len(request.Models) > 0 {
 		return nil, nil
 	}
 	ctx, cancel := hub.Context()
