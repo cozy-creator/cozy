@@ -167,7 +167,7 @@ mod tests {
             };
             if cached {
                 self.store
-                    .apply_cached_repository(None, &mutation, &Fault::default())
+                    .apply_cached_repository(None, &[mutation], &Fault::default())
                     .unwrap();
             } else {
                 self.store
@@ -215,7 +215,7 @@ mod tests {
                 .apply_repository(Some(&body), &mutation, &Fault::default())
                 .unwrap();
             f.store
-                .apply_cached_repository(Some(&body), &mutation, &Fault::default())
+                .apply_cached_repository(Some(&body), &[mutation], &Fault::default())
                 .unwrap();
             assert!(!matches(&f.store, &repo, &body).unwrap());
         }
@@ -310,7 +310,7 @@ mod tests {
         f.store
             .apply_cached_repository(
                 Some(&body),
-                &Mutation::UpdateRelease {
+                &[Mutation::UpdateRelease {
                     repo: repo.clone(),
                     version: "1".into(),
                     expected_revision: 0,
@@ -319,7 +319,7 @@ mod tests {
                         lane: "bf16".into(),
                         manifest,
                     }],
-                },
+                }],
                 &Fault::default(),
             )
             .unwrap();

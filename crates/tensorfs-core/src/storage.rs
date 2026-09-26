@@ -1719,6 +1719,303 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn pull_mutations(repo: &RepositoryName, manifest: &ObjectRef, revision: u64) -> Vec<Mutation> {
+        vec![
+            Mutation::PutCheckpoint {
+                repo: repo.clone(),
+                manifest: manifest.clone(),
+            },
+            release_mutation(repo, "1.0.0", "cpu", manifest, revision),
+        ]
+    }
+
+    #[test]
+    fn cached_pull_concurrent_identical_converges_but_different_manifest_conflicts() {
+        for identical in [true, false] {
+            let root = temporary(if identical {
+                "same-pull"
+            } else {
+                "different-pull"
+            });
+            let (store, repo, first) = fixture(&root);
+            let second = if identical {
+                first.clone()
+            } else {
+                let header = store
+                    .read_manifest(&first)
+                    .unwrap()
+                    .header()
+                    .unwrap()
+                    .clone();
+                store
+                    .put_manifest(
+                        &Draft {
+                            entries: vec![("other.cozytensors".into(), Entry::CozyTensors(header))],
+                        }
+                        .seal()
+                        .unwrap(),
+                    )
+                    .unwrap()
+                    .obj
+            };
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let mut threads = Vec::new();
+            for manifest in [&first, &second] {
+                let store = store.clone();
+                let mutations = pull_mutations(&repo, manifest, 0);
+                let barrier = barrier.clone();
+                threads.push(std::thread::spawn(move || {
+                    // Both callers observed absence, regardless of which wins the writer lock.
+                    barrier.wait();
+                    store.apply_cached_repository(None, &mutations, &Fault::default())
+                }));
+            }
+            barrier.wait();
+            let results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            assert_eq!(
+                results.iter().filter(|result| result.is_ok()).count(),
+                if identical { 2 } else { 1 }
+            );
+            for error in results.iter().filter_map(|result| result.as_ref().err()) {
+                assert_eq!(error.code, Code::REPOSITORY_CONFLICT);
+            }
+            let bytes = fs::read(store.repository_path(&repo)).unwrap();
+            let actual = Repository::parse(&bytes).unwrap();
+            assert_eq!(
+                actual.checkpoints.len(),
+                1,
+                "loser must not partially retain a checkpoint"
+            );
+            assert_eq!(actual.releases.len(), 1);
+            assert_eq!(actual.releases[0].revision, 1);
+            assert_eq!(
+                actual.releases[0].lanes[0].manifest,
+                actual.checkpoints[0].manifest
+            );
+            assert!(crate::cache_roots::matches(&store, &repo, &bytes).unwrap());
+            let connection = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
+            let rows: u64 = connection
+                .query_row(
+                    "SELECT count(*) FROM tensorfs_released_manifests",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 1);
+            drop(connection);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn cached_pull_stale_identical_preserves_other_lanes_and_authored_ownership() {
+        let root = temporary("pull-preserves-edits");
+        let (store, repo, manifest) = fixture(&root);
+        let mutations = pull_mutations(&repo, &manifest, 0);
+        let first = store
+            .apply_cached_repository(None, &mutations, &Fault::default())
+            .unwrap()
+            .unwrap();
+        store
+            .apply_repository(
+                Some(&first.canonical_bytes()),
+                &release_mutation(&repo, "1.0.0", "other", &manifest, 1),
+                &Fault::default(),
+            )
+            .unwrap();
+        let edited = fs::read(store.repository_path(&repo)).unwrap();
+        assert!(!crate::cache_roots::matches(&store, &repo, &edited).unwrap());
+        let converged = store
+            .apply_cached_repository(None, &mutations, &Fault::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(converged.canonical_bytes(), edited);
+        assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), edited);
+        assert_eq!(converged.releases[0].lanes.len(), 2);
+        assert_eq!(converged.releases[0].revision, 2);
+        assert!(!crate::cache_roots::matches(&store, &repo, &edited).unwrap());
+        // A fresh sequential request preserves the checkpoint's existing published facts.
+        store
+            .apply_cached_repository(
+                Some(&edited),
+                &pull_mutations(&repo, &manifest, 2),
+                &Fault::default(),
+            )
+            .unwrap();
+        assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), edited);
+        // The general API must retain strict CAS, even for an identical requested value.
+        assert_eq!(
+            store
+                .apply_repository(None, &mutations[1], &Fault::default())
+                .unwrap_err()
+                .code,
+            Code::REPOSITORY_CONFLICT
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_pull_stale_does_not_unyank_or_accept_malformed_repository() {
+        let root = temporary("pull-refusals");
+        let (store, repo, manifest) = fixture(&root);
+        let mutations = pull_mutations(&repo, &manifest, 0);
+        let first = store
+            .apply_cached_repository(None, &mutations, &Fault::default())
+            .unwrap()
+            .unwrap();
+        store
+            .apply_repository(
+                Some(&first.canonical_bytes()),
+                &Mutation::YankRelease {
+                    expected_revision: 1,
+                    repo: repo.clone(),
+                    version: "1.0.0".into(),
+                },
+                &Fault::default(),
+            )
+            .unwrap();
+        let yanked = fs::read(store.repository_path(&repo)).unwrap();
+        assert_eq!(
+            store
+                .apply_cached_repository(None, &mutations, &Fault::default())
+                .unwrap_err()
+                .code,
+            Code::REPOSITORY_CONFLICT
+        );
+        assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), yanked);
+        fs::write(store.repository_path(&repo), b"not a repository").unwrap();
+        assert!(store
+            .apply_cached_repository(None, &mutations, &Fault::default())
+            .is_err());
+        assert_eq!(
+            fs::read(store.repository_path(&repo)).unwrap(),
+            b"not a repository"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_pull_stale_does_not_move_a_changed_lane_back_to_a_held_checkpoint() {
+        let root = temporary("pull-moved-lane");
+        let (store, repo, first) = fixture(&root);
+        let mutations = pull_mutations(&repo, &first, 0);
+        let recorded = store
+            .apply_cached_repository(None, &mutations, &Fault::default())
+            .unwrap()
+            .unwrap();
+        let header = store
+            .read_manifest(&first)
+            .unwrap()
+            .header()
+            .unwrap()
+            .clone();
+        let second = store
+            .put_manifest(
+                &Draft {
+                    entries: vec![("replacement.cozytensors".into(), Entry::CozyTensors(header))],
+                }
+                .seal()
+                .unwrap(),
+            )
+            .unwrap()
+            .obj;
+        let checkpointed = store
+            .apply_repository(
+                Some(&recorded.canonical_bytes()),
+                &Mutation::PutCheckpoint {
+                    repo: repo.clone(),
+                    manifest: second.clone(),
+                },
+                &Fault::default(),
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .apply_repository(
+                Some(&checkpointed.canonical_bytes()),
+                &release_mutation(&repo, "1.0.0", "cpu", &second, 1),
+                &Fault::default(),
+            )
+            .unwrap();
+        let edited = fs::read(store.repository_path(&repo)).unwrap();
+        let repository = Repository::parse(&edited).unwrap();
+        assert!(repository
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.manifest == first));
+        assert_eq!(repository.releases[0].lanes[0].manifest, second);
+        assert_eq!(
+            store
+                .apply_cached_repository(None, &mutations, &Fault::default())
+                .unwrap_err()
+                .code,
+            Code::REPOSITORY_CONFLICT
+        );
+        assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), edited);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_pull_never_adopts_or_replaces_a_local_alias() {
+        let root = temporary("pull-local-alias");
+        let (store, _, manifest) = fixture(&root);
+        let repo = RepositoryName::new("local", "alias").unwrap();
+        let source_selection = "ab".repeat(32);
+        store
+            .apply_repository(
+                None,
+                &Mutation::ReplaceLocal {
+                    repo: repo.clone(),
+                    manifest: manifest.clone(),
+                    version: source_selection.clone(),
+                },
+                &Fault::default(),
+            )
+            .unwrap();
+        let edited = fs::read(store.repository_path(&repo)).unwrap();
+        let repository = Repository::parse(&edited).unwrap();
+        assert_eq!(
+            repository.checkpoints[0].source_selection.as_ref(),
+            Some(&source_selection)
+        );
+        assert_eq!(
+            store
+                .apply_cached_repository(
+                    None,
+                    &pull_mutations(&repo, &manifest, 0),
+                    &Fault::default()
+                )
+                .unwrap_err()
+                .code,
+            Code::KEY_GRAMMAR
+        );
+        assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), edited);
+        assert!(!crate::cache_roots::matches(&store, &repo, &edited).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_pull_identical_still_verifies_manifest_bytes() {
+        let root = temporary("pull-corrupt-manifest");
+        let (store, repo, manifest) = fixture(&root);
+        let mutations = pull_mutations(&repo, &manifest, 0);
+        store
+            .apply_cached_repository(None, &mutations, &Fault::default())
+            .unwrap();
+        let before = fs::read(store.repository_path(&repo)).unwrap();
+        let path = store.manifest_path(&manifest.sha256);
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"corrupt").unwrap();
+        assert!(store
+            .apply_cached_repository(None, &mutations, &Fault::default())
+            .is_err());
+        assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn same_repo_concurrent_create_has_one_winner_and_one_typed_conflict() {
         let root = temporary("repo-conflict");
