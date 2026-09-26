@@ -40,4 +40,10 @@ func TestUnreferencedRetainsNewestLocalEnvironment(t *testing.T) {
 	if len(rows) != 1 || rows[0].ID != first.ID {
 		t.Fatalf("unreferenced local environments = %+v, want only the older candidate", rows)
 	}
+	if forgotten, problem := store.ForgetIfUnreferenced(second.ID); problem != nil || forgotten {
+		t.Fatalf("newest local environment was reclaimable: forgotten=%v problem=%v", forgotten, problem)
+	}
+	if forgotten, problem := store.ForgetIfUnreferenced(first.ID); problem != nil || !forgotten {
+		t.Fatalf("older local environment was not reclaimable: forgotten=%v problem=%v", forgotten, problem)
+	}
 }
