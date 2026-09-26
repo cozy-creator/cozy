@@ -1,10 +1,11 @@
-package launch
+package producttest
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -14,7 +15,7 @@ func TestReadRetainedFactsWithoutLocalPython(t *testing.T) {
 	for _, sourceKind := range []string{"tensorhub", "wheel", "local"} {
 		t.Run(sourceKind, func(t *testing.T) {
 			dir := filepath.Join(root, sourceKind)
-			path := PackageInterfacePath(dir)
+			path := launch.PackageInterfacePath(dir)
 			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -22,7 +23,7 @@ func TestReadRetainedFactsWithoutLocalPython(t *testing.T) {
 				t.Fatal(err)
 			}
 			inst := records.PackageInstall{ID: sourceKind, Dir: dir, SourceKind: sourceKind, Python: "3.12.12"}
-			facts, problem := Read(inst, root, nil)
+			facts, problem := launch.Read(inst, root, nil)
 			if problem != nil {
 				t.Fatalf("retained facts required a local executor: %v", problem)
 			}

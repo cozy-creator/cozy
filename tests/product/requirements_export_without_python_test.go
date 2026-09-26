@@ -1,4 +1,4 @@
-package install
+package producttest
 
 import (
 	"crypto/sha256"
@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/install"
 )
 
 func TestPublishedRequirementsNeedNoLocalPython(t *testing.T) {
@@ -20,20 +22,20 @@ func TestPublishedRequirementsNeedNoLocalPython(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", tools)
-	exact := func(body string) ExactDocument {
+	exact := func(body string) install.ExactDocument {
 		digest := sha256.Sum256([]byte(body))
-		return ExactDocument{Bytes: []byte(body), Length: int64(len(body)), Digest: "sha256:" + hex.EncodeToString(digest[:])}
+		return install.ExactDocument{Bytes: []byte(body), Length: int64(len(body)), Digest: "sha256:" + hex.EncodeToString(digest[:])}
 	}
-	published := &PublishedSource{
+	published := &install.PublishedSource{
 		Package: "proof/export-proof", Release: "1.0.0", PythonVersion: "3.12.12",
 		IndexURL:      "https://example.com/simple",
 		PackageConfig: exact("[application]\nobject = 'proof:app'\n"),
-		Selection:     Selection{PackageInterface: exact(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[]}`)},
+		Selection:     install.Selection{PackageInterface: exact(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[]}`)},
 		Pyproject:     exact("[project]\nname = 'export-proof'\nversion = '1.0.0'\nrequires-python = '>=3.12'\n"),
 		UVLock:        exact("version = 1\nrevision = 3\nrequires-python = '>=3.12'\n[[package]]\nname = 'export-proof'\nversion = '1.0.0'\nsource = { virtual = '.' }\n"),
-		ProjectWheel:  PublishedWheel{Distribution: "export-proof", Version: "1.0.0", Filename: "export_proof-1.0.0-py3-none-any.whl", Digest: "sha256:" + strings.Repeat("1", 64)},
+		ProjectWheel:  install.PublishedWheel{Distribution: "export-proof", Version: "1.0.0", Filename: "export_proof-1.0.0-py3-none-any.whl", Digest: "sha256:" + strings.Repeat("1", 64)},
 	}
-	body, problem := PublishedRequirements(published)
+	body, problem := install.PublishedRequirements(published)
 	if problem != nil {
 		t.Fatalf("frozen metadata export required a local Python: %v", problem)
 	}
