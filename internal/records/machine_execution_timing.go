@@ -13,9 +13,10 @@ type MachineExecutionInterval struct {
 func (s *Store) MachineExecutionIntervals(id string) ([]MachineExecutionInterval, *exit.Error) {
 	rows, err := s.db.Query(`SELECT attempt,
  COALESCE(MIN(CASE WHEN type='machine.control' THEN at END),''),
- COALESCE(MAX(CASE WHEN type IN ('machine.outcome','machine.terminal') THEN at END),'')
+ COALESCE(MAX(CASE WHEN type IN ('machine.outcome','machine.terminal') THEN at END),
+ MIN(CASE WHEN type='client.machine_lost' THEN at END),'')
  FROM request_events WHERE request_id=? AND (
- type IN ('machine.outcome','machine.terminal') OR
+ type IN ('machine.outcome','machine.terminal','client.machine_lost') OR
  (type='machine.control' AND json_extract(payload,'$.action')='resume'))
  GROUP BY attempt ORDER BY attempt`, id)
 	if err != nil {

@@ -920,8 +920,8 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		EventsURL:    "/v1/requests/" + row.ID + "/events",
 		OutputExport: s.outputExportOf(row.ID),
 	}
-	if row.State == "blocked" {
-		state.ErrorType, state.Error, _ = s.store.RetainedFailure(row.ID)
+	if row.State == "blocked" || row.State == "failed" {
+		state.ErrorType, _, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
 	if row.ParentRequestID != "" {
 		state.ParentRequestID = row.ParentRequestID

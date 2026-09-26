@@ -65,8 +65,8 @@ func (c *Orchestrator) RecoverLostWork() {
 }
 
 // A private transaction's rental owns its local-only intermediate bytes. A new
-// machine cannot honestly resume those bytes, so loss blocks the retained
-// transaction rather than silently purchasing a replacement and recomputing it.
+// machine cannot honestly resume those bytes, so confirmed loss fails the retained
+// transaction instead of promising a resume or purchasing a replacement.
 func (c *Orchestrator) retainLostWork(req records.Request) {
 	attempts, problem := c.opt.Store.Attempts(req.ID)
 	if problem != nil {
@@ -88,7 +88,7 @@ func (c *Orchestrator) retainLostWork(req records.Request) {
 			c.settleDispatch(req.ID, uint64(attempt.Attempt), false)
 		}
 	}
-	_, _ = c.opt.Store.BlockLostRetainedWork(req.ID, "the retained rental and its local intermediate bytes are no longer available")
+	_, _ = c.opt.Store.FailLostRetainedWork(req.ID, req.Worker, c.lostRentalCause(req.Worker))
 	c.forget(req.ID)
 }
 

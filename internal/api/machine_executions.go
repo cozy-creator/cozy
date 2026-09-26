@@ -33,6 +33,9 @@ func (s *Server) refreshMachineExecution(ctx context.Context, request records.Re
 	if problem != nil || link == nil || len(link.Receipt) == 0 || link.Collected && len(link.PendingControl) == 0 {
 		return problem
 	}
+	if lost, problem := s.store.MachineExecutionLost(request.ID); problem != nil || lost {
+		return problem
+	}
 	if s.machineExecutions == nil {
 		return exit.Unavailablef("this client cannot observe Runtime-owned execution")
 	}
@@ -58,6 +61,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		MachineExecution: view,
 	}
 	state.OutputExport = s.outputExportOf(row.ID)
+	if row.State == "failed" || row.State == "blocked" {
+		state.ErrorType, _, state.Error, _ = s.store.SettledFailure(row.ID)
+	}
 	if outputs, problem := s.store.VisibleOutputs(row.ID); problem == nil {
 		for _, output := range outputs {
 			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MediaID: output.MediaID, URL: "/v1/media/" + output.MediaID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
@@ -88,7 +94,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		var body pb.AttemptOutcomeBody
 		if proto.Unmarshal(link.Outcome, &outcome) == nil && canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body) == nil {
 			terminal = &body
-			if body.Cause != nil && body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
+			if state.ErrorType == "" && body.Cause != nil && body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
 				state.Error = body.SafeMessage
 				state.ErrorType = body.Cause.Code.String()
 			}
