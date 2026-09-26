@@ -9,8 +9,11 @@ These are exact artifacts from the real Runtime451 tiny modeled-wheel proof.
   from the same code/environment revision in Runtime451's native CI proof.
   Operation IDs differ; their local revision and environment identities agree.
 
-The Creator product test rebinds only the report's control-stream envelope. It
-retains actual STAGED/OFFLINE, zero convergence, closed admission and no slots.
+The current Creator protocol test explicitly adapts these legacy placement
+envelopes to installation handles and embedded interface bytes. It also rebinds
+the report's installation, placement-set identity and control stream while retaining
+STAGED/OFFLINE, zero convergence, closed admission and no slots. This adaptation
+is a protocol fixture, not evidence that a current Runtime produced these bytes.
 Negative arms alter one refusal condition. Root-owned receipt and reproduction:
 outputs/h3-turbo-20260912/revision-observation/runtime-observe.py.
 

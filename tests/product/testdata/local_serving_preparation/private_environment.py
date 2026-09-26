@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-import hashlib
+import base64
 import json
 import os
 import shutil
@@ -76,7 +76,7 @@ def tile(ctx: Context, payload: Request) -> Result:
     if sdk_wheel:
         shutil.copyfile(sdk_wheel, wheels / Path(sdk_wheel).name)
     rows = [
-        pb.LocalPackageWheel(
+        pb.LocalPackageFile(
             digest=documents.digest_of(path.read_bytes()),
             filename=path.name,
             path=str(path),
@@ -85,24 +85,7 @@ def tile(ctx: Context, payload: Request) -> Result:
         for path in sorted(wheels.glob("*.whl"))
     ]
     rows.sort(key=lambda row: row.digest)
-    revision = pb.LocalPackageRevision(
-        package="local/weightless",
-        release="1.0.0",
-        source_digest=hashlib.sha256(source.encode()).digest(),
-        package_interface=pb.Ref(
-            digest=documents.digest_of(interface), length=len(interface)
-        ),
-        files=[
-            pb.LocalPackageFileRef(
-                digest=row.digest, filename=row.filename, length=row.length
-            )
-            for row in rows
-        ],
-        dependency_requirements=pb.Ref(
-            digest=documents.digest_of(dependency_requirements), length=len(dependency_requirements)
-        ),
-    )
-    revision_digest = documents.identity(revision)[1]
+    installation_id = "private-environment-proof"
 
     def describe(installed, distribution):
         return run(
@@ -117,12 +100,11 @@ def tile(ctx: Context, payload: Request) -> Result:
     request = pb.PrepareLocalPackageRequest(
         operation_id=operation,
         package=pb.DevelopmentPackage(
-            package=revision.package,
-            release=revision.release,
-            source_digest=revision.source_digest,
-            local_revision_digest=revision_digest,
+            package="local/weightless",
+            release="1.0.0",
+            installation_id=installation_id,
         ),
-        wheels=rows,
+        files=rows,
         dependency_requirements=dependency_requirements,
         install_root=str(install),
     )
@@ -140,31 +122,15 @@ def tile(ctx: Context, payload: Request) -> Result:
     (root / "prepared.json").write_bytes(
         result.placement_set.placement_set_canonical_bytes
     )
-    (root / "revision.json").write_text(
-        json.dumps(
-            {
-                "package": revision.package,
-                "release": revision.release,
-                "source_digest": documents.spell(revision.source_digest),
-                "digest": documents.spell(revision_digest),
-                "package_interface_digest": documents.spell(
-                    revision.package_interface.digest
-                ),
-                "package_interface_length": len(interface),
-                "files": [
-                    {
-                        "digest": documents.spell(row.digest),
-                        "filename": row.filename,
-                        "kind": "project" if row.filename == wheel.name else "dependency",
-                        "path": row.path,
-                        "length": row.length,
-                    }
-                    for row in rows
-                ],
-            }
-        )
-    )
-    print(json.dumps({"prepared": True, "revision": documents.spell(revision_digest)}))
+    (root / "installation.json").write_text(json.dumps({
+        "ID": installation_id, "Package": "local/weightless", "Release": "1.0.0",
+        "PackageInterface": base64.b64encode(interface).decode(),
+        "Files": [{"Digest": documents.spell(row.digest), "Filename": row.filename,
+                   "Kind": "project" if row.filename == wheel.name else "dependency",
+                   "Path": row.path, "Length": row.length} for row in rows],
+    }))
+    print(json.dumps({"prepared": True, "installation": installation_id}))
+
 
 
 def accept(root: Path) -> None:
@@ -203,14 +169,14 @@ def accept(root: Path) -> None:
             pb.DesiredWorkerState(
                 revision=1,
                 placement_set=desired,
-                wire_minor=49,
+                wire_minor=62,
             )
         )
         worker.converge_placement(1)
         assert worker.prepared_models, (worker.latched, worker.failed_bindings)
         assert worker.bindings
         declared = next(iter(worker.bindings.values()))
-        assert declared.development is False and declared.environment_digest
+        assert declared.development is False and declared.installation_id
         # The positive arm is the exact Go-emitted offer, including its grant.
         attempt = worker.engine.offer(original)
         worker._bind_attempt_slot(attempt)
@@ -223,12 +189,12 @@ def accept(root: Path) -> None:
         original_spec = documents.read(
             original.invocation_spec_canonical_bytes, pb.InvocationSpec
         )
-        for index, value in enumerate((None, "sha256:" + "ab" * 32), 1):
+        for index, value in enumerate((None, "other-installation"), 1):
             spec = copy.deepcopy(original_spec)
             if value is None:
-                spec.pop("environment_digest", None)
+                spec.pop("installation_id", None)
             else:
-                spec["environment_digest"] = value
+                spec["installation_id"] = value
             body = canonical.write(spec)
             offer = pb.AttemptOffer()
             offer.CopyFrom(original)
@@ -244,11 +210,11 @@ def accept(root: Path) -> None:
                 assert error.code == "environment_mismatch", str(error)
                 refused.append(error.code)
             else:
-                raise AssertionError("mismatched Environment admitted")
+                raise AssertionError("mismatched installation admitted")
         result = {
             "accepted": True,
             "refused": refused,
-            "environment_digest": declared.environment_digest,
+            "installation_id": declared.installation_id,
         }
         (root / "admission.json").write_text(json.dumps(result))
         print(json.dumps(result))

@@ -266,7 +266,7 @@ func assertPrivateTransactionIdentity(t *testing.T, store *records.Store, before
 		after.IdemKey != before.IdemKey || after.BodyDigest != before.BodyDigest || after.CreatedAt != before.CreatedAt ||
 		after.Package != before.Package || after.Entrypoint != before.Entrypoint || after.Release != before.Release ||
 		after.PlanID != before.PlanID || after.LocalInstallationID != before.LocalInstallationID ||
-		after.InstallationId != before.InstallationId || !bytes.Equal(after.Payload, before.Payload) ||
+		after.InstallationID != before.InstallationID || !bytes.Equal(after.Payload, before.Payload) ||
 		!after.RetainWork || after.Worker != before.Worker || after.Ordinal != before.Ordinal {
 		t.Fatalf("transaction identity or state changed: before=%+v after=%+v want-state=%s", before, after, state)
 	}

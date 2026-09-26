@@ -158,19 +158,7 @@ func (o *owner) close() { o.once.Do(o.closer) }
 // bytes: a real process dialing the real socket over the committed contract. `device` is
 // the granted envelope, comma-separated for a multi-device one.
 func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec {
-	ref := func(label string) *pb.Ref {
-		digest := sha256.Sum256([]byte(label))
-		return &pb.Ref{Digest: digest[:], Length: uint64(len(label))}
-	}
 	spelled := func(raw []byte) string { value, _ := canonical.Spell(raw); return value }
-	environment := map[string]canonical.Value{
-		"local_wheels": []canonical.Value{},
-	}
-	environmentIdentity := map[string]canonical.Value{
-		"format":       "cozy.worker.v1.Environment/1",
-		"local_wheels": environment["local_wheels"],
-	}
-	environmentBytes, _ := canonical.Write(environmentIdentity)
 	entrypointIdentity := map[string]canonical.Value{
 		"name": "fake", "slots": []canonical.Value{},
 	}
@@ -187,8 +175,8 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 		PlacementId: "plc-fake-" + name,
 		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{
 			Package: "fake/" + name, Release: "1.0.0"}},
-		InstallationId:   canonical.Digest(environmentBytes),
-		PackageInterface: ref("fake-interface"), BindingsDigest: canonical.Digest(bindingsBytes),
+		InstallationId:   "fake-" + name,
+		PackageInterface: []byte(`{"format":"cozy.package.interface/1","application":"fake:app","entrypoints":[],"jobs":[]}`), BindingsDigest: canonical.Digest(bindingsBytes),
 		Entrypoints: []*pb.Entrypoint{{Name: "fake", EntrypointBindingDigest: entrypointDigest}},
 	}}})
 	setID := spelled(setDigest)

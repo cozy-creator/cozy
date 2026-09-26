@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,27 +14,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestCapturePublicationExcludesTerminalCleanupAcrossProcesses(t *testing.T) {
 	o := hostOwner(t, fmt.Sprintf("capture-publication-%d", time.Now().UnixNano()))
-	digest := func(b byte) []byte { return bytes.Repeat([]byte{b}, 32) }
-	raw, hash, err := canonical.Identity(&pb.LocalPackageRevision{Package: "local/restored", Release: "1.0.0",
-		SourceDigest: digest(1), PackageInterface: &pb.Ref{Digest: digest(2), Length: 1},
-		Files: []*pb.LocalPackageFileRef{{Digest: digest(3), Filename: "restored-1.0.0-py3-none-any.whl", Length: 1}}})
+	revision := "restored-install"
+	raw, err := json.Marshal(localpackage.Installation{ID: revision, Package: "local/restored", Release: "1.0.0"})
 	must(t, err)
-	revision, err := canonical.Spell(hash)
-	must(t, err)
-	root := filepath.Join(o.l.LocalPackages, strings.TrimPrefix(revision, "sha256:"))
+	root := filepath.Join(o.l.LocalPackages, revision)
 	must(t, os.MkdirAll(root, 0700))
-	must(t, os.WriteFile(filepath.Join(root, "revision.json"), raw, 0600))
-	_, _, problem := o.store.Submit(records.Request{ID: "finishing-old", IdemKey: "finishing-old", BodyDigest: revision,
+	must(t, os.WriteFile(filepath.Join(root, "installation.json"), raw, 0600))
+	_, _, problem := o.store.Submit(records.Request{ID: "finishing-old", IdemKey: "finishing-old", BodyDigest: childDigest("a"),
 		Package: "local/restored", Entrypoint: "main", Payload: []byte(`{}`), LocalInstallationID: revision})
 	fatal(t, problem)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -64,7 +59,7 @@ func TestCapturePublicationExcludesTerminalCleanupAcrossProcesses(t *testing.T) 
 	}
 	inst := records.PackageInstall{ID: "restored-install", Package: "local/restored", Dir: o.l.InstallDir("restored-install"), Version: "1.0.0"}
 	fatal(t, o.store.RecordInstall(inst))
-	_, _, problem = o.store.Submit(records.Request{ID: "accepted-new", IdemKey: "accepted-new", BodyDigest: revision,
+	_, _, problem = o.store.Submit(records.Request{ID: "accepted-new", IdemKey: "accepted-new", BodyDigest: childDigest("a"),
 		Package: "local/restored", InstallID: inst.ID, Entrypoint: "main", Payload: []byte(`{}`), LocalInstallationID: revision})
 	fatal(t, problem)
 	must(t, input.Close())

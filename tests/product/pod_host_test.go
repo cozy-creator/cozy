@@ -691,7 +691,7 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	// The Runtime stages this package's job plan records inside THIS call, before the
 	// owner has united anything, so the only build identity it can write is its own
 	// placement's.
-	p.stagedJobBuild = prepared.List("placements")[0].Str("environment_digest")
+	p.stagedJobBuild = prepared.List("placements")[0].Str("installation_id")
 	p.mu.Unlock()
 	samples := max(p.downloadSamples, 1)
 	events := []*pb.PrepareEvent{{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total}}
@@ -1157,9 +1157,9 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 		}
 		doc, err := canonical.Read(sent.PlacementSetCanonicalBytes, &pb.PlacementSet{})
 		must(t, err)
-		wheel := doc.List("placements")[0].Sub("development").Sub("project_wheel").Sub("ref").Str("digest")
-		if wheel != revision.Files[0].Digest && wheel != revision.Files[1].Digest {
-			t.Fatalf("the placement's project wheel %s is not one the owner granted", wheel)
+		installed := doc.List("placements")[0]
+		if installed.Str("installation_id") != revision.ID || installed.Sub("development").Str("installation_id") != revision.ID {
+			t.Fatal("prepared placement lost the accepted installation")
 		}
 		row, e := o.store.RequestRow(requestID)
 		fatal(t, e)
@@ -1186,9 +1186,9 @@ func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
 	must(t, err)
 	prepared, err := canonical.Read(pod.desired[0].GetPlacementSet().PlacementSetCanonicalBytes, &pb.PlacementSet{})
 	must(t, err)
-	environment := prepared.List("placements")[0].Str("environment_digest")
-	if environment == "" || spec.Str("environment_digest") != environment {
-		t.Fatalf("captured serving must name its actual prepared environment: got %q, want %q", spec.Str("environment_digest"), environment)
+	environment := prepared.List("placements")[0].Str("installation_id")
+	if environment == "" || spec.Str("installation_id") != environment {
+		t.Fatalf("captured serving must name its actual prepared environment: got %q, want %q", spec.Str("installation_id"), environment)
 
 	}
 }

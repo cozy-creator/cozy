@@ -34,10 +34,11 @@ func TestPrivateDependencyRequirementsBindReplayAndMachineCapture(t *testing.T) 
 	requirements := []byte("torch @ https://files.pythonhosted.org/torch-2.13.0-py3-none-any.whl --hash=sha256:" + strings.Repeat("a", 64) + "\n")
 	old, problem := localpackage.StageWheels(layout, inst, []byte("{}"), []string{wheelPath}, nil)
 	fatal(t, problem)
+	inst.ID = "fixture-with-requirements"
 	revision, problem := localpackage.StageWheels(layout, inst, []byte("{}"), []string{wheelPath}, requirements)
 	fatal(t, problem)
 	if revision.ID == old.ID || len(revision.Files) != 1 {
-		t.Fatal("public requirements were omitted from identity or became a private wheel")
+		t.Fatal("distinct accepted installations lost ownership or requirements became a wheel")
 	}
 	reopened, problem := localpackage.Open(layout, inst, revision.ID)
 	fatal(t, problem)
@@ -46,8 +47,8 @@ func TestPrivateDependencyRequirementsBindReplayAndMachineCapture(t *testing.T) 
 	}
 	selected, problem := orchestrator.LocalPackageSelection("capture", reopened)
 	fatal(t, problem)
-	if !bytes.Equal(selected.DependencyRequirements, requirements) {
-		t.Fatal("Host selection lost requirements")
+	if !bytes.Equal(selected.DependencyRequirements, requirements) || selected.Package.InstallationId != inst.ID {
+		t.Fatal("Host selection lost installation or requirements")
 	}
 	capture, problem := localpackage.CaptureExecution(inst.ID, reopened, func(string) ([]records.ChildBinding, *exit.Error) { return nil, nil }, func(string, string) (localpackage.Installation, *exit.Error) {
 		t.Fatal("unexpected child lookup")
@@ -56,35 +57,19 @@ func TestPrivateDependencyRequirementsBindReplayAndMachineCapture(t *testing.T) 
 	fatal(t, problem)
 	var doc pb.MachineExecutionCapture
 	must(t, canonical.Unmarshal(capture.Canonical, &doc))
-	ref := doc.InstalledPackages[0].DependencyRequirements
-	if ref == nil || ref.Length != uint64(len(requirements)) || !bytes.Equal(ref.Digest, canonical.Digest(requirements)) {
-		t.Fatal("machine capture lost requirements identity")
+	if doc.RootInstallationId != inst.ID || len(doc.InstalledPackages) != 1 || doc.InstalledPackages[0].InstallationId != inst.ID || !bytes.Equal(doc.InstalledPackages[0].PackageInterface, []byte("{}")) {
+		t.Fatal("machine capture lost accepted installation or interface")
 	}
-	retained := filepath.Join(layout.LocalPackages, strings.TrimPrefix(revision.ID, "sha256:"), "dependency-requirements.txt")
-	must(t, os.Chmod(retained, 0600))
-	must(t, os.WriteFile(retained, bytes.Replace(requirements, []byte("2.13.0"), []byte("2.12.0"), 1), 0600))
-	if _, problem := localpackage.Open(layout, inst, revision.ID); problem == nil {
-		t.Fatal("changed dependency selection was accepted on replay")
+	if len(capture.Installations) != 1 || !bytes.Equal(capture.Installations[0].DependencyRequirements, requirements) {
+		t.Fatal("capture staging lost dependency requirements")
 	}
-	if _, problem := localpackage.Open(layout, inst, old.ID); problem != nil {
-		t.Fatal("complete all-local closure was refused", problem)
+	if _, problem := localpackage.Open(layout, inst, old.ID); problem == nil {
+		t.Fatal("another install opened this installation")
 	}
-	oldPayload := filepath.Join(layout.LocalPackages, strings.TrimPrefix(old.ID, "sha256:"), "dependency-requirements.txt")
-	must(t, os.Remove(oldPayload))
-	if _, problem := localpackage.Open(layout, inst, old.ID); problem == nil || problem.Name != "local_package_recapture_required" {
-		t.Fatalf("old incomplete capture was reused: %v", problem)
+	first, problem := localpackage.Open(layout, records.PackageInstall{ID: old.ID}, old.ID)
+	fatal(t, problem)
+	if len(first.DependencyRequirements) != 0 {
+		t.Fatal("later installation rewrote the earlier closure")
 	}
-	otherPath := filepath.Join(root, "fixture-1.1-py3-none-any.whl")
-	other, err := os.Create(otherPath)
-	must(t, err)
-	otherZip := zip.NewWriter(other)
-	otherMetadata, err := otherZip.Create("fixture-1.1.dist-info/METADATA")
-	must(t, err)
-	_, err = otherMetadata.Write([]byte("Metadata-Version: 2.3\nName: fixture\nVersion: 1.1\n"))
-	must(t, err)
-	must(t, otherZip.Close())
-	must(t, other.Close())
-	if _, problem := localpackage.StageWheels(layout, inst, []byte("{}"), []string{wheelPath, otherPath}, requirements); problem == nil {
-		t.Fatal("duplicate local distribution was accepted")
-	}
+
 }

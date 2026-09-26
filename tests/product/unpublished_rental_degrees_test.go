@@ -66,7 +66,7 @@ func TestUnpublishedRentalPreservesSelectedFunctionDegrees(t *testing.T) {
 			body, err = canonical.NormalizeJCS(body)
 			must(t, err)
 			installed := cleanupTestInstall(layout, fmt.Sprintf("%016x", index+1), "1.14.2")
-			installed.Package, installed.PackageInterface = "local/minimax-h3", assessmentDigest(body)
+			installed.Package = "local/minimax-h3"
 			must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0700))
 			must(t, os.Symlink(venv, filepath.Join(installed.Dir, "venv")))
 			must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), body, 0444))

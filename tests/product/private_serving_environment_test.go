@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
@@ -25,10 +24,11 @@ import (
 
 // Runtime prepares a real unpublished wheel; Creator consumes those exact bytes
 // and emits its real remote InvocationSpec; Runtime judges that emitted document.
-func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
-	// The control interpreter is the host tool, so without a candidate wheel it is the
-	// enforced tool floor; the package-SDK floor predates the revision fields it reads.
-	version := hostruntime.ToolFloor
+func TestCapturedPrivateInstallationReachesRuntimeAdmission(t *testing.T) {
+	integration(t)
+	// This fixture exercises the installed-resource protocol introduced after the
+	// generic controller floor. An explicit candidate wheel qualifies newer cohorts.
+	version := "0.18.28"
 	runtime := "cozy-runtime==" + version
 	if *privateChildRuntimeWheel != "" {
 		version, runtime = runtimeFixtureVersion(t, *privateChildRuntimeWheel), *privateChildRuntimeWheel
@@ -74,28 +74,15 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 	set, err := canonical.Read(raw, &pb.PlacementSet{})
 	must(t, err)
 	placement := set.List("placements")[0]
-	environment := placement.Str("environment_digest")
-	if environment == "" || placement.Sub("development").Sub("project_wheel").Sub("ref").Str("digest") == "" {
+	environment := placement.Str("installation_id")
+	if environment == "" || placement.Sub("development").Str("installation_id") != environment {
 		t.Fatal("Runtime did not prepare a captured wheel with an exact Environment")
 	}
-	var receipt struct {
-		Package                string              `json:"package"`
-		Release                string              `json:"release"`
-		SourceDigest           string              `json:"source_digest"`
-		Digest                 string              `json:"digest"`
-		PackageInterfaceDigest string              `json:"package_interface_digest"`
-		PackageInterfaceLength int64               `json:"package_interface_length"`
-		Files                  []localpackage.File `json:"files"`
-	}
-	metadata, err := os.ReadFile(filepath.Join(root, "revision.json"))
+	var revision localpackage.Installation
+	metadata, err := os.ReadFile(filepath.Join(root, "installation.json"))
 	must(t, err)
-	must(t, json.Unmarshal(metadata, &receipt))
-	revision := localpackage.Installation{
-		Package: receipt.Package, Release: receipt.Release, SourceDigest: receipt.SourceDigest,
-		Digest: receipt.Digest, PackageInterfaceDigest: receipt.PackageInterfaceDigest,
-		PackageInterfaceLength: receipt.PackageInterfaceLength, Files: receipt.Files,
-		DependencyRequirements: dependencyRequirements,
-	}
+	must(t, json.Unmarshal(metadata, &revision))
+	revision.DependencyRequirements = dependencyRequirements
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, serve: true}
@@ -103,7 +90,7 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 		if err := pod.verifyClaim(call.Claim, false); err != nil {
 			return err
 		}
-		if spellOfBytes(call.LocalPackageSet.Package.InstallationId) != revision.ID {
+		if call.LocalPackageSet.Package.InstallationId != revision.ID {
 			t.Error("Creator changed the Runtime-measured revision")
 		}
 		pod.mu.Lock()
@@ -152,8 +139,8 @@ func TestCapturedPrivateEnvironmentReachesRuntimeAdmission(t *testing.T) {
 	}
 	invocation, err := canonical.Read(offer.InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
 	must(t, err)
-	if invocation.Str("environment_digest") != environment {
-		t.Fatalf("InvocationSpec environment %q differs from prepared %q", invocation.Str("environment_digest"), environment)
+	if invocation.Str("installation_id") != environment {
+		t.Fatalf("InvocationSpec environment %q differs from prepared %q", invocation.Str("installation_id"), environment)
 	}
 	must(t, os.WriteFile(filepath.Join(root, "invocation.json"), offer.InvocationSpecCanonicalBytes, 0600))
 	offerBytes, err := proto.Marshal(offer)

@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -103,15 +102,12 @@ func TestPublishedMachineActualLocalAndNewRootAfterRestart(t *testing.T) {
 		must(t, proto.Unmarshal(link.Submission, &submitted))
 		var capture pb.MachineExecutionCapture
 		must(t, canonical.Unmarshal(submitted.CaptureCanonicalBytes, &capture))
-		if len(capture.Revisions) != 0 || len(capture.PublishedRevisions) != 1 {
-			t.Fatal("local published root was recast as private code")
+		if len(capture.InstalledPackages) != 1 || capture.InstalledPackages[0].Package != fixture.Package || capture.InstalledPackages[0].Release != fixture.Release {
+			t.Fatal("published capture changed package origin")
 		}
-		_, identity, err := canonical.Identity(capture.PublishedRevisions[0].Environment)
-		must(t, err)
-		current, err := canonical.Spell(identity)
-		must(t, err)
-		if !bytes.Equal(identity, capture.RootInstallationId) || submitted.PreparedState.GetJob().InstallationId != current || (build != "" && current != build) {
-			t.Fatal("local published Environment identity changed")
+		current := capture.RootInstallationId
+		if current == "" || capture.InstalledPackages[0].InstallationId != current || submitted.PreparedState.GetJob().InstallationId != current {
+			t.Fatal("published installed identity changed during submission")
 		}
 		build = current
 		attempts, problem := store.Attempts(request.ID)

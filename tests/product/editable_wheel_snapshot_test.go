@@ -56,7 +56,7 @@ func TestEditableSnapshotLargeWheelKeepsSourceIdentityFence(t *testing.T) {
 			pack, problem := packagepublish.PrepareLocalFrom(project)
 			fatal(t, problem)
 			defer pack.Close()
-			digest, count, size, problem := pack.SourceIdentity()
+			count, size, problem := pack.SourceInventory()
 			fatal(t, problem)
 			// The deliberately stale release reaches the snapshot's final identity
 			// fence only after every large dependency has copied and rehashed.

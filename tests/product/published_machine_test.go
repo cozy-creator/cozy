@@ -27,15 +27,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestPublishedMachineJobPreservesEnvironmentBuildIdentity(t *testing.T) {
-	environment := &pb.Environment{LockedRequirements: &pb.Ref{Digest: bytes.Repeat([]byte{7}, 32), Length: 100}}
-	_, code, err := canonical.Identity(environment)
-	must(t, err)
-	buildID, err := canonical.Spell(code)
-	must(t, err)
-	raw, digest, err := canonical.Identity(&pb.MachineExecutionCapture{RootInstallationId: code,
-		PublishedRevisions: []*pb.PublishedPackageRevision{{Package: &pb.PackageSelection{Package: "alice/ops", Release: "1.0.0"}, Environment: environment, PackageInterface: &pb.Ref{Digest: bytes.Repeat([]byte{8}, 32), Length: 200}}},
-	})
+func TestPublishedMachineJobPreservesInstallationIdentity(t *testing.T) {
+	buildID := "published-installation"
+	raw, digest, err := canonical.Identity(&pb.MachineExecutionCapture{RootInstallationId: buildID,
+		InstalledPackages: []*pb.InstalledPackage{{InstallationId: buildID, Package: "alice/ops", Release: "1.0.0", PackageInterface: []byte("{}")}}})
 	must(t, err)
 	request := records.Request{ID: "published-root", IdemKey: "published-root", Kind: "job", Package: "alice/ops", Release: "1.0.0", PlanID: childDigest("9"), Payload: []byte(`{}`), Org: "local"}
 	plan := &orchestrator.JobPlan{Function: "main", DescriptorID: request.PlanID, InstallationID: buildID}
@@ -46,7 +41,7 @@ func TestPublishedMachineJobPreservesEnvironmentBuildIdentity(t *testing.T) {
 	if spec.GetJob().InstallationId != buildID || submitted.PreparedState.GetJob().InstallationId != buildID || request.LocalInstallationID != "" {
 		t.Fatal("published code acquired a private revision identity")
 	}
-	plan.InstallationID = childDigest("a")
+	plan.InstallationID = "other-installation"
 	if _, problem := orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan, nil); problem == nil {
 		t.Fatal("a different prepared build was accepted")
 	}
@@ -215,15 +210,12 @@ func TestPublishedMachineActualHostAndNewRootAfterRestart(t *testing.T) {
 		must(t, proto.Unmarshal(link.Submission, &submitted))
 		var capture pb.MachineExecutionCapture
 		must(t, canonical.Unmarshal(submitted.CaptureCanonicalBytes, &capture))
-		if len(capture.Revisions) != 0 || len(capture.PublishedRevisions) != 1 {
-			t.Fatal("published root was recast as a private revision")
+		if len(capture.InstalledPackages) != 1 || capture.InstalledPackages[0].Package != fixture.Package || capture.InstalledPackages[0].Release != fixture.Release {
+			t.Fatal("published capture changed package origin")
 		}
-		_, identity, err := canonical.Identity(capture.PublishedRevisions[0].Environment)
-		must(t, err)
-		current, err := canonical.Spell(identity)
-		must(t, err)
-		if !bytes.Equal(identity, capture.RootInstallationId) || submitted.PreparedState.GetJob().InstallationId != current || (build != "" && current != build) {
-			t.Fatal("published build identity changed across re-preparation")
+		current := capture.RootInstallationId
+		if current == "" || capture.InstalledPackages[0].InstallationId != current || submitted.PreparedState.GetJob().InstallationId != current {
+			t.Fatal("published installed identity changed during submission")
 		}
 		build = current
 		attempts, problem := store.Attempts(request.ID)
