@@ -22,6 +22,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
@@ -167,6 +168,49 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	fleet.owner = c
+	installContext, cancelInstalls := context.WithCancel(context.Background())
+	installationHub := strings.TrimRight(ctx.Cfg.HubURL, "/")
+	installs := rental.NewInstallQueue(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
+		machine, problem := st.RentalRow(row.RentalID)
+		if problem != nil {
+			return problem
+		}
+		if machine == nil {
+			return exit.Named(exit.Unavailable, "rental.ended", "installation rental no longer exists")
+		}
+		if strings.TrimRight(machine.Hub, "/") != installationHub {
+			return exit.Named(exit.Conflict, "rental.tensorhub_mismatch", "installation belongs to a different Tensorhub")
+		}
+
+		instance, _, _, problem := c.EnsureRentalContext(ctx, row.RentalID)
+		if problem != nil {
+			return problem
+		}
+		release, problem := c.UseRental(row.RentalID)
+		if problem != nil {
+			return problem
+		}
+		defer release()
+		claim, problem := c.RentalExecutionClaim(ctx, row.RentalID)
+		if problem != nil {
+			return problem
+		}
+		if claim.WorkerBootId != row.WorkerBootID {
+			return exit.Named(exit.Conflict, "rental.worker_boot_changed", "installation worker identity changed before preparation")
+		}
+		models := orchestrator.DownloadModelRefs(row.Selection.Models)
+		if len(models) != len(row.Selection.Models) {
+			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
+		}
+		if row.Selection.Package == "" {
+			return c.PrepareRentalModels(ctx, instance, models)
+		}
+		return c.PrepareRentalPackage(ctx, instance, &pb.DownloadPackageRef{Package: row.Selection.Package, Release: row.Selection.Release}, models)
+	}, ctx.Out)
+	fleet.installs = installs
+	installsStopped := make(chan struct{})
+	defer cancelInstalls()
+
 	killed, forgotten, e := c.Reconcile()
 	if e != nil {
 		closeListeners()
@@ -202,7 +246,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	server := api.New(api.Options{
 		RuntimeUpdate:     updates.Start,
 		RentalKeepalive:   fleet.keepalive,
-		RentalPreparation: fleet.beginPreparation,
+		RentalInstall:     installs.Accept,
 		MachineExecutions: machines,
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
@@ -218,6 +262,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 	}
 	updates.Resume()
 	machines.Resume()
+	go func() { defer close(installsStopped); installs.Run(installContext) }()
+	defer func() { cancelInstalls(); <-installsStopped }()
 
 	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
 		addr, strings.Join(bound, "+"), socket)
@@ -281,6 +327,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	<-stop
 	close(quit)
+	cancelInstalls()
+	<-installsStopped
 	// Disconnect uploads/observation immediately. Runtime owns accepted execution;
 	// canceling this client context never sends an execution-cancel command.
 	machines.cancel()

@@ -24,12 +24,12 @@ import (
 // Fixed idle expiry counts real work on each machine, never retained bytes or
 // an open controller connection. Durable records survive daemon restarts.
 type managedRentals struct {
-	mu        sync.Mutex
-	ctx       *Context
-	layout    home.Layout
-	store     *records.Store
-	owner     *orchestrator.Orchestrator
-	preparing map[string]int
+	mu       sync.Mutex
+	ctx      *Context
+	layout   home.Layout
+	store    *records.Store
+	owner    *orchestrator.Orchestrator
+	installs *rental.InstallQueue
 	// retryAt holds a rental whose release the hub refused or did not answer; said holds
 	// the last line printed about each rental, so the sweep speaks once per change.
 	retryAt map[string]time.Time
@@ -633,6 +633,9 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 		}
 		owner := m.owner
 		m.mu.Unlock()
+		if m.installs != nil {
+			m.installs.Wake()
+		}
 		if owner != nil {
 			// OUTSIDE the lock, always: replanning released work asks the fleet for
 			// capacity and re-enters this object. Under the lock it deadlocks the daemon,
@@ -1193,44 +1196,6 @@ func rentalCompatibility(ctx *Context, id string, constraints rental.Constraints
 	return nil
 }
 
-// beginPreparation scopes actual explicit preparation, never a transport lifetime.
-func (m *managedRentals) beginPreparation(id string) (func(bool), *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	row, problem := m.store.RentalRow(id)
-	if problem != nil {
-		return nil, problem
-	}
-	if m.closed || row == nil || row.State != "ready" {
-		return nil, exit.New(exit.Conflict, "preparation requires a current ready rental")
-	}
-	if problem := m.store.RecordRentalPreparationStarted(id); problem != nil {
-		return nil, problem
-	}
-	if m.preparing == nil {
-		m.preparing = map[string]int{}
-	}
-	m.preparing[id]++
-	var once sync.Once
-	return func(confirmed bool) {
-		once.Do(func() {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			if confirmed {
-				if problem := m.store.RecordRentalWorkFinished(id, time.Now()); problem != nil {
-					fmt.Fprintln(m.ctx.Err, problem.Message)
-				}
-			}
-			m.preparing[id]--
-			if m.preparing[id] == 0 {
-				delete(m.preparing, id)
-			}
-		})
-	}, nil
-}
-
 func (m *managedRentals) observeIdle(row records.Rental) (rental.Idleness, *exit.Error) {
-	idle, problem := rental.ObserveIdle(m.store, row)
-	idle.Running += m.preparing[row.ID]
-	return idle, problem
+	return rental.ObserveIdle(m.store, row)
 }

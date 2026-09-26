@@ -69,6 +69,12 @@ func handleModelUpload(ctx *Context) *exit.Error {
 }
 
 func handleModelDownload(ctx *Context) *exit.Error {
+	if ctx.Inv.Value("--rental") != "" {
+		return handleRentalModelDownload(ctx)
+	}
+	if len(ctx.Inv.Args) < 2 || strings.TrimSpace(ctx.Inv.Args[1]) == "" {
+		return exit.Usagef("local model download requires a local/name destination; use --rental=NAME for a remote download")
+	}
 	return handleModelTransfer(ctx, "model-download")
 }
 
@@ -503,9 +509,18 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 			}
 			lane = selectedLane
 		}
-		refspec = model + "@" + manifest
-		if release != "" {
-			refspec = model + "@" + release + "@" + manifest
+		if manifest == "" {
+			resolvedModel, problem := resolveRemoteModel(ctx, "", launch.Slot{}, raw, lane, nil)
+			if problem != nil {
+				return publishSource{}, problem
+			}
+			refspec = model + "@" + resolvedModel.Release
+			lane = resolvedModel.Lane
+		} else {
+			refspec = model + "@" + manifest
+			if release != "" {
+				refspec = model + "@" + release + "@" + manifest
+			}
 		}
 	}
 	resolved, problem := client(ctx).ResolveModel(hctx, refspec, lane)

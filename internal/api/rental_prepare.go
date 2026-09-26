@@ -9,25 +9,13 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
-// RentalPackagePrepareRequest is an explicit, idempotent prerequisite operation.
-// The package release and optional model bindings are immutable content identity;
-// Runtime's preparation ledger reuses them when a caller repeats this request.
-type RentalPackagePrepareRequest struct {
-	Package string                  `json:"package"`
-	Release string                  `json:"release"`
-	Models  []orchestrator.ModelRef `json:"models,omitempty"`
-}
-
-type RentalPackagePrepareResult struct {
-	Rental  string `json:"rental"`
-	Package string `json:"package"`
-	Release string `json:"release"`
-	Status  string `json:"status"`
-}
+// RentalPackagePrepareRequest is frozen at admission and retained until the
+// daemon observes a verified preparation receipt or a terminal rental failure.
+type RentalPackagePrepareRequest = records.RentalInstallSelection
+type RentalPackagePrepareResult = records.RentalInstall
 
 func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
@@ -44,62 +32,76 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	}
 	body.Package = strings.TrimSpace(body.Package)
 	body.Release = strings.TrimSpace(body.Release)
-	if _, problem := canonicalPackageRef(body.Package); problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	if body.Release == "" || strings.ContainsAny(body.Release, "\r\n\x00") {
-		s.refuseTyped(w, r, exit.New(exit.Validation, "rental package preparation requires one exact release"))
+	if body.Package != "" {
+		if _, problem := canonicalPackageRef(body.Package); problem != nil {
+			s.refuseTyped(w, r, problem)
+			return
+		}
+		if body.Release == "" || strings.ContainsAny(body.Release, "\r\n\x00") {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation requires one exact package release"))
+			return
+		}
+	} else if body.Release != "" || len(body.Models) == 0 {
+		s.refuseTyped(w, r, exit.New(exit.Validation, "rental installation requires a package release or explicitly selected models"))
 		return
 	}
 	for _, model := range body.Models {
-		if model.Package != body.Package || model.Slot == "" || model.Model == "" || model.Manifest == "" {
-			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model preparation bindings must name the prepared package, slot, model, and manifest"))
+		if !model.Downloadable() {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model installation requires a downloadable Hub checkpoint"))
+			return
+		}
+		if body.Package == "" && (model.Package != "" || model.Slot != "" || model.BindingPath != "" || len(model.SharedSlots) > 0) {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "standalone model installation does not accept application slots"))
+			return
+		}
+
+		if model.Model == "" || model.Manifest == "" || body.Package != "" && (model.Package != body.Package || model.Slot == "") {
+			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model installation requires exact model selections and matching package slots when a package is supplied"))
+			return
+		}
+		if _, problem := canonicalPackageRef(model.Model); problem != nil {
+			s.refuseTyped(w, r, problem)
 			return
 		}
 		if _, err := canonical.Raw(model.Manifest); err != nil {
-			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model preparation manifest is not a canonical digest"))
+			s.refuseTyped(w, r, exit.New(exit.Validation, "rental model installation manifest is not a canonical digest"))
 			return
 		}
 	}
 	id := r.PathValue("rental_id")
-	if s.rentalPreparation == nil {
-		s.refuseTyped(w, r, exit.Unavailablef("rental preparation activity tracker is unavailable"))
-		return
-	}
-	finish, problem := s.rentalPreparation(id)
+	machine, problem := s.store.RentalRow(id)
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	confirmed := false
-	defer func() { finish(confirmed) }()
-	instance, _, _, problem := s.orchestrator.EnsureRentalContext(r.Context(), id)
+	if machine == nil {
+		s.refuseTyped(w, r, exit.New(exit.NotFound, "rental %s is not recorded on this host", id))
+		return
+	}
+	if strings.TrimRight(machine.Hub, "/") != strings.TrimRight(s.cfg.HubURL, "/") {
+		s.refuseTyped(w, r, exit.Named(exit.Conflict, "rental.tensorhub_mismatch", "installation rental belongs to a different Tensorhub"))
+		return
+	}
+
+	if s.rentalInstall == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("rental installation queue is unavailable"))
+		return
+	}
+	result, problem := s.rentalInstall(id, body)
 	if problem != nil {
-		confirmed = problem.Code != exit.Unavailable && problem.Code != exit.Canceled
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	models := orchestrator.DownloadModelRefs(body.Models)
-	if len(models) != len(body.Models) {
-		s.refuseTyped(w, r, exit.New(exit.Validation, "rental model preparation bindings are not downloadable checkpoint selections"))
-		return
-	}
-	release, problem := s.orchestrator.UseRental(id)
+	s.ok(w, r, http.StatusAccepted, result)
+}
+
+func (s *Server) listRentalInstalls(w http.ResponseWriter, r *http.Request) {
+	rows, problem := s.store.RentalInstalls(r.PathValue("rental_id"), false)
 	if problem != nil {
-		confirmed = problem.Code != exit.Unavailable && problem.Code != exit.Canceled
 		s.refuseTyped(w, r, problem)
 		return
 	}
-	defer release()
-	if problem := s.orchestrator.PrepareRentalPackage(r.Context(), instance,
-		&pb.DownloadPackageRef{Package: body.Package, Release: body.Release}, models); problem != nil {
-		confirmed = problem.Code != exit.Unavailable && problem.Code != exit.Canceled
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	confirmed = true
-	s.ok(w, r, http.StatusOK, RentalPackagePrepareResult{Rental: id, Package: body.Package, Release: body.Release, Status: "prepared"})
+	s.ok(w, r, http.StatusOK, rows)
 }
 
 func canonicalPackageRef(value string) (string, *exit.Error) {

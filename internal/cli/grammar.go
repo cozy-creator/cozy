@@ -139,6 +139,7 @@ type PackageInstallCmd struct {
 	Ref      string `arg:"" name:"package-or-directory" predictor:"dir-or-ref" help:"Published org/name or explicit directory such as . or ./project."`
 	Version  string `help:"Install this release instead of the newest, e.g. 1.2.3."`
 	Editable bool   `help:"Keep an explicit local directory live for development."`
+	Rental   string `predictor:"rental" help:"Install published code and dependencies on this existing rental name or id, without model weights."`
 }
 
 type PackageUpdateAllCmd struct{}
@@ -162,7 +163,7 @@ func (c *PackageYankCmd) Run(r *Runtime) error {
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
 	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable),
-		values("--version", c.Version), false)
+		values("--version", c.Version, "--rental", c.Rental), false)
 }
 
 func (c *PackageRecoverCmd) Run(r *Runtime) error {
@@ -198,7 +199,7 @@ type ModelCmd struct {
 	Info     ModelInfoCmd     `cmd:"" help:"Show all releases, lane sizes, and exact checkpoint refs."`
 	Search   ModelSearchCmd   `cmd:"" help:"Search models, showing each model's latest available release."`
 	Family   ModelFamilyCmd   `cmd:"" help:"Set a model repository's discovery family."`
-	Download ModelDownloadCmd `cmd:"" help:"Acquire a source, optionally run one producer job, and retain it locally."`
+	Download ModelDownloadCmd `cmd:"" help:"Download a model into a local destination or an owned rental store."`
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories and reclaim their bytes."`
 	GC       ModelGCCmd       `cmd:"" name:"gc" help:"Reclaim the bytes no local model references."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
@@ -239,10 +240,10 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 }
 
 type ModelDownloadCmd struct {
-	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
-	Ref            string `arg:"" name:"model" help:"Local destination (local/name)."`
+	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Provider source, Tensorhub model (#lane or @release/lane), local alias, or explicit local file."`
+	Ref            string `arg:"" optional:"" name:"model" help:"Local destination (local/name)."`
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental         bool   `help:"Permit a managed rental when compatible local capacity is unavailable."`
+	Rental         string `help:"Download directly into this owned rental (no local destination)."`
 	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
 	DryRun         bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
 	Await          bool   `help:"Watch the accepted run until it settles."`
@@ -251,9 +252,9 @@ type ModelDownloadCmd struct {
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
 	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
-		"--rental", c.Rental, "--rental-only", c.RentalOnly,
+		"--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
-		values("--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
+		values("--rental", c.Rental, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
 }
 
 type ModelRemoveCmd struct {
@@ -277,7 +278,7 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelUploadCmd struct {
-	Source         string  `arg:"" name:"source" predictor:"file-or-ref" help:"Pinned provider source, Tensorhub release, local alias, or explicit local file."`
+	Source         string  `arg:"" name:"source" predictor:"file-or-ref" help:"Provider source, Tensorhub model (#lane or @release/lane), local alias, or explicit local file."`
 	Ref            string  `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
 	Lane           string  `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         *string `predictor:"rental" help:"Use this existing rental name or id; never buy a replacement."`
@@ -437,26 +438,14 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way
 // bare `cozy package` and `cozy model` do.
 type RentalCmd struct {
+	Installs  RentalInstallsCmd  `cmd:"" help:"Show queued package installs and model downloads on a rental."`
 	Keepalive RentalKeepaliveCmd `cmd:"" help:"Explicitly reset this rental's fixed 15-minute idle deadline once."`
 	Update    RentalUpdateCmd    `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
-	Prepare   RentalPrepareCmd   `cmd:"" help:"Install one exact package release and prepare its model inputs on a rental."`
 	SSHInfo   RentalSSHInfoCmd   `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List      RentalListCmd      `cmd:"" help:"List rented machines, live on a terminal."`
 	New       RentalNewCmd       `cmd:"" help:"Start a private rental, or list available machine types."`
 	End       RentalEndCmd       `cmd:"" help:"End a private rental and stop billing."`
 	Prune     RentalPruneCmd     `cmd:"" help:"Free unused cached operation results on a private rental."`
-}
-
-type RentalPrepareCmd struct {
-	Rental  string   `arg:"" name:"rental" predictor:"rental" help:"Existing rental machine name or id."`
-	Package string   `arg:"" name:"package" help:"Published package org/name."`
-	Version string   `help:"Exact package release, e.g. 1.2.3." required:""`
-	Models  []string `name:"model" help:"Exact model binding SLOT=org/model@release/lane; repeat for each slot."`
-}
-
-func (c *RentalPrepareCmd) Run(r *Runtime) error {
-	return r.call(handleRentalPrepare, []string{c.Rental, c.Package}, nil,
-		values("--version", c.Version, "--model", c.Models), false)
 }
 
 type RentalUpdateCmd struct {
@@ -583,4 +572,12 @@ type RentalKeepaliveCmd struct {
 
 func (c *RentalKeepaliveCmd) Run(r *Runtime) error {
 	return r.call(handleRentalKeepalive, []string{c.Rental}, nil, nil, true)
+}
+
+type RentalInstallsCmd struct {
+	Rental string `arg:"" name:"rental" predictor:"rental" help:"Existing rental machine name or id."`
+}
+
+func (c *RentalInstallsCmd) Run(r *Runtime) error {
+	return r.call(handleRentalInstalls, []string{c.Rental}, nil, nil, false)
 }

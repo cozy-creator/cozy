@@ -4,25 +4,61 @@
 not inspect package model defaults or download weights. Package updates follow
 the same rule; the obsolete `--no-model-download` switch has been removed.
 
-Prewarm a rental by name or ID with an exact package release:
+Install package code on an existing rental by name or ID. As with a local
+install, omitting `--version` selects the newest published release:
 
 ```sh
-cozy rental prepare bisco paul/minimax-h3 --version 1.15.7
+cozy package install paul/minimax-h3 --rental=kirukiru
+cozy package install paul/minimax-h3 --rental=kirukiru --version 1.15.7
 ```
 
-That command also installs code only. Explicit model selections opt into weights:
+Rental installation leaves the local package inventory unchanged and sends no
+model selections. It accepts published `org/name` packages only; `--editable`
+and local directories are not supported by this published-release path. Installing
+an editable package locally does not publish it. Use
+`cozy run ./project/<function> --rental=kirukiru` for private local code execution
+and its on-demand preparation.
+
+Download a model directly into the rental's TensorFS store with a model selector:
 
 ```sh
-cozy rental prepare bisco paul/minimax-h3 --version 1.15.7 \
-  --model cut_segment_turbo.models.base_model=paul/minimax-h3@1.0.0-rc.2/fp8-pruned
+cozy model download paul/minimax-h3#fp8-pruned --rental=kirukiru
+cozy model download paul/minimax-h3@1.0.0-rc.2/fp8-pruned --rental=kirukiru
+cozy rental installs kirukiru
 ```
 
-Repeat `--model` for each required slot. Creator resolves the release/lane to an
-exact manifest and forwards that selection to the worker. Completion means the
-Host returned a verified `PREPARED` receipt. Sending a desired state is not
-completion. Preparation does not activate a serving placement or replace other
-loaded packages. Interrupted preparation can be repeated against the same
-worker; the worker owns retained download progress and installed environments.
+`#fp8-pruned` selects that lane from the newest eligible release containing it.
+An explicit release/lane freezes that release. Models-only downloads install no
+package and need no application slot or local destination. `#sha256:<digest>`
+continues to name an exact retained checkpoint.
+
+The rental must already have a local record (booting or ready). A pending
+acquisition that has not produced a rental record cannot yet receive install
+intents. Neither command creates or purchases a rental.
+
+Both commands return a durable queued install ID. Creator resolves
+and records the exact release and checkpoint at acceptance. A booting rental is
+kept queued; the daemon delivers its accepted installs in order once its worker
+is ready. The CLI may disconnect, and a restarted daemon resumes the same exact
+selection without re-resolving latest or buying another rental.
+
+`cozy rental installs <name-or-id>` reports queued, installing, succeeded, or
+failed, with typed failure details. Use the returned rental ID to read retained
+history after a rental has ended. Completion requires a verified Host receipt;
+acceptance is not completion. Failed boot, rental termination, or a changed
+worker identity ends the install with a typed failure. Interrupted transfers
+reuse the worker's retained download progress when Creator reconnects. The queue
+stores exact logical selections, not presigned URLs. The worker refreshes download
+authority at transfer time, so boot time cannot expire an accepted selection.
+
+Package installation leaves model weights untouched. Model downloads do not
+activate a serving placement or replace loaded packages. The former
+`cozy rental prepare` command has been removed in favor of these two commands.
+
+Standalone model downloads require the worker Host support introduced in
+[Runtime PR #761](https://github.com/cozy-creator/cozy-runtime/pull/761).
+Deploy that Host change in worker images before using this command; installing a
+new Creator CLI alone does not update existing rentals.
 
 Prewarming is optional. Inference prepares its exact model inputs before
 admission. Private Python roots upload code directly to the worker, then acquire

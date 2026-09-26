@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -28,6 +30,10 @@ import (
 func modelReleaseCard(ctx context.Context, c *hub.Client, ref hub.Ref, release string) (
 	hub.ModelCard, *hub.ModelReleaseSummary, *exit.Error,
 ) {
+	return modelReleaseCardForLane(ctx, c, ref, release, "")
+}
+
+func modelReleaseCardForLane(ctx context.Context, c *hub.Client, ref hub.Ref, release, lane string) (hub.ModelCard, *hub.ModelReleaseSummary, *exit.Error) {
 	card, problem := c.ModelCard(ctx, ref)
 	if problem != nil {
 		return card, nil, problem
@@ -38,7 +44,19 @@ func modelReleaseCard(ctx context.Context, c *hub.Client, ref hub.Ref, release s
 	}
 	if release == "" {
 		for _, candidate := range card.Releases {
-			if !candidate.Yanked && candidate.YankedAt == "" && candidate.Release > release {
+			if candidate.Yanked || candidate.YankedAt != "" {
+				continue
+			}
+			containsLane := lane == ""
+			for _, row := range candidate.Lanes {
+				if row.Lane == lane {
+					containsLane = true
+				}
+			}
+			if !containsLane {
+				continue
+			}
+			if release == "" || newerModelRelease(candidate.Release, release) {
 				release = candidate.Release
 			}
 		}
@@ -52,6 +70,18 @@ func modelReleaseCard(ctx context.Context, c *hub.Client, ref hub.Ref, release s
 	return card, nil, exit.Named(exit.NotFound, "model.release_not_found",
 		"model %s has no available release %q (releases: %s)",
 		ref.String(), release, orNone(strings.Join(availableReleases(card), ", ")))
+}
+
+// Model cards do not carry creation times for native TensorFS releases. Use
+// the existing version parser for numeric and prerelease precedence; model labels
+// outside its version grammar retain their historical lexical ordering.
+func newerModelRelease(candidate, current string) bool {
+	next, nextErr := pep440.Parse(candidate)
+	prior, priorErr := pep440.Parse(current)
+	if nextErr == nil && priorErr == nil {
+		return next.GreaterThan(prior)
+	}
+	return candidate > current
 }
 
 func availableReleases(card hub.ModelCard) []string {

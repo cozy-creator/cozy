@@ -32,20 +32,9 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 // installRegistryPackage is the ordinary installer. A bulk update additionally
 // pins the observed active install so a concurrent edit or removal wins safely.
 func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Result, []output.Field, *exit.Error) {
-	ref, release, problem := registryPackageRef(ctx.Inv.Args[0], ctx.Inv.Value("--version"))
+	ref, plan, problem := resolveRegistryPackage(ctx, ctx.Inv.Args[0], ctx.Inv.Value("--version"))
 	if problem != nil {
 		return nil, nil, problem
-	}
-	c := client(ctx)
-	hctx, cancel := hub.LongContext()
-	defer cancel()
-	packagePublishStatus(ctx, "Resolving %s...", ref.String())
-	plan, problem := c.PackageDownloads(hctx, ref, release)
-	if problem != nil {
-		return nil, nil, problem
-	}
-	if plan.Release == "" || release != "" && plan.Release != release {
-		return nil, nil, exit.Internalf("Tensorhub returned a changed or absent package release")
 	}
 	packageConfig, problem := exactPackageInstallDocument("package.toml", plan.PackageConfig)
 	if problem != nil {
@@ -64,7 +53,7 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 	if problem != nil {
 		return nil, nil, problem
 	}
-	release = plan.Release
+	release := plan.Release
 	_, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return nil, nil, problem
@@ -125,6 +114,24 @@ func installRegistryPackage(ctx *Context, expectedInstallID string) (*install.Re
 	st.Close()
 	writer.Unlock()
 	return result, cleanup, nil
+}
+
+// resolveRegistryPackage is shared by local and rental installation. An empty
+// release lets Tensorhub select the newest eligible published release; neither
+// path consults installed editable sources or package model defaults.
+func resolveRegistryPackage(ctx *Context, value, version string) (hub.Ref, hub.PackageDownloadPlan, *exit.Error) {
+	ref, release, problem := registryPackageRef(value, version)
+	if problem != nil {
+		return ref, hub.PackageDownloadPlan{}, problem
+	}
+	hctx, cancel := hub.LongContext()
+	defer cancel()
+	packagePublishStatus(ctx, "Resolving %s...", ref.String())
+	plan, problem := client(ctx).PackageDownloads(hctx, ref, release)
+	if problem == nil && (plan.Release == "" || release != "" && plan.Release != release) {
+		problem = exit.Internalf("Tensorhub returned a changed or absent package release")
+	}
+	return ref, plan, problem
 }
 
 func requirePackageUpdatePin(st *records.Store, pkg, expected string) *exit.Error {
