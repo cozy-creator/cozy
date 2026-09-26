@@ -45,13 +45,16 @@ fn cached_repository_satisfies(
                     .checkpoints
                     .iter()
                     .any(|checkpoint| &checkpoint.manifest == manifest),
-                Mutation::UpdateRelease { version, set, remove, .. } if remove.is_empty() => {
-                    repository.releases.iter().any(|release| {
-                        &release.version == version
-                            && !release.yanked
-                            && set.iter().all(|lane| release.lanes.contains(lane))
-                    })
-                }
+                Mutation::UpdateRelease {
+                    version,
+                    set,
+                    remove,
+                    ..
+                } if remove.is_empty() => repository.releases.iter().any(|release| {
+                    &release.version == version
+                        && !release.yanked
+                        && set.iter().all(|lane| release.lanes.contains(lane))
+                }),
                 _ => false,
             }
         })
@@ -1047,11 +1050,17 @@ impl Store {
         cache: bool,
     ) -> Result<Option<crate::repository::Repository>> {
         let Some(first) = mutations.first() else {
-            return refuse(Code::REPOSITORY_CONFLICT, "repository commit has no mutations");
+            return refuse(
+                Code::REPOSITORY_CONFLICT,
+                "repository commit has no mutations",
+            );
         };
         let repo = first.repo();
         if mutations.iter().any(|mutation| mutation.repo() != repo) {
-            return refuse(Code::REPOSITORY_CONFLICT, "repository commit spans repositories");
+            return refuse(
+                Code::REPOSITORY_CONFLICT,
+                "repository commit spans repositories",
+            );
         }
         let catalog = crate::catalog::Catalog::open(&self.root)?;
         let path = self.repository_path(repo);
@@ -1067,7 +1076,9 @@ impl Store {
             );
         }
         // Validation may write verification records; finish it before BEGIN IMMEDIATE.
-        let mut replacement = observed.map(crate::repository::Repository::parse).transpose()?;
+        let mut replacement = observed
+            .map(crate::repository::Repository::parse)
+            .transpose()?;
         for mutation in mutations {
             match mutation {
                 crate::repository::Mutation::PutCheckpoint { manifest, .. }
@@ -1216,11 +1227,7 @@ impl Store {
             fault.hit("repo-after-replace");
             if cache_owned {
                 if let Some(repository) = &replacement {
-                    crate::cache_roots::record(
-                        self,
-                        repo,
-                        &repository.canonical_bytes(),
-                    )?;
+                    crate::cache_roots::record(self, repo, &repository.canonical_bytes())?;
                 }
             }
             crate::storage::Census::open_metadata(&self.root)?.projection_for(&org, &name)

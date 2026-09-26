@@ -1522,7 +1522,11 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
             version: closure.release.clone(),
         });
     }
-    store.apply_cached_repository(observed.as_deref(), &mutations, &crate::store::Fault::default())?;
+    store.apply_cached_repository(
+        observed.as_deref(),
+        &mutations,
+        &crate::store::Fault::default(),
+    )?;
     Ok(())
 }
 
