@@ -17,6 +17,25 @@ import (
 
 const executionRequirementsFile = "execution-requirements.json"
 
+func snapshotEnvironment(store *records.Store, preferred *records.PackageInstall, target records.PackageInstall, source string) (*records.PackageInstall, *exit.Error) {
+	if preferred != nil && preferred.Package == target.Package && preferred.Version == target.Version && reusableSnapshotEnvironment(*preferred, source) {
+		return preferred, nil
+	}
+	candidates, problem := store.SourceEnvironments(target.Package, target.Version)
+	if problem != nil {
+		return nil, problem
+	}
+	for _, candidate := range candidates {
+		if preferred != nil && candidate.ID == preferred.ID {
+			continue
+		}
+		if reusableSnapshotEnvironment(candidate, source) {
+			return &candidate, nil
+		}
+	}
+	return nil, nil
+}
+
 // InstalledRequirements survives the local environment: remote placement needs
 // its selected declarations, not another copy of its Python packages.
 func InstalledRequirements(ctx context.Context, inst records.PackageInstall) (packagepublish.RequirementSelection, *exit.Error) {
@@ -52,6 +71,12 @@ func retainExecutionRequirements(dir string, selected packagepublish.Requirement
 // Comparing ordinary files here is a reuse decision, never a content identity.
 func reusableSnapshotEnvironment(prior records.PackageInstall, source string) bool {
 	if prior.SourceKind != "local" || prior.ProjectDir == "" {
+		return false
+	}
+	// New remote snapshots intentionally have no venv. Skip them before any
+	// dependency-byte comparison while searching retained environments.
+	info, err := os.Stat(filepath.Join(prior.Dir, "venv", "pyvenv.cfg"))
+	if err != nil || !info.Mode().IsRegular() {
 		return false
 	}
 	for _, name := range []string{"pyproject.toml", "uv.lock", ".python-version"} {
@@ -105,8 +130,7 @@ func reusableSnapshotEnvironment(prior records.PackageInstall, source string) bo
 			}
 		}
 	}
-	_, err = os.Stat(filepath.Join(prior.Dir, "venv", "pyvenv.cfg"))
-	return err == nil
+	return true
 }
 
 func sameSnapshotFile(left, right string) bool {

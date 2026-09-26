@@ -26,7 +26,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	}
 	environmentDir := parent.Install.Dir
 	if parent.RemoteSnapshot {
-		environmentDir = i.remoteEnvironment.Dir
+		environmentDir = parent.MetadataEnvironment.Dir
 	}
 	python := home.VenvPython(filepath.Join(environmentDir, "venv"))
 	possible, problem := install.HasInstalledApplications(python, parent.Install.Closure, i.Package.Name, sourceOverlays)

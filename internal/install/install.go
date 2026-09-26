@@ -39,6 +39,7 @@ type Request struct {
 	// RemoteEnvironment is read only while capturing a remote-only invocation.
 	// Source/interface/requirements custody is independent when Run returns.
 	RemoteEnvironment *records.PackageInstall
+	RemoteCapture     bool
 }
 
 // LocalSource is one author-controlled directory after Creator's bounded source
@@ -175,6 +176,9 @@ type Timing struct {
 type Result struct {
 	RemoteSnapshot bool
 	Install        records.PackageInstall
+	// Borrowed only while capture holds the install writer. The accepted source,
+	// interface and requirements retain no dependency on this local environment.
+	MetadataEnvironment *records.PackageInstall
 	// CapturedProjectWheel is the metadata-sealed executable of a captured App
 	// wheel. Its original archive remains under this install's original/ directory.
 	CapturedProjectWheel string
@@ -192,7 +196,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if req.Snapshot && req.Local == nil {
 		return nil, exit.Internalf("an invocation snapshot requires local package source")
 	}
-	if req.RemoteEnvironment != nil && !req.Snapshot {
+	if (req.RemoteEnvironment != nil || req.RemoteCapture) && !req.Snapshot {
 		return nil, exit.Internalf("environment reuse requires a remote invocation snapshot")
 	}
 	if (req.Published == nil) == (req.Local == nil) {
@@ -335,13 +339,21 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	var packageInterface *launch.PackageInterface
 	var placement ExactDocument
 	var err *exit.Error
+	var reusable *records.PackageInstall
+	if req.RemoteEnvironment != nil || req.RemoteCapture {
+		reusable, err = snapshotEnvironment(st, req.RemoteEnvironment, inst, sourceDir)
+		if err != nil {
+			return guard(err)
+		}
+	}
 	if req.Published != nil {
 		packageInterface, placement, inst.Runtime, env, err = preparePublished(l, installDir, req.Published)
-	} else if prior := req.RemoteEnvironment; prior != nil && prior.Package == inst.Package && reusableSnapshotEnvironment(*prior, sourceDir) {
+	} else if prior := reusable; prior != nil {
 		metadataVenv = filepath.Join(prior.Dir, "venv")
 		env = &EnvironmentReceipt{Python: prior.Python, UV: prior.UV, Platform: prior.Platform,
 			Extra: prior.Extra, Packages: prior.Packages, Closure: prior.Closure}
 		res.RemoteSnapshot = true
+		res.MetadataEnvironment = prior
 	} else {
 		env, err = materializeEnvironment(sourceDir, venvDir, !req.Snapshot)
 	}
@@ -363,7 +375,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		}
 		metadataInstall := inst
 		if res.RemoteSnapshot {
-			metadataInstall = *req.RemoteEnvironment
+			metadataInstall = *res.MetadataEnvironment
 		}
 		selected, problem := InstalledRequirements(context.Background(), metadataInstall)
 		if problem != nil {

@@ -1443,6 +1443,33 @@ func (s *Store) Install(id string) (*PackageInstall, *exit.Error) {
 	return &inst, nil
 }
 
+// SourceEnvironments returns retained same-package candidates for capture-time
+// metadata reuse. The installer still compares their frozen dependency inputs;
+// an install ID or version alone never makes an environment reusable.
+func (s *Store) SourceEnvironments(pkg, version string) ([]PackageInstall, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+installCols("i.")+` FROM installs i
+		WHERE i.package=? AND i.version=? AND i.source_kind='local' AND (
+		EXISTS(SELECT 1 FROM pins p WHERE p.install_id=i.id) OR
+		EXISTS(SELECT 1 FROM private_child_bindings b WHERE b.child_install_id=i.id AND b.parent_install_id<>i.id))
+		ORDER BY i.created_at DESC,i.id DESC`, pkg, version)
+	if err != nil {
+		return nil, exit.Internalf("cannot read retained source environments: %s", err)
+	}
+	defer rows.Close()
+	var out []PackageInstall
+	for rows.Next() {
+		inst, err := scanInstall(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read retained source environment: %s", err)
+		}
+		out = append(out, inst)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish retained source environments: %s", err)
+	}
+	return out, nil
+}
+
 // Installed is every active package pin joined to its install, package ordered.
 // This is what `cozy package list` reads — records only, never a walk of the filesystem.
 func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
