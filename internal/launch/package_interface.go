@@ -344,8 +344,8 @@ func validateClosedPackageInterface(data []byte) error {
 							for name, field := range fields {
 								if name == "gpus" {
 									var count int
-									if json.Unmarshal(field, &count) != nil || count < 1 || count > 16 {
-										return fmt.Errorf("default_ladder gpus must be an integer from 1 through 16")
+									if json.Unmarshal(field, &count) != nil || count < 1 {
+										return fmt.Errorf("default_ladder gpus must be a positive integer")
 									}
 									continue
 								}
@@ -891,5 +891,5 @@ func (e *Entrypoint) RequestFields() []string {
 
 // AllowsGPUCount checks an explicit execution group against the authored model capability.
 func (s Slot) AllowsGPUCount(count int) bool {
-	return count >= 0 && count <= 16 && (count <= 1 || s.sequenceParallelDegrees()[count])
+	return count >= 0 && (count <= 1 || s.sequenceParallelDegrees()[count])
 }

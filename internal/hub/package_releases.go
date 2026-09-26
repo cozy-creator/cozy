@@ -402,8 +402,8 @@ func ValidateLadder(ladder []BindingRung) *exit.Error {
 		return exit.Usagef("a binding needs at least one --gpu <GPU>=<lane> rung")
 	}
 	for i, rung := range ladder {
-		if rung.GPUs < 0 || rung.GPUs > 16 {
-			return exit.Usagef("rung %d GPU count must be 1 through 16 when supplied", i+1)
+		if rung.GPUs < 0 {
+			return exit.Usagef("rung %d GPU count must be positive when supplied", i+1)
 		}
 		if len(rung.GPU) == 0 || len(rung.GPU) > 64 || strings.TrimSpace(rung.GPU) != rung.GPU ||
 			(rung.GPU != "*" && strings.IndexFunc(rung.GPU, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }) < 0) ||

@@ -106,6 +106,9 @@ func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot
 	}
 	rungs := make([]*pb.MachineModelDefaultRung, 0, len(selected.Ladder))
 	for _, rung := range selected.Ladder {
+		if uint64(rung.GPUs) > uint64(^uint32(0)) {
+			return "", nil, "model_default_unavailable"
+		} // protobuf uint32 representation must not wrap
 		if count > 0 && rung.GPUs > 0 && rung.GPUs != count {
 			continue
 		}

@@ -290,8 +290,8 @@ func parseLadder(raw []string) ([]hub.BindingRung, *exit.Error) {
 		count := 0
 		if prefix, model, found := strings.Cut(gpu, "x"); found {
 			if parsed, err := strconv.Atoi(prefix); err == nil {
-				if parsed < 1 || parsed > 16 {
-					return nil, exit.Usagef("GPU count must be 1 through 16")
+				if parsed < 1 {
+					return nil, exit.Usagef("GPU count must be positive")
 				}
 				count, gpu = parsed, model
 			}
