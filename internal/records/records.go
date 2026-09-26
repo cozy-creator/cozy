@@ -146,7 +146,15 @@ func Open(path string) (*Store, *exit.Error) {
 // referenced file into its attempt row, and the caller deletes the directory once
 // this open has returned.
 func OpenForDaemon(path, triageDir string) (*Store, *exit.Error) {
-	return open(path, true, triageDir)
+	store, problem := open(path, true, triageDir)
+	if problem != nil {
+		return nil, problem
+	}
+	if problem := store.ReconcileLostRetainedWork(); problem != nil {
+		store.Close()
+		return nil, problem
+	}
+	return store, nil
 }
 
 func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error) {
