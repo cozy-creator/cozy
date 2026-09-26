@@ -715,11 +715,14 @@ type Residency struct {
 	// Need names each slot's figure: `condition_text: text_encoder`, the largest single
 	// component when the slot declares no component_use, or `lane <lane>` for whole-lane bytes.
 	Need string
-	// Weights is the resident figure alone; Bytes adds the measured Working peak over
-	// WorkingRuns runs. WorkingRuns == 0 means working memory is unmeasured.
-	Weights     int64
-	Working     int64
-	WorkingRuns int
+	// Weights is the resident figure alone. Bytes either adds the legacy Working
+	// peak or takes the maximum with an exactly matched ObservedTotal. Separate run
+	// counts keep an unknown measurement distinct from measured zero.
+	Weights           int64
+	Working           int64
+	WorkingRuns       int
+	ObservedTotal     int64
+	ObservedTotalRuns int
 }
 
 // Resident sizes the pinned selection against ONE accelerator, at every rental width
