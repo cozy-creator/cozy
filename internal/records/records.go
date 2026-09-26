@@ -69,7 +69,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 46
+const schemaVersion = 47
 
 // Retained only to recognize and migrate released schemas 41 through 45.
 const priorCapturePinsDDL = `
@@ -120,7 +120,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 func init() {
 	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
-	schema = append(schema, runtimeUpdatesDDL, rentalIdleDDL,
+	schema = append(schema, rentalInstallsDDL, rentalInstallsIndex, runtimeUpdatesDDL, rentalIdleDDL,
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex)
 }
 
@@ -539,6 +539,13 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			}
 		}
 	}
+	if sourceVersion < 47 {
+		for _, statement := range []string{rentalInstallsDDL, rentalInstallsIndex} {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot add durable rental installations: %s", err)
+			}
+		}
+	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
 		if _, err := tx.Exec(statement); err != nil {
 			return exit.Internalf("cannot restore request indexes in %s: %s", path, err)
@@ -918,6 +925,9 @@ func priorStatements(version int) []string {
 		"  install_id      TEXT    REFERENCES installs(id),\n  package_revision_digest      TEXT    NOT NULL,\n", 1)
 	statements := make([]string, 0, len(schema)+len(schemaNineModelProduction))
 	for _, statement := range schema {
+		if version < 47 && (statement == rentalInstallsDDL || statement == rentalInstallsIndex) {
+			continue
+		}
 		if version == 44 && statement == deviceMemoryMeasurementsDDL {
 			for _, column := range []string{" total_peak_bytes INTEGER NOT NULL DEFAULT 0,\n", " request_digest TEXT NOT NULL DEFAULT '',\n", " exact_models_digest TEXT NOT NULL DEFAULT '',\n", " gpu_count INTEGER NOT NULL DEFAULT 0,\n"} {
 				statement = strings.Replace(statement, column, "", 1)

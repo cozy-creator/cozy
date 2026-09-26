@@ -69,7 +69,7 @@ func TestPackageInstallRental(t *testing.T) {
 					t.Errorf("wrong preparation or implicit model selection: %+v", request)
 				}
 				preparations.Add(1)
-				_ = json.NewEncoder(w).Encode(api.RentalPackagePrepareResult{Rental: "rental-proof", Package: request.Package, Release: request.Release, Status: "prepared"})
+				_ = json.NewEncoder(w).Encode(api.RentalPackagePrepareResult{ID: "install-proof", RentalID: "rental-proof", Selection: request, State: "queued"})
 			}))
 			defer localPeer.Close()
 			layout, problem := home.Open(t.TempDir())
