@@ -70,24 +70,35 @@ type dependencyRecord struct {
 }
 
 type dependencyCollector struct {
-	ctx      context.Context
-	stage    string
-	wheels   []DependencyWheel
-	vendored []VendoredDependency
-	byName   map[string]dependencyRecord
-	extras   map[string]map[string]bool
-	stack    map[string]bool
-	total    int64
-	count    int
-	registry bool
-	scanOnly bool
-	python   string
-	root     string
+	ctx         context.Context
+	stage       string
+	wheels      []DependencyWheel
+	vendored    []VendoredDependency
+	byName      map[string]dependencyRecord
+	extras      map[string]map[string]bool
+	stack       map[string]bool
+	total       int64
+	count       int
+	registry    bool
+	scanOnly    bool
+	python      string
+	root        string
+	captureOnly bool
+	selected    map[string]string
 }
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
 
 func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string, targetPython ...string) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
+	return collectLocalDependenciesForClosure(ctx, root, document, stage, nil, targetPython...)
+}
+
+// collectLocalDependenciesForClosure is the capture variant of the local
+// dependency collector. A source project can be present in uv's installed
+// environment without being part of any callable wheel closure. We still
+// validate its declared identity, but avoid recursively building its wheel
+// unless the selected closure names it.
+func collectLocalDependenciesForClosure(ctx context.Context, root string, document projectMetadata, stage string, selected map[string]string, targetPython ...string) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
 	canonical, problem := canonicalLocalPath(root)
 	if problem != nil {
 		return nil, false, nil, problem
@@ -98,6 +109,7 @@ func collectLocalDependencies(ctx context.Context, root string, document project
 	}
 	collector := &dependencyCollector{
 		python: python, root: root,
+		captureOnly: selected != nil, selected: selected,
 		ctx: ctx, stage: stage, byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
 		stack: map[string]bool{canonical: true},
 	}
@@ -224,6 +236,13 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	}
 	if problem := req.accepts(version); problem != nil {
 		return problem
+	}
+	// Capture only the local projects selected by callable closures. The
+	// installed environment may contain additional editable/source projects;
+	// those are valid inputs to the parent environment but do not need a wheel
+	// built merely because they appear in its source map.
+	if c.captureOnly && c.selected[name] == "" {
+		return nil
 	}
 	if prior, exists := c.byName[name]; exists {
 		if prior.source != canonical || prior.version != version {
