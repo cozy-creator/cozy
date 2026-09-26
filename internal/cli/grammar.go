@@ -17,7 +17,6 @@ type CLI struct {
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
 	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
 	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
-	Volume  VolumeCmd  `cmd:"" group:"Rentals" help:"Manage an optional repo-object cache in a datacenter you rent in."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
 	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
@@ -505,35 +504,6 @@ type RentalListCmd struct {
 
 func (c *RentalListCmd) Run(r *Runtime) error {
 	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch), nil, false)
-}
-
-type VolumeCmd struct {
-	Current VolumeListCmd `cmd:"" default:"1" hidden:""`
-	Warm    VolumeWarmCmd `cmd:"" help:"Create an optional cache volume in a datacenter before renting there."`
-	Drop    VolumeDropCmd `cmd:"" help:"Delete a disposable cache volume and its cached copies."`
-}
-
-type VolumeListCmd struct{}
-
-func (c *VolumeListCmd) Run(r *Runtime) error {
-	return r.call(handleVolumeLs, nil, nil, nil, false)
-}
-
-type VolumeWarmCmd struct {
-	Datacenter string `arg:"" name:"datacenter" help:"Provider datacenter id, such as EU-RO-1."`
-	Provider   string `help:"Provider name; the hub's primary when omitted."`
-}
-
-func (c *VolumeWarmCmd) Run(r *Runtime) error {
-	return r.call(handleVolumeWarm, []string{c.Datacenter}, nil, values("--provider", c.Provider), false)
-}
-
-type VolumeDropCmd struct {
-	Target string `arg:"" name:"volume" help:"Volume id (pvl-…) or its datacenter."`
-}
-
-func (c *VolumeDropCmd) Run(r *Runtime) error {
-	return r.call(handleVolumeDrop, []string{c.Target}, nil, nil, false)
 }
 
 type UnloadCmd struct{}
