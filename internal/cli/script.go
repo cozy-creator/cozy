@@ -147,7 +147,7 @@ func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInter
 	// dependency graph, including raw source dependencies such as Qwen, so use
 	// the same intake that a one-off client script uses before accepting it.
 	var reusable *records.PackageInstall
-	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != "" {
+	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || ctx.Inv.Value("--rental") != "" {
 		reusable = current
 	}
 	frozen, surface, problem := snapshotTarget(ctx, pack, reusable)

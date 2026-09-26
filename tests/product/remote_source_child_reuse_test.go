@@ -132,7 +132,11 @@ async def main(payload: Input) -> Result:
 	var firstChild *records.PackageInstall
 	for run := 0; run < 3; run++ {
 		began := time.Now()
-		code, out := runCozy(t, layout.Root, "run", "local/source-parent/main", "--rental-only", "--json", "--full")
+		remote := "--rental-only"
+		if run == 2 {
+			remote = "--rent-new"
+		}
+		code, out := runCozy(t, layout.Root, "run", "local/source-parent/main", remote, "--json", "--full")
 		if code != 0 || !strings.Contains(out, `"queued"`) {
 			t.Fatalf("durable queued CLI [%d]: %s", code, out)
 		}
