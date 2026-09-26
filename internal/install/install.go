@@ -253,12 +253,15 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		inst.SourceKind, inst.SourceRef = "local", abs
 		inst.Package, inst.Version = local.Package, local.Release
 		res.Files, res.Bytes = local.Files, local.Bytes
+		// Keep the authored tree as the watch target, while the installation and
+		// its sibling dependencies share one owned root for imports and describe.
+		sourceDir, e = snapshotSource(installDir, local)
+		if e != nil {
+			return fail(e)
+		}
+		inst.ProjectDir = sourceDir
 		if req.Snapshot {
-			sourceDir, e = snapshotSource(installDir, local)
-			if e != nil {
-				return fail(e)
-			}
-			inst.SourceRef, inst.ProjectDir = sourceDir, sourceDir
+			inst.SourceRef = sourceDir
 		}
 	}
 	mark("stage")
