@@ -1136,7 +1136,11 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 			return out, problem
 		}
 		out.Requirements, out.RequiresPython = selection.Requirements, selection.RequiresPython
-		out.PythonVersion = installed.Python
+		// A wheel closure can depend on its selected ABI/markers. Transferred
+		// source instead lets the worker satisfy its authored Requires-Python.
+		if installed.SourceKind != "local" {
+			out.PythonVersion = installed.Python
+		}
 		declared, _ = launch.ReadPackageInterface(launch.PackageInterfacePath(installed.Dir))
 	} else {
 		if req.Package == "" || req.Release == "" {
