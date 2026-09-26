@@ -538,6 +538,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 				}
 			}
 		}
+	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
 		if _, err := tx.Exec(statement); err != nil {
 			return exit.Internalf("cannot restore request indexes in %s: %s", path, err)
