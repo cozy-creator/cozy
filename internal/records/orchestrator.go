@@ -680,6 +680,15 @@ func (m ModelRef) Pinned() bool { return m.Manifest != "" }
 // NVIDIA device — fits only the "*" rung.
 func (m ModelRef) RungFor(accelerator string, count int) (ModelRung, int, bool) {
 	if m.Pinned() {
+		if m.GPUs > 0 && len(m.Ladder) > 0 {
+			supported := false
+			for _, rung := range m.Ladder {
+				supported = supported || (rung.GPUs == m.GPUs && rung.Lane == m.Lane && RungMatches(rung.GPU, accelerator))
+			}
+			if !supported {
+				return ModelRung{}, -1, false
+			}
+		}
 		return ModelRung{GPU: "*", GPUs: m.GPUs, Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes,
 			ComponentBytes: m.ComponentBytes}, 0, m.GPUs <= count
 	}

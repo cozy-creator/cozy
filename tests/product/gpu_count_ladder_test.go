@@ -30,6 +30,9 @@ func TestCountedLaddersBuyMaximumChildGroupAndReuseExactReplica(t *testing.T) {
 	if !ok || pinned[0].GPUs != 1 || pinned[1].GPUs != 2 {
 		t.Fatalf("reuse did not preserve exact authored groups: %#v", pinned)
 	}
+	if _, _, ok := pinned[1].RungFor("NVIDIA H200", 4); ok {
+		t.Fatal("counted H100 selection silently broadened on replacement")
+	}
 	legacy := records.ModelRef{Ladder: []records.ModelRung{{GPU: "H100", Lane: "fp8", Manifest: "h"}}}
 	if _, _, ok := legacy.RungFor("NVIDIA H100", 4); !ok {
 		t.Fatal("older uncounted ladder lost four-card compatibility")
