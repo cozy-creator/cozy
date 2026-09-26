@@ -1,6 +1,9 @@
 package orchestrator
 
-import "testing"
+import (
+	"github.com/cozy-creator/cozy/internal/records"
+	"testing"
+)
 
 func TestFreshRentalIntentAndReplayIdentity(t *testing.T) {
 	submission := Submission{IdemKey: "fresh", Package: "proof/model", Entrypoint: "run", Payload: []byte(`{}`), RentNew: true}
@@ -28,5 +31,20 @@ func TestFreshRentalIntentAndReplayIdentity(t *testing.T) {
 	submission.RequestedRental = "pr-existing"
 	if _, _, problem := requestRecord(submission); problem == nil {
 		t.Fatal("fresh plus existing rental accepted")
+	}
+}
+
+func TestFreshRequestsHaveIndependentPreparationAdmission(t *testing.T) {
+	first := records.Request{ID: "first", Package: "proof/model", RentNew: true}
+	second := first
+	second.ID = "second"
+	if requestSlot(first) == requestSlot(second) {
+		t.Fatal("fresh requests share another request's acquisition/preparation guard")
+	}
+	// No worker census is needed: already staged fleet packages do not satisfy
+	// an explicit fresh-machine acquisition request.
+	var owner *Orchestrator
+	if owner.rentalHeld(first) {
+		t.Fatal("a fresh request reused fleet preparation")
 	}
 }

@@ -1064,6 +1064,9 @@ func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return c
 // rental affinity already identifies an independent machine at this point.
 func requestSlot(req records.Request) string {
 	slot := pinnedPackage(req.Package, req.RequestedRental)
+	if req.RentNew {
+		slot += "/fresh/" + req.ID
+	}
 	if req.InstallID != "" {
 		slot += "/install/" + req.InstallID
 	}
@@ -1077,6 +1080,9 @@ func requestSlot(req records.Request) string {
 // that rental's pinned package name — capacity `drain` routes onto the moment its lane
 // has room, so the request waits unpinned. Callers hold c.mu.
 func (c *Orchestrator) rentalHeld(req records.Request) bool {
+	if req.RentNew && req.Worker == "" {
+		return false
+	}
 	for _, w := range c.workers {
 		if w.exited || w.stopping || !w.supportsCurrentProtocol() || w.spec.IsJob() != req.IsJob() ||
 			retirementGround(w) != "" || w.spec.Connection == nil {
