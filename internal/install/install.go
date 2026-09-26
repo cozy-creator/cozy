@@ -280,9 +280,6 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		if e := CaptureSelfBindings(st, *priorInstall, nil); e != nil {
 			return nil, e
 		}
-		if e := invalidateCapture(st, req); e != nil {
-			return nil, e
-		}
 		return res, nil
 	}
 	if !req.Snapshot && prior != nil && !req.Force {
@@ -408,21 +405,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	res.Install, res.Superseded = inst, superseded
 	mark("activate")
-	if e := invalidateCapture(st, req); e != nil {
-		return nil, e
-	}
 	return res, nil
-}
-
-func invalidateCapture(store *records.Store, req Request) *exit.Error {
-	if req.Snapshot || req.Local == nil {
-		return nil
-	}
-	caller, problem := CaptureCaller(req.Local.Tree)
-	if problem != nil {
-		return problem
-	}
-	return store.ForgetCapturePin(caller)
 }
 
 // readDevelopmentInterface reads only the source interface. Model construction

@@ -69,16 +69,6 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 			writer.Unlock()
 		}
 	}()
-	reuse, problem := prepareCaptureReuse(ctx, pack, layout, store)
-	if problem != nil {
-		return Target{}, nil, problem
-	}
-	if existing, surface, problem := reuse.lookup(); problem != nil {
-		return Target{}, nil, problem
-	} else if existing != nil {
-		handedOff = true
-		return Target{Package: existing.Package, InstallID: existing.ID, Release: existing.Version, Snapshot: true, releaseCapture: writer.Unlock}, surface, nil
-	}
 	var intake *childIntake
 	var result *install.Result
 	problem = packagePublishStage(ctx, "Preparing local script environment", func() *exit.Error {
@@ -109,12 +99,6 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 	if problem != nil {
 		_, _ = install.Reclaim(layout, store, result.Install.ID)
 		return Target{}, nil, problem
-	}
-	if !ctx.Inv.Bool("--describe") {
-		if problem := reuse.complete(result.Install); problem != nil {
-			_, _ = install.Reclaim(layout, store, result.Install.ID)
-			return Target{}, nil, problem
-		}
 	}
 	handedOff = true
 	return Target{Package: result.Install.Package, InstallID: result.Install.ID,

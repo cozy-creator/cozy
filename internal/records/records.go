@@ -72,7 +72,16 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 44
+const schemaVersion = 45
+
+// Retained only to recognize and migrate released schemas 41 through 44.
+const priorCapturePinsDDL = `
+CREATE TABLE IF NOT EXISTS capture_pins (
+ caller TEXT PRIMARY KEY,
+ input_digest TEXT NOT NULL,
+ install_id TEXT NOT NULL REFERENCES installs(id),
+ revision_digest TEXT NOT NULL
+)`
 
 const installsDDL = `
 CREATE TABLE IF NOT EXISTS installs (
@@ -117,7 +126,7 @@ var schema = append([]string{installsDDL, pinsDDL, childBindingsDDL}, append(orc
 func init() {
 	schema = append(schema, successfulWorkDDL, weightsRetentionsDDL, operationLookupsDDL, nativeCallsDDL, nativeArtifactRetentionsDDL, byteOutputsDDL, nativeByteOutputIndex, childArgumentsDDL, activeChildRequestIndex, activeNativeCallIndex, servingPlacementsDDL, operationContextsDDL)
 	schema = append(schema, machineExecutionSchema...)
-	schema = append(schema, capturePinsDDL, runtimeUpdatesDDL, rentalIdleDDL,
+	schema = append(schema, runtimeUpdatesDDL, rentalIdleDDL,
 		deviceMemoryMeasurementsDDL, deviceMemoryMeasurementsIndex)
 }
 
@@ -461,11 +470,6 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			}
 		}
 	}
-	if sourceVersion < 41 {
-		if _, err := tx.Exec(capturePinsDDL); err != nil {
-			return exit.Internalf("cannot add completed capture ownership: %s", err)
-		}
-	}
 	if sourceVersion < 42 {
 		if _, err := tx.Exec(runtimeUpdatesDDL); err != nil {
 			return exit.Internalf("cannot add rental Runtime update records: %s", err)
@@ -482,6 +486,9 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 				return exit.Internalf("cannot add measured working memory: %s", err)
 			}
 		}
+	}
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS capture_pins`); err != nil {
+		return exit.Internalf("cannot remove package fingerprint cache: %s", err)
 	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
 		if _, err := tx.Exec(statement); err != nil {
@@ -864,9 +871,6 @@ func priorStatements(version int) []string {
 		if version < 42 && statement == runtimeUpdatesDDL {
 			continue
 		}
-		if version < 41 && statement == capturePinsDDL {
-			continue
-		}
 		if version < 40 && containsStatement(machineExecutionSchema, statement) {
 			continue
 		}
@@ -996,6 +1000,9 @@ func priorStatements(version int) []string {
 			stmt = strings.ReplaceAll(stmt, "call_index<4294967296", "call_index<32")
 		}
 		statements[index] = stmt
+	}
+	if version >= 41 && version < 45 {
+		statements = append(statements, priorCapturePinsDDL)
 	}
 	return statements
 }
@@ -1356,7 +1363,6 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
 		FROM installs i WHERE i.id NOT IN (SELECT install_id FROM pins)
-		AND NOT EXISTS(SELECT 1 FROM capture_pins WHERE install_id=i.id)
 		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND (state IN (` + activeRequestStates + `) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
 		AND NOT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=i.id AND parent_install_id!=i.id)
 		ORDER BY i.created_at`)
@@ -1416,10 +1422,9 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	// not sever the result schema from a completed child still owned by its parent.
 	var held bool
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM pins WHERE install_id=?)
-		OR EXISTS(SELECT 1 FROM capture_pins WHERE install_id=?)
 		OR EXISTS(SELECT 1 FROM requests WHERE install_id=? AND (state IN (`+activeRequestStates+`) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
 		OR EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=? AND parent_install_id!=child_install_id)
-		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`, id, id, id, id, id).Scan(&held); err != nil {
+		OR EXISTS(SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`, id, id, id, id).Scan(&held); err != nil {
 		return false, exit.New(exit.Conflict, "cannot inspect install %s gc ownership: %s", id, err)
 	}
 	if held {
@@ -1436,12 +1441,11 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	}
 	result, err := tx.Exec(`DELETE FROM installs WHERE id=?
 		AND NOT EXISTS (SELECT 1 FROM pins WHERE install_id=?)
-		AND NOT EXISTS (SELECT 1 FROM capture_pins WHERE install_id=?)
 		AND NOT EXISTS (SELECT 1 FROM requests WHERE install_id=?
 		  AND state IN (`+activeRequestStates+`))
 		AND NOT EXISTS (SELECT 1 FROM private_child_bindings WHERE child_install_id=? AND parent_install_id!=child_install_id)
 		AND NOT EXISTS (SELECT 1 FROM worker_processes WHERE install_id=? AND state!='closed')`,
-		id, id, id, id, id, id)
+		id, id, id, id, id)
 	if err != nil {
 		return false, exit.New(exit.Conflict, "cannot claim install %s for gc: %s", id, err)
 	}

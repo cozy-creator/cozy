@@ -1269,12 +1269,6 @@ func (s *Store) LocalPackageInUse(digest, packageName, release,
 	sourceDigest string,
 ) (bool, *exit.Error) {
 	var used int
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM capture_pins WHERE revision_digest=?)`, digest).Scan(&used); err != nil {
-		return false, exit.Internalf("cannot read completed capture revision ownership: %s", err)
-	}
-	if used != 0 {
-		return true, nil
-	}
 	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM private_child_bindings WHERE local_revision_digest=?)`, digest).Scan(&used); err != nil {
 		return false, exit.Internalf("cannot read child dependency revision ownership: %s", err)
 	}
