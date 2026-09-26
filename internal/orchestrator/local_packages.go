@@ -17,7 +17,6 @@ import (
 
 type localTransfer struct {
 	revision           string
-	source             []byte
 	instanceID, bootID string
 	epoch              uint64
 	canceled           bool
@@ -62,7 +61,7 @@ type localTransferStatus struct {
 // DesiredLocalPackageSet and the pod replays its ledger. The editable refresh converges
 // with no request and no durable marker: its next run proves the bytes again if it must.
 func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
-	revision localpackage.Revision, uploadedBootID string, uploaded func(bootID string) *exit.Error,
+	revision localpackage.Installation, uploadedBootID string, uploaded func(bootID string) *exit.Error,
 ) *exit.Error {
 	selected, transfer, problem := localSelection(operationID, revision)
 	if problem != nil {
@@ -76,9 +75,9 @@ func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
 	// the same revision must not each ask the pod to prepare over the other's placement.
 	w.localMu.Lock()
 	defer w.localMu.Unlock()
-	if c.localIssued(w, s, revision.Digest) {
+	if c.localIssued(w, s, revision.ID) {
 		c.logf("worker %s already has local revision %s issued on this session; waiting on it",
-			instanceID, shortDigest(revision.Digest))
+			instanceID, shortDigest(revision.ID))
 		return nil
 	}
 	if uploadedBootID != "" && uploadedBootID != s.bootID {
@@ -106,7 +105,7 @@ func (c *Orchestrator) ConvergeLocalPackage(instanceID, operationID string,
 			uploadedBootID = s.bootID
 		}
 	}
-	if problem := c.hostNothing(instanceID, revision.Digest); problem != nil {
+	if problem := c.hostNothing(instanceID, revision.ID); problem != nil {
 		return problem
 	}
 	for {
@@ -139,7 +138,7 @@ func (c *Orchestrator) hostNothing(instanceID, revision string) *exit.Error {
 	if w != nil {
 		s = c.sessions[w.bootID]
 		held = len(w.observedRemote)
-		holdsRevision = w.holdsLocalRevision(revision)
+		holdsRevision = w.holdsLocalInstallation(revision)
 	}
 	c.mu.Unlock()
 	if w == nil || s == nil || held == 0 || holdsRevision {
@@ -183,8 +182,8 @@ func (c *Orchestrator) hostNothing(instanceID, revision string) *exit.Error {
 // observation. Placement IDs and local revision digests are different namespaces.
 // STAGED is sufficient for model preparation; empty code cannot be dispatchable.
 // Called under c.mu, like all reads of the desired set and observed placements.
-func (w *worker) holdsLocalRevision(revision string) bool {
-	if !validDigest(revision) || len(w.setBytes) == 0 || len(w.setDigest) == 0 {
+func (w *worker) holdsLocalInstallation(revision string) bool {
+	if revision == "" || len(w.setBytes) == 0 || len(w.setDigest) == 0 {
 		return false
 	}
 	doc, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
@@ -192,7 +191,7 @@ func (w *worker) holdsLocalRevision(revision string) bool {
 		return false
 	}
 	for _, row := range doc.List("placements") {
-		if row.Sub("development").Str("local_revision_digest") != revision {
+		if row.Str("installation_id") != revision {
 			continue
 		}
 		observed, ok := w.observedRemote[row.Str("placement_id")]
@@ -207,14 +206,14 @@ func (w *worker) holdsLocalRevision(revision string) bool {
 // awaitLocalRevision waits until the rented worker REPORTS the local revision among its
 // placements — the pod's prepare has landed — or the desire it rides is refused, the
 // worker goes, or the daemon stops. Observation only: there is no clock in it.
-func (c *Orchestrator) awaitLocalRevision(instanceID, revision string) *exit.Error {
+func (c *Orchestrator) awaitLocalInstallation(instanceID, revision string) *exit.Error {
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
 		var held, current bool
 		var refused, desiredRefusal *exit.Error
 		if w != nil {
-			held = w.holdsLocalRevision(revision)
+			held = w.holdsLocalInstallation(revision)
 			current = !w.exited
 			refused, desiredRefusal = w.refusal, w.desiredRefusal
 		}
@@ -239,60 +238,41 @@ func (c *Orchestrator) awaitLocalRevision(instanceID, revision string) *exit.Err
 	}
 }
 
-func localSelection(operationID string, revision localpackage.Revision) (
+func localSelection(operationID string, revision localpackage.Installation) (
 	*pb.DesiredLocalPackageSet, *localTransfer, *exit.Error,
 ) {
-	source, err := canonical.Raw(revision.SourceDigest)
-	if err != nil || operationID == "" || revision.Package == "" || revision.Release == "" ||
-		!validDigest(revision.Digest) || len(revision.Files) == 0 ||
-		len(revision.Files) > pb.MaxLocalPackageFiles || len(revision.DependencyRequirements) > pb.MaxLockedRequirementsBytes {
-		return nil, nil, exit.Named(exit.Structural, "local_package_revision_invalid",
-			"local package revision is incomplete")
+	if operationID == "" || revision.ID == "" || revision.Package == "" || revision.Release == "" || len(revision.Files) == 0 || len(revision.Files) > pb.MaxLocalPackageFiles {
+		return nil, nil, exit.New(exit.Validation, "private installation inputs are incomplete")
 	}
-	selected := &pb.DesiredLocalPackageSet{PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, OperationId: operationID, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
-		Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release,
-			SourceDigest: source}}
-	localDigest, _ := canonical.Raw(revision.Digest)
-	selected.Package.LocalRevisionDigest = localDigest
-	transfer := &localTransfer{revision: revision.Digest, source: source,
-		files:  make(map[string]localTransferFile, len(revision.Files)),
-		status: make(map[string]localTransferStatus, len(revision.Files)),
-		abortC: make(chan localAbortStatus, 1)}
-	var prior []byte
-	var total uint64
-	projects := 0
+	selected := &pb.DesiredLocalPackageSet{PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, OperationId: operationID,
+		SourceArchive: revision.SourceArchive, DependencyRequirements: revision.DependencyRequirements,
+		Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, InstallationId: revision.ID}}
+	transfer := &localTransfer{revision: revision.ID, files: map[string]localTransferFile{}, status: map[string]localTransferStatus{}, abortC: make(chan localAbortStatus, 1)}
+	var total int64
+	prior := ""
 	for _, file := range revision.Files {
-		digest, err := canonical.Raw(file.Digest)
-		if file.Kind == "project" {
-			projects++
-		} else if file.Kind != "dependency" {
-			return nil, nil, exit.Named(exit.Structural, "local_package_file_kind_invalid",
-				"local package file %s has kind %q", file.Filename, file.Kind)
+		var digest []byte
+		if file.Kind != "source" {
+			var err error
+			digest, err = canonical.Raw(file.Digest)
+			if err != nil {
+				return nil, nil, exit.New(exit.Validation, "wheel integrity hash is invalid")
+			}
 		}
-		if err != nil || file.Length <= 0 || file.Length > maxLocalWheelBytes ||
-			(prior != nil && bytes.Compare(prior, digest) >= 0) ||
-			file.Length > maxLocalWheelSetBytes-int64(total) {
-			return nil, nil, exit.Named(exit.Structural, "local_package_file_invalid",
-				"local package file %s has invalid identity or bounds", file.Filename)
+		if file.Length <= 0 || file.Length > maxLocalWheelSetBytes-total || file.Filename <= prior {
+			return nil, nil, exit.New(exit.Validation, "source transfer exceeds its bound or repeats a filename")
 		}
-		total += uint64(file.Length)
-		spelled := file.Digest
-		transfer.files[spelled] = localTransferFile{digest: digest, filename: file.Filename,
-			path: file.Path, project: file.Kind == "project", length: uint64(file.Length)}
-		selected.Files = append(selected.Files, &pb.LocalPackageFileRef{Digest: digest,
-			Filename: file.Filename, Length: uint64(file.Length)})
-		prior = digest
-	}
-	if projects != 1 || len(transfer.files) != len(revision.Files) {
-		return nil, nil, exit.Named(exit.Structural, "local_package_project_wheel_count",
-			"local package revision must carry one project wheel and unique files")
+		total += file.Length
+		prior = file.Filename
+		transfer.files[file.Filename] = localTransferFile{digest: digest, filename: file.Filename, path: file.Path, project: file.Kind == "project", length: uint64(file.Length)}
+		selected.Files = append(selected.Files, &pb.LocalPackageFileRef{Digest: digest, Filename: file.Filename, Length: uint64(file.Length)})
 	}
 	return selected, transfer, nil
 }
 
 // LocalPackageSelection is the passive code-preparation document. Calling it
 // neither converges worker state nor creates an execution attempt.
-func LocalPackageSelection(operationID string, revision localpackage.Revision) (*pb.DesiredLocalPackageSet, *exit.Error) {
+func LocalPackageSelection(operationID string, revision localpackage.Installation) (*pb.DesiredLocalPackageSet, *exit.Error) {
 	selected, _, problem := localSelection(operationID, revision)
 	return selected, problem
 }
@@ -351,7 +331,7 @@ func (c *Orchestrator) uploadLocalWheel(current *session, operationID string,
 	}()
 	problem := localpackage.UploadFile(ctx, current.host,
 		&pb.LocalPackageUploadHeader{Claim: current.claim, OperationId: operationID,
-			SourceDigest: transfer.source, File: &pb.LocalPackageFileRef{Digest: selected.digest,
+			File: &pb.LocalPackageFileRef{Digest: selected.digest,
 				Filename: selected.filename, Length: selected.length}}, selected.path,
 		func(status *pb.LocalPackageFileStatus) { c.onLocalPackageFileStatus(current, status) })
 	c.mu.Lock()
@@ -433,14 +413,8 @@ func (c *Orchestrator) cancelLocalTransfer(operationID string) *exit.Error {
 	if s == nil || s.instanceID != transfer.instanceID || s.epoch != transfer.epoch {
 		return exit.Unavailablef("local package transfer has no current worker session to abort")
 	}
-	localDigest, localErr := canonical.Raw(transfer.revision)
-	if localErr != nil {
-		return exit.Internalf("cannot decode local package abort identity: %s", localErr)
-	}
 	abort := &pb.LocalPackageAbort{RecordOwnerEpoch: recordOwnerEpoch,
-		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
-		OperationId: operationID, SourceDigest: append([]byte(nil), transfer.source...),
-		LocalRevisionDigest: localDigest}
+		ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, OperationId: operationID}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_LocalPackageAbort{
 		LocalPackageAbort: abort}}) {
 		return exit.Unavailablef("worker control stream closed before local package abort")
@@ -486,7 +460,7 @@ func transferFilesInOrder(transfer *localTransfer) []localTransferFile {
 	// The revision already proved digest order. Rebuild that order without trusting a map.
 	for i := 0; i < len(rows); i++ {
 		for j := i + 1; j < len(rows); j++ {
-			if bytes.Compare(rows[j].digest, rows[i].digest) < 0 {
+			if rows[j].filename < rows[i].filename {
 				rows[i], rows[j] = rows[j], rows[i]
 			}
 		}
@@ -546,14 +520,13 @@ func (c *Orchestrator) localStatus(operationID, digest string) localTransferStat
 func (c *Orchestrator) onLocalPackageFileStatus(current *session,
 	frame *pb.LocalPackageFileStatus,
 ) {
-	spelled, err := canonical.Spell(frame.Digest)
+	spelled := frame.Filename
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	transfer := c.localTransfers[frame.OperationId]
-	if err != nil || transfer == nil || transfer.canceled || current == nil ||
+	if transfer == nil || transfer.canceled || current == nil ||
 		transfer.instanceID != current.instanceID || transfer.bootID != current.bootID ||
-		transfer.epoch != current.epoch ||
-		!bytes.Equal(frame.SourceDigest, transfer.source) {
+		transfer.epoch != current.epoch {
 		return
 	}
 	expected, ok := transfer.files[spelled]
@@ -595,13 +568,7 @@ func (c *Orchestrator) onLocalPackageAbortStatus(current *session,
 	c.mu.Lock()
 	transfer := c.localTransfers[frame.OperationId]
 	if transfer == nil || current == nil || transfer.instanceID != current.instanceID ||
-		transfer.bootID != current.bootID || transfer.epoch != current.epoch ||
-		!bytes.Equal(frame.SourceDigest, transfer.source) {
-		c.mu.Unlock()
-		return
-	}
-	digest, err := canonical.Spell(frame.LocalRevisionDigest)
-	if err != nil || digest != transfer.revision {
+		transfer.bootID != current.bootID || transfer.epoch != current.epoch {
 		c.mu.Unlock()
 		return
 	}
@@ -621,21 +588,10 @@ func (c *Orchestrator) replayLocalAborts(current *session, workerID string) {
 		return
 	}
 	for _, row := range rows {
-		install, installProblem := c.opt.Store.Install(row.InstallID)
-		if installProblem != nil || install == nil {
-			c.logf("canceled request %s has no source install for local package abort", row.ID)
-			continue
-		}
-		source, sourceErr := canonical.Raw(install.SourceDigest)
-		revision, revisionErr := canonical.Raw(row.LocalPackageDigest)
-		if sourceErr != nil || revisionErr != nil {
-			c.logf("canceled request %s has invalid local package abort identity", row.ID)
-			continue
-		}
 		_ = current.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_LocalPackageAbort{
 			LocalPackageAbort: &pb.LocalPackageAbort{RecordOwnerEpoch: recordOwnerEpoch,
 				ControlStreamEpoch: current.epoch, WorkerBootId: current.bootID,
-				OperationId: row.ID, SourceDigest: source, LocalRevisionDigest: revision}}})
+				OperationId: row.ID}}})
 	}
 }
 
@@ -643,31 +599,27 @@ func (c *Orchestrator) replayLocalAborts(current *session, workerID string) {
 // and the pod has not refused it: prepared, or preparing and not yet reported. A second
 // convergence of the same revision then waits on the pod's report instead of asking again.
 func (c *Orchestrator) localIssued(w *worker, s *session, revision string) bool {
-	raw, err := canonical.Raw(revision)
-	if err != nil {
-		return false
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if w.desiredRefusal != nil || w.desiredEpoch != s.epoch {
 		return false
 	}
-	if w.desiredLocal != nil && bytes.Equal(w.desiredLocal.Package.GetLocalRevisionDigest(), raw) {
+	if w.desiredLocal != nil && w.desiredLocal.Package.GetInstallationId() == revision {
 		return true
 	}
 	return w.desiredUnpublishedPlacement != nil &&
-		bytes.Equal(w.desiredUnpublishedPlacement.LocalRevisionDigest, raw)
+		w.desiredUnpublishedPlacement.InstallationId == revision
 }
 
 // localOperation names the operation the pod prepared revision under, when this owner
 // issued one: a model placement must bind over that operation, whoever converges it.
-func (c *Orchestrator) localOperation(w *worker, revision []byte, fallback string) string {
+func (c *Orchestrator) localOperation(w *worker, revision string, fallback string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if w.desiredLocal != nil && bytes.Equal(w.desiredLocal.Package.GetLocalRevisionDigest(), revision) {
+	if w.desiredLocal != nil && w.desiredLocal.Package.GetInstallationId() == revision {
 		return w.desiredLocal.OperationId
 	}
-	if w.desiredUnpublishedPlacement != nil && bytes.Equal(w.desiredUnpublishedPlacement.LocalRevisionDigest, revision) {
+	if w.desiredUnpublishedPlacement != nil && w.desiredUnpublishedPlacement.InstallationId == revision {
 		return w.desiredUnpublishedPlacement.OperationId
 	}
 	return fallback
@@ -679,16 +631,13 @@ func (c *Orchestrator) issueLocalPackageSet(s *session, w *worker,
 	if selected == nil {
 		return exit.Internalf("cannot issue an empty local package set")
 	}
-	revision, err := canonical.Spell(selected.Package.GetLocalRevisionDigest())
-	if err != nil {
-		return exit.Internalf("cannot spell the local revision digest: %s", err)
-	}
+	revision := selected.Package.GetInstallationId()
 	c.mu.Lock()
 	w.desiredLocal = cloneLocalPackageSet(selected)
 	w.desiredUnpublishedPlacement = nil
 	w.desiredPackages, w.desiredModels, w.desiredDownloadSets = nil, nil, nil
 	w.desiredEpoch = s.epoch
-	held := w.holdsLocalRevision(revision)
+	held := w.holdsLocalInstallation(revision)
 	c.mu.Unlock()
 	if held {
 		// The pod reports this exact revision already: nothing to prepare, and asking would
@@ -713,7 +662,7 @@ func (c *Orchestrator) ConvergeUnpublishedPlacement(instanceID, operationID,
 }
 
 func (c *Orchestrator) convergeUnpublishedModels(instanceID, operationID, localRevisionDigest string, models []*pb.DownloadModelRef, native []*pb.NativeModelBinding) *exit.Error {
-	if operationID == "" || !validDigest(localRevisionDigest) || len(models)+len(native) == 0 {
+	if operationID == "" || localRevisionDigest == "" || len(models)+len(native) == 0 {
 		return exit.Named(exit.Validation, "private_placement_incomplete",
 			"local package placement requires operation, exact revision, and models")
 	}
@@ -741,7 +690,7 @@ func (c *Orchestrator) convergeUnpublishedModels(instanceID, operationID, localR
 	// `ConvergeLocalPackage` only ISSUES the prepare, and an unpublished package placement sent on its
 	// heels is refused `private_placement_invalid: unpublished package placement revision is not
 	// prepared` (found live, L4 `shiranui`, cl-101). Wait on the pod's own report of it.
-	if problem := c.awaitLocalRevision(instanceID, localRevisionDigest); problem != nil {
+	if problem := c.awaitLocalInstallation(instanceID, localRevisionDigest); problem != nil {
 		return problem
 	}
 	var downloadSet []byte
@@ -752,14 +701,14 @@ func (c *Orchestrator) convergeUnpublishedModels(instanceID, operationID, localR
 			return problem
 		}
 	}
-	revision, err := canonical.Raw(localRevisionDigest)
-	if err != nil || (len(downloadSet) == 0 && len(native) == 0) {
+	revision := localRevisionDigest
+	if len(downloadSet) == 0 && len(native) == 0 {
 		return exit.Named(exit.Validation, "private_placement_download_set_incomplete",
 			"local package placement download set is incomplete")
 	}
 	operationID = c.localOperation(w, revision, operationID)
 	selected := &pb.DesiredPrivatePlacementSet{OperationId: operationID,
-		LocalRevisionDigest: revision, DownloadDelegation: downloadSet, NativeModels: native}
+		InstallationId: revision, DownloadDelegation: downloadSet, NativeModels: native}
 	return c.issueUnpublishedPlacementSet(s, w, selected)
 }
 
@@ -796,19 +745,7 @@ func cloneLocalPackageSet(in *pb.DesiredLocalPackageSet) *pb.DesiredLocalPackage
 	if in == nil {
 		return nil
 	}
-	out := &pb.DesiredLocalPackageSet{PythonRequires: in.PythonRequires, PythonVersion: in.PythonVersion, OperationId: in.OperationId, DependencyRequirements: append([]byte(nil), in.DependencyRequirements...)}
-	if in.Package != nil {
-		out.Package = &pb.DevelopmentPackage{Package: in.Package.Package,
-			Release: in.Package.Release, SourceDigest: append([]byte(nil), in.Package.SourceDigest...),
-			LocalRevisionDigest: append([]byte(nil), in.Package.LocalRevisionDigest...)}
-	}
-	for _, file := range in.Files {
-		if file != nil {
-			out.Files = append(out.Files, &pb.LocalPackageFileRef{Digest: append([]byte(nil), file.Digest...),
-				Filename: file.Filename, Length: file.Length})
-		}
-	}
-	return out
+	return proto.Clone(in).(*pb.DesiredLocalPackageSet)
 }
 
 func cloneUnpublishedPlacementSet(in *pb.DesiredPrivatePlacementSet) *pb.DesiredPrivatePlacementSet {

@@ -45,7 +45,7 @@ type scheduled struct {
 // and model transfers keep their own preparation paths.
 func scheduledVenue(req records.Request) string {
 	if req.IsJob() || req.InstallID != "" || req.ParentRequestID != "" || req.ModelTransfer != nil ||
-		req.RetainWork || req.LocalPackageDigest != "" || req.Release == "" {
+		req.RetainWork || req.LocalInstallationID != "" || req.Release == "" {
 		return ""
 	}
 	if req.Worker != "" {

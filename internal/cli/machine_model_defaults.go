@@ -1,16 +1,13 @@
 package cli
 
 import (
-	"bytes"
 	"net"
 	"net/url"
-	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
@@ -25,21 +22,12 @@ func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCap
 	if err := canonical.Unmarshal(capture.Canonical, document); err != nil {
 		return capture, exit.New(exit.Conflict, "captured model defaults have no exact code inventory")
 	}
-	layout, problem := home.Open(r.cfg.Home)
-	if problem != nil {
-		return capture, problem
-	}
-	for _, revision := range capture.Revisions {
-		iface, problem := launch.ReadPackageInterface(filepath.Join(layout.LocalPackages,
-			strings.TrimPrefix(revision.Digest, "sha256:"), launch.PackageInterfaceFile), revision.PackageInterfaceDigest)
+	for _, installation := range capture.Installations {
+		iface, problem := launch.DecodePackageInterface(installation.PackageInterface)
 		if problem != nil {
 			return capture, problem
 		}
-		digest, err := canonical.Raw(revision.Digest)
-		if err != nil {
-			return capture, exit.New(exit.Conflict, "captured default revision changed")
-		}
-		r.captureDefaultRows(document, revision.Package, digest, iface, rental, publicOrigin)
+		r.captureDefaultRows(document, installation.Package, installation.ID, iface, rental, publicOrigin)
 	}
 	var err error
 	capture.Canonical, capture.Digest, err = canonical.Identity(document)
@@ -49,10 +37,10 @@ func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCap
 	return capture, nil
 }
 
-func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg string, revision []byte, iface *launch.PackageInterface, rental bool, publicOrigin string) {
+func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg string, revision string, iface *launch.PackageInterface, rental bool, publicOrigin string) {
 	entries := map[string]bool{}
 	for _, binding := range document.Bindings {
-		if bytes.Equal(binding.CalleeRevisionDigest, revision) {
+		if binding.CalleeInstallationId == revision {
 			entries[binding.Entrypoint] = true
 		}
 	}
@@ -61,15 +49,15 @@ func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg 
 			continue
 		}
 		for _, slot := range entry.Models {
-			row := &pb.MachineModelDefault{CalleeRevisionDigest: revision, Entrypoint: entry.Name, Parameter: slot.Param}
+			row := &pb.MachineModelDefault{CalleeInstallationId: revision, Entrypoint: entry.Name, Parameter: slot.Param}
 			row.PublicOrigin, row.Rungs, row.UnavailableCode = r.captureDefaultLadder(pkg, entry.Name, slot, rental, publicOrigin)
 			document.ModelDefaults = append(document.ModelDefaults, row)
 		}
 	}
 	sort.Slice(document.ModelDefaults, func(i, j int) bool {
 		a, b := document.ModelDefaults[i], document.ModelDefaults[j]
-		if compared := bytes.Compare(a.CalleeRevisionDigest, b.CalleeRevisionDigest); compared != 0 {
-			return compared < 0
+		if a.CalleeInstallationId != b.CalleeInstallationId {
+			return a.CalleeInstallationId < b.CalleeInstallationId
 		}
 		if a.Entrypoint != b.Entrypoint {
 			return a.Entrypoint < b.Entrypoint

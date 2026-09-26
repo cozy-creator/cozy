@@ -20,7 +20,7 @@ import (
 const childCallMaxBytes = 48 * 1024
 
 type unpublishedChildResolver interface {
-	ResolveUnpublishedChild(records.Request, string, string, string, []byte) (Submission, string, *exit.Error)
+	ResolveUnpublishedChild(records.Request, string, string, []byte) (Submission, string, *exit.Error)
 }
 
 func (c *Orchestrator) childParent(s *session, id string, ordinal uint64, digest []byte) (*records.Request, *exit.Error) {
@@ -58,7 +58,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Named(exit.Conflict, "child.parent_stopped", "stopped parent cannot start child work"))
 		return
 	}
-	if len(call.InterfaceDigest) != 32 || len(call.IntentDigest) != 32 || len(call.RequestCanonicalBytes) > childCallMaxBytes || len(call.Module) == 0 || len(call.Export) == 0 || len(call.Module) > 256 || len(call.Export) > 128 {
+	if len(call.IntentDigest) != 32 || len(call.RequestCanonicalBytes) > childCallMaxBytes || len(call.Module) == 0 || len(call.Export) == 0 || len(call.Module) > 256 || len(call.Export) > 128 {
 		refuse(exit.New(exit.Validation, "child call exceeds its closed identity or payload bounds"))
 		return
 	}
@@ -67,8 +67,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.New(exit.Validation, "child input must be one canonical JSON object"))
 		return
 	}
-	iface, _ := canonical.Spell(call.InterfaceDigest)
-	intent := map[string]any{"interface_digest": iface, "module": call.Module, "export": call.Export, "request": json.RawMessage(payload)}
+	intent := map[string]any{"module": call.Module, "export": call.Export, "request": json.RawMessage(payload)}
 	capture, problem := captureOptions(call.Capture)
 	if problem != nil {
 		refuse(problem)
@@ -129,7 +128,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		refuse(exit.Unavailablef("this package owner cannot resolve frozen child interfaces"))
 		return
 	}
-	spec, target, problem := resolver.ResolveUnpublishedChild(*parent, iface, call.Module, call.Export, payload)
+	spec, target, problem := resolver.ResolveUnpublishedChild(*parent, call.Module, call.Export, payload)
 	if problem != nil {
 		refuse(problem)
 		return

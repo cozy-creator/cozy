@@ -28,7 +28,7 @@ func (r *Resolver) NativeSourceEligible(parent records.Request, operation string
 	if problem != nil || install == nil {
 		return exit.Named(exit.Conflict, "native.parent_install_absent", "source caller has no captured install")
 	}
-	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
+	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir))
 	if problem != nil {
 		return problem
 	}

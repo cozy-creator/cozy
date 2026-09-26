@@ -35,16 +35,26 @@ type machineExecutionClient interface {
 
 type publishedPreparation struct {
 	*pb.DesiredPlacementSet
+	InstalledPackage   *pb.InstalledPackage
 	LockedRequirements []byte
 }
 
+func retainWorkerInstallation(connection *machineConnection, expected localpackage.Installation, installed *pb.InstalledPackage) *exit.Error {
+	if installed == nil || installed.InstallationId != expected.ID || installed.Package != expected.Package || installed.Release != expected.Release || len(installed.PackageInterface) == 0 || len(installed.PackageInterface) > 1<<20 {
+		return exit.New(exit.Validation, "worker did not return the selected installation and interface")
+	}
+	connection.installed[expected.ID] = proto.Clone(installed).(*pb.InstalledPackage)
+	return nil
+}
+
 type machineConnection struct {
+	installed          map[string]*pb.InstalledPackage
 	importInputTree    func(context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error)
 	connection         *machineClientConnection
 	client             machineExecutionClient
 	claim              *pb.Claim
-	prepare            func(context.Context, string, localpackage.Revision) *exit.Error
-	prepareModels      func(context.Context, records.Request, localpackage.Revision) *exit.Error
+	prepare            func(context.Context, string, localpackage.Installation) *exit.Error
+	prepareModels      func(context.Context, records.Request, localpackage.Installation) *exit.Error
 	modelDefaultOrigin func(context.Context) (string, *exit.Error)
 	preparePublished   func(context.Context, records.Request) (*publishedPreparation, *exit.Error)
 	wireMinor          uint32
@@ -292,7 +302,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return problem
 		}
 		var built *pb.MachineExecutionSubmit
-		if request.LocalPackageDigest == "" {
+		if request.LocalInstallationID == "" {
 			built, problem = m.publishedSubmission(m.ctx, request, connection)
 			if problem != nil {
 				return problem
@@ -301,6 +311,29 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			capture, problem := m.resolver.CaptureMachineExecution(request)
 			if problem != nil {
 				return problem
+			}
+			for index, revision := range capture.Installations {
+				if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
+					return problem
+				}
+				capture.Installations[index].PackageInterface = connection.installed[revision.ID].PackageInterface
+				if connection.prepareModels != nil {
+					if problem := connection.prepareModels(m.ctx, request, revision); problem != nil {
+						return problem
+					}
+				}
+			}
+			var graph pb.MachineExecutionCapture
+			if err := canonical.Unmarshal(capture.Canonical, &graph); err != nil {
+				return exit.Internalf("cannot read accepted installation graph: %s", err)
+			}
+			for i, installed := range graph.InstalledPackages {
+				graph.InstalledPackages[i] = connection.installed[installed.InstallationId]
+			}
+			var encodeErr error
+			capture.Canonical, capture.Digest, encodeErr = canonical.Identity(&graph)
+			if encodeErr != nil {
+				return exit.Internalf("cannot retain worker installation metadata: %s", encodeErr)
 			}
 			if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
 				origin := ""
@@ -313,16 +346,6 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 				capture, problem = m.resolver.captureMachineModelDefaults(capture, request.Rental, origin)
 				if problem != nil {
 					return problem
-				}
-			}
-			for _, revision := range capture.Revisions {
-				if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
-					return problem
-				}
-				if connection.prepareModels != nil {
-					if problem := connection.prepareModels(m.ctx, request, revision); problem != nil {
-						return problem
-					}
 				}
 			}
 			prepared, problem := m.resolver.ResolveJobInstall(request.InstallID, request.Entrypoint)
@@ -352,7 +375,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if _, problem := m.resolver.capturedResultInterface(request); problem != nil {
 		return problem
 	}
-	if request.LocalPackageDigest == "" && connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
+	if request.LocalInstallationID == "" && connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
 		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires Runtime protocol 54")
 	}
 	if problem := m.sendMachineSubmission(m.ctx, connection, request.ID, submission); problem != nil {
@@ -653,6 +676,9 @@ func readMachinePreparationEvent(stream grpc.ServerStreamingClient[pb.PrepareEve
 			}
 			return event, exit.Named(exit.Conflict, "machine_execution.prepare_refused", "%s: %s", event.SafeCode, event.SafeDetail)
 		case pb.PrepareStage_PREPARE_STAGE_PREPARED:
+			if event.InstalledPackage != nil {
+				return event, nil
+			}
 			return event, validateMachinePrepared(event.PlacementSet)
 		}
 	}

@@ -177,20 +177,20 @@ func body(m protoreflect.Message) (map[string]Value, error) {
 var explicitRepeated = map[string][]string{
 	"cozy.worker.v1.DownloadDelegation":      {"models", "packages"},
 	"cozy.worker.v1.Entrypoint":              {"slots"},
-	"cozy.worker.v1.Environment":             {"local_wheels"},
 	"cozy.worker.v1.Placement":               {"entrypoints", "models"},
-	"cozy.worker.v1.LocalPackageRevision":    {"files"},
-	"cozy.worker.v1.MachineExecutionCapture": {"revisions", "bindings"},
+	"cozy.worker.v1.MachineExecutionCapture": {"installed_packages", "bindings"},
 	"cozy.worker.v1.Slot":                    {"components", "stamps"},
 	"cozy.worker.v1.Stamp":                   {"values"},
-	"cozy.worker.v1.WheelFact":               {"import_roots", "tags"},
 }
 
 // Format is the canonical `format` tag for one message's document: its full name plus the
 // sole pre-release document version. There are no compatibility aliases or version-specific
-// readers: every current document is `/1`, and every other suffix refuses.
+// readers: Capture uses /2 after removing revision fingerprints; other documents use /1.
 func Format(m proto.Message) string {
 	name := string(m.ProtoReflect().Descriptor().FullName())
+	if name == "cozy.worker.v1.MachineExecutionCapture" {
+		return name + "/2"
+	}
 	return name + "/1"
 }
 

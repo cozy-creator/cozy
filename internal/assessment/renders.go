@@ -189,7 +189,7 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 			if problem != nil {
 				return nil, problem
 			}
-			intent := map[string]any{"interface_digest": target.binding.InterfaceDigest, "module": target.binding.Module, "export": target.binding.Export, "request": json.RawMessage(arguments)}
+			intent := map[string]any{"module": target.binding.Module, "export": target.binding.Export, "request": json.RawMessage(arguments)}
 			if request.Capture != "" {
 				intent["capture"] = json.RawMessage(request.Capture)
 			}
@@ -226,7 +226,7 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 				return nil, renderRefusal()
 			}
 			if request.IsJob() {
-				if spec.Sub("job").Str("build_id") != target.binding.LocalRevisionDigest {
+				if spec.Sub("job").Str("installation_id") != target.binding.ChildInstallID {
 					return nil, renderRefusal()
 				}
 				modelInput := false
@@ -268,7 +268,7 @@ func VerifyRenderBindings(st *records.Store, parentID string, info RenderInspect
 
 func servingModelMatches(request records.Request, attempt records.Attempt, binding records.ChildBinding, checkpoint string) bool {
 	placement, problem := records.BoundServingPlacement(request, attempt)
-	if problem != nil || placement == nil || placement.Sub("development").Str("local_revision_digest") != binding.LocalRevisionDigest || placement.Sub("package_interface").Str("digest") != binding.InterfaceDigest {
+	if problem != nil || placement == nil || placement.Str("installation_id") != binding.ChildInstallID {
 		return false
 	}
 	models := map[string]canonical.Doc{}

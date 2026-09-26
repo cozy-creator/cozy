@@ -66,11 +66,6 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		if problem := pack.BuildForPublish(hctx, ctx.Inv.Values["--wheel"]...); problem != nil {
 			return problem
 		}
-		projects, problem := publishedCallableWheels(hctx, pack)
-		if problem != nil {
-			return problem
-		}
-		pack.ProjectWheels, pack.Wheel = projects, projects[0]
 		return nil
 	}); problem != nil {
 		return problem

@@ -2,41 +2,12 @@ package producttest
 
 import (
 	"archive/zip"
-	"context"
-	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
-
-func TestPrivateInterfaceRefusesOlderDependencyRuntimeBeforeGeneration(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the metadata-only peer is a POSIX shell script")
-	}
-	for _, version := range []string{"0.9.1", "invalid", "0.11.0", "0.12.0"} {
-		t.Run(version, func(t *testing.T) {
-			root := t.TempDir()
-			tool, called := filepath.Join(root, "runtime"), filepath.Join(root, "generation-called")
-			body := fmt.Sprintf("#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = version ]; then\nprintf '%%s\\n' '{\"distribution\":\"%s\"}'\nexit 0\nfi\ndone\n: > %q\nexit 17\n", version, called)
-			must(t, os.WriteFile(tool, []byte(body), 0o700))
-			peer := launch.RuntimeCLI{Bin: tool, Dir: root, Home: root} //cozy:allow metadata-only admission peer
-			_, problem := peer.InterfaceWheel(context.Background(), "interface.json", "local-library", "1.0.0", "implementation", "source.whl", "digest", root)
-			_, generated := os.Stat(called)
-			if version == "0.9.1" || version == "invalid" {
-				if problem == nil || problem.ErrName() != "interface_runtime_below_floor" || !strings.Contains(problem.Remedy, "uv lock --upgrade-package cozy-runtime") || !os.IsNotExist(generated) {
-					t.Fatalf("old dependency Runtime received ABI5 generation instead of its lock remedy: %v, generated=%v", problem, generated)
-				}
-			} else if generated != nil || problem == nil || problem.ErrName() == "interface_runtime_below_floor" {
-				t.Fatalf("supported dependency Runtime did not reach generation: %v, generated=%v", problem, generated)
-			}
-		})
-	}
-}
 
 func TestLocalApplicationEntryPointUsesOrdinaryDependencyCapture(t *testing.T) {
 	root := t.TempDir()

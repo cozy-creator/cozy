@@ -1,43 +1,25 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/inputasset"
-	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // ResolveUnpublishedChild resolves only the immutable interface binding captured by
 // the parent's intake. Current pins, mutable source trees and package-supplied
 // install identities never participate in this execution authority.
-func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module, export string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
+func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, export string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
 	var out orchestrator.Submission
-	binding, problem := r.store.ChildBinding(parent.InstallID, iface, module, export)
+	binding, problem := r.store.ChildBinding(parent.InstallID, module, export)
 	if problem != nil {
 		return out, "", problem
-	}
-	if binding == nil && module == runtimeoperation.Module && runtimeoperation.Export(export) {
-		parentInstall, problem := r.store.Install(parent.InstallID)
-		if problem != nil || parentInstall == nil {
-			return out, "", exit.New(exit.Conflict, "builtin caller install is unavailable")
-		}
-		layout, problem := home.Open(r.cfg.Home)
-		if problem != nil {
-			return out, "", problem
-		}
-		binding, problem = install.ResolveRuntimeOperations(context.Background(), layout, r.store, *parentInstall, iface, export)
-		if problem != nil {
-			return out, "", problem
-		}
 	}
 	if binding == nil {
 		return out, "", exit.Named(exit.Conflict, "child.binding_absent", "the parent did not capture this invocable dependency")
@@ -46,14 +28,8 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 	if problem != nil || install == nil {
 		return out, "", exit.Named(exit.Conflict, "child.install_absent", "the captured child implementation is unavailable")
 	}
-	// A self binding names the parent's own install and therefore captures no separate
-	// carrier revision: the calling request's own frozen revision IS the child's, which
-	// is what keeps a replayed self call byte-identical to the first one.
-	revision := binding.LocalRevisionDigest
-	if revision == "" && binding.ChildInstallID == parent.InstallID {
-		revision = parent.LocalPackageDigest
-	}
-	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), iface)
+	revision := binding.ChildInstallID
+	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir))
 	if problem != nil {
 		return out, "", problem
 	}
@@ -61,7 +37,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 	if problem != nil {
 		return out, "", problem
 	}
-	if job.Internal && (binding.ChildInstallID != parent.InstallID || revision != parent.LocalPackageDigest) {
+	if job.Internal && (binding.ChildInstallID != parent.InstallID || revision != parent.LocalInstallationID) {
 		return out, "", exit.Named(exit.Conflict, "callable_internal", "internal functions require an admitted parent from the same package revision")
 	}
 	if (job.Kind != "job" && job.Kind != "entrypoint") || job.Invocable == nil || job.Invocable.Module != module || job.Invocable.Export != export {
@@ -78,7 +54,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 	if problem != nil || parentInstall == nil {
 		return out, "", exit.Named(exit.Conflict, "child.parent_install_absent", "the parent snapshot is unavailable")
 	}
-	parentSurface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(parentInstall.Dir), parentInstall.PackageInterface)
+	parentSurface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(parentInstall.Dir))
 	if problem != nil {
 		return out, "", problem
 	}
@@ -105,7 +81,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 		return out, "", problem
 	}
 	if revision != "" {
-		if _, problem := r.LocalRevision(install.ID, revision); problem != nil {
+		if _, problem := r.LocalInstallation(install.ID, revision); problem != nil {
 			return out, "", problem
 		}
 	}
@@ -184,12 +160,12 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, iface, module
 	}
 	out.ChildReusable = job.Invocable.Memoize
 	out.ChildArtifacts = len(launch.ModelArtifactPaths(job.Result)) > 0 || len(out.Outputs) > len(out.WeightsOutputs)
-	out.LocalPackageDigest = revision
+	out.LocalInstallationID = revision
 	if parent.Worker != "" {
 		out.Worker, out.Rental, out.RentalRequired = parent.Worker, true, true
 		out.RequestedRental = parent.RequestedRental
 	}
-	identity, _ := json.Marshal(map[string]any{"local_revision_digest": revision, "interface_digest": iface, "entrypoint": binding.Entrypoint, "module": module, "export": export})
+	identity, _ := json.Marshal(map[string]any{"installation_id": revision, "entrypoint": binding.Entrypoint, "module": module, "export": export})
 	identity, err := canonical.NormalizeJCS(identity)
 	if err != nil {
 		return out, "", exit.Internalf("cannot encode frozen child identity: %s", err)
@@ -203,7 +179,7 @@ func (r *Resolver) CapturedArtifactPaths(request records.Request) ([][]string, *
 	if problem != nil || install == nil {
 		return nil, exit.Named(exit.Conflict, "child.install_absent", "captured artifact result schema is unavailable")
 	}
-	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
+	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir))
 	if problem != nil {
 		return nil, problem
 	}
@@ -242,7 +218,7 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 			if child == nil {
 				return false, exit.Named(exit.Conflict, "child.install_absent", "captured child implementation is unavailable for rental sizing")
 			}
-			surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(child.Dir), binding.InterfaceDigest)
+			surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(child.Dir))
 			if problem != nil {
 				return false, problem
 			}
@@ -255,9 +231,7 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 			}
 			// The same immutable closure predicate JobsInstall uses; no package
 			// code needs importing again merely to choose a machine class.
-			if child.Package != "local/"+runtimeoperation.Name || surface.Application != runtimeoperation.Application {
-				needed = needed || launch.AcceleratorRequired(strings.Split(child.Closure, "\n"))
-			}
+			needed = needed || launch.AcceleratorRequired(strings.Split(child.Closure, "\n"))
 			queue = append(queue, binding.ChildInstallID)
 		}
 	}

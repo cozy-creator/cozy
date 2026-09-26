@@ -113,10 +113,6 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 		return nil, empty, "", nil, exit.Named(exit.Structural, "package_interface_invalid",
 			"the release commits an invalid package interface: %s", problem.Message)
 	}
-	if packageInterface.Digest != published.Selection.PackageInterface.Digest {
-		return nil, empty, "", nil, exit.Named(exit.Structural, "package_interface_invalid",
-			"the release package interface does not match its committed digest")
-	}
 	// Installing code is not permission to run its imports or constructors.
 	// Serving selections are prepared by the claimed worker before activation.
 	return packageInterface, empty, runtimeBin, environment, nil
@@ -145,10 +141,6 @@ func PreparePublishedSelection(l home.Layout, inst records.PackageInstall,
 		return empty, exit.New(exit.NotFound, "cannot read installed package interface: %s", err)
 	}
 	packageInterfaceDigest, _ := canonical.Spell(canonical.Digest(packageInterfaceBytes))
-	if packageInterfaceDigest != inst.PackageInterface {
-		return empty, exit.Named(exit.Conflict, "package_interface_changed",
-			"installed package interface does not match %s", inst.PackageInterface)
-	}
 	published := &PublishedSource{Package: inst.Package, Release: inst.Version,
 		Models: append([]PublishedModel(nil), models...), Selection: Selection{
 			PackageInterface: ExactDocument{Bytes: packageInterfaceBytes, Digest: packageInterfaceDigest,
@@ -167,8 +159,7 @@ func runPublishedSelection(l home.Layout, inst records.PackageInstall,
 		// evaluates the checkpoint, so nothing here may call it a fit (model-code-fit §3).
 		return empty, problem
 	}
-	if answer.Package != inst.Package || answer.Release != inst.Version ||
-		!bytes.Equal(answer.PackageInterface.Bytes, published.Selection.PackageInterface.Bytes) {
+	if answer.Package != inst.Package || answer.Release != inst.Version {
 		return empty, exit.Named(exit.Structural, "package_prepare_invalid",
 			"cozy-runtime returned an invalid selected package preparation")
 	}

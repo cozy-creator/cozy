@@ -19,7 +19,6 @@ type JobPin struct {
 	Function     string `json:"function"`
 	InstallID    string `json:"install_id,omitempty"`
 	Release      string `json:"release"`
-	SourceDigest string `json:"source_digest,omitempty"`
 	DescriptorID string `json:"descriptor_id"`
 }
 
@@ -85,21 +84,19 @@ func (i Instruction) ID() string {
 }
 
 type Plan struct {
-	Instruction            Instruction
-	Destination            string
-	Source                 string
-	SourceSelection        string
-	SourceLicense          string
-	SourceFiles            []SourceFile
-	InputLane              string
-	Producer               string
-	ProducerInstallID      string
-	ProducerRelease        string
-	ProducerSourceDigest   string
-	PackageInterfaceDigest string
-	Job                    *JobPin
-	SourceProfiles         map[string]string
-	Outputs                []OutputPin
+	Instruction       Instruction
+	Destination       string
+	Source            string
+	SourceSelection   string
+	SourceLicense     string
+	SourceFiles       []SourceFile
+	InputLane         string
+	Producer          string
+	ProducerInstallID string
+	ProducerRelease   string
+	Job               *JobPin
+	SourceProfiles    map[string]string
+	Outputs           []OutputPin
 }
 
 // Bytes is the restart record. It contains only immutable identities and
@@ -145,8 +142,7 @@ func (p Plan) ID() string {
 	for _, value := range []string{
 		"cozy-model-upload/1", p.Destination, p.Source,
 		p.SourceSelection, p.SourceLicense, p.InputLane, p.Producer,
-		p.ProducerInstallID, p.ProducerRelease, p.ProducerSourceDigest,
-		p.PackageInterfaceDigest,
+		p.ProducerInstallID, p.ProducerRelease,
 	} {
 		_, _ = io.WriteString(hash, value)
 		_, _ = hash.Write([]byte{0})
@@ -154,7 +150,7 @@ func (p Plan) ID() string {
 	if p.Job != nil {
 		job := *p.Job
 		for _, value := range []string{
-			job.Callable, job.Package, job.Function, job.InstallID, job.Release, job.SourceDigest,
+			job.Callable, job.Package, job.Function, job.InstallID, job.Release,
 			job.DescriptorID,
 		} {
 			_, _ = io.WriteString(hash, value)

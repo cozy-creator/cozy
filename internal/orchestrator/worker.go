@@ -52,8 +52,7 @@ type Entrypoint struct {
 type DesiredPlacement struct {
 	Package             string `json:"package"` // org/name — the slot this placement serves under
 	Release             string `json:"release"`
-	SourceDigest        string `json:"source_digest,omitempty"` // local-only DevelopmentPackage identity
-	LocalRevisionDigest string `json:"local_revision_digest,omitempty"`
+	InstallationID string `json:"installation_id"` // worker environment lifetime; never package content
 	// InstallID is the install this placement was resolved from ("" = an uninstalled dev
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
 	InstallID string `json:"install_id"`
@@ -63,7 +62,6 @@ type DesiredPlacement struct {
 	// participates in identity.
 	PlacementSetDigest string       `json:"placement_set_digest"`
 	PlacementSetBytes  []byte       `json:"placement_set_bytes"`
-	EnvironmentDigest  string       `json:"environment_digest"`
 	BindingsDigest     string       `json:"bindings_digest"`
 	Entrypoints        []Entrypoint `json:"entrypoints"`
 	PlacementIDValue   string       `json:"placement_id,omitempty"`
@@ -103,52 +101,24 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	}
 	row := rows[0]
 	packageFact, development := row.Sub("package"), row.Sub("development")
-	environment := row.Sub("environment")
+	selected := packageFact
+	if development.Str("package") != "" {
+		if len(packageFact) != 0 || development.Str("installation_id") != row.Str("installation_id") {
+			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
+				"development placement mixes package selections or installation handles")
+		}
+		selected = development
+	}
 	placement := DesiredPlacement{
 		Package: pkg, InstallID: installID, PlacementIDValue: row.Str("placement_id"),
-		Release:            packageFact.Str("release"),
-		EnvironmentDigest:  row.Str("environment_digest"),
+		Release: selected.Str("release"), InstallationID: row.Str("installation_id"),
 		PlacementSetDigest: digest, PlacementSetBytes: append([]byte(nil), data...),
 	}
-	if development.Str("source_digest") != "" {
-		placement.Release = development.Str("release")
-		placement.SourceDigest = development.Str("source_digest")
-		placement.LocalRevisionDigest = development.Str("local_revision_digest")
-		if development.Str("package") != pkg || placement.Release == "" ||
-			placement.PlacementIDValue == "" || len(packageFact) != 0 || len(environment.Sub("locked_requirements")) != 0 {
-			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
-				"development PlacementSet mixes local source with published selection facts")
-		}
-		project := development.Sub("project_wheel")
-		if placement.LocalRevisionDigest == "" {
-			if len(project) != 0 || placement.EnvironmentDigest != "" {
-				return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
-					"source-only development placement cannot carry an incomplete captured environment")
-			}
-		} else if project.Sub("ref").Str("digest") == "" || placement.EnvironmentDigest == "" {
-			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
-				"captured development placement requires its project wheel and environment identity")
-		}
-	} else if packageFact.Str("package") != pkg || placement.Release == "" ||
-		placement.EnvironmentDigest == "" ||
-		placement.PlacementIDValue == "" {
+	if selected.Str("package") != pkg || placement.Release == "" ||
+		placement.InstallationID == "" || placement.PlacementIDValue == "" ||
+		row.Str("package_interface") == "" {
 		return DesiredPlacement{}, exit.Named(exit.Structural, "placement_set_incomplete",
-			"PlacementSet omits or mismatches its placement, package selection, or environment identity")
-	}
-	if placement.EnvironmentDigest != "" {
-		// Wire 30: a published Environment is its locked-requirements ref; supplied
-		// wheels belong to editable revisions only.
-		environmentIdentity := map[string]canonical.Value{
-			"format":       "cozy.worker.v1.Environment/1",
-			"local_wheels": arrayOrEmpty(environment["local_wheels"]),
-		}
-		if locked, ok := environment["locked_requirements"]; ok {
-			environmentIdentity["locked_requirements"] = locked
-		}
-		if !digestMatches(environmentIdentity, placement.EnvironmentDigest) {
-			return DesiredPlacement{}, exit.Named(exit.Conflict, "environment_identity_mismatch",
-				"environment_digest does not hash the exact nested Environment")
-		}
+			"PlacementSet requires its selected package, installation and callable metadata")
 	}
 	for _, entrypoint := range row.List("entrypoints") {
 		name, binding := entrypoint.Str("name"), entrypoint.Str("entrypoint_binding_digest")
@@ -449,7 +419,6 @@ type worker struct {
 	// localMu serializes ConvergeLocalPackage on this worker. It is never held by the
 	// control stream's receive loop, whose reports the holder waits on.
 	localMu   sync.Mutex
-	localCode *localPreparedCode // guarded by localMu; valid only for this live worker/base
 	// hostPrepareSeq numbers the logical desires issued through PodHost (proto-025); a
 	// prepare that completes for an older number sends nothing.
 	hostPrepareSeq uint64
@@ -529,7 +498,7 @@ type worker struct {
 	convergedRevision    uint64
 	acceptedSetDigest    []byte
 	snapshotAcknowledged bool
-	environmentDigest    string
+	installationID    string
 	// The job lane uses the same reported-versus-pre-offer split as serving. jobsAvail is
 	// the effective number dispatch reads.
 	reportedJobs int
@@ -574,7 +543,7 @@ type worker struct {
 type remotePlacementObservation struct {
 	placementID         string
 	placementSetDigest  string
-	environmentDigest   string
+	installationID   string
 	materialization     pb.MaterializationState
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
@@ -645,11 +614,11 @@ func (w *worker) remoteDispatchable(placement DesiredPlacement, planID string) b
 		observed.dispatchablePlanIDs[planID]
 }
 
-func (w *worker) remoteStaged(packageName, planID, release, localRevision string,
+func (w *worker) remoteStaged(packageName, planID, release, installationID string,
 	models []ModelRef) bool {
 	placement, ok := w.remotePlacements[remotePlanKey(packageName, planID)]
 	if !ok || placement.Release != release ||
-		(localRevision != "" && placement.LocalRevisionDigest != localRevision) ||
+		(installationID != "" && placement.InstallationID != installationID) ||
 		!selectionServes(models, placement.Models) {
 		return false
 	}
@@ -690,13 +659,9 @@ func placementRow(setBytes []byte, digest, pkg, release, placementID string) (De
 			PlacementIDValue: row.Str("placement_id"), PlacementSetDigest: digest,
 			BindingsDigest:    row.Str("bindings_digest"),
 			PlacementSetBytes: append([]byte(nil), setBytes...),
-			EnvironmentDigest: row.Str("environment_digest")}
-		if development.Str("package") != "" {
-			placement.SourceDigest = development.Str("source_digest")
-			placement.LocalRevisionDigest = development.Str("local_revision_digest")
-		}
+			InstallationID: row.Str("installation_id")}
 		if placement.PlacementIDValue == "" || !validDigest(placement.BindingsDigest) ||
-			(placement.SourceDigest == "" && placement.EnvironmentDigest == "") {
+			placement.InstallationID == "" {
 			return DesiredPlacement{}, nil, false, exit.Named(exit.Structural,
 				"rental.placement_incomplete", "prepared placement for %s@%s is incomplete", pkg, release)
 		}
@@ -1234,9 +1199,7 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 					return WorkerLaunchSpec{}, "", problem
 				}
 			}
-			if ready && desired.SourceDigest == "" &&
-				(!validDigest(observed.environmentDigest) ||
-					observed.environmentDigest != desired.EnvironmentDigest) {
+			if ready && (observed.installationID == "" || observed.installationID != desired.InstallationID) {
 				c.mu.Unlock()
 				return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
 					"rental.invocation_identity_invalid",

@@ -7,7 +7,7 @@
 //   - THE SURFACE is an install-scoped package interface read once at install by THIS host's
 //     Runtime — a static reading of the source that imports nothing (cl-175) — and compared
 //     with the committed release. Reading it back costs microseconds; the recorded semantic
-//     digest is checked on every read.
+//     metadata is read without a content fingerprint admission gate.
 //   - THE PLACEMENT FACTS come from the exact PlacementSet retained at install. Runtime owns
 //     no local model-ref index, and cozy-creator never composes a TensorFS store path.
 //   - THE SELECTION is the request's own: the hub binding's rung for the machine, or a
@@ -50,7 +50,6 @@ type PackageInterface struct {
 	Application string          `json:"application"`
 	Entrypoints []Entrypoint    `json:"entrypoints"`
 	Jobs        []Entrypoint    `json:"jobs"`
-	Digest      string          `json:"-"`
 	Raw         json.RawMessage `json:"-"`
 }
 
@@ -73,15 +72,17 @@ type Entrypoint struct {
 }
 
 type Invocable struct {
-	Memoize      bool                       `json:"memoize"`
-	Capabilities []string                   `json:"capabilities"`
-	Context      string                     `json:"context"`
-	Module       string                     `json:"module"`
-	Export       string                     `json:"export"`
-	Parameters   []string                   `json:"parameters"`
-	Defaults     map[string]json.RawMessage `json:"defaults"`
-	TypeNames    map[string]string          `json:"type_names"`
-	EnumMembers  map[string]json.RawMessage `json:"enum_members"`
+	OperationIdentity            string                     `json:"operation_identity,omitempty"`
+	OperationIdentityUnavailable string                     `json:"operation_identity_unavailable,omitempty"`
+	Memoize                      bool                       `json:"memoize"`
+	Capabilities                 []string                   `json:"capabilities"`
+	Context                      string                     `json:"context"`
+	Module                       string                     `json:"module"`
+	Export                       string                     `json:"export"`
+	Parameters                   []string                   `json:"parameters"`
+	Defaults                     map[string]json.RawMessage `json:"defaults"`
+	TypeNames                    map[string]string          `json:"type_names"`
+	EnumMembers                  map[string]json.RawMessage `json:"enum_members"`
 }
 
 type WeightsOutput struct {
@@ -289,8 +290,22 @@ func validateClosedPackageInterface(data []byte) error {
 				return fmt.Errorf("internal must be a boolean")
 			}
 			if metadata := callable["invocable"]; metadata != nil {
-				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"memoize", "capabilities"}); err != nil {
+				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"memoize", "capabilities", "operation_identity", "operation_identity_unavailable"}); err != nil {
 					return err
+				}
+				var memo Invocable
+				if json.Unmarshal(metadata, &memo) != nil {
+					return fmt.Errorf("invalid invocable memo metadata")
+				}
+				if memo.OperationIdentity != "" || memo.OperationIdentityUnavailable != "" {
+					if !memo.Memoize || memo.OperationIdentity != "" && memo.OperationIdentityUnavailable != "" || len(memo.OperationIdentityUnavailable) > 512 {
+						return fmt.Errorf("operation memo identity requires memoize and one bounded identity or unavailable reason")
+					}
+					if memo.OperationIdentity != "" {
+						if _, err := canonical.Raw(memo.OperationIdentity); err != nil {
+							return fmt.Errorf("operation memo identity must be SHA-256")
+						}
+					}
 				}
 			}
 			for _, name := range []string{"request", "result"} {
@@ -644,7 +659,7 @@ func PackageInterfacePath(installDir string) string {
 }
 
 // ReadPackageInterface reads the stored package interface and joins it to the install record.
-func ReadPackageInterface(path, expectDigest string) (*PackageInterface, *exit.Error) {
+func ReadPackageInterface(path string) (*PackageInterface, *exit.Error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "package_interface_absent",
@@ -655,16 +670,11 @@ func ReadPackageInterface(path, expectDigest string) (*PackageInterface, *exit.E
 	if problem != nil {
 		return nil, problem
 	}
-	if expectDigest != "" && d.Digest != expectDigest {
-		return nil, exit.Named(exit.Conflict, "package_interface_stale",
-			"the stored package interface content digests to %s and this install recorded %s", d.Digest, expectDigest).
-			WithRemedy("the immutable install is corrupt; reinstall it from its original source")
-	}
 	return d, nil
 }
 
 // DecodePackageInterface reads the one closed package-interface/1 grammar and derives its canonical
-// semantic identity. Collection membership supplies callable kind; the document does not
+// interface facts. Collection membership supplies callable kind; the document does not
 // repeat it.
 func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 	if len(data) > canonical.DocMax {
@@ -712,11 +722,6 @@ func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 			return nil, problem
 		}
 	}
-	digest, err := canonical.Spell(canonical.Digest(normalized))
-	if err != nil {
-		return nil, exit.Internalf("cannot spell package interface digest: %s", err)
-	}
-	d.Digest = digest
 	d.Raw = normalized
 	return &d, nil
 }

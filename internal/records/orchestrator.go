@@ -40,9 +40,9 @@ CREATE TABLE IF NOT EXISTS requests (
   entrypoint   TEXT    NOT NULL,
   plan_id      TEXT    NOT NULL,
   package_release TEXT NOT NULL DEFAULT '',
-  local_package_digest TEXT NOT NULL DEFAULT '',
+  local_installation_id TEXT NOT NULL DEFAULT '',
   local_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
-  environment_digest TEXT NOT NULL DEFAULT '',
+  installation_id TEXT NOT NULL DEFAULT '',
   payload      BLOB    NOT NULL,
   outputs      TEXT    NOT NULL DEFAULT '',
   state        TEXT    NOT NULL,
@@ -463,11 +463,11 @@ type Request struct {
 	Entrypoint string
 	PlanID     string
 	Release    string
-	// LocalPackageDigest names Creator's sealed carrier set. UploadedBootID binds the
+	// LocalInstallationID names Creator's sealed carrier set. UploadedBootID binds the
 	// completed transfer to the exact pod generation that acknowledged every file.
-	LocalPackageDigest         string
+	LocalInstallationID        string
 	LocalPackageUploadedBootID string
-	EnvironmentDigest          string
+	InstallationID             string
 	Payload                    []byte
 	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
 	// because a REQUEUE re-derives the same grant shape without a client saying so again.
@@ -828,16 +828,16 @@ func Lanes(models []ModelRef) string {
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-	local_package_digest,local_package_uploaded_boot_id,
-	environment_digest,payload,outputs,
+	local_installation_id,local_package_uploaded_boot_id,
+	installation_id,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,capture,attention_kernel,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
 	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental`
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.Release, &r.LocalPackageDigest,
-		&r.LocalPackageUploadedBootID, &r.EnvironmentDigest, &r.Payload, &r.Outputs,
+		&r.Release, &r.LocalInstallationID,
+		&r.LocalPackageUploadedBootID, &r.InstallationID, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, &r.Capture, &r.AttentionKernel, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
@@ -973,13 +973,13 @@ func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
 
 // BindRemoteInvocation records the exact invocation identity learned from the worker
 // after logical package_set resolution. The client never supplies these values.
-func (s *Store) BindRemoteInvocation(id, planID, environment string) *exit.Error {
-	if id == "" || planID == "" || environment == "" {
+func (s *Store) BindRemoteInvocation(id, planID, installation string) *exit.Error {
+	if id == "" || planID == "" || installation == "" {
 		return exit.Internalf("cannot bind an incomplete remote invocation identity")
 	}
-	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,environment_digest=?
-		WHERE id=? AND (plan_id='' OR plan_id=?) AND environment_digest=''`,
-		planID, environment, id, planID)
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,installation_id=?
+		WHERE id=? AND (plan_id='' OR plan_id=?) AND installation_id=''`,
+		planID, installation, id, planID)
 	if err != nil {
 		return exit.Internalf("cannot bind request %s remote invocation: %s", id, err)
 	}
@@ -990,12 +990,12 @@ func (s *Store) BindRemoteInvocation(id, planID, environment string) *exit.Error
 	if changed == 1 {
 		return nil
 	}
-	var heldPlan, heldEnvironment string
-	if err := s.db.QueryRow(`SELECT plan_id,environment_digest FROM requests WHERE id=?`, id).Scan(
-		&heldPlan, &heldEnvironment); err != nil {
+	var heldPlan, heldInstallation string
+	if err := s.db.QueryRow(`SELECT plan_id,installation_id FROM requests WHERE id=?`, id).Scan(
+		&heldPlan, &heldInstallation); err != nil {
 		return exit.Internalf("cannot read request %s remote invocation binding: %s", id, err)
 	}
-	if heldPlan != planID || heldEnvironment != environment {
+	if heldPlan != planID || heldInstallation != installation {
 		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
 			"request %s already binds a different worker-derived invocation identity", id)
 	}
@@ -1011,7 +1011,7 @@ func (s *Store) MarkLocalPackageUploaded(id, digest, bootID string) *exit.Error 
 		return exit.Internalf("cannot record an incomplete local package upload")
 	}
 	result, err := s.db.Exec(`UPDATE requests SET local_package_uploaded_boot_id=?
-		WHERE id=? AND local_package_digest=?`, bootID, id, digest)
+		WHERE id=? AND local_installation_id=?`, bootID, id, digest)
 	if err != nil {
 		return exit.Internalf("cannot record request %s local package upload: %s", id, err)
 	}
@@ -1023,7 +1023,7 @@ func (s *Store) MarkLocalPackageUploaded(id, digest, bootID string) *exit.Error 
 		return nil
 	}
 	var heldDigest string
-	if err := s.db.QueryRow(`SELECT local_package_digest FROM requests WHERE id=?`, id).
+	if err := s.db.QueryRow(`SELECT local_installation_id FROM requests WHERE id=?`, id).
 		Scan(&heldDigest); err != nil {
 		return exit.Internalf("cannot read request %s local package upload: %s", id, err)
 	}
@@ -1265,48 +1265,23 @@ func (s *Store) Unsettled() ([]Request, *exit.Error) {
 	return out, nil
 }
 
-// LocalPackageInUse keeps one exact wheel revision while executable work or the current
-// editable declaration can still select it. Terminal request rows retain audit identity but no
-// bytes; an edited pin stops retaining the superseded source revision.
-func (s *Store) LocalPackageInUse(digest, packageName, release,
-	sourceDigest string,
-) (bool, *exit.Error) {
-	var used int
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM capture_pins WHERE revision_digest=?)`, digest).Scan(&used); err != nil {
-		return false, exit.Internalf("cannot read completed capture revision ownership: %s", err)
+// LocalInstallationInUse preserves inputs owned by accepted requests, bindings or pins.
+func (s *Store) LocalInstallationInUse(id string) (bool, *exit.Error) {
+	var used bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=?)
+		OR EXISTS(SELECT 1 FROM requests WHERE local_installation_id=? AND state IN (`+activeRequestStates+`))
+		OR EXISTS(SELECT 1 FROM pins WHERE install_id=?)`, id, id, id).Scan(&used)
+	if err != nil {
+		return false, exit.Internalf("cannot read installation ownership: %s", err)
 	}
-	if used != 0 {
-		return true, nil
-	}
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM private_child_bindings WHERE local_revision_digest=?)`, digest).Scan(&used); err != nil {
-		return false, exit.Internalf("cannot read child dependency revision ownership: %s", err)
-	}
-	if used != 0 {
-		return true, nil
-	}
-	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests
-		WHERE local_package_digest=?
-		  AND state IN (`+activeRequestStates+`))`, digest).
-		Scan(&used); err != nil {
-		return false, exit.Internalf("cannot read live local package ownership: %s", err)
-	}
-	if used != 0 {
-		return true, nil
-	}
-	if err := s.db.QueryRow(`SELECT EXISTS(
-		SELECT 1 FROM pins p JOIN installs i ON i.id=p.install_id
-		WHERE i.package=? AND i.version=? AND i.source_kind='local' AND i.source_digest=?)`,
-		packageName, release, sourceDigest).Scan(&used); err != nil {
-		return false, exit.Internalf("cannot read current editable local package ownership: %s", err)
-	}
-	return used != 0, nil
+	return used, nil
 }
 
 // CanceledLocalPackages are durable transfer tombstones owed to one attached worker. Replaying
 // them on every claimed session is idempotent and finishes cleanup after a daemon/stream crash.
 func (s *Store) CanceledLocalPackages(workerID string) ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT `+requestCols+` FROM requests
-		WHERE state='canceled' AND worker=? AND local_package_digest<>''
+		WHERE state='canceled' AND worker=? AND local_installation_id<>''
 		ORDER BY created_at,id`, workerID)
 	if err != nil {
 		return nil, exit.Internalf("cannot read canceled local package transfers: %s", err)
@@ -1499,15 +1474,15 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		machineRental = r.RequestedRental
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,package_release,local_package_digest,
-		local_package_uploaded_boot_id,environment_digest,
+		plan_id,package_release,local_installation_id,
+		local_package_uploaded_boot_id,installation_id,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
 		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
 		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
-		r.Release, r.LocalPackageDigest,
-		r.LocalPackageUploadedBootID, r.EnvironmentDigest, r.Payload,
+		r.Release, r.LocalInstallationID,
+		r.LocalPackageUploadedBootID, r.InstallationID, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.NeedsAccelerator, r.Org, r.Trees, r.Worker,
 		machineRental, r.Rental,
 		r.RentalRequired,

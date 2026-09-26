@@ -379,8 +379,7 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
 	}
 	retained, retainProblem := exactInvocationInstall(ctx, target)
-	if retainProblem != nil || retained.ID != installRow.ID ||
-		retained.SourceDigest != installRow.SourceDigest {
+	if retainProblem != nil || retained.ID != installRow.ID {
 		return nil, exit.Named(exit.Conflict, "package_install_changed",
 			"the selected package install disappeared or changed during model acquisition").
 			WithRemedy("retry against the current installed package")
@@ -2369,8 +2368,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
 				"Tensorhub returned an invalid package interface: %s", problem.Message)
 		}
-		if packageInterface.Digest != detail.Release.PackageInterfaceDigest ||
-			detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
+		if detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
 			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
 				"Tensorhub package interface does not match its committed digest or length")
 		}

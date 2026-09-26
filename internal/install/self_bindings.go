@@ -26,7 +26,7 @@ func CaptureSelfBindings(st *records.Store, inst records.PackageInstall, surface
 		return exit.Internalf("self binding capture needs one recorded install")
 	}
 	if surface == nil {
-		read, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(inst.Dir), inst.PackageInterface)
+		read, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(inst.Dir))
 		if problem != nil {
 			return problem
 		}
@@ -40,7 +40,6 @@ func CaptureSelfBindings(st *records.Store, inst records.PackageInstall, surface
 		}
 		bindings = append(bindings, records.ChildBinding{
 			ParentInstallID: inst.ID,
-			InterfaceDigest: surface.Digest,
 			Module:          entry.Invocable.Module,
 			Export:          entry.Invocable.Export,
 			ChildInstallID:  inst.ID,

@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"context"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -14,7 +13,7 @@ import (
 // A modeled child must not activate the intermediate code-only PlacementSet.
 // Prepare code, join its exact model inputs, then publish one complete placement
 // while retaining the CPU parent whose canonical invocation authorized this call.
-func (c *Orchestrator) prepareChildServing(instance string, req records.Request, revision localpackage.Revision) *exit.Error {
+func (c *Orchestrator) prepareChildServing(instance string, req records.Request, revision localpackage.Installation) *exit.Error {
 	_, current, problem := c.localControl(instance)
 	if problem != nil {
 		return problem
@@ -51,10 +50,6 @@ func (c *Orchestrator) prepareChildServing(instance string, req records.Request,
 		if problem != nil {
 			return problem
 		}
-		digest, err := canonical.Raw(revision.Digest)
-		if err != nil {
-			return exit.Internalf("child code revision is not canonical")
-		}
 		var downloadSet []byte
 		if models := downloadModelRefs(req.Models); len(models) > 0 {
 			if c.opt.RentalPackageSet == nil {
@@ -65,7 +60,7 @@ func (c *Orchestrator) prepareChildServing(instance string, req records.Request,
 				return problem
 			}
 		}
-		selected = &pb.DesiredPrivatePlacementSet{OperationId: req.ID, LocalRevisionDigest: digest, NativeModels: native, DownloadDelegation: downloadSet}
+		selected = &pb.DesiredPrivatePlacementSet{OperationId: req.ID, InstallationId: revision.ID, NativeModels: native, DownloadDelegation: downloadSet}
 	}
 	rev := c.nextRevision()
 	c.mu.Lock()

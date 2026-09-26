@@ -12,7 +12,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // Facts is everything one package install needs to be served, gathered once.
@@ -38,13 +37,7 @@ func (f *Facts) environmentPython() string {
 // EnvironmentPython preserves the ordinary venv layout and resolves only the
 // fixed builtin's independently prepared Runtime generation through bound metadata.
 func EnvironmentPython(inst records.PackageInstall) (string, *exit.Error) {
-	if inst.Package != "local/"+runtimeoperation.Name {
-		return home.VenvPython(filepath.Join(inst.Dir, "venv")), nil
-	}
-	if inst.SourceKind != "wheel" {
-		return "", exit.New(exit.Conflict, "Runtime builtin is not a captured metadata carrier")
-	}
-	return runtimeoperation.ReadEnvironment(inst.Dir, inst.LockDigest, inst.PackageInterface, inst.SourceDigest)
+	return home.VenvPython(filepath.Join(inst.Dir, "venv")), nil
 }
 
 // Read gathers an install's facts: where its source is, the surface it proved at install,
@@ -58,7 +51,7 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 		}
 	}
 	source := SourceDir(inst)
-	d, e := ReadPackageInterface(PackageInterfacePath(inst.Dir), inst.PackageInterface)
+	d, e := ReadPackageInterface(PackageInterfacePath(inst.Dir))
 	if e != nil {
 		return nil, e
 	}
@@ -72,11 +65,6 @@ func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *
 	environmentPython, e := EnvironmentPython(inst)
 	if e != nil {
 		return nil, e
-	}
-	if inst.Package == "local/"+runtimeoperation.Name {
-		if inst.SourceKind != "wheel" || d.Application != runtimeoperation.Application {
-			return nil, exit.New(exit.Conflict, "Runtime builtin install changed its fixed application")
-		}
 	}
 	return &Facts{
 		Install:          inst,

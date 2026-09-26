@@ -26,14 +26,13 @@ import (
 
 // EnvironmentReceipt is the environment record: exactly what produced this install's venv.
 type EnvironmentReceipt struct {
-	Python     string
-	UV         string
-	LockDigest string
-	Platform   string
-	Extra      string
-	Packages   int
-	Closure    string
-	Warnings   []string
+	Python   string
+	UV       string
+	Platform string
+	Extra    string
+	Packages int
+	Closure  string
+	Warnings []string
 }
 
 // MaterializeEnvironment is the ONE code-executing step, and it runs only after the source has
@@ -54,7 +53,7 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 
 func materializeEnvironment(sourceDir, venvDir string, editable bool) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
-	lockDigest, err := fileDigest(lock)
+	_, err := os.Stat(lock)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "lock_missing",
 			"the release carries no uv.lock at %s", lock).
@@ -66,9 +65,8 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 		return nil, problem
 	}
 	env := &EnvironmentReceipt{
-		LockDigest: "sha256:" + lockDigest,
-		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
-		UV:         toolVersion("uv", "--version"),
+		Platform: runtime.GOOS + "/" + runtime.GOARCH,
+		UV:       toolVersion("uv", "--version"),
 	}
 	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
 
@@ -114,7 +112,7 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	published *PublishedSource,
 ) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
-	lockDigest, err := fileDigest(lock)
+	_, err := os.Stat(lock)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "lock_missing",
 			"the published release carries no uv.lock").
@@ -128,9 +126,8 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 		return nil, problem
 	}
 	env := &EnvironmentReceipt{
-		LockDigest: "sha256:" + lockDigest,
-		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
-		UV:         toolVersion("uv", "--version"),
+		Platform: runtime.GOOS + "/" + runtime.GOARCH,
+		UV:       toolVersion("uv", "--version"),
 	}
 	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_python_incompatible",
 		"the package Python requirement cannot select an interpreter",

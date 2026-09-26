@@ -76,7 +76,7 @@ func (c *Orchestrator) PackageHolders(pkg string) ([]LocalHolder, []RentalHolder
 // request asks: the sealed revision crosses through PodHost, its models rebind, and the
 // worker's placement for the function is recorded so the next run finds it staged.
 func (c *Orchestrator) PrepareRentalRevision(rentalID, operationID string,
-	revision localpackage.Revision, logical LogicalPackage,
+	revision localpackage.Installation, logical LogicalPackage,
 ) (DesiredPlacement, *exit.Error) {
 	instance, _, _, problem := c.EnsureRental(rentalID)
 	if problem != nil {
@@ -92,7 +92,7 @@ func (c *Orchestrator) PrepareRentalRevision(rentalID, operationID string,
 				"private_placement_model_unpublished",
 				"private serving requires exact published model releases")
 		}
-		if problem := c.ConvergeUnpublishedPlacement(instance, operationID, revision.Digest,
+		if problem := c.ConvergeUnpublishedPlacement(instance, operationID, revision.ID,
 			models); problem != nil {
 			return DesiredPlacement{}, problem
 		}

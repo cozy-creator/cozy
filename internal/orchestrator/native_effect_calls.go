@@ -27,8 +27,7 @@ func (c *Orchestrator) onNativeEffect(s *session, parent records.Request, call *
 	refuse := func(problem *exit.Error) {
 		c.sendChildResult(s, call, "", pb.ChildCallState_CHILD_CALL_STATE_REFUSED, nil, problem)
 	}
-	iface, _ := canonical.Spell(call.InterfaceDigest)
-	if iface != publication.InterfaceDigest() || (call.Export != "upload_checkpoint" && call.Export != "publish_release" && call.Export != "attach_assessment") {
+	if call.Export != "upload_checkpoint" && call.Export != "publish_release" && call.Export != "attach_assessment" {
 		refuse(exit.New(exit.Validation, "publication effect differs from its fixed interface"))
 		return true
 	}

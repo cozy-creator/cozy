@@ -321,13 +321,8 @@ func (s *editableSync) settle(tree *editableTree) uint64 {
 			s.refused(tree.pkg, snapshot.Current.ID, problem)
 			return seen
 		}
-		if !snapshot.Changed() {
-			snapshot.Close()
-			s.settled(tree.pkg, snapshot)
-			return seen
-		}
-		fmt.Fprintf(s.log, "editable %s: source moved to %s (%d files, %d B); rebuilding install %s\n",
-			tree.pkg, digest12(snapshot.Digest), snapshot.Files, snapshot.Bytes, short12(snapshot.Current.ID))
+		fmt.Fprintf(s.log, "editable %s: syncing source (%d files, %d B) after install %s\n",
+			tree.pkg, snapshot.Files, snapshot.Bytes, short12(snapshot.Current.ID))
 		installID, changed, problem := s.resolver.RefreshSnapshot(snapshot)
 		snapshot.Close()
 		if problem != nil {
@@ -338,23 +333,6 @@ func (s *editableSync) settle(tree *editableTree) uint64 {
 			s.reprepare(tree.pkg, snapshot, installID)
 		}
 		return seen
-	}
-}
-
-// settled records that an unchanged tree matches its install when the last word on it was
-// a refusal: the edit that broke it was undone, and `cozy package list` should say so.
-func (s *editableSync) settled(pkg string, snapshot *EditableSnapshot) {
-	last, e := s.store.LastPackageEvent(pkg)
-	if e != nil || last == nil || last.Type != "package.refresh_failed" {
-		return
-	}
-	fmt.Fprintf(s.log, "editable %s: source is back at %s, install %s\n",
-		pkg, digest12(snapshot.Digest), short12(snapshot.Current.ID))
-	if e := s.store.AppendPackageEvent(pkg, "package.refreshed", map[string]any{
-		"install": snapshot.Current.ID, "source_digest": snapshot.Digest, "files": snapshot.Files,
-		"bytes": snapshot.Bytes, "workers": []string{},
-	}); e != nil {
-		fmt.Fprintf(s.log, "editable %s: cannot record the refresh: %s\n", pkg, e.Message)
 	}
 }
 
@@ -404,13 +382,13 @@ func (s *editableSync) reprepare(pkg string, snapshot *EditableSnapshot, install
 		workers = append(workers, s.reprepareRentals(pkg, installID, rentals)...)
 	}
 	if e := s.store.AppendPackageEvent(pkg, "package.refreshed", map[string]any{
-		"install": installID, "source_digest": snapshot.Digest, "files": snapshot.Files,
+		"install": installID, "files": snapshot.Files,
 		"bytes": snapshot.Bytes, "workers": workers,
 	}); e != nil {
 		fmt.Fprintf(s.log, "editable %s: cannot record the refresh: %s\n", pkg, e.Message)
 	}
-	fmt.Fprintf(s.log, "editable %s: install %s active at %s; %d worker(s) re-prepared\n",
-		pkg, short12(installID), digest12(snapshot.Digest), len(workers))
+	fmt.Fprintf(s.log, "editable %s: install %s active; %d worker(s) re-prepared\n",
+		pkg, short12(installID), len(workers))
 }
 
 func (s *editableSync) reprepareRentals(pkg, installID string, rentals []orchestrator.RentalHolder) []string {
@@ -423,7 +401,7 @@ func (s *editableSync) reprepareRentals(pkg, installID string, rentals []orchest
 		return nil
 	}
 	fmt.Fprintf(s.log, "editable %s: sealed revision %s (%d wheel(s)) for %d rental(s)\n",
-		pkg, digest12(revision.Digest), len(revision.Files), len(rentals))
+		pkg, digest12(revision.ID), len(revision.Files), len(rentals))
 	var workers []string
 	for _, rental := range rentals {
 		for _, held := range rental.Placements {
@@ -457,7 +435,7 @@ func (s *editableSync) reprepareRentals(pkg, installID string, rentals []orchest
 				continue
 			}
 			fmt.Fprintf(s.log, "editable %s: rental %s serves %s at revision %s (placement %s)\n",
-				pkg, rental.RentalID, function, digest12(revision.Digest), placement.PlacementIDValue)
+				pkg, rental.RentalID, function, digest12(revision.ID), placement.PlacementIDValue)
 			workers = append(workers, "rental/"+rental.RentalID+"/"+function)
 		}
 	}

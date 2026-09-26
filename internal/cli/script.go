@@ -69,16 +69,6 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 			writer.Unlock()
 		}
 	}()
-	reuse, problem := prepareCaptureReuse(ctx, pack, layout, store)
-	if problem != nil {
-		return Target{}, nil, problem
-	}
-	if existing, surface, problem := reuse.lookup(); problem != nil {
-		return Target{}, nil, problem
-	} else if existing != nil {
-		handedOff = true
-		return Target{Package: existing.Package, InstallID: existing.ID, Release: existing.Version, Snapshot: true, releaseCapture: writer.Unlock}, surface, nil
-	}
 	var intake *childIntake
 	var result *install.Result
 	problem = packagePublishStage(ctx, "Preparing local script environment", func() *exit.Error {
@@ -110,30 +100,30 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 		_, _ = install.Reclaim(layout, store, result.Install.ID)
 		return Target{}, nil, problem
 	}
-	if !ctx.Inv.Bool("--describe") {
-		if problem := reuse.complete(result.Install); problem != nil {
-			_, _ = install.Reclaim(layout, store, result.Install.ID)
-			return Target{}, nil, problem
-		}
-	}
 	handedOff = true
 	return Target{Package: result.Install.Package, InstallID: result.Install.ID,
 		Release: result.Install.Version, Snapshot: true, releaseCapture: writer.Unlock}, surface, nil
 }
 
 func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
+	_, store, writer, problem := open(ctx.Cfg, true)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	defer store.Close()
 	current, problem := exactInvocationInstall(ctx, target)
 	if problem != nil {
+		writer.Unlock()
 		return Target{}, nil, problem
 	}
-	pack, problem := packagepublish.PrepareLocalFrom(current.SourceRef)
+	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(current.Dir))
 	if problem != nil {
+		writer.Unlock()
 		return Target{}, nil, problem
 	}
-	defer pack.Close()
-	frozen, surface, problem := snapshotTarget(ctx, pack)
-	frozen.Function = target.Function
-	return frozen, surface, problem
+	target.Package, target.InstallID, target.Release = current.Package, current.ID, current.Version
+	target.Snapshot, target.releaseCapture = true, writer.Unlock
+	return target, surface, nil
 }
 
 func reclaimSnapshot(ctx *Context, target Target) {

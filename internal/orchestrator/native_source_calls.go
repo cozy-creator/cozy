@@ -1,7 +1,6 @@
 package orchestrator
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -53,7 +52,7 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 		refuse(exit.Named(exit.Conflict, "native.source_wire_unsupported", "native source operations require worker protocol 46"))
 		return true
 	}
-	if !bytes.Equal(call.InterfaceDigest, nativeinterface.SourceDigest()) || nativeSourceOperation(call.Export) == 0 {
+	if nativeSourceOperation(call.Export) == 0 {
 		refuse(exit.New(exit.Validation, "source call is not a fixed native interface"))
 		return true
 	}
@@ -151,7 +150,7 @@ func (c *Orchestrator) onNativeSourceStatus(s *session, status *pb.NativeSourceS
 	if row.IntentDigest != intent {
 		return
 	}
-	call := &pb.ChildCallRequest{ParentRequestId: parent.ID, ParentAttemptOrdinal: status.ParentAttemptOrdinal, ParentInvocationSpecDigest: status.ParentInvocationSpecDigest, CallIndex: status.CallIndex, InterfaceDigest: nativeinterface.SourceDigest(), Module: nativeinterface.SourceModule, Export: row.Operation, RequestCanonicalBytes: row.Request, IntentDigest: status.IntentDigest}
+	call := &pb.ChildCallRequest{ParentRequestId: parent.ID, ParentAttemptOrdinal: status.ParentAttemptOrdinal, ParentInvocationSpecDigest: status.ParentInvocationSpecDigest, CallIndex: status.CallIndex, Module: nativeinterface.SourceModule, Export: row.Operation, RequestCanonicalBytes: row.Request, IntentDigest: status.IntentDigest}
 	switch status.State {
 	case pb.NativeSourceState_NATIVE_SOURCE_STATE_RESOLVED:
 		var request struct {
@@ -231,7 +230,7 @@ func (c *Orchestrator) cancelNativeSource(s *session, call *pb.ChildCallCancel) 
 	}
 	_ = c.opt.Store.StopNativeCall(row.ID, "canceled", "native_source_stopped")
 	parent := &pb.ChildCallRequest{ParentRequestId: call.ParentRequestId, ParentAttemptOrdinal: call.ParentAttemptOrdinal, ParentInvocationSpecDigest: call.ParentInvocationSpecDigest,
-		CallIndex: call.CallIndex, InterfaceDigest: nativeinterface.SourceDigest(), Module: nativeinterface.SourceModule, Export: row.Operation, RequestCanonicalBytes: row.Request, IntentDigest: call.IntentDigest}
+		CallIndex: call.CallIndex, Module: nativeinterface.SourceModule, Export: row.Operation, RequestCanonicalBytes: row.Request, IntentDigest: call.IntentDigest}
 	c.sendNativeSource(s, parent, row.ID, pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_CANCEL, nil)
 	return true
 }

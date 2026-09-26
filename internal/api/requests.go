@@ -249,11 +249,11 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: installID, Release: release,
-		LocalPackageDigest: recorded.LocalPackageDigest,
-		Rental:             sub.Rental || sub.RentalRequired || sub.RequestedRental != "",
-		RentalRequired:     sub.RentalRequired || sub.RequestedRental != "",
-		RequestedRental:    sub.RequestedRental,
-		Models:             models, NeedsAccelerator: recorded.NeedsAccelerator,
+		LocalInstallationID: recorded.LocalInstallationID,
+		Rental:              sub.Rental || sub.RentalRequired || sub.RequestedRental != "",
+		RentalRequired:      sub.RentalRequired || sub.RequestedRental != "",
+		RequestedRental:     sub.RequestedRental,
+		Models:              models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
 		// Replays compare the caller's requested execution path with the original.
 		AttentionKernel: sub.AttentionKernel,
@@ -595,7 +595,7 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 	}
 	out.InstallID, out.PlanID = installID, planID
 	out.Release = revision.Release
-	out.LocalPackageDigest = revision.Digest
+	out.LocalInstallationID = revision.ID
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
 	}
@@ -630,7 +630,7 @@ func (s *Server) resolvePendingServing(ctx context.Context, sub Submission, out 
 		if problem != nil {
 			return out, problem
 		}
-		out.LocalPackageDigest = revision.Digest
+		out.LocalInstallationID = revision.ID
 	}
 	if len(out.Outputs) == 0 {
 		out.Outputs = launch.AssetPaths(entrypoint.Result)

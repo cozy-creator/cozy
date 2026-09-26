@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -42,10 +43,8 @@ import (
 type JobPlan struct {
 	Function     string
 	DescriptorID string
-	// BuildID is `build_id`: the BUILD this job plan record is written under, and the
-	// value `JobDirective.build_id` must name. See `JobBuildID` for why it is the
-	// preparing placement's own identity and never the PlacementSet digest.
-	BuildID string
+	// InstallationID names a retained installed resource, never package bytes.
+	InstallationID string
 	// Outputs are the job's declared asset result field paths — the output ids the
 	// publication grant names, one destination each. Grants mint off the DECLARATION.
 	Outputs []string
@@ -64,70 +63,38 @@ type JobPlan struct {
 
 const DefaultJobRSSCap int64 = 8 << 30
 
-// JobBuildID reads the BUILD a job plan record is staged under out of the prepared
-// PlacementSet document itself.
-//
-// IT IS NOT THE PlacementSet DIGEST. This owner UNITES the sets several packages
-// prepared into one document (`unitePreparedPlacementSets`), so the set digest a worker
-// would have to compare against is a value that worker cannot know while it is staging
-// its records — and a rented worker stages them itself, from
-// `package_prepare.py::_prepare_published`, before this owner has united anything. The
-// identity a preparation CAN name is its own placement's, and that is what the runtime
-// writes: `environment_digest` for a published preparation, and the complete
-// `local_revision_digest` for a transported private preparation. A source-local
-// development install instead has its project wheel or captured source digest.
-// This reads those existing identities from the document, so the local lane — which stages the record
-// here, in Go — writes the same value the remote lane's worker wrote for itself.
-func JobBuildID(setBytes []byte, pkg string) (string, *exit.Error) {
+// JobInstallationID reads Runtime's opaque installed resource handle.
+func JobInstallationID(setBytes []byte, pkg string) (string, *exit.Error) {
 	doc, err := canonical.Read(setBytes, &pb.PlacementSet{})
 	if err != nil {
-		return "", exit.Named(exit.Structural, "job_build_identity_unreadable",
-			"the prepared PlacementSet for %s is not its canonical document: %s", pkg, err)
+		return "", exit.New(exit.Structural, "prepared placement is not a canonical document: %s", err)
 	}
 	for _, row := range doc.List("placements") {
-		if development := row.Sub("development"); development.Str("package") == pkg {
-			id := development.Str("local_revision_digest")
-			if id == "" {
-				id = development.Sub("project_wheel").Sub("ref").Str("digest")
-			}
-			if id == "" {
-				// A local immutable source install has no transported project wheel.
-				// Its captured source closure is the build identity; the environment
-				// remains separately bound in the invocation and writer fingerprint.
-				id = development.Str("source_digest")
-			}
-			if id == "" {
-				return "", exit.Named(exit.Structural, "job_build_identity_missing",
-					"the development placement for %s names no project wheel", pkg)
-			}
-			return id, nil
-		}
-		if row.Sub("package").Str("package") != pkg {
+		if row.Sub("development").Str("package") != pkg && row.Sub("package").Str("package") != pkg {
 			continue
 		}
-		id := row.Str("environment_digest")
-		if id == "" {
-			return "", exit.Named(exit.Structural, "job_build_identity_missing",
-				"the prepared placement for %s names no environment identity", pkg)
+		id := row.Str("installation_id")
+		if !jobInstallationID.MatchString(id) {
+			return "", exit.New(exit.Structural, "prepared package has no bounded installation ID")
 		}
 		return id, nil
 	}
-	return "", exit.Named(exit.Structural, "job_build_identity_missing",
-		"the prepared PlacementSet carries no placement for %s", pkg)
+	return "", exit.New(exit.Structural, "prepared placement contains no installation for %s", pkg)
 }
+
+var jobInstallationID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$`)
 
 // stageJobPlans writes one job plan record per declared job into the worker's own home.
 // The file name is the descriptor id's hex, which is how the supervisor finds it.
 func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
 	for _, p := range plans {
-		for _, id := range []string{p.BuildID, p.DescriptorID} {
-			raw, err := canonical.Raw(id)
-			spelled, _ := canonical.Spell(raw)
-			if err != nil || spelled != id {
-				return exit.New(exit.Validation, "job plan path requires exact canonical build and descriptor digests")
-			}
+		if !jobInstallationID.MatchString(p.InstallationID) {
+			return exit.New(exit.Validation, "job plan needs a bounded installation ID")
 		}
-		dir := filepath.Join(workerHome, "job-plans", strings.TrimPrefix(p.BuildID, "sha256:"))
+		if _, err := canonical.Raw(p.DescriptorID); err != nil {
+			return exit.New(exit.Validation, "job plan descriptor identity is invalid")
+		}
+		dir := filepath.Join(workerHome, "job-plans", p.InstallationID)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return exit.Internalf("cannot create the job plan directory: %s", err)
 		}
@@ -171,10 +138,10 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker, replacement *Work
 		spec = *replacement
 	}
 	plan := spec.Placement.Jobs[0]
-	if plan.BuildID == "" {
+	if plan.InstallationID == "" {
 		c.mu.Unlock()
-		return exit.Named(exit.Structural, "job_build_identity_missing",
-			"job %s carries no build identity to name in its directive", plan.Function)
+		return exit.Named(exit.Structural, "job_installation_missing",
+			"job %s carries no installation ID to name in its directive", plan.Function)
 	}
 	rev := c.nextRevisionLocked()
 	// Publish the selection and its new readiness fence together. A concurrent
@@ -212,7 +179,7 @@ func jobDirectiveWithLimit(plan *JobPlan, outputLimit uint64) *pb.JobDirective {
 		return proto.Clone(plan.FrozenDirective).(*pb.JobDirective)
 	}
 	directive := &pb.JobDirective{
-		BuildId:         plan.BuildID,
+		InstallationId:  plan.InstallationID,
 		JobDescriptorId: plan.DescriptorID,
 		ResourceCaps: &pb.ResourceCaps{
 			DeviceRequired: gpuCountOf(plan) > 0,

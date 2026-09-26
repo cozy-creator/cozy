@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -13,26 +12,22 @@ const childRequestIndex = `CREATE UNIQUE INDEX IF NOT EXISTS requests_parent_cal
 const childBindingsDDL = `
 CREATE TABLE IF NOT EXISTS private_child_bindings (
  parent_install_id TEXT NOT NULL REFERENCES installs(id) ON DELETE CASCADE,
- interface_digest TEXT NOT NULL,
  module TEXT NOT NULL,
  export TEXT NOT NULL,
  child_install_id TEXT NOT NULL REFERENCES installs(id),
- local_revision_digest TEXT NOT NULL,
  entrypoint TEXT NOT NULL,
- PRIMARY KEY(parent_install_id,interface_digest,module,export)
+ PRIMARY KEY(parent_install_id,module,export)
 )`
 
 // ChildBinding is a frozen dependency fact belonging to a parent install. It is
 // written by intake, never supplied by executing package code or looked up by a
 // mutable package pin. The child install stays owned while this binding exists.
 type ChildBinding struct {
-	ParentInstallID     string
-	InterfaceDigest     string
-	Module              string
-	Export              string
-	ChildInstallID      string
-	LocalRevisionDigest string
-	Entrypoint          string
+	ParentInstallID string
+	Module          string
+	Export          string
+	ChildInstallID  string
+	Entrypoint      string
 }
 
 func (s *Store) HasChildBindings(parentInstall string) (bool, *exit.Error) {
@@ -44,7 +39,7 @@ func (s *Store) HasChildBindings(parentInstall string) (bool, *exit.Error) {
 }
 
 func (s *Store) ChildBindings(parentInstall string) ([]ChildBinding, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+childBindingCols+` FROM private_child_bindings WHERE parent_install_id=? ORDER BY interface_digest,module,export`, parentInstall)
+	rows, err := s.db.Query(`SELECT `+childBindingCols+` FROM private_child_bindings WHERE parent_install_id=? ORDER BY module,export`, parentInstall)
 	if err != nil {
 		return nil, exit.Internalf("cannot read frozen child dependencies: %s", err)
 	}
@@ -63,7 +58,7 @@ func (s *Store) ChildBindings(parentInstall string) ([]ChildBinding, *exit.Error
 	return out, nil
 }
 
-const childBindingCols = `parent_install_id,interface_digest,module,export,child_install_id,local_revision_digest,entrypoint`
+const childBindingCols = `parent_install_id,module,export,child_install_id,entrypoint`
 
 // SelfCallableEntrypoints names the install's own exports it captured as its own
 // children. Those entrypoints are the CALLEES of a composition, never its parent, so
@@ -106,12 +101,12 @@ func (s *Store) CompositionParent(installID, entrypoint string) (bool, *exit.Err
 
 func scanChildBinding(row interface{ Scan(...any) error }) (ChildBinding, error) {
 	var binding ChildBinding
-	err := row.Scan(&binding.ParentInstallID, &binding.InterfaceDigest, &binding.Module, &binding.Export, &binding.ChildInstallID, &binding.LocalRevisionDigest, &binding.Entrypoint)
+	err := row.Scan(&binding.ParentInstallID, &binding.Module, &binding.Export, &binding.ChildInstallID, &binding.Entrypoint)
 	return binding, err
 }
 
-func (s *Store) ChildBinding(parentInstall, interfaceDigest, module, export string) (*ChildBinding, *exit.Error) {
-	binding, err := scanChildBinding(s.db.QueryRow(`SELECT `+childBindingCols+` FROM private_child_bindings WHERE parent_install_id=? AND interface_digest=? AND module=? AND export=?`, parentInstall, interfaceDigest, module, export))
+func (s *Store) ChildBinding(parentInstall, module, export string) (*ChildBinding, *exit.Error) {
+	binding, err := scanChildBinding(s.db.QueryRow(`SELECT `+childBindingCols+` FROM private_child_bindings WHERE parent_install_id=? AND module=? AND export=?`, parentInstall, module, export))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -128,20 +123,13 @@ func (s *Store) RecordChildBindings(bindings []ChildBinding) *exit.Error {
 	}
 	defer tx.Rollback()
 	for _, binding := range bindings {
-		_, interfaceError := canonical.Raw(binding.InterfaceDigest)
-		revisionError := error(nil)
-		// A self binding names the parent's own install, so it carries no separate
-		// frozen revision: the calling request's own carrier set IS the child's.
-		if binding.LocalRevisionDigest != "" || binding.ChildInstallID != binding.ParentInstallID {
-			_, revisionError = canonical.Raw(binding.LocalRevisionDigest)
+		if binding.ParentInstallID == "" || binding.ChildInstallID == "" || binding.Module == "" || binding.Export == "" || binding.Entrypoint == "" {
+			return exit.New(exit.Validation, "child binding requires parent installation, export, child installation and entrypoint")
 		}
-		if binding.ParentInstallID == "" || binding.ChildInstallID == "" || binding.Module == "" || binding.Export == "" || binding.Entrypoint == "" || interfaceError != nil || revisionError != nil {
-			return exit.New(exit.Validation, "child binding requires exact parent, interface, export, child revision and entrypoint")
-		}
-		if _, err := tx.Exec(`INSERT INTO private_child_bindings(`+childBindingCols+`) VALUES(?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, binding.ParentInstallID, binding.InterfaceDigest, binding.Module, binding.Export, binding.ChildInstallID, binding.LocalRevisionDigest, binding.Entrypoint); err != nil {
+		if _, err := tx.Exec(`INSERT INTO private_child_bindings(`+childBindingCols+`) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING`, binding.ParentInstallID, binding.Module, binding.Export, binding.ChildInstallID, binding.Entrypoint); err != nil {
 			return exit.Internalf("cannot capture child dependency: %s", err)
 		}
-		held, err := scanChildBinding(tx.QueryRow(`SELECT `+childBindingCols+` FROM private_child_bindings WHERE parent_install_id=? AND interface_digest=? AND module=? AND export=?`, binding.ParentInstallID, binding.InterfaceDigest, binding.Module, binding.Export))
+		held, err := scanChildBinding(tx.QueryRow(`SELECT `+childBindingCols+` FROM private_child_bindings WHERE parent_install_id=? AND module=? AND export=?`, binding.ParentInstallID, binding.Module, binding.Export))
 		if err != nil {
 			return exit.Internalf("cannot verify captured child binding: %s", err)
 		}
