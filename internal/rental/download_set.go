@@ -58,7 +58,8 @@ func DownloadSet(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRe
 	for _, row := range models {
 		key := modelKey(row)
 		_, digestErr := canonical.Raw(row.GetManifest())
-		packageSelected := selectedPackages[row.GetPackage()]
+		standalone := len(packages) == 0 && row.GetPackage() == "" && row.GetSlot() == ""
+		packageSelected := standalone || selectedPackages[row.GetPackage()]
 		if len(packages) == 0 && row != nil {
 			if _, problem := hub.ParseRef(row.Package); problem == nil {
 				if modelOnlyPackage == "" {
@@ -70,7 +71,7 @@ func DownloadSet(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRe
 		if row == nil || strings.TrimSpace(row.Model) != row.Model || row.Model == "" ||
 			strings.TrimSpace(row.Release) != row.Release ||
 			strings.TrimSpace(row.Package) != row.Package || !packageSelected ||
-			strings.TrimSpace(row.Slot) != row.Slot || row.Slot == "" ||
+			strings.TrimSpace(row.Slot) != row.Slot || row.Slot == "" && !standalone ||
 			strings.TrimSpace(row.Lane) != row.Lane || (row.Release == "") != (row.Lane == "") ||
 			digestErr != nil || key <= prior {
 			return nil, exit.Named(exit.Validation, "rental.download_set_model_invalid",

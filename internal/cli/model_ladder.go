@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -28,6 +29,10 @@ import (
 func modelReleaseCard(ctx context.Context, c *hub.Client, ref hub.Ref, release string) (
 	hub.ModelCard, *hub.ModelReleaseSummary, *exit.Error,
 ) {
+	return modelReleaseCardForLane(ctx, c, ref, release, "")
+}
+
+func modelReleaseCardForLane(ctx context.Context, c *hub.Client, ref hub.Ref, release, lane string) (hub.ModelCard, *hub.ModelReleaseSummary, *exit.Error) {
 	card, problem := c.ModelCard(ctx, ref)
 	if problem != nil {
 		return card, nil, problem
@@ -37,9 +42,23 @@ func modelReleaseCard(ctx context.Context, c *hub.Client, ref hub.Ref, release s
 			"Tensorhub returned model %s while resolving %s", card.Model.Ref(), ref.String())
 	}
 	if release == "" {
+		var newest time.Time
 		for _, candidate := range card.Releases {
-			if !candidate.Yanked && candidate.YankedAt == "" && candidate.Release > release {
-				release = candidate.Release
+			if candidate.Yanked || candidate.YankedAt != "" {
+				continue
+			}
+			containsLane := lane == ""
+			for _, row := range candidate.Lanes {
+				if row.Lane == lane {
+					containsLane = true
+				}
+			}
+			if !containsLane {
+				continue
+			}
+			cut, _ := time.Parse(time.RFC3339Nano, candidate.CutAt)
+			if release == "" || cut.After(newest) || cut.Equal(newest) && candidate.Release > release {
+				release, newest = candidate.Release, cut
 			}
 		}
 	}

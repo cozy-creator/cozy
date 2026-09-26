@@ -555,7 +555,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 			ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
 			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}, nil
 	}
-	_, selected, problem := modelReleaseCard(hctx, client(ctx), ref, release)
+	_, selected, problem := modelReleaseCardForLane(hctx, client(ctx), ref, release, wantedLane)
 	if problem != nil {
 		return empty, problem
 	}
