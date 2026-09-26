@@ -88,9 +88,15 @@ cozy package search video
 cozy package search org/name
 cozy package install org/name
 cozy package install org/name --version 1.2.3
-cozy package install .
+cozy package install org/name --rental=kirukiru
+cozy package install . --editable
 cozy package list
 ```
+
+`--rental` installs published code and Python dependencies on that existing rental,
+without downloading model weights or changing the local package installation.
+Omit `--version` to select the newest published release. See
+[package and model preparation](docs/worker-preparation.md) for explicit model prewarming.
 
 An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) creates a
 local-only editable install after a bounded source scan. While the daemon runs it watches that
