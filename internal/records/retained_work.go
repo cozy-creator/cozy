@@ -38,6 +38,10 @@ func retainRetryTx(tx *sql.Tx, request *Request) *exit.Error {
 	if err != nil {
 		return exit.Internalf("cannot read retry predecessor: %s", err)
 	}
+	return retainRetryFrom(tx, request, prior)
+}
+
+func retainRetryFrom(tx retryReader, request *Request, prior Request) *exit.Error {
 	retainedResult := prior.RetainsLocalOutputs()
 	if prior.State == "succeeded" && !retainedResult {
 		if err := tx.QueryRow(retainedDescendantsSQL, prior.ID).Scan(&retainedResult); err != nil {

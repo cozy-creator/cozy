@@ -95,7 +95,23 @@ func watchRunStream(ctx *Context, client *localclient.Client, id string,
 		}
 	}()
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
-	terminal, problem := client.WatchContext(watchCtx, id, 0, lines.On)
+	var manualStop *localclient.Event
+	terminal, problem := client.WatchContext(watchCtx, id, 0, func(event localclient.Event) bool {
+		if event.Type == "request.blocked" {
+			state, problem := client.Request(id)
+			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.EventID) {
+				projected := publicFailureEvent(event)
+				lines.On(projected)
+				manualStop = &projected
+				return false
+			}
+			return true
+		}
+		return lines.On(event)
+	})
+	if terminal == nil {
+		terminal = manualStop
+	}
 	lines.Done()
 	wasDetached := false
 	select {

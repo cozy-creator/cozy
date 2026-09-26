@@ -355,7 +355,7 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 	base := "/v1/requests/" + row.ID
 	h := Handle{
-		Number: row.Number, RequestID: row.ID, Status: contractStatus(row.State), Attempt: attempt,
+		Number: row.Number, RequestID: row.ID, Status: s.publicStatusOf(row), Attempt: attempt,
 		StatusURL: base, ResponseURL: base, CancelURL: base + "/cancel",
 		EventsURL: base + "/events",
 	}
@@ -371,24 +371,16 @@ func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 // The two are deliberately not the same word list: the store records what happened to a
 // row, the contract says what a client should do next.
 func contractStatus(state string) string {
-	switch state {
-	case "submitted", "queued", "requeue_pending":
-		// `queued` is BOTH "never dispatched" and "an attempt ended and the orchestrator
-		// is minting the next ordinal". From a client's seat those are the same fact:
-		// work is owed and nothing has settled.
+	return records.PublicRunStatus(state, false)
+}
+
+func (s *Server) publicStatusOf(row records.Request) string {
+	status, problem := s.store.PublicRunState(row)
+	if problem != nil {
+		// A failed observation does not prove that an ambiguous submission stopped.
 		return "queued"
-	case "dispatching":
-		return "in_progress"
-	case "succeeded":
-		return "completed"
-	case "failed", "abandoned", "refused":
-		return "failed"
-	case "canceled":
-		return "canceled"
-	case "releasing":
-		return "canceling"
 	}
-	return state
+	return status
 }
 
 // resolvePlan turns the client's package/function into the orchestrator's Submission.
@@ -755,8 +747,11 @@ type Lifecycle struct {
 	ErrorType        string                               `json:"error_type,omitempty"`
 	// ErrorCode is the originating component's stable code (for example a pod's
 	// `insufficient_storage`) when the failure did not originate in Creator.
-	ErrorCode string `json:"error_code,omitempty"`
-	Error     string `json:"error,omitempty"`
+	ErrorCode      string `json:"error_code,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Retaining      bool   `json:"retaining,omitempty"`
+	RetryAvailable bool   `json:"retry_available,omitempty"`
+	StoppedEventID int64  `json:"stopped_event_id,omitempty"`
 	// CanceledBy is the recorded actor behind a canceled run (cl-108): the explicit
 	// `cozy run cancel`, a caller-authored --timeout, `cozy down --all` — never blank
 	// for a run this daemon canceled on request.
@@ -852,7 +847,7 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	life := s.lifecycleFacts(row)
-	if life.Error == "" && (life.Status == "failed" || life.Status == "blocked") {
+	if life.Error == "" && life.Status == "failed" {
 		if errType, errCode, errText, problem := s.store.SettledFailure(row.ID); problem == nil {
 			life.ErrorType, life.ErrorCode, life.Error = errType, errCode, errText
 		} else {
@@ -874,7 +869,8 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 			ExecutionMS: state.ExecutionMS,
 			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, Outputs: state.Outputs,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
-			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution}
+			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
+			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}
 		s.fillLifecycleProgress(&life, row)
 		return life
 	}
@@ -884,10 +880,15 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 	}
 	life := Lifecycle{
 		Number: row.Number, Kind: kind, RequestID: row.ID,
-		Status: contractStatus(row.State), Package: row.Package,
+		Status: s.publicStatusOf(row), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{}, Rental: row.Rental, RentalID: row.Worker,
+	}
+	life.Retaining, _ = s.store.RequestRetaining(row)
+	life.RetryAvailable = s.store.RetainedRetryAvailable(row)
+	if row.State == "blocked" && life.Status == "failed" {
+		life.StoppedEventID = s.store.StoppedEventID(row)
 	}
 	if row.RequestedRental != "" {
 		life.RequestedRental, life.RequestedMachine = row.RequestedRental, row.Machine
@@ -944,6 +945,9 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		}
 	}
 	terminalAt, _ := s.store.TerminalEventAt(row.ID)
+	if terminalAt == "" && life.StoppedEventID != 0 {
+		terminalAt = s.store.StoppedEventAt(row)
+	}
 	life.QueuedMS = queuedMS(row, attempts, terminalAt)
 	life.ExecutionMS = executionMS(row, attempts, terminalAt)
 	outs, _ := s.store.VisibleOutputs(row.ID)
@@ -1031,23 +1035,23 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 	switch strings.TrimSpace(r.URL.Query().Get("status")) {
 	case "", "any":
 	case "queued":
-		state = "submitted"
+		state = "queued"
 	case "in_progress":
-		state = "dispatching"
+		state = "in_progress"
 	case "completed":
-		state = "succeeded"
+		state = "completed"
 	case "failed":
 		state = "failed"
 	case "canceled":
 		state = "canceled"
-	case "paused", "pausing", "blocked", "canceling":
+	case "paused", "pausing", "canceling", "finalizing":
 		state = strings.TrimSpace(r.URL.Query().Get("status"))
 	default:
 		s.refuse(w, r, http.StatusBadRequest, "invalid_status",
 			"unknown status filter", "any | queued | in_progress | completed | failed | canceled")
 		return
 	}
-	rows, e := s.store.RequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), limit, before)
+	rows, e := s.store.PublicRequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), limit, before)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return

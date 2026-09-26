@@ -111,7 +111,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 		if frame, ok := s.orchestrator.LatestFrame(requestID); ok {
 			writeEvent(w, 0, liveEnvelope(frame))
 			flusher.Flush()
-		} else if row, problem := s.store.RequestRow(requestID); problem == nil && row != nil && contractStatus(row.State) == "queued" {
+		} else if row, problem := s.store.RequestRow(requestID); problem == nil && row != nil && s.publicStatusOf(*row) == "queued" {
 			if phase, ok := s.orchestrator.QueuePhase(requestID); ok {
 				writeEvent(w, 0, liveEnvelope(phase.Frame(requestID)))
 				flusher.Flush()

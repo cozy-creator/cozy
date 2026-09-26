@@ -181,6 +181,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 }
 
 func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Error {
+	state.Status = publicObservedStatus(state.Status)
 	reference := runReference(state.Number, state.JobID)
 	fields := []output.Field{
 		{K: "run", V: reference}, {K: "id", V: state.JobID},
@@ -227,9 +228,9 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 	if state.RetainWork {
 		if state.Status == "paused" {
 			rec.Next = append(rec.Next, "cozy run resume "+reference)
-		} else if state.Status == "blocked" && state.ErrorType != "request.state_lost" {
+		} else if state.Status == "failed" && state.RetryAvailable {
 			rec.Next = append(rec.Next, "cozy run <updated-script-or-package> --retry "+reference)
-		} else if state.Status != "pausing" {
+		} else if state.Status != "pausing" && !invocationSettled(state.Status) {
 			rec.Next = append(rec.Next, "cozy run pause "+reference)
 		}
 	}
@@ -429,8 +430,18 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
 	var stopped *localapi.Event
 	terminal, e := c.WatchContext(watchCtx, jobID, 0, func(event localapi.Event) bool {
+		if event.Type == "request.blocked" {
+			state, problem := c.Job(jobID)
+			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.EventID) {
+				projected := publicFailureEvent(event)
+				lines.On(projected)
+				stopped = &projected
+				return false
+			}
+			return true // historical stop or actively reconciling acceptance
+		}
 		keep := lines.On(event)
-		if event.Type == "request.paused" || event.Type == "request.blocked" {
+		if event.Type == "request.paused" {
 			// A resumed request may replay an older pause event. Stop only when
 			// its current state still matches the event being observed.
 			state, problem := c.Job(jobID)
@@ -463,6 +474,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 }
 
 func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event) *exit.Error {
+	state.Status = publicObservedStatus(state.Status)
 	if machine := state.MachineExecution; machine != nil && state.Status == "completed" && !machine.Collected {
 		return exit.Named(exit.Unavailable, "machine_execution.result_collection_pending", "run %s completed on its machine, but its result has not been collected: %s", state.JobID, machine.ObservationError)
 	}
@@ -547,7 +559,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		humanStatus = humanCancellationStatus(state.CanceledBy)
 	}
 	err := exit.Named(code, status, "job %s ended %s", state.JobID, humanStatus)
-	if status == "blocked" && state.ErrorType != "request.state_lost" {
+	if status == "failed" && state.RetryAvailable {
 		err.WithNext("cozy run <updated-script-or-package> --retry " + runReference(state.Number, state.JobID))
 	}
 	if state.Error != "" {
