@@ -63,12 +63,8 @@ func readActiveRequirements(ctx context.Context, input map[string]any) (Requirem
 	}
 	// Metadata is evaluated by a trusted tool interpreter; the target version
 	// stays in the input document and does not select or execute package code.
-	python, problem := hostruntime.EnsurePython(ctx, ">=3.12", "")
-	if problem != nil {
-		return result, problem
-	}
 	command := exec.CommandContext(ctx, "uv", "run", "--isolated", "--no-project", "--no-config",
-		"--python", python.Executable, "--no-python-downloads", "--with", "packaging==26.2", "python", "-I", "-c", activeRequirementsScript)
+		"--python", ">=3.12", "--no-python-downloads", "--with", "packaging==26.2", "python", "-I", "-c", activeRequirementsScript)
 	command.Env, command.Stdin = config.Frozen().Tool(), bytes.NewReader(raw) //cozy:stdin-value bounded metadata, never an interactive prompt
 	out, err := command.StdoutPipe()
 	if err != nil || command.Start() != nil {

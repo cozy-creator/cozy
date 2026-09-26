@@ -1451,14 +1451,14 @@ func (s *Store) Install(id string) (*PackageInstall, *exit.Error) {
 	return &inst, nil
 }
 
-// SourceEnvironments returns retained same-package candidates for capture-time
+// SourceEnvironments returns recorded same-package candidates for capture-time
 // metadata reuse. The installer still compares their frozen dependency inputs;
-// an install ID or version alone never makes an environment reusable.
+// an install ID or version alone never makes an environment reusable. Capture
+// holds the install writer, so GC cannot remove an unreferenced candidate while
+// its metadata is read. Completed/dry-run history need not keep a caller alive.
 func (s *Store) SourceEnvironments(pkg, version string) ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT `+installCols("i.")+` FROM installs i
-		WHERE i.package=? AND i.version=? AND i.source_kind='local' AND (
-		EXISTS(SELECT 1 FROM pins p WHERE p.install_id=i.id) OR
-		EXISTS(SELECT 1 FROM private_child_bindings b WHERE b.child_install_id=i.id AND b.parent_install_id<>i.id))
+		WHERE i.package=? AND i.version=? AND i.source_kind='local'
 		ORDER BY i.created_at DESC,i.id DESC`, pkg, version)
 	if err != nil {
 		return nil, exit.Internalf("cannot read retained source environments: %s", err)
