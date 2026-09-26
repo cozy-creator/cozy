@@ -649,7 +649,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				}
 				row := remotePlacementObservation{
 					placementID: p.PlacementId, placementSetDigest: spellOf(p.PlacementSetDigest),
-					environmentDigest: p.EnvironmentDigest,
+					installationID: p.InstallationId,
 					materialization:   p.Materialization, serving: p.Serving,
 					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
 					loadedPlanIDs: map[string]bool{},
@@ -702,7 +702,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			if status != nil {
 				w.placementID = status.PlacementId
 				w.materialization, w.serving = status.Materialization, status.Serving
-				w.environmentDigest = status.EnvironmentDigest
+				w.installationID = status.InstallationId
 				w.executorEpoch = status.ExecutorEpoch
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -710,7 +710,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			} else {
 				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
 				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
-				w.environmentDigest = ""
+				w.installationID = ""
 			}
 		} else {
 			for _, p := range r.Placements {
@@ -720,7 +720,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 			if status != nil {
 				w.materialization, w.serving = status.Materialization, status.Serving
-				w.environmentDigest = status.EnvironmentDigest
+				w.installationID = status.InstallationId
 				w.executorEpoch = status.ExecutorEpoch
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -740,7 +740,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				// dispatchable, which is exactly true.
 				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
 				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
-				w.environmentDigest = ""
+				w.installationID = ""
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable
@@ -1547,7 +1547,7 @@ func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
 			c.logf("request %s snapshot cleanup deferred: %s", req.ID, problem.Message)
 		}
 	}
-	if req.LocalPackageDigest == "" {
+	if req.LocalInstallationID == "" {
 		return
 	}
 	writer, problem := home.LockWriter(c.opt.Layout)
@@ -1558,8 +1558,8 @@ func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
 	defer writer.Unlock()
 	unlockLocal := localpackage.Guard()
 	defer unlockLocal()
-	if e := localpackage.DropDigestUnowned(c.opt.Layout, c.opt.Store,
-		req.LocalPackageDigest); e != nil {
+	if e := localpackage.DropUnowned(c.opt.Layout, c.opt.Store,
+		req.LocalInstallationID); e != nil {
 		c.logf("request %s local package cleanup deferred: %s", req.ID, e.Message)
 	}
 }
@@ -2083,7 +2083,7 @@ func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.F
 		return
 	}
 	if w.spec.Connection == nil || w.spec.Connection.RentalID == "" ||
-		w.spec.Placement.LocalRevisionDigest != "" ||
+		w.spec.Placement.InstallID != "" ||
 		len(w.desiredPackages) != 1 || w.defectReportedRevision == revision {
 		return
 	}
