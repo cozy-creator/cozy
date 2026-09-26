@@ -11,3 +11,7 @@ No identity comes from remote cache metadata or an untrusted request. The config
 Required remote qualification: successful write as the Store owner, credential restoration on success/error/unwind, a concurrent thread retaining its identity, non-root behavior, and actual cached Qwen objects appearing on Solitar followed by an origin-free read on a replacement Store. Do not claim the current implementation is proven before these checks and a native wheel build succeed.
 
 Sources: https://docs.rs/nix/0.31.3/nix/unistd/fn.setfsuid.html and https://man7.org/linux/man-pages/man2/setfsuid.2.html.
+
+## Qualification attempt
+
+Manual narrow GitHub run https://github.com/cozy-creator/tensorfs/actions/runs/36216925860 was rejected before starting any step on 2026-09-26: "The job was not started because an Actions budget is preventing further use." This provides no compilation or test evidence. The draft must remain unqualified until the job runs remotely or a coordinated CPU build slot is available on an already-active worker. No local CI fallback or live credential/permission changes were made.
