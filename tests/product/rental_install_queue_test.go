@@ -304,3 +304,74 @@ func TestRentalInstallSchema46MigrationPreservesRental(t *testing.T) {
 		t.Fatal(accepted)
 	}
 }
+
+func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
+	_, store := rentalInstallStore(t)
+	machine := rentalInstallMachine("converging")
+	rentalInstallCheck(t, store.RecordRental(machine))
+	entered := make(chan string, 4)
+	release := make(chan struct{})
+	var calls, active atomic.Int32
+	q := rental.NewInstallQueue(store, func(ctx context.Context, row records.RentalInstall) *exit.Error {
+		if active.Add(1) != 1 {
+			t.Error("one rental received concurrent installations")
+		}
+		defer active.Add(-1)
+		call := calls.Add(1)
+		entered <- row.Selection.Release
+		if call == 1 {
+			return exit.Unavailablef("control stream unavailable")
+		}
+		if call == 2 {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return exit.New(exit.Canceled, "disconnected")
+			}
+		}
+		return nil
+	}, io.Discard)
+	first, problem := q.Accept(machine.ID, records.RentalInstallSelection{Package: "proof/queued", Release: "1.0.0"})
+	rentalInstallCheck(t, problem)
+	second, problem := q.Accept(machine.ID, records.RentalInstallSelection{Package: "proof/queued", Release: "2.0.0"})
+	rentalInstallCheck(t, problem)
+	machine.State = "ready"
+	rentalInstallCheck(t, store.RecordRental(machine))
+	stop := runRentalInstallQueue(t, q)
+	defer stop()
+	select {
+	case got := <-entered:
+		if got != "1.0.0" {
+			t.Fatalf("dispatch order=%s", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first install did not start")
+	}
+	waitRentalInstall(t, store, first.ID, "queued")
+	select {
+	case got := <-entered:
+		t.Fatalf("transient failure spun or bypassed ordering: %s", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	q.Wake()
+	select {
+	case got := <-entered:
+		if got != "1.0.0" {
+			t.Fatalf("retry changed selection: %s", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconciler wake did not retry")
+	}
+	q.Wake()
+	select {
+	case got := <-entered:
+		t.Fatalf("second install bypassed active first install: %s", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	waitRentalInstall(t, store, first.ID, "succeeded")
+	waitRentalInstall(t, store, second.ID, "succeeded")
+	if calls.Load() != 3 {
+		t.Fatalf("prepare calls=%d", calls.Load())
+	}
+}

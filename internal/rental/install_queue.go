@@ -75,6 +75,9 @@ func (q *InstallQueue) Run(ctx context.Context) {
 			}
 			seen := map[string]bool{}
 			for _, row := range rows {
+				if ctx.Err() != nil {
+					break
+				}
 				machine, problem := q.store.RentalRow(row.RentalID)
 				if problem != nil {
 					q.report(problem)

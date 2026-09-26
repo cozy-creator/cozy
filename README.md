@@ -95,7 +95,8 @@ cozy package list
 
 `--rental` installs published code and Python dependencies on that existing rental,
 without downloading model weights or changing the local package installation.
-Omit `--version` to select the newest published release. See
+Omit `--version` to select the newest published release. Rental installs are queued
+durably while the worker boots; inspect them with `cozy rental installs kirukiru`. See
 [package and model preparation](docs/worker-preparation.md) for explicit model prewarming.
 
 An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) creates a

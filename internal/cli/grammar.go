@@ -441,24 +441,11 @@ type RentalCmd struct {
 	Installs  RentalInstallsCmd  `cmd:"" help:"Show queued package installs and model downloads on a rental."`
 	Keepalive RentalKeepaliveCmd `cmd:"" help:"Explicitly reset this rental's fixed 15-minute idle deadline once."`
 	Update    RentalUpdateCmd    `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
-	Prepare   RentalPrepareCmd   `cmd:"" help:"Install one exact package release and prepare its model inputs on a rental."`
 	SSHInfo   RentalSSHInfoCmd   `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List      RentalListCmd      `cmd:"" help:"List rented machines, live on a terminal."`
 	New       RentalNewCmd       `cmd:"" help:"Start a private rental, or list available machine types."`
 	End       RentalEndCmd       `cmd:"" help:"End a private rental and stop billing."`
 	Prune     RentalPruneCmd     `cmd:"" help:"Free unused cached operation results on a private rental."`
-}
-
-type RentalPrepareCmd struct {
-	Rental  string   `arg:"" name:"rental" predictor:"rental" help:"Existing rental machine name or id."`
-	Package string   `arg:"" name:"package" help:"Published package org/name."`
-	Version string   `help:"Exact package release, e.g. 1.2.3." required:""`
-	Models  []string `name:"model" help:"Exact model binding SLOT=org/model@release/lane; repeat for each slot."`
-}
-
-func (c *RentalPrepareCmd) Run(r *Runtime) error {
-	return r.call(handleRentalPrepare, []string{c.Rental, c.Package}, nil,
-		values("--version", c.Version, "--model", c.Models), false)
 }
 
 type RentalUpdateCmd struct {

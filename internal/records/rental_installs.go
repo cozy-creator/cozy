@@ -130,9 +130,11 @@ func (s *Store) RentalInstalls(rental string, activeOnly bool) ([]RentalInstall,
 	if activeOnly {
 		where += " AND state IN ('queued','installing')"
 	}
-	query := `SELECT ` + rentalInstallCols + ` FROM rental_installs WHERE ` + where + ` ORDER BY created_at,id`
-	if !activeOnly {
-		query += ` DESC LIMIT 200`
+	query := `SELECT ` + rentalInstallCols + ` FROM rental_installs WHERE ` + where
+	if activeOnly {
+		query += ` ORDER BY created_at,id`
+	} else {
+		query += ` ORDER BY created_at DESC,id DESC LIMIT 200`
 	}
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
