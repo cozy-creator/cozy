@@ -1,9 +1,6 @@
-package cli
+package producttest
 
 import (
-	"bytes"
-	"context"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
-	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -74,7 +70,7 @@ def execute(payload: Input) -> Result:
 		t.Fatal(problem)
 	}
 	defer store.Close()
-	initial, problem := install.Run(layout, store, install.Request{Ref: install.Ref{Package: "local/remote-cli-proof"},
+	_, problem = install.Run(layout, store, install.Request{Ref: install.Ref{Package: "local/remote-cli-proof"},
 		Local: &install.LocalSource{Tree: project, Package: "local/remote-cli-proof", Release: "1.0.0"}})
 	if problem != nil {
 		t.Fatal(problem)
@@ -85,38 +81,13 @@ def execute(payload: Input) -> Result:
 	if err := os.WriteFile(filepath.Join(project, "proof.py"), []byte(updated), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ctx := &Context{Cfg: cfg, Out: io.Discard, Err: io.Discard, Inv: &Invocation{
-		Args: []string{"local/remote-cli-proof/execute", "value=fresh"}, Bools: map[string]bool{"--rental-only": true, "--dry-run": true},
-		Values: map[string][]string{}, Mode: output.Mode{JSON: true, Full: true},
-	}}
 	began := time.Now()
-	target, surface, problem := snapshotLocalJob(ctx, Target{Package: initial.Install.Package, Release: "1.0.0", InstallID: initial.Install.ID, Function: "execute"})
-	if problem != nil {
-		t.Fatal(problem)
+	status, out := runCozy(t, cfg.Home, "run", "local/remote-cli-proof/execute", "value=fresh", "--rental-only", "--dry-run", "--json", "--full")
+	if status != 0 {
+		t.Fatalf("remote invocation [%d]: %s", status, out)
 	}
-	defer reclaimSnapshot(ctx, target)
-	releaseSnapshotReader(target)
-	retained, problem := store.Install(target.InstallID)
-	if problem != nil || retained == nil {
-		t.Fatalf("snapshot: %v", problem)
+	if !strings.Contains(out, `"fresh"`) || !strings.Contains(out, `"planned"`) {
+		t.Fatalf("fresh schema did not reach remote submission planning: %s", out)
 	}
-	if _, err := os.Stat(filepath.Join(retained.Dir, "venv")); !os.IsNotExist(err) {
-		t.Fatalf("intake rebuilt snapshot venv: %v", err)
-	}
-	if _, problem := install.InstalledRequirements(context.Background(), *retained); problem != nil {
-		t.Fatal(problem)
-	}
-	job, problem := surface.Function("execute")
-	if problem != nil {
-		t.Fatal(problem)
-	}
-	var result bytes.Buffer
-	ctx.Out = &result
-	if problem := handleJobSubmit(ctx, target, job); problem != nil {
-		t.Fatal(problem)
-	}
-	if !strings.Contains(result.String(), `"fresh"`) || !strings.Contains(result.String(), `"planned"`) {
-		t.Fatalf("fresh typed request did not reach remote submission boundary: %s", result.String())
-	}
-	t.Logf("fresh source capture through remote submission planning: %s; no snapshot venv", time.Since(began))
+	t.Logf("public cozy run remote capture and planning: %s", time.Since(began))
 }

@@ -386,6 +386,11 @@ func (m *managedRentals) attachedLocked(req records.Request, bySKU map[machineKe
 		}
 		c := orchestrator.PlacementCandidate{Rental: row.ID, Machine: row.MachineName, SKU: row.SKU,
 			GPUs: row.AcceleratorCount, RateUSDMicrosPerHour: row.HourlyRateUSDMicros}
+		if req.RentNew && row.ManagedRequestID != req.ID {
+			c.Verdict = orchestrator.VerdictExcluded + "fresh_rental_requested"
+			out = append(out, c)
+			continue
+		}
 		sku, offered := bySKU[machineKey{row.SKU, row.AcceleratorCount}]
 		if offered {
 			c.RateUSDMicrosPerHour = sku.PriceUSDMicrosPerHour + sku.StorageUSDMicrosPerHour

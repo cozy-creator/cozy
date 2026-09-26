@@ -166,7 +166,7 @@ func TestRemoteReleaseSharesSlotsOfOneConstruction(t *testing.T) {
 	var detail hub.PackageReleaseDetail
 	detail.PackageInterface = iface
 	detail.Release.Release = "1.0.0"
-	detail.Release.PackageInterfaceDigest = contract.Digest
+	detail.Release.PackageInterfaceDigest = assessmentDigest(contract.Raw)
 	detail.Release.PackageInterfaceLength = int64(len(iface))
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25", "torch<3,>=2.13"}
 	ladder := []hub.BindingRung{{GPU: "H100", Lane: "fp8-adaln-pruned"}, {GPU: "*", Lane: "bf16-full"}}
@@ -233,7 +233,7 @@ func TestRemoteReleaseSharesSlotsOfOneConstruction(t *testing.T) {
 		parsed, problem := launch.DecodePackageInterface(changed)
 		fatal(t, problem)
 		detail.PackageInterface = changed
-		detail.Release.PackageInterfaceDigest = parsed.Digest
+		detail.Release.PackageInterfaceDigest = assessmentDigest(parsed.Raw)
 		detail.Release.PackageInterfaceLength = int64(len(changed))
 	}
 	setInterface()
@@ -255,7 +255,7 @@ func TestRemoteReleaseSharesSlotsOfOneConstruction(t *testing.T) {
 	}
 	// Restore the original interface for the ladder/release mismatch arms.
 	detail.PackageInterface = iface
-	detail.Release.PackageInterfaceDigest = contract.Digest
+	detail.Release.PackageInterfaceDigest = assessmentDigest(contract.Raw)
 	detail.Release.PackageInterfaceLength = int64(len(iface))
 	bindings[1].Ladder = []hub.BindingRung{{GPU: "*", Lane: "bf16-full"}}
 	if got := shared(sharedFirst, unpinned); len(got) != 0 {

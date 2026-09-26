@@ -38,7 +38,7 @@ type Submission struct {
 	Release                  string // immutable remote package release; empty for local execution
 	// LocalInstallationID is the exact staged wheel-set identity for one editable rental.
 	LocalInstallationID string
-	Models             []ModelRef
+	Models              []ModelRef
 
 	// Payload is the request body, verbatim. It rides the DeliveryGrant as the input
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
@@ -95,6 +95,8 @@ type Submission struct {
 	// RentalRequired is the explicit development/E2E override that forbids local capacity.
 	// It implies Rental and survives queue/restart scheduling in the request row.
 	RentalRequired bool
+	// RentNew requires an acquisition owned by this request, never an existing fleet rental.
+	RentNew bool
 	// OutputDirectory is the caller's explicit --out; empty means the package's store.
 	// It is part of the submission's identity, where the derived intent below is not.
 	OutputDirectory string
@@ -185,6 +187,12 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 }
 
 func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
+	if s.RentNew {
+		if s.RequestedRental != "" || s.RetryOf != "" {
+			return records.Request{}, nil, exit.Usagef("a fresh rental cannot reuse a selected machine or retained run")
+		}
+		s.RentalRequired = true
+	}
 	if s.RequestedRental != "" {
 		if s.Worker != "" && s.Worker != s.RequestedRental {
 			return records.Request{}, nil, exit.New(exit.Conflict, "assigned rental differs from requested rental")
@@ -210,6 +218,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 			document := map[string]canonical.Value{
 				"payload": base64.StdEncoding.EncodeToString(s.Payload),
 				"rental":  true, "rental_required": s.RentalRequired,
+			}
+			if s.RentNew {
+				document["rent_new"] = true
 			}
 			if s.RequestedRental != "" {
 				document["requested_rental"] = s.RequestedRental
@@ -246,7 +257,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 				"a local package request requires its editable installation")
 		}
 		identity, err := canonical.Write(map[string]canonical.Value{
-			"body_digest":          bodyDigest,
+			"body_digest":           bodyDigest,
 			"local_installation_id": s.LocalInstallationID,
 		})
 		if err != nil {
@@ -274,15 +285,15 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		DeadlineUnixMS:           s.DeadlineUnixMS,
 		ID:                       id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
-		Release:            s.Release,
+		Release:             s.Release,
 		LocalInstallationID: s.LocalInstallationID,
-		Outputs:            strings.Join(s.Outputs, ","),
-		Assets:             s.Assets, WeightsOutputs: string(weightsBytes),
+		Outputs:             strings.Join(s.Outputs, ","),
+		Assets:              s.Assets, WeightsOutputs: string(weightsBytes),
 		Kind: s.Kind, RetainWork: s.RetainWork, ReleaseImplicitWork: s.ReleaseImplicitWork, RetryOf: s.RetryOf, ChildArtifacts: s.ChildArtifacts, NeedsAccelerator: s.NeedsAccelerator, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		RequestedRental: s.RequestedRental,
 		AttentionKernel: s.AttentionKernel,
 		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
-		RentalRequired: s.RentalRequired, Models: s.Models,
+		RentalRequired: s.RentalRequired, RentNew: s.RentNew, Models: s.Models,
 		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
 	}
 	event := map[string]any{
@@ -304,6 +315,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	if s.Rental {
 		event["rental"] = true
 		event["rental_required"] = s.RentalRequired
+		event["rent_new"] = s.RentNew
 		event["release"] = s.Release
 		if s.LocalInstallationID != "" {
 			event["local_installation_id"] = s.LocalInstallationID
@@ -1052,6 +1064,9 @@ func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return c
 // rental affinity already identifies an independent machine at this point.
 func requestSlot(req records.Request) string {
 	slot := pinnedPackage(req.Package, req.RequestedRental)
+	if req.RentNew {
+		slot += "/fresh/" + req.ID
+	}
 	if req.InstallID != "" {
 		slot += "/install/" + req.InstallID
 	}
@@ -1065,6 +1080,9 @@ func requestSlot(req records.Request) string {
 // that rental's pinned package name — capacity `drain` routes onto the moment its lane
 // has room, so the request waits unpinned. Callers hold c.mu.
 func (c *Orchestrator) rentalHeld(req records.Request) bool {
+	if req.RentNew && req.Worker == "" {
+		return false
+	}
 	for _, w := range c.workers {
 		if w.exited || w.stopping || !w.supportsCurrentProtocol() || w.spec.IsJob() != req.IsJob() ||
 			retirementGround(w) != "" || w.spec.Connection == nil {
@@ -1474,10 +1492,10 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		spec := WorkerLaunchSpec{Connection: remote.Connection, Devices: remote.Devices, Placement: DesiredPlacement{
 			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
 			InstallID: req.InstallID, Models: append([]ModelRef(nil), logical.Models...),
-			InstallationID: req.LocalInstallationID,
-			PlacementSetDigest:  preparedSet,
+			InstallationID:     req.LocalInstallationID,
+			PlacementSetDigest: preparedSet,
 			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
-				InstallationID:        buildID,
+				InstallationID: buildID,
 				Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
 				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap,
 				NeedsAccelerator: req.NeedsAccelerator}},
@@ -1760,11 +1778,11 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
 		// daemon was frozen with — a request cannot choose the environment it runs under.
-		InstallationId: installationID,
-		PayloadDigest:     payloadDigest,
-		Inputs:            inputBindings(req, payloadDigest),
-		Outputs:           invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
-		AttentionKernel:   req.AttentionKernel,
+		InstallationId:  installationID,
+		PayloadDigest:   payloadDigest,
+		Inputs:          inputBindings(req, payloadDigest),
+		Outputs:         invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
+		AttentionKernel: req.AttentionKernel,
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingDigest: req.PlanID,
 			BindingsDigest:          servingPlacement.BindingsDigest,
@@ -1782,7 +1800,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// request's scratch repo, which is why a queue-serving worker can hold one
 		// directive and still publish each attempt into its own place.
 		spec.Spec = &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{
-			InstallationId:         w.spec.Placement.Jobs[0].InstallationID,
+			InstallationId:  w.spec.Placement.Jobs[0].InstallationID,
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),

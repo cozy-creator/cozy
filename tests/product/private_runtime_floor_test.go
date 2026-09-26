@@ -138,7 +138,7 @@ async def main(ctx):
 	fatal(t, problem)
 	attempts, problem := store.Attempts(before.ID)
 	fatal(t, problem)
-	if after.Ordinal != before.Ordinal || len(attempts) != 1 || after.LocalPackageDigest != before.LocalPackageDigest || after.InstallID != before.InstallID || !after.RetainWork {
+	if after.Ordinal != before.Ordinal || len(attempts) != 1 || after.LocalInstallationID != before.LocalInstallationID || after.InstallID != before.InstallID || !after.RetainWork {
 		t.Fatalf("refusal changed immutable work: before=%+v after=%+v attempts=%d", before, after, len(attempts))
 	}
 	data, err := exec.Command("docker", "exec", host.Container, "cat", "/tmp/cozy-legacy-retained-work").Output()

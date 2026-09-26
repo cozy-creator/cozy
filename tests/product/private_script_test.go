@@ -107,7 +107,7 @@ def main(ctx):
 	}
 	second, problem := store.RequestByReference("2")
 	fatal(t, problem)
-	if second == nil || second.RetryOf != first.ID || second.ID == first.ID || second.LocalPackageDigest == first.LocalPackageDigest {
+	if second == nil || second.RetryOf != first.ID || second.ID == first.ID || second.LocalInstallationID == first.LocalInstallationID {
 		t.Fatalf("corrected run replaced original history: first=%+v second=%+v", first, second)
 	}
 	status, resumed := runCozy(t, root, "run", "resume", "1", "--json")

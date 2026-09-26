@@ -26,7 +26,7 @@ func observedAssessment(t *testing.T, observed bool) (*records.Store, string, as
 	parent, _, problem := store.SubmitChild(records.Request{ID: "observed-parent", IdemKey: "observed-parent", BodyDigest: childDigest("1"), Kind: "job", Package: "local/parent", Entrypoint: "main", InstallID: "assessment-owner", RetainWork: true, Payload: []byte(`{}`), ParentRequestID: outer.ID, ParentCallIndex: 0, ChildIntentDigest: childDigest("e"), ChildTargetDigest: childDigest("f"), ChildArtifacts: true, Outputs: "report,workloads"}, 1, childDigest("1"), "private-boot", nil)
 	fatal(t, problem)
 	parent = offerChildParent(t, store, parent)
-	binding := records.ChildBinding{ParentInstallID: parent.InstallID, ChildInstallID: "assessment-render", InterfaceDigest: childDigest("2"), Module: "fixture", Export: "render", Entrypoint: "render", LocalRevisionDigest: childDigest("3")}
+	binding := records.ChildBinding{ParentInstallID: parent.InstallID, ChildInstallID: "assessment-render", Module: "fixture", Export: "render", Entrypoint: "render"}
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{binding}))
 	artifacts := map[string]records.ModelArtifact{}
 	for index, name := range []string{"reference", "candidate"} {
@@ -58,10 +58,10 @@ func observedAssessment(t *testing.T, observed bool) (*records.Store, string, as
 		}
 		arguments := assessmentJSON(t, map[string]any{"prompt": "fixture", "seed": 8, "model": model})
 		capture := []byte(`{"components":["dit"],"steps":[0]}`)
-		intent := assessmentJSON(t, map[string]any{"interface_digest": binding.InterfaceDigest, "module": binding.Module, "export": binding.Export, "request": json.RawMessage(arguments), "capture": json.RawMessage(capture)})
-		request, _, problem := store.SubmitChild(records.Request{ID: "render-" + name, IdemKey: "render-" + name, BodyDigest: assessmentDigest(arguments), Package: "local/render", Entrypoint: binding.Entrypoint, InstallID: binding.ChildInstallID, Kind: "job", Payload: arguments, Capture: string(capture), Outputs: "image,runtime.capture", ChildArtifacts: true, Models: []records.ModelRef{{Slot: "model", Manifest: model.Manifest.Digest, ManifestLength: 100}}, ParentRequestID: parent.ID, ParentCallIndex: int64(index + 2), ChildIntentDigest: assessmentDigest(intent), ChildTargetDigest: binding.LocalRevisionDigest}, 1, childDigest("1"), "private-boot", nil)
+		intent := assessmentJSON(t, map[string]any{"module": binding.Module, "export": binding.Export, "request": json.RawMessage(arguments), "capture": json.RawMessage(capture)})
+		request, _, problem := store.SubmitChild(records.Request{ID: "render-" + name, IdemKey: "render-" + name, BodyDigest: assessmentDigest(arguments), Package: "local/render", Entrypoint: binding.Entrypoint, InstallID: binding.ChildInstallID, Kind: "job", Payload: arguments, Capture: string(capture), Outputs: "image,runtime.capture", ChildArtifacts: true, Models: []records.ModelRef{{Slot: "model", Manifest: model.Manifest.Digest, ManifestLength: 100}}, ParentRequestID: parent.ID, ParentCallIndex: int64(index + 2), ChildIntentDigest: assessmentDigest(intent), ChildTargetDigest: binding.ChildInstallID}, 1, childDigest("1"), "private-boot", nil)
 		fatal(t, problem)
-		spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(arguments), Inputs: []*pb.InputBinding{{InputId: "model:model", Digest: model.Manifest.Digest, Length: 100}}, Spec: &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{BuildId: binding.LocalRevisionDigest}}, Capture: &pb.ActivationCapture{Components: []string{"dit"}, Steps: []uint32{0}}})
+		spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(arguments), Inputs: []*pb.InputBinding{{InputId: "model:model", Digest: model.Manifest.Digest, Length: 100}}, Spec: &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{InstallationId: binding.ChildInstallID}}, Capture: &pb.ActivationCapture{Components: []string{"dit"}, Steps: []uint32{0}}})
 		ordinal, problem := store.Dispatch(records.Attempt{RequestID: request.ID, InstanceID: "private-worker", SessionID: "private-boot", InvocationDigest: assessmentDigest(spec), InvocationCanonical: spec})
 		fatal(t, problem)
 		fatal(t, store.OfferDispatch(request.ID, ordinal, "private-boot"))

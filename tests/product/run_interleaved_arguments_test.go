@@ -75,7 +75,7 @@ func interleavedAssetsRoot(t *testing.T, extra ...map[string]any) string {
 	var detail hub.PackageReleaseDetail
 	detail.PackageInterface = raw
 	detail.Release.Release = "1.0.0"
-	detail.Release.PackageInterfaceDigest = iface.Digest
+	detail.Release.PackageInterfaceDigest = assessmentDigest(iface.Raw)
 	detail.Release.PackageInterfaceLength = int64(len(raw))
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
 	mux := http.NewServeMux()

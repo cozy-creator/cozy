@@ -26,13 +26,13 @@ func TestUnpublishedJobPreparationDoesNotActivateServing(t *testing.T) {
 		Address: connection.Addr, CertPath: connection.CACert,
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	install := records.PackageInstall{ID: "inst-unpublished-job", Package: revision.Package, Major: 1, Version: revision.Release,
-		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"), SourceDigest: revision.SourceDigest,
+		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"),
 		Dir: filepath.Join(o.root, "installs", "job"), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, problem := o.store.Activate(install)
 	fatal(t, problem)
 	requestID, _, problem := o.c.Submit(orchestrator.Submission{
 		IdemKey: "unpublished-job", Package: revision.Package, Entrypoint: "prepare", PlanID: "sha256:" + strings.Repeat("34", 32),
-		Release: revision.Release, LocalPackageDigest: revision.Digest, Payload: []byte(`{"value":7}`),
+		Release: revision.Release, LocalInstallationID: revision.ID, Payload: []byte(`{"value":7}`),
 		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true, Kind: "job", RetainWork: true,
 	})
 	fatal(t, problem)

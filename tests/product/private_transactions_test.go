@@ -243,9 +243,9 @@ func recordPrivateTransaction(t *testing.T, store *records.Store, label, rentalI
 		BodyDigest: "sha256:" + strings.Repeat("a", 64),
 		Package:    "local/private-proof", Entrypoint: "prepare", Kind: "job", Org: "local",
 		Release: "1.0.0", PlanID: "sha256:" + strings.Repeat("b", 64),
-		LocalPackageDigest: "sha256:" + strings.Repeat("c", 64),
-		Payload:            []byte(`{"source_revision":"frozen","seed":17,"quality_bar":0.95}`),
-		Worker:             rentalID, Rental: rentalID != "", RentalRequired: rentalID != "",
+		LocalInstallationID: "sha256:" + strings.Repeat("c", 64),
+		Payload:             []byte(`{"source_revision":"frozen","seed":17,"quality_bar":0.95}`),
+		Worker:              rentalID, Rental: rentalID != "", RentalRequired: rentalID != "",
 		RetainWork: true,
 	}
 	_, fresh, problem := store.Submit(request)
@@ -265,8 +265,8 @@ func assertPrivateTransactionIdentity(t *testing.T, store *records.Store, before
 	if after == nil || after.State != state || after.ID != before.ID || after.Number != before.Number ||
 		after.IdemKey != before.IdemKey || after.BodyDigest != before.BodyDigest || after.CreatedAt != before.CreatedAt ||
 		after.Package != before.Package || after.Entrypoint != before.Entrypoint || after.Release != before.Release ||
-		after.PlanID != before.PlanID || after.LocalPackageDigest != before.LocalPackageDigest ||
-		after.EnvironmentDigest != before.EnvironmentDigest || !bytes.Equal(after.Payload, before.Payload) ||
+		after.PlanID != before.PlanID || after.LocalInstallationID != before.LocalInstallationID ||
+		after.InstallationID != before.InstallationID || !bytes.Equal(after.Payload, before.Payload) ||
 		!after.RetainWork || after.Worker != before.Worker || after.Ordinal != before.Ordinal {
 		t.Fatalf("transaction identity or state changed: before=%+v after=%+v want-state=%s", before, after, state)
 	}

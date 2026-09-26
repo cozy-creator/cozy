@@ -36,6 +36,9 @@ exit 96
 	iface := []byte(`{"application":"q:app","entrypoints":[{"models":[{"class":"Source","component_use":{},"path":"generate.models.source"}],"name":"generate","request":{"fields":[]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
 	parsed, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
+	if len(parsed.Raw) == 0 {
+		t.Fatal("fixture lost its canonical interface")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/packages/proof/quiet/bindings", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"bindings":[]}`))
@@ -58,7 +61,7 @@ exit 96
 	must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	_, problem = store.Activate(records.PackageInstall{ID: "quiet-install", Package: "proof/quiet", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, PackageInterface: parsed.Digest, SourceDigest: "sha256:" + strings.Repeat("4", 64), Platform: "linux-x86"})
+	_, problem = store.Activate(records.PackageInstall{ID: "quiet-install", Package: "proof/quiet", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, Platform: "linux-x86"})
 	fatal(t, problem)
 	store.Close()
 	for _, structured := range []bool{false, true} {

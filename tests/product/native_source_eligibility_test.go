@@ -26,7 +26,7 @@ func TestNativeDownloadsCannotHideResolutionInsideMemoizedParents(t *testing.T) 
 		}
 		raw, err := canonical.NormalizeJCS([]byte(text))
 		must(t, err)
-		install.PackageInterface, _ = canonical.Spell(canonical.Digest(raw))
+
 		must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(install.Dir)), 0o700))
 		must(t, os.WriteFile(launch.PackageInterfacePath(install.Dir), raw, 0o444))
 		fatal(t, store.RecordInstall(install))

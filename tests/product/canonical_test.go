@@ -272,8 +272,8 @@ func TestPackageInterface(t *testing.T) {
 	must(t, err)
 	doc, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
-	if doc.Digest != want {
-		t.Fatalf("package-interface identity %s != %s", doc.Digest, want)
+	if assessmentDigest(doc.Raw) != want {
+		t.Fatalf("package-interface identity %s != %s", assessmentDigest(doc.Raw), want)
 	}
 	if len(doc.Entrypoints) != 1 || doc.Entrypoints[0].Kind != "entrypoint" {
 		t.Fatalf("entrypoint kind is not inferred from collection membership: %+v", doc.Entrypoints)
@@ -295,12 +295,12 @@ func TestPackageInterface(t *testing.T) {
 		[]byte(`{"jobs":[],"format":"cozy.package.interface/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"type":"float","name":"strength","constraints":{"gt":0}},{"type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run"}],"application":"probe:app"}`),
 	} {
 		got, problem := launch.DecodePackageInterface(same)
-		if problem != nil || got.Digest != want || !bytes.Equal(got.Raw, raw) {
+		if problem != nil || assessmentDigest(got.Raw) != want || !bytes.Equal(got.Raw, raw) {
 			t.Errorf("a spelling change moved package-interface identity: %v", problem)
 		}
 	}
 	changed := bytes.Replace(raw, []byte(`"name":"run"`), []byte(`"name":"other"`), 1)
-	if got, problem := launch.DecodePackageInterface(changed); problem != nil || got.Digest == want {
+	if got, problem := launch.DecodePackageInterface(changed); problem != nil || assessmentDigest(got.Raw) == want {
 		t.Error("a meaning change did not move package-interface identity")
 	}
 	for name, planted := range map[string][]byte{

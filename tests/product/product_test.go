@@ -387,7 +387,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("edited body was not live on the next invocation [exit %d]\n%s", code, out)
 	}
 	second := activePackageInstall(t, root)
-	if second.ID == first.ID || second.SourceDigest == first.SourceDigest {
+	if second.ID == first.ID || second.Dir == first.Dir {
 		t.Fatalf("body edit did not advance the editable install: %#v -> %#v", first, second)
 	}
 
@@ -405,7 +405,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("metadata/lock refresh did not remain runnable [exit %d]\n%s", code, out)
 	}
 	third := activePackageInstall(t, root)
-	if third.ID == second.ID || third.LockDigest == second.LockDigest {
+	if third.ID == second.ID || third.Dir == second.Dir {
 		t.Fatalf("metadata/lock edit did not atomically refresh the environment: %#v -> %#v", second, third)
 	}
 
@@ -418,7 +418,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("failed edit did not return the typed refresh refusal [exit %d]\n%s", code, out)
 	}
 	failed := activePackageInstall(t, root)
-	if failed.ID != third.ID || failed.SourceDigest != third.SourceDigest {
+	if failed.ID != third.ID || failed.Dir != third.Dir {
 		t.Fatalf("failed refresh displaced the last good install: %#v -> %#v", third, failed)
 	}
 	must(t, os.WriteFile(pyproject, goodMetadata, 0o644))

@@ -49,7 +49,7 @@ func TestInternalCallablesAreAbsentFromCLIAndRefuseDirectRun(t *testing.T) {
 	var detail hub.PackageReleaseDetail
 	detail.PackageInterface = surface.Raw
 	detail.Release.Release = "1.0.0"
-	detail.Release.PackageInterfaceDigest = surface.Digest
+	detail.Release.PackageInterfaceDigest = assessmentDigest(surface.Raw)
 	detail.Release.PackageInterfaceLength = int64(len(surface.Raw))
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
 	mux := http.NewServeMux()

@@ -28,7 +28,7 @@ func TestRentalEndPreservesCompletedNativeResultHistory(t *testing.T) {
 		t.Helper()
 		request, _, problem := store.Submit(records.Request{ID: id, IdemKey: id,
 			BodyDigest: childDigest("3"), Package: "local/native", Entrypoint: "main", Kind: "job",
-			Org: "local", PlanID: childDigest("4"), LocalPackageDigest: childDigest("5"), Payload: []byte(`{}`),
+			Org: "local", PlanID: childDigest("4"), LocalInstallationID: childDigest("5"), Payload: []byte(`{}`),
 			Worker: rental, Rental: true, RetainWork: true, ChildArtifacts: true})
 		fatal(t, problem)
 		request = offerChildParent(t, store, request)

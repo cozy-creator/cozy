@@ -37,7 +37,7 @@ func TestProducerAssessmentBindsRetainedInvocationResultAndReceipt(t *testing.T)
 		{"candidate", func(i *assessment.Inspection) { i.Subject.Candidate = "sha256:" + strings.Repeat("9", 64) }},
 		{"reference", func(i *assessment.Inspection) { i.Subject.Reference = "sha256:" + strings.Repeat("9", 64) }},
 		{"invocation", func(i *assessment.Inspection) { i.Subject.Invocation = "sha256:" + strings.Repeat("9", 64) }},
-		{"build", func(i *assessment.Inspection) { i.Subject.Build = "sha256:" + strings.Repeat("9", 64) }},
+		{"installation", func(i *assessment.Inspection) { i.Subject.Installation = "other-installation" }},
 		{"receipt", func(i *assessment.Inspection) { i.Subject.Receipt = "sha256:" + strings.Repeat("9", 64) }},
 		{"wrong output", func(i *assessment.Inspection) { i.OutputSlot = "other" }},
 		{"false weights", func(i *assessment.Inspection) {

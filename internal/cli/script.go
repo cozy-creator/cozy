@@ -86,7 +86,7 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*recor
 	pack = frozen
 	var intake *childIntake
 	var result *install.Result
-	problem = packagePublishStage(ctx, "Capturing invocation source and dependencies", func() *exit.Error {
+	problem = packagePublishStage(ctx, "Capturing local package and dependencies", func() *exit.Error {
 		var problem *exit.Error
 		intake, problem = prepareChildIntake(ctx, pack, layout, store, remote...)
 		if problem != nil {

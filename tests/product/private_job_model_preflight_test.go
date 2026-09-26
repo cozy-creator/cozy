@@ -50,14 +50,14 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 				doc["jobs"] = []any{call}
 			}
 			raw := assessmentJSON(t, doc)
-			child.PackageInterface = assessmentDigest(raw)
+
 			must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(child.Dir)), 0o700))
 			must(t, os.WriteFile(launch.PackageInterfacePath(child.Dir), raw, 0o444))
 			fatal(t, store.RecordInstall(parent))
 			fatal(t, store.RecordInstall(child))
 			fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: parent.ID,
-				ChildInstallID: child.ID, InterfaceDigest: child.PackageInterface, LocalRevisionDigest: childDigest("b"),
-				Module: "private_ops", Export: "compute", Entrypoint: "compute"}}))
+				ChildInstallID: child.ID,
+				Module:         "private_ops", Export: "compute", Entrypoint: "compute"}}))
 			resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.server.URL, HubToken: secret.New("ladder-test")}, nil)
 			models, problem := resolver.UnpublishedChildModels(records.Request{InstallID: parent.ID, Kind: "job"})
 			switch mode {
@@ -95,12 +95,12 @@ func TestInvokedCapturedEntrypointStillRequiresItsActualModel(t *testing.T) {
 		"jobs": []any{map[string]any{"name": "parent", "publishes": false, "models": []any{},
 			"request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}}, "weights_outputs": []any{}}},
 	})
-	installed.PackageInterface = assessmentDigest(raw)
+
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0o700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), raw, 0o444))
 	fatal(t, store.RecordInstall(installed))
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID, ChildInstallID: installed.ID,
-		InterfaceDigest: installed.PackageInterface, Module: "captured", Export: "judge", Entrypoint: "judge"}}))
+		Module: "captured", Export: "judge", Entrypoint: "judge"}}))
 	resolver := cli.NewResolver(store, config.Config{Home: layout.Root}, nil)
 	parent := records.Request{ID: "parent", InstallID: installed.ID, Entrypoint: "parent", Kind: "job"}
 	models, problem := resolver.UnpublishedChildModels(parent)
@@ -108,7 +108,7 @@ func TestInvokedCapturedEntrypointStillRequiresItsActualModel(t *testing.T) {
 	if len(models) != 0 {
 		t.Fatal("preflight invented a model")
 	}
-	_, _, problem = resolver.ResolveUnpublishedChild(parent, installed.PackageInterface, "captured", "judge",
+	_, _, problem = resolver.ResolveUnpublishedChild(parent, "captured", "judge",
 		assessmentJSON(t, map[string]any{"payload": map[string]any{}, "models": map[string]any{"model": nil}}))
 	if problem == nil || problem.ErrName() != "child.model_unbound" {
 		t.Fatal("invoking an unbound entrypoint bypassed actual model admission", problem)

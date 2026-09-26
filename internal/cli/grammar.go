@@ -352,6 +352,7 @@ type RunExecuteCmd struct {
 	LoRAs           []string `name:"lora" sep:"none" help:"Apply an ordered LoRA as model-parameter:component=reference[,strength] (repeatable)."`
 	AttentionKernel string   `name:"attention-kernel" help:"Development override for this request: backend (all sites) or [model/]component=backend. Example: model/fl2va_dit=kitchen-int8. No fallback; Runtime validates hardware, compiled mode and parallelism."`
 	Rental          *string  `predictor:"rental" help:"Run only on this existing rental name or id; never buy a replacement."`
+	RentNew         bool     `help:"Buy a fresh managed rental for this run; do not reuse existing machines."`
 	RentalOnly      bool     `help:"Require a remote rental even when local capacity is ready."`
 	IdempotencyKey  string   `help:"Stable request identity for safe retries."`
 	Retry           string   `help:"Retry with current code while retaining compatible work from this prior run."`
@@ -373,7 +374,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
 		"--await", c.Await,
-		"--rental-only", c.RentalOnly, "--describe", c.Describe, "--dry-run", c.DryRun), values(
+		"--rental-only", c.RentalOnly, "--rent-new", c.RentNew, "--describe", c.Describe, "--dry-run", c.DryRun), values(
 		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,

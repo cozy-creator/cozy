@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -67,7 +68,7 @@ func retainedRenderBindings(t *testing.T, serving, wrongModel bool) {
 		assessmentRecord(t, st.RecordInstall(records.PackageInstall{ID: id, Package: "local/" + id, Version: "1.0.0", SourceKind: "local"}))
 	}
 	revision := "sha256:" + strings.Repeat("a", 64)
-	binding := records.ChildBinding{ParentInstallID: "parent-install", ChildInstallID: "render-install", InterfaceDigest: "sha256:" + strings.Repeat("b", 64), Module: "proof", Export: "render", Entrypoint: "render", LocalRevisionDigest: revision}
+	binding := records.ChildBinding{ParentInstallID: "parent-install", ChildInstallID: "render-install", Module: "proof", Export: "render", Entrypoint: "render"}
 	assessmentRecord(t, st.RecordChildBindings([]records.ChildBinding{binding}))
 	parent, _, problem := st.Submit(records.Request{ID: "parent", IdemKey: "parent", BodyDigest: assessmentDigest([]byte("parent")), Kind: "job", Package: "local/parent", Entrypoint: "main", InstallID: "parent-install", RetainWork: true, Payload: []byte(`{}`)})
 	assessmentRecord(t, problem)
@@ -95,10 +96,10 @@ func retainedRenderBindings(t *testing.T, serving, wrongModel bool) {
 			kind = "serving"
 			arguments = assessmentJSON(t, map[string]any{"payload": json.RawMessage(payload), "models": map[string]any{"model": map[string]any{"producer_request_id": "producer", "output_slot": "model", "manifest": map[string]any{"digest": checkpoint, "length": 1}}}})
 		}
-		intent := assessmentJSON(t, map[string]any{"interface_digest": binding.InterfaceDigest, "module": binding.Module, "export": binding.Export, "request": json.RawMessage(arguments)})
+		intent := assessmentJSON(t, map[string]any{"module": binding.Module, "export": binding.Export, "request": json.RawMessage(arguments)})
 		request, _, problem := st.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: assessmentDigest([]byte(id)), Kind: kind, Package: "local/render-install", Entrypoint: "render", InstallID: binding.ChildInstallID, RetainWork: true, ParentRequestID: parent.ID, ParentCallIndex: int64(i), ChildIntentDigest: assessmentDigest(intent), ChildTargetDigest: revision, Payload: payload, Models: []records.ModelRef{{Slot: "model", Manifest: checkpoint, ManifestLength: 1}}})
 		assessmentRecord(t, problem)
-		spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(payload), Inputs: []*pb.InputBinding{{InputId: "model:model", Digest: checkpoint, Length: 1}}, Spec: &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{BuildId: revision}}})
+		spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(payload), Inputs: []*pb.InputBinding{{InputId: "model:model", Digest: checkpoint, Length: 1}}, Spec: &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{InstallationId: revision}}})
 		var prepared []byte
 		if serving {
 			resident := checkpoint
@@ -206,8 +207,8 @@ func assessmentServingPlacement(t *testing.T, binding records.ChildBinding, chec
 	must(t, err)
 	bindingsDigest := assessmentDigest(raw)
 	set, err := canonical.Write(map[string]canonical.Value{"format": "cozy.worker.v1.PlacementSet/1", "placements": []canonical.Value{map[string]canonical.Value{
-		"placement_id": "private-render", "development": map[string]canonical.Value{"package": "local/render-install", "release": "1.0.0", "source_digest": binding.LocalRevisionDigest, "local_revision_digest": binding.LocalRevisionDigest},
-		"package_interface": map[string]canonical.Value{"digest": binding.InterfaceDigest, "length": int64(1)}, "entrypoints": entries, "models": models, "bindings_digest": bindingsDigest,
+		"placement_id": "private-render", "development": map[string]canonical.Value{"package": "local/render-install", "release": "1.0.0", "installation_id": binding.ChildInstallID},
+		"installation_id": binding.ChildInstallID, "package_interface": base64.StdEncoding.EncodeToString(fixturePackageInterface), "entrypoints": entries, "models": models, "bindings_digest": bindingsDigest,
 	}}})
 	must(t, err)
 	spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(payload), Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{EntrypointBindingDigest: entryDigest, AttemptBindingId: entryDigest, BindingsDigest: bindingsDigest}}})

@@ -47,6 +47,7 @@ type Submission struct {
 	// only its opaque reference.
 	LocalAssets    []records.AssetBinding  `json:"local_assets,omitempty"`
 	Rental         bool                    `json:"rental,omitempty"`
+	RentNew        bool                    `json:"rent_new,omitempty"`
 	RentalRequired bool                    `json:"rental_required,omitempty"`
 	Models         []orchestrator.ModelRef `json:"models,omitempty"`
 	// OutputDirectory is the caller's --out. Empty means the package's own store under
@@ -156,7 +157,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if sub.Rental || sub.RentalRequired {
+		if sub.Rental || sub.RentalRequired || sub.RentNew {
 			unlock := localpackage.Guard()
 			defer unlock()
 		}
@@ -250,10 +251,10 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: installID, Release: release,
 		LocalInstallationID: recorded.LocalInstallationID,
-		Rental:              sub.Rental || sub.RentalRequired || sub.RequestedRental != "",
-		RentalRequired:      sub.RentalRequired || sub.RequestedRental != "",
-		RequestedRental:     sub.RequestedRental,
-		Models:              models, NeedsAccelerator: recorded.NeedsAccelerator,
+		Rental:              sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
+		RentalRequired:      sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
+		RequestedRental:     sub.RequestedRental, RentNew: sub.RentNew,
+		Models: models, NeedsAccelerator: recorded.NeedsAccelerator,
 		OutputDirectory: sub.OutputDirectory,
 		// Replays compare the caller's requested execution path with the original.
 		AttentionKernel: sub.AttentionKernel,
@@ -295,6 +296,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.Rental {
 		doc["rental"] = true
+	}
+	if spec.RentNew {
+		doc["rent_new"] = true
 	}
 	if spec.RentalRequired {
 		doc["rental_required"] = true
@@ -396,8 +400,8 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
 		Release: sub.Release,
-		Rental:  sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
-		RequestedRental: sub.RequestedRental,
+		Rental:  sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
+		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
 		AttentionKernel: sub.AttentionKernel,
 		OutputDirectory: sub.OutputDirectory,

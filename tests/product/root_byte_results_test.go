@@ -26,7 +26,7 @@ func TestRootByteResultRetainsFinalCustodyWithoutInventingPublication(t *testing
 	fatal(t, problem)
 	defer store.Close()
 	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "private-worker", Package: "local/test", WorkerID: "worker", Devices: []string{"cpu"}}))
-	request, _, problem := store.Submit(records.Request{ID: "req-root-native", IdemKey: "root-native", BodyDigest: childDigest("3"), Package: "local/native", Entrypoint: "main", Kind: "job", Org: "local", PlanID: childDigest("4"), LocalPackageDigest: childDigest("5"), Payload: []byte(`{}`), RetainWork: true, ChildArtifacts: true})
+	request, _, problem := store.Submit(records.Request{ID: "req-root-native", IdemKey: "root-native", BodyDigest: childDigest("3"), Package: "local/native", Entrypoint: "main", Kind: "job", Org: "local", PlanID: childDigest("4"), LocalInstallationID: childDigest("5"), Payload: []byte(`{}`), RetainWork: true, ChildArtifacts: true})
 	fatal(t, problem)
 	request = offerChildParent(t, store, request)
 	output := records.ByteOutput{RequestID: request.ID, Attempt: 1, OutputID: "value", Digest: childDigest("6"), Length: 100, MimeType: "application/vnd.cozy.tree-manifest", ProducerRootID: childDigest("7"), ReceiptDigest: childDigest("8"), ManifestID: childDigest("6"), ManifestLength: 100, ContentBytes: 10000}

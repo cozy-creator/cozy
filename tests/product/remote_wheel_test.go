@@ -1,4 +1,4 @@
-package install
+package producttest
 
 import (
 	"archive/zip"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
@@ -67,11 +68,11 @@ func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
 	defer store.Close()
 	dependencies := map[string]packagepublish.CapturedDependency{"remote-callable": dependency}
 	selected := packagepublish.RequirementSelection{RequiresPython: ">=3.12", Requirements: []string{"cozy-runtime>=0.18.0"}}
-	if _, problem := CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected); problem == nil {
+	if _, problem := install.CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected); problem == nil {
 		t.Fatal("remote wheel omitted its required Runtime closure")
 	}
 	dependencies["cozy-runtime"] = packagepublish.CapturedDependency{Name: "cozy-runtime", Version: "0.18.30", Requirement: "cozy-runtime==0.18.30"}
-	result, problem := CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected)
+	result, problem := install.CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected)
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -81,7 +82,7 @@ func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(result.Install.Dir, "venv")); !os.IsNotExist(err) {
 		t.Fatalf("wheel constructed a local venv: %v", err)
 	}
-	if _, problem := InstalledRequirements(context.Background(), result.Install); problem != nil {
+	if _, problem := install.InstalledRequirements(context.Background(), result.Install); problem != nil {
 		t.Fatal(problem)
 	}
 	if _, problem := localpackage.StageWheels(layout, result.Install, surface.Raw, []string{result.CapturedProjectWheel}, []byte("cozy-runtime==0.18.30\n")); problem != nil {

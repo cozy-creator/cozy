@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
@@ -30,7 +31,11 @@ func main() {
 	if surface.Application != runtimeoperation.Application {
 		panic("not the fixed Runtime App")
 	}
-	name, body, problem := runtimeoperation.Carrier(*version, surface.Digest)
+	digest, err := canonical.Spell(canonical.Digest(surface.Raw))
+	if err != nil {
+		panic(err)
+	}
+	name, body, problem := runtimeoperation.Carrier(*version, digest)
 	if problem != nil {
 		panic(problem)
 	}

@@ -18,7 +18,7 @@ type libraryChildLauncher struct{ localLauncher }
 
 func (l libraryChildLauncher) ResolveUnpublishedChild(parent records.Request, _, _, _ string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
 	return orchestrator.Submission{Kind: "job", Package: parent.Package, Entrypoint: "compute", Release: parent.Release,
-		InstallID: parent.InstallID, LocalPackageDigest: parent.LocalPackageDigest, PlanID: childDigest("5"), Payload: payload,
+		InstallID: parent.InstallID, LocalInstallationID: parent.LocalInstallationID, PlanID: childDigest("5"), Payload: payload,
 		RetainWork: true, Worker: parent.Worker, Rental: true, RentalRequired: true}, childDigest("6"), nil
 }
 
@@ -37,12 +37,12 @@ func TestLibraryConsumerRunsButCannotQueueChildBehindItself(t *testing.T) {
 		Address: connection.Addr, CertPath: connection.CACert,
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	install := records.PackageInstall{ID: "library-job", Package: revision.Package, Major: 1, Version: revision.Release,
-		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"), SourceDigest: revision.SourceDigest,
+		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"),
 		Dir: filepath.Join(o.root, "installs", "job"), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, problem := o.store.Activate(install)
 	fatal(t, problem)
 	fatal(t, o.store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: install.ID, ChildInstallID: install.ID,
-		InterfaceDigest: childDigest("b"), Module: "helper", Export: "compute", Entrypoint: "compute"}}))
+		Module: "helper", Export: "compute", Entrypoint: "compute"}}))
 	intent, err := canonical.NormalizeJCS([]byte(`{"interface_digest":"` + childDigest("b") + `","module":"helper","export":"compute","request":{}}`))
 	must(t, err)
 	result := make(chan *pb.ChildCallResult, 1)
@@ -52,18 +52,17 @@ func TestLibraryConsumerRunsButCannotQueueChildBehindItself(t *testing.T) {
 			return true, nil
 		}
 		if offer := frame.GetAttemptOffer(); offer != nil {
-			iface, _ := canonical.Raw(childDigest("b"))
 			return false, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ChildCallRequest{ChildCallRequest: &pb.ChildCallRequest{
 				RecordOwnerEpoch: offer.RecordOwnerEpoch, ControlStreamEpoch: offer.ControlStreamEpoch, WorkerBootId: offer.WorkerBootId,
 				ParentRequestId: offer.RequestId, ParentAttemptOrdinal: offer.AttemptOrdinal, ParentInvocationSpecDigest: offer.InvocationSpecDigest,
-				InterfaceDigest: iface, IntentDigest: canonical.Digest(intent), Module: "helper", Export: "compute", RequestCanonicalBytes: []byte(`{}`),
+				IntentDigest: canonical.Digest(intent), Module: "helper", Export: "compute", RequestCanonicalBytes: []byte(`{}`),
 			}}})
 		}
 		return false, nil
 	}
 	requestID, _, problem := o.c.Submit(orchestrator.Submission{
 		IdemKey: "library-job", Package: revision.Package, Entrypoint: "prepare", PlanID: childDigest("4"),
-		Release: revision.Release, LocalPackageDigest: revision.Digest, Payload: []byte(`{}`),
+		Release: revision.Release, LocalInstallationID: revision.ID, Payload: []byte(`{}`),
 		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true, Kind: "job", RetainWork: true,
 		Outputs: []string{"weights"}, WeightsOutputs: []orchestrator.WeightsOutput{{OutputID: "weights", MimeType: orchestrator.WeightsManifestMime, MaxBytes: 4096}},
 	})

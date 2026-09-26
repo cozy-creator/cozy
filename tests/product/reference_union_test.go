@@ -20,7 +20,7 @@ func TestH3ReferenceImageUsesPublishedTaggedUnion(t *testing.T) {
 	must(t, err)
 	iface, problem := launch.DecodePackageInterface(raw)
 	fatal(t, problem)
-	if iface.Digest != "sha256:94e2be3a0661184a49a66d31dd3dd79e5d259fe7a53561aadfc890497cc88222" {
+	if assessmentDigest(iface.Raw) != "sha256:94e2be3a0661184a49a66d31dd3dd79e5d259fe7a53561aadfc890497cc88222" {
 		t.Fatal("fixture no longer names the published H3 interface")
 	}
 	ep, problem := iface.Function("reference_media_to_video")

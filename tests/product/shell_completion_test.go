@@ -99,6 +99,9 @@ func seedCompletionRoot(t *testing.T, root string) {
 	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[],"name":"prepare","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[]}]}`)
 	parsed, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
+	if len(parsed.Raw) == 0 {
+		t.Fatal("fixture lost its canonical interface")
+	}
 	dir := filepath.Join(root, "installs", "dryrun")
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(dir)), 0o700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0o600))
@@ -106,8 +109,8 @@ func seedCompletionRoot(t *testing.T, root string) {
 	fatal(t, problem)
 	defer store.Close()
 	_, problem = store.Activate(records.PackageInstall{ID: "completion-install", Package: "proof/dryrun", Major: 1,
-		Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, PackageInterface: parsed.Digest,
-		SourceDigest: "sha256:" + strings.Repeat("4", 64), Platform: "linux-x86"})
+		Version: "1.0.0", SourceKind: "tensorhub", Dir: dir,
+		Platform: "linux-x86"})
 	fatal(t, problem)
 	for _, rental := range []records.Rental{
 		{ID: "rental-live", MachineName: "loran", State: "ready"},
