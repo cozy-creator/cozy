@@ -71,7 +71,7 @@ type Store struct{ db *sql.DB }
 
 const schemaVersion = 46
 
-// Retained only to recognize and migrate released schemas 41 through 44.
+// Retained only to recognize and migrate released schemas 41 through 45.
 const priorCapturePinsDDL = `
 CREATE TABLE IF NOT EXISTS capture_pins (
  caller TEXT PRIMARY KEY,
@@ -1074,7 +1074,7 @@ func priorStatements(version int) []string {
 			}
 		}
 	}
-	if version >= 41 && version < 45 {
+	if version >= 41 && version < 46 {
 		statements = append(statements, priorCapturePinsDDL)
 	}
 	return statements

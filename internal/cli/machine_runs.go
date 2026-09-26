@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -348,18 +349,28 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 					return problem
 				}
 			}
-			prepared, problem := m.resolver.ResolveJobInstall(request.InstallID, request.Entrypoint)
+			installed := connection.installed[request.LocalInstallationID]
+			if installed == nil {
+				return exit.New(exit.Conflict, "machine root installation is unavailable")
+			}
+			surface, problem := launch.DecodePackageInterface(installed.PackageInterface)
 			if problem != nil {
 				return problem
 			}
-			if len(prepared.Placement.Jobs) != 1 {
-				return exit.New(exit.Conflict, "machine root requires its exact prepared job declaration")
+			job, problem := surface.Function(request.Entrypoint)
+			if problem != nil {
+				return problem
 			}
+			if job.Kind != "job" {
+				return exit.New(exit.Conflict, "installed callable is not a job")
+			}
+			request.PlanID = job.DescriptorID
+			plan := machineJobPlan(request, installed.InstallationId, job)
 			byteInputs, problem := m.stageMachineInputs(m.ctx, request, connection)
 			if problem != nil {
 				return problem
 			}
-			built, problem = orchestrator.MachineJobSubmission(request, capture, prepared.Placement.Jobs[0], byteInputs)
+			built, problem = orchestrator.MachineJobSubmission(request, capture, plan, byteInputs)
 			if problem != nil {
 				return problem
 			}
