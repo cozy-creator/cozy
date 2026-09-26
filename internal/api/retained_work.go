@@ -36,7 +36,7 @@ func (s *Server) pauseJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.machineJobControl(w, r, row, "pause") {
+	if s.machineJobControl(w, r, row, "pause", "") {
 		return
 	}
 	if problem := s.orchestrator.PauseRequest(row.ID, requestActor(r)); problem != nil {
@@ -60,7 +60,7 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.machineJobControl(w, r, row, "resume") {
+	if s.machineJobControl(w, r, row, "resume", "") {
 		return
 	}
 	s.shutdownAdmission.RLock()

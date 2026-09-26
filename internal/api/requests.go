@@ -1093,11 +1093,11 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+reference+" on this host", "")
 		return
 	}
-	if s.machineRequestControl(w, r, *row, "cancel") {
+	actor := requestActor(r)
+	if s.machineRequestControl(w, r, *row, "cancel", actor) {
 		return
 	}
 	id := row.ID
-	actor := requestActor(r)
 	if row.RetainWork && (row.IsJob() || row.ParentRequestID != "") && row.State != "finalizing" && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) {
 		if e := s.orchestrator.CancelRetainedRequest(id, actor); e != nil {
 			s.refuseTyped(w, r, e)

@@ -1219,10 +1219,10 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.machineJobControl(w, r, row, "cancel") {
+	actor := requestActor(r)
+	if s.machineJobControl(w, r, row, "cancel", actor) {
 		return
 	}
-	actor := requestActor(r)
 	retaining, problem := s.store.RequestRetaining(row)
 	if problem != nil {
 		s.refuseTyped(w, r, problem)

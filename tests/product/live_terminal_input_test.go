@@ -117,6 +117,13 @@ func TestLiveTablesAndWatchOwnTerminalInput(t *testing.T) {
 		if row == nil || row.State != "submitted" {
 			t.Fatalf("watcher changed durable work %s: %+v", id, row)
 		}
+		events, problem := store.EventsAfter(id, 0, 256)
+		fatal(t, problem)
+		for _, event := range events {
+			if event.Type == "request.cancel_requested" || event.Type == "request.canceled" {
+				t.Fatalf("watcher signal created a cancellation event for %s: %+v", id, event)
+			}
+		}
 	}
 	t.Run("json does not borrow input", func(t *testing.T) {
 		p := liveInputPTY(t, root, "run", "watch", "req-input-serving", "--json")

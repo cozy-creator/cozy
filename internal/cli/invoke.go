@@ -267,7 +267,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	var terminal *localapi.Event
 	stopped := ""
 	if ctx.Inv.Bool("--await") {
-		terminal, stopped, e = watch(ctx, c, handle.RequestID, deadline, began)
+		terminal, stopped, e = watch(ctx, c, c.Cancel, handle.RequestID, deadline, began)
 	} else {
 		terminal, e = observe(ctx, c, handle.RequestID, optimisticObservation, began)
 	}
@@ -1252,7 +1252,15 @@ func runStatus(status string) string {
 // same question as what the terminal says: a canceled terminal caused by `--timeout` is
 // exit 10, because a caller that set a deadline wants to know the deadline is what
 // happened.
-func watch(ctx *Context, c *localapi.Client, requestID string,
+// invocationEventObserver is the observation-only view used by awaited runs.
+// Keep cancellation out of this dependency: a terminal disconnect is a local
+// observer event, never a request to stop durable work.
+type invocationEventObserver interface {
+	Request(string) (api.Lifecycle, *exit.Error)
+	WatchContext(context.Context, string, int64, func(localapi.Event) bool) (*localapi.Event, *exit.Error)
+}
+
+func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) *exit.Error, requestID string,
 	deadline time.Duration, began time.Time) (*localapi.Event, string, *exit.Error) {
 	interrupt, restoreInput, _, problem := liveSignals(ctx, nil)
 	if problem != nil {
@@ -1295,7 +1303,7 @@ func watch(ctx *Context, c *localapi.Client, requestID string,
 			return
 		}
 		cancelResult := make(chan *exit.Error, 1)
-		go func() { cancelResult <- c.Cancel(requestID, fmt.Sprintf("cozy run --timeout %s", deadline)) }()
+		go func() { cancelResult <- cancel(requestID, fmt.Sprintf("cozy run --timeout %s", deadline)) }()
 		select {
 		case <-interrupt:
 			if !ctx.Mode().JSON {

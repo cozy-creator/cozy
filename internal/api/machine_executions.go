@@ -186,8 +186,8 @@ func machineExecutionMS(row records.Request, link *records.MachineExecution, int
 	return total
 }
 
-func (s *Server) machineJobControl(w http.ResponseWriter, r *http.Request, row records.Request, action string) bool {
-	owned, problem := s.controlMachineExecution(r.Context(), row, action)
+func (s *Server) machineJobControl(w http.ResponseWriter, r *http.Request, row records.Request, action, actor string) bool {
+	owned, problem := s.controlMachineExecution(r.Context(), row, action, actor)
 	if !owned {
 		return false
 	}
@@ -203,8 +203,8 @@ func (s *Server) machineJobControl(w http.ResponseWriter, r *http.Request, row r
 	return true
 }
 
-func (s *Server) machineRequestControl(w http.ResponseWriter, r *http.Request, row records.Request, action string) bool {
-	owned, problem := s.controlMachineExecution(r.Context(), row, action)
+func (s *Server) machineRequestControl(w http.ResponseWriter, r *http.Request, row records.Request, action, actor string) bool {
+	owned, problem := s.controlMachineExecution(r.Context(), row, action, actor)
 	if !owned {
 		return false
 	}
@@ -220,7 +220,7 @@ func (s *Server) machineRequestControl(w http.ResponseWriter, r *http.Request, r
 	return true
 }
 
-func (s *Server) controlMachineExecution(ctx context.Context, row records.Request, action string) (bool, *exit.Error) {
+func (s *Server) controlMachineExecution(ctx context.Context, row records.Request, action, actor string) (bool, *exit.Error) {
 	link, problem := s.store.MachineExecution(row.ID)
 	if problem != nil {
 		return true, problem
@@ -234,6 +234,20 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 		problem = exit.Unavailablef("this client cannot control Runtime-owned execution")
 	} else {
 		problem = s.machineExecutions.Control(ctx, row, action)
+	}
+	// Machine execution controls used to leave no durable actor when they came
+	// through the machine-owned route. That made a cancellation look like it
+	// came from an observer disconnect. Record the successful explicit control
+	// at the API boundary; a watcher never reaches this handler.
+	if problem == nil && action == "cancel" {
+		if actor == "" {
+			actor = "an unnamed api client"
+		}
+		if e := s.store.AppendEvent(row.ID, "request.cancel_requested", int64(row.Ordinal), map[string]any{
+			"actor": actor, "source": "machine_control",
+		}); e != nil {
+			return true, e
+		}
 	}
 	return true, problem
 }
