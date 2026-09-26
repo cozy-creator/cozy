@@ -69,3 +69,22 @@ func TestParsePayloadRejectsUnknownOverlaySlot(t *testing.T) {
 		t.Fatalf("problem = %#v, want model_slot_unknown", problem)
 	}
 }
+
+func TestParsePayloadStartsEachRequestWithPristineOverlaySet(t *testing.T) {
+	_, first, problem := ParsePayload(overlayEntrypoint(), []string{
+		`model.base_model.lora=org/style@1,weight=0.5`,
+	}, "")
+	if problem != nil {
+		t.Fatalf("first parse refused: %v", problem)
+	}
+	if len(first.Overlays["generate.models.base_model"]) != 1 {
+		t.Fatalf("first overlays = %#v", first.Overlays)
+	}
+	_, second, problem := ParsePayload(overlayEntrypoint(), nil, "")
+	if problem != nil {
+		t.Fatalf("second parse refused: %v", problem)
+	}
+	if len(second.Overlays) != 0 {
+		t.Fatalf("overlay state leaked between requests: %#v", second.Overlays)
+	}
+}
