@@ -83,8 +83,6 @@ var Routes = []Route{
 	{"POST", "/v1/local/rentals/{rental_id}/prepare", Local, true, true, false, "",
 		"queue exact package or model installation on an existing rental",
 		"`cozy package install --rental` and `cozy model download --rental`"},
-	{"GET", "/v1/local/rentals/{rental_id}/installs", Local, true, false, false, "",
-		"list durable rental installation status and typed failures", "`cozy rental installs`"},
 	{"POST", "/v1/local/rentals/{rental_id}/runtime-update", Local, true, true, false, "",
 		"Update one private worker's Runtime under a maintenance hold.", "`cozy rental update`"},
 	{"GET", "/v1/local/rentals/{rental_id}/runtime-update", Local, true, false, false, "",

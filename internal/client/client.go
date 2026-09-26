@@ -282,12 +282,6 @@ func (c *Client) PrepareRentalPackage(rentalID string, request api.RentalPackage
 	return result, problem
 }
 
-func (c *Client) RentalInstalls(rentalID string) ([]api.RentalPackagePrepareResult, *exit.Error) {
-	var result []api.RentalPackagePrepareResult
-	problem := c.call(http.MethodGet, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/installs", nil, &result)
-	return result, problem
-}
-
 func (c *Client) UpdateRentalRuntime(rentalID string, request api.RuntimeUpdateRequest) (api.RuntimeUpdate, *exit.Error) {
 	var result api.RuntimeUpdate
 	problem := c.call(http.MethodPost, "/v1/local/rentals/"+url.PathEscape(rentalID)+"/runtime-update", request, &result)

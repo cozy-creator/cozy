@@ -95,15 +95,6 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusAccepted, result)
 }
 
-func (s *Server) listRentalInstalls(w http.ResponseWriter, r *http.Request) {
-	rows, problem := s.store.RentalInstalls(r.PathValue("rental_id"), false)
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	s.ok(w, r, http.StatusOK, rows)
-}
-
 func canonicalPackageRef(value string) (string, *exit.Error) {
 	ref, problem := hub.ParseRef(value)
 	if problem != nil {
