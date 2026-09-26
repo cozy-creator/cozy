@@ -43,6 +43,13 @@ func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.
 }
 
 func handleInstall(ctx *Context) *exit.Error {
+	if ctx.Inv.Value("--rental") != "" {
+		if explicitPackageDirectory(ctx.Inv.Args[0]) || ctx.Inv.Bool("--editable") {
+			return exit.Usagef("package install --rental requires a published org/name; editable directories use private execution").
+				WithRemedy("use `cozy run ./project/<function> --rental=<rental>` to upload local code privately")
+		}
+		return handleRentalPackageInstall(ctx)
+	}
 	if explicitPackageDirectory(ctx.Inv.Args[0]) {
 		if !ctx.Inv.Bool("--editable") {
 			return exit.Usagef("an explicit package directory requires --editable")

@@ -14,19 +14,6 @@ import (
 )
 
 func handleRentalPrepare(ctx *Context) *exit.Error {
-	_, store, problem := rentalStores(ctx)
-	if problem != nil {
-		return problem
-	}
-	row, problem := store.RentalByMachine(strings.TrimSpace(ctx.Inv.Args[0]))
-	store.Close()
-	if problem != nil {
-		return problem
-	}
-	if row == nil {
-		return exit.New(exit.NotFound, "no rental %q on this host", ctx.Inv.Args[0])
-	}
-	rentalID := row.ID
 	packageName := strings.TrimSpace(ctx.Inv.Args[1])
 	ref, problem := hub.ParseRef(packageName)
 	if problem != nil {
@@ -35,7 +22,7 @@ func handleRentalPrepare(ctx *Context) *exit.Error {
 	version := strings.TrimSpace(ctx.Inv.Value("--version"))
 	if version == "" {
 		return exit.Usagef("rental package preparation requires --version for the exact package release").
-			WithRemedy("use `cozy rental prepare %s %s --version 1.2.3`", rentalID, packageName)
+			WithRemedy("use `cozy rental prepare %s %s --version 1.2.3`", ctx.Inv.Args[0], packageName)
 	}
 	models := make([]orchestrator.ModelRef, 0, len(ctx.Inv.Values["--model"]))
 	for _, selection := range ctx.Inv.Values["--model"] {
@@ -61,6 +48,32 @@ func handleRentalPrepare(ctx *Context) *exit.Error {
 		}
 		models = append(models, selected)
 	}
+	return prepareRentalPackage(ctx, ctx.Inv.Args[0], ref.String(), version, models)
+}
+
+func handleRentalPackageInstall(ctx *Context) *exit.Error {
+	ref, plan, problem := resolveRegistryPackage(ctx, ctx.Inv.Args[0], ctx.Inv.Value("--version"))
+	if problem != nil {
+		return problem
+	}
+	// No model bindings are resolved or forwarded by package installation.
+	return prepareRentalPackage(ctx, ctx.Inv.Value("--rental"), ref.String(), plan.Release, nil)
+}
+
+func prepareRentalPackage(ctx *Context, rentalName, packageName, version string, models []orchestrator.ModelRef) *exit.Error {
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return problem
+	}
+	row, problem := store.RentalByMachine(strings.TrimSpace(rentalName))
+	store.Close()
+	if problem != nil {
+		return problem
+	}
+	if row == nil {
+		return exit.New(exit.NotFound, "no rental %q on this host", rentalName)
+	}
+	rentalID := row.ID
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return problem
@@ -71,10 +84,10 @@ func handleRentalPrepare(ctx *Context) *exit.Error {
 		return problem
 	}
 	if !ctx.Mode().JSON {
-		fmt.Fprintf(ctx.Err, "Preparing %s on %s (%d explicitly selected models)...\n", ref.String(), row.MachineName, len(models))
+		fmt.Fprintf(ctx.Err, "Preparing %s on %s (%d explicitly selected models)...\n", packageName, row.MachineName, len(models))
 	}
 	result, problem := client.PrepareRentalPackage(rentalID, api.RentalPackagePrepareRequest{
-		Package: ref.String(), Release: version, Models: models,
+		Package: packageName, Release: version, Models: models,
 	})
 	if problem != nil {
 		return problem
@@ -82,7 +95,10 @@ func handleRentalPrepare(ctx *Context) *exit.Error {
 	fields := []output.Field{{K: "rental", V: result.Rental}, {K: "package", V: result.Package},
 		{K: "release", V: result.Release}, {K: "status", V: result.Status}, {K: "models", V: len(models)}}
 	record := compactRecord(fields, "rental", "package", "release", "status")
-	record.Notes = []string{"the worker retained this package and its model inputs; repeating this command reuses preparation"}
+	record.Notes = []string{"the worker retained this package; repeating this command reuses preparation"}
+	if len(models) == 0 {
+		record.Notes = append(record.Notes, "no model weights were requested")
+	}
 	record.Next = []string{"cozy run " + packageName + "/<function> --rental=" + rentalID}
 	return emit(ctx, record)
 }

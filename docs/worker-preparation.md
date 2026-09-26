@@ -4,13 +4,22 @@
 not inspect package model defaults or download weights. Package updates follow
 the same rule; the obsolete `--no-model-download` switch has been removed.
 
-Prewarm a rental by name or ID with an exact package release:
+Install package code on an existing rental by name or ID. As with a local
+install, omitting `--version` selects the newest published release:
 
 ```sh
-cozy rental prepare bisco paul/minimax-h3 --version 1.15.7
+cozy package install paul/minimax-h3 --rental=kirukiru
+cozy package install paul/minimax-h3 --rental=kirukiru --version 1.15.7
 ```
 
-That command also installs code only. Explicit model selections opt into weights:
+Rental installation leaves the local package inventory unchanged and sends no
+model selections. It accepts published `org/name` packages only; `--editable`
+and local directories are not supported by this published-release path. Installing
+an editable package locally does not publish it. Use
+`cozy run ./project/<function> --rental=kirukiru` for private local code execution
+and its on-demand preparation.
+
+Model prewarming remains a separate explicit operation through `rental prepare`:
 
 ```sh
 cozy rental prepare bisco paul/minimax-h3 --version 1.15.7 \
