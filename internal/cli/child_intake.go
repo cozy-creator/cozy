@@ -19,14 +19,15 @@ import (
 // install-writer lock. Finish attaches its exact dependency facts to the parent's
 // normal install before that snapshot can be submitted for execution.
 type childIntake struct {
-	Package      *packagepublish.Package
-	Bindings     []records.ChildBinding
-	layout       home.Layout
-	store        *records.Store
-	created      []string
-	staging      string
-	ownedPackage bool
-	prepared     *install.Result
+	Package           *packagepublish.Package
+	Bindings          []records.ChildBinding
+	layout            home.Layout
+	store             *records.Store
+	created           []string
+	staging           string
+	ownedPackage      bool
+	prepared          *install.Result
+	remoteEnvironment *records.PackageInstall
 }
 
 func (i *childIntake) Finish(parentInstall string) *exit.Error {
@@ -65,24 +66,29 @@ func (i *childIntake) Install() (*install.Result, *exit.Error) {
 		return nil, problem
 	}
 	result, problem := install.Run(i.layout, i.store, install.Request{Ref: install.Ref{Package: "local/" + i.Package.Name}, Snapshot: true,
-		Local: &install.LocalSource{Bytes: size, Files: files, Package: "local/" + i.Package.Name, Release: i.Package.Release, Tree: i.Package.Tree}})
+		RemoteEnvironment: i.remoteEnvironment,
+		Local:             &install.LocalSource{Bytes: size, Files: files, Package: "local/" + i.Package.Name, Release: i.Package.Release, Tree: i.Package.Tree}})
 	if problem == nil {
 		i.prepared = result
 	}
 	return result, problem
 }
 
-func prepareChildIntake(ctx *Context, pack *packagepublish.Package, layout home.Layout, store *records.Store) (*childIntake, *exit.Error) {
-	return prepareChildIntakeDepth(ctx, pack, layout, store, map[string]bool{}, 0)
+func prepareChildIntake(ctx *Context, pack *packagepublish.Package, layout home.Layout, store *records.Store, remote ...*records.PackageInstall) (*childIntake, *exit.Error) {
+	var environment *records.PackageInstall
+	if len(remote) > 0 {
+		environment = remote[0]
+	}
+	return prepareChildIntakeDepth(ctx, pack, layout, store, map[string]bool{}, 0, environment)
 }
 
-func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout home.Layout, store *records.Store, stack map[string]bool, depth int) (*childIntake, *exit.Error) {
+func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout home.Layout, store *records.Store, stack map[string]bool, depth int, remote *records.PackageInstall) (*childIntake, *exit.Error) {
 	if depth > 16 || stack[pack.Tree] {
 		return nil, exit.New(exit.Validation, "private invocable dependency graph is cyclic or exceeds 16 levels")
 	}
 	stack[pack.Tree] = true
 	defer delete(stack, pack.Tree)
-	intake := &childIntake{Package: pack, layout: layout, store: store}
+	intake := &childIntake{Package: pack, layout: layout, store: store, remoteEnvironment: remote}
 	fail := func(problem *exit.Error) (*childIntake, *exit.Error) { intake.Close(); return nil, problem }
 	dependencies, problem := packagepublish.LocalDependencySelections(pack.Tree)
 	if problem != nil {
@@ -109,7 +115,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 		if problem != nil {
 			return fail(problem)
 		}
-		nested, problem := prepareChildIntakeDepth(ctx, dependency, layout, store, stack, depth+1)
+		nested, problem := prepareChildIntakeDepth(ctx, dependency, layout, store, stack, depth+1, nil)
 		if problem != nil {
 			dependency.Close()
 			return fail(problem)

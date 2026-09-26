@@ -24,17 +24,21 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	if problem != nil {
 		return problem
 	}
-	python := home.VenvPython(filepath.Join(parent.Install.Dir, "venv"))
+	environmentDir := parent.Install.Dir
+	if parent.RemoteSnapshot {
+		environmentDir = i.remoteEnvironment.Dir
+	}
+	python := home.VenvPython(filepath.Join(environmentDir, "venv"))
 	possible, problem := install.HasInstalledApplications(python, parent.Install.Closure, i.Package.Name, sourceOverlays)
 	if problem != nil || !possible {
 		return problem
 	}
-	selection, problem := install.ExecutionRequirements(ctx, filepath.Join(parent.Install.Dir, "venv"),
+	selection, problem := install.ExecutionRequirements(ctx, filepath.Join(environmentDir, "venv"),
 		i.Package.Name, strings.Fields(parent.Install.Extra))
 	if problem != nil {
 		return problem
 	}
-	basePython, problem := install.BasePython(filepath.Join(parent.Install.Dir, "venv"))
+	basePython, problem := install.BasePython(filepath.Join(environmentDir, "venv"))
 	if problem != nil {
 		return problem
 	}
@@ -146,7 +150,16 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			overlays[name] = captured[name]
 			return nil
 		}
-		result, problem := install.CaptureWheel(ctx, i.layout, i.store, basePython, name, selection.Extras[name], closure, surface)
+		var result *install.Result
+		if parent.RemoteSnapshot {
+			selected, err := install.ExecutionRequirements(ctx, filepath.Join(environmentDir, "venv"), name, selection.Extras[name])
+			if err != nil {
+				return err
+			}
+			result, problem = install.CaptureRemoteWheel(ctx, i.layout, i.store, name, parent.Install.Python, selection.Extras[name], closure, surface, selected)
+		} else {
+			result, problem = install.CaptureWheel(ctx, i.layout, i.store, basePython, name, selection.Extras[name], closure, surface)
+		}
 		if problem != nil {
 			return problem
 		}
