@@ -8,7 +8,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // THE JOB HALF of an installed package (cl-004). A job is an attempt class on the one
@@ -167,11 +166,6 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		WeightsOutputs:   weightsOutputs,
 		Publishes:        declared.Publishes,
 		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")) && !(f.CPUOrchestration && !f.SelfCallable[function] && len(declared.Models) == 0 && len(declared.WeightsOutputs) == 0),
-	}
-	if f.Install.Package == "local/"+runtimeoperation.Name && f.PackageInterface.Application == runtimeoperation.Application {
-		// The fixed builtin encodes through native TensorFS/NumPy. Optional GPU
-		// packages in the Runtime base do not turn this CPU operation into inference.
-		facts.NeedsAccelerator = false
 	}
 	facts.RetainsArtifacts = len(ModelArtifactPaths(declared.Result)) > 0 || len(RetainedAssetPaths(declared)) > 0
 	for _, model := range declared.Models {

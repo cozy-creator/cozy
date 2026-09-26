@@ -1,12 +1,10 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
@@ -27,10 +25,10 @@ func publishedPlanInterface(plan hub.PackageDownloadPlan) (*launch.PackageInterf
 // execution. Subsequent child scheduling needs no client or catalog lookup.
 func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request records.Request, connection *machineConnection, capture *pb.MachineExecutionCapture, rootLocked []byte) *exit.Error {
 	type node struct {
-		digest []byte
-		plan   hub.PackageDownloadPlan
-		iface  *launch.PackageInterface
-		locked []byte
+		installationID string
+		plan           hub.PackageDownloadPlan
+		iface          *launch.PackageInterface
+		locked         []byte
 	}
 	nodes := map[string]node{}
 	visiting := map[string]bool{}
@@ -43,11 +41,11 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 	if problem != nil {
 		return problem
 	}
-	rootInterface, problem := publishedPlanInterface(rootPlan)
+	rootInterface, problem := launch.DecodePackageInterface(capture.InstalledPackages[0].PackageInterface)
 	if problem != nil {
 		return problem
 	}
-	nodes[rootKey] = node{capture.RootRevisionDigest, rootPlan, rootInterface, rootLocked}
+	nodes[rootKey] = node{capture.RootInstallationId, rootPlan, rootInterface, rootLocked}
 	var walk func(string, int) *exit.Error
 	walk = func(key string, depth int) *exit.Error {
 		if depth > 16 || len(nodes) > 128 || visiting[key] {
@@ -79,19 +77,6 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 				if plan.Release != dependency.Version {
 					return exit.New(exit.Conflict, "published child release changed")
 				}
-				matched := false
-				for _, wheel := range plan.Downloads {
-					if wheel.Kind == "project_wheel" && dependency.Digests[wheel.Digest] && wheel.Version == dependency.Version {
-						matched = true
-					}
-				}
-				if !matched {
-					return exit.New(exit.Conflict, "published dependency wheel is not the committed callee implementation")
-				}
-				iface, problem := publishedPlanInterface(plan)
-				if problem != nil {
-					return problem
-				}
 				sub := request
 				sub.Package, sub.Release, sub.InstallID = dependency.Package, dependency.Version, ""
 				sub.Models = nil
@@ -99,68 +84,53 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 				if problem != nil {
 					return problem
 				}
-				var set pb.PlacementSet
-				if err := canonical.Unmarshal(prepared.PlacementSetCanonicalBytes, &set); err != nil || len(set.Placements) != 1 {
-					return exit.New(exit.Conflict, "published child preparation needs one exact placement")
+				installed := prepared.InstalledPackage
+				if installed == nil || installed.InstallationId == "" || installed.Package != dependency.Package || installed.Release != dependency.Version {
+					return exit.New(exit.Conflict, "published child preparation returned another installation")
 				}
-				placement := set.Placements[0]
-				if placement.GetPackage().GetPackage() != dependency.Package || placement.GetPackage().GetRelease() != dependency.Version || placement.Environment == nil || placement.PackageInterface == nil || !bytes.Equal(placement.PackageInterface.Digest, canonical.Digest(iface.Raw)) {
-					return exit.New(exit.Conflict, "published child preparation changed its exact release")
+				iface, problem := launch.DecodePackageInterface(installed.PackageInterface)
+				if problem != nil {
+					return problem
 				}
-				_, digest, err := canonical.Identity(placement.Environment)
-				if err != nil || !bytes.Equal(digest, placement.EnvironmentDigest) {
-					return exit.New(exit.Conflict, "published child environment changed")
-				}
-				child = node{digest, plan, iface, prepared.LockedRequirements}
+				child = node{installed.InstallationId, plan, iface, prepared.LockedRequirements}
 				nodes[childKey] = child
-				capture.PublishedRevisions = append(capture.PublishedRevisions, &pb.PublishedPackageRevision{Package: placement.GetPackage(), Environment: placement.Environment, PackageInterface: placement.PackageInterface})
-				addPublishedBindings(capture, digest, digest, iface, true)
+				capture.InstalledPackages = append(capture.InstalledPackages, installed)
+				addPublishedBindings(capture, installed.InstallationId, installed.InstallationId, iface, true)
 				if problem := walk(childKey, depth+1); problem != nil {
 					return problem
 				}
 			} else {
-				matched := false
-				for _, wheel := range child.plan.Downloads {
-					if wheel.Kind == "project_wheel" && dependency.Digests[wheel.Digest] {
-						matched = true
-					}
-				}
-				if !matched {
-					return exit.New(exit.Conflict, "published parents disagree on a callee wheel")
-				}
 				if visiting[childKey] {
 					return exit.New(exit.Validation, "published callable closure is cyclic")
 				}
 			}
-			addPublishedBindings(capture, parent.digest, child.digest, child.iface, false)
+			addPublishedBindings(capture, parent.installationID, child.installationID, child.iface, false)
 		}
 		return nil
 	}
 	if problem := walk(rootKey, 0); problem != nil {
 		return problem
 	}
-	sort.Slice(capture.PublishedRevisions, func(i, j int) bool {
-		_, a, _ := canonical.Identity(capture.PublishedRevisions[i].Environment)
-		_, b, _ := canonical.Identity(capture.PublishedRevisions[j].Environment)
-		return bytes.Compare(a, b) < 0
+	sort.Slice(capture.InstalledPackages, func(i, j int) bool {
+		return capture.InstalledPackages[i].InstallationId < capture.InstalledPackages[j].InstallationId
 	})
 	if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
 		// Root defaults are recorded by the caller after the entire binding inventory exists.
 		for key, node := range nodes {
 			if key != rootKey {
-				m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.digest, node.iface, request.Rental, connection.publicOrigin)
+				m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.installationID, node.iface, request.Rental, connection.publicOrigin)
 			}
 		}
 	}
 	return nil
 }
 
-func addPublishedBindings(capture *pb.MachineExecutionCapture, caller, callee []byte, iface *launch.PackageInterface, self bool) {
+func addPublishedBindings(capture *pb.MachineExecutionCapture, caller, callee string, iface *launch.PackageInterface, self bool) {
 	for _, entry := range append(append([]launch.Entrypoint(nil), iface.Jobs...), iface.Entrypoints...) {
 		if entry.Invocable == nil || entry.Internal && !self {
 			continue
 		}
-		capture.Bindings = append(capture.Bindings, &pb.MachineCallableBinding{CallerRevisionDigest: caller, CalleeRevisionDigest: callee, InterfaceDigest: canonical.Digest(iface.Raw), Module: entry.Invocable.Module, Export: entry.Invocable.Export, Entrypoint: entry.Name})
+		capture.Bindings = append(capture.Bindings, &pb.MachineCallableBinding{CallerInstallationId: caller, CalleeInstallationId: callee, Module: entry.Invocable.Module, Export: entry.Invocable.Export, Entrypoint: entry.Name})
 	}
 }
 
