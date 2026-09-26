@@ -64,7 +64,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		PlanID: req.PlanID, Models: req.Models, Outputs: splitOutputs(req.Outputs)}
 	c.mu.Lock()
 	already := w.spec.Placement.PlacementSetDigest != "" && selectionServes(req.Models, w.spec.Placement.Models) &&
-		(req.LocalInstallationID == "" || req.LocalInstallationID == w.spec.Placement.InstallID) && w.desiredRefusal == nil
+		(req.LocalInstallationID == "" || req.LocalInstallationID == w.spec.Placement.InstallationID) && w.desiredRefusal == nil
 	preparedSpec := w.spec
 	c.mu.Unlock()
 	if already && req.ParentRequestID == "" {
@@ -169,7 +169,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	if problem != nil {
 		return WorkerLaunchSpec{}, "", problem
 	}
-	if desired.Release != logical.Release || (!prep.Published && desired.InstallID != req.LocalInstallationID) ||
+	if desired.Release != logical.Release || (!prep.Published && desired.InstallationID != req.LocalInstallationID) ||
 		(len(req.Models) > 0 && len(desired.Models) == 0) || !selectionServes(req.Models, desired.Models) {
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "local_preparation_selection_changed", "worker placement differs from accepted code or model selections")
 	}

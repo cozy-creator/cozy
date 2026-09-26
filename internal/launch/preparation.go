@@ -25,7 +25,7 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 		InstallRoot:   filepath.Join(f.Install.Dir, "worker-environments"),
 		TensorFSRoot:  config.Frozen().TensorFSRoot,
 		Placement: orchestrator.DesiredPlacement{
-			Package: f.Install.Package, InstallID: f.Install.ID, Release: f.Install.Version,
+			Package: f.Install.Package, InstallID: f.Install.ID, InstallationID: f.Install.ID, Release: f.Install.Version,
 		},
 		Preparation: &orchestrator.LocalServingPreparation{
 			PythonVersion: f.Install.Python, Published: f.Install.SourceKind == "tensorhub", Application: f.PackageInterface.Application,
@@ -42,8 +42,8 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 func (f *Facts) JobInstallationID() (orchestrator.DesiredPlacement, string, *exit.Error) {
 	if f.Install.PlacementSetDigest != "" {
 		placement, problem := f.Placement()
-		return placement, placement.InstallID, problem
+		return placement, placement.InstallationID, problem
 	}
-	placement := orchestrator.DesiredPlacement{Package: f.Install.Package, InstallID: f.Install.ID, Release: f.Install.Version}
+	placement := orchestrator.DesiredPlacement{Package: f.Install.Package, InstallID: f.Install.ID, InstallationID: f.Install.ID, Release: f.Install.Version}
 	return placement, f.Install.ID, nil
 }
