@@ -331,7 +331,36 @@ fn present(
 /// One pull retains only references rejected by the bounded optional write queue.
 /// Its maximum is the already-declared closure; no payload buffer or persistent
 /// queue is added, and origin workers never wait for cache I/O or queue space.
+/// Successful newly published objects from one pull. Shared only with that pull's
+/// asynchronous cache work; another pull cannot contribute to its receipt.
+#[derive(Debug, Clone, Default)]
+pub struct CacheWriteReceipt(
+    std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
+);
+
+impl CacheWriteReceipt {
+    fn record(&self, object: &ObjectRef, outcome: CacheWrite) {
+        if outcome == CacheWrite::Stored {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(object.id(), object.length);
+        }
+    }
+
+    /// A snapshot of unique verified bytes published so far. Incomplete optional
+    /// replication produces a lower bound; held local objects are not inferred.
+    pub fn bytes(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .sum()
+    }
+}
+
 pub(crate) struct BackfillBatch<'a> {
+    receipt: CacheWriteReceipt,
     cache: RepoObjectCache,
     source: PathBuf,
     limit: usize,
@@ -358,6 +387,7 @@ impl<'a> BackfillBatch<'a> {
         pool: &'a Backfills,
     ) -> Self {
         Self {
+            receipt: CacheWriteReceipt::default(),
             cache,
             source: source.root().to_path_buf(),
             limit,
@@ -366,8 +396,14 @@ impl<'a> BackfillBatch<'a> {
         }
     }
 
+    pub(crate) fn observe(mut self, receipt: CacheWriteReceipt) -> Self {
+        self.receipt = receipt;
+        self
+    }
+
     fn work(&self, kind: CacheKind, object: &ObjectRef, trust: CacheTrust) -> Backfill {
         Backfill {
+            receipt: self.receipt.clone(),
             cache: self.cache.clone(),
             source: self.source.clone(),
             kind,
@@ -422,6 +458,7 @@ impl Drop for BackfillBatch<'_> {
 const BACKFILL_QUEUE: usize = 128;
 
 struct Backfill {
+    receipt: CacheWriteReceipt,
     cache: RepoObjectCache,
     source: PathBuf,
     kind: CacheKind,
@@ -619,6 +656,9 @@ impl Backfill {
                 )
                 .ok()
         });
+        if let Some(outcome) = copied {
+            self.receipt.record(&self.object, outcome);
+        }
         if !matches!(copied, Some(CacheWrite::Stored | CacheWrite::Present)) {
             activity
                 .incomplete
@@ -1693,6 +1733,45 @@ mod acquisition_backfill_tests {
     use std::sync::{atomic::Ordering, Arc, Mutex};
 
     #[test]
+    fn cache_write_receipts_are_scoped_and_count_only_new_verified_objects() {
+        let root =
+            std::env::temp_dir().join(format!("tfs-cache-receipts-{}", store::now_nanos_unique()));
+        let source = Store::init(&root.join("source")).unwrap();
+        let cache = RepoObjectCache::new(root.join("cache"));
+        let pool = Backfills::start();
+        let first = CacheWriteReceipt::default();
+        let second = CacheWriteReceipt::default();
+        let object = ObjectRef::of(b"first verified object");
+        let other = ObjectRef::of(b"second independently verified object");
+        for (bytes, reference) in [
+            (b"first verified object".as_slice(), &object),
+            (b"second independently verified object".as_slice(), &other),
+        ] {
+            source
+                .put_stream(&mut &*bytes, Some(reference), &Fault::default())
+                .unwrap();
+        }
+        let batch =
+            BackfillBatch::with_pool(cache.clone(), &source, 1, &pool).observe(first.clone());
+        let another =
+            BackfillBatch::with_pool(cache.clone(), &source, 1, &pool).observe(second.clone());
+        batch.offer(CacheKind::Blob, &object, CacheTrust::Name);
+        another.offer(CacheKind::Blob, &other, CacheTrust::Name);
+        assert!(batch.finish_offers() && another.finish_offers());
+        assert!(pool.activity.wait());
+        assert_eq!(first.bytes(), object.length);
+        assert_eq!(second.bytes(), other.length);
+        // Present is not a newly verified publication. Duplicate callbacks for
+        // one immutable object cannot inflate a byte estimate either.
+        batch.offer(CacheKind::Blob, &object, CacheTrust::Name);
+        assert!(batch.finish_offers() && pool.activity.wait());
+        first.record(&object, CacheWrite::Stored);
+        first.record(&other, CacheWrite::Unavailable);
+        assert_eq!(first.bytes(), object.length);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn an_abandoned_saturated_batch_reports_incomplete_after_accepted_work_drains() {
         let root = std::env::temp_dir().join(format!(
             "tfs-backfill-abandoned-{}",
@@ -1840,6 +1919,7 @@ mod acquisition_backfill_tests {
         let activity = Arc::new(BackfillActivity::new(Ledger::new()));
         activity.offered();
         Backfill {
+            receipt: CacheWriteReceipt::default(),
             cache: RepoObjectCache::new(root.join("not-a-directory")),
             source: source.root().to_owned(),
             kind: CacheKind::Blob,
