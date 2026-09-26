@@ -1503,6 +1503,15 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
 		FROM installs i WHERE i.id NOT IN (SELECT install_id FROM pins)
+		-- Keep the newest local environment for each exact package/version. Remote
+		-- capture may reuse that compatible metadata environment after a daemon
+		-- restart; unlike a pin, this retention is bounded to one candidate per
+		-- source revision and older candidates remain ordinary GC work.
+		AND NOT (i.source_kind='local' AND NOT EXISTS(
+			SELECT 1 FROM installs newer
+			WHERE newer.source_kind='local' AND newer.package=i.package AND newer.version=i.version
+			AND (newer.created_at > i.created_at OR (newer.created_at = i.created_at AND newer.id > i.id))
+		))
 		AND NOT EXISTS(SELECT 1 FROM requests WHERE install_id=i.id AND (state IN (` + activeRequestStates + `) OR (retain_work=1 AND state='succeeded' AND child_artifacts=1)))
 		AND NOT EXISTS(SELECT 1 FROM private_child_bindings WHERE child_install_id=i.id AND parent_install_id!=i.id)
 		ORDER BY i.created_at`)
