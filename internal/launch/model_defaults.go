@@ -19,6 +19,9 @@ func defaultModelBinding(slot Slot) (*hub.PackageBindingRow, *exit.Error) {
 	}
 	row := &hub.PackageBindingRow{Slot: slot.Path}
 	for _, rung := range slot.DefaultLadder {
+		if rung.GPUs > 1 && !slot.sequenceParallelDegrees()[rung.GPUs] {
+			return nil, exit.Named(exit.Validation, "package_model_default_invalid", "%s default count %d is not a declared sequence-parallel degree", slot.Path, rung.GPUs)
+		}
 		model, release, lane, manifest, problem := hub.ParseModelRef(rung.Lane)
 		if problem != nil || manifest != "" || strings.TrimSpace(rung.Lane) != rung.Lane || !hub.ValidModelLabel(release) || digestShapedRelease.MatchString(release) || !authoredLanePattern.MatchString(lane) {
 			return nil, exit.Named(exit.Validation, "package_model_default_invalid", "%s default lane %q must be org/model@release/lane", slot.Path, rung.Lane)
@@ -27,7 +30,7 @@ func defaultModelBinding(slot Slot) (*hub.PackageBindingRow, *exit.Error) {
 			return nil, exit.Named(exit.Validation, "package_model_default_invalid", "%s default ladder must use the same model and release in every rung", slot.Path)
 		}
 		row.Model, row.Release = model, release
-		row.Ladder = append(row.Ladder, hub.BindingRung{GPU: rung.GPU, Lane: lane})
+		row.Ladder = append(row.Ladder, hub.BindingRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: lane})
 	}
 	if problem := hub.ValidateLadder(row.Ladder); problem != nil {
 		return nil, exit.Named(exit.Validation, "package_model_default_invalid", "%s default ladder: %s", slot.Path, problem.Message)

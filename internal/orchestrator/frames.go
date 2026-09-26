@@ -467,7 +467,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 				"the persisted PlacementSet does not name placement %s: %v", p.PlacementID(), err)
 		}
 		setBytes, digest = append([]byte(nil), p.PlacementSetBytes...), append([]byte(nil), declared...)
-		authored, problem := devicePins(setBytes, w.spec.Devices)
+		authored, problem := devicePins(setBytes, w.spec.Devices, p.Models)
 		if problem != nil {
 			return problem
 		}
@@ -530,7 +530,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // Serving weight is read from entrypoint model slots in the exact set, matching
 // Runtime's executable bindings. A job can retain model input metadata without
 // constructing any serving model; a model inventory alone cannot justify a group.
-func devicePins(setBytes []byte, envelope []string) ([]*pb.PlacementDevicePin, *exit.Error) {
+func devicePins(setBytes []byte, envelope []string, models []ModelRef) ([]*pb.PlacementDevicePin, *exit.Error) {
 	if len(envelope) < 2 {
 		return nil, nil
 	}
@@ -554,8 +554,18 @@ func devicePins(setBytes []byte, envelope []string) ([]*pb.PlacementDevicePin, *
 	if !modelBearing {
 		return nil, nil
 	}
-	ordinals := make([]uint32, 0, len(envelope))
-	for ordinal := range envelope {
+	count := 0
+	for _, model := range models {
+		count = max(count, model.GPUs)
+	}
+	if count > len(envelope) {
+		return nil, exit.Named(exit.Conflict, "placement_gpu_count_unavailable", "model group needs %d GPUs but machine has %d", count, len(envelope))
+	}
+	if count == 0 {
+		count = len(envelope)
+	}
+	ordinals := make([]uint32, 0, count)
+	for ordinal := range count {
 		ordinals = append(ordinals, uint32(ordinal))
 	}
 	return []*pb.PlacementDevicePin{{
@@ -649,8 +659,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				}
 				row := remotePlacementObservation{
 					placementID: p.PlacementId, placementSetDigest: spellOf(p.PlacementSetDigest),
-					installationID: p.InstallationId,
-					materialization:   p.Materialization, serving: p.Serving,
+					installationID:  p.InstallationId,
+					materialization: p.Materialization, serving: p.Serving,
 					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
 					loadedPlanIDs: map[string]bool{},
 					loadedKnown:   w.wireMinor >= pb.ExecutionLifecycleWireMinor,

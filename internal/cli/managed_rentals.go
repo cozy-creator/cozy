@@ -246,10 +246,14 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	// choice (cl-210). Accelerator-owning requests retain only their own model slots;
 	// unrelated captures must not inflate their residency or preparation selection.
 	childModels, problem := resolver.UnpublishedChildModels(req)
+	if req.InstallID == "" {
+		childModels, problem = resolver.PublishedChildModels(m.ctx, req)
+	}
 	if problem != nil {
 		return none, "", problem
 	}
 	req.Models = append(append([]records.ModelRef(nil), req.Models...), childModels...)
+	needsAccelerator = needsAccelerator || len(childModels) > 0
 	if problem := m.reconcileLocked(); problem != nil {
 		return none, "", problem
 	}

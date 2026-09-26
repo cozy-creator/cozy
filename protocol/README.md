@@ -16,11 +16,11 @@ service path. `WireMinor` is its additive compatibility level. Additive changes 
 minor; independently negotiated optional capabilities are documented by the canonical
 protocol and default to unsupported, without inferring support from a version range. A breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
-This cohort pins wire61 with minimum60. Ordinary peers negotiate an overlapping
-supported range; they do not need identical versions. New senders carry the release
-PackageInterface, while supported older senders may omit it and use Runtime's cached
-installed-interface derivation. The minor60 `CheckPackageSetCompatibility` RPC remains
-available for older Hosts until minor60 leaves the supported window.
+This cohort pins wire63 with minimum62. Ordinary peers negotiate an overlapping
+supported range and do not need identical versions. Explicit model GPU group
+counts require feature63; uncounted captures preserve their earlier behavior at
+wire62. Counted preferences never raise the floor for unrelated calls or accepted
+executions.
 
 Machine submissions retain the workspace fence introduced at minor59: callers
 persist the authenticated execution-workspace identity with the exact submission,

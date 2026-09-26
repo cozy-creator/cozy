@@ -60,7 +60,7 @@ func exampleRows() []hub.ModelThroughput {
 // the attached H100 `morgiana` with `ahead` attempts queued before this one.
 func exampleCandidates(t *testing.T, ahead int) []orchestrator.PlacementCandidate {
 	t.Helper()
-	pinned, rung, ok := rental.Pin(exampleLadder(), "NVIDIA H100 80GB HBM3")
+	pinned, rung, ok := rental.Pin(exampleLadder(), "NVIDIA H100 80GB HBM3", 1)
 	if !ok || rung != 1 {
 		t.Fatalf("the H100 does not fit rung 1: %v %d", pinned, rung)
 	}

@@ -352,7 +352,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, wireMinor: info.WireMinor}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 		if request.InstallID == "" {
-			plan, iface, locked, requires, problem := m.publishedChildPreparation(ctx, request)
+			plan, iface, locked, requires, problem := m.resolver.publishedChildPreparation(ctx, m.context, request)
 			if problem != nil {
 				return nil, problem
 			}

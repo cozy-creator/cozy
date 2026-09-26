@@ -379,7 +379,18 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 	// prepared its own bytes and this owner relays them — so the device pin has to be
 	// authored over the SAME rule as a locally prepared set, or a wide pod would take a
 	// placement with no pin and refuse `device_group_unsupported` after the hour started.
-	pins, problem := devicePins(setBytes, w.spec.Devices)
+	models := w.spec.Placement.Models
+	if w.preparingRequest != "" {
+		request, err := c.opt.Store.RequestRow(w.preparingRequest)
+		if err != nil {
+			c.setDesiredRefusal(w, seq, err)
+			return
+		}
+		if request != nil {
+			models = request.Models
+		}
+	}
+	pins, problem := devicePins(setBytes, w.spec.Devices, models)
 	if problem != nil {
 		c.setDesiredRefusal(w, seq, problem)
 		return

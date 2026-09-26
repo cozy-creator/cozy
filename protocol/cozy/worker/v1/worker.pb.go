@@ -2766,7 +2766,7 @@ type MachineModelDefault struct {
 	Entrypoint           string                     `protobuf:"bytes,2,opt,name=entrypoint,proto3" json:"entrypoint,omitempty"`
 	Parameter            string                     `protobuf:"bytes,3,opt,name=parameter,proto3" json:"parameter,omitempty"`
 	PublicOrigin         string                     `protobuf:"bytes,4,opt,name=public_origin,json=publicOrigin,proto3" json:"public_origin,omitempty"`          // exact configured anonymous catalog origin; no credentials
-	Rungs                []*MachineModelDefaultRung `protobuf:"bytes,5,rep,name=rungs,proto3" json:"rungs,omitempty"`                                            // authored/owner ladder order, unique GPU selectors
+	Rungs                []*MachineModelDefaultRung `protobuf:"bytes,5,rep,name=rungs,proto3" json:"rungs,omitempty"`                                            // authored/owner ladder order, unique (GPU, count) selectors
 	UnavailableCode      string                     `protobuf:"bytes,6,opt,name=unavailable_code,json=unavailableCode,proto3" json:"unavailable_code,omitempty"` // exclusive with origin/rungs; bounded safe reason
 	CalleeInstallationId string                     `protobuf:"bytes,7,opt,name=callee_installation_id,json=calleeInstallationId,proto3" json:"callee_installation_id,omitempty"`
 	unknownFields        protoimpl.UnknownFields
@@ -2846,10 +2846,13 @@ func (x *MachineModelDefault) GetCalleeInstallationId() string {
 }
 
 type MachineModelDefaultRung struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Gpu           string                 `protobuf:"bytes,1,opt,name=gpu,proto3" json:"gpu,omitempty"`               // existing GPU selector, or "*"
-	Repository    string                 `protobuf:"bytes,2,opt,name=repository,proto3" json:"repository,omitempty"` // org/name; native catalog membership remains mandatory
-	Manifest      *Ref                   `protobuf:"bytes,3,opt,name=manifest,proto3" json:"manifest,omitempty"`     // immutable checkpoint, never a release/lane lookup at use time
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Zero preserves earlier captures: count was unspecified, never implicitly one.
+	// Positive counts select the exact execution group, not the whole machine width.
+	Gpus          uint32 `protobuf:"varint,4,opt,name=gpus,proto3" json:"gpus,omitempty"`
+	Gpu           string `protobuf:"bytes,1,opt,name=gpu,proto3" json:"gpu,omitempty"`               // existing GPU selector, or "*"
+	Repository    string `protobuf:"bytes,2,opt,name=repository,proto3" json:"repository,omitempty"` // org/name; native catalog membership remains mandatory
+	Manifest      *Ref   `protobuf:"bytes,3,opt,name=manifest,proto3" json:"manifest,omitempty"`     // immutable checkpoint, never a release/lane lookup at use time
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2882,6 +2885,13 @@ func (x *MachineModelDefaultRung) ProtoReflect() protoreflect.Message {
 // Deprecated: Use MachineModelDefaultRung.ProtoReflect.Descriptor instead.
 func (*MachineModelDefaultRung) Descriptor() ([]byte, []int) {
 	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *MachineModelDefaultRung) GetGpus() uint32 {
+	if x != nil {
+		return x.Gpus
+	}
+	return 0
 }
 
 func (x *MachineModelDefaultRung) GetGpu() string {
@@ -4872,8 +4882,11 @@ type PrepareModelProgress struct {
 	TransferredBytes uint64                 `protobuf:"varint,3,opt,name=transferred_bytes,json=transferredBytes,proto3" json:"transferred_bytes,omitempty"` // held + newly verified origin/cache bytes for this model
 	OriginBytes      uint64                 `protobuf:"varint,4,opt,name=origin_bytes,json=originBytes,proto3" json:"origin_bytes,omitempty"`                // newly fetched from origin during this preparation
 	CachedBytes      uint64                 `protobuf:"varint,5,opt,name=cached_bytes,json=cachedBytes,proto3" json:"cached_bytes,omitempty"`                // newly fetched from cache during this preparation
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Verified bytes newly published to the mounted cache for this exact runtime closure.
+	// A lower bound when replication is incomplete; never inferred from origin/held bytes.
+	CacheWrittenBytes uint64 `protobuf:"varint,6,opt,name=cache_written_bytes,json=cacheWrittenBytes,proto3" json:"cache_written_bytes,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *PrepareModelProgress) Reset() {
@@ -4937,6 +4950,13 @@ func (x *PrepareModelProgress) GetOriginBytes() uint64 {
 func (x *PrepareModelProgress) GetCachedBytes() uint64 {
 	if x != nil {
 		return x.CachedBytes
+	}
+	return 0
+}
+
+func (x *PrepareModelProgress) GetCacheWrittenBytes() uint64 {
+	if x != nil {
+		return x.CacheWrittenBytes
 	}
 	return 0
 }
@@ -22584,8 +22604,9 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\rpublic_origin\x18\x04 \x01(\tR\fpublicOrigin\x12=\n" +
 	"\x05rungs\x18\x05 \x03(\v2'.cozy.worker.v1.MachineModelDefaultRungR\x05rungs\x12)\n" +
 	"\x10unavailable_code\x18\x06 \x01(\tR\x0funavailableCode\x124\n" +
-	"\x16callee_installation_id\x18\a \x01(\tR\x14calleeInstallationIdJ\x04\b\x01\x10\x02R\x16callee_revision_digest\"|\n" +
-	"\x17MachineModelDefaultRung\x12\x10\n" +
+	"\x16callee_installation_id\x18\a \x01(\tR\x14calleeInstallationIdJ\x04\b\x01\x10\x02R\x16callee_revision_digest\"\x90\x01\n" +
+	"\x17MachineModelDefaultRung\x12\x12\n" +
+	"\x04gpus\x18\x04 \x01(\rR\x04gpus\x12\x10\n" +
 	"\x03gpu\x18\x01 \x01(\tR\x03gpu\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x02 \x01(\tR\n" +
@@ -22748,14 +22769,15 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\vsafe_detail\x18\x06 \x01(\tR\n" +
 	"safeDetail\x12K\n" +
 	"\x0emodel_progress\x18\a \x03(\v2$.cozy.worker.v1.PrepareModelProgressR\rmodelProgress\x12M\n" +
-	"\x11installed_package\x18\b \x01(\v2 .cozy.worker.v1.InstalledPackageR\x10installedPackage\"\xe2\x01\n" +
+	"\x11installed_package\x18\b \x01(\v2 .cozy.worker.v1.InstalledPackageR\x10installedPackage\"\x92\x02\n" +
 	"\x14PrepareModelProgress\x126\n" +
 	"\x05model\x18\x01 \x01(\v2 .cozy.worker.v1.DownloadModelRefR\x05model\x12\x1f\n" +
 	"\vtotal_bytes\x18\x02 \x01(\x04R\n" +
 	"totalBytes\x12+\n" +
 	"\x11transferred_bytes\x18\x03 \x01(\x04R\x10transferredBytes\x12!\n" +
 	"\forigin_bytes\x18\x04 \x01(\x04R\voriginBytes\x12!\n" +
-	"\fcached_bytes\x18\x05 \x01(\x04R\vcachedBytes\"\x84\x01\n" +
+	"\fcached_bytes\x18\x05 \x01(\x04R\vcachedBytes\x12.\n" +
+	"\x13cache_written_bytes\x18\x06 \x01(\x04R\x11cacheWrittenBytes\"\x84\x01\n" +
 	"\x13ModelSourceFileCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12@\n" +
 	"\arequest\x18\x02 \x01(\v2&.cozy.worker.v1.ModelSourceFileRequestR\arequest\"\x8a\x01\n" +

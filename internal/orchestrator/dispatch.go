@@ -1212,7 +1212,7 @@ func modelBindingSlot(model ModelRef) string {
 // that placement pins the request to.
 func rungHolding(m ModelRef, manifest string) (records.ModelRung, bool) {
 	if m.Pinned() {
-		return records.ModelRung{Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes}, m.Manifest == manifest
+		return records.ModelRung{GPUs: m.GPUs, Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes}, m.Manifest == manifest
 	}
 	for _, rung := range m.Ladder {
 		if rung.Manifest == manifest {
