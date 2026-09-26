@@ -1898,6 +1898,106 @@ mod tests {
     }
 
     #[test]
+    fn cached_pull_stale_does_not_move_a_changed_lane_back_to_a_held_checkpoint() {
+        let root = temporary("pull-moved-lane");
+        let (store, repo, first) = fixture(&root);
+        let mutations = pull_mutations(&repo, &first, 0);
+        let recorded = store
+            .apply_cached_repository(None, &mutations, &Fault::default())
+            .unwrap()
+            .unwrap();
+        let header = store
+            .read_manifest(&first)
+            .unwrap()
+            .header()
+            .unwrap()
+            .clone();
+        let second = store
+            .put_manifest(
+                &Draft {
+                    entries: vec![("replacement.cozytensors".into(), Entry::CozyTensors(header))],
+                }
+                .seal()
+                .unwrap(),
+            )
+            .unwrap()
+            .obj;
+        let checkpointed = store
+            .apply_repository(
+                Some(&recorded.canonical_bytes()),
+                &Mutation::PutCheckpoint {
+                    repo: repo.clone(),
+                    manifest: second.clone(),
+                },
+                &Fault::default(),
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .apply_repository(
+                Some(&checkpointed.canonical_bytes()),
+                &release_mutation(&repo, "1.0.0", "cpu", &second, 1),
+                &Fault::default(),
+            )
+            .unwrap();
+        let edited = fs::read(store.repository_path(&repo)).unwrap();
+        let repository = Repository::parse(&edited).unwrap();
+        assert!(repository
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.manifest == first));
+        assert_eq!(repository.releases[0].lanes[0].manifest, second);
+        assert_eq!(
+            store
+                .apply_cached_repository(None, &mutations, &Fault::default())
+                .unwrap_err()
+                .code,
+            Code::REPOSITORY_CONFLICT
+        );
+        assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), edited);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_pull_never_adopts_or_replaces_a_local_alias() {
+        let root = temporary("pull-local-alias");
+        let (store, _, manifest) = fixture(&root);
+        let repo = RepositoryName::new("local", "alias").unwrap();
+        let source_selection = "ab".repeat(32);
+        store
+            .apply_repository(
+                None,
+                &Mutation::ReplaceLocal {
+                    repo: repo.clone(),
+                    manifest: manifest.clone(),
+                    version: source_selection.clone(),
+                },
+                &Fault::default(),
+            )
+            .unwrap();
+        let edited = fs::read(store.repository_path(&repo)).unwrap();
+        let repository = Repository::parse(&edited).unwrap();
+        assert_eq!(
+            repository.checkpoints[0].source_selection.as_ref(),
+            Some(&source_selection)
+        );
+        assert_eq!(
+            store
+                .apply_cached_repository(
+                    None,
+                    &pull_mutations(&repo, &manifest, 0),
+                    &Fault::default()
+                )
+                .unwrap_err()
+                .code,
+            Code::KEY_GRAMMAR
+        );
+        assert_eq!(fs::read(store.repository_path(&repo)).unwrap(), edited);
+        assert!(!crate::cache_roots::matches(&store, &repo, &edited).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cached_pull_identical_still_verifies_manifest_bytes() {
         let root = temporary("pull-corrupt-manifest");
         let (store, repo, manifest) = fixture(&root);
