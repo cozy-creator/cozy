@@ -69,7 +69,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 			BaseWorkerImageDigest: live[row.ID].BaseWorkerImageDigest,
 			BaseWorkerImageTag:    live[row.ID].BaseWorkerImageTag,
 		}
-		if idle.PendingPreparation > fleet.preparing[row.ID] {
+		if idle.PendingPreparation > 0 {
 			summary.Activity = nil
 		}
 		if due, eligible := idle.ReleaseAt(); eligible {
