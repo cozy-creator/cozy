@@ -23,7 +23,7 @@ func (s *Server) refreshPackage(pkg string) (installID string, editable, changed
 // Provider acquisition remains Tensorhub's responsibility.
 func (s *Server) claimRental(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("rental_id")
-	instance, pkg, change, problem := s.orchestrator.EnsureRental(id)
+	instance, pkg, change, problem := s.orchestrator.EnsureRentalContext(r.Context(), id)
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return

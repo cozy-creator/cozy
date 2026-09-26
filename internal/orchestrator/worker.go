@@ -50,8 +50,8 @@ type Entrypoint struct {
 // rev-2's Placement nested directly in PlacementSet (#481). It carries the identity
 // facts, and nothing about how a process is started.
 type DesiredPlacement struct {
-	Package             string `json:"package"` // org/name — the slot this placement serves under
-	Release             string `json:"release"`
+	Package        string `json:"package"` // org/name — the slot this placement serves under
+	Release        string `json:"release"`
 	InstallationID string `json:"installation_id"` // worker environment lifetime; never package content
 	// InstallID is the install this placement was resolved from ("" = an uninstalled dev
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
@@ -418,7 +418,7 @@ type worker struct {
 	desiredEpoch uint64
 	// localMu serializes ConvergeLocalPackage on this worker. It is never held by the
 	// control stream's receive loop, whose reports the holder waits on.
-	localMu   sync.Mutex
+	localMu sync.Mutex
 	// hostPrepareSeq numbers the logical desires issued through PodHost (proto-025); a
 	// prepare that completes for an older number sends nothing.
 	hostPrepareSeq uint64
@@ -498,7 +498,7 @@ type worker struct {
 	convergedRevision    uint64
 	acceptedSetDigest    []byte
 	snapshotAcknowledged bool
-	installationID    string
+	installationID       string
 	// The job lane uses the same reported-versus-pre-offer split as serving. jobsAvail is
 	// the effective number dispatch reads.
 	reportedJobs int
@@ -543,7 +543,7 @@ type worker struct {
 type remotePlacementObservation struct {
 	placementID         string
 	placementSetDigest  string
-	installationID   string
+	installationID      string
 	materialization     pb.MaterializationState
 	serving             pb.ServingState
 	dispatchablePlanIDs map[string]bool
@@ -659,7 +659,7 @@ func placementRow(setBytes []byte, digest, pkg, release, placementID string) (De
 			PlacementIDValue: row.Str("placement_id"), PlacementSetDigest: digest,
 			BindingsDigest:    row.Str("bindings_digest"),
 			PlacementSetBytes: append([]byte(nil), setBytes...),
-			InstallationID: row.Str("installation_id")}
+			InstallationID:    row.Str("installation_id")}
 		if placement.PlacementIDValue == "" || !validDigest(placement.BindingsDigest) ||
 			placement.InstallationID == "" {
 			return DesiredPlacement{}, nil, false, exit.Named(exit.Structural,
@@ -1070,7 +1070,48 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 // EnsureRentalContext lets a foreground preparation stop waiting for an
 // unavailable control session when its caller disconnects.
 func (c *Orchestrator) EnsureRentalContext(ctx context.Context, id string) (string, string, WorkerChange, *exit.Error) {
+	if _, problem := c.retryRentalReadback(ctx, id); problem != nil {
+		return "", "", ChangeNone, problem
+	}
 	return c.ensureRentalContext(ctx, id)
+}
+
+// retryRentalReadback is an explicit caller's retry of an unreadable hardware
+// observation, not a retry of an identity mismatch. Re-enter the normal claim
+// and snapshot handshake; missing observations never authorize maintenance or
+// execution. Background dispatch keeps the refusal instead of spinning claims.
+func (c *Orchestrator) retryRentalReadback(ctx context.Context, id string) (bool, *exit.Error) {
+	c.mu.Lock()
+	w := c.workers[rentalInstanceID(id)]
+	if w == nil || w.exited || w.stopping || c.closing || w.spec.Connection == nil ||
+		w.spec.Connection.RentalID != id || w.refusal == nil ||
+		w.refusal.ErrName() != "rental.worker_readback_incomplete" {
+		c.mu.Unlock()
+		return false, nil
+	}
+	refusal, done := w.refusal, w.attachDone
+	c.mu.Unlock()
+	// Only one attach goroutine may own a boot. The refused conversation must
+	// finish before its completion channel can be replaced.
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return false, exit.Unavailablef("rental readback retry canceled")
+	case <-c.done:
+		return false, exit.Unavailablef("worker owner closed")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.workers[w.instanceID] != w || w.exited || w.stopping || c.closing ||
+		w.refusal != refusal || w.attachDone != done {
+		return false, nil
+	}
+	w.refusal = nil
+	w.snapshotAcknowledged = false
+	w.attachDone = make(chan struct{})
+	c.logf("rental %s: explicit retry of incomplete worker readback; requiring a fresh claim and snapshot", id)
+	go c.attach(w)
+	return true, nil
 }
 
 func (c *Orchestrator) ensureRentalContext(ctx context.Context, id string) (string, string, WorkerChange, *exit.Error) {

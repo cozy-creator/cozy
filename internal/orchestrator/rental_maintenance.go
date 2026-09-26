@@ -48,15 +48,29 @@ func (c *Orchestrator) MaintainRental(ctx context.Context, id string,
 	if id == "" || update == nil || c.opt.Rentals == nil {
 		return exit.New(exit.Validation, "maintenance requires one attached rental and an updater")
 	}
+	if retried, problem := c.retryRentalReadback(ctx, id); problem != nil {
+		return problem
+	} else if retried {
+		if problem := c.ensureWorkerClaimedContext(ctx, rentalInstanceID(id)); problem != nil {
+			return problem
+		}
+	}
 	// ClaimAck can precede the snapshot and the first observed-state tick. That
 	// missing observation is not evidence of active work. Let the existing
 	// authenticated connection finish reporting before applying the idle fence.
 	for {
 		c.mu.Lock()
 		w := c.workers[rentalInstanceID(id)]
+		var refused *exit.Error
+		if w != nil {
+			refused = w.refusal
+		}
 		waiting := !c.closing && w != nil && !w.exited && !w.stopping &&
 			(!w.snapshotAcknowledged || w.lastReport.IsZero())
 		c.mu.Unlock()
+		if refused != nil {
+			return refused
+		}
 		if !waiting {
 			break
 		}
