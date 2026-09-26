@@ -162,7 +162,11 @@ func (r *Resolver) childSlotBinding(pkg, entrypoint string, slot launch.Slot) (h
 // the child's; a local parent's child runs on this host's device.
 func (r *Resolver) childAccelerator(parent records.Request) (string, int, *exit.Error) {
 	if parent.Worker == "" {
-		return localAccelerator(r.cfg), len(hostgpu.Probe(r.cfg).GPUs), nil
+		inventory := hostgpu.Probe(r.cfg)
+		if len(inventory.GPUs) == 0 {
+			return "", 0, nil
+		}
+		return inventory.GPUs[0].Model, len(inventory.GPUs), nil
 	}
 	row, problem := r.store.RentalRow(parent.Worker)
 	if problem != nil {
