@@ -132,9 +132,21 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	if !ctx.Mode().JSON {
-		fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", handle.Package, handle.Function)
+		fmt.Fprintf(ctx.Err, "Queued run %s: %s/%s\n", runReference(handle.Number, handle.JobID), handle.Package, handle.Function)
+		if rental := ctx.Inv.Value("--rental"); rental != "" {
+			fmt.Fprintf(ctx.Err, "Machine: %s\n", rental)
+		}
 	}
 	if handle.MachineExecution {
+		// The daemon already owns this run. Waiting for the worker's receipt is
+		// part of --await, not a second acceptance gate for a detached command.
+		if !ctx.Inv.Bool("--follow") {
+			state, problem := c.Job(handle.JobID)
+			if problem != nil {
+				return problem
+			}
+			return renderSubmittedJob(ctx, state, !handle.Replay)
+		}
 		state, detached, problem := waitMachineAcceptance(ctx, c, handle)
 		if problem != nil {
 			return problem
@@ -149,9 +161,6 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		}
 		if state.Status == "blocked" || state.Status == "paused" {
 			return renderJobTerminal(ctx, state, nil)
-		}
-		if !ctx.Inv.Bool("--follow") {
-			return renderSubmittedJob(ctx, state, !handle.Replay)
 		}
 	}
 	if ctx.Inv.Bool("--follow") {
@@ -186,7 +195,11 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 			defaults = append(defaults, "machine_accepted")
 		}
 		if !machine.Accepted {
-			fields = append(fields, output.Field{K: "stage", V: "queued locally; machine acceptance is pending"})
+			stage := state.Stage
+			if stage == "" || stage == "waiting for durable machine acceptance" {
+				stage = "queued locally; machine preparation continues in the background"
+			}
+			fields = append(fields, output.Field{K: "stage", V: stage})
 			defaults = append(defaults, "stage")
 		}
 	}
