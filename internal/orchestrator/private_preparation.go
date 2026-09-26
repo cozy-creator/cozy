@@ -6,6 +6,46 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
+// preparedPrivateServing reuses only a root serving request's exact installed
+// environment and model bindings. It changes no desired state and acquires no
+// preparation ownership. Dispatch still validates the request, grants and live
+// admission epoch and reserves only the seats the worker actually reports free.
+func (c *Orchestrator) preparedPrivateServing(instance string, req records.Request,
+	logical LogicalPackage) (WorkerLaunchSpec, string, bool) {
+	if req.IsJob() || req.ParentRequestID != "" || req.ModelTransfer != nil ||
+		req.RetainWork || req.InstallID == "" || req.LocalInstallationID == "" {
+		return WorkerLaunchSpec{}, "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w := c.workers[instance]
+	if w == nil || w.exited || w.stopping || !w.snapshotAcknowledged ||
+		!w.supportsCurrentProtocol() || c.sessions[w.bootID] == nil ||
+		w.spec.Connection == nil || w.spec.Connection.RentalID != req.Worker ||
+		w.spec.IsJob() || w.orchestrationParent != nil || w.preparingRequest != "" ||
+		c.rentalMaintenance[req.Worker] || w.desiredRefusal != nil ||
+		w.acceptedRevision < w.revision || w.convergedRevision < w.revision ||
+		c.modeClaimedLocked(w, false, req.ID) || !c.rentalParentAllows(w, req) {
+		return WorkerLaunchSpec{}, "", false
+	}
+	placement, planID, observed, held := observedServing(w, logical)
+	if !held || placement.InstallationID != req.LocalInstallationID ||
+		observed.installationID != placement.InstallationID ||
+		observed.materialization != pb.MaterializationState_MATERIALIZATION_STATE_STAGED ||
+		observed.serving != pb.ServingState_SERVING_STATE_DISPATCHABLE ||
+		!observed.dispatchablePlanIDs[planID] ||
+		requireAdapterEcho(req.Models, placement.Models) != nil {
+		return WorkerLaunchSpec{}, "", false
+	}
+	placement.Package = pinnedPackage(req.Package, req.Worker)
+	placement.Entrypoints = []Entrypoint{{Name: logical.Function, Digest: planID,
+		Outputs: append([]string(nil), logical.Outputs...)}}
+	w.remotePlacements[remotePlanKey(placement.Package, planID)] = placement
+	spec := w.spec
+	spec.Placement = placement
+	return spec, planID, true
+}
+
 func (c *Orchestrator) activeParentFor(req records.Request) (*pb.JobDirective, *exit.Error) {
 	if req.ParentRequestID == "" {
 		return nil, nil

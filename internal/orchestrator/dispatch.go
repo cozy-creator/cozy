@@ -1362,6 +1362,12 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
 		}
 	}
+	// Reusing an observed installation is not preparation. Its next ordinary
+	// offer may use the worker's released seat while earlier output custody is
+	// still settling; mutations and different selections retain the idle fence.
+	if spec, planID, ready := c.preparedPrivateServing(instance, req, logical); ready {
+		return spec, planID, nil
+	}
 	// Published serving on a serving worker only adds to the rental's set: it claims
 	// nothing and fences nothing. Everything else owns the machine while it prepares.
 	if !c.ordinaryServing(instance, req) {
