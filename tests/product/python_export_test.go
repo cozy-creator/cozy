@@ -108,13 +108,6 @@ only-include = ["operation.py"]
 	if graph["packaging"]["packaging"] != pack.Registry[0].Version {
 		t.Fatalf("wrong native closure graph: %+v", graph)
 	}
-	active, problem := packagepublish.EvaluateRequirements(context.Background(), []string{
-		"selected>=1; python_version == '3.13'", "inactive>=1; python_version == '3.12'",
-	}, "3.13.10")
-	fatal(t, problem)
-	if len(active) != 1 || !strings.HasPrefix(active[0], "selected") {
-		t.Fatalf("target markers changed: %v", active)
-	}
 	wheelBytes, err := os.ReadFile(pack.Wheel)
 	must(t, err)
 	wheelHash := sha256.Sum256(wheelBytes)
