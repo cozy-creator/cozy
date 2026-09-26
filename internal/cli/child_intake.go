@@ -109,9 +109,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 		if problem != nil {
 			return fail(problem)
 		}
-		stack[path] = true
 		nested, problem := prepareChildIntakeDepth(ctx, dependency, layout, store, stack, depth+1)
-		delete(stack, path)
 		if problem != nil {
 			dependency.Close()
 			return fail(problem)
