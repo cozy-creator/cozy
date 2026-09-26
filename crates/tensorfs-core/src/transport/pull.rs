@@ -941,7 +941,7 @@ pub fn fetch_wanted(
     on_object: Option<ObjectObserver<'_>>,
 ) -> Result<WalkOutcome> {
     fetch_wanted_bounded(
-        store, plan, urls, policy, credential, deadline, ledger, streams, on_object, None,
+        store, plan, urls, policy, credential, deadline, ledger, streams, on_object, None, None,
     )
 }
 
@@ -957,10 +957,12 @@ pub(super) fn fetch_wanted_bounded(
     streams: usize,
     on_object: Option<ObjectObserver<'_>>,
     download_budget: Option<(u64, u64)>,
+    cache_writes: Option<&crate::repo_cache::CacheWriteReceipt>,
 ) -> Result<WalkOutcome> {
     let cache = store.repo_cache();
     let backfill = cache.map(|cache| {
         crate::repo_cache::BackfillBatch::new(cache.clone(), store, plan.wanted.len())
+            .observe(cache_writes.cloned().unwrap_or_default())
     });
     // Nothing is checked up front any more, because there is no up-front set to check. The
     // invariant it proved — the grant set covers the wanted set exactly — is enforced per
@@ -1158,6 +1160,8 @@ impl<'a> PullRequest<'a> {
 /// What a pull actually did — counted, never estimated.
 #[derive(Debug, Clone, Default)]
 pub struct PullReport {
+    pub scope: String,
+    pub cache_writes: crate::repo_cache::CacheWriteReceipt,
     pub refspec: String,
     pub model: String,
     pub release: String,
@@ -1293,6 +1297,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             request.streams,
             request.on_object,
             request.download_budget,
+            Some(&report.cache_writes),
         )?;
         report.fetched = walked.fetched;
         report.bytes_moved = walked.bytes_moved;
@@ -1330,6 +1335,7 @@ fn plan_against_store(
     };
     let (plan, why) = FetchPlan::of(request.store, &session, &closure.manifest, &closure.objects)?;
     let report = PullReport {
+        scope: closure.scope.clone(),
         refspec: request.refspec.to_string(),
         model: closure.model.clone(),
         release: closure.release.clone(),

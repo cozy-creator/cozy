@@ -5340,6 +5340,7 @@ fn bounded_warm_tail_speculates_without_a_completed_speed_reference() {
                 plan.wanted_bytes() + plan.wanted.iter().map(|o| o.length).max().unwrap(),
                 count as u64 + 1,
             )),
+            None,
         );
         live.store(false, Ordering::Release);
         monitor.join().unwrap();

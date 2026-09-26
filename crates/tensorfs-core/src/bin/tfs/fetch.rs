@@ -305,6 +305,14 @@ fn pull_with_budget(
     if !tensorfs_core::repo_cache::finish_optional_backfills() {
         eprintln!("repo cache replication incomplete; local fetch remains complete");
     }
+    // Exactly one model pull owns this receipt; a shared library process may
+    // concurrently finish other pulls without contaminating this observation.
+    let quoted = |value: &str| String::from_utf8(canon::write(&canon::Value::str(value))).unwrap();
+    eprintln!(
+        "{{\"event\":\"pull.cache\",\"model\":{},\"manifest\":{},\"scope\":{},\"cache_written_bytes\":{},\"cache_bytes\":{},\"total_bytes\":{}}}",
+        quoted(&report.model), quoted(&report.manifest), quoted(&report.scope),
+        report.cache_writes.bytes(), report.bytes_cached, report.bytes_total,
+    );
     println!(
         "model        {}@{} lane {}",
         report.model, report.release, report.lane
