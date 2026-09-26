@@ -7,7 +7,6 @@ package install
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -322,15 +321,6 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 
 	// ---- environment: the first code-executing step, on verified source only ----
-	// An editable tree runs its own build backend first: a wheel a worker could not
-	// import from is refused here, not on the rented pod a later --rental reaches.
-	if req.Local != nil {
-		if e := packagepublish.VerifyProjectWheel(context.Background(), sourceDir,
-			strings.TrimPrefix(req.Local.Package, "local/"), req.Local.Release); e != nil {
-			return guard(e)
-		}
-		mark("wheel")
-	}
 	venvDir := filepath.Join(installDir, "venv")
 	var env *EnvironmentReceipt
 	var packageInterface *launch.PackageInterface

@@ -180,18 +180,6 @@ func (p *Package) build(ctx context.Context, publish bool, prebuiltWheels ...str
 	return nil
 }
 
-// projectWheel builds the tree's own wheel and refuses one a worker could not run:
-// its identity must come from [project], and it must install at least one Python
-// module or package. A backend left to guess a flat layout can emit a wheel holding
-// nothing but .dist-info; that wheel would fail on a rented pod, so it fails here.
-func projectWheel(ctx context.Context, tree, out, name, release string, python string) (string, *exit.Error) {
-	paths, problem := projectWheels(ctx, tree, out, name, release, python)
-	if problem != nil {
-		return "", problem
-	}
-	return paths[0], nil
-}
-
 func projectWheels(ctx context.Context, tree, out, name, release string, python string, prebuiltWheels ...string) ([]string, *exit.Error) {
 	var paths []string
 	if len(prebuiltWheels) != 0 {
@@ -323,24 +311,6 @@ func applicationObject(path string) (string, *exit.Error) {
 			WithRemedy("set `[application] object = \"<module>:app\"` in package.toml")
 	}
 	return object, nil
-}
-
-// VerifyProjectWheel is the same fence for an editable install: the tree must build
-// into a wheel a worker could run BEFORE it is pinned, so `cozy run --rental` never
-// discovers on a paid pod what `cozy package install` could have said at once. The
-// wheel is disposable; the local revision builds its own from the pinned source.
-func VerifyProjectWheel(ctx context.Context, tree, name, release string) *exit.Error {
-	out, err := os.MkdirTemp("", "cozy-project-wheel-")
-	if err != nil {
-		return exit.Internalf("cannot create project wheel staging: %s", err)
-	}
-	defer os.RemoveAll(out)
-	python, problem := hostruntime.ProjectPython(ctx, tree)
-	if problem != nil {
-		return problem
-	}
-	_, problem = projectWheel(ctx, tree, out, name, release, python.Executable)
-	return problem
 }
 
 // Paths returns the sorted source-relative paths of one prepared tree.
