@@ -1,20 +1,22 @@
-package launch
+package producttest
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/launch"
 )
 
-func overlayEntrypoint() *Entrypoint {
-	return &Entrypoint{
+func overlayEntrypoint() *launch.Entrypoint {
+	return &launch.Entrypoint{
 		Name:   "generate",
-		Models: []Slot{{Path: "generate.models.base_model", Param: "base_model"}},
+		Models: []launch.Slot{{Path: "generate.models.base_model", Param: "base_model"}},
 	}
 }
 
 func TestParsePayloadCanonicalWeightedOverlayList(t *testing.T) {
-	payload, keys, problem := ParsePayload(overlayEntrypoint(), []string{
+	payload, keys, problem := launch.ParsePayload(overlayEntrypoint(), []string{
 		`model.base_model=org/base@1.0`,
 		`model.base_model.lora:=[{"ref":"org/style-a@1","weight":0.5},{"ref":"org/style-b@2","weight":-0.25}]`,
 	}, "")
@@ -39,7 +41,7 @@ func TestParsePayloadInputModelEnvelopePreservesOrder(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"prompt":"hello","models":{"base_model":{"ref":"org/base@1","lora":[{"ref":"org/a@1","weight":1},{"ref":"org/b@1","weight":"0.75"}]}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	payload, keys, problem := ParsePayload(overlayEntrypoint(), nil, path)
+	payload, keys, problem := launch.ParsePayload(overlayEntrypoint(), nil, path)
 	if problem != nil {
 		t.Fatalf("ParsePayload refused: %v", problem)
 	}
@@ -53,7 +55,7 @@ func TestParsePayloadInputModelEnvelopePreservesOrder(t *testing.T) {
 }
 
 func TestParsePayloadInlineOverlayShorthandRepeatsInOrder(t *testing.T) {
-	_, keys, problem := ParsePayload(overlayEntrypoint(), []string{
+	_, keys, problem := launch.ParsePayload(overlayEntrypoint(), []string{
 		`base_model.lora=org/a@1,weight=0.5`,
 		`model.base_model.lora=org/b@1,weight=-0.25`,
 	}, "")
@@ -67,7 +69,7 @@ func TestParsePayloadInlineOverlayShorthandRepeatsInOrder(t *testing.T) {
 }
 
 func TestParsePayloadRejectsInvalidOverlayWeight(t *testing.T) {
-	_, _, problem := ParsePayload(overlayEntrypoint(), []string{
+	_, _, problem := launch.ParsePayload(overlayEntrypoint(), []string{
 		`model.base_model.lora=org/style@1,weight=nan`,
 	}, "")
 	if problem == nil || problem.ErrName() != "usage" {
@@ -76,7 +78,7 @@ func TestParsePayloadRejectsInvalidOverlayWeight(t *testing.T) {
 }
 
 func TestParsePayloadRequiresCanonicalOverlayWeight(t *testing.T) {
-	_, _, problem := ParsePayload(overlayEntrypoint(), []string{
+	_, _, problem := launch.ParsePayload(overlayEntrypoint(), []string{
 		`model.base_model.lora:=[{"ref":"org/style@1"}]`,
 	}, "")
 	if problem == nil || problem.ErrName() != "usage" {
@@ -85,7 +87,7 @@ func TestParsePayloadRequiresCanonicalOverlayWeight(t *testing.T) {
 }
 
 func TestParsePayloadRejectsUnknownOverlaySlot(t *testing.T) {
-	_, _, problem := ParsePayload(overlayEntrypoint(), []string{
+	_, _, problem := launch.ParsePayload(overlayEntrypoint(), []string{
 		`model.other.lora=org/style@1,weight=0.5`,
 	}, "")
 	if problem == nil || problem.ErrName() != "model_slot_unknown" {
@@ -94,7 +96,7 @@ func TestParsePayloadRejectsUnknownOverlaySlot(t *testing.T) {
 }
 
 func TestParsePayloadStartsEachRequestWithPristineOverlaySet(t *testing.T) {
-	_, first, problem := ParsePayload(overlayEntrypoint(), []string{
+	_, first, problem := launch.ParsePayload(overlayEntrypoint(), []string{
 		`model.base_model.lora=org/style@1,weight=0.5`,
 	}, "")
 	if problem != nil {
@@ -103,7 +105,7 @@ func TestParsePayloadStartsEachRequestWithPristineOverlaySet(t *testing.T) {
 	if len(first.Overlays["generate.models.base_model"]) != 1 {
 		t.Fatalf("first overlays = %#v", first.Overlays)
 	}
-	_, second, problem := ParsePayload(overlayEntrypoint(), nil, "")
+	_, second, problem := launch.ParsePayload(overlayEntrypoint(), nil, "")
 	if problem != nil {
 		t.Fatalf("second parse refused: %v", problem)
 	}
