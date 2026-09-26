@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,11 +44,6 @@ func EnvironmentPython(inst records.PackageInstall) (string, *exit.Error) {
 // interface, while live editable checkouts use source. The tool is resolved when a question is
 // asked (Job), so a host that never asks one needs none.
 func Read(inst records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
-	if inst.Python != "" {
-		if _, problem := hostruntime.EnsurePython(context.Background(), "", inst.Python); problem != nil {
-			return nil, problem
-		}
-	}
 	source := SourceDir(inst)
 	d, e := ReadPackageInterface(PackageInterfacePath(inst.Dir))
 	if e != nil {
