@@ -25,7 +25,7 @@ func RuntimeUpdateHost(version string, target *RuntimeWire, hostWireMinor uint32
 		return nil
 	}
 	return exit.Named(exit.Conflict, "rental.runtime_update_host_too_old",
-		"Runtime %s needs worker protocol %d or newer on the pod host; this rental reports %d — nothing was changed",
+		"Runtime %s needs worker protocol %d or newer on the pod host; this rental reports %d. Runtime wheel updates do not replace the pod Host — nothing was changed",
 		version, target.MinimumWireMinor, hostWireMinor).
 		WithRemedy("rent a machine on the current worker image")
 }

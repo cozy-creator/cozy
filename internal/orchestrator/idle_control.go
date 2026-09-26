@@ -6,6 +6,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -28,16 +29,26 @@ type IdleControl struct {
 func (s *IdleControl) Close() error { s.cancel(); return s.connection.Close() }
 
 func DialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
-	control, problem := dialIdleControl(parent, remote, sign, retained)
+	control, problem := dialIdleControl(parent, remote, sign, retained, false)
 	if problem != nil && problem.ErrName() == "rental.control_reconnect" {
 		// A cold Host transfers its workspace ledger to Runtime once and then
 		// requires a new Claim. Never accept that first, unrecovered snapshot.
-		return dialIdleControl(parent, remote, sign, retained)
+		return dialIdleControl(parent, remote, sign, retained, false)
 	}
 	return control, problem
 }
 
-func dialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
+// DialMaintenanceControl negotiates the stable Claim/closed-snapshot lane for
+// Runtime repair. Ordinary idle control and execution keep their current gate.
+func DialMaintenanceControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
+	control, problem := dialIdleControl(parent, remote, sign, retained, true)
+	if problem != nil && problem.ErrName() == "rental.control_reconnect" {
+		return dialIdleControl(parent, remote, sign, retained, true)
+	}
+	return control, problem
+}
+
+func dialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store, maintenance bool) (*IdleControl, *exit.Error) {
 	if remote == nil || remote.CACert == "" || remote.WorkerBootID == "" || sign == nil {
 		return nil, exit.New(exit.Credential, "operator control requires a pinned rental and Claim signer")
 	}
@@ -57,14 +68,26 @@ func dialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 			_ = control.Close()
 		}
 	}()
-	if problem := probeWorkerProtocol(ctx, conn, true); problem != nil {
+	wireMinor, minimumMinor := pb.WireMinor, pb.MinCompatibleWireMinor
+	if maintenance {
+		probeContext, probeCancel := context.WithTimeout(ctx, hub.Timeout)
+		info, err := pb.NewPodHostClient(conn).ProtocolInfo(probeContext, &pb.ProtocolInfoRequest{})
+		probeCancel()
+		if err != nil {
+			return nil, idleControlEnd(err)
+		}
+		if problem := validateMaintenanceProtocol(info); problem != nil {
+			return nil, problem
+		}
+		wireMinor, minimumMinor = min(info.WireMinor, pb.WireMinor), max(info.MinimumWireMinor, pb.RentalKeepaliveWireMinor)
+	} else if problem := probeWorkerProtocol(ctx, conn, true); problem != nil {
 		return nil, problem
 	}
 	stream, err := pb.NewWorkerControlClient(conn).Control(ctx)
 	if err != nil {
 		return nil, idleControlEnd(err)
 	}
-	claim := &pb.Claim{RecordOwnerEpoch: recordOwnerEpoch, RecordOwnerId: recordOwnerID, WorkerId: remote.WorkerID, WorkerBootId: remote.WorkerBootID, WireMinor: pb.WireMinor, Proof: proof}
+	claim := &pb.Claim{RecordOwnerEpoch: recordOwnerEpoch, RecordOwnerId: recordOwnerID, WorkerId: remote.WorkerID, WorkerBootId: remote.WorkerBootID, WireMinor: wireMinor, Proof: proof}
 	if err = stream.Send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: claim}}); err != nil {
 		return nil, idleControlEnd(err)
 	}
@@ -80,7 +103,7 @@ func dialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 		switch message := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
 			ack := message.ClaimAck
-			if !ack.Accepted || ack.RecordOwnerEpoch != recordOwnerEpoch || ack.WorkerId != remote.WorkerID || ack.WorkerBootId != remote.WorkerBootID || ack.ControlStreamEpoch == 0 || ack.WireMinor < pb.MinCompatibleWireMinor {
+			if !ack.Accepted || ack.RecordOwnerEpoch != recordOwnerEpoch || ack.WorkerId != remote.WorkerID || ack.WorkerBootId != remote.WorkerBootID || ack.ControlStreamEpoch == 0 || ack.WireMinor < minimumMinor {
 				return nil, exit.New(exit.Conflict, "operator control claim was refused or changed the pinned worker")
 			}
 			epoch = ack.ControlStreamEpoch
