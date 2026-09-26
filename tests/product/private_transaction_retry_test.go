@@ -30,7 +30,7 @@ func TestUnpublishedTransactionEditedRetryPreservesHistoryAndCustody(t *testing.
 	retry.ID, retry.IdemKey = "req-private-fixed-program", "idem-private-fixed-program"
 	retry.RetryOf = prior.ID
 	retry.BodyDigest = "sha256:" + strings.Repeat("d", 64)
-	retry.LocalPackageDigest = "sha256:" + strings.Repeat("e", 64)
+	retry.LocalInstallationID = "sha256:" + strings.Repeat("e", 64)
 	retry.PlanID = "sha256:" + strings.Repeat("f", 64)
 	retry.Payload = []byte(`{"source_revision":"fixed-B","seed":17,"quality_bar":0.95}`)
 	retry.Worker, retry.Rental, retry.RentalRequired = "", false, false
@@ -38,7 +38,7 @@ func TestUnpublishedTransactionEditedRetryPreservesHistoryAndCustody(t *testing.
 	fatal(t, problem)
 	if !fresh || admitted.ID == prior.ID || admitted.Number == prior.Number || admitted.RetryOf != prior.ID ||
 		admitted.ReuseScope != prior.ID || admitted.Worker != rental || !admitted.Rental || !admitted.RentalRequired ||
-		admitted.LocalPackageDigest != retry.LocalPackageDigest || admitted.PlanID != retry.PlanID ||
+		admitted.LocalInstallationID != retry.LocalInstallationID || admitted.PlanID != retry.PlanID ||
 		admitted.BodyDigest != retry.BodyDigest || !bytes.Equal(admitted.Payload, retry.Payload) || admitted.Ordinal != 0 {
 		t.Fatalf("edited retry lost immutable program or retained custody: %+v", admitted)
 	}

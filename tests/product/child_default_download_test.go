@@ -88,17 +88,17 @@ func TestCapturedLocalDefaultDownloadsColdModel(t *testing.T) {
 		}},
 		"jobs": []any{map[string]any{"name": "parent", "publishes": false, "models": []any{}, "request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}}, "weights_outputs": []any{}}},
 	})
-	installed.PackageInterface = assessmentDigest(raw)
+
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), raw, 0444))
 	fatal(t, store.RecordInstall(installed))
-	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID, ChildInstallID: installed.ID, InterfaceDigest: installed.PackageInterface, Module: "captured", Export: "judge", Entrypoint: "judge"}}))
+	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID, ChildInstallID: installed.ID, Module: "captured", Export: "judge", Entrypoint: "judge"}}))
 	cfg := config.Config{Home: layout.Root, HubURL: server.URL, HubToken: secret.New("fixture"), Tfs: binary, TensorFSRoot: filepath.Join(layout.Root, "native-store")}
 	resolver := cli.NewResolver(store, cfg, nil)
 	parent := records.Request{ID: "parent", InstallID: installed.ID, Entrypoint: "parent", Kind: "job"}
 	args := assessmentJSON(t, map[string]any{"payload": map[string]any{}, "models": map[string]any{"model": nil}})
 	for turn := range 2 {
-		selected, _, problem := resolver.ResolveUnpublishedChild(parent, installed.PackageInterface, "captured", "judge", args)
+		selected, _, problem := resolver.ResolveUnpublishedChild(parent, "captured", "judge", args)
 		fatal(t, problem)
 		if len(selected.Models) != 1 || selected.Models[0].Manifest != manifestID || selected.Models[0].BindingPath != "judge.models.model" {
 			t.Fatal("default input identity changed")
@@ -115,7 +115,7 @@ func TestCapturedLocalDefaultDownloadsColdModel(t *testing.T) {
 		}
 	}
 	changed.Store(true)
-	selected, _, problem := resolver.ResolveUnpublishedChild(parent, installed.PackageInterface, "captured", "judge", args)
+	selected, _, problem := resolver.ResolveUnpublishedChild(parent, "captured", "judge", args)
 	fatal(t, problem)
 	problem = resolver.EnsureLocalModels(selected.Models)
 	if problem == nil || problem.ErrName() != "child.model_manifest_changed" {

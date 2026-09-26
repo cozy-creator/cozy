@@ -41,13 +41,12 @@ func TestLocalPreparationRetainsPublishedInterface(t *testing.T) {
 	iface, problem := launch.DecodePackageInterface([]byte(`{"format":"cozy.package.interface/1","application":"proof:app","entrypoints":[],"jobs":[]}`))
 	fatal(t, problem)
 	facts := launch.Facts{Install: records.PackageInstall{ID: "published", Package: "proof/model",
-		Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir(), PackageInterface: iface.Digest},
+		Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir()},
 		PackageInterface: iface}
 	spec, problem := facts.PreparationSpec([]string{"0"})
 	fatal(t, problem)
 	if spec.Preparation == nil || !spec.Preparation.Published ||
-		!bytes.Equal(spec.Preparation.PackageInterface, iface.Raw) ||
-		spec.Preparation.PackageInterfaceDigest != iface.Digest {
+		!bytes.Equal(spec.Preparation.PackageInterface, iface.Raw) {
 		t.Fatalf("local launch lost published interface: %+v", spec.Preparation)
 	}
 }

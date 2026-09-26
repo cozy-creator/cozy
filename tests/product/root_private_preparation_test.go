@@ -26,13 +26,13 @@ func TestRootPrivateModelFreeServingObtainsPlanFromPreparation(t *testing.T) {
 		opt.Packages = localLauncher{revision: revision}
 	})
 	install := records.PackageInstall{ID: "root-private", Package: revision.Package, Major: 1, Version: revision.Release,
-		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"), SourceDigest: revision.SourceDigest,
+		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"),
 		Dir: filepath.Join(o.root, "installs", "root-private"), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, problem := o.store.Activate(install)
 	fatal(t, problem)
 	requestID, _, problem := o.c.Submit(orchestrator.Submission{
 		IdemKey: "root-private", Package: revision.Package, Entrypoint: "tile", Release: revision.Release,
-		LocalPackageDigest: revision.Digest, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
+		LocalInstallationID: revision.ID, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
 		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true,
 	})
 	fatal(t, problem)
@@ -51,7 +51,7 @@ func TestRootPrivateModelFreeServingObtainsPlanFromPreparation(t *testing.T) {
 	if row.ParentRequestID != "" || len(row.Models) != 0 || row.PlanID != podPlanID(revision.Package) || row.Ordinal != 1 {
 		t.Fatalf("root request did not obtain its model-free plan from preparation: %+v", row)
 	}
-	if row.LocalPackageDigest != revision.Digest || row.LocalPackageUploadedBootID != podBootID {
+	if row.LocalInstallationID != revision.ID || row.LocalPackageUploadedBootID != podBootID {
 		t.Fatal("private preparation lost its exact revision or verified upload boot")
 	}
 	spec, err := canonical.Read(pod.offers[0].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})

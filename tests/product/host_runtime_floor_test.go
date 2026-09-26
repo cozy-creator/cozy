@@ -10,7 +10,8 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 func TestAdmissionRequiresNativeIngestionRuntimeAndAcceptsSourceDevWheel(t *testing.T) {
@@ -67,9 +68,15 @@ func TestNewControllerAcceptsExistingPackageSDKClosure(t *testing.T) {
 	must(t, err)
 	must(t, archive.Close())
 	must(t, file.Close())
-	captured := localpackage.Revision{Files: []localpackage.File{{Kind: "project", Path: path}}}
-	fatal(t, localpackage.RequireRuntimeFloor(captured, hostruntime.PackageFloor))
-	if problem := localpackage.RequireRuntimeFloor(captured, hostruntime.ToolFloor); problem == nil {
-		t.Fatal("control: this old package must not claim the new controller API")
+	captured, problem := packagepublish.CaptureDependency(path)
+	fatal(t, problem)
+	if captured.Path != path || captured.Name != "existing" || captured.Version != "1.0" {
+		t.Fatal("existing SDK wheel changed during capture")
 	}
+	raw, problem := wheel.Metadata(captured.Path)
+	fatal(t, problem)
+	if !strings.Contains(string(raw), "Requires-Dist: cozy-runtime==0.18.13") {
+		t.Fatal("controller upgrade rewrote package SDK requirements")
+	}
+
 }

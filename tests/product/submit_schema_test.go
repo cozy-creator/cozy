@@ -157,7 +157,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	// inject here. Reuse the real retained binding while bypassing only validation.
 	prepared, problem := o.store.RequestRow(handle.RequestID)
 	fatal(t, problem)
-	if prepared.PlanID == "" || prepared.LocalPackageDigest == "" {
+	if prepared.PlanID == "" || prepared.LocalInstallationID == "" {
 		t.Fatal("the completed request retained no worker-prepared local binding")
 	}
 	requestID, _, problem := o.c.Submit(orchestrator.Submission{
@@ -165,7 +165,7 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		PlanID: prepared.PlanID, Payload: []byte(`{"bogus":1}`),
 		Outputs:   strings.FieldsFunc(prepared.Outputs, func(r rune) bool { return r == ',' }),
 		InstallID: prepared.InstallID, Release: prepared.Release,
-		LocalPackageDigest: prepared.LocalPackageDigest,
+		LocalInstallationID: prepared.LocalInstallationID,
 	})
 	fatal(t, problem)
 	deadline := time.Now().Add(180 * time.Second)

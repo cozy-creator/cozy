@@ -18,7 +18,7 @@ func TestRunServingAcceptsRetainedCheckpointWithoutRelease(t *testing.T) {
 		contract, problem := launch.DecodePackageInterface(iface)
 		fatal(t, problem)
 		detail.PackageInterface = iface
-		detail.Release.PackageInterfaceDigest = contract.Digest
+		detail.Release.PackageInterfaceDigest = assessmentDigest(contract.Raw)
 		detail.Release.PackageInterfaceLength = int64(len(iface))
 	})
 	daemon := startDaemonProcess(t, root)

@@ -29,7 +29,7 @@ func TestAttentionPinSurvivesSubmissionAndConflictingReplayRefuses(t *testing.T)
 	if request == nil || request.AttentionKernel != "flash-attn3-fp8" {
 		t.Fatalf("durable request lost pin: %+v; CLI %s", request, first)
 	}
-	t.Logf("recorded release=%q install=%q local_revision=%q", request.Release, request.InstallID, request.LocalPackageDigest)
+	t.Logf("recorded release=%q install=%q local_revision=%q", request.Release, request.InstallID, request.LocalInstallationID)
 	// Same request is idempotent; changing only the kernel must never replay it.
 	_, replay := runCozy(t, root, args...)
 	if strings.Contains(replay, "different body") {
@@ -98,13 +98,16 @@ func TestJobAttentionOverrideCannotBeSilentlyIgnored(t *testing.T) {
 	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[],"name":"prepare","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	parsed, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
+	if len(parsed.Raw) == 0 {
+		t.Fatal("fixture lost its canonical interface")
+	}
 	dir := filepath.Join(root, "installs", "attention-job")
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(dir)), 0700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0600))
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	_, problem = store.Activate(records.PackageInstall{ID: "attention-job", Package: "proof/attention-job", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, PackageInterface: parsed.Digest, SourceDigest: "sha256:" + strings.Repeat("4", 64), Platform: "linux-x86"})
+	_, problem = store.Activate(records.PackageInstall{ID: "attention-job", Package: "proof/attention-job", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, Platform: "linux-x86"})
 	fatal(t, problem)
 	for _, term := range []string{"--attention-kernel=dit=kitchen-int8", "kernel.attention=dit=kitchen-int8"} {
 		if code, out := runCozy(t, root, "run", "proof/attention-job/prepare", term, "--idempotency-key=job-pin"); code == 0 || !strings.Contains(out, "applies only to serving callables") {

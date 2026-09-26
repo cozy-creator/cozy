@@ -61,7 +61,7 @@ func privateJobDownload(t *testing.T, versioned, rootModels bool) {
 		Address: connection.Addr, CertPath: connection.CACert,
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	install := records.PackageInstall{ID: "private-job-download", Package: revision.Package, Major: 1, Version: revision.Release,
-		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"), SourceDigest: revision.SourceDigest,
+		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"),
 		Dir: filepath.Join(o.root, "installs", "job"), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, problem := o.store.Activate(install)
 	fatal(t, problem)
@@ -70,7 +70,7 @@ func privateJobDownload(t *testing.T, versioned, rootModels bool) {
 	fatal(t, o.store.RecordInstall(child))
 	fatal(t, o.store.RecordChildBindings([]records.ChildBinding{{
 		ParentInstallID: install.ID, ChildInstallID: child.ID,
-		InterfaceDigest: childDigest("b"), LocalRevisionDigest: childDigest("c"),
+
 		Module: "imported_invocable", Export: "child", Entrypoint: "child",
 	}}))
 	pod.onJobReady = func(frame *pb.WorkerFrame, send func(*pb.WorkerFrame) error) error {
@@ -130,7 +130,7 @@ func privateJobDownload(t *testing.T, versioned, rootModels bool) {
 	}
 	id, _, problem := o.c.Submit(orchestrator.Submission{
 		IdemKey: "private-job-download", Package: revision.Package, Entrypoint: "prepare", PlanID: childDigest("4"),
-		Release: revision.Release, LocalPackageDigest: revision.Digest, Payload: []byte(`{}`),
+		Release: revision.Release, LocalInstallationID: revision.ID, Payload: []byte(`{}`),
 		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true, Kind: "job", RetainWork: true,
 		ProducerParams: params, Models: models,
 	})

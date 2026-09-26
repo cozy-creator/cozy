@@ -55,11 +55,11 @@ func stoppedServingParent(t *testing.T, stop string, mixed, supported bool) {
 	fatal(t, o.store.RecordRental(records.Rental{ID: podRental, MachineName: "otter", State: "ready", SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000,
 		Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	install := records.PackageInstall{ID: "stopped-parent", Package: revision.Package, Major: 1, Version: revision.Release,
-		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"), SourceDigest: revision.SourceDigest,
+		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"),
 		Dir: filepath.Join(o.root, "installs", "parent"), Python: "/usr/bin/python3", Platform: "linux-x86"}
 	_, problem := o.store.Activate(install)
 	fatal(t, problem)
-	fatal(t, o.store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: install.ID, ChildInstallID: install.ID, InterfaceDigest: childDigest("b"), Module: "helper", Export: "compute", Entrypoint: "compute"}}))
+	fatal(t, o.store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: install.ID, ChildInstallID: install.ID, Module: "helper", Export: "compute", Entrypoint: "compute"}}))
 	var offers atomic.Int32
 	parentOffered := make(chan *pb.AttemptOffer, 1)
 	pod.onJobReady = func(frame *pb.WorkerFrame, send func(*pb.WorkerFrame) error) error {
@@ -95,7 +95,7 @@ func stoppedServingParent(t *testing.T, stop string, mixed, supported bool) {
 		return false, nil
 	}
 	parent, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "parent", Package: revision.Package, Entrypoint: "prepare", PlanID: childDigest("4"),
-		Release: revision.Release, LocalPackageDigest: revision.Digest, Payload: []byte(`{}`), Worker: podRental, RequestedRental: podRental,
+		Release: revision.Release, LocalInstallationID: revision.ID, Payload: []byte(`{}`), Worker: podRental, RequestedRental: podRental,
 		InstallID: install.ID, Rental: true, RentalRequired: true, Kind: "job", RetainWork: true})
 	fatal(t, problem)
 	select {
@@ -116,7 +116,7 @@ func stoppedServingParent(t *testing.T, stop string, mixed, supported bool) {
 			plan = childDigest("d")
 		}
 		r, _, problem := o.store.SubmitChild(records.Request{ID: id, IdemKey: id, Kind: "serving", Package: revision.Package, Entrypoint: "tile", Release: revision.Release,
-			InstallID: install.ID, LocalPackageDigest: revision.Digest, PlanID: plan, Payload: []byte(`{"size":48}`), BodyDigest: childDigest("1"),
+			InstallID: install.ID, LocalInstallationID: revision.ID, PlanID: plan, Payload: []byte(`{"size":48}`), BodyDigest: childDigest("1"),
 			ParentRequestID: parent, ParentCallIndex: index, ChildIntentDigest: childDigest("2"), ChildTargetDigest: childDigest("3"), Models: models},
 			parentAttempt.Attempt, parentAttempt.InvocationDigest, parentAttempt.SessionID, arguments)
 		fatal(t, problem)

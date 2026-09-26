@@ -1,12 +1,14 @@
-package packagepublish
+package producttest
 
 import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,6 +29,9 @@ func TestCapturedHubStorageRedirectRetainsExactWheel(t *testing.T) {
 	}
 	storage := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(payload.Bytes()) }))
 	defer storage.Close()
+	priorTransport := http.DefaultTransport
+	http.DefaultTransport = storage.Client().Transport
+	t.Cleanup(func() { http.DefaultTransport = priorTransport })
 	for _, arm := range []struct {
 		name, target, hash, code string
 		status                   int
@@ -39,11 +44,24 @@ func TestCapturedHubStorageRedirectRetainsExactWheel(t *testing.T) {
 		t.Run(arm.name, func(t *testing.T) {
 			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, arm.target, arm.status) }))
 			defer hub.Close()
-			row := RegistryRow{Name: "fixture", Version: "1.0", URL: hub.URL + "/v1/index/paul/files/" + arm.hash + "/fixture-1.0-py3-none-any.whl", SHA256: arm.hash, captureLocally: true}
-			problem := fetchCapturedWheel(t.Context(), storage.Client(), row, filepath.Join(t.TempDir(), "fixture-1.0-py3-none-any.whl"))
+			root := t.TempDir()
+			metadata := []byte("[project]\nname='root'\nversion='1.0'\n")
+			if err := os.WriteFile(filepath.Join(root, "pyproject.toml"), metadata, 0600); err != nil {
+				t.Fatal(err)
+			}
+			object := hub.URL + "/v1/index/paul/files/" + arm.hash + "/fixture-1.0-py3-none-any.whl"
+			lock := fmt.Sprintf("version=1\n[[package]]\nname='root'\nversion='1.0'\nsource={editable='.'}\n[[package]]\nname='fixture'\nversion='1.0'\nsource={registry=%q}\nwheels=[{url=%q,hash=%q}]\n", hub.URL+"/v1/index/paul/simple/", object, "sha256:"+arm.hash)
+			if err := os.WriteFile(filepath.Join(root, "uv.lock"), []byte(lock), 0600); err != nil {
+				t.Fatal(err)
+			}
+			captured, problem := packagepublish.CaptureWheelDependencies(t.Context(), root, "root", "root==1.0\nfixture==1.0", t.TempDir(), map[string]map[string]string{"fixture": {"fixture": "1.0"}}, "3.12.12")
 			if arm.code == "" {
 				if problem != nil {
 					t.Fatal(problem)
+				}
+				data, err := os.ReadFile(captured["fixture"].Path)
+				if err != nil || !bytes.Equal(data, payload.Bytes()) || captured["fixture"].RegistryRequirement != "" {
+					t.Fatal("captured redirect lost exact wheel custody", err)
 				}
 				return
 			}

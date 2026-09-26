@@ -30,12 +30,12 @@ func TestPrivateRentalIncludesChildGPUWithoutGrantingItToParent(t *testing.T) {
 			}
 			raw, err := canonical.NormalizeJCS([]byte(`{"format":"cozy.package.interface/1","application":"private_ops:app","entrypoints":[],"jobs":[{"name":"compute","models":[],"request":{"fields":[]},"result":{"fields":[]},"publishes":false,"weights_outputs":[],"invocable":{"context":"ctx","module":"private_ops","export":"compute","parameters":[],"defaults":{},"type_names":{},"enum_members":{},"memoize":true,"capabilities":[]}}]}`))
 			must(t, err)
-			child.PackageInterface, _ = canonical.Spell(canonical.Digest(raw))
+
 			must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(child.Dir)), 0o700))
 			must(t, os.WriteFile(launch.PackageInterfacePath(child.Dir), raw, 0o444))
 			fatal(t, store.RecordInstall(parent))
 			fatal(t, store.RecordInstall(child))
-			fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: parent.ID, ChildInstallID: child.ID, InterfaceDigest: child.PackageInterface, LocalRevisionDigest: childDigest("b"), Module: "private_ops", Export: "compute", Entrypoint: "compute"}}))
+			fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: parent.ID, ChildInstallID: child.ID, Module: "private_ops", Export: "compute", Entrypoint: "compute"}}))
 			request := records.Request{InstallID: parent.ID, Kind: "job", NeedsAccelerator: false, RetainWork: true, Rental: true}
 			resolver := cli.NewResolver(store, config.Config{Home: layout.Root}, nil)
 			requiresGPU, problem := resolver.PrivateRentalNeedsAccelerator(request)

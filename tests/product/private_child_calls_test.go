@@ -1,8 +1,6 @@
 package producttest
 
 import (
-	"bytes"
-	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,31 +14,25 @@ import (
 
 func childDigest(letter string) string { return "sha256:" + strings.Repeat(letter, 64) }
 
-func TestUnpublishedJobBuildIncludesChangedDependencyRevision(t *testing.T) {
-	development := &pb.DevelopmentPackage{Package: "local/script", Release: "0.0.0", SourceDigest: bytes.Repeat([]byte{0x11}, 32), ProjectWheel: &pb.WheelFact{Ref: &pb.Ref{Digest: bytes.Repeat([]byte{0x22}, 32), Length: 123}}}
-	set := &pb.PlacementSet{Placements: []*pb.Placement{{PackageMode: &pb.Placement_Development{Development: development}}}}
-	var before string
-	for _, value := range []byte{0x33, 0x44} {
-		development.LocalRevisionDigest = bytes.Repeat([]byte{value}, 32)
+func TestJobInstallationUsesRuntimeOwnedHandle(t *testing.T) {
+	development := &pb.DevelopmentPackage{Package: "local/script", Release: "0.0.0"}
+	placement := &pb.Placement{PackageMode: &pb.Placement_Development{Development: development}}
+	set := &pb.PlacementSet{Placements: []*pb.Placement{placement}}
+	for _, id := range []string{"installed-original", "installed-edited"} {
+		placement.InstallationId = id
 		raw, _, err := canonical.Identity(set)
 		must(t, err)
-		build, problem := orchestrator.JobBuildID(raw, "local/script")
+		got, problem := orchestrator.JobInstallationID(raw, "local/script")
 		fatal(t, problem)
-		want, _ := canonical.Spell(development.LocalRevisionDigest)
-		if build != want || build == before {
-			t.Fatalf("same parent wheel hid changed dependency revision: %s", build)
+		if got != id {
+			t.Fatalf("prepared installation changed: %s", got)
 		}
-		before = build
 	}
-	development.LocalRevisionDigest = nil
-	development.ProjectWheel = nil
+	placement.InstallationId = ""
 	raw, _, err := canonical.Identity(set)
 	must(t, err)
-	build, problem := orchestrator.JobBuildID(raw, "local/script")
-	fatal(t, problem)
-	want, _ := canonical.Spell(development.SourceDigest)
-	if build != want {
-		t.Fatal("same-host source install lost its captured build identity")
+	if _, problem := orchestrator.JobInstallationID(raw, "local/script"); problem == nil {
+		t.Fatal("missing installed resource acquired an invented identity")
 	}
 }
 
@@ -54,74 +46,25 @@ func offerChildParent(t *testing.T, store *records.Store, parent records.Request
 	return *current
 }
 
-func TestUnpublishedChildSchemaUpgradePreservesPriorOwnership(t *testing.T) {
+func TestUnpublishedChildReopenPreservesPriorOwnership(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
 	fatal(t, problem)
-	prior := recordPrivateTransaction(t, store, "schema27", "")
-	_, problem = store.RequestPause(prior.ID, "before upgrade")
+	prior := recordPrivateTransaction(t, store, "reopen", "")
+	_, problem = store.RequestPause(prior.ID, "before reopen")
 	fatal(t, problem)
 	_, problem = store.CompleteRequestPause(prior.ID)
 	fatal(t, problem)
 	before, problem := store.RequestRow(prior.ID)
 	fatal(t, problem)
 	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	restorePriorCallIndexBounds(t, db)
-	var ddl string
-	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='requests'`).Scan(&ddl))
-	_, err = db.Exec(`PRAGMA foreign_keys=OFF`)
-	must(t, err)
-	_, err = db.Exec(`PRAGMA legacy_alter_table=ON`)
-	must(t, err)
-	_, err = db.Exec(`ALTER TABLE requests RENAME TO prior28`)
-	must(t, err)
-	_, err = db.Exec(strings.Replace(strings.Replace(ddl, "  capture      TEXT    NOT NULL DEFAULT '',\n", "", 1), ",\n  child_artifacts INTEGER NOT NULL DEFAULT 0 CHECK(child_artifacts IN (0,1))", "", 1))
-	must(t, err)
-	rows, err := db.Query(`PRAGMA table_info(requests)`)
-	must(t, err)
-	var columns []string
-	for rows.Next() {
-		var index, notnull, pk int
-		var name, kind string
-		var fallback any
-		must(t, rows.Scan(&index, &name, &kind, &notnull, &fallback, &pk))
-		columns = append(columns, name)
-	}
-	must(t, rows.Close())
-	joined := strings.Join(columns, ",")
-	_, err = db.Exec(`INSERT INTO requests(` + joined + `) SELECT ` + joined + ` FROM prior28`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE prior28`)
-	must(t, err)
-	_, err = db.Exec(`CREATE UNIQUE INDEX requests_parent_call ON requests(parent_request_id,parent_call_index) WHERE parent_request_id!=''`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE request_weights_retentions`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE request_operation_lookups`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE native_artifact_retentions`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE byte_outputs`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE attempt_serving_placements`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE request_child_arguments`)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE native_calls`)
-	must(t, err)
-	revertRentalsBeforeWidth(t, db)
-	_, err = db.Exec(`DROP TABLE IF EXISTS successful_work_releases; PRAGMA user_version=27`)
-	must(t, err)
-	db.Close()
 	store, problem = records.OpenForDaemon(path, "")
 	fatal(t, problem)
 	defer store.Close()
 	after, problem := store.RequestRow(prior.ID)
 	fatal(t, problem)
 	if after.State != "paused" || !after.RetainWork || after.ReuseScope != before.ReuseScope || after.ControlRevision != before.ControlRevision || after.ParentCallIndex != -1 {
-		t.Fatalf("migration changed retained ownership: before=%+v after=%+v", before, after)
+		t.Fatalf("reopen changed retained ownership: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -130,7 +73,7 @@ func TestUnpublishedParentRetainsExactOrchestrationContract(t *testing.T) {
 	store, problem := records.Open(path)
 	fatal(t, problem)
 	parent := recordPrivateTransaction(t, store, "parent-capacity", "")
-	directive := &pb.JobDirective{BuildId: childDigest("a"), JobDescriptorId: parent.PlanID, Orchestration: true, ResourceCaps: &pb.ResourceCaps{MaxRssBytes: 123456}}
+	directive := &pb.JobDirective{InstallationId: childDigest("a"), JobDescriptorId: parent.PlanID, Orchestration: true, ResourceCaps: &pb.ResourceCaps{MaxRssBytes: 123456}}
 	raw, _, err := canonical.Identity(directive)
 	must(t, err)
 	fatal(t, store.CaptureOrchestrationDirective(parent.ID, raw))
@@ -175,7 +118,7 @@ func TestUnpublishedChildBindingsAreImmutableAndOwnTheirImplementation(t *testin
 	for _, inst := range []records.PackageInstall{parent, child, replacement} {
 		fatal(t, store.RecordInstall(inst))
 	}
-	binding := records.ChildBinding{ParentInstallID: parent.ID, InterfaceDigest: childDigest("a"), Module: "private_ops", Export: "compute", ChildInstallID: child.ID, LocalRevisionDigest: childDigest("b"), Entrypoint: "compute"}
+	binding := records.ChildBinding{ParentInstallID: parent.ID, Module: "private_ops", Export: "compute", ChildInstallID: child.ID, Entrypoint: "compute"}
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{binding}))
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{binding}))
 	binding.ChildInstallID = replacement.ID
@@ -196,7 +139,7 @@ func TestUnpublishedChildBindingsAreImmutableAndOwnTheirImplementation(t *testin
 	if completedRow.InstallID != child.ID {
 		t.Fatal("rejected GC severed a completed child's exact result schema")
 	}
-	held, problem := store.LocalPackageInUse(binding.LocalRevisionDigest, "local/ignored", "1.0.0", childDigest("c"))
+	held, problem := store.LocalInstallationInUse(child.ID)
 	fatal(t, problem)
 	if !held {
 		t.Fatal("GC discarded the frozen implementation wheel revision")
@@ -288,7 +231,7 @@ func TestUnpublishedChildHistoryDoesNotActAsOperationCache(t *testing.T) {
 	next := parent
 	next.ID, next.IdemKey = "req-parent-edited", "parent-edited"
 	next.RetryOf = parent.ID
-	next.BodyDigest, next.LocalPackageDigest = childDigest("6"), childDigest("7")
+	next.BodyDigest, next.LocalInstallationID = childDigest("6"), childDigest("7")
 	next, _, problem = store.Submit(next)
 	fatal(t, problem)
 	next = offerChildParent(t, store, next)

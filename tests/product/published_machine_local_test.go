@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -75,7 +74,7 @@ func TestPublishedMachineActualLocalAndNewRootAfterRestart(t *testing.T) {
 	fatal(t, problem)
 	_, problem = store.Activate(records.PackageInstall{ID: "published-local-proof", Package: fixture.Package, Major: 1,
 		Version: fixture.Release, SourceKind: "tensorhub", SourceRef: fixture.Package + "@" + fixture.Release,
-		Dir: installDir, PackageInterface: iface.Digest, SourceDigest: wheelDigest, Platform: "linux-x86_64",
+		Dir: installDir, Platform: "linux-x86_64",
 		Runtime: runtimeFixtureVersion(t, *privateChildRuntimeWheel), Closure: "cozy-runtime>=0.17.2"})
 	fatal(t, problem)
 	defer store.Close()
@@ -91,7 +90,7 @@ func TestPublishedMachineActualLocalAndNewRootAfterRestart(t *testing.T) {
 		}
 		request, problem := store.RequestByIdempotencyKey(key)
 		fatal(t, problem)
-		if request == nil || request.State != "succeeded" || request.LocalPackageDigest != "" || request.Release != fixture.Release || request.Rental {
+		if request == nil || request.State != "succeeded" || request.LocalInstallationID != "" || request.Release != fixture.Release || request.Rental {
 			t.Fatalf("published local request changed origin: %+v", request)
 		}
 		link, problem := store.MachineExecution(request.ID)
@@ -103,15 +102,12 @@ func TestPublishedMachineActualLocalAndNewRootAfterRestart(t *testing.T) {
 		must(t, proto.Unmarshal(link.Submission, &submitted))
 		var capture pb.MachineExecutionCapture
 		must(t, canonical.Unmarshal(submitted.CaptureCanonicalBytes, &capture))
-		if len(capture.Revisions) != 0 || len(capture.PublishedRevisions) != 1 {
-			t.Fatal("local published root was recast as private code")
+		if len(capture.InstalledPackages) != 1 || capture.InstalledPackages[0].Package != fixture.Package || capture.InstalledPackages[0].Release != fixture.Release {
+			t.Fatal("published capture changed package origin")
 		}
-		_, identity, err := canonical.Identity(capture.PublishedRevisions[0].Environment)
-		must(t, err)
-		current, err := canonical.Spell(identity)
-		must(t, err)
-		if !bytes.Equal(identity, capture.RootRevisionDigest) || submitted.PreparedState.GetJob().BuildId != current || (build != "" && current != build) {
-			t.Fatal("local published Environment identity changed")
+		current := capture.RootInstallationId
+		if current == "" || capture.InstalledPackages[0].InstallationId != current || submitted.PreparedState.GetJob().InstallationId != current {
+			t.Fatal("published installed identity changed during submission")
 		}
 		build = current
 		attempts, problem := store.Attempts(request.ID)

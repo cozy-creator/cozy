@@ -12,7 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
-func TestUnpublishedDependencyRefusesSourceMutationDuringResolution(t *testing.T) {
+func TestUnpublishedResolutionKeepsCapturedParentWhenAuthoredSourceChanges(t *testing.T) {
 	root := t.TempDir()
 	project, library := filepath.Join(root, "operation"), filepath.Join(root, "library")
 	must(t, os.MkdirAll(project, 0o700))
@@ -38,7 +38,7 @@ backend-path = ["."]
 `), 0o600))
 	marker := filepath.Join(project, "added_during_resolution.py")
 	// uv runs this real PEP 517 backend to resolve dynamic dependency metadata.
-	// Adding an authored file during resolution must invalidate the capture.
+	// An authored edit after capture must not alter the already-owned parent copy.
 	backend := fmt.Sprintf(`from pathlib import Path
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     Path(%q).write_text("CHANGED = True\n")
@@ -51,13 +51,14 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
 	must(t, os.WriteFile(filepath.Join(library, "backend.py"), []byte(backend), 0o600))
 	pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
 	if pack != nil {
-		pack.Close()
+		defer pack.Close()
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("real uv resolution did not execute the mutation arm: %v (%v)", err, problem)
 	}
-	if problem == nil || problem.ErrName() != "conflict" {
-		t.Fatalf("source changed during resolution without a capture refusal: %v", problem)
+	fatal(t, problem)
+	if _, err := os.Stat(filepath.Join(pack.Tree, "added_during_resolution.py")); !os.IsNotExist(err) {
+		t.Fatal("later authored file leaked into the accepted source copy")
 	}
 }
 
@@ -86,15 +87,14 @@ private-lock-library = {path = "../library", editable = true}
 	first, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
 	fatal(t, problem)
 	defer first.Close()
-	firstIdentity, _, _, problem := first.SourceIdentity()
+	frozen, problem := packagepublish.SnapshotSource(first.Tree, filepath.Join(t.TempDir(), "accepted"))
 	fatal(t, problem)
+	defer frozen.Close()
 	second, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
 	fatal(t, problem)
 	defer second.Close()
-	secondIdentity, _, _, problem := second.SourceIdentity()
-	fatal(t, problem)
-	if first.Tree == second.Tree || firstIdentity != secondIdentity {
-		t.Fatalf("temporary capture path changed source identity: %s / %s", firstIdentity, secondIdentity)
+	if first.Tree == second.Tree {
+		t.Fatal("independent captures share an owned directory")
 	}
 	dependencies, problem := packagepublish.LocalDependencyPaths(first.Tree)
 	fatal(t, problem)
@@ -118,10 +118,20 @@ private-lock-library = {path = "../library", editable = true}
 	edited, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
 	fatal(t, problem)
 	defer edited.Close()
-	editedIdentity, _, _, problem := edited.SourceIdentity()
+	newCapture, problem := packagepublish.SnapshotSource(edited.Tree, filepath.Join(t.TempDir(), "accepted"))
 	fatal(t, problem)
-	if editedIdentity == firstIdentity {
-		t.Fatal("same-version local library edit did not change captured identity")
+	defer newCapture.Close()
+	for _, row := range []struct {
+		pack *packagepublish.Package
+		want string
+	}{{frozen, "VALUE = 11\n"}, {newCapture, "VALUE = 12\n"}} {
+		paths, problem := packagepublish.LocalDependencyPaths(row.pack.Tree)
+		fatal(t, problem)
+		raw, err := os.ReadFile(filepath.Join(paths["private-lock-library"], "library.py"))
+		must(t, err)
+		if string(raw) != row.want {
+			t.Fatalf("captured dependency changed: %q", raw)
+		}
 	}
 }
 
@@ -158,14 +168,14 @@ private-extra-alternate={path="../alternate"}
 		pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, extras...)
 		fatal(t, problem)
 		t.Cleanup(pack.Close)
-		identity, _, _, problem := pack.SourceIdentity()
-		fatal(t, problem)
-		return pack, identity
+		metadata, err := os.ReadFile(filepath.Join(pack.Tree, "pyproject.toml"))
+		must(t, err)
+		return pack, string(metadata)
 	}
 	first, identity := capture("managed", "TOOL_box", "managed")
 	_, repeat := capture("tool-box", "managed")
 	if identity != repeat {
-		t.Fatal("extra normalization/order changed immutable capture")
+		t.Fatal("extra normalization/order changed captured dependency metadata")
 	}
 	grouped, _ := capture("all")
 	groupDependencies, problem := packagepublish.LocalDependencySelections(grouped.Tree)
@@ -187,7 +197,7 @@ private-extra-alternate={path="../alternate"}
 	}
 	_, one := capture("managed")
 	if one == identity {
-		t.Fatal("different selected extras kept the same closure")
+		t.Fatal("different selected extras kept the same dependency metadata")
 	}
 	selected, problem := packagepublish.LocalDependencySelections(first.Tree)
 	fatal(t, problem)
@@ -213,8 +223,8 @@ private-extra-alternate={path="../alternate"}
 	}
 	must(t, os.WriteFile(filepath.Join(library, "helper.py"), []byte("VALUE=12\n"), 0600))
 	_, edited := capture("managed")
-	if edited == one {
-		t.Fatal("selected same-version helper edit did not change captured closure")
+	if edited != one {
+		t.Fatal("same-version helper edit unexpectedly changed declared dependency metadata")
 	}
 	changed := strings.Replace(metadata, "private-extra-library>=0.0.1", "private-extra-library>=0.0.1,<1", 1)
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(changed), 0600))

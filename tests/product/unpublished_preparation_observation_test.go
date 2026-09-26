@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,32 +18,42 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// These are exact outputs of Runtime's real tiny-wheel/native-checkpoint proof.
-// The protocol peer reports code staging without pretending it can dispatch it.
+// Model and wheel bytes come from the retained native proof. The old placement
+// envelope is explicitly adapted to installed handles for this protocol test;
+// this is not a qualification of a current Runtime build.
 func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 	for _, condition := range []string{"staged", "wrong_revision", "wrong_placement", "wrong_set", "materializing", "failed"} {
 		t.Run(condition, func(t *testing.T) {
 			root := filepath.Join("testdata", "unpublished_preparation")
+			installationID := "code-only-installation"
+			surface := []byte(`{"format":"cozy.package.interface/1","application":"code_only_package:app","entrypoints":[],"jobs":[]}`)
 			readSet := func(name string) *pb.DesiredPlacementSet {
 				raw, err := os.ReadFile(filepath.Join(root, name))
+				must(t, err)
+				var document map[string]any
+				must(t, json.Unmarshal(raw, &document))
+				for _, value := range document["placements"].([]any) {
+					row := value.(map[string]any)
+					development := row["development"].(map[string]any)
+					row["development"] = map[string]any{"package": development["package"], "release": development["release"], "installation_id": installationID}
+					delete(row, "environment")
+					delete(row, "environment_digest")
+					row["installation_id"] = installationID
+					row["package_interface"] = surface
+				}
+				raw, err = json.Marshal(document)
+				must(t, err)
+				raw, err = canonical.NormalizeJCS(raw)
 				must(t, err)
 				return &pb.DesiredPlacementSet{PlacementSetCanonicalBytes: raw, PlacementSetDigest: canonical.Digest(raw)}
 			}
 			code, modeled := readSet("prepared-code.json"), readSet("prepared-model.json")
-			doc, err := canonical.Read(code.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+			wheelPath, err := filepath.Abs(filepath.Join(root, "code_only-1.0.0-py3-none-any.whl"))
 			must(t, err)
-			row := doc.List("placements")[0]
-			development, wheel := row.Sub("development"), row.Sub("development").Sub("project_wheel")
-			wheelPath, err := filepath.Abs(filepath.Join(root, wheel.Str("filename")))
+			wheelBytes, err := os.ReadFile(wheelPath)
 			must(t, err)
-			revision := localpackage.Revision{
-				Package: development.Str("package"), Release: development.Str("release"),
-				SourceDigest: development.Str("source_digest"), Digest: development.Str("local_revision_digest"),
-				PackageInterfaceDigest: row.Sub("package_interface").Str("digest"),
-				PackageInterfaceLength: row.Sub("package_interface").Int("length"),
-				Files: []localpackage.File{{Filename: wheel.Str("filename"), Path: wheelPath,
-					Digest: wheel.Sub("ref").Str("digest"), Length: wheel.Sub("ref").Int("length"), Kind: "project"}},
-			}
+			revision := localpackage.Installation{ID: installationID, Package: "local/code-only", Release: "1.0.0", PackageInterface: surface,
+				Files: []localpackage.File{{Filename: filepath.Base(wheelPath), Path: wheelPath, Digest: assessmentDigest(wheelBytes), Length: int64(len(wheelBytes)), Kind: "project"}}}
 			public, private, err := ed25519.GenerateKey(rand.Reader)
 			must(t, err)
 			pod := &fakePod{controlKey: public}
@@ -50,7 +61,7 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 				if err := pod.verifyClaim(call.Claim, false); err != nil {
 					return err
 				}
-				if spell, _ := canonical.Spell(call.LocalPackageSet.Package.LocalRevisionDigest); spell != revision.Digest {
+				if spell := call.LocalPackageSet.Package.InstallationId; spell != revision.ID {
 					t.Errorf("preparation changed captured revision: %s", spell)
 				}
 				return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, PlacementSet: code})
@@ -89,7 +100,7 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 			if !bytes.Equal(stage.desired.GetPlacementSet().PlacementSetCanonicalBytes, code.PlacementSetCanonicalBytes) {
 				t.Fatal("Creator changed prepared code bytes")
 			}
-			wanted := revision.Digest
+			wanted := revision.ID
 			if condition == "wrong_revision" {
 				wanted = childDigest("a")
 			}
@@ -98,9 +109,8 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 				finished <- o.c.ConvergeUnpublishedPlacement(instance, "model-only", wanted,
 					[]*pb.DownloadModelRef{{Slot: "generate.models.model", Model: "proof/native", Manifest: childDigest("b")}})
 			}()
-			// Actual installed Runtime451 emitted this after preparing the fixture wheel,
-			// applying DesiredWorkerState and completing convergence. Only stream identity
-			// is rebound here; serving/materialization/admission facts remain its bytes.
+			// Retain the prior native proof's staging and admission facts, while
+			// adapting its routing envelope to the current installed-resource schema.
 			observed, err := os.ReadFile(filepath.Join(root, "observed.pb"))
 			must(t, err)
 			state := &pb.ObservedWorkerState{}
@@ -109,6 +119,10 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 			state.ControlStreamEpoch = stage.desired.ControlStreamEpoch
 			state.WorkerBootId = pod.bootID()
 			state.AcceptedDesiredStateRevision = stage.desired.Revision
+			for _, placement := range state.Placements {
+				placement.InstallationId = installationID
+				placement.PlacementSetDigest = code.PlacementSetDigest
+			}
 
 			switch condition {
 			case "wrong_placement":
@@ -136,7 +150,7 @@ func TestStagedUnpublishedCodeAdvancesToModelPreparation(t *testing.T) {
 			}
 			select {
 			case call := <-entered:
-				if spell, _ := canonical.Spell(call.PrivatePlacementSet.LocalRevisionDigest); spell != revision.Digest {
+				if spell := call.PrivatePlacementSet.InstallationId; spell != revision.ID {
 					t.Fatal("model preparation changed revision")
 				}
 			case <-time.After(3 * time.Second):

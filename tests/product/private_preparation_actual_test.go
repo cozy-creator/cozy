@@ -318,7 +318,7 @@ from isolation_step import advance, serve
 		fatal(t, problem)
 		invocation, err := canonical.Read(attempt.InvocationCanonical, &pb.InvocationSpec{})
 		must(t, err)
-		if served.EnvironmentDigest == "" || invocation.Str("environment_digest") != served.EnvironmentDigest {
+		if served.InstallationID == "" || invocation.Str("environment_digest") != served.InstallationID {
 			t.Fatal("modeled child did not bind the activated prepared Environment")
 		}
 		proofData["native_weights"] = weights

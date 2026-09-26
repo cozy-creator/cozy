@@ -81,7 +81,7 @@ func TestUnpublishedWheelCapacityBeforeTransfer(t *testing.T) {
 
 // Even the maximum capability-bearing frame remains below the control ceiling.
 func TestUnpublishedWheelMaximumGrantFrameFitsControl(t *testing.T) {
-	request := &pb.LocalPackageFetchRequest{RecordOwnerEpoch: ^uint64(0), ControlStreamEpoch: ^uint64(0), WorkerBootId: strings.Repeat("b", 256), OperationId: strings.Repeat("o", 256), SourceDigest: bytes.Repeat([]byte{1}, 32)}
+	request := &pb.LocalPackageFetchRequest{RecordOwnerEpoch: ^uint64(0), ControlStreamEpoch: ^uint64(0), WorkerBootId: strings.Repeat("b", 256), OperationId: strings.Repeat("o", 256)}
 	for i := 0; i < pb.MaxLocalPackageFiles; i++ {
 		request.Files = append(request.Files, &pb.LocalPackageFileGrant{Digest: bytes.Repeat([]byte{byte(i)}, 32), Filename: strings.Repeat("f", pb.MaxLocalPackageFilenameBytes), Length: ^uint64(0), Url: strings.Repeat("u", pb.MaxLocalPackageGrantURLBytes)})
 	}

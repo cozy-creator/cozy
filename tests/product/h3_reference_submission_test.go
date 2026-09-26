@@ -62,7 +62,7 @@ func submitH3Reference(t *testing.T, release string) {
 	var detail hub.PackageReleaseDetail
 	detail.PackageInterface = iface.Raw
 	detail.Release.Release = release
-	detail.Release.PackageInterfaceDigest = iface.Digest
+	detail.Release.PackageInterfaceDigest = assessmentDigest(iface.Raw)
 	detail.Release.PackageInterfaceLength = int64(len(iface.Raw))
 	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.28", "torch>=2.13,<2.14"}
 	detail.RequiresPython = ">=3.12,<3.13"
@@ -163,5 +163,5 @@ func submitH3Reference(t *testing.T, release string) {
 	if paidPosts.Load() != 0 {
 		t.Fatal("the isolated proof reached paid acquisition")
 	}
-	t.Logf("retained request=%s interface=%s images=2 video=video/mp4 continuation=image/png; no attempt or rental", row.ID, iface.Digest)
+	t.Logf("retained request=%s interface=%s images=2 video=video/mp4 continuation=image/png; no attempt or rental", row.ID, assessmentDigest(iface.Raw))
 }

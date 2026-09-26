@@ -188,7 +188,7 @@ p=pathlib.Path(sys.argv[2])/'weightless.py';p.write_text(p.read_text().replace('
 	must(t, os.WriteFile(filepath.Join(root, "before.json"), snapshot, 0600))
 	var before records.Request
 	must(t, json.Unmarshal(snapshot, &before))
-	if before.ID == "" || (before.State != "queued" && before.State != "submitted") || before.LocalPackageDigest == "" {
+	if before.ID == "" || (before.State != "queued" && before.State != "submitted") || before.LocalInstallationID == "" {
 		t.Fatalf("not an old private queued request: %+v", before)
 	}
 	for _, model := range before.Models {
@@ -216,7 +216,7 @@ p=pathlib.Path(sys.argv[2])/'weightless.py';p.write_text(p.read_text().replace('
 	defer store.Close()
 	after, problem := store.RequestByIdempotencyKey("old55-queued")
 	fatal(t, problem)
-	if after.ID != before.ID || after.BodyDigest != before.BodyDigest || after.PlanID != before.PlanID || after.InstallID != before.InstallID || after.LocalPackageDigest != before.LocalPackageDigest || !bytes.Equal(after.Payload, before.Payload) {
+	if after.ID != before.ID || after.BodyDigest != before.BodyDigest || after.PlanID != before.PlanID || after.InstallID != before.InstallID || after.LocalInstallationID != before.LocalInstallationID || !bytes.Equal(after.Payload, before.Payload) {
 		t.Fatal("upgrade rewrote immutable request/captured-code identity")
 	}
 	must(t, exec.Command("docker", "unpause", host.Container).Run())
@@ -229,7 +229,7 @@ p=pathlib.Path(sys.argv[2])/'weightless.py';p.write_text(p.read_text().replace('
 	}
 	after, problem = store.RequestByIdempotencyKey("old55-queued")
 	fatal(t, problem)
-	if after.ID != before.ID || after.BodyDigest != before.BodyDigest || after.LocalPackageDigest != before.LocalPackageDigest || !bytes.Equal(after.Payload, before.Payload) {
+	if after.ID != before.ID || after.BodyDigest != before.BodyDigest || after.LocalInstallationID != before.LocalInstallationID || !bytes.Equal(after.Payload, before.Payload) {
 		t.Fatal("refusal changed old request identity")
 	}
 	if attempts, e := store.Attempts(before.ID); e != nil || len(attempts) != 0 {
@@ -288,10 +288,10 @@ p=pathlib.Path(sys.argv[2])/'weightless.py';p.write_text(p.read_text().replace('
 	frozen, err := json.MarshalIndent(h3, "", "  ")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(root, "published-h3-record.json"), frozen, 0600))
-	if h3.Package != "paul/minimax-h3" || h3.Release != "1.14.3" || h3.LocalPackageDigest != "" {
+	if h3.Package != "paul/minimax-h3" || h3.Release != "1.14.3" || h3.LocalInstallationID != "" {
 		t.Fatalf("published H3 unexpectedly became a private capture: %+v", h3)
 	}
 	t.Logf("new normal H3 submission %s remains published1.14.3 with no private-capture floor path; output %s", h3.ID, out)
 
-	t.Logf("actual old55 schema39 request %s migrated unchanged to schema40 and refused before attempts at capture floor; body %s/code %s", before.ID, before.BodyDigest, before.LocalPackageDigest)
+	t.Logf("actual old55 schema39 request %s migrated unchanged to schema40 and refused before attempts at capture floor; body %s/code %s", before.ID, before.BodyDigest, before.LocalInstallationID)
 }

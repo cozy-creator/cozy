@@ -17,10 +17,10 @@ func TestCapturedSelfServingCallsGiveModelFreeParentItsCPULane(t *testing.T) {
 			code := bytes.Repeat([]byte{3}, 32)
 			build, err := canonical.Spell(code)
 			must(t, err)
-			capture := &pb.MachineExecutionCapture{RootRevisionDigest: code,
-				Bindings: []*pb.MachineCallableBinding{{CallerRevisionDigest: code, CalleeRevisionDigest: code, InterfaceDigest: bytes.Repeat([]byte{4}, 32), Module: "model_tools", Export: "segment", Entrypoint: "segment"}}}
-			request := records.Request{ID: "root", IdemKey: "root", Kind: "job", Package: "local/tools", Entrypoint: "compose", PlanID: childDigest("9"), LocalPackageDigest: build, Payload: []byte(`{}`), Org: "local"}
-			plan := &orchestrator.JobPlan{Function: "compose", DescriptorID: request.PlanID, BuildID: build, NeedsAccelerator: true, RSSCap: orchestrator.DefaultJobRSSCap}
+			capture := &pb.MachineExecutionCapture{RootInstallationId: build,
+				Bindings: []*pb.MachineCallableBinding{{CallerInstallationId: build, CalleeInstallationId: build, Module: "model_tools", Export: "segment", Entrypoint: "segment"}}}
+			request := records.Request{ID: "root", IdemKey: "root", Kind: "job", Package: "local/tools", Entrypoint: "compose", PlanID: childDigest("9"), LocalInstallationID: build, Payload: []byte(`{}`), Org: "local"}
+			plan := &orchestrator.JobPlan{Function: "compose", DescriptorID: request.PlanID, InstallationID: build, NeedsAccelerator: true, RSSCap: orchestrator.DefaultJobRSSCap}
 			if arm == "callee" {
 				request.Entrypoint = "segment"
 			}

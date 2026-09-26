@@ -31,6 +31,9 @@ func TestLocalJobDryRunResolvesOnlyModelMetadata(t *testing.T) {
 	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"prepare.models.source"}],"name":"prepare","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}]}]}`)
 	parsed, problem := launch.DecodePackageInterface(iface)
 	fatal(t, problem)
+	if len(parsed.Raw) == 0 {
+		t.Fatal("fixture lost its canonical interface")
+	}
 	var bodyReads, rootReads atomic.Int32
 	var corrupted atomic.Bool
 	mux := http.NewServeMux()
@@ -61,7 +64,7 @@ func TestLocalJobDryRunResolvesOnlyModelMetadata(t *testing.T) {
 	must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0600))
 	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
-	_, problem = st.Activate(records.PackageInstall{ID: "dryrun-install", Package: "proof/dryrun", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, PackageInterface: parsed.Digest, SourceDigest: "sha256:" + strings.Repeat("4", 64), Platform: "linux-x86"})
+	_, problem = st.Activate(records.PackageInstall{ID: "dryrun-install", Package: "proof/dryrun", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, Platform: "linux-x86"})
 	fatal(t, problem)
 	st.Close()
 	args := []string{"run", "proof/dryrun/prepare", "--model.source=proof/source@1.0.0/bf16", "--timeout=20s", "--dry-run", "--json", "--full", "--idempotency-key=dryrun-only"}

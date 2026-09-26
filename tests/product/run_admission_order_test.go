@@ -77,7 +77,7 @@ func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, 
 			var detail hub.PackageReleaseDetail
 			detail.PackageInterface = iface
 			detail.Release.Release = "1.0.0"
-			detail.Release.PackageInterfaceDigest = parsed.Digest
+			detail.Release.PackageInterfaceDigest = assessmentDigest(parsed.Raw)
 			detail.Release.PackageInterfaceLength = int64(len(iface))
 			detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25", "torch<3,>=2.13"}
 			_ = json.NewEncoder(w).Encode(detail)
@@ -111,7 +111,7 @@ func admissionRoot(t *testing.T, iface []byte, gpu string, offline bool) (root, 
 	defer store.Close()
 	_, problem = store.Activate(records.PackageInstall{ID: "inst-admission", Package: ladderPackage,
 		Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: installDir,
-		PackageInterface: parsed.Digest, SourceDigest: "sha256:" + strings.Repeat("4", 64), Platform: "linux-x86"})
+		Platform: "linux-x86"})
 	fatal(t, problem)
 	return root, path, activity, probe
 }

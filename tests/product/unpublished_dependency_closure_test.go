@@ -68,7 +68,7 @@ func TestCapturedRegistryStage(t *testing.T) {
 	encoded, err := json.MarshalIndent(revision, "", "  ")
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(directory, "qualification.json"), encoded, 0o600))
-	t.Logf("captured %s with %d exact wheels", revision.Digest, len(revision.Files))
+	t.Logf("captured %s with %d exact wheels", revision.ID, len(revision.Files))
 }
 
 func capturedClosureLock() []byte {
