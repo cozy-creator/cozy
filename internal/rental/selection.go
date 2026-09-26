@@ -67,9 +67,9 @@ func Purchases(skus []hub.RentalSKU, models []records.ModelRef, needsAccelerator
 // selection is a job's inputs, which are derive-only and never resident (cl-180); the
 // rung still selects the lane, and nothing is compared against memory.
 //
-// The need is the resident weights plus the largest working memory any earlier run of
-// this release entrypoint measured on the same pinned models (proto-061 B). Nothing is
-// predicted: an unmeasured selection is sized by its weights alone and says so.
+// Component-staged selections with exact workload/manifest/SKU evidence use the
+// larger of resident weights and the observed total allocator peak. Otherwise the
+// legacy weights-plus-working estimate applies; unmeasured selections say so.
 func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, accelerator string,
 	vramGB int64, device, job bool, working records.WorkingPeaks) {
 	var ok bool
@@ -81,15 +81,25 @@ func Size(c *orchestrator.PlacementCandidate, models []records.ModelRef, acceler
 	if !device {
 		return
 	}
-	need := WithWorking(records.Resident(c.Models, accelerator, job), working[records.ModelsDigest(c.Models)])
+	need := WithWorking(records.Resident(c.Models, accelerator, job), working.For(c.Models, c.SKU, c.GPUs))
 	c.Fit, c.Verdict = FitNote(need, vramGB), Fit(need, vramGB, c.SKU)
 }
 
-// WithWorking adds a measured working peak to a resident figure. A rung-asserted fit
-// stays the owner's word; a derive-only job adds what its runs measured.
+// WithWorking applies exact total evidence only to component-staged selections.
+// Other selections retain weights-plus-working; rung-asserted fits stay the owner's word.
 func WithWorking(need records.Residency, peak records.WorkingPeak) records.Residency {
 	need.Weights = need.Bytes
-	if need.Fit == records.FitRungAsserted || peak.Runs == 0 {
+	if need.Fit == records.FitRungAsserted {
+		return need
+	}
+	// A total allocator peak already includes the weights resident in its scope.
+	// Adding the largest unrelated scope's weights would invent co-residency.
+	if need.Fit == records.FitComponents && peak.TotalRuns > 0 && peak.TotalBytes > 0 {
+		need.ObservedTotal, need.ObservedTotalRuns = peak.TotalBytes, peak.TotalRuns
+		need.Bytes = max(need.Bytes, peak.TotalBytes)
+		return need
+	}
+	if peak.Runs == 0 {
 		return need
 	}
 	need.Working, need.WorkingRuns = peak.Bytes, peak.Runs
@@ -136,7 +146,9 @@ func Fit(need records.Residency, vramGB int64, name string) string {
 		return ""
 	}
 	why := need.Need
-	if need.WorkingRuns > 0 {
+	if need.ObservedTotalRuns > 0 {
+		why = strings.TrimPrefix(why+"; ", "; ") + fmt.Sprintf("measured total %.1f GiB", gib(need.ObservedTotal))
+	} else if need.WorkingRuns > 0 {
 		why = strings.TrimPrefix(why+"; ", "; ") + fmt.Sprintf("measured working %.1f GiB", gib(need.Working))
 	}
 	return fmt.Sprintf("%s%s: needs %.1f GiB resident (%s), %s has %d GB", orchestrator.VerdictExcluded,
@@ -148,6 +160,10 @@ func Fit(need records.Residency, vramGB int64, name string) string {
 func FitNote(need records.Residency, vramGB int64) string {
 	if need.Bytes == 0 {
 		return need.Fit
+	}
+	if need.ObservedTotalRuns > 0 {
+		return fmt.Sprintf("max(%s %.1f GiB, measured total %.1f GiB from %d exact runs) = %.1f GiB of %d GB",
+			need.Fit, gib(need.Weights), gib(need.ObservedTotal), need.ObservedTotalRuns, gib(need.Bytes), vramGB)
 	}
 	if need.WorkingRuns == 0 {
 		return fmt.Sprintf("%s %.1f GiB (working memory unmeasured) of %d GB", need.Fit, gib(need.Weights), vramGB)
