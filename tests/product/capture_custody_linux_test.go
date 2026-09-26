@@ -64,13 +64,14 @@ func TestCapturePublicationExcludesTerminalCleanupAcrossProcesses(t *testing.T) 
 	}
 	inst := records.PackageInstall{ID: "restored-install", Package: "local/restored", Dir: o.l.InstallDir("restored-install"), Version: "1.0.0"}
 	fatal(t, o.store.RecordInstall(inst))
-	_, problem = o.store.ReplaceCapturePin(records.CapturePin{Caller: revision, InputDigest: revision, InstallID: inst.ID, RevisionDigest: revision})
+	_, _, problem = o.store.Submit(records.Request{ID: "accepted-new", IdemKey: "accepted-new", BodyDigest: revision,
+		Package: "local/restored", InstallID: inst.ID, Entrypoint: "main", Payload: []byte(`{}`), LocalPackageDigest: revision})
 	fatal(t, problem)
 	must(t, input.Close())
 	must(t, child.Wait())
 	fatal(t, localpackage.DropDigestUnowned(o.l, o.store, revision))
 	if _, err := os.Stat(root); err != nil {
-		t.Fatal("completed pin failed to take custody after writer release", err)
+		t.Fatal("accepted request failed to take custody after writer release", err)
 	}
 }
 
@@ -122,13 +123,6 @@ def main():
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
-	caller, problem := install.CaptureCaller(script)
-	fatal(t, problem)
-	pin, problem := store.CapturePin(caller)
-	fatal(t, problem)
-	if pin == nil {
-		t.Fatal("initial capture has no completed pin")
-	}
 	bad := filepath.Join(root, "bad.json")
 	must(t, os.WriteFile(bad, []byte(`[]`), 0600))
 	if code, _, _ := runCozyStreams(t, root, "run", script, "--in", bad, "--json"); code == 0 {
@@ -166,7 +160,7 @@ def main():
 	defer pipe.Close()
 	if other, problem := install.Lock(layout); problem == nil {
 		other.Unlock()
-		t.Fatal("cached target released its writer before the request owned it")
+		t.Fatal("invocation target released its writer before the request owned it")
 	}
 	_, err = pipe.Write([]byte(`{}`))
 	must(t, err)
@@ -185,10 +179,15 @@ def main():
 	}
 	writer, problem = install.Lock(layout)
 	fatal(t, problem) // --await must no longer own the writer
-	fatal(t, store.ForgetCapturePin(caller))
-	_, problem = install.Reclaim(layout, store, pin.InstallID)
+	active, problem := store.ActiveRequests()
 	fatal(t, problem)
-	if _, err := os.Stat(layout.InstallDir(pin.InstallID)); err != nil {
+	if len(active) != 1 || active[0].InstallID == "" {
+		t.Fatal("expected one accepted invocation with its install")
+	}
+	installID := active[0].InstallID
+	_, problem = install.Reclaim(layout, store, installID)
+	fatal(t, problem)
+	if _, err := os.Stat(layout.InstallDir(installID)); err != nil {
 		t.Fatal("request failed to retain its install after reader release", err)
 	}
 	writer.Unlock()
