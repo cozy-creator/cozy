@@ -63,7 +63,8 @@ func protocolUpgradeTarget(info *pb.ProtocolInfoResult) string {
 }
 
 // RentalProtocolInfo reads the pinned PodHost's supported range without a Claim.
-// PodHost answers its intersection with the installed Runtime.
+// PodHost answers its intersection with the installed Runtime. This maintenance
+// probe does not admit execution or require the Creator execution range.
 func RentalProtocolInfo(ctx context.Context, remote *WorkerConnection) (*pb.ProtocolInfoResult, *exit.Error) {
 	if remote == nil || remote.CACert == "" {
 		return nil, exit.New(exit.Credential, "the protocol probe requires a pinned rental")
@@ -79,5 +80,18 @@ func RentalProtocolInfo(ctx context.Context, remote *WorkerConnection) (*pb.Prot
 	if err != nil {
 		return nil, exit.Unavailablef("the rental's protocol probe failed: %s", status.Convert(err).Message())
 	}
-	return info, ValidateWorkerProtocol(info, true)
+	return info, validateMaintenanceProtocol(info)
+}
+
+// Maintenance uses only the signed Claim and closed snapshot surfaces retained
+// since the rental keepalive contract. It never acknowledges the snapshot or
+// sends execution/preparation messages. Future hard cuts remain refused.
+func validateMaintenanceProtocol(info *pb.ProtocolInfoResult) *exit.Error {
+	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor || info.WireMinor < pb.RentalKeepaliveWireMinor || info.MinimumWireMinor > pb.WireMinor {
+		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker has no supported maintenance protocol range")
+	}
+	if !info.SupportsRentalKeepalive {
+		return exit.Named(exit.Conflict, "worker.rental_idle_guard_required", "rental maintenance requires reliable active-work reporting and manual keepalive")
+	}
+	return nil
 }

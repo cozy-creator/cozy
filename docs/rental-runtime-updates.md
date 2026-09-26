@@ -121,3 +121,43 @@ an operation is active must name the same filename and bytes; a different
 candidate cannot replace an unfinished operation. A missing original build file
 does not prevent resume. After success, use a new version for another candidate;
 the default command continues to select public releases without downgrading.
+
+## Execution protocol changes and maintenance
+
+Runtime repair has a separate admission decision from execution. A Creator that
+requires execution wire 62 can inspect and maintain a worker on wire 60. The
+current maintenance lane accepts the known Claim/closed-snapshot contract from
+wire 60 through Creator's current wire version, requires the rental keepalive
+capability, and signs a Claim using the peer's supported intersection. It never
+sends SnapshotAck, desired state, preparations, or attempt offers. Certificate,
+worker/boot identity, owner signature, durable local custody, held outcomes, and
+the updater's independent active-work restart guard remain mandatory. A failed
+execution probe is not evidence that a worker is idle.
+
+The existing protocol probe reports the intersection of Host and installed
+Runtime. Before applying any wheel, Creator conservatively requires this range
+to reach the candidate Runtime's declared minimum. A Host on wire 60 cannot run
+a Runtime requiring wire 62. Installing Runtime/TensorFS wheels does not upgrade
+the Host binary; the existing guardian only restarts that binary. A range
+refusal leaves both components unchanged and requires a compatible worker image.
+Even a newer Host hidden behind an older Runtime's intersection is conservatively
+refused until separate Host capability reporting is available.
+
+### Required follow-up: independent Host and Runtime recovery
+
+A genuinely independent maintenance protocol must live in the supervisor, outside
+both replaceable Host and Runtime processes. It must report its own version and
+each component's independent range, authenticate the existing owner and pinned
+worker lifetime, and expose only inspect/stage/apply/reconcile operations. It must
+remain usable when Host and Runtime have no execution-protocol overlap.
+
+Extending the existing guardian requires immutable, digest-verified Host binary
+and wheel selections as one durable operation; compatibility and platform checks
+before stop; independent Host-ledger and Runtime active-work fences; dispatch
+withdrawal; and retained identity, workspace, deadline, and rollback selection.
+The guardian must restart and validate the entire selected pair, roll back both
+components on a failed health check, and retain ambiguous operations for explicit
+reconciliation. A new protocol must not grant execution authority or bypass idle
+shutdown. The current wheel-only API does not implement this Host replacement
+contract. Qualify disconnect/restart, active work, wrong owner, failed Host start,
+failed Runtime start, and full rollback before enabling Host updates.

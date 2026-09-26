@@ -339,7 +339,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 			return problem
 		}
 	}
-	control, problem := orchestrator.DialIdleControl(ctx, identity, rental.ClaimProof(u.machines.layout), u.machines.store)
+	control, problem := orchestrator.DialMaintenanceControl(ctx, identity, rental.ClaimProof(u.machines.layout), u.machines.store)
 	if problem != nil {
 		return problem
 	}
@@ -499,7 +499,7 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 					if actual.Observed.Updating {
 						break
 					}
-					control, problem := orchestrator.DialIdleControl(ctx, identity, rental.ClaimProof(u.machines.layout), u.machines.store)
+					control, problem := orchestrator.DialMaintenanceControl(ctx, identity, rental.ClaimProof(u.machines.layout), u.machines.store)
 					if problem != nil {
 						return problem
 					}
