@@ -181,6 +181,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 }
 
 func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Error {
+	state.Status = publicObservedStatus(state.Status)
 	reference := runReference(state.Number, state.JobID)
 	fields := []output.Field{
 		{K: "run", V: reference}, {K: "id", V: state.JobID},
@@ -431,7 +432,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	terminal, e := c.WatchContext(watchCtx, jobID, 0, func(event localapi.Event) bool {
 		if event.Type == "request.blocked" {
 			state, problem := c.Job(jobID)
-			if problem == nil && state.Status == "failed" && state.StoppedEventID == event.EventID {
+			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.EventID) {
 				projected := publicFailureEvent(event)
 				lines.On(projected)
 				stopped = &projected
@@ -473,6 +474,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 }
 
 func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event) *exit.Error {
+	state.Status = publicObservedStatus(state.Status)
 	if machine := state.MachineExecution; machine != nil && state.Status == "completed" && !machine.Collected {
 		return exit.Named(exit.Unavailable, "machine_execution.result_collection_pending", "run %s completed on its machine, but its result has not been collected: %s", state.JobID, machine.ObservationError)
 	}

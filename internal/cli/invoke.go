@@ -760,6 +760,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 	}
 	states := map[string]int{}
 	for _, life := range rows {
+		life.Status = publicObservedStatus(life.Status)
 		life.Machine = life.DisplayMachine()
 		kind := life.Kind
 		if kind == "" {
@@ -1322,7 +1323,7 @@ func watch(ctx *Context, c *localapi.Client, requestID string,
 	terminal, e := c.WatchContext(watchCtx, requestID, 0, func(event localapi.Event) bool {
 		if event.Type == "request.blocked" {
 			state, problem := c.Request(requestID)
-			if problem == nil && state.Status == "failed" && state.StoppedEventID == event.EventID {
+			if problem == nil && currentManualStop(state.Status, state.StoppedEventID, event.EventID) {
 				projected := publicFailureEvent(event)
 				lines.On(projected)
 				manualStop = &projected
@@ -1994,6 +1995,7 @@ const opaqueType = "application/octet-stream"
 // succeeded 0 · failed 11 · canceled 12 · deadline 10, from `exit.JobTerminal`.
 func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopped string,
 	saved []savedFile, submitted time.Duration) *exit.Error {
+	life.Status = publicObservedStatus(life.Status)
 	status := localapi.StreamStatus(terminal)
 	if status == "" {
 		status = life.Status

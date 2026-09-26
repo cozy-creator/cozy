@@ -1231,7 +1231,7 @@ func (s *Store) requestsBefore(kind, state, packageName string, limit int, befor
 	// Number only narrow index facts across history; load payloads and other
 	// request documents only for the bounded selected page.
 	selectedState := "state"
-	if public {
+	if public && state != "" {
 		selectedState = publicRunStatusSQL()
 	}
 	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,

@@ -2,12 +2,19 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -133,5 +140,39 @@ func TestPublicRunStatusFreezesStoppedExecutionAtOriginalEvent(t *testing.T) {
 	fatal(t, problem)
 	if len(link.Outcome) != 0 {
 		t.Fatal("public failure invented a Runtime terminal outcome")
+	}
+}
+
+func TestPublicRunStatusWatchAcceptsOlderDaemonWithoutStopIdentity(t *testing.T) {
+	for _, kind := range []string{"job", "invocation"} {
+		t.Run(kind, func(t *testing.T) {
+			var streams atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/" {
+					return
+				}
+				if strings.HasSuffix(r.URL.Path, "/events") {
+					streams.Add(1)
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprint(w, "id: 3\ndata: "+`{"type":"request.blocked","request_id":"legacy-stop","event_id":3,"at":"2026-09-26T01:00:01Z","payload":{"status":"blocked","error_type":"dependency.missing","error":"repair input"}}`+"\n\n")
+					return
+				}
+				// Deliberately omit retry_available and stopped_event_id, as old releases do.
+				_ = json.NewEncoder(w).Encode(map[string]any{"number": 1, "kind": kind, "request_id": "legacy-stop", "job_id": "legacy-stop", "status": "blocked", "created_at": "2026-09-26T01:00:00Z", "error_type": "dependency.missing", "error": "repair input"})
+			}))
+			defer server.Close()
+			layout, problem := home.Open(t.TempDir())
+			fatal(t, problem)
+			held, problem := daemon.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
+			fatal(t, problem)
+			defer held.Release()
+			_, problem = api.Mint(layout)
+			fatal(t, problem)
+			code, out := runCozy(t, layout.Root, "run", "watch", "1", "--json")
+			var result struct{ Error struct{ Code string } }
+			if code == 0 || json.Unmarshal([]byte(out), &result) != nil || result.Error.Code != "failed" || strings.Contains(out, "--retry") || strings.Contains(out, "ended blocked") || streams.Load() != 1 {
+				t.Fatalf("older daemon manual stop was not tolerated [%d] streams=%d: %s", code, streams.Load(), out)
+			}
+		})
 	}
 }
