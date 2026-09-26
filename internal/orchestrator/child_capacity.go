@@ -91,8 +91,8 @@ func (c *Orchestrator) retainedOrchestrationParent(child records.Request) (*JobP
 		return nil, exit.Internalf("the parent invocation is not canonical")
 	}
 	var directive pb.JobDirective
-	if canonical.Unmarshal(parent.OrchestrationDirective, &directive) != nil || !directive.Orchestration || directive.OrchestrationParent != nil || directive.ResourceCaps.GetDeviceRequired() || directive.DeviceCount != 0 || directive.JobDescriptorId != parent.PlanID || directive.BuildId != doc.Sub("job").Str("build_id") {
+	if canonical.Unmarshal(parent.OrchestrationDirective, &directive) != nil || !directive.Orchestration || directive.OrchestrationParent != nil || directive.ResourceCaps.GetDeviceRequired() || directive.DeviceCount != 0 || directive.JobDescriptorId != parent.PlanID || directive.InstallationId != doc.Sub("job").Str("installation_id") {
 		return nil, exit.Named(exit.Conflict, "child.parent_slot_unavailable", "the rental has no exact retained CPU orchestration parent")
 	}
-	return &JobPlan{Function: parent.Entrypoint, DescriptorID: directive.JobDescriptorId, BuildID: directive.BuildId, Orchestration: true, FrozenDirective: &directive}, nil
+	return &JobPlan{Function: parent.Entrypoint, DescriptorID: directive.JobDescriptorId, InstallationID: directive.InstallationId, Orchestration: true, FrozenDirective: &directive}, nil
 }

@@ -25,12 +25,12 @@ type Inspection struct {
 		Schema string `json:"schema"`
 	} `json:"report"`
 	Subject struct {
-		Type       string `json:"type"`
-		Candidate  string `json:"candidate_checkpoint"`
-		Reference  string `json:"reference_checkpoint"`
-		Invocation string `json:"producer_invocation"`
-		Build      string `json:"producer_build"`
-		Receipt    string `json:"weights_receipt"`
+		Type         string `json:"type"`
+		Candidate    string `json:"candidate_checkpoint"`
+		Reference    string `json:"reference_checkpoint"`
+		Invocation   string `json:"producer_invocation"`
+		Installation string `json:"producer_installation"`
+		Receipt      string `json:"weights_receipt"`
 	} `json:"subject"`
 	OutputSlot string          `json:"output_slot"`
 	Verdict    string          `json:"publisher_reported_verdict"`
@@ -68,7 +68,7 @@ func VerifyProducer(st *records.Store, requestID string, report []byte, inspecte
 		return refuse()
 	}
 	invocation, err := canonical.Read(attempt.InvocationCanonical, &pb.InvocationSpec{})
-	if err != nil || invocation.Sub("job").Str("build_id") != info.Subject.Build {
+	if err != nil || invocation.Sub("job").Str("installation_id") != info.Subject.Installation {
 		return refuse()
 	}
 	actual, err := canonical.Spell(canonical.Digest(attempt.InvocationCanonical))

@@ -44,10 +44,6 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 	if problem != nil {
 		return nil, problem
 	}
-	before, _, _, problem := parent.SourceIdentity(extras...)
-	if problem != nil {
-		return nil, problem
-	}
 	root, err := os.MkdirTemp("", "cozy-child-interfaces-")
 	if err != nil {
 		return nil, exit.Internalf("cannot stage captured interfaces: %s", err)
@@ -75,12 +71,6 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 			return fail(exit.New(exit.Conflict, "parent source changed while capturing child interfaces"))
 		}
 		captured.Files[name] = to
-	}
-	// Read the copied bytes with the original dependency base before rebasing.
-	// An edit that is reverted during copying still cannot produce a mixed copy.
-	copied, _, _, problem := captured.SourceIdentity(extras...)
-	if problem != nil || copied != before {
-		return fail(exit.New(exit.Conflict, "parent source or dependency changed during interface capture"))
 	}
 	path := filepath.Join(root, "pyproject.toml")
 	raw, err := os.ReadFile(path)
@@ -264,15 +254,6 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 			detail = detail[len(detail)-2000:]
 		}
 		return fail(exit.Named(exit.Structural, "child.interface_lock_refused", "cannot lock the captured interface dependencies: %s", detail))
-	}
-	// Rewalk as well as rehash: added and removed authored files matter too.
-	tree, files, problem := boundedSourceTree(parent.Tree, []string{"package.toml", "pyproject.toml"})
-	if problem != nil {
-		return fail(problem)
-	}
-	after, _, _, problem := (&Package{Tree: tree, Files: files}).SourceIdentity(extras...)
-	if problem != nil || after != before {
-		return fail(exit.New(exit.Conflict, "captured source or dependency changed while resolving dependencies"))
 	}
 	prepared, problem := PrepareLocalFrom(root)
 	if problem != nil {

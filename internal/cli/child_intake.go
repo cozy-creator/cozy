@@ -5,10 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
-	pep440 "github.com/aquasecurity/go-pep440-version"
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
@@ -16,7 +13,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // childIntake is bounded installation staging under the caller's existing
@@ -41,59 +37,8 @@ func (i *childIntake) Finish(parentInstall string) *exit.Error {
 	if problem := i.store.RecordChildBindings(bindings); problem != nil {
 		return problem
 	}
-	if problem := i.captureBuiltinWithChildren(parentInstall); problem != nil {
-		return problem
-	}
 	if i.prepared != nil && i.prepared.Install.ID == parentInstall {
 		i.prepared = nil
-	}
-	return nil
-}
-
-// Each caller owns an immutable base capture. Optional numerical preparation
-// occurs only when that caller actually asks for the shared Runtime operation.
-func (i *childIntake) captureBuiltinWithChildren(parent string) *exit.Error {
-	queue := []string{parent}
-	seen := map[string]bool{}
-	for len(queue) > 0 {
-		id := queue[0]
-		queue = queue[1:]
-		if seen[id] {
-			continue
-		}
-		seen[id] = true
-		if len(seen) > 1024 {
-			return exit.New(exit.Validation, "private builtin dependency graph exceeds its bound")
-		}
-		bindings, problem := i.store.ChildBindings(id)
-		if problem != nil {
-			return problem
-		}
-		for _, binding := range bindings {
-			if binding.Module != runtimeoperation.Module {
-				queue = append(queue, binding.ChildInstallID)
-			}
-		}
-		installed, problem := i.store.Install(id)
-		if problem != nil {
-			return problem
-		}
-		if installed == nil {
-			return exit.New(exit.Conflict, "captured builtin caller is unavailable")
-		}
-		eligible := false
-		for _, pin := range strings.Split(installed.Closure, "\n") {
-			if version, ok := strings.CutPrefix(pin, "cozy-runtime=="); ok {
-				parsed, err := pep440.Parse(version)
-				eligible = err == nil && !parsed.LessThan(pep440.MustParse(runtimeoperation.Floor))
-			}
-		}
-		if !eligible {
-			continue
-		}
-		if problem := install.CaptureRuntimeOperations(context.Background(), i.layout, *installed); problem != nil {
-			return problem
-		}
 	}
 	return nil
 }
@@ -115,12 +60,12 @@ func (i *childIntake) Install() (*install.Result, *exit.Error) {
 	if i.prepared != nil {
 		return i.prepared, nil
 	}
-	source, files, size, problem := i.Package.SourceIdentity()
+	files, size, problem := i.Package.SourceInventory()
 	if problem != nil {
 		return nil, problem
 	}
 	result, problem := install.Run(i.layout, i.store, install.Request{Ref: install.Ref{Package: "local/" + i.Package.Name}, Snapshot: true,
-		Local: &install.LocalSource{SourceDigest: source, Bytes: size, Files: files, Package: "local/" + i.Package.Name, Release: i.Package.Release, Tree: i.Package.Tree}})
+		Local: &install.LocalSource{Bytes: size, Files: files, Package: "local/" + i.Package.Name, Release: i.Package.Release, Tree: i.Package.Tree}})
 	if problem == nil {
 		i.prepared = result
 	}
@@ -183,7 +128,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 			dependency.Close()
 			return fail(problem)
 		}
-		surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(result.Install.Dir), result.Install.PackageInterface)
+		surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(result.Install.Dir))
 		if problem != nil {
 			nested.Close()
 			dependency.Close()
@@ -200,51 +145,18 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 			dependency.Close()
 			continue
 		}
-		revision, problem := localpackage.Stage(context.Background(), layout, result.Install)
+		_, problem = localpackage.Stage(context.Background(), layout, result.Install)
 		if problem != nil {
 			nested.Close()
 			dependency.Close()
 			return fail(problem)
 		}
-		if intake.staging == "" {
-			if err := os.MkdirAll(layout.Tmp, 0o700); err != nil {
-				nested.Close()
-				dependency.Close()
-				return fail(exit.Internalf("cannot create interface staging parent: %s", err))
-			}
-			var err error
-			intake.staging, err = os.MkdirTemp(layout.Tmp, "child-interfaces-")
-			if err != nil {
-				nested.Close()
-				dependency.Close()
-				return fail(exit.Internalf("cannot stage child interfaces: %s", err))
-			}
-		}
-		var projectWheel localpackage.File
-		for _, file := range revision.Files {
-			if file.Kind == "project" {
-				projectWheel = file
-			}
-		}
-		wheel, problem := launch.GenerateInterfaceWheel(context.Background(), result.Install, layout.Root, config.Frozen().Tool(), revision.Digest, projectWheel.Path, projectWheel.Digest, intake.staging)
-		if problem != nil {
-			nested.Close()
-			dependency.Close()
-			return fail(problem)
-		}
-		replacements[name] = wheel.Path
+		replacements[name] = path
 		for _, job := range exports {
-			intake.Bindings = append(intake.Bindings, records.ChildBinding{InterfaceDigest: surface.Digest, Module: job.Invocable.Module, Export: job.Invocable.Export, ChildInstallID: result.Install.ID, LocalRevisionDigest: revision.Digest, Entrypoint: job.Name})
+			intake.Bindings = append(intake.Bindings, records.ChildBinding{Module: job.Invocable.Module, Export: job.Invocable.Export, ChildInstallID: result.Install.ID, Entrypoint: job.Name})
 		}
 		nested.Close()
 		dependency.Close()
-	}
-	if len(replacements) > 0 {
-		overlay, problem := packagepublish.WithChildInterfaces(context.Background(), pack, replacements)
-		if problem != nil {
-			return fail(problem)
-		}
-		intake.Package, intake.ownedPackage = overlay, true
 	}
 	if problem := intake.prepareWheelIntake(context.Background(), replacements); problem != nil {
 		return fail(problem)

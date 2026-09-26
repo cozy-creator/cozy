@@ -3,11 +3,7 @@ package packagepublish
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -52,16 +48,6 @@ type Package struct {
 	Release                string
 	ScriptModels           map[string]string // plain-main default model refs; ordinary CLI overrides win
 	temporarySource        string            // generated single-file project, copied into a retained install
-}
-
-type sourceIdentityFile struct {
-	Digest string `json:"digest"`
-	Length int64  `json:"length"`
-	Path   string `json:"path"`
-}
-
-type sourceIdentityDocument struct {
-	Sources []sourceIdentityFile `json:"sources"`
 }
 
 func (p *Package) Close() {
@@ -367,11 +353,8 @@ func Paths(files map[string]string) []string {
 	return out
 }
 
-// SourceIdentity binds an editable install to the exact publishable source tree.
-// It neither builds nor claims a wheel: editable execution uses this live tree,
-// while published execution remains the separate wheel-backed path.
-func (p *Package) SourceIdentity(extras ...string) (string, int, int64, *exit.Error) {
-	document := sourceIdentityDocument{}
+// SourceInventory counts bounded project and dependency files without hashing their contents.
+func (p *Package) SourceStats(extras ...string) (map[string]SourceStamp, int64, *exit.Error) {
 	var sourceBytes int64
 	files := make(map[string]string, len(p.Files))
 	for name, path := range p.Files {
@@ -379,13 +362,13 @@ func (p *Package) SourceIdentity(extras ...string) (string, int, int64, *exit.Er
 	}
 	dependencies, problem := LocalDependencySelections(p.Tree, extras...)
 	if problem != nil {
-		return "", 0, 0, problem
+		return nil, 0, problem
 	}
 	for name, selection := range dependencies {
 		source := selection.Path
 		info, err := os.Stat(source)
 		if err != nil {
-			return "", 0, 0, exit.Internalf("cannot inspect local dependency: %s", err)
+			return nil, 0, exit.Internalf("cannot inspect local dependency: %s", err)
 		}
 		if !info.IsDir() {
 			files["dependencies/"+name+"/"+filepath.Base(source)] = source
@@ -393,48 +376,30 @@ func (p *Package) SourceIdentity(extras ...string) (string, int, int64, *exit.Er
 		}
 		_, members, problem := LibrarySourceTree(source)
 		if problem != nil {
-			return "", 0, 0, problem
+			return nil, 0, problem
 		}
 		for member, path := range members {
 			files["dependencies/"+name+"/"+member] = path
 		}
 	}
-	for _, path := range Paths(files) {
-		row, problem := sourceIdentityFileAt(path, files[path])
-		if problem != nil {
-			return "", 0, 0, problem
+	stats := map[string]SourceStamp{}
+	for name, path := range files {
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > SourceFileLimit(name) {
+			return nil, 0, exit.New(exit.Validation, "local source inventory contains an unavailable or unbounded file")
 		}
-		document.Sources = append(document.Sources, row)
-		sourceBytes += row.Length
-		if len(document.Sources) > MaxSourceFiles || sourceBytes > MaxSourceBytes {
-			return "", 0, 0, exit.Named(exit.Validation, "local_source_closure_too_large", "local project and dependency sources exceed package bounds")
+		stats[name] = SourceStamp{Size: info.Size(), Modified: info.ModTime().UnixNano()}
+		sourceBytes += info.Size()
+		if len(files) > MaxSourceFiles || sourceBytes > MaxSourceBytes {
+			return nil, 0, exit.Named(exit.Validation, "local_source_closure_too_large", "local project and dependency sources exceed package bounds")
 		}
 	}
-	raw, err := json.Marshal(document)
-	if err != nil {
-		return "", 0, 0, exit.Internalf("cannot encode local package source identity: %s", err)
-	}
-	digest := sha256.Sum256(raw)
-	return "sha256:" + hex.EncodeToString(digest[:]), len(document.Sources), sourceBytes, nil
+	return stats, sourceBytes, nil
 }
 
-func sourceIdentityFileAt(name, file string) (sourceIdentityFile, *exit.Error) {
-	input, err := os.Open(file)
-	if err != nil {
-		return sourceIdentityFile{}, exit.Named(exit.Structural, "local_package_source_changed",
-			"cannot read %s while fixing the local build identity: %s", name, err).
-			WithRemedy("stop changing the project while `cozy package install` is building it")
-	}
-	hash := sha256.New()
-	length, copyErr := io.Copy(hash, input)
-	closeErr := input.Close()
-	if copyErr != nil || closeErr != nil {
-		return sourceIdentityFile{}, exit.Named(exit.Structural, "local_package_source_changed",
-			"cannot finish reading %s while fixing the local build identity", name).
-			WithRemedy("stop changing the project while `cozy package install` is building it")
-	}
-	return sourceIdentityFile{Path: name, Length: length,
-		Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil))}, nil
+func (p *Package) SourceInventory(extras ...string) (int, int64, *exit.Error) {
+	stats, size, problem := p.SourceStats(extras...)
+	return len(stats), size, problem
 }
 
 type projectMetadata struct {

@@ -25,8 +25,8 @@ func UploadFile(ctx context.Context, host pb.PodHostClient, header *pb.LocalPack
 	path string, onStatus func(*pb.LocalPackageFileStatus),
 ) *exit.Error {
 	if header == nil || header.Claim == nil || header.File == nil ||
-		header.OperationId == "" || len(header.SourceDigest) != 32 ||
-		len(header.File.Digest) != 32 || header.File.Filename == "" ||
+		header.OperationId == "" ||
+		(len(header.File.Digest) != 32 && !(len(header.File.Digest) == 0 && header.File.Filename == "source.tar")) || header.File.Filename == "" ||
 		header.File.Length == 0 || header.File.Length > math.MaxInt64 {
 		return exit.Named(exit.Structural, "local_package_upload_header_invalid", "captured wheel upload has no complete identity")
 	}
@@ -151,7 +151,7 @@ func sendUpload(ctx context.Context, stream pb.PodHost_LocalPackageUploadClient,
 
 func uploadStatus(header *pb.LocalPackageUploadHeader, ack *pb.LocalPackageFileStatus, expected *uint64) (bool, *exit.Error) {
 	file := header.File
-	if ack == nil || ack.OperationId != header.OperationId || !bytes.Equal(ack.SourceDigest, header.SourceDigest) ||
+	if ack == nil || ack.OperationId != header.OperationId ||
 		!bytes.Equal(ack.Digest, file.Digest) || ack.Filename != file.Filename || ack.Length != file.Length ||
 		ack.ReceivedBytes > file.Length || (expected != nil && ack.ReceivedBytes != *expected) {
 		return false, exit.Named(exit.Conflict, "local_package_upload_identity_changed", "worker returned another captured file or unexpected upload offset")

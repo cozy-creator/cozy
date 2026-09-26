@@ -106,18 +106,24 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package) (Target, *launch
 }
 
 func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
+	_, store, writer, problem := open(ctx.Cfg, true)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	defer store.Close()
 	current, problem := exactInvocationInstall(ctx, target)
 	if problem != nil {
+		writer.Unlock()
 		return Target{}, nil, problem
 	}
-	pack, problem := packagepublish.PrepareLocalFrom(current.SourceRef)
+	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(current.Dir))
 	if problem != nil {
+		writer.Unlock()
 		return Target{}, nil, problem
 	}
-	defer pack.Close()
-	frozen, surface, problem := snapshotTarget(ctx, pack)
-	frozen.Function = target.Function
-	return frozen, surface, problem
+	target.Package, target.InstallID, target.Release = current.Package, current.ID, current.Version
+	target.Snapshot, target.releaseCapture = true, writer.Unlock
+	return target, surface, nil
 }
 
 func reclaimSnapshot(ctx *Context, target Target) {

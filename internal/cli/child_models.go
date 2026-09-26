@@ -204,7 +204,7 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 				return nil, exit.Named(exit.Conflict, "child.install_absent",
 					"captured child implementation is unavailable for model selection")
 			}
-			surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(child.Dir), binding.InterfaceDigest)
+			surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(child.Dir))
 			if problem != nil {
 				return nil, problem
 			}

@@ -11,7 +11,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -19,7 +18,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/runtimeoperation"
 )
 
 // The LOCAL module's package resolver: `org/name` -> the spec that makes its worker
@@ -58,42 +56,42 @@ type Resolver struct {
 // PrepareLocal freezes one editable install into exact wheels before rental attachment.
 // Tensorhub selects the base; the worker validates the package against that exact base.
 func (r *Resolver) PrepareLocal(ctx context.Context, installID string) (
-	localpackage.Revision, *exit.Error,
+	localpackage.Installation, *exit.Error,
 ) {
 	install, problem := r.store.Install(installID)
 	if problem != nil {
-		return localpackage.Revision{}, problem
+		return localpackage.Installation{}, problem
 	}
 	if install == nil {
-		return localpackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
+		return localpackage.Installation{}, exit.New(exit.NotFound, "install %s does not exist", installID)
 	}
 	layout, problem := home.Open(r.cfg.Home)
 	if problem != nil {
-		return localpackage.Revision{}, problem
+		return localpackage.Installation{}, problem
 	}
 	revision, problem := localpackage.Stage(ctx, layout, *install)
 	if problem != nil {
-		return localpackage.Revision{}, problem
+		return localpackage.Installation{}, problem
 	}
 	return revision, nil
 }
 
 // LocalRevision reopens the exact staged wheel set a durable request already names.
-func (r *Resolver) LocalRevision(installID, digest string) (localpackage.Revision, *exit.Error) {
+func (r *Resolver) LocalInstallation(installID, digest string) (localpackage.Installation, *exit.Error) {
 	install, problem := r.store.Install(installID)
 	if problem != nil {
-		return localpackage.Revision{}, problem
+		return localpackage.Installation{}, problem
 	}
 	if install == nil {
-		return localpackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
+		return localpackage.Installation{}, exit.New(exit.NotFound, "install %s does not exist", installID)
 	}
 	layout, problem := home.Open(r.cfg.Home)
 	if problem != nil {
-		return localpackage.Revision{}, problem
+		return localpackage.Installation{}, problem
 	}
 	revision, problem := localpackage.Open(layout, *install, digest)
 	if problem != nil {
-		return localpackage.Revision{}, problem
+		return localpackage.Installation{}, problem
 	}
 	return revision, nil
 }
@@ -104,15 +102,10 @@ type EditableSnapshot struct {
 	Package  string
 	Current  *records.PackageInstall
 	Editable bool
-	Digest   string
+	Changed  bool
 	Files    int
 	Bytes    int64
 	pack     *packagepublish.Package
-}
-
-// Changed answers whether the tree no longer matches the install that was active.
-func (s *EditableSnapshot) Changed() bool {
-	return s.Editable && s.Digest != s.Current.SourceDigest
 }
 
 func (s *EditableSnapshot) Close() {
@@ -165,12 +158,13 @@ func (r *Resolver) SnapshotEditable(pkg string) (*EditableSnapshot, *exit.Error)
 			"local", pack.Name, pack.Release, current.Package, current.Version).
 			WithRemedy("install the renamed package directory explicitly"))
 	}
-	digest, files, bytes, problem := pack.SourceIdentity()
+	stats, bytes, problem := pack.SourceStats()
 	if problem != nil {
 		pack.Close()
 		return snapshot, refreshFailure(pkg, current, problem)
 	}
-	snapshot.pack, snapshot.Digest, snapshot.Files, snapshot.Bytes = pack, digest, files, bytes
+	snapshot.pack, snapshot.Files, snapshot.Bytes = pack, len(stats), bytes
+	snapshot.Changed = !packagepublish.SourceStatsUnchanged(current.Dir, stats)
 	return snapshot, nil
 }
 
@@ -191,13 +185,10 @@ func refreshFailure(pkg string, current *records.PackageInstall, cause *exit.Err
 func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string, changed bool, problem *exit.Error) {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
-	if !snapshot.Editable {
+	if !snapshot.Editable || !snapshot.Changed {
 		return snapshot.Current.ID, false, nil
 	}
-	pkg, current, pack, digest := snapshot.Package, snapshot.Current, snapshot.pack, snapshot.Digest
-	if digest == current.SourceDigest {
-		return current.ID, false, nil
-	}
+	pkg, current, pack := snapshot.Package, snapshot.Current, snapshot.pack
 	layout, problem := home.Open(r.cfg.Home)
 	if problem != nil {
 		return current.ID, false, refreshFailure(pkg, current, problem)
@@ -222,13 +213,10 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 				"the active package changed while its editable source was being checked").
 				WithRemedy("retry against the current install"))
 		}
-		if current.SourceDigest == digest {
-			return current.ID, false, nil
-		}
 	}
 	result, problem := install.Run(layout, r.store, install.Request{
 		Ref: install.Ref{Package: current.Package}, Force: true,
-		Local: &install.LocalSource{SourceDigest: digest, Bytes: snapshot.Bytes, Files: snapshot.Files,
+		Local: &install.LocalSource{Bytes: snapshot.Bytes, Files: snapshot.Files,
 			Package: current.Package, Release: current.Version, Tree: current.SourceRef},
 	})
 	if problem != nil {
@@ -636,7 +624,7 @@ func (r *Resolver) installPackageInterface(installID string) (*records.PackageIn
 	if e != nil {
 		return nil, nil, e
 	}
-	packageInterface, e := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir), install.PackageInterface)
+	packageInterface, e := launch.ReadPackageInterface(launch.PackageInterfacePath(install.Dir))
 	if e != nil {
 		return nil, nil, e
 	}
@@ -656,27 +644,7 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	if !facts.CPUOrchestration && facts.PackageInterface.Application == packagepublish.ScriptApplication {
-		facts.CPUOrchestration, problem = install.HasRuntimeOperationsCapture(*installed)
-		if problem != nil {
-			return nil, problem
-		}
-	}
-	if facts.CPUOrchestration && facts.PackageInterface.Application != packagepublish.ScriptApplication {
-		bindings, problem := r.store.ChildBindings(installID)
-		if problem != nil {
-			return nil, problem
-		}
-		// Runtime availability alone does not mean an ordinary package delegates
-		// its GPU work. Explicit captured package calls keep the prior CPU rule.
-		facts.CPUOrchestration = false
-		for _, binding := range bindings {
-			if binding.Module != runtimeoperation.Module {
-				facts.CPUOrchestration = true
-				break
-			}
-		}
-	}
+	facts.CPUOrchestration = facts.CPUOrchestration || facts.PackageInterface.Application == packagepublish.ScriptApplication
 	facts.SelfCallable, problem = r.store.SelfCallableEntrypoints(installID)
 	return facts, problem
 }
@@ -922,30 +890,9 @@ func ladderOffers(ladder []hub.BindingRung, model orchestrator.ModelRef) bool {
 	return true
 }
 
-// ValidateExecutionCapture checks the execution owner's immutable constraint.
-// Base-owned builtin carriers inherit this admitted parent's worker requirement;
-// their version label alone is not proof of the installed remote Runtime.
+// ValidateExecutionCapture checks that the accepted installation is available.
+// Runtime dependency constraints are resolved by uv during package installation.
 func (r *Resolver) ValidateExecutionCapture(request records.Request) *exit.Error {
-	owner := request
-	for depth := 0; owner.ParentRequestID != ""; depth++ {
-		if depth >= 32 {
-			return exit.New(exit.Conflict, "captured execution ancestry exceeds its bound")
-		}
-		parent, problem := r.store.RequestRow(owner.ParentRequestID)
-		if problem != nil {
-			return problem
-		}
-		if parent == nil {
-			return exit.New(exit.Conflict, "captured execution owner is unavailable")
-		}
-		owner = *parent
-	}
-	if owner.InstallID == "" || owner.LocalPackageDigest == "" {
-		return exit.Named(exit.Conflict, "request.capture_runtime_floor_unproven", "the execution owner has no immutable Runtime minimum")
-	}
-	revision, problem := r.LocalRevision(owner.InstallID, owner.LocalPackageDigest)
-	if problem != nil {
-		return problem
-	}
-	return localpackage.RequireRuntimeFloor(revision, hostruntime.PackageFloor)
+	_, problem := r.LocalInstallation(request.InstallID, request.LocalInstallationID)
+	return problem
 }

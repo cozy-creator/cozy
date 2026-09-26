@@ -42,19 +42,16 @@ type PackageInstall struct {
 	Version            string
 	SourceKind         string // "tensorhub" | "local" | "wheel" (private immutable dependency)
 	SourceRef          string
-	SourceDigest       string
 	Verified           bool // false = an explicit local/development install, not published custody
 	Dir                string
 	Python             string
 	Runtime            string // exact cozy-runtime binary; empty on older source installs derives from venv
 	ProjectDir         string // exact installed project root; empty on source installs derives from source kind
 	UV                 string
-	LockDigest         string
 	Platform           string
 	Extra              string // the CUDA-extra pick ("" = none declared or no accelerator)
 	Packages           int
 	Closure            string // one "name==version" per line
-	PackageInterface   string // exact digest of the install-private Runtime-derived PackageInterface
 	PlacementSetDigest string // exact Hub-selected PlacementSet/1 stored in the artifact cache
 	BytesExcl          int64
 	BytesShared        int64
@@ -72,7 +69,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 45
+const schemaVersion = 46
 
 // Retained only to recognize and migrate released schemas 41 through 44.
 const priorCapturePinsDDL = `
@@ -91,19 +88,16 @@ CREATE TABLE IF NOT EXISTS installs (
   version       TEXT    NOT NULL,
   source_kind   TEXT    NOT NULL,
   source_ref    TEXT    NOT NULL,
-  source_digest TEXT    NOT NULL,
   verified      INTEGER NOT NULL,
   dir           TEXT    NOT NULL,
   python        TEXT    NOT NULL,
   runtime       TEXT    NOT NULL DEFAULT '',
   project_dir   TEXT    NOT NULL DEFAULT '',
   uv            TEXT    NOT NULL,
-  lock_digest   TEXT    NOT NULL,
   platform      TEXT    NOT NULL,
   extra         TEXT    NOT NULL,
   packages      INTEGER NOT NULL,
   closure       TEXT    NOT NULL,
-  package_interface TEXT    NOT NULL,
   placement_set_digest TEXT  NOT NULL DEFAULT '',
   bytes_excl    INTEGER NOT NULL,
   bytes_shared  INTEGER NOT NULL,
@@ -490,6 +484,47 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if _, err := tx.Exec(`DROP TABLE IF EXISTS capture_pins`); err != nil {
 		return exit.Internalf("cannot remove package fingerprint cache: %s", err)
 	}
+	if sourceVersion < 46 {
+		var statements []string
+		if sourceVersion >= 38 {
+			columns := strings.Replace(requestCols, "COALESCE(install_id,'')", "install_id", 1)
+			selected := strings.Split(columns, ",")
+			for index, column := range selected {
+				switch strings.TrimSpace(column) {
+				case "local_installation_id":
+					selected[index] = "CASE WHEN local_package_digest<>'' THEN COALESCE(install_id,'') ELSE '' END"
+				case "installation_id":
+					selected[index] = "''"
+				}
+			}
+			statements = append(statements,
+				`ALTER TABLE requests RENAME TO requests_prior46`, requestsDDL,
+				`INSERT INTO requests(`+columns+`) SELECT `+strings.Join(selected, ",")+` FROM requests_prior46`,
+				`DROP TABLE requests_prior46`)
+		}
+		if sourceVersion >= 20 {
+			statements = append(statements,
+				`ALTER TABLE installs RENAME TO installs_prior46`, installsDDL,
+				`INSERT INTO installs(`+installCols("")+`) SELECT `+installCols("")+` FROM installs_prior46`,
+				`DROP TABLE installs_prior46`)
+		}
+		for _, statement := range statements {
+			if _, err := tx.Exec(statement); err != nil {
+				return exit.Internalf("cannot migrate request installation ownership: %s", err)
+			}
+		}
+		if sourceVersion >= 27 {
+			for _, statement := range []string{
+				`ALTER TABLE private_child_bindings RENAME TO private_child_bindings_prior45`, childBindingsDDL,
+				`INSERT INTO private_child_bindings(parent_install_id,module,export,child_install_id,entrypoint) SELECT DISTINCT parent_install_id,module,export,child_install_id,entrypoint FROM private_child_bindings_prior45`,
+				`DROP TABLE private_child_bindings_prior45`,
+			} {
+				if _, err := tx.Exec(statement); err != nil {
+					return exit.Internalf("cannot migrate accepted installation bindings: %s", err)
+				}
+			}
+		}
+	}
 	for _, statement := range []string{childRequestIndex, activeChildRequestIndex} {
 		if _, err := tx.Exec(statement); err != nil {
 			return exit.Internalf("cannot restore request indexes in %s: %s", path, err)
@@ -537,7 +572,7 @@ func migrateInstalls(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	if sourceVersion < 12 {
 		priorTable, priorInstallID = "install_generations", "generation"
 	}
-	priorInstallCols := strings.Replace(installCols(""), "package_interface", "package_descriptor", 1)
+	priorInstallCols := installCols("")
 	for _, statement := range []string{
 		`DROP INDEX worker_session`,
 		`ALTER TABLE ` + priorTable + ` RENAME TO installs_prior`,
@@ -744,8 +779,8 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		return exit.Internalf("cannot create current requests table while migrating %s: %s", path, err)
 	}
 	destinationColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-		local_package_digest,local_package_uploaded_boot_id,
-		environment_digest,payload,outputs,state,ordinal,requeues,created_at,kind,
+		local_installation_id,local_package_uploaded_boot_id,
+		installation_id,payload,outputs,state,ordinal,requeues,created_at,kind,
 		needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,models,weights_outputs`
 	rentalRequired := "rental_required"
 	if sourceVersion == 6 {
@@ -765,7 +800,7 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	}
 	selectColumns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 		` + localPackage + `,
-		environment_digest,payload,outputs,state,ordinal,requeues,created_at,kind,` +
+		'',payload,outputs,state,ordinal,requeues,created_at,kind,` +
 		needsAccelerator + `,
 		org,trees,worker,` + machine + `,rental,` + rentalRequired +
 		`,install_id,assets,models,weights_outputs`
@@ -825,8 +860,15 @@ CREATE TABLE IF NOT EXISTS rentals (
 
 // priorStatements is the released DDL of one earlier schema, derived from the current one
 // so a released shape is never a second copy that can drift from it.
+func priorInstallMetadata(stmt string) string {
+	stmt = strings.Replace(stmt, "  source_ref    TEXT    NOT NULL,\n", "  source_ref    TEXT    NOT NULL,\n  source_digest TEXT    NOT NULL,\n", 1)
+	stmt = strings.Replace(stmt, "  uv            TEXT    NOT NULL,\n", "  uv            TEXT    NOT NULL,\n  lock_digest   TEXT    NOT NULL,\n", 1)
+	return strings.Replace(stmt, "  closure       TEXT    NOT NULL,\n", "  closure       TEXT    NOT NULL,\n  package_interface TEXT    NOT NULL,\n", 1)
+}
+
 func priorStatements(version int) []string {
-	priorRequestsNineteen := strings.Replace(requestsDDL,
+	priorRequestsDDL := strings.Replace(requestsDDL, "  installation_id TEXT NOT NULL DEFAULT '',", "  environment_digest TEXT NOT NULL DEFAULT '',", 1)
+	priorRequestsNineteen := strings.Replace(priorRequestsDDL,
 		"  package_release TEXT NOT NULL DEFAULT '',\n",
 		"  package_release TEXT NOT NULL DEFAULT '',\n  package_revision_digest TEXT NOT NULL DEFAULT '',\n", 1)
 	priorRequestsEighteen := strings.Replace(priorRequestsNineteen,
@@ -855,7 +897,7 @@ func priorStatements(version int) []string {
 	priorRequests = priorLocalPackageNames(priorRequests)
 	priorRequestsSix = priorLocalPackageNames(priorRequestsSix)
 	priorRequestsFourteen := priorLocalPackageNames(priorRequestsSixteen)
-	priorInstalls := strings.Replace(installsDDL,
+	priorInstalls := strings.Replace(priorInstallMetadata(installsDDL),
 		"  package_interface TEXT    NOT NULL,\n", "  package_descriptor TEXT    NOT NULL,\n", 1)
 	priorWorkerProcesses := strings.Replace(workerProcessesDDL,
 		"  install_id      TEXT    REFERENCES installs(id),\n",
@@ -1000,6 +1042,18 @@ func priorStatements(version int) []string {
 			stmt = strings.ReplaceAll(stmt, "call_index<4294967296", "call_index<32")
 		}
 		statements[index] = stmt
+		if version < 46 {
+			if stmt == installsDDL {
+				statements[index] = priorInstallMetadata(stmt)
+			}
+			statements[index] = strings.ReplaceAll(statements[index], "local_installation_id", "local_package_digest")
+			statements[index] = strings.ReplaceAll(statements[index], "  installation_id TEXT NOT NULL DEFAULT '',", "  environment_digest TEXT NOT NULL DEFAULT '',")
+			if stmt == childBindingsDDL {
+				statements[index] = strings.ReplaceAll(statements[index], " module TEXT NOT NULL,", " interface_digest TEXT NOT NULL,\n module TEXT NOT NULL,")
+				statements[index] = strings.ReplaceAll(statements[index], " entrypoint TEXT NOT NULL,", " local_revision_digest TEXT NOT NULL,\n entrypoint TEXT NOT NULL,")
+				statements[index] = strings.ReplaceAll(statements[index], "PRIMARY KEY(parent_install_id,module,export)", "PRIMARY KEY(parent_install_id,interface_digest,module,export)")
+			}
+		}
 	}
 	if version >= 41 && version < 45 {
 		statements = append(statements, priorCapturePinsDDL)
@@ -1038,7 +1092,7 @@ func priorInstallNames(stmt string) string {
 // priorLocalPackageNames restores the pre-15 spelling of the request's two editable
 // revision columns, which said `private_package_*` before proto-027 settled on one word.
 func priorLocalPackageNames(stmt string) string {
-	stmt = strings.Replace(stmt, "  local_package_digest TEXT", "  private_package_digest TEXT", 1)
+	stmt = strings.Replace(stmt, "  local_installation_id TEXT", "  private_package_digest TEXT", 1)
 	stmt = strings.Replace(stmt, "  local_package_uploaded_boot_id TEXT", "  private_package_uploaded_boot_id TEXT", 1)
 	return stmt
 }
@@ -1204,9 +1258,9 @@ func verifySchema(db *sql.DB, path string) *exit.Error {
 func (s *Store) Close() { _ = s.db.Close() }
 
 var installFields = []string{
-	"id", "package", "major", "version", "source_kind", "source_ref", "source_digest",
-	"verified", "dir", "python", "runtime", "project_dir", "uv", "lock_digest", "platform", "extra",
-	"packages", "closure", "package_interface", "placement_set_digest", "bytes_excl", "bytes_shared", "created_at",
+	"id", "package", "major", "version", "source_kind", "source_ref",
+	"verified", "dir", "python", "runtime", "project_dir", "uv", "platform", "extra",
+	"packages", "closure", "placement_set_digest", "bytes_excl", "bytes_shared", "created_at",
 }
 
 // installCols is the select list, optionally table-qualified for a join.
@@ -1226,8 +1280,8 @@ func scanInstall(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 	var inst PackageInstall
 	var verified int
 	err := rows.Scan(&inst.ID, &inst.Package, &inst.Major, &inst.Version, &inst.SourceKind, &inst.SourceRef,
-		&inst.SourceDigest, &verified, &inst.Dir, &inst.Python, &inst.Runtime, &inst.ProjectDir, &inst.UV, &inst.LockDigest, &inst.Platform,
-		&inst.Extra, &inst.Packages, &inst.Closure, &inst.PackageInterface, &inst.PlacementSetDigest,
+		&verified, &inst.Dir, &inst.Python, &inst.Runtime, &inst.ProjectDir, &inst.UV, &inst.Platform,
+		&inst.Extra, &inst.Packages, &inst.Closure, &inst.PlacementSetDigest,
 		&inst.BytesExcl, &inst.BytesShared, &inst.CreatedAt)
 	inst.Verified = verified == 1
 	return inst, err
@@ -1268,9 +1322,9 @@ func (s *Store) recordInstall(inst PackageInstall, activate bool) (string, *exit
 	}
 	if _, err := tx.Exec(`INSERT INTO installs(`+installCols("")+`)
 		VALUES(`+placeholders()+`)`,
-		inst.ID, inst.Package, inst.Major, inst.Version, inst.SourceKind, inst.SourceRef, inst.SourceDigest,
-		verified, inst.Dir, inst.Python, inst.Runtime, inst.ProjectDir, inst.UV, inst.LockDigest, inst.Platform, inst.Extra,
-		inst.Packages, inst.Closure, inst.PackageInterface, inst.PlacementSetDigest,
+		inst.ID, inst.Package, inst.Major, inst.Version, inst.SourceKind, inst.SourceRef,
+		verified, inst.Dir, inst.Python, inst.Runtime, inst.ProjectDir, inst.UV, inst.Platform, inst.Extra,
+		inst.Packages, inst.Closure, inst.PlacementSetDigest,
 		inst.BytesExcl, inst.BytesShared, inst.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert install %s: %s", inst.ID, err)
 	}

@@ -73,7 +73,7 @@ func ModelsDigest(models []ModelRef) string {
 func measurementSubject(req Request) (string, string, string) {
 	release := req.Release
 	if release == "" {
-		release = req.LocalPackageDigest
+		release = req.LocalInstallationID
 	}
 	return req.Package, release, req.Entrypoint
 }

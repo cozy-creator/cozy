@@ -1,493 +1,170 @@
-// Package localpackage freezes an editable checkout into one exact rented-worker revision.
-// The directory is Creator-private staging, not a Tensorhub release or package cache API.
+// Package localpackage transports invocation-owned private installations.
 package localpackage
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
-	"net/textproto"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-const (
-	maxFiles                   = pb.MaxLocalPackageFiles
-	localPackageInterfaceFile  = "package-interface.json"
-	localRevisionFile          = "revision.json"
-	dependencyRequirementsFile = "dependency-requirements.txt"
-)
+const installationFile = "installation.json"
 
 type File struct {
 	Digest, Filename, Kind, Path string
 	Length                       int64
 }
 
-type Revision struct {
-	Package, Release, SourceDigest, Digest, PackageInterfaceDigest string
-	PackageInterfaceLength                                         int64
-	Files                                                          []File
-	DependencyRequirements                                         []byte
-	PythonRequires, PythonVersion                                  string
+// ID belongs to the ordinary install record. It is never derived from content.
+type Installation struct {
+	ID, Package, Release          string
+	PackageInterface              []byte
+	SourceArchive                 string
+	Files                         []File
+	DependencyRequirements        []byte
+	PythonRequires, PythonVersion string
 }
 
-func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Revision, *exit.Error) {
-	if install.SourceKind == "wheel" {
-		raw, err := os.ReadFile(filepath.Join(install.Dir, "private-revision"))
-		if err != nil {
-			return Revision{}, exit.New(exit.NotFound, "captured wheel revision is unavailable")
-		}
-		return Open(layout, install, string(raw))
+func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Installation, *exit.Error) {
+	if !validInstallationID(install.ID) {
+		return Installation{}, exit.New(exit.Validation, "source sync requires an install ID")
 	}
-	if _, problem := hostruntime.EnsurePython(ctx, "", install.Python); problem != nil {
-		return Revision{}, problem
+	if _, err := os.Stat(filepath.Join(layout.LocalPackages, install.ID, installationFile)); err == nil {
+		return Open(layout, install, install.ID)
 	}
-	if install.Platform != "linux/amd64" {
-		return Revision{}, exit.Named(exit.Validation, "private_dependency_platform_unsupported", "unpublished worker revisions require a captured Linux amd64 environment")
+	if install.SourceKind != "local" || install.SourceRef == "" {
+		return Installation{}, exit.New(exit.NotFound, "private installation has not been staged")
 	}
-	if install.SourceKind != "local" || install.SourceRef == "" || install.SourceDigest == "" ||
-		!strings.HasPrefix(install.Package, "local/") {
-		return Revision{}, exit.Named(exit.Validation, "local_package_install_invalid",
-			"install %s is not one editable local package", install.ID)
+	if ctx.Err() != nil {
+		return Installation{}, exit.New(exit.Failed, "source sync canceled")
 	}
-	pack, problem := packagepublish.PrepareLocalFrom(install.SourceRef)
+	stage, problem := newStage(layout)
 	if problem != nil {
-		return Revision{}, problem
+		return Installation{}, problem
+	}
+	defer os.RemoveAll(stage)
+	pack, problem := packagepublish.SnapshotSource(install.SourceRef, filepath.Join(stage, "source"))
+	if problem != nil {
+		return Installation{}, problem
 	}
 	defer pack.Close()
 	if "local/"+pack.Name != install.Package || pack.Release != install.Version {
-		return Revision{}, exit.Named(exit.Conflict, "local_package_identity_changed",
-			"editable source now names local/%s@%s, not installed %s@%s",
-			pack.Name, pack.Release, install.Package, install.Version)
+		return Installation{}, exit.New(exit.Conflict, "source declares a different package name or version")
 	}
-	sourceDigest, _, _, problem := pack.SourceIdentity()
+	length, problem := packagepublish.WriteSourceArchive(pack.Tree, filepath.Join(stage, "source.tar"))
 	if problem != nil {
-		return Revision{}, problem
+		return Installation{}, problem
 	}
-	if sourceDigest != install.SourceDigest {
-		return Revision{}, exit.Named(exit.Conflict, "local_package_source_changed",
-			"editable source changed after its install revision was selected").
-			WithRemedy("retry the command to select and build the new revision")
+	surface, err := os.ReadFile(filepath.Join(install.Dir, "documents", "package-interface.json"))
+	if err != nil {
+		return Installation{}, exit.Internalf("cannot read installed interface: %s", err)
 	}
-	recapture := false
-	if raw, err := os.ReadFile(filepath.Join(install.Dir, "private-revision")); err == nil {
-		previous, problem := Open(layout, install, string(raw))
-		if problem == nil || problem.Name != "local_package_recapture_required" {
-			return previous, problem
-		}
-		recapture = true
-	} else if !os.IsNotExist(err) {
-		return Revision{}, exit.New(exit.Conflict, "captured source revision is unavailable")
-	}
-	if problem := pack.Build(ctx); problem != nil {
-		return Revision{}, problem
-	}
-	if problem := pack.CaptureUnpublishedClosure(ctx, install.Closure, strings.Fields(install.Extra), install.Python); problem != nil {
-		return Revision{}, problem
-	}
-	after, _, _, problem := pack.SourceIdentity()
-	if problem != nil || after != sourceDigest {
-		return Revision{}, exit.Named(exit.Conflict, "local_package_source_changed",
-			"editable source changed while its local wheel revision was being built").
-			WithRemedy("stop editing briefly and retry")
-	}
-	packageInterfaceBytes, err := os.ReadFile(pack.PackageInterface)
-	if err != nil || len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
-		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
-			"local package interface is absent or exceeds the canonical document bound")
-	}
-	paths := []string{pack.Wheel}
-	for _, dependency := range pack.DependencyWheels {
-		paths = append(paths, dependency.Path)
-	}
-	revision, problem := StageWheels(layout, install, packageInterfaceBytes, paths, pack.DependencyRequirements)
-	if problem == nil && recapture {
-		problem = RetainRevision(install, revision.Digest)
-	}
-	return revision, problem
+	result := Installation{ID: install.ID, Package: install.Package, Release: install.Version, PackageInterface: surface, SourceArchive: "source.tar", PythonVersion: install.Python,
+		Files: []File{{Filename: "source.tar", Kind: "source", Length: length}}}
+	return retain(layout, stage, result)
 }
 
-// StageWheels binds the complete captured closure to this revision. Public
-// requirements may be empty only when every dependency is a supplied local wheel.
-func StageWheels(layout home.Layout, install records.PackageInstall, packageInterfaceBytes []byte, paths []string, requirements []byte) (Revision, *exit.Error) {
-	if len(requirements) > pb.MaxLockedRequirementsBytes {
-		return Revision{}, exit.New(exit.Validation, "private dependency requirements exceed their byte bound")
+// StageWheels retains ordinary published/builtin wheels. Editable projects use Stage.
+func StageWheels(layout home.Layout, install records.PackageInstall, surface []byte, paths []string, requirements []byte) (Installation, *exit.Error) {
+	if !validInstallationID(install.ID) || len(paths) == 0 || len(paths) > 256 {
+		return Installation{}, exit.New(exit.Validation, "wheel installation inputs are incomplete")
 	}
-
-	if len(paths) == 0 || len(paths) > maxFiles {
-		return Revision{}, exit.Named(exit.Structural, "local_package_revision_invalid", "local package revision requires 1..%d wheels", maxFiles)
+	stage, problem := newStage(layout)
+	if problem != nil {
+		return Installation{}, problem
 	}
-	if len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
-		return Revision{}, exit.New(exit.Validation, "captured wheel interface exceeds its document bound")
-	}
-	sourceDigest := install.SourceDigest
-	normalized, normalizeErr := canonical.NormalizeJCS(packageInterfaceBytes)
-	packageInterfaceDigest, err := canonical.Spell(canonical.Digest(packageInterfaceBytes))
-	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, packageInterfaceBytes) {
-		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
-			"local package interface bytes are not their canonical identity")
-	}
-	if err := os.MkdirAll(layout.LocalPackages, 0o700); err != nil {
-		return Revision{}, exit.Internalf("cannot create the local package store: %s", err)
-	}
-	stage, err := os.MkdirTemp(layout.LocalPackages, ".stage-")
-	if err != nil {
-		return Revision{}, exit.Internalf("cannot create local package staging: %s", err)
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			_ = os.RemoveAll(stage)
-		}
-	}()
-	wheelDir := filepath.Join(stage, "wheels")
-	if err := os.Mkdir(wheelDir, 0o700); err != nil {
-		return Revision{}, exit.Internalf("cannot create local wheel staging: %s", err)
-	}
-	if problem := copyPackageInterface(packageInterfaceBytes, filepath.Join(stage, localPackageInterfaceFile)); problem != nil {
-		return Revision{}, problem
-	}
-	if problem := copyPackageInterface(requirements, filepath.Join(stage, dependencyRequirementsFile)); problem != nil {
-		return Revision{}, problem
-	}
-	pythonRequires := ""
-	files := make([]File, 0, len(paths))
-	names := map[string]bool{}
+	defer os.RemoveAll(stage)
+	result := Installation{ID: install.ID, Package: install.Package, Release: install.Version, PackageInterface: append([]byte(nil), surface...), DependencyRequirements: append([]byte(nil), requirements...), PythonVersion: install.Python}
 	for index, source := range paths {
 		fact, problem := wheel.InspectIdentity(source)
 		if problem != nil {
-			return Revision{}, problem
+			return Installation{}, problem
 		}
-		if names[fact.Distribution] {
-			return Revision{}, exit.New(exit.Validation, "unpublished revision repeats a wheel distribution")
+		input, err := os.Open(source)
+		if err != nil {
+			return Installation{}, exit.Internalf("cannot read dependency wheel: %s", err)
 		}
-		names[fact.Distribution] = true
+		output, err := os.OpenFile(filepath.Join(stage, fact.Filename), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			input.Close()
+			return Installation{}, exit.Internalf("cannot stage dependency wheel: %s", err)
+		}
+		hash := sha256.New()
+		length, copyErr := io.Copy(io.MultiWriter(output, hash), io.LimitReader(input, (512<<20)+1))
+		input.Close()
+		closeErr := output.Close()
+		if copyErr != nil || closeErr != nil || length != fact.Length || length > 512<<20 {
+			return Installation{}, exit.New(exit.Validation, "dependency wheel exceeds its declared size")
+		}
 		kind := "dependency"
 		if index == 0 {
 			kind = "project"
-			var problem *exit.Error
-			pythonRequires, problem = wheelPythonRequires(source)
-			if problem != nil {
-				return Revision{}, problem
-			}
 		}
-		file, problem := copyWheel(source, wheelDir, kind)
-		if problem != nil {
-			return Revision{}, problem
-		}
-		files = append(files, file)
+		result.Files = append(result.Files, File{Filename: fact.Filename, Kind: kind, Length: length, Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil))})
 	}
-	revision, revisionBytes, problem := identity(install.Package, install.Version, sourceDigest,
-		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files, requirements, pythonRequires, install.Python)
-	if problem != nil {
-		return Revision{}, problem
+	return retain(layout, stage, result)
+}
+
+func newStage(layout home.Layout) (string, *exit.Error) {
+	if err := os.MkdirAll(layout.LocalPackages, 0700); err != nil {
+		return "", exit.Internalf("cannot create source sync staging: %s", err)
 	}
-	if problem := copyPackageInterface(revisionBytes,
-		filepath.Join(stage, localRevisionFile)); problem != nil {
-		return Revision{}, problem
+	stage, err := os.MkdirTemp(layout.LocalPackages, ".stage-")
+	if err != nil {
+		return "", exit.Internalf("cannot stage source sync: %s", err)
 	}
-	if err := syncDirectory(wheelDir); err != nil {
-		return Revision{}, exit.Internalf("cannot sync local wheel staging: %s", err)
+	return stage, nil
+}
+
+func retain(layout home.Layout, stage string, result Installation) (Installation, *exit.Error) {
+	sort.Slice(result.Files, func(i, j int) bool { return result.Files[i].Filename < result.Files[j].Filename })
+	data, err := json.Marshal(result)
+	if err != nil {
+		return Installation{}, exit.Internalf("cannot encode source sync record: %s", err)
 	}
-	if err := syncDirectory(stage); err != nil {
-		return Revision{}, exit.Internalf("cannot sync local package staging: %s", err)
+	if err := os.WriteFile(filepath.Join(stage, installationFile), data, 0600); err != nil {
+		return Installation{}, exit.Internalf("cannot retain source sync record: %s", err)
 	}
-	final := filepath.Join(layout.LocalPackages, strings.TrimPrefix(revision.Digest, "sha256:"))
+	final := filepath.Join(layout.LocalPackages, result.ID)
 	if err := os.Rename(stage, final); err != nil {
-		if info, statErr := os.Stat(final); statErr != nil || !info.IsDir() {
-			return Revision{}, exit.Internalf("cannot publish local package revision: %s", err)
-		}
-		existing, problem := Open(layout, install, revision.Digest)
-		if problem != nil {
-			return Revision{}, problem
-		}
-		return existing, nil
+		return Installation{}, exit.Internalf("cannot retain private installation: %s", err)
 	}
-	if err := syncDirectory(layout.LocalPackages); err != nil {
-		return Revision{}, exit.Internalf("cannot commit local package revision: %s", err)
+	for i := range result.Files {
+		result.Files[i].Path = filepath.Join(final, result.Files[i].Filename)
 	}
-	keep = true
-	for index := range revision.Files {
-		revision.Files[index].Path = filepath.Join(final, "wheels", revision.Files[index].Filename)
-	}
-	return revision, nil
+	return result, nil
 }
 
-// RetainRevision commits the existing install-private pointer only after the
-// revision's immutable wheel directory is durable.
-func RetainRevision(install records.PackageInstall, digest string) *exit.Error {
-	if !validDigest(digest) {
-		return exit.New(exit.Validation, "captured revision requires an exact digest")
+func Open(layout home.Layout, install records.PackageInstall, id string) (Installation, *exit.Error) {
+	if !validInstallationID(id) || id != install.ID {
+		return Installation{}, exit.New(exit.Validation, "private installation belongs to a different install record")
 	}
-	file, err := os.CreateTemp(install.Dir, ".capture-revision-")
-	if err != nil {
-		return exit.Internalf("cannot stage captured revision pointer: %s", err)
+	root := filepath.Join(layout.LocalPackages, id)
+	raw, err := os.ReadFile(filepath.Join(root, installationFile))
+	var result Installation
+	if err != nil || len(raw) > 1<<20 || json.Unmarshal(raw, &result) != nil || result.ID != id {
+		return Installation{}, exit.New(exit.NotFound, "private installation is unavailable")
 	}
-	defer os.Remove(file.Name())
-	_, writeErr := file.WriteString(digest)
-	syncErr, closeErr := file.Sync(), file.Close()
-	if writeErr != nil || syncErr != nil || closeErr != nil {
-		return exit.Internalf("cannot retain captured revision pointer")
+	for i := range result.Files {
+		if filepath.Base(result.Files[i].Filename) != result.Files[i].Filename {
+			return Installation{}, exit.New(exit.Validation, "private installation contains an invalid file path")
+		}
+		result.Files[i].Path = filepath.Join(root, result.Files[i].Filename)
 	}
-	if err := os.Rename(file.Name(), filepath.Join(install.Dir, "private-revision")); err != nil {
-		return exit.Internalf("cannot publish captured revision pointer: %s", err)
-	}
-	if err := syncDirectory(install.Dir); err != nil {
-		return exit.Internalf("cannot commit captured revision pointer: %s", err)
-	}
-	return nil
+	return result, nil
 }
 
-func Open(layout home.Layout, install records.PackageInstall, digest string) (Revision, *exit.Error) {
-	if len(digest) != 71 || !strings.HasPrefix(digest, "sha256:") {
-		return Revision{}, exit.Named(exit.Validation, "local_package_digest_invalid",
-			"local package revision digest is malformed")
-	}
-	root := filepath.Join(layout.LocalPackages, strings.TrimPrefix(digest, "sha256:"))
-	stored, readErr := os.ReadFile(filepath.Join(root, localRevisionFile))
-	var declared pb.LocalPackageRevision
-	if readErr == nil && canonical.Unmarshal(stored, &declared) == nil && install.Python != "" && declared.PythonVersion == "" {
-		return Revision{}, exit.Named(exit.Conflict, "local_package_recapture_required", "captured revision predates the explicit Python executor selection").WithRemedy("run the original source again to capture its supported Python environment")
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return Revision{}, exit.Named(exit.NotFound, "local_package_revision_absent", "local package revision %s is absent or incomplete", digest)
-	}
-	allowed := map[string]bool{localPackageInterfaceFile: false, localRevisionFile: false, "wheels": true, dependencyRequirementsFile: false}
-	seen := map[string]bool{}
-	for _, entry := range entries {
-		directory, ok := allowed[entry.Name()]
-		if !ok || entry.IsDir() != directory || !directory && !entry.Type().IsRegular() {
-			return Revision{}, exit.Named(exit.NotFound, "local_package_revision_absent", "local package revision %s is absent or incomplete", digest)
-		}
-		seen[entry.Name()] = true
-	}
-	if !seen[localPackageInterfaceFile] || !seen[localRevisionFile] || !seen["wheels"] {
-		return Revision{}, exit.New(exit.NotFound, "local package revision is incomplete")
-	}
-	if !seen[dependencyRequirementsFile] {
-		return Revision{}, exit.Named(exit.Conflict, "local_package_recapture_required", "captured dependency closure predates the complete environment contract").WithRemedy("run the original source again to capture its full dependency closure")
-	}
-	info, err := os.Stat(filepath.Join(root, dependencyRequirementsFile))
-	if err != nil || info.Size() < 0 || info.Size() > pb.MaxLockedRequirementsBytes {
-		return Revision{}, exit.New(exit.Conflict, "private dependency requirements exceed their byte bound")
-	}
-	requirements, err := os.ReadFile(filepath.Join(root, dependencyRequirementsFile))
-	if err != nil || len(requirements) > pb.MaxLockedRequirementsBytes {
-		return Revision{}, exit.New(exit.Conflict, "private dependency requirements changed")
-	}
-	packageInterfacePath := filepath.Join(root, localPackageInterfaceFile)
-	packageInterfaceBytes, err := os.ReadFile(packageInterfacePath)
-	if err != nil || len(packageInterfaceBytes) == 0 || len(packageInterfaceBytes) > canonical.DocMax {
-		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
-			"local package interface is absent or exceeds the canonical document bound")
-	}
-	normalized, normalizeErr := canonical.NormalizeJCS(packageInterfaceBytes)
-	packageInterfaceDigest, err := canonical.Spell(canonical.Digest(packageInterfaceBytes))
-	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, packageInterfaceBytes) {
-		return Revision{}, exit.Named(exit.Structural, "local_package_interface_invalid",
-			"local package interface bytes changed")
-	}
-	wheelDir := filepath.Join(root, "wheels")
-	wheels, err := os.ReadDir(wheelDir)
-	if err != nil || len(wheels) == 0 || len(wheels) > maxFiles {
-		return Revision{}, exit.Named(exit.Structural, "local_package_revision_invalid",
-			"local package revision requires 1..%d wheels", maxFiles)
-	}
-	pythonRequires := ""
-	files := make([]File, 0, len(wheels))
-	projects := 0
-	for _, entry := range wheels {
-		path := filepath.Join(wheelDir, entry.Name())
-		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
-			return Revision{}, exit.Named(exit.Structural, "local_package_revision_invalid",
-				"local package carrier %s is not a regular file", entry.Name())
-		}
-		fact, problem := wheel.InspectIdentity(path)
-		if problem != nil {
-			return Revision{}, problem
-		}
-		kind := "dependency"
-		if fact.Distribution == strings.TrimPrefix(install.Package, "local/") &&
-			fact.Version == install.Version {
-			kind, projects = "project", projects+1
-			pythonRequires, problem = wheelPythonRequires(path)
-			if problem != nil {
-				return Revision{}, problem
-			}
-		}
-		file, problem := measured(path, fact, kind)
-		if problem != nil {
-			return Revision{}, problem
-		}
-		files = append(files, file)
-	}
-	if projects != 1 {
-		return Revision{}, exit.Named(exit.Structural, "local_package_project_wheel_count",
-			"local package revision has %d project wheels", projects)
-	}
-	revision, revisionBytes, problem := identity(install.Package, install.Version, install.SourceDigest,
-		packageInterfaceDigest, int64(len(packageInterfaceBytes)), files, requirements, pythonRequires, install.Python)
-	if problem != nil {
-		return Revision{}, problem
-	}
-	if revision.Digest != digest {
-		return Revision{}, exit.Named(exit.Conflict, "local_package_revision_changed",
-			"local package revision bytes no longer match %s", digest)
-	}
-	storedRevision, err := os.ReadFile(filepath.Join(root, localRevisionFile))
-	if err != nil || !bytes.Equal(storedRevision, revisionBytes) {
-		return Revision{}, exit.Named(exit.Conflict, "local_package_revision_changed",
-			"local package revision document no longer matches %s", digest)
-	}
-	return revision, nil
-}
-
-func copyWheel(source, destination, kind string) (File, *exit.Error) {
-	fact, problem := wheel.InspectIdentity(source)
-	if problem != nil {
-		return File{}, problem
-	}
-	input, err := os.Open(source)
-	if err != nil {
-		return File{}, exit.Named(exit.Structural, "local_package_wheel_unreadable", "%s", err)
-	}
-	defer input.Close()
-	outputPath := filepath.Join(destination, fact.Filename)
-	output, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
-	if err != nil {
-		return File{}, exit.Internalf("cannot stage local package wheel: %s", err)
-	}
-	hash := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(output, hash), input)
-	syncErr, closeErr := output.Sync(), output.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil || written != fact.Length {
-		return File{}, exit.Named(exit.Structural, "local_package_wheel_changed",
-			"wheel %s changed while it was being staged", fact.Filename)
-	}
-	staged, problem := wheel.InspectIdentity(outputPath)
-	if problem != nil || staged != fact {
-		return File{}, exit.Named(exit.Structural, "local_package_wheel_changed",
-			"wheel %s identity changed while it was being staged", fact.Filename)
-	}
-	return File{Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil)), Filename: fact.Filename,
-		Kind: kind, Length: written, Path: outputPath}, nil
-}
-
-func copyPackageInterface(data []byte, destination string) *exit.Error {
-	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
-	if err != nil {
-		return exit.Internalf("cannot stage local package interface: %s", err)
-	}
-	written, writeErr := output.Write(data)
-	syncErr, closeErr := output.Sync(), output.Close()
-	if writeErr != nil || syncErr != nil || closeErr != nil || written != len(data) {
-		return exit.Named(exit.Structural, "local_package_interface_changed",
-			"local package interface changed while it was being staged")
-	}
-	return nil
-}
-
-func measured(path string, fact wheel.Identity, kind string) (File, *exit.Error) {
-	input, err := os.Open(path)
-	if err != nil {
-		return File{}, exit.Named(exit.Structural, "local_package_wheel_unreadable", "%s", err)
-	}
-	defer input.Close()
-	hash := sha256.New()
-	length, err := io.Copy(hash, input)
-	if err != nil || length != fact.Length {
-		return File{}, exit.Named(exit.Structural, "local_package_wheel_changed", "%s", fact.Filename)
-	}
-	return File{Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil)), Filename: fact.Filename,
-		Kind: kind, Length: length, Path: path}, nil
-}
-
-func identity(packageName, release, sourceDigest, packageInterfaceDigest string,
-	packageInterfaceLength int64, files []File, requirements []byte, pythonRequires, pythonVersion string,
-) (Revision, []byte, *exit.Error) {
-	rows := append([]File(nil), files...)
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Digest < rows[j].Digest })
-	if len(rows) == 0 || len(rows) > maxFiles {
-		return Revision{}, nil, exit.Named(exit.Structural, "local_package_revision_invalid",
-			"local package revision requires 1..%d wheels", maxFiles)
-	}
-	refs := make([]*pb.LocalPackageFileRef, 0, len(rows))
-	for index, file := range rows {
-		digest, err := canonical.Raw(file.Digest)
-		if err != nil || file.Length <= 0 || index > 0 && rows[index-1].Digest == file.Digest {
-			return Revision{}, nil, exit.Named(exit.Structural, "local_package_file_invalid",
-				"local package file %s has an invalid or duplicate identity", file.Filename)
-		}
-		// Wire 30: no kind row travels. The project wheel is the row whose measured
-		// wheel identity names the package's own distribution and release; the local
-		// Kind stays a Creator-side staging fact only.
-		if file.Kind != "project" && file.Kind != "dependency" {
-			return Revision{}, nil, exit.Named(exit.Structural, "local_package_file_invalid",
-				"local package file %s has an invalid identity", file.Filename)
-		}
-		refs = append(refs, &pb.LocalPackageFileRef{Digest: digest, Filename: file.Filename,
-			Length: uint64(file.Length)})
-	}
-	source, sourceErr := canonical.Raw(sourceDigest)
-	packageInterface, packageInterfaceErr := canonical.Raw(packageInterfaceDigest)
-	if sourceErr != nil || packageInterfaceErr != nil || packageInterfaceLength <= 0 {
-		return Revision{}, nil, exit.Named(exit.Structural, "local_package_revision_invalid",
-			"local package revision has invalid source or package interface identity")
-	}
-	var requirementsRef *pb.Ref
-	if len(requirements) > pb.MaxLockedRequirementsBytes {
-		return Revision{}, nil, exit.New(exit.Validation, "private dependency requirements exceed their byte bound")
-	}
-	if len(requirements) > 0 {
-		requirementsRef = &pb.Ref{Digest: canonical.Digest(requirements), Length: uint64(len(requirements))}
-	}
-	revisionBytes, rawDigest, err := canonical.Identity(&pb.LocalPackageRevision{PythonVersion: pythonVersion, PythonRequires: pythonRequires, DependencyRequirements: requirementsRef, Package: packageName,
-		Release: release, SourceDigest: source, PackageInterface: &pb.Ref{Digest: packageInterface,
-			Length: uint64(packageInterfaceLength)}, Files: refs})
-	if err != nil {
-		return Revision{}, nil, exit.Internalf("cannot digest local package identity: %s", err)
-	}
-	digest, err := canonical.Spell(rawDigest)
-	if err != nil {
-		return Revision{}, nil, exit.Internalf("cannot spell local package identity: %s", err)
-	}
-	return Revision{Package: packageName, Release: release, SourceDigest: sourceDigest,
-		Digest: digest, PackageInterfaceDigest: packageInterfaceDigest, PackageInterfaceLength: packageInterfaceLength,
-		PythonVersion: pythonVersion, PythonRequires: pythonRequires, Files: rows, DependencyRequirements: append([]byte(nil), requirements...)}, revisionBytes, nil
-}
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
-}
-
-func wheelPythonRequires(path string) (string, *exit.Error) {
-	raw, problem := wheel.Metadata(path)
-	if problem != nil {
-		return "", problem
-	}
-	headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw))).ReadMIMEHeader()
-	if (err != nil && err != io.EOF) || len(headers.Values("Requires-Python")) > 1 {
-		return "", exit.New(exit.Validation, "project wheel has invalid Requires-Python metadata")
-	}
-	return headers.Get("Requires-Python"), nil
+func validInstallationID(id string) bool {
+	return id != "" && id != "." && id != ".." && !strings.ContainsAny(id, "/\\:\x00")
 }

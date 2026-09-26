@@ -189,7 +189,7 @@ type Launcher interface {
 	// the choice into the orchestrator, which resolves nothing.
 	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
 	ResolveJobInstall(installID, function string) (WorkerLaunchSpec, *exit.Error)
-	LocalRevision(installID, digest string) (localpackage.Revision, *exit.Error)
+	LocalInstallation(installID, digest string) (localpackage.Installation, *exit.Error)
 }
 
 type LogicalPackage struct {

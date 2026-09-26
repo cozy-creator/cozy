@@ -115,7 +115,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 	}
 	fail := func(problem *exit.Error) (*Result, *exit.Error) { _ = os.RemoveAll(dir); return nil, problem }
 	root, ok := dependencies[project]
-	if !ok || root.Path == "" || root.Digest == "" || !root.Application {
+	if !ok || root.Path == "" || root.ID == "" || !root.Application {
 		return fail(exit.New(exit.Validation, "captured wheel install requires its exact App wheel"))
 	}
 	original, problem := retainOriginalWheel(dir, root)
@@ -154,7 +154,7 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 		requirements = append(requirements, dependency.Requirement)
 		item := identity{Name: name, Version: dependency.Version, Wheel: dependency.Digest}
 		if name == project {
-			item.OriginalWheel = root.Digest
+			item.OriginalWheel = root.ID
 		}
 		if dependency.Path == "" {
 			item.BaseRequirement = dependency.Requirement
@@ -202,9 +202,9 @@ func CaptureWheel(ctx context.Context, layout home.Layout, store *records.Store,
 		return fail(problem)
 	}
 	inst := records.PackageInstall{ID: id, Package: "local/" + project, Version: root.Version, Major: major,
-		SourceKind: "wheel", SourceRef: dir, SourceDigest: digest, ProjectDir: dir, Dir: dir,
-		Python: pythonVersion(venv), UV: toolVersion("uv", "--version"), LockDigest: digest,
-		Platform: "linux/amd64", Packages: count, Closure: installed, PackageInterface: surface.Digest}
+		SourceKind: "wheel", SourceRef: dir, ProjectDir: dir, Dir: dir,
+		Python: pythonVersion(venv), UV: toolVersion("uv", "--version"),
+		Platform: "linux/amd64", Packages: count, Closure: installed}
 	inst.BytesExcl, inst.BytesShared = Disk(dir)
 	if problem := store.RecordInstall(inst); problem != nil {
 		return fail(problem)

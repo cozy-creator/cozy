@@ -185,7 +185,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		spec, e = replayJobSubmission(sub, *existing)
-		if e == nil && spec.LocalPackageDigest != "" && spec.InstallID == "" {
+		if e == nil && spec.LocalInstallationID != "" && spec.InstallID == "" {
 			spec.InstallID = sub.InstallID
 		}
 		if e == nil {
@@ -236,7 +236,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
-		if !spec.Rental || (spec.LocalPackageDigest == "" && !publishedMachineJob(spec)) || s.machineExecutions == nil {
+		if !spec.Rental || (spec.LocalInstallationID == "" && !publishedMachineJob(spec)) || s.machineExecutions == nil {
 			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-publish requires a Runtime-owned rented transaction with its own certificate identity"))
 			return
 		}
@@ -261,7 +261,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.BodyDigest = digest
-	if s.machineExecutions != nil && (spec.LocalPackageDigest != "" || publishedMachineJob(spec)) {
+	if s.machineExecutions != nil && (spec.LocalInstallationID != "" || publishedMachineJob(spec)) {
 		if existing == nil {
 			spec.MachineExecutionObserver = true
 		} else if link, problem := s.store.MachineExecution(existing.ID); problem == nil {
@@ -384,8 +384,8 @@ func replayJobSubmission(sub JobSubmission,
 		ChildArtifacts: recorded.ChildArtifacts, OutputDirectory: sub.OutputDirectory,
 		Entrypoint: function, Payload: payload, Org: org, Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
 		InstallID: recorded.InstallID, Release: recorded.Release,
-		LocalPackageDigest: recorded.LocalPackageDigest,
-		PlanID:             recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
+		LocalInstallationID: recorded.LocalInstallationID,
+		PlanID:              recorded.PlanID, Outputs: outputs, WeightsOutputs: weightsOutputs,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RequestedRental != "",
 		RequestedRental: sub.RequestedRental,
@@ -611,7 +611,7 @@ func (s *Server) resolveLocalJob(ctx context.Context, sub JobSubmission,
 	out.InstallID = installID
 	out.Release = revision.Release
 	out.Trees = append([]string(nil), sub.Trees...)
-	out.LocalPackageDigest = revision.Digest
+	out.LocalInstallationID = revision.ID
 	return out, nil
 }
 
@@ -671,10 +671,10 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"trees":           strings.Join(spec.Trees, ","),
 		"models":          models,
 	}
-	if spec.LocalPackageDigest != "" {
+	if spec.LocalInstallationID != "" {
 		// The immutable code identity outlives its reclaimable intake install.
 		delete(doc, "install_id")
-		doc["local_package_digest"] = spec.LocalPackageDigest
+		doc["local_installation_id"] = spec.LocalInstallationID
 	}
 	if spec.TimeoutMS > 0 {
 		doc["timeout_ms"] = spec.TimeoutMS

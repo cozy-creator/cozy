@@ -1132,7 +1132,7 @@ func RentalConstraints(ctx *Context, req records.Request) (rental.Constraints, *
 		}
 		out.Requirements, out.RequiresPython = selection.Requirements, selection.RequiresPython
 		out.PythonVersion = installed.Python
-		declared, _ = launch.ReadPackageInterface(launch.PackageInterfacePath(installed.Dir), installed.PackageInterface)
+		declared, _ = launch.ReadPackageInterface(launch.PackageInterfacePath(installed.Dir))
 	} else {
 		if req.Package == "" || req.Release == "" {
 			return out, exit.Unavailablef("package requirements are unavailable for %s@%s", req.Package, req.Release)

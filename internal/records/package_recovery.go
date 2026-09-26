@@ -166,10 +166,10 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 		}
 		if _, err := tx.Exec(`INSERT INTO installs(`+installCols("")+`) VALUES(`+placeholders()+`)`,
 			inst.ID, inst.Package, inst.Major, inst.Version,
-			inst.SourceKind, inst.SourceRef, inst.SourceDigest, verified,
+			inst.SourceKind, inst.SourceRef, verified,
 			inst.Dir, inst.Python, inst.Runtime, inst.ProjectDir,
-			inst.UV, inst.LockDigest, inst.Platform, inst.Extra,
-			inst.Packages, inst.Closure, inst.PackageInterface,
+			inst.UV, inst.Platform, inst.Extra,
+			inst.Packages, inst.Closure,
 			inst.PlacementSetDigest, inst.BytesExcl, inst.BytesShared,
 			inst.CreatedAt); err != nil {
 			return 0, exit.Internalf("cannot recover package install %s: %s", inst.ID, err)
@@ -189,7 +189,6 @@ func (s *Store) RecoverPackageInventory(sourcePath, installsRoot string) (int, *
 
 func verifyRecoverableInstall(inst PackageInstall, installsRoot string) *exit.Error {
 	if inst.ID == "" || inst.Package == "" || inst.Version == "" ||
-		(inst.SourceKind == "local" && inst.SourceDigest == "") || inst.PackageInterface == "" ||
 		inst.SourceKind != "tensorhub" && inst.SourceKind != "local" {
 		return exit.Named(exit.Validation, "package_install_recovery_invalid",
 			"backup install %q has incomplete immutable identity", inst.ID)
@@ -208,10 +207,6 @@ func verifyRecoverableInstall(inst PackageInstall, installsRoot string) *exit.Er
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return exit.Named(exit.Validation, "package_install_recovery_path_invalid",
 			"backup install %s directory is absent, not a directory, or a symlink", inst.ID)
-	}
-	if problem := verifyRecoveryDigest(filepath.Join(inst.Dir, "documents", "package-interface.json"),
-		inst.PackageInterface); problem != nil {
-		return problem
 	}
 	if inst.PlacementSetDigest != "" {
 		if problem := verifyRecoveryDigest(filepath.Join(inst.Dir, "artifact-cache",

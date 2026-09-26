@@ -85,7 +85,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		return nil, problem
 	}
 
-	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
+	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
 	result.modelDefaultOrigin = func(ctx context.Context) (string, *exit.Error) {
 		facts, problem := client(m.context).RentalImageInventory(ctx, identity.RentalID)
 		return facts.PublicOrigin, problem
@@ -140,9 +140,9 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	result.readBytes = func(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
 		return host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
 	}
-	result.prepare = func(ctx context.Context, request string, revision localpackage.Revision) *exit.Error {
+	result.prepare = func(ctx context.Context, request string, revision localpackage.Installation) *exit.Error {
 		baseOperation := machinePackageOperation(request, revision)
-		transfer, problem := m.store.MachinePackageTransfer(request, claim.WorkerBootId, revision.Digest)
+		transfer, problem := m.store.MachinePackageTransfer(request, claim.WorkerBootId, revision.ID)
 		if problem != nil {
 			return problem
 		}
@@ -162,51 +162,16 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			return problem
 		}
 		uploaded := transfer.Uploaded
-		// Installation belongs to the worker. A new request asks about its immutable
-		// revision; no client's upload event proves current installation readiness.
-		if info.SupportsLocalInstallationReuse && (transfer.Operation == "" || uploaded) {
-			stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
-			if err != nil {
-				return machineTransport(err)
-			}
-			event, problem := readMachinePreparationEvent(stream)
-			if problem == nil {
-				return m.store.AppendEvent(request, "machine.package_reused", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest})
-			}
-			if event == nil || event.Stage != pb.PrepareStage_PREPARE_STAGE_REFUSED {
-				return problem
-			}
-			switch event.SafeCode {
-			case "local_package_reuse_unavailable":
-				if uploaded {
-					// Prepared transfers are terminal; repair with a new recorded
-					// operation, leaving the previous transfer and root intact.
-					operation = baseOperation + ".repair-" + strconv.Itoa(transfer.Completed)
-					selected, problem = orchestrator.LocalPackageSelection(operation, revision)
-					if problem != nil {
-						return problem
-					}
-					uploaded = false
-				}
-			case "local_package_transfer_incomplete":
-				// An older client may have left a durable prefix before recording
-				// upload-start. Host has verified that every received header still
-				// belongs to this exact source and selected wheel inventory.
-				uploaded = false
-			default:
-				return problem
-			}
-		}
 		if !uploaded {
 			if transfer.Operation != operation || transfer.Uploaded {
-				if problem := m.store.AppendEvent(request, "machine.package_upload_started", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest, "operation_id": operation}); problem != nil {
+				if problem := m.store.AppendEvent(request, "machine.package_upload_started", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
 					return problem
 				}
 			}
 			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
 				return problem
 			}
-			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest, "operation_id": operation}); problem != nil {
+			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
 				return problem
 			}
 		}
@@ -214,17 +179,21 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return machineTransport(err)
 		}
-		return readMachinePreparation(stream)
+		event, problem := readMachinePreparationEvent(stream)
+		if problem != nil {
+			return problem
+		}
+		return retainWorkerInstallation(result, revision, event.InstalledPackage)
 	}
 
 	// Only inference supplies these exact inputs. Installing the captured code
 	// above remains independent of any model, including unused child defaults.
-	result.prepareModels = func(ctx context.Context, request records.Request, revision localpackage.Revision) *exit.Error {
+	result.prepareModels = func(ctx context.Context, request records.Request, revision localpackage.Installation) *exit.Error {
 		models := orchestrator.PrivateRevisionModelRefs(request, revision.Package)
 		if len(models) == 0 {
 			return nil
 		}
-		transfer, problem := m.store.MachinePackageTransfer(request.ID, claim.WorkerBootId, revision.Digest)
+		transfer, problem := m.store.MachinePackageTransfer(request.ID, claim.WorkerBootId, revision.ID)
 		if problem != nil {
 			return problem
 		}
@@ -236,11 +205,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if problem != nil {
 			return problem
 		}
-		digest, err := canonical.Raw(revision.Digest)
-		if err != nil {
-			return exit.New(exit.Conflict, "private inference model preparation changed its revision")
-		}
-		selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, LocalRevisionDigest: digest, DownloadDelegation: downloads}
+		selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, InstallationId: revision.ID, DownloadDelegation: downloads}
 		stream, err := host.PreparePrivatePlacement(ctx, &pb.PreparePrivatePlacementCall{
 			Claim: claim, SupportsModelMaterializationRecovery: true, PrivatePlacementSet: selected,
 		})
@@ -254,23 +219,19 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 	return result, nil
 }
 
-func machinePackageOperation(request string, revision localpackage.Revision) string {
-	return request + "." + strings.TrimPrefix(revision.Digest, "sha256:")
+func machinePackageOperation(request string, revision localpackage.Installation) string {
+	return request + "." + revision.ID
 }
 
 // The ordinary Host upload has durable verified prefixes. Private code moves
 // directly from this client to its machine, without a package repository.
-func uploadMachinePackage(ctx context.Context, host pb.PodHostClient, claim *pb.Claim, operation string, revision localpackage.Revision) *exit.Error {
-	source, err := canonical.Raw(revision.SourceDigest)
-	if err != nil {
-		return exit.New(exit.Conflict, "captured source identity is invalid")
-	}
+func uploadMachinePackage(ctx context.Context, host pb.PodHostClient, claim *pb.Claim, operation string, revision localpackage.Installation) *exit.Error {
 	for _, file := range revision.Files {
 		digest, err := canonical.Raw(file.Digest)
-		if err != nil {
+		if err != nil && file.Kind != "source" {
 			return exit.New(exit.Conflict, "captured wheel identity is invalid")
 		}
-		header := &pb.LocalPackageUploadHeader{Claim: claim, OperationId: operation, SourceDigest: source,
+		header := &pb.LocalPackageUploadHeader{Claim: claim, OperationId: operation,
 			File: &pb.LocalPackageFileRef{Digest: digest, Length: uint64(file.Length), Filename: file.Filename}}
 		if problem := localpackage.UploadFile(ctx, host, header, file.Path, nil); problem != nil {
 			return problem
@@ -390,7 +351,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		}
 		m.localPID = process.PID
 	}
-	result := &machineConnection{connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, wireMinor: info.WireMinor}
+	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, wireMinor: info.WireMinor}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 		if request.InstallID == "" {
 			plan, iface, locked, requires, problem := m.publishedChildPreparation(ctx, request)
@@ -457,29 +418,12 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 	result.readBytes = func(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
 		return preparation.WorkspaceReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
 	}
-	result.prepare = func(ctx context.Context, requestID string, revision localpackage.Revision) *exit.Error {
+	result.prepare = func(ctx context.Context, requestID string, revision localpackage.Installation) *exit.Error {
 		selected, problem := orchestrator.LocalPackageSelection(machinePackageOperation(requestID, revision), revision)
 		if problem != nil {
 			return problem
 		}
-		request := &pb.PrepareLocalPackageRequest{PythonRequires: selected.PythonRequires, PythonVersion: selected.PythonVersion, OperationId: selected.OperationId, Package: selected.Package, DependencyRequirements: append([]byte(nil), selected.DependencyRequirements...), InstallRoot: filepath.Join(root, "environments")}
-		if info.SupportsLocalInstallationReuse {
-			for _, file := range revision.Files {
-				digest, _ := canonical.Raw(file.Digest)
-				request.Wheels = append(request.Wheels, &pb.LocalPackageWheel{Digest: digest, Filename: file.Filename, Length: uint64(file.Length)})
-			}
-			prepared, err := preparation.PrepareLocalPackage(ctx, request)
-			if err == nil {
-				if problem := validateMachinePrepared(prepared.PlacementSet); problem != nil {
-					return problem
-				}
-				return m.store.AppendEvent(requestID, "machine.package_reused", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.Digest})
-			}
-			if status.Code(err) != codes.FailedPrecondition || !strings.HasPrefix(status.Convert(err).Message(), "local_package_reuse_unavailable:") {
-				return machineTransport(err)
-			}
-			request.Wheels = nil
-		}
+		request := &pb.PrepareLocalPackageRequest{PythonRequires: selected.PythonRequires, PythonVersion: selected.PythonVersion, OperationId: selected.OperationId, Package: selected.Package, DependencyRequirements: append([]byte(nil), selected.DependencyRequirements...), SourceArchive: selected.SourceArchive, InstallRoot: filepath.Join(root, "environments")}
 		wheelRoot := filepath.Join(request.InstallRoot, ".stage", selected.OperationId, "wheels")
 		if err := os.MkdirAll(wheelRoot, 0o700); err != nil {
 			return exit.Internalf("cannot stage local Runtime wheels: %s", err)
@@ -490,13 +434,13 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 				return problem
 			}
 			digest, _ := canonical.Raw(file.Digest)
-			request.Wheels = append(request.Wheels, &pb.LocalPackageWheel{Digest: digest, Filename: file.Filename, Length: uint64(file.Length), Path: path})
+			request.Files = append(request.Files, &pb.LocalPackageFile{Digest: digest, Filename: file.Filename, Length: uint64(file.Length), Path: path})
 		}
 		prepared, err := preparation.PrepareLocalPackage(ctx, request)
 		if err != nil {
 			return machineTransport(err)
 		}
-		return validateMachinePrepared(prepared.PlacementSet)
+		return retainWorkerInstallation(result, revision, prepared.InstalledPackage)
 	}
 	return result, nil
 }
@@ -547,7 +491,7 @@ func stageMachineWheel(root string, file localpackage.File) (string, *exit.Error
 	defer output.Close()
 	hash := sha256.New()
 	count, err := io.Copy(io.MultiWriter(output, hash), reader)
-	if err != nil || count != file.Length || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != file.Digest {
+	if err != nil || count != file.Length || (file.Digest != "" && "sha256:"+hex.EncodeToString(hash.Sum(nil)) != file.Digest) {
 		return "", exit.New(exit.Conflict, "captured wheel changed before local preparation")
 	}
 	if err := output.Sync(); err != nil {

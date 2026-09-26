@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
@@ -175,33 +174,14 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		if len(requirements) > 0 {
 			dependencyRequirements = []byte(strings.Join(requirements, "\n") + "\n")
 		}
-		revision, problem := localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths, dependencyRequirements)
+		_, problem = localpackage.StageWheels(i.layout, result.Install, surface.Raw, paths, dependencyRequirements)
 		if problem != nil {
 			return problem
 		}
-		if err := os.WriteFile(filepath.Join(result.Install.Dir, "private-revision"), []byte(revision.Digest), 0o400); err != nil {
-			return exit.Internalf("cannot retain callable wheel revision")
-		}
-		output, err := os.MkdirTemp(i.staging, "wheel-overlay-")
-		if err != nil {
-			return exit.Internalf("cannot stage callable wheel interface")
-		}
-		executable, problem := packagepublish.CaptureDependency(result.CapturedProjectWheel)
-		if problem != nil {
-			return problem
-		}
-		generated, problem := launch.GenerateInterfaceWheel(ctx, result.Install, i.layout.Root, config.Frozen().Tool(), revision.Digest, executable.Path, executable.Digest, output)
-		if problem != nil {
-			return problem
-		}
-		overlay, problem := packagepublish.CaptureDependency(generated.Path)
-		if problem != nil {
-			return problem
-		}
-		overlays[name] = overlay
+		overlays[name] = captured[name]
 		for _, entry := range exports {
-			bindings[name] = append(bindings[name], records.ChildBinding{InterfaceDigest: surface.Digest, Module: entry.Invocable.Module, Export: entry.Invocable.Export,
-				ChildInstallID: result.Install.ID, LocalRevisionDigest: revision.Digest, Entrypoint: entry.Name})
+			bindings[name] = append(bindings[name], records.ChildBinding{Module: entry.Invocable.Module, Export: entry.Invocable.Export,
+				ChildInstallID: result.Install.ID, Entrypoint: entry.Name})
 		}
 		return nil
 	}
@@ -210,7 +190,6 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	replacements := map[string]string{}
 	for _, name := range names {
 		if problem := prepare(name, 0); problem != nil {
 			return problem
@@ -222,20 +201,6 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 		if len(i.Bindings) > 32 {
 			return exit.New(exit.Validation, "unpublished parent exceeds 32 invocable dependency exports")
 		}
-		replacements[name] = overlays[name].Path
 	}
-	if len(replacements) == 0 {
-		return nil
-	}
-	overlay, problem := packagepublish.WithChildInterfaces(ctx, i.Package, replacements)
-	if problem != nil {
-		return problem
-	}
-	if i.ownedPackage {
-		i.Package.Close()
-	}
-	i.Package, i.ownedPackage = overlay, true
-	i.created = append(i.created, parent.Install.ID)
-	i.prepared = nil
 	return nil
 }

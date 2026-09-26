@@ -73,7 +73,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer pack.Close()
-	sourceDigest, files, bytes, problem := pack.SourceIdentity()
+	files, bytes, problem := pack.SourceInventory()
 	if problem != nil {
 		return problem
 	}
@@ -91,7 +91,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	problem = packagePublishStage(ctx, "Creating local package environment", func() *exit.Error {
 		var installProblem *exit.Error
 		result, installProblem = install.Run(l, st, install.Request{Ref: ref, Force: true,
-			Local: &install.LocalSource{SourceDigest: sourceDigest, Bytes: bytes, Files: files,
+			Local: &install.LocalSource{Bytes: bytes, Files: files,
 				Package: ref.Package, Release: pack.Release, Tree: pack.Tree}})
 		return installProblem
 	})
@@ -170,12 +170,11 @@ func emitInstallResult(ctx *Context, res *install.Result, cleanup ...output.Fiel
 		{K: "version", V: inst.Version}, {K: "status", V: status},
 		{K: "disk", V: diskText(inst)}, {K: "changed", V: !res.Idempotent},
 		{K: "install_id", V: inst.ID}, {K: "source", V: inst.SourceKind + " " + inst.SourceRef},
-		{K: "source_digest", V: inst.SourceDigest}, {K: "verified", V: inst.Verified},
-		{K: "python", V: inst.Python}, {K: "uv", V: inst.UV}, {K: "lock", V: inst.LockDigest},
+		{K: "verified", V: inst.Verified},
+		{K: "python", V: inst.Python}, {K: "uv", V: inst.UV},
 		{K: "platform", V: inst.Platform}, {K: "cuda_extra", V: orNone(inst.Extra)},
 		{K: "packages", V: inst.Packages},
 		{K: "closure", V: strings.ReplaceAll(inst.Closure, "\n", " ")},
-		{K: "package_interface", V: inst.PackageInterface},
 		{K: "placement_set", V: inst.PlacementSetDigest},
 	}
 	if res.Idempotent {
@@ -227,24 +226,23 @@ func handleLs(ctx *Context) *exit.Error {
 			return e
 		}
 		l.Rows = append(l.Rows, map[string]string{
-			"package":           inst.Package,
-			"major":             fmt.Sprintf("v%d", inst.Major),
-			"version":           inst.Version,
-			"install_id":        inst.ID,
-			"size":              output.Int(inst.BytesExcl),
-			"dependencies":      output.Int(inst.BytesShared),
-			"python":            inst.Python,
-			"python_status":     pythonStatus,
-			"uv":                inst.UV,
-			"cuda_extra":        orNone(inst.Extra),
-			"packages":          fmt.Sprintf("%d", inst.Packages),
-			"closure":           strings.ReplaceAll(inst.Closure, "\n", " "),
-			"package_interface": inst.PackageInterface,
-			"placement_set":     inst.PlacementSetDigest,
-			"source":            inst.SourceKind + " " + inst.SourceRef,
-			"synced":            synced,
-			"verified":          fmt.Sprintf("%t", inst.Verified),
-			"installed":         inst.CreatedAt,
+			"package":       inst.Package,
+			"major":         fmt.Sprintf("v%d", inst.Major),
+			"version":       inst.Version,
+			"install_id":    inst.ID,
+			"size":          output.Int(inst.BytesExcl),
+			"dependencies":  output.Int(inst.BytesShared),
+			"python":        inst.Python,
+			"python_status": pythonStatus,
+			"uv":            inst.UV,
+			"cuda_extra":    orNone(inst.Extra),
+			"packages":      fmt.Sprintf("%d", inst.Packages),
+			"closure":       strings.ReplaceAll(inst.Closure, "\n", " "),
+			"placement_set": inst.PlacementSetDigest,
+			"source":        inst.SourceKind + " " + inst.SourceRef,
+			"synced":        synced,
+			"verified":      fmt.Sprintf("%t", inst.Verified),
+			"installed":     inst.CreatedAt,
 		})
 	}
 	if len(l.Rows) == 0 {

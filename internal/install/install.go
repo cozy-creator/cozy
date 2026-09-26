@@ -40,14 +40,13 @@ type Request struct {
 
 // LocalSource is one author-controlled directory after Creator's bounded source
 // scan. It is deliberately neither a wheel nor a Hub release/qualification: the
-// live source digest is its local-only identity.
+// source is installed through normal uv editable semantics.
 type LocalSource struct {
-	SourceDigest string
-	Bytes        int64
-	Files        int
-	Package      string
-	Release      string
-	Tree         string
+	Bytes   int64
+	Files   int
+	Package string
+	Release string
+	Tree    string
 }
 
 type PublishedSource struct {
@@ -214,6 +213,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 
 	// ---- stage: bytes land under bounds; no code from the release has run ----
 	var sourceDir string
+	var sourceStats map[string]packagepublish.SourceStamp
 	switch {
 	case req.Published != nil:
 		if req.Published.Package == "" || req.Published.Release == "" ||
@@ -233,7 +233,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		res.Files, res.Bytes = req.Published.Files, req.Published.Bytes
 	case req.Local != nil:
 		local := req.Local
-		if local.Package == "" || local.Release == "" || local.Tree == "" || local.SourceDigest == "" {
+		if local.Package == "" || local.Release == "" || local.Tree == "" {
 			return fail(exit.Internalf("local package build input is incomplete"))
 		}
 		abs, err := filepath.Abs(local.Tree)
@@ -241,7 +241,16 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(exit.Usagef("local package directory %q is not resolvable: %s", local.Tree, err))
 		}
 		sourceDir = abs
-		inst.SourceKind, inst.SourceRef, inst.SourceDigest = "local", abs, local.SourceDigest
+		observed, problem := packagepublish.PrepareLocalFrom(abs)
+		if problem != nil {
+			return fail(problem)
+		}
+		sourceStats, _, problem = observed.SourceStats()
+		observed.Close()
+		if problem != nil {
+			return fail(problem)
+		}
+		inst.SourceKind, inst.SourceRef = "local", abs
 		inst.Package, inst.Version = local.Package, local.Release
 		res.Files, res.Bytes = local.Files, local.Bytes
 		if req.Snapshot {
@@ -250,7 +259,6 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 				return fail(e)
 			}
 			inst.SourceRef, inst.ProjectDir = sourceDir, sourceDir
-			inst.SourceDigest = local.SourceDigest
 		}
 	}
 	mark("stage")
@@ -271,7 +279,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	if !req.Snapshot && prior != nil && priorInstall != nil && priorInstall.SourceKind == inst.SourceKind &&
 		priorInstall.Package == inst.Package && priorInstall.Version == inst.Version &&
-		(inst.SourceKind == "tensorhub" || priorInstall.SourceDigest == inst.SourceDigest) {
+		inst.SourceKind == "tensorhub" {
 		res.Idempotent = true
 		res.Install = *priorInstall
 		_ = os.RemoveAll(installDir)
@@ -333,7 +341,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if err != nil {
 		return guard(err)
 	}
-	inst.Python, inst.UV, inst.LockDigest = env.Python, env.UV, env.LockDigest
+	inst.Python, inst.UV = env.Python, env.UV
 	inst.Platform, inst.Extra = env.Platform, env.Extra
 	inst.Packages, inst.Closure = env.Packages, env.Closure
 	res.Warnings = append(res.Warnings, env.Warnings...)
@@ -354,7 +362,6 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if err := os.WriteFile(packageInterfacePath, packageInterface.Raw, 0o600); err != nil {
 		return guard(exit.Internalf("cannot store unpublished package interface: %s", err))
 	}
-	inst.PackageInterface = packageInterface.Digest
 	if req.Local != nil {
 		cache := filepath.Join(installDir, "artifact-cache")
 		if err := os.MkdirAll(cache, 0o700); err != nil {
@@ -376,9 +383,10 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 				WithRemedy("source recheck failed: %s", problem.Message))
 		}
 		defer current.Close()
-		digest, _, _, problem := current.SourceIdentity()
-		if problem != nil || digest != req.Local.SourceDigest ||
-			"local/"+current.Name != req.Local.Package || current.Release != req.Local.Release {
+		if problem := packagepublish.RecordSourceStats(installDir, sourceStats); problem != nil {
+			return guard(problem)
+		}
+		if "local/"+current.Name != req.Local.Package || current.Release != req.Local.Release {
 			return guard(exit.Named(exit.Conflict, "editable_source_changed",
 				"the editable package changed while its replacement was being prepared").
 				WithRemedy("retry after the source tree is stable"))

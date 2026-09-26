@@ -23,7 +23,7 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 		return nil, exit.New(exit.Conflict, "machine job has no canonical execution capture")
 	}
 	installationID := rootCapture.Str("root_installation_id")
-	if _, err := canonical.Raw(buildID); err != nil || (request.LocalInstallationID != "" && request.LocalInstallationID != buildID) || (request.LocalInstallationID == "" && plan.InstallationID != buildID) {
+	if installationID == "" || (request.LocalInstallationID != "" && request.LocalInstallationID != installationID) || (request.LocalInstallationID == "" && plan.InstallationID != installationID) {
 		return nil, exit.New(exit.Conflict, "machine job changed its selected installation")
 	}
 	if request.Trees != "" || request.ModelTransfer != nil {
@@ -71,14 +71,14 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 		DeadlineUnixMs: request.DeadlineUnixMS, InstallationId: installationID,
 		PayloadDigest: payloadDigest, Inputs: inputBindings(request, payloadDigest), Outputs: outputs,
 		AttentionKernel: request.AttentionKernel,
-		Spec:            &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{InstallationId: buildID, JobDescriptorId: request.PlanID, PublicationContract: publication}},
+		Spec:            &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{InstallationId: installationID, JobDescriptorId: request.PlanID, PublicationContract: publication}},
 	}
 	raw, digest, err := canonical.Identity(spec)
 	if err != nil {
 		return nil, exit.Internalf("cannot encode machine invocation: %s", err)
 	}
 	root := *plan
-	root.InstallationID, root.OrchestrationParent, root.FrozenDirective = buildID, nil, nil
+	root.InstallationID, root.OrchestrationParent, root.FrozenDirective = installationID, nil, nil
 	// The frozen capture also contains self-serving exports which need not have
 	// separate install binding rows. Apply the same composition-parent rule to
 	// those actual capabilities, rather than inferring a GPU from package imports.

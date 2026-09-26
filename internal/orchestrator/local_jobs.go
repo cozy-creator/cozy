@@ -12,11 +12,11 @@ import (
 
 // A unpublished package job needs its prepared environment and job records. Preparing it
 // must not activate a serving placement or remove a running orchestration parent.
-func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Request, revision localpackage.Revision) (*pb.DesiredPlacementSet, *exit.Error) {
+func (c *Orchestrator) prepareLocalJob(instanceID string, request records.Request, revision localpackage.Installation) (*pb.DesiredPlacementSet, *exit.Error) {
 	return c.prepareUnpublishedPackage(instanceID, request, revision, true)
 }
 
-func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request records.Request, revision localpackage.Revision, jobModels bool) (*pb.DesiredPlacementSet, *exit.Error) {
+func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request records.Request, revision localpackage.Installation, jobModels bool) (*pb.DesiredPlacementSet, *exit.Error) {
 	selected, transfer, problem := localSelection(request.ID, revision)
 	if problem != nil {
 		return nil, problem
@@ -35,10 +35,10 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 		if problem != nil {
 			return nil, problem
 		}
-		if !c.localTransferVerified(request.ID, revision.Digest, s) {
+		if !c.localTransferVerified(request.ID, revision.ID, s) {
 			return nil, exit.Unavailablef("unpublished package job files await verification on the current worker")
 		}
-		if problem := c.opt.Store.MarkLocalPackageUploaded(request.ID, revision.Digest, s.bootID); problem != nil {
+		if problem := c.opt.Store.MarkLocalPackageUploaded(request.ID, revision.ID, s.bootID); problem != nil {
 			return nil, problem
 		}
 	}
@@ -75,7 +75,7 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 			return nil, problem
 		}
 		call := &pb.PreparePrivatePlacementCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PrivatePlacementSet: &pb.DesiredPrivatePlacementSet{
-			OperationId: selected.OperationId, LocalRevisionDigest: selected.Package.LocalRevisionDigest, DownloadDelegation: downloads}}
+			OperationId: selected.OperationId, InstallationId: selected.Package.InstallationId, DownloadDelegation: downloads}}
 		result = c.runHostPrepare(s, w, 0, hostLabel("local_job_models", request.ID),
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 				return s.host.PreparePrivatePlacement(ctx, call)
