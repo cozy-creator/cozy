@@ -76,12 +76,19 @@ func (c *Orchestrator) recordOperationResult(s *session, request records.Request
 	if problem != nil {
 		return problem
 	}
+	// The cache is optional: a workspace that refuses or answers another identity costs
+	// only memoization, never the completed outcome's acknowledgment.
 	answer, err := workspace.RecordOperationResult(s.ctx, &pb.RecordOperationResultCall{Claim: s.claim, ComputationDigest: keyBytes, RequestId: request.ID, AttemptOrdinal: uint64(attempt.Attempt), InvocationSpecDigest: invocation, OutcomeId: attempt.TerminalID, OutcomeDigest: outcome})
 	if err != nil {
-		return operationCacheProblem(err)
+		if problem := operationCacheProblem(err); problem.Code == exit.Unavailable {
+			return problem
+		}
+		c.logf("%s completed without memoization: the workspace refused its cache entry", request.ID)
+		return nil
 	}
 	if answer == nil || !bytes.Equal(answer.ComputationDigest, keyBytes) {
-		return exit.Named(exit.Structural, "operation.cache_changed", "worker operation cache changed the completed computation identity")
+		c.logf("%s completed without memoization: the workspace answered another computation identity", request.ID)
+		return nil
 	}
 	if !answer.Recorded {
 		c.logf("%s completed without memoization: the workspace declined this optional cache entry", request.ID)
@@ -180,10 +187,17 @@ func (c *Orchestrator) lookupOperationWithSession(ctx context.Context, request r
 	}
 	answer, err := workspace.LookupOperation(ctx, &pb.LookupOperationCall{Claim: s.claim, ComputationDigest: keyBytes, ConsumerRequestId: request.ID})
 	if err != nil {
-		return false, operationCacheProblem(err)
+		if problem := operationCacheProblem(err); problem.Code == exit.Unavailable {
+			return false, problem
+		}
+		// A workspace without, or refusing, the optional cache answers a miss: the
+		// child executes normally.
+		c.logf("%s executes without memoization: the workspace refused its cache lookup", request.ID)
+		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
 	}
 	if answer == nil || !bytes.Equal(answer.ComputationDigest, keyBytes) || answer.ConsumerRequestId != request.ID || proto.Size(answer) > pb.MaxInlineControlBytes {
-		return false, exit.Named(exit.Structural, "operation.cache_changed", "worker operation cache changed its lookup subject or result bound")
+		c.logf("%s executes without memoization: the workspace answered another lookup subject", request.ID)
+		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)
 	}
 	if !answer.Found {
 		return false, c.opt.Store.CompleteOperationMiss(request.ID, key)

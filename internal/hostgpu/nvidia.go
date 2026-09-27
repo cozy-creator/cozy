@@ -62,34 +62,36 @@ func Probe(cfg config.Config) Inventory {
 
 func parseGPUs(raw string) ([]GPU, error) {
 	reader := csv.NewReader(strings.NewReader(raw))
+	reader.FieldsPerRecord = -1
 	records, err := reader.ReadAll()
 	if err != nil {
 		return nil, fmt.Errorf("nvidia-smi returned unreadable GPU data")
 	}
+	// A row this build cannot read is skipped, not a reason to discard every GPU; a
+	// device that reports no compute capability keeps its model and memory.
 	gpus := make([]GPU, 0, len(records))
 	for _, record := range records {
-		if len(record) == 1 && strings.TrimSpace(record[0]) == "" {
+		if len(record) < 6 {
 			continue
-		}
-		if len(record) != 6 {
-			return nil, fmt.Errorf("nvidia-smi returned an unexpected GPU record")
 		}
 		index, indexErr := strconv.Atoi(strings.TrimSpace(record[0]))
 		freeMiB, freeErr := strconv.ParseInt(strings.TrimSpace(record[2]), 10, 64)
 		totalMiB, totalErr := strconv.ParseInt(strings.TrimSpace(record[3]), 10, 64)
 		if indexErr != nil || freeErr != nil || totalErr != nil || freeMiB < 0 || totalMiB <= 0 {
-			return nil, fmt.Errorf("nvidia-smi returned invalid GPU numbers")
+			continue
 		}
-		compute := strings.TrimSpace(record[5])
-		if compute == "" || strings.EqualFold(compute, "N/A") {
-			return nil, fmt.Errorf("nvidia-smi did not report GPU compute capability")
-		}
-		gpus = append(gpus, GPU{
+		gpu := GPU{
 			Index: index, Model: strings.TrimSpace(record[1]),
 			VRAMFreeBytes: freeMiB << 20, VRAMTotalBytes: totalMiB << 20,
-			DriverVersion: strings.TrimSpace(record[4]), ComputeCapability: compute,
-			SM: "sm_" + strings.ReplaceAll(compute, ".", ""),
-		})
+			DriverVersion: strings.TrimSpace(record[4]),
+		}
+		if compute := strings.Trim(strings.TrimSpace(record[5]), "[]"); compute != "" && !strings.EqualFold(compute, "N/A") {
+			gpu.ComputeCapability, gpu.SM = compute, "sm_"+strings.ReplaceAll(compute, ".", "")
+		}
+		gpus = append(gpus, gpu)
+	}
+	if len(gpus) == 0 && strings.TrimSpace(raw) != "" {
+		return nil, fmt.Errorf("nvidia-smi returned no readable GPU record")
 	}
 	return gpus, nil
 }

@@ -38,8 +38,8 @@ func TestOperationNumericsBelongToCalleeAndRemainPinnedThroughLookupReplay(t *te
 	if *replayed != *context {
 		t.Fatal("reconnect changed the pending numerical identity")
 	}
-	if _, problem := store.BindOperationContext(first.ID, childDigest("f")); problem == nil || problem.Name != "operation.numerical_environment_changed" {
-		t.Fatal("changed environment replaced the pinned lookup")
+	if _, problem := store.BindOperationContext(first.ID, childDigest("f")); problem == nil || problem.Name != "operation.key_changed" {
+		t.Fatal("changed environment replaced the in-flight lookup")
 	}
 	lookup, problem := store.OperationLookup(first.ID)
 	fatal(t, problem)
@@ -63,6 +63,19 @@ func TestOperationNumericsBelongToCalleeAndRemainPinnedThroughLookupReplay(t *te
 	if changed.Key == context.Key {
 		t.Fatal("actual numerical environment change reused the old computation key")
 	}
+	// An unoffered call whose lookup missed moves with its worker: a changed Runtime or
+	// machine rebinds it to the environment it will run in instead of parking it.
+	moved := makeCall("moved")
+	bound, problem := store.BindOperationContext(moved.ID, childDigest("e"))
+	fatal(t, problem)
+	fatal(t, store.BeginOperationLookup(moved.ID, bound.Key))
+	fatal(t, store.CompleteOperationMiss(moved.ID, bound.Key))
+	rebound, problem := store.BindOperationContext(moved.ID, childDigest("f"))
+	fatal(t, problem)
+	if rebound.Key != changed.Key || rebound.NumericalEnvironment != childDigest("f") {
+		t.Fatalf("a missed lookup did not rebind to the new environment: %+v", rebound)
+	}
+	fatal(t, store.BeginOperationLookup(moved.ID, rebound.Key))
 }
 
 func TestOldPendingLookupOnlyReconcilesForCancellation(t *testing.T) {

@@ -240,8 +240,15 @@ func (s *Store) EventsAfter(requestID string, cursor int64, limit int) ([]Event,
 		if err := rows.Scan(&e.Seq, &e.RequestID, &e.Type, &e.Attempt, &body, &e.At); err != nil {
 			return nil, exit.Internalf("cannot read an event row: %s", err)
 		}
+		// One payload a stream consumer cannot read as an object is carried, not allowed
+		// to end every stream reading past it.
 		if err := json.Unmarshal([]byte(body), &e.Payload); err != nil {
-			return nil, exit.Internalf("event %d has an unreadable payload: %s", e.Seq, err)
+			var value any
+			if json.Unmarshal([]byte(body), &value) == nil {
+				e.Payload = map[string]any{"value": value}
+			} else {
+				e.Payload = map[string]any{"unreadable": body}
+			}
 		}
 		out = append(out, e)
 	}

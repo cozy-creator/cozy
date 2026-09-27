@@ -125,6 +125,14 @@ func TestRentalKeepaliveReceiptSurvivesReconnectAndRejectsInvalidAcknowledgment(
 	later.IdleDeadlineUnixMs += 120000
 	fatal(t, store.RecordRentalKeepalive(row.ID, later, at.Add(120*time.Second)))
 	check(at.Add(1020 * time.Second))
+	// A Host whose own idle window differs is still an acknowledgment: Creator's
+	// schedule comes from its own observation, not the Host's window.
+	longer := proto.Clone(later).(*pb.KeepRentalAliveResult)
+	longer.RequestId = "manual-3"
+	longer.AcknowledgedAtUnixMs += 60000
+	longer.IdleDeadlineUnixMs = longer.AcknowledgedAtUnixMs + 1800000
+	fatal(t, store.RecordRentalKeepalive(row.ID, longer, at.Add(180*time.Second)))
+	check(at.Add(1080 * time.Second))
 	row.State = "release_requested"
 	fatal(t, store.RecordRental(row))
 	if store.RecordRentalKeepalive(row.ID, later, at.Add(120*time.Second)) == nil {
@@ -165,15 +173,13 @@ func TestRentalIdleConfigurationHasNoDurationOrDisableEscape(t *testing.T) {
 	if code, out := runCozy(t, root, "help", "rental", "keepalive"); code != 0 {
 		t.Fatalf("ordinary fixed-policy CLI: %d %s", code, out)
 	}
-	for _, value := range []string{"0", "1", "900", "3600"} {
-		must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("rentals:\n  idle_release_s: "+value+"\n"), 0600))
-		if code, out := runCozy(t, root, "rental", "list", "--json"); code == 0 || !strings.Contains(out, "idle_release_s") {
-			t.Fatalf("retired override %s accepted or misdiagnosed: %d %s", value, code, out)
+	// A retired override is named as unused on every command and changes nothing: the
+	// fixed policy has no escape, and the stale line no longer disables the CLI.
+	for _, body := range []string{"rentals:\n  idle_release_s: 0\n", "rentals:\n  idle_release_s: 3600\n", "rentals_idle_release_s: 0\n"} {
+		must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(body), 0600))
+		if _, stdout, stderr := runCozyStreams(t, root, "rental", "list", "--json"); !strings.Contains(stderr, "idle_release_s; ignored") || strings.Contains(stdout, "is invalid") {
+			t.Fatalf("retired override %q was not named as ignored: %s %s", body, stdout, stderr)
 		}
-	}
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("rentals_idle_release_s: 0\n"), 0600))
-	if code, out := runCozy(t, root, "rental", "list", "--json"); code == 0 || !strings.Contains(out, "rentals_idle_release_s") {
-		t.Fatalf("flat retired override accepted: %d %s", code, out)
 	}
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("{}\n"), 0600))
 	t.Setenv("COZY_RENTALS_IDLE_RELEASE_S", "0")

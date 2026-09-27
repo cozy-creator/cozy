@@ -318,3 +318,82 @@ func rentalWiringDownloadSet(connection *orchestrator.WorkerConnection, signer e
 	rentalWiring(connection, signer)(&options)
 	return options.RentalPackageSet(packages, models)
 }
+
+// One package the pod refuses to prepare fails only its own requests. It leaves the
+// rental's desired set, so a co-tenant requested afterwards prepares and dispatches on
+// the same rental instead of inheriting the refusal.
+func TestRefusedPackageFailsAloneOnASharedRental(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	pod := &fakePod{controlKey: public, serve: true, slots: 2,
+		refusePrepare: map[string]string{"acme/alpha": "package_prepare_interface_failed"}}
+	connection, _ := startFakePod(t, t.TempDir(), pod)
+	o := hostOwner(t, "podhost-refused-cotenant", rentalWiring(connection, private))
+	submit := func(pkg string) string {
+		id, _, problem := o.c.Submit(orchestrator.Submission{
+			IdemKey: pkg, Package: pkg, Entrypoint: "tile", PlanID: podPlanID(pkg), Release: "1.0.0",
+			Payload: []byte(`{"size":16}`), Outputs: []string{"image"},
+			Worker: podRental, Rental: true, RentalRequired: true,
+		})
+		fatal(t, problem)
+		return id
+	}
+	alpha := submit("acme/alpha")
+	waitUntil(t, "the refused package's request fails", func() bool {
+		row, problem := o.store.RequestRow(alpha)
+		fatal(t, problem)
+		return row.State == "failed"
+	})
+	beta := submit("acme/beta")
+	waitUntil(t, "the co-tenant's offer", func() bool {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		for _, offer := range pod.offers {
+			if offer.RequestId == beta {
+				return true
+			}
+		}
+		return false
+	})
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	sets := assertOnePackagePerPrepare(t, pod.prepares)
+	if len(sets["acme/alpha"]) != 1 || len(sets["acme/beta"]) != 1 {
+		t.Fatalf("prepares alpha=%d beta=%d; the refused package must not ride along with its co-tenant",
+			len(sets["acme/alpha"]), len(sets["acme/beta"]))
+	}
+	if united := placementsOf(t, pod.desired[len(pod.desired)-1]); len(united) != 1 {
+		t.Fatalf("the converged set carries %v; want only the prepared co-tenant", united)
+	}
+}
+
+// A Runtime that cannot read a placement set an older Runtime prepared asks the owner to
+// prepare again. The rental prepares its package set once more and the request runs; it
+// never surfaces as a user failure.
+func TestStalePlacementSetIsPreparedAgain(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	pod := &fakePod{controlKey: public, serve: true, slots: 2, stalePlacementSets: 1}
+	connection, _ := startFakePod(t, t.TempDir(), pod)
+	o := hostOwner(t, "podhost-reprepare", rentalWiring(connection, private))
+	id, _, problem := o.c.Submit(orchestrator.Submission{
+		IdemKey: "reprepare", Package: "acme/alpha", Entrypoint: "tile", PlanID: podPlanID("acme/alpha"), Release: "1.0.0",
+		Payload: []byte(`{"size":16}`), Outputs: []string{"image"}, Worker: podRental, Rental: true, RentalRequired: true,
+	})
+	fatal(t, problem)
+	waitUntil(t, "the request's offer after preparing again", func() bool {
+		pod.mu.Lock()
+		defer pod.mu.Unlock()
+		return len(pod.offers) > 0
+	})
+	row, problem := o.store.RequestRow(id)
+	fatal(t, problem)
+	if row.State == "failed" {
+		t.Fatalf("a stale placement set surfaced as a user failure: %+v", row)
+	}
+	pod.mu.Lock()
+	defer pod.mu.Unlock()
+	if len(pod.prepares) != 2 || len(pod.desired) < 2 {
+		t.Fatalf("prepares=%d desires=%d; want the package set prepared again once", len(pod.prepares), len(pod.desired))
+	}
+}

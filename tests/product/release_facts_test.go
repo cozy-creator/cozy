@@ -119,6 +119,9 @@ func TestWorkingMemoryLedgerSizesTheNextSelection(t *testing.T) {
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	o := hostOwner(t, "working-memory-ledger", rentalWiring(connection, private))
+	fatal(t, o.store.RecordRental(records.Rental{AcceleratorCount: 1, ID: podRental, MachineName: "otter", State: "ready",
+		SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3", HourlyRateUSDMicros: 100_000,
+		Address: connection.Addr, CertPath: connection.CACert, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}))
 	const pkg = "proof/working"
 	run := func(key string, status pb.OutcomeStatus, metrics *pb.AttemptMetrics) records.Request {
 		t.Helper()
@@ -166,6 +169,17 @@ func TestWorkingMemoryLedgerSizesTheNextSelection(t *testing.T) {
 	want := records.WorkingPeak{Bytes: 30 << 30, Runs: 2}
 	if len(peaks) != 1 || peaks[records.ModelsDigest(req.Models)] != want {
 		t.Fatalf("ledger = %+v, want the two succeeded measured runs at their max %+v", peaks, want)
+	}
+	// A measured total device peak for the same published request, SKU and width sizes
+	// that exact selection (Runtime #685's measured-total path).
+	run("total", pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, &pb.AttemptMetrics{RuntimeMs: 1, WorkingPeakDeviceBytes: 30 << 30, PeakDeviceMemoryBytes: 44 << 30})
+	totals, problem := o.store.WorkingPeaks(req)
+	fatal(t, problem)
+	if exact := totals.For(req.Models, "h100-80", 1); exact.TotalBytes != 44<<30 || exact.TotalRuns != 1 {
+		t.Fatalf("the published request's measured total was not recorded for its SKU and width: %+v", exact)
+	}
+	if other := totals.For(req.Models, "rtx-4090", 1); other.TotalBytes != 0 {
+		t.Fatalf("another SKU inherited the measured total: %+v", other)
 	}
 	other := req
 	other.Entrypoint = "other"

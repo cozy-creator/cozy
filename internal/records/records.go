@@ -862,10 +862,6 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		destinationColumns += ",child_artifacts"
 		selectColumns += ",child_artifacts"
 	}
-	if sourceVersion >= 48 {
-		destinationColumns += ",rent_new"
-		selectColumns += ",rent_new"
-	}
 	if sourceVersion >= 37 {
 		destinationColumns += ",requested_rental"
 		selectColumns += ",requested_rental"
@@ -1455,7 +1451,7 @@ func (s *Store) Install(id string) (*PackageInstall, *exit.Error) {
 // metadata reuse. The installer still compares their frozen dependency inputs;
 // an install ID or version alone never makes an environment reusable. Capture
 // holds the install writer, so GC cannot remove an unreferenced candidate while
-// its metadata is read. Completed/dry-run history need not keep a caller alive.
+// its metadata is read. Completed history need not keep a caller alive.
 func (s *Store) SourceEnvironments(pkg, version string) ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT `+installCols("i.")+` FROM installs i
 		WHERE i.package=? AND i.version=? AND i.source_kind='local'

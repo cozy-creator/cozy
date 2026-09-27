@@ -507,15 +507,26 @@ func (s *Store) RecordModelTransferWeights(row ModelTransferWeights) *exit.Error
 		held.ManifestLength != row.ManifestLength ||
 		held.Attempt != row.Attempt || held.InvocationDigest != row.InvocationDigest ||
 		held.TransactionID != row.TransactionID || held.ReceiptDigest != row.ReceiptDigest ||
-		string(held.Receipt) != string(row.Receipt) ||
-		string(mustJSON(held.Objects)) != string(mustJSON(row.Objects)) {
+		string(held.Receipt) != string(row.Receipt) || !sameObjectInventory(held.Objects, row.Objects) {
 		return exit.Named(exit.Conflict, "model_transfer.weights_changed",
 			"model transfer output %s replay changed identity", row.OutputSlot)
 	}
 	return nil
 }
 
-func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
+// sameObjectInventory compares a replay by object identity; stored rows also carry
+// transfer progress the frame never did.
+func sameObjectInventory(held, replay []ModelTransferObject) bool {
+	if len(held) != len(replay) {
+		return false
+	}
+	for i := range held {
+		if held[i].ObjectID != replay[i].ObjectID || held[i].Length != replay[i].Length || held[i].SourceRef != replay[i].SourceRef {
+			return false
+		}
+	}
+	return true
+}
 
 func (s *Store) ModelTransferWeights(requestID string, attempt int64, slot string) (*ModelTransferWeights, *exit.Error) {
 	row, problem := s.modelTransferWeightsMetadata(requestID, attempt, slot, true)
@@ -946,3 +957,5 @@ func (s *Store) DeclaredServingModels(requestID string) ([]ModelRef, *exit.Error
 func (model ModelRef) Downloadable() bool {
 	return model.Model != "" && model.Manifest != "" && (model.Release != "" || model.HubCheckpoint)
 }
+
+func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }

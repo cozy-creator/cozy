@@ -394,6 +394,10 @@ type worker struct {
 	// relayed to the hub (cl-078/th-106); defectReported latches per revision so one
 	// falsification files one report.
 	desiredDownloadSets map[string][]byte
+	// packageRefusals hold one package's verdict on its own preparation. The package
+	// leaves the desired set and only its requests fail; the rental's other packages
+	// keep preparing and serving. A later desire naming the package asks again.
+	packageRefusals map[string]*exit.Error
 	// preparedSets holds the pod host's PREPARED answer for each download set it prepared
 	// on boot preparedBoot and the rental still desires, keyed by downloadSetKey.
 	preparedSets           map[string]*pb.DesiredPlacementSet
@@ -1269,10 +1273,16 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				return spec, planID, nil
 			}
 		}
+		var packageRefused *exit.Error
+		if w != nil {
+			packageRefused = w.packageRefusals[logical.Package]
+		}
 		c.mu.Unlock()
 		switch {
 		case refused != nil:
 			return WorkerLaunchSpec{}, "", refused
+		case packageRefused != nil:
+			return WorkerLaunchSpec{}, "", packageRefused
 		case desiredRefusal != nil:
 			return WorkerLaunchSpec{}, "", desiredRefusal
 		case placementFailed:
@@ -2472,16 +2482,21 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	if e != nil {
 		return 0, 0, e
 	}
+	// A local worker that may have started before its birth identity was journaled keeps
+	// its row, so its devices stay reserved and its attempts unsettled; the daemon still
+	// starts for every other device and rental.
+	unresolved := map[string]bool{}
 	for _, row := range rows {
 		if row.WorkerID == "local" && row.State == "spawned_without_birth" {
-			return 0, 0, exit.Named(exit.Conflict, "worker_birth_identity_unresolved",
-				"local worker %s may have started before its OS birth identity was journaled",
-				row.InstanceID).
-				WithRemedy("do not start another worker on devices [%s]; locate and stop the orphan, then explicitly close its retained worker row",
-					strings.Join(row.Devices, ","))
+			unresolved[row.InstanceID] = true
+			c.logf("worker %s may have started before its OS birth identity was journaled; devices [%s] stay reserved "+
+				"until the orphan is stopped and its row closed", row.InstanceID, strings.Join(row.Devices, ","))
 		}
 	}
 	for _, row := range rows {
+		if unresolved[row.InstanceID] {
+			continue
+		}
 		if row.PID > 0 && birthOf(row.PID) == row.Birth && row.Birth != "" {
 			_ = processtree.Kill(row.PID, syscall.SIGKILL)
 			killed++
@@ -2547,6 +2562,9 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 			return killed, forgotten, problem
 		}
 		for _, attempt := range attempts {
+			if unresolved[attempt.InstanceID] {
+				continue
+			}
 			switch attempt.State {
 			case "preparing", "offered", "accepted", "recovered_open", "terminal":
 				c.settleLocalProcessDeath(attempt)

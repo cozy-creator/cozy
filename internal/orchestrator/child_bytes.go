@@ -12,6 +12,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -44,7 +46,13 @@ func (c *Orchestrator) changeByteRetention(ctx context.Context, h records.Native
 	} else {
 		result, err = session.preparation.WorkspaceRetainByteTree(ctx, call)
 	}
+	// Runtime answers UNAVAILABLE for a busy or failing store (the caller retries) and
+	// keeps typed refusals permanent.
 	if err != nil {
+		switch status.Code(err) {
+		case codes.InvalidArgument, codes.PermissionDenied, codes.FailedPrecondition, codes.NotFound:
+			return exit.Named(exit.Conflict, "child.byte_retention_refused", "native byte custody refused its captured owner or source")
+		}
 		return exit.Unavailablef("native byte custody awaits its retained workspace")
 	}
 	if result == nil || !proto.Equal(result.Source, request.Source) || result.RetentionId != h.RetentionID || result.Released != release {
