@@ -703,6 +703,11 @@ fn a_go_hub_refusal_envelope_is_its_verdict() {
     let error = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
     assert_eq!(error.code, Code::CREDENTIAL_REQUIRED, "{error:?}");
     assert!(error.detail.contains("<owner only>"), "{}", error.detail);
+    assert_eq!(
+        origin.hits("/v1/tensorfs/closure"),
+        1,
+        "a verdict is asked once"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
