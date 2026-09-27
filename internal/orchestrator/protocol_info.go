@@ -47,7 +47,7 @@ func rentalIdleGuardRequired() *exit.Error {
 func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental bool) *exit.Error {
 	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor {
 		return exit.Named(exit.Conflict, pb.CapabilityUnavailableCode, "worker reported no usable protocol range").
-			WithRemedy("update the worker Runtime")
+			WithRemedy("update the worker Runtime (`cozy rental update <rental>` for a rental)")
 	}
 	if info.WireMinor < pb.MinCompatibleWireMinor || pb.WireMinor < info.MinimumWireMinor {
 		return exit.Named(exit.Conflict, pb.CapabilityUnavailableCode,
@@ -65,7 +65,7 @@ func protocolUpgradeTarget(peerMinimum uint32) string {
 	if peerMinimum > pb.WireMinor {
 		return "the local cozy CLI"
 	}
-	return "the worker Runtime"
+	return "the worker Runtime (`cozy rental update <rental>` for a rental)"
 }
 
 // RentalProtocolInfo reads the pinned PodHost's supported range without a Claim.

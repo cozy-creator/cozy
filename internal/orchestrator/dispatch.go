@@ -691,7 +691,7 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 				if reason == ExcludedProtocol {
 					problem = exit.Named(exit.Conflict, pb.CapabilityUnavailableCode,
 						"rental %s's worker speaks protocol minor %d, below the %d this Creator executes", req.Worker, c.workerWireMinor(req.Worker), pb.MinCompatibleWireMinor).
-						WithRemedy("update the rental's worker Runtime, or run on another machine; the rental and its other work are untouched")
+						WithRemedy("run `cozy rental update %s` to update its Runtime, or run on another machine; the rental and its other work are untouched", req.Worker)
 				}
 				c.failPreparation(req, problem, "")
 				return false
