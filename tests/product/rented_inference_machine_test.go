@@ -158,7 +158,7 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 			_, _ = w.Write(bundle)
 			return true
 		}}
-	root, layout := rentedLadderMachine(t, h, pod, func(store *records.Store) {
+	root, layout := rentedLadderMachine(t, h, pod, func(_ home.Layout, store *records.Store) {
 		holder, _, problem := store.Submit(records.Request{ID: "req-gpu-holder", IdemKey: "gpu-holder", BodyDigest: childDigest("7"),
 			Package: ladderPackage, Entrypoint: "generate", Payload: []byte(`{}`)})
 		fatal(t, problem)
@@ -255,9 +255,10 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 
 // rentedLadderMachine publishes the ladder package, its model slot declaring `degrees`, and
 // attaches `pod` as the ready rental "tessa", as many fake-4090 cards wide as its
-// deviceCount, then starts the daemon. `before` runs against the store while nothing else
-// holds it.
-func rentedLadderMachine(t *testing.T, h *ladderHub, pod *fakePod, before func(*records.Store), degrees ...int) (string, home.Layout) {
+// deviceCount, then starts the daemon. The pod prepares the placement its own
+// preparedPlacement authors (modelBearingPlacement when nil), the ladder package's with
+// its release interface. `before` runs against the home while nothing else holds it.
+func rentedLadderMachine(t *testing.T, h *ladderHub, pod *fakePod, before func(home.Layout, *records.Store), degrees ...int) (string, home.Layout) {
 	t.Helper()
 	publishWorkflowRelease(t, h, degrees...)
 	var detail hub.PackageReleaseDetail
@@ -286,16 +287,22 @@ func rentedLadderMachine(t *testing.T, h *ladderHub, pod *fakePod, before func(*
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	if before != nil {
-		before(store)
+		before(layout, store)
 	}
 	identity, problem := rental.PendingCreatorIdentity(layout, "rented-inference")
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
 	pod.controlKey = public
+	author := pod.preparedPlacement
+	if author == nil {
+		author = modelBearingPlacement(t)
+	}
 	pod.preparedPlacement = func(download []byte, pkg, release string) *pb.Placement {
-		placement := modelBearingPlacement(t)(download, pkg, release)
-		placement.PackageInterface = detail.PackageInterface
+		placement := author(download, pkg, release)
+		if pkg == ladderPackage {
+			placement.PackageInterface = detail.PackageInterface
+		}
 		return placement
 	}
 	connection, certPath := startFakePod(t, root, pod)

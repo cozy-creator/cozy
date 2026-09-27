@@ -425,17 +425,7 @@ func mustJSON(t *testing.T, value any) string {
 // installConversionPackage installs an editable package whose conversion job declares one
 // Model input and one weights output, and returns the interface its source describes.
 func installConversionPackage(t *testing.T, layout home.Layout, store *records.Store) []byte {
-	t.Helper()
-	cfg, problem := config.Load()
-	fatal(t, problem)
-	project := filepath.Join(t.TempDir(), "project")
-	must(t, os.MkdirAll(project, 0o700))
-	files := map[string]string{
-		"pyproject.toml": "[project]\nname = \"conversion-proof\"\nversion = \"1.0.0\"\nrequires-python = \">=3.12,<3.13\"\ndependencies = []\n" +
-			"[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n[tool.hatch.build.targets.wheel]\nonly-include = [\"convert.py\"]\n",
-		"package.toml":    "[application]\nobject='convert:app'\n",
-		".python-version": "3.12\n",
-		"convert.py": `from cozy_runtime.author import App, Context, Model, ModelArtifact, WeightsOutput, invocable
+	return installLocalPackage(t, layout, store, "conversion-proof", "convert", `from cozy_runtime.author import App, Context, Model, ModelArtifact, WeightsOutput, invocable
 
 app = App()
 
@@ -451,18 +441,34 @@ async def quantize(ctx: Context, *, source: Source, steps: int) -> ModelArtifact
 
 
 app.job(quantize, weights=(WeightsOutput("fp8", max_new_bytes=1 << 20),))
-`,
+`)
+}
+
+// installLocalPackage installs local/<name>@1.0.0, an editable package of one module, and
+// returns the interface its source describes.
+func installLocalPackage(t *testing.T, layout home.Layout, store *records.Store, name, module, source string) []byte {
+	t.Helper()
+	cfg, problem := config.Load()
+	fatal(t, problem)
+	project := filepath.Join(t.TempDir(), "project")
+	must(t, os.MkdirAll(project, 0o700))
+	files := map[string]string{
+		"pyproject.toml": "[project]\nname = \"" + name + "\"\nversion = \"1.0.0\"\nrequires-python = \">=3.12,<3.13\"\ndependencies = []\n" +
+			"[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n[tool.hatch.build.targets.wheel]\nonly-include = [\"" + module + ".py\"]\n",
+		"package.toml":    "[application]\nobject='" + module + ":app'\n",
+		".python-version": "3.12\n",
+		module + ".py":    source,
 	}
-	for name, body := range files {
-		must(t, os.WriteFile(filepath.Join(project, name), []byte(body), 0o600))
+	for file, body := range files {
+		must(t, os.WriteFile(filepath.Join(project, file), []byte(body), 0o600))
 	}
 	lock := exec.Command("uv", "lock", "--offline", "--python", "3.12")
 	lock.Dir, lock.Env = project, cfg.Tool()
 	if out, err := lock.CombinedOutput(); err != nil {
 		t.Fatalf("lock: %s: %s", err, out)
 	}
-	result, problem := install.Run(layout, store, install.Request{Ref: install.Ref{Package: "local/conversion-proof"},
-		Local: &install.LocalSource{Tree: project, Package: "local/conversion-proof", Release: "1.0.0"}})
+	result, problem := install.Run(layout, store, install.Request{Ref: install.Ref{Package: "local/" + name},
+		Local: &install.LocalSource{Tree: project, Package: "local/" + name, Release: "1.0.0"}})
 	fatal(t, problem)
 	surface, problem := launch.ReadPackageInterface(launch.PackageInterfacePath(result.Install.Dir))
 	fatal(t, problem)
