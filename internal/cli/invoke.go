@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/mattn/go-isatty"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -179,8 +180,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 			WithRemedy("use the component-explicit --lora model-parameter:component=reference[,strength] form until this slot publishes adapter compatibility")
 	}
 	if pin := ctx.Inv.Value("--attention-kernel"); pin != "" {
-		if overrides.AttentionKernel != "" {
-			return exit.Usagef("attention kernel was pinned more than once")
+		if overrides.AttentionKernel != "" && overrides.AttentionKernel != pin {
+			return exit.Usagef("attention kernel was pinned as both %s and %s", overrides.AttentionKernel, pin)
 		}
 		if problem := launch.ValidateAttentionOverride(pin); problem != nil {
 			return problem
@@ -594,9 +595,17 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 			ref.String(), release, manifest)
 	}
 	if manifest == "" {
+		if len(manifestLanes) != 1 && binding != nil && binding.Model == ref.String() {
+			// Several lanes and no lane named: the owner's ladder for this model picks
+			// one per machine, exactly as it does for an unselected slot.
+			if rungs, problem := ladderRungs(ctx, ref, selected, slot, raw, binding.Ladder); problem == nil && len(rungs) > 0 {
+				return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(),
+					CatalogRepository: ref.String(), Release: release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
+			}
+		}
 		if len(manifestLanes) != 1 {
 			return empty, exit.Usagef("model %s@%s has %d manifests", ref.String(), release, len(manifestLanes)).
-				WithRemedy("append #sha256:<digest> to select one exact manifest")
+				WithRemedy("append /<lane> or #sha256:<digest> to select one exact manifest")
 		}
 		for digest := range manifestLanes {
 			manifest = digest
@@ -2456,41 +2465,32 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	return target, facts.PackageInterface, nil
 }
 
-func newestPackageRelease(releases []hub.ReleaseSummary, majors ...int) (string, *exit.Error) {
-	wantedMajor := -1
-	if len(majors) == 1 {
-		wantedMajor = majors[0]
-	}
-	best := ""
-	bestVersion := [3]int{-1, -1, -1}
+// newestPackageRelease is the newest non-yanked release by PEP 440 order, preferring a
+// final release and falling back to prereleases when the package has published only those.
+func newestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
+	var best, bestPre string
+	var bestVersion, bestPreVersion pep440.Version
 	for _, row := range releases {
 		if row.Yanked || row.YankedAt != "" {
 			continue
 		}
-		parts := strings.Split(row.Release, ".")
-		if len(parts) != 3 {
+		version, err := pep440.Parse(row.Release)
+		if err != nil {
 			continue
 		}
-		var version [3]int
-		valid := true
-		for i, part := range parts {
-			value, err := strconv.Atoi(part)
-			if err != nil || value < 0 || strconv.Itoa(value) != part {
-				valid = false
-				break
+		if version.IsPreRelease() {
+			if bestPre == "" || version.GreaterThan(bestPreVersion) {
+				bestPre, bestPreVersion = row.Release, version
 			}
-			version[i] = value
-		}
-		if valid && (wantedMajor < 0 || version[0] == wantedMajor) &&
-			(version[0] > bestVersion[0] ||
-				version[0] == bestVersion[0] && version[1] > bestVersion[1] ||
-				version[0] == bestVersion[0] && version[1] == bestVersion[1] &&
-					version[2] > bestVersion[2]) {
+		} else if best == "" || version.GreaterThan(bestVersion) {
 			best, bestVersion = row.Release, version
 		}
 	}
 	if best == "" {
-		return "", exit.New(exit.NotFound, "package has no non-yanked numeric release")
+		best = bestPre
+	}
+	if best == "" {
+		return "", exit.New(exit.NotFound, "package has no non-yanked release")
 	}
 	return best, nil
 }

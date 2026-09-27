@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -128,8 +129,8 @@ func resolveRegistryPackage(ctx *Context, value, version string) (hub.Ref, hub.P
 	defer cancel()
 	packagePublishStatus(ctx, "Resolving %s...", ref.String())
 	plan, problem := client(ctx).PackageDownloads(hctx, ref, release)
-	if problem == nil && (plan.Release == "" || release != "" && plan.Release != release) {
-		problem = exit.Internalf("Tensorhub returned a changed or absent package release")
+	if problem == nil && (plan.Release == "" || release != "" && !sameRelease(plan.Release, release)) {
+		problem = exit.Internalf("Tensorhub answered release %q for requested %q", plan.Release, release)
 	}
 	return ref, plan, problem
 }
@@ -292,9 +293,15 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 		if problem != nil {
 			return empty, problem
 		}
-		digest, err := canonical.Spell(canonical.Digest(root))
-		if err != nil || len(root) == 0 || digest != resolved.ManifestID {
-			return empty, exit.Named(exit.Conflict, "job.model_manifest_changed", "published model root differs from its selected checkpoint")
+		if !manifestBytes(root, resolved.ManifestID) && resolved.Release != "" {
+			// The lane moved since resolution; read the selected checkpoint itself.
+			if checkpoint, fallback := hubClient.CheckpointManifest(ctx, fetch.Ref, resolved.ManifestID); fallback == nil {
+				root = checkpoint
+			}
+		}
+		if !manifestBytes(root, resolved.ManifestID) {
+			return empty, exit.Named(exit.Conflict, "job.model_manifest_changed",
+				"Tensorhub serves no bytes for the selected checkpoint %s", resolved.ManifestID)
 		}
 		return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: fetch.Ref.String(), Release: resolved.Release, Lane: resolved.Lane, Manifest: resolved.ManifestID, ManifestLength: int64(len(root))}, nil
 	}
@@ -386,4 +393,14 @@ func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
 	// Zero or ambiguous local rows defer to Tensorhub's catalog resolver. In particular,
 	// never guess between two lanes merely because both are on disk.
 	return empty, false, nil
+}
+
+// sameRelease compares release labels by PEP 440 value, so 1.0.0rc1 and 1.0.0-rc1 agree.
+func sameRelease(a, b string) bool {
+	left, errA := pep440.Parse(a)
+	right, errB := pep440.Parse(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return left.Equal(right)
 }

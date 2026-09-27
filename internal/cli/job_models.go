@@ -136,14 +136,19 @@ func jobManifestInputs(ctx *Context, job *launch.Entrypoint, models []orchestrat
 			}
 			hctx, cancel := hub.Context()
 			raw, problem := client(ctx).ReleaseManifest(hctx, ref, model.Release, model.Lane)
+			if problem == nil && !manifestBytes(raw, model.Manifest) {
+				// The lane moved since selection; read the selected checkpoint itself.
+				if checkpoint, fallback := client(ctx).CheckpointManifest(hctx, ref, model.Manifest); fallback == nil {
+					raw = checkpoint
+				}
+			}
 			cancel()
 			if problem != nil {
 				return nil, problem
 			}
-			digest, err := canonical.Spell(canonical.Digest(raw))
-			if err != nil || len(raw) == 0 || digest != model.Manifest {
+			if !manifestBytes(raw, model.Manifest) {
 				return nil, exit.Named(exit.Conflict, "job.model_manifest_changed",
-					"the published model manifest differs from the selected checkpoint")
+					"Tensorhub serves no bytes for the selected checkpoint %s", model.Manifest)
 			}
 			model.ManifestLength = int64(len(raw))
 		}
@@ -156,4 +161,9 @@ func jobManifestInputs(ctx *Context, job *launch.Entrypoint, models []orchestrat
 		model.BindingPath, model.Slot = model.Slot, param
 	}
 	return models, nil
+}
+
+func manifestBytes(raw []byte, manifest string) bool {
+	digest, err := canonical.Spell(canonical.Digest(raw))
+	return err == nil && len(raw) > 0 && digest == manifest
 }

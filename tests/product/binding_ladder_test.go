@@ -701,3 +701,27 @@ func TestAJobIsNotSizedByTheComponentsItNeverStages(t *testing.T) {
 		t.Fatalf("a job's derive-only model excluded a card for memory:\n%s", log)
 	}
 }
+
+// A rung naming a lane the release no longer carries is skipped; the rest of the owner's
+// ladder still places the run instead of the stale rung refusing it.
+func TestRunSkipsAStaleRungAndKeepsTheLadder(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: "1.0.0-rc.1",
+		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "retired-lane"}, {GPU: "*", Lane: "bf16-full"}}, Revision: 1})
+	root := ladderRoot(t, h)
+	startDaemonProcess(t, root)
+	_, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--json",
+		"--idempotency-key", "ladder-stale-rung")
+	if strings.Contains(out, "model.lane_not_found") {
+		t.Fatalf("one stale rung refused the whole ladder: %s", out)
+	}
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	queued, problem := store.RequestByIdempotencyKey("ladder-stale-rung")
+	fatal(t, problem)
+	if queued == nil || len(queued.Models) != 1 || len(queued.Models[0].Ladder) != 1 ||
+		queued.Models[0].Ladder[0].Lane != "bf16-full" {
+		t.Fatalf("the usable rung was not submitted: %+v\n%s", queued, out)
+	}
+}

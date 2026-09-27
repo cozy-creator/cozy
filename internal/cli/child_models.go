@@ -61,10 +61,15 @@ func (r *Resolver) childModelSelection(pkg, entrypoint string, slot launch.Slot,
 	if problem != nil {
 		return orchestrator.ModelRef{}, problem
 	}
-	digest, err := canonical.Spell(canonical.Digest(raw))
-	if err != nil || len(raw) == 0 || digest != out.Manifest {
+	if !manifestBytes(raw, out.Manifest) {
+		// The lane moved since selection; read the selected checkpoint itself.
+		if checkpoint, fallback := r.catalog.CheckpointManifest(hctx, ref, out.Manifest); fallback == nil {
+			raw = checkpoint
+		}
+	}
+	if !manifestBytes(raw, out.Manifest) {
 		return orchestrator.ModelRef{}, exit.Named(exit.Conflict, "child.model_manifest_changed",
-			"the published model manifest differs from the selected checkpoint")
+			"Tensorhub serves no bytes for the selected checkpoint %s", out.Manifest)
 	}
 	out.ManifestLength = int64(len(raw))
 	return out, nil

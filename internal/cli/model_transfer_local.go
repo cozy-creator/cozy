@@ -53,12 +53,14 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root stri
 		hctx, cancel := hub.LongContext()
 		defer cancel()
 		row, problem := fetch.Resolve(hctx)
+		if problem == nil && row.ManifestID != intent.SourceSelection {
+			// The release lane moved after acceptance; fetch the accepted manifest by digest.
+			model, _, _ := strings.Cut(intent.Source, "@")
+			fetch.Spec, fetch.Lane = model+"@"+intent.SourceSelection, ""
+			row, problem = fetch.Resolve(hctx)
+		}
 		if problem != nil {
 			return nil, problem
-		}
-		if row.ManifestID != intent.SourceSelection {
-			return nil, exit.Named(exit.Conflict, "model_transfer.source_changed",
-				"Tensorhub source resolved to a different Manifest than the accepted request")
 		}
 		fetch.Scratch = filepath.Join(root, "fetch")
 		fetched, problem := fetch.Acquire(hctx, row)

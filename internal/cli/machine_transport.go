@@ -272,8 +272,13 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 	processPath := filepath.Join(root, "process.json")
 	var process localMachineProcess
 	if raw, err := os.ReadFile(processPath); err == nil {
+		// A record left by a dead process is stale derived state and is replaced below;
+		// only a live process of another identity is refused rather than taken over.
 		if json.Unmarshal(raw, &process) != nil || process.WorkerID != workerID {
-			return nil, exit.New(exit.Conflict, "local Runtime process record has a different identity")
+			if process.PID != 0 && processtree.Alive(process.PID) {
+				return nil, exit.New(exit.Conflict, "local Runtime process record has a different identity")
+			}
+			process = localMachineProcess{}
 		}
 	}
 	if process.PID == 0 || !processtree.Alive(process.PID) {

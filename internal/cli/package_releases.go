@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -141,8 +142,8 @@ func handlePackageYank(ctx *Context) *exit.Error {
 		return problem
 	}
 	release := strings.TrimSpace(ctx.Inv.Value("--version"))
-	if !immutablePackageVersion.MatchString(release) {
-		return exit.Usagef("--version %q is not an immutable N.M.P package release", release).
+	if _, err := pep440.Parse(release); err != nil {
+		return exit.Usagef("--version %q is not a package release", release).
 			WithRemedy("use a release such as 1.2.3")
 	}
 	reason := "cozy package yank " + ref.String() + "@" + release

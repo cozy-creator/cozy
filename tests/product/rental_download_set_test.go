@@ -605,10 +605,20 @@ func TestUnversionedCheckpointReachesRentalDownloadSet(t *testing.T) {
 	if !seen[0].accepted || len(rows) != 1 || rows[0].Str("manifest") != digest || rows[0].Str("release") != "" || rows[0].Str("lane") != "" {
 		t.Fatalf("checkpoint gained a synthetic release or was lost: %s", seen[0].document)
 	}
+	// Half a release label beside an exact manifest is that manifest as a checkpoint.
 	for _, pair := range [][2]string{{"release", ""}, {"", "lane"}} {
 		models[0].Release, models[0].Lane = pair[0], pair[1]
-		if _, problem := rental.DownloadSet(packages, models); problem == nil {
-			t.Fatalf("partial provenance accepted: %v", pair)
+		raw, problem := rental.DownloadSet(append(packages, packages...), models)
+		fatal(t, problem)
+		document, err := canonical.Read(raw, &pb.DownloadDelegation{})
+		must(t, err)
+		rows := document.List("models")
+		if len(document.List("packages")) != len(packages) || len(rows) != 1 || rows[0].Str("manifest") != digest ||
+			rows[0].Str("release") != "" || rows[0].Str("lane") != "" {
+			t.Fatalf("partial label %v was not fetched as the exact checkpoint: %s", pair, raw)
+		}
+		if models[0].Release != pair[0] || models[0].Lane != pair[1] {
+			t.Fatal("normalization mutated the caller's selection")
 		}
 	}
 }

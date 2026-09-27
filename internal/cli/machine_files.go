@@ -121,7 +121,13 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 				return false, problem
 			}
 		} else if problem := verifyMachineResultCopy(file); problem != nil {
-			return false, problem
+			// The machine still holds bytes it has not released: receive them again.
+			if file.State != "copied" {
+				return false, problem
+			}
+			if problem := receiveMachineFile(ctx, connection, file); problem != nil {
+				return false, problem
+			}
 		}
 		if recoveredDecodedBound > 0 {
 			if file.Source.OutputID != "value" || file.Source.MimeType != "image/png" {

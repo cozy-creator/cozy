@@ -3,6 +3,7 @@ package producttest
 import (
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -34,6 +35,11 @@ func TestAttentionPinSurvivesSubmissionAndConflictingReplayRefuses(t *testing.T)
 	_, replay := runCozy(t, root, args...)
 	if strings.Contains(replay, "different body") {
 		t.Fatalf("same pin conflicts: %s", replay)
+	}
+	// The same pin given by flag and by payload term is one pin, not a conflict.
+	twice := append(append([]string(nil), args...), "kernel.attention=flash-attn3-fp8")
+	if _, out := runCozy(t, root, twice...); strings.Contains(out, "pinned") || strings.Contains(out, "different body") {
+		t.Fatalf("an identical repeated pin was refused: %s", out)
 	}
 	args[4] = "--attention-kernel=flash-attn3"
 	if code, out := runCozy(t, root, args...); code == 0 || !strings.Contains(out, "different body") {
@@ -116,5 +122,35 @@ func TestJobAttentionOverrideCannotBeSilentlyIgnored(t *testing.T) {
 	}
 	if request, problem := store.RequestByIdempotencyKey("job-pin"); problem != nil || request != nil {
 		t.Fatalf("unsupported job pin was submitted: request=%+v problem=%v", request, problem)
+	}
+}
+
+// A version bump in editable metadata is a new revision of the same package: the next
+// run refreshes onto it instead of refusing until a manual reinstall.
+func TestEditableVersionBumpRefreshesTheInstall(t *testing.T) {
+	root := t.TempDir()
+	project := weightlessProject(t)
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
+		t.Fatalf("install %d: %s", code, out)
+	}
+	pyproject := filepath.Join(project, "pyproject.toml")
+	metadata, err := os.ReadFile(pyproject)
+	must(t, err)
+	bumped := strings.Replace(string(metadata), `version = "1.0.0"`, `version = "1.0.1"`, 1)
+	if bumped == string(metadata) {
+		t.Fatal("editable fixture declares no 1.0.0 version")
+	}
+	must(t, os.WriteFile(pyproject, []byte(bumped), 0o644))
+	relock := exec.Command("uv", "lock")
+	relock.Dir, relock.Env = project, childEnv(t, project)
+	if out, err := relock.CombinedOutput(); err != nil {
+		t.Fatalf("relock the bumped fixture: %v\n%s", err, out)
+	}
+	_, out := runCozy(t, root, "--json", "run", localWeightlessRef+"/echo", "why=version-bump", "--idempotency-key=version-bump")
+	if strings.Contains(out, "editable_refresh_failed") || strings.Contains(out, "editable_identity_changed") {
+		t.Fatalf("editable version bump refused: %s", out)
+	}
+	if active := activePackageInstall(t, root); active.Version != "1.0.1" {
+		t.Fatalf("editable version bump left install version %s: %s", active.Version, out)
 	}
 }

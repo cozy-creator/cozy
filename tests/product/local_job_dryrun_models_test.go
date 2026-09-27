@@ -112,3 +112,46 @@ func TestLocalJobDryRunResolvesOnlyModelMetadata(t *testing.T) {
 		t.Fatalf("changed root accepted: %d %s", code, out)
 	}
 }
+
+// A job selects an exact checkpoint. When the release lane moves on after selection, the
+// selected checkpoint's own bytes are read instead of refusing the run.
+func TestLocalJobReadsTheSelectedCheckpointAfterItsLaneMoves(t *testing.T) {
+	root, tools := t.TempDir(), t.TempDir()
+	script := "#!/bin/sh\ncase \"$1 $2\" in\n'store ensure') exit 0;;\n'repo list') : > \"$5\"; exit 0;;\nesac\nexit 97\n"
+	must(t, os.WriteFile(filepath.Join(tools, "tfs"), []byte(script), 0700))
+	manifest := []byte(`{"fixture":"selected root"}`)
+	digest, err := canonical.Spell(canonical.Digest(manifest))
+	must(t, err)
+	iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"prepare.models.source"}],"name":"prepare","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}]}]}`)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/packages/proof/lanemove/bindings", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"bindings":[]}`)) })
+	mux.HandleFunc("GET /v1/models/resolve", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(hub.ModelResolution{Model: "proof/source", Release: "1.0.0", Lane: "bf16", ManifestID: digest, HeaderID: "sha256:" + strings.Repeat("7", 64), Bytes: 1, Objects: 1, Components: []string{"model"}})
+	})
+	mux.HandleFunc("GET /v1/models/proof/source/releases/1.0.0/lanes/bf16/manifest", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"fixture":"a newer root"}`))
+	})
+	mux.HandleFunc("GET /v1/models/proof/source/checkpoints/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("id") != digest {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(manifest)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntfs: "+filepath.Join(tools, "tfs")+"\n"), 0600))
+	dir := filepath.Join(root, "installs", "lanemove")
+	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(dir)), 0700))
+	must(t, os.WriteFile(launch.PackageInterfacePath(dir), iface, 0600))
+	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	_, problem = st.Activate(records.PackageInstall{ID: "lanemove-install", Package: "proof/lanemove", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: dir, Platform: "linux-x86"})
+	fatal(t, problem)
+	st.Close()
+	code, out := runAdmissionCLI(t, root, tools, "run", "proof/lanemove/prepare", "--model.source=proof/source@1.0.0/bf16",
+		"--timeout=20s", "--dry-run", "--json", "--full", "--idempotency-key=lanemove")
+	if code != 0 || !strings.Contains(out, `"status":"planned"`) || !strings.Contains(out, digest) {
+		t.Fatalf("a moved lane refused the selected checkpoint: %d %s", code, out)
+	}
+}
