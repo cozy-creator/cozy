@@ -26,7 +26,7 @@ func Unmarshal(data []byte, message proto.Message) error {
 	if err != nil {
 		return err
 	}
-	return (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(encoded, message)
+	return (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(encoded, message)
 }
 
 func protobufObject(doc Doc, descriptor protoreflect.MessageDescriptor) (map[string]any, error) {

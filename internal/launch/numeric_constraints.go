@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -18,21 +17,6 @@ func positiveMultipleOf(value json.Number) (*big.Rat, error) {
 		return nil, fmt.Errorf("multiple_of is not a decimal number")
 	}
 	return divisor, nil
-}
-
-func validateMultipleOfJSON(raw json.RawMessage) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return err
-	}
-	number, ok := value.(json.Number)
-	if !ok {
-		return fmt.Errorf("multiple_of must be numeric")
-	}
-	_, err := positiveMultipleOf(number)
-	return err
 }
 
 func matchesMultipleOf(value, bound json.Number) (bool, error) {

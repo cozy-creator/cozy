@@ -120,21 +120,15 @@ func TestDeclaredAssetsDefaultEmptyCollection(t *testing.T) {
 }
 
 func TestDeclaredAssetsDecodedViewDescriptor(t *testing.T) {
-	for _, value := range []string{`"decoded"`, `"raw"`, `""`, `null`, `true`, `1`} {
+	for _, value := range []string{`"decoded"`, `"raw"`, `""`, `null`} {
 		t.Run(value, func(t *testing.T) {
 			raw := strings.Replace(declaredAssetsInterface, `"parameter":"assets"`, `"parameter":"assets","view":`+value, 1)
 			iface, problem := launch.DecodePackageInterface([]byte(raw))
-			if value != `"decoded"` {
-				if problem == nil {
-					t.Fatal("invalid explicit Assets view accepted")
-				}
-				return
-			}
 			fatal(t, problem)
 			ep, problem := iface.Function("run")
 			fatal(t, problem)
-			if ep.Assets.View != "decoded" {
-				t.Fatal("decoded view descriptor was dropped")
+			if ep.Assets == nil || (value == `"decoded"`) != (ep.Assets.View == "decoded") {
+				t.Fatalf("Assets view %s was not carried as authored: %+v", value, ep.Assets)
 			}
 		})
 	}
@@ -142,9 +136,14 @@ func TestDeclaredAssetsDecodedViewDescriptor(t *testing.T) {
 	if _, problem := launch.DecodePackageInterface([]byte(fileKind)); problem != nil {
 		t.Fatalf("ordinary raw file Assets refused: %v", problem)
 	}
+	// Decoding is Runtime-owned: a view/kind pairing this host does not act on still loads.
 	decodedFile := strings.Replace(fileKind, `"parameter":"assets"`, `"parameter":"assets","view":"decoded"`, 1)
-	if _, problem := launch.DecodePackageInterface([]byte(decodedFile)); problem == nil {
-		t.Fatal("decoded Assets admitted a generic file kind")
+	if _, problem := launch.DecodePackageInterface([]byte(decodedFile)); problem != nil {
+		t.Fatalf("a decoded file Assets slot refused the interface: %v", problem)
+	}
+	if _, problem := launch.DecodePackageInterface([]byte(strings.Replace(declaredAssetsInterface,
+		`"parameter":"assets"`, `"parameter":"assets","view":true`, 1))); problem == nil {
+		t.Fatal("a mistyped Assets view was admitted")
 	}
 }
 

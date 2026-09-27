@@ -121,12 +121,23 @@ func TestUnbindPreservesConcurrentOwnerChoice(t *testing.T) {
 	}
 }
 
-func TestAuthoredModelDefaultDescriptorIsClosed(t *testing.T) {
-	for _, raw := range []string{`null`, `[]`, `[{"gpu":"H100","lane":"proof/m@1.0.0/fp8","extra":true}]`, `[{"gpu":1,"lane":"proof/m@1.0.0/fp8"}]`} {
-		body := authoredInterfaceDocument(t, json.RawMessage(raw))
-		if _, problem := launch.DecodePackageInterface(body); problem == nil {
-			t.Fatalf("invalid authored ladder admitted: %s", raw)
+func TestAuthoredModelDefaultDescriptorTolerance(t *testing.T) {
+	for _, raw := range []string{`null`, `[]`} {
+		iface, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t, json.RawMessage(raw)))
+		fatal(t, problem)
+		if iface.Entrypoints[0].Models[0].DefaultBinding != nil {
+			t.Fatalf("empty authored ladder %s became a binding", raw)
 		}
+	}
+	iface, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t,
+		json.RawMessage(`[{"gpu":"H100","lane":"proof/m@1.0.0/fp8","extra":true}]`)))
+	fatal(t, problem)
+	if binding := iface.Entrypoints[0].Models[0].DefaultBinding; binding == nil || binding.Model != "proof/m" || len(binding.Ladder) != 1 {
+		t.Fatalf("an additive rung member dropped the authored default: %+v", binding)
+	}
+	if _, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t,
+		json.RawMessage(`[{"gpu":1,"lane":"proof/m@1.0.0/fp8"}]`))); problem == nil {
+		t.Fatal("a mistyped GPU pattern was admitted")
 	}
 }
 
@@ -206,9 +217,6 @@ func TestAuthoredDefaultsMatchRuntimeCorpus(t *testing.T) {
 	fatal(t, problem)
 	if iface.Entrypoints[0].Models[0].DefaultBinding != nil {
 		t.Fatal("absent default became a binding")
-	}
-	if _, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t, json.RawMessage(`null`))); problem == nil {
-		t.Fatal("explicit null default was accepted")
 	}
 }
 

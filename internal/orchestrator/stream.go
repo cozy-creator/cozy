@@ -195,19 +195,11 @@ func progressCoordinates(value any) (progressCoordinate, bool) {
 	if !isMap {
 		return out, false
 	}
-	for key := range fields {
-		switch key {
-		case "stage", "stage_fraction", "overall_fraction", "position", "total", "step_ms":
-		default:
-			return out, false
-		}
-	}
 	out.stage, _ = fields["stage"].(string)
-	step, hasStep := fields["step_ms"]
-	var stepOK bool
-	out.stepMS, stepOK = step.(float64)
-	if out.stage == "" || len(out.stage) > 120 || !hasStep || !stepOK || math.IsNaN(out.stepMS) ||
-		math.IsInf(out.stepMS, 0) || out.stepMS < 0 {
+	if step, ok := fields["step_ms"].(float64); ok && !math.IsNaN(step) && !math.IsInf(step, 0) && step >= 0 {
+		out.stepMS = step
+	}
+	if out.stage == "" || len(out.stage) > 120 {
 		return out, false
 	}
 	if value, present := fields["stage_fraction"]; present {
@@ -239,14 +231,8 @@ func progressCoordinates(value any) (progressCoordinate, bool) {
 			return out, false
 		}
 		out.position, out.total, out.hasPosition = int64(position), int64(total), true
-		derived := position / total
-		// Runtime rounds fractions to six decimal places. Counted progress has
-		// exact integer coordinates; keep those authoritative after checking that
-		// the approximate fraction agrees to its reported precision.
-		if out.hasStageFraction && math.Abs(out.stageFraction-derived) > 1e-6 {
-			return out, false
-		}
-		out.stageFraction, out.hasStageFraction = derived, true
+		// Counted progress has exact integer coordinates; they win over a rounded fraction.
+		out.stageFraction, out.hasStageFraction = position/total, true
 	}
 	return out, true
 }

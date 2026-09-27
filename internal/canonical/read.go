@@ -3,22 +3,22 @@ package canonical
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
+	"math"
 	"strconv"
-	"strings"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Read turns exact canonical bytes into a typed document. It refuses everything the
-// writer could not have produced — that is the reading side of law 4, and the reason a
-// planted `service_class` key on an ExecutionSpec is a REFUSAL and not an ignored field.
-//
-// The refusals, in the order they fire: size cap, JSON grammar (no null, no float,
-// printable ASCII, only \" and \\), duplicate key, the RE-EMIT LAW (the bytes must be
-// the canonical encoding of their own content), the document's `format` tag, and finally
-// the message's closed key set.
+// Read turns a peer's document bytes into a typed document. The digest a caller checks is
+// over these exact bytes, so the reader needs no second identity law: a document from an
+// older or newer peer keeps loading. Members the message does not declare, and null
+// members, are dropped; whitespace and any valid JSON spelling are accepted. What still
+// refuses is what cannot be read unambiguously: malformed JSON, a duplicate key, the caps,
+// and a `format` tag naming another document or another major version.
 func Read(data []byte, m proto.Message) (Doc, error) {
 	obj, err := ReadObject(data)
 	if err != nil {
@@ -29,45 +29,17 @@ func Read(data []byte, m proto.Message) (Doc, error) {
 	if obj["format"] != want {
 		return nil, refuse("unknown_format", "%v is not %q", obj["format"], want)
 	}
-	known := map[string]bool{"format": true}
-	for i := 0; i < d.Fields().Len(); i++ {
-		known[string(d.Fields().Get(i).Name())] = true
-	}
-	for k := range obj {
-		if !known[k] {
-			return nil, refuse("unknown_field", "%s: unknown field %q", want, k)
-		}
-	}
+	prune(obj, d)
+	obj["format"] = want
 	if err := semantics(string(d.FullName()), obj); err != nil {
 		return nil, err
 	}
 	return obj, nil
 }
 
-// ReadObject validates the shared canonical JSON profile without assigning a
-// document schema. It is for exact control documents whose schemas live outside
-// worker-protocol (for example PackageBindingRelease). Callers must still
-// enforce their closed key set and semantic joins.
+// ReadObject parses one JSON object under the size, depth and duplicate-key bounds
+// without assigning a document schema.
 func ReadObject(data []byte) (Doc, error) {
-	obj, err := parseObject(data)
-	if err != nil {
-		return nil, err
-	}
-	again, err := Write(map[string]Value(obj))
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(again, data) {
-		return nil, refuse("noncanonical_encoding", "bytes are not the canonical encoding of their own content")
-	}
-	return obj, nil
-}
-
-// parseObject applies the bounded JSON grammar and duplicate-key refusal but
-// does not require compact canonical rendering. Descriptor bytes have their own
-// exact stored-byte identity and may be pretty-printed; their schema owner, not
-// this codec, decides that presentation.
-func parseObject(data []byte) (Doc, error) {
 	if len(data) > DocMax {
 		return nil, refuse("size_cap", "%d B over the %d B cap", len(data), DocMax)
 	}
@@ -78,13 +50,38 @@ func parseObject(data []byte) (Doc, error) {
 	}
 	p.space()
 	if p.i != len(p.src) {
-		return nil, refuse("noncanonical_encoding", "%d trailing byte(s) after the document", len(p.src)-p.i)
+		return nil, refuse("malformed_json", "%d trailing byte(s) after the document", len(p.src)-p.i)
 	}
 	obj, ok := v.(map[string]Value)
 	if !ok {
 		return nil, refuse("wrong_type", "a document is a JSON object")
 	}
 	return Doc(obj), nil
+}
+
+// prune keeps the members a message declares, recursively. The dropped members are
+// another version's additions this reader has no use for.
+func prune(obj map[string]Value, d protoreflect.MessageDescriptor) {
+	for key, value := range obj {
+		field := d.Fields().ByName(protoreflect.Name(key))
+		if field == nil {
+			delete(obj, key)
+			continue
+		}
+		if field.Kind() != protoreflect.MessageKind || field.IsMap() {
+			continue
+		}
+		if nested, ok := value.(map[string]Value); ok {
+			prune(nested, field.Message())
+		}
+		if items, ok := value.([]Value); ok {
+			for _, item := range items {
+				if nested, ok := item.(map[string]Value); ok {
+					prune(nested, field.Message())
+				}
+			}
+		}
+	}
 }
 
 // semantics carries the few document rules the KEY SET cannot state. A closed key set says
@@ -106,14 +103,18 @@ func weightsReceiptList(d Doc) error {
 		return nil
 	}
 	items, ok := raw.([]Value)
-	if !ok || len(items) == 0 {
-		return refuse("weights_receipt_shape", "weights_receipts is a non-empty list when present")
+	if !ok {
+		return refuse("weights_receipt_shape", "weights_receipts is a list")
+	}
+	if len(items) == 0 {
+		delete(d, "weights_receipts")
+		return nil
 	}
 	if len(items) > pb.MaxWeightsReceipts {
 		return refuse("weights_receipt_count_cap", "%d receipts exceeds the %d-item cap",
 			len(items), pb.MaxWeightsReceipts)
 	}
-	aggregate, prior := 0, ""
+	aggregate, slots := 0, map[string]bool{}
 	for _, item := range items {
 		fields, ok := item.(map[string]Value)
 		if !ok {
@@ -125,10 +126,10 @@ func weightsReceiptList(d Doc) error {
 		}
 		aggregate += size
 		slot := receipt.Str("output_slot")
-		if slot <= prior {
-			return refuse("weights_receipt_order", "output slot %q is not strictly after %q", slot, prior)
+		if slots[slot] {
+			return refuse("weights_receipt_duplicate", "output slot %q has two receipts", slot)
 		}
-		prior = slot
+		slots[slot] = true
 	}
 	if aggregate > pb.MaxWeightsReceiptAggregateBytes {
 		return refuse("weights_receipt_aggregate_cap", "%d receipt bytes exceeds the %d-byte cap",
@@ -160,9 +161,8 @@ func weightsReceipt(d Doc) error {
 }
 
 func readWeightsReceiptRef(ref Doc) (Doc, int, error) {
-	if len(ref) != 2 || ref.Str("weights_receipt_digest") == "" ||
-		ref.Str("weights_receipt_canonical_bytes") == "" {
-		return nil, 0, refuse("weights_receipt_ref_shape", "the reference has exactly digest and bytes")
+	if ref.Str("weights_receipt_digest") == "" || ref.Str("weights_receipt_canonical_bytes") == "" {
+		return nil, 0, refuse("weights_receipt_ref_shape", "the reference carries a digest and bytes")
 	}
 	data, err := decodeCanonicalBytes(ref.Str("weights_receipt_canonical_bytes"))
 	if err != nil {
@@ -253,8 +253,7 @@ type parser struct {
 	i   int
 }
 
-// space skips insignificant whitespace. The parser ACCEPTS it so the re-emit law is
-// what refuses it — one rule refusing non-canonical bytes, never two.
+// space skips insignificant whitespace.
 func (p *parser) space() {
 	for p.i < len(p.src) {
 		switch p.src[p.i] {
@@ -286,7 +285,7 @@ func (p *parser) value(depth int) (Value, error) {
 	case c == 'f':
 		return false, p.lit("false")
 	case c == 'n':
-		return nil, refuse("wrong_type", "null has no canonical spelling in this profile")
+		return null{}, p.lit("null")
 	default:
 		return p.number()
 	}
@@ -330,7 +329,9 @@ func (p *parser) object(depth int) (Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		out[name] = v
+		if _, absent := v.(null); !absent {
+			out[name] = v
+		}
 		p.space()
 		if p.i >= len(p.src) {
 			return nil, refuse("malformed_json", "unterminated object")
@@ -360,7 +361,9 @@ func (p *parser) array(depth int) (Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, v)
+		if _, absent := v.(null); !absent {
+			out = append(out, v)
+		}
 		p.space()
 		if p.i >= len(p.src) {
 			return nil, refuse("malformed_json", "unterminated array")
@@ -378,38 +381,28 @@ func (p *parser) array(depth int) (Value, error) {
 }
 
 func (p *parser) str() (Value, error) {
+	start := p.i
 	p.i++ // '"'
-	var sb strings.Builder
 	for p.i < len(p.src) {
-		c := p.src[p.i]
-		switch {
-		case c == '"':
-			p.i++
-			return sb.String(), nil
-		case c == '\\':
-			if p.i+1 >= len(p.src) {
-				return nil, refuse("malformed_json", "escape at end of document")
-			}
-			switch p.src[p.i+1] {
-			case '"':
-				sb.WriteByte('"')
-			case '\\':
-				sb.WriteByte('\\')
-			default:
-				return nil, refuse("noncanonical_encoding",
-					"escape \\%c is outside the profile's two escapes", p.src[p.i+1])
-			}
+		switch p.src[p.i] {
+		case '\\':
 			p.i += 2
-		case c < 0x20 || c > 0x7e:
-			return nil, refuse("non_ascii_field", "byte 0x%02x in a string; fields are printable ASCII", c)
+		case '"':
+			p.i++
+			var out string
+			if err := json.Unmarshal(p.src[start:p.i], &out); err != nil {
+				return nil, refuse("malformed_json", "invalid string at offset %d", start)
+			}
+			return out, nil
 		default:
-			sb.WriteByte(c)
 			p.i++
 		}
 	}
 	return nil, refuse("malformed_json", "unterminated string")
 }
 
+// number reads integers as int64 and any other JSON number as float64. A float can only
+// sit in a member this reader does not consume; accessors read integers.
 func (p *parser) number() (Value, error) {
 	start := p.i
 	for p.i < len(p.src) {
@@ -424,12 +417,18 @@ func (p *parser) number() (Value, error) {
 	if tok == "" {
 		return nil, refuse("malformed_json", "expected a value at offset %d", start)
 	}
-	if strings.ContainsAny(tok, ".eE") {
-		return nil, refuse("non_integer_number", "%s is a float; documents are integer-only", tok)
+	if n, err := strconv.ParseInt(tok, 10, 64); err == nil {
+		return n, nil
 	}
-	n, err := strconv.ParseInt(tok, 10, 64)
-	if err != nil || n < intMin || n > intMax {
-		return nil, refuse("number_range", "%s is outside the interoperable integer range", tok)
+	f, err := strconv.ParseFloat(tok, 64)
+	if err != nil {
+		return nil, refuse("malformed_json", "%s is not a number", tok)
 	}
-	return n, nil
+	if f == math.Trunc(f) && f >= float64(intMin) && f <= float64(intMax) {
+		return int64(f), nil
+	}
+	return f, nil
 }
+
+// null marks a JSON null while parsing; the containing object or array drops it.
+type null struct{}

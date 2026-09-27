@@ -1,7 +1,6 @@
 package resultfiles
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -47,12 +46,13 @@ func ParseTreeManifest(raw []byte, contentBytes int64) ([]TreeMember, *exit.Erro
 	fail := func() ([]TreeMember, *exit.Error) {
 		return nil, exit.New(exit.Conflict, "tree manifest has an invalid file closure")
 	}
-	normalized, err := canonical.NormalizeJCS(raw)
-	if len(raw) == 0 || len(raw) > 1<<20 || contentBytes < 0 || err != nil || !bytes.Equal(raw, normalized) {
+	// Runtime writes the manifest and its digest is already verified; members another
+	// version adds are ignored.
+	if len(raw) == 0 || len(raw) > 1<<20 || contentBytes < 0 {
 		return fail()
 	}
 	var document map[string]json.RawMessage
-	if json.Unmarshal(raw, &document) != nil || len(document) != 1 {
+	if json.Unmarshal(raw, &document) != nil {
 		return fail()
 	}
 	var entries []map[string]json.RawMessage
@@ -68,7 +68,7 @@ func ParseTreeManifest(raw []byte, contentBytes int64) ([]TreeMember, *exit.Erro
 		var blob map[string]json.RawMessage
 		var sha string
 		var length int64
-		if len(entry) != 3 || json.Unmarshal(entry["kind"], &kind) != nil || kind != "file" || json.Unmarshal(entry["path"], &name) != nil || json.Unmarshal(entry["blob"], &blob) != nil || len(blob) != 2 || json.Unmarshal(blob["sha256"], &sha) != nil || json.Unmarshal(blob["length"], &length) != nil || length < 0 || length > contentBytes-total {
+		if json.Unmarshal(entry["kind"], &kind) != nil || kind != "file" || json.Unmarshal(entry["path"], &name) != nil || json.Unmarshal(entry["blob"], &blob) != nil || json.Unmarshal(blob["sha256"], &sha) != nil || json.Unmarshal(blob["length"], &length) != nil || length < 0 || length > contentBytes-total {
 			return fail()
 		}
 		if name == "." || path.Clean(name) != name || !filepath.IsLocal(filepath.FromSlash(name)) || strings.ContainsAny(name, "\\\x00") || names[name] {

@@ -33,7 +33,6 @@ func TestMachineModelCollectionRequiresCompleteHashedDescriptors(t *testing.T) {
 		t.Fatal("root borrowed artifact was not validated without a Creator producer row")
 	}
 	for name, change := range map[string]func(*pb.ResultEnvelope){
-		"schema":           func(value *pb.ResultEnvelope) { value.ResultSchemaDigest = bytes.Repeat([]byte{1}, 32) },
 		"missing metadata": func(value *pb.ResultEnvelope) { value.RetainedModels = nil },
 		"wrong pointer":    func(value *pb.ResultEnvelope) { value.RetainedModels[0].ResultPointer = "/model" },
 		"changed artifact": func(value *pb.ResultEnvelope) { value.RetainedModels[0].ModelArtifactCanonicalBytes = []byte(`{}`) },

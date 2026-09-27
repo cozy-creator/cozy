@@ -577,7 +577,7 @@ func authorOutcome(requestID string, ordinal uint64, spec []byte, status pb.Outc
 }
 
 // badOutcomes is the terminal refusal matrix, sent in order against ONE open attempt. Only
-// the LAST one is admissible, and the ack that follows it is the orchestrator saying so.
+// the third is admissible; the fourth replays it.
 func (f *fakeControl) badOutcomes(emit func(*pb.AttemptOutcome), offer *pb.AttemptOffer) {
 	send := func(t *pb.AttemptOutcome) {
 		emit(t)
@@ -601,10 +601,10 @@ func (f *fakeControl) badOutcomes(emit func(*pb.AttemptOutcome), offer *pb.Attem
 	f.say("ARM 2: envelope/document divergence")
 	send(t)
 
-	// 3. A key the closed document has no slot for, written BY HAND because the schema
-	//    cannot express it — which is the point of the arm.
+	// 3. A newer Runtime's outcome: a member this Creator's schema does not declare,
+	//    written BY HAND because the schema cannot express it. It is admissible.
 	t, data := authorOutcome(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
-		succeeded, "planted key")
+		pb.OutcomeStatus_OUTCOME_STATUS_FAILED, "the fake worker has no GPU")
 	if doc, err := canonical.Read(data, &pb.AttemptOutcomeBody{}); err == nil {
 		raw := map[string]canonical.Value(doc)
 		raw["service_class"] = "priority"
@@ -612,16 +612,10 @@ func (f *fakeControl) badOutcomes(emit func(*pb.AttemptOutcome), offer *pb.Attem
 			t.OutcomeCanonicalBytes, t.OutcomeDigest = planted, canonical.Digest(planted)
 		}
 	}
-	f.say("ARM 3: a planted key in the outcome document")
+	f.say("ARM 3: an admissible outcome carrying a newer peer's member")
 	send(t)
-
-	// 4/5. An admissible outcome, then the exact same one again: a replay must re-ack and
-	// apply nothing twice.
-	t, _ = authorOutcome(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
-		pb.OutcomeStatus_OUTCOME_STATUS_FAILED, "the fake worker has no GPU")
-	f.say("ARM 4: an admissible outcome")
-	send(t)
-	f.say("ARM 5: the same outcome replayed")
+	// 4. The exact same outcome again: a replay must re-ack and apply nothing twice.
+	f.say("ARM 4: the same outcome replayed")
 	send(t)
 }
 

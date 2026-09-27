@@ -229,7 +229,6 @@ func preparePackageSet(l home.Layout, installDir string, published *PublishedSou
 			stdout.String(), stderr.String())
 	}
 	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
-	decoder.DisallowUnknownFields()
 	decodeErr := decoder.Decode(&answer)
 	var trailing any
 	if decodeErr == nil {

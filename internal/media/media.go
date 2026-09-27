@@ -62,6 +62,8 @@ type Client struct {
 	// the same number the DeliveryGrant bounds the write by, so both ends of one object
 	// are held to one figure.
 	maxObject int64
+	// rev is the plane's declared contract revision, learned by Health.
+	rev int
 }
 
 // Budget is the I/O stall allowance: how long one call may go with no byte moving in either
@@ -284,8 +286,9 @@ func codeFor(status int) exit.Code {
 // into its base worker image while this client floats with Cozy master, so a route or a
 // field can move on one side alone. The revision closes that: a plane at another revision,
 // or one too old to declare a revision at all, is refused here rather than fed bytes whose
-// answer shape this host would misread. This media contract has its own explicit revision;
-// it is independent of the protobuf worker protocol.
+// answer shape this host would misread. A newer plane is accepted: its revision is
+// recorded and a route it or an older plane lacks fails only that operation. This media
+// contract has its own explicit revision; it is independent of the protobuf worker protocol.
 func (c *Client) Health() *exit.Error {
 	_, data, e := c.call(http.MethodGet, "/v1/health", nil)
 	if e != nil {
@@ -300,13 +303,14 @@ func (c *Client) Health() *exit.Error {
 			brief(said.Service), mediawire.Service)
 	}
 	if said.ContractRev == nil {
-		return c.skew("declares NO media contract revision and this host speaks rev %d",
-			mediawire.ContractRev)
+		return c.skew("declares NO media contract revision and this host reads rev %d or newer",
+			mediawire.MinContractRev)
 	}
-	if *said.ContractRev != mediawire.ContractRev {
-		return c.skew("speaks media contract rev %d and this host speaks rev %d",
-			*said.ContractRev, mediawire.ContractRev)
+	if *said.ContractRev < mediawire.MinContractRev {
+		return c.skew("speaks media contract rev %d and this host reads rev %d or newer",
+			*said.ContractRev, mediawire.MinContractRev)
 	}
+	c.rev = *said.ContractRev
 	return nil
 }
 
@@ -317,10 +321,9 @@ func (c *Client) skew(format string, args ...any) *exit.Error {
 		WithRemedy("the pod's media server is built into its image from a pinned "+
 			"Tensorhub recipe commit while this host floats with Cozy master, so the "+
 			"two ends can differ. Rebuild "+
-			"the pod image from a commit that speaks rev %d, or run an owner that speaks "+
-			"what the pod does. Nothing is uploaded to a plane whose answers this host "+
-			"cannot read: a misparsed field is worse than a refused rental.",
-			mediawire.ContractRev).
+			"the pod image from a commit that speaks rev %d or newer. Nothing is uploaded "+
+			"to a plane whose answers this host cannot read.",
+			mediawire.MinContractRev).
 		WithNext("cozy rental")
 }
 
@@ -389,7 +392,8 @@ func (c *Client) putInput(slot, inputID string, body io.Reader, wantDigest strin
 		return "", exit.Internalf("the pod accepted an input and returned no readable path")
 	}
 	gotDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
-	if gotDigest != wantDigest || doc.Length != wantLength || doc.Digest != wantDigest {
+	// The pod's echo is optional; one it does send must agree with the bytes streamed.
+	if gotDigest != wantDigest || doc.Length != 0 && doc.Length != wantLength || doc.Digest != "" && doc.Digest != wantDigest {
 		return "", exit.Named(exit.Conflict, "input_asset_changed",
 			"input %s did not retain its recorded digest/length during upload", inputID)
 	}
@@ -518,6 +522,10 @@ const MaxTriageBundle = 1 << 20
 // GetOutputTo this is a transport check of the pod's own declaration; whether the bundle
 // is KEPT is the orchestrator's decision against the terminal it accepted.
 func (c *Client) GetTriage(subject, wantDigest string, wantLength int64) ([]byte, *exit.Error) {
+	if c.rev != 0 && c.rev < mediawire.TriageContractRev {
+		return nil, exit.Named(exit.Unavailable, "triage_unsupported",
+			"the pod's media plane speaks rev %d, before triage bundles (rev %d)", c.rev, mediawire.TriageContractRev)
+	}
 	if wantLength <= 0 || wantLength > MaxTriageBundle {
 		return nil, exit.Named(exit.Validation, "triage_length_invalid",
 			"the terminal declares triage bundle %s as %d B; the protocol bounds one at %d B",

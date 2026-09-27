@@ -118,7 +118,8 @@ func TestWorkerRefusals(t *testing.T) {
 	}
 
 	// TERMINAL-LEVEL REFUSALS: the digest fence, the document fence, the replay. The peer
-	// sends five outcomes for one attempt and only the fourth is admissible.
+	// sends four outcomes for one attempt; the third carries a member only a newer Runtime
+	// declares and is admissible, and the fourth replays it.
 	badspec := fakeSpec("badterminal", "3", "--arm", "badterminal")
 	instanceB, _, e := o.c.EnsureWorker(badspec)
 	fatal(t, e)
@@ -134,7 +135,6 @@ func TestWorkerRefusals(t *testing.T) {
 	for _, want := range []string{
 		"does not hash the",            // a planted terminal_digest, recomputed over the resident bytes
 		"envelope/document divergence", // routing copies that disagree with the document
-		"unknown field",                // a planted key in the closed terminal document
 		"exact replay",                 // an exact replay is re-acked and applied ONCE
 	} {
 		if _, ok := waitEvent(o, want, 5*time.Second); !ok {

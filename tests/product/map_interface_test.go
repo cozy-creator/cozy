@@ -22,15 +22,15 @@ func TestPublishedH3ToolsInterfaceAcceptsMaps(t *testing.T) {
 	if !strings.Contains(string(raw), valid) {
 		t.Fatal("published fixture no longer includes the map that blocked installation")
 	}
-	for _, invalid := range []string{
-		`"map":{"key":"str"}`,
-		`"map":{"value":"str"}`,
+	// Runtime owns its type grammar; a map shape this host cannot read still loads and its
+	// values are validated by Runtime at execution.
+	for _, evolved := range []string{
 		`"map":{"key":"str","value":"str","extra":true}`,
 		`"map":{"key":"str","value":{"unknown":"str"}}`,
 		`"map":{"key":{"unknown":"str"},"value":"str"}`,
 	} {
-		if _, problem := launch.DecodePackageInterface([]byte(strings.Replace(string(raw), valid, invalid, 1))); problem == nil {
-			t.Fatalf("malformed map schema accepted: %s", invalid)
+		if _, problem := launch.DecodePackageInterface([]byte(strings.Replace(string(raw), valid, evolved, 1))); problem != nil {
+			t.Fatalf("an evolved map schema refused the interface: %s: %s", evolved, problem.Message)
 		}
 	}
 }

@@ -97,6 +97,59 @@ func TestMediaHealthFlagsNeverChangeTheRequestShape(t *testing.T) {
 	}
 }
 
+// The pod's media server ships in its image, independently of this host. A plane at the
+// floor or newer is dialled and moves bytes; a route an older plane lacks fails only that
+// operation, and a plane below the floor is refused before any byte moves.
+func TestMediaPlaneRevisionIsAFloor(t *testing.T) {
+	for _, arm := range []struct {
+		name     string
+		rev      *int
+		accepted bool
+		triage   bool
+	}{
+		{"absent", nil, false, false},
+		{"rev1", new(1), false, false},
+		{"rev2", new(2), true, false},
+		{"current", new(mediawire.ContractRev), true, true},
+		{"newer", new(mediawire.ContractRev + 1), true, true},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			var writes atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/health" {
+					_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: arm.rev})
+					return
+				}
+				writes.Add(1)
+				if strings.HasPrefix(r.URL.Path, "/v1/triage/") {
+					_, _ = w.Write([]byte("{}"))
+					return
+				}
+				body, _ := io.ReadAll(r.Body)
+				_ = json.NewEncoder(w).Encode(map[string]any{"path": "/tmp/cozy/input", "digest": inputDigest(body), "length": len(body)})
+			}))
+			defer server.Close()
+			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
+			problem := client.Health()
+			if !arm.accepted {
+				if problem == nil || problem.ErrName() != "media_contract_mismatch" {
+					t.Fatalf("a plane below the floor was not refused: %v", problem)
+				}
+				return
+			}
+			fatal(t, problem)
+			_, problem = client.PutInput("attempt-7", "payload", []byte("payload"))
+			fatal(t, problem)
+			_, problem = client.GetTriage("subject-1", inputDigest([]byte("{}")), 2)
+			if arm.triage {
+				fatal(t, problem)
+			} else if problem == nil || problem.ErrName() != "triage_unsupported" {
+				t.Fatalf("an older plane's missing triage route was not a typed operation failure: %v", problem)
+			}
+		})
+	}
+}
+
 // An unprobed client still sends the exact output count.
 func TestMediaReservationCarriesCountWithoutHealth(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -217,10 +270,13 @@ func TestMediaInputRetryKeepsAttemptAndOriginalFile(t *testing.T) {
 	}
 }
 
-func TestMediaInputRequiresExactReceipt(t *testing.T) {
-	for _, response := range []string{
-		`{"path":"/tmp/cozy/input","length":3}`,
-		`{"path":"/tmp/cozy/input","length":2,"digest":"sha256:incorrect"}`,
+// The pod's receipt echo is optional (the worker re-verifies the digest it consumes);
+// an echo it does send must agree with the bytes streamed.
+func TestMediaInputReceiptEchoMustAgree(t *testing.T) {
+	for response, accepted := range map[string]bool{
+		`{"path":"/tmp/cozy/input","length":3}`: true,
+		`{"path":"/tmp/cozy/input","length":2,"digest":"sha256:incorrect"}`: false,
+		`{"path":"/tmp/cozy/input","length":3,"digest":"sha256:incorrect"}`: false,
 	} {
 		t.Run(response, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -234,8 +290,9 @@ func TestMediaInputRequiresExactReceipt(t *testing.T) {
 			defer server.Close()
 			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
 			fatal(t, client.Health())
-			if path, problem := client.PutInput("attempt-1", "payload", []byte("abc")); problem == nil || path != "" {
-				t.Fatalf("inexact receipt became input grant: %q, %v", path, problem)
+			path, problem := client.PutInput("attempt-1", "payload", []byte("abc"))
+			if accepted != (problem == nil && path != "") {
+				t.Fatalf("receipt echo admission = %q, %v; want accepted=%v", path, problem, accepted)
 			}
 		})
 	}
