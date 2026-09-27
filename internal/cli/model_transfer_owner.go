@@ -68,11 +68,20 @@ func (o *modelTransferOwner) requestContext(parent context.Context, requestID st
 	return ctx, cancel
 }
 
-func (o *modelTransferOwner) MaterializeLocal(parent context.Context, requestID string,
+// canceledTransfer reports a canceled run at a phase boundary. The orchestrator cancels
+// ctx when the request is canceled; nothing past this point may install or publish.
+func canceledTransfer(ctx context.Context, requestID string) *exit.Error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	return exit.New(exit.Canceled, "model transfer %s was canceled", requestID)
+}
+
+// MaterializeLocal and PassThrough run under the orchestrator's per-request transfer
+// context: a cancel stops their I/O at the next safe point.
+func (o *modelTransferOwner) MaterializeLocal(ctx context.Context, requestID string,
 	intent records.ModelTransferIntent,
 ) ([]orchestrator.ModelRef, *exit.Error) {
-	ctx, cancel := o.requestContext(parent, requestID)
-	defer cancel()
 	work, problem := o.requestScratch(requestID)
 	if problem != nil {
 		return nil, problem
@@ -145,14 +154,12 @@ func sameSourceFiles(left []modeltransfer.SourceFile,
 	return true
 }
 
-func (o *modelTransferOwner) PassThrough(parent context.Context, requestID string,
+func (o *modelTransferOwner) PassThrough(ctx context.Context, requestID string,
 	intent records.ModelTransferIntent,
 ) *exit.Error {
 	if problem := o.store.BeginModelTransferMaterialization(requestID); problem != nil {
 		return problem
 	}
-	ctx, cancel := o.requestContext(parent, requestID)
-	defer cancel()
 	// The request's scratch holds the downloaded source only until its CozyTensors are in
 	// the CAS; it is released before finalization, which claims it again for its own
 	// small exchange files.
@@ -164,6 +171,9 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(intent, false), work.Path,
 		intent, map[string]string{"model": ""})
 	if problem != nil {
+		return problem
+	}
+	if problem := canceledTransfer(ctx, requestID); problem != nil {
 		return problem
 	}
 	source := prepared["model"]
@@ -201,6 +211,9 @@ func (o *modelTransferOwner) PassThrough(parent context.Context, requestID strin
 		return problem
 	}
 	work.Release()
+	if problem := canceledTransfer(ctx, requestID); problem != nil {
+		return problem
+	}
 	return o.Finalize(ctx, requestID, nil)
 }
 
@@ -280,6 +293,9 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 			return "", problem
 		}
 		defer work.Release()
+		if problem := canceledTransfer(ctx, weights.RequestID); problem != nil {
+			return "", problem
+		}
 		name := strings.TrimPrefix(intent.Destination, "local/")
 		observed, problem := tool.ObserveLocal(name,
 			filepath.Join(work.Path, "local-observed.jsonl"))

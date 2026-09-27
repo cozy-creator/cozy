@@ -11,7 +11,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/tfs"
@@ -50,20 +49,19 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root stri
 		}
 		fetch := &transfer.Fetch{Tool: tool, Hub: client(ctx), Spec: intent.Source,
 			Lane: intent.InputLane, Progress: progress(ctx), Locks: layout.AcquisitionLocks()}
-		hctx, cancel := hub.LongContext()
-		defer cancel()
-		row, problem := fetch.Resolve(hctx)
+		// The run's own context: a cancel stops the Hub fetch between and within objects.
+		row, problem := fetch.Resolve(runCtx)
 		if problem == nil && row.ManifestID != intent.SourceSelection {
 			// The release lane moved after acceptance; fetch the accepted manifest by digest.
 			model, _, _ := strings.Cut(intent.Source, "@")
 			fetch.Spec, fetch.Lane = model+"@"+intent.SourceSelection, ""
-			row, problem = fetch.Resolve(hctx)
+			row, problem = fetch.Resolve(runCtx)
 		}
 		if problem != nil {
 			return nil, problem
 		}
 		fetch.Scratch = filepath.Join(root, "fetch")
-		fetched, problem := fetch.Acquire(hctx, row)
+		fetched, problem := fetch.Acquire(runCtx, row)
 		if problem != nil {
 			return nil, problem
 		}

@@ -22,6 +22,7 @@ func (c *Orchestrator) CancelRetainedRequest(id, actor string) *exit.Error {
 
 func (c *Orchestrator) finishRequestedCancellation(id string) *exit.Error {
 	c.forget(id)
+	c.cancelTransfer(id)
 	if problem := c.cancelChildCalls(id, id); problem != nil {
 		return problem
 	}

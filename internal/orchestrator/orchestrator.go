@@ -574,7 +574,7 @@ type Orchestrator struct {
 	transferRunning      map[string]bool
 	sourcePauseRunning   map[string]bool
 	transferDispatching  map[string]bool
-	transferCancels      map[string]context.CancelFunc
+	transferWork         map[string]*transferWork
 	transferProgressSeq  map[string]uint64
 	sourcePrepareReplies map[string]uint64
 	sourcePrepareBlocked map[string]sourcePreparationBackoff
@@ -626,7 +626,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		transferRunning:      make(map[string]bool),
 		sourcePauseRunning:   make(map[string]bool),
 		transferDispatching:  make(map[string]bool),
-		transferCancels:      make(map[string]context.CancelFunc),
+		transferWork:         make(map[string]*transferWork),
 		transferProgressSeq:  make(map[string]uint64),
 		sourcePrepareReplies: make(map[string]uint64),
 		sourcePrepareBlocked: make(map[string]sourcePreparationBackoff),
@@ -1378,6 +1378,9 @@ func (c *Orchestrator) CancelQueued(requestID, actor string) *exit.Error {
 	}
 	abortProblem := c.cancelLocalTransfer(requestID)
 	c.forget(requestID)
+	// The canceled terminal is only honest once nothing moves this request's bytes.
+	c.stopTransfer(requestID)
+	c.releaseCanceledSource(*row)
 	if row.ModelTransfer != nil {
 		c.forgetTransferProgress(requestID)
 		c.signalTransfer(requestID)
