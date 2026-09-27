@@ -119,9 +119,10 @@ func TestAnEmptyCatalogBesideADeadFleetWaitsAndSaysWhichIsWhich(t *testing.T) {
 	startDaemonProcess(t, root)
 	submitExplicit(t, root, "empty-catalog")
 	var row *records.Request
-	waitFor(t, root, "the placement over an empty catalog", func() bool {
+	waitFor(t, root, "the placement over an empty catalog and its park", func() bool {
 		row, problem = store.RequestByIdempotencyKey("empty-catalog")
-		return problem == nil && row != nil && len(placementEvents(t, store, row.ID)) > 0
+		return problem == nil && row != nil && len(placementEvents(t, store, row.ID)) > 0 &&
+			len(parkReasons(t, store, row.ID)) > 0
 	})
 	if verdicts := candidateVerdicts(lastPlacement(t, store, row.ID)); verdicts["karam"] != "excluded:not_ready: failed" {
 		t.Fatalf("verdicts %v; a finished rental is excluded and NAMES the state that finished it", verdicts)
@@ -193,9 +194,9 @@ func TestAnIdleAttachedMachineOutranksWaitingForOneComingUp(t *testing.T) {
 	startDaemonProcess(t, root)
 	submitExplicit(t, root, "idle-wins")
 	var row *records.Request
-	waitFor(t, root, "the request pinned to the idle attached machine", func() bool {
+	waitFor(t, root, "the request pinned to the idle attached machine and its placement recorded", func() bool {
 		row, problem = store.RequestByIdempotencyKey("idle-wins")
-		return problem == nil && row != nil && row.Worker != ""
+		return problem == nil && row != nil && row.Worker != "" && len(placementEvents(t, store, row.ID)) > 0
 	})
 	if row.Worker != "pr-guchuko" {
 		t.Fatalf("pinned to %q; the idle attached machine is taken over waiting", row.Worker)

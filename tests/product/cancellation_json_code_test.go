@@ -2,10 +2,11 @@ package producttest
 
 import (
 	"fmt"
-	"github.com/cozy-creator/cozy/internal/records"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func TestCancellationPresentationPreservesMachineVocabulary(t *testing.T) {
@@ -28,12 +29,24 @@ func TestCancellationPresentationPreservesMachineVocabulary(t *testing.T) {
 			t.Fatal("fixture did not reach terminal cancellation")
 		}
 		code, stdout, stderr := runCozyStreams(t, root, "run", "watch", id)
-		if code == 0 || !strings.Contains(stdout+stderr, tc.want) {
+		said := tc.want
+		if tc.actor != "" {
+			said = "was " + tc.want // an attributed cancellation names who did it
+		}
+		if code != 1 || !strings.Contains(stdout+stderr, said) {
 			t.Fatalf("actor %q: %d %s %s", tc.actor, code, stdout, stderr)
 		}
 		_, document := runCozy(t, root, "run", "watch", id, "--json")
 		if !strings.Contains(document, `"code":"canceled"`) {
 			t.Fatalf("human spelling changed machine vocabulary: %s", document)
+		}
+		// Neither projection rewrites the lifecycle facts it renders.
+		row, problem := store.RequestRow(id)
+		fatal(t, problem)
+		actor, _, _, problem := store.CancelAttribution(id)
+		fatal(t, problem)
+		if row.State != "canceled" || actor != tc.actor {
+			t.Fatalf("projection rewrote lifecycle facts: state=%s actor=%q", row.State, actor)
 		}
 	}
 }

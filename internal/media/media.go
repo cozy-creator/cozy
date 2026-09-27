@@ -189,12 +189,12 @@ type answer struct {
 
 // call is the ONE request builder, and therefore the one place the media bearer becomes an
 // Authorization header for this plane.
-func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.Error) {
+func (c *Client) call(ctx context.Context, method, path string, body []byte) (answer, []byte, *exit.Error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	request, err := http.NewRequest(method, c.url(path), reader)
+	request, err := http.NewRequestWithContext(ctx, method, c.url(path), reader)
 	if err != nil {
 		return answer{}, nil, exit.Internalf("cannot build the media request: %s", err)
 	}
@@ -289,8 +289,8 @@ func codeFor(status int) exit.Code {
 // answer shape this host would misread. A newer plane is accepted: its revision is
 // recorded and a route it or an older plane lacks fails only that operation. This media
 // contract has its own explicit revision; it is independent of the protobuf worker protocol.
-func (c *Client) Health() *exit.Error {
-	_, data, e := c.call(http.MethodGet, "/v1/health", nil)
+func (c *Client) Health(ctx context.Context) *exit.Error {
+	_, data, e := c.call(ctx, http.MethodGet, "/v1/health", nil)
 	if e != nil {
 		return e
 	}
@@ -422,7 +422,7 @@ func (c *Client) ReserveOutputs(slot string, maxBytes int64, outputCount int) (s
 	}
 	path := "/v1/outputs/" + url.PathEscape(slot) + "?max_bytes=" + strconv.FormatInt(maxBytes, 10) +
 		"&output_count=" + strconv.Itoa(outputCount)
-	doc, _, e := c.call(http.MethodPost, path, nil)
+	doc, _, e := c.call(context.Background(), http.MethodPost, path, nil)
 	if e != nil {
 		return "", e
 	}
@@ -436,7 +436,7 @@ func (c *Client) ReserveOutputs(slot string, maxBytes int64, outputCount int) (s
 // Shared cached input bytes remain available to other attempts. The call is
 // idempotent, serving both failed-grant rollback and post-ack terminal cleanup.
 func (c *Client) DropAttempt(slot string) *exit.Error {
-	_, _, e := c.call(http.MethodDelete, "/v1/attempts/"+slot, nil)
+	_, _, e := c.call(context.Background(), http.MethodDelete, "/v1/attempts/"+slot, nil)
 	return e
 }
 

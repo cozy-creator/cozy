@@ -80,9 +80,11 @@ func TestDaemonHTTPDrainFlushesReplyAndEndsStream(t *testing.T) {
 	must(t, <-drained)
 }
 
+// The drain is proven deterministically above; these real up/down cycles prove the CLI
+// receives the final response.
 func TestRepeatedCLIUpDownReceivesTheFinalResponse(t *testing.T) {
 	root := t.TempDir()
-	for i := range 20 {
+	for i := range 3 {
 		if code, out := runCozy(t, root, "up", "--json"); code != 0 {
 			t.Fatalf("up iteration%d: %d %s", i, code, out)
 		}

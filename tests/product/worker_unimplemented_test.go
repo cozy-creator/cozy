@@ -22,7 +22,7 @@ import (
 // redial rate seen from the other end. Nothing is stubbed inside the code under test.
 func TestADeletedCallEndsTheConversationInsteadOfRedialingForever(t *testing.T) {
 	pod := &standInPod{unimplemented: make(chan struct{})}
-	attachStandInRental(t, "unimplemented-terminal", pod)
+	o, _ := attachStandInRental(t, "unimplemented-terminal", pod)
 
 	// The lane is deleted from here on — after the claim, after the snapshot, after the
 	// desired state converged. That ordering is the defect's home: the model-source
@@ -31,8 +31,12 @@ func TestADeletedCallEndsTheConversationInsteadOfRedialingForever(t *testing.T) 
 	settled := pod.claims()
 	close(pod.unimplemented)
 
-	// Fifteen redial windows. A loop would have claimed roughly that many more times.
-	time.Sleep(3 * time.Second)
+	// The owner's verdict first, then five redial windows: a loop would have claimed
+	// roughly that many more times.
+	if _, ok := waitEvent(o, "worker.call_unimplemented", 10*time.Second); !ok {
+		t.Fatal("the owner never refused the worker that deleted a call")
+	}
+	time.Sleep(time.Second)
 
 	if grew := pod.claims() - settled; grew > 1 {
 		t.Fatalf("the owner re-claimed the worker %d more time(s) after a deleted call "+

@@ -18,8 +18,6 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// reportCadence is cozy-runtime's ObservedWorkerState period (REPORT_SECONDS).
-const reportCadence = 2 * time.Second
 
 // laneDepth is cozy-runtime's LANE_RUNNING + LANE_STAGED: the attempts one lane admits
 // before a device release.
@@ -499,7 +497,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				// The report cadence, restating the held outcome until the ack drops it.
 				go func() {
 					for held := 1; ; held++ {
-						time.Sleep(reportCadence)
+						time.Sleep(*reportCadence)
 						heldMu.Lock()
 						pending := heldOutcome != nil
 						heldMu.Unlock()

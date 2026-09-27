@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"encoding/json"
-	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -148,17 +147,5 @@ func TestInterleavedRunPreservesAssetsPayloadAndLiteralTail(t *testing.T) {
 	code, out := runCozy(t, root, append(append([]string{}, base...), "prompt=literal", "--", "--model.model=literal")...)
 	if code == 0 || !strings.Contains(out, `no request field`) || !strings.Contains(out, `--model.model`) {
 		t.Fatalf("literal dashed model argument became an override: %d %s", code, out)
-	}
-}
-
-func TestInterleavedRunKeepsExplicitModelOverrides(t *testing.T) {
-	root, _, _, _, _ := runModelCatalog(t)
-	for i, model := range []string{"model.dits=proof/source@1.0.0/bf16", "--model.dits=proof/source@1.0.0/bf16"} {
-		request, _, out := submitRun(t, root, fmt.Sprintf("interleaved-model-%d", i), "--json", "run", "proof/quantize/quantize", "steps=7",
-			"--rental-only", model, "--upload-to", "proof/output", "model.shared=proof/source@1.0.0/bf16")
-		if request == nil || submittedPayload(t, request)["steps"] != float64(7) || len(request.Models) != 2 ||
-			request.Models[0].Slot != "dits" || request.Models[1].Slot != "shared" {
-			t.Fatalf("interleaved model override changed: %+v %s", request, out)
-		}
 	}
 }

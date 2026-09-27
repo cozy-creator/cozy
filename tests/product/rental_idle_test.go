@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -89,8 +92,7 @@ func awaitLog(t *testing.T, logPath, substr string, within time.Duration) {
 	t.Fatalf("the daemon log never said %q within %s\n%s", substr, within, tail(logPath))
 }
 
-// reservePort finds a loopback port the test can bind later, so a hub can be absent and
-// then present at the one address the daemon was configured with.
+// reservePort finds a loopback port nothing listens on, for a hub that must be absent.
 func reservePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the test reserves the loopback port its stand-in hub will answer on; the product binds through internal/api
@@ -365,6 +367,49 @@ func (h *fakeRentalHub) releases(id string) int {
 	defer h.mu.Unlock()
 	return h.released[id]
 }
+
+// rentUntilRecorded runs `cozy rental new <args>` against a stand-in whose rental never
+// becomes ready. Once the paid ask is recorded locally as rental `id`, the watch is
+// interrupted: an interrupted acquisition stays open exactly as a --timeout leaves it, and
+// no clock decides when that is. It returns what runCozy would.
+func rentUntilRecorded(t *testing.T, root, id string, args ...string) (int, string) {
+	t.Helper()
+	cmd := exec.Command(cozyBin, append([]string{"rental", "new"}, args...)...)
+	cmd.Env = childEnv(t, root)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	must(t, cmd.Start())
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	deadline := time.After(30 * time.Second)
+	for waiting := true; waiting; {
+		if row, problem := store.RentalRow(id); problem == nil && row != nil {
+			_ = cmd.Process.Signal(os.Interrupt)
+			waiting = false
+			continue
+		}
+		select {
+		case <-exited:
+			waiting = false
+		case <-deadline:
+			_ = cmd.Process.Kill()
+			t.Fatalf("rental %s was never recorded:\n%s%s", id, stdout.String(), stderr.String())
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	<-exited
+	if slices.Contains(args, "--json") {
+		return cmd.ProcessState.ExitCode(), stdout.String()
+	}
+	return cmd.ProcessState.ExitCode(), stdout.String() + stderr.String()
+}
+
+// port is where this stand-in listens. It binds first and the config names it after,
+// so no other process can take the address in between.
+func (h *fakeRentalHub) port() int { return h.server.Listener.Addr().(*net.TCPAddr).Port }
 
 func (h *fakeRentalHub) close() {
 	h.mu.Lock()

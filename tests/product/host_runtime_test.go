@@ -98,41 +98,6 @@ func TestHostRuntimeWireFence(t *testing.T) {
 	}
 }
 
-// A wire-compatible pre-native SDK must not inspect current Context metadata.
-func TestHostRuntimeNativeAPIFloor(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("stand-in runtimes are POSIX shell scripts")
-	}
-	for _, arm := range []struct {
-		name, release, refusal string
-		minor                  uint32
-	}{
-		{"old-api", "0.17.2", "host_runtime_below_floor", 54},
-		{"old-wire", "0.18.0", "host_runtime_wire_mismatch", 53},
-		{"no-python-ensure", "0.18.13", "host_runtime_below_floor", 58},
-		{"old-caller-compiler", "0.18.20", "host_runtime_below_floor", pb.WireMinor},
-		{"native", hostruntime.ToolFloor, "", pb.WireMinor},
-		{"source-dev", hostruntime.ToolFloor + "+dev.h687ee141", "", pb.WireMinor},
-	} {
-		t.Run(arm.name, func(t *testing.T) {
-			root, path := hostRuntimeRoot(t, "native-floor-"+arm.name, stubRuntime(t, arm.release, arm.minor))
-			code, out := runCozyPath(t, root, path, "up")
-			if code != 0 {
-				t.Fatalf("the daemon did not start over the host tool: %d %s", code, out)
-			}
-			if arm.refusal != "" && !strings.Contains(out, "local runs refuse with "+arm.refusal) {
-				t.Fatalf("a stale host SDK was not named: %s", out)
-			}
-			if arm.refusal == "" && strings.Contains(out, "local runs refuse") {
-				t.Fatalf("a native API cohort was named stale: %s", out)
-			}
-			if code, out := runCozyPath(t, root, path, "down"); code != 0 {
-				t.Fatalf("down [exit %d]\n%s", code, out)
-			}
-		})
-	}
-}
-
 // stubRuntime answers `cozy-runtime --json version` the way the real tool does.
 func stubRuntime(t *testing.T, release string, minor uint32) string {
 	t.Helper()

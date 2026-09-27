@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,6 +46,27 @@ const grantLife = 2 * time.Second
 // objectsInWalk is more objects than one window, so the walk refills mid-flight.
 const objectsInWalk = 40
 
+// grantClock is the one clock the stand-in hub, the origin and the walk share, so a walk
+// several grant lifetimes long is replayed exactly instead of waited out.
+type grantClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newGrantClock() *grantClock { return &grantClock{now: time.Now()} }
+
+func (c *grantClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *grantClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
 // expiringOrigin honours a signature only until the instant the signature itself names,
 // exactly as S3/R2 validate X-Amz-Expires on arrival.
 type expiringOrigin struct {
@@ -53,11 +75,11 @@ type expiringOrigin struct {
 	refused  atomic.Int64
 }
 
-func newExpiringOrigin() *expiringOrigin {
+func newExpiringOrigin(clock *grantClock) *expiringOrigin {
 	origin := &expiringOrigin{}
 	origin.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		deadline, err := strconv.ParseInt(r.URL.Query().Get("expires_at"), 10, 64)
-		if err != nil || time.Now().Unix() > deadline {
+		if err != nil || clock.Now().Unix() > deadline {
 			origin.refused.Add(1)
 			w.WriteHeader(http.StatusForbidden)
 			return
@@ -71,7 +93,7 @@ func newExpiringOrigin() *expiringOrigin {
 // standInGrantHub serves the one publication route this walk uses, in the exact wire shape
 // Tensorhub answers with: every grant carries expires_at_unix, and the response carries the
 // hub's own server_time_unix beside them.
-func standInGrantHub(origin *expiringOrigin, mints *atomic.Int64, heldIDs ...string) *httptest.Server {
+func standInGrantHub(origin *expiringOrigin, mints *atomic.Int64, clock *grantClock, heldIDs ...string) *httptest.Server {
 	heldSet := make(map[string]bool, len(heldIDs))
 	for _, id := range heldIDs {
 		heldSet[id] = true
@@ -85,7 +107,7 @@ func standInGrantHub(origin *expiringOrigin, mints *atomic.Int64, heldIDs ...str
 			return
 		}
 		signature := mints.Add(1) // a real signer answers a different signature every time
-		now := time.Now()
+		now := clock.Now()
 		expires := now.Add(grantLife).Unix()
 		grants := make([]map[string]any, 0, len(body.ObjectIDs))
 		held := make([]map[string]any, 0, len(body.ObjectIDs))
@@ -155,14 +177,15 @@ func hubGrantMinter(hubURL string) orchestrator.WeightsGrantMinter {
 }
 
 func TestHeldObjectsReuseOneGrantWindowWithoutAnExpiry(t *testing.T) {
-	origin := newExpiringOrigin()
+	clock := newGrantClock()
+	origin := newExpiringOrigin(clock)
 	defer origin.server.Close()
 	ids := walkObjects()
 	var mints atomic.Int64
-	hubServer := standInGrantHub(origin, &mints, ids...)
+	hubServer := standInGrantHub(origin, &mints, clock, ids...)
 	defer hubServer.Close()
 	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
-	start := time.Now()
+	start := clock.Now()
 	for index, id := range ids {
 		decision, problem := window.Spendable(context.Background(), id, ids[index:],
 			start.Add(time.Duration(index)*time.Hour))
@@ -183,14 +206,15 @@ func TestHeldObjectsReuseOneGrantWindowWithoutAnExpiry(t *testing.T) {
 }
 
 func TestHeldDecisionSurvivesExpiredURLInSameWindow(t *testing.T) {
-	origin := newExpiringOrigin()
+	clock := newGrantClock()
+	origin := newExpiringOrigin(clock)
 	defer origin.server.Close()
 	ids := walkObjects()[:3]
 	var mints atomic.Int64
-	hubServer := standInGrantHub(origin, &mints, ids[0], ids[1])
+	hubServer := standInGrantHub(origin, &mints, clock, ids[0], ids[1])
 	defer hubServer.Close()
 	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
-	start := time.Now()
+	start := clock.Now()
 	if _, problem := window.Spendable(context.Background(), ids[0], ids, start); problem != nil {
 		t.Fatal(problem)
 	}
@@ -214,17 +238,18 @@ func TestHeldDecisionSurvivesExpiredURLInSameWindow(t *testing.T) {
 // signature the origin honours, because the window re-mints once the hub's OWN declared life
 // is half spent.
 func TestAWalkThatOutlivesOneGrantLifetimeCompletes(t *testing.T) {
-	origin := newExpiringOrigin()
+	clock := newGrantClock()
+	origin := newExpiringOrigin(clock)
 	defer origin.server.Close()
 	var mints atomic.Int64
-	hubServer := standInGrantHub(origin, &mints)
+	hubServer := standInGrantHub(origin, &mints, clock)
 	defer hubServer.Close()
 
 	ids := walkObjects()
 	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
 	perObject := 3 * grantLife / objectsInWalk
 	for index, id := range ids {
-		decision, problem := window.Spendable(context.Background(), id, ids[index:], time.Now())
+		decision, problem := window.Spendable(context.Background(), id, ids[index:], clock.Now())
 		if problem != nil {
 			t.Fatalf("object %d could not be authorized: %s", index, problem.Message)
 		}
@@ -232,7 +257,7 @@ func TestAWalkThatOutlivesOneGrantLifetimeCompletes(t *testing.T) {
 			t.Fatalf("object %d presented a signature the store refused with %d after %d "+
 				"mint(s): a grant went cold before its bytes moved", index, code, mints.Load())
 		}
-		time.Sleep(perObject)
+		clock.Advance(perObject)
 	}
 	if origin.accepted.Load() != objectsInWalk || origin.refused.Load() != 0 {
 		t.Fatalf("the store accepted %d and refused %d of %d objects",
@@ -247,10 +272,11 @@ func TestAWalkThatOutlivesOneGrantLifetimeCompletes(t *testing.T) {
 // detect the defect: the SAME origin, the SAME walk, the SAME lifetime, with the grants asked
 // for once up front the way finalizeOutput used to. The store refuses.
 func TestAnUpFrontMintCannotOutliveItsOwnLifetime(t *testing.T) {
-	origin := newExpiringOrigin()
+	clock := newGrantClock()
+	origin := newExpiringOrigin(clock)
 	defer origin.server.Close()
 	var mints atomic.Int64
-	hubServer := standInGrantHub(origin, &mints)
+	hubServer := standInGrantHub(origin, &mints, clock)
 	defer hubServer.Close()
 
 	ids := walkObjects()
@@ -266,7 +292,7 @@ func TestAnUpFrontMintCannotOutliveItsOwnLifetime(t *testing.T) {
 			}
 			return // the cliff, exactly where an up-front mint puts it
 		}
-		time.Sleep(perObject)
+		clock.Advance(perObject)
 	}
 	t.Fatal("every up-front grant outlived the walk; this control can no longer detect the " +
 		"defect the point-of-use mint exists to remove")
@@ -276,20 +302,21 @@ func TestAnUpFrontMintCannotOutliveItsOwnLifetime(t *testing.T) {
 // says the signature aged out is answered by a NEW signature; re-presenting the same URL under
 // a bumped GrantRevision would be a lie about time.
 func TestAnExpiredGrantIsReMintedRatherThanReplayed(t *testing.T) {
-	origin := newExpiringOrigin()
+	clock := newGrantClock()
+	origin := newExpiringOrigin(clock)
 	defer origin.server.Close()
 	var mints atomic.Int64
-	hubServer := standInGrantHub(origin, &mints)
+	hubServer := standInGrantHub(origin, &mints, clock)
 	defer hubServer.Close()
 
 	ids := walkObjects()
 	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
-	first, problem := window.Spendable(context.Background(), ids[0], ids, time.Now())
+	first, problem := window.Spendable(context.Background(), ids[0], ids, clock.Now())
 	if problem != nil {
 		t.Fatal(problem.Message)
 	}
 	window.Expire() // the pod reported weights_grant_expired: nothing about the bytes decided
-	second, problem := window.Spendable(context.Background(), ids[0], ids, time.Now())
+	second, problem := window.Spendable(context.Background(), ids[0], ids, clock.Now())
 	if problem != nil {
 		t.Fatal(problem.Message)
 	}
@@ -305,14 +332,15 @@ func TestAnExpiredGrantIsReMintedRatherThanReplayed(t *testing.T) {
 // lifetime correct: an object never starts its transfer holding less than half a grant.
 func TestStalenessIsMeasuredAgainstTheHubsDeclaredLife(t *testing.T) {
 	var mints atomic.Int64
-	origin := newExpiringOrigin()
+	clock := newGrantClock()
+	origin := newExpiringOrigin(clock)
 	defer origin.server.Close()
-	hubServer := standInGrantHub(origin, &mints)
+	hubServer := standInGrantHub(origin, &mints, clock)
 	defer hubServer.Close()
 
 	// A window minted now is fresh, and past half its declared life it is not.
 	window := orchestrator.NewWeightsGrantWindow(hubGrantMinter(hubServer.URL))
-	start := time.Now()
+	start := clock.Now()
 	if _, problem := window.Spendable(context.Background(), "sha256:"+fmt.Sprintf("%064x", 0),
 		walkObjects(), start); problem != nil {
 		t.Fatal(problem.Message)

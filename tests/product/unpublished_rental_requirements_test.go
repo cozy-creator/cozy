@@ -14,11 +14,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestUnpublishedExtraImageRequirementReachesTheSealedWheel(t *testing.T) {
@@ -93,10 +91,6 @@ func TestRentalRequirementsIncludeTheWholeSelectedClosure(t *testing.T) {
 	metadata("scipy", "1.18.1", "Requires-Dist: numpy>=2.5,<2.6\n")
 	metadata("project", "1", "Requires-Dist: torch>=2.13,<3\nRequires-Dist: scipy>=1.18\nRequires-Dist: torch>=3; sys_platform == 'win32'\n")
 	metadata("unused-development-library", "1", "Requires-Dist: torch>=99\n")
-	inventory := &pb.ImageInventory{Python: "3.12.12", Distributions: []*pb.ImageDistribution{
-		{Distribution: "torch", Version: "2.13.0"}, {Distribution: "cuda-bindings", Version: "13.0.3"},
-		{Distribution: "numpy", Version: "2.5.2"},
-	}}
 	selection, problem := install.ExecutionRequirements(context.Background(), venv, "project", nil)
 	fatal(t, problem)
 	requirements := selection.Requirements
@@ -108,9 +102,6 @@ func TestRentalRequirementsIncludeTheWholeSelectedClosure(t *testing.T) {
 	}
 	if !strings.Contains(joined, `sys_platform == "win32"`) || strings.Contains(joined, "torch>=99") {
 		t.Fatal("target marker was lost or development dependency entered selected closure")
-	}
-	if why := launch.InventoryMismatch(inventory, requirements, ""); why != "" {
-		t.Fatalf("private dependency versions constrained base image: %s", why)
 	}
 
 }

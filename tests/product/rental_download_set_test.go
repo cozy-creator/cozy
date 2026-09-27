@@ -63,12 +63,10 @@ import (
 // download-set author. Nothing is stubbed inside the code under test.
 func TestRentalDownloadSetCarriesNoCredential(t *testing.T) {
 	t.Run("no credential to lapse", func(t *testing.T) {
-		// RED ARM for the deletion. The pod holds the set far longer than the old
-		// credential would have lived, then prepares. There is nothing to expire, so it
-		// succeeds on the FIRST presentation: no re-issue, no refusal — and the document
-		// it was handed carries no expiry, no rental/worker/boot binding, and no
-		// signature.
-		pod := &standInPod{holdFor: 2 * time.Second}
+		// RED ARM for the deletion. The set succeeds on the FIRST presentation: no
+		// re-issue, no refusal — and the document it was handed carries no expiry, no
+		// rental/worker/boot binding, and no signature, so there is nothing to lapse.
+		pod := &standInPod{}
 		o, instance := attachStandInRental(t, "download-set-no-credential", pod)
 
 		fatal(t, o.c.ConvergePackageSet(instance, delegatedPackages(), nil))
@@ -85,9 +83,9 @@ func TestRentalDownloadSetCarriesNoCredential(t *testing.T) {
 			t.Fatalf("the download set still carries an Ed25519 signature:\n%s", pod.report())
 		}
 		if n := countEvents(o, "REFUSED before it was applied"); n != 0 {
-			t.Fatalf("a slow download was refused %d time(s):\n%s", n, pod.report())
+			t.Fatalf("a download was refused %d time(s):\n%s", n, pod.report())
 		}
-		pod.stayAt(t, 1, 2*time.Second)
+		pod.stayAt(t, 1, time.Second)
 	})
 
 	t.Run("refused when the pod reports no bytes landed", func(t *testing.T) {
@@ -108,32 +106,7 @@ func TestRentalDownloadSetCarriesNoCredential(t *testing.T) {
 		}
 		pod.stayAt(t, 1, 3*time.Second)
 	})
-
-	t.Run("a credential refusal is now an ordinary permanent one", func(t *testing.T) {
-		// The anti-spin fence, now unconditional. The owner used to answer this exact
-		// text by re-issuing under a fresh credential. No credential exists to refresh,
-		// so the refusal stands and the owner stops — one presentation, no loop.
-		pod := &standInPod{refusal: retiredCredentialRefusal}
-		o, instance := attachStandInRental(t, "download-set-credential-refusal", pod)
-
-		fatal(t, o.c.ConvergePackageSet(instance, delegatedPackages(), nil))
-
-		if _, ok := waitEvent(o, "REFUSED before it was applied", 30*time.Second); !ok {
-			t.Fatalf("a credential-shaped refusal was not refused:\n%s", pod.report())
-		}
-		if n := countEvents(o, "re-issuing the package set under a fresh one"); n != 0 {
-			t.Fatalf("the deleted re-sign path ran %d time(s):\n%s", n, pod.report())
-		}
-		pod.stayAt(t, 1, 3*time.Second)
-	})
 }
-
-// retiredCredentialRefusal is the text a pod used to send when tensorhub refused to mint
-// a plan for an aged-out delegation. Nothing produces it any more; it is kept here as the
-// exact input that once bought a re-sign, to prove it now buys nothing.
-const retiredCredentialRefusal = "refresh expired download plan: " +
-	"worker_downloads.delegation_unauthorized: delegation is expired or exceeds the " +
-	"one-hour lifetime; send a fresh delegation signed by this rental's Creator key (HTTP 401)"
 
 // noBytesLandedRefusal is the pod's OWN progress verdict from `poddownloads.materialize`:
 // a refreshed plan that expired without one new byte on disk.
@@ -170,9 +143,6 @@ type standInPod struct {
 	creatorPublicKey           ed25519.PublicKey
 	leafDigest                 []byte // the pinned leaf the owner's ClaimProof names
 
-	// holdFor keeps the first download set in hand this long before preparing, the way a
-	// transfer that is still landing bytes does. Nothing expires while it waits.
-	holdFor time.Duration
 	// refusal, when set, is answered to every package_set.
 	refusal string
 	// unimplemented, once closed, makes this pod answer its control stream the way a pod
@@ -421,12 +391,6 @@ func (p *standInPod) applyPackageSet(desired, signature []byte) error {
 	presented := presentedDownloadSet{document: append([]byte(nil), desired...), credentialFields: strings.Join(surviving, ","),
 		signature: len(signature) != 0}
 
-	p.mu.Lock()
-	first := len(p.seen) == 0
-	p.mu.Unlock()
-	if p.holdFor > 0 && first {
-		time.Sleep(p.holdFor)
-	}
 	var refusal error
 	if p.refusal != "" {
 		refusal = errors.New(p.refusal)

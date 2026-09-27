@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -152,17 +153,25 @@ func TestRentalMachineNames(t *testing.T) {
 	}
 
 	// With every other word held by a live rental, the released word is what the next
-	// acquisition is named — the draw is over free words, not over history.
+	// acquisition is named — the draw is over free words, not over history. The rows are
+	// copies of one the store recorded, written in one transaction rather than 5,000.
+	db, err := sql.Open("sqlite", filepath.Join(dir, "creator.sqlite"))
+	must(t, err)
+	tx, err := db.Begin()
+	must(t, err)
+	_, err = tx.Exec(`CREATE TEMP TABLE seed AS SELECT * FROM rentals WHERE machine_name = ?`, second)
+	must(t, err)
 	for _, word := range words {
 		if word == first || taken[word] {
 			continue
 		}
-		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
-			ID: "pr-" + word, MachineName: word, SKU: "cpu", AcceleratorModel: "CPU",
-			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL, Address: "127.0.0.1:1",
-			CertPath: word + ".pem",
-		}))
+		_, err = tx.Exec(`UPDATE seed SET id = ?, machine_name = ?, cert_path = ?`, "pr-"+word, word, word+".pem")
+		must(t, err)
+		_, err = tx.Exec(`INSERT INTO rentals SELECT * FROM seed`)
+		must(t, err)
 	}
+	must(t, tx.Commit())
+	must(t, db.Close())
 	if reused := begin("op-reuse"); reused != first {
 		t.Fatalf("the released word %s was not reused; got %s", first, reused)
 	}

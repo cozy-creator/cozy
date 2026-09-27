@@ -27,9 +27,9 @@ func TestRefusedDesiredRevisionKeepsTheRentalConversation(t *testing.T) {
 	for pod.claims() == claimed && time.Now().Before(deadline) {
 		time.Sleep(25 * time.Millisecond)
 	}
-	// Fifteen redial windows: a loop restating the refused desire would have re-claimed
-	// and re-sent it many times over.
-	time.Sleep(3 * time.Second)
+	// Five redial windows (200 ms each): a loop restating the refused desire would have
+	// re-claimed and re-sent it several times over.
+	time.Sleep(time.Second)
 	if grew := pod.claims() - claimed; grew != 1 {
 		t.Fatalf("the owner re-claimed the pod %d time(s) after the refusal, want exactly one redial", grew)
 	}
@@ -46,7 +46,7 @@ func TestRefusedDesiredRevisionKeepsTheRentalConversation(t *testing.T) {
 	if n := pod.desires(); n != 2 {
 		t.Fatalf("the next desire was not sent: %d desire(s)", n)
 	}
-	if _, ok := waitEvent(o, "REFUSING the claimed worker", time.Second); ok {
+	if n := countEvents(o, "REFUSING the claimed worker"); n != 0 {
 		t.Fatal("a refused desire ended the conversation with the rented worker")
 	}
 }

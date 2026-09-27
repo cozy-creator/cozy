@@ -8,8 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -125,44 +123,6 @@ func TestIncompleteOrFailedPublicationCannotSucceedWithoutSession(t *testing.T) 
 			}
 		})
 	}
-}
-
-func TestCompletedPublicationActualRetainedSnapshot(t *testing.T) {
-	if *retainedPublicationProof == "" || *retainedPublicationRequest == "" {
-		t.Skip("requires isolated post-publication producer snapshot")
-	}
-	raw, err := os.ReadFile(*retainedPublicationProof)
-	must(t, err)
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	must(t, os.WriteFile(path, raw, 0600))
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	defer store.Close()
-	id := *retainedPublicationRequest
-	before, problem := store.Attempts(id)
-	fatal(t, problem)
-	weights, problem := store.AllModelTransferWeights(id, 1)
-	fatal(t, problem)
-	var releases atomic.Int64
-	o := publicationStateOwner(t, "publication-actual-retained", store, &releases)
-	fatal(t, o.c.ResumeModelTransfers())
-	waitUntil(t, "actual retained publication succeeded without worker", func() bool { row, p := store.RequestRow(id); fatal(t, p); return row.State == "succeeded" })
-	o.close()
-	after, problem := store.Attempts(id)
-	fatal(t, problem)
-	retained, problem := store.AllModelTransferWeights(id, 1)
-	fatal(t, problem)
-	for _, pair := range [][2]any{{before, after}, {weights, retained}} {
-		left, _ := json.Marshal(pair[0])
-		right, _ := json.Marshal(pair[1])
-		if !bytes.Equal(left, right) {
-			t.Fatal("settlement changed actual producer or checkpoint facts")
-		}
-	}
-	if releases.Load() != 0 {
-		t.Fatal("settlement attempted provider teardown without worker ACK")
-	}
-	t.Logf("%d exact terminal attempt(s), %d checkpoint receipts preserved; user request succeeded without ACK", len(after), len(retained))
 }
 
 func TestCompletedPublicationEventuallyAcknowledgesSameOutcome(t *testing.T) {

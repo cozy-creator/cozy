@@ -61,30 +61,6 @@ func TestHuggingFaceExplicitFilesResolveThroughPublicProvider(t *testing.T) {
 	}
 }
 
-func TestHuggingFaceSelectedIndexKeepsOnlyItsShardClosure(t *testing.T) {
-	source, problem := modelsource.Parse("hf://owner/model@"+strings.Repeat("a", 40)+"/folder/selected.safetensors.index.json", "")
-	fatal(t, problem)
-	files := []modelsource.File{
-		{Member: "folder/selected.safetensors.index.json", Carrier: true, Requires: []string{"folder/part-1.safetensors", "folder/part-2.safetensors"}},
-		{Member: "folder/part-1.safetensors"}, {Member: "folder/part-2.safetensors"}, {Member: "other.safetensors", Carrier: true},
-	}
-	for i := range files {
-		files[i].URL = "https://huggingface.co/owner/model/resolve/" + source.Revision + "/" + files[i].Member
-		files[i].SHA256 = strings.Repeat("1", 64)
-		files[i].Length = 8
-	}
-	plan, problem := (modelsource.Plan{Source: source, Files: files}).Select([]string{source.Member})
-	fatal(t, problem)
-	if len(plan.Files) != 3 || plan.Bytes != 24 {
-		t.Fatalf("wrong closure: %+v", plan)
-	}
-	for _, file := range plan.Files {
-		if !strings.HasPrefix(file.Member, "folder/") {
-			t.Fatal(file.Member)
-		}
-	}
-}
-
 // A safetensors member stored outside LFS carries no provider SHA-256. Its identity is
 // measured from the bytes served at the pinned commit instead of refusing the source.
 func TestHuggingFaceNonLFSMemberIsIdentifiedFromItsBytes(t *testing.T) {

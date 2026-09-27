@@ -1356,7 +1356,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	if e != nil {
 		return "", e
 	}
-	if e := byteplane.Health(); e != nil {
+	if e := byteplane.Health(c.closingCtx); e != nil {
 		return "", e
 	}
 	// Health can block while the retained rental is released. Revalidate its

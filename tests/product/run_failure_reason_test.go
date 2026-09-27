@@ -2,6 +2,8 @@ package producttest
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -125,6 +127,10 @@ func TestFailedRunWatchCarriesItsTriageBundle(t *testing.T) {
 	if details.Error != "ValueError: bad latent shape" || details.Triage.SubjectID != "trb-watch" ||
 		!details.Triage.Kept || !strings.HasSuffix(details.Triage.Bundle.Terminal.Traceback, "bad latent shape") {
 		t.Fatalf("run watch --json lost the triage bundle: %s", out)
+	}
+	// The bundle lives in its attempt row (cl-116): no directory exists for orphans.
+	if _, err := os.Stat(filepath.Join(o.root, "triage")); !os.IsNotExist(err) {
+		t.Fatalf("a triage directory exists: %v", err)
 	}
 }
 

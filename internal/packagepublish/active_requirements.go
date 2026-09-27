@@ -10,7 +10,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -79,18 +78,4 @@ func readActiveRequirements(ctx context.Context, input map[string]any) (Requirem
 		return result, exit.New(exit.Validation, "captured dependency requirements could not be evaluated")
 	}
 	return result, nil
-}
-
-func (s RequirementSelection) ImageRequirements() []string {
-	// The controller's execution contract is an additional constraint, never a
-	// replacement for the author's bound. Development images may update this
-	// protected base; Runtime validates the actual installed SDK before selecting
-	// a prepared interpreter, so stale Hub inventory cannot grant execution.
-	out := []string{"cozy-runtime>=" + hostruntime.PackageFloor}
-	for _, raw := range s.Requirements {
-		if req, problem := parseRequirement(raw); problem == nil && ImageOwnedDistribution(req.name) {
-			out = append(out, raw)
-		}
-	}
-	return out
 }

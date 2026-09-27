@@ -155,7 +155,7 @@ func TestWorkerRefusals(t *testing.T) {
 	// THE OUTPUT-SET FENCE. A local worker has no media peer, but it owes the same manifest
 	// completeness as a remote one: SUCCEEDED may not silently publish a subset of the
 	// granted set, and the refused terminal may not disturb the attempt row it names.
-	missingSpec := fakeSpec("missing-output", "5", "--arm", "missing-output")
+	missingSpec := fakeSpec("missing-output", "5", "--arm", "missing-output", "--report-cadence", "50ms")
 	instanceC, _, e := o.c.EnsureWorker(missingSpec)
 	fatal(t, e)
 	planC := planIDOf(t, missingSpec)

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -37,8 +38,11 @@ var (
 	stealSpec    = flag.String("spec", "", "the steal arm's victim invocation digest, hex")
 	// --gate holds each lanes-arm attempt on its device until <gate>/<request id> exists.
 	gateDir = flag.String("gate", "", "the lanes arm's device-release gate directory")
-	_       = flag.String("devices", "", "")
-	_       = flag.String("grace", "", "")
+	// The owner counts restatements and never times them, so an arm may report faster
+	// than cozy-runtime's ObservedWorkerState period (REPORT_SECONDS).
+	reportCadence = flag.Duration("report-cadence", 2*time.Second, "held-outcome restatement period")
+	_             = flag.String("devices", "", "")
+	_             = flag.String("grace", "", "")
 )
 
 func main() { os.Exit(run()) }

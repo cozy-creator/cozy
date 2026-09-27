@@ -71,17 +71,6 @@ func pythonMismatch(profile BaseProfile, requiresPython string) string {
 		" and this base is " + profile.PythonABI
 }
 
-// InventoryMismatch validates the interpreter that will create the private
-// environment. Distribution and worker-control compatibility are separate:
-// package wheels may differ from the base; protocol negotiation guards control.
-func InventoryMismatch(inventory *pb.ImageInventory, _ []string, requiresPython string, _ ...bool) string {
-	if inventory == nil {
-		return "the rental image inventory is absent"
-	}
-	_, reason := InventoryPython(inventory, requiresPython, "")
-	return reason
-}
-
 // InventoryPython selects among actual package executors. The legacy singleton
 // Python remains a fallback only for images without an executor advertisement.
 func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected string, supported ...[]string) (string, string) {

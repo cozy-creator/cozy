@@ -120,5 +120,8 @@ func TestRuntimeUpdateRefusesRuntimeAheadOfHost(t *testing.T) {
 		if got != test.code {
 			t.Fatalf("host %d target %+v: %v, want %q", test.host, test.target, problem, test.code)
 		}
+		if got != "" && !strings.Contains(problem.Message, "do not replace the pod Host") {
+			t.Fatal("refusal did not explain the Host replacement boundary")
+		}
 	}
 }

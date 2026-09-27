@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"io"
 	"os"
@@ -17,59 +16,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
-var privateRecordedInstall = flag.String("private-recorded-install", "", "captured PackageInstall JSON for actual private closure qualification")
 var privateStageDirectory = flag.String("private-stage-directory", "", "owned output directory for private closure qualification")
-
-func TestCapturedRegistryStage(t *testing.T) {
-	if *privateRecordedInstall == "" {
-		t.Skip("requires an actual retained install fixture")
-	}
-	data, err := os.ReadFile(*privateRecordedInstall)
-	must(t, err)
-	var install records.PackageInstall
-	must(t, json.Unmarshal(data, &install))
-	directory := *privateStageDirectory
-	if directory == "" {
-		directory = t.TempDir()
-	}
-	revision, problem := localpackage.Stage(t.Context(), home.Layout{LocalPackages: directory}, install)
-	fatal(t, problem)
-	versions := map[string]string{}
-	for _, file := range revision.Files {
-		identity, problem := wheel.InspectIdentity(file.Path)
-		fatal(t, problem)
-		versions[identity.Distribution] = identity.Version
-	}
-	for _, line := range strings.Split(string(revision.DependencyRequirements), "\n") {
-		name, address, ok := strings.Cut(line, " @ ")
-		if !ok {
-			continue
-		}
-		for _, pin := range strings.Split(install.Closure, "\n") {
-			selected, version, _ := strings.Cut(pin, "==")
-			if selected == name && strings.Contains(address, strings.ReplaceAll(name, "-", "_")+"-"+version+"-") {
-				versions[name] = version
-			}
-		}
-	}
-	for _, pin := range strings.Split(install.Closure, "\n") {
-		name, version, _ := strings.Cut(pin, "==")
-		if versions[name] != version {
-			t.Fatalf("captured dependency omitted or changed: %s; supplied=%v", pin, versions)
-		}
-	}
-	encoded, err := json.MarshalIndent(revision, "", "  ")
-	must(t, err)
-	must(t, os.WriteFile(filepath.Join(directory, "qualification.json"), encoded, 0o600))
-	t.Logf("captured %s with %d exact wheels", revision.ID, len(revision.Files))
-}
 
 func capturedClosureLock() []byte {
 	return []byte(`version = 1

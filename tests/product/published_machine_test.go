@@ -4,27 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 func TestPublishedMachineJobPreservesInstallationIdentity(t *testing.T) {
@@ -108,125 +100,5 @@ func TestPublishedMachineRoutingOwnsEveryRentedJob(t *testing.T) {
 		if link == nil || row.LocalInstallationID != "" {
 			t.Fatalf("%s changed published routing or code origin", arm)
 		}
-	}
-}
-
-var publishedMachineFixture = flag.String("published-machine-fixture", "", "exact public-shaped wheel/interface fixture for the owned actual Host proof")
-
-type publishedPackageFixture struct {
-	Package   string          `json:"package"`
-	Release   string          `json:"release"`
-	Wheel     string          `json:"wheel"`
-	Interface json.RawMessage `json:"interface"`
-}
-
-type publishedHostFixture struct {
-	Package publishedPackageFixture
-	Layout  home.Layout
-	Store   *records.Store
-	Host    actualChildHost
-	Path    string
-	Restart func()
-}
-
-func startPublishedMachineHost(t *testing.T, configure ...func(*fakeRentalHub)) publishedHostFixture {
-	t.Helper()
-	if *publishedMachineFixture == "" {
-		t.Skip("requires an exact wheel/interface fixture and owned actual Host")
-	}
-	var fixture publishedPackageFixture
-	raw, err := os.ReadFile(*publishedMachineFixture)
-	must(t, err)
-	must(t, json.Unmarshal(raw, &fixture))
-	iface, problem := launch.DecodePackageInterface(fixture.Interface)
-	fatal(t, problem)
-	wheel, err := os.ReadFile(fixture.Wheel)
-	must(t, err)
-	wheelDigest, err := canonical.Spell(canonical.Digest(wheel))
-	must(t, err)
-	wheelURL := publishedFixtureWheel(t, wheel, filepath.Base(fixture.Wheel))
-	layout, store, host, path, restart := startActualChildHostConfigured(t, func(h *fakeRentalHub) {
-		fallback := h.server.Config.Handler
-		h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			switch r.URL.Path {
-			case "/v1/packages/" + fixture.Package:
-				org, name, _ := strings.Cut(fixture.Package, "/")
-				_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: org, Name: name}, Releases: []hub.ReleaseSummary{{Release: fixture.Release}}})
-			case "/v1/packages/" + fixture.Package + "/releases/" + fixture.Release:
-				var detail hub.PackageReleaseDetail
-				detail.Release.Release = fixture.Release
-				detail.Release.PackageInterfaceDigest = assessmentDigest(iface.Raw)
-				detail.Release.PackageInterfaceLength = int64(len(iface.Raw))
-				detail.PackageInterface = iface.Raw
-				detail.ExecutionRequirements = []string{"cozy-runtime>=0.17.2"}
-				detail.RequiresPython = ">=3.12,<3.13"
-				_ = json.NewEncoder(w).Encode(detail)
-			case "/v1/rentals/rental-private-child-host/prepare-facts":
-				if r.URL.Query().Get("package") != fixture.Package || r.URL.Query().Get("release") != fixture.Release {
-					http.Error(w, "unknown exact release", 404)
-					return
-				}
-				_, distribution, _ := strings.Cut(fixture.Package, "/")
-				locked := fmt.Sprintf("--index-url https://pypi.org/simple\n%s @ %s --hash=%s\n", distribution, wheelURL, wheelDigest)
-				_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: iface.Application, ModelSlotPaths: iface.ModelSlotPaths(), ImageInventory: h.inventories["rental-private-child-host"], LockedRequirements: locked})
-			case "/wheels/" + filepath.Base(fixture.Wheel):
-				w.Header().Set("Content-Type", "application/octet-stream")
-				_, _ = w.Write(wheel)
-			default:
-				fallback.ServeHTTP(w, r)
-			}
-		})
-		for _, update := range configure {
-			update(h)
-		}
-	})
-	return publishedHostFixture{fixture, layout, store, host, path, restart}
-}
-
-func TestPublishedMachineActualHostAndNewRootAfterRestart(t *testing.T) {
-	proof := startPublishedMachineHost(t)
-	fixture, layout, store, host, path, restart := proof.Package, proof.Layout, proof.Store, proof.Host, proof.Path, proof.Restart
-
-	var build string
-	for index := 0; index < 2; index++ {
-		if index == 1 {
-			restart() // The production supervisor restarts Host and Runtime together.
-		}
-		key := fmt.Sprintf("published-host-%d", index)
-		code, out := runCozyPath(t, layout.Root, path, "run", fixture.Package+"/main", "--rental", "child-host", "--await", "--json", "--idempotency-key", key)
-		if code != 0 {
-			t.Fatalf("published root %d [%d]: %s", index, code, out)
-		}
-		request, problem := store.RequestByIdempotencyKey(key)
-		fatal(t, problem)
-		if request == nil || request.State != "succeeded" || request.LocalInstallationID != "" || request.Release != fixture.Release {
-			t.Fatalf("published request changed origin or failed: %+v", request)
-		}
-		link, problem := store.MachineExecution(request.ID)
-		fatal(t, problem)
-		if link == nil || !link.Collected || len(link.Receipt) == 0 {
-			t.Fatal("published root has no collected Runtime receipt")
-		}
-		var submitted pb.MachineExecutionSubmit
-		must(t, proto.Unmarshal(link.Submission, &submitted))
-		var capture pb.MachineExecutionCapture
-		must(t, canonical.Unmarshal(submitted.CaptureCanonicalBytes, &capture))
-		if len(capture.InstalledPackages) != 1 || capture.InstalledPackages[0].Package != fixture.Package || capture.InstalledPackages[0].Release != fixture.Release {
-			t.Fatal("published capture changed package origin")
-		}
-		current := capture.RootInstallationId
-		if current == "" || capture.InstalledPackages[0].InstallationId != current || submitted.PreparedState.GetJob().InstallationId != current {
-			t.Fatal("published installed identity changed during submission")
-		}
-		build = current
-		attempts, problem := store.Attempts(request.ID)
-		fatal(t, problem)
-		children, problem := store.Children(request.ID)
-		fatal(t, problem)
-		if len(attempts) != 0 || len(children) != 0 {
-			t.Fatal("Creator owns published attempts or children")
-		}
-		t.Logf("published root %s accepted/collected, build=%s, container=%s: %s", request.ID, build, host.Container, out)
 	}
 }

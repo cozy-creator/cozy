@@ -43,7 +43,8 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 				return row
 			}
 			stand.mu.Unlock()
-			args := []string{"rental", "new", "h100-nvl", "--timeout=8s"}
+			// The fixture's failure ends the acquisition; the timeout only bounds a hang.
+			args := []string{"rental", "new", "h100-nvl", "--timeout=120s"}
 			var cmd *exec.Cmd
 			var reader io.ReadCloser
 			var stdout bytes.Buffer

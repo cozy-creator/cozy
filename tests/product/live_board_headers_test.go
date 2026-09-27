@@ -76,13 +76,26 @@ func assertLiveFrameFits(t *testing.T, frame, heading string, rows, columns int)
 	return lines[header:]
 }
 
+// firstDataCell is the first field of the row under the heading, or "" before one draws.
+func firstDataCell(frame, heading string) string {
+	lines := strings.Split(frame, "\r\n")
+	for index, line := range lines {
+		if strings.HasPrefix(line, heading) && index+1 < len(lines) {
+			if fields := strings.Fields(lines[index+1]); len(fields) > 0 {
+				return fields[0]
+			}
+		}
+	}
+	return ""
+}
+
 func TestLiveBoardHeadersSurviveResizeAndRefresh(t *testing.T) {
 	for _, board := range []string{"run", "rental"} {
 		t.Run(board, func(t *testing.T) {
 			root := t.TempDir()
-			port := reservePort(t)
+			hub := newFakeRentalHub(t, 0)
+			port := hub.port()
 			hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-			hub := newFakeRentalHub(t, port)
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+hubURL+"\ntensorhub_token: rental-idle-test\n"+
 					"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
@@ -122,9 +135,11 @@ func TestLiveBoardHeadersSurviveResizeAndRefresh(t *testing.T) {
 			frame := readLiveFrame(t, terminal, func(frame string) bool { return !strings.Contains(frame, "· loading") })
 			lines := assertLiveFrameFits(t, frame, heading, 5, 80)
 			first := strings.Fields(lines[1])[0]
+			// Each read waits for the frame that answers the input: a periodic refresh that
+			// lands before the board has read the key is not its answer.
 			_, err := terminal.Write([]byte("\x1b[B"))
 			must(t, err)
-			frame = readLiveFrame(t, terminal, nil)
+			frame = readLiveFrame(t, terminal, func(frame string) bool { return firstDataCell(frame, heading) != first })
 			lines = assertLiveFrameFits(t, frame, heading, 5, 80)
 			anchor := strings.Fields(lines[1])[0]
 			if anchor == first {
@@ -141,7 +156,9 @@ func TestLiveBoardHeadersSurviveResizeAndRefresh(t *testing.T) {
 			for _, size := range [][2]int{{2, 40}, {1, 24}, {6, 80}, {3, 32}} {
 				must(t, unix.IoctlSetWinsize(int(terminal.Fd()), unix.TIOCSWINSZ,
 					&unix.Winsize{Row: uint16(size[0]), Col: uint16(size[1])}))
-				frame = readLiveFrame(t, terminal, nil)
+				frame = readLiveFrame(t, terminal, func(frame string) bool {
+					return len(strings.Split(frame, "\r\n")) <= size[0]
+				})
 				assertLiveFrameFits(t, frame, heading, size[0], size[1])
 			}
 			// Growing again restores useful data; End and Home still operate on
@@ -150,7 +167,10 @@ func TestLiveBoardHeadersSurviveResizeAndRefresh(t *testing.T) {
 				&unix.Winsize{Row: 6, Col: 80}))
 			_, err = terminal.Write([]byte("\x1b[F"))
 			must(t, err)
-			frame = readLiveFrame(t, terminal, nil)
+			frame = readLiveFrame(t, terminal, func(frame string) bool {
+				location := boardLocation.FindStringSubmatch(frame)
+				return len(location) == 4 && location[2] == "31"
+			})
 			assertLiveFrameFits(t, frame, heading, 6, 80)
 			location := boardLocation.FindStringSubmatch(frame)
 			if len(location) != 4 || location[2] != "31" {
@@ -158,7 +178,10 @@ func TestLiveBoardHeadersSurviveResizeAndRefresh(t *testing.T) {
 			}
 			_, err = terminal.Write([]byte("\x1b[H"))
 			must(t, err)
-			frame = readLiveFrame(t, terminal, nil)
+			frame = readLiveFrame(t, terminal, func(frame string) bool {
+				location := boardLocation.FindStringSubmatch(frame)
+				return len(location) == 4 && location[1] == "1"
+			})
 			assertLiveFrameFits(t, frame, heading, 6, 80)
 			location = boardLocation.FindStringSubmatch(frame)
 			if len(location) != 4 || location[1] != "1" {

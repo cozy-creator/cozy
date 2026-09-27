@@ -36,7 +36,7 @@ func TestGPUProductWithoutHostRAMFigureIsBought(t *testing.T) {
 			if code, out := runCozy(t, root, "rental", "new", "--json"); code != 0 || !strings.Contains(out, "h100-nvl") {
 				t.Fatalf("a GPU product without a RAM figure was not listed: %d %s", code, out)
 			}
-			code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--idempotency-key", "ram-"+row.name, "--timeout=2s", "--json")
+			code, out := rentUntilRecorded(t, root, "pr-ram-"+row.name, "h100-nvl", "--idempotency-key", "ram-"+row.name, "--json")
 			stand.mu.Lock()
 			defer stand.mu.Unlock()
 			if asked != 1 || strings.Contains(out, "rental_catalog") {

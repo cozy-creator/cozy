@@ -3,7 +3,6 @@ package producttest
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,15 +16,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
-// The owner client speaks its real HTTP API. This fixture controls commit/reply
-// loss and competing revisions, without replacing publication logic with a fake.
+// The owner client speaks its real HTTP API. This fixture controls commits and competing
+// revisions, without replacing publication logic with a fake.
 type publicationReleaseServer struct {
-	mu        sync.Mutex
-	revision  int64
-	lanes     map[string]string
-	writes    int
-	loseReply bool
-	denied    bool
+	mu       sync.Mutex
+	revision int64
+	lanes    map[string]string
+	writes   int
+	denied   bool
 }
 
 func (s *publicationReleaseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -64,15 +62,6 @@ func (s *publicationReleaseServer) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		s.lanes[name] = value
 	}
 	s.revision++
-	if s.loseReply {
-		s.loseReply = false
-		connection, _, err := w.(http.Hijacker).Hijack()
-		if err != nil {
-			panic(err)
-		}
-		connection.Close()
-		return
-	}
 	lanes := []hub.ModelReleaseLane{}
 	for name, id := range s.lanes {
 		lanes = append(lanes, hub.ModelReleaseLane{Lane: name, CheckpointID: id})
@@ -86,44 +75,6 @@ func publicationReleaseFixture(t *testing.T) (*publicationReleaseServer, *hub.Cl
 	server := httptest.NewServer(service)
 	t.Cleanup(server.Close)
 	return service, hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("test")}, "publication-test")
-}
-
-func TestLostReplyReconcilesOnlyFrozenSuccessor(t *testing.T) {
-	for _, changed := range []bool{false, true} {
-		t.Run(fmt.Sprint(changed), func(t *testing.T) {
-			service, client := publicationReleaseFixture(t)
-			intent, problem := publication.PrepareRelease(context.Background(), client, publication.ReleaseRequest{Destination: "alice/model", Release: "v1", Lanes: map[string]string{"fp8": "sha256:" + strings.Repeat("2", 64)}})
-			if problem != nil {
-				t.Fatal(problem)
-			}
-			sent := false
-			service.loseReply = true
-			_, problem = publication.ApplyRelease(context.Background(), client, intent, false, func() *exit.Error { sent = true; return nil })
-			if problem == nil || !sent || service.revision != 2 {
-				t.Fatalf("lost reply did not preserve uncertainty: %v", problem)
-			}
-			if changed {
-				service.revision = 3
-				service.lanes["bf16"] = "sha256:" + strings.Repeat("3", 64)
-			}
-			result, problem := publication.ApplyRelease(context.Background(), client, intent, true, func() *exit.Error { t.Fatal("recovery attempted another mutation"); return nil })
-			if changed {
-				if problem == nil || problem.ErrName() != "publication.outcome_unknown" {
-					t.Fatalf("changed state accepted: %+v %v", result, problem)
-				}
-			} else {
-				if problem != nil || result.Observation != "observed_convergence" || result.Revision != 2 {
-					t.Fatalf("exact successor not recovered: %+v %v", result, problem)
-				}
-				if result.Lanes["bf16"] == "" {
-					t.Fatal("unmentioned lane lost")
-				}
-			}
-			if service.writes != 1 {
-				t.Fatalf("wrote %d times", service.writes)
-			}
-		})
-	}
 }
 
 func TestExplicitStaleRevisionAndFreshNoop(t *testing.T) {

@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,25 +31,73 @@ func ptyRun(t *testing.T, root string, args ...string) (int, string) {
 	return ptyRunInput(t, root, 24, nil, args...)
 }
 
-// ptyRunInput additionally binds stdin to the pseudo-terminal and sends each input after
-// a short observation window. This drives terminal interaction itself, not parser helpers.
+// ptyRunInput additionally binds stdin to the pseudo-terminal. Each input is written once
+// the board has drawn a located frame (`rows N-M/T`) after the previous one, so the
+// board's own redraws pace the keys, never a clock.
 func ptyRunInput(t *testing.T, root string, rows uint16, input [][]byte, args ...string) (int, string) {
+	t.Helper()
+	return ptyDrive(t, root, rows, len(input), func(step int, drawn string) []byte {
+		if !boardLocation.MatchString(drawn) {
+			return nil
+		}
+		return input[step]
+	}, args...)
+}
+
+// ptyDrive runs the product on a pseudo-terminal for `steps` inputs. Whenever the board
+// draws, next is asked with the output drawn since the previous input; it answers the keys
+// to write for this step, or nil to keep watching. A board that never answers is killed by
+// startPTY's stuck-terminal stop.
+func ptyDrive(t *testing.T, root string, rows uint16, steps int,
+	next func(step int, drawn string) []byte, args ...string) (int, string) {
 	t.Helper()
 	master, cmd := startPTY(t, root, rows, ptyColumns, args...)
 	defer master.Close()
+	var mu sync.Mutex
+	var out bytes.Buffer
+	drew, closed := make(chan struct{}, 1), make(chan struct{})
 	go func() {
-		for _, keys := range input {
-			time.Sleep(500 * time.Millisecond)
-			_, _ = master.Write(keys)
+		defer close(closed)
+		chunk := make([]byte, 4096)
+		for {
+			n, err := master.Read(chunk)
+			mu.Lock()
+			out.Write(chunk[:n])
+			mu.Unlock()
+			select {
+			case drew <- struct{}{}:
+			default:
+			}
+			if err != nil {
+				return
+			}
 		}
 	}()
-	var out bytes.Buffer
-	_, _ = io.Copy(&out, master)
+	since := 0
+	for step := 0; step < steps; {
+		mu.Lock()
+		drawn := out.String()[since:]
+		mu.Unlock()
+		if keys := next(step, drawn); keys != nil {
+			since += len(drawn)
+			_, _ = master.Write(keys)
+			step++
+			continue
+		}
+		select {
+		case <-drew:
+		case <-closed:
+			step = steps
+		}
+	}
+	<-closed
 	_ = cmd.Wait()
 	code := 0
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	return code, out.String()
 }
 

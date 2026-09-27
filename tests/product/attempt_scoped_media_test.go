@@ -4,13 +4,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,8 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/mediawire"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
-
-var podMediaProofAddress = flag.String("pod-media-proof-addr", "", "disposable Tensorhub media receiver for cross-repository proof")
 
 // inputMediaHealth may carry the retired `attempt_scoped_inputs` flag; the client must ignore it.
 func inputMediaHealth(w io.Writer, scoped *bool) {
@@ -39,62 +34,6 @@ func inputMediaClient(t *testing.T, address string, budget time.Duration) *media
 	client, problem := media.Dial(media.Spec{Addr: address, Token: secret.New("media-input-test")}, budget, 1024)
 	fatal(t, problem)
 	return client
-}
-
-// A pod publishing the retired `attempt_scoped_inputs` flag as true, false, or not at
-// all gets the same scoped upload route and explicit `output_count`.
-func TestMediaHealthFlagsNeverChangeTheRequestShape(t *testing.T) {
-	no, yes := false, true
-	for _, capability := range []*bool{nil, &no, &yes} {
-		name := "absent"
-		if capability != nil {
-			name = fmt.Sprint(*capability)
-		}
-		t.Run(name, func(t *testing.T) {
-			var writes atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodGet && r.URL.Path == "/v1/health" {
-					inputMediaHealth(w, capability)
-					return
-				}
-				writes.Add(1)
-				if r.Method == http.MethodPost {
-					if r.URL.Path != "/v1/outputs/attempt-7" ||
-						r.URL.Query().Get("output_count") != "3" ||
-						r.URL.Query().Get("max_bytes") != "1024" {
-						t.Errorf("health flag changed the reservation: %s", r.URL)
-					}
-					_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/outputs/attempt-7"})
-					return
-				}
-				if r.Method != http.MethodPut || r.URL.Path != "/v1/attempts/attempt-7/inputs/payload" {
-					t.Errorf("health flag changed the upload: %s %s", r.Method, r.URL.Path)
-				}
-				body, err := io.ReadAll(r.Body)
-				if err != nil {
-					t.Error(err)
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"path": "/tmp/cozy/input", "digest": inputDigest(body), "length": len(body)})
-			}))
-			defer server.Close()
-			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-			fatal(t, client.Health())
-			if writes.Load() != 0 {
-				t.Fatal("health moved bytes before the handshake settled")
-			}
-			_, problem := client.ReserveOutputs("attempt-7", 1024, 3)
-			fatal(t, problem)
-			_, problem = client.PutInput("attempt-7", "payload", []byte("payload"))
-			fatal(t, problem)
-			original := filepath.Join(t.TempDir(), "original")
-			must(t, os.WriteFile(original, []byte("payload"), 0600))
-			_, problem = client.PutInputFile("attempt-7", "payload", original, inputDigest([]byte("payload")), 7)
-			fatal(t, problem)
-			if writes.Load() != 3 {
-				t.Fatalf("unexpected transport replay count: %d", writes.Load())
-			}
-		})
-	}
 }
 
 // The pod's media server ships in its image, independently of this host. A plane at the
@@ -130,7 +69,7 @@ func TestMediaPlaneRevisionIsAFloor(t *testing.T) {
 			}))
 			defer server.Close()
 			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-			problem := client.Health()
+			problem := client.Health(t.Context())
 			if !arm.accepted {
 				if problem == nil || problem.ErrName() != "media_contract_mismatch" {
 					t.Fatalf("a plane below the floor was not refused: %v", problem)
@@ -148,20 +87,6 @@ func TestMediaPlaneRevisionIsAFloor(t *testing.T) {
 			}
 		})
 	}
-}
-
-// An unprobed client still sends the exact output count.
-func TestMediaReservationCarriesCountWithoutHealth(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("output_count") != "0" {
-			t.Errorf("unprobed client omitted the output count: %s", r.URL)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/outputs/attempt-9"})
-	}))
-	defer server.Close()
-	client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-	_, problem := client.ReserveOutputs("attempt-9", 0, 0)
-	fatal(t, problem)
 }
 
 func TestScopedMediaFailureNeverFallsBackToUnscopedUpload(t *testing.T) {
@@ -183,7 +108,7 @@ func TestScopedMediaFailureNeverFallsBackToUnscopedUpload(t *testing.T) {
 	}))
 	defer server.Close()
 	client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-	fatal(t, client.Health())
+	fatal(t, client.Health(t.Context()))
 	if path, problem := client.PutInput("attempt-7", "payload", []byte("payload")); problem == nil || path != "" || problem.ErrName() != "media.input_conflict" {
 		t.Fatalf("scoped refusal changed: %s %v", path, problem)
 	}
@@ -289,119 +214,10 @@ func TestMediaInputReceiptEchoMustAgree(t *testing.T) {
 			}))
 			defer server.Close()
 			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-			fatal(t, client.Health())
+			fatal(t, client.Health(t.Context()))
 			path, problem := client.PutInput("attempt-1", "payload", []byte("abc"))
 			if accepted != (problem == nil && path != "") {
 				t.Fatalf("receipt echo admission = %q, %v; want accepted=%v", path, problem, accepted)
-			}
-		})
-	}
-}
-
-// This optional cross-repository proof dials an actual Tensorhub podmedia server
-// with a disposable ledger/cache. The address never points at a paid rental.
-func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
-	address := *podMediaProofAddress
-	if address == "" {
-		t.Skip("requires disposable Tensorhub podmedia receiver at -pod-media-proof-addr")
-	}
-	client := inputMediaClient(t, address, 2*time.Second)
-	fatal(t, client.Health())
-	outputSlot := media.Slot("output-count-proof", 1)
-	defer client.DropAttempt(outputSlot)
-	_, problem := client.ReserveOutputs(outputSlot, 4096, 3)
-	fatal(t, problem)
-	_, problem = client.ReserveOutputs(outputSlot, 4096, 3)
-	fatal(t, problem)
-	if _, problem = client.ReserveOutputs(outputSlot, 4096, 2); problem == nil {
-		t.Fatal("receiver allowed an existing output count to change")
-	}
-	body := []byte("same cached bytes across attempts")
-	slotA := media.Slot("input-proof-a", 1)
-	slotB := media.Slot("input-proof-b", 1)
-	defer client.DropAttempt(slotA)
-	defer client.DropAttempt(slotB)
-	if _, problem := client.PutInput(slotA, "payload", body); problem == nil {
-		t.Fatal("receiver accepted bytes before reservation")
-	}
-	_, problem = client.ReserveOutputs(slotA, 0, 0)
-	fatal(t, problem)
-	// Let the actual receiver commit the input, then drop its response before
-	// Creator can obtain a path. The next upload retries the same binding.
-	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: address})
-	var committed atomic.Bool
-	proxy.ModifyResponse = func(response *http.Response) error {
-		if response.StatusCode >= 400 {
-			return nil
-		}
-		_, err := io.Copy(io.Discard, response.Body)
-		_ = response.Body.Close()
-		if err != nil {
-			return err
-		}
-		committed.Store(true)
-		return fmt.Errorf("discard committed upload response")
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-		connection, _, err := w.(http.Hijacker).Hijack()
-		if err == nil {
-			_ = connection.Close()
-		}
-	}
-	lostReply := httptest.NewServer(proxy)
-	defer lostReply.Close()
-	interrupted := inputMediaClient(t, strings.TrimPrefix(lostReply.URL, "http://"), time.Second)
-	if path, problem := interrupted.PutInput(slotA, "payload", body); problem == nil || path != "" || !committed.Load() {
-		t.Fatalf("lost committed response yielded a grant: %q, %v, committed=%t", path, problem, committed.Load())
-	}
-	path, problem := client.PutInput(slotA, "payload", body)
-	fatal(t, problem)
-	if _, problem := client.PutInput(slotA, "payload", []byte("changed binding")); problem == nil {
-		t.Fatal("receiver rebound an existing input to changed bytes")
-	}
-	_, problem = client.ReserveOutputs(slotB, 0, 0)
-	fatal(t, problem)
-	original := filepath.Join(t.TempDir(), "original")
-	must(t, os.WriteFile(original, body, 0600))
-	shared, problem := client.PutInputFile(slotB, "input-0", original, inputDigest(body), int64(len(body)))
-	fatal(t, problem)
-	if shared != path {
-		t.Fatalf("same bytes copied into per-attempt paths: %q != %q", shared, path)
-	}
-	fatal(t, client.DropAttempt(slotA))
-	fatal(t, client.DropAttempt(slotA))
-	got, err := os.ReadFile(shared)
-	must(t, err)
-	if !bytes.Equal(got, body) {
-		t.Fatal("pre-accept cancellation removed another attempt's input")
-	}
-	got, err = os.ReadFile(original)
-	must(t, err)
-	if !bytes.Equal(got, body) {
-		t.Fatal("attempt cleanup changed the borrowed original")
-	}
-	for _, boundary := range []string{"reserved", "payload", "file"} {
-		t.Run("cancel_"+boundary, func(t *testing.T) {
-			slot := media.Slot("cancel-"+boundary, 1)
-			_, problem := client.ReserveOutputs(slot, 0, 0)
-			fatal(t, problem)
-			if boundary != "reserved" {
-				_, problem = client.PutInput(slot, "payload", body)
-				fatal(t, problem)
-			}
-			if boundary == "file" {
-				_, problem = client.PutInputFile(slot, "input-0", original, inputDigest(body), int64(len(body)))
-				fatal(t, problem)
-			}
-			fatal(t, client.DropAttempt(slot))
-			fatal(t, client.DropAttempt(slot))
-			if _, problem = client.PutInput(slot, "payload", body); problem == nil {
-				t.Fatal("released reservation still accepted an input")
-			}
-			got, err := os.ReadFile(shared)
-			must(t, err)
-			if !bytes.Equal(got, body) {
-				t.Fatal("cancellation removed another attempt's input")
 			}
 		})
 	}

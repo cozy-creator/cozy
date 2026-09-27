@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -99,10 +100,36 @@ func holdQueued(t *testing.T, store *records.Store, requestID, rentalID string) 
 			InvocationSpecDigest: canonical.Digest(spec)}}))
 }
 
+// submitExplicit submits the explicit-lane run and leaves once it is recorded: a client that
+// goes away never cancels its run (cl-108), so nothing waits out the CLI's optimistic
+// observation of a run that is meant to stay queued.
 func submitExplicit(t *testing.T, root, key string) {
 	t.Helper()
-	runCozy(t, root, "run", "proof/h3/generate", "steps=1", explicitFP8, "--rental-only", "--json",
+	cmd := exec.Command(cozyBin, "run", "proof/h3/generate", "steps=1", explicitFP8, "--rental-only", "--json",
 		"--idempotency-key", key)
+	cmd.Env = childEnv(t, root)
+	must(t, cmd.Start())
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	deadline := time.After(20 * time.Second)
+	for {
+		if row, problem := store.RequestByIdempotencyKey(key); problem == nil && row != nil {
+			break
+		}
+		select {
+		case <-exited:
+			return
+		case <-deadline:
+			_ = cmd.Process.Kill()
+			t.Fatalf("the run %s was never recorded", key)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	_ = cmd.Process.Kill()
+	<-exited
 }
 
 func lastPlacement(t *testing.T, store *records.Store, requestID string) map[string]any {
@@ -128,9 +155,9 @@ func TestExplicitLaneOfAnotherReleaseReusesTheIdleAttachedRental(t *testing.T) {
 	startDaemonProcess(t, root)
 	submitExplicit(t, root, "fleet-reuse")
 	var row *records.Request
-	waitFor(t, root, "the request pinned", func() bool {
+	waitFor(t, root, "the request pinned and its placement recorded", func() bool {
 		row, problem = store.RequestByIdempotencyKey("fleet-reuse")
-		return problem == nil && row != nil && row.Worker != ""
+		return problem == nil && row != nil && row.Worker != "" && len(placementEvents(t, store, row.ID)) > 0
 	})
 	if row.Worker != "pr-guchuko" || row.Models[0].Lane != "fp8-adaln-pruned" || row.Models[0].Manifest != fp8Manifest {
 		t.Fatalf("pinned to %q with %+v; want pr-guchuko on the explicit rc.1 fp8 lane", row.Worker, row.Models[0])
