@@ -9,10 +9,12 @@ import (
 
 // NativeSourceCredential is called only after a unpublished parent source call was accepted.
 func (r *Resolver) NativeSourceCredential(operation string) string {
+	// upload_* is the rented ingest (cozy model upload --rental); it fetches from the same
+	// provider as download_* and needs the same token.
 	switch operation {
-	case "download_huggingface":
+	case "download_huggingface", "upload_huggingface":
 		return secret.NativeSourceCredential(r.cfg.HuggingFaceToken)
-	case "download_civitai":
+	case "download_civitai", "upload_civitai":
 		return secret.NativeSourceCredential(r.cfg.CivitaiToken)
 	default:
 		return ""
