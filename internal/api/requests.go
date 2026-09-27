@@ -499,7 +499,10 @@ func (s *Server) installedRelease(pkg, release, installID string) (string, *exit
 	if problem != nil {
 		return "", problem
 	}
-	if installed == nil || installed.SourceKind != "tensorhub" || installed.Package != pkg || release != "" && release != installed.Version {
+	if installed == nil {
+		return release, nil
+	}
+	if installed.SourceKind != "tensorhub" || installed.Package != pkg || release != "" && release != installed.Version {
 		return "", exit.Named(exit.Conflict, "install_package_mismatch", "install %s is not %s %s from Tensorhub", installID, pkg, release)
 	}
 	return installed.Version, nil

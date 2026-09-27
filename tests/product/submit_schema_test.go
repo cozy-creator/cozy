@@ -258,6 +258,7 @@ func waitRequestStatus(t *testing.T, daemon *daemonProcess, requestID, wanted st
 			return
 		}
 		if status == "failed" || status == "canceled" {
+			skipWithoutMachine(t, 1, string(answer.Body))
 			t.Fatalf("request %s settled %q, wanted %q: %s", requestID, status, wanted, answer.brief())
 		}
 		time.Sleep(100 * time.Millisecond)
