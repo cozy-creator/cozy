@@ -47,6 +47,14 @@ def main():
         receipt = writer.commit()
         assert receipt["declaration"] == expected
         assert store.derived_lookup(transaction)["receipt"] == receipt
+        # A caller that opts in reads the same receipt naming its declaration by digest.
+        named = tensorfs.Store.open(root, receipts="digest").derived_lookup(transaction)["receipt"]
+        assert "declaration" not in named
+        assert named["declaration_digest"] == tensorfs.object_id(declaration)
+        assert named["declaration_length"] == len(declaration)
+        assert {k: v for k, v in named.items() if not k.startswith("declaration")} == {
+            k: v for k, v in receipt.items() if k != "declaration"
+        }
         store.derived_dispose(transaction)
         print("native declaration green: source-free table + FP8 data/scale + config; exact receipt equality; required work fingerprint")
 

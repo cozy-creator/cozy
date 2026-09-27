@@ -324,3 +324,50 @@ fn an_indexed_checkpoint_does_not_reread_its_chain() {
     release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
     std::fs::remove_dir_all(store.root()).unwrap();
 }
+
+#[test]
+fn a_digest_receipt_names_the_declaration_the_intent_bound() {
+    let (store, meta, id, declaration) = fixture("receipt-digest");
+    let intent = declaration.clone().canonical_work_bytes().unwrap();
+    let writer = begin(&store, &meta, &id, 1, declaration, None).unwrap();
+    for (index, key) in ["weight_0", "weight_1", "weight_2"].into_iter().enumerate() {
+        add(&store, &meta, &id, &writer, key, index as u8 + 1).unwrap();
+    }
+    let receipt = commit(&store, &meta, &id, 1).unwrap();
+    let inline = receipt.value(ReceiptDeclaration::Inline);
+    let digest = receipt.value(ReceiptDeclaration::Digest);
+    assert_eq!(inline, receipt.to_value());
+    let field = |value: &Value, name: &str| {
+        as_obj("receipt", "facts", value)
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        crate::canon::write(&field(&inline, "declaration").unwrap()),
+        intent
+    );
+    assert!(field(&digest, "declaration").is_none());
+    assert_eq!(
+        field(&digest, "declaration_digest"),
+        Some(Value::str(ObjectRef::of(&intent).id()))
+    );
+    assert_eq!(
+        field(&digest, "declaration_length"),
+        Some(Value::uint(intent.len() as u64))
+    );
+    // Every other fact is identical in both forms.
+    let others = |value: &Value| {
+        as_obj("receipt", "facts", value)
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| !key.starts_with("declaration"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(others(&inline), others(&digest));
+    let _ = fence(&meta, &id, 1);
+    release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
