@@ -24,7 +24,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -181,7 +180,7 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 			db.Close()
 			return nil, e
 		}
-	} else if version >= 6 && version < schemaVersion {
+	} else if version < schemaVersion {
 		if !migratePrior {
 			db.Close()
 			return nil, exit.Named(exit.Conflict, "records_schema_upgrade_required",
@@ -189,7 +188,13 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 				version, schemaVersion).
 				WithRemedy("stop the active Cozy daemon, then run `cozy up` so the new daemon can migrate it")
 		}
-		if e := migrate(db, path, version, triageDir); e != nil {
+		// Schemas before 6 predate every released migration: they keep what they hold
+		// and gain what they lack, exactly as an empty database does.
+		upgrade := func() *exit.Error { return initialize(db, path) }
+		if version >= 6 {
+			upgrade = func() *exit.Error { return migrate(db, path, version, triageDir) }
+		}
+		if e := upgrade(); e != nil {
 			db.Close()
 			return nil, e
 		}
@@ -199,10 +204,6 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 			"records database has schema %d; this Creator supports schema %d",
 			version, schemaVersion).
 			WithRemedy("upgrade Cozy Creator to a version that supports schema %d; keep %s in place", version, path)
-	} else if version != schemaVersion {
-		db.Close()
-		return nil, schemaReset(path,
-			"records database has user_version %d, not exact version %d", version, schemaVersion)
 	}
 	if e := verifySchema(db, path); e != nil {
 		db.Close()
@@ -238,17 +239,17 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 // schema 21 retains Tensorhub's sanitized terminal rental boot failure; schema 22 moves
 // each attempt's verified triage bundle bytes INTO the attempt row (cl-116), retiring the
 // triage file directory and its orphan class; schema 34 records the rental's WIDTH
-// (cl-179). That column was initially shipped under the already released schema 33,
-// so migration accepts both exact 33 shapes and preserves existing width values.
+// (cl-179). That column was initially shipped under the already released schema 33;
+// a schema-33 database without it gains it before the steps run.
 // only schema 9's superseded special
 // model-production subsystem is dropped.
 // Schema 10 creates empty request-attached transfer sidecars because older rows cannot be
 // translated into ordinary request identity safely.
 func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit.Error {
-	if e := verifyPriorSchema(db, path, sourceVersion); e != nil {
-		return e
+	prior, err := shapeOf(priorStatements(sourceVersion))
+	if err != nil {
+		return exit.Internalf("cannot derive schema-%d records shape: %s", sourceVersion, err)
 	}
-	// Rebuild the one changed table so sqlite_master matches the closed current schema.
 	// Foreign-key rewriting on ALTER TABLE must be disabled during the swap; integrity is
 	// checked again before Open returns the store.
 	if _, err := db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
@@ -272,7 +273,12 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 		return commitMigration(tx, path)
 	}
 	if version != sourceVersion {
-		return schemaReset(path, "records database changed to user_version %d while migrating", version)
+		return schemaChanged(path, version)
+	}
+	// Each step below reads the prior schema's tables and columns. Whatever of that shape
+	// the database lacks is added first; extra columns, indexes and DDL text are its own.
+	if err := conform(tx, prior); err != nil {
+		return exit.Internalf("cannot complete the schema-%d shape of %s before migrating: %s", sourceVersion, path, err)
 	}
 	// Each rebuild runs only from a schema that still has the prior shape: the install
 	// rename is schema 12's, the rental rebuild ends at 13, the export table's payload
@@ -608,8 +614,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 
 // migrateInstalls carries schema 11's `install_generations` table and the two foreign keys
 // that spelled it `generation` onto their one name. The three tables are REBUILT rather than
-// ALTERed: SQLite's own RENAME rewrites every referencing DDL with the new name QUOTED, and
-// verifySchema compares the stored text to the authored text character for character. Rows
+// ALTERed: SQLite's own RENAME rewrites every referencing DDL with the new name QUOTED. Rows
 // move by column name, so the copy states what it preserves.
 func migrateInstalls(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 	priorTable, priorInstallID := "installs", "install_id"
@@ -1043,6 +1048,10 @@ func priorStatements(version int) []string {
 			stmt = priorRentalsTwenty
 		case stmt == rentalsDDL && version < 33:
 			stmt = priorRentalsThirtyTwo
+		case stmt == rentalsDDL && version == 33:
+			// Schema 33 shipped with and without the width column. The width-less shape is
+			// the one required; migrateRentals reads which one the database holds.
+			stmt = strings.Replace(stmt, "  accelerator_count INTEGER NOT NULL DEFAULT 0,\n", "", 1)
 		case stmt == attemptsDDL && version < 22:
 			stmt = strings.Replace(stmt,
 				"  triage_bundle    BLOB    NOT NULL DEFAULT x'',\n",
@@ -1116,24 +1125,9 @@ func priorStatements(version int) []string {
 	return statements
 }
 
-func priorSchema(version int) ([]string, error) {
-	db, err := sql.Open("sqlite", ":memory:"+pragmas)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-	for _, stmt := range priorStatements(version) {
-		if _, err := db.Exec(stmt); err != nil {
-			return nil, err
-		}
-	}
-	return schemaSnapshot(db)
-}
-
 // priorInstallNames restores the pre-12 spelling of the install table and the two foreign
 // keys that named it. Both retired names are exactly as long as the ones that replaced them,
-// so the released DDL text — which verifyPriorSchema compares character for character — comes
-// back by substitution instead of by keeping a second copy of three tables.
+// so the released DDL comes back by substitution instead of by keeping a second copy of three tables.
 func priorInstallNames(stmt string) string {
 	stmt = strings.Replace(stmt, "EXISTS installs (", "EXISTS install_generations (", 1)
 	stmt = strings.ReplaceAll(stmt, "REFERENCES installs(id)", "REFERENCES install_generations(id)")
@@ -1159,34 +1153,6 @@ func containsStatement(statements []string, wanted string) bool {
 		}
 	}
 	return false
-}
-
-func verifyPriorSchema(db *sql.DB, path string, version int) *exit.Error {
-	want, err := priorSchema(version)
-	if err != nil {
-		return exit.Internalf("cannot derive schema-%d records shape: %s", version, err)
-	}
-	got, err := schemaSnapshot(db)
-	if err != nil {
-		return exit.Internalf("cannot inspect schema-%d records in %s: %s", version, path, err)
-	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		// PR400 and PR405 both shipped user_version33. Permit only the exact
-		// earlier table text, not arbitrary column subsets or unknown schema drift.
-		if version == 33 {
-			legacy := append([]string(nil), want...)
-			for index, row := range legacy {
-				if strings.HasPrefix(row, "table\x00rentals\x00") {
-					legacy[index] = strings.Replace(row, "  accelerator_count INTEGER NOT NULL DEFAULT 0,\n", "", 1)
-				}
-			}
-			if strings.Join(got, "\n") == strings.Join(legacy, "\n") {
-				return nil
-			}
-		}
-		return schemaReset(path, "records database claims schema %d but is not its exact released shape", version)
-	}
-	return nil
 }
 
 func commitMigration(tx *sql.Tx, path string) *exit.Error {
@@ -1218,21 +1184,17 @@ func initialize(db *sql.DB, path string) *exit.Error {
 		}
 		return nil
 	}
-	if version != 0 {
-		return schemaReset(path, "records database changed to user_version %d while opening", version)
+	if version >= 6 {
+		return schemaChanged(path, version)
 	}
-	var objects int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master
-		WHERE name NOT LIKE 'sqlite_%'`).Scan(&objects); err != nil {
-		return exit.Internalf("cannot inspect unversioned records database %s: %s", path, err)
+	// An empty or pre-release database gets every required table, column and index it
+	// lacks; whatever it already holds stays.
+	required, err := requiredCurrentShape()
+	if err != nil {
+		return exit.Internalf("cannot derive current records schema: %s", err)
 	}
-	if objects != 0 {
-		return schemaReset(path, "unversioned records database contains %d schema objects", objects)
-	}
-	for _, stmt := range schema {
-		if _, err := tx.Exec(stmt); err != nil {
-			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
-		}
+	if err := conform(tx, required); err != nil {
+		return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 	}
 	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
@@ -1243,69 +1205,31 @@ func initialize(db *sql.DB, path string) *exit.Error {
 	return nil
 }
 
-func schemaReset(path, format string, args ...any) *exit.Error {
-	return exit.Named(exit.Conflict, "records.schema_reset_required", format, args...).
-		WithRemedy("stop Cozy, move %s aside, and start again to create the current records database", path)
+// schemaChanged answers a database another process re-stamped while this one opened it.
+func schemaChanged(path string, version int) *exit.Error {
+	return exit.Named(exit.Conflict, "records.schema_changed_concurrently",
+		"records database %s changed to schema %d while it was being opened", path, version).
+		WithRemedy("run the command again")
 }
 
-type schemaReader interface {
-	Query(string, ...any) (*sql.Rows, error)
-}
-
-func schemaSnapshot(db schemaReader) ([]string, error) {
-	rows, err := db.Query(`SELECT type,name,COALESCE(sql,'') FROM sqlite_master
-		WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var kind, name, ddl string
-		if err := rows.Scan(&kind, &name, &ddl); err != nil {
-			return nil, err
-		}
-		out = append(out, kind+"\x00"+name+"\x00"+ddl)
-	}
-	return out, rows.Err()
-}
-
-var expectedSchema struct {
-	sync.Once
-	rows []string
-	err  error
-}
-
-func currentSchema() ([]string, error) {
-	expectedSchema.Do(func() {
-		db, err := sql.Open("sqlite", ":memory:"+pragmas)
-		if err != nil {
-			expectedSchema.err = err
-			return
-		}
-		defer db.Close()
-		for _, stmt := range schema {
-			if _, err := db.Exec(stmt); err != nil {
-				expectedSchema.err = err
-				return
-			}
-		}
-		expectedSchema.rows, expectedSchema.err = schemaSnapshot(db)
-	})
-	return expectedSchema.rows, expectedSchema.err
-}
-
+// verifySchema checks only that every required table and column exists, creating what is
+// missing. Extra columns, indexes and tables and differences in DDL text are accepted.
 func verifySchema(db *sql.DB, path string) *exit.Error {
-	want, err := currentSchema()
+	required, err := requiredCurrentShape()
 	if err != nil {
 		return exit.Internalf("cannot derive current records schema: %s", err)
 	}
-	got, err := schemaSnapshot(db)
+	lacking, err := missing(db, required)
 	if err != nil {
 		return exit.Internalf("cannot inspect records schema in %s: %s", path, err)
 	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		return schemaReset(path, "records database schema is not the exact current shape")
+	if len(lacking) == 0 {
+		return nil
+	}
+	if err := conform(db, required); err != nil {
+		return exit.Named(exit.Conflict, "records.schema_incomplete",
+			"records database %s lacks %s and it cannot be added: %s", path, strings.Join(lacking, ", "), err).
+			WithRemedy("keep %s in place; its rows are intact — run the Cozy Creator build that wrote it", path)
 	}
 	return nil
 }
