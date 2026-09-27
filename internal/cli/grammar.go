@@ -87,6 +87,7 @@ type PackageCmd struct {
 	Recover   PackageRecoverCmd   `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
 	Remove    PackageRemoveCmd    `cmd:"" help:"Delete source-code."`
 	List      PackageListCmd      `cmd:"" help:"List installed packages."`
+	Lock      PackageLockCmd      `cmd:"" help:"Lock this package's dependencies for the current Tensorhub and account."`
 	Publish   PackagePublishCmd   `cmd:"" help:"Publish a package release."`
 	Yank      PackageYankCmd      `cmd:"" help:"Permanently yank a package release."`
 
@@ -184,6 +185,14 @@ type PackageListCmd struct{}
 
 func (c *PackageListCmd) Run(r *Runtime) error {
 	return r.call(handleLs, nil, nil, nil, false)
+}
+
+type PackageLockCmd struct {
+	UpgradePackage []string `name:"upgrade-package" help:"Allow this dependency to move to its newest compatible version; repeat for each."`
+}
+
+func (c *PackageLockCmd) Run(r *Runtime) error {
+	return r.call(handlePackageLock, nil, nil, map[string][]string{"--upgrade-package": c.UpgradePackage}, false)
 }
 
 type PackagePublishCmd struct {

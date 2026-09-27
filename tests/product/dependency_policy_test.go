@@ -114,7 +114,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 	pack, problem := packagepublish.PrepareFrom(project)
 	fatal(t, problem)
 	defer pack.Close()
-	problem = pack.BuildForPublish(t.Context())
+	problem = pack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"})
 	if problem == nil || problem.Name != dependencyPolicyCode || !strings.Contains(problem.Message, "project wheel Requires-Dist") {
 		t.Fatalf("backend-injected inactive optional pin bypassed the policy: %+v", problem)
 	}

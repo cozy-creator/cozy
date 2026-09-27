@@ -27,7 +27,7 @@ type scriptMetadata struct {
 
 // PrepareScript adapts a bounded single file into an ordinary unpublished Python
 // project. Only uv resolves dependencies; Runtime later discovers the explicit App.
-func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
+func PrepareScript(ctx context.Context, path string, namespace NamespaceSource) (*Package, *exit.Error) {
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, exit.Named(exit.Validation, "script_source_invalid", "script must be a regular file")
@@ -140,7 +140,7 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 			return nil, exit.Internalf("cannot stage script project: %s", err)
 		}
 	}
-	if problem := selectCapturedHubIndexes(root); problem != nil {
+	if _, _, problem := writeNamedAccountIndex(root, namespace); problem != nil {
 		return nil, problem
 	}
 	cmd := exec.CommandContext(ctx, "uv", "lock", "--no-progress", "--python", selected.Executable, "--no-python-downloads")

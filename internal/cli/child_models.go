@@ -147,7 +147,7 @@ func (r *Resolver) childSlotBinding(pkg, entrypoint string, slot launch.Slot) (h
 		}
 		rows = read
 	}
-	binding, ok := effectiveModelBindings([]launch.Slot{slot}, rows)[slot.Path]
+	binding, ok := effectiveModelBindings([]launch.Slot{slot}, rows, packageOwner(pkg, []launch.Slot{slot}, r.namespace))[slot.Path]
 	if !ok {
 		return hub.PackageBindingRow{}, exit.Named(exit.NotFound, "child.model_unbound",
 			"%s has no owner binding or authored default for %s model slot %s",

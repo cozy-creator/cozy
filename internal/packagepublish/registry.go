@@ -63,16 +63,14 @@ type exactDependency struct {
 	version string
 }
 
-func collectRegistryRows(ctx context.Context, project, stage, organization string, existing []DependencyWheel, selected hostruntime.PythonInterpreter) ([]RegistryRow, *exit.Error) {
-	indexes, problem := selectedHubIndexes(project, true)
-	if problem != nil {
-		return nil, problem
-	}
+// collectRegistryRows exports the locked registry closure of a project whose account index,
+// if any, is already bound to the publishing account.
+func collectRegistryRows(ctx context.Context, project, stage, account string, existing []DependencyWheel, selected hostruntime.PythonInterpreter) ([]RegistryRow, *exit.Error) {
 	lockPath := filepath.Join(stage, "pylock.registry.toml")
 	args := []string{"export", "--locked", "--no-dev", "--no-default-groups", "--no-emit-project", "--no-emit-local",
 		"--format", "pylock.toml", "--output-file", lockPath, "--no-progress", "--directory", project,
 		"--python", selected.Executable, "--no-python-downloads"}
-	command := exec.CommandContext(ctx, "uv", append(args, indexes...)...)
+	command := exec.CommandContext(ctx, "uv", args...)
 	command.Env = config.Frozen().Tool("UV_PYTHON_DOWNLOADS=never")
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -86,14 +84,14 @@ func collectRegistryRows(ctx context.Context, project, stage, organization strin
 			name = "registry_dependency_lock_drift"
 		}
 		return nil, exit.Named(exit.Validation, name, "uv export --locked refused: %s", detail).
-			WithRemedy("run `uv lock`, review uv.lock, and publish again")
+			WithRemedy("run `cozy package lock`, review uv.lock, and publish again")
 	}
 	raw, err := os.ReadFile(lockPath)
 	if err != nil || len(raw) == 0 || int64(len(raw)) > maxLockBytes {
 		return nil, exit.Named(exit.Structural, "registry_dependency_export_invalid",
 			"uv export did not produce a non-empty pylock.toml at or below %d B", maxLockBytes)
 	}
-	return RegistryRowsFromLock(raw, existing, organization, selected.Version)
+	return RegistryRowsFromLock(raw, existing, account, selected.Version)
 }
 
 // orgIndexNamespace answers the org namespace when raw is one hub org index —
@@ -113,8 +111,9 @@ func orgIndexNamespace(raw string) string {
 }
 
 // RegistryRowsFromLock retains every selected dependency, including framework
-// and accelerator distributions. Tensorhub fetches public references directly.
-func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization string, targetPython ...string) ([]RegistryRow, *exit.Error) {
+// and accelerator distributions. Tensorhub fetches public references directly. Rows
+// from a Tensorhub index must come from the publishing account's own index.
+func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, account string, targetPython ...string) ([]RegistryRow, *exit.Error) {
 	var lock registryLock
 	// PEP 751 readers accept any lock-version of the major they implement.
 	if err := toml.Unmarshal(raw, &lock); err != nil || lock.LockVersion != "1" && !strings.HasPrefix(lock.LockVersion, "1.") {
@@ -163,10 +162,12 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 		}
 		pytorchRow := strings.HasPrefix(pkg.Index, "https://download.pytorch.org/whl/")
 		orgRow := pkg.Index != "https://pypi.org/simple" && !pytorchRow
-		if orgRow && (organization == "" || orgIndexNamespace(pkg.Index) != organization) {
+		if orgRow && (account == "" || orgIndexNamespace(pkg.Index) != account) {
 			return nil, exit.Named(exit.Validation, "registry_dependency_index_refused",
-				"%s==%s is locked to neither a supported public index nor this package's own org index",
-				name, pkg.Version)
+				"%s==%s is locked to neither a supported public index nor the publishing account's index",
+				name, pkg.Version).
+				WithRemedy("resolve your own packages with `%s = { index = %q }` in [tool.uv.sources]; other indexes cannot publish",
+					name, AccountIndexName)
 		}
 		candidate, problem := selectRegistryWheel(name, pkg, targetPython...)
 		if problem != nil {
@@ -181,7 +182,7 @@ func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization s
 			candidate, problem = pytorchRegistryWheel(name, pkg.Version, pkg.Index, pkg.Wheels, targetPython...)
 			digest = candidate.Hashes["sha256"]
 		} else if orgRow {
-			digest, problem = orgIndexWheelIdentity(name, pkg.Version, organization, candidate, targetPython...)
+			digest, problem = orgIndexWheelIdentity(name, pkg.Version, account, candidate, targetPython...)
 		} else {
 			digest, problem = registryWheelIdentity(name, pkg.Version, candidate, targetPython...)
 		}
@@ -249,7 +250,7 @@ func registryWheelIdentityBound(name, version string, selected registryWheel, ma
 // /v1/index/<org>/files/<sha256hex>/<filename>, whose path digest IS the
 // wheel's sha256. The index page advertises no size, so the lock's 0 is legal
 // here and the hub's committed claim supplies the length at declare.
-func orgIndexWheelIdentity(name, version, organization string, selected registryWheel, targetPython ...string) (string, *exit.Error) {
+func orgIndexWheelIdentity(name, version, account string, selected registryWheel, targetPython ...string) (string, *exit.Error) {
 	digest := selected.Hashes["sha256"]
 	if len(digest) != 64 || strings.ToLower(digest) != digest || selected.Size < 0 || selected.Size > MaxRegistryWheelBytes {
 		return "", exit.Named(exit.Validation, "registry_dependency_identity_invalid",
@@ -266,7 +267,7 @@ func orgIndexWheelIdentity(name, version, organization string, selected registry
 			"%s==%s wheel is not an exact org index file object", name, version)
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-	if len(parts) != 6 || parts[0] != "v1" || parts[1] != "index" || parts[2] != organization ||
+	if len(parts) != 6 || parts[0] != "v1" || parts[1] != "index" || parts[2] != account ||
 		parts[3] != "files" || parts[4] != digest {
 		return "", exit.Named(exit.Validation, "registry_dependency_origin_refused",
 			"%s==%s wheel is not this package's own org index file for its locked sha256",

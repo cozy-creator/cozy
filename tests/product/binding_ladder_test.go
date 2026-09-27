@@ -30,6 +30,8 @@ import (
 type ladderHub struct {
 	mu                  sync.Mutex
 	server              *httptest.Server
+	mux                 *http.ServeMux
+	iface               []byte // the h3 1.0.0 release interface; nil answers not published
 	bindings            []hub.PackageBindingRow
 	puts                [][]byte
 	deletes             [][]byte
@@ -70,6 +72,12 @@ const (
 
 func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHub {
 	t.Helper()
+	return newOrgLadderHub(t, "proof", authored...)
+}
+
+// newOrgLadderHub is the same stand-in for another account's h3 package and minimax model.
+func newOrgLadderHub(t *testing.T, org string, authored ...[]launch.ModelDefaultRung) *ladderHub {
+	t.Helper()
 	// `generate` is the serving entrypoint whose methods stage components. `lane` is the
 	// se-037 shape: a JOB whose model input is a derive-only source it reads the header of
 	// and inherits by reference — its class declares no component_use, and it writes one
@@ -90,19 +98,10 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 		iface, err = json.Marshal(doc)
 		must(t, err)
 	}
-	normalized, err := canonical.NormalizeJCS(iface)
-	must(t, err)
-	digest, err := canonical.Spell(canonical.Digest(normalized))
-	must(t, err)
-	var detail hub.PackageReleaseDetail
-	detail.PackageInterface = iface
-	detail.Release.Release = "1.0.0"
-	detail.Release.PackageInterfaceDigest = digest
-	detail.Release.PackageInterfaceLength = int64(len(iface))
-	detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25", "torch<3,>=2.13"}
 	h := &ladderHub{soldOut: map[string]bool{}, rentals: map[string]map[string]any{},
-		market: market20260907()}
+		market: market20260907(), iface: iface}
 	mux := http.NewServeMux()
+	h.mux = mux
 	mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		version := h.runtimeVersions[r.PathValue("id")]
@@ -115,14 +114,32 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 			"distributions": []map[string]string{{"name": runtimeDistribution, "version": version}, {"name": "torch", "version": "2.13.0"}},
 		}})
 	})
-	mux.HandleFunc("GET /v1/packages/proof/h3", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "h3"},
+	mux.HandleFunc("GET /v1/packages/"+org+"/h3", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: org, Name: "h3"},
 			Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
 	})
-	mux.HandleFunc("GET /v1/packages/proof/h3/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/packages/"+org+"/h3/releases/1.0.0", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		iface := h.iface
+		h.mu.Unlock()
+		if iface == nil {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":"not_found","message":"not published"}}`))
+			return
+		}
+		normalized, err := canonical.NormalizeJCS(iface)
+		must(t, err)
+		digest, err := canonical.Spell(canonical.Digest(normalized))
+		must(t, err)
+		var detail hub.PackageReleaseDetail
+		detail.PackageInterface = iface
+		detail.Release.Release = "1.0.0"
+		detail.Release.PackageInterfaceDigest = digest
+		detail.Release.PackageInterfaceLength = int64(len(iface))
+		detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25", "torch<3,>=2.13"}
 		_ = json.NewEncoder(w).Encode(detail)
 	})
-	mux.HandleFunc("GET /v1/packages/proof/h3/bindings", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/packages/"+org+"/h3/bindings", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.bindingsUnavailable {
@@ -132,7 +149,7 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"bindings": append([]hub.PackageBindingRow{}, h.bindings...)})
 	})
-	mux.HandleFunc("DELETE /v1/packages/proof/h3/bindings/{slot}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("DELETE /v1/packages/"+org+"/h3/bindings/{slot}", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer ladder-test" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -166,7 +183,7 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 		}
 		_ = json.NewEncoder(w).Encode(hub.PackageBindingReset{Slot: r.PathValue("slot"), Changed: false})
 	})
-	mux.HandleFunc("PUT /v1/packages/proof/h3/bindings/{slot}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PUT /v1/packages/"+org+"/h3/bindings/{slot}", func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
 		must(t, err)
 		if r.Header.Get("Authorization") != "Bearer ladder-test" {
@@ -189,11 +206,11 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 		h.bindings = []hub.PackageBindingRow{row}
 		_ = json.NewEncoder(w).Encode(hub.PackageBindingWrite{Binding: row, Changed: true})
 	})
-	mux.HandleFunc("GET /v1/models/proof/minimax", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/models/"+org+"/minimax", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
 		unsized, later := h.unsized, h.later
 		h.mu.Unlock()
-		card := hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "minimax"},
+		card := hub.ModelCard{Model: hub.Resource{Org: org, Name: "minimax"},
 			Releases: []hub.ModelReleaseSummary{
 				{ReleaseSummary: hub.ReleaseSummary{Release: "0.9.0", Yanked: true}, Lanes: []hub.ModelLaneSummary{
 					{Lane: "bf16-full", ManifestID: bf16Manifest, Bytes: 130 * gib}}},
@@ -225,7 +242,7 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 		}
 		_ = json.NewEncoder(w).Encode(card)
 	})
-	mux.HandleFunc("GET /v1/models/proof/minimax/releases/{release}/lanes/{lane}/manifest",
+	mux.HandleFunc("GET /v1/models/"+org+"/minimax/releases/{release}/lanes/{lane}/manifest",
 		func(w http.ResponseWriter, r *http.Request) {
 			if r.PathValue("release") != ladderRelease || r.PathValue("lane") != ladderLane {
 				http.NotFound(w, r)
@@ -233,14 +250,14 @@ func newLadderHub(t *testing.T, authored ...[]launch.ModelDefaultRung) *ladderHu
 			}
 			_, _ = w.Write(fp8ManifestBody)
 		})
-	mux.HandleFunc("GET /v1/models/proof/minimax/throughput", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /v1/models/"+org+"/minimax/throughput", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if h.throughput == nil {
 			http.NotFound(w, nil)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"model": "proof/minimax", "throughput": h.throughput})
+		_ = json.NewEncoder(w).Encode(map[string]any{"model": org + "/minimax", "throughput": h.throughput})
 	})
 	mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()

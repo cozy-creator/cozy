@@ -98,16 +98,19 @@ func prepareFrom(projectDir string) (*Package, *exit.Error) {
 // Build runs the standard PEP 517 backend and builds local dependency wheels.
 // It is deliberately separate from Prepare so committed replays do no builds.
 func (p *Package) Build(ctx context.Context) *exit.Error {
-	return p.build(ctx, false)
+	return p.build(ctx, nil)
 }
 
-// BuildForPublish also rejects lock rows available only on the author's machine.
-// Declared compatibility bounds are preserved in the package metadata.
-func (p *Package) BuildForPublish(ctx context.Context, prebuiltWheels ...string) *exit.Error {
-	return p.build(ctx, true, prebuiltWheels...)
+// BuildForPublish builds the release for one namespace. It also rejects lock rows
+// available only on the author's machine, rebinds account dependencies to the namespace's
+// index, and writes the account into org-relative model references. Declared
+// compatibility bounds are preserved in the package metadata.
+func (p *Package) BuildForPublish(ctx context.Context, namespace Namespace, prebuiltWheels ...string) *exit.Error {
+	return p.build(ctx, &namespace, prebuiltWheels...)
 }
 
-func (p *Package) build(ctx context.Context, publish bool, prebuiltWheels ...string) *exit.Error {
+func (p *Package) build(ctx context.Context, namespace *Namespace, prebuiltWheels ...string) *exit.Error {
+	publish := namespace != nil
 	if p.Root != "" || p.Wheel != "" {
 		return exit.Internalf("package publication wheel staging was built more than once")
 	}
@@ -148,17 +151,27 @@ func (p *Package) build(ctx context.Context, publish bool, prebuiltWheels ...str
 		p.Root = ""
 		return problem
 	}
+	// Publication resolves from an owned copy bound to the namespace's account index;
+	// that copy's pyproject.toml and uv.lock are the published metadata.
+	project, account := p.Tree, ""
+	if publish {
+		account = namespace.Account
+		if project, problem = p.bindForPublication(ctx, root, *namespace, python.Executable); problem != nil {
+			p.Close()
+			p.Root = ""
+			return problem
+		}
+	}
 	registry := []RegistryRow{}
 	if needsRegistry {
-		organization := strings.TrimSpace(document.Tool.Cozy.Organization)
-		registry, problem = collectRegistryRows(ctx, p.Tree, root, organization, dependencies, python)
+		registry, problem = collectRegistryRows(ctx, project, root, account, dependencies, python)
 		if problem != nil {
 			p.Close()
 			p.Root = ""
 			return problem
 		}
 	}
-	packageInterface, notice, problem := describe(ctx, p.Tree, root, publish)
+	packageInterface, notice, problem := describe(ctx, p.Tree, root, account)
 	p.InterfaceNotice = notice
 	if problem != nil {
 		p.Close()
@@ -182,6 +195,32 @@ func (p *Package) build(ctx context.Context, publish bool, prebuiltWheels ...str
 	p.SourceArchive, p.PackageInterface, p.DependencyWheels, p.Registry = sourceArchive, packageInterface, dependencies, registry
 	p.Vendored = vendored
 	return nil
+}
+
+// bindForPublication copies the source into the staging root and binds its account
+// index. Only a project that names the account index needs the copy.
+func (p *Package) bindForPublication(ctx context.Context, root string, namespace Namespace, python string) (string, *exit.Error) {
+	uses, problem := UsesAccountIndex(p.Tree)
+	if problem != nil || !uses {
+		return p.Tree, problem
+	}
+	bound := filepath.Join(root, "bound-project")
+	for name, source := range p.Files {
+		target := filepath.Join(bound, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			return "", exit.Internalf("cannot stage the bound project: %s", err)
+		}
+		if problem := copySnapshotFile(source, target, SourceFileLimit(name)); problem != nil {
+			return "", problem
+		}
+	}
+	if problem := bindAccountIndex(ctx, bound, func() (Namespace, *exit.Error) { return namespace, nil }, python, true); problem != nil {
+		return "", problem
+	}
+	for _, name := range []string{"pyproject.toml", "uv.lock"} {
+		p.Files[name] = filepath.Join(bound, name)
+	}
+	return bound, nil
 }
 
 func projectWheels(ctx context.Context, tree, out, name, release string, python string, prebuiltWheels ...string) ([]string, *exit.Error) {
@@ -386,9 +425,6 @@ type projectMetadata struct {
 		EntryPoints          map[string]map[string]string `toml:"entry-points"`
 	} `toml:"project"`
 	Tool struct {
-		Cozy struct {
-			Organization string `toml:"organization"`
-		} `toml:"cozy"`
 		UV struct {
 			Sources map[string]any `toml:"sources"`
 			Index   []struct {

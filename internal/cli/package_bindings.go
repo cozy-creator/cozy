@@ -89,12 +89,13 @@ func handlePackageBindings(ctx *Context) *exit.Error {
 	sort.Slice(slots, func(i, j int) bool { return slots[i].Path < slots[j].Path })
 	for _, slot := range slots {
 		declared[slot.Path] = true
+		authored := slot.Default(ref.Org)
 		if override, bound := overrides[slot.Path]; bound {
-			add(slot.Path, "override", &override, slot.DefaultBinding)
+			add(slot.Path, "override", &override, authored)
 			continue
 		}
-		if slot.DefaultBinding != nil {
-			add(slot.Path, "default", slot.DefaultBinding, slot.DefaultBinding)
+		if authored != nil {
+			add(slot.Path, "default", authored, authored)
 			continue
 		}
 		add(slot.Path, "none", nil, nil)

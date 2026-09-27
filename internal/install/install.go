@@ -52,6 +52,9 @@ type LocalSource struct {
 	Package string
 	Release string
 	Tree    string
+	// Namespace is the caller on the command's Tensorhub. The owned source copy binds its
+	// account index there; it is asked only when the source names that index.
+	Namespace packagepublish.NamespaceSource
 }
 
 type PublishedSource struct {
@@ -280,6 +283,9 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		// its sibling dependencies share one owned root for imports and describe.
 		sourceDir, e = snapshotSource(installDir, local)
 		if e != nil {
+			return fail(e)
+		}
+		if e := packagepublish.BindAccountIndex(context.Background(), sourceDir, local.Namespace); e != nil {
 			return fail(e)
 		}
 		inst.ProjectDir = sourceDir

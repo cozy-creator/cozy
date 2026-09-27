@@ -26,16 +26,16 @@ import (
 // exact lightweight interface wheels. The author's project and lock never change.
 // Unrelated local libraries retain their original declarations and are captured
 // by the ordinary snapshotter after this interface-only lock adjustment.
-func WithChildInterfaces(ctx context.Context, parent *Package, replacements map[string]string) (*Package, *exit.Error) {
+func WithChildInterfaces(ctx context.Context, parent *Package, replacements map[string]string, namespace NamespaceSource) (*Package, *exit.Error) {
 	if len(replacements) == 0 {
 		return parent, nil
 	}
-	return prepareUnpublishedCopy(ctx, parent, replacements)
+	return prepareUnpublishedCopy(ctx, parent, replacements, namespace)
 }
 
 // Both ordinary captured dependency resolution and interface substitution use
 // the same bounded source capture, path rebasing and uv resolver.
-func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements map[string]string, extras ...string) (*Package, *exit.Error) {
+func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements map[string]string, namespace NamespaceSource, extras ...string) (*Package, *exit.Error) {
 	extras, problem := normalizedExtras(extras)
 	if problem != nil {
 		return nil, problem
@@ -240,7 +240,7 @@ func prepareUnpublishedCopy(ctx context.Context, parent *Package, replacements m
 	if problem != nil {
 		return fail(problem)
 	}
-	if problem := selectCapturedHubIndexes(root); problem != nil {
+	if _, _, problem := writeNamedAccountIndex(root, namespace); problem != nil {
 		return fail(problem)
 	}
 	command := exec.CommandContext(ctx, "uv", "lock", "--no-progress", "--python", python.Executable, "--no-python-downloads")

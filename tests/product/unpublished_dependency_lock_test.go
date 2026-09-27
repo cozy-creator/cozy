@@ -49,7 +49,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     return name
 `, marker)
 	must(t, os.WriteFile(filepath.Join(library, "backend.py"), []byte(backend), 0o600))
-	pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
+	pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil)
 	if pack != nil {
 		defer pack.Close()
 	}
@@ -84,13 +84,13 @@ private-lock-library = {path = "../library", editable = true}
 	if _, problem := packagepublish.PrepareFrom(project); problem == nil || problem.ErrName() != "package_source_required_file_missing" {
 		t.Fatalf("publication no longer requires an authored lock: %v", problem)
 	}
-	first, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
+	first, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil)
 	fatal(t, problem)
 	defer first.Close()
 	frozen, problem := packagepublish.SnapshotSource(first.Tree, filepath.Join(t.TempDir(), "accepted"))
 	fatal(t, problem)
 	defer frozen.Close()
-	second, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
+	second, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil)
 	fatal(t, problem)
 	defer second.Close()
 	if first.Tree == second.Tree {
@@ -115,7 +115,7 @@ private-lock-library = {path = "../library", editable = true}
 		t.Fatalf("captured package has no resolved lock: %v", err)
 	}
 	must(t, os.WriteFile(implementation, []byte("VALUE = 12\n"), 0o600))
-	edited, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project)
+	edited, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil)
 	fatal(t, problem)
 	defer edited.Close()
 	newCapture, problem := packagepublish.SnapshotSource(edited.Tree, filepath.Join(t.TempDir(), "accepted"))
@@ -165,7 +165,7 @@ private-extra-alternate={path="../alternate"}
 	}
 	capture := func(extras ...string) (*packagepublish.Package, string) {
 		t.Helper()
-		pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, extras...)
+		pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil, extras...)
 		fatal(t, problem)
 		t.Cleanup(pack.Close)
 		metadata, err := os.ReadFile(filepath.Join(pack.Tree, "pyproject.toml"))
@@ -205,7 +205,7 @@ private-extra-alternate={path="../alternate"}
 		t.Fatalf("selected optional dependencies lost their original paths: %+v", selected)
 	}
 	for _, extra := range []string{"missing", "managed; injected"} {
-		pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, extra)
+		pack, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), project, nil, extra)
 		if pack != nil {
 			pack.Close()
 		}

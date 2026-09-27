@@ -64,7 +64,8 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		return lookupProblem
 	}
 	if problem := timings.stage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
-		if problem := pack.BuildForPublish(hctx, ctx.Inv.Values["--wheel"]...); problem != nil {
+		namespace := packagepublish.Namespace{Hub: c.Base(), Account: account.Name}
+		if problem := pack.BuildForPublish(hctx, namespace, ctx.Inv.Values["--wheel"]...); problem != nil {
 			return problem
 		}
 		return nil
@@ -134,6 +135,23 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
 	return emit(ctx, record)
+}
+
+// handlePackageLock writes uv.lock for this command's Tensorhub and account: the pin
+// publication rebinds to each target it publishes to.
+func handlePackageLock(ctx *Context) *exit.Error {
+	locked, problem := packagepublish.Lock(context.Background(), ".", commandNamespace(ctx),
+		ctx.Inv.Values["--upgrade-package"])
+	if problem != nil {
+		return problem
+	}
+	index := locked.Index
+	if index == "" {
+		index = "none"
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "lock", V: locked.Path}, {K: "account_index", V: index}, {K: "changed", V: locked.Changed},
+	}, "lock", "account_index", "changed"))
 }
 
 func handlePackageYank(ctx *Context) *exit.Error {

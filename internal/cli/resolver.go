@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -215,7 +216,8 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 	result, problem := install.Run(layout, r.store, install.Request{
 		Ref: install.Ref{Package: current.Package}, Force: true,
 		Local: &install.LocalSource{Bytes: snapshot.Bytes, Files: snapshot.Files,
-			Package: current.Package, Release: pack.Release, Tree: current.SourceRef},
+			Package: current.Package, Release: pack.Release, Tree: current.SourceRef,
+			Namespace: r.namespace},
 	})
 	if problem != nil {
 		return current.ID, false, refreshFailure(pkg, current, problem)
@@ -241,6 +243,19 @@ func short12(value string) string {
 		return value[:12]
 	}
 	return value
+}
+
+// namespace answers the signed-in caller on the daemon's Tensorhub: the account an
+// editable source's account index and org-relative model defaults resolve against.
+func (r *Resolver) namespace() (packagepublish.Namespace, *exit.Error) {
+	c := hub.New(r.cfg, "cozy-daemon").WithTokenSource(accountauth.New(r.cfg))
+	ctx, cancel := hub.Context()
+	defer cancel()
+	account, problem := c.CurrentAccount(ctx)
+	if problem != nil {
+		return packagepublish.Namespace{}, problem
+	}
+	return packagepublish.Namespace{Hub: c.Base(), Account: account.Name}, nil
 }
 
 // NewResolver builds the resolver over the lifecycle authority. `devices` is the envelope
@@ -453,7 +468,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 		// dispatch. Owner overrides and authored defaults use the same selection here.
 		// Sharing only saves a later preparation, so an unreadable override set skips it.
 		if rows, problem := r.catalog.PackageBindings(ctx, ref); problem == nil {
-			defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows)
+			defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows, ref.Org)
 			shareModelSlots(models, entrypoint, packageInterface.Entrypoints, defaults)
 		}
 	}

@@ -27,7 +27,7 @@ func TestPrebuiltProjectWheelsPublication(t *testing.T) {
 	pack, problem := packagepublish.PrepareFrom(project)
 	fatal(t, problem)
 	t.Cleanup(pack.Close)
-	fatal(t, pack.BuildForPublish(t.Context(), second, first))
+	fatal(t, pack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"}, second, first))
 	if len(pack.ProjectWheels) != 2 || pack.SourceArchive == "" || pack.PackageInterface == "" {
 		t.Fatalf("prebuilt publication lost artifacts: %#v", pack)
 	}
@@ -63,7 +63,7 @@ func TestPrebuiltProjectWheelsPublication(t *testing.T) {
 			pack, problem := packagepublish.PrepareFrom(project)
 			fatal(t, problem)
 			defer pack.Close()
-			if problem := pack.BuildForPublish(t.Context(), tc.wheels...); problem == nil || problem.Name != tc.refusal {
+			if problem := pack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"}, tc.wheels...); problem == nil || problem.Name != tc.refusal {
 				t.Fatalf("bad prebuilt wheel result: %v, want %s", problem, tc.refusal)
 			}
 		})

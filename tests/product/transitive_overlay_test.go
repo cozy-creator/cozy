@@ -111,7 +111,7 @@ captured-leaf = {path = %q}
 	pack, problem := packagepublish.PrepareLocalFrom(project)
 	fatal(t, problem)
 	defer pack.Close()
-	copied, problem := packagepublish.WithChildInterfaces(t.Context(), pack, map[string]string{"captured-leaf": replacement})
+	copied, problem := packagepublish.WithChildInterfaces(t.Context(), pack, map[string]string{"captured-leaf": replacement}, nil)
 	fatal(t, problem)
 	defer copied.Close()
 	run(copied.Tree, "sync", "--frozen", "--no-dev", "--no-default-groups", "--no-install-project", "--python", "3.12")
@@ -141,7 +141,7 @@ captured-leaf = {path = %q}
 	if string(current) != metadata || !bytes.Equal(currentLock, lock) {
 		t.Fatal("interface capture changed the author's project or lock")
 	}
-	if _, problem := packagepublish.WithChildInterfaces(t.Context(), pack, map[string]string{"other": replacement}); problem == nil {
+	if _, problem := packagepublish.WithChildInterfaces(t.Context(), pack, map[string]string{"other": replacement}, nil); problem == nil {
 		t.Fatal("replacement with a different distribution was accepted")
 	}
 }
