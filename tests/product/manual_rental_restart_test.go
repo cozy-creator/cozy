@@ -52,6 +52,12 @@ func TestInterruptedManualAcquisitionCompletesOnDaemonRestart(t *testing.T) {
 	}
 }
 
+// A run pinned to a rental that is still acquiring waits for it, and is placed on it once
+// the Hub reports it ready, without buying anything else.
+func TestQueuedRunWakesWhenItsRentalBecomesReady(t *testing.T) {
+	proveIdleManualRentalRestart(t, "interrupted-queued")
+}
+
 // CPU work has no accelerator requirement; an already-paid idle GPU is usable.
 // Accelerator work still cannot use a CPU worker. Both arms cross real daemon
 // acquisition, retained rental records, signed Claim and independent TLS peer.
@@ -64,6 +70,7 @@ func TestIdleRentalAcceleratorRequirement(t *testing.T) {
 func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	root := t.TempDir()
 	classProof := mode == "cpu_job_on_gpu" || mode == "gpu_job_on_cpu"
+	jobProof := classProof || mode == "interrupted-queued"
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
@@ -184,22 +191,27 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		if r.Method != http.MethodGet && !plan {
 			mutations.Add(1)
 		}
-		if classProof && plan && r.URL.Query().Get("release") == "1" {
+		if jobProof && plan && r.URL.Query().Get("release") == "1" {
 			_ = json.NewEncoder(w).Encode(rentalDownloadPlan("proof/idle-job", "1"))
 			return
 		}
 		if strings.HasPrefix(mode, "interrupted") && r.Method == http.MethodGet {
+			publicKey := identity.PublicKey()
+			if mode == "interrupted-wrong-key" {
+				publicKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+			}
+			ready := map[string]any{"rental_id": podRental, "name": machineName,
+				"state": "ready", "requested_accelerator_model": "CPU", "accelerator_count": 1,
+				"hourly_rate_usd_micros": 1, "worker_address": listener.Addr().String(),
+				"media_address": strings.TrimPrefix(media.URL, "https://"), "cert_pem": string(cert),
+				"worker_id": podWorkerID, "worker_boot_id": podBootID,
+				"creator_public_key": publicKey, "media_token_sha256": []string{secret.HashHex(token)}}
 			if r.URL.Path == "/v1/rentals/"+podRental {
-				publicKey := identity.PublicKey()
-				if mode == "interrupted-wrong-key" {
-					publicKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": podRental, "name": machineName,
-					"state": "ready", "requested_accelerator_model": "CPU", "accelerator_count": 1,
-					"hourly_rate_usd_micros": 1, "worker_address": listener.Addr().String(),
-					"media_address": strings.TrimPrefix(media.URL, "https://"), "cert_pem": string(cert),
-					"worker_id": podWorkerID, "worker_boot_id": podBootID,
-					"creator_public_key": publicKey, "media_token_sha256": []string{secret.HashHex(token)}})
+				_ = json.NewEncoder(w).Encode(ready)
+				return
+			}
+			if r.URL.Path == "/v1/rentals" && mode == "interrupted-queued" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"rentals": []map[string]any{ready}})
 				return
 			}
 			if r.URL.Path == "/v1/rentals" {
@@ -207,7 +219,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 				return
 			}
 		}
-		if classProof && r.Method == http.MethodGet {
+		if jobProof && r.Method == http.MethodGet {
 			switch r.URL.Path {
 			case "/v1/packages/proof/idle-job/releases/1":
 				_ = json.NewEncoder(w).Encode(rentalReleaseFacts())
@@ -275,6 +287,14 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 			pending.State = "released"
 			fatal(t, store.RecordRental(pending))
 		}
+		const queued = "job-queued-on-acquiring-rental"
+		if mode == "interrupted-queued" {
+			_, _, problem := store.Submit(records.Request{ID: queued, IdemKey: queued,
+				BodyDigest: "sha256:" + strings.Repeat("a", 64), Package: "proof/idle-job", Release: "1", Entrypoint: "produce",
+				Kind: "job", Rental: true, RentalRequired: true, RequestedRental: podRental,
+				Payload: []byte("{}"), Outputs: "[]", WeightsOutputs: "[]"})
+			fatal(t, problem)
+		}
 		startDaemonProcess(t, root)
 		if mode == "interrupted-released" || mode == "interrupted-wrong-key" {
 			waitUntil(t, "recovery refuses changed ownership", func() bool {
@@ -309,6 +329,19 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 		}
 		if _, err := os.Stat(layout.PendingRentalMediaToken("manual-restart")); !os.IsNotExist(err) {
 			t.Fatal("pending credential was not retired after authenticated attachment")
+		}
+		if mode == "interrupted-queued" {
+			waitUntil(t, "the queued run is placed on its now-ready rental", func() bool {
+				request, problem := store.RequestRow(queued)
+				fatal(t, problem)
+				return request.Worker != "" || request.State == "failed"
+			})
+			placed, problem := store.RequestRow(queued)
+			fatal(t, problem)
+			if placed.Worker != podRental || mutations.Load() != 0 {
+				t.Fatalf("the queued run was not placed on its rental: worker=%q state=%s paid asks=%d; %s",
+					placed.Worker, placed.State, mutations.Load(), tail(filepath.Join(root, "daemon.log")))
+			}
 		}
 		return
 	}
