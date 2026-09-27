@@ -133,9 +133,13 @@ pub fn cmd_plan(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let mut rev = construction_order(&h);
     rev.reverse();
     println!(
-        "contract:   reversed caller traversal refuses: {}",
+        "contract:   reversed caller traversal plans in its own order: {}",
         match read::plan_for_traversal(&h, &rev, &all_components(&h), window) {
-            Err(e) if e.code == Code::TRAVERSAL_ORDER_MISMATCH => "YES",
+            Ok(p)
+                if p.items.first().is_some_and(|it| it
+                    .what
+                    .starts_with(&format!("{}/{}#", rev[0].0, rev[0].1))) =>
+                "YES",
             _ => "NO — DEFECT",
         }
     );
@@ -991,7 +995,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     short.pop();
     a.arm(
         "traversal missing a tensor",
-        Code::TRAVERSAL_ORDER_MISMATCH,
+        Code::TRAVERSAL_INCOMPLETE,
         read::plan_for_traversal(&h, &short, &all_components(&h), 1 << 20),
     );
 
@@ -1026,7 +1030,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         holed.pop();
         a.arm(
             "a tensor missing WITHIN a requested component",
-            Code::TRAVERSAL_ORDER_MISMATCH,
+            Code::TRAVERSAL_INCOMPLETE,
             read::plan_for_traversal(&h, &holed, only_one, 1 << 20),
         );
     }
@@ -1042,7 +1046,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     }
     a.arm(
         "a tensor from a component the plan did not request",
-        Code::TRAVERSAL_ORDER_MISMATCH,
+        Code::TRAVERSAL_INCOMPLETE,
         read::plan_for_traversal(&h, &smuggled, only_one, 1 << 20),
     );
 

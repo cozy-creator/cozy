@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use crate::checkpoint;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::header::{Asset, Body, Header, Located, Part};
+use crate::header::{Asset, Body, Header, Located, Part, Tensor};
 use crate::ids::ObjectRef;
 use crate::manifest::Manifest;
 use crate::meta::{Hold, Meta};
@@ -594,48 +594,43 @@ impl ReadPlan {
     }
 }
 
-fn build(header: &Header, scope: &[&str], window: u64) -> Result<ReadPlan> {
+fn build(ordered: &[(&str, &str, &Tensor)], window: u64) -> Result<ReadPlan> {
     let mut items = Vec::new();
     let mut dest: u64 = 0;
-    for (comp, tensors) in &header.components {
-        if !scope.contains(&comp.as_str()) {
-            continue;
-        }
-        for (key, tensor) in tensors {
-            for (role, part) in &tensor.parts {
-                let what = format!("{comp}/{key}#{role}");
-                if let Body::Inline(b) = &part.body {
-                    let n = part.nbytes(&what)?;
+    for (comp, key, tensor) in ordered {
+        for (role, part) in &tensor.parts {
+            let what = format!("{comp}/{key}#{role}");
+            if let Body::Inline(b) = &part.body {
+                let n = part.nbytes(&what)?;
+                items.push(PlanItem {
+                    what: what.clone(),
+                    dest_off: dest,
+                    len: n,
+                    source: Source::Inline(b.clone()),
+                });
+                dest += n;
+                continue;
+            }
+            for segment in part.segments() {
+                let mut off = 0u64;
+                while off < segment.length {
+                    let n = if window == 0 {
+                        segment.length - off
+                    } else {
+                        window.min(segment.length - off)
+                    };
                     items.push(PlanItem {
                         what: what.clone(),
                         dest_off: dest,
                         len: n,
-                        source: Source::Inline(b.clone()),
+                        source: Source::Object(ObjectRange {
+                            obj: segment.clone(),
+                            off,
+                            len: n,
+                        }),
                     });
                     dest += n;
-                    continue;
-                }
-                for segment in part.segments() {
-                    let mut off = 0u64;
-                    while off < segment.length {
-                        let n = if window == 0 {
-                            segment.length - off
-                        } else {
-                            window.min(segment.length - off)
-                        };
-                        items.push(PlanItem {
-                            what: what.clone(),
-                            dest_off: dest,
-                            len: n,
-                            source: Source::Object(ObjectRange {
-                                obj: segment.clone(),
-                                off,
-                                len: n,
-                            }),
-                        });
-                        dest += n;
-                        off += n;
-                    }
+                    off += n;
                 }
             }
         }
@@ -658,8 +653,10 @@ fn tally(items: &[PlanItem]) -> (u64, u64, usize) {
     (bytes, io_bytes, inline)
 }
 
-/// The read planner. Runtime's traversal must exactly equal the stored construction order;
-/// after that equality gate, planning walks the header once and never performs key lookup.
+/// The read planner. The destination follows the CALLER's traversal, which is the order it
+/// constructs in; the header's tensor order is a storage choice of whoever wrote it. The two
+/// are written by independently versioned peers, so a permutation is planned, never refused:
+/// only a traversal that names a different set of tensors is.
 ///
 /// COMPLETENESS SCOPES TO THE REQUESTED COMPONENT SET (#570b). `requested` is the caller's
 /// explicit declaration of which components this plan is for; the traversal must name every
@@ -716,34 +713,38 @@ pub fn plan_for_traversal(
         }
     }
 
-    let named: Vec<(&str, &str)> = traversal
-        .iter()
-        .map(|(c, k)| (c.as_str(), k.as_str()))
-        .collect();
-    let have: Vec<(&str, &str)> = header
+    let mut carried: HashMap<(&str, &str), &Tensor> = header
         .tensors()
         .filter(|(c, _, _)| scope.contains(&c.as_str()))
-        .map(|(c, k, _)| (c.as_str(), k.as_str()))
+        .map(|(c, k, t)| ((c.as_str(), k.as_str()), t))
         .collect();
-    if named != have {
-        let at = named
-            .iter()
-            .zip(have.iter())
-            .position(|(got, want)| got != want)
-            .unwrap_or(named.len().min(have.len()));
-        let got = named.get(at).map(|(c, k)| format!("{c}/{k}"));
-        let want = have.get(at).map(|(c, k)| format!("{c}/{k}"));
+    let mut ordered = Vec::with_capacity(traversal.len());
+    for (c, k) in traversal {
+        let Some(tensor) = carried.remove(&(c.as_str(), k.as_str())) else {
+            return refuse(
+                Code::TRAVERSAL_INCOMPLETE,
+                format!(
+                    "the traversal names {c}/{k}, which requested components {scope:?} do \
+                     not carry, or names it twice"
+                ),
+            );
+        };
+        ordered.push((c.as_str(), k.as_str(), tensor));
+    }
+    if !carried.is_empty() {
+        let mut missing: Vec<String> = carried.keys().map(|(c, k)| format!("{c}/{k}")).collect();
+        missing.sort();
+        missing.truncate(4);
         return refuse(
-            Code::TRAVERSAL_ORDER_MISMATCH,
+            Code::TRAVERSAL_INCOMPLETE,
             format!(
-                "construction order differs at row {at}: caller {got:?}, header {want:?}; \
-                 caller has {} rows and requested components {scope:?} carry {}",
-                named.len(),
-                have.len()
+                "the traversal omits {} tensor(s) requested components {scope:?} carry: \
+                 {missing:?}",
+                carried.len()
             ),
         );
     }
-    build(header, &scope, window)
+    build(&ordered, window)
 }
 
 // ---------------------------------------------------------------- the reader pool

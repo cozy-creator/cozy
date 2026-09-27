@@ -80,7 +80,7 @@ fn selection_does_not_weaken_the_complete_plan_gate() {
         plan_for_traversal(&header, &traversal[1..], &["model".into()], 128)
             .unwrap_err()
             .code,
-        Code::TRAVERSAL_ORDER_MISMATCH
+        Code::TRAVERSAL_INCOMPLETE
     );
     let full = plan_for_traversal(&header, &traversal, &["model".into()], 128).unwrap();
     assert_eq!(
