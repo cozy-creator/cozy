@@ -16,7 +16,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Exercise the real owner on pinned TLS: incompatible peers must receive no Claim.
+// Exercise the real owner on pinned TLS. A peer's protocol range, or its absence, never
+// refuses the Claim (worker-protocol fd6d9a92); only the rental idle guard, which makes
+// idle release safe, keeps a Claim from a Host.
 func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 	for _, row := range []struct {
 		name             string
@@ -28,9 +30,9 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 		{"unsafe rental Host", pb.MinCompatibleWireMinor, pb.MinCompatibleWireMinor, false, false, true},
 		{"current", pb.WireMinor, pb.MinCompatibleWireMinor, false, true, false},
 		{"additive", pb.WireMinor + 1, pb.MinCompatibleWireMinor, false, true, false},
-		{"old", pb.MinCompatibleWireMinor - 1, 1, false, false, false},
-		{"new hardcut", pb.WireMinor + 1, pb.WireMinor + 1, false, false, false},
-		{"invalid", 1, 2, false, false, false}, {"missing", 0, 0, true, false, false},
+		{"old", pb.MinCompatibleWireMinor - 1, 1, false, true, false},
+		{"new floor", pb.WireMinor + 1, pb.WireMinor + 1, false, true, false},
+		{"invalid", 1, 2, false, true, false}, {"missing", 0, 0, true, true, false},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -59,10 +61,13 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 			if row.unsafe && (problem == nil || problem.ErrName() != "worker.rental_idle_guard_required" || !strings.Contains(problem.Message, "active-work reporting")) {
 				t.Fatalf("unsafe Host did not get a feature-specific refusal: %v", problem)
 			}
-			if !row.accepted && !row.unsafe && !row.absent && row.floor > 0 && row.floor <= row.minor {
-				if !strings.Contains(problem.Message, fmt.Sprintf("%d–%d", row.floor, row.minor)) ||
+			if row.floor > 0 && row.floor <= row.minor && (row.minor < pb.MinCompatibleWireMinor || row.floor > pb.WireMinor) {
+				// Execution on a peer outside the range fails that operation alone, naming both ranges.
+				problem := orchestrator.ValidateWorkerProtocol(&pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor, SupportsRentalKeepalive: true}, true)
+				if problem == nil || problem.ErrName() != pb.CapabilityUnavailableCode ||
+					!strings.Contains(problem.Message, fmt.Sprintf("%d–%d", row.floor, row.minor)) ||
 					!strings.Contains(problem.Message, fmt.Sprintf("%d–%d", pb.MinCompatibleWireMinor, pb.WireMinor)) {
-					t.Fatalf("range refusal omitted supported versions: %v", problem)
+					t.Fatalf("an execution outside the range was not a named capability failure: %v", problem)
 				}
 			}
 			if probes.Load() == 0 {

@@ -188,12 +188,21 @@ func TestDeclaredAssetsCountsAndFidelity(t *testing.T) {
 	if document.Assets[0].Fidelity != "medium" || document.Assets[1].Fidelity != "low" {
 		t.Fatalf("fidelity selector changed label meaning: %s", payload)
 	}
-	for _, value := range []string{"0", "2", "-1", "null", "true", "1.5"} {
+	// A readable cap is applied; an absent or negative one is no cap; a mistyped one refuses.
+	for value, want := range map[string]int64{"0": 0, "2": 2, "-1": -1, "null": -1} {
 		raw := strings.Replace(declaredAssetsInterface, `"kind":"image"`, `"kind":"image","max_count":`+value, 1)
 		iface, problem := launch.DecodePackageInterface([]byte(raw))
-		valid := value == "0" || value == "2"
-		if (problem == nil) != valid || (valid && iface == nil) {
-			t.Fatalf("max_count %s validation: %v", value, problem)
+		fatal(t, problem)
+		ep, problem := iface.Function("run")
+		fatal(t, problem)
+		if cap := ep.Assets.Kinds[0].MaxCount; (cap == nil) != (want < 0) || cap != nil && *cap != want {
+			t.Fatalf("max_count %s read as %v", value, cap)
+		}
+	}
+	for _, value := range []string{"true", "1.5"} {
+		raw := strings.Replace(declaredAssetsInterface, `"kind":"image"`, `"kind":"image","max_count":`+value, 1)
+		if _, problem := launch.DecodePackageInterface([]byte(raw)); problem == nil {
+			t.Fatalf("mistyped max_count %s was admitted", value)
 		}
 	}
 }
