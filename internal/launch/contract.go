@@ -16,6 +16,9 @@ import (
 // terms bracketed, each spelled in the exact grammar that supplies it.
 func UsageLine(target string, ep *Entrypoint) string {
 	line := "cozy run " + target
+	if slot := ConversionSlot(ep); slot != nil {
+		line += " <" + slot.Param + "> [<org/model>]"
+	}
 	for i := range ep.Request.Fields {
 		line += " " + usageTerm(&ep.Request.Fields[i], ep.Assets)
 	}

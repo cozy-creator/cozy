@@ -343,7 +343,7 @@ type RunCmd struct {
 
 type RunExecuteCmd struct {
 	Target          string   `arg:"" name:"target" predictor:"callable" help:"Package callable org/package[/function], or a single-entrypoint Python script."`
-	Input           []string `arg:"" optional:"" name:"input" help:"Primary value, field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
+	Input           []string `arg:"" optional:"" name:"input" help:"Primary value (a conversion job takes <input-model> [<org/model> destination]), field=value payload, model.<param>=reference overrides (Tensorhub, hf://, or civitai://), and kernel.attention=[component=]backend for a request-scoped development override."`
 	Out             string   `help:"Output directory." type:"path" predictor:"dir"`
 	Timeout         string   `help:"Request deadline."`
 	PayloadFile     string   `name:"input" aliases:"in" help:"Read the whole payload from a JSON file, e.g. --input=request.json; inline fields override file values." type:"path"`
