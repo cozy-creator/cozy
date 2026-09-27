@@ -728,7 +728,6 @@ func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length
 
 // GCReport is one reclamation pass as TensorFS reports it (`tfs gc --json`).
 type GCReport struct {
-	DryRun             bool     `json:"dry_run"`
 	ReclaimedBytes     int64    `json:"reclaimed_bytes"`
 	ReclaimedBlobs     int64    `json:"reclaimed_blobs"`
 	ReclaimedManifests int64    `json:"reclaimed_manifests"`
