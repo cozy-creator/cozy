@@ -16,20 +16,17 @@ import (
 // The store's scheduled reclamation. Owner ruling (2026-09-02): "garbage-collection for
 // repo-CAS (both local and on tensorhub) should run on a cron job." The schedule is a
 // cadence — when a pass runs — never the decision: what is reclaimed is TensorFS's, from
-// its filesystem census, and a live writer or read lease refuses the pass by name. A pass
-// runs only while the daemon manages nothing (the idle predicate): a download's admitted
-// objects are unnamed until its commit, and an ingest of its own sits between `ingest run`
-// and `ingest install` with no live writer — a sweep beside either could take bytes the
-// daemon is still moving in.
+// its filesystem census, and a live writer or read lease refuses the pass by name. The
+// reclamationFence adds what TensorFS cannot see: a local request still moving unnamed
+// bytes in defers the pass, and a retained run keeps the ingest sessions it may resume.
 type gcCron struct {
 	schedule cron.Schedule
 	cfg      config.Config
 	layout   home.Layout
-	idle     idleWatch
 	log      io.Writer
 }
 
-func newGCCron(cfg config.Config, layout home.Layout, idle idleWatch, log io.Writer) (gcCron, bool) {
+func newGCCron(cfg config.Config, layout home.Layout, log io.Writer) (gcCron, bool) {
 	if cfg.MaintenanceGCCron == "" {
 		return gcCron{}, false
 	}
@@ -39,7 +36,7 @@ func newGCCron(cfg config.Config, layout home.Layout, idle idleWatch, log io.Wri
 		fmt.Fprintf(log, "gc: maintenance.gc_cron %q refused: %s\n", cfg.MaintenanceGCCron, err)
 		return gcCron{}, false
 	}
-	return gcCron{schedule: schedule, cfg: cfg, layout: layout, idle: idle, log: log}, true
+	return gcCron{schedule: schedule, cfg: cfg, layout: layout, log: log}, true
 }
 
 func (g gcCron) run(quit <-chan struct{}) {
@@ -57,13 +54,12 @@ func (g gcCron) run(quit <-chan struct{}) {
 }
 
 func (g gcCron) once() {
-	held, problem := g.idle.managed()
+	fence, problem := readReclamationFence(g.layout)
+	if problem == nil {
+		problem = fence.busy()
+	}
 	if problem != nil {
 		fmt.Fprintf(g.log, "gc: deferred: %s\n", problem.Message)
-		return
-	}
-	if len(held) > 0 {
-		fmt.Fprintf(g.log, "gc: deferred: the daemon manages %s\n", strings.Join(held, ", "))
 		return
 	}
 	tool, problem := tfs.Open(g.cfg)
@@ -71,7 +67,7 @@ func (g gcCron) once() {
 		fmt.Fprintf(g.log, "gc: deferred: %s\n", problem.Message)
 		return
 	}
-	report, problem := tool.GC(true)
+	report, notes, problem := fence.collect(tool)
 	if problem != nil {
 		fmt.Fprintf(g.log, "gc: deferred: %s\n", problem.Message)
 		return
@@ -81,6 +77,9 @@ func (g gcCron) once() {
 	if report.KeptObjects > 0 {
 		line += fmt.Sprintf(", kept %s held by ingest session %s", output.Bytes(report.KeptBytes),
 			strings.Join(report.Sessions, ", "))
+	}
+	for _, note := range notes {
+		line += "; " + note
 	}
 	fmt.Fprintln(g.log, line)
 }
