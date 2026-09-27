@@ -415,9 +415,14 @@ impl Store {
     ///
     /// A symlink, non-directory, partial Store, or directory containing foreign state refuses.
     /// There is no old-layout lookup or fallback root.
+    /// Open the Store at `root`, creating it when absent or empty. Concurrent calls on one
+    /// new root serialize on the root directory: exactly one creates it, the rest open it.
     pub fn ensure(root: &Path) -> Result<Store> {
         match fs::symlink_metadata(root) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Store::init(root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(root)
+                    .map_err(|error| io(format!("create Store root {}", root.display()), error))?;
+            }
             Err(error) => return Err(io(format!("stat Store root {}", root.display()), error)),
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return refuse(
@@ -427,6 +432,7 @@ impl Store {
             }
             Ok(_) => {}
         }
+        let _creation = creation_lock(root)?;
         let empty = fs::read_dir(root)
             .map_err(|error| io(format!("read Store root {}", root.display()), error))?
             .next()
@@ -434,7 +440,7 @@ impl Store {
             .map_err(|error| io(format!("read Store root {}", root.display()), error))?
             .is_none();
         if empty {
-            Store::init(root)
+            Store::init_locked(root)
         } else {
             validate_store_root(root)?;
             let catalog_path = root.join("tensorfs.sqlite");
@@ -456,6 +462,15 @@ impl Store {
     }
 
     pub fn init(root: &Path) -> Result<Store> {
+        if matches!(fs::symlink_metadata(root), Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            let _creation = creation_lock(root)?;
+            return Store::init_locked(root);
+        }
+        Store::init_locked(root)
+    }
+
+    fn init_locked(root: &Path) -> Result<Store> {
         match fs::symlink_metadata(root) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
@@ -2101,6 +2116,20 @@ fn read_repo_cache_binding(root: &Path) -> Option<crate::repo_cache::RepoObjectC
     let cache = PathBuf::from(std::ffi::OsString::from_vec(bytes));
     validate_repo_cache_root(&cache, root).ok()?;
     Some(crate::repo_cache::RepoObjectCache::new(cache))
+}
+
+/// Serializes Store creation on one root across threads and processes. A lock on the root
+/// directory itself leaves nothing behind in it.
+fn creation_lock(root: &Path) -> Result<File> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(root)
+        .map_err(|error| io(format!("open Store root {}", root.display()), error))?;
+    directory
+        .lock_exclusive()
+        .map_err(|error| io(format!("lock Store root {}", root.display()), error))?;
+    Ok(directory)
 }
 
 fn open_validated(root: &Path) -> Result<Store> {
