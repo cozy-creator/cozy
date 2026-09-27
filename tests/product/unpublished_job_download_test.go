@@ -27,16 +27,23 @@ func (p *fakePod) PreparePrivatePlacement(call *pb.PreparePrivatePlacementCall, 
 func TestUnpublishedJobDownloadsInputsBeforeDispatchWithoutServing(t *testing.T) {
 	for _, versioned := range []bool{false, true} {
 		t.Run(map[bool]string{false: "checkpoint", true: "release_lane"}[versioned], func(t *testing.T) {
-			privateJobDownload(t, versioned, true)
+			privateJobDownload(t, versioned, true, false)
 		})
 	}
 }
 
 func TestUnpublishedJobLeavesImportedDefaultsForTheirCallee(t *testing.T) {
-	privateJobDownload(t, true, false)
+	privateJobDownload(t, true, false, false)
 }
 
-func privateJobDownload(t *testing.T, versioned, rootModels bool) {
+// The H3 long_form shape: a model-free CPU parent whose GPU children are entrypoints of
+// the SAME package. Their captured defaults share the parent's package but bind the
+// callee's slots, so the parent keeps its CPU orchestration slot and prepares nothing.
+func TestSamePackageCalleeDefaultsLeaveTheParentItsCPUSlot(t *testing.T) {
+	privateJobDownload(t, true, false, true)
+}
+
+func privateJobDownload(t *testing.T, versioned, rootModels, samePackage bool) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	pod := &fakePod{controlKey: public, jobReady: true, localJobOnly: true}
@@ -67,12 +74,15 @@ func privateJobDownload(t *testing.T, versioned, rootModels bool) {
 	fatal(t, problem)
 	child := install
 	child.ID, child.Package, child.Dir = "imported-child", "local/imported-invocable", filepath.Join(o.root, "installs", "child")
-	fatal(t, o.store.RecordInstall(child))
-	fatal(t, o.store.RecordChildBindings([]records.ChildBinding{{
-		ParentInstallID: install.ID, ChildInstallID: child.ID,
-
-		Module: "imported_invocable", Export: "child", Entrypoint: "child",
-	}}))
+	binding := records.ChildBinding{ParentInstallID: install.ID, ChildInstallID: child.ID,
+		Module: "imported_invocable", Export: "child", Entrypoint: "child"}
+	if samePackage {
+		binding = records.ChildBinding{ParentInstallID: install.ID, ChildInstallID: install.ID,
+			Module: "tools", Export: "segment", Entrypoint: "segment"}
+	} else {
+		fatal(t, o.store.RecordInstall(child))
+	}
+	fatal(t, o.store.RecordChildBindings([]records.ChildBinding{binding}))
 	pod.onJobReady = func(frame *pb.WorkerFrame, send func(*pb.WorkerFrame) error) error {
 		frame.GetObservedState().JobCapacity.OrchestrationAvailable = 1
 		return send(frame)
@@ -83,6 +93,9 @@ func privateJobDownload(t *testing.T, versioned, rootModels bool) {
 		Manifest: childDigest("9"), ManifestLength: 161}
 	imported := records.ModelRef{Package: "local/imported-invocable", Slot: "source", BindingPath: model.BindingPath,
 		Model: "proof/library-base", Release: "2.0.0", Lane: "f32", Manifest: childDigest("a"), ManifestLength: 161}
+	if samePackage {
+		imported.Package, imported.BindingPath = revision.Package, "segment.models.source"
+	}
 	if versioned {
 		model.Release, model.Lane = "1.0.0", "bf16"
 	}

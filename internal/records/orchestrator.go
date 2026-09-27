@@ -963,17 +963,29 @@ func scanNumberedRequest(row interface{ Scan(...any) error }) (Request, error) {
 // before the column existed reads as what it was.
 func (r Request) IsJob() bool { return r.Kind == "job" }
 
-// OwnModels are this caller's model inputs. Captured defaults can belong to imported
-// callees; they remain on the request for child resolution but are not its inputs.
-// Missing package attribution is not proof that an input belongs elsewhere.
+// OwnModels are this caller's model inputs. Captured defaults can belong to callees,
+// imported or of the same package; they remain on the request for child resolution but
+// are not its inputs. A selection binds the caller when its package is the caller's and
+// one of its slots is under the caller's entrypoint. Missing package or slot attribution
+// is not proof that an input belongs elsewhere.
 func (r Request) OwnModels() []ModelRef {
 	var models []ModelRef
 	for _, model := range r.Models {
-		if model.Package == "" || model.Package == r.Package {
+		if (model.Package == "" || model.Package == r.Package) && r.bindsOwnSlot(model) {
 			models = append(models, model)
 		}
 	}
 	return models
+}
+
+func (r Request) bindsOwnSlot(model ModelRef) bool {
+	for _, slot := range append([]string{model.BindingSlot()}, model.SharedSlots...) {
+		entrypoint, _, attributed := strings.Cut(slot, ".models.")
+		if !attributed || r.Entrypoint == "" || entrypoint == r.Entrypoint {
+			return true
+		}
+	}
+	return false
 }
 
 // SizedByOwnModels says the request's own execution holds its model slots on a device, so
