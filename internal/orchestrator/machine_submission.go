@@ -32,7 +32,7 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 	}
 	limit := uint64(DefaultMaxOutputMiB) << 20
 	outputs := invocationOutputBindings(splitList(request.Outputs), weights, limit)
-	if len(jobModels(request)) != len(request.Models) {
+	if len(jobModels(request)) != len(request.OwnModels()) {
 		return nil, exit.Named(exit.Structural, "machine_execution.model_identity_missing", "root Model inputs require exact manifest identities and lengths")
 	}
 	models := jobModels(request)
@@ -68,12 +68,12 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 			isCallee = true
 		}
 	}
-	if hasCallees && !isCallee && len(request.Models) == 0 && len(root.WeightsOutputs) == 0 {
+	if hasCallees && !isCallee && len(request.OwnModels()) == 0 && len(root.WeightsOutputs) == 0 {
 		root.NeedsAccelerator = false
 	}
 	// A captured CPU caller must not occupy the execution lane its managed
 	// model children need. Device-bearing roots keep their declared lane.
-	root.Orchestration = !root.NeedsAccelerator && len(request.Models) == 0 && len(root.WeightsOutputs) == 0
+	root.Orchestration = !root.NeedsAccelerator && len(request.OwnModels()) == 0 && len(root.WeightsOutputs) == 0
 	if root.Orchestration && root.RSSCap == DefaultJobRSSCap {
 		// The legacy local launch ceiling is not an authored memory demand.
 		// Let Runtime admit a CPU caller using its own measured host policy.

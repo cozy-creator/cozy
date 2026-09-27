@@ -2242,7 +2242,7 @@ func jobModels(req records.Request) []ModelRef {
 		return nil
 	}
 	var models []ModelRef
-	for _, model := range req.Models {
+	for _, model := range req.OwnModels() { // callee defaults are never the root's inputs
 		if model.ManifestLength > 0 {
 			models = append(models, model)
 		}
