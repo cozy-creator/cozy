@@ -53,3 +53,23 @@ func TestRunTakesAScriptPathHoweverItIsSpelled(t *testing.T) {
 		t.Fatalf("a missing script was read as a package [exit %d]: %s\n%s", code, out, errs)
 	}
 }
+
+// --describe says where a job runs: its own accelerator declaration, in both outputs.
+func TestDescribeShowsAJobsAcceleratorDeclaration(t *testing.T) {
+	root, err := os.MkdirTemp(scratchBase, "describe-accelerator-")
+	must(t, err)
+	t.Cleanup(func() { _ = removeAllForce(root) })
+	for _, test := range []struct{ declared, human, json string }{
+		{"", "runs on: CPU", `"accelerator":false`}, {"# [tool.cozy]\n# accelerator = true\n", "runs on: GPU", `"accelerator":true`},
+	} {
+		script := filepath.Join(t.TempDir(), "job.py")
+		must(t, os.WriteFile(script, []byte("# /// script\n# requires-python=\">=3.12,<3.13\"\n# dependencies=[\"cozy-runtime>="+
+			hostruntime.PackageFloor+"\"]\n"+test.declared+"# ///\ndef main(): pass\n"), 0o600))
+		if code, out := runCozy(t, root, "run", script, "--describe"); code != 0 || !strings.Contains(out, test.human) {
+			t.Fatalf("human --describe omitted %q [exit %d]: %s", test.human, code, out)
+		}
+		if code, out := runCozy(t, root, "run", script, "--describe", "--json"); code != 0 || !strings.Contains(out, test.json) {
+			t.Fatalf("--describe --json omitted %s [exit %d]: %s", test.json, code, out)
+		}
+	}
+}
