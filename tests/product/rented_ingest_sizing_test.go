@@ -24,8 +24,8 @@ import (
 // the paid request and refuses it; nothing is rented.
 func TestRentedIngestDeclaresItsPlannedSourceBytes(t *testing.T) {
 	planned := civitaiPrimaryBytes(t, 128078)
-	root, paid := rentalCapture(t, "")
-	out, code := rentedUpload(t, root, "civitai://128078", "proof/sdxl", "--source-profile", "civitai/sdxl/single-file/1")
+	root, paid := rentalCapture(t)
+	out, code := rentedUpload(t, root, nil, "civitai://128078", "proof/sdxl", "--source-profile", "civitai/sdxl/single-file/1")
 	if request := paid(t, out, code); request.PlannedSourceBytes != planned {
 		t.Fatalf("the ingest's rental declared %d planned source bytes, want the source's %d", request.PlannedSourceBytes, planned)
 	}
@@ -36,16 +36,19 @@ func TestRentedIngestDeclaresItsPlannedSourceBytes(t *testing.T) {
 // still asks for its rental, and only the rental's own TensorFS may refuse it.
 func TestHostTensorFSUnawareOfAProfileDefersToTheRental(t *testing.T) {
 	planned := civitaiPrimaryBytes(t, 128078)
-	root, paid := rentalCapture(t, "{\"entries\":[],\"source_profiles\":[]}")
+	root, paid := rentalCapture(t)
+	registry := filepath.Join(root, "host-registry.json")
+	must(t, os.WriteFile(registry, []byte(`{"entries":[],"source_profiles":[]}`), 0o600))
+	host := []string{"COZY_TFS_REGISTRY=" + registry}
 
 	// Nothing named, and this host recognizes nothing: it cannot choose, and says how the
 	// rental can.
-	out, code := rentedUpload(t, root, "civitai://128078", "proof/sdxl")
+	out, code := rentedUpload(t, root, host, "civitai://128078", "proof/sdxl")
 	if code == 0 || !strings.Contains(string(out), "UNREGISTERED_FINGERPRINT") || !strings.Contains(string(out), "--source-profile") {
 		t.Fatalf("an unrecognized source with no named profile must say how to defer [exit %d]: %s", code, out)
 	}
 
-	out, code = rentedUpload(t, root, "civitai://128078", "proof/sdxl",
+	out, code = rentedUpload(t, root, host, "civitai://128078", "proof/sdxl",
 		"--source-profile", "civitai/101055/128078/single-file-fp16")
 	if request := paid(t, out, code); request.PlannedSourceBytes != planned {
 		t.Fatalf("the deferred ingest declared %d planned source bytes, want the source's %d", request.PlannedSourceBytes, planned)
@@ -80,8 +83,8 @@ func civitaiPrimaryBytes(t *testing.T, version int) int64 {
 }
 
 // rentalCapture starts a daemon against a stand-in Hub that captures the first paid rental
-// request and refuses it. A non-empty registry replaces this host's TensorFS registry.
-func rentalCapture(t *testing.T, registry string) (string, func(*testing.T, []byte, int) hub.RentalRequest) {
+// request and refuses it.
+func rentalCapture(t *testing.T) (string, func(*testing.T, []byte, int) hub.RentalRequest) {
 	t.Helper()
 	var mu sync.Mutex
 	var posts [][]byte
@@ -115,13 +118,8 @@ func rentalCapture(t *testing.T, registry string) (string, func(*testing.T, []by
 	must(t, err)
 	t.Cleanup(func() { _ = removeAllForce(root) })
 	// An operator identity publishes to its named org without a Hub account read.
-	cfg := "tensorhub_url: " + server.URL + "\ntensorhub_token: operator-proof\ndaemon:\n  idle_shutdown_s: 0\n"
-	if registry != "" {
-		path := filepath.Join(root, "host-registry.json")
-		must(t, os.WriteFile(path, []byte(registry), 0o600))
-		cfg += "tensorfs_registry: " + path + "\n"
-	}
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(cfg), 0o600))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+
+		"\ntensorhub_token: operator-proof\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	startDaemonProcess(t, root)
 	return root, func(t *testing.T, out []byte, code int) hub.RentalRequest {
 		t.Helper()
@@ -146,11 +144,11 @@ func rentalCapture(t *testing.T, registry string) (string, func(*testing.T, []by
 	}
 }
 
-func rentedUpload(t *testing.T, root string, args ...string) ([]byte, int) {
+func rentedUpload(t *testing.T, root string, env []string, args ...string) ([]byte, int) {
 	t.Helper()
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin, "model", "upload"},
 		append(args, "--rental-only", "--json")...)...)
-	cmd.Env = childEnv(t, root)
+	cmd.Env = childEnv(t, root, env...)
 	out, _ := cmd.CombinedOutput()
 	return out, cmd.ProcessState.ExitCode()
 }
