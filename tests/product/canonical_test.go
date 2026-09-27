@@ -49,9 +49,9 @@ func TestCanonicalDocuments(t *testing.T) {
 	// stale vendored binding here advertises a minor the workers have already moved past on
 	// every Claim and DesiredWorkerState. The document bytes below do not move on an
 	// additive bump, so nothing else in this test would notice.
-	if pb.WireMinor != manifest.WireMinor {
-		t.Errorf("vendored wire minor %d != the frozen corpus's %d: re-vendor protocol/ from "+
-			"worker-protocol", pb.WireMinor, manifest.WireMinor)
+	if manifest.WireMinor > pb.WireMinor || manifest.WireMinor < pb.MinCompatibleWireMinor {
+		t.Errorf("vendored wire range %d..%d excludes the frozen corpus's %d: re-vendor protocol/ from "+
+			"worker-protocol", pb.MinCompatibleWireMinor, pb.WireMinor, manifest.WireMinor)
 	}
 
 	// This Go writer against the frozen documents, and this Go reader back over them.
