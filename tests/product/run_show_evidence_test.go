@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,52 @@ func TestRunShowReadsAPreRecordBundleTolerantly(t *testing.T) {
 	}
 	if strings.Contains(human, "ranks") {
 		t.Fatalf("a bundle with no execution record showed ranks:\n%s", human)
+	}
+}
+
+// Each rank's attention probe is readable without a shell on the pod: the served kernel's
+// worst row group against its budget, flagged when that budget is uncalibrated on this
+// architecture, and the kernels its probe refused with their numbers. The bundle is a
+// constructed two-rank Blackwell pin in the shape Runtime's execution evidence carries.
+func TestRunShowPrintsEachRanksAttentionProbe(t *testing.T) {
+	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "probe-ranks.json"))
+	must(t, err)
+	o := hostOwner(t, "run-show-probes")
+	id := succeededWithTriage(t, o, bundle)
+	defer publicationControlAPI(t, o)()
+	code, human := runCozy(t, o.root, "run", "show", id)
+	t.Logf("cozy run show:\n%s", human)
+	at := strings.Index(human, "attention probes")
+	if code != 0 || at < 0 || !strings.Contains(human, "sm_100") {
+		t.Fatalf("run show [%d] lacks the ranks' arch or probes:\n%s", code, human)
+	}
+	golden, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "probe-ranks.golden"))
+	must(t, err)
+	if got := human[at:]; got != string(golden) {
+		t.Fatalf("attention probes differ from the golden:\n%s\nwant:\n%s", got, golden)
+	}
+
+	code, out := runCozy(t, o.root, "run", "show", id, "--json")
+	var report struct {
+		Ranks []struct {
+			Arch      string `json:"arch"`
+			Attention struct {
+				Probes  []map[string]any `json:"probes"`
+				Skipped []map[string]any `json:"skipped"`
+			} `json:"attention"`
+		} `json:"ranks"`
+	}
+	if code != 0 || json.Unmarshal([]byte(out), &report) != nil || len(report.Ranks) != 2 {
+		t.Fatalf("run show --json [%d]:\n%s", code, out)
+	}
+	for _, rank := range report.Ranks {
+		probe, skipped := rank.Attention.Probes, rank.Attention.Skipped
+		if rank.Arch != "sm_100" || len(probe) != 1 || len(skipped) != 1 ||
+			probe[0]["budget_state"] != "uncalibrated" || probe[0]["source"] != "warm" ||
+			len(probe[0]["rel_l2_by_rows"].(map[string]any)) != 4 ||
+			skipped[0]["status"] != "attention_kernel_out_of_budget" {
+			t.Fatalf("run show --json lost a rank's probe evidence: %+v", rank)
+		}
 	}
 }
 

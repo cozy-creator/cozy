@@ -1,0 +1,157 @@
+{
+ "measurements": {
+  "attribution": {
+   "stages": {},
+   "steps": {
+    "denoise": {
+     "count": 2,
+     "total_ms": 3000.0,
+     "min_ms": 1400.0,
+     "max_ms": 1600.0,
+     "first_ms": 1600.0,
+     "started_unix_ms": 1790480090000,
+     "series": [
+      [
+       1790480091600,
+       1600.0
+      ],
+      [
+       1790480093000,
+       1400.0
+      ]
+     ],
+     "series_dropped": 0
+    }
+   }
+  },
+  "execution": {
+   "degree": 2,
+   "ranks": [
+    {
+     "rank": 0,
+     "pid": 41021,
+     "ordinal": 0,
+     "uuid": "GPU-6f1c2a9e-0b8d-4c55-9a51-3f0d2e7c1b44",
+     "arch": "sm_100",
+     "start_us": 1790480087578987,
+     "end_us": 1790480143600401,
+     "attention": {
+      "requested": "flash-attn4-fp8",
+      "observed": "flash-attn4-fp8",
+      "impl": "flash_attn.cute.interface._flash_attn_fwd e4m3 per-head",
+      "probes": [
+       {
+        "kernel": "flash-attn4-fp8",
+        "status": "ready",
+        "source": "warm",
+        "shape": [
+         1,
+         73439,
+         2,
+         128
+        ],
+        "rel_l2_by_rows": {
+         "sampled": 0.0268,
+         "first": 0.0271,
+         "last": 0.0266,
+         "tile_edges": 0.0274
+        },
+        "budget": 0.06,
+        "budget_state": "uncalibrated"
+       }
+      ],
+      "skipped": [
+       {
+        "kernel": "sageattention",
+        "status": "attention_kernel_out_of_budget",
+        "source": "warm",
+        "shape": [
+         1,
+         73439,
+         2,
+         128
+        ],
+        "rel_l2_by_rows": {
+         "sampled": 0.0714,
+         "first": 0.0702,
+         "last": 0.0731,
+         "tile_edges": 0.0716
+        },
+        "budget": 0.06,
+        "budget_state": "calibrated"
+       }
+      ]
+     }
+    },
+    {
+     "rank": 1,
+     "pid": 41022,
+     "ordinal": 1,
+     "uuid": "GPU-0a7e5d13-9c2f-4e81-b6d0-58a9c4f2e310",
+     "arch": "sm_100",
+     "start_us": 1790480087579887,
+     "end_us": 1790480143600401,
+     "attention": {
+      "requested": "flash-attn4-fp8",
+      "observed": "flash-attn4-fp8",
+      "impl": "flash_attn.cute.interface._flash_attn_fwd e4m3 per-head",
+      "probes": [
+       {
+        "kernel": "flash-attn4-fp8",
+        "status": "ready",
+        "source": "warm",
+        "shape": [
+         1,
+         73439,
+         2,
+         128
+        ],
+        "rel_l2_by_rows": {
+         "sampled": 0.027,
+         "first": 0.0269,
+         "last": 0.0272,
+         "tile_edges": 0.027
+        },
+        "budget": 0.06,
+        "budget_state": "uncalibrated"
+       }
+      ],
+      "skipped": [
+       {
+        "kernel": "sageattention",
+        "status": "attention_kernel_out_of_budget",
+        "source": "warm",
+        "shape": [
+         1,
+         73439,
+         2,
+         128
+        ],
+        "rel_l2_by_rows": {
+         "sampled": 0.0709,
+         "first": 0.0711,
+         "last": 0.0728,
+         "tile_edges": 0.0715
+        },
+        "budget": 0.06,
+        "budget_state": "calibrated"
+       }
+      ]
+     }
+    }
+   ],
+   "executor": {
+    "started_unix_ms": 0,
+    "ms": 0,
+    "legs_ms": {}
+   },
+   "construction": {
+    "prepared_unix_ms": 0,
+    "prepare_ms": 0,
+    "fill_ms": 0,
+    "warm_ms": 0,
+    "legs_ms": {}
+   }
+  }
+ }
+}

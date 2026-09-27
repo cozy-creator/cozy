@@ -1,0 +1,6 @@
+attention probes
+RANK  KERNEL           MAX REL L2           BUDGET             VERDICT                 MEASURED
+0     flash-attn4-fp8  0.0274 (tile_edges)  0.06 UNCALIBRATED  served                  warm
+0     sageattention    0.0731 (last)        0.06               refused: out_of_budget  warm
+1     flash-attn4-fp8  0.0272 (last)        0.06 UNCALIBRATED  served                  warm
+1     sageattention    0.0728 (last)        0.06               refused: out_of_budget  warm
