@@ -64,6 +64,7 @@ func (publishedRouteResolver) JobsInstall(string) ([]launch.JobFacts, *exit.Erro
 type publishedRouteObserver struct{}
 
 func (publishedRouteObserver) Refresh(context.Context, records.Request) *exit.Error { return nil }
+func (publishedRouteObserver) Withdraw(string)                                      {}
 func (publishedRouteObserver) Control(context.Context, records.Request, string) *exit.Error {
 	return nil
 }

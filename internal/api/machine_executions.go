@@ -18,6 +18,8 @@ import (
 type MachineExecutions interface {
 	Refresh(context.Context, records.Request) *exit.Error
 	Control(context.Context, records.Request, string) *exit.Error
+	// Withdraw stops a canceled request's submission work that has not reached Runtime.
+	Withdraw(string)
 }
 
 // This is a client observation, not an execution or custody receipt of its own.
@@ -274,6 +276,9 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 	}
 	if action == "cancel" && len(link.Receipt) == 0 {
 		_, problem = s.store.CancelMachineBeforeAcceptance(row.ID)
+		if problem == nil && s.machineExecutions != nil {
+			s.machineExecutions.Withdraw(row.ID)
+		}
 	} else if s.machineExecutions == nil {
 		problem = exit.Unavailablef("this client cannot control Runtime-owned execution")
 	} else {
