@@ -112,8 +112,8 @@ type stuckListing struct {
 func (l stuckListing) acquiring(id string) bool {
 	for _, row := range l.Rentals {
 		if row.ID == id {
-			at, err := time.Parse(time.RFC3339Nano, row.RentedAt)
-			return row.State == "acquiring" && err == nil && time.Since(at) >= 0
+			_, err := time.Parse(time.RFC3339Nano, row.RentedAt)
+			return row.State == "acquiring" && err == nil
 		}
 	}
 	return false

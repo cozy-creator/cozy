@@ -484,6 +484,11 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 		return nil, problem
 	}
 	rows = append(rows, reserved...)
+	// A purchase owns its pod until it has pinned its own request, even once attachable.
+	busy, problem := m.inFlightLocked()
+	if problem != nil {
+		return nil, problem
+	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].HourlyRateUSDMicros != rows[j].HourlyRateUSDMicros {
 			return rows[i].HourlyRateUSDMicros < rows[j].HourlyRateUSDMicros
@@ -519,6 +524,11 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 		// is left are the questions only this host can answer.
 		disk := rental.Disk{HaveGB: m.disks[row.ID], SourceBytes: sourceBytes}
 		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints.Working, disk) {
+			if busy[row.ID] {
+				c.Verdict = orchestrator.VerdictAttaching
+				out = append(out, c)
+				continue
+			}
 			if len(constraints.Requirements) > 0 || constraints.RequiresPython != "" {
 				problem, read := compatible[row.ID]
 				if !read {
