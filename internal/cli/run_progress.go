@@ -113,11 +113,20 @@ func (p *RunProgress) rentalNotice(e localapi.Event) {
 		return
 	}
 	*previous = line
-	if p.ctx.Mode().Color {
+	p.notice(e, line)
+}
+
+// notice prints one line above the live block, which is redrawn beneath it.
+func (p *RunProgress) notice(e localapi.Event, line string) {
+	if line == "" {
+		return
+	}
+	live := p.ctx.Mode().Color && !p.ctx.Mode().Full
+	if live {
 		p.eraseLive()
 	}
 	fmt.Fprintln(p.ctx.Err, line)
-	if p.ctx.Mode().Color {
+	if live {
 		p.drawLive(p.displayTime(e))
 	}
 }

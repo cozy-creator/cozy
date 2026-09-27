@@ -362,26 +362,53 @@ func ValidateLadder(ladder []BindingRung) *exit.Error {
 	return nil
 }
 
-// PackageBindings is the anonymous read of a package's current owner overrides.
-func (c *Client) PackageBindings(ctx context.Context, ref Ref) ([]PackageBindingRow, *exit.Error) {
+// PackageBindingRows is the anonymous read of a package's owner overrides, as written.
+func (c *Client) PackageBindingRows(ctx context.Context, ref Ref) ([]PackageBindingRow, *exit.Error) {
 	var out struct {
 		Bindings []PackageBindingRow `json:"bindings"`
 	}
-	e := c.do(ctx, call{method: http.MethodGet,
-		path: resourcePath("packages", ref) + "/bindings"}, &out)
+	if e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("packages", ref) + "/bindings"}, &out); e != nil {
+		return nil, e
+	}
+	return out.Bindings, nil
+}
+
+// PackageBindings is every owner override, each usable. An unusable row is refused, not
+// skipped: skipping it would silently drop the owner's choice. The refusal names the row
+// and how to repair it.
+func (c *Client) PackageBindings(ctx context.Context, ref Ref) ([]PackageBindingRow, *exit.Error) {
+	rows, e := c.PackageBindingRows(ctx, ref)
 	if e != nil {
 		return nil, e
 	}
-	seen := make(map[string]bool, len(out.Bindings))
-	for _, row := range out.Bindings {
-		if row.Slot == "" || row.Model == "" || row.Release == "" || row.Revision < 1 ||
-			seen[row.Slot] || ValidateLadder(row.Ladder) != nil {
+	seen := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		reason := ""
+		switch {
+		case row.Slot == "":
 			return nil, exit.Named(exit.Structural, "hub.package_bindings_invalid",
-				"Tensorhub returned an incomplete or duplicate package binding row for slot %q", row.Slot)
+				"an owner binding of %s names no slot", ref.String()).
+				WithRemedy("only Tensorhub can repair a slotless row; meanwhile choose the model per run: model.<param>=org/model@release")
+		case seen[row.Slot]:
+			reason = "is duplicated"
+		case row.Model == "" || row.Release == "":
+			reason = "names no model release"
+		case row.Revision < 1:
+			reason = "has no revision"
+		default:
+			if problem := ValidateLadder(row.Ladder); problem != nil {
+				reason = "has an invalid ladder: " + problem.Message
+			}
+		}
+		if reason != "" {
+			return nil, exit.Named(exit.Structural, "hub.package_bindings_invalid",
+				"the owner binding of %s for slot %s %s", ref.String(), row.Slot, reason).
+				WithRemedy("rebind it: cozy package bind %s %s org/model@release --gpu <GPU>=<lane>; or remove it: cozy package unbind %s %s",
+					ref.String(), row.Slot, ref.String(), row.Slot)
 		}
 		seen[row.Slot] = true
 	}
-	return out.Bindings, nil
+	return rows, nil
 }
 
 type PackageBindingWrite struct {

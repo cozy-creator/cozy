@@ -96,6 +96,37 @@ func TestAuthoredDefaultsDoNotHideOwnerReadFailure(t *testing.T) {
 	}
 }
 
+// An unusable owner row still refuses (skipping it would drop the owner's choice), but the
+// refusal names the row and its repair, and that repair works on the unusable row.
+func TestUnusableOwnerBindingNamesItsRepair(t *testing.T) {
+	h := newLadderHub(t, authoredH3(ladderLane))
+	root := ladderRoot(t, h)
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
+	broken := goodLadder()
+	broken.Ladder = nil
+	h.bind(broken)
+	code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental-only", "--json", "--idempotency-key", "broken")
+	for _, want := range []string{"package_default_model_unavailable", "slot " + ladderSlot + " has an invalid ladder",
+		"cozy package unbind " + ladderPackage + " " + ladderSlot, "cozy package bind " + ladderPackage + " " + ladderSlot} {
+		if code == 0 || !strings.Contains(out, want) {
+			t.Fatalf("the refusal does not say %q [exit %d]: %s", want, code, out)
+		}
+	}
+	code, out = runCozy(t, root, "package", "unbind", ladderPackage, ladderSlot, "--json")
+	if code != 0 || !strings.Contains(out, `"changed":true`) {
+		t.Fatalf("the named repair failed on the unusable row [exit %d]: %s", code, out)
+	}
+	code, out = runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental-only", "--json", "--idempotency-key", "repaired")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	row, problem := store.RequestByIdempotencyKey("repaired")
+	fatal(t, problem)
+	if row == nil || len(row.Models) != 1 || row.Models[0].Release != ladderRelease {
+		t.Fatalf("the repaired package did not use its authored default [exit %d]: %s row=%+v", code, out, row)
+	}
+}
+
 func TestUnbindPreservesConcurrentOwnerChoice(t *testing.T) {
 	h := newLadderHub(t)
 	root := ladderRoot(t, h)

@@ -26,7 +26,8 @@ import (
 // list rather than a bare "not found" hours later on a paid pod.
 
 // modelReleaseCard reads the card and selects `release` (the newest unyanked one when
-// empty). A miss names the releases the card offers.
+// empty). A release named explicitly is honoured even when yanked. A miss names the
+// releases the card offers.
 func modelReleaseCard(ctx context.Context, c *hub.Client, ref hub.Ref, release string) (
 	hub.ModelCard, *hub.ModelReleaseSummary, *exit.Error,
 ) {
@@ -42,7 +43,8 @@ func modelReleaseCardForLane(ctx context.Context, c *hub.Client, ref hub.Ref, re
 		return card, nil, exit.Named(exit.Conflict, "rental.model_catalog_changed",
 			"Tensorhub returned model %s while resolving %s", card.Model.Ref(), ref.String())
 	}
-	if release == "" {
+	explicit := release != ""
+	if !explicit {
 		for _, candidate := range card.Releases {
 			if candidate.Yanked || candidate.YankedAt != "" {
 				continue
@@ -61,15 +63,36 @@ func modelReleaseCardForLane(ctx context.Context, c *hub.Client, ref hub.Ref, re
 			}
 		}
 	}
+	var yanked *hub.ModelReleaseSummary
 	for i := range card.Releases {
 		candidate := &card.Releases[i]
-		if candidate.Release == release && !candidate.Yanked && candidate.YankedAt == "" {
+		if candidate.Release != release {
+			continue
+		}
+		if !releaseYanked(candidate) {
 			return card, candidate, nil
 		}
+		if explicit && yanked == nil {
+			yanked = candidate
+		}
+	}
+	if yanked != nil {
+		return card, yanked, nil
 	}
 	return card, nil, exit.Named(exit.NotFound, "model.release_not_found",
 		"model %s has no available release %q (releases: %s)",
 		ref.String(), release, orNone(strings.Join(availableReleases(card), ", ")))
+}
+
+func releaseYanked(release *hub.ModelReleaseSummary) bool {
+	return release.Yanked || release.YankedAt != ""
+}
+
+// warnYanked says that an explicitly named release is yanked and is used anyway.
+func warnYanked(ctx *Context, ref hub.Ref, release *hub.ModelReleaseSummary) {
+	if releaseYanked(release) {
+		fmt.Fprintf(ctx.Err, "warning: %s@%s is yanked; using it because it was named explicitly\n", ref.String(), release.Release)
+	}
 }
 
 // Model cards do not carry creation times for native TensorFS releases. Use
@@ -175,6 +198,7 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 	if problem != nil {
 		return empty, rebind(problem, packageName, slot.Path)
 	}
+	warnYanked(ctx, ref, selected)
 	rungs, problem := ladderRungs(ctx, ref, selected, slot, spec.Ref, spec.Binding.Ladder)
 	if problem != nil {
 		return empty, rebind(problem, packageName, slot.Path)

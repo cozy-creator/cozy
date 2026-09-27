@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -25,84 +28,103 @@ type machineByteStream interface {
 	Recv() (*pb.NativeByteReadChunk, error)
 }
 
-func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.Request, connection *machineConnection, outcome *pb.AttemptOutcome, body *pb.AttemptOutcomeBody) (bool, *exit.Error) {
+// machineFilePlan is what one outcome's file receipts leave to collect. The machine is an
+// independently upgraded peer: an output it returns without a declaration is ignored, and a
+// declared output it does not return, or returns unusably, fails alone. Each is one warning.
+type machineFilePlan struct {
+	files    []records.MachineFileResult
+	warnings []string
+}
+
+func (m *machineRuns) planMachineFiles(request records.Request, outcome *pb.AttemptOutcome, body *pb.AttemptOutcomeBody) (*machineFilePlan, *exit.Error) {
 	entries := body.GetOutputManifest().GetOutputs()
 	if len(entries) == 0 && (request.Outputs == "" || body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED) {
-		return false, nil
+		return nil, nil
 	}
 	if len(entries) > pb.MaxChildArtifactGrants || body.Result == nil || body.Result.ResultBlob != nil {
-		return false, exit.New(exit.Conflict, "file result exceeds the captured control bounds")
+		return nil, exit.New(exit.Conflict, "file result exceeds the captured control bounds")
 	}
 	surface, problem := m.resolver.capturedResultInterface(request)
 	if problem != nil {
-		return false, problem
+		return nil, problem
 	}
 	entrypoint, problem := surface.Function(request.Entrypoint)
 	if problem != nil {
-		return false, problem
+		return nil, problem
 	}
 	if len(entries) == 0 && len(launch.AssetPaths(entrypoint.Result)) == 0 {
-		return false, nil
+		return nil, nil
 	}
 	schema, problem := machineResultSchema(surface, request.Entrypoint)
 	if problem != nil {
-		return false, problem
+		return nil, problem
 	}
-	var recoveredDecodedBound int64
 	if problem := launch.ValidateMachineResult(schema, body.Result); problem != nil {
-		projected, maximum, known := launch.Runtime023PNGResultSchema(schema, body.Result,
-			body.GetObservation().GetEnvironment().GetRuntimeVersion())
-		if !known {
-			return false, problem
-		}
-		if problem := launch.ValidateMachineResult(projected, body.Result); problem != nil {
-			return false, problem
-		}
-		recoveredDecodedBound = maximum
+		return nil, problem
 	}
-	inline := body.Result.InlineResult
 	var result any
-	decoder := json.NewDecoder(bytes.NewReader(inline))
+	decoder := json.NewDecoder(bytes.NewReader(body.Result.InlineResult))
 	decoder.UseNumber()
 	if decoder.Decode(&result) != nil {
-		return false, exit.New(exit.Conflict, "file result is unreadable")
+		return nil, exit.New(exit.Conflict, "file result is unreadable")
 	}
 	declared := map[string]bool{}
 	for _, name := range launch.AssetPaths(entrypoint.Result) {
 		declared[name] = true
 	}
-	files := make([]records.MachineFileResult, 0, len(entries))
+	plan := &machineFilePlan{files: make([]records.MachineFileResult, 0, len(entries))}
 	for _, entry := range entries {
-		if entry == nil || !declared[entry.OutputId] || len(entry.Digest) != 32 || entry.Length > math.MaxInt64 || records.ValidateByteRef(entry.NativeTree) != nil {
-			return false, exit.New(exit.Conflict, "file result omits its declared field or exact native receipt")
+		if entry == nil || !declared[entry.OutputId] {
+			plan.warnings = append(plan.warnings, fmt.Sprintf("the machine returned output %q, which the package does not declare; ignored", entry.GetOutputId()))
+			continue
 		}
-		maximum, problem := m.resolver.CapturedByteOutputBound(request, entry.OutputId, entry.MimeType)
-		if problem != nil {
-			return false, problem
-		}
-		if entry.NativeTree.ContentBytes > uint64(maximum) || entry.MimeType != resultfiles.TreeMediaType && entry.NativeTree.ContentBytes != entry.Length {
-			return false, exit.New(exit.Conflict, "file result exceeds its declared size or changes native content length")
-		}
-		digest, _ := canonical.Spell(entry.Digest)
-		receipt, _ := canonical.Spell(entry.NativeTree.ReceiptDigest)
-		manifest, _ := canonical.Spell(entry.NativeTree.Manifest.Digest)
-		source := records.ByteOutput{RequestID: request.ID, Attempt: int64(outcome.AttemptOrdinal), OutputID: entry.OutputId, Digest: digest, Length: int64(entry.Length), MimeType: entry.MimeType, ProducerRootID: entry.NativeTree.ProducerRootId, ReceiptDigest: receipt, ManifestID: manifest, ManifestLength: int64(entry.NativeTree.Manifest.Length), ContentBytes: int64(entry.NativeTree.ContentBytes)}
-		if problem := orchestrator.VerifyByteResultRow(result, source); problem != nil {
-			return false, problem
-		}
-		name, problem := resultfiles.Filename(digest, entry.MimeType)
-		if problem != nil {
-			return false, problem
-		}
-		files = append(files, records.MachineFileResult{OutcomeID: outcome.OutcomeId, RetentionID: records.ByteRetentionID(request.ID, "machine-result", entry.OutputId, source), Source: source, Output: records.Output{OutputID: entry.OutputId, MediaID: records.NewID("med"), Path: filepath.Join(m.layout.PublicationRoot(request.Org, request.ID), "received", name), Digest: digest, Length: int64(entry.Length), MimeType: entry.MimeType}})
 		delete(declared, entry.OutputId)
+		file, problem := m.machineFile(request, outcome, result, entry)
+		if problem != nil {
+			plan.warnings = append(plan.warnings, fmt.Sprintf("output %q failed: %s", entry.OutputId, problem.Message))
+			continue
+		}
+		plan.files = append(plan.files, file)
 	}
-	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && len(declared) > 0 {
-		return false, exit.New(exit.Conflict, "successful file result omitted a declared output")
+	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
+		for _, name := range slices.Sorted(maps.Keys(declared)) {
+			plan.warnings = append(plan.warnings, fmt.Sprintf("output %q failed: the machine did not return it", name))
+		}
 	}
-	// Every descriptor is checked before acquiring a hold or creating a file.
-	for _, file := range files {
-		file, problem = m.store.FreezeMachineFileResult(request.ID, file)
+	return plan, nil
+}
+
+func (m *machineRuns) machineFile(request records.Request, outcome *pb.AttemptOutcome, result any, entry *pb.OutputEntry) (records.MachineFileResult, *exit.Error) {
+	if len(entry.Digest) != 32 || entry.Length > math.MaxInt64 || records.ValidateByteRef(entry.NativeTree) != nil {
+		return records.MachineFileResult{}, exit.New(exit.Conflict, "its native receipt is incomplete")
+	}
+	maximum, problem := m.resolver.CapturedByteOutputBound(request, entry.OutputId, entry.MimeType)
+	if problem != nil {
+		return records.MachineFileResult{}, problem
+	}
+	if entry.NativeTree.ContentBytes > uint64(maximum) || entry.MimeType != resultfiles.TreeMediaType && entry.NativeTree.ContentBytes != entry.Length {
+		return records.MachineFileResult{}, exit.New(exit.Conflict, "it exceeds its declared size or changes its native content length")
+	}
+	digest, _ := canonical.Spell(entry.Digest)
+	receipt, _ := canonical.Spell(entry.NativeTree.ReceiptDigest)
+	manifest, _ := canonical.Spell(entry.NativeTree.Manifest.Digest)
+	source := records.ByteOutput{RequestID: request.ID, Attempt: int64(outcome.AttemptOrdinal), OutputID: entry.OutputId, Digest: digest, Length: int64(entry.Length), MimeType: entry.MimeType, ProducerRootID: entry.NativeTree.ProducerRootId, ReceiptDigest: receipt, ManifestID: manifest, ManifestLength: int64(entry.NativeTree.Manifest.Length), ContentBytes: int64(entry.NativeTree.ContentBytes)}
+	if problem := orchestrator.VerifyByteResultRow(result, source); problem != nil {
+		return records.MachineFileResult{}, problem
+	}
+	name, problem := resultfiles.Filename(digest, entry.MimeType)
+	if problem != nil {
+		return records.MachineFileResult{}, problem
+	}
+	return records.MachineFileResult{OutcomeID: outcome.OutcomeId, RetentionID: records.ByteRetentionID(request.ID, "machine-result", entry.OutputId, source), Source: source, Output: records.Output{OutputID: entry.OutputId, MediaID: records.NewID("med"), Path: filepath.Join(m.layout.PublicationRoot(request.Org, request.ID), "received", name), Digest: digest, Length: int64(entry.Length), MimeType: entry.MimeType}}, nil
+}
+
+func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.Request, connection *machineConnection, plan *machineFilePlan) (bool, *exit.Error) {
+	if plan == nil {
+		return false, nil
+	}
+	for _, file := range plan.files {
+		file, problem := m.store.FreezeMachineFileResult(request.ID, file)
 		if problem != nil {
 			return false, problem
 		}
@@ -129,14 +151,6 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 				return false, problem
 			}
 		}
-		if recoveredDecodedBound > 0 {
-			if file.Source.OutputID != "value" || file.Source.MimeType != "image/png" {
-				return false, exit.New(exit.Conflict, "recovered image result changed its declared kind")
-			}
-			if problem := resultfiles.VerifyPNGDecodedBound(file.Output.Path, recoveredDecodedBound); problem != nil {
-				return false, problem
-			}
-		}
 		if file.State != "released" {
 			released, err := connection.releaseBytes(ctx, fileRetentionRequest(file))
 			if err != nil {
@@ -157,8 +171,7 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 	if export != nil && export.State != "published" {
 		var paths []string
 		for _, declared := range export.Outputs {
-			found := false
-			for _, file := range files {
+			for _, file := range plan.files {
 				if file.Output.OutputID == declared.OutputID {
 					path, problem := materializeMachineResult(file, export.Directory)
 					if problem != nil {
@@ -166,11 +179,7 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 						return false, problem
 					}
 					paths = append(paths, path)
-					found = true
 				}
-			}
-			if !found {
-				return false, exit.New(exit.Conflict, "file export has no verified output")
 			}
 		}
 		if problem := m.store.CompleteOutputExport(request.ID, paths); problem != nil {

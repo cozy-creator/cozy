@@ -586,18 +586,29 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 		return machineTransport(err)
 	}
 	progress.Advance(1)
-	if problem := m.store.RecordMachineOutcome(request.ID, outcome); problem != nil {
-		return problem
-	}
 	var body pb.AttemptOutcomeBody
 	if err := canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body); err != nil {
 		return exit.New(exit.Conflict, "machine outcome is not its canonical document")
+	}
+	plan, planProblem := m.planMachineFiles(request, outcome, &body)
+	if len(link.Outcome) == 0 && plan != nil {
+		for _, warning := range plan.warnings {
+			if problem := m.store.AppendEvent(request.ID, "request.warning", int64(outcome.AttemptOrdinal), map[string]any{"message": warning}); problem != nil {
+				return problem
+			}
+		}
+	}
+	if problem := m.store.RecordMachineOutcome(request.ID, outcome); problem != nil {
+		return problem
 	}
 	models, problem := m.collectMachineModels(ctx, request, connection, outcome, &body)
 	if problem != nil {
 		return problem
 	}
-	files, problem := m.collectMachineFiles(ctx, request, connection, outcome, &body)
+	if planProblem != nil {
+		return planProblem
+	}
+	files, problem := m.collectMachineFiles(ctx, request, connection, plan)
 	if problem != nil {
 		return problem
 	}

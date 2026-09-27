@@ -413,8 +413,6 @@ func TestBindVerifiesTheLadderAgainstTheCardBeforeWriting(t *testing.T) {
 	}{
 		{"release absent from the card", []string{ladderSlot, "proof/minimax@1.0.0", "--gpu", "H100=fp8-adaln-pruned"},
 			[]string{"model.release_not_found", "releases: 1.0.0-rc.1"}},
-		{"yanked release", []string{ladderSlot, "proof/minimax@0.9.0", "--gpu", "*=bf16-full"},
-			[]string{"model.release_not_found", "releases: 1.0.0-rc.1"}},
 		{"lane absent from the release", []string{ladderSlot, "proof/minimax@1.0.0-rc.1", "--gpu", "H100=profile=fp8-adaln-pruned"},
 			[]string{"model.lane_not_found", "lanes: bf16-full, fp8-adaln-pruned, mxfp8-adaln-pruned"}},
 		{"catch-all not last", []string{ladderSlot, "proof/minimax@1.0.0-rc.1", "--gpu", "*=bf16-full", "--gpu", "H100=fp8-adaln-pruned"},
@@ -459,6 +457,18 @@ func TestBindVerifiesTheLadderAgainstTheCardBeforeWriting(t *testing.T) {
 	code, out = runCozy(t, root, "package", "bindings", ladderPackage)
 	if code != 0 || !strings.Contains(out, "H100=fp8-adaln-pruned, *=bf16-full") || !strings.Contains(out, "1.0.0-rc.1") {
 		t.Fatalf("bindings does not print the ladder [exit %d]: %s", code, out)
+	}
+
+	// A yanked release named explicitly is the owner's exact choice: honoured, with a warning.
+	code, out = runCozy(t, root, "package", "bind", ladderPackage, ladderSlot, "proof/minimax@0.9.0", "--gpu", "*=bf16-full")
+	if code != 0 || !strings.Contains(out, "warning: proof/minimax@0.9.0 is yanked; using it because it was named explicitly") {
+		t.Fatalf("an explicitly named yanked release was not honoured with a warning [exit %d]: %s", code, out)
+	}
+	h.mu.Lock()
+	written = append([]byte(nil), h.puts[len(h.puts)-1]...)
+	h.mu.Unlock()
+	if !strings.Contains(string(written), `"release":"0.9.0"`) {
+		t.Fatalf("the yanked release was not bound: %s", written)
 	}
 }
 
