@@ -64,11 +64,147 @@ impl Meta {
         fs::create_dir_all(&lease_dir).map_err(|error| io("mkdir lease markers", error))?;
         let writer_dir = store.root().join("tmp/writers");
         fs::create_dir_all(&writer_dir).map_err(|error| io("mkdir writer markers", error))?;
-        Ok(Self {
+        let meta = Self {
             db: crate::catalog::Catalog::path(store.root()),
             lease_dir,
             recovery_lock: writer_dir.join("recovery.lock"),
-        })
+        };
+        meta.ensure_part_rows()?;
+        Ok(meta)
+    }
+
+    /// Accepted parts are rows of their own, so accepting one costs that one part. Older
+    /// builds ignore both additions; a row one of them rewrites has no `open_session`,
+    /// which sends this build back to its full-row check.
+    fn ensure_part_rows(&self) -> Result<()> {
+        let connection = self.connection()?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| sql("lock derived part schema", error))?;
+        let has_session: bool = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('tensorfs_derived_transactions')
+                 WHERE name='open_session'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| sql("inspect derived transaction columns", error))?
+            > 0;
+        if !has_session {
+            connection
+                .execute_batch(
+                    "ALTER TABLE tensorfs_derived_transactions ADD COLUMN open_session INTEGER",
+                )
+                .map_err(|error| sql("add derived open session", error))?;
+        }
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS tensorfs_derived_parts (
+                   id TEXT NOT NULL,
+                   component TEXT NOT NULL,
+                   key TEXT NOT NULL,
+                   role TEXT NOT NULL,
+                   part BLOB NOT NULL,
+                   PRIMARY KEY (id,component,key,role)
+                 ) STRICT, WITHOUT ROWID;
+                 COMMIT;",
+            )
+            .map_err(|error| sql("create derived parts", error))
+    }
+
+    /// Refuse unless `writer_session` is the transaction's current writer. One indexed read
+    /// when the row names its open session; otherwise the full row gives the exact refusal.
+    pub(crate) fn check_session(&self, id: &str, writer_session: u64) -> Result<()> {
+        let connection = self.connection()?;
+        let open: Option<Option<i64>> = connection
+            .query_row(
+                "SELECT open_session FROM tensorfs_derived_transactions WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| sql("read writer session", error))?;
+        if matches!(open, Some(Some(session)) if session as u64 == writer_session) {
+            return Ok(());
+        }
+        let mut rows: Vec<_> = read_derived_row(&connection, id)?.into_iter().collect();
+        crate::derived::open_row(&mut rows, id, writer_session).map(|_| ())
+    }
+
+    /// Record one accepted part for the current writer: one indexed read of the writer's
+    /// session and of that part. `Ok(false)` is the same part accepted before.
+    pub(crate) fn accept_part(
+        &self,
+        id: &str,
+        writer_session: u64,
+        added: &crate::derived::AddedPart,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| sql("begin part acceptance", error))?;
+        let open: Option<Option<i64>> = connection
+            .query_row(
+                "SELECT open_session FROM tensorfs_derived_transactions WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| sql("read writer session", error))?;
+        let legacy = match open {
+            Some(Some(session)) if session as u64 == writer_session => None,
+            _ => {
+                // Absent, closed, fenced, or last written by a build without the column:
+                // the full row names the exact refusal, or admits this writer.
+                let mut rows: Vec<_> = read_derived_row(&connection, id)?.into_iter().collect();
+                let row = crate::derived::open_row(&mut rows, id, writer_session)?;
+                Some(row.added_parts.clone())
+            }
+        };
+        let bytes = crate::derived::part_bytes(&added.part);
+        let existing: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT part FROM tensorfs_derived_parts
+                 WHERE id=?1 AND component=?2 AND key=?3 AND role=?4",
+                params![id, added.component, added.key, added.role],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| sql("read accepted part", error))?
+            .or_else(|| {
+                legacy.iter().flatten().find(|old| old.same_value(added)).map(|old| {
+                    crate::derived::part_bytes(&old.part)
+                })
+            });
+        match existing {
+            Some(existing) if existing == bytes => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Ok(false)
+            }
+            Some(_) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                refuse(
+                    Code::TRANSACTION_CONFLICT,
+                    format!(
+                        "added value {}/{}#{} differs from accepted bytes",
+                        added.component, added.key, added.role
+                    ),
+                )
+            }
+            None => {
+                connection
+                    .execute(
+                        "INSERT INTO tensorfs_derived_parts(id,component,key,role,part)
+                         VALUES (?1,?2,?3,?4,?5)",
+                        params![id, added.component, added.key, added.role, bytes],
+                    )
+                    .map_err(|error| sql("write accepted part", error))?;
+                connection
+                    .execute_batch("COMMIT")
+                    .map_err(|error| sql("commit accepted part", error))?;
+                Ok(true)
+            }
+        }
     }
 
     fn connection(&self) -> Result<Connection> {
@@ -221,14 +357,39 @@ impl Txn {
                 .execute("DELETE FROM tensorfs_derived_transactions", [])
                 .map_err(|error| sql("clear derived transactions", error))?;
         }
+        match &self.selected {
+            Some(id) => self
+                .connection
+                .execute("DELETE FROM tensorfs_derived_parts WHERE id=?1", [id]),
+            None => self
+                .connection
+                .execute("DELETE FROM tensorfs_derived_parts", []),
+        }
+        .map_err(|error| sql("replace derived parts", error))?;
         for row in &self.rows {
-            let bytes = crate::canon::write(&row.to_value());
+            let (bytes, open) = row.stored();
             self.connection
                 .execute(
-                    "INSERT INTO tensorfs_derived_transactions(id,bytes) VALUES (?1,?2)",
-                    params![row.id, bytes],
+                    "INSERT INTO tensorfs_derived_transactions(id,bytes,open_session)
+                     VALUES (?1,?2,?3)",
+                    params![row.id, bytes, open.map(|session| session as i64)],
                 )
                 .map_err(|error| sql("write derived transaction", error))?;
+            for added in &row.added_parts {
+                self.connection
+                    .execute(
+                        "INSERT INTO tensorfs_derived_parts(id,component,key,role,part)
+                         VALUES (?1,?2,?3,?4,?5)",
+                        params![
+                            row.id,
+                            added.component,
+                            added.key,
+                            added.role,
+                            crate::derived::part_bytes(&added.part)
+                        ],
+                    )
+                    .map_err(|error| sql("write derived part", error))?;
+            }
         }
         self.connection
             .execute_batch("COMMIT")
@@ -251,7 +412,8 @@ fn read_derived_row(
     bytes
         .map(|bytes| {
             let value = crate::canon::parse_canonical(&bytes, limits::DOC_MAX_BYTES)?;
-            let row = crate::derived::TransactionRow::from_value(&value)?;
+            let mut row = crate::derived::TransactionRow::from_value(&value)?;
+            row.accept_stored(read_parts(connection, id)?)?;
             if row.id != id {
                 return refuse(
                     Code::TRANSACTION_CONFLICT,
@@ -276,7 +438,35 @@ fn read_derived(connection: &Connection) -> Result<Vec<crate::derived::Transacti
         .into_iter()
         .map(|bytes| {
             let value = crate::canon::parse_canonical(&bytes, limits::DOC_MAX_BYTES)?;
-            crate::derived::TransactionRow::from_value(&value)
+            let mut row = crate::derived::TransactionRow::from_value(&value)?;
+            row.accept_stored(read_parts(connection, &row.id.clone())?)?;
+            Ok(row)
+        })
+        .collect()
+}
+
+fn read_parts(connection: &Connection, id: &str) -> Result<Vec<crate::derived::AddedPart>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT component,key,role,part FROM tensorfs_derived_parts
+             WHERE id=?1 ORDER BY component,key,role",
+        )
+        .map_err(|error| sql("prepare derived parts", error))?;
+    let rows = statement
+        .query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })
+        .map_err(|error| sql("read derived parts", error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| sql("collect derived parts", error))?;
+    rows.into_iter()
+        .map(|(component, key, role, bytes)| {
+            crate::derived::AddedPart::stored(component, key, role, &bytes)
         })
         .collect()
 }

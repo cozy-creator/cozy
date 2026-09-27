@@ -984,11 +984,12 @@ fn profile_derived_transaction_scaling() {
         for index in 0..writes {
             let key = format!("weight_{index:04}");
             let started = Instant::now();
-            add_part(
+            add_indexed_part(
                 &store,
                 &meta,
                 &id,
                 1,
+                &writer.additions,
                 ("model", &key, "value"),
                 &mut [index as u8; 16].as_slice(),
             )
