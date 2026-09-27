@@ -110,6 +110,8 @@ type Rental struct {
 	// there is no local `rented_at` for a rental the records never saw. RFC 3339 as
 	// the hub says it, or blank from a hub older than th-199.
 	CreatedAt string
+	// ContainerDiskGB is the disk the Hub bought for the pod, or 0 when it does not say.
+	ContainerDiskGB int
 }
 
 // RentalFailure is Tensorhub's sanitized terminal boot diagnosis. It contains
@@ -179,6 +181,7 @@ type wireRental struct {
 	BaseWorkerImageTag    string         `json:"base_worker_image_tag,omitempty"`
 	BaseWorkerProfile     string         `json:"base_worker_profile,omitempty"`
 	CreatedAt             string         `json:"created_at,omitempty"`
+	ContainerDiskGB       int            `json:"container_disk_gb,omitempty"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -216,12 +219,14 @@ func (w wireRental) rental() Rental {
 		BaseWorkerImageTag:    w.BaseWorkerImageTag,
 		BaseWorkerProfile:     w.BaseWorkerProfile,
 		CreatedAt:             w.CreatedAt,
+		ContainerDiskGB:       w.ContainerDiskGB,
 	}
 }
 
 // RentalRequest is the closed provider-neutral product intent. Provider,
-// datacenter, offer, cache volume, disk, and ports do not have fields here:
-// Tensorhub resolves and selects them.
+// datacenter, offer, cache volume, and ports do not have fields here: Tensorhub
+// resolves and selects them. The workload fields say what the pod is bought for;
+// ContainerDiskGB is the renter's explicit disk request.
 type RentalDevelopment struct {
 	SSHPublicKey string `json:"ssh_public_key"`
 }
@@ -262,6 +267,9 @@ type RentalRequest struct {
 	// before any pod is asked for, and the same rows become the pod's desired
 	// download set. Omitted when nothing is declared.
 	ServingModels []ServingModel `json:"serving_models,omitempty"`
+	// ContainerDiskGB is the container disk the renter asks for (`--disk-gb`). The Hub
+	// buys at least this much, on an offer whose disk allows it. Omitted when not given.
+	ContainerDiskGB int `json:"container_disk_gb,omitempty"`
 }
 
 // ServingModel is one declared model, in the exact grammar the pod's desired
@@ -279,8 +287,9 @@ type ServingModel struct {
 // for. The two halves are independent and additive: an ingest declares source
 // bytes, a serving pod declares models, and a pod that does both declares both.
 type DeclaredWorkload struct {
-	SourceBytes   int64
-	ServingModels []ServingModel
+	SourceBytes     int64
+	ServingModels   []ServingModel
+	ContainerDiskGB int
 }
 
 // maxServingModels is the hub's cap and the pod's download-set cap, not a new
@@ -302,6 +311,7 @@ func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPub
 		CreatorPublicKey:   strings.TrimSpace(creatorPublicKey),
 		PlannedSourceBytes: workload.SourceBytes,
 		ServingModels:      canonicalServingModels(workload.ServingModels),
+		ContainerDiskGB:    workload.ContainerDiskGB,
 		Image:              image,
 	}
 	if len(image) > 512 || strings.TrimSpace(image) != image || strings.ContainsAny(image, " \t\r\n\x00") {
@@ -309,6 +319,9 @@ func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPub
 	}
 	if development != nil && (len(development.SSHPublicKey) == 0 || len(development.SSHPublicKey) > 8192 || strings.TrimSpace(development.SSHPublicKey) != development.SSHPublicKey || strings.ContainsAny(development.SSHPublicKey, "\r\n\x00")) {
 		return nil, exit.Usagef("development requires one bounded SSH public-key line")
+	}
+	if workload.ContainerDiskGB < 0 {
+		return nil, exit.Usagef("--disk-gb is a positive number of GB")
 	}
 	if workload.SourceBytes < 0 {
 		return nil, exit.Named(exit.Validation, "rental.planned_workload_invalid",

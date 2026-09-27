@@ -523,6 +523,7 @@ type RentalNewCmd struct {
 	SKU            string   `arg:"" optional:"" name:"machine-slug" help:"Machine type from the rental catalog, such as h100-sxm5-80gb."`
 	GPUs           int      `name:"gpus" default:"1" help:"GPUs on the machine; any count the catalog lists. Keep to an even count for parallelism."`
 	Models         []string `name:"model" help:"Size disk for org/model@release/lane; repeat for several models. Hub measures their shared checkpoint closure."`
+	DiskGB         int      `name:"disk-gb" help:"Container disk to rent, in GB; the Hub picks an offer whose disk allows it."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
 	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
 }
@@ -544,8 +545,13 @@ func (c *RentalNewCmd) Run(r *Runtime) error {
 	if c.GPUs != 1 {
 		gpus = strconv.Itoa(c.GPUs)
 	}
+	disk := ""
+	if c.DiskGB != 0 {
+		disk = strconv.Itoa(c.DiskGB)
+	}
 	return r.call(handleRent, []string{c.SKU}, flags, values(
-		"--gpus", gpus, "--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models, "--ssh-public-key", c.SSHPublicKey, "--image", c.Image), false)
+		"--gpus", gpus, "--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout, "--model", c.Models,
+		"--disk-gb", disk, "--ssh-public-key", c.SSHPublicKey, "--image", c.Image), false)
 }
 
 type RentalEndCmd struct {

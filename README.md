@@ -518,6 +518,7 @@ cozy rental new                   # Cozy GPUs, their GPU counts, VRAM, and hourl
 cozy rental new h100-sxm5-80gb     # prints e.g. otter
 cozy rental new h100-sxm5-80gb --gpus 2   # one machine with 2 GPUs; keep counts even
 cozy rental new h100-sxm5-80gb --model paul/minimax-h3@1.0.0/bf16
+cozy rental new h100-sxm5-80gb --disk-gb=600    # rent at least a 600 GB container disk
 cozy rental new h100-sxm5-80gb \
   --idempotency-key <unique-key>
 cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candidate image
