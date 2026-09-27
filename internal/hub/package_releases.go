@@ -248,35 +248,6 @@ func (c *Client) WaitPackageRelease(ctx context.Context, ref Ref, release string
 	}
 }
 
-type PackageDefectReport struct {
-	Code     string `json:"code"`
-	Detail   string `json:"detail"`
-	RentalID string `json:"rental_id"`
-}
-
-type PackageDefectResult struct {
-	Changed    bool   `json:"changed"`
-	Code       string `json:"code"`
-	Release    string `json:"release"`
-	ReportedAt string `json:"reported_at"`
-	State      string `json:"state"`
-}
-
-// ReportPackageDefect relays a package-interface-falsifying pod refusal (th-106). The
-// hub authorizes the report by rental OWNERSHIP: this account owns the named rental
-// against a committed release. The signed-delegation chain that used to prove the
-// rental had downloaded these exact bytes is deleted (owner ruling 2026-09-03), so the
-// report's provenance is no longer proven.
-func (c *Client) ReportPackageDefect(ctx context.Context, ref Ref, release string,
-	report PackageDefectReport, reason string,
-) (PackageDefectResult, *exit.Error) {
-	var out PackageDefectResult
-	e := c.do(ctx, call{method: http.MethodPost,
-		path: packageReleasePath(ref, release) + "/defects", auth: true, reason: reason,
-		body: report}, &out)
-	return out, e
-}
-
 func (c *Client) YankPackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseYank, *exit.Error) {
 	var out PackageReleaseYank
 	e := c.do(ctx, call{method: http.MethodDelete,

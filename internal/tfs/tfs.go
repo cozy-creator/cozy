@@ -448,23 +448,6 @@ func (t *Tool) SourceProfileMembers(registry string, profiles []string) ([]strin
 	return slices.Compact(members), nil
 }
 
-// SameSelection ignores transient paths and sessions while binding the exact
-// reviewed profile and source-to-component assignment.
-func (p SourcePlan) SameSelection(other SourcePlan) bool {
-	if p.Profile != other.Profile || p.RegistrySHA256 != other.RegistrySHA256 ||
-		p.Target != other.Target || len(p.Sources) != len(other.Sources) {
-		return false
-	}
-	for i := range p.Sources {
-		left, right := p.Sources[i], other.Sources[i]
-		if left.Component != right.Component || left.SourceMember != right.SourceMember ||
-			left.Projected != right.Projected {
-			return false
-		}
-	}
-	return true
-}
-
 // PlanSource asks TensorFS to assign exact physical carriers through its
 // reviewed whole-source profiles. Creator never parses tensor headers or maps
 // filenames to components.

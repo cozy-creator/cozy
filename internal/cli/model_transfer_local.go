@@ -81,7 +81,7 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root stri
 	if problem != nil {
 		return nil, problem
 	}
-	headerPlans, members, problem := planLocalSourceProfiles(tool, ctx, slots, headerFiles,
+	_, members, problem := planLocalSourceProfiles(tool, ctx, slots, headerFiles,
 		parsed.Kind != modelsource.LocalFile, filepath.Join(root, "header-plans"))
 	if problem != nil {
 		return nil, problem
@@ -109,10 +109,6 @@ func prepareLocalTransferSources(runCtx context.Context, ctx *Context, root stri
 		}
 		if problem != nil {
 			return nil, problem
-		}
-		if !headerPlans[slot].SameSelection(full) {
-			return nil, exit.Named(exit.Conflict, "model_source_plan_changed",
-				"downloaded source no longer matches reviewed headers for input %s", slot)
 		}
 		manifestID, problem := tool.RunSource(runCtx, path)
 		if problem != nil {

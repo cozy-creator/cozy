@@ -135,7 +135,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 	updates := &rentalRuntimeUpdates{machines: machines}
 	machines.updates = updates
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
-	defects := newDefectReporter(ctx.Cfg, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution:  machines.Start,
 		RentalRuntimePreflight: machines.updates.preflight,
@@ -161,7 +160,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 			_, problem = install.Reclaim(l, st, id)
 			return problem
 		},
-		ReportReleaseDefect: defects.report,
 	})
 	if e != nil {
 		closeListeners()
