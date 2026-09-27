@@ -152,6 +152,9 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	// edited callers, cancellation and retry; the destination is the sole grant.
 	ctx.Inv.Args = []string{path}
 	ctx.Inv.Values["--allow-publish"] = []string{destination.String()}
+	// The script already names its profiles; the run must not reread them as job
+	// model-slot bindings (slot=profile), which refused every profiled ingest.
+	delete(ctx.Inv.Values, "--source-profile")
 	return true, handleRunExecute(ctx)
 }
 
