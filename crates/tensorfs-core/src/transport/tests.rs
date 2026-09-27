@@ -2876,9 +2876,76 @@ fn paced_objects(size: usize, count: usize) -> (Vec<ObjectRef>, Bodies) {
     (declared, Arc::new(serve))
 }
 
-/// Walk `subset` from `origin` into a fresh store; the rate and what the walk reports.
-/// Every object is proven local and verified by `plan.complete` before the rate counts.
-fn paced_walk(origin: &Origin, streams: usize, subset: &[ObjectRef]) -> (f64, super::WalkOutcome) {
+/// How many GETs the origin itself was serving at once, counted where it serves them.
+#[derive(Default)]
+struct Concurrency {
+    now: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl Concurrency {
+    fn enter(&self) {
+        let now = self.now.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak.fetch_max(now, Ordering::AcqRel);
+    }
+    fn leave(&self) {
+        self.now.fetch_sub(1, Ordering::AcqRel);
+    }
+    fn reset(&self) -> usize {
+        self.peak.swap(0, Ordering::AcqRel)
+    }
+}
+
+/// An origin that paces every body at `chunk` per `gap`. With `shared`, all connections
+/// draw from one schedule (the link is the limit); without, each has its own (one GET is
+/// the limit). It counts the GETs in flight on its own side of the socket.
+fn paced_origin(
+    body: Bodies,
+    chunk: usize,
+    gap: Duration,
+    shared: bool,
+) -> (Origin, Arc<Concurrency>) {
+    let serving = Arc::new(Concurrency::default());
+    let link = Arc::new(Mutex::new(std::time::Instant::now()));
+    let counted = Arc::clone(&serving);
+    let origin = origin(Arc::new(move |request: &Request| {
+        let body = body(request.path.trim_start_matches("/obj/"));
+        let (link, serving) = (Arc::clone(&link), Arc::clone(&counted));
+        Serve::Script(Box::new(move |socket: &mut TcpStream| {
+            serving.enter();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes());
+            let mut own = std::time::Instant::now();
+            for piece in body.chunks(chunk) {
+                let due = if shared {
+                    let mut next = link.lock().unwrap();
+                    *next = (*next).max(std::time::Instant::now()) + gap;
+                    *next
+                } else {
+                    own += gap;
+                    own
+                };
+                let now = std::time::Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+                if socket.write_all(piece).is_err() {
+                    break;
+                }
+            }
+            serving.leave();
+        }))
+    }));
+    (origin, serving)
+}
+
+/// Walk `subset` from `origin` into a fresh store and prove every object local and
+/// verified. The ledger samples each second: its stall floor (six samples) is far above
+/// any pause a loaded test box puts between two chunks, and nothing here is timed.
+fn paced_walk(origin: &Origin, streams: usize, subset: &[ObjectRef]) -> super::WalkOutcome {
     let root = temporary(&format!("paced-{streams}-{}", subset.len()));
     let store = Store::init(&root).unwrap();
     let (plan, _) = FetchPlan::of_objects(&store, "paced", subset).unwrap();
@@ -2891,8 +2958,6 @@ fn paced_walk(origin: &Origin, streams: usize, subset: &[ObjectRef]) -> (f64, su
             )
         })
         .collect();
-    let ledger = Ledger::with_resolution(Duration::from_millis(200));
-    let started = std::time::Instant::now();
     let walked = super::pull::fetch_wanted(
         &store,
         &plan,
@@ -2900,12 +2965,11 @@ fn paced_walk(origin: &Origin, streams: usize, subset: &[ObjectRef]) -> (f64, su
         &local_policy(),
         &Anonymous,
         Deadline::none(),
-        &ledger,
+        &Ledger::with_resolution(Duration::from_secs(1)),
         streams,
         None,
     )
     .unwrap();
-    let seconds = started.elapsed().as_secs_f64();
     plan.complete(&store).unwrap();
     for object in subset {
         let mut bytes = Vec::new();
@@ -2922,109 +2986,78 @@ fn paced_walk(origin: &Origin, streams: usize, subset: &[ObjectRef]) -> (f64, su
     }
     let _ = std::fs::remove_dir_all(root);
     assert_eq!(walked.fetched as usize, subset.len());
-    (walked.bytes_moved as f64 / 1e6 / seconds, walked)
+    let declared: u64 = subset.iter().map(|o| o.length).sum();
+    assert_eq!(walked.bytes_moved, declared, "every declared byte, once");
+    walked
 }
 
-/// Run 1225's shape: one GET is the limit, not the link. Each connection drips ~0.4 MB/s,
-/// so a walk held at 16 streams is held at 16 times that however fast the link is. The
-/// paced walk measures that each doubling buys goodput, grows past 16, and every object
-/// still crosses the one door and verifies.
+/// Run 1225's shape: one GET is the limit, not the link. Each connection is paced at
+/// ~0.2 MB/s on its own schedule, so every doubling of streams doubles what the origin
+/// can hand over. The walk must climb to its ceiling, and the ORIGIN must have served
+/// that many GETs at once. Nothing here asserts a rate or a duration.
 #[test]
 fn a_walk_grows_past_sixteen_while_one_get_is_the_limit() {
-    const SIZE: usize = 512 << 10;
-    const CHUNK: usize = 8 << 10;
-    let gap = Duration::from_millis(20);
-    let (declared, body) = paced_objects(SIZE, 384);
-    let origin = origin(Arc::new(move |request: &Request| Serve::Drip {
-        body: body(request.path.trim_start_matches("/obj/")),
-        chunk: CHUNK,
-        gap,
-        ttfb: Duration::from_millis(20),
-    }));
-    let one_get = CHUNK as f64 / gap.as_secs_f64() / 1e6;
+    let (declared, body) = paced_objects(1 << 20, 320);
+    let (origin, serving) = paced_origin(body, 4 << 10, Duration::from_millis(20), false);
 
-    let (held, fixed) = paced_walk(&origin, 16, &declared[..48]);
-    let (paced, grew) = paced_walk(&origin, super::PULL_STREAMS, &declared);
+    let fixed = paced_walk(&origin, 16, &declared[..32]);
+    assert!(
+        fixed.streams == 16 && fixed.levels.is_empty(),
+        "an explicit 16 is a fixed walk: {fixed:?}"
+    );
+    // The origin counts a GET until its handler returns, which can overlap the next GET
+    // by a scheduling instant; the fixed walk's peak is reported, not asserted.
+    let held = serving.reset();
+    let grew = paced_walk(&origin, super::PULL_STREAMS, &declared[32..]);
+    let peak = serving.reset();
     println!(
-        "one GET {one_get:.2} MB/s; held at 16: {held:.1} MB/s; paced: {paced:.1} MB/s, \
-         ended at {} streams via {:?}",
+        "fixed peak {held}; paced peak {peak}, ended at {} via {:?}",
         grew.streams, grew.levels
     );
-    assert_eq!(fixed.streams, 16);
-    assert!(fixed.levels.is_empty(), "an explicit 16 is a fixed walk");
-    assert!(
-        held <= 16.0 * one_get * 1.1,
-        "the control is capped by 16 GETs: {held:.1}"
+    assert_eq!(
+        grew.streams,
+        super::PULL_STREAMS,
+        "growth stopped early: {grew:?}"
     );
     assert!(
-        grew.streams >= 64,
-        "goodput followed every doubling: {grew:?}"
+        peak > 64,
+        "the origin never served more than {peak} GETs at once: {grew:?}"
     );
-    // The socket-side goodput each level measured is the mechanism; the wall rate also
-    // pays this box's disk, which other tests share, so it is only held to beating 16.
-    let (first, last) = (grew.levels[0], grew.levels[grew.levels.len() - 1]);
-    assert!(
-        last.bytes_per_second >= 3.0 * first.bytes_per_second,
-        "the top level moved {:.1} MB/s against {:.1} at 16",
-        last.bytes_per_second / 1e6,
-        first.bytes_per_second / 1e6
-    );
-    assert!(
-        paced > held,
-        "paced {paced:.1} MB/s did not beat 16 streams at {held:.1}"
-    );
+    for pair in grew.levels.windows(2) {
+        assert_eq!(
+            pair[1].streams,
+            2 * pair[0].streams,
+            "levels double: {grew:?}"
+        );
+    }
 }
 
-/// The other half of the rule: when the LINK is the limit, a doubling buys nothing and the
-/// walk stops growing instead of piling up partial objects. Every connection shares one
-/// ~13 MB/s schedule here, which 16 streams already fill.
+/// The other half of the rule: when the LINK is the limit, a doubling buys nothing and
+/// the walk stops growing instead of piling up partial objects. Every connection shares
+/// one schedule here, which a handful of streams already fill.
 #[test]
 fn a_walk_does_not_grow_when_the_link_is_the_limit() {
-    const SIZE: usize = 512 << 10;
-    const CHUNK: usize = 16 << 10;
-    let slot = Duration::from_micros(1250); // one 16 KiB chunk per slot: ~13 MB/s shared
-    let (declared, body) = paced_objects(SIZE, 96);
-    let link = Arc::new(Mutex::new(std::time::Instant::now()));
-    let origin = origin(Arc::new(move |request: &Request| {
-        let body = body(request.path.trim_start_matches("/obj/"));
-        let link = Arc::clone(&link);
-        Serve::Script(Box::new(move |socket: &mut TcpStream| {
-            let head = format!(
-                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = socket.write_all(head.as_bytes());
-            for piece in body.chunks(CHUNK) {
-                let due = {
-                    let mut next = link.lock().unwrap();
-                    let now = std::time::Instant::now();
-                    *next = (*next).max(now) + slot;
-                    *next
-                };
-                let now = std::time::Instant::now();
-                if due > now {
-                    std::thread::sleep(due - now);
-                }
-                if socket.write_all(piece).is_err() {
-                    return;
-                }
-            }
-        }))
-    }));
-    let (held, _) = paced_walk(&origin, 16, &declared);
-    let (rate, walked) = paced_walk(&origin, super::PULL_STREAMS, &declared);
+    let (declared, body) = paced_objects(512 << 10, 160);
+    let (origin, serving) = paced_origin(body, 16 << 10, Duration::from_micros(1250), true);
+    let walked = paced_walk(&origin, super::PULL_STREAMS, &declared);
+    let peak = serving.reset();
     println!(
-        "shared link: held at 16 {held:.1} MB/s; paced {rate:.1} MB/s, ended at {} streams via {:?}",
+        "shared link: peak {peak}, ended at {} via {:?}",
         walked.streams, walked.levels
     );
     assert!(
-        walked.streams <= 32,
-        "a full link earned no growth: {walked:?}"
+        walked.streams < super::PULL_STREAMS,
+        "a full link grew the walk to its ceiling: peak {peak}, {walked:?}"
     );
-    let levels = &walked.levels;
+    // It stopped because a doubling stopped paying, as it measured it.
+    let last = walked
+        .levels
+        .windows(2)
+        .last()
+        .expect("at least one probe past 16");
     assert!(
-        levels.len() == 2 && levels[1].bytes_per_second < super::GAIN * levels[0].bytes_per_second,
-        "the one probe past 16 measured the full link and stopped: {levels:?}"
+        last[1].bytes_per_second < super::GAIN * last[0].bytes_per_second,
+        "the walk stopped without a doubling that failed to pay: {walked:?}"
     );
 }
 

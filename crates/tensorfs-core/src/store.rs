@@ -158,6 +158,14 @@ const EDQUOT: i32 = 69;
 /// the owner re-issued the fetch, which re-planned, re-asked, and failed at the same byte.
 /// On rented hardware, forever. Naming the condition is what lets a caller stop.
 pub(crate) fn classify_io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+    // A full descriptor table is the process's shortage, not the Store's: every open in
+    // the Store says so the same way, and a transfer treats it as backpressure.
+    if crate::descriptors::exhausted(&e) {
+        return Refusal {
+            code: Code::FD_HEADROOM,
+            detail: format!("{}: no file descriptor ({e})", what.as_ref()),
+        };
+    }
     if matches!(e.raw_os_error(), Some(ENOSPC) | Some(EDQUOT)) {
         return Refusal {
             code: Code::CAPACITY_EXHAUSTED,
@@ -1362,16 +1370,7 @@ impl Store {
                 .create_new(true)
                 .mode(0o600)
                 .open(&tmp)
-                .map_err(|e| {
-                    if crate::descriptors::exhausted(&e) {
-                        Refusal {
-                            code: Code::FD_HEADROOM,
-                            detail: format!("create temp {}: {e}", tmp.display()),
-                        }
-                    } else {
-                        io(format!("create temp {}", tmp.display()), e)
-                    }
-                })?;
+                .map_err(|e| io(format!("create temp {}", tmp.display()), e))?;
             match f.try_lock_exclusive() {
                 Ok(()) => break (tmp, f),
                 // Only a reaper can hold the lock on a name this process just minted: it
@@ -1473,7 +1472,10 @@ impl Store {
         fault: &Fault,
         operation: Option<&str>,
     ) -> Result<Put> {
-        let catalog = crate::catalog::Catalog::open(&self.root)?;
+        let catalog = match crate::catalog::Catalog::open_admitting(&self.root) {
+            Ok(catalog) => catalog,
+            Err(refusal) => return cleanup(&verified.tmp, refusal),
+        };
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
         let object = ObjectRef {
             sha256: verified.sha256.clone(),

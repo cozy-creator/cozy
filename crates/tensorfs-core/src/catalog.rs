@@ -62,6 +62,11 @@ fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
     }
 }
 
+/// Whether a catalog refusal is SQLite's busy timeout expiring behind another writer.
+fn busy(refusal: &Refusal) -> bool {
+    refusal.code == Code::IO_FAILED && refusal.detail.ends_with("database is locked")
+}
+
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
     crate::store::classify_io(what, error)
 }
@@ -115,7 +120,20 @@ fn connect(path: &Path) -> Result<Connection> {
         .entry(path.to_path_buf())
         .or_default() += 1;
     crate::stats::catalog_opened();
-    let connection = Connection::open(path).map_err(|error| sql("open catalog", error))?;
+    let connection = Connection::open(path).map_err(|error| {
+        // SQLite reports a full descriptor table only as "unable to open"; the table
+        // itself answers whether that is what happened.
+        if crate::descriptors::available().is_some_and(|free| free == 0) {
+            crate::descriptors::exhausted(&std::io::Error::from_raw_os_error(
+                rustix::io::Errno::MFILE.raw_os_error(),
+            ));
+            return Refusal {
+                code: Code::FD_HEADROOM,
+                detail: format!("open catalog: no file descriptor ({error})"),
+            };
+        }
+        sql("open catalog", error)
+    })?;
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| sql("set catalog busy timeout", error))?;
@@ -370,6 +388,22 @@ impl Catalog {
         };
         catalog.initialize_schema()?;
         Ok(catalog)
+    }
+
+    /// `open` for an object admission. A catalog busy past SQLite's timeout while this
+    /// process's own admission batches keep committing is a queue, not a failure: the
+    /// verified bytes wait for their turn instead of being thrown away and fetched again.
+    /// Busy with no batch committed in the meantime is another writer's lock, and refuses.
+    pub(crate) fn open_admitting(root: &Path) -> Result<Self> {
+        loop {
+            let committed = crate::stats::snapshot().admission_batches;
+            match Self::open(root) {
+                Err(refusal)
+                    if busy(&refusal) && crate::stats::snapshot().admission_batches > committed => {
+                }
+                opened => return opened,
+            }
+        }
     }
 
     pub fn open(root: &Path) -> Result<Self> {
@@ -1473,16 +1507,7 @@ impl WriterGuard {
             .read(true)
             .write(true)
             .open(&path)
-            .map_err(|error| {
-                if crate::descriptors::exhausted(&error) {
-                    Refusal {
-                        code: Code::FD_HEADROOM,
-                        detail: format!("create writer marker: {error}"),
-                    }
-                } else {
-                    io("create writer marker", error)
-                }
-            })?;
+            .map_err(|error| io("create writer marker", error))?;
         file.try_lock_exclusive()
             .map_err(|error| io("lock writer marker", error))?;
         Ok(Self {
