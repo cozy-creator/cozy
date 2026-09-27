@@ -77,6 +77,38 @@ fn model_manifest(store: &Store, body: Body, shape: Vec<u64>, note: &[u8]) -> Ob
     store.put_manifest(&manifest).unwrap().obj
 }
 
+/// Many processes ensuring one brand-new root at once: one creates it, the others open it,
+/// and none is refused as "not empty".
+#[test]
+fn concurrent_ensures_of_a_new_root_all_succeed() {
+    let root = temporary("concurrent-ensure");
+    fs::create_dir_all(&root).unwrap();
+    let empty = root.join("empty");
+    fs::create_dir(&empty).unwrap();
+    for target in [root.join("absent"), empty] {
+        let children: Vec<_> = (0..16)
+            .map(|_| {
+                Command::new(env!("CARGO_BIN_EXE_tfs"))
+                    .args(["store", "ensure", target.to_str().unwrap()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Store::open(&target).unwrap();
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn ensure_initializes_only_absent_or_empty_real_roots() {
     let root = temporary("ensure");
