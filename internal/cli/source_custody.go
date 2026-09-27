@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -39,9 +40,18 @@ func SyncStoredSourceCustody(ctx context.Context, cfg config.Config, requestID, 
 		return nil, problem
 	}
 	defer store.Close()
-	_, problem = inspectSourceCustody(store, cfg, requestID, rentalID, bootID)
+	_, problem = inspectSourceCustody(store, requestID, rentalID, bootID)
 	if problem != nil {
 		return nil, problem
+	}
+	// Custody is published to the request's own hub with that hub's credential,
+	// whichever hub this process was configured for.
+	row, problem := store.RequestRow(requestID)
+	if problem != nil {
+		return nil, problem
+	}
+	if scoped := cfg.ForHub(row.Hub); scoped.HubURL != cfg.HubURL || auth == nil {
+		cfg, auth = scoped, accountauth.New(scoped)
 	}
 	target, problem := rental.Resolver(layout, store)(rentalID)
 	if problem != nil {
@@ -57,7 +67,7 @@ func SyncStoredSourceCustody(ctx context.Context, cfg config.Config, requestID, 
 	if problem := owner.SyncCheckpoints(connection.Context, requestID, connection.Host); problem != nil {
 		return nil, problem
 	}
-	result, problem := inspectSourceCustody(store, cfg, requestID, rentalID, bootID)
+	result, problem := inspectSourceCustody(store, requestID, rentalID, bootID)
 	if problem != nil {
 		return nil, problem
 	}
@@ -85,10 +95,12 @@ func InspectStoredSourceCustody(cfg config.Config, requestID, rentalID, bootID s
 		return nil, problem
 	}
 	defer store.Close()
-	return inspectSourceCustody(store, cfg, requestID, rentalID, bootID)
+	return inspectSourceCustody(store, requestID, rentalID, bootID)
 }
 
-func inspectSourceCustody(store *records.Store, cfg config.Config, requestID, rentalID, bootID string) (*SourceCustodyResult, *exit.Error) {
+// inspectSourceCustody reads only records. The rental and request are judged on the hub
+// they belong to, never against the hub this process happens to be configured for.
+func inspectSourceCustody(store *records.Store, requestID, rentalID, bootID string) (*SourceCustodyResult, *exit.Error) {
 	request, problem := store.RequestRow(requestID)
 	if problem != nil {
 		return nil, problem
@@ -126,8 +138,11 @@ func inspectSourceCustody(store *records.Store, cfg config.Config, requestID, re
 	if problem != nil {
 		return nil, problem
 	}
-	if row == nil || row.Hub != cfg.HubURL || row.ExpectedWorkerBootID != bootID {
-		return nil, exit.New(exit.Conflict, "source custody rental Hub or worker boot changed")
+	if row == nil || row.ExpectedWorkerBootID != bootID {
+		return nil, exit.New(exit.Conflict, "source custody rental worker boot changed")
+	}
+	if strings.TrimRight(row.Hub, "/") != strings.TrimRight(request.Hub, "/") {
+		return nil, exit.New(exit.Conflict, "source custody request belongs to %s but its rental to %s", request.Hub, row.Hub)
 	}
 	result := &SourceCustodyResult{SourcePrepared: transfer.State == "materialized" && transfer.ModelsWorkerBootID == bootID && len(transfer.Models) == len(transfer.SourceProfiles), SourceSelection: transfer.SourceSelection, Models: transfer.Models, Checkpoints: progress}
 	for _, file := range transfer.SourceFiles {

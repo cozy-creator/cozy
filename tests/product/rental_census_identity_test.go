@@ -24,17 +24,34 @@ func TestRentalCensusDoesNotHideSameIDFromAnotherHub(t *testing.T) {
 	defer store.Close()
 	fatal(t, store.RecordRental(records.Rental{ID: "rental-collision", MachineName: "elsewhere",
 		Hub: "http://127.0.0.1:1", State: "ready", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000}))
-	code, out := runCozy(t, root, "rental", "list", "--json", "--full")
-	var listed struct {
-		Count int              `json:"machines_running"`
-		Rate  int64            `json:"hourly_spend_usd_micros"`
-		Rows  []map[string]any `json:"rentals"`
+	type listing struct {
+		Count  int              `json:"machines_running"`
+		Rate   int64            `json:"hourly_spend_usd_micros"`
+		Rows   []map[string]any `json:"rentals"`
+		Others []map[string]any `json:"other_hubs"`
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || listed.Count != 1 || listed.Rate != 40_000 || len(listed.Rows) != 2 {
+	// The current hub's listing holds its own observation and names the other hub's
+	// rental rather than listing it.
+	code, out := runCozy(t, root, "rental", "list", "--json", "--full")
+	var listed listing
+	if code != 0 || json.Unmarshal([]byte(out), &listed) != nil || listed.Count != 1 || listed.Rate != 40_000 ||
+		len(listed.Rows) != 1 || listed.Rows[0]["hub"] != origin || listed.Rows[0]["machine"] != "current" ||
+		len(listed.Others) != 1 || listed.Others[0]["hub"] != "http://127.0.0.1:1" {
 		t.Fatalf("same ID in another Hub hid or repriced the current account's rental: exit=%d %s", code, out)
 	}
-	if listed.Rows[1]["hub"] != origin || listed.Rows[1]["machine"] != "current" {
-		t.Fatalf("current Hub observation was not preserved: %s", out)
+	// Every hub's listing holds both, each on its own hub; the unreachable one is unverified.
+	code, out = runCozy(t, root, "rental", "list", "--all-hubs", "--json", "--full")
+	listed = listing{}
+	if json.Unmarshal([]byte(out), &listed) != nil || len(listed.Rows) != 2 {
+		t.Fatalf("every-hub listing lost a same-ID rental: exit=%d %s", code, out)
+	}
+	byMachine := map[string]map[string]any{}
+	for _, row := range listed.Rows {
+		byMachine[row["machine"].(string)] = row
+	}
+	if byMachine["current"]["hub"] != origin || byMachine["current"]["unverified"] == true ||
+		byMachine["elsewhere"]["hub"] != "http://127.0.0.1:1" || byMachine["elsewhere"]["unverified"] != true {
+		t.Fatalf("same-ID rentals were not kept on their own hubs: %s", out)
 	}
 }
 

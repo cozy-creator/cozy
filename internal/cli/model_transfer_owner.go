@@ -52,13 +52,14 @@ func (o *modelTransferOwner) cliContext(origin string, intent records.ModelTrans
 		Out: io.Discard, Err: o.log, Cfg: cfg, AccountAuth: auth}
 }
 
-// hubOf is the Tensorhub a request belongs to.
+// hubOf is the Tensorhub a request belongs to: its own, else its rental's, else ""
+// (the configured hub).
 func (o *modelTransferOwner) hubOf(requestID string) string {
-	request, problem := o.store.RequestRow(requestID)
-	if problem != nil || request == nil {
+	hub, problem := o.store.RequestHub(requestID, "")
+	if problem != nil {
 		return ""
 	}
-	return request.Hub
+	return hub
 }
 
 func (o *modelTransferOwner) requestContext(parent context.Context, requestID string) (

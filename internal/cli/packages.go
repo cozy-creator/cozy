@@ -214,7 +214,7 @@ func handleLs(ctx *Context) *exit.Error {
 	l := output.List{
 		Name:      "packages",
 		Fields:    []string{"package", "version", "python", "python_status", "size", "dependencies"},
-		AllFields: []string{"package", "major", "version", "python", "python_status", "size", "dependencies", "placement_set", "install_id", "source", "synced", "verified", "installed"},
+		AllFields: []string{"package", "major", "version", "python", "python_status", "size", "dependencies", "placement_set", "install_id", "source", "hub", "synced", "verified", "installed"},
 		Bytes:     []string{"size", "dependencies"},
 	}
 	inventory, pythonProblem := hostruntime.PythonExecutors(context.Background())
@@ -247,6 +247,7 @@ func handleLs(ctx *Context) *exit.Error {
 			"closure":       strings.ReplaceAll(inst.Closure, "\n", " "),
 			"placement_set": inst.PlacementSetDigest,
 			"source":        inst.SourceKind + " " + inst.SourceRef,
+			"hub":           installHub(ctx, inst),
 			"synced":        synced,
 			"verified":      fmt.Sprintf("%t", inst.Verified),
 			"installed":     inst.CreatedAt,
@@ -256,7 +257,21 @@ func handleLs(ctx *Context) *exit.Error {
 		l.Next = []string{"cozy package search"}
 		return emit(ctx, l)
 	}
+	for _, inst := range rows {
+		if inst.SourceKind == "tensorhub" && ctx.forHub(inst.Hub).Cfg.HubURL != ctx.Cfg.HubURL {
+			l.Fields = append(l.Fields, "hub")
+			break
+		}
+	}
 	return emit(ctx, l)
+}
+
+// installHub names the hub a published install came from; a local install has none.
+func installHub(ctx *Context, inst records.PackageInstall) string {
+	if inst.SourceKind != "tensorhub" {
+		return ""
+	}
+	return ctx.Cfg.HubLabel(ctx.forHub(inst.Hub).Cfg.HubURL)
 }
 
 // syncedText is what the daemon's source watcher last recorded about an editable install's

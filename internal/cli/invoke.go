@@ -2538,6 +2538,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 		return Target{}, nil, problem
 	}
 	target.InstallID = facts.Install.ID
+	adoptInstallHub(ctx, facts.Install)
 	return target, facts.PackageInterface, nil
 }
 

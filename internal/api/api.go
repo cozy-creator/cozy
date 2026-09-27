@@ -174,6 +174,18 @@ func (s *Server) hubOf(r *http.Request) (string, *exit.Error) {
 	return config.HubOrigin(value)
 }
 
+// requestHub is the hub a recorded request belongs to: its own, else its rental's, else
+// this daemon's configured hub.
+func (s *Server) requestHub(row records.Request) string {
+	if row.Hub != "" {
+		return row.Hub
+	}
+	if hub, problem := s.store.RequestHub(row.ID, s.cfg.HubURL); problem == nil {
+		return hub
+	}
+	return s.cfg.HubURL
+}
+
 // submissionHub is the hub new work belongs to. Work on a named rental that the client
 // did not place on a hub itself belongs to that rental's hub.
 func (s *Server) submissionHub(r *http.Request, rentalID string) (string, *exit.Error) {

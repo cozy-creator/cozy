@@ -75,6 +75,11 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("TENSORFS_HOME", filepath.Join(dir, "tensorfs")); err != nil {
 		panic(err)
 	}
+	// Nor production Tensorhub, the product default: in-process owners and CLI children
+	// (childEnv) default to the same unanswered loopback hub.
+	if err := os.Setenv("TENSORHUB_URL", testDefaultHub); err != nil {
+		panic(err)
+	}
 	cozyBin = filepath.Join(dir, "cozy")
 	fakeWorkerBin = filepath.Join(dir, "cozy-fakeworker")
 	for _, b := range [][2]string{{cozyBin, "."}, {fakeWorkerBin, "./tests/support/fakeworker"}} {
@@ -409,6 +414,9 @@ func runCozyStreams(t *testing.T, root string, args ...string) (int, string, str
 // can only ever be started by a process that got its COZY_HOME from here. Registering the
 // root here is therefore the same thing as registering every daemon that can exist, and a
 // test cannot forget to do it. See reap_test.go for what the registration arms.
+// testDefaultHub is the suite's default Tensorhub: loopback, and never production.
+const testDefaultHub = "http://127.0.0.1:8819"
+
 func childEnv(t *testing.T, root string, imposed ...string) []string {
 	t.Helper()
 	trackDaemonRoot(t, root)
@@ -420,7 +428,7 @@ func childEnv(t *testing.T, root string, imposed ...string) []string {
 	// Nor production Tensorhub, the product default: a root that selects no hub gets an
 	// unanswered loopback one.
 	if raw, _ := os.ReadFile(filepath.Join(root, config.FileName)); !strings.Contains(string(raw), "tensorhub_url") {
-		base = append(base, "TENSORHUB_URL=http://127.0.0.1:8819")
+		base = append(base, "TENSORHUB_URL="+testDefaultHub)
 	}
 	return cfg.Child(append(base, imposed...)...)
 }

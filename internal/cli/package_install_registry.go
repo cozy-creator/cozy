@@ -178,6 +178,7 @@ func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 		Selection:     install.Selection{PackageInterface: packageInterface},
 		IndexURL: strings.TrimRight(cli.Cfg.HubURL, "/") +
 			"/v1/index/" + ref.Org + "/simple/",
+		Hub: cli.Cfg.HubURL,
 	}
 	// Wire 30: the plan's rows are release wheel FACTS only. No wheel byte is downloaded;
 	// the environment materializes from the locked-requirements export, whose hashes pin

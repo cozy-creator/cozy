@@ -139,8 +139,8 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if existing != nil && existing.Hub != selectedHub {
-		s.refuseTyped(w, r, idempotencyHubConflict(key, existing.Hub, selectedHub))
+	if existing != nil && s.requestHub(*existing) != selectedHub {
+		s.refuseTyped(w, r, idempotencyHubConflict(key, s.requestHub(*existing), selectedHub))
 		return
 	}
 	var spec orchestrator.Submission
@@ -889,7 +889,7 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	life := s.lifecycleFacts(row)
-	life.Hub = row.Hub
+	life.Hub = s.requestHub(row)
 	if life.Error == "" && life.Status == "failed" {
 		if errType, errCode, errText, problem := s.store.SettledFailure(row.ID); problem == nil {
 			life.ErrorType, life.ErrorCode, life.Error = errType, errCode, errText
@@ -1083,7 +1083,7 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("hubs") == "all" {
 		hub = ""
 	}
-	rows, e := s.store.PublicRequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), hub, limit, before)
+	rows, e := s.store.PublicRequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), hub, s.cfg.HubURL, limit, before)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return

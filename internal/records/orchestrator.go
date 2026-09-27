@@ -1307,31 +1307,57 @@ func (s *Store) Requests(state, packageName string, limit int) ([]Request, *exit
 // RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy run list` reads jobs
 // and the request listing reads serving rows — one table, one reader, two questions.
 func (s *Store) RequestsOfKind(kind, state, packageName string, limit int) ([]Request, *exit.Error) {
-	return s.requestsBefore(kind, state, packageName, "", limit, 0, false)
+	return s.requestsBefore(kind, state, packageName, "", "", limit, 0, false)
 }
 
 // RequestsBefore reads a bounded history page, excluding the supplied run number.
 func (s *Store) RequestsBefore(state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
-	return s.requestsBefore("", state, packageName, "", limit, before, false)
+	return s.requestsBefore("", state, packageName, "", "", limit, before, false)
 }
 
 // PublicRequestsBefore is one history page; a non-empty hub keeps only that hub's runs.
-// Run numbers stay host-wide either way.
-func (s *Store) PublicRequestsBefore(state, packageName, hub string, limit int, before int64) ([]Request, *exit.Error) {
-	return s.requestsBefore("", state, packageName, hub, limit, before, true)
+// A request recorded without a hub belongs to its rental's hub, else fallbackHub, so a
+// run from before hubs were recorded never drops out of its listing. Run numbers stay
+// host-wide either way.
+func (s *Store) PublicRequestsBefore(state, packageName, hub, fallbackHub string, limit int, before int64) ([]Request, *exit.Error) {
+	return s.requestsBefore("", state, packageName, hub, fallbackHub, limit, before, true)
 }
 
-func (s *Store) requestsBefore(kind, state, packageName, hub string, limit int, before int64, public bool) ([]Request, *exit.Error) {
+// requestHubSQL is a request row's hub: its own, else its rental's, else the fallback
+// bound as the statement's parameter.
+const requestHubSQL = `COALESCE(NULLIF(requests.hub,''),(SELECT rentals.hub FROM rentals
+  WHERE rentals.id IN (requests.worker,requests.requested_rental) AND rentals.hub<>'' LIMIT 1),?)`
+
+// RequestHub is the hub one request belongs to, by the same rule as the listing.
+func (s *Store) RequestHub(id, fallbackHub string) (string, *exit.Error) {
+	var hub string
+	err := s.db.QueryRow(`SELECT `+requestHubSQL+` FROM requests WHERE id=?`,
+		strings.TrimRight(fallbackHub, "/"), id).Scan(&hub)
+	if errors.Is(err, sql.ErrNoRows) {
+		return strings.TrimRight(fallbackHub, "/"), nil
+	}
+	if err != nil {
+		return "", exit.Internalf("cannot read the hub of request %s: %s", id, err)
+	}
+	return hub, nil
+}
+
+func (s *Store) requestsBefore(kind, state, packageName, hub, fallbackHub string, limit int, before int64, public bool) ([]Request, *exit.Error) {
 	// Number only narrow index facts across history; load payloads and other
 	// request documents only for the bounded selected page.
 	selectedState := "state"
 	if public && state != "" {
 		selectedState = publicRunStatusSQL()
 	}
-	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
-  id,created_at,kind,` + selectedState + ` AS state,package,hub FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
-	where := []string{}
+	selectedHub := "hub"
 	args := []any{}
+	if hub != "" {
+		selectedHub = requestHubSQL
+		args = append(args, strings.TrimRight(fallbackHub, "/"))
+	}
+	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
+  id,created_at,kind,` + selectedState + ` AS state,package,` + selectedHub + ` AS hub FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
+	where := []string{}
 	if before > 0 {
 		where = append(where, `number<?`)
 		args = append(args, before)
@@ -2687,14 +2713,19 @@ func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
 	return out, nil
 }
 
-// AssignRecordHubs gives requests recorded before per-record hubs (schema 49) the
-// Tensorhub they were created under: their rental's, else the daemon's configured
-// default. Every later request is recorded with its hub, so this settles once.
+// AssignRecordHubs gives records written before they carried a hub the Tensorhub they
+// were created under: a request its rental's, else the daemon's configured default; a
+// published install the configured default. Later records carry their hub, so this
+// settles once.
 func (s *Store) AssignRecordHubs(defaultHub string) *exit.Error {
+	defaultHub = strings.TrimRight(defaultHub, "/")
 	if _, err := s.db.Exec(`UPDATE requests SET hub=COALESCE((SELECT rentals.hub FROM rentals
 		WHERE rentals.id IN (requests.worker, requests.requested_rental) AND rentals.hub<>'' LIMIT 1), ?)
-		WHERE hub=''`, strings.TrimRight(defaultHub, "/")); err != nil {
+		WHERE hub=''`, defaultHub); err != nil {
 		return exit.Internalf("cannot assign request Tensorhubs: %s", err)
+	}
+	if _, err := s.db.Exec(`UPDATE installs SET hub=? WHERE hub='' AND source_kind='tensorhub'`, defaultHub); err != nil {
+		return exit.Internalf("cannot assign install Tensorhubs: %s", err)
 	}
 	return nil
 }
