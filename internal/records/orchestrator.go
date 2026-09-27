@@ -1272,6 +1272,20 @@ func (s *Store) PinRequestModels(id string, models []ModelRef) *exit.Error {
 	return nil
 }
 
+// PinMachineModels records the rungs the executing machine's measured devices fixed, before
+// its submission is frozen.
+func (s *Store) PinMachineModels(id string, models []ModelRef) *exit.Error {
+	encoded, err := json.Marshal(models)
+	if err != nil {
+		return exit.Internalf("cannot encode request %s models: %s", id, err)
+	}
+	if _, err := s.db.Exec(`UPDATE requests SET models=? WHERE id=?
+		AND state IN ('submitted','queued','requeue_pending')`, string(encoded), id); err != nil {
+		return exit.Internalf("cannot record request %s models: %s", id, err)
+	}
+	return nil
+}
+
 func settledRequestState(state string) bool {
 	switch state {
 	case "succeeded", "failed", "canceled", "refused", "abandoned":

@@ -1129,7 +1129,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// refuses here means nothing was started, which is why the refusal has no cleanup.
 	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
 		InstanceID: instanceID, Package: spec.Placement.Package,
-		InstallID: spec.Placement.InstallID, WorkerID: "local", Devices: spec.Devices,
+		InstallID: spec.Placement.InstallID, WorkerID: "local", Devices: spec.Devices, //cozy:venue classic worker for local model transfers until proto-062 PR 7
 	}); e != nil {
 		logFile.Close()
 		return "", e
@@ -2182,7 +2182,7 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	// starts for every other device and rental.
 	unresolved := map[string]bool{}
 	for _, row := range rows {
-		if row.WorkerID == "local" && row.State == "spawned_without_birth" {
+		if row.WorkerID == "local" && row.State == "spawned_without_birth" { //cozy:venue classic worker for local model transfers until proto-062 PR 7
 			unresolved[row.InstanceID] = true
 			c.logf("worker %s may have started before its OS birth identity was journaled; devices [%s] stay reserved "+
 				"until the orphan is stopped and its row closed", row.InstanceID, strings.Join(row.Devices, ","))

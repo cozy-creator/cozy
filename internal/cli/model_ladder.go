@@ -10,12 +10,10 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 // The binding ladder is a FIT MAP (cl-166): the hub binding says which lane of a model
@@ -133,42 +131,6 @@ func laneOf(ref hub.Ref, selected *hub.ModelReleaseSummary, lane string) (hub.Mo
 		orNone(strings.Join(names, ", ")))
 }
 
-// localRungs picks the invocation's slots on this host as one group, the way a rented
-// machine's are picked (rental.Pin). A slot whose ladder names no GPU here still takes its
-// first declared lane when that rung is uncounted: the ladder is not a local hardware
-// allowlist, and Runtime still checks encoding support, construction compatibility and
-// memory capacity. An explicit override is its own rung.
-func localRungs(ctx *Context, selected []invocationModelSpec) ([]records.ModelRef, *exit.Error) {
-	inventory := hostgpu.Probe(ctx.Cfg)
-	accelerator := ""
-	if len(inventory.GPUs) > 0 {
-		accelerator = inventory.GPUs[0].Model
-	}
-	refs := make([]records.ModelRef, len(selected))
-	for i, spec := range selected {
-		if spec.Explicit {
-			refs[i].Manifest, refs[i].Lane = spec.Ref, spec.Lane
-			continue
-		}
-		if len(spec.Binding.Ladder) == 0 {
-			return nil, exit.Named(exit.Validation, "model_ladder_empty",
-				"the model binding has no default lanes").
-				WithRemedy("declare a default lane or supply model.<param>=org/model@release/lane")
-		}
-		for _, rung := range spec.Binding.Ladder {
-			refs[i].Ladder = append(refs[i].Ladder, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane})
-		}
-		if first := refs[i].Ladder[0]; first.GPUs == 0 {
-			refs[i].Ladder = append(refs[i].Ladder, records.ModelRung{GPU: "*", Lane: first.Lane})
-		}
-	}
-	pinned, _, ok := rental.Pin(refs, accelerator, len(inventory.GPUs))
-	if !ok {
-		return nil, exit.Named(exit.Validation, "model_gpu_group_unavailable", "no authored group fits the local inventory of %d GPUs (%s)", len(inventory.GPUs), orNone(accelerator))
-	}
-	return pinned, nil
-}
-
 // bindRemedy is the exact command that gives a slot its hub binding.
 func bindRemedy(packageName, slot string) string {
 	return fmt.Sprintf("cozy package bind %s %s org/model@release --gpu <GPU>=<lane> --gpu '*'=<lane>",
@@ -190,7 +152,7 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 		return empty, problem
 	}
 	if ref.Org == "local" {
-		return empty, localModelOnRental(ref)
+		return empty, localModelOnMachine(ref)
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
@@ -248,8 +210,10 @@ func rebind(problem *exit.Error, packageName, slot string) *exit.Error {
 		packageName, slot, bindRemedy(packageName, slot))
 }
 
-func localModelOnRental(ref hub.Ref) *exit.Error {
-	return exit.Named(exit.Unavailable, "rental_local_model_sync_required",
-		"%s is a private local model and cannot be granted to a rented worker by path", ref.String()).
+// A machine's Host fetches every model it runs from the hub; a local/ model's bytes are in
+// this client's store, which no machine reads by path (proto-062 PR 7 moves them).
+func localModelOnMachine(ref hub.Ref) *exit.Error {
+	return exit.Named(exit.Unavailable, "machine_local_model_sync_required",
+		"%s is a private local model and cannot be granted to a machine by path", ref.String()).
 		WithRemedy("upload it under a non-local org, or explicitly sync it through the model upload workflow")
 }

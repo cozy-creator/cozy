@@ -182,7 +182,10 @@ exit 2
 		}
 		return store, request
 	}
+	// This computer's machine is a sentinel Host: a launch attempt is a new execution.
+	host := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' started >> %q\nexit 1\n", marker)
 	canary := t.TempDir()
+	stubMachine(t, canary, host)
 	canaryStore, _ := seed(canary, "queued")
 	defer canaryStore.Close()
 	if code, out := runCozyPath(t, canary, bin, "up", "--json"); code != 0 {
@@ -196,6 +199,7 @@ exit 2
 	for _, state := range []string{"failed", "paused", "blocked", "canceled", "refused"} {
 		t.Run(state, func(t *testing.T) {
 			root := t.TempDir()
+			stubMachine(t, root, host)
 			store, request := seed(root, state)
 			defer store.Close()
 			for cycle := 0; cycle < 2; cycle++ {
@@ -278,7 +282,7 @@ def main():
 	if submission.ExpectedExecutionWorkspaceId == "" || submission.ExpectedExecutionWorkspaceId != receipt.ExecutionWorkspaceId {
 		t.Fatal("ordinary CLI did not freeze the authenticated Runtime workspace before acceptance")
 	}
-	runtimeProcess, err := os.ReadFile(filepath.Join(root, "runtime", "process.json"))
+	runtimeProcess, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
 	must(t, err)
 	status, out = runCozy(t, root, "down", "--json")
 	if status != 0 {
@@ -287,7 +291,7 @@ def main():
 	if daemon.Probe(config.Config{Home: root}).Up {
 		t.Fatal("client stayed online")
 	}
-	currentProcess, err := os.ReadFile(filepath.Join(root, "runtime", "process.json"))
+	currentProcess, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
 	must(t, err)
 	if !bytes.Equal(runtimeProcess, currentProcess) {
 		t.Fatal("disconnect replaced the Runtime process identity")
@@ -300,7 +304,7 @@ def main():
 	if status != 0 {
 		t.Fatalf("reattach collection [%d]: %s", status, out)
 	}
-	currentProcess, err = os.ReadFile(filepath.Join(root, "runtime", "process.json"))
+	currentProcess, err = os.ReadFile(filepath.Join(root, "machine", "host.json"))
 	must(t, err)
 	if !bytes.Equal(runtimeProcess, currentProcess) {
 		t.Fatal("reattachment replaced the independently running Runtime")

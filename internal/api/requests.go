@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
@@ -171,10 +172,8 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if sub.Rental || sub.RentalRequired || sub.RentNew {
-			unlock := localpackage.Guard()
-			defer unlock()
-		}
+		unlock := localpackage.Guard()
+		defer unlock()
 		spec, e = s.resolvePlan(r.Context(), selectedHub, sub)
 		if e != nil {
 			s.refuseTyped(w, r, e)
@@ -195,16 +194,18 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
-		// A rented inference root is Runtime's to execute, like every rented job: its
-		// root bytes are frozen for native staging before anything is recorded.
-		if s.machineExecutions != nil && spec.Rental {
-			spec.MachineExecutionObserver = true
-			inputStage, e = s.freezeMachineInputs(&spec, &launch.Entrypoint{Name: spec.Entrypoint})
-			defer inputStage.Release()
-			if e != nil {
-				s.refuseTyped(w, r, e)
-				return
-			}
+		// An inference root is Runtime's to execute on whichever machine runs it: its root
+		// bytes are frozen for native staging before anything is recorded.
+		if s.machineExecutions == nil {
+			s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+			return
+		}
+		spec.MachineExecutionObserver = true
+		inputStage, e = s.freezeMachineInputs(&spec, &launch.Entrypoint{Name: spec.Entrypoint})
+		defer inputStage.Release()
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
 		}
 	}
 	spec.IdemKey, spec.Hub = key, selectedHub
@@ -440,104 +441,68 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission) (o
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
 	}
-	// A --rental request validates only immutable package metadata here. The
-	// scheduler chooses and records its worker after admission.
-	if out.Rental {
-		if s.packages == nil {
-			return out, exit.Unavailablef("this Cozy daemon resolves no packages")
-		}
-		if strings.HasPrefix(sub.Package, "local/") {
-			refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
-			if refreshProblem != nil {
-				return out, refreshProblem
-			}
-			if !editable {
-				return out, exit.Named(exit.Conflict, "local_package_install_invalid",
-					"%s is not one editable local package", sub.Package)
-			}
-			return s.resolveLocalServing(ctx, sub, out, refreshed)
-		}
-		if sub.InstallID != "" || sub.Release == "" {
-			return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
-		}
-		logical, entrypoint, e := s.packages.ResolveRemoteRelease(hub,
-			sub.Package, sub.Release, sub.Function, sub.Models)
-		if e != nil {
-			return out, e
-		}
-		if logical.Package != sub.Package || logical.Release != sub.Release {
-			return out, exit.Named(exit.Conflict, "install_package_mismatch",
-				"queued remote release does not match the resolved Tensorhub release")
-		}
-		out.PlanID = logical.PlanID
-		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
-		out.NeedsAccelerator = logical.NeedsAccelerator
-		if len(out.Outputs) == 0 {
-			out.Outputs = logical.Outputs
-		}
-		if e := validateInputs(entrypoint, &out); e != nil {
-			return out, e
-		}
-		if e := s.deriveOutputExport(entrypoint, &out); e != nil {
-			return out, e
-		}
-		return out, nil
-	}
-	var placement orchestrator.DesiredPlacement
+	// Only immutable package metadata is validated here. The scheduler chooses and records
+	// the machine after admission.
 	if s.packages == nil {
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
-	refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
-	if refreshProblem != nil {
-		return out, refreshProblem
-	}
-	if editable || sub.InstallID == "" {
-		sub.InstallID = refreshed
-	}
-	var e *exit.Error
-	if sub.InstallID != "" {
-		var spec orchestrator.WorkerLaunchSpec
-		spec, e = s.packages.ResolveInstall(sub.InstallID, sub.Models)
-		if e == nil && spec.Preparation != nil {
-			return s.resolvePendingServing(ctx, sub, out, spec)
+	if strings.HasPrefix(sub.Package, "local/") {
+		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+		if refreshProblem != nil {
+			return out, refreshProblem
 		}
-		placement = spec.Placement
-	} else {
-		placement, e = s.packages.ResolvePlacement(sub.Package)
+		if !editable {
+			return out, exit.Named(exit.Conflict, "local_package_install_invalid",
+				"%s is not one editable local package", sub.Package)
+		}
+		return s.resolveLocalServing(ctx, sub, out, refreshed)
 	}
+	release, e := s.installedRelease(sub.Package, sub.Release, sub.InstallID)
 	if e != nil {
 		return out, e
 	}
-	if placement.Package != sub.Package {
+	sub.Release, sub.InstallID, out.Release = release, "", release
+	if sub.Release == "" {
+		return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
+	}
+	logical, entrypoint, e := s.packages.ResolveRemoteRelease(hub,
+		sub.Package, sub.Release, sub.Function, sub.Models)
+	if e != nil {
+		return out, e
+	}
+	if logical.Package != sub.Package || logical.Release != sub.Release {
 		return out, exit.Named(exit.Conflict, "install_package_mismatch",
-			"install %s serves %s, not %s", sub.InstallID, placement.Package, sub.Package)
+			"queued remote release does not match the resolved Tensorhub release")
 	}
-	planID, outputs, e := placementPlan(placement, sub.Function)
-	if e != nil {
-		return out, e
-	}
-	if out.PlanID != "" && out.PlanID != planID {
-		return out, exit.Named(exit.Conflict, "plan_mismatch",
-			"%s/%s resolves plan %s, not caller-supplied %s",
-			sub.Package, sub.Function, planID, out.PlanID)
-	}
-	out.PlanID = planID
-	out.InstallID = placement.InstallID
+	out.PlanID = logical.PlanID
+	out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
+	out.NeedsAccelerator = logical.NeedsAccelerator
 	if len(out.Outputs) == 0 {
-		out.Outputs = outputs
-	}
-	entrypoint, needsAccelerator, e := s.packages.Entrypoint(placement.InstallID, sub.Function)
-	if e != nil {
-		return out, e
+		out.Outputs = logical.Outputs
 	}
 	if e := validateInputs(entrypoint, &out); e != nil {
 		return out, e
 	}
-	out.NeedsAccelerator = needsAccelerator
 	if e := s.deriveOutputExport(entrypoint, &out); e != nil {
 		return out, e
 	}
 	return out, nil
+}
+
+// installedRelease is the published release a local install pins. A machine prepares the
+// release itself, so the install names only which release a caller meant.
+func (s *Server) installedRelease(pkg, release, installID string) (string, *exit.Error) {
+	if installID == "" {
+		return release, nil
+	}
+	installed, problem := s.store.Install(installID)
+	if problem != nil {
+		return "", problem
+	}
+	if installed == nil || installed.SourceKind != "tensorhub" || installed.Package != pkg || release != "" && release != installed.Version {
+		return "", exit.Named(exit.Conflict, "install_package_mismatch", "install %s is not %s %s from Tensorhub", installID, pkg, release)
+	}
+	return installed.Version, nil
 }
 
 // deriveOutputExport records where this run's result files will be published: the
@@ -1042,7 +1007,7 @@ func (s *Server) machineOf(row records.Request, attempted bool) string {
 		return row.Machine
 	}
 	if row.Worker == "" && attempted {
-		return "local"
+		return machines.Local
 	}
 	return ""
 }

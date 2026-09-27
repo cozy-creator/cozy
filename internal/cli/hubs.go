@@ -188,8 +188,8 @@ func existingRecords(ctx *Context) (*records.Store, bool) {
 	return store, true
 }
 
-// adoptInstallHub points a local run of a published install at the hub it came from, so
-// its model bindings are that hub's. An explicit --tensorhub is kept.
+// adoptInstallHub points a run of a published install at the hub it came from, so its
+// model bindings are that hub's. An explicit --tensorhub is kept.
 func adoptInstallHub(ctx *Context, install records.PackageInstall) {
 	if install.SourceKind != "tensorhub" || install.Hub == "" || ctx.Cfg.HubURLSource == "flag" {
 		return

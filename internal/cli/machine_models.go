@@ -35,7 +35,7 @@ func (m *machineRuns) planMachineModels(request records.Request, connection *mac
 	if body.Result.ResultBlob != nil {
 		return nil, nil // ordinary file custody needs its separate byte transport
 	}
-	if len(launch.ModelArtifactPaths(entrypoint.Result)) > 0 && connection.wireMinor < 53 {
+	if len(launch.ModelArtifactPaths(entrypoint.Result)) > 0 && connection.WireMinor < 53 {
 		return nil, exit.Named(exit.Unavailable, "machine_execution.model_collection_upgrade_required", "native model collection requires actual Runtime protocol 53; its result remains retained")
 	}
 	schema, problem := machineResultSchema(surface, request.Entrypoint)
@@ -78,7 +78,7 @@ func (m *machineRuns) retainMachineWeights(ctx context.Context, request records.
 		if err != nil {
 			continue
 		}
-		if connection.wireMinor < 53 {
+		if connection.WireMinor < 53 {
 			return exit.Named(exit.Unavailable, "machine_execution.result_custody_required",
 				"weights output %q can be held on the machine only by Runtime protocol 53 or newer", receipt.OutputSlot)
 		}

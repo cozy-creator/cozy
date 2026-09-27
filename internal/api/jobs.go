@@ -347,15 +347,15 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, status, handle)
 }
 
-// Installed local roots and every rented root use Runtime submission. A rented job
-// publishes its weights outputs to their destination from the machine. Source
-// acquisition has no machine-side staging path and stays with its own coordinator,
-// as does a local destination, which has no machine identity to publish with.
+// Every root uses Runtime submission. A rented job publishes its weights outputs to their
+// destination from the machine. Source acquisition has no machine-side staging path and
+// stays with its own coordinator, as does a destination on this computer, whose machine
+// has no hub-known certificate to publish with yet.
 func publishedMachineJob(spec orchestrator.Submission) bool {
 	if spec.ModelTransfer != nil {
 		return machineDestination(spec) != ""
 	}
-	return spec.Rental || spec.MachineExecutionObserver
+	return true
 }
 
 // machineDestination is the repository a rented job's machine publishes its outputs to.
@@ -478,7 +478,10 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission) 
 		return out, nil, exit.Named(exit.Validation, "rental.job_worker_without_rental",
 			"a pinned remote worker requires rental authorization")
 	}
-	if out.Rental {
+	// Every job runs as a machine execution, on this computer or a rental. A model
+	// transfer has no machine-side staging yet: on this computer its producer still runs
+	// under the local transfer coordinator below.
+	if out.Rental || sub.ModelTransfer == nil {
 		if strings.HasPrefix(sub.Package, "local/") {
 			if sub.InstallID != "" {
 				resolved, problem := s.resolveLocalJob(ctx, sub, out, sub.InstallID)
@@ -495,11 +498,16 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission) 
 			resolved, problem := s.resolveLocalJob(ctx, sub, out, refreshed)
 			return resolved, nil, problem
 		}
-		if sub.InstallID != "" || sub.Release == "" {
+		release, problem := s.installedRelease(sub.Package, sub.Release, sub.InstallID)
+		if problem != nil {
+			return out, nil, problem
+		}
+		sub.Release, sub.InstallID, out.Release = release, "", release
+		if sub.Release == "" {
 			return out, nil, exit.Named(exit.Validation, "rental.job_release_incomplete",
 				"remote jobs require one exact published release")
 		}
-		if len(sub.Trees) > 0 && (s.machineExecutions == nil || (out.RequestedRental == "" && out.Worker == "")) {
+		if len(sub.Trees) > 0 && (s.machineExecutions == nil || (out.Rental && out.RequestedRental == "" && out.Worker == "")) {
 			return out, nil, exit.Named(exit.Validation, "rental.job_tree_worker_required",
 				"Tree inputs require a named private Runtime worker")
 		}

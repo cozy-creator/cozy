@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -32,7 +31,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
 // THE LIFECYCLE AND REQUEST VERBS (cl-010), every one of them a CLIENT of the local
@@ -163,7 +161,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
 	// load, and `steps=2` is an int because the schema says int.
 	managedRental := rentalRequested(ctx)
-	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); managedRental && legacy != "" {
+	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); legacy != "" {
 		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
 			WithRemedy("use `--asset <field-path>=<file>`; the field path becomes the exact worker-protocol input id")
@@ -214,11 +212,11 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	} else {
 		packagePublishStatus(ctx, "Finding a rental machine...")
 	}
-	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models, managedRental)
+	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models)
 	if e != nil {
 		return e
 	}
-	if e = resolveInvocationLoRAs(ctx, target, models, loras, managedRental); e != nil {
+	if e = resolveInvocationLoRAs(ctx, target, models, loras); e != nil {
 		return e
 	}
 	outputDirectory, e := requestedOutputDirectory(ctx)
@@ -303,92 +301,45 @@ type invocationModelSpec struct {
 	Binding  *hub.PackageBindingRow
 }
 
-// resolveInvocationModels applies the one selection order for both local and rented
-// execution: an explicit `model.<param>=` run key, then a Hub owner override, then the
-// selected callable's authored default ladder. Local
-// acquisition freezes the exact Manifest and length before submission — the lane is the
-// host GPU's rung; remote acquisition carries the whole ladder and the winning machine
-// pins its rung. Editable packages use authored defaults without a Hub override.
+// resolveInvocationModels applies the one selection order for every machine: an explicit
+// `model.<param>=` run key, then a Hub owner override, then the selected callable's
+// authored default ladder. The whole ladder travels; the machine that runs the call pins
+// its rung from the devices it measured. Editable packages use authored defaults without a
+// Hub override.
 func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
-	overrides map[string]string, remote bool,
+	overrides map[string]string,
 ) ([]orchestrator.ModelRef, *exit.Error) {
 	selected, problem := invocationModelSpecs(ctx, target, ep, overrides)
 	if problem != nil || len(selected) == 0 {
 		return nil, problem
 	}
-	return resolveSelectedInvocationModels(ctx, target, ep, selected, remote)
+	return resolveSelectedInvocationModels(ctx, target, ep, selected)
 }
 
 func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
-	selected []invocationModelSpec, remote bool,
+	selected []invocationModelSpec,
 ) ([]orchestrator.ModelRef, *exit.Error) {
 	slots := make(map[string]launch.Slot, len(ep.Models))
 	for _, slot := range ep.Models {
 		slots[slot.Path] = slot
 	}
-	if remote {
-		out := make([]orchestrator.ModelRef, 0, len(selected))
-		for _, spec := range selected {
-			slot, ok := slots[spec.Slot]
-			if !ok {
-				return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
-			}
-			var row orchestrator.ModelRef
-			var problem *exit.Error
-			if spec.Explicit {
-				row, problem = resolveRemoteModel(ctx, target.Package, slot, spec.Ref, spec.Lane, spec.Binding)
-			} else {
-				row, problem = resolveRemoteLadder(ctx, target.Package, slot, spec)
-			}
-			if problem != nil {
-				return nil, problem
-			}
-			out = append(out, row)
-		}
-		return out, nil
-	}
-	installRow, problem := exactInvocationInstall(ctx, target)
-	if problem != nil {
-		return nil, problem
-	}
-	tool, layout, problem := localTensorFS(ctx)
-	if problem != nil {
-		return nil, problem
-	}
-	work, problem := scratch.Temp(layout.Tmp, "invoke-models-")
-	if problem != nil {
-		return nil, problem
-	}
-	defer work.Release()
-	root := work.Path
-	rungs, problem := localRungs(ctx, selected)
-	if problem != nil {
-		return nil, problem
-	}
-	hctx, cancel := hub.LongContext()
-	defer cancel()
 	out := make([]orchestrator.ModelRef, 0, len(selected))
-	for index, spec := range selected {
-		packagePublishStatus(ctx, "Preparing model %s for local execution...", spec.Ref)
+	for _, spec := range selected {
 		slot, ok := slots[spec.Slot]
 		if !ok {
 			return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
 		}
-		model, problem := acquirePublishedModel(hctx, ctx, tool, client(ctx), spec.Ref,
-			rungs[index].Lane, target.Package, slot,
-			filepath.Join(root, fmt.Sprintf("%03d", index)))
+		var row orchestrator.ModelRef
+		var problem *exit.Error
+		if spec.Explicit {
+			row, problem = resolveRemoteModel(ctx, target.Package, slot, spec.Ref, spec.Lane, spec.Binding)
+		} else {
+			row, problem = resolveRemoteLadder(ctx, target.Package, slot, spec)
+		}
 		if problem != nil {
 			return nil, problem
 		}
-		out = append(out, orchestrator.ModelRef{Package: target.Package, Slot: spec.Slot, GPUs: rungs[index].GPUs,
-			Model: model.Model, CatalogRepository: model.Model, Release: model.Release, Lane: model.Lane,
-			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
-	}
-	retained, retainProblem := exactInvocationInstall(ctx, target)
-	if retainProblem != nil || retained.ID != installRow.ID {
-		return nil, exit.Named(exit.Conflict, "package_install_changed",
-			"the selected package install disappeared or changed during model acquisition").
-			WithRemedy("retry against the current installed package")
+		out = append(out, row)
 	}
 	return out, nil
 }
@@ -551,7 +502,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 		return empty, problem
 	}
 	if ref.Org == "local" {
-		return empty, localModelOnRental(ref)
+		return empty, localModelOnMachine(ref)
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
@@ -2490,69 +2441,50 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	if rentalRequested(ctx) && strings.HasPrefix(target.Package, "local/") {
-		facts, problem := activeInstallFacts(ctx, target.Package)
-		if problem != nil {
-			return Target{}, nil, problem
-		}
-		target.InstallID = facts.Install.ID
+	// An installed package is validated against its installed interface with no hub read;
+	// the machine that runs it prepares that release itself.
+	facts, problem := activeInstallFacts(ctx, target.Package)
+	if problem == nil {
 		target.Release = facts.Install.Version
+		if strings.HasPrefix(target.Package, "local/") {
+			target.InstallID = facts.Install.ID
+		}
+		adoptInstallHub(ctx, facts.Install)
 		return target, facts.PackageInterface, nil
 	}
-	if rentalRequested(ctx) {
-		ref, problem := hub.ParseRef(target.Package)
-		if problem != nil {
-			return Target{}, nil, problem
-		}
-		hctx, cancel := hub.Context()
-		defer cancel()
-		catalog := client(ctx)
-		installed, problem := installedPackage(ctx, target.Package)
-		if problem != nil && problem.Code != exit.NotFound {
-			return Target{}, nil, problem
-		}
-		release := ""
-		if installed != nil {
-			release = installed.Version
-		} else {
-			card, problem := catalog.PackageCard(hctx, ref)
-			if problem != nil {
-				return Target{}, nil, problem
-			}
-			release, problem = newestPackageRelease(card.Releases)
-			if problem != nil {
-				return Target{}, nil, problem
-			}
-		}
-		detail, problem := catalog.PackageRelease(hctx, ref, release)
-		if problem != nil {
-			return Target{}, nil, problem
-		}
-		packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
-		if problem != nil {
-			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
-				"Tensorhub returned an invalid package interface: %s", problem.Message)
-		}
-		if detail.Release.Release != release {
-			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_release_invalid",
-				"Tensorhub returned no immutable package release identity")
-		}
-		target.Release = release
-		return target, packageInterface, nil
+	if problem.Code != exit.NotFound || strings.HasPrefix(target.Package, "local/") {
+		return Target{}, nil, problem
 	}
-	facts, problem := activeInstallFacts(ctx, target.Package)
-	if problem != nil && problem.Code == exit.NotFound {
-		if problem = autoInstallPackage(ctx, target.Package); problem != nil {
-			return Target{}, nil, problem
-		}
-		facts, problem = activeInstallFacts(ctx, target.Package)
-	}
+	ref, problem := hub.ParseRef(target.Package)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	target.InstallID = facts.Install.ID
-	adoptInstallHub(ctx, facts.Install)
-	return target, facts.PackageInterface, nil
+	hctx, cancel := hub.Context()
+	defer cancel()
+	catalog := client(ctx)
+	card, problem := catalog.PackageCard(hctx, ref)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	release, problem := newestPackageRelease(card.Releases)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	detail, problem := catalog.PackageRelease(hctx, ref, release)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	if problem != nil {
+		return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
+			"Tensorhub returned an invalid package interface: %s", problem.Message)
+	}
+	if detail.Release.Release != release {
+		return Target{}, nil, exit.Named(exit.Conflict, "rental.package_release_invalid",
+			"Tensorhub returned no immutable package release identity")
+	}
+	target.Release = release
+	return target, packageInterface, nil
 }
 
 // newestPackageRelease is the newest non-yanked release by PEP 440 order, preferring a
@@ -2672,24 +2604,6 @@ func unknownFunction(target Target, packageInterface *launch.PackageInterface) *
 		problem.WithNext("cozy run " + target.Package + "/" + name)
 	}
 	return problem
-}
-
-func autoInstallPackage(ctx *Context, pkg string) *exit.Error {
-	if ctx.Mode().Human {
-		fmt.Fprintf(ctx.Err, "%s is not installed; installing it from Tensorhub...\n", pkg)
-	}
-	sub := *ctx
-	sub.Out = io.Discard
-	sub.Inv = &Invocation{
-		Args: []string{pkg}, Bools: map[string]bool{}, Values: map[string][]string{}, Mode: ctx.Mode(),
-	}
-	if problem := handleRegistryInstall(&sub); problem != nil {
-		return problem
-	}
-	if ctx.Mode().Human {
-		fmt.Fprintf(ctx.Err, "Installed %s.\n", pkg)
-	}
-	return nil
 }
 
 // activeInstallFacts resolves the package's one active install.

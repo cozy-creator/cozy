@@ -1,11 +1,12 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"os"
-	"path/filepath"
 )
 
 // ResolveWorkspace launches only the installed control Runtime. It imports no

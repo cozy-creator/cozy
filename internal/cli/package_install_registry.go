@@ -2,8 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"context"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,8 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/scratch"
-	"github.com/cozy-creator/cozy/internal/tfs"
-	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 func handleRegistryInstall(ctx *Context) *exit.Error {
@@ -236,69 +232,6 @@ func exactPackageInstallDocument(name string, document hub.ExactDocument) (insta
 		Digest: document.Digest, Length: document.Length}, nil
 }
 
-// acquirePublishedModel is LOCAL-FIRST. An exact TensorFS release row is sufficient
-// authority to invoke an already-installed Manifest even if Tensorhub's catalog was
-// reset or is offline. Only a local miss asks Tensorhub to resolve/download.
-func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
-	hubClient *hub.Client, spec, lane, packageName string, slot launch.Slot, work string,
-) (install.PublishedModel, *exit.Error) {
-	var empty install.PublishedModel
-	if local, ok, problem := exactLocalModel(tool, spec, lane, work); problem != nil {
-		return empty, problem
-	} else if ok {
-		return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: local.Model,
-			Release: local.Release, Lane: local.Lane, Manifest: local.Manifest,
-			ManifestLength: local.ManifestLength, Reused: true}, nil
-	}
-	layout, problem := home.Open(cli.Cfg.Home)
-	if problem != nil {
-		return empty, problem
-	}
-	modelName, release, selectedLane, manifestPin, problem := hub.ParseModelRef(spec)
-	if problem != nil {
-		return empty, problem
-	}
-	if selectedLane != "" {
-		if lane != "" && lane != selectedLane {
-			return empty, exit.Usagef("model reference and selected lane disagree")
-		}
-		lane = selectedLane
-	}
-	refspec := modelName
-	if release != "" {
-		refspec += "@" + release
-	} else if manifestPin != "" {
-		refspec += "@" + manifestPin
-	}
-	fetch := &transfer.Fetch{Tool: tool, Hub: hubClient, Spec: refspec, Lane: lane,
-		Progress: progress(cli), Scratch: work, Locks: layout.AcquisitionLocks()}
-	resolved, problem := fetch.Resolve(ctx)
-	if problem != nil {
-		return empty, exit.Named(problem.Code, "model_resolution_unavailable",
-			"cannot resolve model %s for slot %s: %s", spec, slot.Path, problem.Message).
-			WithRemedy("download another compatible model or override this slot with model.%s=org/model@release", slot.Path[strings.LastIndex(slot.Path, ".")+1:])
-	}
-	if problem := requireCheckpointComponents(spec, slot, resolved.Components); problem != nil {
-		return empty, problem
-	}
-	if manifestPin != "" && resolved.ManifestID != manifestPin {
-		return empty, exit.Named(exit.Conflict, "model_resolution_changed", "resolved model differs from its checkpoint pin")
-	}
-	fetched, problem := fetch.Acquire(ctx, resolved)
-	if problem != nil {
-		return empty, problem
-	}
-	manifest, err := canonical.Raw(fetched.ManifestID)
-	if err != nil || len(manifest) != 32 || fetched.ManifestLength <= 0 ||
-		(fetched.Release == "") != (fetched.Lane == "") || fetch.Ref.String() == "/" {
-		return empty, exit.Named(exit.Structural, "model_download_result_invalid",
-			"model acquisition returned an incomplete exact selection for package slot %s", slot.Path)
-	}
-	return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: fetch.Ref.String(),
-		Release: fetched.Release, Lane: fetched.Lane, Manifest: fetched.ManifestID,
-		ManifestLength: fetched.ManifestLength, Reused: fetched.Moved == 0}, nil
-}
-
 func requireCheckpointComponents(model string, slot launch.Slot, available []string) *exit.Error {
 	missing := launch.MissingComponents(slot, available)
 	if len(missing) == 0 {
@@ -313,65 +246,6 @@ func requireCheckpointComponents(model string, slot launch.Slot, available []str
 type localModelSelection struct {
 	Model, Release, Lane, Manifest string
 	ManifestLength                 int64
-}
-
-func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
-	localModelSelection, bool, *exit.Error,
-) {
-	var empty localModelSelection
-	modelRelease, manifest, hasManifest := strings.Cut(strings.TrimSpace(spec), "#")
-	modelName, release, hasRelease := strings.Cut(modelRelease, "@")
-	if !hasRelease && hasManifest && lane == "" {
-		ref, problem := hub.ParseRef(modelName)
-		if problem != nil {
-			return empty, false, problem
-		}
-		if raw, err := canonical.Raw(manifest); err != nil || len(raw) != 32 {
-			return empty, false, exit.Usagef("%q is not an exact model Manifest", manifest)
-		}
-		if err := os.MkdirAll(work, 0o700); err != nil {
-			return empty, false, exit.Internalf("cannot create model lookup scratch: %s", err)
-		}
-		length, problem := tool.RetainedCheckpoint(ref.Org, ref.Name, manifest, work)
-		if problem != nil || length == 0 {
-			return empty, false, problem
-		}
-		return localModelSelection{Model: ref.String(), Manifest: manifest, ManifestLength: length}, true, nil
-	}
-	if !hasRelease || release == "" || hasManifest && manifest == "" {
-		return empty, false, nil
-	}
-	ref, problem := hub.ParseRef(modelName)
-	if problem != nil {
-		return empty, false, problem
-	}
-	if manifest != "" {
-		if raw, err := canonical.Raw(manifest); err != nil || len(raw) != 32 {
-			return empty, false, exit.Usagef("%q is not an exact model Manifest", manifest)
-		}
-	}
-	if err := os.MkdirAll(work, 0o700); err != nil {
-		return empty, false, exit.Internalf("cannot create model lookup scratch: %s", err)
-	}
-	rows, problem := tool.Releases(filepath.Join(work, "local-releases.jsonl"))
-	if problem != nil {
-		return empty, false, problem
-	}
-	matches := make([]localModelSelection, 0, 1)
-	for _, row := range rows {
-		rowManifest := "sha256:" + row.ManifestSHA256
-		if row.Org == ref.Org && row.Name == ref.Name && row.Version == release &&
-			(lane == "" || row.Lane == lane) && (manifest == "" || rowManifest == manifest) {
-			matches = append(matches, localModelSelection{Model: ref.String(), Release: release,
-				Lane: row.Lane, Manifest: rowManifest, ManifestLength: row.ManifestLength})
-		}
-	}
-	if len(matches) == 1 {
-		return matches[0], true, nil
-	}
-	// Zero or ambiguous local rows defer to Tensorhub's catalog resolver. In particular,
-	// never guess between two lanes merely because both are on disk.
-	return empty, false, nil
 }
 
 // sameRelease compares release labels by PEP 440 value, so 1.0.0rc1 and 1.0.0-rc1 agree.

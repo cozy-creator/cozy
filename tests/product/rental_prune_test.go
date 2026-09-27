@@ -2,12 +2,9 @@ package producttest
 
 import (
 	"net/http"
-	"runtime"
+	"os/exec"
 	"strings"
 	"testing"
-
-	"github.com/cozy-creator/cozy/internal/hostruntime"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestRentalPruneRequiresAuthenticatedKnownWorkspace(t *testing.T) {
@@ -35,16 +32,16 @@ func TestRentalPruneRequiresAuthenticatedKnownWorkspace(t *testing.T) {
 	}
 }
 
-func TestLocalCachePruneRequiresItsWorkspaceWithoutCreatingAJob(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the startup-refusing Runtime fixture is a POSIX shell script")
-	}
-	// This tool passes version admission but exits before publishing a worker
-	// address. A service failure must not become an all-zero successful prune.
-	root, path := hostRuntimeRoot(t, "cache-prune-refused", stubRuntime(t, hostruntime.ToolFloor, pb.WireMinor))
-	code, out := runCozyPath(t, root, path, "cache", "prune", "--json")
-	if code == 0 || !strings.Contains(out, `"code":"workspace.control_unavailable"`) || strings.Contains(out, `"removed_entries"`) {
-		t.Fatalf("workspace startup failure became cache-prune success [%d]: %s", code, out)
+// This computer's cache is its machine's, pruned through the same Host call as a rental's.
+// Without a machine there is nothing to prune, and a refusal is never an all-zero success.
+func TestLocalCachePruneRequiresItsMachineWithoutCreatingAJob(t *testing.T) {
+	root := t.TempDir()
+	cmd := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "cache", "prune", "--json")
+	cmd.Env = childEnv(t, root)
+	raw, _ := cmd.CombinedOutput()
+	out := string(raw)
+	if *machineHostBinary == "" && (cmd.ProcessState.ExitCode() == 0 || !strings.Contains(out, `"code":"machine.not_installed"`) || strings.Contains(out, `"removed_entries"`)) {
+		t.Fatalf("a missing machine became cache-prune success [%d]: %s", cmd.ProcessState.ExitCode(), out)
 	}
 	if rows := listInvocations(t, root); len(rows) != 0 {
 		t.Fatal("local cache pruning created an execution request")

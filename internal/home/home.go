@@ -52,6 +52,10 @@ type Layout struct {
 	// LocalPackages holds exact ephemeral wheel revisions for rented local-package
 	// commands. It is staging the daemon alone writes, never a catalog.
 	LocalPackages string
+	// Machine is this computer as a machine (proto-062): `root/` is laid out exactly as a
+	// pod's `/` for the same pod-supervisor Host, beside the controller's own grant for it
+	// (registration, owner key, launch record).
+	Machine string
 	// Log is the Cozy daemon's own log, bounded by rotation on an observed size
 	// (internal/daemon.OpenLog). Its one rotated predecessor is Log + ".1".
 	Log string
@@ -106,6 +110,7 @@ func Paths(root string) Layout {
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
 	l.LocalPackages = filepath.Join(root, "local-packages")
+	l.Machine = filepath.Join(root, "machine")
 	l.Log = filepath.Join(root, "daemon.log")
 	return l
 }

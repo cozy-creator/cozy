@@ -174,7 +174,9 @@ func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequ
 	if version == 0 {
 		version = pb.WireMinor
 	}
-	return &pb.ProtocolInfoResult{WireMinor: version, MinimumWireMinor: min(version, pb.MinCompatibleWireMinor), SupportsRentalKeepalive: true}, nil
+	_, triage := p.machine.(machineTriagePeer)
+	return &pb.ProtocolInfoResult{WireMinor: version, MinimumWireMinor: min(version, pb.MinCompatibleWireMinor), SupportsRentalKeepalive: true,
+		SupportsMachineExecutionTriage: triage}, nil
 }
 
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,

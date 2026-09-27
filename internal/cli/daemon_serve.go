@@ -15,7 +15,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
+	machineset "github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/reclaim"
@@ -121,7 +123,15 @@ func serveDaemon(ctx *Context) *exit.Error {
 	knownRentals := rental.Known(st)
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	machines := newMachineRuns(ctx, l, st, resolver, fleet)
+	found := &machineset.Resolver{
+		Host: machineset.NewHost(l.Machine, ctx.Cfg.Child()), HubOrigin: ctx.Cfg.HubURL,
+		Hub:     func() *hub.Client { return client(ctx) },
+		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
+		UseRental:     func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
+		ObserveRental: rental.ObserveWorker(st),
+		RentalKey:     func(id string) (rental.CreatorIdentity, *exit.Error) { return rental.CreatorIdentityFor(l, id) },
+	}
+	machines := newMachineRuns(ctx, l, st, resolver, fleet, found)
 	defer machines.cancel()
 	updates := &rentalRuntimeUpdates{machines: machines}
 	machines.updates = updates
@@ -180,30 +190,11 @@ func serveDaemon(ctx *Context) *exit.Error {
 			return exit.Named(exit.Unavailable, "rental.ended", "installation rental no longer exists")
 		}
 
-		instance, _, _, problem := c.EnsureRentalContext(ctx, row.RentalID)
-		if problem != nil {
-			return problem
-		}
-		release, problem := c.UseRental(row.RentalID, "installing "+either(row.Selection.Package, "models"))
-		if problem != nil {
-			return problem
-		}
-		defer release()
-		claim, problem := c.RentalExecutionClaim(ctx, row.RentalID)
-		if problem != nil {
-			return problem
-		}
-		if claim.WorkerBootId != row.WorkerBootID {
-			return exit.Unavailablef("the rental's worker restarted before preparation; the installation is claimed again on its new boot")
-		}
 		models := orchestrator.DownloadModelRefs(row.Selection.Models)
 		if len(models) != len(row.Selection.Models) {
 			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
 		}
-		if row.Selection.Package == "" {
-			return c.PrepareRentalModels(ctx, instance, models)
-		}
-		return c.PrepareRentalPackage(ctx, instance, &pb.DownloadPackageRef{Package: row.Selection.Package, Release: row.Selection.Release}, models)
+		return machines.Prewarm(ctx, row.RentalID, row.WorkerBootID, row.Selection.Package, row.Selection.Release, models)
 	}, ctx.Out)
 	fleet.installs = installs
 	installsStopped := make(chan struct{})

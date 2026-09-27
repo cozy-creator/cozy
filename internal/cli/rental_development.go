@@ -1,11 +1,6 @@
 package cli
 
 import (
-	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/flock"
-	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/records"
 	"io"
 	"net"
 	"os"
@@ -13,6 +8,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func rentalDevelopment(ctx *Context, existing *records.RentalOperation) (*hub.RentalDevelopment, *exit.Error) {

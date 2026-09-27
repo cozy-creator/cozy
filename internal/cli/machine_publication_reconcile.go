@@ -73,7 +73,7 @@ func (m *machineRuns) reconcilePublications(ctx context.Context, request string,
 		}
 		status, body, problem := owner.ModelFinalizationAnswer(ctx, ref, publication.Publication)
 		if problem == nil {
-			_, err := connection.client.ControlMachineExecution(ctx, &pb.MachineExecutionControl{
+			_, err := connection.Host.ControlMachineExecution(ctx, &pb.MachineExecutionControl{
 				Execution: query, CommandId: "reconcile-" + publication.Publication,
 				Action: pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_RECONCILE_PUBLICATION,
 				Publication: &pb.MachinePublicationReconciliation{

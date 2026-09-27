@@ -151,7 +151,7 @@ sys.exit(main())
 	if len(first) != 2 || first[0].State != "succeeded" || first[0].Executions != 1 {
 		t.Fatalf("unexpected before-disconnect work: %+v", first)
 	}
-	identity, err := os.ReadFile(filepath.Join(root, "runtime", "process.json"))
+	identity, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
 	must(t, err)
 	run("down")
 	if daemonOnRoot(root) != 0 {
@@ -205,7 +205,7 @@ sys.exit(main())
 	run("run", "watch", parent.ID)
 	after, problem := store.MachineExecution(parent.ID)
 	fatal(t, problem)
-	nowIdentity, err := os.ReadFile(filepath.Join(root, "runtime", "process.json"))
+	nowIdentity, err := os.ReadFile(filepath.Join(root, "machine", "host.json"))
 	must(t, err)
 	if !after.Collected || after.CancelRequested || !bytes.Equal(before.Receipt, after.Receipt) || !bytes.Equal(before.Submission, after.Submission) || !bytes.Equal(identity, nowIdentity) {
 		t.Fatal("reattachment replaced/canceled/resubmitted accepted execution")

@@ -65,12 +65,9 @@ func (m *machineRuns) stageMachineInputs(ctx context.Context, request records.Re
 	if len(request.Assets) == 0 {
 		return nil, nil
 	}
-	if connection.importInputTree == nil {
-		return nil, exit.Named(exit.Structural, "machine_execution.input_upgrade_required", "this machine cannot import root File/Tree inputs")
-	}
 	access := make([]*pb.InputAccess, 0, len(request.Assets))
 	for _, asset := range request.Assets {
-		header, members, problem := inputTreeHeader(request, asset, connection.claim)
+		header, members, problem := inputTreeHeader(request, asset, connection.Claim)
 		if problem != nil {
 			return nil, problem
 		}
@@ -232,7 +229,7 @@ func (m *machineRuns) releaseMachineInputs(ctx context.Context, request records.
 		if selected == nil {
 			return exit.New(exit.Conflict, "native input lost its frozen capture")
 		}
-		header, members, problem := inputTreeHeader(request, *selected, connection.claim)
+		header, members, problem := inputTreeHeader(request, *selected, connection.Claim)
 		if problem != nil {
 			return problem
 		}

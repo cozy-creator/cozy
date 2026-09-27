@@ -2,218 +2,244 @@ package cli
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
-	"io"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/processtree"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
-	"github.com/cozy-creator/cozy/internal/workertls"
+	"github.com/cozy-creator/cozy/internal/transfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
-// connect opens the machine a run executes on; on a rental, holder is what the run is
-// doing there, which a maintenance refusal names.
-func (m *machineRuns) connect(ctx context.Context, machine, holder string) (*machineConnection, *exit.Error) {
-	if machine == "local" {
-		return m.connectLocalMachine(ctx)
-	}
-	if m.fleet == nil || m.fleet.owner == nil {
-		return nil, exit.Unavailablef("the rental controller is not ready")
-	}
-	release, problem := m.fleet.owner.UseRental(machine, holder)
-	if problem != nil {
-		return nil, problem
-	}
-	transferred := false
-	defer func() {
-		if !transferred {
-			release()
-		}
-	}()
-	target, problem := rental.Resolver(m.layout, m.store)(machine)
-	if problem != nil {
-		return nil, problem
-	}
-	identity := target.Connection
-	pin, err := workertls.LoadPin(identity.CACert)
-	if err != nil {
-		return nil, exit.New(exit.Credential, "machine TLS identity cannot be read")
-	}
-	connection, err := grpc.NewClient(identity.Addr, grpc.WithTransportCredentials(credentials.NewTLS(pin.TLSConfig())), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
-	if err != nil {
-		return nil, machineTransport(err)
-	}
-	host := pb.NewPodHostClient(connection)
-	claim, problem := m.fleet.owner.RentalExecutionClaim(ctx, machine)
-	if problem != nil {
-		connection.Close()
-		return nil, problem
-	}
-	if claim.WorkerId != identity.WorkerID || claim.WorkerBootId != identity.WorkerBootID {
-		connection.Close()
-		return nil, exit.New(exit.Conflict, "the rental control session changed its pinned worker identity")
-	}
-	probeContext, cancel := context.WithTimeout(ctx, 10*time.Second)
-	info, err := host.ProtocolInfo(probeContext, &pb.ProtocolInfoRequest{})
-	cancel()
-	if err != nil {
-		connection.Close()
-		return nil, machineTransport(err)
-	}
-	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, protocol: info, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
-	result.modelDefaultOrigin = func(ctx context.Context) (string, *exit.Error) {
-		facts, problem := client(m.fleet.atRental(identity.RentalID)).RentalImageInventory(ctx, identity.RentalID)
-		return facts.PublicOrigin, problem
-	}
-	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
-		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
-		facts, problem := rental.PrepareFactsSource(client(m.fleet.atRental(identity.RentalID)))(ctx, identity, ref)
-		if problem != nil {
-			return nil, problem
-		}
-		result.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
-		// The package's exact model bindings ride its own download set, so TensorFS holds
-		// each checkpoint before execution admits it. A published callee's bindings ride
-		// the callee's preparation (capturePublishedDependencies).
-		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, orchestrator.DownloadModelRefs(request.PreparedModels()))
-		if problem != nil {
-			return nil, problem
-		}
-		stream, err := host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
-			Claim: claim, SupportsModelMaterializationRecovery: true, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
-			Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
-			PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion, ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
-			PackageInterface: facts.PackageInterface,
-		})
-		if err != nil {
-			return nil, machineTransport(err)
-		}
-		observed := m.preparationPhase(request.ID, request.Package+"@"+request.Release)
-		event, problem := readMachinePreparationEvent(stream, observed.observe)
-		if problem != nil {
-			return nil, problem
-		}
-		return &publishedPreparation{DesiredPlacementSet: event.PlacementSet, InstalledPackage: event.InstalledPackage, LockedRequirements: facts.LockedRequirements, Retained: observed.retained}, nil
-	}
-
-	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
-		return host.RetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
-	}
-	result.releaseModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
-		return host.ReleaseDerivedRetention(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
-	}
-	result.retainBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
-		return host.RetainByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
-	}
-	result.releaseBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
-		return host.ReleaseByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
-	}
-	result.importInputTree = func(ctx context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error) {
-		return host.ImportInputTree(ctx)
-	}
-	result.readBytes = func(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
-		return host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
-	}
-	result.prepare = func(ctx context.Context, request string, revision localpackage.Installation) *exit.Error {
-		baseOperation := machinePackageOperation(request, revision)
-		transfer, problem := m.store.MachinePackageTransfer(request, claim.WorkerBootId, revision.ID)
-		if problem != nil {
-			return problem
-		}
-		operation := transfer.Operation
-		if operation == "" {
-			operation = baseOperation
-		}
-		if operation != baseOperation {
-			prefix := baseOperation + ".repair-"
-			sequence, err := strconv.Atoi(strings.TrimPrefix(operation, prefix))
-			if !strings.HasPrefix(operation, prefix) || err != nil || sequence < 1 || sequence > transfer.Completed {
-				return exit.New(exit.Conflict, "captured package transfer names another operation")
-			}
-		}
-		selected, problem := orchestrator.LocalPackageSelection(operation, revision)
-		if problem != nil {
-			return problem
-		}
-		uploaded := transfer.Uploaded
-		if !uploaded {
-			if transfer.Operation != operation || transfer.Uploaded {
-				if problem := m.store.AppendEvent(request, "machine.package_upload_started", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
-					return problem
-				}
-			}
-			if problem := uploadMachinePackage(ctx, host, claim, operation, revision); problem != nil {
-				return problem
-			}
-			if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
-				return problem
-			}
-		}
-		stream, err := host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: claim, LocalPackageSet: selected})
-		if err != nil {
-			return machineTransport(err)
-		}
-		event, problem := readMachinePreparationEvent(stream, m.preparationPhase(request, revision.Package).observe)
-		if problem != nil {
-			return problem
-		}
-		return retainWorkerInstallation(result, revision, event.InstalledPackage)
-	}
-
-	// Only inference supplies these exact inputs. Installing the captured code
-	// above remains independent of any model, including unused child defaults.
-	result.prepareModels = func(ctx context.Context, request records.Request, revision localpackage.Installation) (*pb.DesiredPlacementSet, *exit.Error) {
-		models := orchestrator.PrivateRevisionModelRefs(request, revision.Package)
-		if len(models) == 0 && (request.IsJob() || revision.ID != request.LocalInstallationID) {
-			return nil, nil // an inference root always needs its prepared placement
-		}
-		transfer, problem := m.store.MachinePackageTransfer(request.ID, claim.WorkerBootId, revision.ID)
-		if problem != nil {
-			return nil, problem
-		}
-		operation := transfer.Operation
-		if operation == "" {
-			operation = machinePackageOperation(request.ID, revision)
-		}
-		downloads, problem := rental.DownloadSet(nil, models)
-		if problem != nil {
-			return nil, problem
-		}
-		selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, InstallationId: revision.ID, DownloadDelegation: downloads}
-		stream, err := host.PreparePrivatePlacement(ctx, &pb.PreparePrivatePlacementCall{
-			Claim: claim, SupportsModelMaterializationRecovery: true, PrivatePlacementSet: selected,
-		})
-		if err != nil {
-			return nil, machineTransport(err)
-		}
-		return readMachinePreparedSet(stream, m.preparationPhase(request.ID, revision.Package).observe)
-	}
-
-	transferred = true
-	return result, nil
+// machineConnection is one claimed machine, local or rented, and what this submission has
+// prepared on it. Every call below is the same PodHost call whichever machine answers it.
+type machineConnection struct {
+	*machines.Machine
+	runs         *machineRuns
+	installed    map[string]*pb.InstalledPackage
+	placements   map[string]*pb.DesiredPlacementSet // each captured revision's code-only placement
+	publicOrigin string                             // renter-authenticated Hub facts name the public byte endpoint
+	progress     *transfer.Progress
 }
 
-// preparationPhase shows a rented run what its machine's preparation is doing: resolving,
+// connect opens the machine a run executes on; holder is what the run is doing there,
+// which a rental's maintenance refusal names.
+func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machineConnection, *exit.Error) {
+	machine, problem := m.machines.Dial(ctx, name, holder)
+	if problem != nil {
+		return nil, problem
+	}
+	return &machineConnection{Machine: machine, runs: m, installed: map[string]*pb.InstalledPackage{}, placements: map[string]*pb.DesiredPlacementSet{}}, nil
+}
+
+func (c *machineConnection) modelDefaultOrigin(ctx context.Context) (string, *exit.Error) {
+	return c.PublicOrigin(ctx)
+}
+
+func (c *machineConnection) preparePublished(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
+	ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
+	facts, problem := c.PrepareFacts(ctx, ref)
+	if problem != nil {
+		return nil, problem
+	}
+	c.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
+	// The package's exact model bindings ride its own download set, so TensorFS holds
+	// each checkpoint before execution admits it. A published callee's bindings ride
+	// the callee's preparation (capturePublishedDependencies).
+	downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{ref}, orchestrator.DownloadModelRefs(request.PreparedModels()))
+	if problem != nil {
+		return nil, problem
+	}
+	stream, err := c.Host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
+		Claim: c.Claim, SupportsModelMaterializationRecovery: true, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
+		Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
+		PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion, ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
+		PackageInterface: facts.PackageInterface,
+	})
+	if err != nil {
+		return nil, machineTransport(err)
+	}
+	observed := c.runs.preparationPhase(request.ID, request.Package+"@"+request.Release)
+	event, problem := readMachinePreparationEvent(stream, observed.observe)
+	if problem != nil {
+		return nil, problem
+	}
+	return &publishedPreparation{DesiredPlacementSet: event.PlacementSet, InstalledPackage: event.InstalledPackage, LockedRequirements: facts.LockedRequirements, Retained: observed.retained}, nil
+}
+
+func (c *machineConnection) retainModel(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
+	return c.Host.RetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: c.Claim, Request: request})
+}
+
+func (c *machineConnection) releaseModel(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
+	return c.Host.ReleaseDerivedRetention(ctx, &pb.DerivedRetentionCall{Claim: c.Claim, Request: request})
+}
+
+func (c *machineConnection) retainBytes(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
+	return c.Host.RetainByteTree(ctx, &pb.NativeByteRetentionCall{Claim: c.Claim, Request: request})
+}
+
+func (c *machineConnection) releaseBytes(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
+	return c.Host.ReleaseByteTree(ctx, &pb.NativeByteRetentionCall{Claim: c.Claim, Request: request})
+}
+
+func (c *machineConnection) importInputTree(ctx context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error) {
+	return c.Host.ImportInputTree(ctx)
+}
+
+func (c *machineConnection) readBytes(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
+	return c.Host.ReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: c.Claim, Source: source, Object: object})
+}
+
+// prepare installs one captured revision: its wheels move from this client to the machine
+// through the Host's verified upload, then the Host prepares its environment.
+func (c *machineConnection) prepare(ctx context.Context, request string, revision localpackage.Installation) *exit.Error {
+	m := c.runs
+	baseOperation := machinePackageOperation(request, revision)
+	transfer, problem := m.store.MachinePackageTransfer(request, c.Claim.WorkerBootId, revision.ID)
+	if problem != nil {
+		return problem
+	}
+	operation := transfer.Operation
+	if operation == "" {
+		operation = baseOperation
+	}
+	if operation != baseOperation {
+		prefix := baseOperation + ".repair-"
+		sequence, err := strconv.Atoi(strings.TrimPrefix(operation, prefix))
+		if !strings.HasPrefix(operation, prefix) || err != nil || sequence < 1 || sequence > transfer.Completed {
+			return exit.New(exit.Conflict, "captured package transfer names another operation")
+		}
+	}
+	selected, problem := orchestrator.LocalPackageSelection(operation, revision)
+	if problem != nil {
+		return problem
+	}
+	if !transfer.Uploaded {
+		if transfer.Operation != operation || transfer.Uploaded {
+			if problem := m.store.AppendEvent(request, "machine.package_upload_started", 0, map[string]any{"worker_boot_id": c.Claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
+				return problem
+			}
+		}
+		if problem := uploadMachinePackage(ctx, c.Host, c.Claim, operation, revision); problem != nil {
+			return problem
+		}
+		if problem := m.store.AppendEvent(request, "machine.package_uploaded", 0, map[string]any{"worker_boot_id": c.Claim.WorkerBootId, "revision": revision.ID, "operation_id": operation}); problem != nil {
+			return problem
+		}
+	}
+	stream, err := c.Host.PrepareLocalPackage(ctx, &pb.PrepareLocalPackageCall{Claim: c.Claim, LocalPackageSet: selected})
+	if err != nil {
+		return machineTransport(err)
+	}
+	event, problem := readMachinePreparationEvent(stream, m.preparationPhase(request, revision.Package).observe)
+	if problem != nil {
+		return problem
+	}
+	c.placements[revision.ID] = event.PlacementSet
+	return retainWorkerInstallation(c, revision, event.InstalledPackage)
+}
+
+// prepareModels lands a captured revision's exact model inputs through the Host's download
+// set. Only inference supplies these; installing the captured code above is independent of
+// any model, including unused child defaults.
+func (c *machineConnection) prepareModels(ctx context.Context, request records.Request, revision localpackage.Installation) (*pb.DesiredPlacementSet, *exit.Error) {
+	models := orchestrator.PrivateRevisionModelRefs(request, revision.Package)
+	if len(models) == 0 {
+		if request.IsJob() || revision.ID != request.LocalInstallationID {
+			return nil, nil
+		}
+		// A model-free inference root runs on the placement its code preparation made.
+		return c.placements[revision.ID], nil
+	}
+	transfer, problem := c.runs.store.MachinePackageTransfer(request.ID, c.Claim.WorkerBootId, revision.ID)
+	if problem != nil {
+		return nil, problem
+	}
+	operation := transfer.Operation
+	if operation == "" {
+		operation = machinePackageOperation(request.ID, revision)
+	}
+	downloads, problem := rental.DownloadSet(nil, models)
+	if problem != nil {
+		return nil, problem
+	}
+	selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, InstallationId: revision.ID, DownloadDelegation: downloads}
+	stream, err := c.Host.PreparePrivatePlacement(ctx, &pb.PreparePrivatePlacementCall{
+		Claim: c.Claim, SupportsModelMaterializationRecovery: true, PrivatePlacementSet: selected,
+	})
+	if err != nil {
+		return nil, machineTransport(err)
+	}
+	return readMachinePreparedSet(stream, c.runs.preparationPhase(request.ID, revision.Package).observe)
+}
+
+// Prewarm prepares a published package, its selected models, or models alone on a machine
+// without running anything: `cozy package install` and `cozy model download` for any
+// machine. bootID, when set, is the worker lifetime the selection was queued for.
+func (m *machineRuns) Prewarm(ctx context.Context, machine, bootID, pkg, release string, models []*pb.DownloadModelRef) *exit.Error {
+	connection, problem := m.connect(ctx, machine, "installing "+either(pkg, "models"))
+	if problem != nil {
+		return problem
+	}
+	defer connection.Close()
+	if bootID != "" && connection.Claim.WorkerBootId != bootID {
+		return exit.Unavailablef("the rental's worker restarted before preparation; the installation is claimed again on its new boot")
+	}
+	if problem := connection.ValidateNewWork(); problem != nil {
+		return problem
+	}
+	var packages []*pb.DownloadPackageRef
+	call := &pb.PreparePackageSetCall{Claim: connection.Claim, SupportsModelMaterializationRecovery: true}
+	if pkg != "" {
+		ref := &pb.DownloadPackageRef{Package: pkg, Release: release}
+		facts, problem := connection.PrepareFacts(ctx, ref)
+		if problem != nil {
+			return problem
+		}
+		packages = append(packages, ref)
+		call.Application, call.ModelSlotPaths, call.ImageInventory = facts.Application, facts.ModelSlotPaths, facts.ImageInventory
+		call.PythonRequires, call.PythonVersion, call.LockedRequirements = facts.PythonRequires, facts.PythonVersion, facts.LockedRequirements
+		call.PackageInterface = facts.PackageInterface
+	}
+	downloads, problem := rental.DownloadSet(packages, models)
+	if problem != nil {
+		return problem
+	}
+	call.PackageSet = &pb.DesiredPackageSet{DownloadDelegation: downloads}
+	stream, err := connection.Host.PreparePackageSet(ctx, call)
+	if err != nil {
+		return machineTransport(err)
+	}
+	_, problem = readMachinePreparationEvent(stream, nil)
+	return problem
+}
+
+// PruneOperationCache frees one machine's unused cached operation results through its Host.
+func (m *machineRuns) PruneOperationCache(ctx context.Context, machine string) (uint32, uint64, bool, *exit.Error) {
+	connection, problem := m.connect(ctx, machine, "pruning its operation cache")
+	if problem != nil {
+		return 0, 0, false, problem
+	}
+	defer connection.Close()
+	result, err := connection.Host.PruneOperationCache(ctx, &pb.PruneOperationCacheCall{Claim: connection.Claim})
+	if err != nil {
+		return 0, 0, false, machineTransport(err)
+	}
+	if result == nil {
+		return 0, 0, false, exit.Named(exit.Structural, "operation.prune_reply_absent", "Host returned no cache pruning observation")
+	}
+	return result.RemovedEntries, result.ReclaimedBytes, result.StoreBusy, nil
+}
+
+// preparationPhase shows a waiting run what its machine's preparation is doing: resolving,
 // downloading its models, installing its package. Each ended stage stays on the run.
 func (m *machineRuns) preparationPhase(request, label string) *machinePreparation {
 	return &machinePreparation{machines: m, request: request, label: label}
@@ -263,276 +289,4 @@ func uploadMachinePackage(ctx context.Context, host pb.PodHostClient, claim *pb.
 		}
 	}
 	return nil
-}
-
-type localMachineProcess struct {
-	PID      int    `json:"pid"`
-	WorkerID string `json:"worker_id"`
-}
-
-func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnection, *exit.Error) {
-	if runtime.GOOS == "windows" {
-		return nil, exit.Named(exit.Structural, "machine_execution.local_platform_unsupported", "Runtime-owned local execution requires the local Runtime IPC launcher on this platform")
-	}
-	m.localMu.Lock()
-	defer m.localMu.Unlock()
-	root := filepath.Join(m.layout.Root, "runtime")
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return nil, exit.Internalf("cannot create local Runtime state: %s", err)
-	}
-	bootstrapPath := filepath.Join(root, "bootstrap")
-	bootstrap, err := os.ReadFile(bootstrapPath)
-	if os.IsNotExist(err) {
-		random := make([]byte, 32)
-		if _, err := rand.Read(random); err != nil {
-			return nil, exit.Internalf("cannot mint local Runtime authentication: %s", err)
-		}
-		bootstrap = []byte(base64.RawURLEncoding.EncodeToString(random))
-		if err := os.WriteFile(bootstrapPath, bootstrap, 0o600); err != nil {
-			return nil, exit.Internalf("cannot retain local Runtime authentication: %s", err)
-		}
-	} else if err != nil || len(bootstrap) != 43 {
-		return nil, exit.New(exit.Credential, "local Runtime authentication is unreadable")
-	}
-	workerID := "local-" + strings.TrimPrefix(spellLocalDigest([]byte(m.layout.Root)), "sha256:")[:24]
-	socket := filepath.Join(root, "control.sock")
-	processPath := filepath.Join(root, "process.json")
-	var process localMachineProcess
-	if raw, err := os.ReadFile(processPath); err == nil {
-		// A record left by a dead process is stale derived state and is replaced below;
-		// only a live process of another identity is refused rather than taken over.
-		if json.Unmarshal(raw, &process) != nil || process.WorkerID != workerID {
-			if process.PID != 0 && processtree.Alive(process.PID) {
-				return nil, exit.New(exit.Conflict, "local Runtime process record has a different identity")
-			}
-			process = localMachineProcess{}
-		}
-	}
-	if process.PID == 0 || !processtree.Alive(process.PID) {
-		tool, problem := hostruntime.Path(m.context.Cfg.Tool())
-		if problem != nil {
-			return nil, problem
-		}
-		resolved, err := filepath.EvalSymlinks(tool)
-		if err != nil {
-			return nil, exit.New(exit.NotFound, "local Runtime tool cannot be resolved")
-		}
-		python := filepath.Join(filepath.Dir(resolved), "python")
-		if _, err := os.Stat(python); err != nil {
-			return nil, exit.Named(exit.Structural, "machine_execution.runtime_python_missing", "the installed Runtime must provide its environment Python beside cozy-runtime")
-		}
-		interpreters, problem := hostruntime.PythonExecutors(ctx)
-		if problem != nil {
-			return nil, problem
-		}
-		backend, devices := "none", strings.Join(m.resolver.Devices, ",")
-		if devices != "" {
-			backend = "cuda"
-		}
-		command := exec.Command(tool, "serve", "--socket", socket, "--out", root,
-			"--worker-id", workerID, "--install-root", filepath.Join(root, "environments"),
-			"--artifact-cache", filepath.Join(root, "artifacts"), "--tensorfs-root", m.context.Cfg.TensorFSRoot,
-			"--environment-python", python, "--accelerator-backend", backend, "--devices", devices,
-			"--grant-root", filepath.Join(root, "grants"))
-		command.Env = m.context.Cfg.Child("COZY_HOME="+root, "COZY_PYTHON_ROOT="+interpreters.ManagedRoot, "COZY_BOOTSTRAP_CREDENTIAL="+string(bootstrap), "CUDA_VISIBLE_DEVICES="+devices, "COZY_DEPENDENCY_CACHE="+m.layout.DependencyCache())
-		command.Dir = root
-		log, err := os.OpenFile(filepath.Join(root, "worker.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			return nil, exit.Internalf("cannot open local Runtime log: %s", err)
-		}
-		// Direct inherited descriptors, not client-owned pipes: Runtime survives
-		// this client daemon disconnecting or exiting.
-		command.Stdout, command.Stderr = log, log
-		processtree.Prepare(command)
-		if err := command.Start(); err != nil {
-			log.Close()
-			return nil, exit.Internalf("cannot start local Runtime: %s", err)
-		}
-		log.Close()
-		process = localMachineProcess{PID: command.Process.Pid, WorkerID: workerID}
-		raw, _ := json.Marshal(process)
-		if err := os.WriteFile(processPath, raw, 0o600); err != nil {
-			return nil, exit.Internalf("cannot retain local Runtime process identity: %s", err)
-		}
-		go func() { _ = command.Wait() }()
-	}
-	connection, err := grpc.NewClient("unix://"+socket, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(16<<20), grpc.MaxCallSendMsgSize(16<<20)))
-	if err != nil {
-		return nil, machineTransport(err)
-	}
-	preparation := pb.NewRuntimePreparationClient(connection)
-	ready, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	info, err := preparation.ProtocolInfo(ready, &pb.ProtocolInfoRequest{}, grpc.WaitForReady(true))
-	if err != nil {
-		connection.Close()
-		return nil, machineTransport(err)
-	}
-	client := pb.NewWorkerControlClient(connection)
-	claim := &pb.Claim{RecordOwnerEpoch: 1, RecordOwnerId: "cozy-local-client", WorkerId: workerID, WireMinor: pb.WireMinor, Proof: bootstrap}
-	if m.localPID != process.PID {
-		if problem := authenticateMachine(ctx, client, claim); problem != nil {
-			connection.Close()
-			return nil, problem
-		}
-		m.localPID = process.PID
-	}
-	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, protocol: info, wireMinor: info.WireMinor}
-	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
-		if request.InstallID == "" {
-			plan, iface, locked, requires, problem := m.resolver.publishedChildPreparation(ctx, m.context.forHub(request.Hub), request)
-			if problem != nil {
-				return nil, problem
-			}
-			slots := iface.ModelSlotPaths()
-			downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{{Package: request.Package, Release: request.Release}}, nil)
-			if problem != nil {
-				return nil, problem
-			}
-			prepared, err := preparation.PreparePackageSet(ctx, &pb.PreparePackageSetRequest{InstallRoot: filepath.Join(root, "environments"), DownloadDelegation: downloads, Application: iface.Application, LockedRequirements: locked, PythonRequires: requires, PythonVersion: plan.PythonVersion, ModelSlotPaths: slots, PackageInterface: iface.Raw})
-			if err != nil {
-				return nil, machineTransport(err)
-			}
-			return &publishedPreparation{DesiredPlacementSet: prepared.PlacementSet, InstalledPackage: prepared.InstalledPackage, LockedRequirements: locked}, validateMachinePrepared(prepared.PlacementSet)
-		}
-
-		facts, problem := m.resolver.installFacts(request.InstallID)
-		if problem != nil {
-			return nil, problem
-		}
-		if facts.Install.SourceKind != "tensorhub" || facts.Install.Package != request.Package || facts.Install.Version != request.Release {
-			return nil, exit.New(exit.Conflict, "published local preparation changed its immutable install")
-		}
-		spec, problem := facts.PreparationSpec(m.resolver.Devices)
-		if problem != nil {
-			return nil, problem
-		}
-		locked, err := os.ReadFile(spec.Preparation.LockedRequirements)
-		if err != nil {
-			return nil, exit.Internalf("cannot read retained published requirements: %s", err)
-		}
-		downloads, problem := rental.DownloadSet([]*pb.DownloadPackageRef{{Package: request.Package, Release: request.Release}}, nil)
-		if problem != nil {
-			return nil, problem
-		}
-		prepared, err := preparation.PreparePackageSet(ctx, &pb.PreparePackageSetRequest{
-			InstallRoot: filepath.Join(root, "environments"), DownloadDelegation: downloads,
-			Application: facts.PackageInterface.Application, LockedRequirements: locked,
-			PythonRequires: spec.Preparation.PythonRequires, PythonVersion: spec.Preparation.PythonVersion, ModelSlotPaths: spec.Preparation.ModelSlotPaths,
-			PackageInterface: facts.PackageInterface.Raw,
-		})
-		if err != nil {
-			return nil, machineTransport(err)
-		}
-		return &publishedPreparation{DesiredPlacementSet: prepared.PlacementSet, InstalledPackage: prepared.InstalledPackage, LockedRequirements: locked}, validateMachinePrepared(prepared.PlacementSet)
-	}
-	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
-		return preparation.WorkspaceRetainDerivedResult(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
-	}
-	result.releaseModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
-		return preparation.WorkspaceReleaseDerivedRetention(ctx, &pb.DerivedRetentionCall{Claim: claim, Request: request})
-	}
-	result.retainBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
-		return preparation.WorkspaceRetainByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
-	}
-	result.releaseBytes = func(ctx context.Context, request *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error) {
-		return preparation.WorkspaceReleaseByteTree(ctx, &pb.NativeByteRetentionCall{Claim: claim, Request: request})
-	}
-	result.importInputTree = func(ctx context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error) {
-		return preparation.ImportInputTree(ctx)
-	}
-	result.readBytes = func(ctx context.Context, source *pb.NativeByteRetentionRequest, object *pb.Ref) (machineByteStream, error) {
-		return preparation.WorkspaceReadByteTreeObject(ctx, &pb.NativeByteReadCall{Claim: claim, Source: source, Object: object})
-	}
-	result.prepare = func(ctx context.Context, requestID string, revision localpackage.Installation) *exit.Error {
-		selected, problem := orchestrator.LocalPackageSelection(machinePackageOperation(requestID, revision), revision)
-		if problem != nil {
-			return problem
-		}
-		request := &pb.PrepareLocalPackageRequest{PythonRequires: selected.PythonRequires, PythonVersion: selected.PythonVersion, OperationId: selected.OperationId, Package: selected.Package, DependencyRequirements: append([]byte(nil), selected.DependencyRequirements...), SourceArchive: selected.SourceArchive, InstallRoot: filepath.Join(root, "environments")}
-		wheelRoot := filepath.Join(request.InstallRoot, ".stage", selected.OperationId, "wheels")
-		if err := os.MkdirAll(wheelRoot, 0o700); err != nil {
-			return exit.Internalf("cannot stage local Runtime wheels: %s", err)
-		}
-		for _, file := range revision.Files {
-			path, problem := stageMachineWheel(wheelRoot, file)
-			if problem != nil {
-				return problem
-			}
-			digest, _ := canonical.Raw(file.Digest)
-			request.Files = append(request.Files, &pb.LocalPackageFile{Digest: digest, Filename: file.Filename, Length: uint64(file.Length), Path: path})
-		}
-		prepared, err := preparation.PrepareLocalPackage(ctx, request)
-		if err != nil {
-			return machineTransport(err)
-		}
-		return retainWorkerInstallation(result, revision, prepared.InstalledPackage)
-	}
-	return result, nil
-}
-
-func authenticateMachine(ctx context.Context, client pb.WorkerControlClient, claim *pb.Claim) *exit.Error {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	stream, err := client.Control(ctx)
-	if err != nil {
-		return machineTransport(err)
-	}
-	defer stream.CloseSend()
-	if err := stream.Send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: claim}}); err != nil {
-		return machineTransport(err)
-	}
-	for {
-		frame, err := stream.Recv()
-		if err != nil {
-			return machineTransport(err)
-		}
-		ack := frame.GetClaimAck()
-		if ack == nil {
-			continue
-		}
-		if !ack.Accepted || ack.WorkerId != claim.WorkerId || ack.WorkerBootId == "" || claim.WorkerBootId != "" && claim.WorkerBootId != ack.WorkerBootId {
-			return exit.New(exit.Credential, "Runtime refused the expected machine identity")
-		}
-		claim.WorkerBootId = ack.WorkerBootId
-		return nil // no SnapshotAck, DesiredState, or AttemptOffer on this stream
-	}
-}
-
-func stageMachineWheel(root string, file localpackage.File) (string, *exit.Error) {
-	if filepath.Base(file.Filename) != file.Filename {
-		return "", exit.New(exit.Conflict, "captured wheel filename is not one component")
-	}
-	target := filepath.Join(root, file.Filename)
-	reader, err := os.Open(file.Path)
-	if err != nil {
-		return "", exit.New(exit.NotFound, "captured local wheel is unavailable: %s", err)
-	}
-	defer reader.Close()
-	output, err := os.CreateTemp(root, ".wheel-")
-	if err != nil {
-		return "", exit.Internalf("cannot stage local wheel: %s", err)
-	}
-	defer os.Remove(output.Name())
-	defer output.Close()
-	hash := sha256.New()
-	count, err := io.Copy(io.MultiWriter(output, hash), reader)
-	if err != nil || count != file.Length || (file.Digest != "" && "sha256:"+hex.EncodeToString(hash.Sum(nil)) != file.Digest) {
-		return "", exit.New(exit.Conflict, "captured wheel changed before local preparation")
-	}
-	if err := output.Sync(); err != nil {
-		return "", exit.Internalf("cannot retain local wheel: %s", err)
-	}
-	if err := output.Close(); err != nil {
-		return "", exit.Internalf("cannot close local wheel: %s", err)
-	}
-	if err := os.Rename(output.Name(), target); err != nil {
-		return "", exit.Internalf("cannot finalize local wheel staging: %s", err)
-	}
-	return target, nil
-}
-
-func spellLocalDigest(raw []byte) string {
-	spelling, _ := canonical.Spell(canonical.Digest(raw))
-	return spelling
 }

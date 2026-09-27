@@ -40,6 +40,8 @@ Enforced families:
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
+  venue     (proto-062) the machine name "local" and any local/rented branch live only in
+            internal/machines; a //cozy:venue door names a remaining classic-engine exception.
   resources package and model are the product nouns. Generic repo/create/show routes and
             untyped model-transfer verbs are refused, not retained as aliases.
 
@@ -351,6 +353,8 @@ DOCUMENT_KINDS: dict[str, str] = {}
 # count.
 HMAC_DOMAINS = {
     "cozy.rental_request/1": "internal/cli/rentals.go",
+    # The pod-supervisor readiness receipt; Tensorhub reads a pod's under the same domain.
+    "cozy.pod-readiness/1": "internal/machines/receipt.go",
 }
 # Kinds another repo authors and this one only reads: the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.package.", "cozy.runtime.", "tensorhub.",
@@ -362,6 +366,29 @@ KIND_READERS: dict[str, set[str]] = {}
 # in `\x00` or `\n`, and requiring the close quote made both of this repo's tags invisible
 # to the registry that exists to hold exactly this class of cross-repo agreed name.
 KIND_LITERAL = re.compile(r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.[A-Za-z0-9_.-]+/\d+)')
+
+
+# (proto-062) Local and rented machines share one path; they differ only in where the
+# machine is found. The machine name "local" and every venue decision on it live in
+# internal/machines. Elsewhere a venue test is a second path, unless a //cozy:venue door on
+# the line names why it still exists (the classic engine's local model-transfer worker).
+VENUE_HOME = "internal/machines/"
+VENUE_DOOR = "//cozy:venue"
+VENUE_TEST = re.compile(r'(?i)\b\w*(machine|venue|worker)\w*\s*(==|!=|:=|=)\s*"local"|"local"\s*(==|!=)|return\s+"local"\s*$')
+
+
+def check_venue() -> list[str]:
+    bad = []
+    for p in files():
+        rel = p.as_posix()
+        if p.suffix != ".go" or not rel.startswith("internal/") or rel.startswith(VENUE_HOME):
+            continue
+        for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+            if VENUE_TEST.search(line) and VENUE_DOOR not in line:
+                bad.append(f"{rel}:{i}: [venue] a local/rented branch outside {VENUE_HOME} — "
+                           "every machine takes one path; find the machine through internal/machines: "
+                           + line.strip())
+    return bad
 
 
 def check_document_kinds() -> list[str]:
@@ -930,7 +957,7 @@ violations = (check_unpublished_vocabulary() + check_sources() + check_matrix()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams() + check_output_shape()
               + check_media_contract() + check_typed_resources() + check_web_boundary()
-              + check_test_boundary() + check_python_seat())
+              + check_test_boundary() + check_python_seat() + check_venue())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:

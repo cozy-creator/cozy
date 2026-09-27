@@ -449,6 +449,7 @@ func runCozy(t *testing.T, root string, args ...string) (int, string) {
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
 	}
+	skipWithoutMachine(t, code, string(data))
 	return code, string(data)
 }
 
@@ -463,6 +464,7 @@ func runCozyStreams(t *testing.T, root string, args ...string) (int, string, str
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
 	}
+	skipWithoutMachine(t, code, stdout.String()+stderr.String())
 	return code, stdout.String(), stderr.String()
 }
 
@@ -486,6 +488,7 @@ func childEnv(t *testing.T, root string, imposed ...string) []string {
 	if raw, _ := os.ReadFile(filepath.Join(root, config.FileName)); !strings.Contains(string(raw), "tensorhub_url") {
 		base = append(base, "TENSORHUB_URL="+testDefaultHub)
 	}
+	provisionMachine(t, root)
 	return cfg.Child(append(base, imposed...)...)
 }
 

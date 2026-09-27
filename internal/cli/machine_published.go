@@ -15,11 +15,11 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Local installed code and rented machines use the same execution path: the machine
-// prepares the release, and a job or an inference root is submitted against that preparation.
+// Every machine prepares a published release the same way, and a job or an inference root
+// is submitted against that preparation.
 func (m *machineRuns) publishedSubmission(ctx context.Context, request records.Request, connection *machineConnection) (*pb.MachineExecutionSubmit, *exit.Error) {
-	if (request.Rental && request.Worker == "") || connection.preparePublished == nil {
-		return nil, exit.New(exit.Conflict, "published machine execution requires a local install or pinned rental")
+	if request.Rental && request.Worker == "" {
+		return nil, exit.New(exit.Conflict, "published machine execution requires a pinned rental")
 	}
 	began := time.Now()
 	prepared, problem := connection.preparePublished(ctx, request)
