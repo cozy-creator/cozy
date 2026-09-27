@@ -338,6 +338,17 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if problem != nil {
 			return problem
 		}
+		if !workspace.ReleaseRoots {
+			if request, problem = m.compatibleModels(ctx, request, connection); problem != nil {
+				return problem
+			}
+		}
+	}
+	if len(link.Submission) == 0 && releaseRoot(request) {
+		workspace, problem := m.workspace(ctx, connection)
+		if problem != nil {
+			return problem
+		}
 		built, problem := m.releaseRootSubmission(ctx, request, connection, workspace)
 		if problem != nil {
 			return problem
@@ -407,14 +418,30 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			for i, installed := range graph.InstalledPackages {
 				graph.InstalledPackages[i] = connection.installed[installed.InstallationId]
 			}
-			// A callee's omitted Model is resolved by the machine at this origin when called.
-			if graph.CatalogOrigin, problem = connection.PublicOrigin(ctx); problem != nil {
+			origin, problem := connection.PublicOrigin(ctx)
+			if problem != nil {
 				return problem
+			}
+			workspace, problem := m.workspace(ctx, connection)
+			if problem != nil {
+				return problem
+			}
+			if workspace.ResolvesModelDefaults {
+				// A callee's omitted Model is resolved by the machine at this origin when called.
+				graph.CatalogOrigin = origin
 			}
 			var encodeErr error
 			capture.Canonical, capture.Digest, encodeErr = canonical.Identity(&graph)
 			if encodeErr != nil {
 				return exit.Internalf("cannot retain worker installation metadata: %s", encodeErr)
+			}
+			if !workspace.ResolvesModelDefaults {
+				began := time.Now()
+				var detail string
+				if capture, detail, problem = m.resolver.captureMachineModelDefaults(capture, request, origin); problem != nil {
+					return problem
+				}
+				m.submissionStage(request.ID, "model_defaults", detail, began)
 			}
 			installed := connection.installed[request.LocalInstallationID]
 			if installed == nil {

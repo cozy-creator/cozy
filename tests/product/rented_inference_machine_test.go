@@ -48,12 +48,13 @@ type runtimeMachine struct {
 	submissions []*pb.MachineExecutionSubmit // every submission as sent, resubmissions included
 	failure     string                       // a failed terminal's safe message; empty succeeds
 	refusal     string                       // a release root this Runtime cannot prepare
+	older       bool                         // a Runtime from before release roots
 }
 
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	workspace := &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
 		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs, ExactExecutionGpus: m.exactGPUs,
-		SourceCredentials: m.sourceCredentials, ReleaseRoots: true, ResolvesModelDefaults: true}
+		SourceCredentials: m.sourceCredentials, ReleaseRoots: !m.older, ResolvesModelDefaults: !m.older}
 	for ordinal := range m.devices {
 		workspace.Devices = append(workspace.Devices, &pb.MachineDevice{Ordinal: uint32(ordinal), Name: "fake-4090"})
 	}
