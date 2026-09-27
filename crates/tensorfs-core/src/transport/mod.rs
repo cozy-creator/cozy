@@ -35,6 +35,7 @@ mod api;
 mod http;
 mod hub;
 mod ledger;
+mod memory;
 mod policy;
 pub(crate) mod prefix;
 mod pull;
@@ -55,6 +56,7 @@ pub use ledger::{
     Deadline, Ledger, PullCancellation, FETCH_ATTEMPTS, SAMPLE_SECONDS, STALL_FACTOR,
     STILL_SAMPLES, STREAMS,
 };
+pub use memory::{memory_available, streams_within, transfer_streams, STREAM_MEMORY};
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
     fetch_authorized, fetch_url, fetch_wanted, pull, FetchObserver, Fetched, ObjectSource,

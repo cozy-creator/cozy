@@ -911,9 +911,14 @@ impl Catalog {
         object: &crate::ids::ObjectRef,
         publish: impl FnOnce() -> Result<Option<crate::store::VRecord>>,
     ) -> Result<bool> {
+        // One admission at a time per catalog in this process, holding the write lock from
+        // before publication: streams landing objects together queue here instead of in
+        // SQLite's busy timeout, where a lost race refused bytes already verified.
+        let turn = admissions(&self.path);
+        let _turn = turn.lock().unwrap_or_else(|error| error.into_inner());
         let mut connection = self.connection()?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| sql("begin blob admission", error))?;
         if let Some(operation) = operation {
             hold_on(
@@ -1077,6 +1082,17 @@ impl Catalog {
         }
         Ok(pruned)
     }
+}
+
+fn admissions(path: &Path) -> Arc<Mutex<()>> {
+    static TURNS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    TURNS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 fn hold_on(connection: &Connection, operation: &str, key: &str, length: u64) -> Result<()> {

@@ -479,7 +479,7 @@ pub(crate) fn fetch_sources(
     };
     download.report(0, held);
     std::thread::scope(|scope| {
-        for _ in 0..options.streams.clamp(1, 128) {
+        for _ in 0..super::transfer_streams(options.streams.clamp(1, 128)) {
             scope.spawn(|| download.work());
         }
     });

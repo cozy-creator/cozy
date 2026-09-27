@@ -465,10 +465,13 @@ class Store:
         self, source_uri: str, carriers: Sequence[str] = ..., *, profiles: Sequence[str] = ..., files: Sequence[str] = ..., credential: str = ...,
         huggingface: str | None = None, civitai: str | None = None, allow_local: bool = False,
     ) -> SelectedSource: ...
+    # progress(present, total): durable bytes of the selection's distinct objects, called
+    # from download threads; an exception it raises stops the download and is re-raised.
     def materialize_source(
         self, owner: str, members: Sequence[tuple[str, str, int, str]], *,
         allowed_hosts: Sequence[str], credential_hosts: Sequence[str] = ...,
         credential: str = ..., allow_local: bool = False,
+        progress: Callable[[int, int], object] | None = None,
     ) -> MaterializedSource: ...
     # An empty checkpoints list with adopt_from_operation_id snapshots the stopped
     # predecessor's verified local journal before normal independent adoption.
@@ -709,6 +712,13 @@ class PullCancellation:
     def cancel(self) -> None: ...
     @property
     def cancelled(self) -> bool: ...
+
+#: The most memory one transfer stream holds, whatever its object's size.
+STREAM_MEMORY: int
+
+# Concurrent transfer streams whose buffers fit the memory available now: at most `wanted`,
+# at least 1 (cgroup limit less unreclaimable usage, or MemAvailable).
+def transfer_streams(wanted: int) -> int: ...
 
 def pull(
     store: Store,

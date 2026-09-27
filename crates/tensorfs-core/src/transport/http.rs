@@ -60,6 +60,11 @@ pub enum Judge {
     /// which is the owner's rule read literally: the lack of measured progress, never a
     /// number of seconds.
     Transfer,
+    /// An UPLOAD. Every wait — connect, handshake, each write, and the answer after the
+    /// last body byte — is judged by this exchange's own silence against the ledger's
+    /// patience. Nothing it moves lands here, so it neither counts as progress nor teaches
+    /// the pace.
+    Silence,
     /// Neither. The caller's deadline is the only bound, which is what a foreign-source
     /// read with its own per-part retry loop above it already had.
     Deadline,
@@ -133,7 +138,7 @@ fn transfer_verdict(
 /// progress may span arbitrarily many windows without exhausting a wall budget.
 fn stream_verdict(judge: Judge, ledger: &Ledger, advanced: Instant, phase: &str) -> Result<()> {
     ledger.check_running()?;
-    if judge != Judge::Stream || advanced.elapsed() <= ledger.patience() {
+    if !judge.silent_is_stall() || advanced.elapsed() <= ledger.patience() {
         return Ok(());
     }
     refuse(
@@ -145,6 +150,12 @@ fn stream_verdict(judge: Judge, ledger: &Ledger, advanced: Instant, phase: &str)
             ledger.patience().as_secs_f64(),
         ),
     )
+}
+
+impl Judge {
+    fn silent_is_stall(self) -> bool {
+        matches!(self, Judge::Stream | Judge::Silence)
+    }
 }
 
 pub struct Client {
@@ -712,7 +723,7 @@ impl BodyReader<'_> {
                 Err(e) if would_block(&e) => {
                     transfer_verdict(self.judge, self.ledger, self.since, "a response body")?;
                     let silent = self.advanced.elapsed();
-                    if self.judge == Judge::Stream && silent > self.ledger.patience() {
+                    if self.judge.silent_is_stall() && silent > self.ledger.patience() {
                         self.stalled = true;
                         let _ = self
                             .wire

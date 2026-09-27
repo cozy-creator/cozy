@@ -941,7 +941,13 @@ impl PyStore {
 
     /// Members are accepted exact (logical member, raw SHA-256, length, URL) rows.
     /// URLs and credentials are used for this call only and are never persisted in roots.
-    #[pyo3(signature = (owner, members, *, allowed_hosts, credential_hosts=Vec::new(), credential=String::new(), allow_local=false))]
+    ///
+    /// `progress(present, total)` is called from download threads, with the GIL, as bytes
+    /// become durable: `present` counts the selection's distinct objects already held plus
+    /// the bytes this call has durably written, out of `total`. It drops only if retained
+    /// bytes had to be discarded. An exception it raises stops the download (retained
+    /// progress is kept) and is raised from this call.
+    #[pyo3(signature = (owner, members, *, allowed_hosts, credential_hosts=Vec::new(), credential=String::new(), allow_local=false, progress=None))]
     #[allow(clippy::too_many_arguments)]
     fn materialize_source<'p>(
         &self,
@@ -952,6 +958,7 @@ impl PyStore {
         credential_hosts: Vec<String>,
         credential: String,
         allow_local: bool,
+        progress: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'p, PyDict>> {
         use tensorfs_core::{providers, transport};
         let rows = members
@@ -980,19 +987,39 @@ impl PyStore {
             allow_local,
             max_redirects: 5,
         };
-        let (root, rows) = py
-            .detach(|| {
-                providers::materialize_selected(
-                    &self.store,
-                    owner,
-                    &resolution,
-                    &policy,
-                    &credentials,
-                    transport::Deadline::none(),
-                    &|_, _| {},
-                )
-            })
-            .or_refuse(py)?;
+        let cancellation = transport::PullCancellation::default();
+        let raised: Mutex<Option<PyErr>> = Mutex::new(None);
+        let report = |present: u64, total: u64| {
+            let Some(callback) = &progress else {
+                return;
+            };
+            Python::attach(|py| {
+                if let Err(error) = callback.bind(py).call1((present, total)) {
+                    raised.lock().unwrap().get_or_insert(error);
+                    cancellation.cancel();
+                }
+            });
+        };
+        let options = transport::SourceDownload {
+            cancellation: Some(cancellation.clone()),
+            ..Default::default()
+        };
+        let materialized = py.detach(|| {
+            providers::materialize_selected_with_options(
+                &self.store,
+                owner,
+                &resolution,
+                &policy,
+                &credentials,
+                transport::Deadline::none(),
+                &report,
+                &options,
+            )
+        });
+        if let Some(error) = raised.lock().unwrap().take() {
+            return Err(error);
+        }
+        let (root, rows) = materialized.or_refuse(py)?;
         let result = PyDict::new(py);
         result.set_item("artifact", tree_root_dict(py, &root)?)?;
         result.set_item(
@@ -1495,6 +1522,7 @@ impl PyStore {
                         "checkpoint upload object is not verified locally",
                     );
                 }
+                // No deadline: every wait of the upload is judged by its own silence.
                 transport::push_object(
                     &self.store,
                     &object.sha256,
@@ -1502,7 +1530,7 @@ impl PyStore {
                     &grant,
                     &policy,
                     &transport::Anonymous,
-                    transport::Deadline::after_seconds(None),
+                    transport::Deadline::none(),
                     &transport::Ledger::new(),
                     "application/octet-stream",
                 )
@@ -3459,6 +3487,15 @@ impl PyPullCancellation {
     fn cancelled(&self) -> bool {
         self.token.is_cancelled()
     }
+}
+
+/// Concurrent transfer streams (pulls, source downloads, pushes) whose buffers fit the
+/// memory this process can use now: at most `wanted`, at least 1. Each stream holds at most
+/// `STREAM_MEMORY` bytes (2 MiB) whatever its object's size; the budget is the tightest of
+/// the cgroup limit less unreclaimable usage and the host's MemAvailable.
+#[pyfunction]
+pub fn transfer_streams(wanted: usize) -> usize {
+    tensorfs_core::transport::transfer_streams(wanted)
 }
 
 /// The ONE transport, from Python (tfs-050): ask for a repo, get a store that has it.
