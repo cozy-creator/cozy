@@ -273,13 +273,14 @@ impl Epoch {
                 )
                 .is_ok()
         {
-            self.sync_batch()?;
+            self.sync_now()?;
         }
         Ok(())
     }
 
-    /// fsync every object admitted since the last batch.
-    fn sync_batch(&self) -> Result<()> {
+    /// fsync every object admitted since the last batch. A writer with its own durability
+    /// points (a derived checkpoint) calls this there; a pull relies on [`SYNC_EVERY`].
+    pub(crate) fn sync_now(&self) -> Result<()> {
         let batch = std::mem::take(
             &mut *self
                 .pending
@@ -301,7 +302,7 @@ impl Epoch {
     /// The walk is over and nothing is admitting under this epoch: sync the last batch and
     /// retire the markers. Returns the batch syncs this pull ran and their wall time.
     pub(crate) fn finish(&self) -> Result<(u32, f64)> {
-        self.sync_batch()?;
+        self.sync_now()?;
         let mut markers = self
             .markers
             .lock()
