@@ -319,10 +319,16 @@ func (m *machineRuns) compatibleModels(ctx context.Context, request records.Requ
 		if problem != nil {
 			return request, problem
 		}
-		models = append(models, records.ModelRef{Package: request.Package, Slot: slot.Path, BindingPath: slot.Path,
+		model := records.ModelRef{Package: request.Package, Slot: slot.Path, BindingPath: slot.Path,
 			Model: resolved.Model, CatalogRepository: resolved.Model, Release: resolved.Release, Lane: resolved.Lane,
 			Manifest: resolved.ManifestID, ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
-			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse})
+			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse}
+		if choice.Manifest != "" && choice.Release == "" {
+			// A checkpoint named by digest alone is downloaded as that checkpoint, whatever
+			// release (if any) names it: without this the machine is never asked for it.
+			model.Release, model.Lane, model.HubCheckpoint = "", "", true
+		}
+		models = append(models, model)
 	}
 	if problem := m.store.PinMachineModels(request.ID, models); problem != nil {
 		return request, problem
