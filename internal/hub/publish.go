@@ -502,9 +502,7 @@ func (c *Client) ReleaseReads(ctx context.Context, ref Ref, release, lane string
 		return nil, exit.Named(exit.Unavailable, "hub.no_read_plane",
 			"the hub at %s serves no object-read route: POST %s answered %q", c.base,
 			"…/releases/{release}/lanes/{lane}/reads", e.Name).
-			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol").
-			WithNext("cozy model upload <source> <org/model> --dry-run",
-				"cozy model download "+ref.String()+"@<release> local/<name> --dry-run")
+			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol")
 	}
 	return out.Reads, e
 }

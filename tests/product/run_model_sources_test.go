@@ -17,7 +17,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -122,25 +121,18 @@ func declaredInstallPlan(distribution, release string, iface *launch.PackageInte
 func TestPinnedCheckpointTransferKeepsReleaseAndLaneConstraints(t *testing.T) {
 	root, _, _, digest, _ := runModelCatalog(t)
 	source := "proof/source@1.0.0/bf16#" + digest
-	code, out := runCozy(t, root, "model", "download", source, "local/pinned", "--dry-run", "--json", "--full")
-	var result struct{ ID string }
-	if code != 0 || json.Unmarshal([]byte(out), &result) != nil {
-		t.Fatalf("pinned checkpoint preflight failed: %d %s", code, out)
+	request, _, out := submitRun(t, root, "pinned-download", "model", "download", source, "local/pinned", "--json", "--full")
+	if request == nil || request.ModelTransfer == nil || request.ModelTransfer.SourceSelection != digest ||
+		request.ModelTransfer.InputLane != "bf16" || !strings.Contains(request.ModelTransfer.Source, "1.0.0") {
+		t.Fatalf("the accepted transfer discarded the explicit release/lane/digest constraints: %+v %s", request, out)
 	}
-	want := modeltransfer.Instruction{Kind: "model-download", Destination: "local/pinned", Source: source}.ID()
-	if result.ID != want {
-		t.Fatal("canonical instruction discarded the explicit release/lane/digest constraints")
-	}
-	code, out = runCozy(t, root, "model", "download", source, "local/pinned", "--lane", "fp8", "--dry-run", "--json")
+	code, out := runCozy(t, root, "model", "download", source, "local/pinned", "--lane", "fp8", "--json")
 	if code == 0 || !strings.Contains(out, "disagree") {
 		t.Fatal("conflicting explicit lane was accepted")
 	}
-	code, out = runCozy(t, root, "model", "download", "proof/source@1.0.0/bf16#sha256:"+strings.Repeat("f", 64), "local/pinned", "--dry-run", "--json")
+	code, out = runCozy(t, root, "model", "download", "proof/source@1.0.0/bf16#sha256:"+strings.Repeat("f", 64), "local/pinned", "--json")
 	if code == 0 || !strings.Contains(out, "manifest.not_found") {
 		t.Fatal("checkpoint outside the pinned release/lane was accepted")
-	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatal("selection refusal or preflight started a daemon")
 	}
 }
 
@@ -182,15 +174,14 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 
 func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
 	root, mu, posts, digest, manifest := runModelCatalog(t)
-	code, out := runCozy(t, root, "model", "download", "proof/source#"+digest, "local/checkpoint-proof", "--dry-run", "--json")
-	if code != 0 {
-		t.Fatalf("checkpoint download preflight refused: %d %s", code, out)
+	startDaemonProcess(t, root)
+	if request, _, out := submitRun(t, root, "checkpoint-download", "model", "download", "proof/source#"+digest, "local/checkpoint-proof", "--json"); request == nil {
+		t.Fatalf("checkpoint download was refused: %s", out)
 	}
 	args := []string{"run", "proof/quantize/quantize", "steps=7",
 		"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
 		"--publish-to", "proof/output", "--rental-only", "--json", "--idempotency-key", "retained-model-job"}
-	startDaemonProcess(t, root)
-	code, out = runCozy(t, root, args...)
+	code, out := runCozy(t, root, args...)
 	if code != 0 {
 		t.Fatalf("digest-only job did not queue: %d %s", code, out)
 	}

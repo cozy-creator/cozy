@@ -582,9 +582,6 @@ def check_manifest() -> list[str]:
     for path, spelling in derived_audits.items():
         if spelling not in pathlib.Path(path).read_text():
             bad.append(f"[grammar] {path} no longer derives its internal audit reason from exact operation facts")
-    transfer_plan = pathlib.Path("internal/modeltransfer/plan.go")
-    if not transfer_plan.is_file() or '"cozy-model-transfer-instruction/1\\x00"' not in transfer_plan.read_text():
-        bad.append("[grammar] model transfer dry-run identity lost its domain separation")
     for retired in (
         "internal/api/model_production.go",
         "internal/cli/model_production_manager.go",

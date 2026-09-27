@@ -253,15 +253,13 @@ type ModelDownloadCmd struct {
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         string `help:"Download directly into this owned rental (no local destination)."`
 	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`
-	DryRun         bool   `help:"Resolve the exact transfer plan without moving bodies or spending."`
 	Await          bool   `help:"Watch the accepted run until it settles."`
 	IdempotencyKey string `help:"Stable request identity for exact replay; otherwise start a new run."`
 }
 
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
 	return r.call(handleModelDownload, []string{c.Source, c.Ref}, bools(
-		"--rental-only", c.RentalOnly,
-		"--dry-run", c.DryRun, "--await", c.Await),
+		"--rental-only", c.RentalOnly, "--await", c.Await),
 		values("--rental", c.Rental, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
 }
 
@@ -291,7 +289,6 @@ type ModelUploadCmd struct {
 	Lane           string   `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         *string  `predictor:"rental" help:"Use this existing rental name or id; never buy a replacement."`
 	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
-	DryRun         bool     `help:"Check conversion and metadata without transferring weights or renting."`
 	Await          bool     `help:"Watch the accepted run until it settles."`
 	IdempotencyKey string   `help:"Stable request identity for exact replay; otherwise a rented re-run of the same ingest reattaches or resumes."`
 	SourceProfiles []string `name:"source-profile" help:"Reviewed TensorFS source profile to convert on the rental (repeatable; several compose one model). Default: the one profile the source headers match."`
@@ -303,8 +300,7 @@ func (c *ModelUploadCmd) Run(r *Runtime) error {
 		return problem
 	}
 	return r.call(handleModelUpload, []string{c.Source, c.Ref}, bools(
-		"--rental-only", c.RentalOnly,
-		"--dry-run", c.DryRun, "--await", c.Await),
+		"--rental-only", c.RentalOnly, "--await", c.Await),
 		values("--rental", rentalName, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey,
 			"--source-profile", c.SourceProfiles), false)
 }

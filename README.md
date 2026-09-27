@@ -238,8 +238,8 @@ the pod downloads the source, converts it to CozyTensors with reviewed TensorFS 
 uploads one checkpoint. The owner-side header preflight picks the one profile the source
 matches; a source matching several names them, and `--source-profile` (repeatable) selects
 them — profiles over different files compose one model (Runtime 0.18.40). A Runtime recipe
-(Qwen Image 2.1) adds its model-owned configuration and tokenizer. `--dry-run` checks the
-conversion from headers before any transfer or allocation. Re-running the same ingest returns
+(Qwen Image 2.1) adds its model-owned configuration and tokenizer. The conversion is
+checked from headers before any transfer or allocation. Re-running the same ingest returns
 its completed checkpoint from any rental without downloading again, reattaches to a live run,
 or retries a stopped one on the same rental so the pod resumes from its journals. The checkpoint has no release label; publish one with `cozy model publish`.
 

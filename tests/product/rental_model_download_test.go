@@ -3,6 +3,11 @@ package producttest
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/cli"
@@ -14,10 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"testing"
 )
 
 func TestRentalModelSelectorFreezesLatestMatchingLane(t *testing.T) {
@@ -38,22 +39,9 @@ func TestRentalModelSelectorFreezesLatestMatchingLane(t *testing.T) {
 	}))
 	defer peer.Close()
 	for _, test := range []struct{ ref, release string }{{"paul/minimax-h3#fp8-pruned", "2.0"}, {"paul/minimax-h3@1.0/fp8-pruned", "1.0"}} {
-		var grammar cli.CLI
-		var out, diagnostic bytes.Buffer
-		parser, err := kong.New(&grammar, kong.Writers(&out, &diagnostic))
-		if err != nil {
-			t.Fatal(err)
-		}
-		parsed, err := parser.Parse([]string{"model", "download", test.ref, "--rental=kirukiru", "--dry-run"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		err = parsed.Run(&cli.Runtime{Cfg: config.Config{Home: t.TempDir(), HubURL: peer.URL}, Out: &out, Err: &diagnostic, Mode: output.Mode{JSON: true}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(out.String(), test.release) || !strings.Contains(out.String(), digest) {
-			t.Fatalf("selection not frozen: %s", out.String())
+		model := queueRentalModelDownload(t, peer.URL, test.ref).Models[0]
+		if model.Release != test.release || model.Manifest != digest {
+			t.Fatalf("selection not frozen: %+v", model)
 		}
 	}
 }
@@ -169,28 +157,54 @@ func TestRentalModelLatestUsesVersionOrderWithoutDates(t *testing.T) {
 				}})
 			}))
 			defer peer.Close()
-			var grammar cli.CLI
-			var out, diagnostic bytes.Buffer
-			parser, err := kong.New(&grammar, kong.Writers(&out, &diagnostic))
-			if err != nil {
-				t.Fatal(err)
-			}
-			parsed, err := parser.Parse([]string{"model", "download", "paul/minimax-h3#fp8-pruned", "--rental=kirukiru", "--dry-run"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err = parsed.Run(&cli.Runtime{Cfg: config.Config{Home: t.TempDir(), HubURL: peer.URL}, Out: &out, Err: &diagnostic, Mode: output.Mode{JSON: true}}); err != nil {
-				t.Fatal(err)
-			}
-			var result struct {
-				Release string `json:"release"`
-			}
-			if err = json.Unmarshal(out.Bytes(), &result); err != nil {
-				t.Fatal(err)
-			}
-			if result.Release != versions[1] {
-				t.Fatalf("selected %q, want %q: %s", result.Release, versions[1], out.String())
+			if model := queueRentalModelDownload(t, peer.URL, "paul/minimax-h3#fp8-pruned").Models[0]; model.Release != versions[1] {
+				t.Fatalf("selected %q, want %q", model.Release, versions[1])
 			}
 		})
 	}
+}
+
+// queueRentalModelDownload runs `cozy model download <ref> --rental=kirukiru` against a
+// stand-in daemon and returns the selection the CLI froze and handed to the queue.
+func queueRentalModelDownload(t *testing.T, hubURL, ref string) records.RentalInstallSelection {
+	t.Helper()
+	var accepted records.RentalInstallSelection
+	localPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/" {
+			return
+		}
+		if r.Method != "POST" || r.URL.Path != "/v1/local/rentals/rental-proof/prepare" || r.Header.Get("Authorization") == "" {
+			t.Errorf("unexpected local request: %s %s", r.Method, r.URL)
+			http.Error(w, "unexpected", 500)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&accepted); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(records.RentalInstall{ID: "install-proof", RentalID: "rental-proof", State: "queued", Selection: accepted})
+	}))
+	defer localPeer.Close()
+	layout, problem := home.Open(t.TempDir())
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	fatal(t, store.RecordRental(records.Rental{ID: "rental-proof", MachineName: "kirukiru", State: "booting", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: hubURL}))
+	held, problem := daemon.Hold(layout, strings.TrimPrefix(localPeer.URL, "http://"), "")
+	fatal(t, problem)
+	defer held.Release()
+	_, problem = api.Mint(layout)
+	fatal(t, problem)
+	var grammar cli.CLI
+	var out, diagnostic bytes.Buffer
+	parser, err := kong.New(&grammar, kong.Writers(&out, &diagnostic))
+	must(t, err)
+	parsed, err := parser.Parse([]string{"model", "download", ref, "--rental=kirukiru"})
+	must(t, err)
+	must(t, parsed.Run(&cli.Runtime{Cfg: config.Config{Home: layout.Root, HubURL: hubURL}, Out: &out, Err: &diagnostic, Mode: output.Mode{JSON: true}}))
+	if len(accepted.Models) != 1 {
+		t.Fatalf("no selection was queued: %s", out.String())
+	}
+	return accepted
 }

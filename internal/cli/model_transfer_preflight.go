@@ -20,8 +20,7 @@ import (
 // on facts totalling under 300 KB — twice the member list, and once the first EIGHT BYTES
 // of one file, read as a header length. None of those refusals needed a tensor byte, and
 // the ordering that put them behind the transfer was an accident of call order rather than
-// a decision. `cozy model upload --dry-run` passed cleanly before all three, because it
-// validated the DISPATCH plan and never the conversion plan.
+// a decision.
 //
 // **Nothing here is new machinery.** `Resolver.Stage(..., headersOnly)` and
 // `planLocalSourceProfiles` are the LOCAL transfer's own header-first path, unchanged: two
@@ -79,7 +78,7 @@ func preflightConversionPlan(runCtx context.Context, ctx *Context, source publis
 ) (conversionPreflight, *exit.Error) {
 	if len(slots) == 0 {
 		// Standalone imports use the same automatic header classification as
-		// their real transfer. A dry run must also refuse ambiguous versions.
+		// their real transfer.
 		slots = map[string]string{"model": ""}
 	}
 	if source.Resolver == nil {
