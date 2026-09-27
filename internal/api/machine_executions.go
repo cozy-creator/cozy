@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"regexp"
 	"slices"
 	"time"
 
@@ -39,6 +40,10 @@ type RetainedOutput struct {
 	Machine  string `json:"machine"`
 	Manifest string `json:"manifest,omitempty"`
 }
+
+// providerRefusal is TensorFS reporting that a provider refused a machine's source call for
+// lack of authentication.
+var providerRefusal = regexp.MustCompile(`CREDENTIAL_REQUIRED|origin answered HTTP 40[13]\b`)
 
 func (s *Server) refreshMachineExecution(ctx context.Context, request records.Request) *exit.Error {
 	link, problem := s.store.MachineExecution(request.ID)
@@ -148,6 +153,13 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			if state.ErrorType == "" && body.Cause != nil && body.Status != pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
 				state.Error = body.SafeMessage
 				state.ErrorType = body.Cause.Code.String()
+				if providerRefusal.MatchString(body.SafeMessage) {
+					state.ErrorType = "model_source.auth_required"
+					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the daemon config. A machine Runtime older than 0.18.54 cannot receive it"
+					if link.MachineID != "local" {
+						state.Error += ": run `cozy rental update " + link.MachineID + "`"
+					}
+				}
 			}
 			if view.Collected && body.Result != nil && len(body.Result.InlineResult) > 0 {
 				state.Result = json.RawMessage(body.Result.InlineResult)

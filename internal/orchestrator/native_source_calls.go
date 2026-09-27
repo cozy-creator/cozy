@@ -96,8 +96,12 @@ func (c *Orchestrator) onNativeSourceCall(s *session, parent *records.Request, c
 }
 func (c *Orchestrator) sendNativeSource(s *session, call *pb.ChildCallRequest, id string, phase pb.NativeSourcePhase, selection *pb.NativeSourceSelection) {
 	command := &pb.NativeSourceCommand{RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID, ParentCall: proto.Clone(call).(*pb.ChildCallRequest), ServiceId: id, Operation: nativeSourceOperation(call.Export), Phase: phase, Selection: selection}
-	if credentials, ok := c.opt.Packages.(interface{ NativeSourceCredential(string) string }); ok && phase != pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_CANCEL {
-		command.Credential = credentials.NativeSourceCredential(call.Export)
+	if credentials, ok := c.opt.Packages.(interface{ SourceCredentials() []*pb.SourceCredential }); ok && phase != pb.NativeSourcePhase_NATIVE_SOURCE_PHASE_CANCEL {
+		for _, row := range credentials.SourceCredentials() {
+			if row.Provider == command.Operation {
+				command.Credential = row.Credential
+			}
+		}
 	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_NativeSourceCommand{NativeSourceCommand: command}})
 }
