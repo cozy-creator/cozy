@@ -236,8 +236,10 @@ func narrowSourceToProfiles(ctx *Context, source publishSource, profiles []strin
 	return narrowPublishSource(ctx, source, profiles)
 }
 
-// ingestRunKey names this ingest wherever it runs: a completed ingest is a memo hit on any
-// rental, and records.ResumableRun resumes a stopped one on the same rental.
+// ingestRunKey names this ingest wherever it runs: a live ingest is reattached and a stopped
+// one resumed on its own rental. A completed one runs again: the pod's Runtime, not this
+// script, decides the result (its version and the source's configs are in its memo key),
+// and its memo answers when nothing changed.
 func ingestRunKey(layout home.Layout, script []byte, rentalID string) (string, string, *exit.Error) {
 	store, problem := records.Open(layout.DB)
 	if problem != nil {
@@ -245,7 +247,7 @@ func ingestRunKey(layout home.Layout, script []byte, rentalID string) (string, s
 	}
 	defer store.Close()
 	digest := sha256.Sum256(script)
-	return store.ResumableRun("model-upload-"+hex.EncodeToString(digest[:]), rentalID)
+	return store.ResumableRun("model-upload-"+hex.EncodeToString(digest[:]), rentalID, false)
 }
 
 func quote(value string) string { raw, _ := json.Marshal(value); return string(raw) }

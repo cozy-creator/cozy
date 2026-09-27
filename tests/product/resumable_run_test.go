@@ -10,7 +10,7 @@ import (
 
 // TestResumableRunWalksToTheRunToResume: a re-run of the same work retries the stopped run
 // that retains its work on the same machine, starts fresh elsewhere or after a cancel, and
-// replays a live or completed run from any machine.
+// replays a live run from any machine and, when asked to, a completed one.
 func TestResumableRunWalksToTheRunToResume(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "creator.sqlite"))
 	fatal(t, problem)
@@ -24,7 +24,7 @@ func TestResumableRunWalksToTheRunToResume(t *testing.T) {
 	}
 	walk := func(base, machine, wantKey, wantRetry string) {
 		t.Helper()
-		key, retryOf, problem := store.ResumableRun(base, machine)
+		key, retryOf, problem := store.ResumableRun(base, machine, true)
 		fatal(t, problem)
 		if key != wantKey || retryOf != wantRetry {
 			t.Fatalf("ResumableRun(%s) = %q retrying %q, want %q retrying %q", machine, key, retryOf, wantKey, wantRetry)
@@ -48,4 +48,10 @@ func TestResumableRunWalksToTheRunToResume(t *testing.T) {
 	submit("job-done", done, "")
 	fatal(t, store.SettleRequest("job-done", "succeeded"))
 	walk(done, "pr-elsewhere", done, "")
+	// Work whose executing Runtime decides the result runs again rather than replaying.
+	key, retryOf, problem := store.ResumableRun(done, "pr-elsewhere", false)
+	fatal(t, problem)
+	if key != done+"/after/job-done" || retryOf != "" {
+		t.Fatalf("a completed ingest replayed: %q retrying %q", key, retryOf)
+	}
 }

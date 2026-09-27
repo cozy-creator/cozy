@@ -432,12 +432,14 @@ func (s *Store) CompleteRetainedCancellation(id string) (bool, *exit.Error) {
 	return true, nil
 }
 
-// ResumableRun makes a re-run of the same work reattach to its live or completed run on
-// any machine, or retry a stopped one that retains its work on the requested machine (""
-// is any) so it resumes from its journals; otherwise a fresh run follows. A completed run
-// that never reached its destination is not complete. It returns the key to submit and
-// the run that key retries.
-func (s *Store) ResumableRun(base, machine string) (string, string, *exit.Error) {
+// ResumableRun makes a re-run of the same work reattach to its live run on any machine, or
+// retry a stopped one that retains its work on the requested machine ("" is any) so it
+// resumes from its journals; otherwise a fresh run follows. A completed run answers the
+// re-run only with replayCompleted: work whose result the executing Runtime decides is run
+// again, and that Runtime's own memo answers when nothing changed. A completed run that
+// never reached its destination is not complete. It returns the key to submit and the run
+// that key retries.
+func (s *Store) ResumableRun(base, machine string, replayCompleted bool) (string, string, *exit.Error) {
 	key, retryOf := base, ""
 	for {
 		row, problem := s.RequestByIdempotencyKey(key)
@@ -456,6 +458,7 @@ func (s *Store) ResumableRun(base, machine string) (string, string, *exit.Error)
 		case (machine == "" || row.Worker == machine) && s.RetainedRetryAvailable(*row):
 			key, retryOf = base+"/retry-of/"+row.ID, row.ID
 		case row.State != "succeeded" && settledRequestState(row.State), unpublished,
+			row.State == "succeeded" && !replayCompleted,
 			RetainedState(row.State) && machine != "" && row.Worker != machine:
 			key, retryOf = base+"/after/"+row.ID, ""
 		default:
