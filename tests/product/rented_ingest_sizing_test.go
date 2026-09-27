@@ -32,29 +32,22 @@ func TestRentedIngestDeclaresItsPlannedSourceBytes(t *testing.T) {
 }
 
 // The host and the rental install TensorFS independently, so the host's may know fewer
-// profiles. A profile this host does not recognize is the rental's to decide: the ingest
-// still asks for its rental, and only the rental's own TensorFS may refuse it.
+// profiles. What this host does not recognize, a profile named or the source itself, is the
+// rental's to decide: the ingest still asks for its rental, and only the rental may refuse.
 func TestHostTensorFSUnawareOfAProfileDefersToTheRental(t *testing.T) {
 	planned := civitaiPrimaryBytes(t, 128078)
-	root, paid := rentalCapture(t)
-	registry := filepath.Join(root, "host-registry.json")
-	must(t, os.WriteFile(registry, []byte(`{"entries":[],"source_profiles":[]}`), 0o600))
-	host := []string{"COZY_TFS_REGISTRY=" + registry}
-
-	// Nothing named, and this host recognizes nothing: it cannot choose, and says how the
-	// rental can.
-	out, code := rentedUpload(t, root, host, "civitai://128078", "proof/sdxl")
-	if code == 0 || !strings.Contains(string(out), "UNREGISTERED_FINGERPRINT") || !strings.Contains(string(out), "--source-profile") {
-		t.Fatalf("an unrecognized source with no named profile must say how to defer [exit %d]: %s", code, out)
-	}
-
-	out, code = rentedUpload(t, root, host, "civitai://128078", "proof/sdxl",
-		"--source-profile", "civitai/101055/128078/single-file-fp16")
-	if request := paid(t, out, code); request.PlannedSourceBytes != planned {
-		t.Fatalf("the deferred ingest declared %d planned source bytes, want the source's %d", request.PlannedSourceBytes, planned)
-	}
-	if !strings.Contains(string(out), "the rental's TensorFS decides") {
-		t.Fatalf("a deferred profile must say who decides: %s", out)
+	for _, named := range [][]string{nil, {"--source-profile", "civitai/101055/128078/single-file-fp16"}} {
+		root, paid := rentalCapture(t)
+		registry := filepath.Join(root, "host-registry.json")
+		must(t, os.WriteFile(registry, []byte(`{"entries":[],"source_profiles":[]}`), 0o600))
+		out, code := rentedUpload(t, root, []string{"COZY_TFS_REGISTRY=" + registry},
+			append([]string{"civitai://128078", "proof/sdxl"}, named...)...)
+		if request := paid(t, out, code); request.PlannedSourceBytes != planned {
+			t.Fatalf("%v: the deferred ingest declared %d planned source bytes, want %d", named, request.PlannedSourceBytes, planned)
+		}
+		if !strings.Contains(string(out), "the rental's TensorFS decides") {
+			t.Fatalf("%v: a deferred ingest must say who decides: %s", named, out)
+		}
 	}
 }
 

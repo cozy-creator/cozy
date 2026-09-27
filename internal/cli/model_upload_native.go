@@ -169,15 +169,12 @@ func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profi
 	runCtx, cancel := hub.LongContext()
 	defer cancel()
 	conversion, problem := preflightConversionPlan(runCtx, ctx, source, profileSlots(profiles))
-	if len(profiles) > 0 && hostUnaware(problem) {
+	if hostUnaware(problem) {
 		return deferToRental(ctx, named, problem), nil
 	}
 	if problem != nil {
 		if tfs.Refused(problem, "AMBIGUOUS_CLASSIFICATION") {
 			problem = problem.WithRemedy("choose the reviewed profile(s) with --source-profile; profiles over different files compose one model")
-		}
-		if hostUnaware(problem) {
-			problem = problem.WithRemedy("this host's TensorFS may predate the source's profile: name it with --source-profile and the rental's TensorFS decides")
 		}
 		return nativeIngestPlan{}, problem
 	}
@@ -200,8 +197,8 @@ func hostUnaware(problem *exit.Error) bool {
 	return tfs.Refused(problem, "UNREGISTERED_FINGERPRINT")
 }
 
-// deferToRental keeps the named profiles and whatever narrowing already happened; the
-// rental's TensorFS selects, plans and refuses on its own registry.
+// deferToRental keeps the named profiles, or none, and whatever narrowing already happened;
+// the rental's TensorFS selects, plans and refuses on its own registry.
 func deferToRental(ctx *Context, plan nativeIngestPlan, problem *exit.Error) nativeIngestPlan {
 	version := "tfs (unavailable)"
 	if tool, _, opened := localTensorFS(ctx); opened == nil {
@@ -211,8 +208,12 @@ func deferToRental(ctx *Context, plan nativeIngestPlan, problem *exit.Error) nat
 	if at := strings.Index(said, "REFUSED "); at >= 0 {
 		said = said[at:]
 	}
+	what := strings.Join(plan.profiles, ", ")
+	if what == "" {
+		what = "this source"
+	}
 	fmt.Fprintf(ctx.Err, "note: this host's %s does not recognize %s (%s); the rental's TensorFS decides\n",
-		version, strings.Join(plan.profiles, ", "), said)
+		version, what, said)
 	return plan
 }
 
@@ -302,6 +303,9 @@ func pythonTuple(values []string) string {
 	quoted := make([]string, len(values))
 	for i, value := range values {
 		quoted[i] = quote(value)
+	}
+	if len(quoted) == 0 {
+		return "()"
 	}
 	return "(" + strings.Join(quoted, ", ") + ",)"
 }
