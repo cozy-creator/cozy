@@ -677,6 +677,14 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		return nil
 	}
 	name, release := selected[0].Str("package"), selected[0].Str("release")
+	// The Runtime binds only the prepared package's own slots (package_prepare
+	// _selected_models): a row naming another package is refused.
+	for _, model := range downloadSet.List("models") {
+		if model.Str("package") != name {
+			return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED, TotalBytes: total,
+				SafeCode: "runtime_preparation_failed", SafeDetail: "package_prepare_model_selection_mismatch: package"})
+		}
+	}
 	p.mu.Lock()
 	refusal := p.refusePrepare[name]
 	p.mu.Unlock()
