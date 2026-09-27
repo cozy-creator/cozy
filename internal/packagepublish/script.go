@@ -133,8 +133,8 @@ func PrepareScript(ctx context.Context, path string) (*Package, *exit.Error) {
 		"cozy_script_entry.py": []byte("from cozy_runtime.author import script_app\napp = script_app(\"cozy_script\")\n"),
 		"pyproject.toml":       project,
 		"package.toml":         []byte("[application]\nobject = \"" + ScriptApplication + "\"\n"),
-		// Keep the selected actual executor with the immutable script snapshot.
-		".python-version": []byte(selected.Version + "\n"),
+		// Keep the selected executor's minor ABI with the immutable script snapshot.
+		".python-version": []byte(hostruntime.PythonMinor(selected.Version) + "\n"),
 	} {
 		if err := os.WriteFile(filepath.Join(root, filename), contents, 0o600); err != nil {
 			return nil, exit.Internalf("cannot stage script project: %s", err)

@@ -60,7 +60,7 @@ func CapturedRegistryRows(raw []byte, closure, project, version string, existing
 	if problem != nil {
 		return nil, nil, problem
 	}
-	if pins[project] != version {
+	if !wheel.SameVersion(pins[project], version) {
 		return nil, nil, exit.Named(exit.Conflict, "private_dependency_project_changed", "captured environment does not contain this exact project")
 	}
 	expected := map[string]string{}

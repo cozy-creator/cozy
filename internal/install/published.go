@@ -70,8 +70,9 @@ func preparePublished(l home.Layout, installDir string, published *PublishedSour
 			return nil, empty, "", nil, exit.Internalf("cannot retain exact %s: %s", name, err)
 		}
 	}
-	if published.PythonVersion != "" {
-		if err := os.WriteFile(filepath.Join(sourceDir, ".python-version"), []byte(published.PythonVersion+"\n"), 0o400); err != nil {
+	// The publisher's patch is provenance; its wheel closure needs only the minor ABI.
+	if minor := hostruntime.PythonMinor(published.PythonVersion); minor != "" {
+		if err := os.WriteFile(filepath.Join(sourceDir, ".python-version"), []byte(minor+"\n"), 0o400); err != nil {
 			return nil, empty, "", nil, exit.Internalf("cannot retain published Python selection: %s", err)
 		}
 	}

@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
+
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
@@ -85,7 +87,7 @@ func InspectIdentity(file string) (Identity, *exit.Error) {
 	if problem != nil {
 		return out, problem
 	}
-	if normalize(metadataName) != distribution || metadataVersion != version {
+	if normalize(metadataName) != distribution || !SameVersion(metadataVersion, version) {
 		return out, exit.Named(exit.Validation, "wheel_identity_mismatch",
 			"filename says %s==%s while METADATA says %s==%s",
 			distribution, version, normalize(metadataName), metadataVersion)
@@ -191,4 +193,15 @@ func sortedUnique(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// SameVersion compares two PEP 440 spellings of one release, so "1.0.0-rc.2" and the
+// "1.0.0rc2" a build backend normalizes it to are one version.
+func SameVersion(a, b string) bool {
+	if a == b {
+		return true
+	}
+	left, errLeft := pep440.Parse(a)
+	right, errRight := pep440.Parse(b)
+	return errLeft == nil && errRight == nil && left.Equal(right)
 }

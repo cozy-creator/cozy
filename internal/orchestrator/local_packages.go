@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -244,7 +245,7 @@ func localSelection(operationID string, revision localpackage.Installation) (
 	if operationID == "" || revision.ID == "" || revision.Package == "" || revision.Release == "" || len(revision.Files) == 0 || len(revision.Files) > pb.MaxLocalPackageFiles {
 		return nil, nil, exit.Named(exit.Validation, "local_package_revision_invalid", "private installation inputs are incomplete")
 	}
-	selected := &pb.DesiredLocalPackageSet{PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, OperationId: operationID,
+	selected := &pb.DesiredLocalPackageSet{PythonRequires: revision.PythonRequires, PythonVersion: hostruntime.PythonMinor(revision.PythonVersion), OperationId: operationID,
 		SourceArchive: revision.SourceArchive, DependencyRequirements: revision.DependencyRequirements,
 		Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, InstallationId: revision.ID}}
 	transfer := &localTransfer{revision: revision.ID, files: map[string]localTransferFile{}, status: map[string]localTransferStatus{}, abortC: make(chan localAbortStatus, 1)}

@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 )
@@ -35,7 +36,7 @@ func (c *Orchestrator) PrepareRentalPackage(ctx context.Context, instance string
 		PackageSet:  &pb.DesiredPackageSet{DownloadDelegation: downloads},
 		Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
 		ImageInventory: facts.ImageInventory, PythonRequires: facts.PythonRequires,
-		PythonVersion: facts.PythonVersion, LockedRequirements: facts.LockedRequirements,
+		PythonVersion: hostruntime.PythonMinor(facts.PythonVersion), LockedRequirements: facts.LockedRequirements,
 		PackageInterface: facts.PackageInterface,
 	}
 	result := c.runHostPrepare(s, w, 0, hostLabel("explicit_prepare", ref.Package),

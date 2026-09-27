@@ -27,6 +27,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -150,7 +151,7 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			Application:    facts.Application,
 			ModelSlotPaths: append([]string(nil), facts.ModelSlotPaths...),
 			ImageInventory: facts.ImageInventory,
-			PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion,
+			PythonRequires: facts.PythonRequires, PythonVersion: hostruntime.PythonMinor(facts.PythonVersion),
 			LockedRequirements: append([]byte(nil), facts.LockedRequirements...),
 			PackageInterface:   append([]byte(nil), facts.PackageInterface...),
 		}

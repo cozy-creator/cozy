@@ -11,13 +11,13 @@ package producttest
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
@@ -73,31 +73,42 @@ func TestStaticDescribeNeverImportsPackageCode(t *testing.T) {
 			staged, committed)
 	}
 
-	// (d) A committed file that no longer matches the tree is refused before upload, naming
-	// the first difference; an absent one is refused by the same name.
+	// (d) Publication uploads the source's own reading. A committed copy that contradicts
+	// it is named in a notice, never refused; ordering, a copy missing members the source
+	// now carries, and an absent copy are no contradiction at all.
 	stale := strings.Replace(string(committed), `"name":"tile"`, `"name":"tiles"`, 1)
 	if stale == string(committed) {
 		t.Fatalf("the committed interface names no tile entrypoint:\n%s", committed)
 	}
 	must(t, os.WriteFile(committedPath, []byte(stale), 0o644))
-	problem = publishStaging(t, project)
-	if problem == nil || problem.Name != "package_publish.interface_stale" ||
-		!strings.Contains(problem.Message, "entrypoints[") ||
-		!strings.Contains(problem.Message, `committed "tiles", tree "tile"`) {
-		t.Fatalf("a stale committed interface was not refused naming the first difference: %v", problem)
+	uploaded, notice := publishStaging(t, project)
+	if !bytes.Equal(uploaded, bytes.TrimSpace(committed)) || !strings.Contains(notice, `"tiles" is absent from the source`) {
+		t.Fatalf("a contradicting copy changed the upload or went unnamed: notice=%q\n%s", notice, uploaded)
+	}
+	var document map[string]any
+	must(t, json.Unmarshal(committed, &document))
+	delete(document, "jobs")
+	older, err := json.MarshalIndent(document, "", "  ")
+	must(t, err)
+	must(t, os.WriteFile(committedPath, older, 0o644))
+	if _, notice := publishStaging(t, project); notice != "" {
+		t.Fatalf("a copy missing members the source now carries was reported: %s", notice)
 	}
 	must(t, os.Remove(committedPath))
-	problem = publishStaging(t, project)
-	if problem == nil || problem.Name != "package_publish.interface_stale" ||
-		!strings.Contains(problem.Message, packagepublish.CommittedInterfacePath+" is absent") {
-		t.Fatalf("an absent committed interface was not refused by name: %v", problem)
+	if staged, notice := publishStaging(t, project); notice != "" || !bytes.Equal(staged, bytes.TrimSpace(committed)) {
+		t.Fatalf("an absent committed copy changed publication: %q", notice)
 	}
 }
 
-func publishStaging(t *testing.T, project string) *exit.Error {
+// publishStaging runs the real publication staging and answers the interface it would
+// upload and any notice about a committed copy.
+func publishStaging(t *testing.T, project string) ([]byte, string) {
 	t.Helper()
 	pack, problem := packagepublish.PrepareFrom(project)
 	fatal(t, problem)
 	defer pack.Close()
-	return pack.BuildForPublish(t.Context())
+	fatal(t, pack.BuildForPublish(t.Context()))
+	staged, err := os.ReadFile(pack.PackageInterface)
+	must(t, err)
+	return staged, pack.InterfaceNotice
 }

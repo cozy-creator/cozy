@@ -10,6 +10,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -96,7 +97,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			return WorkerLaunchSpec{}, "", problem
 		}
 		result, rpcError = s.preparation.PreparePackageSet(s.ctx, &pb.PreparePackageSetRequest{
-			PythonRequires: prep.PythonRequires, PythonVersion: prep.PythonVersion, InstallRoot: root, DownloadDelegation: selected, Application: prep.Application,
+			PythonRequires: prep.PythonRequires, PythonVersion: hostruntime.PythonMinor(prep.PythonVersion), InstallRoot: root, DownloadDelegation: selected, Application: prep.Application,
 			ModelSlotPaths: prep.ModelSlotPaths, LockedRequirements: locked,
 			PackageInterface: append([]byte(nil), prep.PackageInterface...),
 		})
@@ -114,7 +115,7 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 			return WorkerLaunchSpec{}, "", problem
 		}
 		result, rpcError = s.preparation.PrepareLocalPackage(s.ctx, &pb.PrepareLocalPackageRequest{
-			PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, InstallRoot: spec.InstallRoot, OperationId: operation,
+			PythonRequires: revision.PythonRequires, PythonVersion: hostruntime.PythonMinor(revision.PythonVersion), InstallRoot: spec.InstallRoot, OperationId: operation,
 			Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release, InstallationId: revision.ID},
 			Files:   files, SourceArchive: revision.SourceArchive, DependencyRequirements: append([]byte(nil), revision.DependencyRequirements...),
 		}, grpc.Trailer(&trailer))

@@ -116,7 +116,8 @@ func orgIndexNamespace(raw string) string {
 // and accelerator distributions. Tensorhub fetches public references directly.
 func RegistryRowsFromLock(raw []byte, existing []DependencyWheel, organization string, targetPython ...string) ([]RegistryRow, *exit.Error) {
 	var lock registryLock
-	if err := toml.Unmarshal(raw, &lock); err != nil || lock.LockVersion != "1.0" {
+	// PEP 751 readers accept any lock-version of the major they implement.
+	if err := toml.Unmarshal(raw, &lock); err != nil || lock.LockVersion != "1" && !strings.HasPrefix(lock.LockVersion, "1.") {
 		return nil, exit.Named(exit.Validation, "registry_dependency_lock_invalid",
 			"uv export produced an invalid PEP 751 pylock.toml")
 	}

@@ -154,8 +154,8 @@ func TestPythonScriptLockUsesRuntimeExecutable(t *testing.T) {
 	defer pack.Close()
 	raw, err := os.ReadFile(filepath.Join(pack.Tree, ".python-version"))
 	must(t, err)
-	if strings.TrimSpace(string(raw)) != version {
-		t.Fatalf("script lost exact patch: %s", raw)
+	if want := strings.Join(strings.SplitN(version, ".", 3)[:2], "."); strings.TrimSpace(string(raw)) != want {
+		t.Fatalf("script snapshot pinned %s, want the executor's minor %s", raw, want)
 	}
 	raw, err = os.ReadFile(log)
 	must(t, err)
