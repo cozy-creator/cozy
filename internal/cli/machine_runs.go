@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -164,7 +165,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				}
 			} else {
 				if link.CancelRequested {
-					problem = m.Control(m.ctx, *current, "cancel")
+					problem = m.control(m.ctx, *current, "cancel", true)
 				} else {
 					problem = m.Refresh(m.ctx, *current)
 				}
@@ -567,16 +568,65 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 	return connection, link, query, nil
 }
 
-func (m *machineRuns) Refresh(ctx context.Context, request records.Request) *exit.Error {
-	lock := m.observationLock(request.ID)
-	lock.Lock()
-	defer lock.Unlock()
-	return m.refresh(ctx, request)
+func (m *machineRuns) Refresh(parent context.Context, request records.Request) *exit.Error {
+	ctx, done := m.observation(request.ID).observe(parent)
+	defer done()
+	problem := m.refresh(ctx, request)
+	if problem != nil && errors.Is(context.Cause(ctx), errObservationYielded) {
+		return nil // the control that took the turn observes the execution itself
+	}
+	return problem
 }
 
-func (m *machineRuns) observationLock(request string) *sync.Mutex {
-	lock, _ := m.observers.LoadOrStore(request, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+var errObservationYielded = errors.New("machine observation yielded to a control")
+
+// observation orders one request's observation, collection and control. Observing only
+// reads Runtime's journal and resumes wherever it stopped, as after a restart, so it yields
+// to a control: a cancel never queues behind another reader's dial and event pages.
+type observation struct {
+	turn     sync.Mutex
+	mu       sync.Mutex
+	yield    context.CancelCauseFunc
+	controls int
+}
+
+func (m *machineRuns) observation(request string) *observation {
+	value, _ := m.observers.LoadOrStore(request, &observation{})
+	return value.(*observation)
+}
+
+func (o *observation) observe(parent context.Context) (context.Context, func()) {
+	o.turn.Lock()
+	ctx, cancel := context.WithCancelCause(parent)
+	o.mu.Lock()
+	o.yield = cancel
+	if o.controls > 0 {
+		cancel(errObservationYielded)
+	}
+	o.mu.Unlock()
+	return ctx, func() {
+		o.mu.Lock()
+		o.yield = nil
+		o.mu.Unlock()
+		cancel(nil)
+		o.turn.Unlock()
+	}
+}
+
+// control takes the turn at once: an observation in flight stops, and none starts while a
+// control waits.
+func (o *observation) control() func() {
+	o.mu.Lock()
+	o.controls++
+	if o.yield != nil {
+		o.yield(errObservationYielded)
+	}
+	o.mu.Unlock()
+	o.turn.Lock()
+	o.mu.Lock()
+	o.controls--
+	o.mu.Unlock()
+	return o.turn.Unlock
 }
 
 // refresh observes and, once finished, collects one execution. Collection moves result
@@ -591,6 +641,10 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 		return problem
 	}
 	defer connection.connection.Close()
+	return m.observeOn(ctx, progress, request, connection, link, query)
+}
+
+func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress, request records.Request, connection *machineConnection, link *records.MachineExecution, query *pb.MachineExecutionQuery) *exit.Error {
 	connection.progress = progress
 	if len(link.PendingControl) > 0 {
 		if _, problem := m.flushMachineControl(ctx, connection, link); problem != nil {
@@ -699,11 +753,18 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 	return m.store.ObserveMachineExecution(request.ID, collected, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, collected.Sequence)})
 }
 
+// Control sends the command on its own connection the moment it is durable; observing the
+// execution afterwards reuses that connection.
 func (m *machineRuns) Control(parent context.Context, request records.Request, action string) *exit.Error {
-	lock := m.observationLock(request.ID)
-	lock.Lock()
-	defer lock.Unlock()
-	ctx, cancel := (&transfer.Progress{}).Context(parent)
+	return m.control(parent, request, action, false)
+}
+
+// control with requested is the observer delivering a recorded cancel request: one the
+// API's own control finished meanwhile needs only observing.
+func (m *machineRuns) control(parent context.Context, request records.Request, action string, requested bool) *exit.Error {
+	defer m.observation(request.ID).control()()
+	progress := &transfer.Progress{}
+	ctx, cancel := progress.Context(parent)
 	defer cancel()
 	value := map[string]pb.MachineExecutionAction{"pause": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_PAUSE, "resume": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_RESUME, "cancel": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL}[action]
 	if value == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_UNSPECIFIED {
@@ -714,13 +775,16 @@ func (m *machineRuns) Control(parent context.Context, request records.Request, a
 		return problem
 	}
 	defer connection.connection.Close()
+	if requested && !link.CancelRequested {
+		return m.observeOn(ctx, progress, request, connection, link, query)
+	}
 	if len(link.PendingControl) > 0 {
 		previous, problem := m.flushMachineControl(ctx, connection, link)
 		if problem != nil {
 			return problem
 		}
 		if previous == value {
-			return m.refresh(parent, request)
+			return m.observeAfterControl(ctx, progress, request, connection, query)
 		}
 	}
 	state, err := connection.client.GetMachineExecution(ctx, query)
@@ -731,10 +795,22 @@ func (m *machineRuns) Control(parent context.Context, request records.Request, a
 	if problem := m.store.RecordMachineControl(request.ID, command); problem != nil {
 		return problem
 	}
-	if problem := m.refresh(parent, request); problem != nil {
+	if problem := m.observeAfterControl(ctx, progress, request, connection, query); problem != nil {
 		return problem
 	}
 	return m.Start(request)
+}
+
+// observeAfterControl flushes the recorded control and imports what it changed.
+func (m *machineRuns) observeAfterControl(ctx context.Context, progress *transfer.Progress, request records.Request, connection *machineConnection, query *pb.MachineExecutionQuery) *exit.Error {
+	link, problem := m.store.MachineExecution(request.ID)
+	if problem != nil {
+		return problem
+	}
+	if link == nil {
+		return exit.New(exit.Conflict, "machine execution link disappeared during control")
+	}
+	return m.observeOn(ctx, progress, request, connection, link, query)
 }
 
 func (m *machineRuns) flushMachineControl(ctx context.Context, connection *machineConnection, link *records.MachineExecution) (pb.MachineExecutionAction, *exit.Error) {

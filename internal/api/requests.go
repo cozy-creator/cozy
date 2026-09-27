@@ -875,7 +875,12 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 			"no request "+reference+" on this host", "")
 		return
 	}
-	problem := s.refreshMachineExecution(r.Context(), *row)
+	var problem *exit.Error
+	// observe=false answers from the journal the daemon's own observer keeps, without
+	// dialing the machine: a caller about to act on the run needs only its record.
+	if r.URL.Query().Get("observe") != "false" {
+		problem = s.refreshMachineExecution(r.Context(), *row)
+	}
 	if current, e := s.store.RequestRow(row.ID); e == nil && current != nil {
 		current.Number = row.Number
 		row = current
