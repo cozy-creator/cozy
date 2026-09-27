@@ -159,7 +159,9 @@ type rentedIngestPod struct {
 	prepared []*pb.PrepareLocalPackageCall
 }
 
-func newRentedIngestPod(t *testing.T, providerProbe string) *rentedIngestPod {
+// newRentedIngestPod attaches a fake rented pod and starts the daemon with extraConfig appended to
+// its home config. An empty providerProbe skips reaching a real provider.
+func newRentedIngestPod(t *testing.T, providerProbe string, extraConfig ...string) *rentedIngestPod {
 	t.Helper()
 	base, err := os.MkdirTemp(scratchBase, "ingest-script-")
 	must(t, err)
@@ -167,11 +169,13 @@ func newRentedIngestPod(t *testing.T, providerProbe string) *rentedIngestPod {
 	root, tmp := filepath.Join(base, "home"), filepath.Join(base, "tmp")
 	must(t, os.MkdirAll(tmp, 0o700))
 	must(t, os.MkdirAll(root, 0o700))
-	response, err := http.Get(providerProbe)
-	if err != nil {
-		t.Skipf("provider unreachable from this runner: %v", err)
+	if providerProbe != "" {
+		response, err := http.Get(providerProbe)
+		if err != nil {
+			t.Skipf("provider unreachable from this runner: %v", err)
+		}
+		response.Body.Close()
 	}
-	response.Body.Close()
 
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -279,7 +283,7 @@ func newRentedIngestPod(t *testing.T, providerProbe string) *rentedIngestPod {
 		MediaAddress: connection.Media.Addr, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}
 	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token, identity))
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
-		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"+strings.Join(extraConfig, "")), 0o600))
 	startDaemonProcess(t, root, "TMPDIR="+tmp)
 	fixture.env = childEnv(t, root, "TMPDIR="+tmp)
 	return fixture

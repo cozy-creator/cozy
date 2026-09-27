@@ -40,11 +40,16 @@ type runtimeMachine struct {
 	cpuSlotModelInputs bool
 	exactGPUs          bool
 	devices            int
+	sourceCredentials  bool
+
+	submissions []*pb.MachineExecutionSubmit // every submission as sent, resubmissions included
+	failure     string                       // a failed terminal's safe message; empty succeeds
 }
 
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	workspace := &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs, ExactExecutionGpus: m.exactGPUs}
+		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs, ExactExecutionGpus: m.exactGPUs,
+		SourceCredentials: m.sourceCredentials}
 	for ordinal := range m.devices {
 		workspace.Devices = append(workspace.Devices, &pb.MachineDevice{Ordinal: uint32(ordinal), Name: "fake-4090"})
 	}
@@ -60,6 +65,7 @@ func (m *runtimeMachine) SubmitMachineExecution(_ context.Context, submit *pb.Ma
 	if !runtimeExecutionID.MatchString(submit.SubmissionId) {
 		return nil, status.Error(codes.InvalidArgument, "execution identity must be a bounded opaque ID")
 	}
+	m.submissions = append(m.submissions, proto.Clone(submit).(*pb.MachineExecutionSubmit))
 	if m.receipt != nil {
 		return m.receipt, nil
 	}
@@ -91,6 +97,23 @@ func (m *runtimeMachine) finish() {
 	release, _ := json.Marshal(map[string]any{"key": m.state.RequestId + "#1", "ordinals": []int{0, 1, 2, 3}, "cause": "exited"})
 	m.record("gpu.release", release)
 	m.state.State = "succeeded"
+	if m.failure != "" {
+		m.state.State = "failed"
+	}
+}
+
+func (m *runtimeMachine) status() pb.OutcomeStatus {
+	if m.failure == "" {
+		return pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED
+	}
+	return pb.OutcomeStatus_OUTCOME_STATUS_FAILED
+}
+
+func (m *runtimeMachine) cause() *pb.OutcomeCause {
+	if m.failure == "" {
+		return nil
+	}
+	return &pb.OutcomeCause{Code: pb.CauseCode_CAUSE_CODE_AUTHOR_EXCEPTION, Detail: m.failure}
 }
 
 func (m *runtimeMachine) submitted() *pb.MachineExecutionSubmit {
@@ -122,10 +145,10 @@ func (m *runtimeMachine) CollectMachineExecution(context.Context, *pb.MachineExe
 	defer m.mu.Unlock()
 	spec, _ := canonical.Spell(m.receipt.InvocationSpecDigest)
 	body, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{RequestId: m.state.RequestId, AttemptOrdinal: 1,
-		InvocationSpecDigest: spec, Status: pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
+		InvocationSpecDigest: spec, Status: m.status(),
 		Result: &pb.ResultEnvelope{InlineResult: []byte(`{}`)}, Metrics: &pb.AttemptMetrics{RuntimeMs: 1, WorkingPeakDeviceBytes: 30 << 30},
 		TriageBundle: &pb.TriageBundleRef{SubjectId: "trb-rented", WriteReceiptDigest: canonical.Digest(m.triage),
-			Length: uint64(len(m.triage))}})
+			Length: uint64(len(m.triage))}, SafeMessage: m.failure, Cause: m.cause()})
 	if err != nil {
 		return nil, err
 	}

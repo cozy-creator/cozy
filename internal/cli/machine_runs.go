@@ -488,7 +488,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		built.PublicationAuthorizationId = authorization
 		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.wireMinor)
-		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, built); problem != nil {
+		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, link.MachineID, built); problem != nil {
 			return problem
 		}
 		submission = built
@@ -527,7 +527,7 @@ func (m *machineRuns) recordPlacement(request records.Request, decision orchestr
 
 // freezeMachineSubmission persists authenticated journal identity with the exact
 // offer before any Submit RPC. Only a never-transmitted submission may discover it.
-func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, submission *pb.MachineExecutionSubmit) *exit.Error {
+func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *machineConnection, requestID, machine string, submission *pb.MachineExecutionSubmit) *exit.Error {
 	workspace, problem := currentExecutionWorkspace(ctx, connection)
 	if problem != nil {
 		return problem
@@ -536,7 +536,18 @@ func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *m
 		return problem
 	}
 	submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
-	return m.store.RecordMachineSubmission(requestID, submission)
+	if problem := m.store.RecordMachineSubmission(requestID, submission); problem != nil || workspace.SourceCredentials || len(m.resolver.SourceCredentials()) == 0 {
+		return problem
+	}
+	return m.store.AppendEvent(requestID, "request.warning", 0, map[string]any{"message": "this machine's Runtime cannot receive your Hugging Face or Civitai credential, so a gated source fails there; " + runtimeUpdate(machine)})
+}
+
+// runtimeUpdate names how the owner updates a machine's Runtime.
+func runtimeUpdate(machine string) string {
+	if machine == "local" {
+		return "update the local cozy-runtime"
+	}
+	return "run `cozy rental update " + machine + "` first"
 }
 
 // exactExecutionGPUs sends a counted group only to a Runtime that runs it exactly. Without
@@ -568,10 +579,13 @@ func currentExecutionWorkspace(ctx context.Context, connection *machineConnectio
 	return workspace, nil
 }
 
-func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, submission *pb.MachineExecutionSubmit) *exit.Error {
-	if submission.ExpectedExecutionWorkspaceId == "" {
+func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, frozen *pb.MachineExecutionSubmit) *exit.Error {
+	if frozen.ExpectedExecutionWorkspaceId == "" {
 		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; its acceptance cannot safely be retried")
 	}
+	// The owner's provider credentials ride each transmission only, never the frozen record.
+	submission := proto.Clone(frozen).(*pb.MachineExecutionSubmit)
+	submission.SourceCredentials = m.resolver.SourceCredentials()
 	submission.Claim = connection.claim
 	submission.Offer.WorkerBootId = connection.claim.WorkerBootId
 	submission.Offer.RecordOwnerEpoch = connection.claim.RecordOwnerEpoch
@@ -601,6 +615,19 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 		return problem
 	}
 	return nil
+}
+
+// supplySourceCredentials hands Runtime the owner's provider credentials again, by the identical
+// resubmission it answers with the same receipt: after a restart lost them, or before a resume.
+func (m *machineRuns) supplySourceCredentials(ctx context.Context, connection *machineConnection, link *records.MachineExecution, workspace string) *exit.Error {
+	var submission pb.MachineExecutionSubmit
+	if err := proto.Unmarshal(link.Submission, &submission); err != nil {
+		return exit.Internalf("recorded machine submission is unreadable: %s", err)
+	}
+	if submission.ExpectedExecutionWorkspaceId == "" {
+		submission.ExpectedExecutionWorkspaceId = workspace
+	}
+	return m.sendMachineSubmission(ctx, connection, link.RequestID, &submission)
 }
 
 func machineTransport(err error) *exit.Error {
@@ -736,6 +763,11 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 				"the machine no longer holds this run's execution workspace (its worker restarted or the workspace was replaced); the run failed alone and the machine keeps its other work")
 		}
 		return machineTransport(err)
+	}
+	if len(state.AwaitingSourceCredentials) > 0 {
+		if problem := m.supplySourceCredentials(ctx, connection, link, query.ExpectedExecutionWorkspaceId); problem != nil {
+			return problem
+		}
 	}
 	progress.Advance(1)
 	cursor := uint64(link.RemoteCursor)
@@ -935,6 +967,11 @@ func (m *machineRuns) flushMachineControl(ctx context.Context, connection *machi
 		return 0, exit.Internalf("recorded machine control is unreadable")
 	}
 	command.Execution.Claim = connection.claim
+	if command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_RESUME && len(m.resolver.SourceCredentials()) > 0 {
+		if problem := m.supplySourceCredentials(ctx, connection, link, command.Execution.ExpectedExecutionWorkspaceId); problem != nil {
+			return command.Action, problem
+		}
+	}
 	if command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL {
 		if problem := m.releaseMachineFiles(ctx, link.RequestID, connection); problem != nil {
 			return command.Action, problem
