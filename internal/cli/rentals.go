@@ -450,6 +450,12 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 				Model: model.Model, Release: model.Release})
 		}
 	}
+	if existing != nil {
+		hourlyRateUSDMicros = existing.HourlyRateUSDMicros
+	} else if hourlyRateUSDMicros, e = quoteRental(ctx, c, skuName, gpus, secret.HashHex(token), creator.PublicKey(),
+		workload, development, image, hourlyRateUSDMicros); e != nil {
+		return nil, e
+	}
 	// The machine word is the store's to reserve; the request is authored under it.
 	author := func(machineName string) ([]byte, string, *exit.Error) {
 		body, e := hub.RentalRequestBytes(machineName, skuName, gpus, secret.HashHex(token),
@@ -479,6 +485,33 @@ func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuNa
 	return &rentalAcquisition{ctx: ctx, layout: l, store: st, client: c, op: op, machine: request.Name,
 		existing: existing, token: token, creator: creator, replay: replay, sku: skuName,
 		rate: hourlyRateUSDMicros, deadline: deadline, managed: managedRequestID}, nil
+}
+
+// quoteRental asks the Hub what this exact request will lock. Its disk and declared
+// workload choose the machine, so this, not the default-disk listing, is the rate the
+// renter consents to. A Hub without quotes keeps the listed rate.
+func quoteRental(ctx *Context, c *hub.Client, skuName string, gpus int, tokenHash, creatorKey string,
+	workload hub.DeclaredWorkload, development *hub.RentalDevelopment, image string, listed int64,
+) (int64, *exit.Error) {
+	body, e := hub.RentalRequestBytes("quote", skuName, gpus, tokenHash, creatorKey, workload, development, image)
+	if e != nil {
+		return 0, e
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	quote, e := c.QuoteRental(hctx, body)
+	if e != nil && e.ErrName() == "hub.untyped_refusal" {
+		return listed, nil
+	}
+	if e != nil {
+		return 0, e
+	}
+	if quote.PriceUSDMicrosPerHour != listed && ctx.Err != nil && !ctx.Mode().JSON {
+		fmt.Fprintf(ctx.Err, "%s with a %d GB disk is %s + %s storage (the default-disk listing is %s)\n",
+			orchestrator.MachineLabel(skuName, gpus), quote.ContainerDiskGB, rentalPrice(quote.PriceUSDMicrosPerHour),
+			rentalPrice(quote.StorageUSDMicrosPerHour), rentalPrice(listed))
+	}
+	return quote.PriceUSDMicrosPerHour, nil
 }
 
 // complete asks the Hub for the pod, then waits on the Hub's word alone until it is

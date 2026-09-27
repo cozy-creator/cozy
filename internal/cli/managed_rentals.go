@@ -684,6 +684,7 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	if problem != nil {
 		return records.Rental{}, problem
 	}
+	sku.PriceUSDMicrosPerHour = purchase.rate
 	if m.buying == nil {
 		m.buying = map[string]records.Rental{}
 	}
