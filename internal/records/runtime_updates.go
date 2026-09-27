@@ -34,7 +34,37 @@ type RuntimeUpdate struct {
 	UpdatedAt string          `json:"updated_at"`
 }
 
+// Active is an update that holds its rental: in progress, or unusable until the owner acts.
 func (r RuntimeUpdate) Active() bool { return r.State != "succeeded" && r.State != "failed" }
+
+// InProgress is an update the daemon is still carrying out.
+func (r RuntimeUpdate) InProgress() bool {
+	return r.State == "preparing" || r.State == "updating" || r.State == "reconciling"
+}
+
+// RuntimeUpdateHold is why a rental takes no work because of its Runtime update, or nil.
+// Work waits for an update in progress; an update that ended without a serving worker
+// refuses work until the owner resumes it or ends the rental.
+func (s *Store) RuntimeUpdateHold(rental string) *exit.Error {
+	r, problem := s.RuntimeUpdate(rental)
+	if problem != nil || r == nil || !r.Active() {
+		return problem
+	}
+	if r.InProgress() {
+		return exit.Named(exit.Unavailable, "rental.maintenance", "this rental is updating its Runtime; work waits for it")
+	}
+	name := rental
+	if row, _ := s.RentalRow(rental); row != nil && row.MachineName != "" {
+		name = row.MachineName
+	}
+	return r.Unusable(name)
+}
+
+// Unusable is the refusal of work on the machine name while this update is unusable.
+func (r RuntimeUpdate) Unusable(name string) *exit.Error {
+	return exit.Named(exit.Conflict, "rental.unusable", "%s is unusable: its Runtime update could not finish: %s", name, r.Error).
+		WithRemedy("cozy rental update %s retries it; cozy rental end %s ends the rental", name, name)
+}
 
 func (s *Store) RuntimeUpdate(rental string) (*RuntimeUpdate, *exit.Error) {
 	var r RuntimeUpdate
@@ -83,7 +113,7 @@ func (s *Store) BeginRuntimeUpdate(rental, boot, request string, selection json.
 
 func (s *Store) SaveRuntimeUpdate(r RuntimeUpdate) *exit.Error {
 	switch r.State {
-	case "preparing", "updating", "reconciling", "succeeded", "failed":
+	case "preparing", "updating", "reconciling", "unusable", "succeeded", "failed":
 	default:
 		return exit.New(exit.Validation, "invalid Runtime update state")
 	}

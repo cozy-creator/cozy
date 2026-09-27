@@ -177,6 +177,7 @@ func TestRentedWeightsOutputSettlesRetainedOnTheRental(t *testing.T) {
 
 	// The retained bytes are custody, not a use: maintenance goes past the fence to the
 	// rental's own update endpoint, which this stand-in Hub does not publish.
+	f.hub.set(podRental, "development", true)
 	code, out, errs := runCozyWithin(t, f.root, "rental", "update", "collector", "--json")
 	if code == 0 || strings.Contains(out+errs, "rental.maintenance_busy") || !strings.Contains(out+errs, "maintenance endpoint") {
 		t.Fatalf("rental update was held by the retained result [exit %d]: %s%s", code, out, errs)

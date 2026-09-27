@@ -292,6 +292,14 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 // its release interface. `before` runs against the home while nothing else holds it.
 func rentedLadderMachine(t *testing.T, h *ladderHub, pod *fakePod, before func(home.Layout, *records.Store), degrees ...int) (string, home.Layout) {
 	t.Helper()
+	root, layout := rentedLadderHome(t, h, pod, before, degrees...)
+	startDaemonProcess(t, root)
+	return root, layout
+}
+
+// rentedLadderHome is rentedLadderMachine without starting the daemon.
+func rentedLadderHome(t *testing.T, h *ladderHub, pod *fakePod, before func(home.Layout, *records.Store), degrees ...int) (string, home.Layout) {
+	t.Helper()
 	publishWorkflowRelease(t, h, degrees...)
 	var detail hub.PackageReleaseDetail
 	response, err := http.Get(h.server.URL + "/v1/packages/proof/h3/releases/1.0.0")
@@ -351,6 +359,5 @@ func rentedLadderMachine(t *testing.T, h *ladderHub, pod *fakePod, before func(h
 		Address: connection.Addr, MediaAddress: connection.Media.Addr,
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
 	store.Close()
-	startDaemonProcess(t, root)
 	return root, layout
 }

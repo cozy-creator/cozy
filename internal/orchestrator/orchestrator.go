@@ -393,6 +393,8 @@ const (
 	ExcludedProtocol = "protocol_unsupported"
 	// ExcludedSpent: a completed managed job rental is retained custody, not capacity.
 	ExcludedSpent = "managed_job_spent"
+	// ExcludedUnusable: the rental's Runtime update ended without a serving worker.
+	ExcludedUnusable = "runtime_update_unfinished"
 	// ExcludedModeConflict: the rental's worker already holds the other half of the
 	// `oneof mode` — a job where a serving set is wanted, or the reverse.
 	ExcludedModeConflict = "mode_conflict"

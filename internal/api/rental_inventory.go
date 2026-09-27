@@ -76,6 +76,8 @@ type RentalSummary struct {
 	Operation           string          `json:"operation,omitempty"`
 	ProviderState       string          `json:"provider_state,omitempty"`
 	ContainerState      string          `json:"container_state,omitempty"`
+	// RuntimeUpdate is the state of a Runtime update holding this rental's work.
+	RuntimeUpdate string `json:"runtime_update,omitempty"`
 	// The worker image the hub froze for this rental, from its live listing.
 	BaseWorkerImageDigest string            `json:"base_worker_image_digest,omitempty"`
 	BaseWorkerImageTag    string            `json:"base_worker_image_tag,omitempty"`

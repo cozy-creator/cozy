@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import zipfile
@@ -42,6 +43,8 @@ class WheelArtifact(TypedDict):
     file: str
     path: str
     sha256: str
+    length: int
+    url: str
 
 
 class RuntimeVersion(TypedDict):
@@ -142,9 +145,12 @@ def optional_wheel(value: object) -> SelectedWheel | None:
 
 def wheel_artifact(value: object) -> WheelArtifact:
     row = mapping(value)
+    path = text(row["path"])
     return {
         "distribution": text(row["distribution"]), "version": text(row["version"]),
-        "file": text(row["file"]), "path": text(row["path"]), "sha256": text(row["sha256"]),
+        "file": text(row["file"]), "path": path, "sha256": text(row["sha256"]),
+        "length": integer(row["length"]) if "length" in row else Path(path).stat().st_size,
+        "url": text(row.get("url", "")),
     }
 
 
@@ -197,8 +203,6 @@ def worker_python(arguments: Sequence[str]) -> str:
 
 def inspect(arguments: Sequence[str], probe: str, python: str | None = None) -> JSONObject:
     # The script is fixed application code, never a package callback or prompt.
-    import shlex
-
     return mapping(json.loads(ssh(arguments, (python or worker_python(arguments)) + " -I -c " + shlex.quote(probe))))
 
 
@@ -248,8 +252,10 @@ def wheel(name: str, selected: SelectedWheel, tags: Sequence[str], directory: Pa
         temporary = path.with_suffix(".download")
         temporary.write_bytes(data)
         temporary.replace(path)
+    # A published wheel is fetched by the worker itself; only a local build is uploaded.
     return {"distribution": name, "version": version, "file": filename,
-            "path": str(path), "sha256": digest}
+            "path": str(path), "sha256": digest, "length": selected["length"],
+            "url": "" if selected.get("path") else selected["url"]}
 
 
 
@@ -362,11 +368,96 @@ def resolve(observed: Observation, directory: Path,
     return {"runtime_update": {"runtime": runtime, "tensorfs": tensorfs}}, [runtime_wheel, tensorfs_wheel]
 
 
+class NotSent(Exception):
+    """This call failed before asking the worker to apply, so it left the worker unchanged."""
+
+
+STAGED = "/var/lib/cozy/dev/staged/"
+
+
+def staged(arguments: Sequence[str], python: str, stager: str, remote: str,
+           wheels: list[WheelArtifact]) -> dict[str, JSONObject]:
+    job = {"directory": remote, "wheels": [
+        {"file": row["file"], "sha256": row["sha256"], "length": row["length"], "url": row["url"]} for row in wheels]}
+    reply = mapping(json.loads(ssh(arguments, python + " -I -c " + shlex.quote(stager) + " " + shlex.quote(json.dumps(job)))))
+    state = mapping(reply["staged"])
+    return {row["file"]: mapping(state[row["file"]]) for row in wheels}
+
+
+def stage_wheels(request: JSONObject, arguments: Sequence[str], python: str, directory: Path, remote: str,
+          wheels: list[WheelArtifact]) -> None:
+    """The worker fetches published wheels; a local build is uploaded, resumed while it progresses."""
+    for row in wheels:
+        path = Path(row["path"])
+        if not row["url"] and (path.parent != directory or path.name != row["file"]
+                               or hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]):
+            raise ValueError("Selected update wheel changed after verification")
+    arrived = -1
+    while True:
+        state = staged(arguments, python, text(request["stager"]), remote, wheels)
+        pending = [row for row in wheels if not boolean(state[row["file"]]["complete"])]
+        if not pending:
+            return
+        if any(row["url"] for row in pending):
+            raise ValueError("The worker did not stage a published wheel")
+        received = sum(integer(state[row["file"]]["size"]) for row in wheels)
+        if received <= arrived:
+            raise ValueError(f"uploading the local wheels stopped making progress at {received} bytes")
+        arrived = received
+        commands = []
+        for row in pending:
+            # SFTP's quoted path grammar is independent of the remote shell.
+            quoted = row["path"].replace("\\", "\\\\").replace('"', '\\"')
+            verb = "reput" if boolean(state[row["file"]]["exists"]) else "put"
+            commands.append(f'{verb} "{quoted}" {remote}/{row["file"]}')
+        batch = directory / "transfer.batch"
+        batch.write_text("\n".join(commands) + "\n")
+        result = subprocess.run(["sftp", *strings(request["sftp_arguments"]), "-b", str(batch), text(request["host"])],
+                                capture_output=True, text=True)
+        if result.returncode:
+            print(result.stderr, file=sys.stderr)
+
+
+def apply(request: JSONObject, arguments: Sequence[str], probe: str, python: str | None = None) -> JSONObject:
+    stage = text(request["stage"])
+    if not re.fullmatch(r"[a-f0-9]{32}", stage):
+        raise ValueError("Invalid update staging identity")
+    wheels = [wheel_artifact(row) for row in sequence(mapping(request["selection"])["wheels"])]
+    try:
+        python = python or worker_python(arguments)
+        admitted(arguments, probe, python)
+        directory = Path(text(request["directory"]))
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stage_wheels(request, arguments, python, directory, STAGED + stage, wheels)
+    except (ValueError, OSError, subprocess.SubprocessError, KeyError) as error:
+        raise NotSent(str(error)) from error
+    reply = ssh(arguments, python + " /opt/cozy/dev/update.py apply " + stage + " " +
+                " ".join(row["sha256"] for row in wheels))
+    result = mapping(json.loads(reply.strip().splitlines()[-1]))
+    if result.get("operation") != stage or result.get("state") not in {
+        "queued", "running", "succeeded", "rolled_back", "refused"
+    }:
+        raise ValueError("Worker did not acknowledge this durable Runtime update")
+    return {"update": result}
+
+
+def admitted(arguments: Sequence[str], probe: str, python: str) -> JSONObject:
+    observed = inspect(arguments, probe, python)
+    if observed.get("update_in_progress"):
+        raise ValueError("The worker is already applying a Runtime update")
+    row = observation(observed)
+    if not row["updater"] or not row.get("durable_updates", False) or not row["runtime"].get("supports_guarded_restart", False):
+        raise ValueError("This worker image does not support safe Runtime updates; select a current maintenance-capable private image")
+    return observed
+
+
 def main() -> JSONObject:
     request = mapping(json.load(sys.stdin))
     arguments = strings(request["ssh_arguments"])
     action = text(request["action"])
     probe = text(request["probe"])
+    if action == "apply":
+        return apply(request, arguments, probe)
     python = worker_python(arguments)
     if action == "resume":
         stage = text(request["stage"])
@@ -381,7 +472,7 @@ def main() -> JSONObject:
         # Transfer may have ended before enqueue. No accepted operation exists,
         # so replay the same frozen, hash-checked pair through ordinary apply.
         # Never reselect releases, or overwrite staging owned by a live updater.
-        request = {**request, "action": "apply"}
+        return apply(request, arguments, probe, python)
     if action == "status":
         stage = text(request["stage"])
         if not re.fullmatch(r"[a-f0-9]{32}", stage):
@@ -391,61 +482,30 @@ def main() -> JSONObject:
         if update.get("state") in {"succeeded", "rolled_back", "refused"}:
             result["observed"] = inspect(arguments, probe, python)
         return result
-    observed_document = inspect(arguments, probe, python)
-    if request["action"] == "inspect":
-        return {"observed": observed_document}
-    if observed_document.get("update_in_progress"):
-        raise ValueError("The worker is already applying a Runtime update")
+    if action == "inspect":
+        return {"observed": inspect(arguments, probe, python)}
+    if action != "plan":
+        raise ValueError("Unknown Runtime update operation")
+    observed_document = admitted(arguments, probe, python)
     observed = observation(observed_document)
-    if not observed["updater"] or not observed.get("durable_updates", False) or not observed["runtime"].get("supports_guarded_restart", False):
-        raise ValueError("This worker image does not support safe Runtime updates; select a current maintenance-capable private image")
     directory = Path(text(request["directory"]))
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if request["action"] == "plan":
-        target, selection = resolve(observed, directory, optional_wheel(request.get("local_runtime")), optional_wheel(request.get("local_tensorfs")))
-        unchanged = (
-            observed["runtime"]["distribution"] == target["runtime_update"]["runtime"]["version"]
-            and observed["tensorfs"] == target["runtime_update"]["tensorfs"]["version"]
-        )
-        return {"observed": observed_document, "target": target, "wheels": selection, "unchanged": unchanged,
-                "runtime_wire": runtime_wire(selection[0])}
-    if request["action"] != "apply":
-        raise ValueError("Unknown Runtime update operation")
-    stage = text(request["stage"])
-    if not re.fullmatch(r"[a-f0-9]{32}", stage):
-        raise ValueError("Invalid update staging identity")
-    wheels = [wheel_artifact(row) for row in sequence(mapping(request["selection"])["wheels"])]
-    remote = "/var/lib/cozy/dev/staged/" + stage
-    commands = ["-mkdir /var/lib/cozy/dev/staged", "-mkdir " + remote]
-    for row in wheels:
-        path = Path(row["path"])
-        if path.parent != directory or path.name != row["file"] or hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
-            raise ValueError("Selected update wheel changed after verification")
-        # SFTP's quoted path grammar is independent of the remote shell.
-        quoted = str(path).replace("\\", "\\\\").replace('"', '\\"')
-        commands.append(f'put "{quoted}" {remote}/{path.name}')
-    batch = directory / "transfer.batch"
-    batch.write_text("\n".join(commands) + "\n")
-    try:
-        subprocess.run(["sftp", *strings(request["sftp_arguments"]), "-b", str(batch), text(request["host"])],
-                       check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as error:
-        print(error.stderr, file=sys.stderr)
-        raise
-    reply = ssh(arguments, python + " /opt/cozy/dev/update.py apply " + stage + " " +
-                " ".join(row["sha256"] for row in wheels))
-    result = mapping(json.loads(reply.strip().splitlines()[-1]))
-    if result.get("operation") != stage or result.get("state") not in {
-        "queued", "running", "succeeded", "rolled_back", "refused"
-    }:
-        raise ValueError("Worker did not acknowledge this durable Runtime update")
-    return {"update": result}
-
+    target, selection = resolve(observed, directory, optional_wheel(request.get("local_runtime")), optional_wheel(request.get("local_tensorfs")))
+    unchanged = (
+        observed["runtime"]["distribution"] == target["runtime_update"]["runtime"]["version"]
+        and observed["tensorfs"] == target["runtime_update"]["tensorfs"]["version"]
+    )
+    return {"observed": observed_document, "target": target, "wheels": selection, "unchanged": unchanged,
+            "runtime_wire": runtime_wire(selection[0])}
 
 
 if __name__ == "__main__":
     try:
         print(json.dumps(main(), sort_keys=True))
+    except NotSent as error:
+        # The Creator records the worker as unchanged only on this answer.
+        print(json.dumps({"error": str(error), "unsent": True}))
+        raise SystemExit(1)
     except (ValueError, OSError, subprocess.SubprocessError, KeyError, zipfile.BadZipFile) as error:
         # Keep SSH/native tracebacks out of ordinary end-user output. The CLI
         # retains the complete subprocess diagnostics in this update's log.
