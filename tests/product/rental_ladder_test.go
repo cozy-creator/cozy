@@ -397,7 +397,7 @@ func TestRungMatchingIsTheAcceleratorSubsequence(t *testing.T) {
 		}
 	}
 	models := h3Ladder()
-	rung, index, ok := models[0].RungFor("NVIDIA GeForce RTX 5090", 1)
+	rung, index, ok := models[0].RungAt("NVIDIA GeForce RTX 5090", 1)
 	if !ok || index != 2 || rung.Lane != "bf16-full" {
 		t.Fatalf("a 5090 fits rung %d %+v; want the catch-all bf16-full", index, rung)
 	}

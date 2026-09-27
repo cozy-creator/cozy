@@ -10,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 // ResolveUnpublishedChild resolves only the immutable interface binding captured by
@@ -107,8 +108,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 		out.Outputs, out.WeightsOutputs, out.NeedsAccelerator = facts.Outputs, facts.WeightsOutputs, facts.NeedsAccelerator
 	}
 	models := make([]orchestrator.ModelRef, 0, len(job.Models))
-	accelerator, machineRead := "", false
-	count := 0
+	var defaulted []int
 	for _, slot := range job.Models {
 		if _, present := arguments[slot.Param]; job.Kind == "entrypoint" && !present {
 			return out, "", exit.Named(exit.Conflict, "child.model_unbound", "serving model arguments differ from declared slots")
@@ -121,17 +121,11 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 			// No retained artifact: the granting host selects the slot itself, from the
 			// owner's binding or the callee's authored default (cl-210). The caller named
 			// its own callable, never a model.
-			if !machineRead {
-				accelerator, count, problem = r.childAccelerator(parent)
-				if problem != nil {
-					return out, "", problem
-				}
-				machineRead = true
-			}
-			selected, problem := r.childModelSelection(install.Package, binding.Entrypoint, slot, accelerator, count)
+			selected, problem := r.childModelLadder(install.Package, binding.Entrypoint, slot)
 			if problem != nil {
 				return out, "", problem
 			}
+			defaulted = append(defaulted, len(models))
 			models = append(models, selected)
 			continue
 		}
@@ -148,6 +142,25 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 		}
 
 		models = append(models, orchestrator.ModelRef{Package: install.Package, Slot: slot.Param, BindingPath: slot.Path, Model: artifact.ProducerRequestID + "/" + artifact.OutputSlot, Manifest: artifact.Manifest.Digest, ManifestLength: artifact.Manifest.Length})
+	}
+	if len(defaulted) > 0 {
+		accelerator, count, problem := r.childAccelerator(parent)
+		if problem != nil {
+			return out, "", problem
+		}
+		pinned, _, ok := rental.Pin(models, accelerator, count)
+		if !ok {
+			return out, "", exit.Named(exit.Conflict, "child.model_rung_absent",
+				"%s %s has no authored group for %d× %s (ladders: %s)", install.Package, binding.Entrypoint,
+				count, orNone(accelerator), strings.Join(rental.Ladder(models), "; ")).
+				WithRemedy("declare a rung for this accelerator, or run the composition on a machine its ladder names")
+		}
+		for _, i := range defaulted {
+			if pinned[i], problem = r.childManifest(pinned[i]); problem != nil {
+				return out, "", problem
+			}
+		}
+		models = pinned
 	}
 	out.Models = models
 	received, problem := r.store.ReceivedByteAssets(parent.ID)

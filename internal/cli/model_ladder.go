@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 // The binding ladder is a FIT MAP (cl-166): the hub binding says which lane of a model
@@ -109,29 +110,40 @@ func laneOf(ref hub.Ref, selected *hub.ModelReleaseSummary, lane string) (hub.Mo
 		orNone(strings.Join(names, ", ")))
 }
 
-// localRung chooses a GPU-specific preference when present, otherwise the first
-// declared lane. The ladder is not a local hardware allowlist: Runtime still
-// checks actual encoding support, construction compatibility and memory capacity.
-func localRung(ctx *Context, ladder []hub.BindingRung) (hub.BindingRung, *exit.Error) {
+// localRungs picks the invocation's slots on this host as one group, the way a rented
+// machine's are picked (rental.Pin). A slot whose ladder names no GPU here still takes its
+// first declared lane when that rung is uncounted: the ladder is not a local hardware
+// allowlist, and Runtime still checks encoding support, construction compatibility and
+// memory capacity. An explicit override is its own rung.
+func localRungs(ctx *Context, selected []invocationModelSpec) ([]records.ModelRef, *exit.Error) {
 	inventory := hostgpu.Probe(ctx.Cfg)
 	accelerator := ""
 	if len(inventory.GPUs) > 0 {
 		accelerator = inventory.GPUs[0].Model
 	}
-	for _, rung := range ladder {
-		if records.RungMatches(rung.GPU, accelerator) && rung.GPUs <= len(inventory.GPUs) {
-			return rung, nil
+	refs := make([]records.ModelRef, len(selected))
+	for i, spec := range selected {
+		if spec.Explicit {
+			refs[i].Manifest, refs[i].Lane = spec.Ref, spec.Lane
+			continue
+		}
+		if len(spec.Binding.Ladder) == 0 {
+			return nil, exit.Named(exit.Validation, "model_ladder_empty",
+				"the model binding has no default lanes").
+				WithRemedy("declare a default lane or supply model.<param>=org/model@release/lane")
+		}
+		for _, rung := range spec.Binding.Ladder {
+			refs[i].Ladder = append(refs[i].Ladder, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane})
+		}
+		if first := refs[i].Ladder[0]; first.GPUs == 0 {
+			refs[i].Ladder = append(refs[i].Ladder, records.ModelRung{GPU: "*", Lane: first.Lane})
 		}
 	}
-	if len(ladder) > 0 && ladder[0].GPUs == 0 {
-		return ladder[0], nil
+	pinned, _, ok := rental.Pin(refs, accelerator, len(inventory.GPUs))
+	if !ok {
+		return nil, exit.Named(exit.Validation, "model_gpu_group_unavailable", "no authored group fits the local inventory of %d GPUs (%s)", len(inventory.GPUs), orNone(accelerator))
 	}
-	if len(ladder) > 0 {
-		return hub.BindingRung{}, exit.Named(exit.Validation, "model_gpu_group_unavailable", "no authored group fits the local inventory of %d GPUs (%s)", len(inventory.GPUs), orNone(accelerator))
-	}
-	return hub.BindingRung{}, exit.Named(exit.Validation, "model_ladder_empty",
-		"the model binding has no default lanes").
-		WithRemedy("declare a default lane or supply model.<param>=org/model@release/lane")
+	return pinned, nil
 }
 
 // bindRemedy is the exact command that gives a slot its hub binding.
