@@ -264,10 +264,7 @@ sources refuse before acquisition. Tensorhub inputs use the ordinary exact model
 The Hub measures their shared closure when sizing a rental; a manifest's small metadata
 length is never a disk-size estimate.
 
-`cozy run ... --dry-run` resolves the selected release, typed payload, exact inputs, and
-foreign conversion headers without starting a daemon, queueing work or renting. It reads
-provider metadata and headers, never downloads the model bodies. Submission records an
-ordinary `job-*` run; `--await` watches it and `cozy run watch <job-id>` attaches later.
+Submission records an ordinary `job-*` run; `--await` watches it and `cozy run watch <job-id>` attaches later.
 Use `--idempotency-key` to replay the same request. Existing source operations continue
 through their recorded intent after an upgrade. `--producer` on model upload/download is
 removed; jobs have one invocation surface.

@@ -56,16 +56,16 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 		fatal(t, st.RecordRental(records.Rental{ID: id, MachineName: name, AcceleratorModel: "CPU", AcceleratorCount: 1, State: "ready", HourlyRateUSDMicros: 100000, Address: "127.0.0.1:1", CertPath: "unused", Hub: "fixture"}))
 	}
 	st.Close()
-	args := []string{"run", "proof/quantize/quantize", "steps=7", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--dry-run", "--json", "--full"}
+	args := []string{"run", "proof/quantize/quantize", "steps=7", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--json", "--full"}
 	for _, name := range []string{"isao", current} {
-		code, out := runCozy(t, root, append(append([]string{}, args...), "--rental="+name)...)
-		if code != 0 || !strings.Contains(out, `"requested_rental":"`+current+`"`) {
-			t.Fatalf("named rental %s: %d %s", name, code, out)
+		request, _, out := submitRun(t, root, "named-"+name, append(append([]string{}, args...), "--rental="+name)...)
+		if request == nil || request.RequestedRental != current {
+			t.Fatalf("named rental %s: %+v %s", name, request, out)
 		}
 	}
-	code, out := runCozy(t, root, append(append([]string{}, args...), "--rental=giriko")...)
-	if code != 0 || !strings.Contains(out, `"requested_rental":"`+old+`"`) {
-		t.Fatalf("package-private Runtime was constrained by image inventory: %d %s", code, out)
+	request, _, out := submitRun(t, root, "named-giriko", append(append([]string{}, args...), "--rental=giriko")...)
+	if request == nil || request.RequestedRental != old {
+		t.Fatalf("package-private Runtime was constrained by image inventory: %+v %s", request, out)
 	}
 	// Replaying an accepted request preserves its selected identity after the rental
 	// ends; it does not need a fresh inventory read merely to retrieve history.
@@ -79,8 +79,8 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	fatal(t, problem)
 	st.Close()
 	replayReads := inventoryReads.Load()
-	code, out = runCozy(t, root, append(append([]string{}, args...), "--rental=isao", "--idempotency-key=prior")...)
-	if code != 0 || !strings.Contains(out, current) || inventoryReads.Load() != replayReads {
+	code, out := runCozy(t, root, append(append([]string{}, args...), "--rental=isao", "--idempotency-key=prior")...)
+	if strings.Contains(out, "rental.selection_unavailable") || inventoryReads.Load() != replayReads {
 		t.Fatalf("replay required a released rental: %d %s", code, out)
 	}
 	before := inventoryReads.Load()
@@ -99,9 +99,6 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "--rental")
 	if code == 0 || !strings.Contains(out, "--rental-only") {
 		t.Fatalf("bare old flag lacks guidance: %d %s", code, out)
-	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatal("dryrun/invalid selection started a daemon")
 	}
 	mu.Lock()
 	defer mu.Unlock()

@@ -149,7 +149,6 @@ func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 			}})
 		})
 	})
-	// Dry-run capture owns read-only SDK generations, with no daemon or execution.
 	t.Cleanup(func() { must(t, removeAllForce(root)) })
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
@@ -166,7 +165,7 @@ func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 # constraint-dependencies = ["msgspec==0.21.1"]
 # ///
 def main(ctx):
-    raise AssertionError("dry-run must not execute")
+    raise AssertionError("an unreachable rental must not execute")
 `, version)
 	runtimeSource := ""
 	if runtimeWheel := *privateScriptRuntimeWheel; runtimeWheel != "" {
@@ -174,27 +173,25 @@ def main(ctx):
 	}
 	code = strings.Replace(code, "# ///\ndef", "# [tool.uv.sources]\n"+runtimeSource+"# ///\ndef", 1)
 	must(t, os.WriteFile(script, []byte(code), 0600))
-	status, out := runCozy(t, root, "run", script, "--rental=isao", "--dry-run", "--json", "--full")
-	if status != 0 || !strings.Contains(out, current) {
-		t.Fatalf("compatible image was held to the local exact pin [%d]: %s", status, out)
+	request, _, out := submitRun(t, root, "requirements-isao", "run", script, "--rental=isao", "--json", "--full")
+	if request == nil || request.RequestedRental != current {
+		t.Fatalf("compatible image was held to the local exact pin: %s", out)
 	}
-	status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
-	if status != 0 {
-		t.Fatalf("private msgspec version constrained the image [%d]: %s", status, out)
+	if request, _, out := submitRun(t, root, "requirements-giriko", "run", script, "--rental=giriko", "--json"); request == nil {
+		t.Fatalf("private msgspec version constrained the image: %s", out)
 	}
 	patchCode := strings.Replace(code, "msgspec>=0.21,<0.22", "msgspec>=0.21,<0.22; python_full_version >= '3.12.5' and (python_full_version >= '3.12.12' or sys_platform == 'win32' or python_full_version < '3.12.4')", 1)
 	must(t, os.WriteFile(script, []byte(patchCode), 0600))
-	status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
-	if status != 0 {
-		t.Fatalf("private marked requirement constrained the image [%d]: %s", status, out)
+	if request, _, out := submitRun(t, root, "requirements-marked", "run", script, "--rental=giriko", "--json"); request == nil {
+		t.Fatalf("private marked requirement constrained the image: %s", out)
 	}
-	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--dry-run", "--json")
+	status, out := runCozy(t, root, "run", script, "--rental=priorpython", "--json")
 	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "captured Python "+captured.Version) {
 		t.Fatalf("a different remote patch replaced the captured interpreter [%d]: %s", status, out)
 	}
 	pythonCode := strings.Replace(patchCode, `requires-python = ">=3.12,<3.13"`, `requires-python = ">=3.12.5,<3.13"`, 1)
 	must(t, os.WriteFile(script, []byte(pythonCode), 0600))
-	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--dry-run", "--json")
+	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--json")
 	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, ">=3.12.5") {
 		t.Fatalf("authored Python patch floor was replaced by the default minor range [%d]: %s", status, out)
 	}
@@ -229,7 +226,7 @@ app.job(value)
 	if out, err := exec.Command("uv", "build", "--wheel", "--out-dir", wheels, library).CombinedOutput(); err != nil {
 		t.Fatalf("build callable extra fixture: %v\n%s", err, out)
 	}
-	for _, test := range []struct{ selected, wheel bool }{{true, false}, {false, false}, {true, true}, {false, true}} {
+	for i, test := range []struct{ selected, wheel bool }{{true, false}, {false, false}, {true, true}, {false, true}} {
 		selected := test.selected
 		dependency := "marker-library"
 		if selected {
@@ -242,14 +239,13 @@ app.job(value)
 		}
 		extraCode = strings.Replace(extraCode, "# [tool.uv.sources]\n", "# [tool.uv.sources]\n# marker-library = {path = '"+source+"'}\n", 1)
 		must(t, os.WriteFile(script, []byte(extraCode), 0600))
-		status, out = runCozy(t, root, "run", script, "--rental=giriko", "--dry-run", "--json")
-		if status != 0 {
-			t.Fatalf("private library extra constrained the image (selected=%v, wheel=%v) [%d]: %s", selected, test.wheel, status, out)
+		if request, _, out := submitRun(t, root, fmt.Sprintf("requirements-extra-%d", i), "run", script, "--rental=giriko", "--json"); request == nil {
+			t.Fatalf("private library extra constrained the image (selected=%v, wheel=%v): %s", selected, test.wheel, out)
 		}
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	if len(*posts) != 0 {
-		t.Fatal("named-rental preflight attempted paid acquisition")
+		t.Fatal("a named rental attempted paid acquisition")
 	}
 }

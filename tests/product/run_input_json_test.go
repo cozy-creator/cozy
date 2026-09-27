@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,14 +34,13 @@ func runInputJSONRoot(t *testing.T) string {
 	mux.HandleFunc("GET /v1/packages/proof/input/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(detail)
 	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("dry-run reached %s %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	})
+	mux.HandleFunc("/", http.NotFound)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
-	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
+	root, err := os.MkdirTemp(scratchBase, "submitted-run-")
+	must(t, err)
+	t.Cleanup(func() { _ = removeAllForce(root) })
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: proof\n"), 0600))
 	return root
 }
 
@@ -60,30 +60,25 @@ func TestRunInputJSONFileAndAliasPreserveNestedPayload(t *testing.T) {
 			} else {
 				args = append(args, flag, infile)
 			}
-			// This legacy tree option still binds a directory rather than the JSON
-			// payload despite the old internal Values key also being "--input".
-			args = append(args, "--input-tree", "prior="+root, "--rental-only", "--dry-run", "--json", "--full")
-			code, out := runCozy(t, root, args...)
-			var result struct {
-				Input any
-			}
-			if code != 0 || json.Unmarshal([]byte(out), &result) != nil || !reflect.DeepEqual(result.Input, expected) {
-				t.Fatalf("%s inline=%t: %d %s", flag, inline, code, out)
+			args = append(args, "--rental-only", "--json")
+			request, _, out := submitRun(t, root, fmt.Sprintf("input-%s-%t", flag, inline), args...)
+			if request == nil || !reflect.DeepEqual(any(submittedPayload(t, request)), expected) {
+				t.Fatalf("%s inline=%t: %+v %s", flag, inline, request, out)
 			}
 		}
 	}
-	code, out := runCozy(t, root, "run", "proof/input/prepare", "--input="+infile,
-		`shots:=[{"prompt":"Edited shot","seed":999}]`, "steps=8", "--rental-only", "--dry-run", "--json", "--full")
-	if code != 0 || !strings.Contains(out, `"prompt":"Edited shot"`) || !strings.Contains(out, `"seed":999`) || !strings.Contains(out, `"steps":8`) || strings.Contains(out, "First shot") {
-		t.Fatalf("nested inline override changed: %d %s", code, out)
+	request, _, out := submitRun(t, root, "input-inline-override", "run", "proof/input/prepare", "--input="+infile,
+		`shots:=[{"prompt":"Edited shot","seed":999}]`, "steps=8", "--rental-only", "--json")
+	if request == nil || !strings.Contains(string(request.Payload), `"prompt":"Edited shot"`) || !strings.Contains(string(request.Payload), `"seed":999`) ||
+		!strings.Contains(string(request.Payload), `"steps":8`) || strings.Contains(string(request.Payload), "First shot") {
+		t.Fatalf("nested inline override changed: %+v %s", request, out)
 	}
-	code, out = runCozy(t, root, "run", "proof/input/prepare", "--input="+infile,
-		"--input-tree", "prior="+filepath.Join(root, "missing"), "--rental-only", "--dry-run", "--json")
+	// The tree option still binds a directory rather than the JSON payload despite the
+	// old internal Values key also being "--input".
+	code, out := runCozy(t, root, "run", "proof/input/prepare", "--input="+infile,
+		"--input-tree", "prior="+filepath.Join(root, "missing"), "--rental-only", "--json")
 	if code == 0 || !strings.Contains(out, "--input-tree prior") || !strings.Contains(out, "not a directory") {
 		t.Fatalf("JSON input suppressed tree validation: %d %s", code, out)
-	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatal("JSON dry-run started a daemon")
 	}
 }
 

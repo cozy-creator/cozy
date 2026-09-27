@@ -113,14 +113,6 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e := jobOutputDestination(ctx, job, &sub); e != nil {
 		return e
 	}
-	if ctx.Inv.Bool("--dry-run") {
-		return emit(ctx, compactRecord([]output.Field{
-			{K: "target", V: target.Package + "/" + target.Function}, {K: "release", V: target.Release},
-			{K: "input", V: input}, {K: "models", V: models},
-			{K: "publish_to", V: ctx.Inv.Value("--publish-to")},
-			{K: "status", V: "planned"}, {K: "changed", V: false}, {K: "requested_rental", V: selectedRental},
-		}, "target", "release", "models", "publish_to", "status", "changed"))
-	}
 	c, e := dial(ctx)
 	if e != nil {
 		return e
