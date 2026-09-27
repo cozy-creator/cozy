@@ -249,6 +249,7 @@ func receiveMachineBlob(ctx context.Context, connection *machineConnection, rete
 		if _, err := io.MultiWriter(output, hash).Write(chunk.Data); err != nil {
 			return exit.Internalf("cannot write received file: %s", err)
 		}
+		connection.progress.Advance(int64(len(chunk.Data)))
 		offset += uint64(len(chunk.Data))
 	}
 	if offset != uint64(descriptor.Length) || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != descriptor.Digest {

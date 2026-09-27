@@ -102,6 +102,8 @@ type fakePod struct {
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
 	// answerOffer supplies a protocol outcome when a test exercises settlement.
 	answerOffer func(*pb.AttemptOffer) (*pb.AttemptOutcome, error)
+	// machine answers Runtime-owned machine execution observation and collection.
+	machine machineExecutionPeer
 	// onFrame lets a product test delegate selected frames to a real Runtime peer.
 	onFrame func(*pb.RecordOwnerFrame, func(*pb.WorkerFrame) error) (bool, error)
 	// preparedPlacement supplies a complete second-implementation placement for
