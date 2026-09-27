@@ -53,9 +53,14 @@ type JobPlan struct {
 	WeightsOutputs []WeightsOutput
 	// Record is the closed key set `plan.py::JobBinding.read` accepts. An unknown key is
 	// a refusal at the worker, which is what makes "closed at both ends" a fact.
-	Record              map[string]any
-	RSSCap              int64
-	NeedsAccelerator    bool
+	Record           map[string]any
+	RSSCap           int64
+	NeedsAccelerator bool
+	// AcceleratorDeclared: the job's interface names its device; capture does not reclassify it.
+	AcceleratorDeclared bool
+	// CPUSlotModelInputs: the machine's Runtime puts a device-less root holding Model inputs
+	// or weights outputs on its CPU slot (MachineExecutionWorkspace.cpu_slot_model_inputs).
+	CPUSlotModelInputs  bool
 	Orchestration       bool
 	OrchestrationParent *JobPlan
 	FrozenDirective     *pb.JobDirective

@@ -35,11 +35,14 @@ type runtimeMachine struct {
 	receipt    *pb.MachineExecutionReceipt
 	events     []*pb.MachineExecutionEvent
 	state      *pb.MachineExecutionState
+
+	// cpuSlotModelInputs is what this Runtime reports in its workspace.
+	cpuSlotModelInputs bool
 }
 
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "rented-workspace"}, nil
+		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs}, nil
 }
 
 // runtimeExecutionID is Runtime's execution identity grammar (workspace_executions.py `_ID`).

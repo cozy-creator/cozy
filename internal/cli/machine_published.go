@@ -85,7 +85,11 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 	if !request.IsJob() {
 		return orchestrator.MachineServingSubmission(request, frozen, prepared.DesiredPlacementSet, byteInputs)
 	}
-	return orchestrator.MachineJobSubmission(request, frozen, machineJobPlan(request, installed.InstallationId, job), byteInputs)
+	plan, problem := machineJobPlan(ctx, connection, request, installed.InstallationId, job)
+	if problem != nil {
+		return nil, problem
+	}
+	return orchestrator.MachineJobSubmission(request, frozen, plan, byteInputs)
 }
 
 // bindServingPlan records the binding the machine authored for the request's callable in
@@ -109,15 +113,20 @@ func (m *machineRuns) bindServingPlan(request records.Request, installationID st
 
 // Both published and synced-source jobs use the executing installation's
 // declaration. The client's SDK never supplies a competing root descriptor.
-func machineJobPlan(request records.Request, installationID string, job *launch.Entrypoint) *orchestrator.JobPlan {
+func machineJobPlan(ctx context.Context, connection *machineConnection, request records.Request, installationID string, job *launch.Entrypoint) (*orchestrator.JobPlan, *exit.Error) {
+	workspace, problem := currentExecutionWorkspace(ctx, connection)
+	if problem != nil {
+		return nil, problem
+	}
 	plan := &orchestrator.JobPlan{
 		Function: request.Entrypoint, DescriptorID: job.DescriptorID, InstallationID: installationID,
 		Outputs: launch.AssetPaths(job.Result), NeedsAccelerator: request.NeedsAccelerator,
-		RSSCap: orchestrator.DefaultJobRSSCap,
+		RSSCap: orchestrator.DefaultJobRSSCap, AcceleratorDeclared: job.Accelerator != nil,
+		CPUSlotModelInputs: workspace.CpuSlotModelInputs,
 	}
 	for _, output := range job.WeightsOutputs {
 		plan.Outputs = append(plan.Outputs, output.OutputID)
 		plan.WeightsOutputs = append(plan.WeightsOutputs, orchestrator.WeightsOutput{OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes})
 	}
-	return plan
+	return plan, nil
 }

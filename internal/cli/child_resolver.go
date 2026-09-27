@@ -9,6 +9,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
@@ -204,11 +205,31 @@ func (r *Resolver) CapturedArtifactPaths(request records.Request) ([][]string, *
 	return launch.ModelArtifactPaths(job.Result), nil
 }
 
+// composesChildren is Request.ComposesChildren for an installed request, with one exception:
+// a client script is a composition root whose captured bindings are the calls it makes, so a
+// script that writes weights still reserves capacity for its children.
+func (r *Resolver) composesChildren(request records.Request) (bool, *exit.Error) {
+	if request.InstallID == "" {
+		return false, nil
+	}
+	if request.ComposesChildren() || request.SizedByOwnModels() {
+		return request.ComposesChildren(), nil
+	}
+	_, surface, problem := r.installPackageInterface(request.InstallID)
+	if problem != nil {
+		return false, problem
+	}
+	return surface.Application == packagepublish.ScriptApplication, nil
+}
+
 // PrivateRentalNeedsAccelerator sizes the rental for its captured children while
 // keeping the parent itself on the separate CPU orchestration slot.
 func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool, *exit.Error) {
-	if request.NeedsAccelerator || request.InstallID == "" || !request.ComposesChildren() {
-		return request.NeedsAccelerator, nil
+	if request.NeedsAccelerator {
+		return true, nil
+	}
+	if composes, problem := r.composesChildren(request); problem != nil || !composes {
+		return false, problem
 	}
 	queue := []string{request.InstallID}
 	seen := map[string]bool{}
