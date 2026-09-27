@@ -32,6 +32,7 @@ type ladderHub struct {
 	server              *httptest.Server
 	mux                 *http.ServeMux
 	iface               []byte // the h3 1.0.0 release interface; nil answers not published
+	workflow            []byte // the interface publishWorkflowRelease publishes; nil is workflowInterface
 	bindings            []hub.PackageBindingRow
 	puts                [][]byte
 	deletes             [][]byte

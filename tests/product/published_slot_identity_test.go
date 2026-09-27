@@ -109,13 +109,19 @@ func TestPublishedRentalSelectsOneModelPerSlot(t *testing.T) {
 	}
 }
 
+// workflowInterface is the default workflow release: a serving `generate` and a CPU job.
+var workflowInterface = []byte(`{"application":"h3:app","entrypoints":[{"invocable":{"context":"ctx","defaults":{},"enum_members":{},"export":"generate","module":"h3","parameters":["steps"],"type_names":{}},"models":[{"class":"H3","component_use":{"condition_text":["text_encoder"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"]},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"long_form.models.source"}],"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+
 // publishWorkflowRelease replaces proof/h3@1.0.0 with a torch-free release whose serving
-// entrypoint is invocable by a CPU `long_form` job, and publishes its exact install plan
-// and the bf16 checkpoint's exact-digest resolution. `degrees` are the sequence-parallel
-// degrees its serving model slot declares.
+// entrypoint is invocable by a CPU `long_form` job (or with h.workflow's interface), and
+// publishes its exact install plan and the bf16 checkpoint's exact-digest resolution.
+// `degrees` are the sequence-parallel degrees its first serving model slot declares.
 func publishWorkflowRelease(t *testing.T, h *ladderHub, degrees ...int) {
 	t.Helper()
-	raw := []byte(`{"application":"h3:app","entrypoints":[{"invocable":{"context":"ctx","defaults":{},"enum_members":{},"export":"generate","module":"h3","parameters":["steps"],"type_names":{}},"models":[{"class":"H3","component_use":{"condition_text":["text_encoder"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"]},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"long_form.models.source"}],"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	raw := h.workflow
+	if raw == nil {
+		raw = workflowInterface
+	}
 	if len(degrees) > 0 {
 		var doc map[string]any
 		must(t, json.Unmarshal(raw, &doc))
