@@ -10,3 +10,10 @@ vectors/store/meta/
 vectors/store/verified/
 vectors/store/tmp/
 wheel-data/
+
+# Agent task and ownership notes stay out of history
+.task/
+.task-owners/
+.task-owner*.md
+.worktree-owner*.md
+.owner-agent/
