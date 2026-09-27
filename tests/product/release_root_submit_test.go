@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -414,5 +415,65 @@ func TestOlderRuntimeTakesTheCompatibilityPath(t *testing.T) {
 	_, show := runCozy(t, root, "run", "show", "2", "--json")
 	if !strings.Contains(show, "lacks release roots; used the compatibility path") || !strings.Contains(show, "cozy rental update") {
 		t.Fatalf("the run does not say it took the compatibility path: %s", show)
+	}
+}
+
+// A checkpoint named by digest alone (a lane no release names yet) reaches the machine on
+// both paths: a release root carries it as the exact choice, and an older Runtime is asked
+// to download and bind exactly that checkpoint (runs 1406/1408/1411: it was never asked).
+func TestCheckpointOverrideRunsOnBothPaths(t *testing.T) {
+	for _, older := range []bool{false, true} {
+		t.Run(map[bool]string{false: "release root", true: "compatibility"}[older], func(t *testing.T) {
+			h := newLadderHub(t)
+			h.bind(goodLadder())
+			machine := &runtimeMachine{older: older, blocker: "none"}
+			pod := &fakePod{machine: machine, deviceCount: 4}
+			root, layout := rentedLadderMachine(t, h, pod, nil)
+			if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "model.model="+ladderModel+"#"+bf16Manifest,
+				"--rental=tessa", "--json", "--idempotency-key", "checkpoint"); code != 0 {
+				t.Fatalf("the checkpoint override was refused [exit %d]: %s", code, out)
+			}
+			store, problem := records.Open(layout.DB)
+			fatal(t, problem)
+			defer store.Close()
+			var row *records.Request
+			waitFor(t, root, "the submission or a settled run", func() bool {
+				row, problem = store.RequestByIdempotencyKey("checkpoint")
+				return problem == nil && row != nil && (machine.submitted() != nil || records.Settled(row.State))
+			})
+			submission := machine.submitted()
+			if submission == nil {
+				_, show := runCozy(t, root, "run", "show", "2", "--json")
+				t.Fatalf("the checkpoint override never reached the machine: %s", show)
+			}
+			digest, err := canonical.Raw(bf16Manifest)
+			must(t, err)
+			if !older {
+				choices := submission.GetReleaseRoot().GetModels()
+				if len(choices) != 1 || choices[0].Repository != ladderModel || !bytes.Equal(choices[0].Manifest.GetDigest(), digest) {
+					t.Fatalf("the release root does not carry the exact checkpoint: %+v", choices)
+				}
+				return
+			}
+			pod.mu.Lock()
+			prepares := append([]*pb.PreparePackageSetCall(nil), pod.prepares...)
+			pod.mu.Unlock()
+			asked := false
+			for _, call := range prepares {
+				var set pb.DownloadDelegation
+				must(t, canonical.Unmarshal(call.PackageSet.DownloadDelegation, &set))
+				for _, model := range set.Models {
+					asked = asked || model.Model == ladderModel && model.Manifest == bf16Manifest && model.Slot == ladderSlot
+				}
+			}
+			if !asked {
+				t.Fatalf("the older Runtime was never asked for the checkpoint: %d preparation(s)", len(prepares))
+			}
+			machine.finish()
+			waitFor(t, root, "the checkpoint run to succeed", func() bool {
+				row, problem = store.RequestByIdempotencyKey("checkpoint")
+				return problem == nil && row.State == "succeeded"
+			})
+		})
 	}
 }
