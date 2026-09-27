@@ -92,13 +92,13 @@ func (s *session) trySend(m *pb.RecordOwnerFrame) (sent bool) {
 // with the process still alive it re-dials and RE-CLAIMS the same boot (the worker mints
 // a fresh control epoch and resends its snapshot; replay covers the durables).
 //
-// A RECORDED REFUSAL ENDS THE LOOP. The verdicts this owner reaches at claim time — a
-// foreign instance identity or an unpinned release — are facts about the THING AT THE
-// OTHER END, and redialing cannot change any of them. Left
-// running, the loop burns one of the worker's control epochs every 200 ms forever;
-// observed at 1,111 epochs against a pre-rev-2 worker while a waiter sat on a
-// readiness poll that was never going to end. The refusal is already the waiter's answer
-// (`EnsurePlacementReady` reads it first) — this stops the conversation from outliving it.
+// A RECORDED CLAIM REFUSAL ENDS THE LOOP. The verdicts this owner reaches at claim time —
+// a foreign instance identity or an unpinned release — are facts about the THING AT THE
+// OTHER END, and redialing cannot change any of them. Left running, the loop burns one of
+// the worker's control epochs every 200 ms forever; observed at 1,111 epochs against a
+// pre-rev-2 worker while a waiter sat on a readiness poll that was never going to end. A
+// refused DESIRE is not such a fact: it answers one revision, and the conversation that
+// keeps the worker's other placements serving goes on without restating it.
 func (c *Orchestrator) attach(w *worker) {
 	defer close(w.attachDone)
 	for {
@@ -122,7 +122,7 @@ func (c *Orchestrator) attach(w *worker) {
 		err := c.converse(w, addr)
 		if err != nil {
 			c.logf("worker %s: control stream ended: %s", w.instanceID, err)
-			if c.refuseUnimplemented(w, err) || c.refusePendingDesiredState(w, err) {
+			if c.refuseUnimplemented(w, err) || c.refuseDesiredRevision(w, err) {
 				return
 			}
 		}
@@ -142,7 +142,7 @@ func (c *Orchestrator) attach(w *worker) {
 // status a redial can never turn into a success: it does not say the callee failed, it
 // says the callee HAS NO SUCH CALL. Nothing about reconnecting installs one.
 //
-// This is deliberately NOT part of refusePendingDesiredState, and the difference is the
+// This is deliberately NOT part of refuseDesiredRevision, and the difference is the
 // whole defect. That function answers a PENDING desired revision, so it returns false
 // whenever `acceptedRevision >= revision` — and the lane that produced this hazard, a
 // model-source frame refused by a pod that deleted the lane (tensorhub th-124), is sent
@@ -180,35 +180,41 @@ func refusalDetail(err error) string {
 	return detail
 }
 
-// FailedPrecondition is the worker host's final answer when it could not apply the
-// desired revision. Redialing cannot make that exact revision acceptable, and hiding the
-// status behind reconnects leaves the request waiting for a state the worker rejected.
+// FailedPrecondition is the worker host's final answer on the desired revision it could
+// not apply, and it answers that revision only. The refusal is recorded where every waiter
+// on the revision reads it, the stream is redialed as usual so the worker's accepted
+// placements keep serving, and the redial does not restate the refused desire; the next
+// desire this owner issues is sent normally.
 //
-// It used to carry ONE exception (xs-007 row 5): the signed download delegation this
-// owner minted could age out while the pod was still downloading against it -- a 100 GB
-// materialization at 50 MB/s runs 33 minutes -- so every large rental download failed as
-// a credential error, and the answer was to re-issue under a freshly signed one. The
-// credential is deleted (owner ruling 2026-09-03): a download can no longer become
-// unauthorized by running long, so there is nothing left to except and every
-// FailedPrecondition is the worker's final word. Lack of PROGRESS remains the pod's own
-// verdict and arrives here as an ordinary permanent refusal, as it always did.
-func (c *Orchestrator) refusePendingDesiredState(w *worker, err error) bool {
+// It ends the conversation only when the same revision is refused again on a stream that
+// never restated it: that FailedPrecondition is about the conversation, not a desire, and
+// redialing cannot change it.
+func (c *Orchestrator) refuseDesiredRevision(w *worker, err error) (end bool) {
 	if status.Code(err) != codes.FailedPrecondition {
 		return false
 	}
+	detail := refusalDetail(err)
 	c.mu.Lock()
-	if w.revision == 0 || w.acceptedRevision >= w.revision {
+	revision := w.revision
+	if revision == 0 || w.acceptedRevision >= revision {
 		c.mu.Unlock()
 		return false
 	}
-	detail := refusalDetail(err)
+	if w.refusedRevision == revision {
+		c.mu.Unlock()
+		c.refuseClaim(w, exit.Named(exit.Structural, "worker.control_refused",
+			"the worker refused its control stream again without being sent desired revision %d: %s",
+			revision, detail).
+			WithRemedy("the worker refuses the conversation itself; its log names why"))
+		return true
+	}
+	w.refusedRevision = revision
 	w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
-		"%s (the worker refused desired revision %d before applying it)", detail, w.revision)
-	revision := w.revision
+		"%s (the worker refused desired revision %d before applying it)", detail, revision)
 	c.mu.Unlock()
-	c.logf("worker %s: desired revision %d REFUSED before it was applied: %s",
+	c.logf("worker %s: desired revision %d REFUSED before it was applied: %s; redialing without it",
 		w.instanceID, revision, detail)
-	return true
+	return false
 }
 
 // workerAddr resolves the dialable address: the remote spec's own, or the file-handoff
@@ -787,15 +793,27 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	// Native absence invalidates the existing prepared plan. Reissue its saved
 	// inputs before JOB mode so the queued retry can become dispatchable.
 	replayJob := w.spec.IsJob() && (w.spec.Connection == nil || staged(w, w.spec.Placement.Jobs[0].DescriptorID))
+	// A desire the worker refused stays refused: the redial restates nothing, and the
+	// worker keeps serving the revision it accepted.
+	refusedDesire := w.refusedRevision != 0 && w.refusedRevision == w.revision
 	c.mu.Unlock()
+	if refusedDesire {
+		c.logf("worker %s: desired revision %d stays refused; the redial restates nothing",
+			w.instanceID, restateRevision)
+	}
 	if replayJob {
 		c.signalAllTransfers()
-		_ = c.sendJobDirective(s, w, nil)
+		if !refusedDesire {
+			_ = c.sendJobDirective(s, w, nil)
+		}
 		return true
 	}
 	if w.spec.Connection != nil {
 		c.signalAllTransfers()
 		c.replayLocalAborts(s, w.spec.Connection.RentalID)
+		if refusedDesire {
+			return true
+		}
 		c.mu.Lock()
 		private := cloneLocalPackageSet(w.desiredLocal)
 		privatePlacement := cloneUnpublishedPlacementSet(w.desiredUnpublishedPlacement)
@@ -834,6 +852,9 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		return true
 	}
 	placements := []DesiredPlacement(nil)
+	if refusedDesire {
+		return true
+	}
 	if w.spec.Preparation != nil && w.spec.Placement.PlacementSetDigest == "" {
 		return true // the owner activates only the worker's completed preparation
 	}
