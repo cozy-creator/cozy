@@ -177,7 +177,7 @@ func (r *Resolver) childAccelerator(parent records.Request) (string, int, *exit.
 // capture does not mean those children are invoked or resident alongside it.
 // As with PrivateRentalNeedsAccelerator, only CPU orchestration needs the traversal.
 func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.ModelRef, *exit.Error) {
-	if request.SizedByOwnModels() || request.InstallID == "" {
+	if !request.ComposesChildren() || request.InstallID == "" {
 		return nil, nil
 	}
 	var out []records.ModelRef

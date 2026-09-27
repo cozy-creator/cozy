@@ -207,7 +207,7 @@ func (r *Resolver) CapturedArtifactPaths(request records.Request) ([][]string, *
 // PrivateRentalNeedsAccelerator sizes the rental for its captured children while
 // keeping the parent itself on the separate CPU orchestration slot.
 func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool, *exit.Error) {
-	if request.NeedsAccelerator || request.InstallID == "" {
+	if request.NeedsAccelerator || request.InstallID == "" || !request.ComposesChildren() {
 		return request.NeedsAccelerator, nil
 	}
 	queue := []string{request.InstallID}
@@ -243,9 +243,9 @@ func (r *Resolver) PrivateRentalNeedsAccelerator(request records.Request) (bool,
 			if (job.Kind != "job" && job.Kind != "entrypoint") || job.Invocable == nil || job.Invocable.Module != binding.Module || job.Invocable.Export != binding.Export {
 				return false, exit.Named(exit.Conflict, "child.export_changed", "captured child has no exact callable for rental sizing")
 			}
-			// The same immutable closure predicate JobsInstall uses; no package
-			// code needs importing again merely to choose a machine class.
-			needed = needed || launch.AcceleratorRequired(strings.Split(child.Closure, "\n"))
+			// The callable's own declaration, else the closure JobsInstall reads; no
+			// package code needs importing again merely to choose a machine class.
+			needed = needed || job.NeedsAccelerator(strings.Split(child.Closure, "\n"))
 			queue = append(queue, binding.ChildInstallID)
 		}
 	}

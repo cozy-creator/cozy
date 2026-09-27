@@ -52,6 +52,14 @@ func fleetRoot(t *testing.T, h *ladderHub, capUSD float64) string {
 // an attached one carries; `attached` gives it its worker address and certificate.
 func plantH100(t *testing.T, root string, h *ladderHub, store *records.Store, id, machine string, attached bool) records.Rental {
 	t.Helper()
+	return plantAttached(t, root, h, store, records.Rental{AcceleratorCount: 1, ID: id, MachineName: machine, SKU: "h100-80",
+		AcceleratorModel: h100SXM, HourlyRateUSDMicros: 2_490_000, State: "ready", Hub: h.server.URL}, attached)
+}
+
+// plantAttached records one ready rental of any class the fleet holds.
+func plantAttached(t *testing.T, root string, h *ladderHub, store *records.Store, row records.Rental, attached bool) records.Rental {
+	t.Helper()
+	id := row.ID
 	rentals := filepath.Join(root, "rentals")
 	must(t, os.MkdirAll(rentals, 0o700))
 	must(t, os.WriteFile(filepath.Join(rentals, id+".media-token"), []byte("media-"+id), 0o600))
@@ -66,13 +74,11 @@ func plantH100(t *testing.T, root string, h *ladderHub, store *records.Store, id
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(rentals, id+".creator.pem"),
 		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
-	row := records.Rental{AcceleratorCount: 1, ID: id, MachineName: machine, SKU: "h100-80", AcceleratorModel: h100SXM,
-		HourlyRateUSDMicros: 2_490_000, State: "ready", Hub: h.server.URL}
 	if attached {
 		row.Address, row.CertPath = "127.0.0.1:1", filepath.Join(rentals, id+".pem")
 	}
 	fatal(t, store.RecordRental(row))
-	h.addReady(id, machine, h100SXM, row.HourlyRateUSDMicros)
+	h.addReady(id, row.MachineName, row.AcceleratorModel, row.HourlyRateUSDMicros)
 	return row
 }
 

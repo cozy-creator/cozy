@@ -1042,6 +1042,15 @@ func (r Request) SizedByOwnModels() bool {
 	return len(r.OwnModels()) > 0 && (r.NeedsAccelerator || !r.IsJob())
 }
 
+// ComposesChildren says the request's own execution may host managed children that need
+// capacity of their own. A request sized by its own slots holds them itself, and a
+// weights-producing job runs on Runtime's ordinary job slot, beneath which Runtime refuses
+// every model-bearing child ("managed child cannot coexist with an ancestor on the device
+// lane", worker/machine_calls.py `_check_ancestors`).
+func (r Request) ComposesChildren() bool {
+	return !r.SizedByOwnModels() && !(r.IsJob() && r.WeightsOutputs != "" && r.WeightsOutputs != "[]")
+}
+
 // RequestRow reads one request back. Requeue re-derives its dispatch from this row and
 // from nothing a caller has to repeat.
 func (s *Store) RequestRow(id string) (*Request, *exit.Error) {

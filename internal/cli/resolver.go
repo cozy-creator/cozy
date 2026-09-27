@@ -605,7 +605,7 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		WeightsOutputs: weights, NeedsAccelerator: launch.AcceleratorRequired(requirements), Models: models,
+		WeightsOutputs: weights, NeedsAccelerator: job.NeedsAccelerator(requirements), Models: models,
 		ProducerParams: params,
 	}, job, nil
 }
@@ -619,8 +619,8 @@ func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, bool,
 	if problem != nil {
 		return nil, false, problem
 	}
-	accelerator := launch.AcceleratorRequired(strings.Split(install.Closure, "\n"))
-	if entrypoint.Kind == "job" && len(entrypoint.Models) == 0 && len(entrypoint.WeightsOutputs) == 0 {
+	accelerator := entrypoint.NeedsAccelerator(strings.Split(install.Closure, "\n"))
+	if entrypoint.Kind == "job" && entrypoint.Accelerator == nil && len(entrypoint.Models) == 0 && len(entrypoint.WeightsOutputs) == 0 {
 		parent, problem := r.store.CompositionParent(installID, name)
 		if problem != nil {
 			return nil, false, problem

@@ -68,6 +68,8 @@ type Entrypoint struct {
 	WeightsOutputs []WeightsOutput `json:"weights_outputs"`
 	Invocable      *Invocable      `json:"invocable,omitempty"`
 	Assets         *AssetsSlot     `json:"assets,omitempty"`
+	// Accelerator is a job's own execution-device declaration; nil when undeclared.
+	Accelerator *bool `json:"accelerator,omitempty"`
 }
 
 type Invocable struct {
