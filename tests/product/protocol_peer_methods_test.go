@@ -29,9 +29,15 @@ func (p *idleHoldPeer) AcknowledgeMachineExecutionCollection(ctx context.Context
 	return p.UnimplementedWorkerControlServer.AcknowledgeMachineExecutionCollection(ctx, request)
 }
 func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
+	if machine, ok := p.machine.(machineSubmitPeer); ok {
+		return machine.GetMachineExecutionWorkspace(ctx, request)
+	}
 	return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
 }
 func (p *fakePod) SubmitMachineExecution(ctx context.Context, request *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
+	if machine, ok := p.machine.(machineSubmitPeer); ok {
+		return machine.SubmitMachineExecution(ctx, request)
+	}
 	return p.UnimplementedWorkerControlServer.SubmitMachineExecution(ctx, request)
 }
 func (p *fakePod) GetMachineExecution(ctx context.Context, request *pb.MachineExecutionQuery) (*pb.MachineExecutionState, error) {
