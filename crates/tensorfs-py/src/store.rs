@@ -602,7 +602,7 @@ impl PyStore {
         self.store.root().display().to_string()
     }
 
-    /// Exact native source/converter build identity, including same-version source edits.
+    /// Informational native build fingerprint. No TensorFS identity or admission binds it.
     #[getter]
     fn implementation_sha256(&self) -> &'static str {
         tensorfs_core::IMPLEMENTATION_SHA256
