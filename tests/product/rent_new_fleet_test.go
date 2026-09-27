@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/records"
@@ -16,10 +17,9 @@ func TestRentNewCLIExcludesExistingFleetAndReplaysAcquisition(t *testing.T) {
 	plantH100(t, root, h, st, "pr-guchuko", "guchuko", true)
 	startDaemonProcess(t, root)
 	args := []string{"run", "proof/h3/generate", "steps=1", explicitFP8, "--rent-new", "--json", "--idempotency-key", "fresh-one"}
-	code, out := runCozy(t, root, args...)
-	if code != 0 {
-		t.Fatalf("fresh CLI request: %d %s", code, out)
-	}
+	// The stand-in hub fails every pod it sells, so the run may settle failed inside the
+	// CLI's observation window. The fresh acquisition and its replay are the proof.
+	runCozy(t, root, args...)
 	var row *records.Request
 	waitFor(t, root, "new acquisition instead of existing fleet reuse", func() bool {
 		row, problem = st.RequestByIdempotencyKey("fresh-one")
@@ -31,9 +31,8 @@ func TestRentNewCLIExcludesExistingFleetAndReplaysAcquisition(t *testing.T) {
 	operations, problem := st.RentalOperations()
 	fatal(t, problem)
 	count := len(operations)
-	code, out = runCozy(t, root, args...)
-	if code != 0 {
-		t.Fatalf("idempotent replay: %d %s", code, out)
+	if _, out := runCozy(t, root, args...); !strings.Contains(out, row.ID) {
+		t.Fatalf("idempotent replay did not answer run %s: %s", row.ID, out)
 	}
 	operations, problem = st.RentalOperations()
 	fatal(t, problem)

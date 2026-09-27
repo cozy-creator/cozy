@@ -94,6 +94,7 @@ func TestRuntimeUpdateMigrationFrom41PreservesRental(t *testing.T) {
 	f.store.Close()
 	db, err := sql.Open("sqlite", filepath.Join(f.layout.Root, "creator.sqlite"))
 	must(t, err)
+	revertRecordsSchema(t, db, 41)
 	_, err = db.Exec("DROP TABLE device_memory_measurements; DROP TABLE rental_idle; DROP TABLE rental_runtime_updates")
 	must(t, err)
 	_, err = db.Exec("PRAGMA user_version=41")

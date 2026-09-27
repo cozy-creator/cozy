@@ -16,7 +16,7 @@ import (
 
 type libraryChildLauncher struct{ localLauncher }
 
-func (l libraryChildLauncher) ResolveUnpublishedChild(parent records.Request, _, _, _ string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
+func (l libraryChildLauncher) ResolveUnpublishedChild(parent records.Request, _, _ string, payload []byte) (orchestrator.Submission, string, *exit.Error) {
 	return orchestrator.Submission{Kind: "job", Package: parent.Package, Entrypoint: "compute", Release: parent.Release,
 		InstallID: parent.InstallID, LocalInstallationID: parent.LocalInstallationID, PlanID: childDigest("5"), Payload: payload,
 		RetainWork: true, Worker: parent.Worker, Rental: true, RentalRequired: true}, childDigest("6"), nil
@@ -43,7 +43,7 @@ func TestLibraryConsumerRunsButCannotQueueChildBehindItself(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, o.store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: install.ID, ChildInstallID: install.ID,
 		Module: "helper", Export: "compute", Entrypoint: "compute"}}))
-	intent, err := canonical.NormalizeJCS([]byte(`{"interface_digest":"` + childDigest("b") + `","module":"helper","export":"compute","request":{}}`))
+	intent, err := canonical.NormalizeJCS([]byte(`{"module":"helper","export":"compute","request":{}}`))
 	must(t, err)
 	result := make(chan *pb.ChildCallResult, 1)
 	pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {

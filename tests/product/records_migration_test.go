@@ -95,16 +95,16 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 44 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 48 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	if columns := columnNames(t, db, "attempts"); !columns["triage_bundle"] || columns["triage_path"] {
 		t.Fatalf("attempts columns after migration = %v", columns)
 	}
-	// The request keeps the schema-15 local_package spelling, schema 17 records
+	// Schema 46 names the request's local installation, schema 17 records
 	// the machine word, schema 19 deletes the duplicate config digest, and schema 20
 	// deletes the obsolete aggregate package revision digest.
-	if columns := columnNames(t, db, "requests"); !columns["local_package_digest"] ||
+	if columns := columnNames(t, db, "requests"); !columns["local_installation_id"] || columns["local_package_digest"] ||
 		!columns["local_package_uploaded_boot_id"] || columns["private_package_digest"] ||
 		!columns["machine"] || !columns["retain_work"] || !columns["retry_of"] || !columns["reuse_scope"] ||
 		!columns["control_revision"] || columns["config_digest"] || columns["package_revision_digest"] {
@@ -131,7 +131,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 			t.Fatalf("%s columns after migration = %v", table, columns)
 		}
 	}
-	if columns := columnNames(t, db, "installs"); !columns["package_interface"] || columns["package_descriptor"] {
+	if columns := columnNames(t, db, "installs"); columns["package_interface"] || columns["package_descriptor"] {
 		t.Fatalf("installs columns after migration = %v", columns)
 	}
 	if columns := columnNames(t, db, "rentals"); !columns["failure_code"] ||
@@ -207,8 +207,9 @@ func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 		db.Close()
 		t.Fatalf("make schema-37 requests shape: %v", err)
 	}
+	revertRecordsSchema(t, db, 37)
 	if _, err := db.Exec(`DROP TRIGGER machine_execution_no_local_attempt; DROP TABLE machine_executions;
-		DROP TABLE IF EXISTS successful_work_releases; DROP TABLE device_memory_measurements; DROP TABLE rental_idle; DROP TABLE rental_runtime_updates; DROP TABLE capture_pins; PRAGMA user_version=37`); err != nil {
+		DROP TABLE IF EXISTS successful_work_releases; DROP TABLE device_memory_measurements; DROP TABLE rental_idle; DROP TABLE rental_runtime_updates; PRAGMA user_version=37`); err != nil {
 		db.Close()
 		t.Fatalf("stamp schema-37 database: %v", err)
 	}
@@ -232,7 +233,7 @@ func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 44 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 48 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	var pin string
@@ -253,7 +254,7 @@ func TestRecordsRejectsNewerSchemaWithoutResetHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`PRAGMA user_version=45`); err != nil {
+	if _, err := db.Exec(`PRAGMA user_version=49`); err != nil {
 		db.Close()
 		t.Fatalf("stamp future schema: %v", err)
 	}

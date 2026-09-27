@@ -109,7 +109,8 @@ func TestRunBoardEscExits(t *testing.T) {
 	fatal(t, problem)
 	defer store.Close()
 	startDaemonProcess(t, root)
-	for i := range 12 {
+	// More runs than a 14-row terminal pages: the live run board has no footer.
+	for i := range 20 {
 		id := fmt.Sprintf("req-board-%02d", i)
 		if _, _, problem := store.Submit(records.Request{
 			ID: id, IdemKey: "idem-" + id, BodyDigest: "sha256:" + strings.Repeat("ab", 32),

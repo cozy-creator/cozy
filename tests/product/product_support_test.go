@@ -64,7 +64,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	claimScratch(dir)
-	if scratchBase, err = os.MkdirTemp("", "cozy-product-test-"); err != nil {
+	// Short: worker control sockets live under it, and a Unix socket path is at most
+	// 107 bytes (scripts/product-tests.sh gives each process its own short TMPDIR).
+	if scratchBase, err = os.MkdirTemp("", "cozyp-"); err != nil {
 		panic(err)
 	}
 	claimScratch(scratchBase)
@@ -509,5 +511,75 @@ func revertRentalsBeforeWidth(t *testing.T, db *sql.DB) {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("cannot revert the rentals table: %v (%s)", err, statement)
 		}
+	}
+}
+
+// revertRecordsSchema puts a current records database back into the released shape of
+// an older schema for everything schemas 46 through 48 changed: fresh-rental intent (48),
+// durable rental installs (47) and installation ownership (46). Released schemas 41
+// through 45 also carried capture_pins. Callers revert anything older themselves.
+func revertRecordsSchema(t *testing.T, db *sql.DB, version int) {
+	t.Helper()
+	statements := []string{`PRAGMA foreign_keys=OFF`, `PRAGMA legacy_alter_table=ON`}
+	if version < 48 {
+		statements = append(statements, `ALTER TABLE requests DROP COLUMN rent_new`)
+	}
+	if version < 47 {
+		statements = append(statements, `DROP TABLE rental_installs`)
+	}
+	if version < 46 {
+		statements = append(statements,
+			`ALTER TABLE requests RENAME COLUMN local_installation_id TO local_package_digest`,
+			`ALTER TABLE requests RENAME COLUMN installation_id TO environment_digest`)
+		statements = append(statements, priorRecordsTable(t, db, "installs", "source_digest,lock_digest,package_interface", "'','',''",
+			"  source_ref    TEXT    NOT NULL,\n", "  source_ref    TEXT    NOT NULL,\n  source_digest TEXT    NOT NULL,\n",
+			"  uv            TEXT    NOT NULL,\n", "  uv            TEXT    NOT NULL,\n  lock_digest   TEXT    NOT NULL,\n",
+			"  closure       TEXT    NOT NULL,\n", "  closure       TEXT    NOT NULL,\n  package_interface TEXT    NOT NULL,\n")...)
+		statements = append(statements, priorRecordsTable(t, db, "private_child_bindings", "interface_digest,local_revision_digest", "'',''",
+			" module TEXT NOT NULL,", " interface_digest TEXT NOT NULL,\n module TEXT NOT NULL,",
+			" entrypoint TEXT NOT NULL,", " local_revision_digest TEXT NOT NULL,\n entrypoint TEXT NOT NULL,",
+			"PRIMARY KEY(parent_install_id,module,export)", "PRIMARY KEY(parent_install_id,interface_digest,module,export)")...)
+	}
+	if version >= 41 && version < 46 {
+		// The current schema no longer carries this table, so its released text is restated.
+		statements = append(statements, `CREATE TABLE capture_pins (
+ caller TEXT PRIMARY KEY,
+ input_digest TEXT NOT NULL,
+ install_id TEXT NOT NULL REFERENCES installs(id),
+ revision_digest TEXT NOT NULL
+)`)
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("cannot revert records to schema %d: %v (%s)", version, err, statement)
+		}
+	}
+}
+
+// priorRecordsTable rebuilds one table from its current DDL with exact released-text
+// replacements (old, new pairs), filling the columns only the released shape had.
+func priorRecordsTable(t *testing.T, db *sql.DB, table, added, values string, replacements ...string) []string {
+	t.Helper()
+	var ddl string
+	must(t, db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&ddl))
+	prior := ddl
+	for i := 0; i+1 < len(replacements); i += 2 {
+		next := strings.Replace(prior, replacements[i], replacements[i+1], 1)
+		if next == prior {
+			t.Fatalf("%s carries no %q to revert:\n%s", table, replacements[i], ddl)
+		}
+		prior = next
+	}
+	rows, err := db.Query(`SELECT * FROM ` + table + ` LIMIT 0`)
+	must(t, err)
+	columns, err := rows.Columns()
+	must(t, err)
+	must(t, rows.Close())
+	current := strings.Join(columns, ",")
+	return []string{
+		`ALTER TABLE ` + table + ` RENAME TO ` + table + `_current`,
+		prior,
+		`INSERT INTO ` + table + `(` + current + `,` + added + `) SELECT ` + current + `,` + values + ` FROM ` + table + `_current`,
+		`DROP TABLE ` + table + `_current`,
 	}
 }

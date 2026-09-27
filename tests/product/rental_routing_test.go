@@ -186,3 +186,22 @@ func rentalReleaseFacts() hub.PackageReleaseDetail {
 	detail.Release.PackageInterfaceLength = int64(len(raw))
 	return detail
 }
+
+// rentalDownloadPlan is the exact install plan behind a rentalReleaseFacts release: one
+// project wheel and no published callees. Acquisition walks it for callee capacity.
+func rentalDownloadPlan(pkg, release string) hub.PackageDownloadPlan {
+	name := pkg[strings.LastIndex(pkg, "/")+1:]
+	exact := func(raw []byte) hub.ExactDocument {
+		return hub.ExactDocument{CanonicalBytes: raw, Digest: mustSpell(raw), Length: int64(len(raw))}
+	}
+	wheel := []byte(name + " wheel")
+	return hub.PackageDownloadPlan{Release: release,
+		PackageConfig:    exact([]byte("[application]\nobject = \"proof:app\"\n")),
+		PackageInterface: exact([]byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[]}`)),
+		Pyproject:        exact([]byte("[project]\nname = \"" + name + "\"\nversion = \"" + release + "\"\nrequires-python = \">=3.12\"\ndependencies = []\n")),
+		UVLock:           exact([]byte("version = 1\nrequires-python = \">=3.12\"\n\n[[package]]\nname = \"" + name + "\"\nversion = \"" + release + "\"\nsource = { editable = \".\" }\n")),
+		Downloads: []hub.PackageInstallDownload{{Kind: "project_wheel",
+			Path:         strings.ReplaceAll(name, "-", "_") + "-" + release + "-py3-none-any.whl",
+			Distribution: name, Version: release, Digest: mustSpell(wheel), Length: int64(len(wheel)),
+			Tags: []string{"py3-none-any"}, ImportRoots: []string{"proof"}}}}
+}

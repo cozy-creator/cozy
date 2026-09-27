@@ -46,7 +46,7 @@ func activeParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T, pinned bool
 	_, problem := owner.store.Activate(install)
 	fatal(t, problem)
 	fatal(t, owner.store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: install.ID, ChildInstallID: install.ID, Module: "helper", Export: "compute", Entrypoint: "compute"}}))
-	intent, err := canonical.NormalizeJCS([]byte(`{"interface_digest":"` + childDigest("b") + `","module":"helper","export":"compute","request":{}}`))
+	intent, err := canonical.NormalizeJCS([]byte(`{"module":"helper","export":"compute","request":{}}`))
 	must(t, err)
 	var offers atomic.Int32
 	childOffers := make(chan *pb.AttemptOffer, 3)

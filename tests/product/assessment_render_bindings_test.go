@@ -99,7 +99,7 @@ func retainedRenderBindings(t *testing.T, serving, wrongModel bool) {
 		intent := assessmentJSON(t, map[string]any{"module": binding.Module, "export": binding.Export, "request": json.RawMessage(arguments)})
 		request, _, problem := st.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: assessmentDigest([]byte(id)), Kind: kind, Package: "local/render-install", Entrypoint: "render", InstallID: binding.ChildInstallID, RetainWork: true, ParentRequestID: parent.ID, ParentCallIndex: int64(i), ChildIntentDigest: assessmentDigest(intent), ChildTargetDigest: revision, Payload: payload, Models: []records.ModelRef{{Slot: "model", Manifest: checkpoint, ManifestLength: 1}}})
 		assessmentRecord(t, problem)
-		spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(payload), Inputs: []*pb.InputBinding{{InputId: "model:model", Digest: checkpoint, Length: 1}}, Spec: &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{InstallationId: revision}}})
+		spec := assessmentDocument(t, &pb.InvocationSpec{PayloadDigest: assessmentDigest(payload), Inputs: []*pb.InputBinding{{InputId: "model:model", Digest: checkpoint, Length: 1}}, Spec: &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{InstallationId: binding.ChildInstallID}}})
 		var prepared []byte
 		if serving {
 			resident := checkpoint

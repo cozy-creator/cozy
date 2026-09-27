@@ -56,9 +56,15 @@ func tableRows(t *testing.T, db *sql.DB, table string) string {
 		must(t, rows.Scan(pointers...))
 		record := map[string]any{}
 		for i, name := range columns {
-			if name != "accelerator_count" && name != "native_service_id" && name != "requested_rental" && name != "attention_kernel" {
-				record[name] = values[i]
+			switch name {
+			case "accelerator_count", "native_service_id", "requested_rental", "attention_kernel", "rent_new":
+				continue
+			case "local_package_digest": // schema 46 renamed both installation columns
+				name = "local_installation_id"
+			case "environment_digest":
+				name = "installation_id"
 			}
+			record[name] = values[i]
 		}
 		result = append(result, record)
 	}
@@ -118,7 +124,7 @@ func TestBothReleasedSchema33RentalShapesMigrateWithoutLosingWork(t *testing.T) 
 				}
 			}
 			must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-			if version != 44 {
+			if version != 48 {
 				t.Fatalf("migration version=%d", version)
 			}
 			violations, err := db.Query(`PRAGMA foreign_key_check`)

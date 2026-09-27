@@ -179,8 +179,14 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 	rentalView := map[string]any{"rental_id": podRental, "name": "manual-empty", "state": "ready", "accelerator_count": 1, "hourly_rate_usd_micros": 1}
 	// Control reattachment needs the retained identity, not a successful cloud poll.
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		// The install plan is minted by POST but buys nothing.
+		plan := r.Method == http.MethodPost && r.URL.Path == "/v1/packages/proof/idle-job/download"
+		if r.Method != http.MethodGet && !plan {
 			mutations.Add(1)
+		}
+		if classProof && plan && r.URL.Query().Get("release") == "1" {
+			_ = json.NewEncoder(w).Encode(rentalDownloadPlan("proof/idle-job", "1"))
+			return
 		}
 		if strings.HasPrefix(mode, "interrupted") && r.Method == http.MethodGet {
 			if r.URL.Path == "/v1/rentals/"+podRental {

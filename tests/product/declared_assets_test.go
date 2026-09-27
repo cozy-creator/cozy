@@ -12,6 +12,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 )
 
+// retainedAssetRef is an existing content reference; a bare JSON string is a local filename.
+const retainedAssetRef = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
 const declaredAssetsInterface = `{"application":"assets:app","format":"cozy.package.interface/1","jobs":[],"entrypoints":[{"name":"run","assets":{"parameter":"assets","kinds":[{"kind":"image","max_bytes":1024,"max_decoded_bytes":4096,"media_types":["image/png"]}]},"request":{"fields":[{"name":"prompt","type":"str"},{"name":"assets","constraints":{"min_length":1,"max_length":3},"type":{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"},{"name":"fidelity","type":{"literal":["auto","high","low","medium"]},"wire":"optional"}]}}},{"name":"poster","type":{"asset":"image"},"asset_bound":{"max_bytes":1024,"media_types":["image/png"]},"wire":"optional"}]},"result":{"fields":[]}}]}`
 
 func assetsCallable(t *testing.T) *launch.Entrypoint {
@@ -105,10 +108,10 @@ func TestDeclaredAssetsDefaultEmptyCollection(t *testing.T) {
 	// A zero-reference callable uses the same payload builder and schema owner.
 	ep.Request.Fields[1].Constraints.MinLength = nil
 	fatal(t, launch.ValidatePayload("proof/assets", ep, payload))
-	explicit := []byte(`{"prompt":"text only","assets":[{"asset":"retained","label":"last"}]}`)
+	explicit := []byte(`{"prompt":"text only","assets":[{"asset":"` + retainedAssetRef + `","label":"last"}]}`)
 	payload, bindings, problem = launch.ParseAssets(ep, explicit, nil, nil, nil)
 	fatal(t, problem)
-	if len(bindings) != 0 || !strings.Contains(string(payload), `"asset":"retained","label":"last"`) {
+	if len(bindings) != 0 || !strings.Contains(string(payload), `"asset":"`+retainedAssetRef+`","label":"last"`) {
 		t.Fatalf("explicit collection was replaced: %s %+v", payload, bindings)
 	}
 	if _, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"text only","assets":null}`), nil, nil, nil); problem == nil {
@@ -177,7 +180,7 @@ func TestDeclaredAssetsCountsAndFidelity(t *testing.T) {
 		}
 	}
 	// Exact labels win, including numeric labels; the final '=' belongs to the hint.
-	payload, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"same","assets":[{"asset":"retained","label":"名=字"},{"asset":"retained","label":"0"}]}`), nil, []string{"名=字=medium", "0=low"}, nil)
+	payload, _, problem = launch.ParseAssets(ep, []byte(`{"prompt":"same","assets":[{"asset":"`+retainedAssetRef+`","label":"名=字"},{"asset":"`+retainedAssetRef+`","label":"0"}]}`), nil, []string{"名=字=medium", "0=low"}, nil)
 	fatal(t, problem)
 	var document struct {
 		Assets []struct{ Label, Fidelity string }

@@ -29,7 +29,7 @@ const scratchOwnerFile = ".cozy-scratch-owner"
 // scratchPrefixes are the temp-root families this suite creates. A root outside
 // them is somebody else's and is never touched.
 var scratchPrefixes = []string{
-	"cozy-product-test", "cozy-product-", "cozy-native-serving-",
+	"cozy-product-test", "cozy-product-", "cozyp-", "cozy-native-serving-",
 	"cozy-serving-preparation-", "cozy-native-memo-", "cozy-schema-",
 	"cozy-progress-", "cozy-child-media-", "cozy-image-preparation-",
 	"cozy-composition-", "cozy-assets-", "cozy-byte-result-", "cozy-calls-",
