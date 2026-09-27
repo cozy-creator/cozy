@@ -99,7 +99,7 @@ func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot
 	defer cancel()
 	count := 0
 	for _, model := range request.Models {
-		if model.Package == pkg && (model.BindingPath == slot.Path || model.Slot == entrypoint+"/"+slot.Param || model.Slot == slot.Path) {
+		if model.Package == pkg && model.BindingSlot() == slot.Path {
 			count = model.GPUs
 			break
 		}

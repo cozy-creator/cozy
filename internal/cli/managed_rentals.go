@@ -246,17 +246,20 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		return none, "", problem
 	}
 	// CPU orchestration requests need their captured defaults to narrow the rental
-	// choice (cl-210). Accelerator-owning requests retain only their own model slots;
-	// unrelated captures must not inflate their residency or preparation selection.
-	childModels, problem := resolver.UnpublishedChildModels(req)
+	// choice (cl-210). A request sized by its own model slots retains only those;
+	// unrelated captures must not inflate its residency or preparation selection. Its
+	// own selection is made once and supersedes any callee default for the same slot.
+	var childModels []records.ModelRef
 	if req.InstallID == "" {
 		childModels, problem = resolver.PublishedChildModels(m.ctx, req)
+	} else {
+		childModels, problem = resolver.UnpublishedChildModels(req)
 	}
 	if problem != nil {
 		return none, "", problem
 	}
-	req.Models = append(append([]records.ModelRef(nil), req.Models...), childModels...)
-	needsAccelerator = needsAccelerator || len(childModels) > 0
+	req.Models = records.OneSelectionPerSlot(req.Models, childModels)
+	needsAccelerator = needsAccelerator || req.SizedByOwnModels() || len(childModels) > 0
 	if problem := m.reconcileLocked(); problem != nil {
 		return none, "", problem
 	}

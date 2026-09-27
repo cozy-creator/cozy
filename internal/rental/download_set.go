@@ -1,6 +1,7 @@
 package rental
 
 import (
+	"slices"
 	"sort"
 	"strings"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // DownloadSet authors the DESIRED DOWNLOAD SET for one logical package/model selection:
@@ -53,10 +55,10 @@ func DownloadSet(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRe
 		selectedPackages[row.Package] = true
 		prior = key
 	}
-	prior = ""
+	var kept *pb.DownloadModelRef
+	unique := models[:0]
 	modelOnlyPackage := ""
 	for _, row := range models {
-		key := modelKey(row)
 		_, digestErr := canonical.Raw(row.GetManifest())
 		standalone := len(packages) == 0 && row.GetPackage() == "" && row.GetSlot() == ""
 		packageSelected := standalone || selectedPackages[row.GetPackage()]
@@ -73,12 +75,26 @@ func DownloadSet(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRe
 			strings.TrimSpace(row.Package) != row.Package || !packageSelected ||
 			strings.TrimSpace(row.Slot) != row.Slot || row.Slot == "" && !standalone ||
 			strings.TrimSpace(row.Lane) != row.Lane || (row.Release == "") != (row.Lane == "") ||
-			digestErr != nil || key <= prior {
+			digestErr != nil {
 			return nil, exit.Named(exit.Validation, "rental.download_set_model_invalid",
-				"download models need unique exact manifests and a release/lane pair or neither")
+				"download models need exact manifests and a release/lane pair or neither")
 		}
-		prior = key
+		// Rows sort by package and slot, so one slot's rows are adjacent. The same bytes
+		// selected twice for a slot are one selection; different bytes are a conflict.
+		if kept != nil && kept.Package == row.Package && kept.Slot == row.Slot &&
+			(row.Slot != "" || modelKey(kept) == modelKey(row)) {
+			if kept.Manifest == row.Manifest && sameAdapters(kept.Adapters, row.Adapters) {
+				continue
+			}
+			return nil, exit.Named(exit.Conflict, "rental.download_set_slot_conflict",
+				"%s slot %s is selected as both %s and %s; one slot binds one model",
+				row.Package, row.Slot, selectionText(kept), selectionText(row)).
+				WithRemedy("select one model for the slot, then run again")
+		}
+		kept = row
+		unique = append(unique, row)
 	}
+	models = unique
 	document, err := canonical.Bytes(&pb.DownloadDelegation{Models: models, Packages: packages})
 	if err != nil {
 		return nil, exit.Internalf("cannot author the download set: %s", err)
@@ -92,6 +108,17 @@ func modelKey(row *pb.DownloadModelRef) string {
 	}
 	return row.Package + "\x00" + row.Slot + "\x00" + row.Model + "\x00" +
 		row.Release + "\x00" + row.Manifest
+}
+
+func sameAdapters(a, b []*pb.DownloadAdapterRef) bool {
+	return slices.EqualFunc(a, b, func(x, y *pb.DownloadAdapterRef) bool { return proto.Equal(x, y) })
+}
+
+func selectionText(row *pb.DownloadModelRef) string {
+	if row.Release == "" {
+		return row.Model + "@" + row.Manifest
+	}
+	return row.Model + "@" + row.Release + "/" + row.Lane
 }
 
 func PackageSetSource() orchestrator.RentalPackageSetSource {

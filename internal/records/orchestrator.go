@@ -658,6 +658,36 @@ func SameAdapters(a, b []ModelAdapterRef) bool {
 	return true
 }
 
+// BindingSlot is the slot's one identity: its package interface model path. A job keeps
+// Slot as the bare invocation parameter and carries the path beside it.
+func (m ModelRef) BindingSlot() string {
+	if m.BindingPath != "" {
+		return m.BindingPath
+	}
+	return m.Slot
+}
+
+// OneSelectionPerSlot joins selections in precedence order and keeps the first for each
+// package slot, counting the slots a selection shares. The request's own selection, made
+// once as an explicit override or its resolved default, therefore supersedes a callee
+// default for the same slot, and a repeated contribution adds nothing.
+func OneSelectionPerSlot(groups ...[]ModelRef) []ModelRef {
+	var out []ModelRef
+	held := map[string]bool{}
+	for _, models := range groups {
+		for _, model := range models {
+			if held[model.Package+"\x00"+model.BindingSlot()] {
+				continue
+			}
+			for _, slot := range append([]string{model.BindingSlot()}, model.SharedSlots...) {
+				held[model.Package+"\x00"+slot] = true
+			}
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
 // ModelRung is one GPU class, execution group and lane resolved against the model card.
 type ModelRung struct {
 	GPUs           int              `json:"gpus,omitempty"`
@@ -882,7 +912,7 @@ func Lanes(models []ModelRef) string {
 	}
 	parts := make([]string, 0, len(models))
 	for _, model := range models {
-		parts = append(parts, model.Slot+"="+model.Lane)
+		parts = append(parts, model.BindingSlot()+"="+model.Lane)
 	}
 	return strings.Join(parts, ",")
 }
@@ -932,6 +962,27 @@ func scanNumberedRequest(row interface{ Scan(...any) error }) (Request, error) {
 // IsJob answers the attempt class. The default spelling is `serving` so a row written
 // before the column existed reads as what it was.
 func (r Request) IsJob() bool { return r.Kind == "job" }
+
+// OwnModels are this caller's model inputs. Captured defaults can belong to imported
+// callees; they remain on the request for child resolution but are not its inputs.
+// Missing package attribution is not proof that an input belongs elsewhere.
+func (r Request) OwnModels() []ModelRef {
+	var models []ModelRef
+	for _, model := range r.Models {
+		if model.Package == "" || model.Package == r.Package {
+			models = append(models, model)
+		}
+	}
+	return models
+}
+
+// SizedByOwnModels says the request's own execution holds its model slots on a device, so
+// its rental is chosen for them and never for its callees' defaults: a serving callable
+// constructs its slots, and a job's Model inputs are derive-only unless its package itself
+// needs an accelerator.
+func (r Request) SizedByOwnModels() bool {
+	return len(r.OwnModels()) > 0 && (r.NeedsAccelerator || !r.IsJob())
+}
 
 // RequestRow reads one request back. Requeue re-derives its dispatch from this row and
 // from nothing a caller has to repeat.

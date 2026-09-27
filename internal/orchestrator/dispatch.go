@@ -1174,10 +1174,10 @@ func selectionServes(requested, held []ModelRef) bool {
 	}
 	holds := make(map[string]ModelRef, len(held))
 	for _, m := range held {
-		holds[modelBindingSlot(m)] = m
+		holds[m.BindingSlot()] = m
 	}
 	for _, m := range requested {
-		current, ok := holds[modelBindingSlot(m)]
+		current, ok := holds[m.BindingSlot()]
 		if !ok {
 			if len(m.Adapters) > 0 {
 				return false
@@ -1218,13 +1218,6 @@ func requireAdapterPlacementEcho(requested []ModelRef, placement DesiredPlacemen
 	return exit.Named(exit.Structural, "model_adapters_preparation_mismatch", "prepared model binding identity is absent")
 }
 
-func modelBindingSlot(model ModelRef) string {
-	if model.BindingPath != "" {
-		return model.BindingPath
-	}
-	return model.Slot
-}
-
 // rungHolding answers whether a held manifest is one the request's ref accepts: its own
 // pin, or — unpinned — any rung of its ladder (cl-166). The rung is what a dispatch onto
 // that placement pins the request to.
@@ -1245,11 +1238,11 @@ func rungHolding(m ModelRef, manifest string) (records.ModelRung, bool) {
 func pinToPlacement(requested, held []ModelRef) []ModelRef {
 	holds := make(map[string]string, len(held))
 	for _, m := range held {
-		holds[m.Slot] = m.Manifest
+		holds[m.BindingSlot()] = m.Manifest
 	}
 	var out []ModelRef
 	for i, m := range requested {
-		manifest, ok := holds[m.Slot]
+		manifest, ok := holds[m.BindingSlot()]
 		if m.Pinned() || !ok {
 			continue
 		}
@@ -2050,14 +2043,10 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 		if !model.Downloadable() {
 			continue
 		}
-		path := model.Slot
-		if model.BindingPath != "" {
-			path = model.BindingPath
-		}
 		// ONE PLACEMENT PER CONSTRUCTION (h3a-018): the selection rides under every slot
 		// that shares its bytes, so the pod binds each of those entrypoints in the one
 		// placement it prepares.
-		for _, slot := range append([]string{path}, model.SharedSlots...) {
+		for _, slot := range append([]string{model.BindingSlot()}, model.SharedSlots...) {
 			out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: slot,
 				Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, Adapters: downloadAdapters(model.Adapters)})
 		}

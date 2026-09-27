@@ -9,11 +9,13 @@ import (
 
 // PublishedChildModels uses the same exact lock and callable metadata as capture.
 // A CPU workflow needs capacity for its children; their group counts are combined
-// by placement's maximum, since each child reserves its own execution group.
+// by placement's maximum, since each child reserves its own execution group. The
+// request's own callable is never its own child: its slots are already selected.
 func (r *Resolver) PublishedChildModels(command *Context, request records.Request) ([]records.ModelRef, *exit.Error) {
-	if request.NeedsAccelerator && len(request.Models) > 0 {
+	if request.SizedByOwnModels() {
 		return nil, nil
 	}
+	root := request.Package + "@" + request.Release
 	ctx, cancel := hub.Context()
 	defer cancel()
 	seen, visiting := map[string]bool{}, map[string]bool{}
@@ -34,7 +36,7 @@ func (r *Resolver) PublishedChildModels(command *Context, request records.Reques
 			return problem
 		}
 		for _, entry := range iface.Entrypoints {
-			if entry.Invocable == nil || entry.Internal && key != request.Package+"@"+request.Release {
+			if entry.Invocable == nil || entry.Internal && key != root || key == root && entry.Name == request.Entrypoint {
 				continue
 			}
 			for _, slot := range entry.Models {
@@ -42,7 +44,7 @@ func (r *Resolver) PublishedChildModels(command *Context, request records.Reques
 				if problem != nil {
 					continue
 				} // Unused or explicitly overridden defaults stay optional.
-				model.Slot = entry.Name + "/" + slot.Param
+				model.Slot = slot.Path
 				model.Callable = selected.Package + "/" + entry.Name
 				models = append(models, model)
 			}

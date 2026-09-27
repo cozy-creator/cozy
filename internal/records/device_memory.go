@@ -104,14 +104,10 @@ func exactModelsDigest(models []ModelRef) string {
 			}
 			adapters[i].Bytes = 0
 		}
-		slot := model.BindingPath
-		if slot == "" {
-			slot = model.Slot
-		}
 		rows = append(rows, measurementDigest(struct {
 			Package, Slot, Model, Release, Lane, Manifest string
 			Adapters                                      []ModelAdapterRef
-		}{model.Package, slot, model.Model, model.Release, model.Lane, model.Manifest, adapters}))
+		}{model.Package, model.BindingSlot(), model.Model, model.Release, model.Lane, model.Manifest, adapters}))
 	}
 	slices.Sort(rows)
 	return measurementDigest(rows)
@@ -136,11 +132,7 @@ func exactMemoryRequest(req Request) string {
 func ModelsDigest(models []ModelRef) string {
 	rows := make([]string, 0, len(models))
 	for _, model := range models {
-		slot := model.BindingPath
-		if slot == "" {
-			slot = model.Slot
-		}
-		row := []string{slot, model.Model, model.Release, model.Lane}
+		row := []string{model.BindingSlot(), model.Model, model.Release, model.Lane}
 		for _, adapter := range model.Adapters {
 			row = append(row, adapter.Component, adapter.Model, adapter.Release, adapter.Lane, adapter.Scale)
 		}
