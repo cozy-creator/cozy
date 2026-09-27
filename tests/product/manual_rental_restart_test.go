@@ -225,7 +225,7 @@ func proveIdleManualRentalRestart(t *testing.T, mode string) {
 				skus := offeredSKUs()
 				for i := range skus {
 					if skus[i].AcceleratorModel != "CPU" {
-						skus[i].ComputeCapability, skus[i].VRAMGB, skus[i].MinimumRAMPerGPUGB = "8.9", 24, 64
+						skus[i].ComputeCapability, skus[i].VRAMGB = "8.9", 24
 					}
 				}
 				_ = json.NewEncoder(w).Encode(hubapi.RentalProducts(skus))

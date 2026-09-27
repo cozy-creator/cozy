@@ -372,7 +372,6 @@ type RentalSKU struct {
 	BaseWorkerProfile         string                  `json:"base_worker_profile"`
 	ComputeCapability         string                  `json:"compute_capability"`
 	VRAMGB                    int64                   `json:"vram_gb"`
-	MinimumRAMPerGPUGB        int64                   `json:"minimum_ram_per_gpu_gb"`
 	// PriceUSDMicrosPerHour is the per-machine GPU list rate at this count — the unit the
 	// hub's offer matching and replan cap run on, and the accepted quote this client locks.
 	PriceUSDMicrosPerHour int64 `json:"price_usd_micros_per_hour"`
@@ -393,7 +392,6 @@ type RentalProduct struct {
 	BaseWorkerProfile         string                  `json:"base_worker_profile"`
 	ComputeCapability         string                  `json:"compute_capability"`
 	VRAMGB                    int64                   `json:"vram_gb"`
-	MinimumRAMPerGPUGB        int64                   `json:"minimum_ram_per_gpu_gb"`
 	Widths                    []RentalWidth           `json:"widths"`
 }
 
@@ -411,7 +409,7 @@ func (p RentalProduct) Machines() []RentalSKU {
 		out = append(out, RentalSKU{Name: p.Name, AcceleratorModel: p.AcceleratorModel,
 			AcceleratorCount: width.AcceleratorCount, PythonProvisionableMinors: p.PythonProvisionableMinors,
 			PythonInterpreters: p.PythonInterpreters, BaseWorkerProfile: p.BaseWorkerProfile,
-			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB, MinimumRAMPerGPUGB: p.MinimumRAMPerGPUGB,
+			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB,
 			PriceUSDMicrosPerHour: width.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: width.StorageUSDMicrosPerHour})
 	}
 	return out
@@ -430,7 +428,7 @@ func RentalProducts(skus []RentalSKU) []RentalProduct {
 			out = append(out, RentalProduct{Name: sku.Name, AcceleratorModel: sku.AcceleratorModel,
 				PythonProvisionableMinors: sku.PythonProvisionableMinors, PythonInterpreters: sku.PythonInterpreters,
 				BaseWorkerProfile: sku.BaseWorkerProfile, ComputeCapability: sku.ComputeCapability,
-				VRAMGB: sku.VRAMGB, MinimumRAMPerGPUGB: sku.MinimumRAMPerGPUGB})
+				VRAMGB: sku.VRAMGB})
 		}
 		out[i].Widths = append(out[i].Widths, RentalWidth{AcceleratorCount: sku.AcceleratorCount,
 			PriceUSDMicrosPerHour: sku.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: sku.StorageUSDMicrosPerHour})
