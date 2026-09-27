@@ -348,21 +348,22 @@ fn the_journal_restores_what_was_durable_and_a_stale_one_is_discarded_whole() {
     );
 
     // A journal written under a different plan is not partially adopted, migrated or
-    // reconciled. It is refused, and the run that presented it converts from scratch.
-    let stale = tfs(&[
-        "repo-cache",
-        "resume",
-        fresh.to_str().unwrap(),
-        &converted.chain,
-        &converted.chain_length.to_string(),
-        "--plan",
-        &format!("sha256:{}", "ab".repeat(32)),
-    ]);
-    assert!(!stale.status.success());
-    let refusal = String::from_utf8_lossy(&stale.stderr);
+    // reconciled. It is discarded whole, restores nothing, and the run converts afresh.
+    let stale = ok(
+        "repo-cache resume (stale plan)",
+        &tfs(&[
+            "repo-cache",
+            "resume",
+            fresh.to_str().unwrap(),
+            &converted.chain,
+            &converted.chain_length.to_string(),
+            "--plan",
+            &format!("sha256:{}", "ab".repeat(32)),
+        ]),
+    );
     assert!(
-        refusal.contains("JOURNAL_STALE"),
-        "a journal from another plan was not refused as stale:\n{refusal}"
+        stale.contains("DISCARDED JOURNAL_STALE"),
+        "a journal from another plan was not discarded as stale:\n{stale}"
     );
 
     // THE INTERMEDIATE LINK IS A REAL RESUME POINT, and this is where that is proved. The

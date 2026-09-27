@@ -289,6 +289,23 @@ pub fn local_chain(store: &Store, head: &ObjectRef, plan: &str) -> Result<Set> {
     fold(&links, plan)
 }
 
+/// A supplied chain this conversion can continue, or `None` when it was written under another
+/// plan or slot or is no longer whole in this Store. Such a chain is discarded and the work
+/// reconverts into a new chain: losing a checkpoint costs time, never a refusal.
+pub fn continuable(
+    store: &Store,
+    head: &ObjectRef,
+    plan: &str,
+    chain: &str,
+) -> Result<Option<Set>> {
+    match local_chain(store, head, plan) {
+        Ok(set) if set.operation == chain => Ok(Some(set)),
+        Ok(_) => Ok(None),
+        Err(error) if error.code == Code::IO_FAILED => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Export locally complete progress. This does not assert remote durability: the RecordOwner
 /// publishes the bounded chain and advances its durable pointer only after upload acceptance.
 /// NFS is not consulted and cannot delay this checkpoint.

@@ -1378,12 +1378,17 @@ fn prepare_model_source_with_budget(
                     code: Code::DURABILITY_UNPROVEN,
                     detail: "completed source has no local checkpoint cursor".into(),
                 })?;
-                let supplied = request
+                let mut supplied = request
                     .checkpoints
                     .iter()
                     .filter(|_| request.adopt_from_operation_id.is_none())
                     .find(|(slot, _)| slot == &requested.slot)
                     .map(|(_, head)| head);
+                if let Some(head) = supplied {
+                    if durability::continuable(store, head, &plan_digest, &chain)?.is_none() {
+                        supplied = None;
+                    }
+                }
                 let head = durability::checkpoint_predecessor(
                     store,
                     &durability::Policy {
@@ -1473,14 +1478,15 @@ fn prepare_model_source_with_budget(
                 None
             };
         }
-        if let Some(head) = &previous {
-            let held = durability::local_chain(store, head, &plan_digest)?;
-            if held.operation != chain {
-                return refuse(
-                    Code::CROSS_SUBJECT_REPLAY,
-                    "checkpoint belongs to another operation slot",
-                );
-            }
+        let held = match &previous {
+            Some(head) => durability::continuable(store, head, &plan_digest, &chain)?,
+            None => None,
+        };
+        if held.is_none() {
+            previous = None;
+        }
+        discard_other_plans(store, &dir, &chain, &plan_hex)?;
+        if let (Some(head), Some(held)) = (&previous, held) {
             durability::retain_local_chain(store, head, &request.operation_id)?;
             if journal.is_empty() {
                 if let Some(progress) = held.progress.last() {
@@ -1625,17 +1631,15 @@ fn adopt_source_checkpoint(
         }
 
         let plan = format!("sha256:{plan_hex}");
-        let held = durability::local_chain(store, head, &plan)?;
         let slot = chain
             .strip_prefix(&format!("{operation}/"))
             .expect("source slot chain");
-        if held.operation != format!("{prior}/{slot}") {
-            return refuse(
-                Code::CROSS_SUBJECT_REPLAY,
-                "adopted checkpoint belongs to another operation slot",
-            );
-        }
-        if journal.is_empty() {
+        let Some(held) = durability::continuable(store, head, &plan, &format!("{prior}/{slot}"))?
+        else {
+            return Ok(durability::Head::default());
+        };
+        let installed = journal.is_empty();
+        if installed {
             let progress = held.progress.last().ok_or_else(|| Refusal {
                 code: Code::DURABILITY_UNPROVEN,
                 detail: "source checkpoint has no conversion progress".into(),
@@ -1647,8 +1651,9 @@ fn adopt_source_checkpoint(
         // GC already discovers every part through this operation's installed journal.
         // Keep only checkpoint documents in the small session root; duplicating the
         // complete tensor roster there exceeds its independent metadata bound.
-        // checkpoint verifies every part before returning the new head.
-        durability::checkpoint(
+        // checkpoint verifies every part before returning the new head. A part that did not
+        // survive leaves no head to adopt; the journal's own law reconverts it.
+        match durability::checkpoint(
             store,
             &durability::Policy {
                 chain,
@@ -1658,10 +1663,52 @@ fn adopt_source_checkpoint(
             },
             None,
             journal,
-        )
+        ) {
+            Err(error) if error.code != Code::IO_FAILED => {
+                // Nothing of a chain that did not survive is kept, not even its journal.
+                if installed {
+                    super::journal::discard(dir, plan_hex)?;
+                    *journal = super::journal::Journal::open(dir, plan_hex)?;
+                }
+                Ok(durability::Head::default())
+            }
+            result => result,
+        }
     })();
     let released = hold.release(&meta);
     result.and_then(|head| released.map(|()| head))
+}
+
+/// Drop this slot's journals and cursors written under any other plan. They can never be
+/// continued, and keeping them would hold their bytes and leave two cursors for one slot.
+fn discard_other_plans(store: &Store, dir: &Path, chain: &str, plan_hex: &str) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(other) = name
+            .strip_prefix("convert-")
+            .and_then(|rest| rest.strip_suffix(".head.json"))
+        else {
+            continue;
+        };
+        if other == plan_hex {
+            continue;
+        }
+        let head = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| canon::parse(&bytes, crate::limits::SPEC_MAX_BYTES).ok())
+            .and_then(|value| ObjectRef::from_value("source progress head", &value).ok());
+        let slot_of_other = head
+            .and_then(|head| durability::local_link(store, &head).ok())
+            .map(|link| link.operation);
+        if slot_of_other.as_deref() != Some(chain) {
+            continue;
+        }
+        super::journal::discard(dir, other)?;
+    }
+    Ok(())
 }
 
 pub fn release_model_source(store: &Store, operation_id: &str) -> Result<()> {
@@ -1690,7 +1737,8 @@ pub fn source_checkpoints(store: &Store, operation: &str) -> Result<Vec<SourceCh
         return refuse(Code::ROOT_ABSENT, "source operation is not retained");
     }
     let dir = transaction::candidate_dir(store.root(), operation);
-    let mut checkpoints = BTreeMap::new();
+    let mut checkpoints: BTreeMap<String, (std::time::SystemTime, SourceCheckpoint)> =
+        BTreeMap::new();
     for entry in fs::read_dir(&dir).map_err(|e| Refusal {
         code: Code::IO_FAILED,
         detail: format!("source progress directory: {e}"),
@@ -1734,26 +1782,37 @@ pub fn source_checkpoints(store: &Store, operation: &str) -> Result<Vec<SourceCh
             );
         };
         ascii_name("source progress slot", slot, crate::limits::MAX_NAME_BYTES)?;
-        if checkpoints.contains_key(slot) {
-            return refuse(
-                Code::TRANSACTION_CONFLICT,
-                "source slot has multiple durable plans",
-            );
+        // A slot re-planned since (a changed converter or registry) keeps its newest cursor;
+        // the next preparation discards the others.
+        let written = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if checkpoints
+            .get(slot)
+            .is_some_and(|(newer, _)| *newer >= written)
+        {
+            continue;
         }
         checkpoints.insert(
             slot.to_string(),
-            SourceCheckpoint {
-                slot: slot.to_string(),
-                plan_digest,
-                head: durability::Head {
-                    head: Some(head),
-                    links: chain.links,
-                    bytes: chain.bytes,
+            (
+                written,
+                SourceCheckpoint {
+                    slot: slot.to_string(),
+                    plan_digest,
+                    head: durability::Head {
+                        head: Some(head),
+                        links: chain.links,
+                        bytes: chain.bytes,
+                    },
                 },
-            },
+            ),
         );
     }
-    Ok(checkpoints.into_values().collect())
+    Ok(checkpoints
+        .into_values()
+        .map(|(_, checkpoint)| checkpoint)
+        .collect())
 }
 
 /// Export only already-fsynced conversion groups from a stopped exact source writer.
@@ -2369,13 +2428,12 @@ mod tests {
         for row in &request.roster {
             fs::remove_file(&row.path).unwrap();
         }
-        assert_eq!(
+        // Another request's heads are not this operation's: discarded, never adopted.
+        let ordinary =
             prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
-                .unwrap_err()
-                .code,
-            Code::CROSS_SUBJECT_REPLAY,
-            "ordinary resume cannot silently adopt another request"
-        );
+                .unwrap();
+        assert_eq!(ordinary.resumed_roles, 0);
+        assert!(!ordinary.complete);
         retry.adopt_from_operation_id = Some(request.operation_id.clone());
         let adopted =
             prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
@@ -2466,7 +2524,7 @@ mod tests {
     }
 
     #[test]
-    fn source_adoption_refuses_changed_identity_and_missing_payload() {
+    fn source_adoption_discards_what_it_cannot_continue_and_refuses_foreign_authority() {
         for arm in ["selection", "carrier", "operation", "slot", "missing"] {
             let root = temporary(&format!("source-adoption-{arm}"));
             let (store, registry, request) = fixture_sized(&root, false, Some(1024));
@@ -2507,19 +2565,21 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let error =
-                prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
-                    .unwrap_err();
-            assert!(
-                matches!(
-                    error.code,
-                    Code::CROSS_SUBJECT_REPLAY
-                        | Code::OBJECT_ABSENT
-                        | Code::IO_FAILED
-                        | Code::JOURNAL_STALE
-                ) || (arm == "operation" && error.code == Code::ROOT_ABSENT),
-                "{arm}: {error:?}"
-            );
+            let result =
+                prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry);
+            match arm {
+                // Another operation's bytes are never adoption authority.
+                "operation" => assert_eq!(result.unwrap_err().code, Code::ROOT_ABSENT),
+                // A stale or damaged predecessor chain is dropped; the missing work waits
+                // for its carriers instead of refusing.
+                _ => {
+                    let prepared = result.unwrap_or_else(|error| panic!("{arm}: {error:?}"));
+                    assert!(!prepared.complete, "{arm}");
+                    if arm != "missing" {
+                        assert_eq!(prepared.resumed_roles, 0, "{arm}");
+                    }
+                }
+            }
             assert!(Catalog::open(store.root())
                 .unwrap()
                 .model_source_operations()
@@ -3524,7 +3584,8 @@ mod tests {
                 next_request.landed.push(row.member.clone());
             }
         }
-        // A changed immutable source cannot reuse the old journal even with equal headers.
+        // A changed immutable source cannot reuse the old journal even with equal headers:
+        // the supplied chain is discarded and nothing is resumed from it.
         let mut changed = next_request.clone();
         changed.operation_id = "changed-plan".into();
         changed
@@ -3533,17 +3594,14 @@ mod tests {
             .find(|row| row.member == first_member)
             .unwrap()
             .object_id = format!("sha256:{}", "55".repeat(32));
-        assert_eq!(
-            prepare_model_source_with_registry(
-                &replacement,
-                &changed,
-                "fixture:registry",
-                &registry_bytes,
-            )
-            .unwrap_err()
-            .code,
-            Code::JOURNAL_STALE
-        );
+        let reconverted = prepare_model_source_with_registry(
+            &replacement,
+            &changed,
+            "fixture:registry",
+            &registry_bytes,
+        )
+        .unwrap();
+        assert_eq!(reconverted.resumed_roles, 0);
         release_model_source(&replacement, &changed.operation_id).unwrap();
         let corrupt_store = Store::init(&root.join("corrupt-replacement")).unwrap();
         for object in &delivered {
