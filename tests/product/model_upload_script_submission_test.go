@@ -36,7 +36,7 @@ var ingestTensorFSFindLinks = flag.String("ingest-tensorfs-find-links", "",
 // civitaiIngestScript is the one bounded-disk upload call a rented Civitai ingest submits.
 const civitaiIngestScript = `# /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime>=0.18.49,<1", "tensorfs>=0.3.60,<0.4"]
+# dependencies = ["cozy-runtime>=0.18.51,<1", "tensorfs>=0.3.60,<0.4"]
 # ///
 from cozy_runtime.author.sources import upload_civitai, upload_huggingface
 
@@ -169,7 +169,7 @@ func TestRentedCivitaiIngestSubmitsTheSingleCallScript(t *testing.T) {
 	}
 	hub.mu.Lock()
 	hub.inventories = map[string]json.RawMessage{podRental: json.RawMessage(`{"format":"tensorhub.image_inventory/1",` +
-		`"profile":"python3.12-cpu-linux-x86","python":"3.12.12","distributions":[{"name":"` + runtimeDistribution + `","version":"0.18.49"}]}`)}
+		`"profile":"python3.12-cpu-linux-x86","python":"3.12.12","distributions":[{"name":"` + runtimeDistribution + `","version":"0.18.51"}]}`)}
 	hub.mu.Unlock()
 	served := hub.server.Config.Handler
 	hub.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
