@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -148,18 +147,8 @@ async def run(ctx:Context,payload:Request)->ScoreResult:
 `)
 	run := func(args ...string) {
 		t.Helper()
-		for {
-			code, out := runCozyPath(t, root, path, args...)
-			if code != 0 && strings.Contains(out, "another Cozy writer holds") {
-				// The real editable watcher may be capturing the just-edited
-				// dependency. Retry its explicit contention result, not failures.
-				time.Sleep(50 * time.Millisecond)
-				continue
-			}
-			if code != 0 {
-				t.Fatalf("cozy %s [%d]: %s", strings.Join(args, " "), code, out)
-			}
-			return
+		if code, out := runCozyPath(t, root, path, args...); code != 0 {
+			t.Fatalf("cozy %s [%d]: %s", strings.Join(args, " "), code, out)
 		}
 	}
 	if directSource == "" {

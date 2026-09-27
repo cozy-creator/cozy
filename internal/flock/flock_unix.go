@@ -26,6 +26,12 @@ func Block(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
 }
 
+// Shared and BlockShared are the same claim held alongside other shared holders; only an
+// exclusive claim excludes them.
+func Shared(f *os.File) error { return syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB) }
+
+func BlockShared(f *os.File) error { return syscall.Flock(int(f.Fd()), syscall.LOCK_SH) }
+
 func Release(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }

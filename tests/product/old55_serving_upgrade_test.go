@@ -267,15 +267,8 @@ p=pathlib.Path(sys.argv[2])/'weightless.py';p.write_text(p.read_text().replace('
 	hub.rentals[h3Rental] = map[string]any{"rental_id": h3Rental, "name": "metadata-only-h3", "state": "ready", "worker_address": quiet.Addr().String(), "media_address": quiet.Addr().String(), "cert_pem": string(certBytes), "worker_id": "metadata-only-h3", "worker_boot_id": "metadata-only", "accelerator_count": 1, "hourly_rate_usd_micros": 1}
 	hub.skus = append(hub.skus, map[string]any{"name": "h100", "accelerator_model": "NVIDIA H100", "accelerator_count": 1, "price_usd_micros_per_hour": 1, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86", "compute_capability": "9.0", "vram_gb": 80, "minimum_ram_per_gpu_gb": 1})
 	hub.mu.Unlock()
-	for until := time.Now().Add(time.Minute); ; {
-		status, text := run(cozyBin, newBin, "package", "install", "paul/minimax-h3", "--version=1.14.3", "--json")
-		if status == 0 {
-			break
-		}
-		if !strings.Contains(text, "another Cozy writer holds") || time.Now().After(until) {
-			t.Fatalf("exact published H3 code install [%d]: %s", status, text)
-		}
-		time.Sleep(100 * time.Millisecond)
+	if status, text := run(cozyBin, newBin, "package", "install", "paul/minimax-h3", "--version=1.14.3", "--json"); status != 0 {
+		t.Fatalf("exact published H3 code install [%d]: %s", status, text)
 	}
 	h3Input := filepath.Join(proof, "h3-input.json")
 	code, out = run(cozyBin, newBin, "run", "paul/minimax-h3/fl2va", "model.model=paul/minimax-h3@1.0.0-h3-audit.1/fp8-adaln-pruned", "--in="+h3Input, "--rental="+h3Rental, "--idempotency-key=new57-published-h3", "--json")

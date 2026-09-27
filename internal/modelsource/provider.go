@@ -173,6 +173,11 @@ func (r *Resolver) request(ctx context.Context, method, location string, headers
 	if err != nil {
 		return nil, exit.Unavailablef("provider request failed before a valid response")
 	}
+	if (response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden) &&
+		authorizationHost(r.kind, response.Request.URL.Hostname()) {
+		response.Body.Close()
+		return nil, r.authRequired()
+	}
 	if encoding := response.Header.Get("Content-Encoding"); encoding != "" && encoding != "identity" {
 		response.Body.Close()
 		return nil, exit.Named(exit.Validation, "model_source_content_encoding",
@@ -181,17 +186,27 @@ func (r *Resolver) request(ctx context.Context, method, location string, headers
 	return response, nil
 }
 
+// authRequired names the provider credential a refused source needs.
+func (r *Resolver) authRequired() *exit.Error {
+	provider, key, variable := "Hugging Face", "huggingface_token", "HF_TOKEN"
+	if r.kind == Civitai {
+		provider, key, variable = "Civitai", "civitai_token", "CIVITAI_TOKEN"
+	}
+	if r.token.Present() {
+		return exit.Named(exit.Credential, "model_source.auth_required",
+			"%s refused the configured %s for this source", provider, key).
+			WithRemedy("set %s in the daemon config (config.yaml or %s) to a token whose account can download this model", key, variable)
+	}
+	return exit.Named(exit.Credential, "model_source.auth_required", "%s requires authentication for this source", provider).
+		WithRemedy("set %s in the daemon config (config.yaml or %s) and retry", key, variable)
+}
+
 func (r *Resolver) json(ctx context.Context, location string, value any) *exit.Error {
 	response, problem := r.request(ctx, http.MethodGet, location, nil)
 	if problem != nil {
 		return problem
 	}
 	defer response.Body.Close()
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		return exit.Named(exit.Credential, "model_source_credential_required",
-			"provider refused access to the model source").
-			WithRemedy("configure the matching provider token or use --token-stdin for this local import")
-	}
 	if response.StatusCode != http.StatusOK {
 		return exit.Named(exit.Validation, "model_source_metadata_refused",
 			"provider metadata request answered HTTP %d", response.StatusCode)

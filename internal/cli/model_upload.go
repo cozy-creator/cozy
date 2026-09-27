@@ -3,6 +3,7 @@ package cli
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -343,6 +344,9 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 		resolved, problem := resolver.Resolve(hctx, parsed)
 		if problem != nil {
 			return publishSource{}, problem
+		}
+		if parsed.Kind == modelsource.HuggingFace && parsed.Revision == "" {
+			fmt.Fprintf(ctx.Err, "pinned %s\n", resolved.Canonical)
 		}
 		// A single carrier is already exact (for example Civitai's primary
 		// checkpoint). Multi-carrier provider repositories must be narrowed by

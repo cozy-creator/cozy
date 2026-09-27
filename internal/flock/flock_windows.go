@@ -28,6 +28,16 @@ func Block(f *os.File) error {
 		0, 1, 0, &windows.Overlapped{OffsetHigh: 1})
 }
 
+// Shared and BlockShared are the same range held alongside other shared holders.
+func Shared(f *os.File) error {
+	return windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_FAIL_IMMEDIATELY,
+		0, 1, 0, &windows.Overlapped{OffsetHigh: 1})
+}
+
+func BlockShared(f *os.File) error {
+	return windows.LockFileEx(windows.Handle(f.Fd()), 0, 0, 1, 0, &windows.Overlapped{OffsetHigh: 1})
+}
+
 func Release(f *os.File) error {
 	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0,
 		&windows.Overlapped{OffsetHigh: 1})

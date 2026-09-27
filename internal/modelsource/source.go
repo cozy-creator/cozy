@@ -22,8 +22,8 @@ const (
 )
 
 // Source is a parsed, credential-free source identity. A Hugging Face source
-// with an empty Revision came from a moving pasted URL and must be resolved to
-// a full commit before it can be persisted or transferred.
+// with an empty Revision names a moving Reference (a branch or tag) and must be
+// resolved to a full commit before it can be persisted or transferred.
 type Source struct {
 	Kind      Kind
 	Canonical string
@@ -74,20 +74,29 @@ func parseHFURI(raw string) (Source, *exit.Error) {
 	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return Source{}, badSource(raw, "hf source contains credentials, query, fragment, or invalid escaping")
 	}
-	org := u.Host
-	repo, suffix, ok := strings.Cut(strings.TrimPrefix(u.EscapedPath(), "/"), "@")
-	revision, escapedMember, hasMember := strings.Cut(suffix, "/")
+	head, escapedMember, hasMember := strings.Cut(strings.TrimPrefix(u.EscapedPath(), "/"), "/")
+	repo, reference, _ := strings.Cut(head, "@")
 	member, memberErr := url.PathUnescape(escapedMember)
 	decodedRepo, decodeErr := url.PathUnescape(repo)
-	if !ok || decodeErr != nil || !portablePart(org) || !portablePart(decodedRepo) || !fullCommit(revision) ||
-		memberErr != nil || (hasMember && !supportedHFMember(member)) {
-		return Source{}, badSource(raw, "hf sources are hf://org/repo@<40-character-commit>[/file.safetensors]")
+	if reference == "" {
+		reference = "main"
 	}
-	revision = strings.ToLower(revision)
-	source := Source{Kind: HuggingFace, Org: org, Repo: decodedRepo,
-		Reference: revision, Revision: revision, Member: member}
+	if decodeErr != nil || !portablePart(u.Host) || !portablePart(decodedRepo) || !portablePart(reference) ||
+		memberErr != nil || (hasMember && !supportedHFMember(member)) {
+		return Source{}, badSource(raw, "hf sources are hf://org/repo[@commit-or-branch][/file.safetensors]")
+	}
+	return hfSource(u.Host, decodedRepo, reference, member), nil
+}
+
+// hfSource pins a full commit; any other reference is a moving ref the resolver pins.
+func hfSource(org, repo, reference, member string) Source {
+	source := Source{Kind: HuggingFace, Org: org, Repo: repo, Reference: reference, Member: member}
+	if fullCommit(reference) {
+		source.Reference = strings.ToLower(reference)
+		source.Revision = source.Reference
+	}
 	source.Canonical = source.hfCanonical()
-	return source, nil
+	return source
 }
 
 func parseCivitaiURI(raw string) (Source, *exit.Error) {
@@ -138,16 +147,14 @@ func parseHFPasted(raw string, u *url.URL) (Source, *exit.Error) {
 	if err1 != nil || err2 != nil || !portablePart(org) || !portablePart(repo) {
 		return Source{}, badSource(raw, "Hugging Face URL contains an invalid org or repo")
 	}
-	revision, reference, member := "", "main", ""
+	reference, member := "main", ""
 	if len(parts) > 2 {
 		if len(parts) < 4 || (parts[2] != "tree" && parts[2] != "blob" && parts[2] != "resolve") {
 			return Source{}, badSource(raw, "use a Hugging Face repository, tree, or tensor file URL")
 		}
 		reference, _ = url.PathUnescape(parts[3])
-		if fullCommit(reference) {
-			revision = strings.ToLower(reference)
-		} else if reference != "main" {
-			return Source{}, badSource(raw, "a non-main Hugging Face URL must use its full commit")
+		if !portablePart(reference) {
+			return Source{}, badSource(raw, "Hugging Face URL names an invalid revision")
 		}
 		if parts[2] == "tree" {
 			if len(parts) != 4 {
@@ -161,10 +168,7 @@ func parseHFPasted(raw string, u *url.URL) (Source, *exit.Error) {
 			}
 		}
 	}
-	source := Source{Kind: HuggingFace, Org: org, Repo: repo,
-		Reference: reference, Revision: revision, Member: member}
-	source.Canonical = source.hfCanonical()
-	return source, nil
+	return hfSource(org, repo, reference, member), nil
 }
 
 func supportedHFMember(member string) bool {
@@ -174,12 +178,9 @@ func supportedHFMember(member string) bool {
 }
 
 func (s Source) hfCanonical() string {
-	if s.Revision == "" && s.Member != "" {
-		return "https://huggingface.co/" + s.Org + "/" + s.Repo + "/resolve/main/" + escapeMember(s.Member)
-	}
 	canonical := "hf://" + s.Org + "/" + s.Repo
-	if s.Revision != "" {
-		canonical += "@" + s.Revision
+	if s.Reference != "main" {
+		canonical += "@" + s.Reference
 	}
 	if s.Member != "" {
 		canonical += "/" + escapeMember(s.Member)

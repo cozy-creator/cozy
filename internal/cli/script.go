@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
@@ -59,11 +60,17 @@ func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) 
 // snapshotTarget uses the ordinary installer while keeping the user's editable
 // pin unchanged. Both the program and its environment are owned by the run.
 func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*records.PackageInstall) (Target, *launch.PackageInterface, *exit.Error) {
-	layout, store, writer, problem := open(ctx.Cfg, true)
+	layout, store, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
 	defer store.Close()
+	// A capture writes only its own new installs, so captures share the claim; it keeps
+	// a sweep off the unreferenced snapshot until the run that owns it is submitted.
+	writer, problem := home.WaitWriter(layout, true, ctx.Err)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
 	handedOff := false
 	defer func() {
 		if !handedOff {
@@ -121,13 +128,12 @@ func snapshotTarget(ctx *Context, pack *packagepublish.Package, remote ...*recor
 }
 
 func snapshotLocalJob(ctx *Context, target Target) (Target, *launch.PackageInterface, *exit.Error) {
-	_, store, writer, problem := open(ctx.Cfg, true)
+	_, store, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
 	defer store.Close()
 	current, problem := exactInvocationInstall(ctx, target)
-	writer.Unlock()
 	if problem != nil {
 		return Target{}, nil, problem
 	}
@@ -163,12 +169,11 @@ func reclaimSnapshot(ctx *Context, target Target) {
 	if !target.Snapshot || target.InstallID == "" {
 		return
 	}
-	layout, store, writer, problem := open(ctx.Cfg, true)
+	layout, store, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return
 	}
 	defer store.Close()
-	defer writer.Unlock()
 	// Accepted requests keep the install through the existing in-use predicate.
 	// A refusal/describe-only command has no owner and can reclaim it immediately.
 	_, _ = install.Reclaim(layout, store, target.InstallID)
