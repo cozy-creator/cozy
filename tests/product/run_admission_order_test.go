@@ -221,4 +221,3 @@ func TestBareRunReportsRequiredArgumentsAndFullInterface(t *testing.T) {
 		t.Errorf("rendering argument help opened tools: %s", tail(activity))
 	}
 }
-
