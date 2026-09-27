@@ -185,13 +185,14 @@ def main(ctx):
 	if request, _, out := submitRun(t, root, "requirements-marked", "run", script, "--rental=giriko", "--json"); request == nil {
 		t.Fatalf("private marked requirement constrained the image: %s", out)
 	}
-	status, out := runCozy(t, root, "run", script, "--rental=priorpython", "--json")
-	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, "captured Python "+captured.Version) {
-		t.Fatalf("a different remote patch replaced the captured interpreter [%d]: %s", status, out)
+	// Source transport carries the Python minor; another patch that satisfies the authored
+	// Requires-Python runs the script, and only an authored patch floor excludes it.
+	if request, _, out := submitRun(t, root, "requirements-patch", "run", script, "--rental=priorpython", "--json"); request == nil || request.RequestedRental != earlierPython {
+		t.Fatalf("another patch of the captured Python minor was refused: %s", out)
 	}
 	pythonCode := strings.Replace(patchCode, `requires-python = ">=3.12,<3.13"`, `requires-python = ">=3.12.5,<3.13"`, 1)
 	must(t, os.WriteFile(script, []byte(pythonCode), 0600))
-	status, out = runCozy(t, root, "run", script, "--rental=priorpython", "--json")
+	status, out := runCozy(t, root, "run", script, "--rental=priorpython", "--json")
 	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, ">=3.12.5") {
 		t.Fatalf("authored Python patch floor was replaced by the default minor range [%d]: %s", status, out)
 	}
