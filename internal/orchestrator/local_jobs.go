@@ -65,7 +65,7 @@ func (c *Orchestrator) prepareUnpublishedPackage(instanceID string, request reco
 	// Imported invocable defaults belong to the child's package. Keep those exact
 	// selections on the request for child resolution, but do not bind them against
 	// this root script's interface; the child prepares its own package when called.
-	models := downloadModelRefs(ownModelInputs(request))
+	models := downloadModelRefs(request.OwnModels())
 	if jobModels && len(models) > 0 {
 		if c.opt.RentalPackageSet == nil {
 			return nil, exit.Unavailablef("unpublished package job models require a rental download set")

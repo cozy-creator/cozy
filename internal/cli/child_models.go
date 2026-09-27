@@ -183,11 +183,11 @@ func (r *Resolver) childAccelerator(parent records.Request) (string, int, *exit.
 }
 
 // UnpublishedChildModels supplies captured defaults for a CPU request's rental choice.
-// An accelerator-owning request is sized from its own model slots: install-wide
-// callable capture does not mean those children are invoked or resident alongside it.
+// A request sized by its own model slots keeps only those: install-wide callable
+// capture does not mean those children are invoked or resident alongside it.
 // As with PrivateRentalNeedsAccelerator, only CPU orchestration needs the traversal.
 func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.ModelRef, *exit.Error) {
-	if (request.NeedsAccelerator && len(request.Models) > 0) || request.InstallID == "" {
+	if request.SizedByOwnModels() || request.InstallID == "" {
 		return nil, nil
 	}
 	var out []records.ModelRef
@@ -229,8 +229,7 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 					// an actual omitted argument requires that source.
 					continue
 				}
-				// Qualified so a shot's slot cannot collide with the parent's own.
-				selected.Slot = binding.Entrypoint + "/" + slot.Param
+				selected.Slot = slot.Path
 				selected.Callable = child.Package + "/" + binding.Entrypoint
 				out = append(out, selected)
 			}

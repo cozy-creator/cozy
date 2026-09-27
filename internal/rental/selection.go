@@ -303,7 +303,7 @@ func Ladder(models []records.ModelRef) []string {
 		if len(models) == 1 {
 			return []string{rungs}
 		}
-		out = append(out, model.Slot+": "+rungs)
+		out = append(out, model.BindingSlot()+": "+rungs)
 	}
 	return out
 }
@@ -319,7 +319,7 @@ func Override(models []records.ModelRef) string {
 		if len(models) == 1 {
 			return model.Lane
 		}
-		parts = append(parts, model.Slot+"="+model.Lane)
+		parts = append(parts, model.BindingSlot()+"="+model.Lane)
 	}
 	return strings.Join(parts, ",")
 }

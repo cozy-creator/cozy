@@ -105,7 +105,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	request.NeedsAccelerator, request.Models = false, nil
 	children, problem = resolver.UnpublishedChildModels(request)
 	fatal(t, problem)
-	if len(children) != 1 || children[0].Slot != "segment/model" || len(children[0].Ladder) != 3 {
+	if len(children) != 1 || children[0].BindingSlot() != "segment.models.model" || len(children[0].Ladder) != 3 {
 		t.Fatalf("CPU composition lost its captured model defaults: %+v", children)
 	}
 }

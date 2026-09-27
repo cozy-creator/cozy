@@ -231,11 +231,7 @@ func localDownloadSelection(models []ModelRef, packages []*pb.DownloadPackageRef
 		if !model.Pinned() {
 			return nil, exit.Named(exit.Validation, "local_model_selection_incomplete", "local preparation needs exact model manifests")
 		}
-		path := model.Slot
-		if model.BindingPath != "" {
-			path = model.BindingPath
-		}
-		for _, slot := range append([]string{path}, model.SharedSlots...) {
+		for _, slot := range append([]string{model.BindingSlot()}, model.SharedSlots...) {
 			selected = append(selected, &pb.DownloadModelRef{Package: model.Package, Slot: slot, Model: model.Model, Release: model.Release, Lane: model.Lane, Manifest: model.Manifest, Adapters: downloadAdapters(model.Adapters)})
 		}
 	}
