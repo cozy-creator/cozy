@@ -415,8 +415,8 @@ type RunExecuteCmd struct {
 	Retry           string   `help:"Retry with current code while retaining compatible work from this prior run."`
 	Trees           []string `name:"input-tree" predictor:"binding-dir" help:"Bind a job input tree as ref=directory."`
 	Org             string   `help:"Job publication organization (defaults to local)."`
-	PublishTo       string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
-	AllowPublish    []string `help:"Allow this rented transaction to publish only to org/model (repeatable)."`
+	UploadTo        string   `help:"Upload the job's declared weight outputs as private checkpoints to org/model; no release is published."`
+	AllowUpload     []string `help:"Allow this rented transaction to upload checkpoints, and publish releases, only to org/model (repeatable)."`
 	SourceProfiles  []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
 	Await           bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
 	Describe        bool     `help:"Print the callable's request contract instead of running it."`
@@ -435,7 +435,7 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
-		"--publish-to", c.PublishTo, "--allow-publish", c.AllowPublish, "--source-profile", c.SourceProfiles), !c.Describe)
+		"--upload-to", c.UploadTo, "--allow-upload", c.AllowUpload, "--source-profile", c.SourceProfiles), !c.Describe)
 }
 
 type RunRetryPublicationCmd struct {

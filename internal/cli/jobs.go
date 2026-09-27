@@ -38,15 +38,15 @@ import (
 // ---------------------------------------------------------------------- job submit
 
 func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.Error {
-	if names := ctx.Inv.Values["--allow-publish"]; len(names) > 0 {
+	if names := ctx.Inv.Values["--allow-upload"]; len(names) > 0 {
 		normalized, problem := hub.NormalizePublicationRepositories(names)
 		if problem != nil {
 			return problem
 		}
 		if !rentalRequested(ctx) {
-			return exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-publish requires a rented transaction with its own certificate identity")
+			return exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-upload requires a rented transaction with its own certificate identity")
 		}
-		ctx.Inv.Values["--allow-publish"] = normalized
+		ctx.Inv.Values["--allow-upload"] = normalized
 	}
 	deadline, problem := runDeadline(ctx)
 	if problem != nil {
@@ -57,10 +57,10 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	if destination != "" {
-		if named := ctx.Inv.Value("--publish-to"); named != "" && named != destination {
-			return exit.Usagef("destination %s disagrees with --publish-to=%s", destination, named)
+		if named := ctx.Inv.Value("--upload-to"); named != "" && named != destination {
+			return exit.Usagef("destination %s disagrees with --upload-to=%s", destination, named)
 		}
-		ctx.Inv.Values["--publish-to"] = []string{destination}
+		ctx.Inv.Values["--upload-to"] = []string{destination}
 	}
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA before a job exists — the same
 	// client-side check `cozy run` makes, over the job's own declared request struct.
@@ -99,7 +99,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 	sub := api.JobSubmission{Package: target.Package, Function: target.Function, Input: input, LocalAssets: assets,
-		AllowPublish: ctx.Inv.Values["--allow-publish"],
+		AllowPublish: ctx.Inv.Values["--allow-upload"],
 		TimeoutMS:    int64(deadline / time.Millisecond),
 		RetainWork:   strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
@@ -118,7 +118,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		if len(trees) > 0 {
 			return exit.Usagef("foreign model inputs cannot also use local input trees")
 		}
-		return submitSourceTransfer(ctx, "model-upload", source, ctx.Inv.Value("--publish-to"),
+		return submitSourceTransfer(ctx, "model-upload", source, ctx.Inv.Value("--upload-to"),
 			&sourceInvocation{Target: target, Job: job, Profiles: profiles}, sub)
 	}
 	if e := jobOutputDestination(ctx, job, &sub); e != nil {
@@ -574,7 +574,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if len(state.RetainedOutputs) > 0 {
 		machine := state.RetainedOutputs[0].Machine
 		rec.Notes = append(rec.Notes, fmt.Sprintf("retained outputs stay on %s until `cozy rental end %s`; "+
-			"to publish them, run again there with --publish-to <org/model>", machine, machine))
+			"to upload them, run again there with --upload-to <org/model>", machine, machine))
 	}
 	if export := state.OutputExport; export != nil && export.State == "failed" {
 		rec.Notes = append(rec.Notes, fmt.Sprintf("output export to %s failed (%s): %s; accepted output bytes remain in internal custody",
@@ -582,14 +582,14 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	}
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK && state.ModelDestination != "" && state.ErrorType != "" {
-		return exit.Named(exit.Conflict, state.ErrorType, "job %s completed without publishing to %s: %s",
+		return exit.Named(exit.Conflict, state.ErrorType, "job %s completed without uploading to %s: %s",
 			state.JobID, state.ModelDestination, state.Error)
 	}
 	if code == exit.OK {
 		if hint := modelPublishHint(state); hint != "" {
 			rec.Next = []string{hint}
 		} else if len(state.RetainedOutputs) > 0 {
-			rec.Next = []string{"cozy run <script-or-package> --rental=" + state.RetainedOutputs[0].Machine + " --publish-to <org/model>"}
+			rec.Next = []string{"cozy run <script-or-package> --rental=" + state.RetainedOutputs[0].Machine + " --upload-to <org/model>"}
 		} else if len(state.NativeOutputs) > 0 {
 			rec.Next = []string{"cozy run watch " + runReference(state.Number, state.JobID) + " --full"}
 		} else if state.Publication != nil {

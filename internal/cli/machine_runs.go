@@ -810,7 +810,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	}
 	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ModelTransfer != nil {
 		if problem := m.store.SettleMachineDestination(request.ID, fmt.Sprintf(
-			"the machine published no checkpoint to %s; its Runtime predates machine destinations. Update the rental's Runtime to %s or newer and run again",
+			"the machine uploaded no checkpoint to %s; its Runtime predates machine destinations. Update the rental's Runtime to %s or newer and run again",
 			request.ModelTransfer.Destination, machineDestinationRuntimeFloor)); problem != nil {
 			return problem
 		}

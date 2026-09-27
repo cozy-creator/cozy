@@ -388,7 +388,7 @@ or explicit cancellation finishes cleanup. `cozy run retry-publication <job>` (o
 retry-publication route with an optional `actor`) retries the failed publication with the
 same request, attempt, receipts and per-object transfer identities. It does not rerun the
 producer. `cozy run cancel <job>` abandons unfinished destination holds and then settles
-cancellation; already completed checkpoints remain published. Both decisions survive a
+cancellation; already uploaded checkpoints remain uploaded. Both decisions survive a
 daemon restart. A failed request from an older build is not silently resurrected.
 
 `queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot;
@@ -410,7 +410,7 @@ payload and attempt outcomes stay immutable. Cancellation releases only the call
 ownership. Explicit rental release also abandons its dependent transactions.
 
 Private source/weights checkpoints stay on that worker; they are not implicitly uploaded
-to Tensorhub. `--publish-to` remains an explicit final-output publication choice. A job
+to Tensorhub. `--upload-to` remains the explicit final-output upload choice. A job
 document's `retaining` boolean reports continuing resource custody, including successful
 private model outputs. Such a completed job can be explicitly canceled to release custody
 without rewriting its successful execution outcome.

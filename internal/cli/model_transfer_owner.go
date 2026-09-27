@@ -447,5 +447,5 @@ func modelPublicationReason(intent records.ModelTransferIntent) string {
 	if intent.HasAcquisition() {
 		return "cozy model upload " + intent.Source + " " + intent.Destination
 	}
-	return "publish job model outputs to " + intent.Destination
+	return "upload job model outputs to " + intent.Destination
 }

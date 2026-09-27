@@ -228,7 +228,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 	if invocation != nil && kind == "model-upload" && !privateOutputs {
 		org := strings.Split(destination, "/")[0]
 		if submission.Org != "" && submission.Org != org {
-			return exit.Usagef("--org must match the --publish-to organization")
+			return exit.Usagef("--org must match the --upload-to organization")
 		}
 		submission.Org = org
 	}

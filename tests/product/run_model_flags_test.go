@@ -10,7 +10,7 @@ import (
 
 func TestDashedModelFlagsReuseExistingResolver(t *testing.T) {
 	root, _, _, _, _ := runModelCatalog(t)
-	base := []string{"--json", "run", "proof/quantize/quantize", "steps=7", "--rental-only", "--publish-to", "proof/output"}
+	base := []string{"--json", "run", "proof/quantize/quantize", "steps=7", "--rental-only", "--upload-to", "proof/output"}
 	canonical := append(append([]string{}, base[:4]...), append([]string{"model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16"}, base[4:]...)...)
 	want, _, out := submitRun(t, root, "model-flags-canonical", canonical...)
 	if want == nil {

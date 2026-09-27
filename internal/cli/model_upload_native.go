@@ -115,7 +115,7 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	// Run capture owns the exact script and SDK. The same native receipts survive
 	// edited callers, cancellation and retry; the destination is the sole grant.
 	ctx.Inv.Args = []string{path}
-	ctx.Inv.Values["--allow-publish"] = []string{destination.String()}
+	ctx.Inv.Values["--allow-upload"] = []string{destination.String()}
 	// The script already names its profiles; the run must not reread them as job
 	// model-slot bindings (slot=profile), which refused every profiled ingest. The
 	// ingest consumed --lane too; the run has nothing left to read from either.

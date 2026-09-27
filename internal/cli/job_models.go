@@ -94,19 +94,19 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 }
 
 func jobOutputDestination(ctx *Context, job *launch.Entrypoint, sub *api.JobSubmission) *exit.Error {
-	destination := strings.TrimSpace(ctx.Inv.Value("--publish-to"))
+	destination := strings.TrimSpace(ctx.Inv.Value("--upload-to"))
 	if destination == "" {
 		return nil
 	}
 	if len(job.WeightsOutputs) == 0 {
-		return exit.Usagef("--publish-to requires a job with declared weight outputs")
+		return exit.Usagef("--upload-to requires a job with declared weight outputs")
 	}
 	ref, problem := hub.ParseRef(destination)
 	if problem != nil {
 		return problem
 	}
 	if sub.Org != "" && sub.Org != ref.Org {
-		return exit.Usagef("--org must match the --publish-to organization")
+		return exit.Usagef("--org must match the --upload-to organization")
 	}
 	if _, problem := ownedPublication(ctx, ref); problem != nil {
 		return problem

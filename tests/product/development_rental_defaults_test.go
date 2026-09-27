@@ -38,7 +38,7 @@ func TestDevelopmentDefaultsReachManualAndManagedAcquisitions(t *testing.T) {
 			if managed {
 				args = []string{"run", "proof/quantize/quantize", "steps=7",
 					"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
-					"--publish-to", "proof/output", "--rental-only", "--idempotency-key", "development-default", "--json"}
+					"--upload-to", "proof/output", "--rental-only", "--idempotency-key", "development-default", "--json"}
 			}
 			code, out := runCozy(t, root, args...)
 			if managed && code != 0 || !managed && !strings.Contains(out, "proof.no_paid_create") {

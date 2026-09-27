@@ -261,7 +261,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !spec.Rental || (spec.LocalInstallationID == "" && !publishedMachineJob(spec)) || s.machineExecutions == nil {
-			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-publish requires a Runtime-owned rented transaction with its own certificate identity"))
+			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-upload requires a Runtime-owned rented transaction with its own certificate identity"))
 			return
 		}
 	}

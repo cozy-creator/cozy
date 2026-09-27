@@ -108,8 +108,8 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Usagef("--attention-kernel applies only to serving callables")
 	}
 	if callable.Kind != "job" {
-		if len(ctx.Inv.Values["--allow-publish"]) > 0 {
-			return exit.Usagef("--allow-publish applies only to Runtime-owned job transactions")
+		if len(ctx.Inv.Values["--allow-upload"]) > 0 {
+			return exit.Usagef("--allow-upload applies only to Runtime-owned job transactions")
 		}
 		if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
 			return exit.Usagef("--timeout requires --await for serving callables").
@@ -118,8 +118,8 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		if ctx.Inv.Value("--retry") != "" {
 			return exit.Usagef("--retry applies only to job transactions")
 		}
-		if ctx.Inv.Value("--publish-to") != "" || len(ctx.Inv.Values["--source-profile"]) > 0 {
-			return exit.Usagef("--publish-to and --source-profile apply only to job callables")
+		if ctx.Inv.Value("--upload-to") != "" || len(ctx.Inv.Values["--source-profile"]) > 0 {
+			return exit.Usagef("--upload-to and --source-profile apply only to job callables")
 		}
 		if len(ctx.Inv.Values["--input"]) > 0 {
 			return exit.Usagef("--input-tree applies only to a job callable")

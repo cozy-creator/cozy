@@ -109,7 +109,7 @@ func TestPublishedRentalPreparationUsesPersistedMachineKey(t *testing.T) {
 	}
 	t.Logf("machine-key-only published request %s completed and collected; minted=%d authenticated prepare-facts=%d", request.ID, minted.Load(), prepared.Load())
 	before := publicationReads.Load()
-	code, output = runCozyPath(t, proof.Layout.Root, proof.Path, "run", proof.Package.Package+"/main", "--rental", "child-host", "--allow-publish", "proof/checkpoint", "--await", "--json", "--idempotency-key", "machine-key-publication")
+	code, output = runCozyPath(t, proof.Layout.Root, proof.Path, "run", proof.Package.Package+"/main", "--rental", "child-host", "--allow-upload", "proof/checkpoint", "--await", "--json", "--idempotency-key", "machine-key-publication")
 	if code == 0 || !strings.Contains(output, "controlled stop before granting publication") || publicationReads.Load() <= before || publicationRequests.Load() != 1 {
 		t.Fatalf("publication machine-key bridge [%d], reads=%d grants=%d: %s", code, publicationReads.Load()-before, publicationRequests.Load(), output)
 	}

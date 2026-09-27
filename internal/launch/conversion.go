@@ -9,7 +9,7 @@ import (
 // ConversionSlot is the primary input of a conversion job: the first declared model input
 // of a job with at least one weights output. Such a job reads `cozy run <job> <input>
 // [<org/model>]`: the input is any model reference that slot accepts, the second positional
-// is the checkpoint destination `--publish-to` also names, and any further model input is
+// is the checkpoint destination `--upload-to` also names, and any further model input is
 // bound with `model.<param>=`.
 func ConversionSlot(ep *Entrypoint) *Slot {
 	if len(ep.Models) == 0 || len(ep.WeightsOutputs) == 0 {
