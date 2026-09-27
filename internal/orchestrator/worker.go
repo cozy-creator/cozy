@@ -387,9 +387,7 @@ type worker struct {
 	// Runtime's package_prepare takes exactly one package), and the Runtime seeds the
 	// package's placement_id from these bytes. They are a pure function of content, so
 	// an unchanged selection re-authors identical bytes and adding package B cannot
-	// retire package A's serving placement. A package-interface-falsifying refusal is
-	// relayed to the hub (cl-078/th-106); defectReported latches per revision so one
-	// falsification files one report.
+	// retire package A's serving placement.
 	desiredDownloadSets map[string][]byte
 	// packageRefusals hold one package's verdict on its own preparation. The package
 	// leaves the desired set and only its requests fail; the rental's other packages
@@ -397,10 +395,9 @@ type worker struct {
 	packageRefusals map[string]*exit.Error
 	// preparedSets holds the pod host's PREPARED answer for each download set it prepared
 	// on boot preparedBoot and the rental still desires, keyed by downloadSetKey.
-	preparedSets           map[string]*pb.DesiredPlacementSet
-	preparedBoot           string
-	defectReportedRevision uint64
-	desiredMu              sync.Mutex
+	preparedSets map[string]*pb.DesiredPlacementSet
+	preparedBoot string
+	desiredMu    sync.Mutex
 	// A rental is one machine and may host several package environments. Keep the
 	// worker-reported placement for every binding instead of overwriting package A when
 	// package B joins the same desired set.

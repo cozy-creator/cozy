@@ -56,10 +56,9 @@ func InstallToolEnv(inst records.PackageInstall, env []string) []string {
 // host asks the runtime goes through here, so there is one place that knows how to invoke it
 // and one place that renders its refusals. A metadata question goes to THIS host's tool
 // (hostruntime.Path, at or above hostruntime.ToolFloor): package code is untrusted and a reading of it
-// never imports it (cl-175). The install's own Runtime (Binary) is asked only for the
-// interface wheel its executor consumes.
+// never imports it (cl-175).
 type RuntimeCLI struct {
-	Bin               string   // the binary selected for the question: hostruntime.Path for metadata, Binary(install) for interface-wheel
+	Bin               string   // the binary selected for the question
 	Dir               string   // the package project root
 	EnvironmentPython string   // captured environment location for static source reads only
 	PackageInterface  string   // exact installed interface; empty only for live editable source

@@ -81,11 +81,6 @@ type Options struct {
 	// dispatching one package release to this rental. Callback for the same
 	// reason RentalPackageSet is: the orchestrator holds no Tensorhub client.
 	RentalPrepareFacts RentalPrepareFactsSource
-	// ReportReleaseDefect relays a package-interface-falsifying pod refusal to the hub
-	// (th-106). Callback for the same reason RentalPackageSet is: the
-	// orchestrator holds no Tensorhub client. Fire-and-forget; the hub's defect
-	// tombstone is idempotent.
-	ReportReleaseDefect ReleaseDefectReporter
 	// RentalFleet renders the request's hub's fleet burn line after reconciling that
 	// hub's rentals with it. AcquireManagedRental is the placement decision for a --rental
 	// request no rental holds a placement for (placement-economics.md): it pins the
@@ -103,20 +98,6 @@ type Options struct {
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
-
-// ReleaseDefect is one defect report: the exact release the pod refused and the
-// rental it was refused on. The signed-delegation chain of authority that used to
-// travel with it is deleted (owner ruling 2026-09-03), so the hub authorizes the
-// report by rental OWNERSHIP — provenance is no longer proven.
-type ReleaseDefect struct {
-	Package, Release string
-	RentalID         string
-	Code, Detail     string
-}
-
-// ReleaseDefectReporter posts one defect report; failures are logged, never
-// retried here — a republished falsifying release will be refused again.
-type ReleaseDefectReporter func(report ReleaseDefect)
 
 // RentalPackageSetSource authors the desired download set for one selection. It takes
 // no worker connection: the document names content only and binds no rental, worker or

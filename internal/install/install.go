@@ -74,13 +74,6 @@ type PublishedSource struct {
 	IndexURL  string
 	Models    []PublishedModel
 	Selection Selection
-	// ReportDefect relays a package-interface falsification observed during LOCAL
-	// preparation (cl-078). Best-effort: the hub's sound authorization wants a
-	// rental chain, which a local install does not hold, so only an
-	// admin-credentialed daemon's report lands; everyone else still refuses the
-	// install locally, which is the load-bearing half.
-	ReportDefect func(code, detail string)
-
 	// Hub is the Tensorhub origin the release was read from; the install records it.
 	Hub string
 }

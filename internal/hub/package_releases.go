@@ -97,9 +97,6 @@ type PackageReleaseDetail struct {
 		CommittedAt            string `json:"committed_at,omitempty"`
 		Yanked                 bool   `json:"yanked,omitempty"`
 		YankedAt               string `json:"yanked_at,omitempty"`
-		Defective              bool   `json:"defective,omitempty"`
-		DefectiveAt            string `json:"defective_at,omitempty"`
-		DefectiveCode          string `json:"defective_code,omitempty"`
 	} `json:"release"`
 	PackageInterface      json.RawMessage `json:"package_interface"`
 	ExecutionRequirements []string        `json:"requirements"`
