@@ -88,13 +88,7 @@ def execute(payload: Input) -> Result:
 	defer hub.Close()
 	must(t, os.WriteFile(filepath.Join(cfg.Home, config.FileName), []byte("tensorhub_url: "+hub.URL+"\n"), 0600))
 	began := time.Now()
-	// The daemon's own editable sync may hold the install writer as it starts; the CLI
-	// refuses rather than waits, so a retry follows that writer.
 	request, _, out := submitRun(t, cfg.Home, "remote-editable-fresh", "run", "local/remote-cli-proof/execute", "value=fresh", "--rental-only", "--json", "--full")
-	for attempt := 0; request == nil && strings.Contains(out, "another Cozy writer") && attempt < 20; attempt++ {
-		time.Sleep(250 * time.Millisecond)
-		request, _, out = submitRun(t, cfg.Home, "remote-editable-fresh", "run", "local/remote-cli-proof/execute", "value=fresh", "--rental-only", "--json", "--full")
-	}
 	if request == nil || submittedPayload(t, request)["value"] != "fresh" {
 		t.Fatalf("fresh schema did not reach remote submission: %+v %s", request, out)
 	}

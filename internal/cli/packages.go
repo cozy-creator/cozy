@@ -20,7 +20,7 @@ import (
 )
 
 // open resolves the local layout and the ONE lifecycle database. Mutating verbs
-// additionally take the single-writer lock.
+// additionally take the single-writer lock, waiting while a live command holds it.
 func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.Writer, *exit.Error) {
 	l, e := home.Open(cfg.Home)
 	if e != nil {
@@ -28,7 +28,7 @@ func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.
 	}
 	var w *install.Writer
 	if write {
-		if w, e = install.Lock(l); e != nil {
+		if w, e = home.WaitWriter(l, false, os.Stderr); e != nil {
 			return l, nil, nil, e
 		}
 	}

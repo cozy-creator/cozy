@@ -6,8 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,13 +48,126 @@ async def main() -> dict[str, str]:
 // The consumed --source-profile never reaches the run, where it would be reread as a
 // job's slot=profile binding (#762).
 func TestRentedCivitaiIngestSubmitsTheSingleCallScript(t *testing.T) {
+	pod := newRentedIngestPod(t, "https://civitai.com/api/v1/model-versions/128078")
+	code, out := pod.upload("civitai://128078", "proof/sdxl", "--source-profile", "civitai/sdxl/single-file/1")
+	if code != 0 || strings.Contains(out, "slot=profile") {
+		t.Fatalf("the rented ingest was refused [exit %d]:\n%s", code, out)
+	}
+	if script := pod.submittedScript(t); script != civitaiIngestScript {
+		t.Fatalf("the pod received another ingest script:\n%s\nwant:\n%s", script, civitaiIngestScript)
+	}
+}
+
+// A moving Hugging Face ref is pinned to its current commit when the ingest is submitted:
+// the owner sees the pin, and the script (so its resume and memo key) names the commit.
+func TestRentedIngestPinsAMovingHuggingFaceRef(t *testing.T) {
+	const repo = "alibaba-pai/MiniMax-H3-Acc-LoRAs"
+	pod := newRentedIngestPod(t, "https://huggingface.co/api/models/"+repo)
+	var current struct {
+		SHA string `json:"sha"`
+	}
+	response, err := http.Get("https://huggingface.co/api/models/" + repo + "/revision/main")
+	must(t, err)
+	must(t, json.NewDecoder(response.Body).Decode(&current))
+	response.Body.Close()
+	code, out := pod.upload("hf://"+repo, "proof/pdd", "--source-profile", "hf/minimax-h3/pdd-fl2va-bf16/1")
+	if code != 0 || !strings.Contains(out, "pinned hf://"+repo+"@"+current.SHA+"\n") {
+		t.Fatalf("the moving ref was not pinned to %s [exit %d]:\n%s", current.SHA, code, out)
+	}
+	if script := pod.submittedScript(t); !strings.Contains(script, `upload_huggingface("`+repo+`", revision="`+current.SHA+`"`) {
+		t.Fatalf("the submitted script does not name the pinned commit %s:\n%s", current.SHA, script)
+	}
+}
+
+// Several uploads to one pod are submitted together: a capture shares the install root with
+// other captures instead of refusing them as a competing writer.
+func TestConcurrentRentedIngestsAreAllSubmitted(t *testing.T) {
+	pod := newRentedIngestPod(t, "https://civitai.com/api/v1/model-versions/128078")
+	// The owner's local TensorFS store already exists, as it does after any first command.
+	if code, out := runCozy(t, pod.root, "model", "list", "--json"); code != 0 {
+		t.Fatalf("model list [exit %d]: %s", code, out)
+	}
+	outputs := make([]string, 2)
+	codes := make([]int, 2)
+	var group sync.WaitGroup
+	for i := range outputs {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			codes[i], outputs[i] = pod.upload("civitai://128078", fmt.Sprintf("proof/sdxl-%d", i),
+				"--source-profile", "civitai/sdxl/single-file/1")
+		}()
+	}
+	group.Wait()
+	for i := range outputs {
+		if codes[i] != 0 {
+			t.Fatalf("concurrent upload %d was refused [exit %d]:\n%s", i, codes[i], outputs[i])
+		}
+	}
+	runs, problem := pod.store.Requests("", "", 10)
+	fatal(t, problem)
+	if len(runs) != 2 || runs[0].ID == runs[1].ID {
+		t.Fatalf("want both uploads recorded as runs, got %d", len(runs))
+	}
+}
+
+// A gated source without a configured provider token is refused before renting with the
+// credential it needs, never as an origin that cannot serve header ranges.
+func TestGatedProviderSourceNamesTheMissingToken(t *testing.T) {
+	root := filepath.Join(scratchBase, "gated-source")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() { _ = removeAllForce(root) })
+	standIn := httptest.NewServer(http.NotFoundHandler())
+	defer standIn.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+standIn.URL+"\n"), 0o600))
+	for _, row := range []struct{ probe, source, token string }{
+		{"https://civitai.com/api/download/models/889818", "civitai://889818", "civitai_token"},
+		{"https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors",
+			"hf://black-forest-labs/FLUX.1-dev@3de623fc3c33e44ffbe2bad470d0f45bccf2eb21/flux1-dev.safetensors", "huggingface_token"},
+	} {
+		response, err := http.Get(row.probe)
+		if err != nil {
+			t.Skipf("provider unreachable from this runner: %v", err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s is no longer gated: HTTP %d", row.probe, response.StatusCode)
+		}
+		cmd := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "model", "upload", row.source, "proof/gated", "--rental-only", "--json")
+		cmd.Env = childEnv(t, root, "TENSORHUB_TOKEN=operator-proof", "HF_TOKEN=", "CIVITAI_TOKEN=")
+		out, _ := cmd.Output()
+		var document struct {
+			Error struct{ Code, Remedy string } `json:"error"`
+		}
+		if json.Unmarshal(out, &document) != nil || document.Error.Code != "model_source.auth_required" ||
+			!strings.Contains(document.Error.Remedy, row.token) {
+			t.Fatalf("%s must name the missing %s [exit %d]: %s", row.source, row.token, cmd.ProcessState.ExitCode(), out)
+		}
+	}
+}
+
+// rentedIngestPod is a daemon with one attached fake pod, "ingester", that keeps the bytes of
+// every uploaded file and answers preparation with the interface the owner captured.
+type rentedIngestPod struct {
+	root     string
+	env      []string
+	store    *records.Store
+	machine  *runtimeMachine
+	mu       sync.Mutex
+	received map[string][]byte
+	prepared []*pb.PrepareLocalPackageCall
+}
+
+func newRentedIngestPod(t *testing.T, providerProbe string) *rentedIngestPod {
+	t.Helper()
 	base, err := os.MkdirTemp(scratchBase, "ingest-script-")
 	must(t, err)
 	t.Cleanup(func() { _ = removeAllForce(base) })
 	root, tmp := filepath.Join(base, "home"), filepath.Join(base, "tmp")
 	must(t, os.MkdirAll(tmp, 0o700))
 	must(t, os.MkdirAll(root, 0o700))
-	response, err := http.Get("https://civitai.com/api/v1/model-versions/128078")
+	response, err := http.Get(providerProbe)
 	if err != nil {
 		t.Skipf("provider unreachable from this runner: %v", err)
 	}
@@ -62,17 +177,15 @@ func TestRentedCivitaiIngestSubmitsTheSingleCallScript(t *testing.T) {
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 	identity, problem := rental.PendingCreatorIdentity(layout, "ingest-script")
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
 
-	var mu sync.Mutex
-	received := map[string][]byte{}
-	var prepared []*pb.PrepareLocalPackageCall
-	machine := &runtimeMachine{blocker: "gpu-holder"}
-	pod := &fakePod{controlKey: public, machine: machine}
+	fixture := &rentedIngestPod{root: root, store: store, machine: &runtimeMachine{blocker: "gpu-holder"},
+		received: map[string][]byte{}}
+	pod := &fakePod{controlKey: public, machine: fixture.machine}
 	// The pod keeps each uploaded file's bytes: this is where the script crosses.
 	pod.localUpload = func(stream grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error {
 		frame, err := stream.Recv()
@@ -111,9 +224,9 @@ func TestRentedCivitaiIngestSubmitsTheSingleCallScript(t *testing.T) {
 				return err
 			}
 		}
-		mu.Lock()
-		received[file.Filename] = body
-		mu.Unlock()
+		fixture.mu.Lock()
+		fixture.received[file.Filename] = body
+		fixture.mu.Unlock()
 		return nil
 	}
 	// Runtime answers preparation with the installed interface; the owner captured the same one.
@@ -130,9 +243,9 @@ func TestRentedCivitaiIngestSubmitsTheSingleCallScript(t *testing.T) {
 		if err != nil {
 			return status.Error(codes.FailedPrecondition, err.Error())
 		}
-		mu.Lock()
-		prepared = append(prepared, call)
-		mu.Unlock()
+		fixture.mu.Lock()
+		fixture.prepared = append(fixture.prepared, call)
+		fixture.mu.Unlock()
 		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED,
 			InstalledPackage: &pb.InstalledPackage{InstallationId: selected.InstallationId, Package: selected.Package,
 				Release: selected.Release, PackageInterface: surface}})
@@ -168,28 +281,34 @@ func TestRentedCivitaiIngestSubmitsTheSingleCallScript(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	startDaemonProcess(t, root, "TMPDIR="+tmp)
+	fixture.env = childEnv(t, root, "TMPDIR="+tmp)
+	return fixture
+}
 
-	cmd := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "model", "upload", "civitai://128078", "proof/sdxl",
-		"--source-profile", "civitai/sdxl/single-file/1", "--rental=ingester", "--json")
-	cmd.Env = childEnv(t, root, "TMPDIR="+tmp)
+// upload runs one rented `cozy model upload` against the pod and answers its exit and output.
+func (p *rentedIngestPod) upload(args ...string) (int, string) {
+	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin, "model", "upload"},
+		append(args, "--rental=ingester", "--json")...)...)
+	cmd.Env = p.env
 	out, _ := cmd.CombinedOutput()
-	if code := cmd.ProcessState.ExitCode(); code != 0 || strings.Contains(string(out), "slot=profile") {
-		t.Fatalf("the rented ingest was refused [exit %d]:\n%s", code, out)
-	}
-	waitFor(t, root, "the ingest's machine submission", func() bool { return machine.submitted() != nil })
+	return cmd.ProcessState.ExitCode(), string(out)
+}
 
+// submittedScript is the one ingest script the pod was asked to run, from the installation
+// it prepared and the machine submission that names it.
+func (p *rentedIngestPod) submittedScript(t *testing.T) string {
+	t.Helper()
+	waitFor(t, p.root, "the ingest's machine submission", func() bool { return p.machine.submitted() != nil })
 	var capture pb.MachineExecutionCapture
-	must(t, canonical.Unmarshal(machine.submitted().CaptureCanonicalBytes, &capture))
-	mu.Lock()
-	defer mu.Unlock()
-	if len(prepared) != 1 || capture.RootInstallationId != prepared[0].LocalPackageSet.Package.InstallationId {
-		t.Fatalf("the submission does not run the uploaded installation: prepared %d, root %q", len(prepared), capture.RootInstallationId)
+	must(t, canonical.Unmarshal(p.machine.submitted().CaptureCanonicalBytes, &capture))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.prepared) != 1 || capture.RootInstallationId != p.prepared[0].LocalPackageSet.Package.InstallationId {
+		t.Fatalf("the submission does not run the uploaded installation: prepared %d, root %q", len(p.prepared), capture.RootInstallationId)
 	}
-	script, err := tarMember(received["source.tar"], "cozy_script.py")
+	script, err := tarMember(p.received["source.tar"], "cozy_script.py")
 	must(t, err)
-	if string(script) != civitaiIngestScript {
-		t.Fatalf("the pod received another ingest script:\n%s\nwant:\n%s", script, civitaiIngestScript)
-	}
+	return string(script)
 }
 
 func tarMember(archive []byte, name string) ([]byte, error) {

@@ -98,9 +98,13 @@ func preflightConversionPlan(runCtx context.Context, ctx *Context, source publis
 
 	// Reading the headers is the part that can be legitimately impossible. A refusal from
 	// here is a statement about the ORIGIN, never about the model, so it degrades to
-	// undecided. The caller requires a decided plan before renting.
+	// undecided; only a missing credential is the caller's to fix. The caller requires a
+	// decided plan before renting.
 	staged, problem := source.Resolver.Stage(runCtx, source.Resolution,
 		filepath.Join(work.Path, "headers"), true, progress(ctx))
+	if problem != nil && problem.Code == exit.Credential {
+		return conversionPreflight{}, problem
+	}
 	if problem != nil {
 		return conversionPreflight{Undecided: problem.Message}, nil
 	}

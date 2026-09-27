@@ -40,6 +40,9 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 		return true, exit.Internalf("cannot resolve working directory: %s", err)
 	}
 	parsed, problem := modelsource.Parse(ctx.Inv.Args[0], cwd)
+	if problem != nil && !catalogModelSpelling(strings.TrimSpace(ctx.Inv.Args[0])) {
+		return true, problem
+	}
 	if problem != nil || (parsed.Kind != modelsource.HuggingFace && parsed.Kind != modelsource.Civitai) {
 		return false, nil
 	}
