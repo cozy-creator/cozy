@@ -576,8 +576,19 @@ func (c *Orchestrator) ObservePrepareEvent(instanceID, machine, label string, ev
 // so a settled run still separates its download from its package-environment install.
 func (c *Orchestrator) recordPrepareStage(instanceID, label string, stage pb.PrepareStage,
 	began time.Time, last *pb.PrepareEvent) {
-	if stage == pb.PrepareStage_PREPARE_STAGE_UNSPECIFIED || last == nil {
+	payload := PrepareStagePayload(label, stage, began, last)
+	if payload == nil {
 		return
+	}
+	for _, requestID := range c.phaseAudience(instanceID) {
+		c.emit(requestID, "request.preparing", 0, payload)
+	}
+}
+
+// PrepareStagePayload is one ended Host preparation stage as a `request.preparing` payload.
+func PrepareStagePayload(label string, stage pb.PrepareStage, began time.Time, last *pb.PrepareEvent) map[string]any {
+	if stage == pb.PrepareStage_PREPARE_STAGE_UNSPECIFIED || last == nil {
+		return nil
 	}
 	payload := map[string]any{
 		"stage":           strings.ToLower(trimEnum(pb.PrepareStage_name[int32(stage)], "PREPARE_STAGE_")),
@@ -595,9 +606,7 @@ func (c *Orchestrator) recordPrepareStage(instanceID, label string, stage pb.Pre
 	if origin > 0 || cached > 0 {
 		payload["origin_bytes"], payload["cached_bytes"] = origin, cached
 	}
-	for _, requestID := range c.phaseAudience(instanceID) {
-		c.emit(requestID, "request.preparing", 0, payload)
-	}
+	return payload
 }
 
 // RuntimeRequirementTrailer preserves authenticated worker dependency facts for both preparation paths.

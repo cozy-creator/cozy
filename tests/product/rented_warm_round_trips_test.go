@@ -38,6 +38,10 @@ type machineControlPeer interface {
 // prepare facts carry lockedExtra, and starts the daemon with daemonEnv. Run 1 is the
 // blocker the machine's GPU wait names; the test's own run is run 2.
 func startRentedFixture(t *testing.T, h *ladderHub, machine func(blocker string) machineExecutionPeer, lockedExtra string, daemonEnv ...string) string {
+	return startRentedPod(t, h, &fakePod{}, machine, lockedExtra, daemonEnv...)
+}
+
+func startRentedPod(t *testing.T, h *ladderHub, pod *fakePod, machine func(blocker string) machineExecutionPeer, lockedExtra string, daemonEnv ...string) string {
 	t.Helper()
 	publishWorkflowRelease(t, h)
 	var detail hub.PackageReleaseDetail
@@ -73,12 +77,12 @@ func startRentedFixture(t *testing.T, h *ladderHub, machine func(blocker string)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
-	pod := &fakePod{controlKey: public, machine: machine(holder.ID), deviceCount: 4,
-		preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
-			placement := modelBearingPlacement(t)(download, pkg, release)
-			placement.PackageInterface = detail.PackageInterface
-			return placement
-		}}
+	pod.controlKey, pod.machine, pod.deviceCount = public, machine(holder.ID), 4
+	pod.preparedPlacement = func(download []byte, pkg, release string) *pb.Placement {
+		placement := modelBearingPlacement(t)(download, pkg, release)
+		placement.PackageInterface = detail.PackageInterface
+		return placement
+	}
 	connection, certPath := startFakePod(t, root, pod)
 	cert, err := os.ReadFile(certPath)
 	must(t, err)
@@ -244,5 +248,118 @@ func TestRentedCancelDoesNotWaitBehindAnObservation(t *testing.T) {
 	machine.mu.Unlock()
 	if sent != 1 {
 		t.Fatalf("Runtime received %d cancel commands; want one", sent)
+	}
+}
+
+// acceptingMachines accepts every submission and keeps each one waiting for GPUs.
+type acceptingMachines struct {
+	mu     sync.Mutex
+	states map[string]*pb.MachineExecutionState
+}
+
+func (m *acceptingMachines) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
+	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}, nil
+}
+
+func (m *acceptingMachines) SubmitMachineExecution(_ context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := submit.Offer.RequestId
+	if m.states[id] == nil {
+		m.states[id] = &pb.MachineExecutionState{RequestId: id, WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId,
+			ExecutionWorkspaceId: "rented-workspace", Generation: 1, AttemptOrdinal: 1, State: "running"}
+	}
+	return &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: submit.SubmissionId, CaptureDigest: submit.CaptureDigest,
+		InvocationSpecDigest: submit.Offer.InvocationSpecDigest, AcceptedAtMs: uint64(time.Now().UnixMilli()),
+		WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}, nil
+}
+
+func (m *acceptingMachines) GetMachineExecution(_ context.Context, query *pb.MachineExecutionQuery) (*pb.MachineExecutionState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if state := m.states[query.RequestId]; state != nil {
+		return proto.Clone(state).(*pb.MachineExecutionState), nil
+	}
+	return nil, status.Error(codes.NotFound, "no such execution")
+}
+
+func (m *acceptingMachines) ListMachineExecutionEvents(context.Context, *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error) {
+	return &pb.MachineExecutionEventPage{}, nil
+}
+
+func (m *acceptingMachines) CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
+	return nil, status.Error(codes.FailedPrecondition, "still running")
+}
+
+func (m *acceptingMachines) AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
+	return nil, status.Error(codes.FailedPrecondition, "still running")
+}
+
+func (m *acceptingMachines) accepted(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.states[id] != nil
+}
+
+// `cozy run show` attributes the time before machine acceptance: the connection, each
+// package's preparation, captured defaults and the submission itself. A second identical
+// submission is answered by the preparation the machine already holds, in one reply.
+func TestRentedSubmissionAttributesItsTimeAndReusesThePreparation(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machines := &acceptingMachines{states: map[string]*pb.MachineExecutionState{}}
+	pod := &fakePod{retainPrepared: true}
+	root := startRentedPod(t, h, pod, func(string) machineExecutionPeer { return machines }, "")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	for _, key := range []string{"first", "second"} {
+		if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", key); code != 0 {
+			t.Fatalf("the %s rented run was refused [exit %d]: %s", key, code, out)
+		}
+		waitFor(t, root, "the "+key+" Runtime submission", func() bool {
+			row, problem := store.RequestByIdempotencyKey(key)
+			return problem == nil && row != nil && machines.accepted(row.ID)
+		})
+	}
+	stages := func(run string) map[string]string {
+		_, out := runCozy(t, root, "run", "show", run, "--json")
+		var report struct {
+			Stages []struct{ Name, Kind, Detail string } `json:"stages"`
+		}
+		must(t, json.Unmarshal([]byte(out), &report))
+		rows := map[string]string{}
+		for _, stage := range report.Stages {
+			if stage.Kind == "setup" {
+				rows[stage.Name] = stage.Detail
+			}
+		}
+		return rows
+	}
+	first, second := stages("2"), stages("3")
+	for _, name := range []string{"machine connection", "package preparation", "model defaults", "submission"} {
+		if _, ok := first[name]; !ok {
+			t.Fatalf("the first run does not attribute %q: %v", name, first)
+		}
+		if _, ok := second[name]; !ok {
+			t.Fatalf("the second run does not attribute %q: %v", name, second)
+		}
+	}
+	if first["package environment"] != ladderPackage+"@1.0.0" || strings.Contains(first["package preparation"], "reused") {
+		t.Fatalf("the first run's preparation was not the machine's own work: %v", first)
+	}
+	if second["package preparation"] != ladderPackage+"@1.0.0, reused the machine's preparation" {
+		t.Fatalf("the second run did not reuse the identical preparation: %v", second)
+	}
+	for _, name := range []string{"resolve", "download", "package environment"} {
+		if _, ok := second[name]; ok {
+			t.Fatalf("the second run prepared again (%s): %v", name, second)
+		}
+	}
+	pod.mu.Lock()
+	calls := len(pod.prepares)
+	pod.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("two identical submissions made %d preparation calls; want one each", calls)
 	}
 }

@@ -40,6 +40,7 @@ type publishedPreparation struct {
 	*pb.DesiredPlacementSet
 	InstalledPackage   *pb.InstalledPackage
 	LockedRequirements []byte
+	Retained           bool // the machine answered from its preparation of these exact inputs
 }
 
 func retainWorkerInstallation(connection *machineConnection, expected localpackage.Installation, installed *pb.InstalledPackage) *exit.Error {
@@ -285,11 +286,15 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return problem
 		}
 	}
+	began := time.Now()
 	connection, problem := m.connect(m.ctx, link.MachineID)
 	if problem != nil {
 		return problem
 	}
 	defer connection.connection.Close()
+	if len(link.Submission) == 0 {
+		m.submissionStage(request.ID, "connect", link.MachineID, began)
+	}
 	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
 		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
 	}
@@ -377,10 +382,13 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 						return problem
 					}
 				}
-				capture, problem = m.resolver.captureMachineModelDefaults(capture, request, origin)
+				began := time.Now()
+				var detail string
+				capture, detail, problem = m.resolver.captureMachineModelDefaults(capture, request, origin)
 				if problem != nil {
 					return problem
 				}
+				m.submissionStage(request.ID, "model_defaults", detail, began)
 			}
 			installed := connection.installed[request.LocalInstallationID]
 			if installed == nil {
@@ -402,9 +410,13 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			} else if request, problem = m.bindServingPlan(request, installed.InstallationId, placements); problem != nil {
 				return problem
 			}
+			began := time.Now()
 			byteInputs, problem := m.stageMachineInputs(m.ctx, request, connection)
 			if problem != nil {
 				return problem
+			}
+			if len(byteInputs) > 0 {
+				m.submissionStage(request.ID, "inputs", fmt.Sprintf("%d input(s)", len(byteInputs)), began)
 			}
 			if job.Kind == "job" {
 				built, problem = orchestrator.MachineJobSubmission(request, capture, machineJobPlan(request, installed.InstallationId, job), byteInputs)
@@ -442,9 +454,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if request.LocalInstallationID == "" && connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
 		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires Runtime protocol 54")
 	}
+	began = time.Now()
 	if problem := m.sendMachineSubmission(m.ctx, connection, request.ID, submission); problem != nil {
 		return problem
 	}
+	m.submissionStage(request.ID, "submit", "", began)
 	if m.fleet != nil && m.fleet.owner != nil {
 		m.fleet.owner.ForgetPhase(request.ID) // Runtime reports the run from here on
 	}
