@@ -1,9 +1,12 @@
 name: ci
+# Automatic: one ~1 min job on master pushes that touch Rust: `cargo check` of every crate
+# and target (tests included), which targeted local `cargo test -p` runs do not compile.
+# On demand, before a release (full suite, fences, version guards, wheel e2e):
+#   gh workflow run ci.yaml -R cozy-creator/tensorfs --ref <branch> [-f scope=cache-owner]
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [master]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/ci.yaml"]
   workflow_dispatch:
     inputs:
       scope:
@@ -15,6 +18,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  check:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
   cache-owner:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'cache-owner'
     runs-on: ubuntu-latest
@@ -39,10 +52,7 @@ jobs:
           done
           [ "$found" = true ]
   ci:
-    # Draft PRs are checkpoints; CI runs once the PR is ready for review.
-    if: >-
-      (github.event_name != 'workflow_dispatch' || inputs.scope != 'cache-owner') &&
-      (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    if: github.event_name == 'workflow_dispatch' && inputs.scope != 'cache-owner'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -52,50 +62,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Compares the whole tree, docs included, so it runs on every change.
       - run: python3 scripts/released_version.py
-      - id: changes
-        if: github.event_name != 'workflow_dispatch'
-        uses: dorny/paths-filter@v3
-        with:
-          predicate-quantifier: every
-          filters: |
-            code:
-              - "**"
-              - "!**.md"
-              - "!docs/**"
 
       # Pinned: `-D warnings` against a floating stable fails CI with no code change.
-      - if: steps.changes.outputs.code != 'false'
-        uses: dtolnay/rust-toolchain@1.91.1
+      - uses: dtolnay/rust-toolchain@1.91.1
         with:
           components: clippy
-      - if: steps.changes.outputs.code != 'false'
-        uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           save-cache: ${{ github.ref == 'refs/heads/master' }}
       # target/ is the host build; target/manylinux is the wheel's container build.
-      - if: steps.changes.outputs.code != 'false'
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
             . -> target/manylinux
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      - if: steps.changes.outputs.code != 'false'
-        run: |
+      - run: |
           set -eux
           cargo build --workspace
           for s in h3 h3-pdd sdxl civitai-sdxl instruments; do
             python3 "scripts/rebank-$s.py" --tfs target/debug/tfs
           done
-      - if: steps.changes.outputs.code != 'false'
-        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::style
-      - if: steps.changes.outputs.code != 'false'
-        run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::style
+      - run: cargo test --workspace
       - name: Privileged-broker and unprivileged Store-owner writers
-        if: steps.changes.outputs.code != 'false'
         run: |
           for proof in target/debug/deps/store_boundaries-*; do
             if [ -f "$proof" ] && [ -x "$proof" ]; then
@@ -103,26 +95,22 @@ jobs:
             fi
           done
       - name: Transfers inside a 64 MiB memory budget
-        if: steps.changes.outputs.code != 'false'
         run: |
           for proof in target/debug/deps/transfer_memory-*; do
             if [ -f "$proof" ] && [ -x "$proof" ]; then
               sudo systemd-run --scope -p MemoryMax=64M -p MemorySwapMax=0 --quiet "$proof" --exact an_object_larger_than_the_memory_budget_uploads_and_downloads --nocapture
             fi
           done
-      - if: steps.changes.outputs.code != 'false'
-        run: |
+      - run: |
           set -eux
           python3 scripts/fence.py
           uv run --no-project --python 3.12 --with mypy mypy --strict --python-version 3.12 python/tensorfs
           python3 scripts/version_contract.py source
 
-      - if: steps.changes.outputs.code != 'false'
-        run: cargo build --release --bin tfs
+      - run: cargo build --release --bin tfs
       # SHA-256 instructions may only live in the runtime-dispatched routine (tfs-068);
       # anywhere else they SIGILL on a host without them. `ring` carries its own dispatch.
       - name: SHA extensions only behind runtime dispatch
-        if: steps.changes.outputs.code != 'false'
         run: |
           set -e
           out=$(objdump -d --no-show-raw-insn target/release/tfs \
@@ -135,7 +123,6 @@ jobs:
             && echo "runner HAS the sha extensions: both routines were exercised" \
             || echo "runner LACKS the sha extensions: only the scalar fallback was exercised"
       - name: Vectors, capability arms, decoder and CBOR conformance
-        if: steps.changes.outputs.code != 'false'
         run: |
           set -eux
           tfs=target/release/tfs
@@ -154,8 +141,7 @@ jobs:
 
       # The CLI rides the wheel (tfs-051), built in the manylinux container so its glibc
       # floor matches the extension beside it.
-      - if: steps.changes.outputs.code != 'false'
-        uses: PyO3/maturin-action@v1
+      - uses: PyO3/maturin-action@v1
         with:
           target: x86_64
           args: --release --locked --target-dir target/manylinux --out dist
@@ -164,7 +150,6 @@ jobs:
             cargo build --release --locked --target-dir target/manylinux -p tensorfs-core --bin tfs
             install -D -m 755 target/manylinux/release/tfs wheel-data/scripts/tfs
       - name: Wheel end-to-end over a real store
-        if: steps.changes.outputs.code != 'false'
         run: |
           set -eux
           for wheel in dist/*.whl; do python3 scripts/version_contract.py wheel "$wheel"; done
@@ -172,7 +157,6 @@ jobs:
           sudo "${RUNNER_TEMP}/smoke/venv/bin/python" scripts/scoped-derived.py --isolation
           sudo "${RUNNER_TEMP}/smoke/venv/bin/python" scripts/scoped-model-reader.py --isolation
       - name: Optional PyTorch interface over the built wheel
-        if: steps.changes.outputs.code != 'false'
         env:
           CUDA_VISIBLE_DEVICES: ""
           UV_TORCH_BACKEND: cpu
@@ -183,11 +167,10 @@ jobs:
           done
           "${RUNNER_TEMP}/tensor-interface/bin/python" scripts/torch-interface.py
       # A newer-host CLI swapped into the portable wheel must falsify its platform tag.
-      - if: steps.changes.outputs.code != 'false'
-        run: |
+      - run: |
           for wheel in dist/*.whl; do
             uv run --script scripts/wheel-platform.py "$wheel" --prove target/release/tfs
           done
       # The container build leaves root-owned files the cache post-step must read and prune.
-      - if: always() && steps.changes.outputs.code != 'false'
+      - if: always()
         run: sudo chown -R "$(id -u):$(id -g)" target
