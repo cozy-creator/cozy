@@ -101,6 +101,14 @@ jobs:
               sudo "$proof" --exact privileged_writer_preserves_the_store_owners_public_directories --nocapture
             fi
           done
+      - name: Transfers inside a 64 MiB memory budget
+        if: steps.changes.outputs.code != 'false'
+        run: |
+          for proof in target/debug/deps/transfer_memory-*; do
+            if [ -f "$proof" ] && [ -x "$proof" ]; then
+              sudo systemd-run --scope -p MemoryMax=64M -p MemorySwapMax=0 --quiet "$proof" --exact an_object_larger_than_the_memory_budget_uploads_and_downloads --nocapture
+            fi
+          done
       - if: steps.changes.outputs.code != 'false'
         run: |
           set -eux

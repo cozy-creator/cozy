@@ -137,10 +137,14 @@ pub struct Pushed {
     pub bytes_sent: u64,
 }
 
-/// Read one verified object out of the store, whole. Objects are cut on the 64 MiB grid
-/// and a manifest is capped harder, so one object in memory is bounded by construction —
-/// which is what lets a re-send restart from byte zero with no scratch state.
-fn verified_bytes(store: &Store, sha256: &str, manifest: bool) -> Result<(Vec<u8>, ObjectRef)> {
+/// What one push sends: a manifest's bounded document bytes, or a blob's verified
+/// descriptor, streamed in bounded chunks. Either re-sends from byte zero with no scratch.
+enum Body {
+    Bytes(Vec<u8>),
+    Object(crate::store::VerifiedFile),
+}
+
+fn verified_body(store: &Store, sha256: &str, manifest: bool) -> Result<(Body, ObjectRef)> {
     if manifest {
         let path = store.manifest_path(sha256);
         let bytes = std::fs::read(&path).map_err(|error| Refusal {
@@ -155,28 +159,14 @@ fn verified_bytes(store: &Store, sha256: &str, manifest: bool) -> Result<(Vec<u8
             );
         }
         crate::manifest::Manifest::parse(&bytes)?;
-        Ok((bytes, object))
+        Ok((Body::Bytes(bytes), object))
     } else {
         let file = store.open_verified(sha256)?;
-        let length = file.len();
-        let mut bytes = vec![
-            0u8;
-            usize::try_from(length).map_err(|_| Refusal {
-                code: Code::SIZE_CAP,
-                detail: format!("sha256:{sha256} exceeds this platform's address space"),
-            })?
-        ];
-        file.read_exact_at(&mut bytes, 0).map_err(|error| Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("read sha256:{sha256}: {error}"),
-        })?;
-        Ok((
-            bytes,
-            ObjectRef {
-                sha256: sha256.to_string(),
-                length,
-            },
-        ))
+        let object = ObjectRef {
+            sha256: sha256.to_string(),
+            length: file.len(),
+        };
+        Ok((Body::Object(file), object))
     }
 }
 
@@ -195,7 +185,12 @@ pub fn push_object(
     content_type: &str,
 ) -> Result<Pushed> {
     let client = shared_client();
-    let (bytes, object) = verified_bytes(store, sha256, manifest)?;
+    let (body, object) = verified_body(store, sha256, manifest)?;
+    let payload_length = object.length;
+    let payload = match &body {
+        Body::Bytes(bytes) => http::Payload::Bytes(bytes),
+        Body::Object(file) => http::Payload::Object(file),
+    };
     let mut complete_send = false;
     let mut last_refusal: Option<Refusal> = None;
     for attempt in 1..=PUT_ATTEMPTS {
@@ -221,12 +216,12 @@ pub fn push_object(
                 None => headers.push((name.clone(), value.clone())),
             }
         }
-        let sent = http::request(
+        let sent = http::send(
             client,
             &checked,
             "PUT",
             &headers,
-            Some(&bytes),
+            Some(payload),
             deadline,
             ledger,
             // The push plane keeps its own derived write bound below and gains no plane
@@ -280,7 +275,7 @@ pub fn push_object(
                     object,
                     http_status: status,
                     landed_precondition: true,
-                    bytes_sent: bytes.len() as u64,
+                    bytes_sent: payload_length,
                 });
             }
             // The immutable key already holds bytes. Under a content-addressed key that
@@ -297,7 +292,7 @@ pub fn push_object(
                 object,
                 http_status: status,
                 landed_precondition: false,
-                bytes_sent: bytes.len() as u64,
+                bytes_sent: payload_length,
             });
         }
         return refuse(
