@@ -66,13 +66,27 @@ type reportRank struct {
 	PID       int    `json:"pid"`
 	Ordinal   int    `json:"ordinal"`
 	UUID      string `json:"uuid"`
+	Arch      string `json:"arch,omitempty"`
 	StartUS   int64  `json:"start_us"`
 	EndUS     int64  `json:"end_us"`
 	Attention struct {
-		Requested string `json:"requested"`
-		Observed  string `json:"observed"`
-		Impl      string `json:"impl"`
+		Requested string        `json:"requested"`
+		Observed  string        `json:"observed"`
+		Impl      string        `json:"impl"`
+		Probes    []reportProbe `json:"probes,omitempty"`  // kernels the rank served
+		Skipped   []reportProbe `json:"skipped,omitempty"` // kernels its probe refused
 	} `json:"attention"`
+}
+
+// reportProbe is one rank's numeric probe of an attention kernel against exact attention.
+type reportProbe struct {
+	Kernel      string             `json:"kernel"`
+	Status      string             `json:"status"`
+	Source      string             `json:"source,omitempty"` // warm, prepare or request
+	Shape       []int              `json:"shape,omitempty"`
+	RelL2ByRows map[string]float64 `json:"rel_l2_by_rows,omitempty"`
+	Budget      float64            `json:"budget"`
+	BudgetState string             `json:"budget_state,omitempty"` // calibrated or uncalibrated
 }
 
 type triageTrack struct {
@@ -375,7 +389,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	}
 	if len(r.Ranks) > 0 {
 		fmt.Fprintf(w, "\nranks (degree %d)\n", r.Degree)
-		fmt.Fprintln(table, "RANK\tGPU\tUUID\tPID\tSTART\tTIME\tATTENTION")
+		fmt.Fprintln(table, "RANK\tGPU\tARCH\tUUID\tPID\tSTART\tTIME\tATTENTION")
 		for _, rank := range r.Ranks {
 			gpu, start, took := "-", "-", "-"
 			if rank.Ordinal >= 0 {
@@ -384,12 +398,51 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 			if rank.StartUS > 0 {
 				start, took = offset(rank.StartUS/1000), span(float64(rank.EndUS-rank.StartUS)/1000)
 			}
-			fmt.Fprintf(table, "%d\t%s\t%s\t%d\t%s\t%s\t%s\n", rank.Rank, gpu,
+			fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", rank.Rank, gpu, dash(rank.Arch),
 				output.Elide(dash(rank.UUID), 17, mode.Full), rank.PID, start, took, rankAttention(rank))
 		}
 		table.Flush()
+		emitProbes(w, table, r.Ranks)
 	}
 	return nil
+}
+
+// emitProbes prints each rank's attention probes: the worst row group's rel L2 against
+// exact attention beside the kernel's budget, and whether the kernel served or was refused.
+func emitProbes(w io.Writer, table *tabwriter.Writer, ranks []reportRank) {
+	header := false
+	for _, rank := range ranks {
+		rows := append(append([]reportProbe{}, rank.Attention.Probes...), rank.Attention.Skipped...)
+		for index, probe := range rows {
+			if !header {
+				fmt.Fprintln(w, "\nattention probes")
+				fmt.Fprintln(table, "RANK\tKERNEL\tMAX REL L2\tBUDGET\tVERDICT\tMEASURED")
+				header = true
+			}
+			worst, group := "-", ""
+			for name, value := range probe.RelL2ByRows {
+				if group == "" || value > probe.RelL2ByRows[group] || (value == probe.RelL2ByRows[group] && name < group) {
+					group = name
+				}
+			}
+			if group != "" {
+				worst = fmt.Sprintf("%.4g (%s)", probe.RelL2ByRows[group], group)
+			}
+			budget := fmt.Sprintf("%.4g", probe.Budget)
+			if probe.BudgetState == "uncalibrated" {
+				budget += " UNCALIBRATED"
+			}
+			verdict := "served"
+			if index >= len(rank.Attention.Probes) {
+				verdict = "refused: " + strings.TrimPrefix(probe.Status, "attention_kernel_")
+			} else if probe.Status != "ready" {
+				verdict += " (" + probe.Status + ")"
+			}
+			fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\n", rank.Rank, probe.Kernel, worst, budget,
+				verdict, dash(probe.Source))
+		}
+	}
+	table.Flush()
 }
 
 func dash(value string) string {
