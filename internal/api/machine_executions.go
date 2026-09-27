@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
@@ -21,6 +22,8 @@ type MachineExecutions interface {
 	Control(context.Context, records.Request, string) *exit.Error
 	// Withdraw stops a canceled request's submission work that has not reached Runtime.
 	Withdraw(string)
+	// PruneOperationCache frees one machine's unused cached operation results.
+	PruneOperationCache(ctx context.Context, machine string) (uint32, uint64, bool, *exit.Error)
 }
 
 // This is a client observation, not an execution or custody receipt of its own.
@@ -155,10 +158,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 				state.ErrorType = body.Cause.Code.String()
 				if providerRefusal.MatchString(body.SafeMessage) {
 					state.ErrorType = "model_source.auth_required"
-					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the daemon config. A machine Runtime older than 0.18.54 cannot receive it"
-					if link.MachineID != "local" {
-						state.Error += ": run `cozy rental update " + link.MachineID + "`"
-					}
+					state.Error += "; the provider requires authentication: set huggingface_token or civitai_token in the daemon config. A machine Runtime older than 0.18.54 cannot receive it: " + machines.RuntimeUpdate(link.MachineID)
 				}
 			}
 			if view.Collected && body.Result != nil && len(body.Result.InlineResult) > 0 {

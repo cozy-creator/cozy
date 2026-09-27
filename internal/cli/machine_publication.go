@@ -20,7 +20,7 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 	if problem != nil || len(names) == 0 {
 		return "", problem
 	}
-	if machine == "local" || len(connection.certificateDigest) != sha256.Size {
+	if connection.RentalID() == "" || len(connection.CertificateDigest) != sha256.Size {
 		return "", exit.Named(exit.Structural, "publication.machine_identity_required", "publication authority requires the rented machine's pinned certificate identity")
 	}
 	raw, problem := m.store.MachinePublicationIntent(request)
@@ -34,7 +34,7 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 		if problem != nil {
 			return "", problem
 		}
-		if selected.ID != machine || selected.WorkerID != connection.claim.WorkerId || selected.WorkerBootID != connection.claim.WorkerBootId {
+		if selected.ID != machine || selected.WorkerID != connection.Claim.WorkerId || selected.WorkerBootID != connection.Claim.WorkerBootId {
 			return "", exit.New(exit.Conflict, "publication authority rental readback differs from the authenticated machine")
 		}
 		block, remaining := pem.Decode([]byte(selected.CertPEM))
@@ -64,7 +64,7 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 	for _, repository := range intent.Repositories {
 		consented = append(consented, repository.Org+"/"+repository.Name)
 	}
-	if err != nil || intent.RentalID != machine || !bytes.Equal(digest[:], connection.certificateDigest) ||
+	if err != nil || intent.RentalID != machine || !bytes.Equal(digest[:], connection.CertificateDigest) ||
 		!slices.Equal(consented, names) || !slices.Equal(intent.Permissions, []string{"assessment", "checkpoint", "release"}) {
 		return "", exit.New(exit.Conflict, "publication authorization differs from recorded consent or the pinned machine certificate")
 	}

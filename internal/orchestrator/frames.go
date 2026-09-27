@@ -1701,26 +1701,6 @@ func (c *Orchestrator) captureTriage(s *session, requestID string, attempt uint6
 	return tr
 }
 
-// RentalTriage copies a rented Runtime execution's triage bundle over the pod's media plane,
-// verified against the digest and length its terminal names.
-func (c *Orchestrator) RentalTriage(rentalID string, ref *pb.TriageBundleRef) ([]byte, *exit.Error) {
-	c.mu.Lock()
-	w := c.workers[rentalInstanceID(rentalID)]
-	c.mu.Unlock()
-	if w == nil || w.media == nil {
-		return nil, exit.Unavailablef("rental %s has no attached media plane", rentalID)
-	}
-	digest := spellOf(ref.WriteReceiptDigest)
-	data, problem := w.media.GetTriage(ref.SubjectId, digest, int64(ref.Length))
-	if problem != nil {
-		return nil, problem
-	}
-	if uint64(len(data)) != ref.Length || spellOf(canonical.Digest(data)) != digest {
-		return nil, exit.New(exit.Conflict, "triage bundle does not match its terminal")
-	}
-	return data, nil
-}
-
 // requeueable is the record owner's projection: an accepted-but-incomplete attempt, the
 // infra-class failures, and a WORKER pre-execution refusal earn a new ordinal. A
 // deterministic body failure and an author/runtime refusal settle — re-running them would

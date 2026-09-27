@@ -36,6 +36,19 @@ func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.
 	}
 	return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
 }
+
+// machineTriagePeer reads a retained triage bundle for its owner through the Host.
+type machineTriagePeer interface {
+	ReadMachineExecutionTriage(context.Context, *pb.MachineExecutionTriageQuery) (*pb.MachineExecutionTriage, error)
+}
+
+func (p *fakePod) ReadMachineExecutionTriage(ctx context.Context, request *pb.MachineExecutionTriageQuery) (*pb.MachineExecutionTriage, error) {
+	if machine, ok := p.machine.(machineTriagePeer); ok {
+		return machine.ReadMachineExecutionTriage(ctx, request)
+	}
+	return p.UnimplementedPodHostServer.ReadMachineExecutionTriage(ctx, request)
+}
+
 func (p *fakePod) SubmitMachineExecution(ctx context.Context, request *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	if machine, ok := p.machine.(machineSubmitPeer); ok {
 		return machine.SubmitMachineExecution(ctx, request)

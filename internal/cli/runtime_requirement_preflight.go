@@ -24,9 +24,6 @@ type runtimeObservation struct {
 // dispatch only waits for explicit maintenance; worker protocol admission owns
 // control compatibility and never upgrades a rental to satisfy package wheels.
 func (u *rentalRuntimeUpdates) preflight(_ context.Context, _ records.Request, machine string) *exit.Error {
-	if machine == "local" {
-		return nil
-	}
 	current, problem := u.machines.store.RuntimeUpdate(machine)
 	if problem != nil {
 		return problem

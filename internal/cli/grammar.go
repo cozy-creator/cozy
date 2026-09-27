@@ -16,6 +16,7 @@ type CLI struct {
 	Hub     HubCmd     `cmd:"" group:"Authentication" help:"Choose which Tensorhub commands use; one daemon serves them all."`
 	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
+	Machine MachineCmd `cmd:"" group:"Rentals" help:"This computer as a machine: the same Host a rental runs."`
 	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
 	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
@@ -24,6 +25,34 @@ type CLI struct {
 	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
 
 	Completion CompletionCmd `cmd:"" group:"Lifecycle" help:"Print a bash, zsh or fish tab-completion script."`
+}
+
+type MachineCmd struct {
+	Install MachineInstallCmd `cmd:"" help:"Install a worker cohort's Host and Runtime as this computer's machine."`
+	Show    MachineShowCmd    `cmd:"" help:"Show this computer's machine."`
+	Stop    MachineStopCmd    `cmd:"" help:"Stop this computer's machine Host; the next local run starts it again."`
+}
+
+type MachineInstallCmd struct {
+	Host          string `name:"host" predictor:"file" help:"The cohort's pod-supervisor binary."`
+	RuntimeWheel  string `name:"runtime-wheel" predictor:"file" help:"The cohort's Runtime wheel; default: the published Runtime."`
+	TensorFSWheel string `name:"tensorfs-wheel" predictor:"file" help:"The cohort's TensorFS wheel, with --runtime-wheel."`
+}
+
+func (c *MachineInstallCmd) Run(r *Runtime) error {
+	return r.call(handleMachineInstall, nil, nil, values("--host", c.Host, "--runtime-wheel", c.RuntimeWheel, "--tensorfs-wheel", c.TensorFSWheel), false)
+}
+
+type MachineShowCmd struct{}
+
+func (c *MachineShowCmd) Run(r *Runtime) error {
+	return r.call(handleMachineShow, nil, nil, nil, false)
+}
+
+type MachineStopCmd struct{}
+
+func (c *MachineStopCmd) Run(r *Runtime) error {
+	return r.call(handleMachineStop, nil, nil, nil, false)
 }
 
 type DaemonCmd struct {

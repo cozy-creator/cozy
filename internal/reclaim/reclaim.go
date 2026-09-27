@@ -450,6 +450,8 @@ func Retired(l home.Layout) (Swept, *exit.Error) {
 	for _, name := range []string{
 		"triage", "uploads", "job-plans", "jit-cache", "client.cred", "writer.lock",
 		"private-packages", "companions",
+		// The Runtime this daemon used to spawn itself; this computer's machine replaced it.
+		"runtime",
 	} {
 		path := filepath.Join(l.Root, name)
 		if _, err := os.Lstat(path); err != nil {

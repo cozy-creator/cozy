@@ -135,6 +135,7 @@ func runCozyPath(t *testing.T, root, path string, args ...string) (int, string) 
 	if cmd.ProcessState != nil {
 		code = cmd.ProcessState.ExitCode()
 	}
+	skipWithoutMachine(t, code, string(data))
 	return code, string(data)
 }
 

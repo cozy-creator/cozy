@@ -80,6 +80,39 @@ func PendingCreatorIdentity(l home.Layout, operationKey string) (CreatorIdentity
 	return identity, nil
 }
 
+// OwnerIdentityAt is a machine's owner key at path, minted 0600 on first use. The local
+// machine keeps one for its lifetime, as a rental keeps its per-rental key.
+func OwnerIdentityAt(path string) (CreatorIdentity, *exit.Error) {
+	if _, err := os.Stat(path); err == nil {
+		return loadCreatorIdentity(path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return CreatorIdentity{}, exit.Internalf("cannot inspect the machine owner key: %s", err)
+	}
+	identity, problem := mintCreatorIdentity()
+	if problem != nil {
+		return CreatorIdentity{}, problem
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return loadCreatorIdentity(path)
+	}
+	if err != nil {
+		return CreatorIdentity{}, exit.Internalf("cannot create the machine owner key: %s", err)
+	}
+	_, err = f.Write(identity.pem)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return CreatorIdentity{}, exit.Internalf("cannot persist the machine owner key: %s", err)
+	}
+	return identity, nil
+}
+
 func mintCreatorIdentity() (CreatorIdentity, *exit.Error) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

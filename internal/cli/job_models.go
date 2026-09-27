@@ -48,7 +48,7 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 		return "", nil, nil, problem
 	}
 	if len(overrides) == 0 && len(profiles) == 0 {
-		models, problem := resolveInvocationModels(ctx, target, job, overrides, rentalRequested(ctx))
+		models, problem := resolveInvocationModels(ctx, target, job, overrides)
 		if problem == nil {
 			models, problem = jobManifestInputs(ctx, job, models)
 		}
@@ -77,7 +77,7 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 		if len(profiles) > 0 {
 			return "", nil, nil, exit.Usagef("--source-profile applies only to foreign model inputs")
 		}
-		models, problem := resolveSelectedInvocationModels(ctx, target, job, selected, rentalRequested(ctx))
+		models, problem := resolveSelectedInvocationModels(ctx, target, job, selected)
 		if problem == nil {
 			models, problem = jobManifestInputs(ctx, job, models)
 		}

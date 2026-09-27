@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 // UseRental fences one client transport/preparation against maintenance. It is
@@ -139,19 +137,4 @@ func (c *Orchestrator) MaintainRental(ctx context.Context, id string,
 		return exit.New(exit.Conflict, "maintenance rental identity changed")
 	}
 	return update(ctx, target.Connection)
-}
-
-// RentalExecutionClaim reuses the rental's authenticated control authority for
-// independent execution and preparation RPCs. A second Control Claim would fence
-// the live session and cancel preparations on its connection.
-func (c *Orchestrator) RentalExecutionClaim(ctx context.Context, id string) (*pb.Claim, *exit.Error) {
-	instance, _, _, problem := c.ensureRentalContext(ctx, id)
-	if problem != nil {
-		return nil, problem
-	}
-	_, session, problem := c.localControlContext(ctx, instance)
-	if problem != nil {
-		return nil, problem
-	}
-	return proto.Clone(session.claim).(*pb.Claim), nil
 }

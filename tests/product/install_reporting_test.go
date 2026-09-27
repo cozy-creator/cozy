@@ -72,16 +72,25 @@ func TestPublishedInstallDoesNotPrefetchModels(t *testing.T) {
 			defer server.Close()
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
 			if mode == "before-install" {
+				// A live writer makes the install wait, never fail; it proceeds once released.
 				writer, problem := install.Lock(layout)
 				fatal(t, problem)
-				defer writer.Unlock()
+				cmd := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "package", "install", "proof/install-reporting", "--version=1.0.1", "--json", "--full")
+				cmd.Env = childEnv(t, root)
+				var stdout, stderr renderBuffer
+				cmd.Stdout, cmd.Stderr = &stdout, &stderr
+				must(t, cmd.Start())
+				waitUntil(t, "the install waits for the writer", func() bool {
+					return strings.Contains(stderr.String(), "waiting for another Cozy command")
+				})
+				writer.Unlock()
+				if err := cmd.Wait(); err != nil || !strings.Contains(stdout.String(), `"status":"installed"`) {
+					t.Fatalf("install did not proceed after the writer released: %v %s %s", err, stdout.String(), stderr.String())
+				}
+				return
 			}
 			code, stdout, stderr := runCozyStreams(t, root, "package", "install", "proof/install-reporting", "--version=1.0.1", "--json", "--full")
-			if mode == "before-install" {
-				if code == 0 || !strings.Contains(stdout, `"code":"conflict"`) {
-					t.Fatalf("pre-install writer refusal lost: %d %s %s", code, stdout, stderr)
-				}
-			} else {
+			{
 				if modelRequests.Load() != 0 {
 					t.Fatal("package installation requested model bindings")
 				}

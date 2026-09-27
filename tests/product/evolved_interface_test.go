@@ -8,8 +8,8 @@ import (
 
 // A package interface written by a newer Runtime carries members, constraints and type
 // grammar this CLI has never seen (h3a-054: one unknown asset_bound member refused every
-// run of a published release). The real run path still reaches model acquisition, and
-// the readable bounds are still enforced early.
+// run of a published release). The real run path still reaches the machine, and the
+// readable bounds are still enforced before anything is submitted.
 func TestRunAcceptsInterfaceMembersFromANewerRuntime(t *testing.T) {
 	var doc map[string]any
 	must(t, json.Unmarshal(admissionInterface(t, false, false), &doc))
@@ -28,17 +28,17 @@ func TestRunAcceptsInterfaceMembersFromANewerRuntime(t *testing.T) {
 	})
 	raw, err := json.Marshal(doc)
 	must(t, err)
-	root, path, _, probe := admissionRoot(t, raw, "NVIDIA B200", false)
+	root, path, _, _ := admissionRoot(t, raw, "NVIDIA B200", false)
 
 	code, out := runAdmissionCLI(t, root, path, "run", ladderPackage+"/generate", "--json",
 		"--idempotency-key", "evolved-short", "prompt=", `mask:={"shape":[1]}`)
 	if code == 0 || !strings.Contains(out, "prompt") || strings.Contains(out, "proof stopped before model acquisition") {
 		t.Fatalf("the readable min_length bound was not enforced before acquisition [exit %d]: %s", code, out)
 	}
+	assertAdmissionDidNotSubmit(t, root, "evolved-short")
 	code, out = runAdmissionCLI(t, root, path, "run", ladderPackage+"/generate", "--json",
 		"--idempotency-key", "evolved", "prompt=hello", `mask:={"shape":[1]}`)
-	if _, lanes := probe.snapshot(); code == 0 || !strings.Contains(out, "proof stopped before model acquisition") || len(lanes) != 1 {
-		t.Fatalf("a newer Runtime's interface members refused the run [exit %d]: %s", code, out)
+	if code == 0 || !strings.Contains(out, `"machine":"local"`) {
+		t.Fatalf("a newer Runtime's interface members refused the run before it reached the machine [exit %d]: %s", code, out)
 	}
-	assertAdmissionDidNotSubmit(t, root, "evolved")
 }

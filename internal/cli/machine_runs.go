@@ -16,26 +16,16 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/transfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
-
-type machineExecutionClient interface {
-	GetMachineExecutionWorkspace(context.Context, *pb.MachineExecutionWorkspaceQuery, ...grpc.CallOption) (*pb.MachineExecutionWorkspace, error)
-	SubmitMachineExecution(context.Context, *pb.MachineExecutionSubmit, ...grpc.CallOption) (*pb.MachineExecutionReceipt, error)
-	GetMachineExecution(context.Context, *pb.MachineExecutionQuery, ...grpc.CallOption) (*pb.MachineExecutionState, error)
-	ListMachineExecutionEvents(context.Context, *pb.MachineExecutionEventsQuery, ...grpc.CallOption) (*pb.MachineExecutionEventPage, error)
-	ControlMachineExecution(context.Context, *pb.MachineExecutionControl, ...grpc.CallOption) (*pb.MachineExecutionState, error)
-	CollectMachineExecution(context.Context, *pb.MachineExecutionCollect, ...grpc.CallOption) (*pb.AttemptOutcome, error)
-	AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck, ...grpc.CallOption) (*pb.MachineExecutionState, error)
-}
 
 type publishedPreparation struct {
 	*pb.DesiredPlacementSet
@@ -50,41 +40,6 @@ func retainWorkerInstallation(connection *machineConnection, expected localpacka
 	}
 	connection.installed[expected.ID] = proto.Clone(installed).(*pb.InstalledPackage)
 	return nil
-}
-
-type machineConnection struct {
-	installed          map[string]*pb.InstalledPackage
-	importInputTree    func(context.Context) (grpc.ClientStreamingClient[pb.InputTreeImportFrame, pb.NativeByteRetentionResult], error)
-	connection         *machineClientConnection
-	client             machineExecutionClient
-	claim              *pb.Claim
-	protocol           *pb.ProtocolInfoResult
-	prepare            func(context.Context, string, localpackage.Installation) *exit.Error
-	prepareModels      func(context.Context, records.Request, localpackage.Installation) (*pb.DesiredPlacementSet, *exit.Error)
-	modelDefaultOrigin func(context.Context) (string, *exit.Error)
-	preparePublished   func(context.Context, records.Request) (*publishedPreparation, *exit.Error)
-	wireMinor          uint32
-	publicOrigin       string // renter-authenticated Hub facts name the public byte endpoint
-	certificateDigest  []byte
-	retainModel        func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
-	releaseModel       func(context.Context, *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error)
-	retainBytes        func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
-	releaseBytes       func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
-	readBytes          func(context.Context, *pb.NativeByteRetentionRequest, *pb.Ref) (machineByteStream, error)
-	progress           *transfer.Progress
-}
-
-type machineClientConnection struct {
-	*grpc.ClientConn
-	release func()
-}
-
-func (c *machineClientConnection) Close() error {
-	err := c.ClientConn.Close()
-	if c.release != nil {
-		c.release()
-	}
-	return err
 }
 
 // machineDestinationRuntimeFloor is the first Runtime that publishes a job root's weights
@@ -104,8 +59,7 @@ type machineRuns struct {
 	mu        sync.Mutex
 	running   map[string]bool
 	placed    map[string]string // the last placement decision recorded per waiting run
-	localMu   sync.Mutex
-	localPID  int
+	machines  *machines.Resolver
 	observers sync.Map // one collection/control lock per observed request
 	updates   *rentalRuntimeUpdates
 	// ownerReads paces owner finalization reads of publications a machine cannot settle.
@@ -115,9 +69,9 @@ type machineRuns struct {
 	submitting map[string]context.CancelFunc
 }
 
-func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals) *machineRuns {
+func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals, found *machines.Resolver) *machineRuns {
 	background, cancel := context.WithCancel(context.Background())
-	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}, placed: map[string]string{}, submitting: map[string]context.CancelFunc{}}
+	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, machines: found, running: map[string]bool{}, placed: map[string]string{}, submitting: map[string]context.CancelFunc{}}
 }
 
 func (m *machineRuns) Start(request records.Request) *exit.Error {
@@ -164,7 +118,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 						connection, problem = m.connect(m.ctx, link.MachineID, m.runHolder(*current, "releasing its inputs"))
 						if problem == nil {
 							problem = m.releaseMachineInputs(m.ctx, *current, connection)
-							connection.connection.Close()
+							connection.Close()
 						}
 						if problem == nil {
 							return
@@ -295,9 +249,8 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	}
 	request.DeadlineUnixMS = deadline
 	if link.MachineID == "" {
-		machine := "local"
+		machine := machines.Placement(request)
 		if request.Rental {
-			machine = request.Worker
 			if machine == "" {
 				// The placement decision pins the machine and, for a model ladder, the
 				// lanes that machine takes. Runtime alone decides its devices.
@@ -341,21 +294,17 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if problem != nil {
 		return problem
 	}
-	defer connection.connection.Close()
+	defer connection.Close()
 	if len(link.Submission) == 0 {
 		m.submissionStage(request.ID, "connect", link.MachineID, began)
 	}
 	// Only a new submission needs the current contract; observation, collection,
 	// cancellation and release reach any peer.
-	rental := link.MachineID
-	if rental == "local" {
-		rental = ""
-	}
-	if problem := orchestrator.ValidateWorkerProtocol(connection.protocol, rental); problem != nil {
+	if problem := connection.ValidateNewWork(); problem != nil {
 		return problem
 	}
-	if len(request.Models) > 0 && !request.Rental {
-		if problem := m.resolver.EnsureLocalModels(request.Hub, request.Models); problem != nil {
+	if len(link.Submission) == 0 {
+		if request, problem = m.pinToMachine(ctx, request, connection); problem != nil {
 			return problem
 		}
 	}
@@ -395,14 +344,12 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 					return problem
 				}
 				capture.Installations[index].PackageInterface = connection.installed[revision.ID].PackageInterface
-				if connection.prepareModels != nil {
-					set, problem := connection.prepareModels(ctx, request, revision)
-					if problem != nil {
-						return problem
-					}
-					if revision.ID == request.LocalInstallationID {
-						placements = set
-					}
+				set, problem := connection.prepareModels(ctx, request, revision)
+				if problem != nil {
+					return problem
+				}
+				if revision.ID == request.LocalInstallationID {
+					placements = set
 				}
 			}
 			var graph pb.MachineExecutionCapture
@@ -417,12 +364,9 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			if encodeErr != nil {
 				return exit.Internalf("cannot retain worker installation metadata: %s", encodeErr)
 			}
-			origin := ""
-			if connection.modelDefaultOrigin != nil {
-				origin, problem = connection.modelDefaultOrigin(ctx)
-				if problem != nil {
-					return problem
-				}
+			origin, problem := connection.modelDefaultOrigin(ctx)
+			if problem != nil {
+				return problem
 			}
 			began := time.Now()
 			var detail string
@@ -473,7 +417,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			}
 
 		}
-		if connection.wireMinor < pb.ModelDefaultGPUCountWireMinor {
+		if connection.WireMinor < pb.ModelDefaultGPUCountWireMinor {
 			var capture pb.MachineExecutionCapture
 			if err := canonical.Unmarshal(built.CaptureCanonicalBytes, &capture); err != nil {
 				return exit.Internalf("cannot read captured model preferences: %s", err)
@@ -487,7 +431,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			}
 		}
 		built.PublicationAuthorizationId = authorization
-		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.wireMinor)
+		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.WireMinor)
 		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, link.MachineID, built); problem != nil {
 			return problem
 		}
@@ -505,6 +449,36 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		m.fleet.owner.ForgetPhase(request.ID) // Runtime reports the run from here on
 	}
 	return m.releaseMachineInputs(ctx, request, connection)
+}
+
+// pinToMachine fixes each model ladder's rung for the devices this machine measured. A
+// rental's placement decision already pinned its rung from the width it bought.
+func (m *machineRuns) pinToMachine(ctx context.Context, request records.Request, connection *machineConnection) (records.Request, *exit.Error) {
+	pinned := true
+	for _, model := range request.Models {
+		pinned = pinned && model.Pinned()
+	}
+	if pinned {
+		return request, nil
+	}
+	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{Claim: connection.Claim})
+	if err != nil {
+		return request, machineTransport(err)
+	}
+	accelerator := ""
+	if len(workspace.Devices) > 0 {
+		accelerator = workspace.Devices[0].Name
+	}
+	models, _, ok := rental.Pin(request.Models, accelerator, len(workspace.Devices))
+	if !ok {
+		return request, exit.Named(exit.Structural, "machine_execution.model_rung_unavailable",
+			"no rung of this call's model ladder fits %d× %q on %s", len(workspace.Devices), accelerator, connection.Name)
+	}
+	if problem := m.store.PinMachineModels(request.ID, models); problem != nil {
+		return request, problem
+	}
+	request.Models = models
+	return request, nil
 }
 
 // recordPlacement makes a waiting run's placement decision durable, as a queued run's is:
@@ -539,15 +513,7 @@ func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *m
 	if problem := m.store.RecordMachineSubmission(requestID, submission); problem != nil || workspace.SourceCredentials || len(m.resolver.SourceCredentials()) == 0 {
 		return problem
 	}
-	return m.store.AppendEvent(requestID, "request.warning", 0, map[string]any{"message": "this machine's Runtime cannot receive your Hugging Face or Civitai credential, so a gated source fails there; " + runtimeUpdate(machine)})
-}
-
-// runtimeUpdate names how the owner updates a machine's Runtime.
-func runtimeUpdate(machine string) string {
-	if machine == "local" {
-		return "update the local cozy-runtime"
-	}
-	return "run `cozy rental update " + machine + "` first"
+	return m.store.AppendEvent(requestID, "request.warning", 0, map[string]any{"message": "this machine's Runtime cannot receive your Hugging Face or Civitai credential, so a gated source fails there; " + machines.RuntimeUpdate(machine)})
 }
 
 // exactExecutionGPUs sends a counted group only to a Runtime that runs it exactly. Without
@@ -567,12 +533,12 @@ func exactExecutionGPUs(submission *pb.MachineExecutionSubmit, workspace *pb.Mac
 }
 
 func currentExecutionWorkspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
-	workspace, err := connection.client.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{Claim: connection.claim})
+	workspace, err := connection.Host.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{Claim: connection.Claim})
 	if err != nil {
 		return nil, machineTransport(err)
 	}
-	if workspace == nil || workspace.WorkerId != connection.claim.WorkerId || workspace.WorkerBootId == "" ||
-		(connection.claim.WorkerBootId != "" && workspace.WorkerBootId != connection.claim.WorkerBootId) ||
+	if workspace == nil || workspace.WorkerId != connection.Claim.WorkerId || workspace.WorkerBootId == "" ||
+		(connection.Claim.WorkerBootId != "" && workspace.WorkerBootId != connection.Claim.WorkerBootId) ||
 		workspace.ExecutionWorkspaceId == "" || len(workspace.ExecutionWorkspaceId) > 256 {
 		return nil, exit.New(exit.Conflict, "machine returned an invalid execution workspace identity")
 	}
@@ -586,11 +552,11 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 	// The owner's provider credentials ride each transmission only, never the frozen record.
 	submission := proto.Clone(frozen).(*pb.MachineExecutionSubmit)
 	submission.SourceCredentials = m.resolver.SourceCredentials()
-	submission.Claim = connection.claim
-	submission.Offer.WorkerBootId = connection.claim.WorkerBootId
-	submission.Offer.RecordOwnerEpoch = connection.claim.RecordOwnerEpoch
+	submission.Claim = connection.Claim
+	submission.Offer.WorkerBootId = connection.Claim.WorkerBootId
+	submission.Offer.RecordOwnerEpoch = connection.Claim.RecordOwnerEpoch
 	var trailer metadata.MD
-	receipt, err := connection.client.SubmitMachineExecution(ctx, submission, grpc.Trailer(&trailer))
+	receipt, err := connection.Host.SubmitMachineExecution(ctx, submission, grpc.Trailer(&trailer))
 	if err != nil {
 		for _, code := range trailer.Get("cozy-error-code") {
 			if code == "execution_workspace_changed" || code == "execution_workspace_required" {
@@ -608,7 +574,7 @@ func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *mac
 		}
 		return machineTransport(err)
 	}
-	if receipt == nil || receipt.WorkerId != connection.claim.WorkerId || receipt.WorkerBootId == "" {
+	if receipt == nil || receipt.WorkerId != connection.Claim.WorkerId || receipt.WorkerBootId == "" {
 		return exit.New(exit.Conflict, "execution was accepted by an unexpected worker")
 	}
 	if problem := m.store.AcceptMachineExecution(requestID, receipt); problem != nil {
@@ -630,16 +596,7 @@ func (m *machineRuns) supplySourceCredentials(ctx context.Context, connection *m
 	return m.sendMachineSubmission(ctx, connection, link.RequestID, &submission)
 }
 
-func machineTransport(err error) *exit.Error {
-	code := status.Code(err)
-	if code == codes.Unimplemented {
-		return exit.Named(exit.Unavailable, "machine_execution.worker_upgrade_required", "worker does not implement workspace-fenced execution; worker protocol 59 is required")
-	}
-	if code == codes.Unavailable || code == codes.DeadlineExceeded || code == codes.Canceled || code == codes.ResourceExhausted || code == codes.Aborted {
-		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "machine execution observation is unavailable: %s", status.Convert(err).Message())
-	}
-	return exit.Named(exit.Conflict, "machine_execution.refused", "Runtime refused machine execution: %s", status.Convert(err).Message())
-}
+func machineTransport(err error) *exit.Error { return machines.Transport(err) }
 
 func (m *machineRuns) executionConnection(ctx context.Context, request records.Request) (*machineConnection, *records.MachineExecution, *pb.MachineExecutionQuery, *exit.Error) {
 	if lost, problem := m.store.MachineExecutionLost(request.ID); problem != nil || lost {
@@ -660,7 +617,7 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 	if problem != nil {
 		return nil, nil, nil, problem
 	}
-	query := &pb.MachineExecutionQuery{Claim: connection.claim, RequestId: request.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId}
+	query := &pb.MachineExecutionQuery{Claim: connection.Claim, RequestId: request.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId}
 	return connection, link, query, nil
 }
 
@@ -744,7 +701,7 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 	if problem != nil {
 		return problem
 	}
-	defer connection.connection.Close()
+	defer connection.Close()
 	return m.observeOn(ctx, progress, request, connection, link, query)
 }
 
@@ -756,7 +713,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 		}
 	}
 	var trailer metadata.MD
-	state, err := connection.client.GetMachineExecution(ctx, query, grpc.Trailer(&trailer))
+	state, err := connection.Host.GetMachineExecution(ctx, query, grpc.Trailer(&trailer))
 	if err != nil {
 		if slices.Contains(trailer.Get("cozy-error-code"), "execution_workspace_changed") {
 			return m.store.LoseMachineExecution(request.ID, link.MachineID,
@@ -772,7 +729,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	progress.Advance(1)
 	cursor := uint64(link.RemoteCursor)
 	for {
-		page, err := connection.client.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor, Limit: 128})
+		page, err := connection.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor, Limit: 128})
 		if err != nil {
 			return machineTransport(err)
 		}
@@ -797,12 +754,12 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if state.Collected || state.State == "canceled" || state.State != "succeeded" && state.State != "failed" {
 		return nil
 	}
-	outcome, err := connection.client.CollectMachineExecution(ctx, &pb.MachineExecutionCollect{Execution: query, AttemptOrdinal: state.AttemptOrdinal})
+	outcome, err := connection.Host.CollectMachineExecution(ctx, &pb.MachineExecutionCollect{Execution: query, AttemptOrdinal: state.AttemptOrdinal})
 	if err != nil {
 		// Another observer may have completed the same collection after our
 		// status read. Its ACK releases the original root hold, so re-read the
 		// authority before treating that now-stale collect as a custody failure.
-		latest, readError := connection.client.GetMachineExecution(ctx, query)
+		latest, readError := connection.Host.GetMachineExecution(ctx, query)
 		if readError == nil && latest.Collected && latest.AttemptOrdinal == state.AttemptOrdinal {
 			return m.store.ObserveMachineExecution(request.ID, latest, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, latest.Sequence)})
 		}
@@ -837,9 +794,9 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem := m.store.RecordMachineOutcome(request.ID, outcome); problem != nil {
 		return problem
 	}
-	if ref := body.TriageBundle; ref != nil && link.MachineID != "local" && m.fleet != nil {
-		// Evidence, not custody: a bundle the pod cannot hand over leaves the run as it is.
-		if bundle, problem := m.fleet.owner.RentalTriage(link.MachineID, ref); problem != nil {
+	if ref := body.TriageBundle; ref != nil {
+		// Evidence, not custody: a bundle the machine cannot hand over leaves the run as it is.
+		if bundle, problem := readMachineTriage(ctx, connection, query, outcome.AttemptOrdinal, ref); problem != nil {
 			fmt.Fprintf(m.context.Out, "machine execution %s: triage bundle not kept: %s\n", request.ID, problem.Message)
 		} else if problem := m.store.RecordMachineTriage(request.ID, int64(outcome.AttemptOrdinal), bundle); problem != nil {
 			return problem
@@ -874,7 +831,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 		}
 	}
 	ack := &pb.AttemptOutcomeAck{RequestId: outcome.RequestId, AttemptOrdinal: outcome.AttemptOrdinal, InvocationSpecDigest: outcome.InvocationSpecDigest, OutcomeId: outcome.OutcomeId, OutcomeDigest: outcome.OutcomeDigest}
-	collected, err := connection.client.AcknowledgeMachineExecutionCollection(ctx, &pb.MachineExecutionCollectionAck{Execution: query, Outcome: ack})
+	collected, err := connection.Host.AcknowledgeMachineExecutionCollection(ctx, &pb.MachineExecutionCollectionAck{Execution: query, Outcome: ack})
 	if err != nil {
 		return machineTransport(err)
 	}
@@ -922,7 +879,7 @@ func (m *machineRuns) control(parent context.Context, request records.Request, a
 	if problem != nil {
 		return problem
 	}
-	defer connection.connection.Close()
+	defer connection.Close()
 	if requested && !link.CancelRequested {
 		return m.observeOn(ctx, progress, request, connection, link, query)
 	}
@@ -935,7 +892,7 @@ func (m *machineRuns) control(parent context.Context, request records.Request, a
 			return m.observeAfterControl(ctx, progress, request, connection, query)
 		}
 	}
-	state, err := connection.client.GetMachineExecution(ctx, query)
+	state, err := connection.Host.GetMachineExecution(ctx, query)
 	if err != nil {
 		return machineTransport(err)
 	}
@@ -966,7 +923,7 @@ func (m *machineRuns) flushMachineControl(ctx context.Context, connection *machi
 	if proto.Unmarshal(link.PendingControl, &command) != nil || command.Execution == nil {
 		return 0, exit.Internalf("recorded machine control is unreadable")
 	}
-	command.Execution.Claim = connection.claim
+	command.Execution.Claim = connection.Claim
 	if command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_RESUME && len(m.resolver.SourceCredentials()) > 0 {
 		if problem := m.supplySourceCredentials(ctx, connection, link, command.Execution.ExpectedExecutionWorkspaceId); problem != nil {
 			return command.Action, problem
@@ -981,7 +938,7 @@ func (m *machineRuns) flushMachineControl(ctx context.Context, connection *machi
 		}
 	}
 	var trailer metadata.MD
-	if _, err := connection.client.ControlMachineExecution(ctx, &command, grpc.Trailer(&trailer)); err != nil {
+	if _, err := connection.Host.ControlMachineExecution(ctx, &command, grpc.Trailer(&trailer)); err != nil {
 		for _, code := range trailer.Get("cozy-error-code") {
 			if code == "execution_generation_stale" {
 				if problem := m.store.RejectMachineControl(link.RequestID, link.PendingControl); problem != nil {
@@ -1056,4 +1013,21 @@ func machineObservationError(problem *exit.Error) json.RawMessage {
 	}
 	raw, _ := json.Marshal(map[string]string{"code": problem.ErrName(), "message": problem.Message})
 	return raw
+}
+
+// readMachineTriage reads one attempt's retained triage bundle through the Host, the same
+// guarded connection its outcome came over.
+func readMachineTriage(ctx context.Context, connection *machineConnection, query *pb.MachineExecutionQuery, attempt uint64, ref *pb.TriageBundleRef) ([]byte, *exit.Error) {
+	if !connection.SupportsTriage {
+		return nil, exit.Named(exit.Structural, "machine_execution.triage_unsupported", "this machine's Host reads no triage bundle")
+	}
+	triage, err := connection.Host.ReadMachineExecutionTriage(ctx, &pb.MachineExecutionTriageQuery{Execution: query, AttemptOrdinal: attempt})
+	if err != nil {
+		return nil, machineTransport(err)
+	}
+	data := triage.BundleCanonicalBytes
+	if uint64(len(data)) != ref.Length || !bytes.Equal(canonical.Digest(data), ref.WriteReceiptDigest) {
+		return nil, exit.New(exit.Conflict, "triage bundle does not match its terminal")
+	}
+	return data, nil
 }

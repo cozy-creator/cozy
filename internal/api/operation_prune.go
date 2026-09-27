@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/machines"
 )
 
 type CachePruneResult struct {
@@ -22,7 +25,7 @@ func (s *Server) pruneRental(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pruneCache(w http.ResponseWriter, r *http.Request) {
-	s.pruneOperationCache(w, r, "")
+	s.pruneOperationCache(w, r, machines.Local)
 }
 
 func (s *Server) pruneOperationCache(w http.ResponseWriter, r *http.Request, rental string) {
@@ -38,13 +41,17 @@ func (s *Server) pruneOperationCache(w http.ResponseWriter, r *http.Request, ren
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request", "cache pruning takes one empty object", "")
 		return
 	}
-	removed, reclaimed, busy, problem := s.orchestrator.PruneOperationCache(rental)
+	if s.machineExecutions == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("this Cozy daemon runs no machines"))
+		return
+	}
+	removed, reclaimed, busy, problem := s.machineExecutions.PruneOperationCache(r.Context(), rental)
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}
 	result := CachePruneResult{RemovedEntries: removed, ReclaimedBytes: reclaimed, StoreBusy: busy}
-	if rental != "" {
+	if !machines.IsLocal(rental) {
 		s.ok(w, r, http.StatusOK, RentalPruneResult{Rental: rental, CachePruneResult: result})
 		return
 	}

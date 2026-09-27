@@ -90,7 +90,7 @@ func TestUnboundServingDefaultRefusesBeforeAcquisitionButExplicitModelsProceed(t
 		}
 	}
 	code, out = runAdmissionCLI(t, root, path, localArgs...)
-	if code == 0 || !strings.Contains(out, "proof stopped before model acquisition") || strings.Contains(out, "disabled in this deployment") {
-		t.Fatalf("explicit local model inputs failed default availability instead of reaching model resolution: %s", out)
+	if code == 0 || !strings.Contains(out, `"machine":"local"`) || strings.Contains(out, "disabled in this deployment") {
+		t.Fatalf("explicit local model inputs failed default availability instead of reaching this computer's machine: %s", out)
 	}
 }

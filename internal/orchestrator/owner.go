@@ -41,6 +41,12 @@ const recordOwnerEpoch = 1
 // equal-epoch claims from the SAME RecordOwner are reconnects, anything else is refused.
 const recordOwnerID = "cozy-local-client"
 
+// RecordOwnerID and RecordOwnerEpoch are the owner every machine Claim names.
+const (
+	RecordOwnerID    = recordOwnerID
+	RecordOwnerEpoch = recordOwnerEpoch
+)
+
 type session struct {
 	ctx        context.Context
 	bootID     string
@@ -531,6 +537,19 @@ func (c *Orchestrator) fenced(s *session, owner, controlStream uint64, bootID st
 
 // onClaimAck binds the claimed boot to the worker slot: identity checks, the durable
 // binding, and the session registry (the ClaimAck is the flip's Register successor).
+// ObservationFromClaimAck is what a rented worker's ClaimAck reads back about the pod.
+func ObservationFromClaimAck(rentalID string, ack *pb.ClaimAck) RentalObservation {
+	resources := ack.GetResources()
+	return RentalObservation{
+		RentalID: rentalID, Accelerator: resources.GetDeviceName(),
+		DeviceCount: int(resources.GetDeviceCount()), Backend: resources.GetBackend(),
+		DriverVersion: resources.GetDriverVersion(), BackendVersion: resources.GetBackendVersion(),
+		DeviceMemoryTotalBytes: resources.GetDeviceMemoryTotalBytes(),
+		WorkerInstance:         ack.WorkerInstanceId, WorkerID: ack.WorkerId,
+		WorkerBootID: ack.WorkerBootId,
+	}
+}
+
 func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit.Error {
 	c.logf("ClaimAck boot=%s epoch=%d instance=%s minor=%d backend=%q device=%q",
 		ack.WorkerBootId, ack.ControlStreamEpoch, ack.WorkerInstanceId, ack.WireMinor,
@@ -567,14 +586,7 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 			c.refuseClaim(w, e)
 			return e
 		}
-		if e := c.opt.ObserveRental(RentalObservation{
-			RentalID: w.spec.Connection.RentalID, Accelerator: resources.GetDeviceName(),
-			DeviceCount: int(resources.GetDeviceCount()), Backend: resources.GetBackend(),
-			DriverVersion: resources.GetDriverVersion(), BackendVersion: resources.GetBackendVersion(),
-			DeviceMemoryTotalBytes: resources.GetDeviceMemoryTotalBytes(),
-			WorkerInstance:         ack.WorkerInstanceId, WorkerID: ack.WorkerId,
-			WorkerBootID: ack.WorkerBootId,
-		}); e != nil {
+		if e := c.opt.ObserveRental(ObservationFromClaimAck(w.spec.Connection.RentalID, ack)); e != nil {
 			c.refuseClaim(w, e)
 			return e
 		}

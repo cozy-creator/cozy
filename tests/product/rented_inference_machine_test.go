@@ -30,7 +30,7 @@ import (
 type runtimeMachine struct {
 	mu         sync.Mutex
 	blocker    string
-	triage     []byte // the bundle Runtime's terminal names; the pod's media plane serves it
+	triage     []byte // the bundle Runtime's terminal names; the Host reads it for the owner
 	submission *pb.MachineExecutionSubmit
 	receipt    *pb.MachineExecutionReceipt
 	events     []*pb.MachineExecutionEvent
@@ -138,6 +138,11 @@ func (m *runtimeMachine) ListMachineExecutionEvents(_ context.Context, query *pb
 		}
 	}
 	return page, nil
+}
+
+func (m *runtimeMachine) ReadMachineExecutionTriage(_ context.Context, query *pb.MachineExecutionTriageQuery) (*pb.MachineExecutionTriage, error) {
+	return &pb.MachineExecutionTriage{Bundle: &pb.TriageBundleRef{SubjectId: "trb-rented", WriteReceiptDigest: canonical.Digest(m.triage),
+		Length: uint64(len(m.triage))}, BundleCanonicalBytes: m.triage}, nil
 }
 
 func (m *runtimeMachine) CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {

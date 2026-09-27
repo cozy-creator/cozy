@@ -134,46 +134,33 @@ func reapDaemonRoot(root string) {
 	}
 }
 
-// Runtime intentionally survives the client's ordinary down. Test teardown owns
-// both processes, and must stop its exact Runtime before deleting the test home.
+// The machine Host intentionally survives the client's ordinary down, as a pod outlives its
+// controller. Test teardown owns both, and must stop its exact Host before deleting the home.
 func reapMachineRuntimeRoot(root string) bool {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return true
 	}
+	host := filepath.Join(root, "machine", "root", "usr", "local", "bin", "pod-supervisor")
 	var owned []int
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
 		if err != nil {
 			continue
 		}
-		raw, err := os.ReadFile("/proc/" + entry.Name() + "/cmdline")
-		if err != nil {
+		if exe, err := os.Readlink("/proc/" + entry.Name() + "/exe"); err != nil || strings.TrimSuffix(exe, " (deleted)") != host {
 			continue
 		}
-		args := splitNul(raw, -1)
-		if len(args) < 5 || filepath.Base(args[1]) != "cozy-runtime" || args[2] != "serve" || args[3] != "--socket" || args[4] != filepath.Join(root, "runtime", "control.sock") { //cozy:allow exact process identity inspection; no Runtime command is launched
-			continue
-		}
-		env, err := os.ReadFile("/proc/" + entry.Name() + "/environ")
-		if err != nil {
-			continue
-		}
-		for _, value := range splitNul(env, -1) {
-			if value == "COZY_HOME="+filepath.Join(root, "runtime") {
-				process, _ := os.FindProcess(pid)
-				_ = process.Signal(syscall.SIGTERM)
-				owned = append(owned, pid)
-				break
-			}
-		}
+		process, _ := os.FindProcess(pid)
+		_ = process.Signal(syscall.SIGTERM)
+		owned = append(owned, pid)
 	}
-	for i := 0; i < 200 && anyAlive(owned); i++ {
+	for i := 0; i < 400 && anyAlive(owned); i++ {
 		time.Sleep(25 * time.Millisecond)
 	}
 	for _, pid := range owned {
 		if alive(pid) {
-			fmt.Fprintf(os.Stderr, "owned test Runtime %d did not finish explicit teardown\n", pid)
+			fmt.Fprintf(os.Stderr, "owned test machine Host %d did not finish explicit teardown\n", pid)
 			return false
 		}
 	}
