@@ -49,6 +49,10 @@ import (
 // exactly how req-b2df33d17e663a8a1e047246 stayed `in_progress` for sixteen hours against a
 // container destroyed four minutes into its life. A request row always exists while the
 // request is active, so the request is what the sweep must enumerate.
+//
+// Runtime-owned executions settle with their machine instead, in the transaction that
+// records it absent: an offer that never left this host is released to be placed again,
+// and a sent one is lost with the machine that may have run it.
 func (c *Orchestrator) RecoverLostWork() {
 	orphaned, problem := c.opt.Store.OrphanedRentalWork()
 	if problem != nil {

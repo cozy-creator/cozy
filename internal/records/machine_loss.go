@@ -29,17 +29,18 @@ func (s *Store) MachineExecutionLost(id string) (bool, *exit.Error) {
 	return lost, nil
 }
 
-// ReconcileEndedMachineExecutions repairs observers predating loss projection.
-// An absent row, timeout, failed acquisition or empty account listing is not
-// enough: only this owner's durable confirmed-release ledger admits recovery.
+// ReconcileEndedMachineExecutions settles every machine this owner has proof is
+// gone: its confirmed-release ledger, or a Hub state committed only after provider
+// absence. An absent row, timeout or empty account listing is not that proof.
 func (s *Store) ReconcileEndedMachineExecutions() *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin ended-machine reconciliation: %s", err)
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT DISTINCT e.machine_id FROM machine_executions e
- JOIN rental_operations o ON o.rental_id=e.machine_id AND o.state='released'`)
+	rows, err := tx.Query(`SELECT DISTINCT e.machine_id FROM machine_executions e WHERE e.machine_id<>'' AND (
+ EXISTS(SELECT 1 FROM rental_operations o WHERE o.rental_id=e.machine_id AND o.state='released') OR
+ EXISTS(SELECT 1 FROM rentals WHERE id=e.machine_id AND state IN (` + absentRentalStates + `)))`)
 	if err != nil {
 		return exit.Internalf("cannot read confirmed ended machines: %s", err)
 	}
@@ -58,7 +59,7 @@ func (s *Store) ReconcileEndedMachineExecutions() *exit.Error {
 		return exit.Internalf("cannot finish ended machine identities: %s", err)
 	}
 	for _, machine := range machines {
-		if problem := loseMachineExecutions(tx, machine); problem != nil {
+		if problem := settleLostMachine(tx, machine); problem != nil {
 			return problem
 		}
 	}
@@ -68,21 +69,30 @@ func (s *Store) ReconcileEndedMachineExecutions() *exit.Error {
 	return nil
 }
 
-func loseMachineExecutions(tx *sql.Tx, machine string) *exit.Error {
-	rows, err := tx.Query(`SELECT r.id,r.state,e.cancel_requested,length(e.receipt)>0,length(e.outcome)>0
+// settleLostMachine ends every obligation on a machine proven gone. A run whose offer
+// never left this host is released to be placed again, charging nothing. A sent offer
+// may have executed, and that execution and its bytes died with the machine.
+func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
+	var cause string
+	if err := tx.QueryRow(`SELECT failure_code FROM rentals WHERE id=?`, machine).Scan(&cause); err != nil && err != sql.ErrNoRows {
+		return exit.Internalf("cannot read lost machine cause: %s", err)
+	}
+	rows, err := tx.Query(`SELECT r.id,r.state,r.retain_work,r.rental=1 AND r.requested_rental='',
+ e.cancel_requested,length(e.submission)>0,length(e.receipt)>0,length(e.outcome)>0
  FROM machine_executions e JOIN requests r ON r.id=e.request_id
  WHERE e.machine_id=? AND `+machineExecutionOwed, machine)
 	if err != nil {
 		return exit.Internalf("cannot read destroyed machine observers: %s", err)
 	}
 	type observation struct {
-		id, state                   string
-		cancel, accepted, hasResult bool
+		id, state                                                   string
+		retained, placeable, cancel, submitted, accepted, hasResult bool
 	}
 	var observations []observation
 	for rows.Next() {
 		var value observation
-		if err := rows.Scan(&value.id, &value.state, &value.cancel, &value.accepted, &value.hasResult); err != nil {
+		if err := rows.Scan(&value.id, &value.state, &value.retained, &value.placeable,
+			&value.cancel, &value.submitted, &value.accepted, &value.hasResult); err != nil {
 			rows.Close()
 			return exit.Internalf("cannot read destroyed machine observer: %s", err)
 		}
@@ -94,10 +104,31 @@ func loseMachineExecutions(tx *sql.Tx, machine string) *exit.Error {
 		return exit.Internalf("cannot finish destroyed machine observers: %s", err)
 	}
 	for _, value := range observations {
+		if !value.submitted && value.placeable && !value.retained && (value.state == "submitted" || value.state == "queued") {
+			if problem := releaseUnsentTx(tx, value.id, machine, cause); problem != nil {
+				return problem
+			}
+			continue
+		}
+		if value.retained {
+			failed, problem := failLostRetainedWorkTx(tx, value.id, machine, cause)
+			if problem != nil {
+				return problem
+			}
+			if failed {
+				continue
+			}
+		}
+		message := "rented machine was confirmed destroyed; its execution and retained bytes can no longer be observed"
+		if !value.submitted {
+			message = "rented machine was confirmed destroyed before this run was submitted to it"
+		}
 		detail := map[string]any{
-			"machine_id": machine, "error_type": "machine_execution.state_lost",
-			"error":                  "rented machine was confirmed destroyed; its execution and retained bytes can no longer be observed",
+			"machine_id": machine, "error_type": "machine_execution.state_lost", "error": message,
 			"had_acceptance_receipt": value.accepted, "had_recorded_outcome": value.hasResult,
+		}
+		if cause != "" {
+			detail["cause"] = cause
 		}
 		if err := appendEventTx(tx, value.id, "client.machine_lost", 0, detail); err != nil {
 			return exit.Internalf("cannot record destroyed machine: %s", err)
@@ -117,6 +148,38 @@ func loseMachineExecutions(tx *sql.Tx, machine string) *exit.Error {
 				return exit.Internalf("cannot record destroyed execution projection: %s", err)
 			}
 		}
+	}
+	return nil
+}
+
+// releaseUnsentTx unlinks and unpins the run. Input bytes the lost machine held are
+// staged again wherever the run is placed; `machine` stays as the run's history.
+func releaseUnsentTx(tx *sql.Tx, id, machine, cause string) *exit.Error {
+	if _, err := tx.Exec(`UPDATE machine_executions SET machine_id='' WHERE request_id=?`, id); err != nil {
+		return exit.Internalf("cannot release unsent execution: %s", err)
+	}
+	if _, err := tx.Exec(`UPDATE requests SET worker='' WHERE id=?`, id); err != nil {
+		return exit.Internalf("cannot unpin unsent execution: %s", err)
+	}
+	inputs, problem := machineInputsIn(tx, id)
+	if problem != nil {
+		return problem
+	}
+	for _, input := range inputs {
+		if input.State != "held" {
+			continue
+		}
+		if err := appendEventTx(tx, id, "machine.input", 0, map[string]any{"input_id": input.InputID,
+			"manifest": input.Manifest, "content_bytes": input.ContentBytes, "state": "pending"}); err != nil {
+			return exit.Internalf("cannot restage input from lost machine: %s", err)
+		}
+	}
+	reason := "rented machine " + machine + " was lost before this run was submitted"
+	if cause != "" {
+		reason += " (" + cause + ")"
+	}
+	if err := appendEventTx(tx, id, "request.queued", 0, map[string]any{"reason": reason, "machine_id": machine}); err != nil {
+		return exit.Internalf("cannot record released execution: %s", err)
 	}
 	return nil
 }

@@ -1,10 +1,6 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,30 +8,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // TestRentalFailureRecovery is the owner's ruling as behaviour: "it's fine for cozy-daemon
 // to assign work to specific pods, but when that pod fails it should recover those jobs and
 // schedule them elsewhere if possible".
 //
-// The pin stays. What this proves is the arm that was missing: a rental that reaches a
-// terminal failed state HANDS BACK the work pinned to it, and every request it was holding
-// reaches a stated outcome instead of waiting on a machine that no longer exists.
+// Observed live 2026-09-04: rental pr-183abac284d1e16f5f0a (nitian) went `failed` with
+// readiness.receipt_conflict while holding one in-flight and two queued requests, and
+// nothing released them. Every rented call is now a Runtime execution linked to its
+// machine, so the arms are drawn by what crossed to that machine, not by a local attempt:
 //
-// Observed live 2026-09-04 on the code this test was written against: rental
-// pr-183abac284d1e16f5f0a (nitian) went `failed` with readiness.receipt_conflict while
-// holding one in-flight and two queued anima requests. Nothing released them. The deadlock
-// was mutual — the requests could not be routed because they named a dead rental, and the
-// rental could not be released because `RentalRunCounts` still counted them — so the daemon
-// bought a second pod, ran an identical request on it, and idle-released it while the
-// stranded three still sat there. Request 284 read `in_progress 300.8s` against a pod whose
-// provider resource had been destroyed four minutes earlier.
+//	offer never sent        released and placed again; nothing ran, nothing is charged
+//	offer sent              lost with the machine that may have run it, saying so
+//	selected with --rental  settled with the lost rental's cause; it may not move
+//	private transaction     fails as retained work; its bytes died with the pod
 //
-// The daemon here is the real process on a real root, deciding from its real records
-// against a hub that answers the rental routes and can move a rental to `failed` the way
-// Tensorhub does.
+// The daemon is the real process against a hub that moves the rental to `failed` the way
+// Tensorhub does, only after proving provider absence.
 func TestRentalFailureRecovery(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-failure-recovery")
 	must(t, os.RemoveAll(root))
@@ -45,155 +39,135 @@ func TestRentalFailureRecovery(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
-			""+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	logPath := filepath.Join(root, "daemon.log")
 
 	hub := newFakeRentalHub(t, port)
+	hub.packageReleases = map[string]any{"fake/lost@1": rentalReleaseFacts()}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
 
-	// The pod's on-disk credentials exist, as they do for any rental this host actually
-	// rented. Without them routing refuses the pin for a reason that has nothing to do with
-	// the machine being dead, and the arm under test never runs.
-	rentals := filepath.Join(root, "rentals")
-	must(t, os.MkdirAll(rentals, 0o700))
-	plant := func(id, machine string) {
-		t.Helper()
-		hub.add(id, machine)
-		must(t, os.WriteFile(filepath.Join(rentals, id+".media-token"), []byte("media-"+id), 0o600))
-		must(t, os.WriteFile(filepath.Join(rentals, id+".pem"), []byte("-----BEGIN CERTIFICATE-----\n"), 0o600))
-		_, private, err := ed25519.GenerateKey(rand.Reader)
-		must(t, err)
-		key, err := x509.MarshalPKCS8PrivateKey(private)
-		must(t, err)
-		must(t, os.WriteFile(filepath.Join(rentals, id+".creator.pem"),
-			pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}), 0o600))
-		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
-			ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
-			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hubURL,
-			Address: "127.0.0.1:1", CertPath: filepath.Join(rentals, id+".pem"),
-		}))
+	// The pod is degraded while it holds the work: nothing can attach to it, so the runs
+	// wait on it rather than failing for an unrelated transport reason first.
+	hub.add("rental-lost", "nitian")
+	hub.setState("rental-lost", "degraded", "")
+	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
+		ID: "rental-lost", MachineName: "nitian", SKU: "cpu", AcceleratorModel: "CPU",
+		HourlyRateUSDMicros: 100_000, State: "degraded", Hub: hubURL, Address: "127.0.0.1:1",
+	}))
+	type arm struct {
+		kind, selected string
+		sent, accepted bool
+		retained       bool
 	}
-	pin := func(requestID, rentalID, seed string) {
-		t.Helper()
-		if _, _, problem := store.Submit(records.Request{
-			ID: requestID, IdemKey: "idem-" + requestID,
-			BodyDigest: "sha256:" + strings.Repeat(seed, 32),
-			Package:    "fake/lost", Entrypoint: "generate", Payload: []byte("{}"),
-			Rental: true, Worker: rentalID,
-		}); problem != nil {
-			t.Fatal(problem.Message)
+	arms := map[string]arm{
+		"req-lost-queued-a": {}, "req-lost-queued-b": {},
+		"req-lost-selected": {selected: "rental-lost"},
+		"req-lost-sent":     {sent: true},
+		"req-lost-running":  {sent: true, accepted: true},
+		"job-lost-retained": {kind: "job", sent: true, accepted: true, retained: true},
+	}
+	for id, arm := range arms {
+		body, _ := canonical.Spell(canonical.Digest([]byte(id)))
+		request, _, problem := store.Submit(records.Request{ID: id, IdemKey: "idem-" + id,
+			BodyDigest: body, Package: "fake/lost", Release: "1", Entrypoint: "generate",
+			Kind: arm.kind, Payload: []byte("{}"), Rental: true, Worker: "rental-lost",
+			RequestedRental: arm.selected, RetainWork: arm.retained, MachineExecutionObserver: true})
+		fatal(t, problem)
+		fatal(t, store.LinkMachineExecution(id, "rental-lost"))
+		if !arm.sent {
+			continue
 		}
+		capture, spec := []byte(`{"capture":"`+id+`"}`), []byte(`{"invocation":"`+id+`"}`)
+		submission := &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "workspace", SubmissionId: request.IdemKey,
+			CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture),
+			Offer: &pb.AttemptOffer{RequestId: id, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}
+		fatal(t, store.RecordMachineSubmission(id, submission))
+		if !arm.accepted {
+			continue
+		}
+		receipt := &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: request.IdemKey,
+			CaptureDigest: submission.CaptureDigest, InvocationSpecDigest: submission.Offer.InvocationSpecDigest,
+			AcceptedAtMs: 1000, WorkerId: "worker", WorkerBootId: "boot", ExecutionWorkspaceId: "workspace"}
+		fatal(t, store.AcceptMachineExecution(id, receipt))
+		fatal(t, store.ObserveMachineExecution(id, &pb.MachineExecutionState{RequestId: id, WorkerId: "worker",
+			WorkerBootId: "boot", ExecutionWorkspaceId: "workspace", Generation: 1, AttemptOrdinal: 1, State: "running"},
+			&pb.MachineExecutionEventPage{}))
 	}
-
-	// The rental holds three requests when it dies, and they are NOT the same case.
-	// req-lost-queued-a and -b never reached a worker. req-lost-running was accepted by
-	// one and may have partially executed.
-	plant("rental-lost", "nitian")
-	pin("req-lost-queued-a", "rental-lost", "a1")
-	pin("req-lost-queued-b", "rental-lost", "b2")
-	pin("req-lost-running", "rental-lost", "c3")
-	session := "session-lost-running"
-	fatal(t, store.SpawnWorker(records.WorkerProcess{
-		InstanceID: "ins-lost", Package: "fake/lost", WorkerID: "remote", Devices: []string{"cpu"}}))
-	attempt, problem := store.Dispatch(records.Attempt{
-		RequestID: "req-lost-running", SessionID: session, InstanceID: "ins-lost",
-		InvocationDigest: "sha256:" + strings.Repeat("d4", 32), InvocationCanonical: []byte("{}")})
-	fatal(t, problem)
-	fatal(t, store.OfferDispatch("req-lost-running", attempt, session))
-	fatal(t, store.Accepted("req-lost-running", attempt, session))
-
-	// BEFORE: the rental is holding all three, and the listing says so. This is the state
-	// the owner saw — and every part of it is true right up until the machine dies.
 	queued, running, problem := store.RentalRunCounts("rental-lost")
 	fatal(t, problem)
-	if queued != 2 || running != 1 {
-		t.Fatalf("the rental should be holding 2 queued and 1 running before it fails, got %d/%d",
-			queued, running)
+	if queued != 4 || running != 2 {
+		t.Fatalf("the rental should hold 4 queued and 2 running before it fails, got %d/%d", queued, running)
 	}
 
-	daemon := startDaemonProcess(t, root)
-	_ = daemon
-
-	// THE MACHINE DIES. Tensorhub reclaims the provider resource and serves the rental as
-	// `failed`. That state — not an elapsed clock — is the whole trigger.
+	startDaemonProcess(t, root)
+	// THE MACHINE DIES. That state — not an elapsed clock — is the whole trigger.
 	hub.setState("rental-lost", "failed", "readiness.receipt_conflict")
 
-	// AFTER: nothing is left pinned to it. Each request took the arm that fits it.
+	// Recovered means nothing still waits on the corpse, and each released run was placed
+	// again. This hub offers no machine, which is weather: the run waits and says so.
+	replanned := func(id string) bool {
+		return strings.Contains(lastEventField(t, store, id, "request.parked", "reason"), "offered no CPU product")
+	}
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		queued, running, problem = store.RentalRunCounts("rental-lost")
 		fatal(t, problem)
-		recovered, problem := store.RequestRow("req-lost-running")
-		fatal(t, problem)
-		// Recovery commits the unpin before charging the retry budget. Zero
-		// rental counts alone can observe the interval between those two facts.
-		if queued == 0 && running == 0 && recovered != nil && recovered.Requeues > 0 {
+		if queued == 0 && running == 0 && replanned("req-lost-queued-a") && replanned("req-lost-queued-b") {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("rental recovery did not finish after 60s: %d queued, %d running, recovered request %+v\n%s",
-				queued, running, recovered, tail(logPath))
+			t.Fatalf("recovery did not finish after 60s: %d queued, %d running\n%s", queued, running, tail(logPath))
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// (a) THE QUEUED ARM. Neither request ever reached a worker, so neither is charged a
-	// requeue life and neither may still name the dead machine. `machine` is kept: which
-	// pod a run waited on is history worth having (cl-107).
-	for _, id := range []string{"req-lost-queued-a", "req-lost-queued-b"} {
+	for id, arm := range arms {
 		row, problem := store.RequestRow(id)
 		fatal(t, problem)
-		if row == nil {
-			t.Fatalf("%s vanished", id)
+		link, problem := store.MachineExecution(id)
+		fatal(t, problem)
+		owed, problem := store.MachineExecutionOwesWork(id)
+		fatal(t, problem)
+		errType, _, errText, problem := store.SettledFailure(id)
+		fatal(t, problem)
+		events, problem := store.EventsAfter(id, 0, 100)
+		fatal(t, problem)
+		said := map[string]map[string]any{}
+		for _, event := range events {
+			said[event.Type] = event.Payload
 		}
-		if row.Worker == "rental-lost" {
-			t.Fatalf("%s is still pinned to the dead rental (state %s)\n%s",
-				id, row.State, tail(logPath))
+		if errType == "rental.inference_runtime_owned" || row.Requeues != 0 {
+			t.Fatalf("%s: failed as classic dispatch or was charged a life: %+v %s", id, row, errType)
 		}
-		if row.Requeues != 0 {
-			t.Fatalf("%s was charged %d requeue(s) for an attempt it never made",
-				id, row.Requeues)
-		}
-		if row.Machine != "nitian" {
+		switch {
+		case !arm.sent && arm.selected == "":
+			queued := said["request.queued"]
+			if settled(row.State) || link.MachineID != "" || row.Worker != "" || row.Machine != "nitian" ||
+				queued["machine_id"] != "rental-lost" || !strings.Contains(fmt.Sprint(queued["reason"]), "readiness.receipt_conflict") {
+				t.Fatalf("%s was not released to be placed again: %+v link=%q events=%v\n%s",
+					id, row, link.MachineID, said, tail(logPath))
+			}
+		case row.Machine != "nitian":
 			t.Fatalf("%s lost the machine word it ran against: %q", id, row.Machine)
+		case arm.retained:
+			if row.State != "failed" || row.RetainWork || errType != "request.state_lost" || errText != records.LostRetainedWorkMessage || owed {
+				t.Fatalf("%s: retained work did not fail as lost: %+v %s %s owed=%v", id, row, errType, errText, owed)
+			}
+		default:
+			lost := said["client.machine_lost"]
+			if row.State != "failed" || owed || errType != "machine_execution.state_lost" ||
+				lost["cause"] != "readiness.receipt_conflict" || lost["had_acceptance_receipt"] != arm.accepted {
+				t.Fatalf("%s did not settle with the machine's loss: %+v %s %v owed=%v", id, row, errType, lost, owed)
+			}
 		}
-		// "If possible" needs an honest else-branch. This daemon's hub offers no SKU, so
-		// nothing can serve the replan — and the request must SAY so, not wait forever.
-		if !settled(row.State) && row.Worker != "" {
-			t.Fatalf("%s is neither replanned nor settled: state %s, worker %q",
-				id, row.State, row.Worker)
-		}
+	}
+	if log, err := os.ReadFile(logPath); err != nil || strings.Contains(string(log), "inference_runtime_owned") {
+		t.Fatalf("rented work reached classic dispatch [%v]:\n%s", err, tail(logPath))
 	}
 
-	// (b) THE IN-FLIGHT ARM is not the queued one. Its attempt was accepted by a worker and
-	// may have partially executed, so it is closed as lost and re-offered through the
-	// EXISTING requeue budget — a life is charged, and a request out of lives fails saying
-	// so rather than being retried silently or stranded silently.
-	inFlight := attemptRow(t, store, "req-lost-running", attempt)
-	if inFlight.State != "closed" {
-		t.Fatalf("the in-flight attempt is still %q; it owes a terminal no destroyed pod "+
-			"can ever deliver\n%s", inFlight.State, tail(logPath))
-	}
-	if inFlight.TerminalStatus != "ABANDONED" || inFlight.TerminalCause != "EXECUTION_CONTEXT_LOST" {
-		t.Fatalf("the in-flight attempt did not say WHY it ended: status %q cause %q",
-			inFlight.TerminalStatus, inFlight.TerminalCause)
-	}
-	row, problem := store.RequestRow("req-lost-running")
-	fatal(t, problem)
-	if row.Worker == "rental-lost" {
-		t.Fatalf("the re-offered request is still pinned to the dead rental; it would spend "+
-			"its whole budget rediscovering that the machine is gone\n%s", tail(logPath))
-	}
-	if row.Requeues != 1 {
-		t.Fatalf("an attempt that may have partially executed was re-offered without "+
-			"charging the budget: requeues=%d", row.Requeues)
-	}
-
-	// A failed machine has left the current fleet; its retained diagnosis and
-	// historical request association survive the inventory projection.
+	// A failed machine has left the current fleet; its diagnosis survives.
 	if code, out := runCozy(t, root, "rental", "list", "--json", "--full"); code != 0 || strings.Contains(out, "rental-lost") {
 		t.Fatalf("failed rental remained in the current fleet [exit %d]: %s", code, out)
 	}
@@ -202,7 +176,6 @@ func TestRentalFailureRecovery(t *testing.T) {
 	if stored == nil || stored.MachineName != "nitian" || stored.State != "failed" || stored.Failure.Code != "readiness.receipt_conflict" {
 		t.Fatalf("failed rental history lost its diagnosis: %+v", stored)
 	}
-
 }
 
 // TestRentalFailureKeepsARecordedTerminal is the arm that must NOT fire. An attempt whose

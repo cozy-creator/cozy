@@ -21,9 +21,13 @@ func (s *Store) RequestPublicationRepositories(id string) ([]string, *exit.Error
 	return names, nil
 }
 
+// A frozen authorization names one machine's certificate; a run released from a
+// lost machine is authorized again for the machine it is placed on next.
+const linkedPublication = `json_extract(CAST(payload AS TEXT),'$.rental_id')=(SELECT machine_id FROM machine_executions WHERE request_id=?)`
+
 func (s *Store) MachinePublicationIntent(id string) ([]byte, *exit.Error) {
 	var raw []byte
-	err := s.db.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.publication_authorization' ORDER BY seq LIMIT 1`, id).Scan(&raw)
+	err := s.db.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.publication_authorization' AND `+linkedPublication+` ORDER BY seq LIMIT 1`, id, id).Scan(&raw)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -45,7 +49,7 @@ func (s *Store) RecordMachinePublicationIntent(id string, raw []byte) *exit.Erro
 	}
 	defer tx.Rollback()
 	var prior []byte
-	err = tx.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.publication_authorization' ORDER BY seq LIMIT 1`, id).Scan(&prior)
+	err = tx.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.publication_authorization' AND `+linkedPublication+` ORDER BY seq LIMIT 1`, id, id).Scan(&prior)
 	if err == nil {
 		if !bytes.Equal(prior, raw) {
 			return exit.New(exit.Conflict, "machine publication authorization was already frozen")
@@ -56,7 +60,7 @@ func (s *Store) RecordMachinePublicationIntent(id string, raw []byte) *exit.Erro
 		return exit.Internalf("cannot inspect existing machine publication authorization: %s", err)
 	}
 	var allowed bool
-	err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND e.machine_id!='' AND e.machine_id!='local' AND length(e.submission)=0 AND r.state!='canceled')`, id).Scan(&allowed)
+	err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND e.machine_id=json_extract(?,'$.rental_id') AND e.machine_id!='local' AND length(e.submission)=0 AND r.state!='canceled')`, id, string(raw)).Scan(&allowed)
 	if err != nil || !allowed {
 		return exit.New(exit.Conflict, "publication authority has no pending rented machine submission")
 	}
