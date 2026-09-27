@@ -131,6 +131,17 @@ impl Meta {
         crate::derived::open_row(&mut rows, id, writer_session).map(|_| ())
     }
 
+    pub(crate) fn part_count(&self, id: &str) -> Result<usize> {
+        self.connection()?
+            .query_row(
+                "SELECT count(*) FROM tensorfs_derived_parts WHERE id=?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as usize)
+            .map_err(|error| sql("count derived parts", error))
+    }
+
     /// Record one accepted part for the current writer: one indexed read of the writer's
     /// session and of that part. `Ok(false)` is the same part accepted before.
     pub(crate) fn accept_part(

@@ -21,6 +21,16 @@ fn part_key(part: &AddedPart) -> (&str, &str, &str) {
 }
 
 impl Delta {
+    /// The parts a writer accepted since its last checkpoint, sorted as a delta stores them.
+    pub(super) fn accepted(work: ObjectRef, mut parts: Vec<AddedPart>) -> Self {
+        parts.sort_by(|left, right| part_key(left).cmp(&part_key(right)));
+        Self {
+            work,
+            parts,
+            configs: Vec::new(),
+        }
+    }
+
     pub(super) fn between(
         row: &TransactionRow,
         prior: Option<&TransactionRow>,
