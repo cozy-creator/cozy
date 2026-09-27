@@ -359,6 +359,13 @@ func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 	if len(state.ModelOutputs) > 0 {
 		fields = append(fields, output.Field{K: "model_outputs", V: state.ModelOutputs})
 	}
+	if len(state.RetainedOutputs) > 0 {
+		rows := make([]string, 0, len(state.RetainedOutputs))
+		for _, retained := range state.RetainedOutputs {
+			rows = append(rows, retained.Output+" retained on "+retained.Machine)
+		}
+		fields = append(fields, output.Field{K: "retained", V: rows})
+	}
 	if len(state.Outputs) > 0 {
 		outs := make([]string, 0, len(state.Outputs))
 		for _, o := range state.Outputs {
@@ -549,6 +556,9 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if len(state.ModelOutputs) > 0 {
 		defaults = append(defaults, "model_outputs")
 	}
+	if len(state.RetainedOutputs) > 0 {
+		defaults = append(defaults, "retained")
+	}
 	// A verdict is not a --full detail. It is the answer to the question the operator is
 	// asking, so it stands in the default view.
 	if modelSourceVerdict(state.ModelSources) {
@@ -558,6 +568,14 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		defaults = append(defaults, "wall_ms")
 	}
 	rec := compactRecord(fields, defaults...)
+	if machine := state.MachineExecution; machine != nil && machine.Retained != "" {
+		rec.Notes = append(rec.Notes, fmt.Sprintf("its result stays on %s: %s", machine.Machine, machine.Retained))
+	}
+	if len(state.RetainedOutputs) > 0 {
+		machine := state.RetainedOutputs[0].Machine
+		rec.Notes = append(rec.Notes, fmt.Sprintf("retained outputs stay on %s until `cozy rental end %s`; "+
+			"to publish them, run again there with --publish-to <org/model>", machine, machine))
+	}
 	if export := state.OutputExport; export != nil && export.State == "failed" {
 		rec.Notes = append(rec.Notes, fmt.Sprintf("output export to %s failed (%s): %s; accepted output bytes remain in internal custody",
 			export.Directory, export.ErrorCode, export.Error))
@@ -570,6 +588,8 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if code == exit.OK {
 		if hint := modelPublishHint(state); hint != "" {
 			rec.Next = []string{hint}
+		} else if len(state.RetainedOutputs) > 0 {
+			rec.Next = []string{"cozy run <script-or-package> --rental=" + state.RetainedOutputs[0].Machine + " --publish-to <org/model>"}
 		} else if len(state.NativeOutputs) > 0 {
 			rec.Next = []string{"cozy run watch " + runReference(state.Number, state.JobID) + " --full"}
 		} else if state.Publication != nil {
@@ -718,7 +738,8 @@ func awaitMachineCollection(ctx *Context, state api.JobState) (api.JobState, *ex
 	client = client.Following((&reattachNotice{ctx: ctx}).say)
 	const poll = time.Second
 	last, since := "", time.Now()
-	for state.Status == "completed" && state.MachineExecution != nil && !state.MachineExecution.Collected {
+	for state.Status == "completed" && state.MachineExecution != nil && !state.MachineExecution.Collected &&
+		state.MachineExecution.Retained == "" {
 		if observed := state.MachineExecution.ObservationError; observed != last {
 			last, since = observed, time.Now()
 		} else if time.Since(since) >= transfer.StallBudget {

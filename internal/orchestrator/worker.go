@@ -690,7 +690,7 @@ func (w *worker) observeJobs(n int) {
 // tell them "it was there", which is true of both.
 func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange, *exit.Error) {
 	if spec.Connection != nil {
-		release, problem := c.UseRental(spec.Connection.RentalID)
+		release, problem := c.UseRental(spec.Connection.RentalID, "attaching its worker")
 		if problem != nil {
 			return "", ChangeNone, problem
 		}

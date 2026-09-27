@@ -142,7 +142,7 @@ func runCozyWithin(t *testing.T, root string, args ...string) (int, string, stri
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	_ = cmd.Run()
 	if ctx.Err() != nil {
-		t.Fatalf("cozy %s hung past %s beside a stuck purchase\n%s", strings.Join(args, " "), within,
+		t.Fatalf("cozy %s hung past %s\n%s", strings.Join(args, " "), within,
 			tail(filepath.Join(root, "daemon.log")))
 	}
 	return cmd.ProcessState.ExitCode(), stdout.String(), stderr.String()

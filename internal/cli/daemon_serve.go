@@ -184,7 +184,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		release, problem := c.UseRental(row.RentalID)
+		release, problem := c.UseRental(row.RentalID, "installing "+either(row.Selection.Package, "models"))
 		if problem != nil {
 			return problem
 		}

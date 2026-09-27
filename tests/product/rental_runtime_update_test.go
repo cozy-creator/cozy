@@ -36,10 +36,10 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 	c, problem := orchestrator.Open(orchestrator.Options{Store: reopened, Layout: f.layout, Rentals: rental.Resolver(f.layout, reopened)})
 	fatal(t, problem)
 	defer c.Close(orchestrator.StopGrace)
-	if _, problem := c.UseRental(f.rentalID); problem == nil || problem.ErrName() != "rental.maintenance" {
+	if _, problem := c.UseRental(f.rentalID, "run 7 reading its execution"); problem == nil || problem.ErrName() != "rental.maintenance" {
 		t.Fatalf("unfinished update did not retain dispatch hold: %v", problem)
 	}
-	other, problem := c.UseRental("another-rental")
+	other, problem := c.UseRental("another-rental", "run 8 preparing")
 	fatal(t, problem)
 	other()
 	row, problem := reopened.RuntimeUpdate(f.rentalID)
@@ -50,7 +50,7 @@ func TestRentalRuntimeUpdateJournalKeepsDispatchClosedAcrossRestart(t *testing.T
 	row.State = "failed"
 	row.Error = "candidate rolled back"
 	fatal(t, reopened.SaveRuntimeUpdate(*row))
-	release, problem := c.UseRental(f.rentalID)
+	release, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
 	fatal(t, problem)
 	release()
 	release()
@@ -66,24 +66,25 @@ func TestRentalMaintenanceRefusesActiveTransportAndIsolatesOtherRentals(t *testi
 	c, problem := orchestrator.Open(orchestrator.Options{Store: f.store, Layout: f.layout, Rentals: rental.Resolver(f.layout, f.store)})
 	fatal(t, problem)
 	defer c.Close(orchestrator.StopGrace)
-	release, problem := c.UseRental(f.rentalID)
+	release, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
 	fatal(t, problem)
 	called := false
 	updater := func(context.Context, *orchestrator.WorkerConnection) *exit.Error { called = true; return nil }
-	if problem := c.MaintainRental(context.Background(), f.rentalID, updater); problem == nil || problem.ErrName() != "rental.maintenance_busy" || called {
-		t.Fatalf("active transport was interrupted: %v", problem)
+	if problem := c.MaintainRental(context.Background(), f.rentalID, updater); problem == nil || problem.ErrName() != "rental.maintenance_busy" ||
+		!strings.Contains(problem.Message, "run 7 reading its execution") || called {
+		t.Fatalf("active transport was interrupted, or its refusal did not name it: %v", problem)
 	}
 	release()
 	fatal(t, c.MaintainRental(context.Background(), f.rentalID, func(context.Context, *orchestrator.WorkerConnection) *exit.Error {
-		if _, problem := c.UseRental(f.rentalID); problem == nil {
+		if _, problem := c.UseRental(f.rentalID, "run 7 reading its execution"); problem == nil {
 			t.Fatal("the target accepted transport during maintenance")
 		}
-		other, problem := c.UseRental("another-rental")
+		other, problem := c.UseRental("another-rental", "run 8 preparing")
 		fatal(t, problem)
 		other()
 		return nil
 	}))
-	use, problem := c.UseRental(f.rentalID)
+	use, problem := c.UseRental(f.rentalID, "run 7 reading its execution")
 	fatal(t, problem)
 	use()
 }

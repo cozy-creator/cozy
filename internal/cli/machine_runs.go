@@ -157,7 +157,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				if current.State == "canceled" && len(link.Submission) == 0 {
 					if link.MachineID != "" {
 						var connection *machineConnection
-						connection, problem = m.connect(m.ctx, link.MachineID)
+						connection, problem = m.connect(m.ctx, link.MachineID, m.runHolder(*current, "releasing its inputs"))
 						if problem == nil {
 							problem = m.releaseMachineInputs(m.ctx, *current, connection)
 							connection.connection.Close()
@@ -176,6 +176,9 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					problem = m.control(m.ctx, *current, "cancel", true)
 				} else {
 					problem = m.Refresh(m.ctx, *current)
+					if problem != nil && problem.ErrName() == "machine_execution.result_custody_required" {
+						return // the result stays with the machine; nothing here can collect it
+					}
 				}
 				if problem == nil {
 					observed, e := m.store.MachineExecution(request.ID)
@@ -307,7 +310,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 	}
 	began := time.Now()
-	connection, problem := m.connect(m.ctx, link.MachineID)
+	connection, problem := m.connect(m.ctx, link.MachineID, m.runHolder(request, "preparing its submission"))
 	if problem != nil {
 		return problem
 	}
@@ -599,12 +602,20 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 	if link == nil || len(link.Receipt) == 0 || proto.Unmarshal(link.Receipt, &receipt) != nil {
 		return nil, nil, nil, exit.Unavailablef("waiting for durable machine acceptance")
 	}
-	connection, problem := m.connect(ctx, link.MachineID)
+	connection, problem := m.connect(ctx, link.MachineID, m.runHolder(request, "reading or collecting its execution"))
 	if problem != nil {
 		return nil, nil, nil, problem
 	}
 	query := &pb.MachineExecutionQuery{Claim: connection.claim, RequestId: request.ID, ExpectedExecutionWorkspaceId: receipt.ExecutionWorkspaceId}
 	return connection, link, query, nil
+}
+
+// runHolder names a run and what it is doing on its machine.
+func (m *machineRuns) runHolder(request records.Request, doing string) string {
+	if numbered, problem := m.store.RequestByReference(request.ID); problem == nil && numbered != nil && numbered.Number > 0 {
+		return fmt.Sprintf("run %d %s", numbered.Number, doing)
+	}
+	return "run " + request.ID + " " + doing
 }
 
 func (m *machineRuns) Refresh(parent context.Context, request records.Request) *exit.Error {
@@ -784,8 +795,12 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem != nil {
 		return problem
 	}
-	if len(body.WeightsReceipts) > 0 && !models || len(body.GetOutputManifest().GetOutputs()) > 0 && !files || body.GetResult().GetResultBlob() != nil || body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ChildArtifacts && !models && !files {
-		return exit.Named(exit.Unavailable, "machine_execution.result_custody_required", "execution finished; referenced output bytes remain retained on the machine until recipient custody is established")
+	if problem := m.retainMachineWeights(ctx, request, connection, outcome, &body, modelPlan); problem != nil {
+		return m.retainedResult(request, outcome, problem)
+	}
+	if len(body.GetOutputManifest().GetOutputs()) > 0 && !files || body.GetResult().GetResultBlob() != nil || body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ChildArtifacts && !models && !files {
+		return m.retainedResult(request, outcome, exit.Named(exit.Unavailable, "machine_execution.result_custody_required",
+			"execution finished; referenced output bytes remain retained on the machine: this Creator has no recipient for them"))
 	}
 	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ModelTransfer != nil {
 		if problem := m.store.SettleMachineDestination(request.ID, fmt.Sprintf(
@@ -800,6 +815,26 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 		return machineTransport(err)
 	}
 	return m.store.ObserveMachineExecution(request.ID, collected, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, collected.Sequence)})
+}
+
+// retainedResult records, once, that an outcome's result stays with the machine because
+// nothing on this host can receive it. The run is settled for its clients and no
+// observation retries a transfer that nobody drives; a newer Creator retries on restart.
+func (m *machineRuns) retainedResult(request records.Request, outcome *pb.AttemptOutcome, problem *exit.Error) *exit.Error {
+	if problem.ErrName() != "machine_execution.result_custody_required" {
+		return problem
+	}
+	reason, readProblem := m.store.MachineResultRetained(request.ID)
+	if readProblem != nil {
+		return readProblem
+	}
+	if reason != problem.Message {
+		if recordProblem := m.store.AppendEvent(request.ID, "machine.result_retained", int64(outcome.AttemptOrdinal),
+			map[string]any{"reason": problem.Message}); recordProblem != nil {
+			return recordProblem
+		}
+	}
+	return problem
 }
 
 // Control sends the command on its own connection the moment it is durable; observing the

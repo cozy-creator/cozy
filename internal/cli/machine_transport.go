@@ -31,14 +31,16 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConnection, *exit.Error) {
+// connect opens the machine a run executes on; on a rental, holder is what the run is
+// doing there, which a maintenance refusal names.
+func (m *machineRuns) connect(ctx context.Context, machine, holder string) (*machineConnection, *exit.Error) {
 	if machine == "local" {
 		return m.connectLocalMachine(ctx)
 	}
 	if m.fleet == nil || m.fleet.owner == nil {
 		return nil, exit.Unavailablef("the rental controller is not ready")
 	}
-	release, problem := m.fleet.owner.UseRental(machine)
+	release, problem := m.fleet.owner.UseRental(machine, holder)
 	if problem != nil {
 		return nil, problem
 	}

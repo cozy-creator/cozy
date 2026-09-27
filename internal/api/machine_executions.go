@@ -26,6 +26,16 @@ type MachineExecutionView struct {
 	Machine          string `json:"machine"`
 	Collected        bool   `json:"collected"`
 	ObservationError string `json:"observation_error,omitempty"`
+	// Retained says why the finished result stays with the machine: nothing on this host
+	// can receive it, so no observation waits for it.
+	Retained string `json:"retained,omitempty"`
+}
+
+// RetainedOutput is an output held on the machine that produced it, in this host's custody.
+type RetainedOutput struct {
+	Output   string `json:"output"`
+	Machine  string `json:"machine"`
+	Manifest string `json:"manifest,omitempty"`
 }
 
 func (s *Server) refreshMachineExecution(ctx context.Context, request records.Request) *exit.Error {
@@ -34,6 +44,9 @@ func (s *Server) refreshMachineExecution(ctx context.Context, request records.Re
 		return problem
 	}
 	if lost, problem := s.store.MachineExecutionLost(request.ID); problem != nil || lost {
+		return problem
+	}
+	if retained, problem := s.store.MachineResultRetained(request.ID); problem != nil || retained != "" {
 		return problem
 	}
 	if s.machineExecutions == nil {
@@ -53,10 +66,25 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		retaining = true
 		view.ObservationError = retentionProblem.Message
 	}
+	if !link.Collected {
+		view.Retained, _ = s.store.MachineResultRetained(row.ID)
+	}
+	var retained []RetainedOutput
+	if holds, problem := s.store.MachineModelRetentions(row.ID); problem == nil && len(holds) > 0 {
+		holder := machine
+		if rented, _ := s.store.RentalRow(link.MachineID); row.Machine == "" && rented != nil && rented.MachineName != "" {
+			holder = rented.MachineName
+		}
+		for _, hold := range holds {
+			if artifact, _ := records.DecodeModelArtifact(hold.Artifact); hold.State == "held" && artifact != nil {
+				retained = append(retained, RetainedOutput{Output: artifact.OutputSlot, Machine: holder, Manifest: artifact.Manifest.Digest})
+			}
+		}
+	}
 	state := JobState{
 		Number: row.Number, JobID: row.ID, Status: s.publicStatusOf(row), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal), Attempts: int(row.Ordinal),
-		RetainWork: row.RetainWork, Retaining: retaining,
+		RetainWork: row.RetainWork, Retaining: retaining, RetainedOutputs: retained,
 		RetryAvailable: s.store.RetainedRetryAvailable(row),
 		CreatedAt:      row.CreatedAt, EventsURL: "/v1/requests/" + row.ID + "/events", Outputs: []MediaRef{},
 		MachineExecution: view,
