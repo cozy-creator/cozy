@@ -142,7 +142,7 @@ func conversionRunKey(ctx *Context, sub api.JobSubmission) (string, string, *exi
 		return "", "", problem
 	}
 	defer store.Close()
-	return store.ResumableRun("conversion-"+hex.EncodeToString(digest[:]), sub.RequestedRental)
+	return store.ResumableRun("conversion-"+hex.EncodeToString(digest[:]), sub.RequestedRental, true)
 }
 
 // A job grants exact manifest bytes, whereas a serving binding names a model

@@ -147,6 +147,46 @@ func TestGatedProviderSourceNamesTheMissingToken(t *testing.T) {
 	}
 }
 
+// Re-running a completed ingest submits it again to the pod: its Runtime, whose version
+// and the source's configs are in its own memo key, decides whether the result is still
+// the same; the unchanged script is no evidence of that (Runtime 0.18.57 added Diffusers
+// configs to an Anima upload the old checkpoint lacked). A re-run of a live ingest is still
+// the same run, and nothing is submitted twice.
+func TestARerunOfACompletedIngestReachesThePod(t *testing.T) {
+	pod := newRentedIngestPod(t, "https://civitai.com/api/v1/model-versions/128078")
+	args := []string{"civitai://128078", "proof/sdxl", "--source-profile", "civitai/sdxl/single-file/1"}
+	// The pod counts runs by request; a live run's resubmission is the same run.
+	submissions := func() int {
+		pod.machine.mu.Lock()
+		defer pod.machine.mu.Unlock()
+		requests := map[string]bool{}
+		for _, submit := range pod.machine.submissions {
+			requests[submit.Offer.RequestId] = true
+		}
+		return len(requests)
+	}
+	for range 2 {
+		if code, out := pod.upload(args...); code != 0 {
+			t.Fatalf("the ingest was refused [exit %d]:\n%s", code, out)
+		}
+	}
+	waitFor(t, pod.root, "the ingest's machine submission", func() bool { return submissions() > 0 })
+	runs, problem := pod.store.Requests("", "", 10)
+	fatal(t, problem)
+	if len(runs) != 1 || submissions() != 1 {
+		t.Fatalf("a re-run of a live ingest was not the same run: %d runs, %d submitted", len(runs), submissions())
+	}
+	// The ingest completed under the pod's previous Runtime.
+	fatal(t, pod.store.SettleRequest(runs[0].ID, "succeeded"))
+	if code, out := pod.upload(args...); code != 0 {
+		t.Fatalf("the re-run was refused [exit %d]:\n%s", code, out)
+	}
+	waitFor(t, pod.root, "the re-run's machine submission", func() bool { return submissions() == 2 })
+	if runs, problem = pod.store.Requests("", "", 10); problem != nil || len(runs) != 2 {
+		t.Fatalf("the re-run replayed the completed ingest instead of a new run: %d runs %v", len(runs), problem)
+	}
+}
+
 // rentedIngestPod is a daemon with one attached fake pod, "ingester", that keeps the bytes of
 // every uploaded file and answers preparation with the interface the owner captured.
 type rentedIngestPod struct {
