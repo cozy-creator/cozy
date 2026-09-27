@@ -70,11 +70,11 @@ func TestPublishedRequirementsDedupeRepeatedWheelsAndAcceptNewLocalWheels(t *tes
 		UVLock:        exact("version = 1\nrevision = 3\nrequires-python = '>=3.12'\n[[package]]\nname = 'export-proof'\nversion = '1.0.0'\nsource = { virtual = '.' }\n"),
 		ProjectWheel:  wheel("export-proof", "1"),
 		Wheels:        []install.PublishedWheel{wheel("helper", "2"), wheel("helper", "2")},
-		LocalWheels:   []install.PublishedWheel{wheel("cozy-runtime", "3"), wheel("tensorfs", "4"), wheel("varena", "5")},
+		LocalWheels:   []install.PublishedWheel{wheel("tensorfs", "4"), wheel("newer-hub-tool", "5")},
 	}
 	body, problem := install.PublishedRequirements(published)
 	fatal(t, problem)
-	for _, name := range []string{"helper", "cozy-runtime", "tensorfs", "varena"} {
+	for _, name := range []string{"helper", "tensorfs", "newer-hub-tool"} {
 		if strings.Count(string(body), name+"==1.0.0") != 1 {
 			t.Fatalf("%s was not pinned exactly once: %s", name, body)
 		}
