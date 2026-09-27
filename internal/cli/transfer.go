@@ -205,7 +205,7 @@ func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, fence reclam
 			continue
 		}
 		if ref.Org == "local" {
-			if problem := modelsource.LocalName(ref.Name); problem != nil {
+			if _, problem := modelsource.LocalName(ref.Name); problem != nil {
 				return problem
 			}
 			alias, problem := tool.ResolveLocal(ref.Name)

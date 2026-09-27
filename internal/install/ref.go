@@ -30,6 +30,7 @@ func ParseRef(s string) (Ref, *exit.Error) {
 			WithNext("cozy help package install")
 	}
 	name, ver, hasVer := strings.Cut(s, "@")
+	name = strings.ToLower(strings.TrimSpace(name))
 	org, ep, ok := strings.Cut(name, "/")
 	if !ok || org == "" || ep == "" || strings.Contains(ep, "/") {
 		return Ref{}, bad("expected exactly one org/package separator")
