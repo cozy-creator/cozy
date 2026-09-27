@@ -26,6 +26,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/units"
+	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 type Request struct {
@@ -120,7 +121,7 @@ func validatePublished(inst records.PackageInstall, published *PublishedSource) 
 			"published package interface bytes do not match their digest and length")
 	}
 	if published.ProjectWheel.Distribution != inst.Package[strings.LastIndex(inst.Package, "/")+1:] ||
-		published.ProjectWheel.Version != inst.Version ||
+		!wheel.SameVersion(published.ProjectWheel.Version, inst.Version) ||
 		published.ProjectWheel.Digest == "" || published.ProjectWheel.Filename == "" {
 		return exit.Named(exit.Conflict, "package_wheel_release_mismatch",
 			"published project wheel does not name %s@%s", inst.Package, inst.Version)
@@ -144,28 +145,39 @@ func validatePublished(inst records.PackageInstall, published *PublishedSource) 
 				"published %s bytes do not match their digest and length", name)
 		}
 	}
-	seenDependencies := map[string]bool{}
-	for _, wheel := range published.Wheels {
-		if wheel.Distribution == "" || seenDependencies[wheel.Distribution] {
-			return exit.Named(exit.Conflict, "package_dependency_wheel_duplicate",
-				"published package repeats dependency distribution %q", wheel.Distribution)
-		}
-		seenDependencies[wheel.Distribution] = true
+	// Identical repeated rows are one wheel; only two different wheels for one
+	// distribution are ambiguous.
+	dependencies, problem := uniqueWheels(published.Wheels, nil)
+	if problem != nil {
+		return problem
 	}
-	if len(published.LocalWheels) > 2 {
-		return exit.Named(exit.Conflict, "package_local_wheel_count_invalid",
-			"published package carries more than two local materialization wheels")
+	published.Wheels = dependencies
+	local, problem := uniqueWheels(published.LocalWheels, published.Wheels)
+	if problem != nil {
+		return problem
 	}
-	seenLocal := map[string]bool{}
-	for _, wheel := range published.LocalWheels {
-		allowed := wheel.Distribution == "cozy-runtime" || wheel.Distribution == "tensorfs"
-		if !allowed || seenLocal[wheel.Distribution] || seenDependencies[wheel.Distribution] {
-			return exit.Named(exit.Conflict, "package_local_wheel_invalid",
-				"published local materialization wheels must be unique Runtime/TensorFS distributions outside package dependencies")
-		}
-		seenLocal[wheel.Distribution] = true
-	}
+	published.LocalWheels = local
 	return nil
+}
+
+func uniqueWheels(rows, others []PublishedWheel) ([]PublishedWheel, *exit.Error) {
+	chosen := map[string]PublishedWheel{}
+	for _, other := range others {
+		chosen[other.Distribution] = other
+	}
+	out := make([]PublishedWheel, 0, len(rows))
+	for _, row := range rows {
+		prior, seen := chosen[row.Distribution]
+		if row.Distribution == "" || seen && (prior.Digest != row.Digest || prior.Version != row.Version) {
+			return nil, exit.Named(exit.Conflict, "package_wheel_ambiguous",
+				"published package names two different wheels for distribution %q", row.Distribution)
+		}
+		if !seen {
+			chosen[row.Distribution] = row
+			out = append(out, row)
+		}
+	}
+	return out, nil
 }
 
 type Timing struct {

@@ -16,8 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-const wheelGraphUV = "0.12.11"
-
 type graphEdge struct {
 	ID string `json:"id"`
 }
@@ -43,16 +41,8 @@ type wheelGraph struct {
 // WheelClosures contains one exact selected transitive name/version roster per
 // callable dependency. Paths, caller source, inactive extras, and unrelated
 // installed development dependencies never enter a callee's roster.
+// Any uv whose graph this reader can walk is accepted; an unreadable graph refuses below.
 func WheelClosures(ctx context.Context, tree, python, installed, project, extra string) (map[string]map[string]string, *exit.Error) {
-	version := exec.CommandContext(ctx, "uv", "--version")
-	version.Env = config.Frozen().Tool()
-	raw, err := version.Output()
-	fields := strings.Fields(string(raw))
-	if err != nil || len(fields) < 2 || fields[0] != "uv" || (fields[1] != wheelGraphUV && fields[1] != "0.12.7") {
-		return nil, exit.Named(exit.Structural, "private_wheel_graph_uv_unsupported",
-			"installed callable wheel discovery requires uv %s's qualified graph schema", wheelGraphUV).
-			WithRemedy("install uv %s, then retry cozy run", wheelGraphUV)
-	}
 	command := exec.CommandContext(ctx, "uv", "tree", "--frozen", "--no-dev", "--no-default-groups", "--format", "json", "--python", python, "--no-python-downloads")
 	command.Dir, command.Env = tree, config.Frozen().Tool()
 	var stderr strings.Builder
@@ -81,8 +71,8 @@ func readWheelClosures(raw []byte, installed, project, extra string) (map[string
 		return nil, problem
 	}
 	var graph wheelGraph
-	if len(raw) == 0 || int64(len(raw)) > maxLockBytes || json.Unmarshal(raw, &graph) != nil || graph.Schema.Version != "preview" || graph.Inverted || len(graph.Resolution) > 4096 {
-		return nil, exit.Named(exit.Validation, "private_wheel_graph_invalid", "uv dependency graph schema is not the qualified preview format")
+	if len(raw) == 0 || int64(len(raw)) > maxLockBytes || json.Unmarshal(raw, &graph) != nil || graph.Inverted || len(graph.Resolution) > 4096 {
+		return nil, exit.Named(exit.Validation, "private_wheel_graph_invalid", "uv's dependency graph is unreadable")
 	}
 	var roots []string
 	for _, edge := range graph.Roots {

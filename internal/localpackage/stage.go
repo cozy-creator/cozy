@@ -14,6 +14,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
@@ -91,7 +92,7 @@ func StageWheels(layout home.Layout, install records.PackageInstall, surface []b
 		return Installation{}, problem
 	}
 	defer os.RemoveAll(stage)
-	result := Installation{ID: install.ID, Package: install.Package, Release: install.Version, PackageInterface: append([]byte(nil), surface...), DependencyRequirements: append([]byte(nil), requirements...), PythonVersion: install.Python}
+	result := Installation{ID: install.ID, Package: install.Package, Release: install.Version, PackageInterface: append([]byte(nil), surface...), DependencyRequirements: append([]byte(nil), requirements...), PythonVersion: hostruntime.PythonMinor(install.Python)}
 	for index, source := range paths {
 		fact, problem := wheel.InspectIdentity(source)
 		if problem != nil {
@@ -167,6 +168,12 @@ func Open(layout home.Layout, install records.PackageInstall, id string) (Instal
 			return Installation{}, exit.New(exit.Validation, "private installation contains an invalid file path")
 		}
 		result.Files[i].Path = filepath.Join(root, result.Files[i].Filename)
+	}
+	// Earlier stages recorded the observed patch; a wheel closure needs only its minor ABI
+	// and transferred source needs neither.
+	result.PythonVersion = hostruntime.PythonMinor(result.PythonVersion)
+	if result.SourceArchive != "" {
+		result.PythonVersion = ""
 	}
 	return result, nil
 }

@@ -83,8 +83,12 @@ func TestRentalPythonAdmissionUsesAvailableExecutors(t *testing.T) {
 	if _, reason := launch.InventoryPython(inventory, ">=3.15", ""); reason == "" {
 		t.Fatal("future executor admitted")
 	}
-	if _, reason := launch.InventoryPython(inventory, ">=3.12", "3.13.9"); reason == "" {
-		t.Fatal("captured patch silently replaced")
+	// A captured interpreter fixes the ABI minor; any executor of that minor serves it.
+	if selected, reason := launch.InventoryPython(inventory, ">=3.12", "3.13.9"); reason != "" || selected != "3.13.11" {
+		t.Fatalf("a compatible patch of the captured minor was refused: %s %s", selected, reason)
+	}
+	if _, reason := launch.InventoryPython(inventory, ">=3.12", "3.15.1"); reason == "" {
+		t.Fatal("an executor of another minor served the captured ABI")
 	}
 	candidates := rental.Purchases([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", BaseWorkerProfile: "python3.12-cpu-linux-x86", PythonInterpreters: inventory.Interpreters}}, nil, false, true, rental.Constraints{RequiresPython: ">=3.13,<3.14", PythonVersion: "3.13.11"})
 	if len(candidates) != 1 || candidates[0].Verdict != "" {
@@ -123,7 +127,7 @@ func TestPublishedRentalPythonUsesRemoteInventory(t *testing.T) {
 	for _, tc := range []struct {
 		version, abi string
 		want         bool
-	}{{"3.13.11", "cp313", true}, {"3.12.12", "cp312", false}, {"3.13.12", "cp313", false}} {
+	}{{"3.13.11", "cp313", true}, {"3.12.12", "cp312", false}, {"3.13.12", "cp313", true}} {
 		choices := rental.Purchases([]hub.RentalSKU{{Name: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, BaseWorkerProfile: "python3.12-cpu-linux-x86", PythonInterpreters: []*pb.PythonInterpreter{{Version: tc.version, Abi: tc.abi}}}}, nil, false, true, constraints)
 		if len(choices) != 1 || (choices[0].Verdict == "") != tc.want {
 			t.Fatalf("remote %s selected %v; want %v", tc.version, choices, tc.want)
@@ -131,13 +135,14 @@ func TestPublishedRentalPythonUsesRemoteInventory(t *testing.T) {
 	}
 }
 
-func TestRentalPythonProvisioningKeepsExactCaptureAndInventorySeparate(t *testing.T) {
+func TestRentalPythonProvisioningKeepsCaptureAndInventorySeparate(t *testing.T) {
 	for _, tc := range []struct {
 		name, version, requires string
 		minors                  []string
 		want                    bool
 	}{
 		{"missing exact patch", "3.13.7", ">=3.13,<3.14", []string{"3.12", "3.13", "3.14"}, true},
+		{"minor-only capture", "3.13", ">=3.13,<3.14", []string{"3.12", "3.13", "3.14"}, true},
 		{"missing capability", "3.13.7", ">=3.13", nil, false},
 		{"outside window", "3.15.1", ">=3.13", []string{"3.12", "3.13", "3.14"}, false},
 		{"conflicting bound", "3.13.7", ">=3.14", []string{"3.13"}, false},

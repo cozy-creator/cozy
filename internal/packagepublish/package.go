@@ -205,7 +205,7 @@ func projectWheels(ctx context.Context, tree, out, name, release string, python 
 		if problem != nil {
 			return nil, problem
 		}
-		if name != fact.Distribution || release != fact.Version {
+		if name != fact.Distribution || !wheel.SameVersion(release, fact.Version) {
 			return nil, exit.Named(exit.Validation, "project_metadata_mismatch",
 				"pyproject.toml declares %s==%s but the built wheel declares %s==%s",
 				name, release, fact.Distribution, fact.Version).

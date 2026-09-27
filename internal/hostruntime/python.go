@@ -50,7 +50,8 @@ func PythonExecutors(ctx context.Context) (PythonInventory, *exit.Error) {
 	}
 	err = cmd.Wait()
 	var inventory PythonInventory
-	if err != nil || readErr != nil || len(raw) > 1<<20 || json.Unmarshal(raw, &inventory) != nil || !filepath.IsAbs(inventory.ManagedRoot) || len(inventory.SupportedMinors) == 0 || inventory.Format != "cozy.python-interpreters/1" {
+	// Callers read the fields they consume; a newer report revision keeps those members.
+	if err != nil || readErr != nil || len(raw) > 1<<20 || json.Unmarshal(raw, &inventory) != nil || !filepath.IsAbs(inventory.ManagedRoot) || !strings.HasPrefix(inventory.Format, "cozy.python-interpreters/") {
 		return inventory, exit.Named(exit.Structural, "python_window_unavailable", "installed Runtime cannot report its supported Python executors and owned root").WithRemedy("upgrade cozy-runtime and retry")
 	}
 	return inventory, nil

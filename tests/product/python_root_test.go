@@ -52,6 +52,28 @@ printf '%%s\n' '%s'
 	}
 }
 
+// A newer Runtime's inventory report keeps the members this host reads.
+func TestPythonInventoryAcceptsANewerReportRevision(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "runtime-selected-location")
+	newer := 2
+	body := fmt.Sprintf(`{"format":"cozy.python-interpreters/%d","managed_root":%q,"free_threaded":[],"supported_minors":[]}`, newer, root)
+	toolDir := t.TempDir()
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$2" = version ]; then
+ printf '%%s\n' '{"distribution":"%s","wire_protocol":"cozy.worker.v1+minor.54"}'
+ exit 0
+fi
+printf '%%s\n' '%s'
+`, hostruntime.ToolFloor, body)
+	must(t, os.WriteFile(filepath.Join(toolDir, "cozy-runtime"), []byte(script), 0700)) //cozy:allow read-only Runtime inventory boundary fixture
+	t.Setenv("PATH", toolDir)
+	inventory, problem := hostruntime.PythonExecutors(context.Background())
+	fatal(t, problem)
+	if inventory.ManagedRoot != root {
+		t.Fatalf("Runtime root changed: %+v", inventory)
+	}
+}
+
 func TestPythonLocalServeUsesReportedManagedRoot(t *testing.T) {
 	integration(t)
 	if runtime.GOOS != "linux" || *privateScriptRuntimeWheel == "" {

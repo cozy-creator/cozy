@@ -288,7 +288,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	if problem != nil {
 		return problem
 	}
-	if identity.Distribution != name || identity.Version != version {
+	if identity.Distribution != name || !wheel.SameVersion(identity.Version, version) {
 		return exit.Named(exit.Validation, "local_dependency_identity_mismatch",
 			"local project declares %s==%s but its wheel declares %s==%s",
 			name, version, identity.Distribution, identity.Version)

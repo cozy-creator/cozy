@@ -127,17 +127,17 @@ func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected stri
 			continue
 		}
 		version, _ := pep440.Parse(candidate.Version)
-		if bounds.Check(version) && (selected == "" || candidate.Version == selected) {
+		if bounds.Check(version) && (selected == "" || hostruntime.PythonMinor(candidate.Version) == hostruntime.PythonMinor(selected)) {
 			return candidate.Version, ""
 		}
 	}
 	return "", "no available Python executor satisfies " + requiresPython + " (captured Python " + selected + ")"
 }
 
-// ProvisionablePython admits an exact captured interpreter from an explicit
-// Runtime provisioning capability. It never adds a fictitious installed executor.
+// ProvisionablePython admits a captured interpreter minor from an explicit Runtime
+// provisioning capability. It never adds a fictitious installed executor.
 func ProvisionablePython(minors []string, requires, selected string, supported ...[]string) bool {
-	if valid, _ := regexp.MatchString(`^3\.[1-9][0-9]*\.(0|[1-9][0-9]*)$`, selected); !valid {
+	if valid, _ := regexp.MatchString(`^3\.[1-9][0-9]*(\.(0|[1-9][0-9]*))?$`, selected); !valid {
 		return false
 	}
 	version, err := pep440.Parse(selected)

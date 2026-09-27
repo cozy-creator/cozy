@@ -28,7 +28,7 @@ func (f *Facts) PreparationSpec(devices []string) (orchestrator.WorkerLaunchSpec
 			Package: f.Install.Package, InstallID: f.Install.ID, InstallationID: f.Install.ID, Release: f.Install.Version,
 		},
 		Preparation: &orchestrator.LocalServingPreparation{
-			PythonVersion: f.Install.Python, Published: f.Install.SourceKind == "tensorhub", Application: f.PackageInterface.Application,
+			PythonVersion: hostruntime.PythonMinor(f.Install.Python), Published: f.Install.SourceKind == "tensorhub", Application: f.PackageInterface.Application,
 			ModelSlotPaths:     slots,
 			PackageInterface:   append([]byte(nil), f.PackageInterface.Raw...),
 			LockedRequirements: filepath.Join(f.Install.Dir, "locked-requirements.txt"),

@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
@@ -77,16 +78,16 @@ func pythonVersion(venv string) string {
 	if problem != nil {
 		return ""
 	}
-	// -S suppresses startup hooks even in an operator-owned base prefix. The
-	// pyvenv declaration and actual base must agree; some uv releases store only
-	// the major/minor pair, so query the trusted base for the exact patch version.
+	// -S suppresses startup hooks even in an operator-owned base prefix. The base
+	// answers the exact version; the pyvenv declaration need only share its minor ABI,
+	// since uv upgrades a managed interpreter's patch in place under existing venvs.
 	version := strings.TrimSpace(strings.TrimPrefix(runOut(base, "-I", "-S", "-V"), "Python "))
 	metadata := venvMetadata(venv)
 	declared := metadata["version_info"]
 	if declared == "" {
 		declared = metadata["version"]
 	}
-	if declared == "" || !(version == declared || strings.HasPrefix(version, declared+".")) {
+	if declared != "" && hostruntime.PythonMinor(declared) != hostruntime.PythonMinor(version) {
 		return ""
 	}
 	return version
