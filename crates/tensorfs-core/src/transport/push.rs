@@ -12,7 +12,9 @@
 //! The object is RE-SENT when the socket goes silent or the store answers a retryable
 //! status, `PUT_ATTEMPTS` times, exactly as the pull re-asks for one object. The write
 //! silence bound is the ledger's floor — the same derived noise floor `egress.py` used —
-//! never an invented constant. Authority stays where it was: `podweights` (or whoever
+//! never an invented constant. A retryable answer is re-sent after the wait the store
+//! states (`Retry-After`), which spends no attempt, or after the ledger's patience, which
+//! does. Authority stays where it was: `podweights` (or whoever
 //! minted the grant) decided WHETHER these bytes may go; this module only moves them.
 //!
 //! **A grant is a URL AND the headers its signature covers, together.** tensorhub signs
@@ -193,7 +195,9 @@ pub fn push_object(
     };
     let mut complete_send = false;
     let mut last_refusal: Option<Refusal> = None;
-    for attempt in 1..=PUT_ATTEMPTS {
+    let mut attempt = 0;
+    while attempt < PUT_ATTEMPTS {
+        attempt += 1;
         let last = attempt == PUT_ATTEMPTS;
         let checked = policy.check(&grant.url)?;
         let mut headers = vec![
@@ -261,10 +265,22 @@ pub fn push_object(
                 format!("HTTP {status} tried to replace the exact granted URL"),
             );
         }
+        let stated = response.stated_wait();
         let body = response.read_capped(64 * 1024)?;
         let _ = body;
-        if crate::transport::pull::RETRYABLE_STATUS.contains(&status) && !last {
+        if crate::transport::pull::RETRYABLE_STATUS.contains(&status) {
+            let (wait, counted) = ledger.retry_wait(stated);
+            if last && counted {
+                return refuse(
+                    Code::TRANSFER_FAILED,
+                    format!("the object store answered HTTP {status} to every PUT"),
+                );
+            }
+            if !counted {
+                attempt -= 1;
+            }
             complete_send = true;
+            ledger.pause(wait, deadline)?;
             continue;
         }
         if status == HTTP_PRECONDITION_FAILED {

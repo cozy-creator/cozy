@@ -793,6 +793,7 @@ pub fn content_manifest(resolution: &Resolution) -> Result<crate::manifest::Mani
 }
 
 /// Materialize precisely an accepted selection; never re-list or broaden its roster.
+/// `progress` hears (present bytes, total bytes) of the selection's distinct objects.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_selected(
     store: &Store,
@@ -801,7 +802,7 @@ pub fn materialize_selected(
     policy: &SourcePolicy,
     credentials: &dyn CredentialProvider,
     deadline: Deadline,
-    progress: &mut dyn FnMut(&str, u64),
+    progress: crate::transport::SourceProgress<'_>,
 ) -> Result<(crate::source_artifact::TreeRoot, Vec<Pulled>)> {
     materialize_selected_with_options(
         store,
@@ -815,7 +816,7 @@ pub fn materialize_selected(
     )
 }
 
-/// Native development fault points and checkpoint sizing for source qualification.
+/// Stream count, checkpoint sizing, cancellation and development fault points.
 #[allow(clippy::too_many_arguments)]
 pub fn materialize_selected_with_options(
     store: &Store,
@@ -824,7 +825,7 @@ pub fn materialize_selected_with_options(
     policy: &SourcePolicy,
     credentials: &dyn CredentialProvider,
     deadline: Deadline,
-    progress: &mut dyn FnMut(&str, u64),
+    progress: crate::transport::SourceProgress<'_>,
     options: &crate::transport::SourceDownload,
 ) -> Result<(crate::source_artifact::TreeRoot, Vec<Pulled>)> {
     use crate::ids::Doc;
@@ -833,35 +834,54 @@ pub fn materialize_selected_with_options(
     let mut writer = crate::source_artifact::Writer::open(store, owner, tree.object_ref())?;
     let objects = resolution.objects();
     let (plan, _) = FetchPlan::of_objects(store, "selected-source", &objects)?;
-    let ledger = Ledger::new();
-    let mut pulled = vec![];
+    let mut ledger = Ledger::new();
+    if let Some(cancellation) = &options.cancellation {
+        ledger = ledger.with_cancellation(cancellation.clone());
+    }
+    // Every member's liveness is published before any of their bytes move.
+    let mut jobs: Vec<crate::transport::prefix::SourceJob> = vec![];
+    let (mut seen, mut held_bytes) = (std::collections::BTreeSet::new(), 0);
     for member in &resolution.members {
         writer.hold_expected(&member.object)?;
-        let held = matches!(store.record_valid(&member.object.sha256), Ok(row) if row.length == member.object.length);
-        let transferred = if held {
-            0
-        } else {
-            let grant = DeliveryGrant::mint(&plan, &member.object)?;
-            crate::transport::prefix::fetch_source(
-                store,
-                owner,
-                &grant,
-                &member.url,
-                policy,
-                credentials,
-                deadline,
-                &ledger,
-                options,
-                Some(&mut |bytes| progress(&member.member, bytes)),
-            )?
-            .transferred
-        };
+        let object = &member.object;
+        if !seen.insert(&object.sha256) {
+            continue;
+        }
+        if matches!(store.record_valid(&object.sha256), Ok(row) if row.length == object.length) {
+            held_bytes += object.length;
+            continue;
+        }
+        jobs.push(crate::transport::prefix::SourceJob {
+            grant: DeliveryGrant::mint(&plan, object)?,
+            url: member.url.clone(),
+        });
+    }
+    let transferred = crate::transport::prefix::fetch_sources(
+        store,
+        owner,
+        &jobs,
+        policy,
+        credentials,
+        deadline,
+        &ledger,
+        options,
+        held_bytes,
+        progress,
+    )?;
+    let mut pulled = vec![];
+    let mut counted = std::collections::BTreeSet::new();
+    for member in &resolution.members {
         writer.landed(&member.object)?;
+        let first = counted.insert(&member.object.sha256);
+        let fetched = jobs
+            .iter()
+            .position(|job| job.grant.object == member.object)
+            .filter(|_| first);
         pulled.push(Pulled {
             member: member.member.clone(),
             object: member.object.clone(),
-            transferred,
-            held,
+            transferred: fetched.map_or(0, |at| transferred[at]),
+            held: fetched.is_none(),
         });
     }
     plan.complete(store)?;
@@ -2475,7 +2495,7 @@ mod tests {
             &endpoints.policy(&uri),
             &Anonymous,
             Deadline::none(),
-            &mut |_, _| {},
+            &|_, _| {},
         )
         .unwrap();
         assert_eq!(
@@ -2492,7 +2512,7 @@ mod tests {
             &endpoints.policy(&uri),
             &Anonymous,
             Deadline::none(),
-            &mut |_, _| {},
+            &|_, _| {},
         )
         .unwrap();
         assert_eq!(warm, cold);
@@ -2646,7 +2666,7 @@ mod tests {
             &endpoints.policy(&uri),
             &Anonymous,
             Deadline::none(),
-            &mut |_, _| {},
+            &|_, _| {},
         )
         .unwrap_err();
         assert_eq!(error.code, Code::OBJECT_ID_MISMATCH);
@@ -2698,7 +2718,7 @@ mod tests {
             &endpoints.policy(&uri),
             &Anonymous,
             Deadline::none(),
-            &mut |_, _| {},
+            &|_, _| {},
         )
         .unwrap();
         assert!(retained.complete && !retained.released);

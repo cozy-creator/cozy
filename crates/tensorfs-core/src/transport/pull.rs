@@ -323,13 +323,20 @@ pub(super) fn fetch_with_attempts(
         };
         let response = match opened {
             Opened::Body(response) => response,
-            Opened::Retryable(status) => {
-                if last {
+            Opened::Retryable(status, stated) => {
+                let (wait, counted) = ledger.retry_wait(stated);
+                if !retry || (last && counted) {
                     return refuse(
                         Code::TRANSFER_FAILED,
                         format!("{id}: the object store answered {status} on every attempt"),
                     );
                 }
+                if !counted {
+                    // The origin said when to come back; that is not a failed ask.
+                    attempts.fetch_sub(1, Ordering::AcqRel);
+                }
+                drop(_slot);
+                ledger.pause(wait, deadline)?;
                 continue;
             }
             Opened::Expired(status) => {
@@ -418,7 +425,8 @@ pub(super) fn fetch_with_attempts(
 
 pub(super) enum Opened<'l> {
     Body(http::Response<'l>),
-    Retryable(u16),
+    /// A transient answer, and the wait the origin stated for it, if any.
+    Retryable(u16, Option<Duration>),
     /// The origin refused the signature. Whether that is weather or a verdict depends on
     /// the URL's age, which only the supplier knows.
     Expired(u16),
@@ -491,6 +499,8 @@ pub(super) fn open_object<'l>(
                 );
             }
             target = absolute;
+            // Read the few redirect bytes so this connection serves the next hop's ask.
+            response.discard();
             continue;
         }
         // 206 joins 200 as "the origin answered with a body". A caller that asked for no
@@ -501,7 +511,9 @@ pub(super) fn open_object<'l>(
             return Ok(Opened::Body(response));
         }
         if RETRYABLE_STATUS.contains(&status) {
-            return Ok(Opened::Retryable(status));
+            let wait = response.stated_wait();
+            response.discard();
+            return Ok(Opened::Retryable(status, wait));
         }
         // 401/403 is the object store saying the SIGNATURE is no good — the one answer
         // that a fresh URL can change, and the one that used to abort the walk outright.

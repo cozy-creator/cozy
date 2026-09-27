@@ -283,7 +283,7 @@ fn probe(
         // 200 to a ranged ask is the origin saying it does not do ranges. Everything else
         // — busy, expired signature — is a question the single-stream path is better
         // equipped to ask, because it can re-ask and re-authorize and this cannot.
-        Opened::Body(_) | Opened::Retryable(_) | Opened::Expired(_) => Ok(None),
+        Opened::Body(_) | Opened::Retryable(..) | Opened::Expired(_) => Ok(None),
         Opened::Refused(refusal) => Err(refusal),
     }
 }
@@ -584,7 +584,9 @@ fn part(
     let end = (start + size).min(total) - 1;
     let mut at = start;
     let mut last: Option<Refusal> = None;
-    for attempt in 1..=FETCH_ATTEMPTS {
+    let mut attempt = 0;
+    while attempt < FETCH_ATTEMPTS {
+        attempt += 1;
         if wire.stopped() {
             return Ok(false);
         }
@@ -635,11 +637,25 @@ fn part(
                     ),
                 )
             }
-            Opened::Retryable(status) if !last_attempt => {
+            Opened::Retryable(status, stated) => {
+                let (wait, counted) = ledger.retry_wait(stated);
+                if last_attempt && counted {
+                    return refuse(
+                        Code::TRANSFER_FAILED,
+                        format!(
+                            "part {index}: the origin answered {status} on every one of \
+                             {FETCH_ATTEMPTS} asks for {asked}"
+                        ),
+                    );
+                }
+                if !counted {
+                    attempt -= 1;
+                }
                 last = Some(Refusal {
                     code: Code::TRANSFER_FAILED,
                     detail: format!("part {index}: the origin answered {status}"),
                 });
+                ledger.pause(wait, deadline)?;
                 continue;
             }
             // 401/403 on a source URL is the origin refusing the request, not a lease
@@ -654,7 +670,7 @@ fn part(
                 });
                 continue;
             }
-            Opened::Retryable(status) | Opened::Expired(status) => {
+            Opened::Expired(status) => {
                 return refuse(
                     Code::TRANSFER_FAILED,
                     format!(
@@ -909,7 +925,9 @@ impl<'l> Resumed<'_, 'l, '_> {
     /// Ask for `bytes=<at>-<end of the part containing at>`, through the single-stream
     /// path's own opener so the fence, the credential and the redirect rules are the same
     /// ones — not a copy of them.
-    fn ask(&mut self) -> Result<(http::BodyReader<'l>, u64)> {
+    /// `Ok(None)`: the origin stated a wait and it was waited out; ask again without
+    /// spending an attempt.
+    fn ask(&mut self) -> Result<Option<(http::BodyReader<'l>, u64)>> {
         let end = (self.at / self.part + 1)
             .saturating_mul(self.part)
             .min(self.total)
@@ -947,7 +965,20 @@ impl<'l> Resumed<'_, 'l, '_> {
                     ),
                 )
             }
-            Opened::Retryable(status) | Opened::Expired(status) => {
+            Opened::Retryable(status, stated) => {
+                let (wait, counted) = self.ledger.retry_wait(stated);
+                if !counted || self.attempt + 1 < FETCH_ATTEMPTS {
+                    self.ledger.pause(wait, self.deadline)?;
+                }
+                if !counted {
+                    return Ok(None);
+                }
+                return refuse(
+                    Code::TRANSFER_FAILED,
+                    format!("the origin answered {status} to {asked}"),
+                );
+            }
+            Opened::Expired(status) => {
                 return refuse(
                     Code::TRANSFER_FAILED,
                     format!("the origin answered {status} to {asked}"),
@@ -970,7 +1001,7 @@ impl<'l> Resumed<'_, 'l, '_> {
                 }
             }
         }
-        Ok((response.into_body(), end))
+        Ok(Some((response.into_body(), end)))
     }
 
     /// Keep the typed refusal and hand the door the `io::Error` a `Read` can carry.
@@ -991,10 +1022,11 @@ impl Read for Resumed<'_, '_, '_> {
             // and the next ask is always the next thing to do.
             let Some((mut body, end)) = self.open.take() else {
                 match self.ask() {
-                    Ok(open) => {
+                    Ok(Some(open)) => {
                         self.open = Some(open);
                         continue;
                     }
+                    Ok(None) => continue,
                     Err(refusal) => {
                         self.attempt += 1;
                         if self.attempt >= FETCH_ATTEMPTS {

@@ -63,4 +63,4 @@ pub use pull::{
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
 pub use ranged::{fetch_ranged, Ranged, PART_BYTES, RANGED_MIN_BYTES, SOURCE_STREAMS};
 
-pub use prefix::SourceDownload;
+pub use prefix::{SourceDownload, SourceProgress};

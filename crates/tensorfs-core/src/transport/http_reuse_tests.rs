@@ -243,7 +243,7 @@ fn complete_ranged_http_and_tls_bodies_reuse_one_connection() {
 }
 
 #[test]
-fn cached_peer_must_remain_checked_and_credentials_and_signed_target_stay_scoped() {
+fn cached_peer_must_remain_checked_and_credentials_stay_scoped_but_signed_targets_share() {
     let origin = Origin::new(false, Duration::ZERO, |_, _| Reply::body(b"checked"));
     let client = origin.client();
     let checked = origin.checked("/object?signature=one");
@@ -260,8 +260,9 @@ fn cached_peer_must_remain_checked_and_credentials_and_signed_target_stay_scoped
     ask(&client, &checked, &headers).unwrap();
     headers[1].1 = "Bearer second".into();
     ask(&client, &checked, &headers).unwrap();
+    // A re-signed delivery URL on the same origin and credentials rides the same socket.
     ask(&client, &origin.checked("/object?signature=two"), &headers).unwrap();
-    assert_eq!(origin.count(), 4);
+    assert_eq!(origin.count(), 3);
     let calls = origin.asks.lock().unwrap();
     assert_eq!(
         calls
@@ -357,12 +358,9 @@ fn idle_descriptor_retention_is_bounded_and_non_range_gets_do_not_pool() {
     let origin = Origin::new(false, Duration::ZERO, |_, _| Reply::body(b"bytes"));
     let client = origin.client();
     for index in 0..32 {
-        ask(
-            &client,
-            &origin.checked(&format!("/object/{index}")),
-            &ranged(),
-        )
-        .unwrap();
+        let mut headers = ranged();
+        headers.push(("authorization".into(), format!("Bearer {index}")));
+        ask(&client, &origin.checked("/object"), &headers).unwrap();
     }
     assert_eq!(client.idle.lock().unwrap().len(), MAX_IDLE);
     assert_eq!(origin.count(), 32);
@@ -583,21 +581,25 @@ fn retained_source_redirect_ranges_reduce_connections_without_changing_asks_or_b
             &Origin::policy(),
             credentials,
             Deadline::none(),
-            &mut |_, _| {},
+            &|_, _| {},
             &SourceDownload {
                 checkpoint_bytes: 1 << 20,
+                streams: 1,
                 fault: Fault::default(),
+                ..Default::default()
             },
         )
         .unwrap();
         let elapsed = start.elapsed();
         assert_eq!(rows[0].transferred, bytes.len() as u64);
         assert!(store.record_valid(&object.sha256).is_ok());
-        assert_eq!(origin.asks.lock().unwrap().len(), 16);
-        assert_eq!(origin.count(), if close { 16 } else { 2 });
+        // One ask walks the redirect, one GET carries all eight checkpoints of the run,
+        // and the drained redirect's socket serves the delivery hop.
+        assert_eq!(origin.asks.lock().unwrap().len(), 2);
+        assert_eq!(origin.count(), if close { 2 } else { 1 });
         timings.push((close, elapsed.as_secs_f64(), origin.count()));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }
-    println!("retained source 8MiB, eight 1MiB ranges, one redirect/range, 30ms connection setup: {timings:?}");
+    println!("retained source 8MiB, one redirected ask, eight 1MiB checkpoints, 30ms connection setup: {timings:?}");
 }

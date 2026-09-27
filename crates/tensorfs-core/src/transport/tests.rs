@@ -1932,7 +1932,10 @@ fn retryable_status_buys_a_reask_and_authorization_answers_do_not() {
         None
     });
     let policy = SourcePolicy::default();
-    let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    let mut request = request_for(&store, &origin.base, &policy);
+    // An unstated 503 waits the ledger's patience; sample in milliseconds.
+    request.sample_seconds = 0.02;
+    let report = pull(&request).unwrap();
     assert_eq!(report.fetched, 4);
     assert_eq!(origin.hits(&format!("/obj/{flaky}")), 2);
 
@@ -3668,7 +3671,8 @@ fn a_partly_assembled_object_is_never_admitted() {
         FetchPlan::of_objects(&store, "partial", std::slice::from_ref(&object)).unwrap();
     let grant = ranged_grant(&plan, &object);
     let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
+    // Each unstated 503 now waits the ledger's patience before the re-ask.
+    let ledger = Ledger::with_resolution(Duration::from_millis(100));
 
     let refusal = fetch_ranged(
         &store,
@@ -4090,7 +4094,8 @@ fn one_stream_never_admits_a_partial_object() {
         FetchPlan::of_objects(&store, "seq-partial", std::slice::from_ref(&object)).unwrap();
     let grant = ranged_grant(&plan, &object);
     let url = format!("{}/member.safetensors", listener.origin.base);
-    let ledger = Ledger::with_resolution(Duration::from_secs(1));
+    // Each unstated 503 now waits the ledger's patience before the re-ask.
+    let ledger = Ledger::with_resolution(Duration::from_millis(100));
 
     let refusal = fetch_ranged(
         &store,
@@ -5070,7 +5075,7 @@ fn speculative_and_original_asks_share_one_retry_budget() {
     let source = origin(Arc::new(|_| status(503, b"retry")));
     let attempts = std::sync::atomic::AtomicU32::new(0);
     let policy = local_policy();
-    let ledger = Ledger::new();
+    let ledger = Ledger::with_resolution(Duration::from_millis(20));
     std::thread::scope(|scope| {
         for retry in [true, false] {
             let source = &source;

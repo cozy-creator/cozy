@@ -180,7 +180,7 @@ fn accepted_selection_moves_only_its_objects_and_replays_without_network() {
         &policy,
         &Anonymous,
         Deadline::none(),
-        &mut |_, _| {},
+        &|_, _| {},
     )
     .unwrap();
     assert_eq!(rows[0].transferred, body.len() as u64);
@@ -193,7 +193,7 @@ fn accepted_selection_moves_only_its_objects_and_replays_without_network() {
         &policy,
         &Anonymous,
         Deadline::none(),
-        &mut |_, _| {},
+        &|_, _| {},
     )
     .unwrap();
     assert_eq!(first, again);

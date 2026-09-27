@@ -135,7 +135,7 @@ pub struct Still {
 
 /// One caller's cooperative stop signal. Clones name the same pull intent;
 /// a resumed operation uses a new token and retains existing Store bytes.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PullCancellation(Arc<AtomicBool>);
 
 impl PullCancellation {
@@ -355,6 +355,33 @@ impl Ledger {
     pub fn stillness(&self) -> Duration {
         let worst = self.progress.lock().unwrap().worst_still;
         worst.mul_f64(STALL_FACTOR).max(self.patience())
+    }
+
+    /// What a retryable answer costs before the re-ask: the origin's own stated wait,
+    /// which is not a failed attempt, or — when it states none — this pull's patience,
+    /// which is (`true`). The hub's rule, applied to every origin.
+    pub(crate) fn retry_wait(&self, stated: Option<Duration>) -> (Duration, bool) {
+        match stated.filter(|wait| !wait.is_zero()) {
+            Some(wait) => (wait, false),
+            None => (self.patience(), true),
+        }
+    }
+
+    /// Sleep `wait` in sampling ticks; cancellation and the caller's deadline end it.
+    pub(crate) fn pause(&self, wait: Duration, deadline: Deadline) -> Result<()> {
+        let until = Instant::now() + wait;
+        loop {
+            self.check_running()?;
+            let now = Instant::now();
+            if now >= until {
+                return Ok(());
+            }
+            let mut tick = (until - now).min(self.sample);
+            if let Some(left) = deadline.remaining()? {
+                tick = tick.min(left);
+            }
+            std::thread::sleep(tick);
+        }
     }
 
     /// What this pull has moved and how long it has been still.

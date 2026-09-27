@@ -19,11 +19,18 @@ allow_local=False)` returns `artifact` plus per-call `transferred_bytes`. Artifa
 are owner, manifest_digest, manifest_length, complete and released. Owner IDs are prefixed
 SHA-256 identities assigned by the caller's operation journal. They are not user retry IDs.
 
-The default source downloader retains a contiguous prefix every 64 MiB. It fsyncs bytes
-before atomically recording the prefix extent and digest. Restart rehashes retained bytes,
-truncates an uncommitted suffix and continues from the verified extent. Corrupt retained
-prefixes are discarded with an explicit OBJECT_CORRUPT refusal; the following retry
-starts that object at zero. The complete object
+The downloader moves up to 16 ranged GETs at once across all members. Each object is one
+sparse file of verified runs; a run is asked for with one GET from its reached byte to its
+end and retains progress every 64 MiB: bytes are fdatasynced before the run's extent and
+digest are recorded by atomic rename. When no whole run is left to start, an idle stream
+splits the largest range in flight (never below 64 MiB per half), so one large member still
+uses every stream. The object digest is computed in offset order as the run at zero absorbs
+each finished run behind it. A delivery URL the source redirected to is reused until the
+origin refuses it. A 429/5xx is re-asked after its stated `Retry-After`, which spends no
+attempt, or after the ledger's patience, which does. Restart rehashes retained runs and
+continues each from its verified extent. Corrupt retained runs are discarded with an
+explicit OBJECT_CORRUPT refusal; the following retry fetches those ranges again. The
+complete object
 must match the pinned length and SHA-256 before the same native no-clobber CAS admission
 used by ordinary writes. The prefix file becomes the CAS object; there is no second full
 staging write. Actual prefix bytes count in Store occupancy.
@@ -31,9 +38,11 @@ staging write. Actual prefix bytes count in Store occupancy.
 A source owner fences its writer with kernel locks. `adopt_source_progress(source_owner,
 owner)` refuses a live or released predecessor, independently retains completed raw objects,
 and copies verified partial bytes into an independently writable recipient prefix. This
-copy is bounded by retained progress and is charged to disk occupancy. Releasing the source
-then leaves the recipient intact. A plain retry of the same owner performs no such copy.
-Ignored Range responses restart the object and count repeated bytes. Expired delivery
+copy is bounded by retained progress and is charged to disk occupancy. Only the donor's prefix
+is copied; its later runs are fetched again. Releasing the source then leaves the
+recipient intact. A plain retry of the same owner performs no such copy.
+An origin that ignores a Range restarts the object as one body from zero and counts
+repeated bytes. Expired delivery
 URLs preserve progress for a refreshed adapter call. The common HTTP opener refuses
 transformed Content-Encoding before any body bytes reach the prefix.
 

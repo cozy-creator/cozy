@@ -165,10 +165,13 @@ fn run(
         },
         &Anonymous,
         Deadline::none(),
-        &mut |_, _| {},
+        &|_, _| {},
+        // One stream: these kill points prove the single prefix's durability order.
         &SourceDownload {
             checkpoint_bytes: BLOCK,
+            streams: 1,
             fault,
+            ..Default::default()
         },
     )
 }

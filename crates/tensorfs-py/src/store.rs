@@ -989,7 +989,7 @@ impl PyStore {
                     &policy,
                     &credentials,
                     transport::Deadline::none(),
-                    &mut |_, _| {},
+                    &|_, _| {},
                 )
             })
             .or_refuse(py)?;

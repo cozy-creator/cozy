@@ -157,20 +157,21 @@ type IdlePool = Arc<Mutex<Vec<Idle>>>;
 // This bounds retained descriptors, not in-flight transfers (the caller owns those).
 const MAX_IDLE: usize = 8;
 
+/// A connection belongs to its origin and the credentials sent on it, never to one
+/// request target: a signed CDN URL changes per resolve, and keying on it meant the
+/// delivery hop never reused a socket.
 #[derive(PartialEq, Eq)]
 struct Scope {
     https: bool,
     host: String,
     port: u16,
-    // Do not retain signed targets or credentials in an idle connection's key.
+    // Do not retain credentials in an idle connection's key.
     request: [u8; 32],
 }
 
 impl Scope {
     fn ranged(checked: &CheckedUrl, headers: &[(String, String)]) -> Self {
         let mut hash = crate::sha256::Sha256::new();
-        hash.update(&(checked.target.len() as u64).to_le_bytes());
-        hash.update(checked.target.as_bytes());
         for (name, value) in headers
             .iter()
             .filter(|(name, _)| !name.eq_ignore_ascii_case("range"))
@@ -532,6 +533,34 @@ impl<'l> Response<'l> {
         self.body
     }
 
+    /// Drop a small non-artifact body (a redirect's, a refusal's) by reading it to its end,
+    /// so the connection can serve the next ask. Nothing read here is counted; a body
+    /// larger than a response head is simply left, and its connection closes.
+    pub fn discard(self) {
+        let mut body = self.body;
+        let mut buf = [0u8; 4096];
+        let mut left = HEAD_MAX_BYTES;
+        while left > 0 {
+            match body.read_framed(&mut buf[..left.min(4096)]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => left -= n,
+            }
+        }
+    }
+
+    /// The wait this answer states (`Retry-After`), read in the origin's own clock:
+    /// delta-seconds, or an HTTP-date against the answer's own `Date`. `None` when it
+    /// states nothing readable.
+    pub fn stated_wait(&self) -> Option<Duration> {
+        let value = self.header("retry-after")?.trim();
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(Duration::from_secs(seconds));
+        }
+        let at = http_date(value)?;
+        let now = http_date(self.header("date")?)?;
+        Some(Duration::from_secs(at.saturating_sub(now)))
+    }
+
     /// The whole body, refused above `cap` rather than truncated.
     pub fn read_capped(mut self, cap: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -550,6 +579,37 @@ impl<'l> Response<'l> {
             out.extend_from_slice(&buf[..n]);
         }
     }
+}
+
+/// RFC 9110 IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) as Unix seconds.
+fn http_date(text: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = text.split_whitespace().skip(1);
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = parts.next()?;
+    let month = MONTHS.iter().position(|name| *name == month)? as i64 + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let clock: Vec<i64> = parts
+        .next()?
+        .split(':')
+        .map(|part| part.parse().ok())
+        .collect::<Option<_>>()?;
+    if parts.next()? != "GMT" || clock.len() != 3 {
+        return None;
+    }
+    // Days from the civil calendar (Hinnant).
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + (153 * m + 2) / 5 + day - 1;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + clock[0] * 3600 + clock[1] * 60 + clock[2]).ok()
 }
 
 #[derive(Clone, Copy)]
