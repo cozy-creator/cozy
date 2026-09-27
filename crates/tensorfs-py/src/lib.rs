@@ -62,6 +62,9 @@ fn stats(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     result.set_item("catalog_opens", now.catalog_opens)?;
     result.set_item("presence_passes", now.presence_passes)?;
     result.set_item("repo_cache_verified_reads", now.repo_cache_verified_reads)?;
+    result.set_item("admission_batches", now.admission_batches)?;
+    result.set_item("admitted_objects", now.admitted_objects)?;
+    result.set_item("admission_nanos", now.admission_nanos)?;
     Ok(result)
 }
 

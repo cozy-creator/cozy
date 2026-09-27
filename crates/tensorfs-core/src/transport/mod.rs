@@ -23,7 +23,8 @@
 //!   caller or there is none; a stream is judged only against the longest gap this pull
 //!   has actually shown;
 //! - **the N-way walk** (`pull::fetch_wanted`): 49.8 MB/s serial vs 117.6 MB/s at 16
-//!   streams on 92.42 GiB, same pods, same presigned GETs, 141 MB/s ceiling.
+//!   streams on 92.42 GiB, same pods, same presigned GETs, 141 MB/s ceiling. Where one GET
+//!   is the limit rather than the link, `pace` grows the walk past 16 while goodput follows.
 //!
 //! And the address predicate travels WITH the transport (`policy`), so there is still
 //! exactly one downloader with the check — cr-012's fence, retargeted here by cr-090.
@@ -36,6 +37,7 @@ mod http;
 mod hub;
 mod ledger;
 mod memory;
+mod pace;
 mod policy;
 pub(crate) mod prefix;
 mod pull;
@@ -57,6 +59,7 @@ pub use ledger::{
     STILL_SAMPLES, STREAMS,
 };
 pub use memory::{memory_available, streams_within, transfer_streams, STREAM_MEMORY};
+pub use pace::{Level, GAIN, PULL_STREAMS};
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
     fetch_authorized, fetch_url, fetch_wanted, pull, FetchObserver, Fetched, ObjectSource,

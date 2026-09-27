@@ -3514,7 +3514,8 @@ pub fn transfer_streams(wanted: usize) -> usize {
 /// RESOLUTION (configuration, never a verdict); leave it defaulted outside tests.
 #[pyfunction]
 #[pyo3(signature = (store, hub, refspec, *, lane=String::new(), credential=String::new(),
-       timeout=None, session=String::new(), streams=tensorfs_core::transport::STREAMS,
+       timeout=None, session=String::new(), streams=tensorfs_core::transport::PULL_STREAMS,
+       streams_start=tensorfs_core::transport::STREAMS,
        allowed_hosts=Vec::new(), allow_local=false, sample_seconds=None, cancellation=None, progress=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pull<'p>(
@@ -3527,6 +3528,7 @@ pub fn pull<'p>(
     timeout: Option<f64>,
     session: String,
     streams: usize,
+    streams_start: usize,
     allowed_hosts: Vec<String>,
     allow_local: bool,
     sample_seconds: Option<f64>,
@@ -3587,6 +3589,7 @@ pub fn pull<'p>(
         request.lane = &lane;
         request.session = &session;
         request.streams = streams;
+        request.streams_start = streams_start;
         request.deadline = transport::Deadline::after_seconds(timeout);
         if let Some(sample) = sample_seconds {
             request.sample_seconds = sample;
