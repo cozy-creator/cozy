@@ -447,9 +447,9 @@ impl Store {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(io("stat TensorFS catalog", error)),
             }
-            let store = open_validated(root)?;
-            store.trust.validate()?;
-            Ok(store)
+            let trust = crate::catalog::Trust::of(root);
+            trust.validate()?;
+            open_validated(root)
         }
     }
 

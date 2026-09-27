@@ -163,11 +163,12 @@ fn field(hash: &mut Sha256, value: &[u8]) {
 /// journalled part instead of re-reading the carrier is sound.
 ///
 /// Deliberately NOT a function of the output: the whole point is to know the plan before any
-/// weight byte has been converted.
+/// weight byte has been converted. Nor of the TensorFS build: an upgraded or differently
+/// built pod resumes the same plan. Changing a converter's output bytes renames it or bumps
+/// the domain tag below.
 pub fn plan_digest(plan: &Plan, headers: &[(PathBuf, &SourceHeader)]) -> String {
     let mut hash = Sha256::new();
     field(&mut hash, b"tensorfs.conversion-journal/2");
-    field(&mut hash, crate::IMPLEMENTATION_SHA256.as_bytes());
     field(&mut hash, plan.converter.as_bytes());
     field(&mut hash, plan.class_name.as_bytes());
     for (path, header) in headers {

@@ -1091,7 +1091,6 @@ fn digest_field(hash: &mut crate::sha256::Sha256, value: &[u8]) {
 fn request_digest(request: &PrepareModelSource, _registry_bytes: &[u8]) -> String {
     let mut hash = crate::sha256::Sha256::new();
     digest_field(&mut hash, b"tensorfs.model-source-preparation/2");
-    digest_field(&mut hash, crate::IMPLEMENTATION_SHA256.as_bytes());
     digest_field(&mut hash, request.source_selection_digest.as_bytes());
     for row in &request.profiles {
         digest_field(&mut hash, row.slot.as_bytes());

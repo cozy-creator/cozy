@@ -50,12 +50,12 @@ result, including native progress heads; callers repeat incomplete calls until c
 Its `spent` observations do not authorize deletion of the separately retained raw artifact.
 New tensor groups charge the current Store occupancy, including retained raw inputs.
 
-Conversion preparation and tensor-operation journal compatibility bind
-`Store.implementation_sha256`, computed at build time over native sources, built-in vectors,
-dependency locks, compiler and build options. Same-version native edits therefore invalidate
-incompatible partial conversions. Existing accepted source-selection identities are preserved.
-The fingerprint is deliberately conservative; an unrelated native source change can invalidate
-conversion work without making already admitted raw bytes disappear.
+Conversion preparation and tensor-operation journals are keyed by the request and the
+re-derived conversion plan (converter name, ordered ops, carrier headers), never by the
+TensorFS build. An upgraded or differently built process replays completed preparations and
+resumes partial ones. A change to a converter's output bytes renames the converter or bumps
+the `tensorfs.conversion-journal` domain tag.
+`Store.implementation_sha256` remains an informational build fingerprint.
 
 Qualification runs `cargo test --workspace`, plus `scripts/source-artifacts.py` against the
 compiled Python extension (included in wheel smoke). Subprocess tests use real SIGKILLs
