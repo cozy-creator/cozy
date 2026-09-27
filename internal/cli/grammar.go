@@ -155,6 +155,7 @@ type PackageCmd struct {
 	Recover   PackageRecoverCmd   `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
 	Remove    PackageRemoveCmd    `cmd:"" help:"Delete source-code."`
 	List      PackageListCmd      `cmd:"" help:"List installed packages."`
+	Info      PackageInfoCmd      `cmd:"" help:"Show a published package's releases."`
 	Lock      PackageLockCmd      `cmd:"" help:"Lock this package's dependencies for the current Tensorhub and account."`
 	Publish   PackagePublishCmd   `cmd:"" help:"Publish a package release."`
 	Yank      PackageYankCmd      `cmd:"" help:"Permanently yank a package release."`
@@ -218,6 +219,14 @@ func (c *PackageUpdateAllCmd) Run(r *Runtime) error {
 
 type PackageRecoverCmd struct {
 	Database string `arg:"" name:"database" help:"Explicit prior Creator records database." type:"path"`
+}
+
+type PackageInfoCmd struct {
+	Ref string `arg:"" name:"package" help:"Published package name (org/name)."`
+}
+
+func (c *PackageInfoCmd) Run(r *Runtime) error {
+	return r.call(handlePackageInfo, []string{c.Ref}, nil, nil, false)
 }
 
 type PackageYankCmd struct {
