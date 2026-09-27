@@ -77,9 +77,10 @@ impl ObjectRange {
 /// is resolved after verification, so a replacement at the path — same length or not —
 /// cannot reach a reader for the lease's whole life, and a 90 GiB fill pays zero
 /// per-item open/close syscalls. The descriptor-count contract is explicit: acquire proves
-/// `RLIMIT_NOFILE` headroom for the complete set and refuses `FD_HEADROOM` typed —
-/// chosen over a bounded fd cache because a cache's reopen is a second pathname
-/// resolution, which is exactly the defect this type exists to kill.
+/// `RLIMIT_NOFILE` headroom for the complete set, raising the soft limit toward the hard
+/// limit when it must, and refuses `FD_HEADROOM` typed only past the hard limit — chosen
+/// over a bounded fd cache because a cache's reopen is a second pathname resolution, which
+/// is exactly the defect this type exists to kill.
 pub struct ReadLease {
     hold: Hold,
     pub manifest: String,
@@ -130,20 +131,34 @@ impl ReadLease {
 /// The complete-descriptor-set headroom question, answered from `/proc` with std alone.
 /// `None` means the platform cannot answer (no `/proc`, an "unlimited" soft limit): the
 /// pre-check is skipped and a failing open at acquire still refuses before any read.
+/// `None` when the process can hold `need` more descriptors, raising its soft limit up to
+/// the hard limit if that is what it takes. `Some((limit, open, want))` only past the hard
+/// limit.
 fn fd_shortfall(need: usize) -> Option<(u64, u64, u64)> {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
     /// Fds the pre-check leaves free for stdio, locks and whatever the caller opens next.
     const MARGIN: u64 = 64;
-    let soft: u64 = std::fs::read_to_string("/proc/self/limits")
-        .ok()?
-        .lines()
-        .find(|l| l.starts_with("Max open files"))?
-        .split_whitespace()
-        .nth(3)?
-        .parse()
-        .ok()?;
     let open = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
     let want = need as u64 + open + MARGIN;
-    (want > soft).then_some((soft, open, want))
+    let limit = getrlimit(Resource::Nofile);
+    let soft = limit.current?;
+    if want <= soft {
+        return None;
+    }
+    let raised = limit.maximum.unwrap_or(want);
+    if raised >= want
+        && setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(raised),
+                maximum: limit.maximum,
+            },
+        )
+        .is_ok()
+    {
+        return None;
+    }
+    Some((limit.maximum.unwrap_or(soft).max(soft), open, want))
 }
 
 /// Acquire a lease over an explicit object set, verifying every object first and PINNING
@@ -166,8 +181,8 @@ pub fn acquire(
             Code::FD_HEADROOM,
             format!(
                 "this lease pins {} verified descriptors and the process already holds \
-                 {open} fds under an RLIMIT_NOFILE soft limit of {soft} ({want} needed \
-                 with margin) — raise the soft limit; the reader will not fall back to \
+                 {open} fds under an RLIMIT_NOFILE hard limit of {soft} ({want} needed \
+                 with margin) — raise the hard limit; the reader will not fall back to \
                  re-resolving pathnames",
                 distinct.len()
             ),
