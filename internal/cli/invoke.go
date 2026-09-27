@@ -782,7 +782,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"status", "canceled_by", "phase", "phase_machine", "waiting_for", "phase_elapsed_ms",
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
-			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
+			"position", "total", "progress_unit", "progress_rate", "remaining_ms", "queued_ms", "execution_ms", "attempts",
 			"created_at", "error_type", "error_code", "error", "triage", "retaining", "retry_available", "hub"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
@@ -902,6 +902,12 @@ func runListRows(rows []api.Lifecycle) output.List {
 			}
 			if life.Total != nil {
 				typed["total"] = *life.Total
+			}
+			if life.ProgressUnit != "" {
+				typed["progress_unit"] = life.ProgressUnit
+			}
+			if life.ProgressRate != nil {
+				typed["progress_rate"] = *life.ProgressRate
 			}
 			if life.RemainingMS != nil {
 				typed["remaining_ms"] = *life.RemainingMS
@@ -1060,6 +1066,17 @@ func progressValue(life api.Lifecycle) string {
 	// answers a question nobody asked of a list, and the remaining estimate moves
 	// faster than the row it sits in.
 	stage := stageLabel(life.ProgressStage)
+	if life.ProgressUnit == "bytes" && life.Position != nil && life.Total != nil {
+		// A byte stage has no whole-run fraction; its moved/total and rate ARE the number.
+		parts := []string{output.Bytes(*life.Position) + " / " + output.Bytes(*life.Total)}
+		if stage != "" {
+			parts = append([]string{stage}, parts...)
+		}
+		if life.ProgressRate != nil {
+			parts = append(parts, output.Bytes(int64(*life.ProgressRate))+"/s")
+		}
+		stage = strings.Join(parts, " · ")
+	}
 	if life.OverallFraction == nil {
 		if stage == "" {
 			return "-"
@@ -1478,6 +1495,7 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	if p.ctx.Mode().JSON {
 		return true // one JSON document on stdout: the run's own, at the end
 	}
+	e = machineProgressEvent(e)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	kind := strings.TrimPrefix(e.Type, "request.")
@@ -1516,6 +1534,17 @@ func (p *RunProgress) On(e localapi.Event) bool {
 		p.render(diagnosticProgressLine(e))
 	}
 	return true
+}
+
+// machineProgressEvent reads a Runtime-owned execution's imported progress sample in the
+// live lane's shape, so a machine run's stages render exactly as a local run's do.
+func machineProgressEvent(e localapi.Event) localapi.Event {
+	value, ok := e.Payload["payload"].(map[string]any)
+	if e.Type != "machine.progress" || e.Payload["type"] != "progress" || !ok {
+		return e
+	}
+	e.Type, e.Payload = "request.progress", map[string]any{"value": value}
+	return e
 }
 
 // render appends diagnostic text; only the ordinary interactive lane owns a live block.
@@ -1611,6 +1640,9 @@ type stepFacts struct {
 	counted          bool
 	current          int64
 	total            int64
+	bytes            bool
+	rate             float64
+	hasRate          bool
 	perStep          float64
 	overallRemaining time.Duration
 	hasOverallETA    bool
@@ -1653,6 +1685,9 @@ func (p *RunProgress) observe(fields map[string]any) (stepFacts, bool) {
 		facts.counted = true
 		facts.current = int64(position)
 		facts.total = int64(total)
+		facts.bytes = fields["unit"] == "bytes"
+		facts.rate, facts.hasRate = number(fields["rate"])
+		facts.hasRate = facts.hasRate && facts.rate >= 0
 		if !stageFractionOK {
 			stageFraction, stageFractionOK = position/total, true
 		}

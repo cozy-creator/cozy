@@ -763,6 +763,10 @@ type Lifecycle struct {
 	Total            *int64                `json:"total,omitempty"`
 	RemainingMS      *int64                `json:"remaining_ms,omitempty"`
 	StepMS           *float64              `json:"step_ms,omitempty"`
+	// ProgressUnit names what Position and Total count ("bytes" for a transfer or
+	// conversion stage); ProgressRate is that unit per second, as Runtime measured it.
+	ProgressUnit string   `json:"progress_unit,omitempty"`
+	ProgressRate *float64 `json:"progress_rate,omitempty"`
 	// The PREPARATION facts (cl-121). A queued request is not idle — it is acquiring a
 	// machine, booting one, or landing model bytes on it — and these say which, with
 	// whatever advancement that phase actually has. Absent for anything that has left
@@ -1235,6 +1239,7 @@ func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
 		life.Position = progress.Position
 		life.Total = progress.Total
 		life.StepMS = progress.StepMS
+		life.ProgressUnit, life.ProgressRate = progress.Unit, progress.Rate
 		if progress.Estimated {
 			life.RemainingMS = &progress.RemainingMS
 		}

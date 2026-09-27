@@ -242,6 +242,9 @@ func (f stepFacts) countLabel() string {
 	if !f.counted {
 		return ""
 	}
+	if f.bytes {
+		return " · " + output.Bytes(f.current) + " / " + output.Bytes(f.total)
+	}
 	if f.scoped {
 		return fmt.Sprintf(" · step %d/%d", f.current, f.total)
 	}
@@ -249,6 +252,17 @@ func (f stepFacts) countLabel() string {
 }
 
 func (f stepFacts) timing() string {
+	if f.bytes {
+		// Runtime's measured rate since its previous sample; a zero rate is a stall.
+		if !f.hasRate {
+			return ""
+		}
+		line := " · " + output.Bytes(int64(f.rate)) + "/s"
+		if f.rate > 0 && f.current < f.total {
+			line += " · ETA ~" + shortDuration(time.Duration(float64(f.total-f.current)/f.rate*float64(time.Second)))
+		}
+		return line
+	}
 	if !f.counted || f.perStep <= 0 {
 		return ""
 	}

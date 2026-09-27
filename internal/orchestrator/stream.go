@@ -101,8 +101,12 @@ type ProgressSnapshot struct {
 	Position        *int64
 	Total           *int64
 	StepMS          *float64
-	RemainingMS     int64
-	Estimated       bool
+	// Unit names what Position and Total count ("bytes"); Rate is units per second
+	// Runtime measured since its previous sample of the same stage.
+	Unit        string
+	Rate        *float64
+	RemainingMS int64
+	Estimated   bool
 }
 
 type progressAccumulator struct {
@@ -154,6 +158,9 @@ type progressCoordinate struct {
 	total            int64
 	hasPosition      bool
 	stepMS           float64
+	unit             string
+	rate             float64
+	hasRate          bool
 }
 
 // DecodeProgressSnapshot applies the live progress contract to one already
@@ -164,7 +171,11 @@ func DecodeProgressSnapshot(value any) (ProgressSnapshot, bool) {
 }
 
 func (progress progressCoordinate) snapshot() ProgressSnapshot {
-	snapshot := ProgressSnapshot{Stage: progress.stage}
+	snapshot := ProgressSnapshot{Stage: progress.stage, Unit: progress.unit}
+	if progress.hasRate {
+		rate := progress.rate
+		snapshot.Rate = &rate
+	}
 	if progress.stepMS > 0 {
 		step := progress.stepMS
 		snapshot.StepMS = &step
@@ -201,6 +212,12 @@ func progressCoordinates(value any) (progressCoordinate, bool) {
 	}
 	if out.stage == "" || len(out.stage) > 120 {
 		return out, false
+	}
+	if unit, ok := fields["unit"].(string); ok && len(unit) <= 16 {
+		out.unit = unit
+	}
+	if rate, ok := fields["rate"].(float64); ok && !math.IsNaN(rate) && !math.IsInf(rate, 0) && rate >= 0 {
+		out.rate, out.hasRate = rate, true
 	}
 	if value, present := fields["stage_fraction"]; present {
 		var ok bool
@@ -280,6 +297,7 @@ func (f *fanout) observeProgress(frame Frame) {
 		coordinate.stageFraction, coordinate.hasStageFraction
 	progress.position, progress.total, progress.hasPosition =
 		coordinate.position, coordinate.total, coordinate.hasPosition
+	progress.unit, progress.rate, progress.hasRate = coordinate.unit, coordinate.rate, coordinate.hasRate
 	f.progress[frame.RequestID] = progress
 }
 
