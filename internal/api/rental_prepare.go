@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -78,8 +79,16 @@ func (s *Server) prepareRentalPackage(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, exit.New(exit.NotFound, "rental %s is not recorded on this host", id))
 		return
 	}
-	if strings.TrimRight(machine.Hub, "/") != strings.TrimRight(s.cfg.HubURL, "/") {
-		s.refuseTyped(w, r, exit.Named(exit.Conflict, "rental.tensorhub_mismatch", "installation rental belongs to a different Tensorhub"))
+	// The selection was resolved on the command's hub; the rental can only install
+	// what its own hub serves.
+	selected, problem := s.submissionHub(r, id)
+	if problem == nil {
+		if origin, invalid := config.HubOrigin(machine.Hub); invalid == nil && origin != selected {
+			problem = rentalHubMismatch(id, machine.Hub, selected)
+		}
+	}
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
 		return
 	}
 

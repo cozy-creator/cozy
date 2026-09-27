@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/json"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -11,20 +13,79 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
-func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile bool) (api.RentalInventory, *exit.Error) {
+// readRentalInventory is one hub's reconciled fleet, or with allHubs every hub's this
+// host holds rentals on. A listing of one hub still counts this host's live rentals
+// on the others, so switching hubs never hides a machine that is billing.
+func readRentalInventory(st *records.Store, fleet *managedRentals, origin string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
 	// Keep account totals and the corresponding unrecorded set on one observation.
 	fleet.mu.Lock()
 	defer fleet.mu.Unlock()
+	origin = fleet.origin(origin)
+	if !allHubs {
+		result, problem := fleet.inventoryLocked(st, origin, reconcile)
+		if problem != nil {
+			return result, problem
+		}
+		result.OtherHubs, problem = otherHubRentals(st, fleet, origin)
+		return result.Current(), problem
+	}
+	origins, problem := fleet.originsLocked()
+	if problem != nil {
+		return api.RentalInventory{}, problem
+	}
+	if !slices.Contains(origins, origin) {
+		origins = append(origins, origin)
+	}
+	var merged api.RentalInventory
+	for _, each := range origins {
+		result, problem := fleet.inventoryLocked(st, each, reconcile)
+		if problem != nil {
+			return merged, problem
+		}
+		if result.HubUnanswered != nil && merged.HubUnanswered == nil {
+			merged.HubUnanswered = result.HubUnanswered
+		}
+		merged.MachinesRunning += result.MachinesRunning
+		merged.HourlySpendUSDMicros += result.HourlySpendUSDMicros
+		merged.IdleReleaseSeconds = result.IdleReleaseSeconds
+		merged.Rentals = append(merged.Rentals, result.Rentals...)
+		merged.Unrecorded = append(merged.Unrecorded, result.Unrecorded...)
+		merged.Pending = append(merged.Pending, result.Pending...)
+	}
+	return merged.Current(), nil
+}
+
+// otherHubRentals counts this host's live rental records on hubs other than origin.
+func otherHubRentals(st *records.Store, fleet *managedRentals, origin string) ([]api.HubRentals, *exit.Error) {
+	rows, problem := st.Rentals()
+	if problem != nil {
+		return nil, problem
+	}
+	counts := map[string]int{}
+	for _, row := range rows {
+		if each := fleet.origin(row.Hub); each != origin && !hub.RentalAbsent(row.State) {
+			counts[each]++
+		}
+	}
+	var out []api.HubRentals
+	for each, count := range counts {
+		out = append(out, api.HubRentals{Hub: each, Rentals: count})
+	}
+	slices.SortFunc(out, func(a, b api.HubRentals) int { return strings.Compare(a.Hub, b.Hub) })
+	return out, nil
+}
+
+func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, reconcile bool) (api.RentalInventory, *exit.Error) {
 	var result api.RentalInventory
 	if reconcile {
-		if problem := fleet.reconcileLocked(); problem != nil && !hub.Unanswered(problem) {
+		if problem := fleet.reconcileLocked(origin); problem != nil && !hub.Unanswered(problem) {
 			return result, problem
 		}
 	}
 	// totalsLocked propagates a failed Hub census and refuses when the Hub has
 	// no listing route. A Hub that did not answer at all yields this host's own
 	// records marked as such, never totals: the caller must still fail.
-	count, burn, problem := fleet.totalsLocked()
+	count, burn, problem := fleet.totalsLocked(origin)
 	switch {
 	case hub.Unanswered(problem):
 		result.HubUnanswered = problem
@@ -33,6 +94,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 	default:
 		result.MachinesRunning, result.HourlySpendUSDMicros = count, burn
 	}
+	census := fleet.censusLocked(origin)
 	result.IdleReleaseSeconds = int64(rental.IdleTimeout / time.Second)
 	rows, problem := st.Rentals()
 	if problem != nil {
@@ -42,13 +104,16 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 	if problem != nil {
 		return result, problem
 	}
-	live := make(map[string]hub.Rental, len(fleet.live))
-	for _, seen := range fleet.live {
+	live := make(map[string]hub.Rental, len(census.live))
+	for _, seen := range census.live {
 		live[seen.ID] = seen
 	}
 	attached := make(map[string]bool, len(rows))
 	for _, row := range rows {
 		attached[row.ID] = true
+		if fleet.origin(row.Hub) != origin {
+			continue
+		}
 		idle, problem := fleet.observeIdle(row)
 		if problem != nil {
 			return result, problem
@@ -68,7 +133,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 			},
 			BaseWorkerImageDigest: live[row.ID].BaseWorkerImageDigest,
 			BaseWorkerImageTag:    live[row.ID].BaseWorkerImageTag,
-			HubUnknown:            fleet.hubUnknown[row.ID],
+			HubUnknown:            census.hubUnknown[row.ID],
 		}
 		if idle.PendingPreparation > 0 {
 			summary.Activity = nil
@@ -80,13 +145,13 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 		result.Rentals = append(result.Rentals, summary)
 	}
 	hubNamed := map[string]bool{}
-	for _, seen := range fleet.unrecorded {
+	for _, seen := range census.unrecorded {
 		hubNamed[seen.ID], hubNamed[seen.Name] = true, true
 		result.Unrecorded = append(result.Unrecorded, api.RentalSummary{
 			ID: seen.ID, MachineName: seen.Name, State: seen.State,
 			AcceleratorModel: seen.AcceleratorModel, AcceleratorCount: seen.AcceleratorCount,
 			HourlyRateUSDMicros: seen.HourlyRateUSDMicros, Address: seen.Address,
-			MediaAddress: seen.MediaAddress, Hub: fleet.ctx.Cfg.HubURL, RentedAt: seen.CreatedAt,
+			MediaAddress: seen.MediaAddress, Hub: origin, RentedAt: seen.CreatedAt,
 			ProviderState: seen.ProviderState, ContainerState: seen.ContainerState,
 			BaseWorkerImageDigest: seen.BaseWorkerImageDigest, BaseWorkerImageTag: seen.BaseWorkerImageTag,
 		})
@@ -96,7 +161,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 		return result, problem
 	}
 	for _, op := range open {
-		if attached[op.RentalID] {
+		if attached[op.RentalID] || fleet.origin(op.Hub) != origin {
 			continue
 		}
 		var request hub.RentalRequest
@@ -110,5 +175,5 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, reconcile boo
 			Hub: op.Hub, RentedAt: op.CreatedAt, BoughtFor: op.ManagedRequestID, Operation: op.Key,
 		})
 	}
-	return result.Current(), nil
+	return result, nil
 }

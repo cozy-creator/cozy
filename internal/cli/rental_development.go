@@ -128,6 +128,7 @@ func managedRentalSSHKey(ctx *Context) (string, *exit.Error) {
 }
 
 func handleRentalSSHInfo(ctx *Context) *exit.Error {
+	adoptRentalHub(ctx, ctx.Inv.Args[0])
 	_, store, problem := rentalStores(ctx)
 	if problem != nil {
 		return problem

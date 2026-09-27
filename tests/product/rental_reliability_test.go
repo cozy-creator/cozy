@@ -120,7 +120,7 @@ func TestStaleRentalResolutionCannotFailReplacement(t *testing.T) {
 			}
 			return nil, exit.Unavailablef("replacement is preparing")
 		}
-		opt.RentalFleet = func() (string, *exit.Error) { return "one replacement", nil }
+		opt.RentalFleet = func(records.Request) (string, *exit.Error) { return "one replacement", nil }
 		opt.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			creates.Add(1)
 			_, problem := opt.Store.PinRental(req.ID, "rental-new", nil)

@@ -134,6 +134,7 @@ func (c *Orchestrator) onChildCall(s *session, call *pb.ChildCallRequest) {
 		return
 	}
 	spec.IdemKey = fmt.Sprintf("child/%s/%d", parent.ID, call.CallIndex)
+	spec.Hub = parent.Hub
 	request, _, problem := requestRecord(spec)
 	if problem != nil {
 		refuse(problem)

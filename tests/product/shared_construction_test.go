@@ -195,7 +195,7 @@ func TestRemoteReleaseSharesSlotsOfOneConstruction(t *testing.T) {
 	shared := func(function string, model orchestrator.ModelRef) []string {
 		t.Helper()
 		model.Package, model.Slot = "proof/h3", function+".models.model"
-		logical, _, problem := resolver.ResolveRemoteRelease("proof/h3", "1.0.0", function, []orchestrator.ModelRef{model})
+		logical, _, problem := resolver.ResolveRemoteRelease("", "proof/h3", "1.0.0", function, []orchestrator.ModelRef{model})
 		fatal(t, problem)
 		return logical.Models[0].SharedSlots
 	}

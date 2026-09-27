@@ -82,7 +82,7 @@ type Server struct {
 	// rentals resolves only the non-secret, attempt-bound desired placement. The
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
 	rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
-	rentalInventory func(bool) (RentalInventory, *exit.Error)
+	rentalInventory func(string, bool, bool) (RentalInventory, *exit.Error)
 	rentalKeepalive func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
 	rentalInstall   func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	runtimeUpdate   func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
@@ -112,9 +112,9 @@ type Resolver interface {
 	LocalInstallation(string, string) (localpackage.Installation, *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)
-	ResolveRemoteRelease(pkg, release, function string, models []orchestrator.ModelRef) (
+	ResolveRemoteRelease(hub, pkg, release, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
-	ResolveRemoteJob(pkg, release, function string, models []orchestrator.ModelRef,
+	ResolveRemoteJob(hub, pkg, release, function string, models []orchestrator.ModelRef,
 		deferredModels bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, bool, *exit.Error)
 	// Jobs names the `@job` functions one installed package registers, with the
@@ -136,8 +136,9 @@ type Options struct {
 	Packages          Resolver
 	// Rentals validates one attached generic worker id; desired package/model state is
 	// sent separately over WorkerControl.
-	Rentals         func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
-	RentalInventory func(bool) (RentalInventory, *exit.Error)
+	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
+	// RentalInventory answers one hub's fleet, or with allHubs every hub's.
+	RentalInventory func(hub string, allHubs, reconcile bool) (RentalInventory, *exit.Error)
 	RentalKeepalive func(context.Context, string, string) (RentalKeepaliveResult, *exit.Error)
 	RentalInstall   func(string, records.RentalInstallSelection) (*records.RentalInstall, *exit.Error)
 	RuntimeUpdate   func(string, RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error)
@@ -157,6 +158,37 @@ func New(opt Options) *Server {
 		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
 		rentals: opt.Rentals, rentalInventory: opt.RentalInventory, rentalKeepalive: opt.RentalKeepalive, rentalInstall: opt.RentalInstall, runtimeUpdate: opt.RuntimeUpdate, shutdown: opt.Shutdown,
 	}
+}
+
+// HubHeader names the Tensorhub origin a client command addresses. The daemon serves
+// every hub at once: work it records keeps this origin, and reads are scoped to it.
+const HubHeader = "Cozy-Tensorhub"
+
+// hubOf is the request's Tensorhub origin; a client that names none uses the
+// daemon's configured default.
+func (s *Server) hubOf(r *http.Request) (string, *exit.Error) {
+	value := strings.TrimSpace(r.Header.Get(HubHeader))
+	if value == "" {
+		return s.cfg.HubURL, nil
+	}
+	return config.HubOrigin(value)
+}
+
+// submissionHub is the hub new work belongs to. Work on a named rental that the client
+// did not place on a hub itself belongs to that rental's hub.
+func (s *Server) submissionHub(r *http.Request, rentalID string) (string, *exit.Error) {
+	selected, problem := s.hubOf(r)
+	if problem != nil || rentalID == "" || strings.TrimSpace(r.Header.Get(HubHeader)) != "" {
+		return selected, problem
+	}
+	row, problem := s.store.RentalRow(rentalID)
+	if problem != nil || row == nil {
+		return selected, problem
+	}
+	if origin, invalid := config.HubOrigin(row.Hub); invalid == nil {
+		return origin, nil
+	}
+	return selected, nil
 }
 
 // activateRecorded starts capacity selection only after the HTTP authority has durably

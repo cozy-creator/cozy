@@ -17,7 +17,7 @@ import (
 
 type nestedPayloadResolver struct{ publishedRouteResolver }
 
-func (nestedPayloadResolver) ResolveRemoteJob(pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
+func (nestedPayloadResolver) ResolveRemoteJob(hub, pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
 	return orchestrator.LogicalJob{Package: pkg, Release: release, Function: function, DescriptorID: childDigest("9")}, &launch.Entrypoint{Name: function, Kind: "job", Request: launch.Struct{Fields: []launch.Field{{Name: "shots", Type: json.RawMessage(`{"list":{"fields":[{"name":"prompt","type":"str"},{"name":"seed","type":"int"},{"name":"duration_s","type":"int"}]}}`)}}}, Result: launch.Struct{Fields: []launch.Field{}}}, nil
 }
 

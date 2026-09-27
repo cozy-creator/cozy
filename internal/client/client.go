@@ -39,6 +39,17 @@ type Client struct {
 	base  string
 	token secret.Value
 	http  *http.Client
+	// hub is the Tensorhub origin this command addresses; every request names it.
+	hub string
+	// allHubs widens history reads from the command's hub to every hub.
+	allHubs bool
+}
+
+// AllHubs widens this client's run history to every hub's runs.
+func (c *Client) AllHubs() *Client {
+	wide := *c
+	wide.allHubs = true
+	return &wide
 }
 
 // Open reads the running daemon's address and its 0600 credential. It never probes:
@@ -60,17 +71,26 @@ func Open(cfg config.Config, st daemon.State) (*Client, *exit.Error) {
 		// Explicit caller deadlines cancel their request; worker liveness and measured
 		// no-progress facts decide operational failure.
 		http: &http.Client{},
+		hub:  cfg.HubURL,
 	}, nil
 }
 
 // Addr is the daemon address this client talks to, for rendering.
 func (c *Client) Addr() string { return strings.TrimPrefix(c.base, "http://") }
 
-func (c *Client) RentalInventory(ctx context.Context, reconcile bool) (api.RentalInventory, *exit.Error) {
+// RentalInventory is this command's hub's fleet, or every hub's when allHubs.
+func (c *Client) RentalInventory(ctx context.Context, reconcile, allHubs bool) (api.RentalInventory, *exit.Error) {
 	var inventory api.RentalInventory
-	path := "/v1/local/rentals"
+	query := url.Values{}
 	if !reconcile {
-		path += "?reconcile=false"
+		query.Set("reconcile", "false")
+	}
+	if allHubs {
+		query.Set("hubs", "all")
+	}
+	path := "/v1/local/rentals"
+	if len(query) > 0 {
+		path += "?" + query.Encode()
 	}
 	problem := c.callContext(ctx, http.MethodGet, path, nil, &inventory)
 	return inventory, problem
@@ -91,6 +111,9 @@ func (c *Client) request(method, path string, body any, headers ...string) (*htt
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.hub != "" {
+		req.Header.Set(api.HubHeader, c.hub)
 	}
 	for i := 0; i+1 < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])
@@ -236,6 +259,9 @@ func (c *Client) RequestsBefore(ctx context.Context, status, packageName string,
 		Requests []api.Lifecycle `json:"requests"`
 	}
 	path := fmt.Sprintf("/v1/requests?limit=%d", limit)
+	if c.allHubs {
+		path += "&hubs=all"
+	}
 	if before > 0 {
 		path += fmt.Sprintf("&before=%d", before)
 	}

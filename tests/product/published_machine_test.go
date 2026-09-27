@@ -49,7 +49,7 @@ func TestPublishedMachineJobPreservesInstallationIdentity(t *testing.T) {
 
 type publishedRouteResolver struct{ api.Resolver }
 
-func (publishedRouteResolver) ResolveRemoteJob(pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
+func (publishedRouteResolver) ResolveRemoteJob(hub, pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
 	return orchestrator.LogicalJob{Package: pkg, Release: release, Function: function, DescriptorID: childDigest("9")}, &launch.Entrypoint{Name: function, Kind: "job", Request: launch.Struct{Fields: []launch.Field{}}, Result: launch.Struct{Fields: []launch.Field{}}}, nil
 }
 

@@ -106,7 +106,7 @@ func TestCapturedLocalDefaultDownloadsColdModel(t *testing.T) {
 		if turn == 0 && reads.Load() != 0 {
 			t.Fatal("child resolution blocked on byte transfer before admission")
 		}
-		fatal(t, resolver.EnsureLocalModels(selected.Models))
+		fatal(t, resolver.EnsureLocalModels("", selected.Models))
 		tool, problem := tfs.Open(cfg)
 		fatal(t, problem)
 		fatal(t, tool.VerifyManifest(manifestID))
@@ -117,7 +117,7 @@ func TestCapturedLocalDefaultDownloadsColdModel(t *testing.T) {
 	changed.Store(true)
 	selected, _, problem := resolver.ResolveUnpublishedChild(parent, "captured", "judge", args)
 	fatal(t, problem)
-	problem = resolver.EnsureLocalModels(selected.Models)
+	problem = resolver.EnsureLocalModels("", selected.Models)
 	if problem == nil || problem.ErrName() != "child.model_manifest_changed" {
 		t.Fatal("changed download resolution was accepted", problem)
 	}

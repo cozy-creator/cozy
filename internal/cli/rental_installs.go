@@ -10,6 +10,7 @@ import (
 )
 
 func handleRentalPackageInstall(ctx *Context) *exit.Error {
+	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	ref, plan, problem := resolveRegistryPackage(ctx, ctx.Inv.Args[0], ctx.Inv.Value("--version"))
 	if problem != nil {
 		return problem

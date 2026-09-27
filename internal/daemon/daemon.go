@@ -30,7 +30,9 @@ import (
 )
 
 type State struct {
-	Tensorhub     string // the origin selected by this daemon at launch
+	// SingleHub is the one origin a daemon from before multi-hub support serves.
+	// A multi-hub daemon publishes none: every request names its own hub.
+	SingleHub     string
 	Addr          string // the local client API address the live owner published
 	Socket        string // the worker-protocol unix socket the live owner published
 	PID           int
@@ -77,7 +79,7 @@ func Probe(cfg config.Config) State {
 		}
 		switch key {
 		case "tensorhub":
-			st.Tensorhub = value
+			st.SingleHub = value
 		case "addr":
 			st.Addr = value
 			addrPublished = true
@@ -131,19 +133,6 @@ func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 		return nil, exit.Internalf("cannot publish the daemon address: %s", err)
 	}
 	return &Held{f: f}, nil
-}
-
-// PublishTensorhub records the daemon's frozen origin under its existing lock.
-// An invocation selecting a different Hub must not submit work to this owner.
-func (h *Held) PublishTensorhub(base string) *exit.Error {
-	info, err := h.f.Stat()
-	if err == nil {
-		_, err = h.f.WriteAt([]byte("tensorhub="+base+"\n"), info.Size())
-	}
-	if err != nil {
-		return exit.Internalf("cannot publish the daemon Tensorhub: %s", err)
-	}
-	return nil
 }
 
 // Release drops the claim. The kernel does this anyway, on any exit; this is only the

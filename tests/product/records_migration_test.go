@@ -95,7 +95,7 @@ func TestRecordsMigrationFromEleven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 48 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 49 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	if columns := columnNames(t, db, "attempts"); !columns["triage_bundle"] || columns["triage_path"] {
@@ -233,7 +233,7 @@ func TestRecordsMigrationFromThirtySeven(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 48 {
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 49 {
 		t.Fatalf("user_version = %d, %v", version, err)
 	}
 	var pin string
@@ -254,7 +254,7 @@ func TestRecordsRejectsNewerSchemaWithoutResetHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`PRAGMA user_version=49`); err != nil {
+	if _, err := db.Exec(`PRAGMA user_version=50`); err != nil {
 		db.Close()
 		t.Fatalf("stamp future schema: %v", err)
 	}

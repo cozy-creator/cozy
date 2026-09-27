@@ -196,7 +196,7 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 func (u *rentalRuntimeUpdates) connectionSelection(ctx context.Context, row records.RuntimeUpdate) (runtimeUpdateSelection, *exit.Error) {
 	m := u.machines
 	var selection runtimeUpdateSelection
-	remote, problem := client(m.context).Rental(ctx, row.RentalID)
+	remote, problem := client(m.fleet.atRental(row.RentalID)).Rental(ctx, row.RentalID)
 	if problem != nil {
 		return selection, problem
 	}
@@ -362,6 +362,7 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 }
 
 func handleRentalUpdate(ctx *Context) *exit.Error {
+	adoptRentalHub(ctx, ctx.Inv.Args[0])
 	_, store, problem := rentalStores(ctx)
 	if problem != nil {
 		return problem

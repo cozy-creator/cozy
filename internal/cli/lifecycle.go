@@ -237,15 +237,11 @@ func endRentalSilently(ctx *Context, id string) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	sub := *ctx
+	sub := *ctx.forHub(authority)
 	sub.teardown = true
 	sub.Out = io.Discard
 	sub.Inv = &Invocation{Args: []string{id}, Bools: map[string]bool{},
 		Values: map[string][]string{}, Mode: ctx.Mode()}
-	if authority != "" {
-		sub.Cfg.HubURL = authority
-		sub.Cfg.HubURLSource = "rental record"
-	}
 	return handleRentRelease(&sub)
 }
 

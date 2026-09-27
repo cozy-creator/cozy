@@ -68,7 +68,7 @@ func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg 
 }
 
 func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot, request records.Request, publicOrigin string) (string, []*pb.MachineModelDefaultRung, string) {
-	selected, problem := r.childModelLadder(pkg, entrypoint, slot)
+	selected, problem := r.childModelLadder(request.Hub, pkg, entrypoint, slot)
 	if problem != nil {
 		code := "model_default_unavailable"
 		if problem.ErrName() == "child.model_unbound" {
@@ -76,7 +76,7 @@ func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot
 		}
 		return "", nil, code
 	}
-	origin := strings.TrimRight(r.cfg.HubURL, "/")
+	origin := strings.TrimRight(r.cfg.ForHub(request.Hub).HubURL, "/")
 	if publicOrigin != "" {
 		origin = publicOrigin
 	}

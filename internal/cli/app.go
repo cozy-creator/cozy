@@ -59,6 +59,18 @@ type Context struct {
 
 func (c *Context) Mode() output.Mode { return c.Inv.Mode }
 
+// forHub is this context addressing one Tensorhub origin with that origin's own
+// credential. Work on a record uses the record's hub; "" keeps the current one.
+func (c *Context) forHub(origin string) *Context {
+	scoped := c.Cfg.ForHub(origin)
+	if scoped.HubURL == c.Cfg.HubURL {
+		return c
+	}
+	sub := *c
+	sub.Cfg, sub.AccountAuth = scoped, accountauth.New(scoped)
+	return &sub
+}
+
 type handler func(*Context) *exit.Error
 
 // Runtime is injected into the selected Kong command's Run method.

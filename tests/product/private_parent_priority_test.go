@@ -33,7 +33,7 @@ func activeParentChildRetryPrecedesUnrelatedRentalRoot(t *testing.T, pinned bool
 	revision := stageLocalRevision(t, root)
 	owner := hostOwner(t, "parent-priority", rentalWiring(connection, private), func(opt *orchestrator.Options) {
 		opt.Packages = libraryChildLauncher{localLauncher{revision: revision}}
-		opt.RentalFleet = func() (string, *exit.Error) { return "one busy rental", nil }
+		opt.RentalFleet = func(records.Request) (string, *exit.Error) { return "one busy rental", nil }
 		opt.AcquireManagedRental = func(records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			return orchestrator.PlacementDecision{}, "", nil
 		}

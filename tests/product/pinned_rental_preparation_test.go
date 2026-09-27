@@ -52,7 +52,7 @@ func TestPreparationScopesExplicitRentalsIndependently(t *testing.T) {
 					}
 					return nil, exit.New(exit.NotFound, "unknown fixture rental")
 				}
-				opt.RentalFleet = func() (string, *exit.Error) { return "two existing rentals", nil }
+				opt.RentalFleet = func(records.Request) (string, *exit.Error) { return "two existing rentals", nil }
 				opt.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 					id := req.RequestedRental
 					if id == "" {
@@ -180,7 +180,7 @@ func TestWakeQueuePreservesUnassignedRequestedRentalAffinities(t *testing.T) {
 	seen := map[string]bool{}
 	recording := false
 	o := hostOwner(t, "pinned-preparation-wake", func(opt *orchestrator.Options) {
-		opt.RentalFleet = func() (string, *exit.Error) { return "existing requested rentals", nil }
+		opt.RentalFleet = func(records.Request) (string, *exit.Error) { return "existing requested rentals", nil }
 		opt.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			mu.Lock()
 			if recording {
@@ -254,7 +254,7 @@ func TestForeignStagedRentalDoesNotSuppressExplicitPreparation(t *testing.T) {
 	var mu sync.Mutex
 	selected := ""
 	o := hostOwner(t, "pinned-preparation-foreign", rentalWiring(connection, private), func(opt *orchestrator.Options) {
-		opt.RentalFleet = func() (string, *exit.Error) { return "another requested rental", nil }
+		opt.RentalFleet = func(records.Request) (string, *exit.Error) { return "another requested rental", nil }
 		opt.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			mu.Lock()
 			selected = req.RequestedRental

@@ -259,7 +259,7 @@ func newH3Queue(t *testing.T, name string, slots uint32, holdAt int, named bool)
 	t.Cleanup(q.release)
 	connection, _ := startFakePod(t, t.TempDir(), q.pod)
 	q.o = hostOwner(t, name, rentalWiring(connection, private), func(opt *orchestrator.Options) {
-		opt.RentalFleet = func() (string, *exit.Error) { return "one attached rental", nil }
+		opt.RentalFleet = func(records.Request) (string, *exit.Error) { return "one attached rental", nil }
 		opt.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			_, problem := opt.Store.PinRental(req.ID, req.RequestedRental, nil)
 			return orchestrator.PlacementDecision{RentalID: req.RequestedRental}, "", problem

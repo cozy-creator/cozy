@@ -55,9 +55,6 @@ func (m *managedRentals) keepalive(ctx context.Context, id, requestID string) (a
 	if row == nil || row.State != "ready" {
 		return out, exit.New(exit.Conflict, "keepalive requires a current ready rental")
 	}
-	if strings.TrimRight(row.Hub, "/") != client(m.ctx).Base() {
-		return out, exit.New(exit.Conflict, "rental belongs to a different Hub authority")
-	}
 	receipt, problem := m.owner.KeepRentalAlive(ctx, id, requestID)
 	if problem != nil {
 		return out, problem

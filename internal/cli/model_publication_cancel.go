@@ -36,7 +36,7 @@ func (o *modelTransferOwner) AbandonModelTransferPublications(ctx context.Contex
 	if problem != nil {
 		return problem
 	}
-	client, problem := ownedPublication(o.cliContext(transfer.ModelTransferIntent, request.Worker != ""), ref)
+	client, problem := ownedPublication(o.cliContext(request.Hub, transfer.ModelTransferIntent, request.Worker != ""), ref)
 	if problem != nil {
 		return problem
 	}

@@ -140,7 +140,7 @@ func (m *Manager) Forget() *exit.Error {
 }
 
 // Manager owns one Tensorhub origin's machine key and memory-only access token.
-// Constructing one performs no I/O or network work.
+// Obtaining one performs no I/O or network work.
 type Manager struct {
 	hub     string
 	path    string
@@ -150,16 +150,33 @@ type Manager struct {
 	now     func() time.Time
 }
 
+var managers struct {
+	sync.Mutex
+	byPath map[string]*Manager
+}
+
+// New returns this process's one Manager for cfg's Tensorhub origin, so every caller
+// addressing that origin shares one short bearer, and a daemon serving several hubs
+// holds one credential per origin, each sent only to its own.
 func New(cfg config.Config) *Manager {
 	origin := strings.TrimRight(strings.TrimSpace(cfg.HubURL), "/")
 	sum := sha256.Sum256([]byte(origin))
-	return &Manager{
-		hub:  origin,
-		path: filepath.Join(cfg.Home, "auth", hex.EncodeToString(sum[:])+".json"),
-		http: &http.Client{Timeout: hub.Timeout},
-		now:  time.Now,
+	path := filepath.Join(cfg.Home, "auth", hex.EncodeToString(sum[:])+".json")
+	managers.Lock()
+	defer managers.Unlock()
+	if manager := managers.byPath[path]; manager != nil {
+		return manager
 	}
+	if managers.byPath == nil {
+		managers.byPath = map[string]*Manager{}
+	}
+	manager := &Manager{hub: origin, path: path, http: &http.Client{Timeout: hub.Timeout}, now: time.Now}
+	managers.byPath[path] = manager
+	return manager
 }
+
+// Hub is the one origin this Manager's credential belongs to.
+func (m *Manager) Hub() string { return m.hub }
 
 // AccessToken satisfies hub.TokenSource. A daemon reuses the cached token while it is
 // comfortably live; a short CLI process performs one cheap login exchange.
@@ -342,12 +359,12 @@ func (m *Manager) load() (credential, ed25519.PrivateKey, *exit.Error) {
 	if errors.Is(err, os.ErrNotExist) {
 		return credential{}, nil, exit.Named(exit.Credential, "auth.machine_key_missing",
 			"this machine is not logged in to %s", m.hub).
-			WithNext("cozy auth login <email>")
+			WithNext(m.loginCommand())
 	}
 	if err != nil {
 		return credential{}, nil, exit.Named(exit.Credential, "auth.machine_key_unreadable",
 			"the machine credential cannot be read: %s", err).
-			WithNext("cozy auth login <email>")
+			WithNext(m.loginCommand())
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		return credential{}, nil, exit.Named(exit.Credential, "auth.machine_key_permissions",
@@ -362,13 +379,13 @@ func (m *Manager) load() (credential, ed25519.PrivateKey, *exit.Error) {
 	var stored credential
 	if err := json.Unmarshal(data, &stored); err != nil {
 		return credential{}, nil, exit.Named(exit.Credential, "auth.machine_key_invalid",
-			"the stored machine credential is invalid").WithNext("cozy auth login <email>")
+			"the stored machine credential is invalid").WithNext(m.loginCommand())
 	}
 	seed, err := rawBase64.DecodeString(stored.PrivateKey)
 	if stored.Version != credentialVersion || stored.Hub != m.hub || stored.DeviceKeyID == "" ||
 		err != nil || len(seed) != ed25519.SeedSize {
 		return credential{}, nil, exit.Named(exit.Credential, "auth.machine_key_invalid",
-			"the stored machine credential is invalid").WithNext("cozy auth login <email>")
+			"the stored machine credential is invalid").WithNext(m.loginCommand())
 	}
 	return stored, ed25519.NewKeyFromSeed(seed), nil
 }
@@ -434,7 +451,11 @@ func (m *Manager) post(ctx context.Context, path string, body, out any) *exit.Er
 		return exit.Named(exit.Internal, "auth.unreadable_answer", "Tensorhub returned an unreadable authentication answer")
 	}
 	if response.StatusCode >= 300 {
-		return authRefusal(response.StatusCode, data)
+		problem := authRefusal(response.StatusCode, data)
+		if problem.Code == exit.Credential {
+			problem.WithNext(m.loginCommand())
+		}
+		return problem
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return exit.Named(exit.Internal, "auth.unreadable_answer", "Tensorhub returned an invalid authentication answer")
@@ -479,10 +500,16 @@ func authRefusal(status int, data []byte) *exit.Error {
 	} else if answer.Error.Remedy != "" {
 		problem.WithRemedy("%s", answer.Error.Remedy)
 	}
-	if code == exit.Credential {
-		problem.WithNext("cozy auth login <email>")
-	}
 	return problem
+}
+
+// loginCommand names the login that creates this origin's credential. The default
+// hub needs no selection; any other is named, since the credential is per origin.
+func (m *Manager) loginCommand() string {
+	if current := config.Frozen(); current.HubURLSource != "flag" && (m.hub == current.HubURL || current.HubURL == "") {
+		return "cozy auth login <email>"
+	}
+	return "cozy auth login <email> --tensorhub=" + config.Frozen().HubLabel(m.hub)
 }
 
 // Invalidate drops the cached session so the next call mints a fresh bearer from

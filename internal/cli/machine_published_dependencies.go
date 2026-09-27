@@ -37,7 +37,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 	if problem != nil {
 		return problem
 	}
-	rootPlan, problem := m.resolver.catalog.PackageDownloads(ctx, rootRef, request.Release)
+	rootPlan, problem := m.resolver.catalog(request.Hub).PackageDownloads(ctx, rootRef, request.Release)
 	if problem != nil {
 		return problem
 	}
@@ -70,7 +70,7 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 				if problem != nil {
 					return problem
 				}
-				plan, problem := m.resolver.catalog.PackageDownloads(ctx, ref, dependency.Version)
+				plan, problem := m.resolver.catalog(request.Hub).PackageDownloads(ctx, ref, dependency.Version)
 				if problem != nil {
 					return problem
 				}
@@ -141,7 +141,7 @@ func (r *Resolver) publishedChildPreparation(ctx context.Context, command *Conte
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
-	plan, problem := r.catalog.PackageDownloads(ctx, ref, request.Release)
+	plan, problem := r.catalog(request.Hub).PackageDownloads(ctx, ref, request.Release)
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
@@ -173,7 +173,7 @@ func (r *Resolver) publishedChildPreparation(ctx context.Context, command *Conte
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
-	detail, problem := r.catalog.PackageRelease(ctx, ref, request.Release)
+	detail, problem := r.catalog(request.Hub).PackageRelease(ctx, ref, request.Release)
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}

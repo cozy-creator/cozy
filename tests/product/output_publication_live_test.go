@@ -415,7 +415,7 @@ func TestOutputPublicationThroughNativeRuntimeAndHub(t *testing.T) {
 	// The actual catalog resolver still enforces exact input coverage when no
 	// acquisition was deferred; adding a destination must not disable that check.
 	resolver := cli.NewResolver(o.store, authCfg, nil)
-	if _, _, problem := resolver.ResolveRemoteJob("paul/minimax-h3-tools", "2.2.4", "four-lane", nil, false); problem == nil ||
+	if _, _, problem := resolver.ResolveRemoteJob("", "paul/minimax-h3-tools", "2.2.4", "four-lane", nil, false); problem == nil ||
 		!strings.Contains(problem.ErrName(), "job_model_selection_incomplete") {
 		t.Fatalf("generic model selection was not enforced: %v", problem)
 	}

@@ -10,11 +10,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -34,9 +36,11 @@ import (
 var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
 
 const (
-	DefaultHubURL = "http://127.0.0.1:8819"
-	DefaultPort   = 8818
-	FileName      = "config.yaml"
+	// DefaultHubName names DefaultHubURL, the one Tensorhub most installations use.
+	DefaultHubName = "tensorhub"
+	DefaultHubURL  = "https://tensorhub.com"
+	DefaultPort    = 8818
+	FileName       = "config.yaml"
 )
 
 // Config is the frozen value consumed by the rest of the process.
@@ -48,10 +52,22 @@ type Config struct {
 	PortSource string
 	Yield      string
 
-	HubURL         string
-	HubToken       secret.Value
-	HubURLSource   string
-	HubTokenSource string
+	// HubURL is the Tensorhub origin this process's commands address: the current
+	// hub (tensorhub_url, a name or URL) or the one-command --tensorhub selection.
+	// Records keep their own origin; this is only the default for new work.
+	HubURL       string
+	HubName      string            // HubURL's name in Hubs, when it has one
+	Hubs         map[string]string // named hubs (kubectl-style contexts), name -> origin
+	HubURLSource string
+	// ConfiguredHubURL is the current hub before any one-command --tensorhub: what
+	// config.yaml or the environment selects.
+	ConfiguredHubURL string
+	// HubToken is HubURL's static operator bearer, if any. The configured token belongs
+	// to ConfiguredHubURL and is never sent anywhere else (ForHub).
+	HubToken              secret.Value
+	HubTokenSource        string
+	configuredToken       secret.Value
+	configuredTokenSource string
 
 	HuggingFaceToken       secret.Value
 	HuggingFaceTokenSource string
@@ -106,7 +122,7 @@ type Config struct {
 // values is a config-only Kong grammar. It is never embedded in the public CLI
 // grammar and its parser always receives nil argv.
 type values struct {
-	HubURL                   string `name:"tensorhub_url" default:"http://127.0.0.1:8819"`
+	HubURL                   string `name:"tensorhub_url" default:"tensorhub"`
 	HubToken                 string `name:"tensorhub_token"`
 	HuggingFaceToken         string `name:"huggingface_token"`
 	CivitaiToken             string `name:"civitai_token"`
@@ -237,6 +253,7 @@ var fileKeys = map[string]bool{
 	"daemon":                        true,
 	"maintenance":                   true,
 	"placement":                     true,
+	"hubs":                          true,
 }
 
 // nestedFileKeys are the one-level sections config.yaml admits, each mapping its
@@ -270,25 +287,101 @@ var processConfig struct {
 // snapshot; later calls return it.
 func Load() (Config, *exit.Error) { return LoadForTensorhub(nil) }
 
-// LoadForTensorhub freezes the explicit CLI location after file and environment
-// resolution. Subsequent Load consumers see the same origin, including builders.
+// LoadForTensorhub freezes the explicit CLI selection (a hub name or URL) after file
+// and environment resolution. Subsequent Load consumers see the same origin. The
+// static token stays bound to the configured origin, so selecting another hub never
+// carries it there.
 func LoadForTensorhub(override *string) (Config, *exit.Error) {
 	processConfig.once.Do(func() {
 		processConfig.cfg, processConfig.err = load()
 		if processConfig.err != nil || override == nil {
 			return
 		}
-		base := strings.TrimRight(strings.TrimSpace(*override), "/")
-		parsed, err := url.Parse(base)
-		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
-			parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		origin, name, problem := ResolveHub(*override, processConfig.cfg.Hubs)
+		if problem != nil {
 			processConfig.err = exit.Named(exit.Validation, "config.tensorhub_url_invalid",
-				"--tensorhub must be an http or https base URL without credentials, query, or fragment")
+				"--tensorhub must name a hub (see `cozy hub list`) or be an http or https base URL without credentials, query, or fragment")
 			return
 		}
-		processConfig.cfg.HubURL, processConfig.cfg.HubURLSource = base, "flag"
+		processConfig.cfg = processConfig.cfg.ForHub(origin)
+		processConfig.cfg.HubName, processConfig.cfg.HubURLSource = name, "flag"
 	})
 	return processConfig.cfg, processConfig.err
+}
+
+// ForHub is this configuration addressing another Tensorhub origin: the one view a
+// record's own hub is served through. The static token is dropped unless it was
+// issued for that origin; machine credentials are per origin already.
+func (c Config) ForHub(origin string) Config {
+	origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+	if origin == "" || origin == c.HubURL {
+		return c
+	}
+	c.HubURL, c.HubName, c.HubURLSource = origin, c.hubNamed(origin), "record"
+	c.HubToken, c.HubTokenSource = secret.New(""), "unset"
+	if origin == c.ConfiguredHubURL && c.configuredToken.Present() {
+		c.HubToken, c.HubTokenSource = c.configuredToken, c.configuredTokenSource
+	}
+	return c
+}
+
+// StaticToken reports whether an operator token is configured. It is bound to
+// ConfiguredHubURL, so moving the current hub would silently carry it elsewhere.
+func (c Config) StaticToken() bool { return c.configuredToken.Present() }
+
+func (c Config) hubNamed(origin string) string {
+	names := make([]string, 0, len(c.Hubs))
+	for name, url := range c.Hubs {
+		if url == origin {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+// HubLabel is how an origin is shown to a human: its hub name when it has one.
+func (c Config) HubLabel(origin string) string {
+	if name := c.hubNamed(strings.TrimRight(origin, "/")); name != "" {
+		return name
+	}
+	return origin
+}
+
+// ResolveHub turns a hub name or URL into its origin and name.
+func ResolveHub(value string, hubs map[string]string) (string, string, *exit.Error) {
+	value = strings.TrimSpace(value)
+	if origin, named := hubs[value]; named {
+		return origin, value, nil
+	}
+	origin, problem := HubOrigin(value)
+	if problem != nil {
+		return "", "", problem
+	}
+	return origin, Config{Hubs: hubs}.hubNamed(origin), nil
+}
+
+// HubOrigin validates one Tensorhub base URL and returns its canonical spelling.
+func HubOrigin(value string) (string, *exit.Error) {
+	base := strings.TrimRight(strings.TrimSpace(value), "/")
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", exit.Named(exit.Validation, "config.tensorhub_url_invalid",
+			"%q is not a hub name or an http or https Tensorhub base URL without credentials, query, or fragment", redactURL(value))
+	}
+	return base, nil
+}
+
+func redactURL(value string) string {
+	if parsed, err := url.Parse(strings.TrimSpace(value)); err == nil && parsed.User != nil {
+		parsed.User = nil
+		return parsed.String()
+	}
+	return value
 }
 
 func load() (Config, *exit.Error) {
@@ -320,13 +413,21 @@ func load() (Config, *exit.Error) {
 	if problem != nil {
 		return Config{}, problem
 	}
+	hubs := builtinHubs(file.hubs)
+	hubURL, hubName, problem := ResolveHub(input.HubURL, hubs)
+	if problem != nil {
+		return Config{}, problem.WithRemedy("set tensorhub_url in %s to a name from `cozy hub list` or a Tensorhub URL", filepath.Join(home, FileName))
+	}
 	c := Config{
 		Home:                     home,
 		Port:                     input.Port,
 		PortSource:               sourceOf("port", file, environment, "default"),
 		Yield:                    input.Yield,
-		HubURL:                   strings.TrimRight(strings.TrimSpace(input.HubURL), "/"),
+		HubURL:                   hubURL,
+		HubName:                  hubName,
+		Hubs:                     hubs,
 		HubToken:                 hubToken,
+		ConfiguredHubURL:         hubURL,
 		HubURLSource:             sourceOf("tensorhub_url", file, environment, "default"),
 		HubTokenSource:           sourceOf("tensorhub_token", file, environment, "unset"),
 		HuggingFaceToken:         huggingFaceToken,
@@ -352,6 +453,7 @@ func load() (Config, *exit.Error) {
 	if !hubToken.Present() {
 		c.HubTokenSource = "unset"
 	}
+	c.configuredToken, c.configuredTokenSource = c.HubToken, c.HubTokenSource
 	if !huggingFaceToken.Present() {
 		c.HuggingFaceTokenSource = "unset"
 	}
@@ -438,6 +540,8 @@ func readEnvironment() (*resolver, []string) {
 
 type resolver struct {
 	values map[string]any
+	// hubs is `hubs:`, the named Tensorhubs, name -> origin.
+	hubs map[string]string
 	// ignored names keys this build does not read: retired or newer settings.
 	ignored []string
 	// conflicting names behaviour settings the file gives two different values.
@@ -474,6 +578,9 @@ func knownFileKeys() string {
 				keys = append(keys, key+"."+name)
 			}
 			continue
+		}
+		if key == "hubs" {
+			key = "hubs.<name>"
 		}
 		keys = append(keys, key)
 	}
@@ -526,6 +633,48 @@ func digestOf(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// builtinHubs adds the default hub's name unless the file names it itself.
+func builtinHubs(hubs map[string]string) map[string]string {
+	all := map[string]string{DefaultHubName: DefaultHubURL}
+	for name, origin := range hubs {
+		all[name] = origin
+	}
+	return all
+}
+
+var hubName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
+
+// ValidHubName reports whether name can name a hub. A name is never a URL, so a
+// selection is always unambiguous.
+func ValidHubName(name string) bool { return hubName.MatchString(name) }
+
+// hubsSection reads `hubs:`, the named Tensorhubs: each key a hub name, each value
+// that hub's base URL.
+func hubsSection(value *yaml.Node) (map[string]string, error) {
+	if value.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("line %d value for \"hubs\" is not a mapping of names to URLs", value.Line)
+	}
+	hubs := make(map[string]string, len(value.Content)/2)
+	for j := 0; j < len(value.Content); j += 2 {
+		name, url := value.Content[j], value.Content[j+1]
+		if name.Kind != yaml.ScalarNode || !ValidHubName(name.Value) {
+			return nil, fmt.Errorf("line %d hub name %q is not lowercase letters, digits, '.', '_' or '-'", name.Line, name.Value)
+		}
+		if _, exists := hubs[name.Value]; exists {
+			return nil, fmt.Errorf("line %d names hub %q twice", name.Line, name.Value)
+		}
+		if url.Kind != yaml.ScalarNode {
+			return nil, fmt.Errorf("line %d URL for hub %q is not a scalar", url.Line, name.Value)
+		}
+		origin, problem := HubOrigin(url.Value)
+		if problem != nil {
+			return nil, fmt.Errorf("line %d hub %q: %s", url.Line, name.Value, problem.Message)
+		}
+		hubs[name.Value] = origin
+	}
+	return hubs, nil
+}
+
 // fileYAML accepts one flat YAML mapping. Kong remains the typed assignment engine. A key
 // this build does not read — retired by an upgrade or added by a newer build — is ignored
 // and named once, so one stale line never disables every command. A location or
@@ -576,6 +725,17 @@ func fileYAML(reader io.Reader) (*resolver, error) {
 		}
 		if !fileKeys[key.Value] {
 			out.ignored = append(out.ignored, key.Value)
+			continue
+		}
+		if key.Value == "hubs" {
+			if out.hubs != nil {
+				return nil, fmt.Errorf("line %d names %q twice", key.Line, key.Value)
+			}
+			hubs, err := hubsSection(value)
+			if err != nil {
+				return nil, err
+			}
+			out.hubs = hubs
 			continue
 		}
 		if section, nested := nestedFileKeys[key.Value]; nested {
@@ -637,3 +797,165 @@ func (c Config) Tool(imposed ...string) []string {
 // Frozen returns the one process snapshot for legacy consumers while cl-044
 // moves them to explicit dependency injection.
 func Frozen() Config { return processConfig.cfg }
+
+// UseHub makes a hub name or URL the current hub (tensorhub_url) for later commands.
+// Records keep their own hub, so switching never strands existing work.
+func UseHub(home, selection string, hubs map[string]string) (string, *exit.Error) {
+	origin, name, problem := ResolveHub(selection, hubs)
+	if problem != nil {
+		return "", problem
+	}
+	value := origin
+	if name != "" {
+		value = name
+	}
+	return origin, editFile(home, func(root *yaml.Node) bool {
+		setScalar(root, "tensorhub_url", value)
+		return true
+	})
+}
+
+// AddHub names one Tensorhub URL (`hubs.<name>`), replacing an earlier URL for the name.
+func AddHub(home, name, rawURL string) (string, *exit.Error) {
+	if !ValidHubName(name) {
+		return "", exit.Usagef("hub name %q is not lowercase letters, digits, '.', '_' or '-'", name)
+	}
+	origin, problem := HubOrigin(rawURL)
+	if problem != nil {
+		return "", problem
+	}
+	return origin, editFile(home, func(root *yaml.Node) bool {
+		setScalar(mapping(root, "hubs"), name, origin)
+		return true
+	})
+}
+
+// RemoveHub forgets one hub name. The name config.yaml selects as current stays.
+func RemoveHub(home, name string) *exit.Error {
+	found, current := false, false
+	problem := editFile(home, func(root *yaml.Node) bool {
+		for i := 0; i < len(root.Content); i += 2 {
+			if root.Content[i].Value == "tensorhub_url" && root.Content[i+1].Value == name {
+				current = true
+				return false
+			}
+		}
+		section := mapping(root, "hubs")
+		for i := 0; i < len(section.Content); i += 2 {
+			if section.Content[i].Value == name {
+				section.Content = append(section.Content[:i], section.Content[i+2:]...)
+				found = true
+				break
+			}
+		}
+		if len(section.Content) == 0 {
+			remove(root, "hubs")
+		}
+		return found
+	})
+	switch {
+	case problem != nil:
+		return problem
+	case current:
+		return exit.Named(exit.Conflict, "hub.current", "%s is the current hub", name).
+			WithRemedy("switch first with `cozy hub use <other>`")
+	case !found:
+		return exit.Named(exit.NotFound, "hub.unknown", "config.yaml names no hub %q", name).
+			WithNext("cozy hub list")
+	}
+	return nil
+}
+
+// editFile applies one edit to config.yaml, keeps everything else as written, refuses
+// to write a file this package would not load, and replaces it atomically at 0600.
+func editFile(home string, edit func(*yaml.Node) bool) *exit.Error {
+	path := filepath.Join(home, FileName)
+	data, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return exit.Internalf("cannot read %s: %s", path, err)
+	}
+	var document yaml.Node
+	if len(bytes.TrimSpace(data)) > 0 {
+		if err := yaml.Unmarshal(data, &document); err != nil {
+			return exit.Usagef("%s is invalid: %s", path, err)
+		}
+	}
+	if document.Kind == 0 {
+		document = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode}}}
+	}
+	root := document.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return exit.Usagef("%s is invalid: must be one flat key-value mapping", path)
+	}
+	if !edit(root) {
+		return nil
+	}
+	var out bytes.Buffer
+	encoder := yaml.NewEncoder(&out)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&document); err != nil {
+		return exit.Internalf("cannot encode %s: %s", path, err)
+	}
+	_ = encoder.Close()
+	if _, err := fileYAML(bytes.NewReader(out.Bytes())); err != nil {
+		return exit.Usagef("%s would become invalid: %s", path, err)
+	}
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		return exit.Internalf("cannot create %s: %s", home, err)
+	}
+	temporary, err := os.CreateTemp(home, ".config-*.tmp")
+	if err != nil {
+		return exit.Internalf("cannot stage %s: %s", path, err)
+	}
+	defer os.Remove(temporary.Name())
+	if err := temporary.Chmod(0o600); err == nil {
+		_, err = temporary.Write(out.Bytes())
+	}
+	if err == nil {
+		err = temporary.Sync()
+	}
+	if closeErr := temporary.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(temporary.Name(), path)
+	}
+	if err != nil {
+		return exit.Internalf("cannot write %s: %s", path, err)
+	}
+	return nil
+}
+
+func mapping(root *yaml.Node, key string) *yaml.Node {
+	for i := 0; i < len(root.Content); i += 2 {
+		if root.Content[i].Value == key {
+			if root.Content[i+1].Kind != yaml.MappingNode {
+				root.Content[i+1] = &yaml.Node{Kind: yaml.MappingNode}
+			}
+			return root.Content[i+1]
+		}
+	}
+	section := &yaml.Node{Kind: yaml.MappingNode}
+	root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: key}, section)
+	return section
+}
+
+func setScalar(section *yaml.Node, key, value string) {
+	for i := 0; i < len(section.Content); i += 2 {
+		if section.Content[i].Value == key {
+			section.Content[i+1] = &yaml.Node{Kind: yaml.ScalarNode, Value: value}
+			return
+		}
+	}
+	section.Content = append(section.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Value: value})
+}
+
+func remove(root *yaml.Node, key string) {
+	for i := 0; i < len(root.Content); i += 2 {
+		if root.Content[i].Value == key {
+			root.Content = append(root.Content[:i], root.Content[i+2:]...)
+			return
+		}
+	}
+}

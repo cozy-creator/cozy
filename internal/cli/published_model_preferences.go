@@ -41,7 +41,7 @@ func (r *Resolver) PublishedChildModels(command *Context, request records.Reques
 				continue
 			}
 			for _, slot := range entry.Models {
-				model, problem := r.childModelLadder(selected.Package, entry.Name, slot)
+				model, problem := r.childModelLadder(request.Hub, selected.Package, entry.Name, slot)
 				if problem != nil {
 					continue
 				} // Unused or explicitly overridden defaults stay optional.

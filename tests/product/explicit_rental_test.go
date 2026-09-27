@@ -52,8 +52,10 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	})
 	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
+	// The rentals were bought from the catalog's hub; a named rental's hub serves its run.
+	hubURL := configuredHub(t, root)
 	for id, name := range map[string]string{current: "isao", old: "giriko"} {
-		fatal(t, st.RecordRental(records.Rental{ID: id, MachineName: name, AcceleratorModel: "CPU", AcceleratorCount: 1, State: "ready", HourlyRateUSDMicros: 100000, Address: "127.0.0.1:1", CertPath: "unused", Hub: "fixture"}))
+		fatal(t, st.RecordRental(records.Rental{ID: id, MachineName: name, AcceleratorModel: "CPU", AcceleratorCount: 1, State: "ready", HourlyRateUSDMicros: 100000, Address: "127.0.0.1:1", CertPath: "unused", Hub: hubURL}))
 	}
 	st.Close()
 	args := []string{"run", "proof/quantize/quantize", "steps=7", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--json", "--full"}

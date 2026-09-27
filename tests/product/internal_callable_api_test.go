@@ -42,11 +42,11 @@ func (r *internalAPIResolver) Entrypoint(_ string, name string) (*launch.Entrypo
 	return r.entry(name, "entrypoint"), false, nil
 }
 
-func (r *internalAPIResolver) ResolveRemoteRelease(pkg, release, name string, _ []orchestrator.ModelRef) (orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error) {
+func (r *internalAPIResolver) ResolveRemoteRelease(hub, pkg, release, name string, _ []orchestrator.ModelRef) (orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error) {
 	return orchestrator.LogicalPackage{Package: pkg, Release: release, Function: name, PlanID: childDigest("9")}, r.entry(name, "entrypoint"), nil
 }
 
-func (r *internalAPIResolver) ResolveRemoteJob(pkg, release, name string, _ []orchestrator.ModelRef, _ bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
+func (r *internalAPIResolver) ResolveRemoteJob(hub, pkg, release, name string, _ []orchestrator.ModelRef, _ bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
 	return orchestrator.LogicalJob{Package: pkg, Release: release, Function: name, DescriptorID: childDigest("9")}, r.entry(name, "job"), nil
 }
 

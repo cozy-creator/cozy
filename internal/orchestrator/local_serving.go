@@ -30,6 +30,11 @@ type LocalServingPreparation struct {
 	LockedRequirements string   `json:"locked_requirements"`
 }
 
+// localModelAcquirer fetches a local child's models from its request's Tensorhub.
+type localModelAcquirer interface {
+	EnsureLocalModels(hub string, models []ModelRef) *exit.Error
+}
+
 // prepareLocalServing uses the same Runtime preparation messages as the rental
 // host, over this per-install worker's existing local preparation connection.
 func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunchSpec) (WorkerLaunchSpec, string, *exit.Error) {
@@ -51,11 +56,11 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		return WorkerLaunchSpec{}, "", problem
 	}
 	if req.ParentRequestID != "" && len(downloadModelRefs(req.Models)) > 0 {
-		acquirer, ok := c.opt.Packages.(interface{ EnsureLocalModels([]ModelRef) *exit.Error })
+		acquirer, ok := c.opt.Packages.(localModelAcquirer)
 		if !ok {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef("local model acquisition owner is unavailable")
 		}
-		if problem := acquirer.EnsureLocalModels(req.Models); problem != nil {
+		if problem := acquirer.EnsureLocalModels(req.Hub, req.Models); problem != nil {
 			return WorkerLaunchSpec{}, "", problem
 		}
 	}

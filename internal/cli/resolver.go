@@ -48,7 +48,10 @@ type Resolver struct {
 	// placements contain only control-plane facts. Keeping this cache distinct is the
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement
-	catalog    *hub.Client
+	// catalogs is one public catalog client per Tensorhub origin; each request reads
+	// its own hub's catalog.
+	catalogMu sync.Mutex
+	catalogs  map[string]*hub.Client
 	// Devices is the device envelope the daemon GRANTS a worker this host launches: what
 	// it may SEE, and the space the worker's reported lanes index into (proto-024).
 	Devices []string
@@ -266,9 +269,26 @@ func NewResolver(store *records.Store, cfg config.Config, devices []string) *Res
 		cache:      map[string]orchestrator.WorkerLaunchSpec{},
 		selected:   map[string]orchestrator.WorkerLaunchSpec{},
 		placements: map[string]orchestrator.DesiredPlacement{},
-		catalog:    hub.New(cfg, "cozy-daemon"),
+		catalogs:   map[string]*hub.Client{},
 		Devices:    append([]string(nil), devices...),
 	}
+}
+
+// catalog is one Tensorhub origin's catalog; "" is the daemon's default hub. The
+// static token reaches only the origin it was issued for.
+func (r *Resolver) catalog(origin string) *hub.Client {
+	cfg := r.cfg.ForHub(origin)
+	r.catalogMu.Lock()
+	defer r.catalogMu.Unlock()
+	if r.catalogs == nil {
+		r.catalogs = map[string]*hub.Client{}
+	}
+	if c := r.catalogs[cfg.HubURL]; c != nil {
+		return c
+	}
+	c := hub.New(cfg, "cozy-daemon")
+	r.catalogs[cfg.HubURL] = c
+	return c
 }
 
 // ResolvePlacement answers only WHAT a package target should host. The current local
@@ -374,7 +394,7 @@ func selectedInstallKey(installID string, models []orchestrator.ModelRef) string
 	return key.String()
 }
 
-func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
+func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	models []orchestrator.ModelRef,
 ) (
 	orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error,
@@ -390,7 +410,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 	}
 	ctx, cancel := hub.Context()
 	defer cancel()
-	detail, problem := r.catalog.PackageRelease(ctx, ref, release)
+	detail, problem := r.catalog(origin).PackageRelease(ctx, ref, release)
 	if problem != nil {
 		return empty, nil, problem
 	}
@@ -467,7 +487,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 		// so the pod prepares both entrypoints once and a switch between them is a
 		// dispatch. Owner overrides and authored defaults use the same selection here.
 		// Sharing only saves a later preparation, so an unreadable override set skips it.
-		if rows, problem := r.catalog.PackageBindings(ctx, ref); problem == nil {
+		if rows, problem := r.catalog(origin).PackageBindings(ctx, ref); problem == nil {
 			defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows, ref.Org)
 			shareModelSlots(models, entrypoint, packageInterface.Entrypoints, defaults)
 		}
@@ -492,7 +512,7 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 	}, entrypoint, nil
 }
 
-func (r *Resolver) ResolveRemoteJob(pkg, release, function string,
+func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	models []orchestrator.ModelRef, deferredModels bool,
 ) (
 	orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error,
@@ -508,7 +528,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, function string,
 	}
 	ctx, cancel := hub.Context()
 	defer cancel()
-	detail, problem := r.catalog.PackageRelease(ctx, ref, release)
+	detail, problem := r.catalog(origin).PackageRelease(ctx, ref, release)
 	if problem != nil {
 		return empty, nil, problem
 	}

@@ -23,7 +23,7 @@ func TestPublishedJobPreparationCarriesExactInterfaceModelPaths(t *testing.T) {
 		{Package: pkg, Slot: "dits", Model: "paul/minimax-h3", Release: "1.0.0-rc.1", Lane: "bf16-full", Manifest: "sha256:3f6c224a010fbff36adce0f19a8b866f4f1739a1d30e2202c140ba994dc0b4df", ManifestLength: 164},
 		{Package: pkg, Slot: "shared", Model: "paul/minimax-h3", Release: "1.0.0-rc.1", Lane: "bf16-full", Manifest: "sha256:3f6c224a010fbff36adce0f19a8b866f4f1739a1d30e2202c140ba994dc0b4df", ManifestLength: 164},
 	}
-	logical, job, problem := resolver.ResolveRemoteJob(pkg, "2.2.9", "assemble_full", models, false)
+	logical, job, problem := resolver.ResolveRemoteJob("", pkg, "2.2.9", "assemble_full", models, false)
 	fatal(t, problem)
 	for _, model := range logical.Models {
 		matched := false
@@ -40,7 +40,7 @@ func TestPublishedJobPreparationCarriesExactInterfaceModelPaths(t *testing.T) {
 		t.Fatal("resolver mutated caller model bindings")
 	}
 	logical.Models[0].BindingPath = "four-lane.models.dits"
-	if _, _, problem := resolver.ResolveRemoteJob(pkg, "2.2.9", "assemble_full", logical.Models, false); problem == nil {
+	if _, _, problem := resolver.ResolveRemoteJob("", pkg, "2.2.9", "assemble_full", logical.Models, false); problem == nil {
 		t.Fatal("another declared callable's model path was accepted")
 	}
 }
