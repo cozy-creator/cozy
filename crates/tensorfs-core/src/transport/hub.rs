@@ -517,7 +517,8 @@ fn call(
             Err(Retryable { refusal, .. }) if refusal.code == Code::TRANSFER_FAILED => {
                 return Err(refusal)
             }
-            Err(Retryable { wait, refusal }) if !final_attempt => {
+            // A zero wait is a verdict: re-asking reaches the same answer.
+            Err(Retryable { wait, refusal }) if !final_attempt && !wait.is_zero() => {
                 // A wait is spent out of the caller's budget, never past it.
                 let wait = match deadline.remaining()? {
                     Some(left) => wait.min(left),
@@ -638,7 +639,9 @@ fn call_once(
         return Err(Retryable::from(refusal));
     }
     Err(Retryable {
-        wait: stated_wait(&raw).unwrap_or_else(|| ledger.patience()),
+        wait: stated_wait(&raw)
+            .filter(|wait| !wait.is_zero())
+            .unwrap_or_else(|| ledger.patience()),
         refusal,
     })
 }
