@@ -66,7 +66,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		state.StoppedEventID = s.store.StoppedEventID(row)
 	}
 	if row.State == "failed" || row.State == "blocked" {
-		state.ErrorType, _, state.Error, _ = s.store.SettledFailure(row.ID)
+		state.ErrorType, state.ErrorCode, state.Error, _ = s.store.SettledFailure(row.ID)
 	}
 	if outputs, problem := s.store.VisibleOutputs(row.ID); problem == nil {
 		for _, output := range outputs {
@@ -84,6 +84,7 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			for _, event := range events {
 				if event.Type == "request.blocked" || event.Type == "request.failed" {
 					state.ErrorType, _ = event.Payload["error_type"].(string)
+					state.ErrorCode, _ = event.Payload["error_code"].(string)
 					state.Error, _ = event.Payload["error"].(string)
 				}
 			}

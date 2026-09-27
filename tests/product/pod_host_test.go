@@ -144,8 +144,8 @@ type fakePod struct {
 	lanes              []string // the order lanes were used: fetch, prepare_private, placement_set
 	prepareCodes       []codes.Code
 	prepareUnavailable int
-	// refusePrepare maps a package to the Runtime refusal code its own preparation answers.
-	refusePrepare map[string]string
+	// refusePrepare maps a package to the Runtime refusal its own preparation answers.
+	refusePrepare map[string]*pb.PrepareEvent
 	// stalePlacementSets answers that many placement-set desires with Runtime's
 	// placement_set_reprepare_required fault instead of applying them.
 	stalePlacementSets int
@@ -701,10 +701,10 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	if answer != nil {
 		return stream.Send(answer)
 	}
-	if refusal != "" {
+	if refusal != nil {
 		for _, event := range []*pb.PrepareEvent{
 			{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
-			{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED, TotalBytes: total, SafeCode: refusal, SafeDetail: refusal + ": " + name},
+			{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED, TotalBytes: total, SafeCode: refusal.SafeCode, SafeDetail: refusal.SafeDetail},
 		} {
 			if err := stream.Send(event); err != nil {
 				return err
