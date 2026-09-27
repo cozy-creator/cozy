@@ -824,6 +824,8 @@ type JobState struct {
 	ModelSources  []ModelSourceState `json:"model_sources,omitempty"`
 	Publication   *PublicationRef    `json:"publication,omitempty"`
 	NativeOutputs []NativeOutputRef  `json:"native_outputs,omitempty"`
+	// RetainedOutputs are held on the machine that produced them, not on this host.
+	RetainedOutputs []RetainedOutput `json:"retained_outputs,omitempty"`
 	// Bill is ABSENT unless this host was configured with an explicit local rate. There
 	// is no `$0.00`: a fabricated zero is a claim about money nobody made (cl-004).
 	Bill      *JobBill   `json:"bill,omitempty"`

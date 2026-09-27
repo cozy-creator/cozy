@@ -3,7 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"encoding/json"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -46,25 +46,69 @@ func (m *machineRuns) planMachineModels(request records.Request, connection *mac
 	if problem != nil {
 		return nil, problem
 	}
-	plan := &machineModelPlan{models: models, warnings: warnings, native: native}
-	if !native {
-		return plan, nil
+	return &machineModelPlan{models: models, warnings: warnings, native: native}, nil
+}
+
+// covers is whether a collected model output already holds this weights transaction.
+func (p *machineModelPlan) covers(receipt *pb.WeightsReceipt) bool {
+	if p == nil || !p.native {
+		return false
 	}
+	for _, model := range p.models {
+		if receipt.WeightsTransactionId == model.Retention.WeightsTransactionId && receipt.TensorfsReceiptDigest == model.Artifact.TensorFSReceiptDigest {
+			return true
+		}
+	}
+	return false
+}
+
+// retainMachineWeights gives each weights output no collected model result carries a
+// recipient custody of its own on the machine: a derived retention this host holds. The
+// bytes then stay retained on the rental, counted as its disk, until released or the
+// rental ends, and collection completes: nothing waits on a transfer nobody drives.
+func (m *machineRuns) retainMachineWeights(ctx context.Context, request records.Request, connection *machineConnection,
+	outcome *pb.AttemptOutcome, body *pb.AttemptOutcomeBody, plan *machineModelPlan) *exit.Error {
 	for _, ref := range body.WeightsReceipts {
-		var output pb.WeightsReceipt
-		if ref == nil || !bytes.Equal(canonical.Digest(ref.WeightsReceiptCanonicalBytes), ref.WeightsReceiptDigest) || canonical.Unmarshal(ref.WeightsReceiptCanonicalBytes, &output) != nil {
-			plan.warnings = append(plan.warnings, "the machine returned a weights receipt whose bytes do not match its digest; ignored")
+		var receipt pb.WeightsReceipt
+		if ref == nil || !bytes.Equal(canonical.Digest(ref.WeightsReceiptCanonicalBytes), ref.WeightsReceiptDigest) ||
+			canonical.Unmarshal(ref.WeightsReceiptCanonicalBytes, &receipt) != nil || plan.covers(&receipt) {
 			continue
 		}
-		covered := false
-		for _, model := range models {
-			covered = covered || output.WeightsTransactionId == model.Retention.WeightsTransactionId && output.TensorfsReceiptDigest == model.Artifact.TensorFSReceiptDigest
+		digest, err := canonical.Raw(receipt.TensorfsReceiptDigest)
+		if err != nil {
+			continue
 		}
-		if !covered {
-			plan.warnings = append(plan.warnings, fmt.Sprintf("weights transaction %s has no collected model output; it is not collected", output.WeightsTransactionId))
+		if connection.wireMinor < 53 {
+			return exit.Named(exit.Unavailable, "machine_execution.result_custody_required",
+				"weights output %q can be held on the machine only by Runtime protocol 53 or newer", receipt.OutputSlot)
+		}
+		artifact := records.ModelArtifact{ProducerRequestID: request.ID, OutputSlot: receipt.OutputSlot, TensorFSReceiptDigest: receipt.TensorfsReceiptDigest}
+		hold := records.MachineModelRetention{OutcomeID: outcome.OutcomeId, ResultPointer: "weights/" + receipt.OutputSlot,
+			TransactionID: receipt.WeightsTransactionId, ReceiptDigest: digest,
+			RetentionID: records.ArtifactRetentionID(request.ID, "machine-weights", receipt.OutputSlot, artifact)}
+		// The retention id is fixed by the output, so an ask repeated after a lost answer
+		// holds the same bytes once; the root hold is released only after this is recorded.
+		received, err := connection.retainModel(ctx, modelRetentionRequest(hold))
+		if err != nil {
+			return machineTransport(err)
+		}
+		if received == nil || received.WeightsTransactionId != hold.TransactionID || !bytes.Equal(received.TensorfsReceiptDigest, digest) ||
+			received.RetentionId != hold.RetentionID || received.Released || received.Manifest == nil {
+			return exit.New(exit.Conflict, "machine returned a different weights custody receipt")
+		}
+		artifact.Manifest.Digest, _ = canonical.Spell(received.Manifest.Digest)
+		artifact.Manifest.Length = int64(received.Manifest.Length)
+		if hold.Artifact, err = json.Marshal(artifact); err != nil {
+			return exit.Internalf("cannot record weights custody: %s", err)
+		}
+		if problem := m.store.FreezeMachineModelRetention(request.ID, hold); problem != nil {
+			return problem
+		}
+		if problem := m.store.AdvanceMachineModelRetention(request.ID, hold.RetentionID, "held"); problem != nil {
+			return problem
 		}
 	}
-	return plan, nil
+	return nil
 }
 
 func (m *machineRuns) collectMachineModels(ctx context.Context, request records.Request, connection *machineConnection, outcome *pb.AttemptOutcome, plan *machineModelPlan) (bool, *exit.Error) {

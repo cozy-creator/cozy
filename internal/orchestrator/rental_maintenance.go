@@ -2,6 +2,9 @@ package orchestrator
 
 import (
 	"context"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,7 +16,8 @@ import (
 // UseRental fences one client transport/preparation against maintenance. It is
 // not an execution-idleness claim: Runtime must still refuse a restart while it
 // owns queued or active execution. The release belongs to the actual connection.
-func (c *Orchestrator) UseRental(id string) (func(), *exit.Error) {
+// holder says who uses the rental, for a maintenance refusal to name.
+func (c *Orchestrator) UseRental(id, holder string) (func(), *exit.Error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closing || c.rentalMaintenance[id] {
@@ -24,18 +28,38 @@ func (c *Orchestrator) UseRental(id string) (func(), *exit.Error) {
 	} else if recorded != nil && recorded.Active() {
 		return nil, exit.Named(exit.Unavailable, "rental.maintenance", "this rental has an unfinished Runtime update; preparation will resume after reconciliation")
 	}
-	c.rentalUses[id]++
+	if c.rentalUses[id] == nil {
+		c.rentalUses[id] = map[uint64]string{}
+	}
+	c.rentalUseSeq++
+	use := c.rentalUseSeq
+	c.rentalUses[id][use] = holder
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			c.mu.Lock()
-			c.rentalUses[id]--
-			if c.rentalUses[id] == 0 {
+			delete(c.rentalUses[id], use)
+			if len(c.rentalUses[id]) == 0 {
 				delete(c.rentalUses, id)
 			}
 			c.mu.Unlock()
 		})
 	}, nil
+}
+
+// maintenanceBusyLocked names what a Runtime update of this rental would have to
+// interrupt, or "". Callers hold c.mu.
+func (c *Orchestrator) maintenanceBusyLocked(id string) string {
+	switch {
+	case c.closing:
+		return "the daemon is stopping"
+	case c.rentalMaintenance[id]:
+		return "its Runtime is already updating"
+	case c.ensuring[rentalInstanceID(id)] != nil:
+		return "its worker is still attaching"
+	}
+	holders := slices.Sorted(maps.Values(c.rentalUses[id]))
+	return strings.Join(slices.Compact(holders), ", ")
 }
 
 // MaintainRental withdraws one rental from dispatch and gives its existing
@@ -83,9 +107,9 @@ func (c *Orchestrator) MaintainRental(ctx context.Context, id string,
 		}
 	}
 	c.mu.Lock()
-	if c.closing || c.rentalMaintenance[id] || c.rentalUses[id] != 0 || c.ensuring[rentalInstanceID(id)] != nil {
+	if busy := c.maintenanceBusyLocked(id); busy != "" {
 		c.mu.Unlock()
-		return exit.Named(exit.Unavailable, "rental.maintenance_busy", "this rental is still preparing or updating; retry after it finishes")
+		return exit.Named(exit.Unavailable, "rental.maintenance_busy", "this rental is in use (%s); its Runtime was not changed; retry after that finishes", busy)
 	}
 	w := c.workers[rentalInstanceID(id)]
 	if w != nil && !c.idleRentalWorkerLocked(w) {

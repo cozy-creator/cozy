@@ -542,8 +542,11 @@ type Orchestrator struct {
 	// ensuring is the per-instance creation fence beneath every caller, including child
 	// recovery. `starting` serializes queue policy; this prevents two callers that already
 	// chose the same deterministic slot from spawning two processes into it.
-	ensuring          map[string]chan struct{}
-	rentalUses        map[string]int
+	ensuring map[string]chan struct{}
+	// rentalUses names each transport or preparation using a rental, so maintenance can
+	// say what it waits for.
+	rentalUses        map[string]map[uint64]string
+	rentalUseSeq      uint64
 	rentalMaintenance map[string]bool
 	revision          uint64 // hub-owned, monotonic; every Directive bumps it
 	residentRevision  uint64 // local serving-worker arrival order; tie-breaks never-used LRU rows
@@ -605,7 +608,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		desiring:             map[string]string{},
 		preparing:            map[string]bool{},
 		ensuring:             map[string]chan struct{}{},
-		rentalUses:           map[string]int{},
+		rentalUses:           map[string]map[uint64]string{},
 		rentalMaintenance:    map[string]bool{},
 		frames:               newFanout(),
 		phases:               newPhases(),

@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math"
 	"regexp"
 	"strings"
@@ -96,6 +97,21 @@ func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 		return false, exit.Internalf("cannot inspect Runtime execution obligations: %s", err)
 	}
 	return owed, nil
+}
+
+// MachineResultRetained is why an execution's finished result stays with its machine
+// because this host has no recipient for it, or "" when none was recorded.
+func (s *Store) MachineResultRetained(id string) (string, *exit.Error) {
+	var reason string
+	err := s.db.QueryRow(`SELECT COALESCE(json_extract(payload,'$.reason'),'') FROM request_events
+ WHERE request_id=? AND type='machine.result_retained' ORDER BY seq DESC LIMIT 1`, id).Scan(&reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", exit.Internalf("cannot read retained machine result: %s", err)
+	}
+	return reason, nil
 }
 
 // RentalHasLiveMachineExecutions is whether an execution on the rental still needs its
