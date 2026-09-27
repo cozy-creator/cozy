@@ -22,7 +22,7 @@ func TestMachineAssetResultChecksConsumedFinalMetadata(t *testing.T) {
 		must(t, err)
 		return &pb.ResultEnvelope{InlineResult: raw, ResultSchemaDigest: canonical.Digest(schema)}
 	}
-	fatal(t, launch.ValidateMachineResult(schema, envelope(asset)))
+	requireResultUsable(t, schema, envelope(asset))
 	// A newer Runtime's additive metadata and schema spelling are not this host's facts.
 	additive := map[string]any{"worker_note": "newer runtime"}
 	for k, v := range asset {
@@ -30,7 +30,7 @@ func TestMachineAssetResultChecksConsumedFinalMetadata(t *testing.T) {
 	}
 	evolved := envelope(additive)
 	evolved.ResultSchemaDigest = canonical.Digest([]byte(`{"fields":[],"newer":true}`))
-	fatal(t, launch.ValidateMachineResult(schema, evolved))
+	requireResultUsable(t, schema, evolved)
 	for name, change := range map[string]func(map[string]any){
 		"missing digest": func(a map[string]any) { delete(a, "digest") },
 		"changed digest": func(a map[string]any) { a["digest"] = childDigest("5") },
@@ -45,8 +45,8 @@ func TestMachineAssetResultChecksConsumedFinalMetadata(t *testing.T) {
 				copy[k] = v
 			}
 			change(copy)
-			if problem := launch.ValidateMachineResult(schema, envelope(copy)); problem == nil {
-				t.Fatal("changed final asset metadata was accepted")
+			if drift, problem := launch.ValidateMachineResult(schema, envelope(copy)); problem != nil || drift.Usable("image") {
+				t.Fatalf("changed final asset metadata was accepted: %v %v", drift, problem)
 			}
 		})
 	}
@@ -106,5 +106,15 @@ func TestMachineFileCustodySurvivesReplyLossWithoutExecutionRows(t *testing.T) {
 	}
 	if owed, problem := store.MachineExecutionOwesWork(request.ID); problem != nil || owed {
 		t.Fatal("released file hold still owes rental custody")
+	}
+}
+
+// requireResultUsable fails unless every declared output of the result was read.
+func requireResultUsable(t *testing.T, schema json.RawMessage, envelope *pb.ResultEnvelope) {
+	t.Helper()
+	drift, problem := launch.ValidateMachineResult(schema, envelope)
+	fatal(t, problem)
+	if len(drift.Failed) > 0 {
+		t.Fatalf("a valid result was refused: %v", drift.Warnings())
 	}
 }

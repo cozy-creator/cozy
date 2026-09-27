@@ -26,7 +26,7 @@ func TestMachineTreeResultUsesClosedFinalMetadata(t *testing.T) {
 		must(t, err)
 		return &pb.ResultEnvelope{InlineResult: raw, ResultSchemaDigest: canonical.Digest(schema)}
 	}
-	fatal(t, launch.ValidateMachineResult(schema, envelope(asset)))
+	requireResultUsable(t, schema, envelope(asset))
 	for name, change := range map[string]func(map[string]any){
 		"missing digest": func(a map[string]any) { delete(a, "digest") },
 		"changed digest": func(a map[string]any) { a["digest"] = childDigest("5") },
@@ -39,8 +39,8 @@ func TestMachineTreeResultUsesClosedFinalMetadata(t *testing.T) {
 				copy[k] = v
 			}
 			change(copy)
-			if launch.ValidateMachineResult(schema, envelope(copy)) == nil {
-				t.Fatal("invalid final Tree metadata accepted")
+			if drift, problem := launch.ValidateMachineResult(schema, envelope(copy)); problem != nil || drift.Usable("files") {
+				t.Fatalf("invalid final Tree metadata accepted: %v %v", drift, problem)
 			}
 		})
 	}

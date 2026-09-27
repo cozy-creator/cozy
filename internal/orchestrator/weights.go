@@ -320,6 +320,13 @@ func (c *Orchestrator) onWeightsFinalizeResult(s *session, frame *pb.WeightsFina
 // ackSettledOutcome is the one Ack boundary for immediate outcomes and weights outcomes.
 // The latter reach it only after every exact finalize result is durable.
 func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal uint64) {
+	c.ackOutcome(s, requestID, ordinal, nil)
+}
+
+// ackOutcome acknowledges a settled attempt. The ack names the recorded terminal unless
+// `echo` is a replay the worker holds under its own identity: a worker drops a held outcome
+// only on an ack naming exactly that outcome.
+func (c *Orchestrator) ackOutcome(s *session, requestID string, ordinal uint64, echo *pb.AttemptOutcome) {
 	attempt, e := c.opt.Store.AttemptRow(requestID, int64(ordinal))
 	if e != nil || attempt == nil {
 		c.logf("OutcomeAck %s#%d not sent: the durable attempt cannot be read", requestID, ordinal)
@@ -391,9 +398,13 @@ func (c *Orchestrator) ackSettledOutcome(s *session, requestID string, ordinal u
 		successfulPending = release != nil && (release.State == "armed" || release.State == "draining")
 		successfulReleased = release != nil && (release.State == "release_work" || release.State == "complete")
 	}
+	outcomeID := attempt.TerminalID
+	if echo != nil {
+		specDigest, outcomeID, outcomeDigest = echo.InvocationSpecDigest, echo.OutcomeId, echo.OutcomeDigest
+	}
 	ack := &pb.AttemptOutcomeAck{
 		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: specDigest,
-		OutcomeId: attempt.TerminalID, OutcomeDigest: outcomeDigest,
+		OutcomeId: outcomeID, OutcomeDigest: outcomeDigest,
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch,
 		WorkerBootId: s.bootID,
 		RetainWork: req.RetainWork && !successfulReleased && (successfulPending || records.RetainedState(req.State) || req.State == "requeue_pending" ||

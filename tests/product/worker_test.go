@@ -269,3 +269,44 @@ func TestDroppedOutcomeAck(t *testing.T) {
 		t.Errorf("the attempt row is %s/%s", row.TerminalStatus, row.State)
 	}
 }
+
+// A worker that replays a DIFFERENT outcome for an attempt this owner already closed is
+// acknowledged under that outcome's own identity: the recorded terminal stands, the
+// divergence is logged with both digests, and the worker frees the seat.
+func TestDivergentReplayOfAClosedAttemptIsAcknowledged(t *testing.T) {
+	o := hostOwner(t, "divergentreplay")
+	spec := fakeSpec("divergentreplay", "8", "--arm", "divergentreplay")
+	instance, _, e := o.c.EnsureWorker(spec)
+	fatal(t, e)
+	planID := planIDOf(t, spec)
+	fatal(t, o.c.EnsurePlacementReady(instance, planID, ""))
+	requestID, attempt, e := o.c.Submit(submission(planID, "fake/divergentreplay", "divergent-1",
+		map[string]any{"divergent": true}))
+	fatal(t, e)
+	if _, e := o.c.Await(requestID, attempt, 30*time.Second); e == nil || !strings.Contains(e.Message, "first telling") {
+		t.Fatalf("the attempt did not close on its first outcome: %s", briefly(e))
+	}
+	row, e := o.store.AttemptRow(requestID, int64(attempt))
+	fatal(t, e)
+	line, ok := waitEvent(o, "replays terminal", 20*time.Second)
+	if !ok {
+		t.Fatal("the divergent replay was not logged")
+	}
+	if !strings.Contains(line, row.TerminalDigest) || !strings.Contains(line, "the recorded terminal stands") {
+		t.Fatalf("the divergence does not name both digests: %s", trimLog(line))
+	}
+	if line, ok := waitWorkerLog(o, instance, "the ack names held outcome", 20*time.Second); !ok {
+		t.Fatal("the worker never saw an ack naming its replayed outcome")
+	} else {
+		t.Logf("%s", line)
+	}
+	after, e := o.store.AttemptRow(requestID, int64(attempt))
+	fatal(t, e)
+	if after.TerminalDigest != row.TerminalDigest || after.State != "closed" {
+		t.Fatalf("the replay changed the recorded terminal: %s/%s -> %s/%s",
+			row.TerminalDigest, row.State, after.TerminalDigest, after.State)
+	}
+	if n := countEvents(o, "applied in"); n != 1 {
+		t.Fatalf("%d outcomes applied, want exactly 1", n)
+	}
+}

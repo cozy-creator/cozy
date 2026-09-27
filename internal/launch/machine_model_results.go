@@ -37,8 +37,14 @@ func ValidateMachineModelResults(schema json.RawMessage, envelope *pb.ResultEnve
 	if envelope == nil || envelope.ResultBlob != nil || len(envelope.InlineResult) == 0 || len(envelope.RetainedModels) > 32 {
 		return refuse("model result needs its bounded inline result and complete custody descriptors")
 	}
-	if problem := ValidateMachineResult(schema, envelope); problem != nil {
+	drift, problem := ValidateMachineResult(schema, envelope)
+	if problem != nil {
 		return refuse(problem.Message)
+	}
+	for _, path := range paths {
+		if !drift.Usable(strings.Join(path, ".")) {
+			return refuse("a declared model output failed: " + strings.Join(drift.Warnings(), "; "))
+		}
 	}
 	inline := envelope.InlineResult
 	expected := map[string][]byte{}

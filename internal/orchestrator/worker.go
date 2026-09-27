@@ -449,6 +449,10 @@ type worker struct {
 	// owner issued. It is distinct from a claim refusal and from capacity: a config or
 	// placement-set refusal can never become dispatchable by waiting longer.
 	desiredRefusal *exit.Error
+	// refusedRevision is the desired revision the worker ended a control stream over with
+	// FailedPrecondition. A redial does not restate it; the next desire this owner issues
+	// is sent as usual.
+	refusedRevision uint64
 	// exitCode is the process's own disposition. RECYCLE is not a death (cr-009): a
 	// run-once job worker exits with it the moment its terminal is acknowledged, and
 	// reading that as "the worker died" turns a completed job into a failed request.

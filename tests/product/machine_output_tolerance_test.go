@@ -77,13 +77,65 @@ func (m *fileMachine) ReadByteTreeObject(call *pb.NativeByteReadCall, stream grp
 // is ignored with a warning; a declared output it does not return fails alone, and the
 // outputs it did return are still collected.
 func TestMachineOutputsAreCollectedPastExtrasAndOmissions(t *testing.T) {
+	out, store, requestID, image := runDriftedMachine(t, "output-tolerance", true, func(image, mask map[string]any) map[string]any {
+		return map[string]any{"image": image, "mask": mask}
+	})
+	for _, want := range []string{`warning: the machine returned output "extra", which the package does not declare; ignored`,
+		`warning: output "mask" failed: the machine did not return it`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("watch did not show %q:\n%s", want, out)
+		}
+	}
+	requireOnlyImageCollected(t, store, requestID, image)
+}
+
+// The result DOCUMENT drifts the same way: a field the package does not declare is ignored
+// and a declared output absent from it fails alone. Neither rejects the whole result.
+func TestMachineResultDocumentDriftFailsOnlyItsOutput(t *testing.T) {
+	out, store, requestID, image := runDriftedMachine(t, "result-drift", false, func(image, _ map[string]any) map[string]any {
+		return map[string]any{"image": image, "caption_v2": "a field a newer package added"}
+	})
+	for _, want := range []string{`warning: the machine returned result field "caption_v2", which the package does not declare; ignored`,
+		`warning: output "mask" failed: the machine did not return it`} {
+		if strings.Count(out, want) != 1 {
+			t.Fatalf("watch did not show %q exactly once:\n%s", want, out)
+		}
+	}
+	requireOnlyImageCollected(t, store, requestID, image)
+}
+
+func requireOnlyImageCollected(t *testing.T, store *records.Store, requestID string, image []byte) {
+	t.Helper()
+	link, problem := store.MachineExecution(requestID)
+	fatal(t, problem)
+	if link == nil || !link.Collected {
+		t.Fatal("the result was not collected")
+	}
+	outputs, problem := store.VisibleOutputs(requestID)
+	fatal(t, problem)
+	if len(outputs) != 1 || outputs[0].OutputID != "image" {
+		t.Fatalf("collected outputs = %+v, want only the declared image", outputs)
+	}
+	received, err := os.ReadFile(outputs[0].Path)
+	must(t, err)
+	if !bytes.Equal(received, image) {
+		t.Fatal("the collected image differs from the machine's bytes")
+	}
+}
+
+// runDriftedMachine runs one real daemon collecting a machine job whose package declares
+// two image outputs, `image` and `mask`, and watches it through the CLI. The machine returns
+// the `image` bytes, the result document `result` builds, and — when `extraFile` — bytes
+// for an undeclared `extra` output.
+func runDriftedMachine(t *testing.T, tag string, extraFile bool, result func(image, mask map[string]any) map[string]any) (string, *records.Store, string, []byte) {
+	t.Helper()
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
-	defer store.Close()
-	identity, problem := rental.PendingCreatorIdentity(layout, "output-tolerance")
+	t.Cleanup(store.Close)
+	identity, problem := rental.PendingCreatorIdentity(layout, tag)
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
@@ -91,10 +143,10 @@ func TestMachineOutputsAreCollectedPastExtrasAndOmissions(t *testing.T) {
 	asset := `{"type":{"asset":"image"},"wire":"required","asset_bound":{"max_bytes":1000,"media_types":["image/png"]}}`
 	surface := `{"application":"proof:app","format":"cozy.package.interface/1","entrypoints":[],"jobs":[{"name":"main","models":[],"publishes":false,"weights_outputs":[],"request":{"fields":[]},"result":{"fields":[` +
 		`{"name":"image",` + asset[1:] + `,{"name":"mask",` + asset[1:] + `]}}]}`
-	installed := &pb.InstalledPackage{InstallationId: "tolerance-install", Package: "local/example", Release: "1.0.0", PackageInterface: []byte(surface)}
+	installed := &pb.InstalledPackage{InstallationId: tag + "-install", Package: "local/example", Release: "1.0.0", PackageInterface: []byte(surface)}
 	capture, captureDigest, err := canonical.Identity(&pb.MachineExecutionCapture{RootInstallationId: installed.InstallationId, InstalledPackages: []*pb.InstalledPackage{installed}})
 	must(t, err)
-	request, _, problem := store.Submit(records.Request{ID: "job-output-tolerance", IdemKey: "output-tolerance", Package: installed.Package,
+	request, _, problem := store.Submit(records.Request{ID: "job-" + tag, IdemKey: tag, Package: installed.Package,
 		Release: installed.Release, Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"),
 		MachineExecutionObserver: true, LocalInstallationID: installed.InstallationId})
 	fatal(t, problem)
@@ -123,21 +175,25 @@ func TestMachineOutputsAreCollectedPastExtrasAndOmissions(t *testing.T) {
 	imageEntry, imageRow := entry("image", image, 1)
 	extraEntry, _ := entry("extra", extra, 3)
 	_, maskRow := entry("mask", []byte("never sent"), 5)
-	inline, err := json.Marshal(map[string]any{"image": imageRow, "mask": maskRow})
+	inline, err := json.Marshal(result(imageRow, maskRow))
 	must(t, err)
+	manifest := []*pb.OutputEntry{imageEntry}
+	if extraFile {
+		manifest = append(manifest, extraEntry)
+	}
 	specDigest, err := canonical.Spell(receipt.InvocationSpecDigest)
 	must(t, err)
 	body, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{RequestId: request.ID, AttemptOrdinal: 1,
 		InvocationSpecDigest: specDigest, Status: pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
 		Result:         &pb.ResultEnvelope{InlineResult: inline},
-		OutputManifest: &pb.OutputManifest{Outputs: []*pb.OutputEntry{imageEntry, extraEntry}}})
+		OutputManifest: &pb.OutputManifest{Outputs: manifest}})
 	must(t, err)
 	machine := &fileMachine{
 		finishedMachine: finishedMachine{
 			state: &pb.MachineExecutionState{RequestId: request.ID, WorkerId: podWorkerID, WorkerBootId: podBootID,
 				ExecutionWorkspaceId: "workspace", Generation: 1, AttemptOrdinal: 1, State: "succeeded"},
 			outcome: &pb.AttemptOutcome{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecDigest: receipt.InvocationSpecDigest,
-				OutcomeId: "tolerance-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body},
+				OutcomeId: tag + "-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body},
 		},
 		objects: map[string][]byte{string(imageEntry.Digest): image, string(extraEntry.Digest): extra},
 	}
@@ -162,25 +218,5 @@ func TestMachineOutputsAreCollectedPastExtrasAndOmissions(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("the run failed on its machine's outputs [exit %d]: %s\n%s", code, out, tail(filepath.Join(root, "daemon.log")))
 	}
-	for _, want := range []string{`warning: the machine returned output "extra", which the package does not declare; ignored`,
-		`warning: output "mask" failed: the machine did not return it`} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("watch did not show %q:\n%s", want, out)
-		}
-	}
-	link, problem := store.MachineExecution(request.ID)
-	fatal(t, problem)
-	if link == nil || !link.Collected {
-		t.Fatal("the result was not collected")
-	}
-	outputs, problem := store.VisibleOutputs(request.ID)
-	fatal(t, problem)
-	if len(outputs) != 1 || outputs[0].OutputID != "image" {
-		t.Fatalf("collected outputs = %+v, want only the declared image", outputs)
-	}
-	received, err := os.ReadFile(outputs[0].Path)
-	must(t, err)
-	if !bytes.Equal(received, image) {
-		t.Fatal("the collected image differs from the machine's bytes")
-	}
+	return out, store, request.ID, image
 }

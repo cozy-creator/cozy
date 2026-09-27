@@ -542,11 +542,59 @@ func validateField(field Field, value any, path string) *exit.Error {
 	return validateFieldInto(field, value, path, nil)
 }
 
+// reading is what one validation collects beside its verdict. assets gathers the asset
+// positions it passed; ignored, when set, turns an undeclared nested field into an ignored
+// path instead of a refusal. That is how a peer's RESULT is read: a newer package or
+// Runtime may add fields this host does not declare. A caller's request never sets it,
+// because there an undeclared key is a typo.
+type reading struct {
+	assets  *[]string
+	ignored *[]string
+}
+
+func collecting(assets *[]string) *reading {
+	if assets == nil {
+		return nil
+	}
+	return &reading{assets: assets}
+}
+
+func (r *reading) asset(path string) {
+	if r != nil && r.assets != nil {
+		*r.assets = append(*r.assets, path)
+	}
+}
+
+// branch is a scratch reading for one union branch, merged only if the branch matches.
+func (r *reading) branch() *reading {
+	out := &reading{assets: new([]string)}
+	if r != nil && r.ignored != nil {
+		out.ignored = new([]string)
+	}
+	return out
+}
+
+func (r *reading) merge(branch *reading) {
+	if r == nil {
+		return
+	}
+	if r.assets != nil {
+		*r.assets = append(*r.assets, *branch.assets...)
+	}
+	if r.ignored != nil {
+		*r.ignored = append(*r.ignored, *branch.ignored...)
+	}
+}
+
 // validateFieldInto is the early check before anything is rented. Runtime validates the
 // payload against the package's own types at execution, so a type or constraint this host
 // cannot read is left to it rather than refused here.
 func validateFieldInto(field Field, value any, path string, assets *[]string) *exit.Error {
-	if problem := validateRenderedInto(field.Type, value, path, assets); problem != nil {
+	return validateFieldReading(field, value, path, collecting(assets))
+}
+
+func validateFieldReading(field Field, value any, path string, r *reading) *exit.Error {
+	if problem := validateRendered(field.Type, value, path, r); problem != nil {
 		return problem
 	}
 	if field.Constraints.MinLength != nil || field.Constraints.MaxLength != nil {
@@ -602,6 +650,10 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 }
 
 func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[]string) *exit.Error {
+	return validateRendered(raw, value, path, collecting(assets))
+}
+
+func validateRendered(raw json.RawMessage, value any, path string, r *reading) *exit.Error {
 	var scalar string
 	if json.Unmarshal(raw, &scalar) == nil {
 		switch scalar {
@@ -640,18 +692,14 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	}
 	if _, ok := schema["asset"]; ok {
 		if ref, ok := value.(string); ok && ref != "" {
-			if assets != nil {
-				*assets = append(*assets, path)
-			}
+			r.asset(path)
 			return nil
 		}
 		return exit.New(exit.Validation, "request asset field %s is not a non-empty reference", path)
 	}
 	if input, ok := schema["input"]; ok && string(input) == `"tree"` {
 		if _, ok := value.(string); ok {
-			if assets != nil {
-				*assets = append(*assets, path)
-			}
+			r.asset(path)
 			return nil
 		}
 		return exit.New(exit.Validation, "request tree field %s is not a reference", path)
@@ -700,11 +748,9 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 				tagged["tag_field"] = tagField
 				branch, _ = json.Marshal(tagged)
 			}
-			var found []string
-			if validateRenderedInto(branch, value, path, &found) == nil {
-				if assets != nil {
-					*assets = append(*assets, found...)
-				}
+			found := r.branch()
+			if validateRendered(branch, value, path, found) == nil {
+				r.merge(found)
 				return nil
 			}
 		}
@@ -716,8 +762,8 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 			return exit.New(exit.Validation, "request field %s is not a list", path)
 		}
 		for index, element := range values {
-			if problem := validateRenderedInto(item, element,
-				path+"."+strconv.Itoa(index), assets); problem != nil {
+			if problem := validateRendered(item, element,
+				path+"."+strconv.Itoa(index), r); problem != nil {
 				return problem
 			}
 		}
@@ -754,10 +800,14 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 				continue
 			}
 			field, ok := declared[name]
+			if !ok && r != nil && r.ignored != nil {
+				*r.ignored = append(*r.ignored, path+"."+name)
+				continue
+			}
 			if !ok {
 				return exit.New(exit.Validation, "request field %s declares no nested field %q", path, name)
 			}
-			if problem := validateFieldInto(field, element, path+"."+name, assets); problem != nil {
+			if problem := validateFieldReading(field, element, path+"."+name, r); problem != nil {
 				return problem
 			}
 		}

@@ -1131,11 +1131,18 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// particular it must not fetch pod outputs again: after the first mirror and ack this
 	// owner is allowed to delete the remote attempt subtree, while the durable local output
 	// rows and bytes remain the accepted answer.
+	//
+	// A DIVERGENT replay of a closed attempt changes nothing either: the first terminal the
+	// authority accepted stays the answer. It is acknowledged under the worker's own outcome
+	// identity, which is the only ack the worker can match, so its seat is freed instead of
+	// held by a replay no answer would ever close.
 	knownReplay := false
 	if attemptRow.State == "terminal" || attemptRow.State == "closed" {
 		if attemptRow.TerminalDigest != shortNone(t.OutcomeDigest) {
-			refuse("the attempt already closed with terminal %s, not %s",
-				shortDigest(attemptRow.TerminalDigest), shortDigest(shortNone(t.OutcomeDigest)))
+			c.logf("WARNING: AttemptOutcome %s#%d replays terminal %s but the attempt already closed with %s; "+
+				"the recorded terminal stands and the replay is acknowledged so the worker frees its seat",
+				t.RequestId, ordinal, shortNone(t.OutcomeDigest), attemptRow.TerminalDigest)
+			c.ackOutcome(s, t.RequestId, ordinal, t)
 			return
 		}
 		knownReplay = true

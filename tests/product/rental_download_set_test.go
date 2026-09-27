@@ -185,6 +185,12 @@ type standInPod struct {
 	// prepareCalls counts PreparePackageSet calls. It is the owner's re-issue rate seen
 	// from the other end, and the only honest measure of a desired-state retry loop.
 	prepareCalls uint64
+	// refuseDesired, when set, ends the control stream with FailedPrecondition on the
+	// first desired placement set — a worker's final word on that one revision. Later
+	// desires are accepted.
+	refuseDesired string
+	// desiredFrames counts the desired placement sets this pod was sent.
+	desiredFrames uint64
 	// onSession, when set, is called once per accepted control stream with a sender bound
 	// to that stream and the stream's own envelope. It is how an arm drives a lane this
 	// pod does not otherwise speak, on the real wire and behind the real fence.
@@ -206,6 +212,13 @@ func (p *standInPod) claims() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.epoch
+}
+
+// desires counts the desired placement sets this pod has been sent.
+func (p *standInPod) desires() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.desiredFrames
 }
 
 // prepares counts the prepare streams this pod has been asked to open.
@@ -308,6 +321,14 @@ func (p *standInPod) Control(stream pb.WorkerControl_ControlServer) error {
 		if desired.GetPlacementSet() == nil {
 			// A host mode on the control stream is exactly what proto-025 retired.
 			return status.Error(codes.FailedPrecondition, "host modes are PodHost calls")
+		}
+		p.mu.Lock()
+		p.desiredFrames++
+		refusal := p.refuseDesired
+		p.refuseDesired = ""
+		p.mu.Unlock()
+		if refusal != "" {
+			return status.Error(codes.FailedPrecondition, refusal)
 		}
 		observed := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: desired.Revision, ConvergedRevision: desired.Revision,
