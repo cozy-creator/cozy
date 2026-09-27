@@ -98,9 +98,11 @@ func (s *session) trySend(m *pb.RecordOwnerFrame) (sent bool) {
 // the worker's control epochs every 200 ms forever; observed at 1,111 epochs against a
 // pre-rev-2 worker while a waiter sat on a readiness poll that was never going to end. A
 // refused DESIRE is not such a fact: it answers one revision, and the conversation that
-// keeps the worker's other placements serving goes on without restating it.
+// keeps the worker's other placements serving goes on without restating it. Nor is an
+// UNDURABLE claim: the worker refuses it before minting an epoch, until it is durable.
 func (c *Orchestrator) attach(w *worker) {
 	defer close(w.attachDone)
+	ended := ""
 	for {
 		c.mu.Lock()
 		current, live := c.workers[w.instanceID]
@@ -121,7 +123,10 @@ func (c *Orchestrator) attach(w *worker) {
 		}
 		err := c.converse(w, addr)
 		if err != nil {
-			c.logf("worker %s: control stream ended: %s", w.instanceID, err)
+			if err.Error() != ended {
+				c.logf("worker %s: control stream ended: %s", w.instanceID, err)
+			}
+			ended = err.Error()
 			if c.refuseUnimplemented(w, err) || c.refuseDesiredRevision(w, err) {
 				return
 			}
@@ -366,6 +371,11 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			}
 			if !ack.Accepted {
 				name := pb.ClaimRejection_name[int32(ack.Rejection)]
+				if ack.Rejection == pb.ClaimRejection_CLAIM_REJECTION_UNDURABLE {
+					// Not durable yet: its readiness barrier is still committing, or it is
+					// restarting to reopen its store. The attach loop claims it again.
+					return fmt.Errorf("worker %s is not durable yet (%s); claiming it again", w.instanceID, name)
+				}
 				problem := exit.Named(exit.Conflict, "rental.worker_claim_refused",
 					"worker %s refused this owner's claim: %s", w.instanceID, name).
 					WithRemedy("release the rental; a worker that rejects its renter's owner credential cannot converge")
