@@ -14,7 +14,8 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// An incompatible older pod is excluded before any Claim mutates ownership.
+// An older pod keeps its Claim, snapshots and keepalive (no wire minor refuses them); only
+// new preparation and execution route elsewhere.
 func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -34,13 +35,7 @@ func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 			connection, _ := startFakePod(t, t.TempDir(), pod)
 			o := hostOwner(t, "protocol-"+name, rentalWiring(connection, private))
 			_, _, _, problem := o.c.EnsureRental(podRental)
-			if older {
-				if problem == nil || problem.ErrName() != "worker.protocol_incompatible" {
-					t.Fatalf("old peer was not refused before Claim: %v", problem)
-				}
-			} else {
-				fatal(t, problem)
-			}
+			fatal(t, problem)
 			for _, job := range []bool{false, true} {
 				reason, _ := o.c.RentalStanding(podRental, job)
 				if older && reason != "protocol_unsupported" {
@@ -53,7 +48,7 @@ func TestRentalReuseRequiresNegotiatedCurrentProtocol(t *testing.T) {
 	}
 }
 
-func TestIdleControlAcceptsCompatibleMinorSkew(t *testing.T) {
+func TestIdleControlAcceptsMinorSkew(t *testing.T) {
 	for _, minor := range []uint32{pb.MinCompatibleWireMinor, pb.WireMinor, pb.WireMinor + 1, pb.MinCompatibleWireMinor - 1} {
 		public, private, err := ed25519.GenerateKey(rand.Reader)
 		must(t, err)
@@ -67,15 +62,9 @@ func TestIdleControlAcceptsCompatibleMinorSkew(t *testing.T) {
 			must(t, control.Close())
 		}
 		cancel()
-		if minor < pb.MinCompatibleWireMinor {
-			if problem == nil || problem.ErrName() != "worker.protocol_incompatible" {
-				t.Fatalf("minor %d should refuse before Claim: %v", minor, problem)
-			}
-		} else {
-			fatal(t, problem)
-			if control == nil {
-				t.Fatalf("compatible minor %d did not open idle control", minor)
-			}
+		fatal(t, problem)
+		if control == nil {
+			t.Fatalf("minor %d did not open idle control", minor)
 		}
 		pod.mu.Lock()
 		mutated := len(pod.offers) + len(pod.prepares) + len(pod.desired)
@@ -103,9 +92,7 @@ func TestQueuedPinToOlderWorkerReplansWithoutOffering(t *testing.T) {
 		}
 	})
 	_, _, _, problem := o.c.EnsureRental(podRental)
-	if problem == nil || problem.ErrName() != "worker.protocol_incompatible" {
-		t.Fatalf("old peer was not refused before Claim: %v", problem)
-	}
+	fatal(t, problem)
 	id, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "old-pin", Package: "acme/old-pin", Entrypoint: "tile", PlanID: podPlanID("acme/old-pin"), Release: "1.0.0", Payload: []byte(`{"size":16}`), Outputs: []string{"image"}, Worker: podRental, Rental: true, RentalRequired: true})
 	fatal(t, problem)
 	waitUntil(t, "replanning from negotiated old peer", func() bool { return acquisitions.Load() > 0 })

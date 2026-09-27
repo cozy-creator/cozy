@@ -687,7 +687,13 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 		}
 		if reason != "" {
 			if req.RetainWork || req.RequestedRental != "" {
-				c.failPreparation(req, exit.Named(exit.Conflict, "request.retained_rental_unavailable", "the retained rental cannot execute this transaction (%s)", reason), "")
+				problem := exit.Named(exit.Conflict, "request.retained_rental_unavailable", "the retained rental cannot execute this transaction (%s)", reason)
+				if reason == ExcludedProtocol {
+					problem = exit.Named(exit.Conflict, pb.CapabilityUnavailableCode,
+						"rental %s's worker speaks protocol minor %d, below the %d this Creator executes", req.Worker, c.workerWireMinor(req.Worker), pb.MinCompatibleWireMinor).
+						WithRemedy("update the rental's worker Runtime, or run on another machine; the rental and its other work are untouched")
+				}
+				c.failPreparation(req, problem, "")
 				return false
 			}
 			attempts, problem := c.opt.Store.Attempts(req.ID)

@@ -29,26 +29,25 @@ type IdleControl struct {
 func (s *IdleControl) Close() error { s.cancel(); return s.connection.Close() }
 
 func DialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
-	control, problem := dialIdleControl(parent, remote, sign, retained, false)
+	control, problem := dialIdleControl(parent, remote, sign, retained)
 	if problem != nil && problem.ErrName() == "rental.control_reconnect" {
 		// A cold Host transfers its workspace ledger to Runtime once and then
 		// requires a new Claim. Never accept that first, unrecovered snapshot.
-		return dialIdleControl(parent, remote, sign, retained, false)
+		return dialIdleControl(parent, remote, sign, retained)
 	}
 	return control, problem
 }
 
-// DialMaintenanceControl negotiates the stable Claim/closed-snapshot lane for
-// Runtime repair. Ordinary idle control and execution keep their current gate.
+// DialMaintenanceControl opens the same Claim/snapshot lane for Runtime repair.
 func DialMaintenanceControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
-	control, problem := dialIdleControl(parent, remote, sign, retained, true)
+	control, problem := dialIdleControl(parent, remote, sign, retained)
 	if problem != nil && problem.ErrName() == "rental.control_reconnect" {
-		return dialIdleControl(parent, remote, sign, retained, true)
+		return dialIdleControl(parent, remote, sign, retained)
 	}
 	return control, problem
 }
 
-func dialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store, maintenance bool) (*IdleControl, *exit.Error) {
+func dialIdleControl(parent context.Context, remote *WorkerConnection, sign RentalClaimProofSource, retained *records.Store) (*IdleControl, *exit.Error) {
 	if remote == nil || remote.CACert == "" || remote.WorkerBootID == "" || sign == nil {
 		return nil, exit.New(exit.Credential, "operator control requires a pinned rental and Claim signer")
 	}
@@ -68,21 +67,18 @@ func dialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 			_ = control.Close()
 		}
 	}()
-	wireMinor, minimumMinor := pb.WireMinor, pb.MinCompatibleWireMinor
-	if maintenance {
-		probeContext, probeCancel := context.WithTimeout(ctx, hub.Timeout)
-		info, err := pb.NewPodHostClient(conn).ProtocolInfo(probeContext, &pb.ProtocolInfoRequest{})
-		probeCancel()
-		if err != nil {
-			return nil, idleControlEnd(err)
-		}
-		if problem := validateMaintenanceProtocol(info); problem != nil {
-			return nil, problem
-		}
-		wireMinor, minimumMinor = min(info.WireMinor, pb.WireMinor), max(info.MinimumWireMinor, pb.RentalKeepaliveWireMinor)
-	} else if problem := probeWorkerProtocol(ctx, conn, true); problem != nil {
+	// Owner presence and maintenance send only Claim and read snapshots, which no wire
+	// minor refuses; both negotiate the Claim minor from the peer's range.
+	probeContext, probeCancel := context.WithTimeout(ctx, hub.Timeout)
+	info, err := pb.NewPodHostClient(conn).ProtocolInfo(probeContext, &pb.ProtocolInfoRequest{})
+	probeCancel()
+	if err != nil {
+		return nil, idleControlEnd(err)
+	}
+	if problem := validateMaintenanceProtocol(info); problem != nil {
 		return nil, problem
 	}
+	wireMinor, minimumMinor := min(info.WireMinor, pb.WireMinor), pb.RentalKeepaliveWireMinor
 	stream, err := pb.NewWorkerControlClient(conn).Control(ctx)
 	if err != nil {
 		return nil, idleControlEnd(err)

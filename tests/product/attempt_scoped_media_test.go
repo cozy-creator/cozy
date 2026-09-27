@@ -274,7 +274,7 @@ func TestMediaInputRetryKeepsAttemptAndOriginalFile(t *testing.T) {
 // an echo it does send must agree with the bytes streamed.
 func TestMediaInputReceiptEchoMustAgree(t *testing.T) {
 	for response, accepted := range map[string]bool{
-		`{"path":"/tmp/cozy/input","length":3}`: true,
+		`{"path":"/tmp/cozy/input","length":3}`:                             true,
 		`{"path":"/tmp/cozy/input","length":2,"digest":"sha256:incorrect"}`: false,
 		`{"path":"/tmp/cozy/input","length":3,"digest":"sha256:incorrect"}`: false,
 	} {

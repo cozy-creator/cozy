@@ -11,10 +11,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Probe the pinned peer before any Claim or preparation can change ownership.
-// PodHost returns its intersection with the actual Runtime; a local worker is
-// queried directly on the same RuntimePreparation service.
-func probeWorkerProtocol(ctx context.Context, connection grpc.ClientConnInterface, remote bool) *exit.Error {
+// Probe the pinned peer before Claim. Its range is recorded, never a reason to refuse the
+// connection or Claim (worker-protocol VERSIONING): each operation gates on what it uses,
+// and a peer without the probe answers an unknown range. Only the rental idle guard is a
+// connection-level requirement, because idle release is unsafe without it.
+func probeWorkerProtocol(ctx context.Context, connection grpc.ClientConnInterface, remote bool) (*pb.ProtocolInfoResult, *exit.Error) {
 	ctx, cancel := context.WithTimeout(ctx, hub.Timeout)
 	defer cancel()
 	var info *pb.ProtocolInfoResult
@@ -26,38 +27,43 @@ func probeWorkerProtocol(ctx context.Context, connection grpc.ClientConnInterfac
 	}
 	if err != nil {
 		if status.Code(err) != codes.Unimplemented && status.Code(err) != codes.FailedPrecondition {
-			return exit.Unavailablef("worker protocol probe is temporarily unavailable")
+			return nil, exit.Unavailablef("worker protocol probe is temporarily unavailable")
 		}
-		if status.Code(err) == codes.FailedPrecondition {
-			return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker protocol probe refused: %s", status.Convert(err).Message())
-		}
-		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker has no compatible read-only protocol probe; update the worker")
+		return nil, nil
 	}
-	return ValidateWorkerProtocol(info, remote)
+	if remote && !info.SupportsRentalKeepalive {
+		return info, rentalIdleGuardRequired()
+	}
+	return info, nil
 }
 
-// ValidateWorkerProtocol checks the execution range independently of Host-only
-// features. A compatible Runtime need not implement the rental idle contract.
+func rentalIdleGuardRequired() *exit.Error {
+	return exit.Named(exit.Conflict, "worker.rental_idle_guard_required",
+		"this rental worker lacks the reliable active-work reporting or manual keepalive required by the mandatory 15-minute idle shutdown; update the rental worker image")
+}
+
+// ValidateWorkerProtocol gates ordinary preparation and execution on the peer's range.
+// A peer outside it fails only that operation, naming the component to update.
 func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental bool) *exit.Error {
 	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor {
-		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker reported an invalid supported protocol range; update the worker")
+		return exit.Named(exit.Conflict, pb.CapabilityUnavailableCode, "worker reported no usable protocol range").
+			WithRemedy("update the worker Runtime")
 	}
 	if info.WireMinor < pb.MinCompatibleWireMinor || pb.WireMinor < info.MinimumWireMinor {
-		return exit.Named(exit.Conflict, "worker.protocol_incompatible",
-			"Creator supports worker protocol %d–%d; this worker supports %d–%d. Update %s",
-			pb.MinCompatibleWireMinor, pb.WireMinor, info.MinimumWireMinor, info.WireMinor,
-			protocolUpgradeTarget(info))
+		return exit.Named(exit.Conflict, pb.CapabilityUnavailableCode,
+			"Creator executes worker protocol %d–%d; this worker supports %d–%d",
+			pb.MinCompatibleWireMinor, pb.WireMinor, info.MinimumWireMinor, info.WireMinor).
+			WithRemedy("update %s; other work on this machine continues", protocolUpgradeTarget(info.MinimumWireMinor))
 	}
 	if rental && !info.SupportsRentalKeepalive {
-		return exit.Named(exit.Conflict, "worker.rental_idle_guard_required",
-			"this rental worker lacks the reliable active-work reporting or manual keepalive required by the mandatory 15-minute idle shutdown; update the rental worker image")
+		return rentalIdleGuardRequired()
 	}
 	return nil
 }
 
-func protocolUpgradeTarget(info *pb.ProtocolInfoResult) string {
-	if info.MinimumWireMinor > pb.WireMinor {
-		return "the local cozy-creator CLI"
+func protocolUpgradeTarget(peerMinimum uint32) string {
+	if peerMinimum > pb.WireMinor {
+		return "the local cozy CLI"
 	}
 	return "the worker Runtime"
 }
@@ -83,14 +89,10 @@ func RentalProtocolInfo(ctx context.Context, remote *WorkerConnection) (*pb.Prot
 	return info, validateMaintenanceProtocol(info)
 }
 
-// Maintenance uses only the signed Claim and closed snapshot surfaces retained
-// since the rental keepalive contract. It never acknowledges the snapshot or
-// sends execution/preparation messages. Future hard cuts remain refused.
+// Maintenance uses only the signed Claim and snapshot surfaces, which no wire minor
+// refuses. It needs the keepalive capability that makes idle release safe.
 func validateMaintenanceProtocol(info *pb.ProtocolInfoResult) *exit.Error {
-	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor || info.WireMinor < pb.RentalKeepaliveWireMinor || info.MinimumWireMinor > pb.WireMinor {
-		return exit.Named(exit.Conflict, "worker.protocol_incompatible", "worker has no supported maintenance protocol range")
-	}
-	if !info.SupportsRentalKeepalive {
+	if info == nil || info.WireMinor < pb.RentalKeepaliveWireMinor || !info.SupportsRentalKeepalive {
 		return exit.Named(exit.Conflict, "worker.rental_idle_guard_required", "rental maintenance requires reliable active-work reporting and manual keepalive")
 	}
 	return nil

@@ -124,7 +124,7 @@ func TestLoRAOldPeersFailProtocolBeforePreparation(t *testing.T) {
 			fatal(t, e)
 			found := false
 			for _, event := range events {
-				if event.Type == "request.failed" && event.Payload["error_type"] == "worker.protocol_incompatible" {
+				if event.Type == "request.failed" && event.Payload["error_type"] == "model_adapters_protocol_unsupported" {
 					found = true
 				}
 			}
