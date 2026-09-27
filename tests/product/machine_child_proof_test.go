@@ -11,10 +11,12 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
+// Intent is the child's inputs; Computation is its operation identity, which an edit to
+// its implementation also changes. Runtime keeps no separate package revision.
 type machineChildProof struct {
-	Request, State, Intent, Revision, Computation string
-	Executions                                    int
-	Result                                        []byte
+	Request, State, Intent, Computation string
+	Executions                          int
+	Result                              []byte
 }
 
 // Read the actual Runtime journal only as evidence. These product tests submit,
@@ -52,11 +54,10 @@ func machineChildren(t *testing.T, root string, store *records.Store, parentRef 
 		var prepared, outcome []byte
 		must(t, rows.Scan(&child.Request, &child.State, &child.Intent, &prepared, &child.Result, &child.Executions, &outcome))
 		var plan struct {
-			Revision    string `json:"revision"`
 			Computation string `json:"computation"`
 		}
 		must(t, json.Unmarshal(prepared, &plan))
-		child.Revision, child.Computation = plan.Revision, plan.Computation
+		child.Computation = plan.Computation
 		if len(child.Result) == 0 && len(outcome) > 0 {
 			var body pb.AttemptOutcomeBody
 			must(t, canonical.Unmarshal(outcome, &body))

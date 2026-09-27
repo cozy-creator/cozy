@@ -150,17 +150,17 @@ func TestUnpublishedChildLocalArtifactsShareWorkspaceMemoization(t *testing.T) {
 			}
 			continue
 		}
-		if children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[0].Revision != originalA.Revision || string(children[0].Result) != string(originalA.Result) {
+		if children[0].Executions != 0 || children[0].Computation != originalA.Computation || string(children[0].Result) != string(originalA.Result) {
 			t.Fatalf("cycle %d recomputed or changed A: original=%+v actual=%+v", cycle, originalA, children[0])
 		}
 		if cycle < 3 {
 			if children[1].Executions != 1 {
 				t.Fatalf("changed B was not executed exactly once: %+v", children[1])
 			}
-			if cycle == 1 && (children[1].Revision != originalB.Revision || children[1].Intent == originalB.Intent) {
-				t.Fatal("parameter edit changed B's implementation or reused its failed input")
+			if cycle == 1 && children[1].Intent == originalB.Intent {
+				t.Fatal("parameter edit reused B's failed input")
 			}
-			if cycle == 2 && (children[1].Revision == latestB.Revision || children[1].Intent != latestB.Intent) {
+			if cycle == 2 && (children[1].Computation == latestB.Computation || children[1].Intent != latestB.Intent) {
 				t.Fatal("same-version library edit did not change only implementation identity")
 			}
 			latestB = children[1]
