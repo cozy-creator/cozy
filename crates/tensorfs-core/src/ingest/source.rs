@@ -576,6 +576,13 @@ fn plan_source_prepared(
     // indexes are byte-identical, so its 48 members present 47 paths. Assignment is by
     // member and `read_carrier` is a read, so a repeated path costs one extra header read
     // and decides nothing.
+    let mut unique: Vec<CarrierInput> = Vec::with_capacity(carriers.len());
+    for carrier in carriers {
+        if !unique.contains(carrier) {
+            unique.push(carrier.clone());
+        }
+    }
+    let carriers = unique.as_slice();
     let mut members: Vec<&str> = carriers
         .iter()
         .filter_map(|carrier| carrier.member.as_deref())
@@ -584,7 +591,10 @@ fn plan_source_prepared(
     members.sort();
     members.dedup();
     if members.len() != member_count {
-        return refuse(Code::DUPLICATE_KEY, "reviewed members must be unique");
+        return refuse(
+            Code::DUPLICATE_KEY,
+            "one reviewed member names two different carriers",
+        );
     }
     for carrier in carriers {
         if let Some(member) = &carrier.member {
@@ -918,6 +928,40 @@ impl FileFence {
     }
 }
 
+/// Sort by `key` and merge identical rows. Two different rows under one key still refuse.
+fn merge_rows<T: Clone + PartialEq, K: Ord>(
+    what: &str,
+    rows: &mut Vec<T>,
+    key: impl Fn(&T) -> K,
+) -> Result<()> {
+    rows.sort_by_key(&key);
+    rows.dedup();
+    if rows.windows(2).any(|pair| key(&pair[0]) == key(&pair[1])) {
+        return refuse(
+            Code::DUPLICATE_KEY,
+            format!("{what} names one key twice with different values"),
+        );
+    }
+    Ok(())
+}
+
+/// The caller's rows in the one order the digest, plan and replay use.
+fn normalized(request: &PrepareModelSource) -> Result<PrepareModelSource> {
+    let mut request = request.clone();
+    merge_rows("source profiles", &mut request.profiles, |row| {
+        row.slot.clone()
+    })?;
+    merge_rows("verified source files", &mut request.roster, |row| {
+        row.member.clone()
+    })?;
+    merge_rows("source checkpoints", &mut request.checkpoints, |row| {
+        row.0.clone()
+    })?;
+    request.landed.sort();
+    request.landed.dedup();
+    Ok(request)
+}
+
 fn validate_request(
     request: &PrepareModelSource,
     registry: &FingerprintRegistry,
@@ -936,17 +980,6 @@ fn validate_request(
     if request.profiles.is_empty() || request.profiles.len() > 16 {
         return refuse(Code::COUNT_CAP, "source profile count is outside 1..=16");
     }
-    let profile_keys: Vec<&str> = request
-        .profiles
-        .iter()
-        .map(|row| row.slot.as_str())
-        .collect();
-    if profile_keys.windows(2).any(|window| window[0] >= window[1]) {
-        return refuse(
-            Code::SORT_ORDER,
-            "source profiles must be sorted uniquely by slot",
-        );
-    }
     for row in &request.profiles {
         ascii_name("source slot", &row.slot, crate::limits::MAX_NAME_BYTES)?;
         if !registry
@@ -964,17 +997,6 @@ fn validate_request(
         return refuse(
             Code::COUNT_CAP,
             "verified source file count is outside 1..=4096",
-        );
-    }
-    let members: Vec<&str> = request
-        .roster
-        .iter()
-        .map(|row| row.member.as_str())
-        .collect();
-    if members.windows(2).any(|window| window[0] >= window[1]) {
-        return refuse(
-            Code::SORT_ORDER,
-            "verified source files must be sorted uniquely by member",
         );
     }
     // Same rule as the plan above, stated where the object ids are still in hand: a path
@@ -997,7 +1019,6 @@ fn validate_request(
         }
     }
     let mut ready = std::collections::BTreeSet::new();
-    let mut seen = std::collections::BTreeSet::new();
     let mut fences = Vec::new();
     for row in &request.roster {
         fingerprint::validate_source_member(&row.member)?;
@@ -1040,9 +1061,6 @@ fn validate_request(
         }
     }
     for member in &request.landed {
-        if !seen.insert(member) {
-            return refuse(Code::DUPLICATE_KEY, "landed source member repeats");
-        }
         let row = request
             .roster
             .iter()
@@ -1148,6 +1166,7 @@ pub fn prepare_model_source_with_registry_budget(
     registry_bytes: &[u8],
     write_budget_bytes: Option<u64>,
 ) -> Result<PreparedModelSources> {
+    let request = &normalized(request)?;
     // The guard bridges local snapshot publication and recipient root adoption. A
     // predecessor can be released between them, but GC cannot remove the saved bytes.
     let _guard = crate::catalog::WriterGuard::acquire(store.root())?;
@@ -1746,6 +1765,7 @@ pub fn snapshot_model_source(
     registry_locator: &str,
     registry_bytes: &[u8],
 ) -> Result<Vec<SourceCheckpoint>> {
+    let request = &normalized(request)?;
     if request.adopt_from_operation_id.is_some() || !request.checkpoints.is_empty() {
         return refuse(
             Code::TRANSACTION_CONFLICT,
@@ -1969,6 +1989,41 @@ mod tests {
             adopt_from_operation_id: None,
         };
         (store, registry.to_bytes(), request)
+    }
+
+    #[test]
+    fn a_reordered_request_with_repeated_rows_is_the_same_request() {
+        let root = temporary("request-order");
+        let (store, registry, request) = fixture(&root, false);
+        let mut shuffled = request.clone();
+        shuffled.profiles.reverse();
+        shuffled.profiles.push(shuffled.profiles[0].clone());
+        shuffled.roster.reverse();
+        shuffled.roster.push(shuffled.roster[1].clone());
+        shuffled.landed.reverse();
+        shuffled.landed.push(shuffled.landed[0].clone());
+        let first =
+            prepare_model_source_with_registry(&store, &shuffled, "fixture:registry", &registry)
+                .unwrap();
+        assert!(first.complete && !first.replayed);
+        let replay =
+            prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
+                .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.sources, first.sources);
+
+        let mut conflict = request.clone();
+        conflict.operation_id = "model-source-conflict".into();
+        let mut other = conflict.profiles[0].clone();
+        other.profile = "fixture/second/1".into();
+        conflict.profiles.push(other);
+        assert_eq!(
+            prepare_model_source_with_registry(&store, &conflict, "fixture:registry", &registry)
+                .unwrap_err()
+                .code,
+            Code::DUPLICATE_KEY
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3675,17 +3730,32 @@ mod tests {
         .expect("two members sharing one path must plan");
         assert_eq!(prepared.files.len(), 2, "both members are planned");
 
-        // The member rule still holds: the SAME member twice is a real fault.
-        let repeated = vec![carriers[0].clone(), carriers[0].clone()];
-        match plan_source_prepared(
+        // The same row twice is one row; one member on two paths is a real conflict.
+        let repeated = vec![
+            carriers[0].clone(),
+            carriers[1].clone(),
+            carriers[0].clone(),
+        ];
+        let (_, again) = plan_source_prepared(
             "registry",
             &registry.to_bytes(),
             &repeated,
             Some("shared/pair/1"),
             None,
+        )
+        .expect("an identical repeated carrier row is merged");
+        assert_eq!(again.files.len(), 2);
+        let mut elsewhere = carriers[0].clone();
+        elsewhere.path = root.join("elsewhere.safetensors");
+        match plan_source_prepared(
+            "registry",
+            &registry.to_bytes(),
+            &[carriers[0].clone(), carriers[1].clone(), elsewhere],
+            Some("shared/pair/1"),
+            None,
         ) {
             Err(refusal) => assert_eq!(refusal.code, Code::DUPLICATE_KEY),
-            Ok(_) => panic!("one member twice must refuse"),
+            Ok(_) => panic!("one member on two paths must refuse"),
         }
         let _ = fs::remove_dir_all(root);
     }

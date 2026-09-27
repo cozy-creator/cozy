@@ -484,23 +484,36 @@ fn run_309s_eight_bytes_refuse_from_the_header_read() {
     );
 }
 
-/// RUN 294, for a fraction of a second. `DUPLICATE_KEY` on a repeated member is a fact
-/// about the member LIST — the smallest of the three inputs — and it decided a 210.3 GB
-/// run.
+/// RUN 294: a repeated member decided a 210.3 GB run. The same member listed twice is one
+/// member; only two DIFFERENT heads under one name is a fact about the list, and it is
+/// decided from headers, before the transfer.
 #[test]
-fn a_repeated_member_refuses_before_the_transfer() {
+fn a_repeated_member_merges_and_a_conflicting_one_refuses_before_the_transfer() {
     let mut heads = h3_heads();
     let repeat = heads[0].clone();
     heads.push(repeat);
-    let scratch = temporary("duplicate");
-    let refusal = preflight::plan(
+    let merged = preflight::plan(
         BUILTIN_REGISTRY,
         BUILTIN_REGISTRY_BYTES,
         &heads,
         &profiles(),
-        &scratch,
+        &temporary("duplicate"),
     )
-    .expect_err("a member may not repeat");
+    .expect("an identical repeated member is one member");
+    assert_eq!(merged.members, h3_heads().len());
+
+    let mut conflict = h3_heads();
+    let mut other = conflict[0].clone();
+    other.length += 1;
+    conflict.push(other);
+    let refusal = preflight::plan(
+        BUILTIN_REGISTRY,
+        BUILTIN_REGISTRY_BYTES,
+        &conflict,
+        &profiles(),
+        &temporary("conflict"),
+    )
+    .expect_err("one member with two heads must refuse");
     assert_eq!(refusal.code, Code::DUPLICATE_KEY);
 }
 
