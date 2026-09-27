@@ -252,9 +252,6 @@ func projectWheels(ctx context.Context, tree, out, name, release string, python 
 				name, release, fact.Distribution, fact.Version).
 				WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
 		}
-		if problem := validateProjectWheelDependencies(path); problem != nil {
-			return nil, problem
-		}
 		contents, problem := wheel.InspectContents(path)
 		if problem != nil {
 			return nil, problem
@@ -451,7 +448,7 @@ func readProjectDocument(path string) (projectMetadata, *exit.Error) {
 		return document, exit.Named(exit.Validation, "project_metadata_invalid",
 			"pyproject.toml is not valid TOML: %v", err)
 	}
-	return document, validateProjectDependencyPolicy(document)
+	return document, nil
 }
 
 func (document projectMetadata) projectIdentity() (struct {
