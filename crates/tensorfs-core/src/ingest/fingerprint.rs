@@ -508,34 +508,28 @@ impl FingerprintRegistry {
                 provenance,
             });
         }
+        // A newer registry's additional top-level sections belong to a newer reader.
         let source_profiles = match f.opt("source_profiles") {
             None => Vec::new(),
             Some(value) => parse_source_profiles(value)?,
         };
-        f.done()?;
-        let mut seen: Vec<(&str, &str, &str)> = entries
-            .iter()
-            .map(|e| {
-                (
-                    e.keyset_digest.as_str(),
-                    e.component.as_str(),
-                    e.tensor_schema_digest.as_str(),
-                )
-            })
-            .collect();
-        let given = seen.clone();
-        seen.sort();
-        if seen != given {
-            return refuse(
-                Code::SORT_ORDER,
-                "registry entries must be sorted by (keyset_digest, component, tensor_schema_digest)",
-            );
-        }
-        seen.dedup();
-        if seen.len() != entries.len() {
+        let key = |e: &Banked| {
+            (
+                e.keyset_digest.clone(),
+                e.component.clone(),
+                e.tensor_schema_digest.clone(),
+            )
+        };
+        entries.sort_by_key(key);
+        entries.dedup();
+        if entries
+            .windows(2)
+            .any(|pair| key(&pair[0]) == key(&pair[1]))
+        {
             return refuse(
                 Code::DUPLICATE_KEY,
-                "two entries bank the same (keyset_digest, component, tensor_schema_digest)",
+                "two entries bank the same (keyset_digest, component, tensor_schema_digest) \
+                 with different verdicts",
             );
         }
         for profile in &source_profiles {
@@ -997,12 +991,12 @@ mod tests {
         assert!(!String::from_utf8_lossy(&bytes).contains("format"));
         assert_eq!(FingerprintRegistry::parse(&bytes).unwrap(), registry);
 
-        let old = String::from_utf8(bytes)
+        let newer = String::from_utf8(bytes)
             .unwrap()
             .replacen('{', r#"{"format":"retired","#, 1);
         assert_eq!(
-            FingerprintRegistry::parse(old.as_bytes()).unwrap_err().code,
-            Code::UNKNOWN_FIELD
+            FingerprintRegistry::parse(newer.as_bytes()).unwrap(),
+            registry
         );
     }
 

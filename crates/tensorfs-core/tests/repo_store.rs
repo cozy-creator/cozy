@@ -260,6 +260,7 @@ fn local_alias_is_one_atomic_replaceable_checkpoint() {
                     repo: repo.clone(),
                     remove: Vec::new(),
                     set: vec![ReleaseLane {
+                        extra: Default::default(),
                         lane: "other".into(),
                         manifest: manifest_b.clone(),
                     }],
@@ -512,6 +513,7 @@ fn both_cas_domains_rebuild_after_projection_tables_are_emptied() {
                 repo: repo.clone(),
                 remove: Vec::new(),
                 set: vec![ReleaseLane {
+                    extra: Default::default(),
                     lane: "main".into(),
                     manifest: manifest_ref,
                 }],

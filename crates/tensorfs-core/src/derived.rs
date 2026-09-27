@@ -4191,6 +4191,7 @@ mod tests {
                     repo,
                     remove: Vec::new(),
                     set: vec![ReleaseLane {
+                        extra: Default::default(),
                         lane: "main".into(),
                         manifest: manifest_ref.clone(),
                     }],

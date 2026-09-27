@@ -53,7 +53,9 @@ fn cached_repository_satisfies(
                 } if remove.is_empty() => repository.releases.iter().any(|release| {
                     &release.version == version
                         && !release.yanked
-                        && set.iter().all(|lane| release.lanes.contains(lane))
+                        && set
+                            .iter()
+                            .all(|lane| release.lanes.iter().any(|held| held.same_target(lane)))
                 }),
                 _ => false,
             }
@@ -111,7 +113,7 @@ fn merge_cached_repository(
                         let actual = latest.and_then(|release| {
                             release.lanes.iter().find(|lane| lane.lane == wanted.lane)
                         });
-                        actual != Some(wanted) && actual != before
+                        !actual.is_some_and(|lane| lane.same_target(wanted)) && actual != before
                     })
                 {
                     return refuse(

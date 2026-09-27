@@ -104,7 +104,11 @@ header-declared tokenizer or other model asset through the same pinned verified 
 then checks its declared logical length and SHA-256. The supplied header must itself belong to
 the lease.
 
-Those three are the durable format contract. The frozen corpus also verifies the bounded
+Those three are the durable format contract. Repository and Manifest JSON evolve additively:
+a reader carries fields it does not know through every read and rewrite unchanged, so a
+document keeps its bytes and identity across versions, and GC keeps any object such a field
+names. A new entry kind, a changed field meaning or a new header format is a breaking change
+and refuses. The frozen corpus also verifies the bounded
 ingest, encoding-vector, and device-capability grammars that cross process boundaries:
 
 | grammar | where it lives |

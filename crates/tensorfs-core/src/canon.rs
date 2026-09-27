@@ -36,6 +36,14 @@ impl Value {
         v.sort_by(|a, b| a.0.cmp(&b.0));
         Value::Obj(v)
     }
+    /// `obj` plus the fields a parse carried through unread.
+    pub fn obj_with(pairs: Vec<(&str, Value)>, extra: &Extra) -> Value {
+        let mut v: Vec<(String, Value)> =
+            pairs.into_iter().map(|(k, x)| (k.to_string(), x)).collect();
+        v.extend(extra.0.iter().cloned());
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        Value::Obj(v)
+    }
     pub fn str(s: impl Into<String>) -> Value {
         Value::Str(s.into())
     }
@@ -357,7 +365,47 @@ impl<'a> P<'a> {
     }
 }
 
-// ---------------------------------------------------------------- strict field reader
+// ---------------------------------------------------------------- field reader
+
+/// Fields this build does not read. A stored document carries them through unchanged, so a
+/// newer writer's additions keep their bytes, identity and meaning across an older reader.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Extra(Vec<(String, Value)>);
+
+impl Extra {
+    /// Every `{sha256, length}` object anywhere in the unread fields. Reachability treats
+    /// them as referenced: GC never deletes what a newer writer may have named.
+    pub fn refs(&self) -> Vec<crate::ids::ObjectRef> {
+        fn walk(value: &Value, out: &mut Vec<crate::ids::ObjectRef>) {
+            match value {
+                Value::Arr(items) => items.iter().for_each(|item| walk(item, out)),
+                Value::Obj(pairs) => {
+                    let sha256 = pairs.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                        ("sha256", Value::Str(s)) => Some(s),
+                        _ => None,
+                    });
+                    let length = pairs.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                        ("length", Value::Int(n)) if *n >= 0 => Some(*n as u64),
+                        _ => None,
+                    });
+                    if let (Some(sha256), Some(length)) = (sha256, length) {
+                        if crate::ids::hex64("unread reference", sha256).is_ok() {
+                            out.push(crate::ids::ObjectRef {
+                                sha256: sha256.clone(),
+                                length,
+                            });
+                        }
+                    }
+                    pairs.iter().for_each(|(_, v)| walk(v, out));
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        self.0.iter().for_each(|(_, v)| walk(v, &mut out));
+        out
+    }
+}
 
 pub struct Fields<'a> {
     what: &'static str,
@@ -396,6 +444,8 @@ impl<'a> Fields<'a> {
     pub fn req_uint(&mut self, key: &str) -> Result<u64> {
         as_uint(self.what, key, self.req(key)?)
     }
+    /// End a document this build must understand completely: a command, or a record whose
+    /// unread field could change what it means.
     pub fn done(self) -> Result<()> {
         match self.left.first() {
             None => Ok(()),
@@ -404,6 +454,16 @@ impl<'a> Fields<'a> {
                 format!("{}: unknown field {k:?}", self.what),
             ),
         }
+    }
+
+    /// End a document that tolerates additive fields, keeping them for re-emission.
+    pub fn rest(self) -> Extra {
+        Extra(
+            self.left
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
     }
 }
 
