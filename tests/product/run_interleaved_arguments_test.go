@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -51,8 +52,8 @@ func TestRunDescribeAcceptsPayloadAfterOptions(t *testing.T) {
 	}
 }
 
-// The real CLI's job dry-run prints the exact composed payload, making order and
-// literal-value preservation observable without executing Python or renting.
+// The real CLI records the exact composed payload with the admitted run, making order and
+// literal-value preservation observable at admission.
 func interleavedAssetsRoot(t *testing.T, extra ...map[string]any) string {
 	t.Helper()
 	var doc map[string]any
@@ -85,14 +86,14 @@ func interleavedAssetsRoot(t *testing.T, extra ...map[string]any) string {
 	mux.HandleFunc("GET /v1/packages/proof/assets/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(detail)
 	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("metadata-only invocation reached %s %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	})
+	// Admitted runs are canceled once read; anything later in their lifecycle finds nothing.
+	mux.HandleFunc("/", http.NotFound)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
-	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
+	root, err := os.MkdirTemp(scratchBase, "submitted-run-")
+	must(t, err)
+	t.Cleanup(func() { _ = removeAllForce(root) })
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: proof\n"), 0600))
 	return root
 }
 
@@ -111,57 +112,53 @@ func TestInterleavedRunPreservesAssetsPayloadAndLiteralTail(t *testing.T) {
 	prompt := "Picture=1, with literal --asset and --model.model=words"
 	args := []string{"--json", "run", "proof/assets/prepare", "prompt=" + prompt,
 		"--asset", "first=" + images[0], "steps=30", "--asset=second=" + images[1],
-		"seed=24680", "--asset", "again=" + images[0], "--rental-only", "--dry-run", "--full"}
-	code, out := runCozy(t, root, args...)
-	var planned struct {
-		Input struct {
-			Prompt string
-			Steps  int
-			Seed   int
-			Assets []struct{ Asset, Label string }
-		}
+		"seed=24680", "--asset", "again=" + images[0], "--rental-only"}
+	request, _, out := submitRun(t, root, "interleaved", args...)
+	if request == nil {
+		t.Fatalf("interleaved run was not admitted: %s", out)
 	}
-	if code != 0 || json.Unmarshal([]byte(out), &planned) != nil {
-		t.Fatalf("interleaved dry-run failed: %d %s", code, out)
+	var input struct {
+		Prompt string
+		Steps  int
+		Seed   int
+		Assets []struct{ Asset, Label string }
 	}
-	input := planned.Input
+	must(t, json.Unmarshal(request.Payload, &input))
 	if input.Prompt != prompt || input.Steps != 30 || input.Seed != 24680 || len(input.Assets) != 3 {
-		t.Fatalf("payload changed: %s", out)
+		t.Fatalf("payload changed: %s", request.Payload)
 	}
 	labels := []string{input.Assets[0].Label, input.Assets[1].Label, input.Assets[2].Label}
 	if !reflect.DeepEqual(labels, []string{"first", "second", "again"}) || input.Assets[0].Asset != input.Assets[2].Asset || input.Assets[0].Asset == input.Assets[1].Asset {
-		t.Fatalf("asset occurrences reordered, collapsed, or changed: %s", out)
+		t.Fatalf("asset occurrences reordered, collapsed, or changed: %s", request.Payload)
 	}
 	// --in consumes exactly its following value; '=' in that filename stays a
 	// filename, while later payload terms still override its scalar values.
 	infile := filepath.Join(root, "request=seed.json")
 	must(t, os.WriteFile(infile, []byte(`{"prompt":"from file","steps":2}`), 0600))
-	code, out = runCozy(t, root, "run", "proof/assets/prepare", "--in", infile, "steps=7",
-		"--asset", images[0], "--rental-only", "--dry-run", "--json", "--full")
-	if code != 0 || !strings.Contains(out, `"prompt":"from file"`) || !strings.Contains(out, `"steps":7`) {
-		t.Fatalf("flag value or scalar override changed: %d %s", code, out)
+	request, _, out = submitRun(t, root, "interleaved-in", "run", "proof/assets/prepare", "--in", infile, "steps=7",
+		"--asset", images[0], "--rental-only", "--json")
+	if request == nil || submittedPayload(t, request)["prompt"] != "from file" || submittedPayload(t, request)["steps"] != float64(7) {
+		t.Fatalf("flag value or scalar override changed: %s", out)
 	}
-	base := []string{"--json", "run", "proof/assets/prepare", "--asset", images[0], "--rental-only", "--dry-run", "--full"}
-	code, out = runCozy(t, root, append(append([]string{}, base...), "--", "--looks-like-a-flag", "steps=9")...)
-	if code != 0 || !strings.Contains(out, `"prompt":"--looks-like-a-flag"`) || !strings.Contains(out, `"steps":9`) {
-		t.Fatalf("literal tail became options: %d %s", code, out)
+	base := []string{"--json", "run", "proof/assets/prepare", "--asset", images[0], "--rental-only"}
+	request, _, out = submitRun(t, root, "interleaved-tail", append(append([]string{}, base...), "--", "--looks-like-a-flag", "steps=9")...)
+	if request == nil || submittedPayload(t, request)["prompt"] != "--looks-like-a-flag" || submittedPayload(t, request)["steps"] != float64(9) {
+		t.Fatalf("literal tail became options: %s", out)
 	}
-	code, out = runCozy(t, root, append(append([]string{}, base...), "prompt=literal", "--", "--model.model=literal")...)
+	code, out := runCozy(t, root, append(append([]string{}, base...), "prompt=literal", "--", "--model.model=literal")...)
 	if code == 0 || !strings.Contains(out, `no request field`) || !strings.Contains(out, `--model.model`) {
 		t.Fatalf("literal dashed model argument became an override: %d %s", code, out)
-	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatal("dry-run started a daemon")
 	}
 }
 
 func TestInterleavedRunKeepsExplicitModelOverrides(t *testing.T) {
 	root, _, _, _, _ := runModelCatalog(t)
-	for _, model := range []string{"model.dits=proof/source@1.0.0/bf16", "--model.dits=proof/source@1.0.0/bf16"} {
-		code, out := runCozy(t, root, "--json", "run", "proof/quantize/quantize", "steps=7",
-			"--rental-only", model, "--publish-to", "proof/output", "model.shared=proof/source@1.0.0/bf16", "--dry-run", "--full")
-		if code != 0 || !strings.Contains(out, `"steps":7`) || !strings.Contains(out, `"slot":"dits"`) || !strings.Contains(out, `"slot":"shared"`) {
-			t.Fatalf("interleaved model override changed: %d %s", code, out)
+	for i, model := range []string{"model.dits=proof/source@1.0.0/bf16", "--model.dits=proof/source@1.0.0/bf16"} {
+		request, _, out := submitRun(t, root, fmt.Sprintf("interleaved-model-%d", i), "--json", "run", "proof/quantize/quantize", "steps=7",
+			"--rental-only", model, "--publish-to", "proof/output", "model.shared=proof/source@1.0.0/bf16")
+		if request == nil || submittedPayload(t, request)["steps"] != float64(7) || len(request.Models) != 2 ||
+			request.Models[0].Slot != "dits" || request.Models[1].Slot != "shared" {
+			t.Fatalf("interleaved model override changed: %+v %s", request, out)
 		}
 	}
 }

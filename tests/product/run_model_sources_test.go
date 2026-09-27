@@ -92,7 +92,11 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	}
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
-	root := t.TempDir()
+	// Runs start the daemon, whose children may still be leaving when the test ends;
+	// the root is reaped with the daemon rather than by the strict TempDir check.
+	root, err := os.MkdirTemp(scratchBase, "model-catalog-")
+	must(t, err)
+	t.Cleanup(func() { _ = removeAllForce(root) })
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: model-run-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	return root, &mu, &posts, digest, manifest
 }
@@ -143,7 +147,7 @@ func TestPinnedCheckpointTransferKeepsReleaseAndLaneConstraints(t *testing.T) {
 func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 	root, mu, posts, _, _ := runModelCatalog(t)
 	source := "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("4", 40)
-	base := []string{"run", "proof/quantize/quantize", "steps=4", "model.dits=" + source, "model.shared=" + source, "--publish-to", "proof/output", "--rental-only", "--dry-run", "--json"}
+	base := []string{"run", "proof/quantize/quantize", "steps=4", "model.dits=" + source, "model.shared=" + source, "--publish-to", "proof/output", "--rental-only", "--json"}
 	for _, test := range []struct {
 		name string
 		args []string
@@ -162,9 +166,6 @@ func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 				t.Fatalf("exit=%d: %s; want %s", code, out, test.want)
 			}
 		})
-	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatalf("preflight started a daemon: %v", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -188,13 +189,6 @@ func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
 	args := []string{"run", "proof/quantize/quantize", "steps=7",
 		"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
 		"--publish-to", "proof/output", "--rental-only", "--json", "--idempotency-key", "retained-model-job"}
-	code, out = runCozy(t, root, append(append([]string{}, args...), "--dry-run")...)
-	if code != 0 {
-		t.Fatalf("digest-only preflight refused: %d %s", code, out)
-	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatal("preflight started owner")
-	}
 	startDaemonProcess(t, root)
 	code, out = runCozy(t, root, args...)
 	if code != 0 {
@@ -261,15 +255,8 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 	input := filepath.Join(root, "quantize.json")
 	must(t, os.WriteFile(input, []byte(`{"steps":7}`), 0600))
 	args := []string{"run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--in", input, "--publish-to", "proof/output", "--rental-only", "--json", "--full", "--idempotency-key", "published-model-job"}
-	code, out := runCozy(t, root, append(append([]string{}, args...), "--dry-run")...)
-	if code != 0 || !strings.Contains(out, `"steps":7`) {
-		t.Fatalf("dry run lost typed payload: %d %s", code, out)
-	}
-	if _, err := os.Stat(filepath.Join(root, "daemon.lock")); !os.IsNotExist(err) {
-		t.Fatal("dry run started a daemon")
-	}
 	startDaemonProcess(t, root)
-	code, out = runCozy(t, root, args...)
+	code, out := runCozy(t, root, args...)
 	if code != 0 {
 		t.Fatalf("ordinary modeled job did not queue: %d %s", code, out)
 	}
@@ -332,8 +319,8 @@ func TestCatalogCheckpointReferenceRoundTripsThroughRun(t *testing.T) {
 	if ref != "proof/source#"+digest {
 		t.Fatalf("catalog emitted unsupported checkpoint syntax: %s", ref)
 	}
-	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "steps=7", "--model.dits="+ref, "--model.shared="+ref, "--rental-only", "--dry-run", "--json")
-	if code != 0 || !strings.Contains(out, `"hub_checkpoint":true`) {
-		t.Fatalf("copied catalog ref did not resolve checkpoint: %d %s", code, out)
+	request, _, out := submitRun(t, root, "catalog-checkpoint-ref", "run", "proof/quantize/quantize", "steps=7", "--model.dits="+ref, "--model.shared="+ref, "--rental-only", "--json")
+	if request == nil || len(request.Models) != 2 || !request.Models[0].HubCheckpoint || request.Models[0].Manifest != digest {
+		t.Fatalf("copied catalog ref did not resolve checkpoint: %+v %s", request, out)
 	}
 }

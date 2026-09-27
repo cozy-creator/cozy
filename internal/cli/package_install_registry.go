@@ -283,28 +283,6 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	if manifestPin != "" && resolved.ManifestID != manifestPin {
 		return empty, exit.Named(exit.Conflict, "model_resolution_changed", "resolved model differs from its checkpoint pin")
 	}
-	if cli.Inv.Bool("--dry-run") {
-		var root []byte
-		if resolved.Release == "" {
-			root, problem = hubClient.CheckpointManifest(ctx, fetch.Ref, resolved.ManifestID)
-		} else {
-			root, problem = hubClient.ReleaseManifest(ctx, fetch.Ref, resolved.Release, resolved.Lane)
-		}
-		if problem != nil {
-			return empty, problem
-		}
-		if !manifestBytes(root, resolved.ManifestID) && resolved.Release != "" {
-			// The lane moved since resolution; read the selected checkpoint itself.
-			if checkpoint, fallback := hubClient.CheckpointManifest(ctx, fetch.Ref, resolved.ManifestID); fallback == nil {
-				root = checkpoint
-			}
-		}
-		if !manifestBytes(root, resolved.ManifestID) {
-			return empty, exit.Named(exit.Conflict, "job.model_manifest_changed",
-				"Tensorhub serves no bytes for the selected checkpoint %s", resolved.ManifestID)
-		}
-		return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: fetch.Ref.String(), Release: resolved.Release, Lane: resolved.Lane, Manifest: resolved.ManifestID, ManifestLength: int64(len(root))}, nil
-	}
 	fetched, problem := fetch.Acquire(ctx, resolved)
 	if problem != nil {
 		return empty, problem

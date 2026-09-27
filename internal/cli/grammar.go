@@ -362,7 +362,6 @@ type RunExecuteCmd struct {
 	PublishTo       string   `help:"Store the job's declared weight outputs as checkpoints in org/model; no release is created."`
 	AllowPublish    []string `help:"Allow this rented transaction to publish only to org/model (repeatable)."`
 	SourceProfiles  []string `name:"source-profile" help:"Map a foreign model input to a reviewed TensorFS source profile as slot=profile (repeatable)."`
-	DryRun          bool     `help:"Resolve exact job inputs and conversion headers without queueing or renting."`
 	Await           bool     `help:"Show progress and wait for the result; --json writes JSONL events to stderr and one result to stdout."`
 	Describe        bool     `help:"Print the callable's request contract instead of running it."`
 }
@@ -375,12 +374,12 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
 		"--await", c.Await,
-		"--rental-only", c.RentalOnly, "--rent-new", c.RentNew, "--describe", c.Describe, "--dry-run", c.DryRun), values(
+		"--rental-only", c.RentalOnly, "--rent-new", c.RentNew, "--describe", c.Describe), values(
 		"--rental", rentalName, "--out", c.Out, "--timeout", c.Timeout,
 		"--attention-kernel", c.AttentionKernel, "--lora", c.LoRAs,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
-		"--publish-to", c.PublishTo, "--allow-publish", c.AllowPublish, "--source-profile", c.SourceProfiles), !c.DryRun && !c.Describe)
+		"--publish-to", c.PublishTo, "--allow-publish", c.AllowPublish, "--source-profile", c.SourceProfiles), !c.Describe)
 }
 
 type RunRetryPublicationCmd struct {

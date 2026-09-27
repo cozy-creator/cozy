@@ -2,12 +2,15 @@ package producttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // `seed: int | None` is the common optional scalar. Its bare `key=value` spelling must
@@ -29,9 +32,11 @@ func TestRunSpellsNullableScalarsFromPlainAssignment(t *testing.T) {
 	must(t, err)
 	must(t, png.Encode(file, image.NewRGBA(image.Rect(0, 0, 2, 2))))
 	must(t, file.Close())
-	dryRun := func(terms ...string) (int, string) {
+	submissions := 0
+	submit := func(terms ...string) (*records.Request, int, string) {
+		submissions++
 		args := append([]string{"--json", "run", "proof/assets/prepare", "prompt=p", "--asset", picture}, terms...)
-		return runCozy(t, root, append(args, "--rental-only", "--dry-run", "--full")...)
+		return submitRun(t, root, fmt.Sprintf("nullable-%d", submissions), append(args, "--rental-only")...)
 	}
 	for _, test := range []struct {
 		terms []string
@@ -44,13 +49,11 @@ func TestRunSpellsNullableScalarsFromPlainAssignment(t *testing.T) {
 		{[]string{"strength=2", "caption=a lighthouse"}, `{"caption":"a lighthouse","prompt":"p","strength":2}`},
 		{[]string{`noise_seed:=7000`, `caption:="null"`}, `{"caption":"null","noise_seed":7000,"prompt":"p"}`},
 	} {
-		code, out := dryRun(test.terms...)
-		var planned struct{ Input json.RawMessage }
-		if code != 0 || json.Unmarshal([]byte(out), &planned) != nil {
+		request, code, out := submit(test.terms...)
+		if request == nil {
 			t.Fatalf("%v refused: %d %s", test.terms, code, out)
 		}
-		var input map[string]any
-		must(t, json.Unmarshal(planned.Input, &input))
+		input := submittedPayload(t, request)
 		delete(input, "assets")
 		got, _ := json.Marshal(input)
 		if string(got) != test.want {
@@ -64,8 +67,8 @@ func TestRunSpellsNullableScalarsFromPlainAssignment(t *testing.T) {
 		{"mode=medium", "is declared"},
 		{"mask=/tmp/mask.png", "--asset"},
 	} {
-		code, out := dryRun(test.term)
-		if code == 0 || !strings.Contains(out, test.says) {
+		request, code, out := submit(test.term)
+		if code == 0 || request != nil || !strings.Contains(out, test.says) {
 			t.Fatalf("%s was not refused loudly: %d %s", test.term, code, out)
 		}
 	}

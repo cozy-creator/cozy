@@ -105,9 +105,6 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if callable.Kind == "job" && ctx.Inv.Value("--attention-kernel") != "" {
 		return exit.Usagef("--attention-kernel applies only to serving callables")
 	}
-	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--await") {
-		return exit.Usagef("--dry-run and --await conflict")
-	}
 	if callable.Kind != "job" {
 		if len(ctx.Inv.Values["--allow-publish"]) > 0 {
 			return exit.Usagef("--allow-publish applies only to Runtime-owned job transactions")
@@ -119,8 +116,8 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		if ctx.Inv.Value("--retry") != "" {
 			return exit.Usagef("--retry applies only to job transactions")
 		}
-		if ctx.Inv.Value("--publish-to") != "" || len(ctx.Inv.Values["--source-profile"]) > 0 || ctx.Inv.Bool("--dry-run") {
-			return exit.Usagef("--publish-to, --source-profile, and --dry-run apply only to job callables")
+		if ctx.Inv.Value("--publish-to") != "" || len(ctx.Inv.Values["--source-profile"]) > 0 {
+			return exit.Usagef("--publish-to and --source-profile apply only to job callables")
 		}
 		if len(ctx.Inv.Values["--input"]) > 0 {
 			return exit.Usagef("--input-tree applies only to a job callable")

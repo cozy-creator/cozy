@@ -1,6 +1,8 @@
 package producttest
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,13 +83,20 @@ def execute(payload: Input) -> Result:
 	if err := os.WriteFile(filepath.Join(project, "proof.py"), []byte(updated), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// An isolated hub that serves nothing: admission is observed, no machine is bought.
+	hub := httptest.NewServer(http.NotFoundHandler())
+	defer hub.Close()
+	must(t, os.WriteFile(filepath.Join(cfg.Home, config.FileName), []byte("tensorhub_url: "+hub.URL+"\n"), 0600))
 	began := time.Now()
-	status, out := runCozy(t, cfg.Home, "run", "local/remote-cli-proof/execute", "value=fresh", "--rental-only", "--dry-run", "--json", "--full")
-	if status != 0 {
-		t.Fatalf("remote invocation [%d]: %s", status, out)
+	// The daemon's own editable sync may hold the install writer as it starts; the CLI
+	// refuses rather than waits, so a retry follows that writer.
+	request, _, out := submitRun(t, cfg.Home, "remote-editable-fresh", "run", "local/remote-cli-proof/execute", "value=fresh", "--rental-only", "--json", "--full")
+	for attempt := 0; request == nil && strings.Contains(out, "another Cozy writer") && attempt < 20; attempt++ {
+		time.Sleep(250 * time.Millisecond)
+		request, _, out = submitRun(t, cfg.Home, "remote-editable-fresh", "run", "local/remote-cli-proof/execute", "value=fresh", "--rental-only", "--json", "--full")
 	}
-	if !strings.Contains(out, `"fresh"`) || !strings.Contains(out, `"planned"`) {
-		t.Fatalf("fresh schema did not reach remote submission planning: %s", out)
+	if request == nil || submittedPayload(t, request)["value"] != "fresh" {
+		t.Fatalf("fresh schema did not reach remote submission: %+v %s", request, out)
 	}
-	t.Logf("public cozy run remote capture and planning: %s", time.Since(began))
+	t.Logf("public cozy run remote capture and admission: %s", time.Since(began))
 }
