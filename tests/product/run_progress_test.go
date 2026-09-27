@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -107,7 +108,7 @@ func TestRunProgressSurfaces(t *testing.T) {
 	code, _, stderr := runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=3", "delay_ms=2500", "--await")
 	if code != 0 {
-		t.Fatalf("piped run failed [exit %d]\n%s", code, stderr)
+		t.Fatalf("piped run failed [exit %d]\n%s\n%s\ndaemon log:\n%s", code, stderr, productWorkerLogs(root), tail(filepath.Join(root, "daemon.log")))
 	}
 	if strings.ContainsAny(stderr, "\r\033") {
 		t.Fatalf("piped progress carries terminal control bytes\n%q", stderr)
@@ -284,8 +285,10 @@ func TestRunProgressSurfaces(t *testing.T) {
 
 	// The live inventory is a real terminal viewport: a wheel event moves the bounded page,
 	// q exits cleanly, and every input/mouse/output mode is restored without echoing keys.
-	// Seven terminal rows leave room for three data rows; four must scroll.
-	code, tty = ptyRunInput(t, root, 7,
+	// Five terminal rows hold the heading, three data rows and navigation; four must
+	// scroll. Paged run history has no census footer (its pages are not a count of all
+	// retained history), so nothing else takes a row.
+	code, tty = ptyRunInput(t, root, 5,
 		[][]byte{[]byte("\x1b[<65;2;3M"), []byte("q")}, "run", "list", "--limit", "10")
 	if code != 0 {
 		t.Fatalf("q did not exit the live list cleanly [exit %d]\n%q", code, tty)

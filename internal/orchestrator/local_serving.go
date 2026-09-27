@@ -252,7 +252,9 @@ func localDownloadSelection(models []ModelRef, packages []*pb.DownloadPackageRef
 }
 
 func stageLocalPreparationFiles(root, operation string, revision localpackage.Installation) ([]*pb.LocalPackageFile, *exit.Error) {
-	directory := filepath.Join(root, ".stage", operation, "files")
+	// Runtime accepts only carriers staged in the operation's wheel root (the machine
+	// transport stages there too); a source archive is one of those carriers.
+	directory := filepath.Join(root, ".stage", operation, "wheels")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return nil, exit.Internalf("cannot stage local package files: %s", err)
 	}
