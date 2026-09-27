@@ -3,8 +3,11 @@ package records
 import (
 	"database/sql"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
+
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // shape is what one records schema REQUIRES of a database: its tables and each table's
@@ -23,7 +26,8 @@ type requiredTable struct {
 }
 
 type requiredColumn struct {
-	name string
+	name     string
+	affinity string
 	// add is the ADD COLUMN definition that restores the column, or "" when SQLite
 	// cannot add it to an existing table (a primary-key column).
 	add string
@@ -108,9 +112,55 @@ func tableColumns(db schemaDB, table string) ([]requiredColumn, error) {
 		if err := rows.Scan(&name, &kind, &notNull, &fallback, &primary); err != nil {
 			return nil, err
 		}
-		out = append(out, requiredColumn{name: name, add: addColumn(name, kind, notNull != 0, fallback, primary != 0)})
+		out = append(out, requiredColumn{name: name, affinity: affinity(kind),
+			add: addColumn(name, kind, notNull != 0, fallback, primary != 0)})
 	}
 	return out, rows.Err()
+}
+
+// affinity is SQLite's type affinity for a declared column type.
+func affinity(kind string) string {
+	upper := strings.ToUpper(kind)
+	switch {
+	case strings.Contains(upper, "INT"):
+		return "INTEGER"
+	case strings.Contains(upper, "CHAR"), strings.Contains(upper, "CLOB"), strings.Contains(upper, "TEXT"):
+		return "TEXT"
+	case upper == "", strings.Contains(upper, "BLOB"):
+		return "BLOB"
+	case strings.Contains(upper, "REAL"), strings.Contains(upper, "FLOA"), strings.Contains(upper, "DOUB"):
+		return "REAL"
+	}
+	return "NUMERIC"
+}
+
+// compatibleAffinity answers whether values this build writes as `want` read back as it
+// expects from a column of affinity `have`. NUMERIC holds integers and reals alike.
+func compatibleAffinity(want, have string) bool {
+	numeric := func(a string) bool { return a == "INTEGER" || a == "REAL" || a == "NUMERIC" }
+	return want == have || numeric(want) && have == "NUMERIC" || want == "NUMERIC" && numeric(have)
+}
+
+// incompatible names the required columns a database holds with an incompatible type.
+func incompatible(db schemaDB, required shape) ([]string, error) {
+	var out []string
+	for _, table := range required.tables {
+		have, err := tableColumns(db, table.name)
+		if err != nil {
+			return nil, err
+		}
+		existing := make(map[string]string, len(have))
+		for _, column := range have {
+			existing[strings.ToLower(column.name)] = column.affinity
+		}
+		for _, column := range table.columns {
+			held, present := existing[strings.ToLower(column.name)]
+			if present && !compatibleAffinity(column.affinity, held) {
+				out = append(out, fmt.Sprintf("column %s.%s (%s, this build needs %s)", table.name, column.name, held, column.affinity))
+			}
+		}
+	}
+	return out, nil
 }
 
 // addColumn restores a missing column with its declared type and default. A NOT NULL
@@ -233,4 +283,37 @@ func presentObjects(db schemaDB) (map[string]bool, error) {
 		present[name] = true
 	}
 	return present, rows.Err()
+}
+
+// requireTables refuses a read-only source lacking a column, or holding one with an
+// incompatible type, of the named tables this build reads.
+func requireTables(db schemaDB, names ...string) *exit.Error {
+	required, err := requiredCurrentShape()
+	if err != nil {
+		return exit.Internalf("cannot derive current records schema: %s", err)
+	}
+	var subset shape
+	for _, table := range required.tables {
+		if slices.Contains(names, table.name) {
+			subset.tables = append(subset.tables, table)
+		}
+	}
+	lacking, err := missing(db, subset)
+	if err == nil {
+		var mismatched []string
+		mismatched, err = incompatible(db, subset)
+		lacking = append(lacking, mismatched...)
+	}
+	if err != nil || len(lacking) > 0 {
+		return exit.Named(exit.Validation, "package_inventory_source_schema_unsupported",
+			"package inventory source lacks what this build reads: %s%s", strings.Join(lacking, ", "), errText(err))
+	}
+	return nil
+}
+
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return " (" + err.Error() + ")"
 }

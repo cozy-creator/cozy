@@ -3,6 +3,9 @@ package launch
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -10,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 type RetainedModelResult struct {
@@ -19,12 +23,14 @@ type RetainedModelResult struct {
 	Retention *pb.DerivedRetentionRequest
 }
 
-// ValidateMachineModelResults checks only declared model positions, using the
-// exact captured result schema. Metadata is verified as a complete set before
-// any independent native hold is acquired.
-func ValidateMachineModelResults(schema json.RawMessage, envelope *pb.ResultEnvelope) ([]RetainedModelResult, bool, *exit.Error) {
-	refuse := func(message string) ([]RetainedModelResult, bool, *exit.Error) {
-		return nil, false, exit.Named(exit.Conflict, "machine_execution.model_result_invalid", "%s", message)
+// ValidateMachineModelResults checks only declared model positions, using the exact captured
+// result schema. Each model output stands on its own custody record: one that is missing,
+// duplicated with different bytes, or fails its integrity check fails alone with a warning,
+// and every other output is returned for collection. Only a result whose metadata cannot be
+// read at all is refused.
+func ValidateMachineModelResults(schema json.RawMessage, envelope *pb.ResultEnvelope) ([]RetainedModelResult, []string, bool, *exit.Error) {
+	refuse := func(message string) ([]RetainedModelResult, []string, bool, *exit.Error) {
+		return nil, nil, false, exit.Named(exit.Conflict, "machine_execution.model_result_invalid", "%s", message)
 	}
 	var declared Struct
 	if json.Unmarshal(schema, &declared) != nil {
@@ -32,21 +38,16 @@ func ValidateMachineModelResults(schema json.RawMessage, envelope *pb.ResultEnve
 	}
 	paths := ModelArtifactPaths(declared)
 	if len(paths) == 0 && len(envelope.GetRetainedModels()) == 0 {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	if envelope == nil || envelope.ResultBlob != nil || len(envelope.InlineResult) == 0 || len(envelope.RetainedModels) > 32 {
-		return refuse("model result needs its bounded inline result and complete custody descriptors")
+		return refuse("model result needs its bounded inline result and bounded custody descriptors")
 	}
 	drift, problem := ValidateMachineResult(schema, envelope)
 	if problem != nil {
 		return refuse(problem.Message)
 	}
-	for _, path := range paths {
-		if !drift.Usable(strings.Join(path, ".")) {
-			return refuse("a declared model output failed: " + strings.Join(drift.Warnings(), "; "))
-		}
-	}
-	inline := envelope.InlineResult
+	warnings := drift.Warnings()
 	expected := map[string][]byte{}
 	var visit func(json.RawMessage, []string, string)
 	visit = func(value json.RawMessage, path []string, pointer string) {
@@ -73,33 +74,83 @@ func ValidateMachineModelResults(schema json.RawMessage, envelope *pb.ResultEnve
 		}
 	}
 	for _, path := range paths {
-		visit(inline, path, "")
+		if !drift.Usable(strings.Join(path, ".")) {
+			continue // its result position already failed, and says why
+		}
+		visit(envelope.InlineResult, path, "")
 	}
-	if len(expected) != len(envelope.RetainedModels) {
-		return refuse("model result custody descriptors omit or add a declared artifact")
+	records_ := map[string]*pb.RetainedModelResult{}
+	failed := map[string]string{}
+	for _, retained := range envelope.RetainedModels {
+		if retained == nil || len(retained.ResultPointer) > 1024 || len(retained.ModelArtifactCanonicalBytes) > 4096 {
+			warnings = append(warnings, "the machine returned a malformed model custody record; ignored")
+			continue
+		}
+		pointer := retained.ResultPointer
+		if _, declared := expected[pointer]; !declared {
+			warnings = append(warnings, fmt.Sprintf("the machine returned model custody for %q, which the result does not declare; ignored", pointer))
+			continue
+		}
+		if prior, seen := records_[pointer]; seen {
+			if !proto.Equal(prior, retained) {
+				failed[pointer] = "the machine returned two different custody records for it"
+			}
+			continue
+		}
+		records_[pointer] = retained
 	}
 	var results []RetainedModelResult
-	for i, retained := range envelope.RetainedModels {
-		if retained == nil || len(retained.ResultPointer) > 1024 || len(retained.ModelArtifactCanonicalBytes) > 4096 ||
-			i > 0 && envelope.RetainedModels[i-1].ResultPointer >= retained.ResultPointer ||
-			!bytes.Equal(expected[retained.ResultPointer], retained.ModelArtifactCanonicalBytes) {
-			return refuse("model result pointer or exact artifact bytes differ from its schema position")
+	for _, pointer := range slices.Sorted(maps.Keys(expected)) {
+		retained := records_[pointer]
+		reason := failed[pointer]
+		if reason == "" && retained == nil {
+			reason = "the machine returned no custody record for it"
 		}
-		artifact, problem := records.DecodeModelArtifact(retained.ModelArtifactCanonicalBytes)
-		if problem != nil || artifact == nil || retained.Retention == nil {
-			return refuse("model result has no closed artifact and native custody descriptor")
+		var artifact *records.ModelArtifact
+		if reason == "" {
+			artifact, reason = verifyModelCustody(expected[pointer], retained)
 		}
-		receipt, err := canonical.Raw(artifact.TensorFSReceiptDigest)
-		if err != nil || !bytes.Equal(receipt, retained.Retention.TensorfsReceiptDigest) {
-			return refuse("model result names a different native receipt")
+		if reason != "" {
+			warnings = append(warnings, fmt.Sprintf("model output %q failed: %s", modelOutputName(pointer), reason))
+			continue
 		}
-		if _, err := canonical.Raw(retained.Retention.WeightsTransactionId); err != nil {
-			return refuse("model result has no actual native transaction identity")
-		}
-		if _, err := canonical.Raw(retained.Retention.RetentionId); err != nil {
-			return refuse("model result has no actual root-held retention identity")
-		}
-		results = append(results, RetainedModelResult{Pointer: retained.ResultPointer, Canonical: retained.ModelArtifactCanonicalBytes, Artifact: *artifact, Retention: retained.Retention})
+		results = append(results, RetainedModelResult{Pointer: pointer, Canonical: retained.ModelArtifactCanonicalBytes, Artifact: *artifact, Retention: retained.Retention})
 	}
-	return results, len(paths) > 0, nil
+	return results, warnings, len(paths) > 0, nil
+}
+
+// verifyModelCustody is one model output's own integrity check: its custody record names
+// the exact artifact at its schema position, that artifact's native receipt, and actual
+// transaction and root-held retention identities.
+func verifyModelCustody(expected []byte, retained *pb.RetainedModelResult) (*records.ModelArtifact, string) {
+	if !bytes.Equal(expected, retained.ModelArtifactCanonicalBytes) {
+		return nil, "its custody record names different artifact bytes than its result position"
+	}
+	artifact, problem := records.DecodeModelArtifact(retained.ModelArtifactCanonicalBytes)
+	if problem != nil || artifact == nil || retained.Retention == nil {
+		return nil, "its custody record has no closed artifact and native custody descriptor"
+	}
+	receipt, err := canonical.Raw(artifact.TensorFSReceiptDigest)
+	if err != nil || !bytes.Equal(receipt, retained.Retention.TensorfsReceiptDigest) {
+		return nil, "its custody record names a different native receipt"
+	}
+	if _, err := canonical.Raw(retained.Retention.WeightsTransactionId); err != nil {
+		return nil, "its custody record has no actual native transaction identity"
+	}
+	if _, err := canonical.Raw(retained.Retention.RetentionId); err != nil {
+		return nil, "its custody record has no actual root-held retention identity"
+	}
+	return artifact, ""
+}
+
+// modelOutputName spells an RFC 6901 result pointer as the dotted output path.
+func modelOutputName(pointer string) string {
+	if pointer == "" {
+		return "result"
+	}
+	parts := strings.Split(strings.TrimPrefix(pointer, "/"), "/")
+	for i, part := range parts {
+		parts[i] = strings.ReplaceAll(strings.ReplaceAll(part, "~1", "/"), "~0", "~")
+	}
+	return strings.Join(parts, ".")
 }

@@ -21,6 +21,9 @@ import (
 type MachineResultDrift struct {
 	Ignored []string          // undeclared result field paths
 	Failed  map[string]string // declared top-level output -> why it cannot be used
+	// bare is a result declared as one type rather than a struct of outputs; its one
+	// output is named "result".
+	bare bool
 }
 
 // Warnings renders the drift as the one-line warnings a run records.
@@ -38,6 +41,9 @@ func (d MachineResultDrift) Warnings() []string {
 // Usable answers whether the declared output holding this path was read.
 func (d MachineResultDrift) Usable(path string) bool {
 	top, _, _ := strings.Cut(path, ".")
+	if d.bare {
+		top = "result"
+	}
 	_, failed := d.Failed[top]
 	return !failed
 }
@@ -62,6 +68,17 @@ func ValidateMachineResult(schema json.RawMessage, envelope *pb.ResultEnvelope) 
 	decoder.UseNumber()
 	if decoder.Decode(&value) != nil {
 		return drift, exit.New(exit.Conflict, "machine result is unreadable")
+	}
+	var shape map[string]json.RawMessage
+	if json.Unmarshal(schema, &shape) != nil || shape["fields"] == nil {
+		// One declared type is one output.
+		drift.bare = true
+		var ignored []string
+		if problem := validateRendered(schema, value, "result", &reading{ignored: &ignored}); problem != nil {
+			drift.Failed["result"] = problem.Message
+		}
+		drift.Ignored = ignored
+		return drift, nil
 	}
 	object, ok := value.(map[string]any)
 	if !ok {

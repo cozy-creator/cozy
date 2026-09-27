@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -27,11 +28,18 @@ func retainedModelEnvelope(t *testing.T) (json.RawMessage, *pb.ResultEnvelope) {
 
 func TestMachineModelCollectionRequiresCompleteHashedDescriptors(t *testing.T) {
 	schema, envelope := retainedModelEnvelope(t)
-	models, native, problem := launch.ValidateMachineModelResults(schema, envelope)
+	models, warnings, native, problem := launch.ValidateMachineModelResults(schema, envelope)
 	fatal(t, problem)
-	if !native || len(models) != 1 || models[0].Pointer != "" || models[0].Artifact.ProducerRequestID != "runtime-child-with-no-client-row" {
-		t.Fatal("root borrowed artifact was not validated without a Creator producer row")
+	if !native || len(models) != 1 || len(warnings) != 0 || models[0].Pointer != "" || models[0].Artifact.ProducerRequestID != "runtime-child-with-no-client-row" {
+		t.Fatalf("root borrowed artifact was not validated without a Creator producer row: %v", warnings)
 	}
+	// An exact repeat of one custody record is that record.
+	repeated := proto.Clone(envelope).(*pb.ResultEnvelope)
+	repeated.RetainedModels = append(repeated.RetainedModels, proto.Clone(repeated.RetainedModels[0]).(*pb.RetainedModelResult))
+	if models, _, _, problem := launch.ValidateMachineModelResults(schema, repeated); problem != nil || len(models) != 1 {
+		t.Fatalf("an exact repeated custody record was not one record: %d %v", len(models), problem)
+	}
+	// Each defect fails the output it belongs to, with a warning, and refuses nothing else.
 	for name, change := range map[string]func(*pb.ResultEnvelope){
 		"missing metadata": func(value *pb.ResultEnvelope) { value.RetainedModels = nil },
 		"wrong pointer":    func(value *pb.ResultEnvelope) { value.RetainedModels[0].ResultPointer = "/model" },
@@ -41,15 +49,18 @@ func TestMachineModelCollectionRequiresCompleteHashedDescriptors(t *testing.T) {
 		},
 		"missing actual transaction": func(value *pb.ResultEnvelope) { value.RetainedModels[0].Retention.WeightsTransactionId = "" },
 		"missing root custody":       func(value *pb.ResultEnvelope) { value.RetainedModels[0].Retention.RetentionId = "" },
-		"duplicate": func(value *pb.ResultEnvelope) {
-			value.RetainedModels = append(value.RetainedModels, proto.Clone(value.RetainedModels[0]).(*pb.RetainedModelResult))
+		"different duplicate": func(value *pb.ResultEnvelope) {
+			other := proto.Clone(value.RetainedModels[0]).(*pb.RetainedModelResult)
+			other.Retention.RetentionId = childDigest("a")
+			value.RetainedModels = append(value.RetainedModels, other)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			changed := proto.Clone(envelope).(*pb.ResultEnvelope)
 			change(changed)
-			if _, _, problem := launch.ValidateMachineModelResults(schema, changed); problem == nil {
-				t.Fatal("changed model custody descriptor was accepted")
+			models, warnings, _, problem := launch.ValidateMachineModelResults(schema, changed)
+			if problem != nil || len(models) != 0 || !strings.Contains(strings.Join(warnings, "\n"), `model output "result" failed`) {
+				t.Fatalf("a changed custody record did not fail its output alone: %d %v %v", len(models), warnings, problem)
 			}
 		})
 	}
@@ -64,15 +75,16 @@ func TestMachineModelCollectionUsesSchemaPointersNotLookalikeFields(t *testing.T
 	must(t, err)
 	envelope.InlineResult, envelope.ResultSchemaDigest = inline, canonical.Digest(schema)
 	envelope.RetainedModels[0].ResultPointer = "/models~1~0/0"
-	models, native, problem := launch.ValidateMachineModelResults(schema, envelope)
+	models, _, native, problem := launch.ValidateMachineModelResults(schema, envelope)
 	fatal(t, problem)
 	if !native || len(models) != 1 || models[0].Pointer != "/models~1~0/0" {
 		t.Fatal("model list or RFC6901 escaping changed")
 	}
 	schema = json.RawMessage(`{"fields":[],"tag":null,"tag_field":""}`)
 	envelope.ResultSchemaDigest = canonical.Digest(schema)
-	if _, _, problem := launch.ValidateMachineModelResults(schema, envelope); problem == nil {
-		t.Fatal("a model-shaped value outside the schema gained custody")
+	models, warnings, _, problem := launch.ValidateMachineModelResults(schema, envelope)
+	if problem != nil || len(models) != 0 || !strings.Contains(strings.Join(warnings, "\n"), "which the result does not declare; ignored") {
+		t.Fatalf("a model-shaped value outside the schema gained custody: %d %v %v", len(models), warnings, problem)
 	}
 }
 

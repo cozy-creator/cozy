@@ -19,6 +19,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func (p *fakePod) RetainDerivedResult(ctx context.Context, call *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error) {
+	if p.derivedRetain == nil {
+		return nil, status.Error(codes.Unimplemented, "derived retain not configured")
+	}
+	return p.derivedRetain(ctx, call)
+}
+
 func (p *fakePod) ReleaseDerivedRetention(ctx context.Context, call *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error) {
 	if p.derivedRelease == nil {
 		return nil, status.Error(codes.Unimplemented, "derived release not configured")

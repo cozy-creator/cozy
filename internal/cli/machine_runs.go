@@ -643,8 +643,21 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 		return exit.New(exit.Conflict, "machine outcome is not its canonical document")
 	}
 	plan, planProblem := m.planMachineFiles(request, outcome, &body)
-	if len(link.Outcome) == 0 && plan != nil {
-		for _, warning := range plan.warnings {
+	modelPlan, modelProblem := m.planMachineModels(request, connection, &body)
+	if len(link.Outcome) == 0 {
+		var warnings []string
+		if plan != nil {
+			warnings = append(warnings, plan.warnings...)
+		}
+		if modelPlan != nil {
+			warnings = append(warnings, modelPlan.warnings...)
+		}
+		seen := map[string]bool{}
+		for _, warning := range warnings {
+			if seen[warning] {
+				continue // a result position both collectors read warns once
+			}
+			seen[warning] = true
 			if problem := m.store.AppendEvent(request.ID, "request.warning", int64(outcome.AttemptOrdinal), map[string]any{"message": warning}); problem != nil {
 				return problem
 			}
@@ -661,7 +674,10 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 			return problem
 		}
 	}
-	models, problem := m.collectMachineModels(ctx, request, connection, outcome, &body)
+	if modelProblem != nil {
+		return modelProblem
+	}
+	models, problem := m.collectMachineModels(ctx, request, connection, outcome, modelPlan)
 	if problem != nil {
 		return problem
 	}

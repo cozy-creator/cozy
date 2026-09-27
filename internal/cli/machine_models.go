@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -11,46 +12,66 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-func (m *machineRuns) collectMachineModels(ctx context.Context, request records.Request, connection *machineConnection, outcome *pb.AttemptOutcome, body *pb.AttemptOutcomeBody) (bool, *exit.Error) {
+// machineModelPlan is what one outcome's model outputs leave to collect. Each model output
+// stands on its own custody record; one that fails is a warning, never the others' loss.
+type machineModelPlan struct {
+	models   []launch.RetainedModelResult
+	warnings []string
+	native   bool
+}
+
+func (m *machineRuns) planMachineModels(request records.Request, connection *machineConnection, body *pb.AttemptOutcomeBody) (*machineModelPlan, *exit.Error) {
 	if body.Result == nil || !request.ChildArtifacts && len(body.Result.RetainedModels) == 0 {
-		return false, nil
+		return nil, nil
 	}
 	surface, problem := m.resolver.capturedResultInterface(request)
 	if problem != nil {
-		return false, problem
+		return nil, problem
 	}
 	entrypoint, problem := surface.Function(request.Entrypoint)
 	if problem != nil {
-		return false, problem
+		return nil, problem
 	}
 	if body.Result.ResultBlob != nil {
-		return false, nil // ordinary file custody needs its separate byte transport
+		return nil, nil // ordinary file custody needs its separate byte transport
 	}
 	if len(launch.ModelArtifactPaths(entrypoint.Result)) > 0 && connection.wireMinor < 53 {
-		return false, exit.Named(exit.Unavailable, "machine_execution.model_collection_upgrade_required", "native model collection requires actual Runtime protocol 53; its result remains retained")
+		return nil, exit.Named(exit.Unavailable, "machine_execution.model_collection_upgrade_required", "native model collection requires actual Runtime protocol 53; its result remains retained")
 	}
 	schema, problem := machineResultSchema(surface, request.Entrypoint)
 	if problem != nil {
-		return false, problem
+		return nil, problem
 	}
-	models, native, problem := launch.ValidateMachineModelResults(schema, body.Result)
-	if problem != nil || !native {
-		return native, problem
+	models, warnings, native, problem := launch.ValidateMachineModelResults(schema, body.Result)
+	if problem != nil {
+		return nil, problem
+	}
+	plan := &machineModelPlan{models: models, warnings: warnings, native: native}
+	if !native {
+		return plan, nil
 	}
 	for _, ref := range body.WeightsReceipts {
 		var output pb.WeightsReceipt
 		if ref == nil || !bytes.Equal(canonical.Digest(ref.WeightsReceiptCanonicalBytes), ref.WeightsReceiptDigest) || canonical.Unmarshal(ref.WeightsReceiptCanonicalBytes, &output) != nil {
-			return false, exit.New(exit.Conflict, "machine model output receipt changed its exact bytes")
+			plan.warnings = append(plan.warnings, "the machine returned a weights receipt whose bytes do not match its digest; ignored")
+			continue
 		}
 		covered := false
 		for _, model := range models {
 			covered = covered || output.WeightsTransactionId == model.Retention.WeightsTransactionId && output.TensorfsReceiptDigest == model.Artifact.TensorFSReceiptDigest
 		}
 		if !covered {
-			return false, exit.Named(exit.Unavailable, "machine_execution.result_custody_required", "a declared model output has no returned artifact custody descriptor; outputs remain retained")
+			plan.warnings = append(plan.warnings, fmt.Sprintf("weights transaction %s has no collected model output; it is not collected", output.WeightsTransactionId))
 		}
 	}
-	for _, model := range models {
+	return plan, nil
+}
+
+func (m *machineRuns) collectMachineModels(ctx context.Context, request records.Request, connection *machineConnection, outcome *pb.AttemptOutcome, plan *machineModelPlan) (bool, *exit.Error) {
+	if plan == nil || !plan.native {
+		return plan != nil && plan.native, nil
+	}
+	for _, model := range plan.models {
 		hold := records.MachineModelRetention{
 			OutcomeID: outcome.OutcomeId, ResultPointer: model.Pointer, Artifact: model.Canonical,
 			TransactionID: model.Retention.WeightsTransactionId, ReceiptDigest: model.Retention.TensorfsReceiptDigest,
