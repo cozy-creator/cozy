@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,6 +79,8 @@ type fakePod struct {
 	controlDefaults
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey
+	// rebooted is the boot a restarted pod came back on; nil keeps its first boot.
+	rebooted   atomic.Pointer[string]
 	wireMinor  uint32 // zero uses the current protocol; tests can negotiate an older peer
 	leafDigest []byte
 	// mutateHostDigest is the red arm: the host document's digest stops hashing its bytes.
@@ -183,6 +186,9 @@ func (p *fakePod) workerID() string {
 	return "wrk-" + p.identity
 }
 func (p *fakePod) bootID() string {
+	if boot := p.rebooted.Load(); boot != nil {
+		return *boot
+	}
 	if p.identity == "" {
 		return podBootID
 	}

@@ -69,10 +69,32 @@ func (s *Store) ReconcileEndedMachineExecutions() *exit.Error {
 	return nil
 }
 
+// LoseMachineExecution settles one accepted execution its machine proved it no longer
+// holds (the worker restarted without its execution workspace). The machine and its
+// other work continue.
+func (s *Store) LoseMachineExecution(id, machine, message string) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin lost execution: %s", err)
+	}
+	defer tx.Rollback()
+	if problem := settleLost(tx, machine, id, message); problem != nil {
+		return problem
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit lost execution: %s", err)
+	}
+	return nil
+}
+
 // settleLostMachine ends every obligation on a machine proven gone. A run whose offer
 // never left this host is released to be placed again, charging nothing. A sent offer
 // may have executed, and that execution and its bytes died with the machine.
 func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
+	return settleLost(tx, machine, "", "")
+}
+
+func settleLost(tx *sql.Tx, machine, request, lost string) *exit.Error {
 	var cause string
 	if err := tx.QueryRow(`SELECT failure_code FROM rentals WHERE id=?`, machine).Scan(&cause); err != nil && err != sql.ErrNoRows {
 		return exit.Internalf("cannot read lost machine cause: %s", err)
@@ -80,7 +102,7 @@ func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
 	rows, err := tx.Query(`SELECT r.id,r.state,r.retain_work,r.rental=1 AND r.requested_rental='',
  e.cancel_requested,length(e.submission)>0,length(e.receipt)>0,length(e.outcome)>0
  FROM machine_executions e JOIN requests r ON r.id=e.request_id
- WHERE e.machine_id=? AND `+machineExecutionOwed, machine)
+ WHERE e.machine_id=? AND (?='' OR e.request_id=?) AND `+machineExecutionOwed, machine, request, request)
 	if err != nil {
 		return exit.Internalf("cannot read destroyed machine observers: %s", err)
 	}
@@ -122,6 +144,9 @@ func settleLostMachine(tx *sql.Tx, machine string) *exit.Error {
 		message := "rented machine was confirmed destroyed; its execution and retained bytes can no longer be observed"
 		if !value.submitted {
 			message = "rented machine was confirmed destroyed before this run was submitted to it"
+		}
+		if lost != "" {
+			message = lost
 		}
 		detail := map[string]any{
 			"machine_id": machine, "error_type": "machine_execution.state_lost", "error": message,

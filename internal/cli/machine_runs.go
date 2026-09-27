@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -701,8 +702,13 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 			return problem
 		}
 	}
-	state, err := connection.client.GetMachineExecution(ctx, query)
+	var trailer metadata.MD
+	state, err := connection.client.GetMachineExecution(ctx, query, grpc.Trailer(&trailer))
 	if err != nil {
+		if slices.Contains(trailer.Get("cozy-error-code"), "execution_workspace_changed") {
+			return m.store.LoseMachineExecution(request.ID, link.MachineID,
+				"the machine no longer holds this run's execution workspace (its worker restarted or the workspace was replaced); the run failed alone and the machine keeps its other work")
+		}
 		return machineTransport(err)
 	}
 	progress.Advance(1)
