@@ -211,7 +211,7 @@ func TestImageSourceProbeDoesNotHashTheLargeSource(t *testing.T) {
 	if length != sourceLength || mime != "image/png" {
 		t.Fatalf("header/stat probe changed facts: %d %s", length, mime)
 	}
-	if _, _, _, problem := inputasset.Fingerprint(path, 1024); problem == nil {
+	if _, problem := inputasset.Fingerprint(path, 1024); problem == nil {
 		t.Fatal("admitted byte bound was widened by the header probe")
 	}
 }

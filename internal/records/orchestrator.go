@@ -574,6 +574,9 @@ type AssetBinding struct {
 	MediaType string             `json:"media_type,omitempty"`
 	Order     uint32             `json:"order"`
 	MaxBytes  int64              `json:"max_bytes,omitempty"`
+	// ModTime is the file's modification time, in Unix nanoseconds, when Digest was
+	// computed. While the file keeps this time and Length, Digest still names its bytes.
+	ModTime int64 `json:"mtime_ns,omitempty"`
 }
 
 // ModelRef is one exact user-selected model binding. Creator resolves the human

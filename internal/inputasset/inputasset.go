@@ -32,8 +32,7 @@ func ValidateID(fieldPath string) *exit.Error {
 	return nil
 }
 
-// Probe reads only a regular file's stat and MIME prefix. It creates no identity;
-// the prepared or original bytes still pass through Fingerprint before admission.
+// Probe reads only a regular file's stat and MIME prefix. It creates no identity.
 func Probe(path string) (int64, string, *exit.Error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -55,24 +54,33 @@ func Probe(path string) (int64, string, *exit.Error) {
 	return info.Size(), normalizeMediaType(http.DetectContentType(prefix[:n])), nil
 }
 
+// Facts are one file's identity as Fingerprint read it.
+type Facts struct {
+	Length    int64
+	Digest    string
+	MediaType string
+	// ModTime is the file's modification time, in Unix nanoseconds, before it was read.
+	ModTime int64
+}
+
 // Fingerprint streams one bounded regular file and returns the identity facts used by
 // both the request record and InvocationSpec. Encoded media never enters a whole-file
 // buffer. Unknown media type stays empty.
-func Fingerprint(path string, max int64) (int64, string, string, *exit.Error) {
+func Fingerprint(path string, max int64) (Facts, *exit.Error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return 0, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
+		return Facts{}, exit.New(exit.NotFound, "input asset %s: %s", path, err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return 0, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
+		return Facts{}, exit.New(exit.NotFound, "input asset %s: %s", path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return 0, "", "", exit.New(exit.Validation, "input asset %s is not a regular file", path)
+		return Facts{}, exit.New(exit.Validation, "input asset %s is not a regular file", path)
 	}
 	if max > 0 && info.Size() > max {
-		return 0, "", "", overCap(path, info.Size(), max)
+		return Facts{}, overCap(path, info.Size(), max)
 	}
 	hash := sha256.New()
 	prefix := make([]byte, 0, 512)
@@ -83,7 +91,7 @@ func Fingerprint(path string, max int64) (int64, string, string, *exit.Error) {
 		if n > 0 {
 			length += int64(n)
 			if max > 0 && length > max {
-				return 0, "", "", overCap(path, length, max)
+				return Facts{}, overCap(path, length, max)
 			}
 			_, _ = hash.Write(buffer[:n])
 			if len(prefix) < cap(prefix) {
@@ -95,26 +103,40 @@ func Fingerprint(path string, max int64) (int64, string, string, *exit.Error) {
 			break
 		}
 		if readErr != nil {
-			return 0, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, readErr)
+			return Facts{}, exit.New(exit.NotFound, "input asset %s: %s", path, readErr)
 		}
 	}
 	if length != info.Size() {
-		return 0, "", "", exit.Named(exit.Conflict, "input_asset_changed",
+		return Facts{}, exit.Named(exit.Conflict, "input_asset_changed",
 			"input asset %s changed length while it was fingerprinted", filepath.Base(path))
 	}
-	digest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
-	mediaType := normalizeMediaType(http.DetectContentType(prefix))
-	return length, digest, mediaType, nil
+	return Facts{Length: length, Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil)),
+		MediaType: normalizeMediaType(http.DetectContentType(prefix)), ModTime: info.ModTime().UnixNano()}, nil
 }
 
-// Verify proves that the borrowed file still matches the request row before a grant is
-// minted. A mutable path can therefore never silently change an idempotent request.
+// unchanged answers whether a file still has the size and modification time its recorded
+// digest was computed at, so that digest still names its bytes without reading them.
+func unchanged(path string, binding records.AssetBinding) (os.FileInfo, bool) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, false
+	}
+	return info, binding.ModTime != 0 && info.Size() == binding.Length && info.ModTime().UnixNano() == binding.ModTime
+}
+
+// Verify proves that the borrowed file still holds the request's bytes before a grant is
+// minted, so a mutable path can never silently change an idempotent request. The digest
+// recorded when the asset was attached is reused while the file keeps that size and
+// modification time; a changed file is hashed again and must still match.
 func Verify(binding records.AssetBinding, max int64) *exit.Error {
-	length, digest, _, e := Fingerprint(binding.LocalPath, max)
+	if _, same := unchanged(binding.LocalPath, binding); same {
+		return nil
+	}
+	facts, e := Fingerprint(binding.LocalPath, max)
 	if e != nil {
 		return e
 	}
-	if digest != binding.Digest || length != binding.Length {
+	if facts.Digest != binding.Digest || facts.Length != binding.Length {
 		return exit.Named(exit.Conflict, "input_asset_changed",
 			"input asset %s no longer matches its request identity", binding.FieldPath).
 			WithRemedy("keep the original file available and unchanged until the request finishes; restore its original bytes before retrying")
@@ -122,8 +144,11 @@ func Verify(binding records.AssetBinding, max int64) *exit.Error {
 	return nil
 }
 
-// Bind verifies a caller's identity claims while retaining the original path. No file
-// is copied or owned by Creator; dispatch verifies it again before minting access.
+// Bind admits a caller's asset while retaining the original path. No file is copied or
+// owned by Creator. A caller that fingerprinted the file already names its digest, size and
+// modification time; while the file still has them, that digest is its identity and the
+// bytes are not read again. Otherwise the file is hashed here and must match what the
+// caller declared.
 func Bind(binding records.AssetBinding, max int64) (records.AssetBinding, *exit.Error) {
 	if binding.FieldPath == "" {
 		return binding, exit.New(exit.Validation, "an input asset names no request field path")
@@ -135,23 +160,34 @@ func Bind(binding records.AssetBinding, max int64) (records.AssetBinding, *exit.
 	if err != nil {
 		return binding, exit.New(exit.NotFound, "cannot resolve input asset %s: %s", binding.LocalPath, err)
 	}
-	length, digest, mediaType, e := Fingerprint(path, max)
+	if info, same := unchanged(path, binding); same && binding.Digest != "" {
+		if max > 0 && info.Size() > max {
+			return binding, overCap(path, info.Size(), max)
+		}
+		_, mediaType, e := Probe(path)
+		if e != nil {
+			return binding, e
+		}
+		binding.LocalPath, binding.MediaType = path, mediaType
+		return binding, nil
+	}
+	facts, e := Fingerprint(path, max)
 	if e != nil {
 		return binding, e
 	}
-	if binding.Digest != "" && binding.Digest != digest {
+	if binding.Digest != "" && binding.Digest != facts.Digest {
 		return binding, exit.Named(exit.Validation, "input_digest_mismatch",
 			"input asset %s was declared as %s and its bytes hash to %s",
-			binding.FieldPath, binding.Digest, digest)
+			binding.FieldPath, binding.Digest, facts.Digest)
 	}
-	if binding.Length != 0 && binding.Length != length {
+	if binding.Length != 0 && binding.Length != facts.Length {
 		return binding, exit.Named(exit.Validation, "input_length_mismatch",
 			"input asset %s was declared as %d B and holds %d B",
-			binding.FieldPath, binding.Length, length)
+			binding.FieldPath, binding.Length, facts.Length)
 	}
 	// The type the bytes sniff as wins over a caller's label for the same bytes.
 	binding.LocalPath = path
-	binding.Digest, binding.Length, binding.MediaType = digest, length, mediaType
+	binding.Digest, binding.Length, binding.MediaType, binding.ModTime = facts.Digest, facts.Length, facts.MediaType, facts.ModTime
 	return binding, nil
 }
 

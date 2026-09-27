@@ -160,10 +160,11 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []st
 				}
 			}
 		}
-		length, digest, mediaType, e := inputasset.Fingerprint(absolute, maxBytes)
+		facts, e := inputasset.Fingerprint(absolute, maxBytes)
 		if e != nil {
 			return nil, nil, e
 		}
+		length, digest, mediaType := facts.Length, facts.Digest, facts.MediaType
 		selected, admitted := AssetSpecForMedia(ep, fieldPath, mediaType)
 		if !admitted || !selected.AcceptsMediaType(mediaType) {
 			return nil, nil, exit.New(exit.Validation,
@@ -180,6 +181,7 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs, fidelities []st
 		assets = append(assets, records.AssetBinding{
 			FieldPath: fieldPath, LocalPath: absolute, Digest: digest,
 			Length: length, MediaType: mediaType, Order: pathOrder(parts), MaxBytes: maxBytes,
+			ModTime: facts.ModTime,
 		})
 	}
 	if problem := ValidateAssetCounts(ep, assets); problem != nil {
