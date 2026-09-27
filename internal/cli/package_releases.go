@@ -16,12 +16,27 @@ import (
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 var immutablePackageVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
+
+// installableInterface refuses a release its installers would refuse: publish reads the staged
+// interface through the same launch.DecodePackageInterface every install runs.
+func installableInterface(path string) *exit.Error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return exit.Internalf("cannot read the staged package interface: %s", err)
+	}
+	if _, problem := launch.DecodePackageInterface(raw); problem != nil {
+		problem.Message = "this release would not install: " + problem.Message
+		return problem
+	}
+	return nil
+}
 
 func handlePackagePublish(ctx *Context) *exit.Error {
 	publishStarted := time.Now()
@@ -68,7 +83,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		if problem := pack.BuildForPublish(hctx, namespace, ctx.Inv.Values["--wheel"]...); problem != nil {
 			return problem
 		}
-		return nil
+		return installableInterface(pack.PackageInterface)
 	}); problem != nil {
 		return problem
 	}
