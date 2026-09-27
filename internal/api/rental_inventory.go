@@ -25,6 +25,15 @@ type RentalInventory struct {
 	// OtherHubs counts this host's live rentals on hubs this read did not cover, so a
 	// listing scoped to one hub never hides a machine billing on another.
 	OtherHubs []HubRentals `json:"other_hubs,omitempty"`
+	// UnreadableHubs are the hubs an every-hub read could not ask. Each one's rows are
+	// this host's records, marked unverified; every other hub is still listed.
+	UnreadableHubs []HubProblem `json:"unreadable_hubs,omitempty"`
+}
+
+// HubProblem is why one Tensorhub could not be read.
+type HubProblem struct {
+	Hub   string      `json:"hub"`
+	Error *exit.Error `json:"error"`
 }
 
 // HubRentals is one Tensorhub's count of live rentals recorded on this host.
@@ -74,6 +83,9 @@ type RentalSummary struct {
 	// HubUnknown is a host record the Hub answered 404 for: kept, because a missing
 	// Hub record is not proof the provider pod is gone.
 	HubUnknown bool `json:"hub_unknown,omitempty"`
+
+	// Unverified marks a row whose hub could not be asked: this host's last record only.
+	Unverified bool `json:"unverified,omitempty"`
 }
 
 // Activity is absent for machines known only to the Hub: this daemon cannot

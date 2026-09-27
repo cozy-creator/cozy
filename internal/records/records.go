@@ -56,6 +56,9 @@ type PackageInstall struct {
 	BytesExcl          int64
 	BytesShared        int64
 	CreatedAt          string
+	// Hub is the Tensorhub a published install came from; "" for a local install. A
+	// database opened by an older build adds the column empty (the configured hub).
+	Hub string
 }
 
 // Pin is the package's one active install. Major remains recorded for package metadata
@@ -101,7 +104,8 @@ CREATE TABLE IF NOT EXISTS installs (
   placement_set_digest TEXT  NOT NULL DEFAULT '',
   bytes_excl    INTEGER NOT NULL,
   bytes_shared  INTEGER NOT NULL,
-  created_at    TEXT    NOT NULL
+  created_at    TEXT    NOT NULL,
+  hub           TEXT    NOT NULL DEFAULT ''
 )`
 
 const pinsDDL = `
@@ -1299,12 +1303,28 @@ func placeholders() string {
 }
 
 func scanInstall(rows interface{ Scan(...any) error }) (PackageInstall, error) {
+	return scanInstallFields(rows, false)
+}
+
+// installHubCols is installCols plus the install's hub, for readers of the current
+// schema. Package recovery reads a backup through installCols alone.
+func installHubCols(alias string) string { return installCols(alias) + "," + alias + "hub" }
+
+func scanInstallHub(rows interface{ Scan(...any) error }) (PackageInstall, error) {
+	return scanInstallFields(rows, true)
+}
+
+func scanInstallFields(rows interface{ Scan(...any) error }, withHub bool) (PackageInstall, error) {
 	var inst PackageInstall
 	var verified int
-	err := rows.Scan(&inst.ID, &inst.Package, &inst.Major, &inst.Version, &inst.SourceKind, &inst.SourceRef,
+	targets := []any{&inst.ID, &inst.Package, &inst.Major, &inst.Version, &inst.SourceKind, &inst.SourceRef,
 		&verified, &inst.Dir, &inst.Python, &inst.Runtime, &inst.ProjectDir, &inst.UV, &inst.Platform,
 		&inst.Extra, &inst.Packages, &inst.Closure, &inst.PlacementSetDigest,
-		&inst.BytesExcl, &inst.BytesShared, &inst.CreatedAt)
+		&inst.BytesExcl, &inst.BytesShared, &inst.CreatedAt}
+	if withHub {
+		targets = append(targets, &inst.Hub)
+	}
+	err := rows.Scan(targets...)
 	inst.Verified = verified == 1
 	return inst, err
 }
@@ -1342,12 +1362,12 @@ func (s *Store) recordInstall(inst PackageInstall, activate bool) (string, *exit
 	if inst.Verified {
 		verified = 1
 	}
-	if _, err := tx.Exec(`INSERT INTO installs(`+installCols("")+`)
-		VALUES(`+placeholders()+`)`,
+	if _, err := tx.Exec(`INSERT INTO installs(`+installHubCols("")+`)
+		VALUES(`+placeholders()+`,?)`,
 		inst.ID, inst.Package, inst.Major, inst.Version, inst.SourceKind, inst.SourceRef,
 		verified, inst.Dir, inst.Python, inst.Runtime, inst.ProjectDir, inst.UV, inst.Platform, inst.Extra,
 		inst.Packages, inst.Closure, inst.PlacementSetDigest,
-		inst.BytesExcl, inst.BytesShared, inst.CreatedAt); err != nil {
+		inst.BytesExcl, inst.BytesShared, inst.CreatedAt, strings.TrimRight(inst.Hub, "/")); err != nil {
 		return "", exit.Internalf("cannot insert install %s: %s", inst.ID, err)
 	}
 	if activate {
@@ -1404,7 +1424,7 @@ func (s *Store) ActivePin(pkg string, major int) (*Pin, *PackageInstall, *exit.E
 }
 
 func (s *Store) Install(id string) (*PackageInstall, *exit.Error) {
-	inst, err := scanInstall(s.db.QueryRow(`SELECT `+installCols("")+` FROM installs WHERE id=?`, id))
+	inst, err := scanInstallHub(s.db.QueryRow(`SELECT `+installHubCols("")+` FROM installs WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1444,7 +1464,7 @@ func (s *Store) SourceEnvironments(pkg, version string) ([]PackageInstall, *exit
 // Installed is every active package pin joined to its install, package ordered.
 // This is what `cozy package list` reads — records only, never a walk of the filesystem.
 func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
-	rows, err := s.db.Query(`SELECT ` + installCols("i.") + `
+	rows, err := s.db.Query(`SELECT ` + installHubCols("i.") + `
 		FROM installs i JOIN pins p ON p.install_id = i.id
 		ORDER BY i.package, i.major`)
 	if err != nil {
@@ -1453,7 +1473,7 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 	defer rows.Close()
 	var out []PackageInstall
 	for rows.Next() {
-		inst, err := scanInstall(rows)
+		inst, err := scanInstallHub(rows)
 		if err != nil {
 			return nil, exit.Internalf("cannot read an install record: %s", err)
 		}

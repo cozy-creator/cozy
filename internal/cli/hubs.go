@@ -105,9 +105,14 @@ func handleHubUse(ctx *Context) *exit.Error {
 	if selected, _, problem := config.ResolveHub(ctx.Inv.Args[0], ctx.Cfg.Hubs); problem == nil &&
 		ctx.Cfg.StaticToken() && selected != ctx.Cfg.ConfiguredHubURL {
 		// The operator token names no hub of its own: switching would carry it along.
+		target := ctx.Inv.Args[0]
 		return exit.Named(exit.Conflict, "hub.static_token_bound",
-			"an operator token (tensorhub_token or TENSORHUB_TOKEN) is configured for %s", ctx.Cfg.ConfiguredHubURL).
-			WithRemedy("remove it before switching hubs, or use --tensorhub=%s for one command", ctx.Inv.Args[0])
+			"the operator token set by %s belongs to %s; switching the current hub would send it to %s",
+			strings.Join(ctx.Cfg.StaticTokenSettings(), " and "), ctx.Cfg.ConfiguredHubURL, target).
+			WithRemedy("remove %s, then run `cozy hub use %s` again; each hub then uses its own machine login. "+
+				"To address %s for one command instead, pass --tensorhub=%s, which never sends the token",
+				strings.Join(ctx.Cfg.StaticTokenSettings(), " and "), target, target, target).
+			WithNext("cozy auth login <email> --tensorhub="+target, "cozy hub use "+target)
 	}
 	origin, problem := config.UseHub(ctx.Cfg.Home, ctx.Inv.Args[0], ctx.Cfg.Hubs)
 	if problem != nil {
@@ -181,4 +186,18 @@ func existingRecords(ctx *Context) (*records.Store, bool) {
 		return nil, true
 	}
 	return store, true
+}
+
+// adoptInstallHub points a local run of a published install at the hub it came from, so
+// its model bindings are that hub's. An explicit --tensorhub is kept.
+func adoptInstallHub(ctx *Context, install records.PackageInstall) {
+	if install.SourceKind != "tensorhub" || install.Hub == "" || ctx.Cfg.HubURLSource == "flag" {
+		return
+	}
+	origin, invalid := config.HubOrigin(install.Hub)
+	if invalid != nil {
+		return
+	}
+	scoped := ctx.forHub(origin)
+	ctx.Cfg, ctx.AccountAuth = scoped.Cfg, scoped.AccountAuth
 }

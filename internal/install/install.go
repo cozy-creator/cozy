@@ -80,6 +80,9 @@ type PublishedSource struct {
 	// admin-credentialed daemon's report lands; everyone else still refuses the
 	// install locally, which is the load-bearing half.
 	ReportDefect func(code, detail string)
+
+	// Hub is the Tensorhub origin the release was read from; the install records it.
+	Hub string
 }
 
 type PublishedModel struct {
@@ -251,6 +254,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(exit.Internalf("cannot create the package install directory: %s", err))
 		}
 		inst.SourceKind, inst.SourceRef = "tensorhub", req.Published.Package+"@"+req.Published.Release
+		inst.Hub = req.Published.Hub
 		inst.Package, inst.Version, inst.ProjectDir = req.Published.Package, req.Published.Release,
 			filepath.Join(installDir, "source")
 		if e := validatePublished(inst, req.Published); e != nil {
@@ -311,7 +315,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 	if !req.Snapshot && prior != nil && priorInstall != nil && priorInstall.SourceKind == inst.SourceKind &&
 		priorInstall.Package == inst.Package && priorInstall.Version == inst.Version &&
-		inst.SourceKind == "tensorhub" {
+		inst.SourceKind == "tensorhub" && (priorInstall.Hub == "" || priorInstall.Hub == inst.Hub) {
 		res.Idempotent = true
 		res.Install = *priorInstall
 		_ = os.RemoveAll(installDir)

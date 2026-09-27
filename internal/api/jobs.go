@@ -164,7 +164,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		sub.RequestedRental = prior.RequestedRental
 		sub.RetryOf, sub.Worker = prior.ID, prior.Worker
 		// A retry continues its predecessor's work, which belongs to that request's hub.
-		selectedHub = prior.Hub
+		selectedHub = s.requestHub(*prior)
 		sub.RetainWork = true
 		sub.Rental, sub.RentalRequired = prior.Rental, prior.RentalRequired
 	}
@@ -191,8 +191,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	var spec orchestrator.Submission
-	if existing != nil && existing.Hub != selectedHub {
-		s.refuseTyped(w, r, idempotencyHubConflict(key, existing.Hub, selectedHub))
+	if existing != nil && s.requestHub(*existing) != selectedHub {
+		s.refuseTyped(w, r, idempotencyHubConflict(key, s.requestHub(*existing), selectedHub))
 		return
 	}
 	if existing != nil {

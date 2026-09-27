@@ -22,7 +22,7 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 	defer fleet.mu.Unlock()
 	origin = fleet.origin(origin)
 	if !allHubs {
-		result, problem := fleet.inventoryLocked(st, origin, reconcile)
+		result, problem := fleet.inventoryLocked(st, origin, reconcile, false)
 		if problem != nil {
 			return result, problem
 		}
@@ -36,14 +36,21 @@ func readRentalInventory(st *records.Store, fleet *managedRentals, origin string
 	if !slices.Contains(origins, origin) {
 		origins = append(origins, origin)
 	}
+	// One hub that cannot be read never hides another: its problem is named, its rows
+	// are this host's records marked unverified, and every other hub is listed as usual.
 	var merged api.RentalInventory
 	for _, each := range origins {
-		result, problem := fleet.inventoryLocked(st, each, reconcile)
+		result, problem := fleet.inventoryLocked(st, each, reconcile, true)
 		if problem != nil {
 			return merged, problem
 		}
-		if result.HubUnanswered != nil && merged.HubUnanswered == nil {
-			merged.HubUnanswered = result.HubUnanswered
+		if result.HubUnanswered != nil {
+			merged.UnreadableHubs = append(merged.UnreadableHubs, api.HubProblem{Hub: each, Error: result.HubUnanswered})
+			for _, rows := range [][]api.RentalSummary{result.Rentals, result.Pending} {
+				for i := range rows {
+					rows[i].Unverified = true
+				}
+			}
 		}
 		merged.MachinesRunning += result.MachinesRunning
 		merged.HourlySpendUSDMicros += result.HourlySpendUSDMicros
@@ -75,11 +82,16 @@ func otherHubRentals(st *records.Store, fleet *managedRentals, origin string) ([
 	return out, nil
 }
 
-func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, reconcile bool) (api.RentalInventory, *exit.Error) {
+// inventoryLocked is one hub's fleet. isolated keeps any problem asking that hub in
+// HubUnanswered, with this host's records, so an every-hub read can continue past it.
+func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, reconcile, isolated bool) (api.RentalInventory, *exit.Error) {
 	var result api.RentalInventory
 	if reconcile {
 		if problem := fleet.reconcileLocked(origin); problem != nil && !hub.Unanswered(problem) {
-			return result, problem
+			if !isolated {
+				return result, problem
+			}
+			result.HubUnanswered = problem
 		}
 	}
 	// totalsLocked propagates a failed Hub census and refuses when the Hub has
@@ -87,7 +99,8 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, r
 	// records marked as such, never totals: the caller must still fail.
 	count, burn, problem := fleet.totalsLocked(origin)
 	switch {
-	case hub.Unanswered(problem):
+	case result.HubUnanswered != nil:
+	case hub.Unanswered(problem) || problem != nil && isolated:
 		result.HubUnanswered = problem
 	case problem != nil:
 		return result, problem

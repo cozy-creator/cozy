@@ -955,7 +955,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 			last = time.Now()
 		}
 		ctx.exitCode = 0
-		if inventory.HubUnanswered != nil {
+		if inventory.HubUnanswered != nil || len(inventory.UnreadableHubs) > 0 {
 			ctx.exitCode = 1
 		}
 		list := renderRentalList(ctx.Cfg, inventory, allHubs)
@@ -1033,6 +1033,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if r.HubUnknown {
 			state += " (unknown to Hub)"
 		}
+		if r.Unverified {
+			state += " (unverified)"
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU), "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
 			"state": state, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
@@ -1057,6 +1060,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		}
 		if gpus, ok := gpuCount(r.AcceleratorModel, r.AcceleratorCount); ok {
 			typed["gpus"] = gpus
+		}
+		if r.Unverified {
+			typed["unverified"] = true
 		}
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
@@ -1164,9 +1170,13 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	unattached := len(inventory.Pending)
 	for _, op := range inventory.Pending {
 		machine := op.MachineName
+		state := humanRentalState(op.State)
+		if op.Unverified {
+			state += " (unverified)"
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": machine, "sku": orNone(op.SKU), "gpus": gpuCell(op.AcceleratorModel, op.AcceleratorCount),
-			"state":   humanRentalState(op.State),
+			"state":   state,
 			"failure": "—", "uptime": rentalUptime(op.RentedAt), "running": "0", "queued": "0",
 			"idle": "—", "rental": orNone(op.ID), "bought for": orNone(op.BoughtFor),
 			"accelerator": "—", "address": "", "media": "", "hub": op.Hub,
@@ -1179,6 +1189,9 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"machine": machine, "state": op.State, "rental_id": op.ID,
 			"running": 0, "queued": 0, "hourly_rate_usd_micros": op.HourlyRateUSDMicros,
 			"accelerator_count": 0, "operation": op.Operation, "attached": false,
+		}
+		if op.Unverified {
+			typed["unverified"] = true
 		}
 		for key, value := range map[string]string{"sku": op.SKU, "hub": op.Hub,
 			"rented_at": op.RentedAt, "bought_for": op.BoughtFor} {
@@ -1210,6 +1223,22 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 // hub must never hide a running machine.
 func hubRentalsView(cfg config.Config, list *output.List, inventory api.RentalInventory, allHubs bool) {
 	list.Aggregates = append(list.Aggregates, output.Field{K: "hub", V: jsonFact{cfg.HubURL}})
+	if len(inventory.UnreadableHubs) > 0 {
+		unreadable := make([]map[string]any, 0, len(inventory.UnreadableHubs))
+		for _, problem := range inventory.UnreadableHubs {
+			reason := problem.Error.Message
+			if len(problem.Error.Next) > 0 {
+				reason += " (next: " + problem.Error.Next[0] + ")"
+			}
+			list.Lead = append(list.Lead, fmt.Sprintf("hub %s unreachable: %s; its rentals may still be billing",
+				cfg.HubLabel(problem.Hub), reason))
+			unreadable = append(unreadable, map[string]any{"hub": problem.Hub,
+				"code": problem.Error.ErrName(), "message": problem.Error.Message})
+		}
+		list.Aggregates = append(list.Aggregates, output.Field{K: "unreadable_hubs", V: jsonFact{unreadable}})
+		list.TypedFields = append(slices.Clone(list.TypedFields), "unverified")
+		list.TypedAllFields = append(slices.Clone(list.TypedAllFields), "unverified")
+	}
 	if allHubs {
 		list.Fields = append(slices.Clone(list.Fields), "hub")
 		list.TypedFields = append(slices.Clone(list.TypedFields), "hub")

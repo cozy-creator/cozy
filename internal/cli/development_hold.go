@@ -34,7 +34,7 @@ type developmentTarget struct {
 	certificate []byte
 }
 
-func inspectDevelopmentTarget(layout home.Layout, store *records.Store, cfg config.Config, rentalID, bootID string) (*developmentTarget, *exit.Error) {
+func inspectDevelopmentTarget(layout home.Layout, store *records.Store, rentalID, bootID string) (*developmentTarget, *exit.Error) {
 	if rentalID == "" || bootID == "" {
 		return nil, exit.Usagef("development hold requires exact rental and boot identities")
 	}
@@ -42,8 +42,9 @@ func inspectDevelopmentTarget(layout home.Layout, store *records.Store, cfg conf
 	if problem != nil {
 		return nil, problem
 	}
-	if row == nil || row.State != "ready" || row.Hub != cfg.HubURL || row.ExpectedWorkerBootID != bootID || row.ExpectedWorkerID == "" {
-		return nil, exit.Named(exit.Conflict, "development_hold_identity_changed", "development rental is not ready on the exact Hub and worker boot")
+	// The hold contacts no hub; the rental's own recorded hub is authoritative.
+	if row == nil || row.State != "ready" || row.ExpectedWorkerBootID != bootID || row.ExpectedWorkerID == "" {
+		return nil, exit.Named(exit.Conflict, "development_hold_identity_changed", "development rental is not ready on the exact worker boot")
 	}
 	instance := (orchestrator.WorkerLaunchSpec{Connection: &orchestrator.WorkerConnection{RentalID: rentalID}}).InstanceID()
 	attempts, problem := store.OpenAttemptsOf(instance)
@@ -91,7 +92,7 @@ func InspectStoredDevelopmentHold(cfg config.Config, rentalID, bootID string) (*
 		return nil, problem
 	}
 	defer store.Close()
-	target, problem := inspectDevelopmentTarget(layout, store, cfg, rentalID, bootID)
+	target, problem := inspectDevelopmentTarget(layout, store, rentalID, bootID)
 	if problem != nil {
 		return nil, problem
 	}
@@ -122,7 +123,7 @@ func HoldStoredDevelopmentWorker(ctx context.Context, cfg config.Config, rentalI
 		return problem
 	}
 	defer store.Close()
-	frozen, problem := inspectDevelopmentTarget(layout, store, cfg, rentalID, bootID)
+	frozen, problem := inspectDevelopmentTarget(layout, store, rentalID, bootID)
 	if problem != nil {
 		return problem
 	}
@@ -135,7 +136,7 @@ func HoldStoredDevelopmentWorker(ctx context.Context, cfg config.Config, rentalI
 	var acceptedEpoch uint64
 	delay := 250 * time.Millisecond
 	for ctx.Err() == nil {
-		target, problem := inspectDevelopmentTarget(layout, store, cfg, rentalID, bootID)
+		target, problem := inspectDevelopmentTarget(layout, store, rentalID, bootID)
 		if problem != nil {
 			return problem
 		}

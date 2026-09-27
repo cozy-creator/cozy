@@ -68,6 +68,9 @@ type Config struct {
 	HubTokenSource        string
 	configuredToken       secret.Value
 	configuredTokenSource string
+	// tokenSettings names every place the operator token is set, so a refusal can say
+	// exactly what to remove.
+	tokenSettings []string
 
 	HuggingFaceToken       secret.Value
 	HuggingFaceTokenSource string
@@ -329,6 +332,10 @@ func (c Config) ForHub(origin string) Config {
 // ConfiguredHubURL, so moving the current hub would silently carry it elsewhere.
 func (c Config) StaticToken() bool { return c.configuredToken.Present() }
 
+// StaticTokenSettings names where the operator token is set: the config.yaml key and
+// the environment variable, each as the reader must remove it.
+func (c Config) StaticTokenSettings() []string { return c.tokenSettings }
+
 func (c Config) hubNamed(origin string) string {
 	names := make([]string, 0, len(c.Hubs))
 	for name, url := range c.Hubs {
@@ -454,6 +461,14 @@ func load() (Config, *exit.Error) {
 		c.HubTokenSource = "unset"
 	}
 	c.configuredToken, c.configuredTokenSource = c.HubToken, c.HubTokenSource
+	if hubToken.Present() {
+		if file.has("tensorhub_token") {
+			c.tokenSettings = append(c.tokenSettings, "the tensorhub_token line in "+filepath.Join(home, FileName))
+		}
+		if environment.has("tensorhub_token") {
+			c.tokenSettings = append(c.tokenSettings, "the TENSORHUB_TOKEN environment variable")
+		}
+	}
 	if !huggingFaceToken.Present() {
 		c.HuggingFaceTokenSource = "unset"
 	}

@@ -670,12 +670,15 @@ cozy --tensorhub=tensorhub model search minimax   # one command, any hub
 ```
 
 One daemon serves every hub at once, and switching never restarts it. Each run, rental,
-model transfer and publication keeps the hub it was created on, and work on it (ending a
-rental, keepalive, collection, publication) goes to that hub with that hub's own machine
-login; a credential is only ever sent to the origin it was issued for, so each hub needs its
-own `cozy auth login --tensorhub=<hub>`. `cozy rental list` and `cozy run list` show the current
-hub; `--all-hubs` shows every hub, and `rental list` names other hubs with live rentals.
-`tensorhub_token` belongs to the configured hub only, and `cozy hub use` refuses to move it.
+model transfer, publication and published package install keeps the hub it was created on,
+and work on it (ending a rental, keepalive, collection, publication, `package update-all`, a
+local run's model bindings) goes to that hub with that hub's own machine login; a credential
+is only ever sent to the origin it was issued for, so each hub needs its own
+`cozy auth login --tensorhub=<hub>`. `cozy rental list` and `cozy run list` show the current
+hub; `--all-hubs` shows every hub, and `rental list` names other hubs with live rentals. A hub
+that cannot be read is named on its own line, its rentals shown unverified, and every other hub
+is still listed. `tensorhub_token` belongs to the configured hub only, and `cozy hub use`
+refuses to move it until it is removed.
 
 The YAML schema is strict: unknown keys, duplicate keys, undeclared nested structures, and multiple
 documents are refused. Cozy does not load a working-directory `.env` file.

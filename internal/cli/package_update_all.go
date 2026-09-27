@@ -25,10 +25,22 @@ func handlePackageUpdateAll(ctx *Context) *exit.Error {
 		Machine:   []string{"error_code"},
 	}
 	counts := map[string]int{"updated": 0, "current": 0, "failed": 0, "skipped": 0}
+	otherHub := false
 	for _, prior := range installed {
-		row := updateInstalledPackage(ctx, prior)
+		// Each install is checked against the hub it came from; an unreadable hub fails
+		// only its own packages.
+		scoped := ctx.forHub(prior.Hub)
+		row := updateInstalledPackage(scoped, prior)
+		if prior.SourceKind == "tensorhub" {
+			row["hub"] = ctx.Cfg.HubLabel(scoped.Cfg.HubURL)
+			otherHub = otherHub || scoped.Cfg.HubURL != ctx.Cfg.HubURL
+		}
 		list.Rows = append(list.Rows, row)
 		counts[row["status"]]++
+	}
+	list.AllFields = append(list.AllFields, "hub")
+	if otherHub {
+		list.Fields = append(list.Fields, "hub")
 	}
 	for _, status := range []string{"updated", "current", "failed", "skipped"} {
 		list.Aggregates = append(list.Aggregates, output.Field{K: status, V: counts[status]})
