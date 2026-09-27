@@ -185,7 +185,7 @@ func machineSubmission(request records.Request, capture localpackage.ExecutionCa
 	sort.Slice(inputs, func(i, j int) bool { return inputs[i].InputId < inputs[j].InputId })
 	prepared.Revision, prepared.WireMinor, prepared.Posture = 1, pb.WireMinor, pb.Posture_POSTURE_ACCEPTING
 	return &pb.MachineExecutionSubmit{
-		SubmissionId: request.IdemKey, CaptureCanonicalBytes: capture.Canonical, CaptureDigest: capture.Digest,
+		SubmissionId: records.MachineSubmissionID(request.IdemKey), CaptureCanonicalBytes: capture.Canonical, CaptureDigest: capture.Digest,
 		PayloadCanonicalBytes: request.Payload, MaxAttempts: uint32(MaxRequeues + 1),
 		Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, PlacementId: placementID,
 			InvocationSpecCanonicalBytes: raw, InvocationSpecDigest: digest,

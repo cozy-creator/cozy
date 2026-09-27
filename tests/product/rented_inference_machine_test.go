@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -39,9 +42,15 @@ func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *
 		ExecutionWorkspaceId: "rented-workspace"}, nil
 }
 
+// runtimeExecutionID is Runtime's execution identity grammar (workspace_executions.py `_ID`).
+var runtimeExecutionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$`)
+
 func (m *runtimeMachine) SubmitMachineExecution(_ context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if !runtimeExecutionID.MatchString(submit.SubmissionId) {
+		return nil, status.Error(codes.InvalidArgument, "execution identity must be a bounded opaque ID")
+	}
 	if m.receipt != nil {
 		return m.receipt, nil
 	}
@@ -195,8 +204,10 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 	store.Close()
 	startDaemonProcess(t, root)
 
+	// A resume key names its predecessor with slashes; the machine sees an opaque identity.
+	const key = "rented-inference/retry-of/job-1"
 	code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json",
-		"--idempotency-key", "rented-inference")
+		"--idempotency-key", key)
 	if code != 0 {
 		t.Fatalf("the rented run was refused [exit %d]: %s", code, out)
 	}
@@ -218,7 +229,7 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 	defer store.Close()
 	var row *records.Request
 	waitFor(t, root, "the collected result", func() bool {
-		row, problem = store.RequestByIdempotencyKey("rented-inference")
+		row, problem = store.RequestByIdempotencyKey(key)
 		link, linkProblem := store.MachineExecution(row.ID)
 		return problem == nil && linkProblem == nil && row.State == "succeeded" && link != nil && link.Collected
 	})
