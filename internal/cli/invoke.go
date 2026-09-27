@@ -27,6 +27,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -87,7 +88,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return emitDescribe(ctx, target, packageInterface, callable)
 	}
 	if callable.Kind == "job" && strings.HasPrefix(target.Package, "local/") && !target.Snapshot {
+		resolved := target.lease
 		target, packageInterface, problem = snapshotLocalJob(ctx, target)
+		resolved.Release() // the job runs its own snapshot install
 		if problem != nil {
 			return problem
 		}
@@ -2402,6 +2405,8 @@ type Target struct {
 	Release        string
 	Snapshot       bool
 	releaseCapture func()
+	// lease holds the resolved install until the daemon has recorded the submission.
+	lease *install.Lease
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path
@@ -2443,8 +2448,9 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 	}
 	// An installed package is validated against its installed interface with no hub read;
 	// the machine that runs it prepares that release itself.
-	facts, problem := activeInstallFacts(ctx, target.Package)
+	facts, lease, problem := leasedInstallFacts(ctx, target.Package)
 	if problem == nil {
+		target.lease = lease
 		target.Release = facts.Install.Version
 		if strings.HasPrefix(target.Package, "local/") {
 			target.InstallID = facts.Install.ID
@@ -2606,13 +2612,34 @@ func unknownFunction(target Target, packageInterface *launch.PackageInterface) *
 	return problem
 }
 
-// activeInstallFacts resolves the package's one active install.
-func activeInstallFacts(ctx *Context, pkg string) (*launch.Facts, *exit.Error) {
-	install, e := installedPackage(ctx, pkg)
-	if e != nil {
-		return nil, e
+// leasedInstallFacts resolves the active install of pkg and leases it for this submission,
+// so no superseding install can reclaim it before the daemon records the request. An
+// install reclaimed before the lease was taken is resolved again.
+func leasedInstallFacts(ctx *Context, pkg string) (*launch.Facts, *install.Lease, *exit.Error) {
+	layout, store, _, problem := open(ctx.Cfg, false)
+	if problem != nil {
+		return nil, nil, problem
 	}
-	return launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
+	defer store.Close()
+	for {
+		active, problem := installedPackage(ctx, pkg)
+		if problem != nil {
+			return nil, nil, problem
+		}
+		lease, problem := install.LeaseInstall(layout, store, active.ID)
+		if problem != nil && problem.Code == exit.NotFound {
+			continue
+		}
+		if problem != nil {
+			return nil, nil, problem
+		}
+		facts, problem := launch.Read(*active, ctx.Cfg.Home, ctx.Cfg.Tool())
+		if problem != nil {
+			lease.Release()
+			return nil, nil, problem
+		}
+		return facts, lease, nil
+	}
 }
 
 func installedPackage(ctx *Context, pkg string) (*records.PackageInstall, *exit.Error) {
