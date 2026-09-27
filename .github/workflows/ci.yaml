@@ -1,56 +1,51 @@
 name: ci
 
-# Ready (non-draft) PRs and master pushes run the short product suite. The nightly (only
-# when master moved), `gh workflow run ci.yaml -R cozy-creator/cozy --ref <branch>`, and
-# PRs labelled `integration` add integration(t) tests and release acceptance.
+# Automatic: one ~1 min job on master pushes that touch Go. It compiles and vets the whole
+# module, which targeted local `go test ./pkg` runs do not.
+# On demand, before a release (fence, types, cross-compile, product suite):
+#   gh workflow run ci.yaml -R cozy-creator/cozy --ref <branch> [-f full=true]
+# `full` adds integration(t) tests and release install/upgrade acceptance.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
-    paths: ['**', '!**.md', 'README.md', 'docs/exit-matrix.md', 'docs/client-contract.md', 'docs/package-publication.md']
   push:
     branches: [master]
-    paths: ['**', '!**.md', 'README.md', 'docs/exit-matrix.md', 'docs/client-contract.md', 'docs/package-publication.md']
-  schedule:
-    - cron: '17 9 * * *'
+    paths: ['**.go', 'go.mod', 'go.sum', '.github/workflows/ci.yaml']
   workflow_dispatch:
+    inputs:
+      full:
+        description: Also run integration(t) tests and release acceptance
+        type: boolean
+        default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  actions: read
   contents: read
 
 env:
   CGO_ENABLED: '0'
   UV_TORCH_BACKEND: cpu
-  FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'integration') }}
 
 jobs:
-  nightly:
-    if: github.event_name == 'schedule'
+  build:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    outputs:
-      new: ${{ steps.last.outputs.new }}
+    timeout-minutes: 15
     steps:
-      - id: last
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          last=$(gh run list -R "$GITHUB_REPOSITORY" -w ci -e schedule -s success -L 1 --json headSha -q '.[0].headSha')
-          echo "new=$([ "$last" != "$GITHUB_SHA" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+      # Caches modules and the build cache keyed on go.sum.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go build ./... && go vet ./...
 
-  ci:
-    needs: nightly
-    # Draft PRs are checkpoints; CI runs once the PR is ready for review.
-    if: >-
-      !cancelled() && (needs.nightly.result == 'skipped' || needs.nightly.outputs.new == 'true') &&
-      (github.event_name != 'pull_request' ||
-       (!github.event.pull_request.draft &&
-        (github.event.action != 'labeled' || github.event.label.name == 'integration')))
+  suite:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      FULL: ${{ inputs.full }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -117,8 +112,7 @@ jobs:
           uv venv --python 3.12 "$RUNNER_TEMP/types"
           uv pip install --python "$RUNNER_TEMP/types/bin/python" packaging 'cozy-runtime>=0.18.28' 'cozy-eval>=0.7.2' 'tensorfs>=0.3.54'
           COZY_TYPECHECK_PYTHON="$RUNNER_TEMP/types/bin/python" sh scripts/typecheck.sh
-      # Saved from every master run that compiled, pass or fail: a red master must not
-      # leave every later run compiling cold.
+      # Saved from every master run that compiled, pass or fail.
       - if: ${{ !cancelled() && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
         run: uv cache prune --ci
       - if: ${{ !cancelled() && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
