@@ -67,24 +67,32 @@ func (s *Store) BindOperationContext(id, numerical string) (*OperationContext, *
 	if problem != nil {
 		return nil, problem
 	}
-	if held != nil {
-		if held.NumericalEnvironment != numerical || held.Key != key {
-			return nil, exit.Named(exit.Conflict, "operation.numerical_environment_changed", "the selected callee environment changed after its operation context was bound; start a new script invocation")
-		}
+	if held != nil && held.NumericalEnvironment == numerical && held.Key == key {
 		return held, nil
 	}
 	if !request.ChildReusable || request.ParentRequestID == "" || (request.State != "submitted" && request.State != "queued") {
+		if held != nil {
+			return nil, exit.Named(exit.Conflict, "operation.numerical_environment_changed", "the selected callee environment changed after this call was offered; start a new script invocation")
+		}
 		return nil, exit.Named(exit.Conflict, "operation.consumer_stopped", "only an unoffered memoized call can bind its numerical context")
 	}
-	var prior string
-	err = tx.QueryRow(`SELECT computation_digest FROM request_operation_lookups WHERE request_id=?`, id).Scan(&prior)
+	// An unoffered call whose worker or Runtime changed rebinds to the environment it
+	// will actually run in; only a lookup already in flight or adopted pins the old key.
+	var prior, state string
+	err = tx.QueryRow(`SELECT computation_digest,state FROM request_operation_lookups WHERE request_id=?`, id).Scan(&prior, &state)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, exit.Internalf("cannot inspect pending operation identity: %s", err)
 	}
 	if err == nil && prior != key {
-		return nil, exit.Named(exit.Conflict, "operation.key_changed", "an existing lookup is pinned to a different computation; start a new script invocation")
+		if state != "miss" {
+			return nil, exit.Named(exit.Conflict, "operation.key_changed", "an in-flight lookup is pinned to a different computation; start a new script invocation")
+		}
+		if _, err := tx.Exec(`DELETE FROM request_operation_lookups WHERE request_id=? AND state='miss'`, id); err != nil {
+			return nil, exit.Internalf("cannot reset the superseded operation lookup: %s", err)
+		}
 	}
-	if _, err = tx.Exec(`INSERT INTO request_operation_contexts(request_id,numerical_environment_digest,computation_digest) VALUES(?,?,?)`, id, numerical, key); err != nil {
+	if _, err = tx.Exec(`INSERT INTO request_operation_contexts(request_id,numerical_environment_digest,computation_digest) VALUES(?,?,?)
+ ON CONFLICT(request_id) DO UPDATE SET numerical_environment_digest=excluded.numerical_environment_digest,computation_digest=excluded.computation_digest`, id, numerical, key); err != nil {
 		return nil, exit.Internalf("cannot bind operation numerical context: %s", err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -104,21 +104,20 @@ func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
 		}
 		name := strings.TrimPrefix(p.DescriptorID, "sha256:") + ".json"
 		path := filepath.Join(dir, name)
-		out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o444)
-		if os.IsExist(err) {
-			held, readError := os.ReadFile(path)
-			if readError != nil || !bytes.Equal(held, data) {
-				return exit.Named(exit.Conflict, "job.plan_changed", "the exact job build and descriptor already name different plan bytes")
-			}
+		if held, err := os.ReadFile(path); err == nil && bytes.Equal(held, data) {
 			continue
 		}
+		// The record is derived from this Creator's plan; a file an earlier build
+		// rendered differently is replaced atomically rather than refused.
+		out, err := os.CreateTemp(dir, name+".*")
 		if err != nil {
 			return exit.Internalf("cannot stage exact job plan: %s", err)
 		}
 		_, writeError := out.Write(data)
 		syncError := out.Sync()
 		closeError := out.Close()
-		if writeError != nil || syncError != nil || closeError != nil {
+		if writeError != nil || syncError != nil || closeError != nil || os.Chmod(out.Name(), 0o444) != nil || os.Rename(out.Name(), path) != nil {
+			_ = os.Remove(out.Name())
 			return exit.Internalf("cannot durably stage exact job plan")
 		}
 	}

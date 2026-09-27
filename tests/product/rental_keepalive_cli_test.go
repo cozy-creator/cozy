@@ -166,18 +166,28 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code, wrongBoot b
 	if after != before || !baseline().Equal(renewed) {
 		t.Fatal("status or restart renewed the rental")
 	}
-	for _, mode := range []codes.Code{codes.Unavailable, codes.Unimplemented, codes.FailedPrecondition, codes.OK} {
+	for _, mode := range []codes.Code{codes.Unavailable, codes.Unimplemented, codes.FailedPrecondition} {
 		mu.Lock()
 		failure = mode
-		invalidDuration = mode == codes.OK
 		mu.Unlock()
 		if code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json"); code == 0 || strings.Contains(out, `"release_due"`) {
-			t.Fatalf("failed/unsupported/expired/invalid acknowledgment claimed success: %d %s", code, out)
+			t.Fatalf("failed/unsupported/expired acknowledgment claimed success: %d %s", code, out)
 		}
 		if !baseline().Equal(renewed) {
 			t.Fatal("unconfirmed acknowledgment reset local clock")
 		}
 	}
+	// A Host whose own idle window differs from Creator's still acknowledged the reset.
+	mu.Lock()
+	failure, invalidDuration = codes.OK, true
+	mu.Unlock()
+	if code, out := runCozy(t, root, "rental", "keepalive", "keepalive", "--json"); code != 0 || !strings.Contains(out, `"release_due"`) {
+		t.Fatalf("a Host with another idle window was refused: %d %s", code, out)
+	}
+	if !baseline().After(renewed) {
+		t.Fatal("an acknowledged reset did not renew the local clock")
+	}
+	renewed = baseline()
 	if runtimeFailure != codes.OK {
 		pod.mu.Lock()
 		admitted := len(pod.desired) + len(pod.offers)

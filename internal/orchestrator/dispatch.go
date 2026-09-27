@@ -1586,8 +1586,17 @@ func (c *Orchestrator) failQueuedSelection(requestID string, expected *records.R
 		c.signalClosed(requestWaitKey(requestID), cause)
 		return
 	}
+	// A local worker that cannot make this binding resident would hold its device grant
+	// forever. A rental's worker is the shared control lane for every package on that
+	// machine; one request's preparation failure never detaches it.
 	if workerToStop != "" {
-		c.ShutdownWorker(workerToStop, StopGrace)
+		c.mu.Lock()
+		w := c.workers[workerToStop]
+		shared := w != nil && w.spec.Connection != nil
+		c.mu.Unlock()
+		if !shared {
+			c.ShutdownWorker(workerToStop, StopGrace)
+		}
 	}
 	// An output obligation exists before attempt one. Settle it as skipped so
 	// the caller does not wait for bytes a failed preparation cannot produce.

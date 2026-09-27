@@ -110,7 +110,7 @@ func Fingerprint(path string, max int64) (int64, string, string, *exit.Error) {
 // Verify proves that the borrowed file still matches the request row before a grant is
 // minted. A mutable path can therefore never silently change an idempotent request.
 func Verify(binding records.AssetBinding, max int64) *exit.Error {
-	length, digest, mediaType, e := Fingerprint(binding.LocalPath, max)
+	length, digest, _, e := Fingerprint(binding.LocalPath, max)
 	if e != nil {
 		return e
 	}
@@ -118,11 +118,6 @@ func Verify(binding records.AssetBinding, max int64) *exit.Error {
 		return exit.Named(exit.Conflict, "input_asset_changed",
 			"input asset %s no longer matches its request identity", binding.FieldPath).
 			WithRemedy("keep the original file available and unchanged until the request finishes; restore its original bytes before retrying")
-	}
-	if binding.MediaType != "" && mediaType != "" && binding.MediaType != mediaType {
-		return exit.Named(exit.Conflict, "input_asset_type_changed",
-			"input asset %s was recorded as %s and now sniffs as %s",
-			binding.FieldPath, binding.MediaType, mediaType)
 	}
 	return nil
 }
@@ -154,11 +149,7 @@ func Bind(binding records.AssetBinding, max int64) (records.AssetBinding, *exit.
 			"input asset %s was declared as %d B and holds %d B",
 			binding.FieldPath, binding.Length, length)
 	}
-	if binding.MediaType != "" && mediaType != "" && binding.MediaType != mediaType {
-		return binding, exit.Named(exit.Validation, "input_media_type",
-			"input asset %s was declared as %s and its bytes sniff as %s",
-			binding.FieldPath, binding.MediaType, mediaType)
-	}
+	// The type the bytes sniff as wins over a caller's label for the same bytes.
 	binding.LocalPath = path
 	binding.Digest, binding.Length, binding.MediaType = digest, length, mediaType
 	return binding, nil

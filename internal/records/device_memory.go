@@ -225,8 +225,9 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 	if peak == 0 && total == 0 {
 		return nil
 	}
+	// An advisory measurement never costs the attempt its accepted terminal.
 	if peak > math.MaxInt64 || total > math.MaxInt64 {
-		return exit.New(exit.Structural, "%s#%d reported impossible memory peaks %d/%d", t.RequestID, t.Attempt, peak, total)
+		return nil
 	}
 	req, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, t.RequestID))
 	if err != nil {

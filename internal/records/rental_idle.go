@@ -46,10 +46,11 @@ func rentalIdleRunCounts(reader rentalIdleReader, id, buyer string) (queued, run
 }
 
 // RecordRentalKeepalive accepts only a full, identity-bound Host acknowledgment.
-// Creator schedules from the first local observation, not the Host clock.
+// Creator schedules from the first local observation, not the Host clock, so the Host's
+// own idle window is recorded as reported rather than required to equal Creator's.
 // Older receipts never move that clock backward, and a replay cannot renew it.
 func (s *Store) RecordRentalKeepalive(id string, result *pb.KeepRentalAliveResult, observedAt time.Time) *exit.Error {
-	if observedAt.IsZero() || result == nil || result.RequestId == "" || len(result.RequestId) > pb.MaxRentalKeepaliveRequestIDBytes || result.WorkerId == "" || result.WorkerBootId == "" || result.AcknowledgedAtUnixMs <= 0 || result.IdleDeadlineUnixMs <= result.AcknowledgedAtUnixMs || result.IdleDeadlineUnixMs-result.AcknowledgedAtUnixMs != pb.RentalIdleTimeoutSeconds*1000 {
+	if observedAt.IsZero() || result == nil || result.RequestId == "" || len(result.RequestId) > pb.MaxRentalKeepaliveRequestIDBytes || result.WorkerId == "" || result.WorkerBootId == "" || result.AcknowledgedAtUnixMs <= 0 || result.IdleDeadlineUnixMs <= result.AcknowledgedAtUnixMs {
 		return exit.New(exit.Conflict, "worker returned an invalid rental keepalive receipt")
 	}
 	updated, err := s.db.Exec(`INSERT INTO rental_idle(rental_id,worker_id,worker_boot_id,request_id,acknowledged_at_ms,idle_deadline_ms,receipt_observed_at)

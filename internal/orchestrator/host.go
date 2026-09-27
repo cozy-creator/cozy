@@ -85,6 +85,9 @@ func (c *Orchestrator) issuePackagePrepares(s *session, w *worker, label string,
 	w.hostPrepareSeq++
 	seq := w.hostPrepareSeq
 	w.revision, w.desiredRefusal = rev, nil
+	for _, prep := range prepares {
+		delete(w.packageRefusals, prep.pkg)
+	}
 	c.mu.Unlock()
 	c.logf("PodHost prepare %s#%d for revision %d -> %s", label, seq, rev, s.bootID)
 	go c.preparePackagesThroughHost(s, w, seq, rev, label, prepares)
@@ -99,9 +102,16 @@ func (c *Orchestrator) prepareThroughHost(s *session, w *worker, seq, rev uint64
 	c.convergePrepared(s, w, seq, rev, label, result.set)
 }
 
+// preparePackagesThroughHost prepares each package in turn. A package whose preparation is
+// refused fails alone (refusePackage); the others are united and converged without it.
 func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, rev uint64,
 	label string, prepares []packagePrepare) {
 	sets := make([]*pb.DesiredPlacementSet, 0, len(prepares))
+	var lastRefusal *exit.Error
+	refuse := func(pkg string, problem *exit.Error) bool {
+		lastRefusal = problem
+		return c.refusePackage(w, seq, pkg, problem)
+	}
 	for _, prep := range prepares {
 		c.mu.Lock()
 		superseded := w.hostPrepareSeq
@@ -135,15 +145,19 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			if problem.Code == exit.Unavailable || problem.Code == exit.Deadline {
 				c.setDesiredUnavailable(w, seq, exit.Unavailablef(
 					"PodHost prepare %s has no release facts yet: %s", prep.label, problem.Message))
-			} else {
-				c.setDesiredRefusal(w, seq, exit.Named(exit.Structural, "worker.prepare_facts_refused",
-					"the hub refused the release facts for %s: %s", prep.label, problem.Message))
+				return
 			}
-			return
+			if !refuse(prep.pkg, exit.Named(exit.Structural, "worker.prepare_facts_refused",
+				"the hub refused the release facts for %s: %s", prep.label, problem.Message)) {
+				return
+			}
+			continue
 		}
 		if problem := requireAdapterDownloadPeer(s, prep.downloadSet); problem != nil {
-			c.setDesiredRefusal(w, seq, problem)
-			return
+			if !refuse(prep.pkg, problem) {
+				return
+			}
+			continue
 		}
 		call := &pb.PreparePackageSetCall{SupportsModelMaterializationRecovery: true, Claim: s.claim, PackageSet: &pb.DesiredPackageSet{
 			DownloadDelegation: append([]byte(nil), prep.downloadSet...),
@@ -159,6 +173,16 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 			func(ctx context.Context) (grpc.ServerStreamingClient[pb.PrepareEvent], error) {
 				return s.host.PreparePackageSet(ctx, call)
 			})
+		if result.refusal != "" || result.fault != nil {
+			problem := result.fault
+			if problem == nil {
+				problem = c.hostRefusal(w, result.code, result.refusal)
+			}
+			if !refuse(prep.pkg, problem) {
+				return
+			}
+			continue
+		}
 		if !c.settleHostPrepare(s, w, seq, prep.label, result) {
 			return
 		}
@@ -168,6 +192,12 @@ func (c *Orchestrator) preparePackagesThroughHost(s *session, w *worker, seq, re
 		}
 		c.mu.Unlock()
 		sets = append(sets, result.set)
+	}
+	if len(sets) == 0 {
+		if lastRefusal != nil {
+			c.setDesiredRefusal(w, seq, lastRefusal)
+		}
+		return
 	}
 	united, err := unitePreparedPlacementSets(sets)
 	if err != nil {
@@ -325,23 +355,56 @@ func classifyPrepareEnd(err error) hostPrepareResult {
 // so a download can no longer become unauthorized by running long, and the exception has
 // nothing left to except.
 func (c *Orchestrator) hostPrepareRefused(_ *session, w *worker, seq uint64, _, code, detail string) {
+	c.setDesiredRefusal(w, seq, c.hostRefusal(w, code, detail))
+}
+
+// hostRefusal is the pod host's typed verdict on one preparation of the current revision.
+func (c *Orchestrator) hostRefusal(w *worker, code, detail string) *exit.Error {
 	if len(detail) > 1024 {
 		detail = detail[:1024] + "…"
 	}
+	c.mu.Lock()
+	revision := w.revision
+	c.mu.Unlock()
+	return exit.Named(exit.Structural, "worker.desired_state_refused",
+		"%s (the worker refused desired revision %d before applying it)", detail, revision).WithCause(code)
+}
+
+// refusePackage isolates one package's refusal: its requests fail with it, the package
+// leaves the rental's desired set, and the other packages continue. It reports false when
+// a newer preparation superseded this one.
+func (c *Orchestrator) refusePackage(w *worker, seq uint64, pkg string, problem *exit.Error) bool {
 	c.mu.Lock()
 	if w.hostPrepareSeq != seq {
 		live := w.hostPrepareSeq
 		c.mu.Unlock()
 		c.logf("worker %s: PodHost prepare #%d was superseded by #%d before its refusal "+
-			"landed; the newer prepare carries its own verdict: %s", w.instanceID, seq, live, detail)
-		return
+			"landed; the newer prepare carries its own verdict: %s", w.instanceID, seq, live, problem.Message)
+		return false
 	}
-	revision := w.revision
-	w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
-		"%s (the worker refused desired revision %d before applying it)", detail, revision).WithCause(code)
+	if w.packageRefusals == nil {
+		w.packageRefusals = map[string]*exit.Error{}
+	}
+	w.packageRefusals[pkg] = problem
+	var packages []*pb.DownloadPackageRef
+	for _, ref := range w.desiredPackages {
+		if ref.Package != pkg {
+			packages = append(packages, ref)
+		}
+	}
+	var models []*pb.DownloadModelRef
+	for _, ref := range w.desiredModels {
+		if ref.Package != pkg {
+			models = append(models, ref)
+		}
+	}
+	w.desiredPackages, w.desiredModels = packages, models
+	delete(w.desiredDownloadSets, pkg)
+	instance, revision := w.instanceID, w.revision
 	c.mu.Unlock()
-	c.logf("worker %s: desired revision %d REFUSED before it was applied: %s",
-		w.instanceID, revision, detail)
+	c.logf("worker %s: package %s REFUSED in desired revision %d; the rental's other packages continue: %s",
+		instance, pkg, revision, problem.Message)
+	return true
 }
 
 func (c *Orchestrator) setDesiredRefusal(w *worker, seq uint64, e *exit.Error) {

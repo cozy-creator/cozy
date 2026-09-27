@@ -140,6 +140,11 @@ type fakePod struct {
 	lanes              []string // the order lanes were used: fetch, prepare_private, placement_set
 	prepareCodes       []codes.Code
 	prepareUnavailable int
+	// refusePrepare maps a package to the Runtime refusal code its own preparation answers.
+	refusePrepare map[string]string
+	// stalePlacementSets answers that many placement-set desires with Runtime's
+	// placement_set_reprepare_required fault instead of applying them.
+	stalePlacementSets int
 	hostDigest         []byte
 	preparedSet        []byte
 	preparedDig        []byte
@@ -391,7 +396,23 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 				p.jobDirectives = append(p.jobDirectives, job)
 			}
 			latched, serve := p.latch != nil, p.serve
+			stale := p.stalePlacementSets > 0 && m.DesiredState.GetPlacementSet() != nil
+			if stale {
+				p.stalePlacementSets--
+			}
 			p.mu.Unlock()
+			if stale {
+				d := m.DesiredState
+				if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
+					RecordOwnerEpoch: d.RecordOwnerEpoch, ControlStreamEpoch: 1, WorkerBootId: p.bootID(),
+					WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE, AppliedWireMinor: pb.WireMinor,
+					Faults: []*pb.Fault{{Kind: pb.FaultKind_FAULT_KIND_ARTIFACT_FETCH_FAILED, Subject: "revision " + strconv.FormatUint(d.Revision, 10),
+						Reason: "placement_set_reprepare_required", Detail: "this placement set was prepared by an older Runtime"}},
+				}}}); err != nil {
+					return err
+				}
+				continue
+			}
 			if p.jobReady && m.DesiredState.GetJob() != nil {
 				d := m.DesiredState
 				ready := &pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: &pb.ObservedWorkerState{
@@ -672,6 +693,20 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		return nil
 	}
 	name, release := selected[0].Str("package"), selected[0].Str("release")
+	p.mu.Lock()
+	refusal := p.refusePrepare[name]
+	p.mu.Unlock()
+	if refusal != "" {
+		for _, event := range []*pb.PrepareEvent{
+			{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
+			{Stage: pb.PrepareStage_PREPARE_STAGE_REFUSED, TotalBytes: total, SafeCode: refusal, SafeDetail: refusal + ": " + name},
+		} {
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	distribution := name[strings.IndexByte(name, '/')+1:]
 	placement := podPlacement(call.PackageSet.DownloadDelegation, name, release, distribution)
 	if p.preparedPlacement != nil {

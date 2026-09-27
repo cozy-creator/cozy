@@ -775,8 +775,16 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.fault = ""
 			}
 		}
+		reprepare := false
 		for _, f := range r.Faults {
 			w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
+			// A newer Runtime cannot read a set an older one prepared. Nothing is wrong
+			// with the request: the rental prepares its desired packages again.
+			if f.Reason == placementSetReprepareRequired && w.spec.Connection != nil &&
+				r.AcceptedDesiredStateRevision < desiredRevision && f.Subject == fmt.Sprintf("revision %d", desiredRevision) {
+				reprepare = true
+				continue
+			}
 			if r.AcceptedDesiredStateRevision < desiredRevision &&
 				f.Subject == fmt.Sprintf("revision %d", desiredRevision) && permanentDesiredRefusal(f.Kind) {
 				w.desiredRefusal = exit.Named(exit.Structural, "placement_config_refused",
@@ -794,7 +802,17 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 		recovering := false
-		if w.modelMaterializationMiss(r) {
+		if reprepare && w.modelEnsureRevision != 0 && w.modelEnsureRevision == desiredRevision {
+			// The set prepared again on this machine is refused too: the host and its
+			// Runtime disagree, which another preparation cannot change.
+			recovering = true
+			w.desiredRefusal = exit.Named(exit.Structural, placementSetReprepareRequired,
+				"the rented worker cannot read a placement set its own host just prepared").
+				WithRemedy("run `cozy rental update %s` so the host and its Runtime agree", w.spec.Connection.RentalID)
+		} else if reprepare && w.modelEnsureFromRevision != desiredRevision {
+			w.modelEnsureFromRevision, w.modelEnsureRevision = desiredRevision, 0
+			reensureRevision, recovering = desiredRevision, true
+		} else if w.modelMaterializationMiss(r) {
 			switch {
 			case w.modelEnsureFromRevision != 0 && w.modelEnsureRevision == 0:
 				recovering = true // the ensure call is still issuing its replacement revision
@@ -932,6 +950,10 @@ func heldPlacements(rows []*pb.HeldAttempt) []string {
 	}
 	return out
 }
+
+// placementSetReprepareRequired is Runtime's non-permanent fault for a placement set an
+// older Runtime prepared; the owner answers it by preparing the package set again.
+const placementSetReprepareRequired = "placement_set_reprepare_required"
 
 func permanentDesiredRefusal(kind pb.FaultKind) bool {
 	switch kind {

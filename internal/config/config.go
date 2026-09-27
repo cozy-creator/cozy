@@ -354,7 +354,11 @@ func readEnvironment() (*resolver, []string) {
 	return &resolver{values: values}, inherited
 }
 
-type resolver struct{ values map[string]any }
+type resolver struct {
+	values map[string]any
+	// ignored names keys this build does not read: retired or newer settings.
+	ignored []string
+}
 
 func (r *resolver) Resolve(_ *kong.Context, _ *kong.Path, flag *kong.Flag) (any, error) {
 	return r.values[flag.Name], nil
@@ -411,10 +415,14 @@ func readConfigFile(path string) (*resolver, string, *exit.Error) {
 		return nil, "", exit.Internalf("cannot read %s: %s", path, err)
 	}
 
-	resolved, err := strictYAML(bytes.NewReader(data))
+	resolved, err := fileYAML(bytes.NewReader(data))
 	if err != nil {
 		return nil, "", exit.Usagef("%s is invalid: %s", path, err).
 			WithRemedy("this file admits: %s", knownFileKeys())
+	}
+	if len(resolved.ignored) > 0 {
+		fmt.Fprintf(os.Stderr, "cozy: %s: this version does not use %s; ignored (it reads: %s)\n",
+			path, strings.Join(resolved.ignored, ", "), knownFileKeys())
 	}
 	if resolved.has("huggingface_token") || resolved.has("civitai_token") {
 		openedInfo, statErr := file.Stat()
@@ -434,9 +442,11 @@ func digestOf(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// strictYAML accepts one flat YAML mapping. Kong remains the typed assignment
-// and validation engine; this loader only protects the closed file vocabulary.
-func strictYAML(reader io.Reader) (*resolver, error) {
+// fileYAML accepts one flat YAML mapping. Kong remains the typed assignment and
+// validation engine. A key this build does not read — retired by an upgrade or added by
+// a newer build — is ignored and named once, so one stale line never disables every
+// command; a repeated key refuses only when its values disagree.
+func fileYAML(reader io.Reader) (*resolver, error) {
 	decoder := yaml.NewDecoder(reader)
 	var document yaml.Node
 	if err := decoder.Decode(&document); err != nil {
@@ -460,17 +470,25 @@ func strictYAML(reader io.Reader) (*resolver, error) {
 		return nil, fmt.Errorf("must be one flat key-value mapping")
 	}
 
-	values := make(map[string]any, len(root.Content)/2)
+	out := &resolver{values: make(map[string]any, len(root.Content)/2)}
+	set := func(name, spelled string, value *yaml.Node) error {
+		if value.Kind != yaml.ScalarNode {
+			return fmt.Errorf("line %d value for %q is not a scalar", value.Line, spelled)
+		}
+		if prior, exists := out.values[name]; exists && prior != value.Value {
+			return fmt.Errorf("line %d names %q twice with different values", value.Line, spelled)
+		}
+		out.values[name] = value.Value
+		return nil
+	}
 	for i := 0; i < len(root.Content); i += 2 {
 		key, value := root.Content[i], root.Content[i+1]
 		if key.Kind != yaml.ScalarNode || key.Value == "" {
 			return nil, fmt.Errorf("line %d has a non-scalar or empty key", key.Line)
 		}
 		if !fileKeys[key.Value] {
-			return nil, fmt.Errorf("line %d names unknown key %q", key.Line, key.Value)
-		}
-		if _, exists := values[key.Value]; exists {
-			return nil, fmt.Errorf("line %d names %q twice", key.Line, key.Value)
+			out.ignored = append(out.ignored, key.Value)
+			continue
 		}
 		if section, nested := nestedFileKeys[key.Value]; nested {
 			if value.Kind != yaml.MappingNode {
@@ -481,24 +499,20 @@ func strictYAML(reader io.Reader) (*resolver, error) {
 				spelled := key.Value + "." + nestedKey.Value
 				name, ok := section[nestedKey.Value]
 				if nestedKey.Kind != yaml.ScalarNode || !ok {
-					return nil, fmt.Errorf("line %d names unknown key %q", nestedKey.Line, spelled)
+					out.ignored = append(out.ignored, spelled)
+					continue
 				}
-				if _, exists := values[name]; exists {
-					return nil, fmt.Errorf("line %d names %q twice", nestedKey.Line, spelled)
+				if err := set(name, spelled, nestedValue); err != nil {
+					return nil, err
 				}
-				if nestedValue.Kind != yaml.ScalarNode {
-					return nil, fmt.Errorf("line %d value for %q is not a scalar", nestedValue.Line, spelled)
-				}
-				values[name] = nestedValue.Value
 			}
 			continue
 		}
-		if value.Kind != yaml.ScalarNode {
-			return nil, fmt.Errorf("line %d value for %q is not a scalar", value.Line, key.Value)
+		if err := set(key.Value, key.Value, value); err != nil {
+			return nil, err
 		}
-		values[key.Value] = value.Value
 	}
-	return &resolver{values: values}, nil
+	return out, nil
 }
 
 // Child constructs a child process's complete environment. Imposed values win
