@@ -43,9 +43,11 @@ func ParseModelRef(raw string) (model, release, lane, manifest string, problem *
 		return "", "", "", "", exit.Usagef("%q carries more than one release", rest)
 	}
 	model, versioned, pinned := strings.Cut(rest, "@")
-	if _, e := ParseRef(model); e != nil {
+	ref, e := ParseRef(model)
+	if e != nil {
 		return "", "", "", "", e
 	}
+	model = ref.String()
 	if pinned {
 		var sliced bool
 		var explicitLane string

@@ -2383,7 +2383,8 @@ func parseTarget(raw string) (Target, *exit.Error) {
 	if parts[0] == "" || parts[1] == "" || (len(parts) == 3 && parts[2] == "") {
 		return Target{}, usage
 	}
-	target := Target{Package: parts[0] + "/" + parts[1]}
+	// Org and package names are never case-sensitive; the callable name is Python's.
+	target := Target{Package: strings.ToLower(parts[0] + "/" + parts[1])}
 	if len(parts) == 3 {
 		target.Function = parts[2]
 	}

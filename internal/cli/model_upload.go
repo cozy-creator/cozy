@@ -105,12 +105,14 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 		}
 		destination = ref.String()
 	} else {
-		if !strings.HasPrefix(destinationArg, "local/") {
+		name, local, problem := modelsource.LocalAlias(destinationArg)
+		if !local {
 			return exit.Usagef("model download destination %q is not local/name", destinationArg)
 		}
-		if problem := modelsource.LocalName(strings.TrimPrefix(destinationArg, "local/")); problem != nil {
+		if problem != nil {
 			return problem
 		}
+		destination = "local/" + name
 		if ctx.Inv.Bool("--rental-only") {
 			return exit.Named(exit.Unavailable, "model_download.rented_return_unavailable",
 				"rented model download cannot yet return an output to local TensorFS").
@@ -345,11 +347,8 @@ func modelTransferIntent(plan modeltransfer.Plan) records.ModelTransferIntent {
 
 func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
 	raw = strings.TrimSpace(raw)
-	if strings.HasPrefix(raw, "local/") {
-		if problem := modelsource.LocalName(strings.TrimPrefix(raw, "local/")); problem != nil {
-			return "", problem
-		}
-		return raw, nil
+	if name, local, problem := modelsource.LocalAlias(raw); local {
+		return "local/" + name, problem
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -391,9 +390,8 @@ func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
 func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (publishSource, *exit.Error) {
 	raw = strings.TrimSpace(raw)
 	lane := strings.TrimSpace(ctx.Inv.Value("--lane"))
-	if strings.HasPrefix(raw, "local/") {
-		name := strings.TrimPrefix(raw, "local/")
-		if problem := modelsource.LocalName(name); problem != nil {
+	if name, local, problem := modelsource.LocalAlias(raw); local {
+		if problem != nil {
 			return publishSource{}, problem
 		}
 		if ctx.Inv.Bool("--rental") {

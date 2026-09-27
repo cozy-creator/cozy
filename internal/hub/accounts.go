@@ -29,9 +29,10 @@ func (c *Client) CurrentAccount(ctx context.Context) (Account, *exit.Error) {
 // RegisterAccount gives the authenticated user its one immutable account name.
 func (c *Client) RegisterAccount(ctx context.Context, name string) (Account, *exit.Error) {
 	var out Account
+	name = CanonicalName(name)
 	if !resourceSlug.MatchString(name) {
 		return out, exit.Usagef("%q is not a Tensorhub account name", name).
-			WithRemedy("use lowercase letters, digits, dots, underscores, or hyphens")
+			WithRemedy("use letters, digits, dots, underscores, or hyphens")
 	}
 	problem := c.do(ctx, call{
 		method: http.MethodPut, path: "/v1/accounts/" + url.PathEscape(name),

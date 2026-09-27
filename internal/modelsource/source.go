@@ -235,16 +235,32 @@ func parseLocal(raw, cwd string) (Source, *exit.Error) {
 	return Source{Kind: LocalFile, Canonical: "file:" + filepath.ToSlash(path), Path: path, Bytes: info.Size()}, nil
 }
 
-// LocalName validates the one portable segment used below the reserved local/ namespace.
-func LocalName(name string) *exit.Error {
+// LocalName returns the canonical spelling of the one portable segment used below
+// the reserved local/ namespace. Names are never case-sensitive.
+func LocalName(name string) (string, *exit.Error) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return name, localName(name)
+}
+
+// LocalAlias reads `local/<name>` in any case and returns its canonical name.
+func LocalAlias(raw string) (string, bool, *exit.Error) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < len("local/") || !strings.EqualFold(raw[:len("local/")], "local/") {
+		return "", false, nil
+	}
+	name, problem := LocalName(raw[len("local/"):])
+	return name, true, problem
+}
+
+func localName(name string) *exit.Error {
 	if len(name) < 1 || len(name) > 128 || !lowerAlphaNum(name[0]) {
 		return exit.Usagef("local model name %q is not a portable name", name).
-			WithRemedy("use 1-128 lowercase letters, digits, dots, dashes, or underscores, starting with a letter or digit")
+			WithRemedy("use 1-128 letters, digits, dots, dashes, or underscores, starting with a letter or digit")
 	}
 	for i := 1; i < len(name); i++ {
 		if !lowerAlphaNum(name[i]) && !strings.ContainsRune("._-", rune(name[i])) {
 			return exit.Usagef("local model name %q is not a portable name", name).
-				WithRemedy("use 1-128 lowercase letters, digits, dots, dashes, or underscores")
+				WithRemedy("use 1-128 letters, digits, dots, dashes, or underscores")
 		}
 	}
 	return nil

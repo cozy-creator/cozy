@@ -48,6 +48,10 @@ const maxDocument = 64 << 20
 
 var resourceSlug = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$`)
 
+// CanonicalName is the one spelling of an account, org or resource name. Names are
+// never case-sensitive: `Paul/SDXL` is `paul/sdxl`.
+func CanonicalName(name string) string { return strings.ToLower(strings.TrimSpace(name)) }
+
 // A call whose work is proportional to the bytes it moves is bounded by THOSE BYTES,
 // at the storage edge where they are (`transfer.mover`). There is no `Transfer`
 // constant any more: a 30-minute total is a ceiling on how big a checkpoint may be,
@@ -549,10 +553,10 @@ func ParseRef(s string) (Ref, *exit.Error) {
 			WithRemedy("name exactly org/name here; model download parses @release and @sha256 pins separately").
 			WithNext("cozy package search", "cozy model search")
 	}
-	org, name, ok := strings.Cut(s, "/")
+	org, name, ok := strings.Cut(CanonicalName(s), "/")
 	if !ok || !resourceSlug.MatchString(org) || !resourceSlug.MatchString(name) {
 		return Ref{}, exit.Usagef("%q is not a model or package ref: expected exactly one org/name separator", s).
-			WithRemedy("org and name use lowercase letters, digits, dots, underscores, or hyphens").
+			WithRemedy("org and name use letters, digits, dots, underscores, or hyphens").
 			WithNext("cozy package search", "cozy model search")
 	}
 	return Ref{Org: org, Name: name}, nil
