@@ -332,6 +332,8 @@ async def main(ctx):
 
 The optional context supplies cancellation, logs, progress and metrics. Discovery checks the
 script's syntax without importing it on the client; its captured code executes on the worker.
+Any target ending in `.py` is a script path, relative (with or without `./`) or absolute; a
+two-part `org/name.py` runs the file when it exists.
 Generator entrypoints are refused rather than reported as completed without running their body.
 
 ```sh

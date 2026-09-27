@@ -2473,6 +2473,9 @@ func parseTarget(raw string) (Target, *exit.Error) {
 
 func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
 	if isScriptTarget(ctx.Inv.Args[0]) {
+		if ambiguousScriptTarget(ctx.Inv.Args[0]) {
+			fmt.Fprintf(ctx.Err, "running the local file %s; spell a package as org/name/function\n", ctx.Inv.Args[0])
+		}
 		return scriptTarget(ctx)
 	}
 	target, problem := parseTarget(ctx.Inv.Args[0])
