@@ -104,7 +104,7 @@ fn referenced_blobs(header: &Header, draft: &Draft) -> Result<BTreeMap<String, u
         }
     }
     for (_, entry) in &draft.entries {
-        if let Entry::File(object) = entry {
+        if let Some(object) = entry.content() {
             add_ref(&mut refs, object, "manifest file")?;
         }
     }
@@ -257,6 +257,9 @@ pub fn cmd_show(root: &Path, hex: &str) -> ExitCode {
                 blob.id(),
                 blob.length
             ),
+            Entry::Other { kind, blob } => {
+                println!("    {kind:<12} {path}  {} ({} B)", blob.id(), blob.length)
+            }
         }
     }
     ExitCode::SUCCESS

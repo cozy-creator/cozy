@@ -10,12 +10,54 @@ use crate::limits;
 pub enum Entry {
     File(ObjectRef),
     CozyTensors(ObjectRef),
+    /// A kind a newer TensorFS wrote. Its bytes are carried, fetched and kept like a file's;
+    /// only materializing it at a path refuses here.
+    Other {
+        kind: String,
+        blob: ObjectRef,
+    },
 }
 
 impl Entry {
     pub fn blob(&self) -> &ObjectRef {
         match self {
-            Entry::File(blob) | Entry::CozyTensors(blob) => blob,
+            Entry::File(blob) | Entry::CozyTensors(blob) | Entry::Other { blob, .. } => blob,
+        }
+    }
+
+    pub fn kind(&self) -> &str {
+        match self {
+            Entry::File(_) => "file",
+            Entry::CozyTensors(_) => "cozytensors",
+            Entry::Other { kind, .. } => kind,
+        }
+    }
+
+    /// Snapshot content other than the CozyTensors header: fetched, retained and carried.
+    pub fn content(&self) -> Option<&ObjectRef> {
+        match self {
+            Entry::File(blob) | Entry::Other { blob, .. } => Some(blob),
+            Entry::CozyTensors(_) => None,
+        }
+    }
+
+    /// The bytes to place at this entry's path, or a refusal naming a kind this build
+    /// cannot materialize.
+    pub fn materializable(&self, path: &str) -> Result<&ObjectRef> {
+        match self {
+            Entry::File(blob) => Ok(blob),
+            Entry::CozyTensors(_) => refuse(
+                Code::WRONG_TYPE,
+                format!("{path:?} is the CozyTensors header, not an ordinary file"),
+            ),
+            Entry::Other { kind, .. } => refuse(
+                Code::UNKNOWN_FIELD,
+                format!(
+                    "{path:?} is a {kind:?} entry written by a newer TensorFS; this {} cannot \
+                     materialize it — upgrade TensorFS",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            ),
         }
     }
 }
@@ -117,7 +159,7 @@ impl Manifest {
     pub fn header(&self) -> Option<&ObjectRef> {
         self.entries.iter().find_map(|(_, entry)| match entry {
             Entry::CozyTensors(blob) => Some(blob),
-            Entry::File(_) => None,
+            _ => None,
         })
     }
 
@@ -199,10 +241,11 @@ impl Doc for Manifest {
                 "file" => Entry::File(blob),
                 "cozytensors" => Entry::CozyTensors(blob),
                 other => {
-                    return refuse(
-                        Code::UNKNOWN_FIELD,
-                        format!("manifest entry kind {other:?} is outside {{file,cozytensors}}"),
-                    )
+                    crate::ids::ascii_name("Manifest.entry.kind", other, limits::MAX_NAME_BYTES)?;
+                    Entry::Other {
+                        kind: other.to_string(),
+                        blob,
+                    }
                 }
             };
             entry_extra.push(item.rest());
@@ -235,13 +278,7 @@ fn manifest_value(entries: &[(String, Entry)], extra: &Extra, entry_extra: &[Ext
                         Value::obj_with(
                             vec![
                                 ("blob", entry.blob().to_value()),
-                                (
-                                    "kind",
-                                    Value::str(match entry {
-                                        Entry::File(_) => "file",
-                                        Entry::CozyTensors(_) => "cozytensors",
-                                    }),
-                                ),
+                                ("kind", Value::str(entry.kind())),
                                 ("path", Value::str(path.clone())),
                             ],
                             entry_extra.get(index).unwrap_or(&none),

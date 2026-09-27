@@ -191,7 +191,7 @@ fn ordinary_companions_survive_derivation_without_copying_tensor_backing_files()
         .push(("LICENSE".into(), b"explicit licence".to_vec()));
     assert_eq!(
         companion_files(&d, &sources).unwrap()["LICENSE"],
-        ObjectRef::of(b"explicit licence")
+        Entry::File(ObjectRef::of(b"explicit licence"))
     );
     std::fs::remove_dir_all(store.root()).unwrap();
 }
