@@ -262,9 +262,21 @@ pub fn plan(
     }
     let mut sorted: Vec<&str> = profiles.iter().map(String::as_str).collect();
     sorted.sort();
-    if sorted.windows(2).any(|window| window[0] == window[1]) {
-        return refuse(Code::DUPLICATE_KEY, "source profiles must be unique");
+    sorted.dedup();
+    let mut unique: Vec<MemberHead> = Vec::with_capacity(heads.len());
+    for head in heads {
+        match unique.iter().find(|kept| kept.member == head.member) {
+            Some(kept) if kept == head => {}
+            Some(_) => {
+                return refuse(
+                    Code::DUPLICATE_KEY,
+                    format!("{} is listed twice with different heads", head.member),
+                )
+            }
+            None => unique.push(head.clone()),
+        }
     }
+    let heads = unique.as_slice();
     let staged = stage(scratch, heads)?;
     let mut plans = Vec::with_capacity(profiles.len());
     for profile in &sorted {
