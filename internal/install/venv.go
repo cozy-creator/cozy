@@ -142,13 +142,17 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string,
 	if err := os.WriteFile(requirements, body, 0o600); err != nil {
 		return nil, exit.Internalf("cannot retain locked requirements: %s", err)
 	}
-	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
+	// The export already applied the package's uv settings at lock time. Installing from
+	// its source directory would let uv re-read them, and a constraint-dependencies row
+	// is an unpinned requirement --require-hashes refuses.
+	installRoot := filepath.Dir(venvDir)
+	if problem := runUV(installRoot, config.Frozen().Tool(), "locked_environment_refused",
 		"the exact locked closure is incompatible with the selected Python environment",
 		"pip", "install", "--no-deps", "--require-hashes", "--python",
 		home.VenvPython(venvDir), "--requirements", requirements); problem != nil {
 		return nil, problem
 	}
-	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_requirement_incompatible",
+	if problem := runUV(installRoot, config.Frozen().Tool(), "package_requirement_incompatible",
 		"the installed package requirements are not satisfied", "pip", "check", "--python",
 		home.VenvPython(venvDir)); problem != nil {
 		return nil, problem
