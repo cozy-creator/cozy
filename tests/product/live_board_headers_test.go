@@ -118,7 +118,8 @@ func TestLiveBoardHeadersSurviveResizeAndRefresh(t *testing.T) {
 				seed(i)
 			}
 			terminal, cmd := startPTY(t, root, 5, 80, board, "list", "--full")
-			frame := readLiveFrame(t, terminal, nil)
+			// The first fetch is asynchronous; its placeholder frame has no table yet.
+			frame := readLiveFrame(t, terminal, func(frame string) bool { return !strings.Contains(frame, "· loading") })
 			lines := assertLiveFrameFits(t, frame, heading, 5, 80)
 			first := strings.Fields(lines[1])[0]
 			_, err := terminal.Write([]byte("\x1b[B"))

@@ -24,7 +24,7 @@ func TestRequirementMetadataParserDoesNotRequireRuntimeInventory(t *testing.T) {
 	tools := t.TempDir()
 	must(t, os.Symlink(uv, filepath.Join(tools, "uv")))
 	t.Setenv("PATH", tools)
-	if _, err := exec.LookPath("cozy-runtime"); err == nil {
+	if _, err := exec.LookPath("cozy-runtime"); err == nil { //cozy:allow asserts the fixture PATH has no Runtime; nothing is invoked
 		t.Fatal("fixture exposes a Runtime inventory command")
 	}
 	selection, problem := packagepublish.ActiveRequirements(context.Background(), "metadata-proof", nil, map[string]string{

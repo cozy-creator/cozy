@@ -117,6 +117,14 @@ type fakeRentalHub struct {
 	server   *httptest.Server
 	// publishes is whether this stand-in hub carries th-199's account listing.
 	publishes bool
+	// reads counts rental reads, so a test can plant a transition after the daemon's first look.
+	reads int
+}
+
+func (h *fakeRentalHub) rentalReads() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reads
 }
 
 func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
@@ -133,11 +141,22 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		}
 		_ = json.NewEncoder(w).Encode(release)
 	})
+	mux.HandleFunc("POST /v1/packages/{owner}/{name}/download", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		pkg, release := r.PathValue("owner")+"/"+r.PathValue("name"), r.URL.Query().Get("release")
+		if _, ok := h.packageReleases[pkg+"@"+release]; !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(rentalDownloadPlan(pkg, release))
+	})
 	// Ordinary fixtures provide the real account census. Tests of an unavailable
 	// route must opt into that refusal explicitly.
 	mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		h.reads++
 		if !h.publishes || r.Header.Get("Authorization") != "Bearer rental-idle-test" {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -158,6 +177,7 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
+		h.reads++
 		row, ok := h.rentals[r.PathValue("id")]
 		if !ok || r.Header.Get("Authorization") != "Bearer rental-idle-test" {
 			w.WriteHeader(http.StatusNotFound)

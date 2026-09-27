@@ -171,19 +171,19 @@ func TestLadderWalkNeversBuysWhatTheLaneCannotFit(t *testing.T) {
 		t.Fatalf("B200 and H200 pin %q and %q; want mxfp8-adaln-pruned and bf16-full",
 			find(t, decision, "b200").Lane, find(t, decision, "h200").Lane)
 	}
-	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB (working memory unmeasured) of 80 GB")
-	sized(t, find(t, decision, "h100-nvl"), "components 51.5 GiB (working memory unmeasured) of 94 GB")
+	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 80 GB")
+	sized(t, find(t, decision, "h100-nvl"), "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 94 GB")
 	// The mxfp8 lane publishes no component bytes: the owner's B200 rung is the fit, and
 	// the record says so rather than pretending a figure was compared.
 	sized(t, find(t, decision, "b200"), records.FitRungAsserted)
-	sized(t, find(t, decision, "h200"), "components 51.5 GiB (working memory unmeasured) of 141 GB")
+	sized(t, find(t, decision, "h200"), "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 141 GB")
 	for _, name := range []string{"rtx-4090", "rtx-5090"} {
 		row := find(t, decision, name)
 		if row.Rung != 3 || row.Lane != "bf16-full" || !strings.HasPrefix(row.Verdict, textEncoderVerdict) {
 			t.Fatalf("%s recorded %+v; want rung 3 bf16-full %s", name, row, orchestrator.ExcludedVRAMShort)
 		}
 	}
-	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB (working memory unmeasured) of 24 GB")
+	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 24 GB")
 	absent(t, decision, "cpu")
 	if ladder := rental.Ladder(h3Ladder()); len(ladder) != 1 || ladder[0] != "H100=fp8-adaln-pruned > B200=mxfp8-adaln-pruned > *=bf16-full" {
 		t.Fatalf("the record does not carry the ladder it walked: %v", ladder)
@@ -220,8 +220,8 @@ func TestExplicitLaneIsHeldToTheSameFloor(t *testing.T) {
 			t.Fatalf("%s recorded %q; want the need and the card's memory", name, row.Verdict)
 		}
 	}
-	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB (working memory unmeasured) of 24 GB")
-	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB (working memory unmeasured) of 80 GB")
+	sized(t, find(t, decision, "rtx-4090"), "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 24 GB")
+	sized(t, find(t, decision, "h100-80"), "components 51.5 GiB (total memory unmeasured for this exact workload/SKU) of 80 GB")
 	rental.Conclude(decision, rental.Place("balanced", decision))
 	if find(t, decision, "h100-80").Verdict != orchestrator.VerdictChosen || find(t, decision, "h100-nvl").Verdict != orchestrator.VerdictUnmeasured {
 		t.Fatalf("h100-80 %q, h100-nvl %q; want h100-80 chosen with h100-nvl unmeasured",

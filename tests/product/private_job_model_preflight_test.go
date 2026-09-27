@@ -99,6 +99,9 @@ func TestInvokedCapturedEntrypointStillRequiresItsActualModel(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0o700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), raw, 0o444))
 	fatal(t, store.RecordInstall(installed))
+	// The captured child's staged private installation, which resolution opens before model admission.
+	must(t, os.MkdirAll(filepath.Join(layout.LocalPackages, installed.ID), 0o700))
+	must(t, os.WriteFile(filepath.Join(layout.LocalPackages, installed.ID, "installation.json"), []byte(`{"ID":"`+installed.ID+`"}`), 0o600))
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID, ChildInstallID: installed.ID,
 		Module: "captured", Export: "judge", Entrypoint: "judge"}}))
 	resolver := cli.NewResolver(store, config.Config{Home: layout.Root}, nil)

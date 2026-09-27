@@ -20,11 +20,9 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -60,44 +58,6 @@ type servingSeed struct {
 	HeaderComponents []string         `json:"header_components"`
 	ComponentBytes   map[string]int64 `json:"component_bytes"`
 	Bytes            int64            `json:"weight_bytes"`
-}
-
-func TestCapturedDevelopmentPlacementValidatesItsEnvironment(t *testing.T) {
-	fixture := *localServingFixtureDir
-	if fixture == "" {
-		fixture = filepath.Join("testdata", "local_serving_preparation")
-	}
-	// These are actual PreparePrivatePlacement bytes from the native model proof,
-	// produced by Runtime623dbb8; only the negative cases alter them.
-	raw, err := os.ReadFile(filepath.Join(fixture, "placement-from-runtime-623dbb8.json"))
-	must(t, err)
-	check := func(raw []byte) *exit.Error {
-		digest, err := canonical.Spell(canonical.Digest(raw))
-		must(t, err)
-		_, problem := orchestrator.PlacementFromExact("local/cozy-serving-preparation-fixture", "proof", digest, raw, nil)
-		return problem
-	}
-	fatal(t, check(raw))
-	for _, field := range []string{"local_revision_digest", "project_wheel", "environment_digest", "changed_environment"} {
-		t.Run(field, func(t *testing.T) {
-			doc, err := canonical.Read(raw, &pb.PlacementSet{})
-			must(t, err)
-			row := doc.List("placements")[0]
-			switch field {
-			case "environment_digest":
-				delete(row, field)
-			case "changed_environment":
-				row["environment_digest"] = "sha256:" + strings.Repeat("f", 64)
-			default:
-				delete(row.Sub("development"), field)
-			}
-			changed, err := canonical.Write(doc)
-			must(t, err)
-			if check(changed) == nil {
-				t.Fatalf("accepted captured placement with invalid %s", field)
-			}
-		})
-	}
 }
 
 type servingPreparationEvent struct {

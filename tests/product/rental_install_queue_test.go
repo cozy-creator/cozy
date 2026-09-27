@@ -268,10 +268,9 @@ func TestRentalInstallSchema46MigrationPreservesRental(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, statement := range []string{"DROP TABLE rental_installs", "PRAGMA user_version=46"} {
-		if _, err := db.Exec(statement); err != nil {
-			t.Fatal(err)
-		}
+	revertRecordsSchema(t, db, 46)
+	if _, err := db.Exec("PRAGMA user_version=46"); err != nil {
+		t.Fatal(err)
 	}
 	db.Close()
 	old, problem := records.Open(layout.DB)

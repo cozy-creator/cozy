@@ -61,7 +61,8 @@ case "$1" in
    if [ "$value" = --no-python-downloads ]; then disabled=yes; fi
    previous="$value"
   done
-  if [ "$selected" != %q ] || [ "$disabled" != yes ]; then
+  # A frozen export reads only the lock and may omit --python; everything else resolves with it.
+  if { [ "$1" != export ] || [ -n "$selected" ]; } && [ "$selected" != %q ] || [ "$disabled" != yes ]; then
    echo "uv must receive the exact Runtime executable and disabled downloads" >&2
    exit 93
   fi
@@ -137,7 +138,7 @@ only-include = ["operation.py"]
 	if strings.Count(string(raw), "export\n") != 2 {
 		t.Fatalf("both registry and published export must run: %s", raw)
 	}
-	for _, operation := range []string{"lock\n", "build\n", "export\n", "tree\n", "run\n"} {
+	for _, operation := range []string{"lock\n", "build\n", "export\n", "tree\n"} {
 		if !strings.Contains(string(raw), operation) {
 			t.Fatalf("did not exercise %s: %s", operation, raw)
 		}

@@ -1,9 +1,10 @@
-package records
+package producttest
 
 import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func TestUnreferencedRetainsNewestLocalEnvironment(t *testing.T) {
@@ -11,13 +12,13 @@ func TestUnreferencedRetainsNewestLocalEnvironment(t *testing.T) {
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	store, problem := Open(layout.DB)
+	store, problem := records.Open(layout.DB)
 	if problem != nil {
 		t.Fatal(problem)
 	}
 	defer store.Close()
-	install := func(id, createdVersion string) PackageInstall {
-		return PackageInstall{ID: id, Package: "local/example", Major: 1, Version: "1.0.0", SourceKind: "local", SourceRef: "file:///example/" + createdVersion, Dir: layout.InstallDir(id), ProjectDir: "/example/" + createdVersion}
+	install := func(id, createdVersion string) records.PackageInstall {
+		return records.PackageInstall{ID: id, Package: "local/example", Major: 1, Version: "1.0.0", SourceKind: "local", SourceRef: "file:///example/" + createdVersion, Dir: layout.InstallDir(id), ProjectDir: "/example/" + createdVersion}
 	}
 	first := install("first", "first")
 	if _, problem := store.Activate(first); problem != nil {

@@ -45,7 +45,7 @@ func TestUnpublishedWheelCapacityBeforeTransfer(t *testing.T) {
 				digest, _ := canonical.Spell(sha256Of(body))
 				revision.Files = append(revision.Files, localpackage.File{Digest: digest, Filename: name, Kind: "dependency", Path: path, Length: int64(len(body))})
 			}
-			sort.Slice(revision.Files, func(i, j int) bool { return revision.Files[i].Digest < revision.Files[j].Digest })
+			sort.Slice(revision.Files, func(i, j int) bool { return revision.Files[i].Filename < revision.Files[j].Filename })
 			o := hostOwner(t, "capacity-"+tc.name, rentalWiring(connection, private), func(opt *orchestrator.Options) { opt.Packages = localLauncher{revision: revision} })
 			instance, _, _, problem := o.c.EnsureRental(podRental)
 			fatal(t, problem)

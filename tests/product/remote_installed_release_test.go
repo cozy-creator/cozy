@@ -41,6 +41,9 @@ func TestRentalRunPreservesInstalledPublishedRelease(t *testing.T) {
 				detail.ExecutionRequirements = []string{"cozy-runtime>=0.2.25"}
 				_ = json.NewEncoder(w).Encode(detail)
 			})
+			mux.HandleFunc("POST /v1/packages/proof/releases/download", func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(declaredInstallPlan("releases", r.URL.Query().Get("release"), parsed))
+			})
 			mux.HandleFunc("GET /v1/rentals", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"rentals":[]}`)) })
 			mux.HandleFunc("GET /v1/rental-skus", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`[]`)) })
 			server := httptest.NewServer(mux)

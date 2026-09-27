@@ -57,6 +57,11 @@ func TestRentalListLiveBoard(t *testing.T) {
 	// The transitions are planted against the wall clock while the board runs: the hub
 	// moves the pod to ready, then queued work holds it, then the work settles.
 	go func() {
+		// Plant against the daemon's first rental read, not the CLI start: the board's
+		// first fetch starts the daemon and draws only a loading frame until it returns.
+		for deadline := time.Now().Add(10 * time.Second); hub.rentalReads() == 0 && time.Now().Before(deadline); {
+			time.Sleep(20 * time.Millisecond)
+		}
 		time.Sleep(1200 * time.Millisecond)
 		hub.set("rental-tui", "state", "ready")
 		time.Sleep(3 * time.Second)

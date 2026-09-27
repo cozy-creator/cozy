@@ -12,7 +12,8 @@ import (
 // by placement's maximum, since each child reserves its own execution group. The
 // request's own callable is never its own child: its slots are already selected.
 func (r *Resolver) PublishedChildModels(command *Context, request records.Request) ([]records.ModelRef, *exit.Error) {
-	if request.SizedByOwnModels() {
+	// An unversioned request has no exact closure to walk; RentalConstraints answers it.
+	if request.SizedByOwnModels() || request.Release == "" {
 		return nil, nil
 	}
 	root := request.Package + "@" + request.Release

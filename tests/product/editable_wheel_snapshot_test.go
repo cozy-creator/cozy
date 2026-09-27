@@ -62,7 +62,7 @@ func TestEditableSnapshotLargeWheelKeepsSourceIdentityFence(t *testing.T) {
 			// fence only after every large dependency has copied and rehashed.
 			local := &install.LocalSource{Package: "local/snapshot-root", Release: "2.0", Tree: project, Files: count, Bytes: size}
 			_, problem = install.Run(home.Layout{Installs: filepath.Join(root, "installs")}, nil, install.Request{Snapshot: true, Local: local})
-			if problem == nil || problem.Name != "local_package_source_changed" || !strings.Contains(problem.Error(), "package changed while capturing its invocation snapshot") {
+			if problem == nil || problem.Name != "local_package_source_changed" || !strings.Contains(problem.Error(), "copied project declares a different package name or version") {
 				t.Fatalf("large admitted wheel did not reach the unchanged metadata identity fence: %v", problem)
 			}
 			// An ordinary member of the same size must still fail source admission.

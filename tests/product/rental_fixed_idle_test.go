@@ -249,6 +249,7 @@ func TestRentalIdleSchemaUpgradePreservesReadyAndRetainedWork(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
+	revertRecordsSchema(t, db, 42)
 	_, err = db.Exec(`DROP TABLE device_memory_measurements; DROP TABLE rental_idle; PRAGMA user_version=42`)
 	must(t, err)
 	must(t, db.Close())
@@ -265,6 +266,8 @@ func TestRentalIdleSchemaUpgradePreservesReadyAndRetainedWork(t *testing.T) {
 	if current == nil || current.ReadyAt != row.ReadyAt || current.ExpectedWorkerBootID != row.ExpectedWorkerBootID {
 		t.Fatal("migration changed rental clock/identity")
 	}
+	// Schema 46 derives the local installation from install_id; this row has none.
+	request.LocalInstallationID = ""
 	assertPrivateTransactionIdentity(t, store, request, "blocked")
 	idle, problem := rental.ObserveIdle(store, *current)
 	fatal(t, problem)

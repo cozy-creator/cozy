@@ -44,7 +44,7 @@ const (
 	vendorDir = "../../protocol/cozy/worker/v1"
 	// Where the generated Go lives inside a worker-protocol checkout.
 	peerDir        = "gen/go/cozy/worker/v1"
-	wantRepository = "https://github.com/cozy-creator/worker-protocol-v2"
+	wantRepository = "https://github.com/cozy-creator/worker-protocol"
 	sourceManifest = vendorDir + "/SOURCE"
 	// worker-protocol's canonical corpus and selected byte-transport fixtures,
 	// vendored so the cross-language identity fence needs no token.
@@ -231,9 +231,12 @@ func TestCorpusAgreesWithBindings(t *testing.T) {
 		t.Errorf("the bindings are vendored from %s but the corpus from %s; re-vendor both "+
 			"from one worker-protocol commit", bindings.commit, corpus.commit)
 	}
-	if corpus.wireMinor != pb.WireMinor {
-		t.Errorf("%s records wire_minor = %d but the compiled binding speaks %d",
-			corpusManifest, corpus.wireMinor, pb.WireMinor)
+	// The corpus may trail the binding within its supported range; a binding older
+	// than the corpus is the stale half-landed bump this test exists to catch.
+	inRange := func(minor uint32) bool { return minor >= pb.MinCompatibleWireMinor && minor <= pb.WireMinor }
+	if !inRange(corpus.wireMinor) {
+		t.Errorf("%s records wire_minor = %d outside the compiled binding's range %d..%d",
+			corpusManifest, corpus.wireMinor, pb.MinCompatibleWireMinor, pb.WireMinor)
 	}
 	var frozen struct {
 		WireMinor uint32 `json:"wire_minor"`
@@ -245,9 +248,10 @@ func TestCorpusAgreesWithBindings(t *testing.T) {
 	if err := json.Unmarshal(raw, &frozen); err != nil {
 		t.Fatalf("parse the frozen MANIFEST.json: %v", err)
 	}
-	if frozen.WireMinor != pb.WireMinor {
-		t.Errorf("the frozen corpus was written at wire minor %d but the compiled binding "+
-			"speaks %d; %s", frozen.WireMinor, pb.WireMinor, reCorpusRemedy)
+	if frozen.WireMinor != corpus.wireMinor || !inRange(frozen.WireMinor) {
+		t.Errorf("the frozen corpus was written at wire minor %d; SOURCE records %d and the "+
+			"compiled binding speaks %d..%d; %s", frozen.WireMinor, corpus.wireMinor,
+			pb.MinCompatibleWireMinor, pb.WireMinor, reCorpusRemedy)
 	}
 }
 

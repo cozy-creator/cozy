@@ -44,6 +44,14 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 		_ = json.NewEncoder(w).Encode(hub.PackageCard{Package: hub.Resource{Org: "proof", Name: "quantize"}, Releases: []hub.ReleaseSummary{{Release: "1.0.0"}}})
 	})
 	mux.HandleFunc("GET /v1/packages/proof/quantize/releases/1.0.0", func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(detail) })
+	mux.HandleFunc("POST /v1/packages/proof/quantize/download", func(w http.ResponseWriter, r *http.Request) {
+		current, problem := launch.DecodePackageInterface(detail.PackageInterface)
+		if problem != nil {
+			t.Error(problem)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(declaredInstallPlan("quantize", r.URL.Query().Get("release"), current))
+	})
 	mux.HandleFunc("GET /v1/models/proof/source", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(hub.ModelCard{Model: hub.Resource{Org: "proof", Name: "source"}, Releases: []hub.ModelReleaseSummary{{ReleaseSummary: hub.ReleaseSummary{Release: "1.0.0"}, Lanes: []hub.ModelLaneSummary{{Lane: "bf16", ManifestID: digest, Bytes: 210_000_000_000}}}}})
 	})
@@ -87,6 +95,24 @@ func runModelCatalog(t *testing.T, configure ...func(*http.ServeMux, *hub.Packag
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: model-run-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	return root, &mu, &posts, digest, manifest
+}
+
+// declaredInstallPlan is a release's exact install plan with no dependencies. Rental
+// placement reads it to find published callees' model defaults; its lock names none.
+// It carries wheel facts only; no wheel byte is served.
+func declaredInstallPlan(distribution, release string, iface *launch.PackageInterface) hub.PackageDownloadPlan {
+	exact := func(raw []byte) hub.ExactDocument {
+		return hub.ExactDocument{CanonicalBytes: raw, Digest: mustSpell(raw), Length: int64(len(raw))}
+	}
+	wheel := []byte(distribution + " wheel")
+	return hub.PackageDownloadPlan{Release: release,
+		PackageConfig:    exact([]byte("[application]\nobject = \"" + iface.Application + "\"\n")),
+		PackageInterface: exact(iface.Raw),
+		Pyproject:        exact([]byte("[project]\nname = \"" + distribution + "\"\nversion = \"" + release + "\"\nrequires-python = \">=3.12\"\ndependencies = []\n")),
+		UVLock:           exact([]byte("version = 1\nrequires-python = \">=3.12\"\n\n[[package]]\nname = \"" + distribution + "\"\nversion = \"" + release + "\"\nsource = { editable = \".\" }\n")),
+		Downloads: []hub.PackageInstallDownload{{Kind: "project_wheel", Path: distribution + "-" + release + "-py3-none-any.whl",
+			Distribution: distribution, Version: release, Digest: mustSpell(wheel), Length: int64(len(wheel)),
+			Tags: []string{"py3-none-any"}, ImportRoots: []string{distribution}}}}
 }
 
 func TestPinnedCheckpointTransferKeepsReleaseAndLaneConstraints(t *testing.T) {

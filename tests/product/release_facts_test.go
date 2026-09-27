@@ -202,22 +202,34 @@ func TestWorkingMemoryLedgerSizesTheNextSelection(t *testing.T) {
 		t.Fatalf("h100-80 verdict %q fit %q", candidates[1].Verdict, candidates[1].Fit)
 	}
 
-	// Weights and working memory add: the fit names both, and an unmeasured
-	// selection says so rather than reading as "needs nothing more".
+	// A staged selection is sized by its declared residency and says its total is
+	// unmeasured. A legacy working peak has no co-resident scope, so it cannot enlarge
+	// a staged execution.
 	models := []records.ModelRef{{Slot: "generate.models.model", Model: "proof/minimax", Release: "1.0.0",
 		Lane: "fp8", Manifest: "sha256:" + strings.Repeat("ab", 32),
 		ComponentBytes: map[string]int64{"text_encoder": 51 << 30, "fl2va_dit": 21 << 30},
 		ComponentUse:   map[string][]string{"condition_text": {"text_encoder"}, "sample_fl2va": {"fl2va_dit"}}}}
-	sized := rental.Purchases(skus[1:], models, true, false, rental.Constraints{})
-	if sized[0].Fit != "components 51.0 GiB (working memory unmeasured) of 80 GB" || sized[0].Verdict != "" {
+	working := records.WorkingPeaks{records.ModelsDigest(models): {Bytes: 30 << 30, Runs: 3}}
+	for _, peaks := range []records.WorkingPeaks{nil, working} {
+		sized := rental.Purchases(skus[1:], models, true, false, rental.Constraints{Working: peaks})
+		if sized[0].Fit != "components 51.0 GiB (total memory unmeasured for this exact workload/SKU) of 80 GB" || sized[0].Verdict != "" {
+			t.Fatalf("staged fit %q verdict %q", sized[0].Fit, sized[0].Verdict)
+		}
+	}
+
+	// Unstaged weights and working memory add: the fit names both, and an unmeasured
+	// selection says so rather than reading as "needs nothing more".
+	lane := []records.ModelRef{{Slot: "generate.models.model", Model: "proof/minimax", Release: "1.0.0",
+		Lane: "fp8", Manifest: "sha256:" + strings.Repeat("ab", 32), Bytes: 51 << 30}}
+	sized := rental.Purchases(skus[1:], lane, true, false, rental.Constraints{})
+	if sized[0].Fit != "lane_bytes 51.0 GiB (working memory unmeasured) of 80 GB" || sized[0].Verdict != "" {
 		t.Fatalf("unmeasured fit %q verdict %q", sized[0].Fit, sized[0].Verdict)
 	}
-	working := records.WorkingPeaks{records.ModelsDigest(models): {Bytes: 30 << 30, Runs: 3}}
-	sized = rental.Purchases(skus[1:], models, true, false, rental.Constraints{Working: working})
-	if !strings.Contains(sized[0].Verdict, "needs 81.0 GiB resident (condition_text: text_encoder; measured working 30.0 GiB)") {
+	sized = rental.Purchases(skus[1:], lane, true, false, rental.Constraints{Working: working})
+	if !strings.Contains(sized[0].Verdict, "needs 81.0 GiB resident (lane fp8; measured working 30.0 GiB)") {
 		t.Fatalf("measured verdict %q fit %q", sized[0].Verdict, sized[0].Fit)
 	}
-	if sized[0].Fit != "components 51.0 GiB + measured working 30.0 GiB (3 runs) of 80 GB" {
+	if sized[0].Fit != "lane_bytes 51.0 GiB + measured working 30.0 GiB (3 runs) of 80 GB" {
 		t.Fatalf("measured fit %q", sized[0].Fit)
 	}
 }
