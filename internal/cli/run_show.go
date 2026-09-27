@@ -40,7 +40,7 @@ type runReport struct {
 
 type reportStage struct {
 	Name        string  `json:"name"`
-	Kind        string  `json:"kind"` // setup, gpu, inference or transfer
+	Kind        string  `json:"kind"` // setup, gpu, phase, inference or transfer
 	StartUnixMS int64   `json:"start_unix_ms,omitempty"`
 	MS          float64 `json:"ms"`
 	Count       int     `json:"count,omitempty"`
@@ -155,6 +155,10 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			}
 		case "request.preparing":
 			report.Stages = append(report.Stages, preparingStage(event.Payload))
+		case "request.log":
+			if stage, ok := phaseStage(event.Payload); ok {
+				report.Stages = append(report.Stages, stage)
+			}
 		case "request.outputs_fetched":
 			outputs, _ := event.Payload["outputs"].([]any)
 			moved := payloadInt(event.Payload["bytes"])
@@ -189,8 +193,9 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		}
 		sort.Slice(report.Steps, func(i, j int) bool { return report.Steps[i].Name < report.Steps[j].Name })
 	}
-	// Setup, then inference, then transfer; within a kind, by start (unknown last).
-	order := map[string]int{"setup": 0, "gpu": 1, "inference": 2, "transfer": 3}
+	// Setup, GPU wait, then execution phases and inference, then transfer; within an
+	// order, by start (unknown last).
+	order := map[string]int{"setup": 0, "gpu": 1, "phase": 2, "inference": 2, "transfer": 3}
 	sort.SliceStable(report.Stages, func(i, j int) bool {
 		a, b := report.Stages[i], report.Stages[j]
 		if order[a.Kind] != order[b.Kind] {
@@ -227,6 +232,39 @@ func preparingStage(payload map[string]any) reportStage {
 		}
 	}
 	return row
+}
+
+// phaseStage reads one Runtime phase record: a named piece of execution work (a source
+// download, a conversion, a checkpoint upload) with its elapsed time and, for byte work,
+// what it moved and at what average rate.
+func phaseStage(payload map[string]any) (reportStage, bool) {
+	fields, _ := payload["fields"].(map[string]any)
+	name, _ := fields["phase"].(string)
+	elapsed, timed := number(fields["elapsed_ms"])
+	if name == "" || !timed {
+		return reportStage{}, false
+	}
+	start := payloadInt(fields["started_unix_ms"])
+	if start == 0 {
+		if at := payloadInt(payload["at_unix_ms"]); at > 0 {
+			start = at - int64(elapsed)
+		}
+	}
+	row := reportStage{Name: name, Kind: "phase", StartUnixMS: start, MS: elapsed}
+	if total := payloadInt(fields["total_bytes"]); total > 0 {
+		row.Bytes = payloadInt(fields["bytes"])
+		row.Detail = units.Bytes(row.Bytes) + " of " + units.Bytes(total)
+		if moved := payloadInt(fields["moved_bytes"]); moved != row.Bytes {
+			row.Detail += ", " + units.Bytes(moved) + " moved"
+		}
+		if rate, ok := number(fields["rate_bytes_per_second"]); ok && rate > 0 {
+			row.Detail += " at " + units.Bytes(int64(rate)) + "/s"
+		}
+	}
+	if completed, ok := fields["completed"].(bool); ok && !completed {
+		row.Detail = strings.TrimPrefix(row.Detail+"; did not complete", "; ")
+	}
+	return row, true
 }
 
 // setupStage marks setup that finished before the run was submitted as reused, not paid.

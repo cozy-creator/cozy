@@ -89,6 +89,13 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			}
 		}
 	}
+	if view.Accepted && state.Status == "in_progress" {
+		// No live fanout carries Runtime-owned progress; the imported sample does.
+		if value, problem := s.store.LatestMachineProgress(row.ID, row.Ordinal); problem == nil && value != nil {
+			state.Progress = value
+			state.Stage, _ = value["stage"].(string)
+		}
+	}
 	var submission pb.MachineExecutionSubmit
 	if proto.Unmarshal(link.Submission, &submission) == nil {
 		state.RetryBudget = int64(submission.MaxAttempts)
