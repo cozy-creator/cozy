@@ -218,9 +218,23 @@ func (s *Store) failQueuedRequest(requestID string, expected *Request, payload m
 // one of these instead of one connection per request (the connection-cap reason the
 // local host multiplexes at all).
 func (s *Store) EventsAfter(requestID string, cursor int64, limit int) ([]Event, *exit.Error) {
+	return s.events(requestID, cursor, limit, false)
+}
+
+// EvidenceEvents is one request's durable record without its imported progress samples.
+// A multi-hour machine run journals a sample a second; those ticks would otherwise fill
+// a bounded read before its phase records and terminal.
+func (s *Store) EvidenceEvents(requestID string, limit int) ([]Event, *exit.Error) {
+	return s.events(requestID, 0, limit, true)
+}
+
+func (s *Store) events(requestID string, cursor int64, limit int, withoutTicks bool) ([]Event, *exit.Error) {
 	// A kept triage bundle rides beside the events as a document, never as one of them.
 	query := `SELECT seq,request_id,type,attempt,payload,at FROM request_events
 		WHERE seq>? AND type!='machine.triage'`
+	if withoutTicks {
+		query += ` AND type!='machine.progress'`
+	}
 	args := []any{cursor}
 	if requestID != "" {
 		query += ` AND request_id=?`
