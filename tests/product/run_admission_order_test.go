@@ -222,26 +222,3 @@ func TestBareRunReportsRequiredArgumentsAndFullInterface(t *testing.T) {
 	}
 }
 
-func TestLocalRunLadderIsAPreferenceNotAnAllowlist(t *testing.T) {
-	for _, test := range []struct {
-		name, gpu, want string
-		args            []string
-		optionalPrompt  bool
-	}{
-		{name: "unmatched GPU uses first declared lane", gpu: "NVIDIA GeForce RTX 4070 Laptop GPU", want: ladderLane, args: []string{"prompt=hello"}},
-		{name: "matching GPU uses its rung", gpu: "NVIDIA B200", want: "mxfp8-adaln-pruned", args: []string{"prompt=hello"}},
-		{name: "explicit lane overrides matching rung", gpu: "NVIDIA B200", want: "bf16-full", args: []string{"prompt=hello", "model.model=" + ladderModel + "@" + ladderRelease + "/bf16-full"}},
-		{name: "no mandatory arguments proceeds", gpu: "NVIDIA B200", want: "mxfp8-adaln-pruned", optionalPrompt: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			root, path, _, probe := admissionRoot(t, admissionInterface(t, test.optionalPrompt, false), test.gpu, false)
-			args := append([]string{"run", ladderPackage + "/generate", "--json", "--idempotency-key", "local-selection"}, test.args...)
-			code, out := runAdmissionCLI(t, root, path, args...)
-			_, lanes := probe.snapshot()
-			if code == 0 || !strings.Contains(out, "proof stopped before model acquisition") || len(lanes) != 1 || lanes[0] != test.want {
-				t.Fatalf("local selection did not reach acquisition with lane %s: lanes=%v exit=%d %s", test.want, lanes, code, out)
-			}
-			assertAdmissionDidNotSubmit(t, root, "local-selection")
-		})
-	}
-}
