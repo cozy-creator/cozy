@@ -16,6 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/machines"
@@ -174,7 +175,9 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	} else {
 		unlock := localpackage.Guard()
 		defer unlock()
-		spec, e = s.resolvePlan(r.Context(), selectedHub, sub)
+		var lease *install.Lease
+		defer func() { lease.Release() }()
+		spec, e = s.resolvePlan(r.Context(), selectedHub, sub, &lease)
 		if e != nil {
 			s.refuseTyped(w, r, e)
 			return
@@ -423,8 +426,9 @@ func (s *Server) publicStatusOf(row records.Request) string {
 // resolvePlan turns the client's package/function into the orchestrator's Submission.
 // The plan id is resolved through the LOCAL resolver — the same object `start` uses — so
 // a client never names a plan digest and a submission can never bind a binding this host
-// did not install.
-func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission) (orchestrator.Submission, *exit.Error) {
+// did not install. The local install it resolves is leased into lease, which the caller
+// releases once the request is recorded.
+func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, lease **install.Lease) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
@@ -447,7 +451,8 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission) (o
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
 	if strings.HasPrefix(sub.Package, "local/") {
-		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+		refreshed, editable, leased, refreshProblem := s.leaseRefreshed(sub.Package)
+		*lease = leased
 		if refreshProblem != nil {
 			return out, refreshProblem
 		}
@@ -603,6 +608,23 @@ func (s *Server) resolveLocalServing(ctx context.Context, sub Submission,
 		return out, problem
 	}
 	return out, nil
+}
+
+// leaseRefreshed refreshes pkg and, when it is editable, leases the install it now runs
+// until the request that references it is recorded: neither the editable watcher nor
+// another process's install may reclaim it in between. An install reclaimed before the
+// lease was taken is resolved again.
+func (s *Server) leaseRefreshed(pkg string) (string, bool, *install.Lease, *exit.Error) {
+	for {
+		refreshed, editable, _, problem := s.refreshPackage(pkg)
+		if problem != nil || !editable {
+			return refreshed, editable, nil, problem
+		}
+		lease, problem := install.LeaseInstall(s.layout, s.store, refreshed)
+		if problem == nil || problem.Code != exit.NotFound {
+			return refreshed, true, lease, problem
+		}
+	}
 }
 
 // resolvePendingServing retains only code and model selections. The worker's

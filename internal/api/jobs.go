@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
@@ -225,7 +226,9 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			defer unlock()
 		}
 		var inputDeclaration *launch.Entrypoint
-		spec, inputDeclaration, e = s.resolveJob(r.Context(), selectedHub, sub)
+		var lease *install.Lease
+		defer func() { lease.Release() }()
+		spec, inputDeclaration, e = s.resolveJob(r.Context(), selectedHub, sub, &lease)
 		if e == nil && spec.OutputExport != nil {
 			e = resultfiles.Preflight(spec.OutputExport.Directory)
 		}
@@ -430,8 +433,10 @@ func replayJobSubmission(sub JobSubmission,
 
 // resolveJob turns package+function into the orchestrator's Submission. The
 // `job_descriptor_id` is resolved HERE, from the installed package's own PackageInterface —
-// a client never names a digest, exactly as it never names a binding plan id.
-func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
+// a client never names a digest, exactly as it never names a binding plan id. The local
+// install it resolves is leased into lease, which the caller releases once the request
+// is recorded.
+func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, lease **install.Lease) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
 	if sub.RentNew && sub.Worker != "" {
 		return orchestrator.Submission{}, nil, exit.Usagef("a fresh rental cannot name an existing worker")
 	}
@@ -485,9 +490,13 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission) 
 		if strings.HasPrefix(sub.Package, "local/") {
 			if sub.InstallID != "" {
 				resolved, problem := s.resolveLocalJob(ctx, sub, out, sub.InstallID)
+				if problem == nil {
+					*lease, problem = install.LeaseInstall(s.layout, s.store, sub.InstallID)
+				}
 				return resolved, nil, problem
 			}
-			refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+			refreshed, editable, leased, refreshProblem := s.leaseRefreshed(sub.Package)
+			*lease = leased
 			if refreshProblem != nil {
 				return out, nil, refreshProblem
 			}
@@ -531,12 +540,18 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission) 
 		return out, job, nil
 	}
 	if sub.InstallID == "" {
-		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+		refreshed, editable, leased, refreshProblem := s.leaseRefreshed(sub.Package)
+		*lease = leased
 		if refreshProblem != nil {
 			return out, nil, refreshProblem
 		}
 		if editable {
 			sub.InstallID = refreshed
+		}
+	} else {
+		var problem *exit.Error
+		if *lease, problem = install.LeaseInstall(s.layout, s.store, sub.InstallID); problem != nil {
+			return out, nil, problem
 		}
 	}
 	if s.machineExecutions != nil && strings.HasPrefix(sub.Package, "local/") && sub.InstallID != "" {

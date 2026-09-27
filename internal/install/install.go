@@ -570,7 +570,8 @@ func Remove(l home.Layout, st *records.Store, pkg string, major int) (int64, *ex
 
 // Reclaim removes an unpinned install immediately. The database claim wins
 // before filesystem deletion, so a newly pinned install is never removed. Only
-// after that claim may the read-only published tree be made removable.
+// after that claim may the read-only published tree be made removable. An install a
+// submission has leased (LeaseInstall) is left for a later pass.
 func Reclaim(l home.Layout, st *records.Store, id string) (int64, *exit.Error) {
 	inst, problem := st.Install(id)
 	if problem != nil || inst == nil {
@@ -580,6 +581,11 @@ func Reclaim(l home.Layout, st *records.Store, id string) (int64, *exit.Error) {
 	if problem != nil {
 		return 0, problem
 	}
+	lease, problem := claimForReclaim(l, id)
+	if problem != nil || lease == nil {
+		return 0, problem
+	}
+	defer lease.Close()
 	claimed, problem := st.ForgetIfUnreferenced(id)
 	if problem != nil || !claimed {
 		return 0, problem
@@ -587,6 +593,7 @@ func Reclaim(l home.Layout, st *records.Store, id string) (int64, *exit.Error) {
 	if problem := removeInstallTree(target); problem != nil {
 		return 0, problem
 	}
+	_ = os.Remove(leasePath(l, id))
 	return inst.BytesExcl, nil
 }
 
@@ -617,6 +624,7 @@ func Sweep(l home.Layout, st *records.Store) (Swept, *exit.Error) {
 		// A DirEntry's type is its own lstat, so a symlink is skipped as a symlink: the
 		// sweep removes trees this root owns and nothing it merely names.
 		if !entry.IsDir() {
+			sweepLease(l, st, entry.Name())
 			continue
 		}
 		swept.Scanned++

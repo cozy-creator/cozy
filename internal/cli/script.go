@@ -183,6 +183,7 @@ func releaseSnapshotReader(target Target) {
 	if target.releaseCapture != nil {
 		target.releaseCapture()
 	}
+	target.lease.Release()
 }
 
 // isScriptTarget answers whether a run target names a Python script. A package ref never
