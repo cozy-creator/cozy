@@ -92,10 +92,23 @@ jobs:
           uv tool install --python 3.12 cozy-eval
           uv tool dir --bin >> "$GITHUB_PATH"
           echo "RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
+      # This computer's machine: the pod's Host, built at a pinned Tensorhub commit. Local
+      # execution tests run on it; -require-machine-host fails them rather than skipping.
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/tensorhub
+          ref: 52f12811ea1bd6b60b538d85d55e251ee561dcb4
+          path: tensorhub-host
+          ssh-key: ${{ secrets.TENSORHUB_READ_KEY }}
+          persist-credentials: false
+      - name: Machine Host
+        run: |
+          (cd tensorhub-host && GOTOOLCHAIN=auto go build -trimpath -o "$RUNNER_TEMP/pod-supervisor" ./pod-supervisor)
+          echo "MACHINE_HOST=$RUNNER_TEMP/pod-supervisor" >> "$GITHUB_ENV"
       # The runner's service cgroup is not delegated; Runtime's executor containment needs its own subtree.
       - name: Product tests
         run: |
-          args=(-j 3 -serving-cpu-fixture
+          args=(-j 3 -serving-cpu-fixture -machine-host="$MACHINE_HOST" -require-machine-host
             -script-runtime-wheel="$RUNTIME_WHEEL" -child-runtime-wheel="$RUNTIME_WHEEL")
           [ "$FULL" = true ] || args+=(-test.short)
           sudo systemd-run --wait --pipe --collect \
