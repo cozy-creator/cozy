@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/scratch"
+	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 // Floors for the generated ingest script: Runtime 0.18.51 and TensorFS 0.3.60 stream the
@@ -154,17 +155,29 @@ func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profi
 	if recipe != nil {
 		profiles = []string{recipe.Profile}
 	}
+	named := nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}
 	if len(profiles) > 0 {
-		if source, problem = narrowSourceToProfiles(ctx, source, profiles); problem != nil {
+		narrowed, problem := narrowSourceToProfiles(ctx, source, profiles)
+		if hostUnaware(problem) {
+			return deferToRental(ctx, named, problem), nil
+		}
+		if problem != nil {
 			return nativeIngestPlan{}, problem
 		}
+		source, named.source = narrowed, narrowed
 	}
 	runCtx, cancel := hub.LongContext()
 	defer cancel()
 	conversion, problem := preflightConversionPlan(runCtx, ctx, source, profileSlots(profiles))
+	if len(profiles) > 0 && hostUnaware(problem) {
+		return deferToRental(ctx, named, problem), nil
+	}
 	if problem != nil {
-		if strings.Contains(problem.Message, "AMBIGUOUS_CLASSIFICATION") {
+		if tfs.Refused(problem, "AMBIGUOUS_CLASSIFICATION") {
 			problem = problem.WithRemedy("choose the reviewed profile(s) with --source-profile; profiles over different files compose one model")
+		}
+		if hostUnaware(problem) {
+			problem = problem.WithRemedy("this host's TensorFS may predate the source's profile: name it with --source-profile and the rental's TensorFS decides")
 		}
 		return nativeIngestPlan{}, problem
 	}
@@ -178,6 +191,29 @@ func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profi
 		}
 	}
 	return nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}, nil
+}
+
+// hostUnaware is this host's TensorFS not recognizing a profile or fingerprint. The host
+// and the rental install TensorFS independently, so the rental's may know what this one
+// does not: that is the rental's decision, never a veto here.
+func hostUnaware(problem *exit.Error) bool {
+	return tfs.Refused(problem, "UNREGISTERED_FINGERPRINT")
+}
+
+// deferToRental keeps the named profiles and whatever narrowing already happened; the
+// rental's TensorFS selects, plans and refuses on its own registry.
+func deferToRental(ctx *Context, plan nativeIngestPlan, problem *exit.Error) nativeIngestPlan {
+	version := "tfs (unavailable)"
+	if tool, _, opened := localTensorFS(ctx); opened == nil {
+		version = tool.Version()
+	}
+	said := problem.Message
+	if at := strings.Index(said, "REFUSED "); at >= 0 {
+		said = said[at:]
+	}
+	fmt.Fprintf(ctx.Err, "note: this host's %s does not recognize %s (%s); the rental's TensorFS decides\n",
+		version, strings.Join(plan.profiles, ", "), said)
+	return plan
 }
 
 func profileSlots(profiles []string) map[string]string {

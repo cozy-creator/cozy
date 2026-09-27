@@ -84,17 +84,34 @@ func (t *Tool) runContext(ctx context.Context, args ...string) (string, *exit.Er
 		}
 		// Namespace/tool warnings can precede the actual refusal. Preserve the
 		// byte plane's typed cause instead of attributing failure to a warning.
+		code := ""
 		for _, line := range strings.Split(said, "\n") {
 			if line = strings.TrimSpace(line); strings.HasPrefix(line, "REFUSED ") {
 				said = line
+				code, _, _ = strings.Cut(strings.TrimPrefix(line, "REFUSED "), ":")
 				break
 			}
 		}
 		return out.String(), exit.Named(exit.Validation, "tfs_refused",
 			"tfs %s: %s", strings.Join(redact(args), " "), firstLine(said)).
-			WithRemedy("the byte plane refused in its own words; nothing above it may overrule that")
+			WithRemedy("the byte plane refused in its own words; nothing above it may overrule that").
+			WithCause(code)
 	}
 	return out.String(), nil
+}
+
+// Refused reports whether problem is tfs refusing with its own code.
+func Refused(problem *exit.Error, code string) bool {
+	return problem != nil && problem.Name == "tfs_refused" && problem.Cause == code
+}
+
+// Version is this host's `tfs version` line, for notes that name which TensorFS spoke.
+func (t *Tool) Version() string {
+	out, problem := t.run("version")
+	if fields := strings.Fields(out); problem == nil && len(fields) >= 2 {
+		return fields[0] + " " + fields[1]
+	}
+	return "tfs (version unknown)"
 }
 
 // redact keeps an absolute store path out of a refusal line's head, where it buries
