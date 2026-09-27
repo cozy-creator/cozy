@@ -196,15 +196,16 @@ func narrowSourceToProfiles(ctx *Context, source publishSource, profiles []strin
 	return narrowPublishSource(ctx, source, profiles)
 }
 
-// ingestRunKey names this ingest on this rental; records.ResumableRun walks its history.
+// ingestRunKey names this ingest wherever it runs: a completed ingest is a memo hit on any
+// rental, and records.ResumableRun resumes a stopped one on the same rental.
 func ingestRunKey(layout home.Layout, script []byte, rentalID string) (string, string, *exit.Error) {
 	store, problem := records.Open(layout.DB)
 	if problem != nil {
 		return "", "", problem
 	}
 	defer store.Close()
-	digest := sha256.Sum256(append(append([]byte(nil), script...), "\x00"+rentalID...))
-	return store.ResumableRun("model-upload-" + hex.EncodeToString(digest[:]))
+	digest := sha256.Sum256(script)
+	return store.ResumableRun("model-upload-"+hex.EncodeToString(digest[:]), rentalID)
 }
 
 func quote(value string) string { raw, _ := json.Marshal(value); return string(raw) }
