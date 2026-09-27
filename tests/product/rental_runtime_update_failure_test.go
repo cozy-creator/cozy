@@ -48,8 +48,14 @@ func newMaintenancePod(t *testing.T) *maintenancePod {
 
 // path is the daemon's PATH with this pod's endpoint first. The product's configuration
 // is loaded once per process, so it is imposed on the daemon rather than set here.
-func (p *maintenancePod) path() string {
-	return "PATH=" + filepath.Join(p.dir, "bin") + string(os.PathListSeparator) + os.Getenv("PATH")
+func (p *maintenancePod) path(t *testing.T, root string) string {
+	path := filepath.Join(p.dir, "bin")
+	for _, item := range childEnv(t, root) {
+		if strings.HasPrefix(item, "PATH=") {
+			path += string(os.PathListSeparator) + strings.TrimPrefix(item, "PATH=")
+		}
+	}
+	return "PATH=" + path
 }
 
 func (p *maintenancePod) sftpMode(t *testing.T, mode string) {
@@ -95,7 +101,7 @@ func localRuntimePair(t *testing.T) (string, string) {
 		must(t, os.WriteFile(path, buffer.Bytes(), 0o644))
 		return path
 	}
-	return write("cozy_runtime-0.18.60+dev.proof-cp312-abi3-manylinux_2_28_x86_64.whl", "cozy-runtime", "0.18.60+dev.proof", "tensorfs>=0.3.60"),
+	return write("cozy_runtime-0.18.60+dev.proof-cp312-abi3-manylinux_2_28_x86_64.whl", "cozy-runtime", "0.18.60+dev.proof", "tensorfs>=0.3.60"), //cozy:allow a wheel's distribution name, not the binary
 		write("tensorfs-0.3.66+dev.proof-cp312-abi3-manylinux_2_28_x86_64.whl", "tensorfs", "0.3.66+dev.proof")
 }
 
@@ -184,7 +190,7 @@ func TestAnUpdateThatNeverReachedTheWorkerEndsAndTheUploadResumes(t *testing.T) 
 	serveMaintenance(t, layout, public, func(key string, value any) { hub.set(podRental, key, value) })
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	startDaemonProcess(t, root, pod.path())
+	startDaemonProcess(t, root, pod.path(t, root))
 	runtimeWheel, tensorfsWheel := localRuntimePair(t)
 
 	// A pod rented without SSH maintenance is refused before anything is recorded.
@@ -239,7 +245,7 @@ func TestAParkedRunReachesItsMachineWhenTheUpdateFails(t *testing.T) {
 		h.rentals[podRental][key] = value
 		h.mu.Unlock()
 	})
-	startDaemonProcess(t, root, pod.path())
+	startDaemonProcess(t, root, pod.path(t, root))
 	runtimeWheel, tensorfsWheel := localRuntimePair(t)
 
 	pod.sftpMode(t, "hold")
@@ -305,7 +311,7 @@ func TestAnUnfinishedUpdateMakesTheRentalUnusableUntilItsOwnerResumesIt(t *testi
 		h.rentals[podRental][key] = value
 		h.mu.Unlock()
 	})
-	startDaemonProcess(t, root, pod.path())
+	startDaemonProcess(t, root, pod.path(t, root))
 	runtimeWheel, tensorfsWheel := localRuntimePair(t)
 	must(t, os.WriteFile(filepath.Join(pod.dir, "update-outcome"), []byte("recovery_required"), 0o644))
 
