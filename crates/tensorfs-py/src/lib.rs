@@ -114,6 +114,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<docs::PyClosure>()?;
 
     m.add_function(wrap_pyfunction!(ingest::read_source_heads, m)?)?;
+    m.add_function(wrap_pyfunction!(ingest::select_source_profile, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::prepare_selected_source, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::record_model_source_custody, m)?)?;
     m.add_function(wrap_pyfunction!(ingest::model_source_objects, m)?)?;

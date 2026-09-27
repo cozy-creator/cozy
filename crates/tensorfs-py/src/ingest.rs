@@ -90,6 +90,35 @@ pub fn read_source_heads<'p>(
     Ok(out)
 }
 
+/// The one reviewed profile these `(member, length, header)` heads plan under. A caller
+/// that names no profile converts with this one.
+#[pyfunction]
+#[pyo3(signature = (store, heads, *, registry=None))]
+pub fn select_source_profile(
+    py: Python<'_>,
+    store: &PyStore,
+    heads: Vec<(String, u64, Vec<u8>)>,
+    registry: Option<Vec<u8>>,
+) -> PyResult<String> {
+    let heads: Vec<providers::MemberHead> = heads
+        .into_iter()
+        .map(|(member, length, head)| providers::MemberHead {
+            member,
+            length,
+            head,
+        })
+        .collect();
+    py.detach(|| {
+        let (locator, bytes) = model_source::effective_registry(&store.store, registry.as_deref())?;
+        let scratch = store.store.root().join("tmp").join(format!(
+            "select-profile-{}",
+            tensorfs_core::meta::now_nanos_unique()
+        ));
+        tensorfs_core::ingest::preflight::select_profile(&locator, &bytes, &heads, &scratch)
+    })
+    .or_refuse(py)
+}
+
 /// Advance one exact selection against whatever bodies the Store holds now. `members` are
 /// `(member, object id, length, header)`; the result is `prepare_model_source`'s plus the
 /// members counted as landed.
@@ -122,21 +151,16 @@ pub fn prepare_selected_source<'p>(
         .collect();
     let (prepared, landed) = py
         .detach(|| {
-            let (locator, bytes) = match &registry {
-                Some(bytes) => ("supplied:native-registry", bytes.as_slice()),
-                None => (
-                    model_source::BUILTIN_REGISTRY,
-                    model_source::BUILTIN_REGISTRY_BYTES,
-                ),
-            };
+            let (locator, bytes) =
+                model_source::effective_registry(&store.store, registry.as_deref())?;
             model_source::prepare_selected_source(
                 &store.store,
                 operation_id,
                 source_selection_digest,
                 profiles,
                 &members,
-                locator,
-                bytes,
+                &locator,
+                &bytes,
                 write_budget_bytes,
             )
         })

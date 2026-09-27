@@ -690,12 +690,6 @@ fn plan_source_prepared(
         }
         for assignments in profile_assignments(profile, &registry, carriers, &headers) {
             matches.push((profile, assignments));
-            if matches.len() >= 2 {
-                break;
-            }
-        }
-        if matches.len() >= 2 {
-            break;
         }
     }
     if matches.is_empty() {
@@ -704,20 +698,61 @@ fn plan_source_prepared(
             "carrier set matches no reviewed source profile",
         );
     }
-    if matches.len() != 1 {
-        let profiles: Vec<&str> = matches
+    // Every match is planned. Matches whose plans are identical (the same sources, order,
+    // target and session under different profile names) are one answer, named by the most
+    // specific profile; only genuinely different plans are ambiguous.
+    let mut planned = Vec::with_capacity(matches.len());
+    let mut first_error = None;
+    for (profile, assignments) in matches {
+        match plan_match(
+            profile,
+            assignments,
+            carriers,
+            &set,
+            &registry,
+            registry_locator,
+            registry_bytes,
+            spec_variant,
+        ) {
+            Ok(result) => planned.push((profile, result)),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if planned.is_empty() {
+        return Err(first_error.expect("every match was planned or refused"));
+    }
+    let same = |left: &SourcePlan, right: &SourcePlan| {
+        (
+            &left.session,
+            &left.construction_order,
+            &left.sources,
+            &left.target,
+        ) == (
+            &right.session,
+            &right.construction_order,
+            &right.sources,
+            &right.target,
+        )
+    };
+    if planned
+        .iter()
+        .any(|(_, (plan, _))| !same(plan, &planned[0].1 .0))
+    {
+        let mut profiles: Vec<&str> = planned
             .iter()
             .map(|(profile, _)| profile.name.as_str())
             .collect();
-        let mut members: Vec<String> = matches
+        profiles.dedup();
+        let mut members: Vec<String> = planned
             .iter()
-            .flat_map(|(_, assignments)| {
-                assignments.iter().map(|assignment| {
-                    let carrier = &carriers[assignment.carrier];
-                    carrier
-                        .member
+            .flat_map(|(_, (plan, _))| {
+                plan.sources.iter().map(|source| {
+                    source
+                        .source_member
                         .clone()
-                        .unwrap_or_else(|| carrier.path.display().to_string())
+                        .unwrap_or_else(|| source.path.display().to_string())
                 })
             })
             .collect();
@@ -731,7 +766,42 @@ fn plan_source_prepared(
             ),
         );
     }
-    let (profile, mut assignments) = matches.remove(0);
+    planned.sort_by_key(|(profile, _)| {
+        (
+            std::cmp::Reverse(specificity(profile)),
+            profile.name.clone(),
+        )
+    });
+    let (_, (plan, prepared)) = planned.swap_remove(0);
+    Ok((plan, prepared))
+}
+
+/// How exactly a profile binds its components: provider members, then member prefixes.
+fn specificity(profile: &SourceProfile) -> (usize, usize) {
+    let exact = profile
+        .components
+        .iter()
+        .filter(|component| component.source_member.is_some())
+        .count();
+    let prefixed = profile
+        .components
+        .iter()
+        .filter(|component| component.source_member_prefix.is_some())
+        .count();
+    (exact, prefixed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_match(
+    profile: &SourceProfile,
+    mut assignments: Vec<SourceAssignment>,
+    carriers: &[CarrierInput],
+    set: &CarrierSet,
+    registry: &FingerprintRegistry,
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    spec_variant: Option<usize>,
+) -> Result<(SourcePlan, Prepared)> {
     assignments.sort_by(|left, right| left.component.cmp(&right.component));
     let sources: Vec<(String, CarrierInput)> = assignments
         .iter()
@@ -762,7 +832,7 @@ fn plan_source_prepared(
                 .map(|key| (component.component.clone(), key.clone()))
         })
         .collect();
-    let mut prepared = prepare_with_registry(&target, &sources, &set, &registry, spec_variant)?;
+    let mut prepared = prepare_with_registry(&target, &sources, set, registry, spec_variant)?;
     prepared.plan.apply_order(&order)?;
     prepared.plan.check_converts_something()?;
     let plan = SourcePlan {
