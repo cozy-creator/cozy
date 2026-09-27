@@ -215,7 +215,13 @@ func orgRelativeRuntime(t *testing.T) string {
 			t.Fatalf("uv %v: %v\n%s", args, err, out)
 		}
 	}
-	return filepath.Join(venv, "bin") + string(os.PathListSeparator) + os.Getenv("PATH")
+	path := filepath.Join(venv, "bin")
+	for _, item := range childEnv(t, t.TempDir()) {
+		if inherited, ok := strings.CutPrefix(item, "PATH="); ok {
+			path += string(os.PathListSeparator) + inherited
+		}
+	}
+	return path
 }
 
 // orgRelativeSource is the one authored tree: no org anywhere, a committed interface read by
@@ -249,7 +255,7 @@ org-relative-dep = { index = "tensorhub" }
 	} {
 		must(t, os.WriteFile(filepath.Join(source, name), []byte(body), 0o644))
 	}
-	runtime := filepath.Join(filepath.SplitList(path)[0], "cozy-runtime")
+	runtime := filepath.Join(filepath.SplitList(path)[0], "cozy-runtime") //cozy:allow the Runtime under test describes the authored source
 	raw, err := exec.Command(runtime, "--json", "--dir", source, "describe").Output()
 	if err != nil {
 		t.Fatalf("describe the org-relative source: %v", err)
