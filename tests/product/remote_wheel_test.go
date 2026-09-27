@@ -71,7 +71,7 @@ func TestRemoteWheelRetainsCaptureWithoutLocalEnvironment(t *testing.T) {
 	if _, problem := install.CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected); problem == nil {
 		t.Fatal("remote wheel omitted its required Runtime closure")
 	}
-	dependencies["cozy-runtime"] = packagepublish.CapturedDependency{Name: "cozy-runtime", Version: "0.18.30", Requirement: "cozy-runtime==0.18.30"}
+	dependencies["cozy-runtime"] = packagepublish.CapturedDependency{Name: "cozy-runtime", Version: "0.18.30", Requirement: "cozy-runtime==0.18.30"} //cozy:allow captured distribution row, nothing shells out
 	result, problem := install.CaptureRemoteWheel(context.Background(), layout, store, "remote-callable", "3.12.12", nil, dependencies, surface, selected)
 	if problem != nil {
 		t.Fatal(problem)

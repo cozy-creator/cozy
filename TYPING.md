@@ -20,6 +20,10 @@ Do not add blanket ignores, Any casts, or a baseline suppression file to obtain 
 green result. Existing exceptions and outstanding errors are recorded in
 [the typing rollout](https://github.com/cozy-creator/tracker/blob/master/tracker/cross-cutting/xs-034-strict-python-typing.md).
 
+`tests/product/testdata/` is excluded: those fixture packages and scripts run inside
+the environments the product builds for them, and the product tests that run them
+are their gate.
+
 Adding this configuration does not establish that the entire tree is green.
 Record the source commit, interpreter/checker versions, exact command and complete
 result before claiming qualification. Generated and attributed upstream code may

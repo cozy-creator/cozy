@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from typing import Any
 
 import tensorfs
 
@@ -30,6 +31,7 @@ with tempfile.TemporaryDirectory(prefix="cozy-batch-recovery-proof-") as directo
         }}},
         {"model": {"kind": "add"}}, [("model", name) for name in bodies],
         4 * length + 4096,
+        work_fingerprint="sha256:" + "3" * 64,
     )
     for name, body in bodies.items():
         writer.add_part("model", name, "value", io.BytesIO(body))
@@ -43,17 +45,17 @@ with tempfile.TemporaryDirectory(prefix="cozy-batch-recovery-proof-") as directo
                for row in store.walk(manifest["digest"])
                if str(row["id"])[7:] in expected]
     assert len(objects) == 4
-    uploaded = {}
-    attempts = []
+    uploaded: dict[str, bytes] = {}
+    attempts: list[str] = []
     active = peak = 0
     lock = threading.Lock()
     all_bodies = threading.Barrier(4)
 
     class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
+        def log_message(self, *args: object) -> None:
             pass
 
-        def do_PUT(self):
+        def do_PUT(self) -> None:
             global active, peak
             digest = self.path.split("?")[0].split("/")[-1]
             with lock:
@@ -90,8 +92,10 @@ with tempfile.TemporaryDirectory(prefix="cozy-batch-recovery-proof-") as directo
          "--allow-local"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
+    stdin, stdout, stderr = child.stdin, child.stdout, child.stderr
+    assert stdin and stdout and stderr
     try:
-        def request(obj):
+        def request(obj: dict[str, Any]) -> dict[str, Any]:
             return {"manifest": manifest, "object": obj, "grant": {
                 "url": f"http://127.0.0.1:{server.server_port}/objects/{obj['digest'][7:]}?secret=never-print",
                 "required_headers": {
@@ -100,10 +104,11 @@ with tempfile.TemporaryDirectory(prefix="cozy-batch-recovery-proof-") as directo
                 },
             }}
 
-        def ask(value):
-            child.stdin.write(json.dumps(value) + "\n")
-            child.stdin.flush()
-            raw = child.stdout.readline()
+        def ask(value: object) -> Any:
+            assert stdin and stdout
+            stdin.write(json.dumps(value) + "\n")
+            stdin.flush()
+            raw = stdout.readline()
             assert raw and "never-print" not in raw
             return json.loads(raw)
 
@@ -133,9 +138,9 @@ with tempfile.TemporaryDirectory(prefix="cozy-batch-recovery-proof-") as directo
         assert all(row["ok"] and row["http_status"] == 412 for row in replay)
         single = ask(batch[0])
         assert single["ok"] and single["http_status"] == 412
-        child.stdin.close()
+        stdin.close()
         assert child.wait(timeout=5) == 0
-        assert "never-print" not in child.stderr.read()
+        assert "never-print" not in stderr.read()
         assert store.derived_lookup(transaction_id)["disposition"]["kind"] == "adopted"
         print(json.dumps({"tensorfs": tensorfs.__version__, "uploads": 4, "bytes": 4 * length,
                           "peak_simultaneous_bodies": peak, "ordered_results": True,
