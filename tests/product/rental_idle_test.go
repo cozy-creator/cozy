@@ -112,6 +112,8 @@ type fakeRentalHub struct {
 	packageReleases map[string]any
 	skus            []map[string]any
 	rent            func(map[string]any) map[string]any
+	// quote answers POST /v1/rental-quotes; nil is a Hub without quotes.
+	quote func(map[string]any) (int, string)
 	// spendCap stands in for Tensorhub's owner fleet cap: a paid ask whose SKU
 	// total would take the live rentals' burn past it is refused, buying nothing.
 	spendCap int64
@@ -204,6 +206,20 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 		defer h.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(catalogRows(h.skus))
+	})
+	mux.HandleFunc("POST /v1/rental-quotes", func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		quote := h.quote
+		h.mu.Unlock()
+		var request map[string]any
+		if quote == nil || json.NewDecoder(r.Body).Decode(&request) != nil {
+			http.NotFound(w, r)
+			return
+		}
+		status, body := quote(request)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
 	})
 	mux.HandleFunc("POST /v1/rentals", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()

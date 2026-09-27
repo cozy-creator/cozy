@@ -3,6 +3,7 @@
 package producttest
 
 import (
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -94,5 +95,41 @@ func TestRentalRenamedByTheHubIsKept(t *testing.T) {
 				t.Fatalf("rental recorded as %+v, want name %q: %s", rented, want, out)
 			}
 		})
+	}
+}
+
+// `--disk-gb=160` on production's CPU flavors fits only the $0.48 flavor, while the
+// listing prices the default disk at $0.28. The renter consents to the Hub's quote for
+// the exact request, so the rental it locks is kept; a disk no machine holds is refused
+// before anything is bought.
+func TestRentalConsentsToTheQuoteForItsDisk(t *testing.T) {
+	root, _, stand := rentalEndRoot(t, "rental-quote")
+	stand.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1,
+		"base_worker_profile": "torch2.14.0-cpu-cp312-linux-x86", "price_usd_micros_per_hour": 280_000})
+	var quoted []any
+	stand.mu.Lock()
+	stand.quote = func(request map[string]any) (int, string) {
+		quoted = append(quoted, request["container_disk_gb"])
+		if request["container_disk_gb"] == float64(500) {
+			return http.StatusUnprocessableEntity, `{"error":{"code":"rental.disk_unavailable","message":"a 500 GB container disk: cpu offers allow at most 160 GB"}}`
+		}
+		return http.StatusOK, `{"name":"cpu","accelerator_count":1,"price_usd_micros_per_hour":480000,"storage_usd_micros_per_hour":22240,"container_disk_gb":160}`
+	}
+	stand.rent = func(request map[string]any) map[string]any {
+		return map[string]any{"rental_id": "pr-quote", "name": request["name"], "state": "pending_acquisition",
+			"requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 480_000}
+	}
+	stand.mu.Unlock()
+	_, out := rentUntilRecorded(t, root, "pr-quote", "cpu", "--disk-gb=160", "--idempotency-key", "quote-160")
+	if stand.releases("pr-quote") != 0 || strings.Contains(out, "rental.hourly_rate_changed") ||
+		!strings.Contains(out, "160 GB disk is $0.48/hr") {
+		t.Fatalf("the quoted rate was not what the renter consented to: %s", out)
+	}
+	code, out := runCozy(t, root, "rental", "new", "cpu", "--disk-gb=500", "--idempotency-key", "quote-500", "--json")
+	stand.mu.Lock()
+	rentals := len(stand.rentals)
+	stand.mu.Unlock()
+	if code == 0 || !strings.Contains(out, "rental.disk_unavailable") || rentals != 1 || len(quoted) != 2 {
+		t.Fatalf("an unholdable disk reached a purchase (rentals=%d, quotes=%v): %s", rentals, quoted, out)
 	}
 }

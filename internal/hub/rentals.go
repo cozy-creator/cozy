@@ -761,6 +761,21 @@ type RentalSKUStatus struct {
 	RetryAfter        *time.Time     `json:"retry_after,omitempty"`
 }
 
+// RentalQuote is what one exact rental request will lock: its disk and declared
+// workload choose the machine, so it can differ from the default-disk listing.
+type RentalQuote struct {
+	PriceUSDMicrosPerHour   int64 `json:"price_usd_micros_per_hour"`
+	StorageUSDMicrosPerHour int64 `json:"storage_usd_micros_per_hour"`
+	ContainerDiskGB         int   `json:"container_disk_gb"`
+}
+
+// QuoteRental prices the exact body a rental POST would send.
+func (c *Client) QuoteRental(ctx context.Context, body []byte) (RentalQuote, *exit.Error) {
+	var out RentalQuote
+	e := c.do(ctx, call{method: http.MethodPost, path: "/v1/rental-quotes", bodyBytes: body}, &out)
+	return out, e
+}
+
 func (c *Client) RentalSKUStatus(ctx context.Context, name string, gpus int) (RentalSKUStatus, *exit.Error) {
 	var out RentalSKUStatus
 	if e := c.do(ctx, call{method: http.MethodGet,
