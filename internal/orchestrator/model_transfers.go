@@ -45,8 +45,15 @@ func (c *Orchestrator) runModelPassThrough(req records.Request) {
 		return
 	}
 	if problem == nil && transfer != nil {
-		problem = c.opt.ModelTransfers.PassThrough(context.Background(), req.ID,
-			transfer.ModelTransferIntent)
+		ctx, leave := c.joinTransfer(req.ID)
+		problem = c.opt.ModelTransfers.PassThrough(ctx, req.ID, transfer.ModelTransferIntent)
+		canceled := ctx.Err() != nil
+		leave()
+		if canceled {
+			// Canceled: the cancel settled the request; nothing here retries or fails it.
+			c.forgetTransferProgress(req.ID)
+			return
+		}
 	}
 	if problem != nil {
 		if permanentTransferFailure(problem) {
@@ -235,8 +242,10 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	if !transfer.HasAcquisition() {
 		return req, nil
 	}
+	ctx, leave := c.joinTransfer(req.ID)
+	defer leave()
 	if w.spec.Connection != nil {
-		if problem := c.controlRetainedSource(context.Background(), req, false); problem != nil {
+		if problem := c.controlRetainedSource(ctx, req, false); problem != nil {
 			return req, problem
 		}
 	}
@@ -245,7 +254,7 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 	c.mu.Unlock()
 	if len(transfer.Models) > 0 && (w.spec.Connection == nil || transfer.ModelsWorkerBootID == bootID) {
 		if w.spec.Connection != nil {
-			if problem := c.awaitSourceInputCustody(req, bootID); problem != nil {
+			if problem := c.awaitSourceInputCustody(ctx, req, bootID); problem != nil {
 				return req, problem
 			}
 		}
@@ -263,14 +272,14 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 		"transferred_bytes": int64(0), "total_bytes": transferSourceBytes(transfer.SourceFiles)})
 	var models []ModelRef
 	if w.spec.Connection == nil {
-		models, problem = c.opt.ModelTransfers.MaterializeLocal(context.Background(), req.ID,
+		models, problem = c.opt.ModelTransfers.MaterializeLocal(ctx, req.ID,
 			transfer.ModelTransferIntent)
 	} else {
 		var capabilities []ModelSourceCapability
-		capabilities, problem = c.opt.ModelTransfers.RefreshRemoteSource(context.Background(),
+		capabilities, problem = c.opt.ModelTransfers.RefreshRemoteSource(ctx,
 			transfer.ModelTransferIntent)
 		if problem == nil {
-			models, problem = c.prepareModelTransferRemote(context.Background(), req,
+			models, problem = c.prepareModelTransferRemote(ctx, req,
 				transfer.ModelTransferIntent, capabilities)
 		}
 	}
@@ -291,7 +300,7 @@ func (c *Orchestrator) materializeModelTransfer(req records.Request, w *worker) 
 		if problem := c.opt.Store.CompleteModelTransferMaterialization(req.ID, models, ""); problem != nil {
 			return req, problem
 		}
-	} else if problem := c.awaitSourceInputCustody(req, bootID); problem != nil {
+	} else if problem := c.awaitSourceInputCustody(ctx, req, bootID); problem != nil {
 		return req, problem
 	}
 	current, problem := c.opt.Store.RequestRow(req.ID)
@@ -655,18 +664,17 @@ func (c *Orchestrator) kickModelTransferFinalizer(requestID string, attempt int6
 		return
 	}
 	c.transferRunning[requestID] = true
-	runCtx, cancel := context.WithCancel(context.Background())
-	c.transferCancels[requestID] = cancel
 	c.mu.Unlock()
+	runCtx, leave := c.joinTransfer(requestID)
 	go func() {
 		defer func() {
+			leave()
 			c.mu.Lock()
 			delete(c.transferRunning, requestID)
-			delete(c.transferCancels, requestID)
 			c.mu.Unlock()
-			cancel()
 		}()
 		problem := c.finalizeModelTransfer(runCtx, requestID)
+		leave()
 		if problem != nil {
 			c.logf("model transfer %s finalization failed: %s", requestID, problem.Message)
 			transfer, _ := c.opt.Store.ModelTransferOf(requestID)
@@ -724,13 +732,7 @@ func (c *Orchestrator) CancelModelTransferFinalization(requestID, actor string) 
 	if problem := c.opt.Store.RequestModelTransferCancellation(requestID); problem != nil {
 		return problem
 	}
-	c.mu.Lock()
-	cancel := c.transferCancels[requestID]
-	c.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	c.signalTransfer(requestID)
+	c.cancelTransfer(requestID)
 	c.kickCheckpointUpload(requestID)
 	return c.resumeModelTransferPublication(requestID)
 }
@@ -822,20 +824,20 @@ func (c *Orchestrator) kickRecoveredLocalTransfer(requestID string, attempt int6
 		return
 	}
 	c.transferRunning[requestID] = true
-	runCtx, cancel := context.WithCancel(context.Background())
-	c.transferCancels[requestID] = cancel
 	c.mu.Unlock()
+	runCtx, leave := c.joinTransfer(requestID)
 	go func() {
 		defer func() {
+			leave()
 			c.mu.Lock()
 			delete(c.transferRunning, requestID)
-			delete(c.transferCancels, requestID)
 			c.mu.Unlock()
-			cancel()
 		}()
 		transfer, _ := c.opt.Store.ModelTransferOf(requestID)
 		if transfer == nil || (transfer.State != "failed" && transfer.State != "canceled") {
-			if problem := c.finalizeModelTransfer(runCtx, requestID); problem != nil {
+			problem := c.finalizeModelTransfer(runCtx, requestID)
+			leave()
+			if problem != nil {
 				transfer, _ = c.opt.Store.ModelTransferOf(requestID)
 				if transfer != nil && (transfer.State == "failed" || transfer.State == "canceled") {
 					// The ordinary terminal owns the verdict; only closure/teardown remains.

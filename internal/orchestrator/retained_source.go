@@ -43,6 +43,10 @@ func (c *Orchestrator) releaseRetainedSource(ctx context.Context, request record
 	answer, err := s.host.ModelSourceRelease(ctx, &pb.ModelSourceReleaseCall{
 		Claim: s.claim, OperationId: request.ID, SourceSelectionDigest: selection,
 	})
+	if status.Code(err) == codes.Unimplemented {
+		return exit.Named(exit.Structural, "request.source_release_unsupported",
+			"the original pod cannot release source work")
+	}
 	if err != nil {
 		return exit.Unavailablef("source release is awaiting the original pod")
 	}

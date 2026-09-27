@@ -16,7 +16,7 @@ type checkpointUpload struct {
 
 // Conversion overlaps upload, but producer dispatch consumes only recoverable
 // inputs. A refused producer therefore cannot interrupt unfinished source custody.
-func (c *Orchestrator) awaitSourceInputCustody(req records.Request, bootID string) *exit.Error {
+func (c *Orchestrator) awaitSourceInputCustody(ctx context.Context, req records.Request, bootID string) *exit.Error {
 	for {
 		transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
 		if problem != nil {
@@ -74,7 +74,7 @@ func (c *Orchestrator) awaitSourceInputCustody(req records.Request, bootID strin
 		c.ObservePhase(req.ID, PhaseSample{Name: PhasePreparing, Detail: "retaining converted source checkpoints in Tensorhub",
 			HasBytes: true, Moved: held, Total: total})
 		c.kickCheckpointUpload(req.ID)
-		if problem := c.waitTransfer(context.Background(), req.ID); problem != nil {
+		if problem := c.waitTransfer(ctx, req.ID); problem != nil {
 			return problem
 		}
 	}

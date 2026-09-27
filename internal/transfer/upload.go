@@ -494,7 +494,7 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 	var header http.Header
 	var raw []byte
 	var moved int64
-	exhausted, err := retryStorage(func(attempt int) (bool, error) {
+	exhausted, err := retryStorage(ctx, func(attempt int) (bool, error) {
 		status, header, raw = 0, nil, nil
 		body, err := open()
 		if err != nil {

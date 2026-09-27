@@ -328,6 +328,13 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 			dst := filepath.Join(dir, strings.TrimPrefix(o.ID, "sha256:"))
 			n, e := download(ctx, r.URL, dst, o.Length)
 			if e != nil {
+				// A stopped or broken batch still admits the objects that fully arrived,
+				// so the next run moves only what never landed.
+				if plan.Len() > 0 {
+					if problem := f.install(plan.String(), out); problem != nil {
+						return problem
+					}
+				}
 				return e
 			}
 			out.Moved += n
@@ -370,7 +377,7 @@ func (f *Fetch) install(plan string, out *Fetched) *exit.Error {
 // attempt so a half-received body never becomes the input to the next one.
 func download(ctx context.Context, url, dst string, length int64) (int64, *exit.Error) {
 	var n int64
-	exhausted, err := retryStorage(func(int) (bool, error) {
+	exhausted, err := retryStorage(ctx, func(int) (bool, error) {
 		got, retryable, e := fetchOnce(ctx, url, dst, length)
 		if e != nil {
 			return retryable, e
