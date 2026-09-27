@@ -364,3 +364,55 @@ func TestObserverTakesTheMachinesNextEventWithoutPolling(t *testing.T) {
 	}
 	t.Logf("machine event to recorded: %s", took.Round(time.Millisecond))
 }
+
+// A machine whose Runtime predates release roots is not refused: the client resolves the
+// call's slots and prepares it as before, and the run says how to reach the fast path.
+func TestOlderRuntimeTakesTheCompatibilityPath(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machine := &runtimeMachine{older: true}
+	pod := &fakePod{machine: machine, deviceCount: 4}
+	root, layout := rentedLadderMachine(t, h, pod, func(_ home.Layout, store *records.Store) {
+		holder, _, problem := store.Submit(records.Request{ID: "req-gpu-holder", IdemKey: "gpu-holder", BodyDigest: childDigest("7"),
+			Package: ladderPackage, Entrypoint: "generate", Payload: []byte(`{}`)})
+		fatal(t, problem)
+		_, problem = store.FailQueuedRequest(holder.ID, map[string]any{"error_type": "proof", "error": "held elsewhere"})
+		fatal(t, problem)
+		machine.blocker = holder.ID
+	})
+	if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", "older"); code != 0 {
+		t.Fatalf("the run was refused on an older Runtime [exit %d]: %s", code, out)
+	}
+	waitFor(t, root, "the Runtime submission", func() bool { return machine.submitted() != nil })
+	machine.finish()
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	var row *records.Request
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		row, problem = store.RequestByIdempotencyKey("older")
+		if problem == nil && row.State == "succeeded" {
+			break
+		}
+		if time.Now().After(deadline) {
+			_, show := runCozy(t, root, "run", "show", "2", "--json")
+			t.Fatalf("the run did not complete (%s): %s\n%s", row.State, show, tail(filepath.Join(root, "daemon.log")))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	submission := machine.submitted()
+	if submission.ReleaseRoot != nil || submission.PreparedState.GetPlacementSet() == nil {
+		t.Fatalf("an older Runtime was sent a release root: %+v", submission)
+	}
+	pod.mu.Lock()
+	prepares := len(pod.prepares)
+	pod.mu.Unlock()
+	if prepares == 0 || len(row.Models) != 1 || row.Models[0].Manifest == "" {
+		t.Fatalf("the compatibility path did not prepare the pinned model: %d preparations, %+v", prepares, row.Models)
+	}
+	_, show := runCozy(t, root, "run", "show", "2", "--json")
+	if !strings.Contains(show, "lacks release roots; used the compatibility path") || !strings.Contains(show, "cozy rental update") {
+		t.Fatalf("the run does not say it took the compatibility path: %s", show)
+	}
+}

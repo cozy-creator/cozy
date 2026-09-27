@@ -693,7 +693,10 @@ func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
 		t.Fatalf("the install's hub was not asked for its release: %d %s", code, out)
 	}
 	crossed := false
-	askedB.Range(func(key, _ any) bool { crossed = crossed || strings.HasPrefix(key.(string), "proof/alpha"); return true })
+	askedB.Range(func(key, _ any) bool {
+		crossed = crossed || strings.HasPrefix(key.(string), "proof/alpha")
+		return true
+	})
 	if crossed {
 		t.Fatal("the current hub was asked for another hub's install")
 	}

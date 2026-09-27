@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -50,10 +51,6 @@ func releaseRoot(request records.Request) bool {
 }
 
 func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records.Request, connection *machineConnection, workspace *pb.MachineExecutionWorkspace) (*pb.MachineExecutionSubmit, *exit.Error) {
-	if !workspace.ReleaseRoots {
-		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
-			"this machine's Runtime cannot take a run by its release; %s", machines.RuntimeUpdate(connection.Name))
-	}
 	facts, problem := m.releaseFacts(ctx, request.Hub, connection, request.Package, request.Release)
 	if problem != nil {
 		return nil, problem
@@ -266,4 +263,70 @@ func (m *machineRuns) submissionRefused(requestID string, trailer metadata.MD, e
 		}
 	}
 	return machineTransport(err)
+}
+
+// compatibleModels readies a release root for a machine whose Runtime cannot take one: the
+// client resolves each slot as it did before (the caller's choice, else the owner's binding
+// or the authored default, as a ladder the machine's devices then pin) and the call goes the
+// preparation path. It says so on the run, with how to reach the one-message path.
+func (m *machineRuns) compatibleModels(ctx context.Context, request records.Request, connection *machineConnection) (records.Request, *exit.Error) {
+	_ = m.store.AppendEvent(request.ID, "request.preparing", 0, map[string]any{"stage": "machine",
+		"detail": "this machine's Runtime lacks release roots; used the compatibility path (" + machines.RuntimeUpdate(connection.Name) + " for the fast path)"})
+	ref, problem := hub.ParseRef(request.Package)
+	if problem != nil {
+		return request, problem
+	}
+	catalog := m.resolver.catalog(request.Hub)
+	detail, problem := catalog.PackageRelease(ctx, ref, request.Release)
+	if problem != nil {
+		return request, problem
+	}
+	surface, problem := launch.DecodePackageInterface(detail.PackageInterface)
+	if problem != nil {
+		return request, problem
+	}
+	entrypoint, problem := surface.Function(request.Entrypoint)
+	if problem != nil {
+		return request, problem
+	}
+	chosen := map[string]records.ModelRef{}
+	for _, model := range request.Models {
+		chosen[model.BindingSlot()] = model
+	}
+	models := make([]records.ModelRef, 0, len(entrypoint.Models))
+	for _, slot := range entrypoint.Models {
+		choice, explicit := chosen[slot.Path]
+		if !explicit {
+			selected, problem := m.resolver.childModelLadder(request.Hub, request.Package, request.Entrypoint, slot)
+			if problem != nil {
+				return request, problem
+			}
+			selected.Slot = slot.Path
+			models = append(models, selected)
+			continue
+		}
+		spec := choice.Model
+		if choice.Manifest != "" {
+			spec += "@" + choice.Manifest
+		} else if choice.Release != "" {
+			spec += "@" + choice.Release
+		}
+		lane := choice.Lane
+		if choice.Manifest != "" {
+			lane = ""
+		}
+		resolved, problem := catalog.ResolveModel(ctx, spec, lane)
+		if problem != nil {
+			return request, problem
+		}
+		models = append(models, records.ModelRef{Package: request.Package, Slot: slot.Path, BindingPath: slot.Path,
+			Model: resolved.Model, CatalogRepository: resolved.Model, Release: resolved.Release, Lane: resolved.Lane,
+			Manifest: resolved.ManifestID, ManifestLength: resolved.ManifestLength, Bytes: resolved.Bytes,
+			ComponentBytes: resolved.ComponentBytes, ComponentUse: slot.ComponentUse})
+	}
+	if problem := m.store.PinMachineModels(request.ID, models); problem != nil {
+		return request, problem
+	}
+	request.Models = models
+	return request, nil
 }

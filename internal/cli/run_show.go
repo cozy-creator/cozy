@@ -235,7 +235,7 @@ func preparingStage(payload map[string]any) reportStage {
 	stage, _ := payload["stage"].(string)
 	name := map[string]string{"resolved": "resolve", "downloading": "download",
 		"preparing": "package environment", "connect": "machine connection",
-		"package_preparation": "package preparation", "machine": "machine preparation",
+		"package_preparation": "package preparation", "machine": "machine preparation", "model_defaults": "model defaults",
 		"inputs": "input staging", "submit": "submission"}[stage]
 	if name == "" {
 		name = stage
