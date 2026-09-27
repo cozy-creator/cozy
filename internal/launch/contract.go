@@ -18,6 +18,9 @@ func UsageLine(target string, ep *Entrypoint) string {
 	line := "cozy run " + target
 	if slot := ConversionSlot(ep); slot != nil {
 		line += " <" + slot.Param + "> [<org/model>]"
+		for _, other := range ep.Models[1:] {
+			line += " model." + other.Param + "=<ref>"
+		}
 	}
 	for i := range ep.Request.Fields {
 		line += " " + usageTerm(&ep.Request.Fields[i], ep.Assets)
