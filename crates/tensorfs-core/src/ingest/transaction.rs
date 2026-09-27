@@ -566,7 +566,15 @@ pub fn convert(
     mirror: Option<&Mirror>,
 ) -> Result<Progress> {
     convert_bounded(
-        store, plan, files, journal, operation, carriers, mirror, None,
+        store,
+        plan,
+        files,
+        journal,
+        operation,
+        carriers,
+        mirror,
+        None,
+        &super::custody::Custody::default(),
     )
 }
 
@@ -580,6 +588,7 @@ fn convert_bounded(
     carriers: Carriers<'_>,
     mirror: Option<&Mirror>,
     mut budget: Option<&mut Budget>,
+    custody: &super::custody::Custody,
 ) -> Result<Progress> {
     plan.require_order()?;
     let mut progress = Progress::default();
@@ -594,11 +603,11 @@ fn convert_bounded(
         if let Some(done) = journal.op(&op.component, &op.out_key, &roles) {
             // A journalled part carries only if its objects still stand. This is
             // `Bytes::Inherit`'s existing law: `contains` is a presence hint and nothing
-            // more, so admission takes a standing verification record or one rehash.
-            if done
-                .iter()
-                .all(|(_, part)| journal::segments_still_stand(store, part))
-            {
+            // more, so admission takes a standing verification record or one rehash. A part
+            // the operation's publication custodian already holds stands without local bytes.
+            if done.iter().all(|(_, part)| {
+                custody.holds_part(part) || journal::segments_still_stand(store, part)
+            }) {
                 progress.resumed_roles += roles.len();
                 journal.resumed += roles.len();
                 continue;
@@ -1041,6 +1050,7 @@ pub fn advance(
         mirror,
         &mut journal,
         None,
+        &super::custody::Custody::default(),
     )
 }
 
@@ -1058,10 +1068,11 @@ pub fn advance_journal(
     mirror: Option<&Mirror>,
     journal: &mut Journal,
     budget: Option<&mut Budget>,
+    custody: &super::custody::Custody,
 ) -> Result<(Progress, Option<Outcome>)> {
     let t0 = Instant::now();
     let progress = convert_bounded(
-        store, plan, files, journal, operation, carriers, mirror, budget,
+        store, plan, files, journal, operation, carriers, mirror, budget, custody,
     )?;
     if !progress.complete() {
         return Ok((progress, None));
@@ -1080,6 +1091,26 @@ pub fn advance_journal(
         },
     )?;
     Ok((progress, Some(outcome)))
+}
+
+/// Convert what has landed within the budget and never finalize. A custodied source
+/// operation names no slot's header until every slot's plan is journalled: a finished
+/// slot's candidate Manifest would hold its whole closure against GC while the others
+/// still need the disk.
+#[allow(clippy::too_many_arguments)]
+pub fn convert_journal(
+    store: &Store,
+    plan: &Plan,
+    files: &[SourceFile],
+    operation: &str,
+    carriers: Carriers<'_>,
+    journal: &mut Journal,
+    budget: Option<&mut Budget>,
+    custody: &super::custody::Custody,
+) -> Result<Progress> {
+    convert_bounded(
+        store, plan, files, journal, operation, carriers, None, budget, custody,
+    )
 }
 
 /// Drop the conversion journal for one plan. The coordinator's act, after its result is

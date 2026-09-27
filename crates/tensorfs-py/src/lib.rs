@@ -10,6 +10,7 @@
 
 mod docs;
 mod errors;
+mod ingest;
 mod store;
 
 use pyo3::prelude::*;
@@ -109,6 +110,10 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(docs::recanonicalize, m)?)?;
     m.add_class::<docs::PyClosure>()?;
 
+    m.add_function(wrap_pyfunction!(ingest::read_source_heads, m)?)?;
+    m.add_function(wrap_pyfunction!(ingest::prepare_selected_source, m)?)?;
+    m.add_function(wrap_pyfunction!(ingest::record_model_source_custody, m)?)?;
+    m.add_function(wrap_pyfunction!(ingest::model_source_objects, m)?)?;
     m.add_function(wrap_pyfunction!(store::plan, m)?)?;
     m.add_function(wrap_pyfunction!(store::gc, m)?)?;
     m.add_function(wrap_pyfunction!(store::transfer_object, m)?)?;

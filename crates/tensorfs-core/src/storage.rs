@@ -321,6 +321,9 @@ pub struct Census {
     repositories: Vec<(Repository, Vec<u8>)>,
     manifests: BTreeMap<String, (Manifest, Vec<u8>)>,
     inventory: BTreeMap<String, InventoryEntry>,
+    /// Objects a live model-source session's publication custodian holds. A held manifest
+    /// may reach them without their bytes: there is nothing local to keep or to delete.
+    custodied: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -601,6 +604,7 @@ impl Census {
             repositories,
             manifests,
             inventory,
+            custodied: crate::ingest::custody::live(root)?,
         })
     }
 
@@ -611,6 +615,7 @@ impl Census {
             repositories: read_repositories(root)?,
             manifests: read_manifests(root)?,
             inventory: BTreeMap::new(),
+            custodied: crate::ingest::custody::live(root)?,
         })
     }
 
@@ -1116,18 +1121,23 @@ impl Census {
                 }
             }
         }
-        for (kind, object) in objects.values() {
-            if self.inventory.get(&object.sha256).map(|entry| entry.length) != Some(object.length) {
-                return refuse(
-                    Code::OBJECT_ABSENT,
-                    format!(
-                        "{kind} {} is absent or length-mismatched in inventory",
-                        object.id()
-                    ),
-                );
+        let mut resident = Vec::with_capacity(objects.len());
+        for (kind, object) in objects.into_values() {
+            match self.inventory.get(&object.sha256).map(|entry| entry.length) {
+                Some(length) if length == object.length => resident.push(object),
+                None if self.custodied.contains(&object.sha256) => {}
+                _ => {
+                    return refuse(
+                        Code::OBJECT_ABSENT,
+                        format!(
+                            "{kind} {} is absent or length-mismatched in inventory",
+                            object.id()
+                        ),
+                    )
+                }
             }
         }
-        Ok(objects.into_values().map(|(_, object)| object).collect())
+        Ok(resident)
     }
 }
 

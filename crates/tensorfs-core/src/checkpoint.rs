@@ -418,6 +418,28 @@ impl Walk {
         }
         Ok(())
     }
+
+    /// Every reached object present, or held by a live source operation's publication
+    /// custodian. A complete checkpoint for publication, never a readable one.
+    pub fn require_held(
+        &self,
+        store: &Store,
+        custodied: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        for r in self.distinct() {
+            if !store.contains(&r.sha256) && !custodied.contains(&r.sha256) {
+                return refuse(
+                    Code::OBJECT_ABSENT,
+                    format!(
+                        "{} is committed by this manifest but neither resident nor held by \
+                         a live publication custodian",
+                        r.id()
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Manifest → CozyTensorsHeader → contained tensor rules → storage-part object runs.
