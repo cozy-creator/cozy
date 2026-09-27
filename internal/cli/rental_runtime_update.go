@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -33,6 +34,9 @@ var runtimeUpdateTransport string
 
 //go:embed runtime_update_probe.py
 var runtimeUpdateProbe string
+
+//go:embed runtime_update_stage.py
+var runtimeUpdateStager string
 
 type rentalRuntimeUpdates struct {
 	machines *machineRuns
@@ -68,14 +72,10 @@ type runtimeUpdateSelection struct {
 }
 
 func (u *rentalRuntimeUpdates) Start(id string, options api.RuntimeUpdateRequest) (*records.RuntimeUpdate, *exit.Error) {
-	return u.start(id, "", options.RuntimeWheel, options.TensorFSWheel)
+	return u.start(id, options.RuntimeWheel, options.TensorFSWheel)
 }
 
-func (u *rentalRuntimeUpdates) startForRequest(id, request string) (*records.RuntimeUpdate, *exit.Error) {
-	return u.start(id, request, "", "")
-}
-
-func (u *rentalRuntimeUpdates) start(id, request, wheelPath, tensorfsPath string) (*records.RuntimeUpdate, *exit.Error) {
+func (u *rentalRuntimeUpdates) start(id, wheelPath, tensorfsPath string) (*records.RuntimeUpdate, *exit.Error) {
 	if tensorfsPath != "" && wheelPath == "" {
 		return nil, exit.New(exit.Validation, "--tensorfs-wheel requires --runtime-wheel")
 	}
@@ -86,6 +86,15 @@ func (u *rentalRuntimeUpdates) start(id, request, wheelPath, tensorfsPath string
 	}
 	if row == nil || row.State != "ready" {
 		return nil, exit.New(exit.Conflict, "this rental is not ready; no machine was purchased or changed")
+	}
+	hctx, cancel := hub.Context()
+	remote, hubProblem := client(m.fleet.atRental(id)).Rental(hctx, id)
+	cancel()
+	// Only the Hub's answer can refuse here; an unanswered read leaves the refusal to the update.
+	if hubProblem == nil && !remote.Development {
+		return nil, exit.Named(exit.Conflict, "rental.maintenance_unavailable",
+			"%s was rented without SSH maintenance, so its Runtime cannot be updated in place; nothing was changed", row.MachineName).
+			WithRemedy("rent a replacement with SSH maintenance, the default (omit --development=false)")
 	}
 	current, problem := m.store.RuntimeUpdate(id)
 	if problem != nil {
@@ -122,13 +131,18 @@ func (u *rentalRuntimeUpdates) start(id, request, wheelPath, tensorfsPath string
 		if candidate != nil {
 			selection, _ = json.Marshal(runtimeUpdateSelection{LocalRuntime: candidate, LocalTensorFS: tensorfs})
 		}
-		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, request, selection)
+		current, problem = m.store.BeginRuntimeUpdate(id, row.ExpectedWorkerBootID, "", selection)
 		if problem == nil && snapshot != nil {
 			snapshot.Detach()
 			if tensorfsSnapshot != nil {
 				tensorfsSnapshot.Detach()
 			}
 		}
+	}
+	if problem == nil && current.State == "unusable" {
+		// The owner resumes the same recorded operation; its error says what to re-check.
+		current.State = "reconciling"
+		problem = m.store.SaveRuntimeUpdate(*current)
 	}
 	if problem == nil {
 		u.run(*current)
@@ -150,7 +164,9 @@ func (u *rentalRuntimeUpdates) Resume() {
 		return
 	}
 	for _, row := range rows {
-		u.run(row)
+		if row.InProgress() {
+			u.run(row)
+		}
 	}
 }
 
@@ -180,10 +196,16 @@ func (u *rentalRuntimeUpdates) run(row records.RuntimeUpdate) {
 		})
 		if problem != nil {
 			row.Error = problem.Message
-			if row.State != "updating" && row.State != "reconciling" {
+			switch {
+			case row.State != "updating" && row.State != "reconciling":
+				row.State = "failed" // nothing was sent to the worker
+			case m.ctx.Err() != nil:
+				row.State = "reconciling" // the next daemon resumes it
+			case problem.ErrName() == "rental.ended":
 				row.State = "failed"
-			} else {
-				row.State = "reconciling"
+			default:
+				// The worker may be part-way through: it takes no work until its owner acts.
+				row.State = "unusable"
 			}
 		}
 		if problem := m.store.SaveRuntimeUpdate(row); problem != nil {
@@ -253,6 +275,7 @@ func (u *rentalRuntimeUpdates) transport(ctx context.Context, selection runtimeU
 	// The probe is fixed first-party source, kept in its own file so the same
 	// strict type check covers code executed on the worker as well as the client.
 	fields["probe"] = runtimeUpdateProbe
+	fields["stager"] = runtimeUpdateStager
 	input, _ = json.Marshal(fields)
 	// This helper executes trusted maintenance code, not the package's Python.
 	python, problem := hostruntime.EnsurePython(ctx, ">=3.12", "")
@@ -274,6 +297,13 @@ func (u *rentalRuntimeUpdates) transport(ctx context.Context, selection runtimeU
 	}
 	if err != nil {
 		_, _ = log.Write(answer)
+		var reply struct {
+			Error  string `json:"error"`
+			Unsent bool   `json:"unsent"`
+		}
+		if json.Unmarshal(answer, &reply) == nil && reply.Unsent {
+			return nil, exit.Named(exit.Failed, "rental.runtime_update_unsent", "the update never reached the worker: %s; diagnostics: %s", reply.Error, log.Name())
+		}
 		return nil, exit.Named(exit.Failed, "rental.runtime_update_failed", "Runtime update could not %s; diagnostics: %s", action, log.Name())
 	}
 	if !json.Valid(answer) {
@@ -290,7 +320,9 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 		}
 		if row.State == "updating" || row.State == "reconciling" {
 			if row.Error != "" {
-				if _, problem := u.transport(ctx, selection, "resume"); problem != nil {
+				if _, problem := u.transport(ctx, selection, "resume"); unsent(problem) {
+					return unchanged(row, selection, problem)
+				} else if problem != nil {
 					return problem
 				}
 				row.Error = ""
@@ -350,6 +382,9 @@ func (u *rentalRuntimeUpdates) update(ctx context.Context, row *records.RuntimeU
 	}
 	_, problem = u.transport(ctx, selection, "apply")
 	_ = control.Close()
+	if unsent(problem) {
+		return unchanged(row, selection, problem)
+	}
 	// Once apply may have reached the guardian, only its durable operation
 	// journal may decide completion. SSH loss is not an update failure.
 	row.State = "reconciling"
@@ -403,7 +438,7 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 		return problem
 	}
 	lastState := ""
-	for result.Active() {
+	for result.InProgress() {
 		if !ctx.Mode().JSON && lastState != result.State {
 			messages := map[string]string{"preparing": "Checking Runtime and published updates", "updating": "Updating Runtime", "reconciling": "Checking the worker after an interrupted update"}
 			if message := messages[result.State]; message != "" {
@@ -416,9 +451,9 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		if result.State == "reconciling" && result.Error != "" {
-			return exit.Named(exit.Unavailable, "rental.runtime_update_reconciliation_required", "%s: %s", row.MachineName, result.Error)
-		}
+	}
+	if result.State == "unusable" {
+		return result.Unusable(row.MachineName)
 	}
 	if result.State == "failed" {
 		return exit.Named(exit.Failed, "rental.runtime_update_failed", "%s: %s", row.MachineName, result.Error)
@@ -461,6 +496,14 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 	resumed := false
 	for ctx.Err() == nil {
 		raw, problem := u.transport(ctx, selection, "status")
+		if problem != nil {
+			// An unreachable worker is asked again only while its rental lasts.
+			if rented, readProblem := u.machines.store.RentalRow(row.RentalID); readProblem != nil {
+				return readProblem
+			} else if rented == nil || rented.State != "ready" {
+				return exit.Named(exit.Conflict, "rental.ended", "the rental ended during its Runtime update")
+			}
+		}
 		if problem == nil {
 			var status runtimeUpdateStatus
 			var actual runtimeObservation
@@ -474,7 +517,9 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 				resumed = true
 				// The enqueue response may have been lost before acceptance. Replaying
 				// this same immutable stage is idempotent, including while running.
-				if _, problem := u.transport(ctx, selection, "apply"); problem != nil {
+				if _, problem := u.transport(ctx, selection, "apply"); unsent(problem) {
+					return unchanged(row, selection, problem)
+				} else if problem != nil {
 					return problem
 				}
 			} else {
@@ -532,4 +577,20 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 		}
 	}
 	return exit.New(exit.Canceled, "Runtime update observation interrupted")
+}
+
+func unsent(problem *exit.Error) bool {
+	return problem != nil && problem.ErrName() == "rental.runtime_update_unsent"
+}
+
+// unchanged ends an update whose apply never reached the worker: it still runs, and
+// serves, the Runtime it had.
+func unchanged(row *records.RuntimeUpdate, selection runtimeUpdateSelection, problem *exit.Error) *exit.Error {
+	var before runtimeObservation
+	_ = json.Unmarshal(selection.Selection, &before)
+	row.State, row.Error = "failed", problem.Message
+	if runtime := before.Observed.Runtime.Distribution; runtime != "" {
+		row.Error += "; the worker keeps serving Runtime " + runtime
+	}
+	return nil
 }

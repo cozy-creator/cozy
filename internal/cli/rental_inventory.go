@@ -159,6 +159,11 @@ func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, a
 			BaseWorkerImageTag:    live[row.ID].BaseWorkerImageTag,
 			HubUnknown:            census.hubUnknown[row.ID],
 		}
+		if update, problem := st.RuntimeUpdate(row.ID); problem != nil {
+			return result, problem
+		} else if update != nil && update.Active() {
+			summary.RuntimeUpdate = update.State
+		}
 		if idle.PendingPreparation > 0 {
 			summary.Activity = nil
 		}

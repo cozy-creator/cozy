@@ -24,12 +24,5 @@ type runtimeObservation struct {
 // dispatch only waits for explicit maintenance; worker protocol admission owns
 // control compatibility and never upgrades a rental to satisfy package wheels.
 func (u *rentalRuntimeUpdates) preflight(_ context.Context, _ records.Request, machine string) *exit.Error {
-	current, problem := u.machines.store.RuntimeUpdate(machine)
-	if problem != nil {
-		return problem
-	}
-	if current != nil && current.Active() {
-		return exit.Named(exit.Unavailable, "rental.maintenance", "this rental is updating its Runtime; this request remains queued")
-	}
-	return nil
+	return u.machines.store.RuntimeUpdateHold(machine)
 }

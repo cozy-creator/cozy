@@ -640,6 +640,9 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 	if spent {
 		return orchestrator.ExcludedSpent, nil
 	}
+	if hold := m.store.RuntimeUpdateHold(row.ID); hold != nil && hold.ErrName() == "rental.unusable" {
+		return orchestrator.ExcludedUnusable, nil
+	}
 	return "", nil
 }
 

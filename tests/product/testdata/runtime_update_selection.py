@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import runpy
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,8 @@ from packaging.markers import default_environment
 
 MODULE = Path(__file__).parents[3] / "internal/cli/runtime_update_transport.py"
 PROBE = MODULE.with_name("runtime_update_probe.py").read_text()
+STAGER_PATH = MODULE.with_name("runtime_update_stage.py")
+STAGER = STAGER_PATH.read_text()
 
 
 class PublishedRuntimeUpdates(unittest.TestCase):
@@ -143,34 +146,34 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         self.assertEqual(calls[1], "/opt/cozy/python/bin/python3 /opt/cozy/dev/update.py apply " + stage + " " + " ".join(expected))
         self.assertEqual(calls[2], calls[0])
 
-    def test_missing_update_retransfers_only_the_frozen_verified_pair(self):
+    def test_missing_update_has_the_worker_fetch_the_frozen_published_pair(self):
         _, wheels = self.resolve()
         stage = "b" * 32
-        calls = []
+        calls, jobs = [], []
         self.api["inspect"] = lambda arguments, probe, python=None: self.observed
         self.api["fetch"] = lambda *args: self.fail("recovery must not select another release")
         def remote(arguments, command):
             calls.append(command)
+            if " -c " in command:
+                job = json.loads(shlex.split(command)[-1])
+                jobs.append(job)
+                return json.dumps({"staged": {row["file"]: {"size": row["length"], "exists": True, "complete": True} for row in job["wheels"]}})
             return json.dumps({"operation": stage, "state": "missing" if " status " in command else "queued"})
         self.api["ssh"] = remote
-        request = {"ssh_arguments": [], "probe": PROBE, "sftp_arguments": [], "host": "fixture",
+        request = {"ssh_arguments": [], "probe": PROBE, "stager": STAGER, "sftp_arguments": [], "host": "fixture",
                    "action": "resume", "stage": stage, "directory": str(self.directory),
                    "selection": {"wheels": wheels}}
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))), patch.object(subprocess, "run") as transfer:
             result = self.api["main"]()
         self.assertEqual(result["update"]["state"], "queued")
-        transfer.assert_called_once()
-        batch = (self.directory / "transfer.batch").read_text()
+        # Published bytes never cross the maintenance connection: the worker fetches them.
+        transfer.assert_not_called()
+        self.assertEqual(jobs[0]["directory"], "/var/lib/cozy/dev/staged/" + stage)
+        self.assertEqual([(row["url"], row["sha256"], row["length"]) for row in jobs[0]["wheels"]],
+                         [(row["url"], row["sha256"], row["length"]) for row in wheels])
         for row in wheels:
-            self.assertIn(str(row["path"]), batch)
-            self.assertIn(stage + "/" + row["file"], batch)
+            self.assertTrue(row["url"].startswith("https://files.pythonhosted.org/"))
             self.assertIn(row["sha256"], calls[-1])
-        # A failed transfer cannot make changed local bytes admissible on retry.
-        Path(wheels[0]["path"]).write_bytes(b"changed")
-        with patch.object(sys, "stdin", io.StringIO(json.dumps(request))), patch.object(subprocess, "run") as transfer:
-            with self.assertRaisesRegex(ValueError, "changed after verification"):
-                self.api["main"]()
-            transfer.assert_not_called()
 
     def test_resume_never_retransfers_when_status_names_another_operation(self):
         _, wheels = self.resolve()
@@ -269,7 +272,8 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         request = {"ssh_arguments": [], "probe": PROBE, "action": "apply", "directory": str(self.directory),
                    "stage": "a" * 32, "selection": {"wheels": wheels}}
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
-            with self.assertRaisesRegex(ValueError, "changed after verification"):
+            # Refused before the worker was asked, so the update ends with the worker unchanged.
+            with self.assertRaisesRegex(self.module["NotSent"], "changed after verification"):
                 self.api["main"]()
 
     def test_python_selection_supports_both_fixed_image_layouts(self):
@@ -318,6 +322,64 @@ class PublishedRuntimeUpdates(unittest.TestCase):
                 if body is not None:
                     wheel.writestr("cozy/worker/v1/wire_version.py", '"""Generated."""\n\n' + body)
             self.assertEqual(self.api["runtime_wire"]({"path": path}), want)
+
+class WorkerStaging(unittest.TestCase):
+    """The worker side of staging: a published wheel is fetched and verified there."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.module = runpy.run_path(str(STAGER_PATH))
+        self.api = self.module["main"].__globals__
+        self.api["STAGED"] = Path(temporary.name)
+        self.directory = Path(temporary.name) / ("c" * 32)
+        self.served = {}
+        fetching = patch("urllib.request.urlopen", self.urlopen)
+        fetching.start()
+        self.addCleanup(fetching.stop)
+
+    def urlopen(self, url, timeout):
+        body = self.served[url]
+        response = io.BytesIO(body)
+        response.geturl = lambda: url
+        return response
+
+    def stage(self, *rows):
+        with patch.object(sys, "argv", ["stage", json.dumps({"directory": str(self.directory), "wheels": list(rows)})]):
+            return self.api["main"]()["staged"]
+
+    def row(self, name, body, url=""):
+        return {"file": name, "sha256": hashlib.sha256(body).hexdigest(), "length": len(body), "url": url}
+
+    def test_published_wheel_is_fetched_verified_and_kept(self):
+        body, url = b"published runtime", "https://files.pythonhosted.org/packages/x/cozy_runtime-1-cp312-abi3-manylinux_2_28_x86_64.whl"
+        self.served[url] = body
+        row = self.row("cozy_runtime-1-cp312-abi3-manylinux_2_28_x86_64.whl", body, url)
+        self.assertEqual(self.stage(row)[row["file"]], {"size": len(body), "exists": True, "complete": True})
+        self.assertEqual((self.directory / row["file"]).read_bytes(), body)
+        self.served[url] = b"tampered runtime!"
+        self.assertTrue(self.stage(row)[row["file"]]["complete"])
+        (self.directory / row["file"]).unlink()
+        for tampered, error in [(b"tampered runtime!", "digest verification"), (body + b"+", "exceeds its published length")]:
+            self.served[url] = tampered
+            with self.assertRaisesRegex(ValueError, error):
+                self.stage(row)
+            self.assertEqual(list(self.directory.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, "outside the first-party release index"):
+            self.stage({**row, "url": "https://example.com/" + row["file"]})
+
+    def test_local_upload_reports_what_arrived_and_never_resumes_onto_wrong_bytes(self):
+        body = b"local build bytes"
+        row = self.row("tensorfs-1-cp312-abi3-manylinux_2_28_x86_64.whl", body)
+        self.assertEqual(self.stage(row)[row["file"]], {"size": 0, "exists": False, "complete": False})
+        (self.directory / row["file"]).write_bytes(body[:5])
+        self.assertEqual(self.stage(row)[row["file"]], {"size": 5, "exists": True, "complete": False})
+        (self.directory / row["file"]).write_bytes(b"x" * len(body))
+        self.assertEqual(self.stage(row)[row["file"]], {"size": 0, "exists": False, "complete": False})
+        with self.assertRaisesRegex(ValueError, "staging directory"):
+            with patch.object(sys, "argv", ["stage", json.dumps({"directory": "/tmp/elsewhere", "wheels": []})]):
+                self.api["main"]()
+
 
 if __name__ == "__main__":
     unittest.main()

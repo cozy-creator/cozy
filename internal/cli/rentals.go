@@ -1150,7 +1150,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	} else {
 		list.Aggregates = append(list.Aggregates, output.Field{K: "live", V: jsonFact{true}})
 	}
-	haveFailure, haveHubUnknown := false, false
+	haveFailure, haveHubUnknown, haveUpdate := false, false, false
 	for _, r := range rows {
 		activity := api.RentalActivity{}
 		if r.Activity != nil {
@@ -1165,6 +1165,13 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			idleText = idleClock(time.Since(since)) + " / " + idleClock(due.Sub(since))
 		}
 		state := humanRentalState(r.State)
+		switch r.RuntimeUpdate {
+		case "":
+		case "unusable":
+			state, haveUpdate = "unusable (Runtime update unfinished)", true
+		default:
+			state, haveUpdate = state+" (updating Runtime)", true
+		}
 		if r.HubUnknown {
 			state += " (unknown to Hub)"
 		}
@@ -1200,7 +1207,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			typed["unverified"] = true
 		}
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
-			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub,
+			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub, "runtime_update": r.RuntimeUpdate,
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
 			"idle_since_at": idleSince, "release_due_at": releaseDue,
 			"base_worker_image_digest": either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest),
@@ -1239,6 +1246,10 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 	if haveHubUnknown {
 		list.TypedFields = append(list.TypedFields, "hub_unknown")
 		list.TypedAllFields = append(list.TypedAllFields, "hub_unknown")
+	}
+	if haveUpdate {
+		list.TypedFields = append(list.TypedFields, "runtime_update")
+		list.TypedAllFields = append(list.TypedAllFields, "runtime_update")
 	}
 	// THE HUB'S HALF (cl-199, on th-199). Everything above is what this host FILED, and
 	// the incident of 2026-09-07 is the gap between that and what the account is

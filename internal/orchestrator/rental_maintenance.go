@@ -21,10 +21,8 @@ func (c *Orchestrator) UseRental(id, holder string) (func(), *exit.Error) {
 	if c.closing || c.rentalMaintenance[id] {
 		return nil, exit.Named(exit.Unavailable, "rental.maintenance", "this rental is updating its Runtime; preparation will resume afterward")
 	}
-	if recorded, problem := c.opt.Store.RuntimeUpdate(id); problem != nil {
+	if problem := c.opt.Store.RuntimeUpdateHold(id); problem != nil {
 		return nil, problem
-	} else if recorded != nil && recorded.Active() {
-		return nil, exit.Named(exit.Unavailable, "rental.maintenance", "this rental has an unfinished Runtime update; preparation will resume after reconciliation")
 	}
 	if c.rentalUses[id] == nil {
 		c.rentalUses[id] = map[uint64]string{}
