@@ -2,8 +2,10 @@ package cli
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -112,6 +114,43 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	case len(l.Rows) == 0:
 		l.Next = []string{"cozy " + kind + " search"}
 	}
+	return emit(ctx, l)
+}
+
+// handlePackageInfo lists one published package's releases, newest first, from the
+// package card the Hub already serves.
+func handlePackageInfo(ctx *Context) *exit.Error {
+	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
+	if problem != nil {
+		return problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	card, problem := client(ctx).PackageCard(hctx, ref)
+	if problem != nil {
+		return problem
+	}
+	l := output.List{Name: "releases", Fields: []string{"release", "published", "yanked"},
+		AllFields: []string{"release", "published", "yanked", "yanked_at"},
+		Lead:      []string{ref.String() + ", latest " + card.Package.LatestRelease + ":"}}
+	releases := slices.Clone(card.Releases)
+	slices.SortFunc(releases, func(a, b hub.ReleaseSummary) int {
+		left, errLeft := pep440.Parse(a.Release)
+		right, errRight := pep440.Parse(b.Release)
+		if errLeft != nil || errRight != nil {
+			return strings.Compare(b.Release, a.Release)
+		}
+		return right.Compare(left)
+	})
+	for _, row := range releases {
+		yanked := "no"
+		if row.Yanked || row.YankedAt != "" {
+			yanked = "yes"
+		}
+		l.Rows = append(l.Rows, map[string]string{"release": row.Release, "published": stamp(row.CutAt),
+			"yanked": yanked, "yanked_at": stamp(row.YankedAt)})
+	}
+	l.Total = len(l.Rows)
 	return emit(ctx, l)
 }
 

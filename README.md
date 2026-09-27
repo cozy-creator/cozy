@@ -86,6 +86,7 @@ Search the Tensorhub catalog, install a package, and inspect local installations
 ```sh
 cozy package search video
 cozy package search org/name
+cozy package info org/name        # releases, newest first, with publication time and yanked state
 cozy package install org/name
 cozy package install org/name --version 1.2.3
 cozy package install org/name --rental=kirukiru
