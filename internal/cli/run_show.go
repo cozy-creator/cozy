@@ -132,7 +132,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Machine: life.Machine,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS, ExecutionMS: life.ExecutionMS,
 		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
-	if life.Phase == orchestrator.PhaseGPUWait {
+	if life.Phase == orchestrator.PhaseGPUWait || life.Phase == orchestrator.PhaseOwnerReconciliation {
 		report.Waiting = PhaseCell(life)
 	}
 	created, _ := time.Parse(time.RFC3339Nano, life.CreatedAt)

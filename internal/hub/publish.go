@@ -265,6 +265,24 @@ func (c *Client) readModelFinalization(ctx context.Context, ref Ref, operation s
 	return raw, e
 }
 
+// ModelFinalizationAnswer is Hub's exact answer to the owner's read of one publication's
+// finalization: a 2xx document, or a 404 naming an absent publication or finalization.
+// Any other answer settles nothing, and the caller keeps waiting.
+func (c *Client) ModelFinalizationAnswer(ctx context.Context, ref Ref, operation string) (int, []byte, *exit.Error) {
+	var raw []byte
+	var status int
+	e := c.do(ctx, call{
+		method: http.MethodGet,
+		path:   publications(ref) + "/" + url.PathEscape(operation) + "/finalization",
+		auth:   true, responseBytes: 1 << 20, raw: &raw, status: &status,
+	}, nil)
+	if e == nil || status == http.StatusNotFound &&
+		(e.ErrName() == "publication.not_found" || e.ErrName() == "publication.finalization_absent") {
+		return status, raw, nil
+	}
+	return 0, nil, e
+}
+
 func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation string,
 	request FinalizePublicationRequest, reason string,
 ) (CheckpointPublication, *exit.Error) {

@@ -980,6 +980,9 @@ func PhaseCell(life api.Lifecycle) string {
 		}
 		return "waiting for GPU (" + detail + ")"
 	}
+	if life.Phase == orchestrator.PhaseOwnerReconciliation {
+		return "awaiting owner reconciliation: machine authorization expired (publication " + life.PhaseDetail + ")"
+	}
 	if life.Phase == orchestrator.WaitSlotBusy || life.Phase == orchestrator.WaitQueueAhead {
 		if life.WaitingFor != nil {
 			return fmt.Sprintf("waiting: run %d", life.WaitingFor.Number)
@@ -1039,7 +1042,7 @@ func PhaseCell(life api.Lifecycle) string {
 }
 
 func progressValue(life api.Lifecycle) string {
-	if life.Phase == orchestrator.PhaseGPUWait {
+	if life.Phase == orchestrator.PhaseGPUWait || life.Phase == orchestrator.PhaseOwnerReconciliation {
 		return phaseValue(life)
 	}
 	if life.Status == "queued" {

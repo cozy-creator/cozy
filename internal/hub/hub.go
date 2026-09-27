@@ -231,6 +231,8 @@ type call struct {
 	// manifest route answers a canonical document verbatim, and this client must
 	// carry it the same way — nothing here re-encodes one.
 	raw *[]byte
+	// status receives the answer's HTTP status; with raw, a refusal's exact bytes too.
+	status *int
 }
 
 // WithToken returns a copy of the client carrying a credential supplied for this
@@ -452,6 +454,12 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 		return resp.StatusCode, exit.Named(exit.Unavailable, "hub.response_interrupted",
 			"Tensorhub at %s broke off its response: %s", c.base, innermost(err)).
 			WithRemedy("retry; if it persists the hub or a proxy in front of it is dropping connections")
+	}
+	if cl.status != nil {
+		*cl.status = resp.StatusCode
+		if cl.raw != nil {
+			*cl.raw = raw
+		}
 	}
 	if resp.StatusCode >= 400 {
 		return resp.StatusCode, c.refusal(resp.StatusCode, raw)
