@@ -631,6 +631,12 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "download set: %v", err)
 	}
+	// The pod host's capability check (workerhost/prepare.go checkModelRecovery): a caller
+	// that does not declare materialization recovery cannot prepare downloadable models.
+	if len(downloadSet.List("models")) > 0 && !call.SupportsModelMaterializationRecovery {
+		return status.Error(codes.FailedPrecondition,
+			"model_materialization_recovery_unsupported: update Creator before preparing downloadable models on this Host")
+	}
 	p.mu.Lock()
 	p.prepares = append(p.prepares, call)
 	unavailable := p.prepareUnavailable > 0

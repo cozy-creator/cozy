@@ -105,7 +105,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 			return nil, problem
 		}
 		stream, err := host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
-			Claim: claim, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
+			Claim: claim, SupportsModelMaterializationRecovery: true, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
 			Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
 			PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion, ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
 			PackageInterface: facts.PackageInterface,
