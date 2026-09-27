@@ -36,6 +36,7 @@ type Package struct {
 	PythonRequires         string
 	Files                  map[string]string // source-relative path -> local path
 	PackageInterface       string
+	InterfaceNotice        string // a committed interface copy that contradicts the source
 	Wheel                  string
 	ProjectWheels          []string
 	SourceArchive          string
@@ -157,7 +158,8 @@ func (p *Package) build(ctx context.Context, publish bool, prebuiltWheels ...str
 			return problem
 		}
 	}
-	packageInterface, problem := describe(ctx, p.Tree, root, publish)
+	packageInterface, notice, problem := describe(ctx, p.Tree, root, publish)
+	p.InterfaceNotice = notice
 	if problem != nil {
 		p.Close()
 		p.Root = ""

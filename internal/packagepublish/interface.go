@@ -1,73 +1,65 @@
 package packagepublish
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
+	"slices"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 )
 
-// CommittedInterfacePath is where a publishable tree commits its own PackageInterface — the
-// record Tensorhub accepts as truth (#713). Publication reads it and never re-derives it.
+// CommittedInterfacePath is where a package tree may keep a copy of its PackageInterface.
+// Publication uploads this host's fresh reading of the source; a committed copy is only
+// compared, and a contradiction is reported, never refused.
 const CommittedInterfacePath = "metadata/package-interface.json"
 
 // describe stages the tree's PackageInterface. The reading is THIS host's Runtime parsing the
 // source (hostruntime.Describe): package code is untrusted and nothing here imports it, so no
-// environment is built for the question. A unpublished package revision (Build) ships that reading. A
-// publication (BuildForPublish) treats it as a pre-flight only — the committed file is what
-// uploads — so a committed file that differs from the tree, or is absent, is refused naming
-// the first difference, and an equal one is staged unchanged.
-func describe(ctx context.Context, tree, root string, publish bool) (string, *exit.Error) {
+// environment is built for the question. Both an unpublished revision and a publication ship
+// that reading. For a publication, a committed copy that contradicts it — something the copy
+// names that the source no longer declares, or declares differently — is returned as a
+// notice; ordering and members only the fresh reading carries are not contradictions.
+func describe(ctx context.Context, tree, root string, publish bool) (string, string, *exit.Error) {
 	env := config.Frozen().Tool()
 	if _, problem := hostruntime.Path(env); problem != nil {
-		return "", problem
+		return "", "", problem
 	}
 	raw, problem := hostruntime.Describe(ctx, env, tree)
 	if problem != nil {
-		return "", exit.Named(exit.Validation, "package_interface_refused",
+		return "", "", exit.Named(exit.Validation, "package_interface_refused",
 			"cozy-runtime could not describe the package").WithRemedy("%s", problem.Message)
 	}
 	if len(raw) == 0 || len(raw) > 1<<20 || !json.Valid(raw) {
-		return "", exit.Named(exit.Structural, "package_interface_invalid",
+		return "", "", exit.Named(exit.Structural, "package_interface_invalid",
 			"cozy-runtime returned an invalid package interface")
 	}
+	notice := ""
 	if publish {
-		committed, err := os.ReadFile(filepath.Join(tree, CommittedInterfacePath))
-		if err != nil {
-			return "", staleInterface("%s is absent", CommittedInterfacePath)
-		}
-		if difference := firstDifference(bytes.TrimSpace(committed), raw); difference != "" {
-			return "", staleInterface("%s: %s", CommittedInterfacePath, difference)
+		if committed, err := os.ReadFile(filepath.Join(tree, CommittedInterfacePath)); err == nil {
+			if contradiction := contradicts(committed, raw); contradiction != "" {
+				notice = fmt.Sprintf("%s contradicts this tree's source (%s); publishing the source's interface. "+
+					"Delete or regenerate the committed copy.", CommittedInterfacePath, contradiction)
+				fmt.Fprintf(os.Stderr, "cozy: %s\n", notice)
+			}
 		}
 	}
 	path := filepath.Join(root, "package-interface.json")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", exit.Internalf("cannot stage package interface: %s", err)
+		return "", "", exit.Internalf("cannot stage package interface: %s", err)
 	}
-	return path, nil
+	return path, notice, nil
 }
 
-func staleInterface(format string, args ...any) *exit.Error {
-	return exit.Named(exit.Validation, "package_publish.interface_stale",
-		"the committed PackageInterface is not this tree's — "+format, args...).
-		WithRemedy("in the package tree run `cozy-runtime --json describe > %s` and commit it",
-			CommittedInterfacePath)
-}
-
-// firstDifference names the first place the committed document and the tree's reading
-// disagree — a path into the document and both values — or "" when they are equal.
-func firstDifference(committed, tree []byte) string {
-	if bytes.Equal(committed, tree) {
-		return ""
-	}
+// contradicts names the first thing the committed copy states that the fresh reading does
+// not, or "" when the copy is consistent with it.
+func contradicts(committed, tree []byte) string {
 	var a, b any
 	if json.Unmarshal(committed, &a) != nil {
 		return "the committed file is not JSON"
@@ -75,64 +67,62 @@ func firstDifference(committed, tree []byte) string {
 	if json.Unmarshal(tree, &b) != nil {
 		return "the tree's reading is not JSON"
 	}
-	if difference := differ("", a, b); difference != "" {
-		return difference
-	}
-	return "the committed file is not the canonical spelling of this tree's interface"
+	return contradiction("", a, b)
 }
 
-func differ(path string, committed, tree any) string {
+func contradiction(path string, committed, tree any) string {
 	switch c := committed.(type) {
 	case map[string]any:
 		t, ok := tree.(map[string]any)
 		if !ok {
-			return fmt.Sprintf("%s: committed %s, tree %s", path, spell(committed), spell(tree))
+			return fmt.Sprintf("%s: committed %s, source %s", path, spell(committed), spell(tree))
 		}
-		keys := map[string]bool{}
-		for key := range c {
-			keys[key] = true
-		}
-		for key := range t {
-			keys[key] = true
-		}
-		sorted := make([]string, 0, len(keys))
-		for key := range keys {
-			sorted = append(sorted, key)
-		}
-		sort.Strings(sorted)
-		for _, key := range sorted {
+		for _, key := range slices.Sorted(maps.Keys(c)) {
 			child := key
 			if path != "" {
 				child = path + "." + key
 			}
-			cv, inCommitted := c[key]
 			tv, inTree := t[key]
-			switch {
-			case !inCommitted:
-				return child + ": absent from the committed file"
-			case !inTree:
-				return child + ": absent from the tree"
+			if !inTree {
+				return child + ": absent from the source"
 			}
-			if difference := differ(child, cv, tv); difference != "" {
-				return difference
+			if found := contradiction(child, c[key], tv); found != "" {
+				return found
 			}
 		}
 	case []any:
 		t, ok := tree.([]any)
 		if !ok {
-			return fmt.Sprintf("%s: committed %s, tree %s", path, spell(committed), spell(tree))
+			return fmt.Sprintf("%s: committed %s, source %s", path, spell(committed), spell(tree))
 		}
-		for i := 0; i < len(c) && i < len(t); i++ {
-			if difference := differ(fmt.Sprintf("%s[%d]", path, i), c[i], t[i]); difference != "" {
-				return difference
+		named := map[string]any{}
+		for _, item := range t {
+			if object, ok := item.(map[string]any); ok {
+				if name, ok := object["name"].(string); ok {
+					named[name] = item
+				}
 			}
 		}
-		if len(c) != len(t) {
-			return fmt.Sprintf("%s: committed %d entries, tree %d", path, len(c), len(t))
+		for i, item := range c {
+			if object, ok := item.(map[string]any); ok {
+				if name, ok := object["name"].(string); ok {
+					match, found := named[name]
+					if !found {
+						return fmt.Sprintf("%s: %q is absent from the source", path, name)
+					}
+					if found := contradiction(fmt.Sprintf("%s[%s]", path, name), item, match); found != "" {
+						return found
+					}
+					continue
+				}
+			}
+			if !slices.ContainsFunc(t, func(candidate any) bool { return reflect.DeepEqual(candidate, item) }) {
+				return fmt.Sprintf("%s[%d]: committed %s is absent from the source", path, i, spell(item))
+			}
 		}
 	default:
 		if !reflect.DeepEqual(committed, tree) {
-			return fmt.Sprintf("%s: committed %s, tree %s", path, spell(committed), spell(tree))
+			return fmt.Sprintf("%s: committed %s, source %s", path, spell(committed), spell(tree))
 		}
 	}
 	return ""
