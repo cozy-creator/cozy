@@ -1,5 +1,5 @@
 //! The one socket this crate opens (tfs-049). A deliberately small HTTP/1.1 client — GET,
-//! POST, PUT, bounded reuse for exact ranged GETs, Content-Length or chunked bodies, no compression, no
+//! POST, PUT, bounded reuse for ranged GETs and uploads, Content-Length or chunked bodies, no compression, no
 //! proxy, redirects surfaced to the caller rather than followed — written directly over
 //! `TcpStream`/rustls for exactly two properties no shelf client offers together:
 //!
@@ -181,12 +181,9 @@ struct Scope {
 }
 
 impl Scope {
-    fn ranged(checked: &CheckedUrl, headers: &[(String, String)]) -> Self {
+    fn of(checked: &CheckedUrl, headers: &[(String, String)]) -> Self {
         let mut hash = crate::sha256::Sha256::new();
-        for (name, value) in headers
-            .iter()
-            .filter(|(name, _)| !name.eq_ignore_ascii_case("range"))
-        {
+        for (name, value) in headers {
             // Preserve duplicate-header ordering as well as values: an origin
             // can assign different meaning to their first or last occurrence.
             let name = name.to_ascii_lowercase();
@@ -241,7 +238,7 @@ impl Client {
 
     fn take(&self, scope: &Scope, checked: &CheckedUrl) -> Option<Wire> {
         let mut idle = self.idle.lock().ok()?;
-        let at = idle.iter().position(|entry| entry.scope == *scope)?;
+        let at = idle.iter().rposition(|entry| entry.scope == *scope)?;
         let mut entry = idle.remove(at);
         // Every request has already rechecked its policy and DNS. An established
         // socket is usable only while its exact peer remains in that checked set.
@@ -671,7 +668,7 @@ impl Drop for BodyReader<'_> {
         let Ok(mut idle) = pool.lock() else {
             return;
         };
-        idle.retain(|entry| entry.scope != scope);
+        // Concurrent streams to one origin each keep their socket, within the bound.
         if idle.len() == MAX_IDLE {
             idle.remove(0);
         }
@@ -949,12 +946,28 @@ pub fn request<'l>(
     write_silence: Option<Duration>,
     fail: Code,
 ) -> Result<Response<'l>> {
+    // Retained-source ranges already own their retry/resume budget. Other GETs and
+    // metadata writes keep their one-connection behavior.
+    let ranged = method == "GET"
+        && body.is_none()
+        && headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("range"))
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("connection"));
+    let scoped: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("range"))
+        .cloned()
+        .collect();
     send(
         client,
         checked,
         method,
         headers,
         body.map(Payload::Bytes),
+        ranged.then_some(scoped.as_slice()),
         deadline,
         ledger,
         judge,
@@ -971,6 +984,9 @@ pub fn request<'l>(
 /// deadline-free caller wait forever. `write_silence` additionally bounds one WRITE
 /// operation that moves nothing — the push plane derives it from the ledger's floor, the
 /// port of egress.py's one derived silence bound; `None` leaves the write to `judge`.
+/// `pool` keeps the connection alive for the next exchange with this origin that names
+/// the same headers — the credentials, never a request's own target or signed
+/// conditions; `None` closes it after this exchange.
 #[allow(clippy::too_many_arguments)]
 pub fn send<'l>(
     client: &Client,
@@ -978,6 +994,7 @@ pub fn send<'l>(
     method: &str,
     headers: &[(String, String)],
     body: Option<Payload<'_>>,
+    pool: Option<&[(String, String)]>,
     deadline: Deadline,
     ledger: &'l Ledger,
     judge: Judge,
@@ -986,17 +1003,7 @@ pub fn send<'l>(
 ) -> Result<Response<'l>> {
     ledger.check_running()?;
     let opened = Instant::now();
-    // Retained-source ranges already own their retry/resume budget. Other GETs,
-    // metadata writes and uploads retain their existing one-connection behavior.
-    let scope = (method == "GET"
-        && body.is_none()
-        && headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("range"))
-        && !headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("connection")))
-    .then(|| Scope::ranged(checked, headers));
+    let scope = pool.map(|scoped| Scope::of(checked, scoped));
     let cached = scope.as_ref().and_then(|scope| client.take(scope, checked));
     let mut wire = if let Some(wire) = cached {
         wire
