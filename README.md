@@ -286,7 +286,11 @@ cozy model publish org/model --release 1.0.0 \
   --lane fp8=sha256:<checkpoint>
 cozy model publish org/model --release 1.0.0 --remove-lane defective
 cozy model yank org/model --release 1.0.0
+cozy model delete org/model#sha256:<checkpoint> --yes   # one unreleased checkpoint
+cozy model delete org/model --yes                       # the model, once every release is yanked
 ```
+
+Deletion drops Tensorhub's references only; its GC reclaims objects no other model shares.
 
 Checkpoint IDs are immutable. Release labels and their lane maps are mutable owner pointers. Ordinary
 consumers follow a release lane so fixes take effect; accepted runs freeze the checkpoint they resolved.
