@@ -671,17 +671,20 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 
 func (m *managedRentals) sweepLocked() {
 	m.sayUnrecordedLocked()
-	for id := range m.hubUnknown {
-		m.sayLocked("hub-unknown:"+id, fmt.Sprintf(
-			"rental %s is recorded on this host but unknown to %s; kept until its provider release is confirmed",
-			id, client(m.ctx).Base()))
-	}
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		m.sayLocked("", "idle release deferred: "+problem.Message)
 		return
 	}
 	for _, row := range rows {
+		if m.hubUnknown[row.ID] {
+			settle := "kept until its provider release is confirmed"
+			if row.State == hub.RentalFailed {
+				settle = "it failed (provider absent) before the Hub lost it; `cozy rental end " + row.ID + "` forgets it"
+			}
+			m.sayLocked("hub-unknown:"+row.ID, fmt.Sprintf("rental %s is recorded on this host but unknown to %s; %s",
+				row.ID, client(m.ctx).Base(), settle))
+		}
 		if _, problem := m.observeLocked(row); problem != nil {
 			m.sayLocked(row.ID, fmt.Sprintf("rental %s release deferred: %s; retrying every %s",
 				row.ID, problem.Message, idleReleaseRetry))
