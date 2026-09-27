@@ -1010,7 +1010,7 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 	} else {
 		list.Aggregates = append(list.Aggregates, output.Field{K: "live", V: jsonFact{true}})
 	}
-	haveFailure := false
+	haveFailure, haveHubUnknown := false, false
 	for _, r := range rows {
 		activity := api.RentalActivity{}
 		if r.Activity != nil {
@@ -1024,9 +1024,13 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		if eligible {
 			idleText = idleClock(time.Since(since)) + " / " + idleClock(due.Sub(since))
 		}
+		state := humanRentalState(r.State)
+		if r.HubUnknown {
+			state += " (unknown to Hub)"
+		}
 		list.Rows = append(list.Rows, map[string]string{
 			"machine": r.MachineName, "sku": orNone(r.SKU), "gpus": gpuCell(r.AcceleratorModel, r.AcceleratorCount),
-			"state": humanRentalState(r.State), "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
+			"state": state, "failure": orNone(r.Failure.Code), "uptime": rentalUptime(r.RentedAt),
 			"running": strconv.Itoa(activity.Running), "queued": strconv.Itoa(activity.Queued),
 			"idle":   idleText,
 			"rental": r.ID, "bought for": orNone(r.BoughtFor),
@@ -1062,6 +1066,12 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		if eligible {
 			typed["idle_s"] = int64(time.Since(since).Seconds())
 		}
+		if r.HubUnknown {
+			haveHubUnknown = true
+			typed["hub_unknown"] = true
+			list.Trail = append(list.Trail, fmt.Sprintf("Rental %s (%s) is recorded here but unknown to Tensorhub; "+
+				"its record is kept until its provider release is confirmed.", r.ID, r.MachineName))
+		}
 		if r.Failure.Code != "" {
 			haveFailure = true
 			typed["failure_code"] = r.Failure.Code
@@ -1075,6 +1085,10 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		list.Fields = []string{"machine", "sku", "gpus", "state", "$/hour", "failure", "uptime", "running", "queued", "idle"}
 		list.TypedFields = []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
 			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest", "failure_code"}
+	}
+	if haveHubUnknown {
+		list.TypedFields = append(list.TypedFields, "hub_unknown")
+		list.TypedAllFields = append(list.TypedAllFields, "hub_unknown")
 	}
 	// THE HUB'S HALF (cl-199, on th-199). Everything above is what this host FILED, and
 	// the incident of 2026-09-07 is the gap between that and what the account is

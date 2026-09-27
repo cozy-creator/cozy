@@ -54,6 +54,10 @@ type managedRentals struct {
 	live           []hub.Rental
 	listed         bool
 	listingProblem *exit.Error
+	// hubUnknown is every host row the hub answered `rental.not_found` for on the last
+	// reconcile. A 404 is not proof of provider destruction, so the row is KEPT and shown;
+	// it must never stop the reconcile of every other rental against the same hub.
+	hubUnknown map[string]bool
 }
 
 // Failed provider release is retried without changing the idle deadline.
@@ -667,6 +671,11 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 
 func (m *managedRentals) sweepLocked() {
 	m.sayUnrecordedLocked()
+	for id := range m.hubUnknown {
+		m.sayLocked("hub-unknown:"+id, fmt.Sprintf(
+			"rental %s is recorded on this host but unknown to %s; kept until its provider release is confirmed",
+			id, client(m.ctx).Base()))
+	}
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		m.sayLocked("", "idle release deferred: "+problem.Message)
@@ -949,6 +958,7 @@ func (m *managedRentals) reconcileRowsLocked() *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	m.hubUnknown = map[string]bool{}
 	pending := map[string]records.RentalOperation{}
 	for _, operation := range operations {
 		if operation.ManagedRequestID == "" && operation.RentalID != "" &&
@@ -976,9 +986,8 @@ func (m *managedRentals) reconcileRowsLocked() *exit.Error {
 		cancel()
 		if observed != nil {
 			if observed.ErrName() == "rental.not_found" {
-				return exit.Named(exit.Conflict, "rental.hub_record_missing",
-					"Tensorhub no longer has rental %s, but this host still has its non-released record", row.ID).
-					WithRemedy("reconcile Tensorhub with its provider before retrying; do not forget this rental or rent replacement capacity until its provider resource is confirmed released")
+				m.hubUnknown[row.ID] = true
+				continue
 			}
 			return observed
 		}

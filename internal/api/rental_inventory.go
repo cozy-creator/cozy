@@ -27,10 +27,11 @@ type RentalInventory struct {
 // Current removes proven-absent rentals from the fleet projection without
 // changing retained history or the Hub-reconciled spend totals. Applying it on
 // both sides of the API also supports older daemons that include terminal rows.
+// A Hub-unknown host record is not proven absent and stays.
 func (inventory RentalInventory) Current() RentalInventory {
 	current := func(rows []RentalSummary) []RentalSummary {
 		return slices.DeleteFunc(slices.Clone(rows), func(row RentalSummary) bool {
-			return hub.RentalAbsent(row.State)
+			return hub.RentalAbsent(row.State) && !row.HubUnknown
 		})
 	}
 	inventory.Rentals = current(inventory.Rentals)
@@ -61,6 +62,9 @@ type RentalSummary struct {
 	BaseWorkerImageDigest string            `json:"base_worker_image_digest,omitempty"`
 	BaseWorkerImageTag    string            `json:"base_worker_image_tag,omitempty"`
 	Failure               hub.RentalFailure `json:"failure"`
+	// HubUnknown is a host record the Hub answered 404 for: kept, because a missing
+	// Hub record is not proof the provider pod is gone.
+	HubUnknown bool `json:"hub_unknown,omitempty"`
 }
 
 // Activity is absent for machines known only to the Hub: this daemon cannot
