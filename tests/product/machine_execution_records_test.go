@@ -50,6 +50,7 @@ type retentionReleaseMachine struct {
 }
 
 func (m *retentionReleaseMachine) Refresh(context.Context, records.Request) *exit.Error { return nil }
+func (m *retentionReleaseMachine) Withdraw(string)                                      {}
 
 func (m *retentionReleaseMachine) Control(_ context.Context, request records.Request, action string) *exit.Error {
 	if action != "cancel" {

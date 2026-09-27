@@ -110,11 +110,14 @@ type machineRuns struct {
 	updates   *rentalRuntimeUpdates
 	// ownerReads paces owner finalization reads of publications a machine cannot settle.
 	ownerReads ownerReads
+	// submitting stops each request's submission work in flight (upload, preparation,
+	// staging) once its cancel is durable; guarded by mu.
+	submitting map[string]context.CancelFunc
 }
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals) *machineRuns {
 	background, cancel := context.WithCancel(context.Background())
-	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}, placed: map[string]string{}}
+	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}, placed: map[string]string{}, submitting: map[string]context.CancelFunc{}}
 }
 
 func (m *machineRuns) Start(request records.Request) *exit.Error {
@@ -210,13 +213,16 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				lastError = problem.Message
 				// submit may have durably frozen/transmitted its offer after this
 				// loop read link. Only a fresh journal read can prove it was unsent.
-				// A machine lost mid-preparation released the run; it is placed again.
+				// A machine lost mid-preparation released the run; it is placed again. A
+				// canceled run is neither failed nor parked: the next pass releases its inputs.
 				latest, readProblem := m.store.MachineExecution(request.ID)
-				if readProblem == nil && latest != nil && problem.Code != exit.Unavailable && problem.Code != exit.Deadline && len(latest.Submission) == 0 && latest.MachineID == link.MachineID {
+				row, rowProblem := m.store.RequestRow(request.ID)
+				unsent := readProblem == nil && rowProblem == nil && latest != nil && row != nil && row.State != "canceled" && len(latest.Submission) == 0
+				if unsent && problem.Code != exit.Unavailable && problem.Code != exit.Deadline && latest.MachineID == link.MachineID {
 					_, _ = m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
 					return
 				}
-				if readProblem == nil && latest != nil && len(latest.Submission) == 0 {
+				if unsent {
 					// A run still waiting to reach its machine says why, as a queued run does.
 					_ = m.store.AppendEvent(request.ID, "request.parked", 0, map[string]any{"reason": problem.Message, "wait": orchestrator.WaitRental})
 				}
@@ -252,6 +258,16 @@ func (m *machineRuns) Resume() {
 	}
 }
 
+// Withdraw stops the submission work in flight for a request whose cancel is durable. The
+// observer's next pass releases whatever of it reached the machine.
+func (m *machineRuns) Withdraw(request string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if stop := m.submitting[request]; stop != nil {
+		stop()
+	}
+}
+
 // machineWorkOwed is whether the execution still owes work or custody, or holds a sent
 // publication only its owner can settle.
 func (m *machineRuns) machineWorkOwed(request string) (bool, *exit.Error) {
@@ -263,6 +279,16 @@ func (m *machineRuns) machineWorkOwed(request string) (bool, *exit.Error) {
 }
 
 func (m *machineRuns) submit(request records.Request, link *records.MachineExecution) (out *exit.Error) {
+	ctx, stop := context.WithCancel(m.ctx)
+	m.mu.Lock()
+	m.submitting[request.ID] = stop
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.submitting, request.ID)
+		m.mu.Unlock()
+		stop()
+	}()
 	_, deadline, problem := m.store.RequestExecutionTiming(request.ID)
 	if problem != nil {
 		return problem
@@ -306,12 +332,12 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	}
 
 	if len(link.Submission) == 0 && m.updates != nil {
-		if problem := m.updates.preflight(m.ctx, request, link.MachineID); problem != nil {
+		if problem := m.updates.preflight(ctx, request, link.MachineID); problem != nil {
 			return problem
 		}
 	}
 	began := time.Now()
-	connection, problem := m.connect(m.ctx, link.MachineID, m.runHolder(request, "preparing its submission"))
+	connection, problem := m.connect(ctx, link.MachineID, m.runHolder(request, "preparing its submission"))
 	if problem != nil {
 		return problem
 	}
@@ -341,20 +367,20 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if submission.ExpectedExecutionWorkspaceId == "" {
 			// A submission recorded before workspace fencing defaults to the machine's
 			// current workspace; the receipt then pins the one that accepted it.
-			workspace, problem := currentExecutionWorkspace(m.ctx, connection)
+			workspace, problem := currentExecutionWorkspace(ctx, connection)
 			if problem != nil {
 				return problem
 			}
 			submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
 		}
 	} else {
-		authorization, problem := m.publicationAuthorization(m.ctx, request.ID, link.MachineID, connection)
+		authorization, problem := m.publicationAuthorization(ctx, request.ID, link.MachineID, connection)
 		if problem != nil {
 			return problem
 		}
 		var built *pb.MachineExecutionSubmit
 		if request.LocalInstallationID == "" {
-			built, problem = m.publishedSubmission(m.ctx, request, connection)
+			built, problem = m.publishedSubmission(ctx, request, connection)
 			if problem != nil {
 				return problem
 			}
@@ -365,12 +391,12 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			}
 			var placements *pb.DesiredPlacementSet
 			for index, revision := range capture.Installations {
-				if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
+				if problem := connection.prepare(ctx, request.ID, revision); problem != nil {
 					return problem
 				}
 				capture.Installations[index].PackageInterface = connection.installed[revision.ID].PackageInterface
 				if connection.prepareModels != nil {
-					set, problem := connection.prepareModels(m.ctx, request, revision)
+					set, problem := connection.prepareModels(ctx, request, revision)
 					if problem != nil {
 						return problem
 					}
@@ -393,7 +419,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			}
 			origin := ""
 			if connection.modelDefaultOrigin != nil {
-				origin, problem = connection.modelDefaultOrigin(m.ctx)
+				origin, problem = connection.modelDefaultOrigin(ctx)
 				if problem != nil {
 					return problem
 				}
@@ -426,7 +452,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 				return problem
 			}
 			began = time.Now()
-			byteInputs, problem := m.stageMachineInputs(m.ctx, request, connection)
+			byteInputs, problem := m.stageMachineInputs(ctx, request, connection)
 			if problem != nil {
 				return problem
 			}
@@ -435,7 +461,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			}
 			if job.Kind == "job" {
 				var plan *orchestrator.JobPlan
-				if plan, problem = machineJobPlan(m.ctx, connection, request, installed.InstallationId, job); problem != nil {
+				if plan, problem = machineJobPlan(ctx, connection, request, installed.InstallationId, job); problem != nil {
 					return problem
 				}
 				built, problem = orchestrator.MachineJobSubmission(request, capture, plan, byteInputs)
@@ -462,7 +488,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		}
 		built.PublicationAuthorizationId = authorization
 		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.wireMinor)
-		if problem := m.freezeMachineSubmission(m.ctx, connection, request.ID, built); problem != nil {
+		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, built); problem != nil {
 			return problem
 		}
 		submission = built
@@ -471,14 +497,14 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		return problem
 	}
 	began = time.Now()
-	if problem := m.sendMachineSubmission(m.ctx, connection, request.ID, submission); problem != nil {
+	if problem := m.sendMachineSubmission(ctx, connection, request.ID, submission); problem != nil {
 		return problem
 	}
 	m.submissionStage(request.ID, "submit", "", began)
 	if m.fleet != nil && m.fleet.owner != nil {
 		m.fleet.owner.ForgetPhase(request.ID) // Runtime reports the run from here on
 	}
-	return m.releaseMachineInputs(m.ctx, request, connection)
+	return m.releaseMachineInputs(ctx, request, connection)
 }
 
 // recordPlacement makes a waiting run's placement decision durable, as a queued run's is:
