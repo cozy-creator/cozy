@@ -108,8 +108,12 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
     let mut sessions = Vec::new();
     for session in tx::sessions(store) {
         let root = tx::read_session(store.root(), &session)?;
-        let journalled =
+        // An object the operation's publication custodian already holds is not in flight:
+        // the journal stops naming it, so the local copy is ordinary unreferenced bytes.
+        let custody = crate::ingest::custody::read_session(store.root(), &session)?;
+        let mut journalled =
             crate::ingest::journal::session_objects(&tx::candidate_dir(store.root(), &session))?;
+        journalled.retain(|object| !custody.contains(object));
         if root.candidates.is_empty() && journalled.is_empty() {
             continue;
         }

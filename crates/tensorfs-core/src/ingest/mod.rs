@@ -17,6 +17,7 @@
 
 pub mod carrier;
 pub mod convert;
+pub mod custody;
 pub mod fingerprint;
 pub mod gguf;
 mod h3_lora;

@@ -1123,7 +1123,11 @@ fn request_digest(request: &PrepareModelSource, _registry_bytes: &[u8]) -> Strin
     format!("sha256:{}", crate::sha256::hex(&hash.finish()))
 }
 
-fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Result<()> {
+fn validate_prepared_result(
+    store: &Store,
+    source: &PreparedModelSource,
+    custody: &super::custody::Custody,
+) -> Result<()> {
     let manifest_ref = ObjectRef {
         sha256: source
             .manifest_digest
@@ -1138,7 +1142,8 @@ fn validate_prepared_result(store: &Store, source: &PreparedModelSource) -> Resu
         detail: "prepared model Manifest has no CozyTensors header".into(),
     })?;
     crate::checkpoint::load_header(store, header_ref)?;
-    crate::checkpoint::walk_cozytensors(store, &manifest)?.require_resident(store)?;
+    crate::checkpoint::walk_cozytensors(store, &manifest)?
+        .require_held(store, &custody.digests())?;
     Ok(())
 }
 
@@ -1229,6 +1234,7 @@ pub fn prepare_model_source_with_registry_budget(
             Some(limit) => transaction::Budget::bounded(limit),
             None => transaction::Budget::new(durability::INTERVAL_BYTES),
         },
+        true,
     )
 }
 
@@ -1325,12 +1331,15 @@ fn plan_preparation(
     })
 }
 
+/// `chain` writes the durability chain a RecordOwner uploads for cross-pod resume. A
+/// custodied operation's durable progress is its publication instead, so it has no chain.
 fn prepare_model_source_with_budget(
     store: &Store,
     request: &PrepareModelSource,
     registry_locator: &str,
     registry_bytes: &[u8],
     budget: &mut transaction::Budget,
+    chain: bool,
 ) -> Result<PreparedModelSources> {
     let PlannedPreparation {
         ready,
@@ -1338,6 +1347,13 @@ fn prepare_model_source_with_budget(
         plans,
         digest,
     } = plan_preparation(store, request, registry_locator, registry_bytes)?;
+    let custody = super::custody::read(store.root(), &request.operation_id)?;
+    if chain && !custody.is_empty() {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            "a custodied source operation has no local durability chain",
+        );
+    }
     let catalog = crate::catalog::Catalog::open(store.root())?;
     let writer = match catalog.begin_source_preparation(&request.operation_id, &digest)? {
         crate::catalog::SourcePreparation::Prepared(rows) => {
@@ -1364,13 +1380,14 @@ fn prepare_model_source_with_budget(
                 })
                 .collect();
             for source in &sources {
-                validate_prepared_result(store, source)?;
+                validate_prepared_result(store, source, &custody)?;
             }
             // The final response can be lost after its catalog commit. Its existing local
             // cursors must remain discoverable without converting or reading source bodies.
             let mut checkpoints = Vec::new();
             let dir = transaction::candidate_dir(store.root(), &request.operation_id);
-            for (requested, (plan_hex, _)) in request.profiles.iter().zip(&plans) {
+            for (requested, (plan_hex, _)) in request.profiles.iter().zip(&plans).filter(|_| chain)
+            {
                 let plan_digest = format!("sha256:{plan_hex}");
                 let chain = format!("{}/{}", request.operation_id, requested.slot);
                 let journal = super::journal::Journal::open(&dir, plan_hex)?;
@@ -1447,9 +1464,50 @@ fn prepare_model_source_with_budget(
         required_write_bytes: 0,
     };
     let mut needed = std::collections::BTreeSet::new();
+    if !chain {
+        // Convert every slot first; finalize below only once all of them are journalled.
+        let dir = transaction::candidate_dir(store.root(), &request.operation_id);
+        for (plan_hex, prepared) in &plans {
+            let mut journal = super::journal::Journal::open(&dir, plan_hex)?;
+            for fence in &fences {
+                fence.check()?;
+            }
+            let progress = transaction::convert_journal(
+                store,
+                &prepared.plan,
+                &prepared.files,
+                &request.operation_id,
+                transaction::Carriers::Ready(&ready),
+                &mut journal,
+                Some(budget),
+                &custody,
+            )?;
+            needed.extend(progress.needed);
+            result.converted_roles += progress.converted_roles;
+            result.converted_bytes += progress.written;
+            result.resumed_roles += progress.resumed_roles;
+            result.deferred_ops += progress.deferred_ops;
+        }
+        result.largest_op_bytes = budget.largest_op;
+        result.required_write_bytes = budget.required_write_bytes;
+        if result.deferred_ops > 0 {
+            for fence in &fences {
+                fence.check()?;
+            }
+            result.complete = false;
+            result.spent = request
+                .roster
+                .iter()
+                .filter(|row| !needed.contains(&row.path))
+                .map(|row| row.member.clone())
+                .collect();
+            drop(writer);
+            return Ok(result);
+        }
+    }
     for (requested, (plan_hex, prepared)) in request.profiles.iter().zip(plans) {
         let plan_digest = format!("sha256:{plan_hex}");
-        let chain = format!("{}/{}", request.operation_id, requested.slot);
+        let chain_name = format!("{}/{}", request.operation_id, requested.slot);
         let mut previous = request
             .checkpoints
             .iter()
@@ -1466,7 +1524,7 @@ fn prepare_model_source_with_budget(
                 adopt_source_checkpoint(
                     store,
                     prior,
-                    &chain,
+                    &chain_name,
                     &request.operation_id,
                     &plan_hex,
                     head,
@@ -1479,13 +1537,13 @@ fn prepare_model_source_with_budget(
             };
         }
         let held = match &previous {
-            Some(head) => durability::continuable(store, head, &plan_digest, &chain)?,
+            Some(head) => durability::continuable(store, head, &plan_digest, &chain_name)?,
             None => None,
         };
         if held.is_none() {
             previous = None;
         }
-        discard_other_plans(store, &dir, &chain, &plan_hex)?;
+        discard_other_plans(store, &dir, &chain_name, &plan_hex)?;
         if let (Some(head), Some(held)) = (&previous, held) {
             durability::retain_local_chain(store, head, &request.operation_id)?;
             if journal.is_empty() {
@@ -1512,32 +1570,37 @@ fn prepare_model_source_with_budget(
             None,
             &mut journal,
             Some(budget),
+            &custody,
         )?;
-        let checkpoint = durability::checkpoint(
-            store,
-            &durability::Policy {
-                chain: &chain,
-                operation: &request.operation_id,
-                plan: &plan_digest,
-                interval: durability::INTERVAL_BYTES,
-            },
-            previous.as_ref(),
-            &journal,
-        )?;
-        if checkpoint.head.is_some() {
-            result.checkpoints.push(SourceCheckpoint {
-                slot: requested.slot.clone(),
-                plan_digest,
-                head: checkpoint,
-            });
+        if chain {
+            let checkpoint = durability::checkpoint(
+                store,
+                &durability::Policy {
+                    chain: &chain_name,
+                    operation: &request.operation_id,
+                    plan: &plan_digest,
+                    interval: durability::INTERVAL_BYTES,
+                },
+                previous.as_ref(),
+                &journal,
+            )?;
+            if checkpoint.head.is_some() {
+                result.checkpoints.push(SourceCheckpoint {
+                    slot: requested.slot.clone(),
+                    plan_digest,
+                    head: checkpoint,
+                });
+            }
         }
         needed.extend(progress.needed);
-        result.converted_roles += progress.converted_roles;
-        result.converted_bytes += progress.written;
-        result.largest_op_bytes = budget.largest_op;
-        result.required_write_bytes = budget.required_write_bytes;
-        result.resumed_roles += progress.resumed_roles;
-        result.deferred_ops += progress.deferred_ops;
+        if chain {
+            result.converted_roles += progress.converted_roles;
+            result.converted_bytes += progress.written;
+            result.largest_op_bytes = budget.largest_op;
+            result.required_write_bytes = budget.required_write_bytes;
+            result.resumed_roles += progress.resumed_roles;
+            result.deferred_ops += progress.deferred_ops;
+        }
         if let Some(outcome) = outcome {
             if outcome.header.tensor_schema_digest()
                 != tensor_schema_digest_of(&plan_tensor_schema(&prepared.plan))
@@ -1568,7 +1631,7 @@ fn prepare_model_source_with_budget(
         .collect();
     if result.complete {
         for source in &result.sources {
-            validate_prepared_result(store, source)?;
+            validate_prepared_result(store, source, &custody)?;
         }
         let rows: Vec<_> = result
             .sources
@@ -1596,6 +1659,73 @@ pub fn prepare_model_source(
     request: &PrepareModelSource,
 ) -> Result<PreparedModelSources> {
     prepare_model_source_with_registry(store, request, BUILTIN_REGISTRY, BUILTIN_REGISTRY_BYTES)
+}
+
+/// One member of an exact provider selection: its pinned identity and the header a ranged
+/// read bought before any body moved. Only index and tensor carriers belong here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedSourceMember {
+    pub member: String,
+    pub object: ObjectRef,
+    /// Exact index JSON or safetensors length-plus-header prefix, never payload.
+    pub header: Vec<u8>,
+}
+
+/// Advance an exact selection whose bodies arrive and leave while it converts, within a
+/// bounded disk. A member is landed when the Store holds its verified body right now;
+/// output the operation's custodian holds stands without local bytes. There is no
+/// durability chain: the custodian is this operation's durable progress.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_selected_source(
+    store: &Store,
+    operation_id: &str,
+    source_selection_digest: &str,
+    profiles: Vec<ModelSourceProfile>,
+    members: &[SelectedSourceMember],
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    write_budget_bytes: Option<u64>,
+) -> Result<(PreparedModelSources, Vec<String>)> {
+    // Presence is read under the writer fence, so GC cannot remove a body counted as landed.
+    let _guard = crate::catalog::WriterGuard::acquire(store.root())?;
+    let mut landed = Vec::new();
+    let roster = members
+        .iter()
+        .map(|row| {
+            if matches!(store.record_valid(&row.object.sha256), Ok(record) if record.length == row.object.length)
+            {
+                landed.push(row.member.clone());
+            }
+            VerifiedModelSourceFile {
+                member: row.member.clone(),
+                object_id: row.object.id(),
+                length: row.object.length,
+                path: store.object_path(&row.object.sha256),
+                header: row.header.clone(),
+            }
+        })
+        .collect();
+    let request = normalized(&PrepareModelSource {
+        operation_id: operation_id.to_string(),
+        source_selection_digest: source_selection_digest.to_string(),
+        profiles,
+        roster,
+        landed,
+        checkpoints: Vec::new(),
+        adopt_from_operation_id: None,
+    })?;
+    let prepared = prepare_model_source_with_budget(
+        store,
+        &request,
+        registry_locator,
+        registry_bytes,
+        &mut match write_budget_bytes {
+            Some(limit) => transaction::Budget::bounded(limit),
+            None => transaction::Budget::new(u64::MAX),
+        },
+        false,
+    )?;
+    Ok((prepared, request.landed))
 }
 
 /// Reuse verified journal parts without relabeling the old chain or its ownership.
@@ -2050,6 +2180,99 @@ mod tests {
         (store, registry.to_bytes(), request)
     }
 
+    fn selected(request: &PrepareModelSource) -> Vec<SelectedSourceMember> {
+        request
+            .roster
+            .iter()
+            .map(|row| SelectedSourceMember {
+                member: row.member.clone(),
+                object: ObjectRef {
+                    sha256: row.object_id.trim_start_matches("sha256:").into(),
+                    length: row.length,
+                },
+                header: row.header.clone(),
+            })
+            .collect()
+    }
+
+    fn land(store: &Store, path: &Path) {
+        let body = fs::read(path).unwrap();
+        store
+            .put_stream(
+                &mut body.as_slice(),
+                Some(&ObjectRef::of(&body)),
+                &Default::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn custodied_output_leaves_the_disk_and_is_never_converted_again() {
+        use crate::ingest::custody;
+        let root = temporary("custodied-selection");
+        let (store, registry, request) = fixture_sized(&root, false, Some(1024));
+        let members = selected(&request);
+        let operation = "bounded-selection";
+        let prepare = |budget| {
+            prepare_selected_source(
+                &store,
+                operation,
+                &request.source_selection_digest,
+                request.profiles.clone(),
+                &members,
+                "fixture:registry",
+                &registry,
+                budget,
+            )
+            .unwrap()
+        };
+        let (nothing, landed) = prepare(Some(0));
+        assert!(landed.is_empty() && !nothing.complete && nothing.converted_roles == 0);
+        assert!(
+            nothing.spent.is_empty(),
+            "no op is journalled, so no body is spent"
+        );
+
+        land(&store, &request.roster[0].path);
+        let (first, landed) = prepare(Some(1 << 20));
+        assert_eq!(landed, vec!["provider/first.safetensors".to_string()]);
+        assert_eq!((first.complete, first.converted_roles), (false, 1));
+        assert_eq!(first.spent, vec!["provider/first.safetensors".to_string()]);
+        assert!(
+            first.checkpoints.is_empty(),
+            "custodied work writes no chain"
+        );
+
+        let journalled = custody::journalled(store.root(), operation).unwrap();
+        assert!(!journalled.is_empty());
+        assert_eq!(
+            custody::record(&store, operation, &[ObjectRef::of(b"foreign")], "hub:p1")
+                .unwrap_err()
+                .code,
+            Code::OBJECT_ID_MISMATCH,
+        );
+        custody::record(&store, operation, &journalled, "hub:p1").unwrap();
+        let collected = crate::gc::collect(store.root(), false).unwrap();
+        assert!(collected.reclaimed_bytes > 0);
+        for object in &journalled {
+            assert!(
+                !store.contains(&object.sha256),
+                "custodied output stays on disk"
+            );
+        }
+
+        land(&store, &request.roster[1].path);
+        let (second, _) = prepare(Some(1 << 20));
+        assert!(second.complete);
+        assert_eq!((second.converted_roles, second.resumed_roles), (1, 1));
+        assert_eq!(second.sources.len(), 2);
+        // Sparse held manifests: GC walks them without their custodied bodies.
+        crate::gc::collect(store.root(), false).unwrap();
+        let (again, _) = prepare(Some(0));
+        assert!(again.replayed && again.complete);
+        assert_eq!(again.sources, second.sources);
+    }
+
     #[test]
     fn a_reordered_request_with_repeated_rows_is_the_same_request() {
         let root = temporary("request-order");
@@ -2247,7 +2470,7 @@ mod tests {
         crate::gc::collect(store.root(), false).unwrap();
         store.open_verified(&part.sha256).unwrap();
         for source in &completed.sources {
-            validate_prepared_result(&store, source).unwrap();
+            validate_prepared_result(&store, source, &Default::default()).unwrap();
         }
         let replay =
             prepare_model_source_with_registry(&store, &retry, "fixture:registry", &registry)
@@ -2471,7 +2694,7 @@ mod tests {
         assert_eq!(replay.checkpoints, adopted.checkpoints);
         assert_eq!(replay.converted_bytes, 0);
         for source in &replay.sources {
-            validate_prepared_result(&store, source).unwrap();
+            validate_prepared_result(&store, source, &Default::default()).unwrap();
         }
         release_model_source(&store, &retry.operation_id).unwrap();
         crate::gc::collect(store.root(), false).unwrap();
@@ -2488,6 +2711,7 @@ mod tests {
             "fixture:registry",
             &registry,
             &mut transaction::Budget::new(1024),
+            true,
         )
         .unwrap();
         assert!(!first.complete);
@@ -2672,7 +2896,7 @@ mod tests {
         );
         release_model_source(&store, &original).unwrap();
         crate::gc::collect(store.root(), false).unwrap();
-        validate_prepared_result(&store, &adopted.sources[0]).unwrap();
+        validate_prepared_result(&store, &adopted.sources[0], &Default::default()).unwrap();
         let replay =
             prepare_model_source_with_registry(&store, &request, "fixture:registry", &registry)
                 .unwrap();
@@ -2745,6 +2969,7 @@ mod tests {
                 "fixture:registry",
                 &registry,
                 &mut transaction::Budget::new(limit),
+                true,
             )
             .unwrap();
             assert!(!first.complete);
@@ -2760,6 +2985,7 @@ mod tests {
                 "fixture:registry",
                 &registry,
                 &mut transaction::Budget::new(limit),
+                true,
             )
             .unwrap();
             assert_eq!(no_work.converted_bytes, 0);
@@ -2771,6 +2997,7 @@ mod tests {
                 "fixture:registry",
                 &registry,
                 &mut transaction::Budget::new(limit),
+                true,
             )
             .unwrap();
             assert!(second.complete);

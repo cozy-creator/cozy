@@ -691,6 +691,29 @@ def plan(
     window: int = ...,
 ) -> ReadPlan: ...
 def gc(root: StrPath, dry_run: bool = False, *, evict_cached: bool = False, keep_manifests: list[str] = ...) -> dict[str, Any]: ...
+def read_source_heads(
+    source_uri: str,
+    members: Sequence[tuple[str, str, int, str]],
+    *,
+    credential: str = ...,
+    huggingface: str | None = None,
+    civitai: str | None = None,
+    allow_local: bool = False,
+) -> list[tuple[str, bytes]]: ...
+def prepare_selected_source(
+    store: Store,
+    operation_id: str,
+    source_selection_digest: str,
+    profiles: Sequence[tuple[str, str]],
+    members: Sequence[tuple[str, str, int, bytes]],
+    *,
+    registry: bytes | None = None,
+    write_budget_bytes: int | None = None,
+) -> dict[str, Any]: ...
+def record_model_source_custody(
+    store: Store, operation_id: str, objects: Sequence[tuple[str, int]], evidence: str
+) -> None: ...
+def model_source_objects(store: Store, operation_id: str) -> list[dict[str, Any]]: ...
 def transfer_object(
     source: Store, destination: Store, object_id: str, expected_length: int
 ) -> dict[str, Any]: ...

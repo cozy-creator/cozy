@@ -1601,6 +1601,9 @@ fn require_source_roots(store: &Store, declaration: &Declaration) -> Result<()> 
 }
 
 fn load_sources(store: &Store, declaration: &Declaration) -> Result<Vec<SourceData>> {
+    // A prepared model whose output a live source operation's publication custodian holds
+    // derives by reference without its bytes; the result is publishable, never readable.
+    let custodied = crate::ingest::custody::live(store.root())?;
     let mut out = Vec::new();
     for declared in &declaration.sources {
         let manifest = checkpoint::load_manifest(store, &declared.manifest)?;
@@ -1625,11 +1628,13 @@ fn load_sources(store: &Store, declaration: &Declaration) -> Result<Vec<SourceDa
         let closure = checkpoint::load_closure(store, &header)?;
         header.validate(&closure)?;
         let walk = checkpoint::walk_cozytensors(store, &manifest)?;
-        walk.require_resident(store)?;
+        walk.require_held(store, &custodied)?;
         // This is the zero-read/zero-hash inherit gate: the verification record proves the
         // exact installed inode/length/generation without opening or hashing payload bytes.
         for reached in &walk.objects {
-            if reached.kind == "part" || reached.kind == "config" {
+            if (reached.kind == "part" || reached.kind == "config")
+                && !custodied.contains(&reached.obj.sha256)
+            {
                 require_payload_record(store, &reached.obj, reached.kind)?;
             }
         }
@@ -2308,9 +2313,35 @@ pub fn begin(
         release_guards(meta, Some(writer_hold), Vec::new());
         return Err(error);
     }
+    // Pin every resident source object. A custodied object has no local bytes to pin: a
+    // derivation over it carries it by reference and never reads it.
+    let custodied = match crate::ingest::custody::live(store.root()) {
+        Ok(custodied) => custodied,
+        Err(error) => {
+            release_guards(meta, Some(writer_hold), Vec::new());
+            return Err(error);
+        }
+    };
     let mut source_leases = Vec::new();
     for source in &sources {
-        match read::acquire_cozytensors(store, meta, &source.manifest) {
+        let pinned = if custodied.is_empty() {
+            read::acquire_cozytensors(store, meta, &source.manifest)
+        } else {
+            checkpoint::walk_cozytensors(store, &source.manifest).and_then(|walk| {
+                let id = source.manifest.manifest_id();
+                read::acquire(
+                    store,
+                    meta,
+                    id.strip_prefix("sha256:").unwrap_or(&id),
+                    walk.distinct()
+                        .into_iter()
+                        .filter(|object| !custodied.contains(&object.sha256))
+                        .cloned()
+                        .collect(),
+                )
+            })
+        };
+        match pinned {
             Ok((lease, receipts)) if receipts.0.is_empty() => {
                 source_leases.push((source.fact.alias.clone(), lease));
             }
@@ -3276,7 +3307,7 @@ pub fn commit(
     let manifest_ref = store.put_manifest(&manifest)?.obj;
     store.read_manifest(&manifest_ref)?;
     let walk = checkpoint::walk(store, &manifest)?;
-    walk.require_resident(store)?;
+    walk.require_held(store, &crate::ingest::custody::live(store.root())?)?;
     let (inherited_payload_objects, inherited_payload_bytes) =
         inherit_observation(&header, &row_before)?;
 
