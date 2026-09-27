@@ -113,16 +113,37 @@ func exactModelsDigest(models []ModelRef) string {
 	return measurementDigest(rows)
 }
 
-// exactMemoryRequest names the workload independently of candidate model pinning.
-// The sealed local delivery covers the complete transported package closure. A
-// published request must already carry its immutable environment identity; a cold
-// request without one retains the legacy estimate. Never replace either with a
-// mutable install name, a package version, or a fingerprint that omits delivery.
+// exactMemoryRequest names the workload independently of candidate model pinning. A
+// published release is immutable code under a locked environment, so it names the
+// delivery; a local package's installation handle is not a content identity and keeps
+// the conservative legacy estimate.
 func exactMemoryRequest(req Request) string {
-	// Installation handles select a worker environment but are deliberately not
-	// content or memoization identities. Without an operation-owned delivery
-	// identity, retain the conservative legacy estimate.
-	return ""
+	if req.Release == "" || req.LocalInstallationID != "" || strings.HasPrefix(req.Package, "local/") {
+		return ""
+	}
+	payload, err := canonical.NormalizeJCS(req.Payload)
+	if err != nil {
+		return ""
+	}
+	assets := append([]AssetBinding(nil), req.Assets...)
+	for i := range assets {
+		asset := &assets[i]
+		if !exactMemoryDigest(asset.Digest) {
+			return ""
+		}
+		asset.LocalPath = ""
+		if asset.Snapshot != nil {
+			snapshot := *asset.Snapshot
+			snapshot.Path = ""
+			asset.Snapshot = &snapshot
+		}
+	}
+	return measurementDigest(struct {
+		Package, Release, Entrypoint, Kind, Plan, Kernel, Trees string
+		Payload                                                 json.RawMessage
+		Assets                                                  []AssetBinding
+	}{req.Package, req.Release, req.Entrypoint, req.Kind, req.PlanID,
+		req.AttentionKernel, req.Trees, payload, assets})
 }
 
 // ModelsDigest names a pinned model selection: every slot's model, release and

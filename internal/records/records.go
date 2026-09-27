@@ -862,10 +862,6 @@ func migrateRequests(tx *sql.Tx, path string, sourceVersion int) *exit.Error {
 		destinationColumns += ",child_artifacts"
 		selectColumns += ",child_artifacts"
 	}
-	if sourceVersion >= 48 {
-		destinationColumns += ",rent_new"
-		selectColumns += ",rent_new"
-	}
 	if sourceVersion >= 37 {
 		destinationColumns += ",requested_rental"
 		selectColumns += ",requested_rental"
