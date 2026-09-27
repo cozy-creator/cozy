@@ -55,6 +55,8 @@ type PackageReleaseCommit struct {
 	State         string                 `json:"state"`
 	StatusURL     string                 `json:"status_url,omitempty"`
 	Error         *PackageReleaseFailure `json:"error,omitempty"`
+	// Warnings is Tensorhub's advice about a committed release; it never blocks one.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // PackageReleaseFailure is a durable terminal refusal reported by an

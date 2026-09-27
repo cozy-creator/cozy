@@ -126,6 +126,9 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		{K: "timings", V: *timings},
 	}
 	record := compactRecord(fields, "package", "release", "status", "timings")
+	for _, warning := range done.Warnings {
+		record.Notes = append(record.Notes, "warning: "+warning)
+	}
 	for _, dependency := range pack.Vendored {
 		record.Notes = append(record.Notes, packagepublish.VendoredNote(account.Name, dependency))
 	}
