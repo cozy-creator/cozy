@@ -57,12 +57,14 @@ func watchJob(ctx *Context, client *localclient.Client, state api.JobState) *exi
 }
 
 func watchInvocation(ctx *Context, client *localclient.Client, id string) *exit.Error {
+	notice := &reattachNotice{ctx: ctx}
+	client = client.Following(notice.say)
 	life, problem := client.Request(id)
 	if problem != nil {
 		return problem
 	}
 	began := recordedRunStart(life.CreatedAt)
-	terminal, detached, problem := watchRunStream(ctx, client, id, began)
+	terminal, detached, problem := watchRunStream(ctx, client, id, began, notice)
 	if problem != nil {
 		return problem
 	}
@@ -81,7 +83,7 @@ func watchInvocation(ctx *Context, client *localclient.Client, id string) *exit.
 }
 
 func watchRunStream(ctx *Context, client runEventObserver, id string,
-	began time.Time,
+	began time.Time, notice *reattachNotice,
 ) (*localclient.Event, bool, *exit.Error) {
 	watchCtx, stop := context.WithCancel(context.Background())
 	defer stop()
@@ -105,6 +107,8 @@ func watchRunStream(ctx *Context, client runEventObserver, id string,
 		}
 	}()
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
+	notice.lines = lines
+	defer func() { notice.lines = nil }()
 	var manualStop *localclient.Event
 	terminal, problem := client.WatchContext(watchCtx, id, 0, func(event localclient.Event) bool {
 		if event.Type == "request.blocked" {

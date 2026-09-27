@@ -56,14 +56,28 @@ func (c *Client) WatchContext(ctx context.Context, requestID string, from int64,
 ) (*Event, *exit.Error) {
 	cursor := from
 	attempts := 0
+	recovering := false
 	for {
 		terminal, last, stopped, e := c.readStream(ctx, requestID, cursor, on)
 		if last > cursor {
 			cursor = last
 			attempts = 0 // progress resets the budget: a long run is not a broken one
 		}
+		if c.reattached != nil && lostDaemon(e, recovering) {
+			// The run is durable and the daemon owns it; a restarted daemon replays the
+			// stream from this cursor.
+			if !c.reattach(ctx) {
+				return nil, nil
+			}
+			recovering, attempts = true, 0
+			continue
+		}
 		if e != nil {
 			return nil, e
+		}
+		if recovering {
+			recovering = false
+			c.reattached()
 		}
 		if terminal != nil || stopped {
 			return terminal, nil
