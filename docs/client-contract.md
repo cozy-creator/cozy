@@ -17,6 +17,7 @@ payloads, and behavior are documented below but are outside that row-level fence
 | encoding | JSON, UTF-8. SSE for streams. |
 | auth | `Authorization: Bearer <token>`. Cozy never accepts a cookie. |
 | idempotency | `Idempotency-Key` header on submit; required. |
+| hub | `Cozy-Tensorhub: <origin>` names the Tensorhub a command addresses; absent is the daemon's configured hub. Submissions record it; `GET /v1/requests` and `GET /v1/local/rentals` are scoped to it unless `hubs=all`. |
 | errors | one envelope, §6 |
 
 Bearer-only prevents a cross-site request from carrying ambient authority into the local

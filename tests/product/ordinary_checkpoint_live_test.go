@@ -122,7 +122,7 @@ func ordinaryScheduledCheckpoint(t *testing.T) {
 		options.Packages = resolver
 		options.ModelTransfers = cli.NewModelTransferOwner(options.Cfg, options.Store, options.Log, auth)
 		options.ObserveRental = rental.ObserveWorker(options.Store)
-		options.RentalFleet = func() (string, *exit.Error) { return "isolated existing CPU fixture", nil }
+		options.RentalFleet = func(records.Request) (string, *exit.Error) { return "isolated existing CPU fixture", nil }
 		options.AcquireManagedRental = func(request records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			if len(request.Models) != 1 || request.Models[0].Manifest != bridge.SourceManifest {
 				return orchestrator.PlacementDecision{}, "", exit.Internalf("fixture received another model selection")

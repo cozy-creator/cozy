@@ -5,7 +5,7 @@ import "strconv"
 // CLI is the complete public command grammar. Kong derives parsing and help from
 // this tree; there is no parallel command manifest or string handler registry.
 type CLI struct {
-	Tensorhub *string  `help:"Use this Tensorhub URL for this command, overriding config and environment." placeholder:"URL"`
+	Tensorhub *string  `help:"Use this hub (a name from cozy hub list, or a URL) for this command only." placeholder:"HUB"`
 	JSON      bool     `help:"Emit JSON instead of human-readable output."`
 	Full      bool     `help:"Include complete values and all available fields."`
 	Fields    []string `help:"Select result fields." sep:","`
@@ -13,6 +13,7 @@ type CLI struct {
 	Package PackageCmd `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
 	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
 	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
+	Hub     HubCmd     `cmd:"" group:"Authentication" help:"Choose which Tensorhub commands use; one daemon serves them all."`
 	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
 	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud (alias: rent)."`
 	Rent    RentalCmd  `cmd:"" hidden:"" help:"Alias of cozy rental."`
@@ -78,6 +79,44 @@ type AuthRevokeOtherMachinesCmd struct{}
 
 func (c *AuthRevokeOtherMachinesCmd) Run(r *Runtime) error {
 	return r.call(handleAuthRevokeOtherMachines, nil, nil, nil, false)
+}
+
+type HubCmd struct {
+	List   HubListCmd   `cmd:"" default:"1" help:"List named hubs and which one is current."`
+	Use    HubUseCmd    `cmd:"" help:"Make a hub current for later commands; existing work keeps its own hub."`
+	Add    HubAddCmd    `cmd:"" help:"Name a Tensorhub URL."`
+	Remove HubRemoveCmd `cmd:"" help:"Forget a hub name."`
+}
+
+type HubListCmd struct{}
+
+func (c *HubListCmd) Run(r *Runtime) error {
+	return r.call(handleHubList, nil, nil, nil, false)
+}
+
+type HubUseCmd struct {
+	Hub string `arg:"" name:"hub" help:"A hub name or Tensorhub URL."`
+}
+
+func (c *HubUseCmd) Run(r *Runtime) error {
+	return r.call(handleHubUse, []string{c.Hub}, nil, nil, false)
+}
+
+type HubAddCmd struct {
+	Name string `arg:"" name:"name" help:"Hub name, such as local."`
+	URL  string `arg:"" name:"url" help:"Tensorhub base URL, such as http://127.0.0.1:8819."`
+}
+
+func (c *HubAddCmd) Run(r *Runtime) error {
+	return r.call(handleHubAdd, []string{c.Name, c.URL}, nil, nil, false)
+}
+
+type HubRemoveCmd struct {
+	Name string `arg:"" name:"name" help:"Hub name."`
+}
+
+func (c *HubRemoveCmd) Run(r *Runtime) error {
+	return r.call(handleHubRemove, []string{c.Name}, nil, nil, false)
 }
 
 type PackageCmd struct {
@@ -422,6 +461,7 @@ func (c *RunCancelCmd) Run(r *Runtime) error {
 }
 
 type RunListCmd struct {
+	AllHubs bool   `help:"List runs on every hub, not only the current one."`
 	State   string `help:"Filter by lifecycle state."`
 	Package string `predictor:"package" help:"Filter by package."`
 	Limit   *int   `help:"Maximum runs; snapshots default to 50, 0 reads all history. Live lists load more while scrolling."`
@@ -434,7 +474,7 @@ func (c *RunListCmd) Run(r *Runtime) error {
 	if c.Limit != nil {
 		limit = strconv.Itoa(*c.Limit)
 	}
-	return r.call(handleRunList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch), values(
+	return r.call(handleRunList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch, "--all-hubs", c.AllHubs), values(
 		"--state", c.State, "--package", c.Package, "--limit", limit), true)
 }
 
@@ -517,12 +557,13 @@ func (c *RentalEndCmd) Run(r *Runtime) error {
 }
 
 type RentalListCmd struct {
+	AllHubs bool `help:"List rentals on every hub, not only the current one."`
 	Watch   bool `help:"Refresh continuously (requires a terminal)."`
 	NoWatch bool `help:"Print one snapshot even in a terminal."`
 }
 
 func (c *RentalListCmd) Run(r *Runtime) error {
-	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch), nil, false)
+	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch, "--all-hubs", c.AllHubs), nil, false)
 }
 
 type UnloadCmd struct{}

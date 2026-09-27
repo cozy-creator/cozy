@@ -22,6 +22,15 @@ type RentalInventory struct {
 	// HubUnanswered is set when Tensorhub did not answer this read. Rows are then
 	// this host's last records and the totals are unknown, not zero.
 	HubUnanswered *exit.Error `json:"hub_unanswered,omitempty"`
+	// OtherHubs counts this host's live rentals on hubs this read did not cover, so a
+	// listing scoped to one hub never hides a machine billing on another.
+	OtherHubs []HubRentals `json:"other_hubs,omitempty"`
+}
+
+// HubRentals is one Tensorhub's count of live rentals recorded on this host.
+type HubRentals struct {
+	Hub     string `json:"hub"`
+	Rentals int    `json:"rentals"`
 }
 
 // Current removes proven-absent rentals from the fleet projection without
@@ -82,7 +91,13 @@ func (s *Server) listRentals(w http.ResponseWriter, r *http.Request) {
 			"this daemon cannot report its rental inventory", "update the daemon when its work permits")
 		return
 	}
-	inventory, problem := s.rentalInventory(r.URL.Query().Get("reconcile") != "false")
+	hub, problem := s.hubOf(r)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	inventory, problem := s.rentalInventory(hub, r.URL.Query().Get("hubs") == "all",
+		r.URL.Query().Get("reconcile") != "false")
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return

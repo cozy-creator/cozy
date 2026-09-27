@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS requests (
   rental       INTEGER NOT NULL DEFAULT 0,
   rental_required INTEGER NOT NULL DEFAULT 0,
   rent_new INTEGER NOT NULL DEFAULT 0 CHECK(rent_new IN (0,1)),
+  hub TEXT NOT NULL DEFAULT '',
   install_id   TEXT    REFERENCES installs(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
   capture      TEXT    NOT NULL DEFAULT '',
@@ -449,6 +450,9 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 // --------------------------------------------------------------------------- requests
 
 type Request struct {
+	// Hub is the Tensorhub origin this request belongs to. Every hub operation for it
+	// (resolution, rental acquisition, transfer, publication) addresses this origin.
+	Hub string
 	// RequestedRental is immutable caller affinity; Worker is the current assignment.
 	RequestedRental string
 	Capture         string
@@ -944,7 +948,10 @@ const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_
 	installation_id,payload,outputs,
 	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,capture,attention_kernel,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
-	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new`
+	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub`
+
+// requestColsPriorHub is the request row before it recorded its Tensorhub (schema 49).
+var requestColsPriorHub = strings.TrimSuffix(requestCols, ",hub")
 
 func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
@@ -953,7 +960,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, &r.Capture, &r.AttentionKernel, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
-		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew}
+		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub}
 }
 
 func finishRequestScan(r Request, assets, models string, err error) (Request, error) {
@@ -1300,19 +1307,21 @@ func (s *Store) Requests(state, packageName string, limit int) ([]Request, *exit
 // RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy run list` reads jobs
 // and the request listing reads serving rows — one table, one reader, two questions.
 func (s *Store) RequestsOfKind(kind, state, packageName string, limit int) ([]Request, *exit.Error) {
-	return s.requestsBefore(kind, state, packageName, limit, 0, false)
+	return s.requestsBefore(kind, state, packageName, "", limit, 0, false)
 }
 
 // RequestsBefore reads a bounded history page, excluding the supplied run number.
 func (s *Store) RequestsBefore(state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
-	return s.requestsBefore("", state, packageName, limit, before, false)
+	return s.requestsBefore("", state, packageName, "", limit, before, false)
 }
 
-func (s *Store) PublicRequestsBefore(state, packageName string, limit int, before int64) ([]Request, *exit.Error) {
-	return s.requestsBefore("", state, packageName, limit, before, true)
+// PublicRequestsBefore is one history page; a non-empty hub keeps only that hub's runs.
+// Run numbers stay host-wide either way.
+func (s *Store) PublicRequestsBefore(state, packageName, hub string, limit int, before int64) ([]Request, *exit.Error) {
+	return s.requestsBefore("", state, packageName, hub, limit, before, true)
 }
 
-func (s *Store) requestsBefore(kind, state, packageName string, limit int, before int64, public bool) ([]Request, *exit.Error) {
+func (s *Store) requestsBefore(kind, state, packageName, hub string, limit int, before int64, public bool) ([]Request, *exit.Error) {
 	// Number only narrow index facts across history; load payloads and other
 	// request documents only for the bounded selected page.
 	selectedState := "state"
@@ -1320,7 +1329,7 @@ func (s *Store) requestsBefore(kind, state, packageName string, limit int, befor
 		selectedState = publicRunStatusSQL()
 	}
 	query := `WITH numbered AS (SELECT ROW_NUMBER() OVER (ORDER BY created_at,id) AS number,
-  id,created_at,kind,` + selectedState + ` AS state,package FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
+  id,created_at,kind,` + selectedState + ` AS state,package,hub FROM requests), page AS (SELECT number,id AS page_request_id FROM numbered`
 	where := []string{}
 	args := []any{}
 	if before > 0 {
@@ -1338,6 +1347,10 @@ func (s *Store) requestsBefore(kind, state, packageName string, limit int, befor
 	if packageName != "" {
 		where = append(where, `package=?`)
 		args = append(args, packageName)
+	}
+	if hub != "" {
+		where = append(where, `hub=?`)
+		args = append(args, hub)
 	}
 	if len(where) > 0 {
 		query += ` WHERE ` + strings.Join(where, " AND ")
@@ -1646,9 +1659,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		plan_id,package_release,local_installation_id,
 		local_package_uploaded_boot_id,installation_id,
 		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
-		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new)
+		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
-		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalInstallationID,
 		r.LocalPackageUploadedBootID, r.InstallationID, r.Payload,
@@ -1657,7 +1670,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, r.AttentionKernel, models, r.WeightsOutputs, r.RetainWork, r.RetryOf, r.ReuseScope, r.ControlRevision,
-		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew); err != nil {
+		r.ParentRequestID, r.ParentCallIndex, r.ChildIntentDigest, r.ChildTargetDigest, r.ChildReusable, r.ReusedFrom, blobOrEmpty(r.OrchestrationDirective), r.ChildArtifacts, r.RequestedRental, r.RentNew, r.Hub); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	if r.MachineExecutionObserver {
@@ -2672,4 +2685,16 @@ func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// AssignRecordHubs gives requests recorded before per-record hubs (schema 49) the
+// Tensorhub they were created under: their rental's, else the daemon's configured
+// default. Every later request is recorded with its hub, so this settles once.
+func (s *Store) AssignRecordHubs(defaultHub string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE requests SET hub=COALESCE((SELECT rentals.hub FROM rentals
+		WHERE rentals.id IN (requests.worker, requests.requested_rental) AND rentals.hub<>'' LIMIT 1), ?)
+		WHERE hub=''`, strings.TrimRight(defaultHub, "/")); err != nil {
+		return exit.Internalf("cannot assign request Tensorhubs: %s", err)
+	}
+	return nil
 }

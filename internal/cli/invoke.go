@@ -68,6 +68,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
+	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	target, packageInterface, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
@@ -699,6 +700,9 @@ func handleRunList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	if ctx.Inv.Bool("--all-hubs") {
+		client = client.AllHubs()
+	}
 	limit := 0
 	if raw := ctx.Inv.Value("--limit"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -725,6 +729,12 @@ func handleRunList(ctx *Context) *exit.Error {
 	list, problem := runList(context.Background(), client, ctx.Inv.Value("--state"), ctx.Inv.Value("--package"), limit)
 	if problem != nil {
 		return problem
+	}
+	if ctx.Inv.Bool("--all-hubs") {
+		list.Fields, list.TypedFields = append(list.Fields, "hub"), append(list.TypedFields, "hub")
+		for _, row := range list.Rows {
+			row["hub"] = ctx.Cfg.HubLabel(row["hub"])
+		}
 	}
 	return emit(ctx, list)
 }
@@ -764,7 +774,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 		Name:     "invocations", Fields: []string{"number", "target", "machine", "status", "progress", "execution", "reason"},
 		AllFields: []string{"number", "id", "kind", "target", "machine", "rental_id", "status",
 			"progress", "phase", "progress_stage", "stage_fraction", "overall_fraction",
-			"position", "total", "queued", "execution", "attempts", "created", "reason"},
+			"position", "total", "queued", "execution", "attempts", "created", "reason", "hub"},
 		TypedFields: []string{"number", "target", "machine", "rental_id", "requested_rental", "requested_machine", "status",
 			"phase", "progress_stage", "stage_fraction", "overall_fraction", "position", "total",
 			"remaining_ms", "execution_ms", "error_type", "error_code", "error", "retaining", "retry_available"},
@@ -773,7 +783,7 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"phase_moved_bytes", "phase_total_bytes", "phase_rate_bytes_per_second",
 			"phase_remaining_ms", "phase_sample_age_ms", "progress_stage", "stage_fraction", "overall_fraction",
 			"position", "total", "remaining_ms", "queued_ms", "execution_ms", "attempts",
-			"created_at", "error_type", "error_code", "error", "triage", "retaining", "retry_available"},
+			"created_at", "error_type", "error_code", "error", "triage", "retaining", "retry_available", "hub"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		// The raw rental id is a machine fact: JSON always carries it, the compact
 		// human table never does — the human word is the MACHINE column (cl-107).
@@ -819,6 +829,9 @@ func runListRows(rows []api.Lifecycle) output.List {
 			"target": life.Package + "/" + life.Function, "machine": life.Machine,
 			"status": life.Status, "queued_ms": life.QueuedMS, "execution_ms": life.ExecutionMS,
 			"attempts": life.Attempts, "created_at": life.CreatedAt,
+		}
+		if life.Hub != "" {
+			list.Rows[len(list.Rows)-1]["hub"], typed["hub"] = life.Hub, life.Hub
 		}
 		if life.Retaining {
 			typed["retaining"] = true

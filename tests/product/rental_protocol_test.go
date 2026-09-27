@@ -82,7 +82,7 @@ func TestQueuedPinToOlderWorkerReplansWithoutOffering(t *testing.T) {
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	var acquisitions atomic.Int64
 	o := hostOwner(t, "old-pin", rentalWiring(connection, private), func(options *orchestrator.Options) {
-		options.RentalFleet = func() (string, *exit.Error) { return "fleet retained", nil }
+		options.RentalFleet = func(records.Request) (string, *exit.Error) { return "fleet retained", nil }
 		options.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			if req.Worker != "" {
 				t.Errorf("acquisition retained obsolete pin: %s", req.Worker)

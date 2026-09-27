@@ -250,6 +250,7 @@ func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, fence reclam
 
 // handleRentalModelDownload freezes a catalog selection before durable acceptance.
 func handleRentalModelDownload(ctx *Context) *exit.Error {
+	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	if len(ctx.Inv.Args) > 1 && strings.TrimSpace(ctx.Inv.Args[1]) != "" {
 		return exit.Usagef("--rental downloads into the worker store and takes no local destination")
 	}

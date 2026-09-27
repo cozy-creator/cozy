@@ -215,7 +215,7 @@ func queuedPinnedJobKeepsRentalJobMode(t *testing.T, requested bool) {
 	// The managed fleet is present, as in the daemon; the selected rental already holds
 	// the job's placement, so it is never asked to buy or pin.
 	fleet := func(options *orchestrator.Options) {
-		options.RentalFleet = func() (string, *exit.Error) { return "", nil }
+		options.RentalFleet = func(records.Request) (string, *exit.Error) { return "", nil }
 		options.AcquireManagedRental = func(records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 			return orchestrator.PlacementDecision{}, "", exit.Internalf("fleet asked to place work its rental already holds")
 		}

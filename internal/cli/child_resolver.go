@@ -121,7 +121,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 			// No retained artifact: the granting host selects the slot itself, from the
 			// owner's binding or the callee's authored default (cl-210). The caller named
 			// its own callable, never a model.
-			selected, problem := r.childModelLadder(install.Package, binding.Entrypoint, slot)
+			selected, problem := r.childModelLadder(parent.Hub, install.Package, binding.Entrypoint, slot)
 			if problem != nil {
 				return out, "", problem
 			}
@@ -156,7 +156,7 @@ func (r *Resolver) ResolveUnpublishedChild(parent records.Request, module, expor
 				WithRemedy("declare a rung for this accelerator, or run the composition on a machine its ladder names")
 		}
 		for _, i := range defaulted {
-			if pinned[i], problem = r.childManifest(pinned[i]); problem != nil {
+			if pinned[i], problem = r.childManifest(parent.Hub, pinned[i]); problem != nil {
 				return out, "", problem
 			}
 		}

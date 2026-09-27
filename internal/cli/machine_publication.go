@@ -33,7 +33,7 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 		return "", problem
 	}
 	var intent hub.MachinePublicationGrantIntent
-	account := client(m.context)
+	account := client(m.fleet.atRental(machine))
 	if len(raw) == 0 {
 		selected, problem := account.Rental(ctx, machine)
 		if problem != nil {

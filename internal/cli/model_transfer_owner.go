@@ -39,10 +39,26 @@ func NewModelTransferOwner(cfg config.Config, store *records.Store, log io.Write
 	return &modelTransferOwner{cfg: cfg, store: store, log: log, auth: auth}
 }
 
-func (o *modelTransferOwner) cliContext(intent records.ModelTransferIntent, rental bool) *Context {
+// cliContext is one transfer's command context on its request's hub, with that hub's
+// credential; "" is the daemon's default hub.
+func (o *modelTransferOwner) cliContext(origin string, intent records.ModelTransferIntent, rental bool) *Context {
+	cfg := o.cfg.ForHub(origin)
+	auth := o.auth
+	if cfg.HubURL != o.cfg.HubURL || auth == nil {
+		auth = accountauth.New(cfg)
+	}
 	return &Context{Inv: &Invocation{Args: []string{intent.Source, intent.Destination},
 		Bools: bools("--rental", rental), Values: values("--lane", intent.InputLane)},
-		Out: io.Discard, Err: o.log, Cfg: o.cfg, AccountAuth: o.auth}
+		Out: io.Discard, Err: o.log, Cfg: cfg, AccountAuth: auth}
+}
+
+// hubOf is the Tensorhub a request belongs to.
+func (o *modelTransferOwner) hubOf(requestID string) string {
+	request, problem := o.store.RequestRow(requestID)
+	if problem != nil || request == nil {
+		return ""
+	}
+	return request.Hub
 }
 
 func (o *modelTransferOwner) requestContext(parent context.Context, requestID string) (
@@ -87,7 +103,7 @@ func (o *modelTransferOwner) MaterializeLocal(ctx context.Context, requestID str
 		return nil, problem
 	}
 	defer work.Release()
-	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(intent, false), work.Path,
+	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(o.hubOf(requestID), intent, false), work.Path,
 		intent, intent.SourceProfiles)
 	if problem != nil {
 		return nil, problem
@@ -105,7 +121,7 @@ func (o *modelTransferOwner) MaterializeLocal(ctx context.Context, requestID str
 func (o *modelTransferOwner) RefreshRemoteSource(parent context.Context,
 	intent records.ModelTransferIntent,
 ) ([]orchestrator.ModelSourceCapability, *exit.Error) {
-	ctx := o.cliContext(intent, true)
+	ctx := o.cliContext("", intent, true)
 	resolved, problem := resolvePublishSource(ctx, intent.Source,
 		sourceProfileNames(intent.SourceProfiles))
 	if problem != nil {
@@ -168,7 +184,7 @@ func (o *modelTransferOwner) PassThrough(ctx context.Context, requestID string,
 		return problem
 	}
 	defer work.Release()
-	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(intent, false), work.Path,
+	prepared, problem := prepareLocalTransferSources(ctx, o.cliContext(o.hubOf(requestID), intent, false), work.Path,
 		intent, map[string]string{"model": ""})
 	if problem != nil {
 		return problem
@@ -177,7 +193,7 @@ func (o *modelTransferOwner) PassThrough(ctx context.Context, requestID string,
 		return problem
 	}
 	source := prepared["model"]
-	tool, _, problem := localTensorFS(o.cliContext(intent, false))
+	tool, _, problem := localTensorFS(o.cliContext("", intent, false))
 	if problem != nil {
 		return problem
 	}
@@ -282,7 +298,7 @@ func (o *modelTransferOwner) finalizeOutput(ctx context.Context,
 		// is no external publication unless the caller selected a destination.
 		return weights.ManifestID, nil
 	}
-	cli := o.cliContext(intent, worker != "")
+	cli := o.cliContext(o.hubOf(weights.RequestID), intent, worker != "")
 	if intent.Kind == "model-download" {
 		tool, _, problem := localTensorFS(cli)
 		if problem != nil {

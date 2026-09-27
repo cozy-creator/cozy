@@ -93,10 +93,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	defer held.Release()
-	if e := held.PublishTensorhub(ctx.Cfg.HubURL); e != nil {
-		closeListeners()
-		return e
-	}
 
 	// The schema-22 migration folds each kept triage file into its attempt row; the
 	// retired-shape sweep below removes the directory afterwards.
@@ -106,6 +102,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
+	if e := st.AssignRecordHubs(ctx.Cfg.HubURL); e != nil {
+		closeListeners()
+		return e
+	}
 	retired, retiredNote := reclaimNote(reclaim.Retired(l))
 
 	// The resolver is built BEFORE the orchestrator, because the orchestrator holds it:
@@ -126,13 +126,22 @@ func serveDaemon(ctx *Context) *exit.Error {
 	updates := &rentalRuntimeUpdates{machines: machines}
 	machines.updates = updates
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
+	// A rental's release facts come from the hub it was bought from.
+	prepareFacts := func(c context.Context, connection *orchestrator.WorkerConnection,
+		ref *pb.DownloadPackageRef) (orchestrator.PrepareFacts, *exit.Error) {
+		owner := ctx
+		if connection != nil {
+			owner = fleet.atRental(connection.RentalID)
+		}
+		return rental.PrepareFactsSource(client(owner))(c, connection, ref)
+	}
 	c, e := orchestrator.Open(orchestrator.Options{
 		StartMachineExecution:  machines.Start,
 		RentalRuntimePreflight: machines.updates.preflight,
 		Cfg:                    ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
-		RentalPrepareFacts: rental.PrepareFactsSource(client(ctx)),
+		RentalPrepareFacts: prepareFacts,
 		RentalFleet:        fleet.status, AcquireManagedRental: fleet.acquire,
 		ReleaseManagedRental:  fleet.release,
 		ReleaseRetainedRental: fleet.releaseRetained,
@@ -162,7 +171,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// worker, including after a daemon restart.
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
-	installationHub := strings.TrimRight(ctx.Cfg.HubURL, "/")
 	installs := rental.NewInstallQueue(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
 		machine, problem := st.RentalRow(row.RentalID)
 		if problem != nil {
@@ -170,9 +178,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		}
 		if machine == nil {
 			return exit.Named(exit.Unavailable, "rental.ended", "installation rental no longer exists")
-		}
-		if strings.TrimRight(machine.Hub, "/") != installationHub {
-			return exit.Named(exit.Conflict, "rental.tensorhub_mismatch", "installation belongs to a different Tensorhub")
 		}
 
 		instance, _, _, problem := c.EnsureRentalContext(ctx, row.RentalID)
@@ -243,8 +248,8 @@ func serveDaemon(ctx *Context) *exit.Error {
 		MachineExecutions: machines,
 		Orchestrator:      c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
-		RentalInventory: func(reconcile bool) (api.RentalInventory, *exit.Error) {
-			return readRentalInventory(st, fleet, reconcile)
+		RentalInventory: func(hub string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
+			return readRentalInventory(st, fleet, hub, allHubs, reconcile)
 		},
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})

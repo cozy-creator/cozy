@@ -69,7 +69,9 @@ func TestTensorhubFlagOverridesFileAndEnvironment(t *testing.T) {
 	}
 }
 
-func TestTensorhubFlagRefusesDifferentDaemonOrigin(t *testing.T) {
+// A daemon from before multi-hub support serves only the hub it started with. A command
+// for another hub must refuse rather than have its work silently use the old one.
+func TestSingleHubDaemonRefusesAnotherHub(t *testing.T) {
 	var submitted atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -84,19 +86,25 @@ func TestTensorhubFlagRefusesDifferentDaemonOrigin(t *testing.T) {
 	held, problem := daemon.Hold(layout, strings.TrimPrefix(server.URL, "http://"), "")
 	fatal(t, problem)
 	defer held.Release()
-	fatal(t, held.PublishTensorhub("https://local-hub.invalid"))
+	record, err := os.OpenFile(layout.Daemon, os.O_WRONLY|os.O_APPEND, 0)
+	must(t, err)
+	_, err = record.WriteString("tensorhub=https://local-hub.invalid\n")
+	must(t, err)
+	must(t, record.Close())
 	_, problem = api.Mint(layout)
 	fatal(t, problem)
 	code, out := runCozy(t, root, "--tensorhub=https://other-hub.invalid", "run", "list", "--json")
-	if code == 0 || !strings.Contains(out, "daemon.tensorhub_mismatch") {
-		t.Fatalf("cross-Hub submission not refused: %d %s", code, out)
+	if code == 0 || !strings.Contains(out, "daemon.single_hub") {
+		t.Fatalf("cross-Hub work reached a single-hub daemon: %d %s", code, out)
 	}
 	if submitted.Load() != 0 {
 		t.Fatalf("cross-Hub command submitted %d API calls", submitted.Load())
 	}
 }
 
-func TestTensorhubFlagStartsDaemonForSelectedOrigin(t *testing.T) {
+// `up` with a one-command hub starts the one daemon on the configured default, and that
+// daemon then serves commands for any hub.
+func TestTensorhubFlagDoesNotBindTheDaemon(t *testing.T) {
 	server := httptest.NewServer(http.NotFoundHandler())
 	defer server.Close()
 	root := t.TempDir()
@@ -110,11 +118,15 @@ func TestTensorhubFlagStartsDaemonForSelectedOrigin(t *testing.T) {
 		t.Fatalf("daemon startup failed: %v %s", err, out)
 	}
 	state := daemon.Probe(config.Config{Home: root})
-	if !state.Up || state.Tensorhub != server.URL {
-		t.Fatalf("daemon lost override: %+v", state)
+	if !state.Up || state.SingleHub != "" {
+		t.Fatalf("daemon did not start as a multi-hub daemon: %+v", state)
 	}
-	code, outText := runCozy(t, root, "run", "list", "--json")
-	if code == 0 || !strings.Contains(outText, "daemon.tensorhub_mismatch") {
-		t.Fatalf("following command silently crossed origins: %d %s", code, outText)
+	for _, args := range [][]string{{"run", "list", "--json"}, {"--tensorhub=" + server.URL, "run", "list", "--json"}} {
+		if code, outText := runCozy(t, root, args...); code != 0 {
+			t.Fatalf("%v was refused by the multi-hub daemon: %d %s", args, code, outText)
+		}
+	}
+	if after := daemon.Probe(config.Config{Home: root}); after.PID != state.PID {
+		t.Fatalf("a hub selection restarted the daemon: %d -> %d", state.PID, after.PID)
 	}
 }

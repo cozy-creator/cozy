@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -201,7 +203,7 @@ func handleRent(ctx *Context) *exit.Error {
 	ready := attachable
 	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release",
 		idleReleaseNote()}
-	if line, problem := fleet.status(); problem == nil {
+	if line, problem := fleet.status(records.Request{Hub: ctx.Cfg.HubURL}); problem == nil {
 		notes = append(notes, line)
 	}
 	if replay {
@@ -914,6 +916,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 		return exit.Usagef("--watch requires interactive terminal output").
 			WithRemedy("omit --watch for one snapshot, or use --json for automation")
 	}
+	allHubs := ctx.Inv.Bool("--all-hubs")
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -930,7 +933,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 		reconcile := last.IsZero() || time.Since(last) >= pollCadence
 		var inventory api.RentalInventory
 		if legacy == nil {
-			inventory, problem = client.RentalInventory(call, reconcile)
+			inventory, problem = client.RentalInventory(call, reconcile, allHubs)
 			// Older daemons have no inventory route. Their compatible local store
 			// remains a migration bridge; a schema mismatch refuses without
 			// replacing the owner. All other API errors stay authoritative.
@@ -943,7 +946,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 			}
 		}
 		if legacy != nil {
-			inventory, problem = readRentalInventory(legacy, legacyFleet, reconcile)
+			inventory, problem = readRentalInventory(legacy, legacyFleet, ctx.Cfg.HubURL, allHubs, reconcile)
 		}
 		if problem != nil {
 			return output.List{}, problem
@@ -955,7 +958,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 		if inventory.HubUnanswered != nil {
 			ctx.exitCode = 1
 		}
-		list := renderRentalList(inventory)
+		list := renderRentalList(ctx.Cfg, inventory, allHubs)
 		if watching {
 			list.Next = nil
 		}
@@ -972,7 +975,7 @@ func handleRentalList(ctx *Context) *exit.Error {
 }
 
 // renderRentalList formats the daemon's public read model; it never opens SQLite.
-func renderRentalList(inventory api.RentalInventory) output.List {
+func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs bool) output.List {
 	inventory = inventory.Current()
 	count, burn := inventory.MachinesRunning, inventory.HourlySpendUSDMicros
 	rows, unrecorded := inventory.Rentals, inventory.Unrecorded
@@ -1198,7 +1201,41 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 			row["state"] += " (unverified)"
 		}
 	}
+	hubRentalsView(cfg, &list, inventory, allHubs)
 	return list
+}
+
+// hubRentalsView shows the hub of each row when a listing spans hubs, and otherwise
+// says which other hubs still have rentals billing: a listing scoped to the current
+// hub must never hide a running machine.
+func hubRentalsView(cfg config.Config, list *output.List, inventory api.RentalInventory, allHubs bool) {
+	list.Aggregates = append(list.Aggregates, output.Field{K: "hub", V: jsonFact{cfg.HubURL}})
+	if allHubs {
+		list.Fields = append(slices.Clone(list.Fields), "hub")
+		list.TypedFields = append(slices.Clone(list.TypedFields), "hub")
+		for _, row := range list.Rows {
+			row["hub"] = cfg.HubLabel(row["hub"])
+		}
+		return
+	}
+	others := make([]map[string]any, 0, len(inventory.OtherHubs))
+	for _, other := range inventory.OtherHubs {
+		label := cfg.HubLabel(other.Hub)
+		rentals := "rentals"
+		if other.Rentals == 1 {
+			rentals = "rental"
+		}
+		use := "cozy hub use " + label
+		if label == other.Hub {
+			use = "--tensorhub=" + other.Hub
+		}
+		list.Lead = append(list.Lead, fmt.Sprintf("%d %s running on hub %s; see `cozy rental list --all-hubs` or `%s`",
+			other.Rentals, rentals, label, use))
+		others = append(others, map[string]any{"hub": other.Hub, "rentals": other.Rentals})
+	}
+	if len(others) > 0 {
+		list.Aggregates = append(list.Aggregates, output.Field{K: "other_hubs", V: jsonFact{others}})
+	}
 }
 
 // rentalHourlyRate uses the known rental rate; a missing quote is not free.
@@ -1308,12 +1345,13 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	row := known.Row
+	// The rental's own hub answers for it, with that hub's credential, whatever hub
+	// this command otherwise addresses: a 404 from another hub says nothing about it.
+	ctx = ctx.forHub(known.Hub)
 	c := client(ctx)
-	if known.Hub != "" && known.Hub != c.Base() {
+	if known.Hub != "" && strings.TrimRight(known.Hub, "/") != c.Base() {
 		return exit.Named(exit.Conflict, "rental.hub_mismatch",
-			"rental %s was rented from %s, not the configured hub %s",
-			either(known.RentalID, subject), known.Hub, c.Base()).
-			WithRemedy("point TENSORHUB_URL at the hub that holds the pod; a 404 from another hub says nothing about it")
+			"rental %s was rented from %s, not %s", either(known.RentalID, subject), known.Hub, c.Base())
 	}
 	// An ask this host recorded but never got an id back from is the exact shape of the
 	// live incident: the pod is provisioned and billing, and the only handle on it is the
@@ -1477,11 +1515,9 @@ func handleRentRelease(ctx *Context) *exit.Error {
 func learnRentalIdentity(ctx *Context, l home.Layout, st *records.Store,
 	op *records.RentalOperation,
 ) (string, *exit.Error) {
-	sub := *ctx
-	sub.Cfg.HubURL = op.Hub
-	sub.Cfg.HubURLSource = "rental operation"
+	// The replay goes to the hub the ask was sent to, with that hub's credential.
 	hctx, cancel := hub.LongContext()
-	seen, answered, problem := client(&sub).Rent(hctx, op.RequestBody, op.Reason, op.Key)
+	seen, answered, problem := client(ctx.forHub(op.Hub)).Rent(hctx, op.RequestBody, op.Reason, op.Key)
 	cancel()
 	// A REFUSAL created nothing, so the ask may be settled as having bought nothing. An
 	// ANSWERED ask did create something, whatever this client makes of the body, so its
@@ -1675,7 +1711,7 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 	}
 	summary := []string{message,
 		"Temporary pod files are gone. Local outputs and uploaded checkpoints remain."}
-	if line, problem := (&managedRentals{ctx: w.ctx, layout: l, store: st}).status(); problem == nil {
+	if line, problem := (&managedRentals{ctx: w.ctx, layout: l, store: st}).status(records.Request{Hub: w.ctx.Cfg.HubURL}); problem == nil {
 		notes = append(notes, line)
 		summary = append(summary, line)
 	} else {

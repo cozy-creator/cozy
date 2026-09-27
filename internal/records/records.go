@@ -68,7 +68,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 48
+const schemaVersion = 49
 
 // Retained only to recognize and migrate released schemas 41 through 45.
 const priorCapturePinsDDL = `
@@ -515,7 +515,7 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 	if sourceVersion < 46 {
 		var statements []string
 		if sourceVersion >= 38 {
-			columns := strings.Replace(requestCols, "COALESCE(install_id,'')", "install_id", 1)
+			columns := strings.Replace(requestColsPriorHub, "COALESCE(install_id,'')", "install_id", 1)
 			selected := strings.Split(columns, ",")
 			for index, column := range selected {
 				switch strings.TrimSpace(column) {
@@ -555,16 +555,21 @@ func migrate(db *sql.DB, path string, sourceVersion int, triageDir string) *exit
 			}
 		}
 	}
-	if sourceVersion >= 46 && sourceVersion < 48 {
-		columns := strings.Replace(requestCols, "COALESCE(install_id,'')", "install_id", 1)
-		selected := strings.Replace(columns, ",rent_new", ",0", 1)
+	if sourceVersion >= 46 && sourceVersion < 49 {
+		// Schema 48 adds fresh-rental intent; schema 49 the request's Tensorhub, which
+		// the daemon assigns from the request's rental or its default (AssignRecordHubs).
+		columns := strings.Replace(requestColsPriorHub, "COALESCE(install_id,'')", "install_id", 1)
+		selected := columns
+		if sourceVersion < 48 {
+			selected = strings.Replace(columns, ",rent_new", ",0", 1)
+		}
 		for _, statement := range []string{
-			`ALTER TABLE requests RENAME TO requests_prior48`, requestsDDL,
-			`INSERT INTO requests(` + columns + `) SELECT ` + selected + ` FROM requests_prior48`,
-			`DROP TABLE requests_prior48`,
+			`ALTER TABLE requests RENAME TO requests_prior49`, requestsDDL,
+			`INSERT INTO requests(` + columns + `) SELECT ` + selected + ` FROM requests_prior49`,
+			`DROP TABLE requests_prior49`,
 		} {
 			if _, err := tx.Exec(statement); err != nil {
-				return exit.Internalf("cannot preserve fresh rental intent: %s", err)
+				return exit.Internalf("cannot record request Tensorhubs: %s", err)
 			}
 		}
 	}
@@ -1066,6 +1071,9 @@ func priorStatements(version int) []string {
 			stmt = strings.Replace(stmt,
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n",
 				"  manifest_length  INTEGER NOT NULL CHECK(manifest_length>0),\n  evidence         BLOB NOT NULL,\n", 1)
+		}
+		if requestStatement && version < 49 {
+			stmt = strings.Replace(stmt, "  hub TEXT NOT NULL DEFAULT '',\n", "", 1)
 		}
 		if requestStatement && version < 48 {
 			stmt = strings.Replace(stmt, "  rent_new INTEGER NOT NULL DEFAULT 0 CHECK(rent_new IN (0,1)),\n", "", 1)

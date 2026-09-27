@@ -45,6 +45,7 @@ func TestRentNewPublicStoreSurvivesMigrationAndReopen(t *testing.T) {
 		if err := rows.Scan(&statement); err != nil {
 			t.Fatal(err)
 		}
+		statement = strings.Replace(statement, "  hub TEXT NOT NULL DEFAULT '',\n", "", 1)
 		statements = append(statements, strings.Replace(statement, "  rent_new INTEGER NOT NULL DEFAULT 0 CHECK(rent_new IN (0,1)),\n", "", 1))
 	}
 	if err := rows.Err(); err != nil {

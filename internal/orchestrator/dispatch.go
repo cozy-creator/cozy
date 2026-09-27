@@ -26,6 +26,8 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
+	// Hub is the Tensorhub origin the request belongs to; empty is the daemon's default.
+	Hub                      string
 	RequestID                string // server-reserved identity for request-owned input capture
 	AllowPublish             []string
 	MachineExecutionObserver bool
@@ -175,6 +177,9 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 	if e != nil {
 		return records.Request{}, false, e
 	}
+	if req.Hub == "" {
+		req.Hub = c.opt.Cfg.HubURL
+	}
 	req, fresh, e := c.opt.Store.SubmitWithEvent(req, event)
 	if e != nil {
 		return records.Request{}, false, e
@@ -283,7 +288,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	req := records.Request{
 		MachineExecutionObserver: s.MachineExecutionObserver,
 		DeadlineUnixMS:           s.DeadlineUnixMS,
-		ID:                       id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
+		ID:                       id, IdemKey: s.IdemKey, BodyDigest: bodyDigest, Hub: s.Hub,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Release:             s.Release,
 		LocalInstallationID: s.LocalInstallationID,
@@ -745,7 +750,7 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 			delete(c.starting, guard)
 			c.mu.Unlock()
 		}
-		line, problem := c.opt.RentalFleet()
+		line, problem := c.opt.RentalFleet(req)
 		if problem != nil {
 			unguard()
 			if deferred, _ := c.deferUnavailable(req, problem); deferred {
@@ -1296,11 +1301,11 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		}
 		if req.InstallID != "" {
 			if req.IsJob() && req.ParentRequestID != "" && len(downloadModelRefs(req.Models)) > 0 {
-				acquirer, ok := c.opt.Packages.(interface{ EnsureLocalModels([]ModelRef) *exit.Error })
+				acquirer, ok := c.opt.Packages.(localModelAcquirer)
 				if !ok {
 					return WorkerLaunchSpec{}, "", exit.Unavailablef("local model acquisition owner is unavailable")
 				}
-				if problem := acquirer.EnsureLocalModels(req.Models); problem != nil {
+				if problem := acquirer.EnsureLocalModels(req.Hub, req.Models); problem != nil {
 					return WorkerLaunchSpec{}, "", problem
 				}
 			}

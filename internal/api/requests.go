@@ -127,10 +127,19 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, problem)
 		return
 	}
+	selectedHub, e := s.submissionHub(r, sub.RequestedRental)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	existing, e := s.store.RequestByIdempotencyKey(key)
 	if e != nil {
 		s.refuseTyped(w, r, e)
+		return
+	}
+	if existing != nil && existing.Hub != selectedHub {
+		s.refuseTyped(w, r, idempotencyHubConflict(key, existing.Hub, selectedHub))
 		return
 	}
 	var spec orchestrator.Submission
@@ -161,7 +170,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			unlock := localpackage.Guard()
 			defer unlock()
 		}
-		spec, e = s.resolvePlan(r.Context(), sub)
+		spec, e = s.resolvePlan(r.Context(), selectedHub, sub)
 		if e != nil {
 			s.refuseTyped(w, r, e)
 			return
@@ -182,7 +191,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	spec.IdemKey = key
+	spec.IdemKey, spec.Hub = key, selectedHub
 	// THE BODY DIGEST is over the whole submission the key names, not over the payload
 	// alone: one key that named a different FUNCTION must conflict as loudly as one
 	// that named different input. The canonical preimage is the digest's subject, so
@@ -215,6 +224,14 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	s.ok(w, r, status, handle)
+}
+
+// idempotencyHubConflict refuses a key already naming a request on another hub: one
+// key cannot mean two submissions.
+func idempotencyHubConflict(key, recorded, selected string) *exit.Error {
+	return exit.Named(exit.Conflict, "request.hub_conflict",
+		"idempotency key %q already names a request on Tensorhub %s, not %s", key, recorded, selected).
+		WithRemedy("use a new idempotency key, or repeat the request with --tensorhub=%s", recorded)
 }
 
 func replaySubmission(sub Submission, recorded records.Request) orchestrator.Submission {
@@ -387,7 +404,7 @@ func (s *Server) publicStatusOf(row records.Request) string {
 // The plan id is resolved through the LOCAL resolver — the same object `start` uses — so
 // a client never names a plan digest and a submission can never bind a binding this host
 // did not install.
-func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.Submission, *exit.Error) {
+func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
@@ -398,7 +415,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		AttentionKernel: sub.AttentionKernel,
 		OutputDirectory: sub.OutputDirectory,
 	}
-	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
+	if problem := s.validateRequestedRental(out.RequestedRental, hub); problem != nil {
 		return out, problem
 	}
 	if len(out.Payload) == 0 {
@@ -424,7 +441,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		if sub.InstallID != "" || sub.Release == "" {
 			return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
 		}
-		logical, entrypoint, e := s.packages.ResolveRemoteRelease(
+		logical, entrypoint, e := s.packages.ResolveRemoteRelease(hub,
 			sub.Package, sub.Release, sub.Function, sub.Models)
 		if e != nil {
 			return out, e
@@ -707,6 +724,8 @@ func bindAssets(assets []records.AssetBinding) ([]records.AssetBinding, *exit.Er
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
+	// Hub is the Tensorhub origin the request belongs to.
+	Hub              string                `json:"hub,omitempty"`
 	MachineExecution *MachineExecutionView `json:"machine_execution,omitempty"`
 	Number           int64                 `json:"number"`
 	Kind             string                `json:"kind"`
@@ -847,6 +866,7 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	life := s.lifecycleFacts(row)
+	life.Hub = row.Hub
 	if life.Error == "" && life.Status == "failed" {
 		if errType, errCode, errText, problem := s.store.SettledFailure(row.ID); problem == nil {
 			life.ErrorType, life.ErrorCode, life.Error = errType, errCode, errText
@@ -1051,7 +1071,15 @@ func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
 			"unknown status filter", "any | queued | in_progress | completed | failed | canceled")
 		return
 	}
-	rows, e := s.store.PublicRequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), limit, before)
+	hub, e := s.hubOf(r)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	if r.URL.Query().Get("hubs") == "all" {
+		hub = ""
+	}
+	rows, e := s.store.PublicRequestsBefore(state, strings.TrimSpace(r.URL.Query().Get("package")), hub, limit, before)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return

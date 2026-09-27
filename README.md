@@ -637,10 +637,12 @@ Nothing is kept on disk without a live reason; the daemon's start-time sweeps (`
 them) are only the backstop for a process that crashed and report `reclaimed 0` on a healthy box.
 
 Configuration is read once from `~/.cozy/config.yaml`, then credential/location environment
-variables override it. `--tensorhub=URL` overrides both for one command:
+variables override it. `--tensorhub=<hub>` overrides both for one command:
 
 ```yaml
-tensorhub_url: https://tensorhub.example
+tensorhub_url: local        # the current hub: a name from `hubs` or a URL
+hubs:
+  local: http://127.0.0.1:8819
 tensorhub_token: replace-with-your-token
 huggingface_token: hf_replace-with-your-token
 civitai_token: replace-with-your-token
@@ -657,17 +659,23 @@ Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an 
 loopback port when another process owns 8818. A configured nonzero port is strict; `port: 0`
 explicitly asks the OS to select any available port.
 
-Without `tensorhub_url`, Cozy uses the standing local Tensorhub at `http://127.0.0.1:8819`.
+Hubs work like kubectl contexts. Without `tensorhub_url`, Cozy uses `tensorhub`
+(`https://tensorhub.com`). Local development names its own hub and switches to it:
 
 ```sh
-cozy --tensorhub=https://tensorhub.com model search minimax
-cozy package publish --tensorhub=http://127.0.0.1:8819
+cozy hub add local http://127.0.0.1:8819
+cozy hub use local                      # later commands use local
+cozy hub list                           # names, URLs, logins, live rentals
+cozy --tensorhub=tensorhub model search minimax   # one command, any hub
 ```
 
-The override does not rewrite `config.yaml`. Machine login records are scoped to the selected
-Tensorhub. A running daemon keeps its launch-time Tensorhub; a run selecting a different Hub
-is refused before submission. Finish that daemon's work before restarting it for another Hub.
-Catalog and publication commands can select another Hub without restarting the daemon.
+One daemon serves every hub at once, and switching never restarts it. Each run, rental,
+model transfer and publication keeps the hub it was created on, and work on it (ending a
+rental, keepalive, collection, publication) goes to that hub with that hub's own machine
+login; a credential is only ever sent to the origin it was issued for, so each hub needs its
+own `cozy auth login --tensorhub=<hub>`. `cozy rental list` and `cozy run list` show the current
+hub; `--all-hubs` shows every hub, and `rental list` names other hubs with live rentals.
+`tensorhub_token` belongs to the configured hub only, and `cozy hub use` refuses to move it.
 
 The YAML schema is strict: unknown keys, duplicate keys, undeclared nested structures, and multiple
 documents are refused. Cozy does not load a working-directory `.env` file.

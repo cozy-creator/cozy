@@ -157,10 +157,12 @@ func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 			// Missing/newer schema metadata never authorizes replacing a live owner.
 			if state.Addr != "" && credentialReady {
 				if _, problem := api.ClientCredential(layout); problem == nil && uiReady(state.Addr) {
-					if (state.Tensorhub != "" || ctx.Cfg.HubURLSource == "flag") && state.Tensorhub != ctx.Cfg.HubURL {
-						return daemon.State{}, false, exit.Named(exit.Conflict, "daemon.tensorhub_mismatch",
-							"this Cozy daemon uses Tensorhub %q; this command selected %q", state.Tensorhub, ctx.Cfg.HubURL).
-							WithRemedy("use the daemon's Tensorhub for runs; finish its work before restarting with the selected Tensorhub")
+					if state.SingleHub != "" && state.SingleHub != ctx.Cfg.HubURL {
+						// A daemon from before multi-hub serves only the hub it started with and
+						// would silently use it for this command's work.
+						return daemon.State{}, false, exit.Named(exit.Conflict, "daemon.single_hub",
+							"the running Cozy daemon predates multi-hub support and serves only %s", state.SingleHub).
+							WithRemedy("restart it once with `cozy down` then `cozy up`; rentals and runs survive a daemon restart")
 					}
 					changed := child != nil && state.PID == child.pid
 					if child != nil {
@@ -212,7 +214,10 @@ func startDaemon(ctx *Context) (*daemonChild, *exit.Error) {
 	}
 	command := exec.Command(self)
 	command.Args[0] = daemonProcessName
-	command.Env = ctx.Cfg.Child("COZY_HOME="+ctx.Cfg.Home, "TENSORHUB_URL="+ctx.Cfg.HubURL)
+	// The daemon serves every hub and each request names its own. Its default (for
+	// records older than per-record hubs) is the configured hub, never a one-command
+	// --tensorhub selection.
+	command.Env = ctx.Cfg.Child("COZY_HOME="+ctx.Cfg.Home, "TENSORHUB_URL="+ctx.Cfg.ConfiguredHubURL)
 	command.Stdout = discard
 	diagnostics, err := command.StderrPipe()
 	if err != nil {

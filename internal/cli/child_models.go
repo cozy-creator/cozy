@@ -33,7 +33,7 @@ import (
 // childManifest completes one captured child slot pinned to the machine the child will run
 // on — for a rental composition the parent's own pod, so the rung is decided here rather
 // than left for a placement decision the child never enters.
-func (r *Resolver) childManifest(out orchestrator.ModelRef) (orchestrator.ModelRef, *exit.Error) {
+func (r *Resolver) childManifest(origin string, out orchestrator.ModelRef) (orchestrator.ModelRef, *exit.Error) {
 	// A JOB's model is an invocation INPUT, so it carries exact manifest bytes the way
 	// `jobManifestInputs` grants them for a top-level job — not a bare model identity.
 	ref, problem := hub.ParseRef(out.Model)
@@ -42,13 +42,13 @@ func (r *Resolver) childManifest(out orchestrator.ModelRef) (orchestrator.ModelR
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	raw, problem := r.catalog.ReleaseManifest(hctx, ref, out.Release, out.Lane)
+	raw, problem := r.catalog(origin).ReleaseManifest(hctx, ref, out.Release, out.Lane)
 	if problem != nil {
 		return orchestrator.ModelRef{}, problem
 	}
 	if !manifestBytes(raw, out.Manifest) {
 		// The lane moved since selection; read the selected checkpoint itself.
-		if checkpoint, fallback := r.catalog.CheckpointManifest(hctx, ref, out.Manifest); fallback == nil {
+		if checkpoint, fallback := r.catalog(origin).CheckpointManifest(hctx, ref, out.Manifest); fallback == nil {
 			raw = checkpoint
 		}
 	}
@@ -64,9 +64,9 @@ func (r *Resolver) childManifest(out orchestrator.ModelRef) (orchestrator.ModelR
 // callee's authored default, every rung resolved against the model card the way a rented
 // top-level run resolves it. The machine decision reads this to keep a composition off a
 // card no shot of it declares a lane for.
-func (r *Resolver) childModelLadder(pkg, entrypoint string, slot launch.Slot) (orchestrator.ModelRef, *exit.Error) {
+func (r *Resolver) childModelLadder(origin, pkg, entrypoint string, slot launch.Slot) (orchestrator.ModelRef, *exit.Error) {
 	var empty orchestrator.ModelRef
-	binding, problem := r.childSlotBinding(pkg, entrypoint, slot)
+	binding, problem := r.childSlotBinding(origin, pkg, entrypoint, slot)
 	if problem != nil {
 		return empty, problem
 	}
@@ -86,7 +86,7 @@ func (r *Resolver) childModelLadder(pkg, entrypoint string, slot launch.Slot) (o
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	_, selected, problem := modelReleaseCard(hctx, r.catalog, ref, release)
+	_, selected, problem := modelReleaseCard(hctx, r.catalog(origin), ref, release)
 	if problem != nil {
 		return empty, problem
 	}
@@ -116,7 +116,7 @@ func (r *Resolver) childModelLadder(pkg, entrypoint string, slot launch.Slot) (o
 // childSlotBinding is the selection order minus the run key: a run key belongs to the
 // caller's own invocation and a captured child has none. An editable package has no hub
 // row and stands on its authored default, exactly as a top-level run of it does.
-func (r *Resolver) childSlotBinding(pkg, entrypoint string, slot launch.Slot) (hub.PackageBindingRow, *exit.Error) {
+func (r *Resolver) childSlotBinding(origin, pkg, entrypoint string, slot launch.Slot) (hub.PackageBindingRow, *exit.Error) {
 	var rows []hub.PackageBindingRow
 	if !strings.HasPrefix(pkg, "local/") {
 		ref, problem := hub.ParseRef(pkg)
@@ -125,7 +125,7 @@ func (r *Resolver) childSlotBinding(pkg, entrypoint string, slot launch.Slot) (h
 		}
 		hctx, cancel := hub.Context()
 		defer cancel()
-		read, problem := r.catalog.PackageBindings(hctx, ref)
+		read, problem := r.catalog(origin).PackageBindings(hctx, ref)
 		if problem != nil {
 			return hub.PackageBindingRow{}, exit.Named(problem.Code, "child.model_binding_unreadable",
 				"%s default bindings are not readable: %s", pkg, problem.Message)
@@ -211,7 +211,7 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 				return nil, problem
 			}
 			for _, slot := range job.Models {
-				selected, problem := r.childModelLadder(child.Package, binding.Entrypoint, slot)
+				selected, problem := r.childModelLadder(request.Hub, child.Package, binding.Entrypoint, slot)
 				if problem != nil {
 					// This is advisory sizing for an unknown future call. An
 					// inaccessible default may be unused or explicitly overridden;
@@ -231,10 +231,10 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 
 // EnsureLocalModels runs after child admission, on the ordinary activation path.
 // The control-frame reader must not block on a model download before recording the child.
-func (r *Resolver) EnsureLocalModels(models []orchestrator.ModelRef) *exit.Error {
+func (r *Resolver) EnsureLocalModels(origin string, models []orchestrator.ModelRef) *exit.Error {
 	for _, model := range models {
 		if model.Downloadable() {
-			if problem := r.ensureLocalChildModel(model); problem != nil {
+			if problem := r.ensureLocalChildModel(origin, model); problem != nil {
 				return problem
 			}
 		}
@@ -244,7 +244,7 @@ func (r *Resolver) EnsureLocalModels(models []orchestrator.ModelRef) *exit.Error
 
 // A local child skips the top-level CLI's model intake. Use that same acquisition
 // owner here; code publication cannot make cold model bytes appear in the store.
-func (r *Resolver) ensureLocalChildModel(model orchestrator.ModelRef) *exit.Error {
+func (r *Resolver) ensureLocalChildModel(origin string, model orchestrator.ModelRef) *exit.Error {
 	tool, problem := tfs.Open(r.cfg)
 	if problem != nil {
 		return problem
@@ -263,7 +263,7 @@ func (r *Resolver) ensureLocalChildModel(model orchestrator.ModelRef) *exit.Erro
 		spec += "@" + model.Release
 	}
 	spec += "@" + model.Manifest
-	fetch := transfer.Fetch{Tool: tool, Hub: r.catalog, Spec: spec, Lane: model.Lane,
+	fetch := transfer.Fetch{Tool: tool, Hub: r.catalog(origin), Spec: spec, Lane: model.Lane,
 		Scratch: work.Path, Locks: layout.AcquisitionLocks()}
 	ctx, cancel := hub.LongContext()
 	defer cancel()

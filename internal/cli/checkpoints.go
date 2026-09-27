@@ -48,7 +48,7 @@ func (o *modelTransferOwner) checkpointPublicationClient(requestID string) (*hub
 	if problem != nil {
 		return nil, ref, nil, problem
 	}
-	client, problem := ownedPublication(o.cliContext(intent.ModelTransferIntent, true), ref)
+	client, problem := ownedPublication(o.cliContext(o.hubOf(requestID), intent.ModelTransferIntent, true), ref)
 	return client, ref, intent, problem
 }
 

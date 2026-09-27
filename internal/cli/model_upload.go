@@ -61,6 +61,7 @@ func sourceProfileNames(profiles map[string]string) []string {
 }
 
 func handleModelUpload(ctx *Context) *exit.Error {
+	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
 	if handled, problem := nativeModelUpload(ctx); handled {
 		return problem
 	}

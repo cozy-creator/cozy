@@ -74,7 +74,7 @@ func (l *restartLauncher) Resolve(string) (orchestrator.WorkerLaunchSpec, *exit.
 func TestRentalHubOutageKeepsTheRequestQueued(t *testing.T) {
 	var observations atomic.Int64
 	o := hostOwner(t, "rental-hub-outage", func(options *orchestrator.Options) {
-		options.RentalFleet = func() (string, *exit.Error) {
+		options.RentalFleet = func(records.Request) (string, *exit.Error) {
 			observations.Add(1)
 			return "", exit.Unavailablef("Tensorhub is temporarily unreachable")
 		}

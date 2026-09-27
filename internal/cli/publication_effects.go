@@ -14,8 +14,7 @@ func (o *modelTransferOwner) publicationEffectClient(ctx context.Context, call r
 	if problem != nil {
 		return nil, problem
 	}
-	configured := &Context{Cfg: o.cfg, AccountAuth: o.auth}
-	return ownedPublication(configured, ref)
+	return ownedPublication(o.cliContext(o.hubOf(call.ParentRequestID), records.ModelTransferIntent{}, false), ref)
 }
 func (o *modelTransferOwner) PreparePublicationEffect(ctx context.Context, call records.NativeCall) ([]byte, *exit.Error) {
 	client, problem := o.publicationEffectClient(ctx, call)

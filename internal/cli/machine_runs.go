@@ -283,7 +283,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "durable root Model inputs require Runtime protocol 55")
 		}
 		if !request.Rental {
-			if problem := m.resolver.EnsureLocalModels(request.Models); problem != nil {
+			if problem := m.resolver.EnsureLocalModels(request.Hub, request.Models); problem != nil {
 				return problem
 			}
 		}

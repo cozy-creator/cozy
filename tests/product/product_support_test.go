@@ -416,8 +416,13 @@ func childEnv(t *testing.T, root string, imposed ...string) []string {
 	cfg, e := config.Load()
 	fatal(t, e)
 	// Both homes are isolated: a product test must never reach the user's ~/.tensorfs.
-	return cfg.Child(append([]string{"COZY_HOME=" + root,
-		"TENSORFS_HOME=" + filepath.Join(root, "tensorfs")}, imposed...)...)
+	base := []string{"COZY_HOME=" + root, "TENSORFS_HOME=" + filepath.Join(root, "tensorfs")}
+	// Nor production Tensorhub, the product default: a root that selects no hub gets an
+	// unanswered loopback one.
+	if raw, _ := os.ReadFile(filepath.Join(root, config.FileName)); !strings.Contains(string(raw), "tensorhub_url") {
+		base = append(base, "TENSORHUB_URL=http://127.0.0.1:8819")
+	}
+	return cfg.Child(append(base, imposed...)...)
 }
 
 // --------------------------------------------------------------------------- the small stuff
@@ -521,6 +526,9 @@ func revertRentalsBeforeWidth(t *testing.T, db *sql.DB) {
 func revertRecordsSchema(t *testing.T, db *sql.DB, version int) {
 	t.Helper()
 	statements := []string{`PRAGMA foreign_keys=OFF`, `PRAGMA legacy_alter_table=ON`}
+	if version < 49 {
+		statements = append(statements, `ALTER TABLE requests DROP COLUMN hub`)
+	}
 	if version < 48 {
 		statements = append(statements, `ALTER TABLE requests DROP COLUMN rent_new`)
 	}

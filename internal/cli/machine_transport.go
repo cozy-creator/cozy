@@ -85,12 +85,12 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 
 	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
 	result.modelDefaultOrigin = func(ctx context.Context) (string, *exit.Error) {
-		facts, problem := client(m.context).RentalImageInventory(ctx, identity.RentalID)
+		facts, problem := client(m.fleet.atRental(identity.RentalID)).RentalImageInventory(ctx, identity.RentalID)
 		return facts.PublicOrigin, problem
 	}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 		ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
-		facts, problem := rental.PrepareFactsSource(client(m.context))(ctx, identity, ref)
+		facts, problem := rental.PrepareFactsSource(client(m.fleet.atRental(identity.RentalID)))(ctx, identity, ref)
 		if problem != nil {
 			return nil, problem
 		}
@@ -357,7 +357,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, wireMinor: info.WireMinor}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 		if request.InstallID == "" {
-			plan, iface, locked, requires, problem := m.resolver.publishedChildPreparation(ctx, m.context, request)
+			plan, iface, locked, requires, problem := m.resolver.publishedChildPreparation(ctx, m.context.forHub(request.Hub), request)
 			if problem != nil {
 				return nil, problem
 			}

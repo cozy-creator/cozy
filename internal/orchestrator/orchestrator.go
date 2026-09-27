@@ -86,14 +86,14 @@ type Options struct {
 	// orchestrator holds no Tensorhub client. Fire-and-forget; the hub's defect
 	// tombstone is idempotent.
 	ReportReleaseDefect ReleaseDefectReporter
-	// RentalFleet renders the one fleet burn line after reconciling every local
-	// rental with Tensorhub. AcquireManagedRental is the placement decision for a --rental
+	// RentalFleet renders the request's hub's fleet burn line after reconciling that
+	// hub's rentals with it. AcquireManagedRental is the placement decision for a --rental
 	// request no rental holds a placement for (placement-economics.md): it pins the
 	// request to an attached ready rental or BUYS a pod (owner ruling 2026-09-03:
 	// --rental is permission AND intent to spend) and records what it chose over what.
 	// ReleaseManagedRental observes a rental as a request pinned to it settles and tears
 	// it down once nothing is left on it.
-	RentalFleet          func() (string, *exit.Error)
+	RentalFleet          func(records.Request) (string, *exit.Error)
 	AcquireManagedRental func(req records.Request) (PlacementDecision, string, *exit.Error)
 	ReleaseManagedRental func(string) (string, *exit.Error)
 	// ReleaseRetainedRental is explicit owner abandonment, independent of idle policy.

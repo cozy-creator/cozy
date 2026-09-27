@@ -134,6 +134,15 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
 	}
+	named := sub.RequestedRental
+	if named == "" {
+		named = sub.Worker
+	}
+	selectedHub, e := s.submissionHub(r, named)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
 	if sub.RetryOf != "" {
 		prior, problem := s.store.RequestByReference(sub.RetryOf)
 		if problem != nil {
@@ -154,6 +163,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 		sub.RequestedRental = prior.RequestedRental
 		sub.RetryOf, sub.Worker = prior.ID, prior.Worker
+		// A retry continues its predecessor's work, which belongs to that request's hub.
+		selectedHub = prior.Hub
 		sub.RetainWork = true
 		sub.Rental, sub.RentalRequired = prior.Rental, prior.RentalRequired
 	}
@@ -180,6 +191,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	var spec orchestrator.Submission
+	if existing != nil && existing.Hub != selectedHub {
+		s.refuseTyped(w, r, idempotencyHubConflict(key, existing.Hub, selectedHub))
+		return
+	}
 	if existing != nil {
 		if e = s.verifyJobReplayInstall(r.Context(), sub, *existing); e != nil {
 			s.refuseTyped(w, r, e)
@@ -207,7 +222,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			defer unlock()
 		}
 		var inputDeclaration *launch.Entrypoint
-		spec, inputDeclaration, e = s.resolveJob(r.Context(), sub)
+		spec, inputDeclaration, e = s.resolveJob(r.Context(), selectedHub, sub)
 		if e == nil && spec.OutputExport != nil {
 			e = resultfiles.Preflight(spec.OutputExport.Directory)
 		}
@@ -230,7 +245,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	spec.IdemKey = key
+	spec.IdemKey, spec.Hub = key, selectedHub
 	if len(sub.AllowPublish) > 0 {
 		spec.AllowPublish, e = hub.NormalizePublicationRepositories(sub.AllowPublish)
 		if e != nil {
@@ -396,7 +411,7 @@ func replayJobSubmission(sub JobSubmission,
 // resolveJob turns package+function into the orchestrator's Submission. The
 // `job_descriptor_id` is resolved HERE, from the installed package's own PackageInterface —
 // a client never names a digest, exactly as it never names a binding plan id.
-func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
+func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission) (orchestrator.Submission, *launch.Entrypoint, *exit.Error) {
 	if sub.RentNew && sub.Worker != "" {
 		return orchestrator.Submission{}, nil, exit.Usagef("a fresh rental cannot name an existing worker")
 	}
@@ -419,7 +434,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 		ModelTransfer: sub.ModelTransfer,
 	}
-	if problem := s.validateRequestedRental(out.RequestedRental); problem != nil {
+	if problem := s.validateRequestedRental(out.RequestedRental, hub); problem != nil {
 		return out, nil, problem
 	}
 	if len(out.Payload) == 0 {
@@ -468,7 +483,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 			return out, nil, exit.Named(exit.Validation, "rental.job_tree_worker_required",
 				"Tree inputs require a named private Runtime worker")
 		}
-		logical, job, problem := s.packages.ResolveRemoteJob(
+		logical, job, problem := s.packages.ResolveRemoteJob(hub,
 			sub.Package, sub.Release, sub.Function, sub.Models,
 			sub.ModelTransfer.HasAcquisition())
 		if problem != nil {

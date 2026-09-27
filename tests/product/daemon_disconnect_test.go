@@ -327,12 +327,12 @@ type shutdownRaceResolver struct {
 	release chan struct{}
 }
 
-func (r shutdownRaceResolver) ResolveRemoteJob(pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
+func (r shutdownRaceResolver) ResolveRemoteJob(hub, pkg, release, function string, models []orchestrator.ModelRef, deferred bool) (orchestrator.LogicalJob, *launch.Entrypoint, *exit.Error) {
 	if r.entered != nil {
 		close(r.entered)
 		<-r.release
 	}
-	return r.publishedRouteResolver.ResolveRemoteJob(pkg, release, function, models, deferred)
+	return r.publishedRouteResolver.ResolveRemoteJob(hub, pkg, release, function, models, deferred)
 }
 
 func TestDaemonDownFencesConcurrentMachineIntake(t *testing.T) {

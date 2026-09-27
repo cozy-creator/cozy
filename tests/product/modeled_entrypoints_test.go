@@ -34,7 +34,7 @@ func TestPublishedH3ModeledEntrypointSelection(t *testing.T) {
 		models := []orchestrator.ModelRef{{Package: "paul/minimax-h3", Slot: function + ".models.model",
 			Model: "paul/minimax-h3", Release: "1.0.0", Lane: "bf16-full",
 			Manifest: "sha256:" + strings.Repeat("1", 64), ManifestLength: 164}}
-		logical, entrypoint, problem := resolver.ResolveRemoteRelease("paul/minimax-h3", "1.1.2", function, models)
+		logical, entrypoint, problem := resolver.ResolveRemoteRelease("", "paul/minimax-h3", "1.1.2", function, models)
 		fatal(t, problem)
 		if entrypoint.Name != function || logical.Function != function || logical.PlanID != "" ||
 			len(logical.Models) != 1 || logical.Models[0].Slot != models[0].Slot ||
@@ -42,7 +42,7 @@ func TestPublishedH3ModeledEntrypointSelection(t *testing.T) {
 			t.Fatal("remote metadata resolution changed the callable or its selected model")
 		}
 		models[0].Slot = "unselected.models.model"
-		if _, _, problem := resolver.ResolveRemoteRelease("paul/minimax-h3", "1.1.2", function, models); problem == nil {
+		if _, _, problem := resolver.ResolveRemoteRelease("", "paul/minimax-h3", "1.1.2", function, models); problem == nil {
 			t.Fatal("another callable's model selection was accepted")
 		}
 	}

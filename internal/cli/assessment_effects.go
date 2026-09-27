@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 
-	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/assessment"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -24,7 +23,7 @@ func (o *modelTransferOwner) PrepareAssessmentPublication(ctx context.Context, c
 	if problem != nil {
 		return intent, problem
 	}
-	intent.Account, problem = publication.Authorize(ctx, client, ref, o.assessmentOperator())
+	intent.Account, problem = publication.Authorize(ctx, client, ref, o.assessmentOperator(o.hubOf(call.ParentRequestID)))
 	if problem != nil {
 		return intent, problem
 	}
@@ -82,7 +81,7 @@ func (o *modelTransferOwner) ApplyAssessmentPublication(ctx context.Context, cal
 	if problem != nil {
 		return nil, problem
 	}
-	account, problem := publication.Authorize(ctx, client, ref, o.assessmentOperator())
+	account, problem := publication.Authorize(ctx, client, ref, o.assessmentOperator(o.hubOf(call.ParentRequestID)))
 	if problem != nil {
 		return nil, problem
 	}
@@ -93,10 +92,7 @@ func (o *modelTransferOwner) ApplyAssessmentPublication(ctx context.Context, cal
 	return publication.Canonical(receipt)
 }
 
-func (o *modelTransferOwner) assessmentOperator() bool {
-	auth := o.auth
-	if auth == nil {
-		auth = accountauth.New(o.cfg)
-	}
-	return o.cfg.HubToken.Present() && !auth.CredentialPresent()
+func (o *modelTransferOwner) assessmentOperator(origin string) bool {
+	command := o.cliContext(origin, records.ModelTransferIntent{}, false)
+	return command.Cfg.HubToken.Present() && !command.AccountAuth.CredentialPresent()
 }
