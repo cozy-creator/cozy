@@ -29,6 +29,7 @@ type childIntake struct {
 	prepared          *install.Result
 	remoteEnvironment *records.PackageInstall
 	remoteCapture     bool
+	namespace         packagepublish.NamespaceSource
 }
 
 func (i *childIntake) Finish(parentInstall string) *exit.Error {
@@ -69,7 +70,7 @@ func (i *childIntake) Install() (*install.Result, *exit.Error) {
 	result, problem := install.Run(i.layout, i.store, install.Request{Ref: install.Ref{Package: "local/" + i.Package.Name}, Snapshot: true,
 		RemoteEnvironment: i.remoteEnvironment,
 		RemoteCapture:     i.remoteCapture,
-		Local:             &install.LocalSource{Bytes: size, Files: files, Package: "local/" + i.Package.Name, Release: i.Package.Release, Tree: i.Package.Tree}})
+		Local:             &install.LocalSource{Bytes: size, Files: files, Package: "local/" + i.Package.Name, Release: i.Package.Release, Tree: i.Package.Tree, Namespace: i.namespace}})
 	if problem == nil {
 		i.prepared = result
 	}
@@ -91,7 +92,8 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 	stack[pack.Tree] = true
 	defer delete(stack, pack.Tree)
 	intake := &childIntake{Package: pack, layout: layout, store: store, remoteEnvironment: remote,
-		remoteCapture: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || ctx.Inv.Value("--rental") != ""}
+		remoteCapture: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || ctx.Inv.Value("--rental") != "",
+		namespace:     commandNamespace(ctx)}
 	fail := func(problem *exit.Error) (*childIntake, *exit.Error) { intake.Close(); return nil, problem }
 	dependencies, problem := packagepublish.LocalDependencySelections(pack.Tree)
 	if problem != nil {
@@ -114,7 +116,7 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 		if len(intake.Bindings) >= 32 {
 			return fail(exit.New(exit.Validation, "unpublished parent exceeds 32 invocable dependency exports"))
 		}
-		dependency, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), path, dependencies[name].Extras...)
+		dependency, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), path, commandNamespace(ctx), dependencies[name].Extras...)
 		if problem != nil {
 			return fail(problem)
 		}

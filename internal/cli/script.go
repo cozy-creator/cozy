@@ -15,7 +15,7 @@ import (
 )
 
 func scriptTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Error) {
-	pack, problem := packagepublish.PrepareScript(context.Background(), ctx.Inv.Args[0])
+	pack, problem := packagepublish.PrepareScript(context.Background(), ctx.Inv.Args[0], commandNamespace(ctx))
 	if problem != nil {
 		return Target{}, nil, problem
 	}

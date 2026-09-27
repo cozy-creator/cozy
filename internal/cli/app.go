@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/mattn/go-isatty"
 )
 
@@ -53,6 +54,7 @@ type Context struct {
 	Cfg            config.Config
 	Daemon         daemon.State
 	AccountAuth    *accountauth.Manager
+	namespace      packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
 }
 
 func (c *Context) Mode() output.Mode { return c.Inv.Mode }

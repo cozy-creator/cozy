@@ -64,7 +64,7 @@ func TestStaticDescribeNeverImportsPackageCode(t *testing.T) {
 	must(t, err)
 	pack, problem := packagepublish.PrepareFrom(project)
 	fatal(t, problem)
-	fatal(t, pack.BuildForPublish(t.Context()))
+	fatal(t, pack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"}))
 	staged, err := os.ReadFile(pack.PackageInterface)
 	pack.Close()
 	must(t, err)
@@ -107,7 +107,7 @@ func publishStaging(t *testing.T, project string) ([]byte, string) {
 	pack, problem := packagepublish.PrepareFrom(project)
 	fatal(t, problem)
 	defer pack.Close()
-	fatal(t, pack.BuildForPublish(t.Context()))
+	fatal(t, pack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"}))
 	staged, err := os.ReadFile(pack.PackageInterface)
 	must(t, err)
 	return staged, pack.InterfaceNotice

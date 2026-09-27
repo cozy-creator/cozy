@@ -1,6 +1,7 @@
 package packagepublish
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
@@ -23,10 +26,12 @@ const CommittedInterfacePath = "metadata/package-interface.json"
 // describe stages the tree's PackageInterface. The reading is THIS host's Runtime parsing the
 // source (hostruntime.Describe): package code is untrusted and nothing here imports it, so no
 // environment is built for the question. Both an unpublished revision and a publication ship
-// that reading. For a publication, a committed copy that contradicts it — something the copy
-// names that the source no longer declares, or declares differently — is returned as a
-// notice; ordering and members only the fresh reading carries are not contradictions.
-func describe(ctx context.Context, tree, root string, publish bool) (string, string, *exit.Error) {
+// that reading. For a publication (a nonempty account), a committed copy that contradicts it —
+// something the copy names that the source no longer declares, or declares differently — is
+// returned as a notice; ordering and members only the fresh reading carries are not
+// contradictions. The staged publication names the account in every org-relative lane.
+func describe(ctx context.Context, tree, root, account string) (string, string, *exit.Error) {
+	publish := account != ""
 	env := config.Frozen().Tool()
 	if _, problem := hostruntime.Path(env); problem != nil {
 		return "", "", problem
@@ -48,6 +53,12 @@ func describe(ctx context.Context, tree, root string, publish bool) (string, str
 					"Delete or regenerate the committed copy.", CommittedInterfacePath, contradiction)
 				fmt.Fprintf(os.Stderr, "cozy: %s\n", notice)
 			}
+		}
+	}
+	if publish {
+		var problem *exit.Error
+		if raw, problem = QualifyInterface(raw, account); problem != nil {
+			return "", "", problem
 		}
 	}
 	path := filepath.Join(root, "package-interface.json")
@@ -131,4 +142,49 @@ func contradiction(path string, committed, tree any) string {
 func spell(value any) string {
 	raw, _ := json.Marshal(value)
 	return string(raw)
+}
+
+// QualifyInterface writes account into every org-relative default lane
+// (`model@release/lane` becomes `account/model@release/lane`). Explicit orgs are kept, so the
+// published interface names only absolute references.
+func QualifyInterface(raw []byte, account string) ([]byte, *exit.Error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var document map[string]any
+	if err := decoder.Decode(&document); err != nil {
+		return nil, exit.Named(exit.Structural, "package_interface_invalid", "the package interface is not a JSON object")
+	}
+	changed := false
+	for _, group := range []string{"entrypoints", "jobs"} {
+		callables, _ := document[group].([]any)
+		for _, callable := range callables {
+			row, _ := callable.(map[string]any)
+			models, _ := row["models"].([]any)
+			for _, model := range models {
+				slot, _ := model.(map[string]any)
+				ladder, _ := slot["default_ladder"].([]any)
+				for _, rung := range ladder {
+					fields, _ := rung.(map[string]any)
+					lane, _ := fields["lane"].(string)
+					if name, _, found := strings.Cut(lane, "@"); found && !strings.Contains(name, "/") {
+						fields["lane"], changed = account+"/"+lane, true
+					}
+				}
+			}
+		}
+	}
+	if !changed {
+		return raw, nil
+	}
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(document); err != nil {
+		return nil, exit.Internalf("cannot encode the qualified package interface: %s", err)
+	}
+	normalized, err := canonical.NormalizeJCS(bytes.TrimSpace(out.Bytes()))
+	if err != nil {
+		return nil, exit.Internalf("cannot normalize the qualified package interface: %s", err)
+	}
+	return normalized, nil
 }

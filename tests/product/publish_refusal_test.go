@@ -107,7 +107,7 @@ func buildForPublish(t *testing.T, tree string) *packagepublish.Package {
 	pack, problem := packagepublish.PrepareFrom(tree)
 	fatal(t, problem)
 	t.Cleanup(pack.Close)
-	fatal(t, pack.BuildForPublish(t.Context()))
+	fatal(t, pack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"}))
 	return pack
 }
 
@@ -116,7 +116,7 @@ func TestPublishRefusesAuthorLocalLockRows(t *testing.T) {
 	pack, problem := packagepublish.PrepareFrom(tree)
 	fatal(t, problem)
 	defer pack.Close()
-	problem = pack.BuildForPublish(t.Context())
+	problem = pack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"})
 	if problem == nil || problem.Name != "package_publish.author_local_row" {
 		t.Fatalf("editable cozy-runtime lock answered %v", problem)
 	}
@@ -134,7 +134,7 @@ func TestPublishRefusesAuthorLocalLockRows(t *testing.T) {
 	machinePack, problem := packagepublish.PrepareFrom(machine)
 	fatal(t, problem)
 	defer machinePack.Close()
-	problem = machinePack.BuildForPublish(t.Context())
+	problem = machinePack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"})
 	if problem == nil || problem.Name != "package_publish.author_local_row" ||
 		!strings.Contains(problem.Message, `cozy-utils 0.2.0 (directory = "/opt/checkouts/cozy-utils")`) {
 		t.Fatalf("machine-path lock answered %v", problem)
@@ -171,7 +171,7 @@ cozy-fixture-helper = { path = "libs/helper" }
 	pack, problem := packagepublish.PrepareFrom(tree)
 	fatal(t, problem)
 	defer pack.Close()
-	problem = pack.BuildForPublish(t.Context())
+	problem = pack.BuildForPublish(t.Context(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"})
 	if problem == nil || problem.Name != "package_interface_refused" {
 		t.Fatalf("in-tree dependency tree stopped early: %v", problem)
 	}

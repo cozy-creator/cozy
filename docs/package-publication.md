@@ -152,47 +152,45 @@ capture cannot rent that image; additional executors must already be present
 and advertised. Interface generator ABI 7 declares Python >=3.12, independently
 of the Runtime execution window.
 
-### Selecting a development Tensorhub index
+### One source, any Hub and account
 
-Keep ordinary uv metadata pointed at the canonical organization index:
+A package publishes into the namespace of the account that publishes it, on the
+command's Tensorhub (`--tensorhub`, or the configured Hub). The source names no
+account: the same tree publishes as `paul` on a development Hub and as `fidika` on
+tensorhub.com.
+
+Model defaults may omit the org. `minimax-h3@1.0.0-rc.2/fp8-pruned` names the
+publishing account's model; `alice/sdxl@1.0.0/fp8` names Alice's and is never
+rewritten. Publication writes the account into every org-relative lane of the
+uploaded `package-interface.json`, so Tensorhub and consumers only see absolute
+references. An editable `local/` package resolves them against the caller on the
+run's Hub.
+
+Packages published by the same account resolve from the reserved `tensorhub` index.
+Name it and never declare its URL:
 
 ```toml
-[tool.cozy]
-organization = "paul"
-
 [tool.uv.sources]
-qwen-image-2 = { index = "tensorhub-paul" }
-
-[[tool.uv.index]]
-name = "tensorhub-paul"
-url = "https://tensorhub.com/v1/index/paul/simple/"
-explicit = true
+qwen-image-2 = { index = "tensorhub" }
 ```
 
-For a development Hub, copy the project into an owned staging directory. In that
-copy, change only the organization index URL to
-`http://127.0.0.1:8819/v1/index/paul/simple/`, retaining `explicit = true` and all
-other settings. Run ordinary `uv lock` in the copy, review the resulting lock, and
-copy that reviewed `uv.lock` back to the authored project. Then run:
+Cozy writes `[[tool.uv.index]] name = "tensorhub"`, with
+`url = "<hub>/v1/index/<account>/simple/"` and `explicit = true`, into its own copy of
+the project for the command's Hub and caller. The authored files never change, and
+other indexes and PyPI keep their behavior. Raw `uv lock` cannot resolve the project,
+so lock it with Cozy:
 
 ```sh
-cozy package publish --tensorhub=http://127.0.0.1:8819
+cozy package lock                                  # the configured Hub and account
+cozy package lock --upgrade-package qwen-image-2   # take a newer same-account release
 ```
 
-Do not use `uv lock --index name=url` for this preparation: qualified uv versions
-replace the index settings and lose `explicit = true`. The owned-copy workflow
-preserves the boundary between named dependencies and the public default index.
-
-Standard uv records the selected index and exact artifact URLs/hashes in `uv.lock`;
-the pyproject stays canonical, while the lock honestly identifies the selected Hub.
-Publication passes the matching named-index override to `uv export --locked` and
-refuses a different-Hub or stale lock. It never silently relocks or rewrites either
-file. Moving to production requires explicitly locking against production and
-reviewing that change. No separate Cozy lock command is needed.
-
-Only explicitly named canonical Tensorhub indexes for the project's own declared
-organization are overridden. PyPI, other organizations, and third-party indexes
-retain their existing behavior and validation. For owned editable-package or client-script captures, Cozy changes only the
-recognized URL in the owned pyproject before locking, preserving `explicit` and
-other index settings; authored files remain unchanged. Index selection does not expand the child environment allowlist
-or forward Hub credentials to uv.
+The committed `uv.lock` pins versions. When a publication targets another Hub or
+account, Cozy relocks its copy against that account's index, seeded by the committed
+lock, and refuses (`account_index_lock_drift`) unless every package keeps its version,
+every non-`tensorhub` row is unchanged, and each `tensorhub` row keeps its dependency
+edges. Package releases are immutable, so one commit publishes the same closure to
+each target. The uploaded `pyproject.toml` and `uv.lock` are that bound copy, carrying
+the target's index URL and wheel hashes. Before publishing to a new target, publish
+the locked versions of your `tensorhub` dependencies there as the same account.
+Editable installs bind their owned snapshot the same way.

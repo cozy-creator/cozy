@@ -444,7 +444,7 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 			defaults = map[string]hub.PackageBindingRow{}
 		}
 	} else {
-		defaults = effectiveModelBindings(ep.Models, nil)
+		defaults = effectiveModelBindings(ep.Models, nil, packageOwner(target.Package, ep.Models, commandNamespace(ctx)))
 	}
 	out := make([]invocationModelSpec, 0, len(ep.Models))
 	for _, slot := range ep.Models {
@@ -457,6 +457,17 @@ func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
 		}
 		binding, ok := defaults[slot.Path]
 		if !ok {
+			if editable && slot.RelativeDefault() {
+				_, problem := commandNamespace(ctx)()
+				message := "the caller on this Tensorhub is unknown"
+				if problem != nil {
+					message = problem.Message
+				}
+				return nil, exit.Named(exit.Unavailable, "package_model_default_owner_unknown",
+					"%s default %s for model slot %s names your account's model, but %s",
+					target.Package, slot.DefaultBinding.Ref(), slot.Path, message).
+					WithRemedy("sign in on %s, or override this run: model.%s=org/model@release[/lane]", ctx.Cfg.HubURL, slot.Param)
+			}
 			if editable {
 				return nil, exit.Named(exit.Usage, "package_model_override_required",
 					"%s has no authored default for model slot %s", target.Package, slot.Path).
@@ -495,7 +506,7 @@ func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot)
 			"%s default bindings are not readable: %s", target.Package, problem.Message).
 			WithRemedy("supply model.<param>=org/model@release to bypass the hub default")
 	}
-	return effectiveModelBindings(slots, rows), nil
+	return effectiveModelBindings(slots, rows, ref.Org), nil
 }
 
 func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstall, *exit.Error) {
@@ -2538,7 +2549,7 @@ func emitFunctions(ctx *Context, target Target, packageInterface *launch.Package
 		}
 	}
 	slots := declaredModelSlots(public)
-	defaults := effectiveModelBindings(slots, nil)
+	defaults := effectiveModelBindings(slots, nil, packageOwner(target.Package, slots, commandNamespace(ctx)))
 	var bindingProblem *exit.Error
 	if len(slots) > 0 && !strings.HasPrefix(target.Package, "local/") {
 		defaults, bindingProblem = invocationDefaultBindings(ctx, target, slots)

@@ -99,7 +99,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 		var installProblem *exit.Error
 		result, installProblem = install.Run(l, st, install.Request{Ref: ref, Force: true,
 			Local: &install.LocalSource{Bytes: bytes, Files: files,
-				Package: ref.Package, Release: pack.Release, Tree: pack.Tree}})
+				Package: ref.Package, Release: pack.Release, Tree: pack.Tree, Namespace: commandNamespace(ctx)}})
 		return installProblem
 	})
 	if problem != nil {

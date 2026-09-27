@@ -20,7 +20,7 @@ func TestPublishedSourceArchiveIsStandardSdist(t *testing.T) {
 		t.Fatal(problem)
 	}
 	defer pack.Close()
-	if problem := pack.BuildForPublish(context.Background()); problem != nil {
+	if problem := pack.BuildForPublish(context.Background(), packagepublish.Namespace{Hub: "http://127.0.0.1:1", Account: "proof"}); problem != nil {
 		t.Fatal(problem)
 	}
 	if pack.SourceArchive == "" {
