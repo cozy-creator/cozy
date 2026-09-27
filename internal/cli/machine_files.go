@@ -59,7 +59,8 @@ func (m *machineRuns) planMachineFiles(request records.Request, outcome *pb.Atte
 	if problem != nil {
 		return nil, problem
 	}
-	if problem := launch.ValidateMachineResult(schema, body.Result); problem != nil {
+	drift, problem := launch.ValidateMachineResult(schema, body.Result)
+	if problem != nil {
 		return nil, problem
 	}
 	var result any
@@ -72,13 +73,16 @@ func (m *machineRuns) planMachineFiles(request records.Request, outcome *pb.Atte
 	for _, name := range launch.AssetPaths(entrypoint.Result) {
 		declared[name] = true
 	}
-	plan := &machineFilePlan{files: make([]records.MachineFileResult, 0, len(entries))}
+	plan := &machineFilePlan{files: make([]records.MachineFileResult, 0, len(entries)), warnings: drift.Warnings()}
 	for _, entry := range entries {
 		if entry == nil || !declared[entry.OutputId] {
 			plan.warnings = append(plan.warnings, fmt.Sprintf("the machine returned output %q, which the package does not declare; ignored", entry.GetOutputId()))
 			continue
 		}
 		delete(declared, entry.OutputId)
+		if !drift.Usable(entry.OutputId) {
+			continue // its result position already failed, and says why
+		}
 		file, problem := m.machineFile(request, outcome, result, entry)
 		if problem != nil {
 			plan.warnings = append(plan.warnings, fmt.Sprintf("output %q failed: %s", entry.OutputId, problem.Message))
@@ -88,7 +92,9 @@ func (m *machineRuns) planMachineFiles(request records.Request, outcome *pb.Atte
 	}
 	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED {
 		for _, name := range slices.Sorted(maps.Keys(declared)) {
-			plan.warnings = append(plan.warnings, fmt.Sprintf("output %q failed: the machine did not return it", name))
+			if drift.Usable(name) {
+				plan.warnings = append(plan.warnings, fmt.Sprintf("output %q failed: the machine did not return it", name))
+			}
 		}
 	}
 	return plan, nil
