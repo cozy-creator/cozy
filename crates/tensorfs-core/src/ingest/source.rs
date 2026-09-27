@@ -242,6 +242,9 @@ fn profile_assignments(
 ) -> Vec<Vec<SourceAssignment>> {
     let mut candidates = Vec::new();
     for component in &profile.components {
+        // Carriers banked from this exact tensor schema first; otherwise any carrier with
+        // the reviewed key set, whose shapes and dtypes the conversion itself validates.
+        let mut exact = Vec::new();
         let mut hits = Vec::new();
         for (variant_index, variant) in component.variants.iter().enumerate() {
             for entry in registry.entries.iter().filter(|entry| {
@@ -277,15 +280,21 @@ fn profile_assignments(
                         Ok(observed) => observed,
                         Err(_) => continue,
                     };
-                    if observed.keyset_digest == variant.keyset_digest
-                        && observed.tensor_schema_digest == entry.tensor_schema_digest
+                    if observed.keyset_digest != variant.keyset_digest {
+                        continue;
+                    }
+                    let hit = (index, projected, variant_index);
+                    if observed.tensor_schema_digest == entry.tensor_schema_digest
                         && observed.logical_keys as u64 == entry.logical_keys
                     {
-                        hits.push((index, projected, variant_index));
+                        exact.push(hit);
+                    } else if !hits.contains(&hit) {
+                        hits.push(hit);
                     }
                 }
             }
         }
+        let hits = if exact.is_empty() { hits } else { exact };
         if hits.is_empty() {
             return Vec::new();
         }
@@ -301,6 +310,58 @@ fn profile_assignments(
         &mut solutions,
     );
     solutions
+}
+
+/// Where a Store keeps a reviewed registry newer than the built-in one: shipped as a pinned
+/// file or served by the Hub, and bound with [`bind_registry`]. It only extends the built-in
+/// registry, so a TensorFS older than a model can still ingest it.
+pub const REGISTRY_BINDING: &str = "fingerprint-registry.json";
+
+/// Bind (or with `None`, clear) the Store's reviewed registry. The data is validated here,
+/// provenance included, so a malformed file is a caller's mistake at bind time.
+pub fn bind_registry(store: &Store, bytes: Option<&[u8]>) -> Result<()> {
+    let path = store.root().join(REGISTRY_BINDING);
+    let Some(bytes) = bytes else {
+        return match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => refuse(Code::IO_FAILED, format!("clear registry binding: {error}")),
+        };
+    };
+    FingerprintRegistry::parse(bytes)?;
+    let temporary = store.root().join("tmp").join(format!(
+        "{REGISTRY_BINDING}.{}",
+        crate::meta::now_nanos_unique()
+    ));
+    let written = fs::write(&temporary, bytes)
+        .and_then(|()| fs::File::open(&temporary)?.sync_all())
+        .and_then(|()| fs::rename(&temporary, &path));
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return refuse(Code::IO_FAILED, format!("bind registry: {error}"));
+    }
+    Ok(())
+}
+
+/// The registry an ingest on this Store classifies with: the built-in one, extended by the
+/// Store's bound registry, then by a caller-`supplied` one. A bound file that no longer
+/// parses is skipped (it can only add); supplied data that does not parse refuses.
+pub fn effective_registry(store: &Store, supplied: Option<&[u8]>) -> Result<(String, Vec<u8>)> {
+    let mut registry = FingerprintRegistry::parse(BUILTIN_REGISTRY_BYTES)?;
+    let mut locator = BUILTIN_REGISTRY.to_string();
+    let bound = fs::read(store.root().join(REGISTRY_BINDING))
+        .ok()
+        .filter(|bytes| bytes.len() <= crate::limits::DOC_MAX_BYTES)
+        .and_then(|bytes| FingerprintRegistry::parse(&bytes).ok());
+    if let Some(bound) = bound {
+        registry.extend(bound);
+        locator.push_str("+store");
+    }
+    if let Some(bytes) = supplied {
+        registry.extend(FingerprintRegistry::parse(bytes)?);
+        locator.push_str("+supplied");
+    }
+    Ok((locator, registry.to_bytes()))
 }
 
 pub fn read_header_only(path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
@@ -1658,7 +1719,8 @@ pub fn prepare_model_source(
     store: &Store,
     request: &PrepareModelSource,
 ) -> Result<PreparedModelSources> {
-    prepare_model_source_with_registry(store, request, BUILTIN_REGISTRY, BUILTIN_REGISTRY_BYTES)
+    let (locator, bytes) = effective_registry(store, None)?;
+    prepare_model_source_with_registry(store, request, &locator, &bytes)
 }
 
 /// One member of an exact provider selection: its pinned identity and the header a ranged
@@ -2305,6 +2367,36 @@ mod tests {
                 .code,
             Code::DUPLICATE_KEY
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_bound_registry_ingests_models_the_build_never_banked_at_any_precision() {
+        let root = temporary("bound-registry");
+        let (store, registry, mut request) = fixture(&root, false);
+        // Banked from F32 carriers; the first carrier is now re-uploaded as F16.
+        let first_path = request.roster[0].path.clone();
+        let header = "{\"weight\":{\"data_offsets\":[0,2],\"dtype\":\"F16\",\"shape\":[1]}}";
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0x00, 0x3c]);
+        fs::write(&first_path, &bytes).unwrap();
+        request.roster[0].object_id = ObjectRef::of(&bytes).id();
+        request.roster[0].length = bytes.len() as u64;
+        request.roster[0].header = header_prefix(&bytes);
+
+        // Unknown to the compiled-in registry until the reviewed data is bound.
+        assert_eq!(
+            prepare_model_source(&store, &request).unwrap_err().code,
+            Code::UNREGISTERED_FINGERPRINT
+        );
+        bind_registry(&store, Some(&registry)).unwrap();
+        let prepared = prepare_model_source(&store, &request).unwrap();
+        assert!(prepared.complete);
+        assert_eq!(prepared.sources.len(), 2);
+        // Registry data without provenance is not reviewed data.
+        assert!(bind_registry(&store, Some(b"{\"entries\":[{\"component\":\"x\"}]}")).is_err());
+        bind_registry(&store, None).unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

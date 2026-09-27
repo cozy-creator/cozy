@@ -262,6 +262,21 @@ impl FingerprintRegistry {
         crate::canon::write(&self.to_value())
     }
 
+    /// Extend this registry with a newer reviewed one: its entries and profiles replace
+    /// these under the same key and add the rest. Every entry keeps its own provenance.
+    pub fn extend(&mut self, newer: FingerprintRegistry) {
+        for entry in newer.entries {
+            self.merge(entry);
+        }
+        for profile in newer.source_profiles {
+            self.merge_source_profile(profile);
+        }
+    }
+
+    /// Key set and component classify. An entry banked from the exact same tensor schema is
+    /// preferred; otherwise any entry for this key set and component serves when they agree
+    /// on dialect and converter, and conversion validates the actual shapes and dtypes (an
+    /// fp16 upload of a model banked in bf16 classifies).
     pub fn classify(&self, fp: &Fingerprint) -> Verdict {
         let keyset: Vec<&Banked> = self
             .entries
@@ -281,7 +296,7 @@ impl FingerprintRegistry {
                 banked_as: keyset.iter().map(|e| name_of(e)).collect(),
             };
         }
-        let hits: Vec<&Banked> = component
+        let exact: Vec<&Banked> = component
             .iter()
             .copied()
             .filter(|e| {
@@ -289,6 +304,14 @@ impl FingerprintRegistry {
                     && e.logical_keys as usize == fp.logical_keys
             })
             .collect();
+        let hits = if exact.is_empty() {
+            let mut verdicts = component.clone();
+            verdicts.sort_by(|a, b| (&a.dialect, &a.converter).cmp(&(&b.dialect, &b.converter)));
+            verdicts.dedup_by(|a, b| (&a.dialect, &a.converter) == (&b.dialect, &b.converter));
+            verdicts
+        } else {
+            exact
+        };
         match hits.len() {
             0 => Verdict::Unregistered,
             1 => Verdict::Authorized(Box::new(hits[0].clone())),
