@@ -42,6 +42,9 @@ type managedRentals struct {
 	// each rental is reconciled, released and counted against the hub it was bought
 	// from, with that hub's own credential.
 	census map[string]*rentalCensus
+	// disks is each rental's container disk as its Hub last reported it; a rental the
+	// Hub has not reported is absent.
+	disks map[string]int
 }
 
 // rentalCensus is one hub's answer to "what does this account own there".
@@ -461,6 +464,10 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 		}
 		return rows[i].ID < rows[j].ID
 	})
+	sourceBytes, problem := m.store.PlannedSourceBytes(req.ID)
+	if problem != nil {
+		return nil, problem
+	}
 	out := make([]orchestrator.PlacementCandidate, 0, len(rows))
 	for _, row := range rows {
 		if req.RequestedRental != "" && row.ID != req.RequestedRental {
@@ -484,7 +491,8 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 		// Everything decidable from the rental ROW is settled by the chooser, in the one
 		// order that keeps a transient state out of a permanent verdict (cl-185). What
 		// is left are the questions only this host can answer.
-		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints.Working) {
+		disk := rental.Disk{HaveGB: m.disks[row.ID], SourceBytes: sourceBytes}
+		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints.Working, disk) {
 			if len(constraints.Requirements) > 0 || constraints.RequiresPython != "" {
 				if problem := rentalCompatibility(m.at(origin), row.ID, constraints); problem != nil {
 					c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + problem.Message
@@ -583,7 +591,7 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	if problem != nil {
 		return records.Rental{}, problem
 	}
-	row, _, _, problem := acquireRental(m.at(req.Hub), m.layout, m.store, sku.Name, sku.AcceleratorCount,
+	row, bought, _, problem := acquireRental(m.at(req.Hub), m.layout, m.store, sku.Name, sku.AcceleratorCount,
 		operationKey, rental.AcquisitionReason(req),
 		sku.PriceUSDMicrosPerHour, time.Time{}, req.ID,
 		func(seen hub.Rental) {
@@ -613,7 +621,21 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 					}})
 			}
 		})
+	if problem == nil {
+		m.observeDiskLocked(row.ID, bought)
+	}
 	return row, problem
+}
+
+// observeDiskLocked keeps the container disk a Hub view reports for a rental.
+func (m *managedRentals) observeDiskLocked(id string, seen hub.Rental) {
+	if seen.ContainerDiskGB <= 0 {
+		return
+	}
+	if m.disks == nil {
+		m.disks = map[string]int{}
+	}
+	m.disks[id] = seen.ContainerDiskGB
 }
 
 // pinText is a candidate's pin for a log line; the rung is named when the ladder chose.
@@ -1108,6 +1130,7 @@ func (m *managedRentals) reconcileRowsLocked(origin string) *exit.Error {
 			}
 			return observed
 		}
+		m.observeDiskLocked(row.ID, remote)
 		// Adopt the hub's reconciled billed rate (th-120): the burn this host
 		// reports and caps on must be what the provider actually charges.
 		if remote.HourlyRateUSDMicros > 0 {

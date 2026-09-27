@@ -383,12 +383,21 @@ func Attaching(candidates []orchestrator.PlacementCandidate) int {
 // the request settled FAILED on a fleet that was simply still booting.
 func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	row records.Rental, vramGB int64, needsAccelerator, offered, job bool,
-	working records.WorkingPeaks,
+	working records.WorkingPeaks, disk Disk,
 ) bool {
 	if needsAccelerator && row.AcceleratorModel == "CPU" {
 		c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
 		return false
 	}
+	// The disk the Hub bought is a fact about the machine, like its class. Too small is
+	// excluded; not reported is chosen only after the rentals known to fit.
+	need := disk.NeedGB()
+	if need > 0 && disk.HaveGB > 0 && disk.HaveGB < need {
+		c.Verdict = fmt.Sprintf("%s%s: %d GB disk, the ingest needs %d GB", orchestrator.VerdictExcluded,
+			orchestrator.ExcludedDiskShort, disk.HaveGB, need)
+		return false
+	}
+	c.DiskUnknown = need > 0 && disk.HaveGB == 0
 	// A machine the user already has up is held to the same memory floor as a buy; the
 	// catalog's figure for its product is the fact (a product gone from the catalog this
 	// minute decides nothing). Its GPU count is not held to the package's degrees: the
@@ -406,6 +415,29 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 		return false
 	}
 	return true
+}
+
+// Disk is an existing rental's container disk as the Hub reported it (0: not reported)
+// and the source bytes the request ingests there.
+type Disk struct {
+	HaveGB      int
+	SourceBytes int64
+}
+
+// ingestFixedGB is the disk an ingest pod spends beside its workload: the image, the OS
+// writable layer, caches and installs (the Hub's own fixed allowance).
+const ingestFixedGB = 21
+
+// NeedGB is the disk an ingest of SourceBytes needs, or 0 when it ingests nothing. The
+// fetched source and the converted output built from it (at least as large) share one
+// Store on the container disk.
+func (d Disk) NeedGB() int {
+	if d.SourceBytes <= 0 {
+		return 0
+	}
+	const bytesPerGB = 1_000_000_000
+	source := 1 + (d.SourceBytes-1)/bytesPerGB
+	return int(2*source) + ingestFixedGB
 }
 
 // Refusal names why nothing could be placed. The FIRST question is not which reason to
@@ -626,6 +658,9 @@ func Place(tier string, candidates []orchestrator.PlacementCandidate) int {
 }
 
 func prefers(tier string, a, b orchestrator.PlacementCandidate) bool {
+	if a.Attached() && b.Attached() && a.DiskUnknown != b.DiskUnknown {
+		return !a.DiskUnknown
+	}
 	if a.Measured {
 		if x, y := key(tier, a), key(tier, b); x != y {
 			return x < y
