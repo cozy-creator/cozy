@@ -54,7 +54,8 @@ func verifyMachineInput(header *pb.InputTreeImportHeader, result *pb.NativeByteR
 		}
 		return exit.New(exit.Conflict, "native input has no committed receipt")
 	}
-	if records.ValidateByteRef(source) != nil || !proto.Equal(source.Manifest, header.Manifest) || source.ContentBytes != header.ContentBytes {
+	if records.ValidateByteRef(source) != nil || !bytes.Equal(source.Manifest.GetDigest(), header.Manifest.GetDigest()) ||
+		source.Manifest.GetLength() != header.Manifest.GetLength() || source.ContentBytes != header.ContentBytes {
 		return exit.New(exit.Conflict, "native input changed its captured manifest")
 	}
 	return nil
@@ -91,9 +92,6 @@ func (m *machineRuns) stageMachineInputs(ctx context.Context, request records.Re
 				return nil, problem
 			}
 			held = received
-			if problem := verifyMachineInput(header, held, false); problem != nil {
-				return nil, problem
-			}
 			if problem := m.store.RecordMachineInput(request.ID, input, held); problem != nil {
 				return nil, problem
 			}

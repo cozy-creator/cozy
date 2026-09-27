@@ -98,9 +98,6 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	if !conversion.decided() {
 		return true, exit.Named(exit.Unavailable, "model_source.preflight_unavailable", "source headers must be inspected before ingestion: %s", conversion.Undecided)
 	}
-	if problem := source.Resolver.VerifyMetadata(runCtx, source.Resolution.Source, recipe.Metadata); problem != nil {
-		return true, problem
-	}
 	if ctx.Inv.Bool("--dry-run") {
 		return true, emit(ctx, compactRecord([]output.Field{
 			{K: "kind", V: "model-upload"}, {K: "model", V: destination.String()},

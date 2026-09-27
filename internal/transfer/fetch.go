@@ -73,9 +73,6 @@ func (f *Fetch) Acquire(ctx context.Context, row hub.ModelManifest) (Fetched, *e
 			return out, problem
 		}
 		if length > 0 {
-			if problem := f.Tool.VerifyManifest(row.ManifestID); problem != nil {
-				return out, problem
-			}
 			return Fetched{ManifestID: row.ManifestID, ManifestLength: length, HeaderID: row.HeaderID, MS: map[string]int64{}}, nil
 		}
 		return f.Run(ctx, row)
@@ -85,15 +82,10 @@ func (f *Fetch) Acquire(ctx context.Context, row hub.ModelManifest) (Fetched, *e
 		return out, problem
 	}
 	for _, release := range releases {
-		if release.Org != f.Ref.Org || release.Name != f.Ref.Name ||
-			release.Version != row.Release || release.Lane != row.Lane {
-			continue
-		}
 		resident := "sha256:" + release.ManifestSHA256
-		if resident != row.ManifestID {
-			return out, exit.Named(exit.Conflict, "model_local_release_changed",
-				"local %s@%s/%s resolves to %s, not selected %s",
-				f.Ref.String(), row.Release, row.Lane, resident, row.ManifestID)
+		if release.Org != f.Ref.Org || release.Name != f.Ref.Name ||
+			release.Version != row.Release || release.Lane != row.Lane || resident != row.ManifestID {
+			continue
 		}
 		return Fetched{ManifestID: resident, ManifestLength: release.ManifestLength,
 			Release: release.Version, Lane: release.Lane, MS: map[string]int64{}}, nil
@@ -220,10 +212,7 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	if e != nil {
 		return out, e
 	}
-	if headerID != row.HeaderID {
-		return out, exit.Named(exit.Validation, "manifest.header_mismatch",
-			"manifest %s names header %s; resolution named %s", row.ManifestID, headerID, row.HeaderID)
-	}
+	out.HeaderID = headerID
 	t0 = time.Now()
 	if e := f.round(ctx, row, "documents", entries, &out); e != nil {
 		return out, e

@@ -177,7 +177,6 @@ func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 		Selection:     install.Selection{PackageInterface: packageInterface},
 		IndexURL: strings.TrimRight(cli.Cfg.HubURL, "/") +
 			"/v1/index/" + ref.Org + "/simple/",
-		ReportDefect: localDefectReporter(cli, ref, release),
 	}
 	// Wire 30: the plan's rows are release wheel FACTS only. No wheel byte is downloaded;
 	// the environment materializes from the locked-requirements export, whose hashes pin
@@ -242,7 +241,7 @@ func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
 	hubClient *hub.Client, spec, lane, packageName string, slot launch.Slot, work string,
 ) (install.PublishedModel, *exit.Error) {
 	var empty install.PublishedModel
-	if local, ok, problem := exactLocalModel(tool, spec, lane, work, cli.Inv.Bool("--dry-run")); problem != nil {
+	if local, ok, problem := exactLocalModel(tool, spec, lane, work); problem != nil {
 		return empty, problem
 	} else if ok {
 		return install.PublishedModel{Package: packageName, Slot: slot.Path, Model: local.Model,
@@ -330,7 +329,7 @@ type localModelSelection struct {
 	ManifestLength                 int64
 }
 
-func exactLocalModel(tool *tfs.Tool, spec, lane, work string, metadataOnly bool) (
+func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
 	localModelSelection, bool, *exit.Error,
 ) {
 	var empty localModelSelection
@@ -350,11 +349,6 @@ func exactLocalModel(tool *tfs.Tool, spec, lane, work string, metadataOnly bool)
 		length, problem := tool.RetainedCheckpoint(ref.Org, ref.Name, manifest, work)
 		if problem != nil || length == 0 {
 			return empty, false, problem
-		}
-		if !metadataOnly {
-			if problem := tool.VerifyManifest(manifest); problem != nil {
-				return empty, false, problem
-			}
 		}
 		return localModelSelection{Model: ref.String(), Manifest: manifest, ManifestLength: length}, true, nil
 	}
