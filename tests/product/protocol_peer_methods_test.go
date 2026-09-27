@@ -2,7 +2,9 @@ package producttest
 
 import (
 	"context"
+
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc"
 )
 
 // The shared machine RPCs stay explicitly unsupported on these protocol fixtures.
@@ -90,4 +92,15 @@ func (p *standInPod) CollectMachineExecution(ctx context.Context, request *pb.Ma
 }
 func (p *standInPod) AcknowledgeMachineExecutionCollection(ctx context.Context, request *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
 	return p.UnimplementedWorkerControlServer.AcknowledgeMachineExecutionCollection(ctx, request)
+}
+
+type inputTreeImporter interface {
+	ImportInputTree(grpc.ClientStreamingServer[pb.InputTreeImportFrame, pb.NativeByteRetentionResult]) error
+}
+
+func (p *fakePod) ImportInputTree(stream grpc.ClientStreamingServer[pb.InputTreeImportFrame, pb.NativeByteRetentionResult]) error {
+	if importer, ok := p.machine.(inputTreeImporter); ok {
+		return importer.ImportInputTree(stream)
+	}
+	return p.UnimplementedPodHostServer.ImportInputTree(stream)
 }
