@@ -180,7 +180,25 @@ func releaseSnapshotReader(target Target) {
 	}
 }
 
+// isScriptTarget answers whether a run target names a Python script. A package ref never
+// ends in .py except a two-part org/name.py (a function is an identifier), so every other
+// .py target is a script, and org/name.py is one when that file exists.
 func isScriptTarget(value string) bool {
-	return strings.EqualFold(filepath.Ext(value), ".py") &&
-		(explicitPackageDirectory(value) || !strings.ContainsAny(value, `/\`))
+	if !strings.EqualFold(filepath.Ext(value), ".py") {
+		return false
+	}
+	if explicitPackageDirectory(value) || strings.Count(filepath.ToSlash(value), "/") != 1 {
+		return true
+	}
+	return scriptFileExists(value)
+}
+
+// ambiguousScriptTarget is a script target that could also be read as org/name.py.
+func ambiguousScriptTarget(value string) bool {
+	return !explicitPackageDirectory(value) && strings.Count(filepath.ToSlash(value), "/") == 1 && scriptFileExists(value)
+}
+
+func scriptFileExists(value string) bool {
+	info, err := os.Stat(value)
+	return err == nil && info.Mode().IsRegular()
 }
