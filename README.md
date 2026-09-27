@@ -222,9 +222,13 @@ cozy run paul/minimax-h3-tools/four-lane \
   --source-profile shared=hf/minimax-h3/shared-bf16/1 \
   --publish-to paul/minimax-h3 --rental-only --await
 
-cozy run org/quantize/convert --model.source=org/model@release/bf16 \
-  --input quantize.json --publish-to org/quantized --rental-only
+cozy run org/quantize/convert org/model@release/bf16 org/quantized --rental=otter
 ```
+
+A conversion job — one model input and at least one declared weight output — reads
+`cozy run <job> <input> [<org/model>]`: the first positional binds its model input, the
+second is the `--publish-to` destination (it may be the input's own repository). Each output
+becomes a checkpoint named by its output slot; publish lanes with `cozy model publish`.
 
 Rented uploads of complete Hugging Face repositories with a reviewed Runtime recipe use native
 download, TensorFS conversion, model-owned configuration/tokenizer preparation, and

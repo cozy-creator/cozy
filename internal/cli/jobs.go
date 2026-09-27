@@ -51,11 +51,21 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if problem != nil {
 		return problem
 	}
+	terms, destination, e := launch.ConversionTerms(target.Package+"/"+target.Function, job, ctx.Inv.Args[1:])
+	if e != nil {
+		return e
+	}
+	if destination != "" {
+		if named := ctx.Inv.Value("--publish-to"); named != "" && named != destination {
+			return exit.Usagef("destination %s disagrees with --publish-to=%s", destination, named)
+		}
+		ctx.Inv.Values["--publish-to"] = []string{destination}
+	}
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA before a job exists — the same
 	// client-side check `cozy run` makes, over the job's own declared request struct.
 	input, overrides, e := launch.ParsePayload(&launch.Entrypoint{
 		Name: job.Name, Request: job.Request, Result: job.Result, Models: job.Models,
-	}, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
+	}, terms, ctx.Inv.Value("--in"))
 	if e != nil {
 		return e
 	}
