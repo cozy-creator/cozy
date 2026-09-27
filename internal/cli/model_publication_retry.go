@@ -7,7 +7,7 @@ func handleRunRetryPublication(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	state, problem := client.RetryJobPublication(ctx.Inv.Args[0], "cozy run retry-publication")
+	state, problem := client.RetryJobPublication(ctx.Inv.Args[0], "cozy run retry-upload")
 	if problem != nil {
 		return problem
 	}

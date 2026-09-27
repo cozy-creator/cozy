@@ -242,7 +242,7 @@ func decodeModelFinalization(raw []byte) (CheckpointPublication, modelFinalizati
 	case "failed":
 		if view.Error == nil || view.Error.Code == "" {
 			return CheckpointPublication{}, view, exit.Named(exit.Failed,
-				"publication.finalization_failed", "Tensorhub failed model finalization")
+				"upload.finalization_failed", "Tensorhub failed model finalization")
 		}
 		failure := exit.Named(exit.Failed, view.Error.Code, "%s", view.Error.Message)
 		if view.Error.Remedy != "" {

@@ -257,6 +257,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/jobs/{id}/pause":                    s.pauseJob,
 		"POST /v1/local/jobs/{id}/resume":                   s.resumeJob,
 		"POST /v1/local/jobs/{id}/retry-publication":        s.retryJobPublication,
+		"POST /v1/local/jobs/{id}/uploads":                  s.uploadJobOutput,
 		"POST /v1/local/jobs/{id}/cancel":                   s.cancelJob,
 		"GET /{$}":                                          s.webUI,
 		"GET /app.css":                                      s.webUI,

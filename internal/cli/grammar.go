@@ -417,14 +417,15 @@ func (c *ModelDeleteCmd) Run(r *Runtime) error {
 }
 
 type RunCmd struct {
-	RetryPublication RunRetryPublicationCmd `cmd:"" help:"Retry a blocked model publication without rerunning its producer."`
-	Execute          RunExecuteCmd          `cmd:"" default:"withargs" hidden:""`
-	Cancel           RunCancelCmd           `cmd:"" help:"Cancel a queued or running run."`
-	Pause            RunPauseCmd            `cmd:"" help:"Pause a private transaction and retain its work. Rentals still shut down after 15 idle minutes; cozy rental keepalive <name> resets the deadline once."`
-	Resume           RunResumeCmd           `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
-	List             RunListCmd             `cmd:"" help:"List current and past runs."`
-	Watch            RunWatchCmd            `cmd:"" help:"Watch one recorded run until it settles."`
-	Show             RunShowCmd             `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, ranks, attention and its numeric probes."`
+	RetryUpload RunRetryUploadCmd `cmd:"" help:"Retry a blocked checkpoint upload without rerunning its producer."`
+	Upload      RunUploadCmd      `cmd:"" help:"Upload a run's retained output, from the rental holding it, as a private checkpoint in org/model without running it again."`
+	Execute     RunExecuteCmd     `cmd:"" default:"withargs" hidden:""`
+	Cancel      RunCancelCmd      `cmd:"" help:"Cancel a queued or running run."`
+	Pause       RunPauseCmd       `cmd:"" help:"Pause a private transaction and retain its work. Rentals still shut down after 15 idle minutes; cozy rental keepalive <name> resets the deadline once."`
+	Resume      RunResumeCmd      `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
+	List        RunListCmd        `cmd:"" help:"List current and past runs."`
+	Watch       RunWatchCmd       `cmd:"" help:"Watch one recorded run until it settles."`
+	Show        RunShowCmd        `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, ranks, attention and its numeric probes."`
 }
 
 type RunExecuteCmd struct {
@@ -467,12 +468,22 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--upload-to", c.UploadTo, "--allow-upload", c.AllowUpload, "--source-profile", c.SourceProfiles), !c.Describe)
 }
 
-type RunRetryPublicationCmd struct {
-	ID string `arg:"" name:"run" help:"Run id with a retained failed model publication."`
+type RunRetryUploadCmd struct {
+	ID string `arg:"" name:"run" help:"Run id with a retained failed checkpoint upload."`
 }
 
-func (c *RunRetryPublicationCmd) Run(r *Runtime) error {
+func (c *RunRetryUploadCmd) Run(r *Runtime) error {
 	return r.call(handleRunRetryPublication, []string{c.ID}, nil, nil, true)
+}
+
+type RunUploadCmd struct {
+	Output      string `arg:"" name:"run[#output]" help:"Run number or id; name the output when the run retains more than one."`
+	Destination string `arg:"" name:"model" help:"Tensorhub model repository (org/name) for the private checkpoint."`
+	Await       bool   `help:"Wait until the checkpoint is uploaded."`
+}
+
+func (c *RunUploadCmd) Run(r *Runtime) error {
+	return r.call(handleRunUpload, []string{c.Output, c.Destination}, bools("--await", c.Await), nil, true)
 }
 
 type RunCancelCmd struct {

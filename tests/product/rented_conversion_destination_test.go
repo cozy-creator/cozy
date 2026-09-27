@@ -401,7 +401,7 @@ func TestRentedConversionPublishesFromTheMachineThatIngestedItsSource(t *testing
 	machine.mu.Unlock()
 	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "steps=8",
 		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
-	if code == 0 || !strings.Contains(out, "publication.destination_unpublished") || !strings.Contains(out, "0.18.52") {
+	if code == 0 || !strings.Contains(out, "upload.destination_missing") || !strings.Contains(out, "0.18.52") {
 		t.Fatalf("an unpublished destination was reported as a success [exit %d]: %s", code, out)
 	}
 	// After the Runtime update the same command runs again rather than replaying that run.

@@ -125,13 +125,19 @@ func (s *Store) RentalHasLiveMachineExecutions(id string) (bool, *exit.Error) {
 	return live, nil
 }
 
-// RentalRetainedModelBytes estimates the disk the rental's collected machine models hold:
-// each retaining ingest's converted output is at least as large as its planned source.
+// RentalRetainedModelBytes is the disk the rental's held machine models take: what each
+// output's write added, as its native receipt reported it. A hold recorded before that
+// was counted keeps the estimate that an ingest's output is at least its planned source.
 func (s *Store) RentalRetainedModelBytes(id string) (int64, *exit.Error) {
 	var total int64
-	err := s.db.QueryRow(`SELECT COALESCE(SUM(COALESCE((SELECT SUM(length) FROM request_model_transfer_files f WHERE f.request_id=r.id),0)
- + COALESCE((SELECT source_bytes FROM request_planned_sources p WHERE p.request_id=r.id),0)),0)
- FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE (e.machine_id=? OR r.worker=?) AND `+machineModelRetentionOwed, id, id).Scan(&total)
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(CASE WHEN written>0 THEN written ELSE estimate END),0) FROM (
+ SELECT (SELECT COALESCE(SUM(json_extract(hold.payload,'$.bytes')),0) FROM request_events hold
+   WHERE hold.request_id=r.id AND hold.type='machine.model_retention' AND json_extract(hold.payload,'$.state')!='released'
+   AND NOT EXISTS(SELECT 1 FROM request_events newer WHERE newer.request_id=hold.request_id AND newer.type=hold.type
+   AND newer.seq>hold.seq AND json_extract(newer.payload,'$.retention_id')=json_extract(hold.payload,'$.retention_id'))) AS written,
+ COALESCE((SELECT SUM(length) FROM request_model_transfer_files f WHERE f.request_id=r.id),0)
+ + COALESCE((SELECT source_bytes FROM request_planned_sources p WHERE p.request_id=r.id),0) AS estimate
+ FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE (e.machine_id=? OR r.worker=?) AND `+machineModelRetentionOwed+`)`, id, id).Scan(&total)
 	if err != nil {
 		return 0, exit.Internalf("cannot total retained rented model bytes: %s", err)
 	}

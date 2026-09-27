@@ -384,8 +384,8 @@ inspected headers, and uses the existing source preparation and checkpoint-custo
 A successful model producer remains `finalizing` while output publication is incomplete,
 including after an upload failure. Its receipts, worker custody and rental remain held;
 no outcome acknowledgement or automatic rental release occurs before publication succeeds
-or explicit cancellation finishes cleanup. `cozy run retry-publication <job>` (or the
-retry-publication route with an optional `actor`) retries the failed publication with the
+or explicit cancellation finishes cleanup. `cozy run retry-upload <job>` (or the
+retry-publication route with an optional `actor`) retries the failed upload with the
 same request, attempt, receipts and per-object transfer identities. It does not rerun the
 producer. `cozy run cancel <job>` abandons unfinished destination holds and then settles
 cancellation; already uploaded checkpoints remain uploaded. Both decisions survive a
