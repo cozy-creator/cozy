@@ -111,10 +111,21 @@ func TestPublishedRentalSelectsOneModelPerSlot(t *testing.T) {
 
 // publishWorkflowRelease replaces proof/h3@1.0.0 with a torch-free release whose serving
 // entrypoint is invocable by a CPU `long_form` job, and publishes its exact install plan
-// and the bf16 checkpoint's exact-digest resolution.
-func publishWorkflowRelease(t *testing.T, h *ladderHub) {
+// and the bf16 checkpoint's exact-digest resolution. `degrees` are the sequence-parallel
+// degrees its serving model slot declares.
+func publishWorkflowRelease(t *testing.T, h *ladderHub, degrees ...int) {
 	t.Helper()
-	iface, err := canonical.NormalizeJCS([]byte(`{"application":"h3:app","entrypoints":[{"invocable":{"context":"ctx","defaults":{},"enum_members":{},"export":"generate","module":"h3","parameters":["steps"],"type_names":{}},"models":[{"class":"H3","component_use":{"condition_text":["text_encoder"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"]},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"long_form.models.source"}],"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`))
+	raw := []byte(`{"application":"h3:app","entrypoints":[{"invocable":{"context":"ctx","defaults":{},"enum_members":{},"export":"generate","module":"h3","parameters":["steps"],"type_names":{}},"models":[{"class":"H3","component_use":{"condition_text":["text_encoder"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"]},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"long_form.models.source"}],"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	if len(degrees) > 0 {
+		var doc map[string]any
+		must(t, json.Unmarshal(raw, &doc))
+		slot := doc["entrypoints"].([]any)[0].(map[string]any)["models"].([]any)[0].(map[string]any)
+		slot["sequence_parallel"] = map[string]any{"degrees": degrees}
+		var err error
+		raw, err = json.Marshal(doc)
+		must(t, err)
+	}
+	iface, err := canonical.NormalizeJCS(raw)
 	must(t, err)
 	exact := func(raw []byte) hub.ExactDocument {
 		return hub.ExactDocument{CanonicalBytes: raw, Digest: mustSpell(raw), Length: int64(len(raw))}

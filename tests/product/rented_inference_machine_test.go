@@ -36,13 +36,19 @@ type runtimeMachine struct {
 	events     []*pb.MachineExecutionEvent
 	state      *pb.MachineExecutionState
 
-	// cpuSlotModelInputs is what this Runtime reports in its workspace.
+	// cpuSlotModelInputs, exactGPUs and devices are what this Runtime reports in its workspace.
 	cpuSlotModelInputs bool
+	exactGPUs          bool
+	devices            int
 }
 
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
-	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs}, nil
+	workspace := &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
+		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs, ExactExecutionGpus: m.exactGPUs}
+	for ordinal := range m.devices {
+		workspace.Devices = append(workspace.Devices, &pb.MachineDevice{Ordinal: uint32(ordinal), Name: "fake-4090"})
+	}
+	return workspace, nil
 }
 
 // runtimeExecutionID is Runtime's execution identity grammar (workspace_executions.py `_ID`).
@@ -193,7 +199,7 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 
 	submission := machine.submitted()
 	set := submission.PreparedState.GetPlacementSet()
-	if set == nil || len(set.DevicePins) != 0 {
+	if set == nil || len(set.DevicePins) != 0 || set.ExecutionGpus != 0 {
 		t.Fatalf("the root was not submitted against its prepared placement alone: %+v", submission.PreparedState)
 	}
 	placements, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
@@ -247,12 +253,13 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 	}
 }
 
-// rentedLadderMachine publishes the ladder package and attaches `pod` as the ready rental
-// "tessa", as many fake-4090 cards wide as its deviceCount, then starts the daemon.
-// `before` runs against the store while nothing else holds it.
-func rentedLadderMachine(t *testing.T, h *ladderHub, pod *fakePod, before func(*records.Store)) (string, home.Layout) {
+// rentedLadderMachine publishes the ladder package, its model slot declaring `degrees`, and
+// attaches `pod` as the ready rental "tessa", as many fake-4090 cards wide as its
+// deviceCount, then starts the daemon. `before` runs against the store while nothing else
+// holds it.
+func rentedLadderMachine(t *testing.T, h *ladderHub, pod *fakePod, before func(*records.Store), degrees ...int) (string, home.Layout) {
 	t.Helper()
-	publishWorkflowRelease(t, h)
+	publishWorkflowRelease(t, h, degrees...)
 	var detail hub.PackageReleaseDetail
 	response, err := http.Get(h.server.URL + "/v1/packages/proof/h3/releases/1.0.0")
 	must(t, err)
