@@ -9,7 +9,7 @@ use tensorfs_core::err::{Code, Refusal};
 use tensorfs_core::gc;
 use tensorfs_core::header::{Body, Header};
 use tensorfs_core::ids::{hex64, prefixed, Doc, ObjectRef};
-use tensorfs_core::manifest::{Entry, Manifest};
+use tensorfs_core::manifest::Manifest;
 use tensorfs_core::reclaim;
 use tensorfs_core::repository::{self, Mutation, Repository};
 use tensorfs_core::storage::{
@@ -738,13 +738,7 @@ pub fn cmd_manifest_inspect(path: &Path, flags: &Flags) -> ExitCode {
         .iter()
         .map(|(path, entry)| {
             tensorfs_core::canon::write(&Value::obj(vec![
-                (
-                    "kind",
-                    Value::str(match entry {
-                        Entry::File(_) => "file",
-                        Entry::CozyTensors(_) => "cozytensors",
-                    }),
-                ),
+                ("kind", Value::str(entry.kind())),
                 ("length", Value::uint(entry.blob().length)),
                 ("path", Value::str(path.clone())),
                 ("sha256", Value::str(entry.blob().sha256.clone())),
@@ -855,7 +849,7 @@ fn closure_refs(
     // Runtime roles precede ordinary snapshot paths so an aliased README/sample path cannot
     // relabel a required config, model asset, or tensor part as an ignorable file.
     for (_, entry) in manifest.entries() {
-        if let Entry::File(object) = entry {
+        if let Some(object) = entry.content() {
             insert(&mut refs, "file", object)?;
         }
     }
@@ -1206,7 +1200,7 @@ pub fn cmd_reclaim_run(root: &Path, flags: &Flags) -> ExitCode {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use tensorfs_core::manifest::Draft;
+    use tensorfs_core::manifest::{Draft, Entry};
 
     #[test]
     fn inspect_closure_preserves_runtime_roles_over_aliased_files() {
@@ -1246,10 +1240,7 @@ mod tests {
         let file_ids: HashSet<&str> = manifest
             .entries()
             .iter()
-            .filter_map(|(_, entry)| match entry {
-                Entry::File(object) => Some(object.sha256.as_str()),
-                Entry::CozyTensors(_) => None,
-            })
+            .filter_map(|(_, entry)| entry.content().map(|object| object.sha256.as_str()))
             .collect();
 
         assert!(header.assets.iter().any(|(_, asset)| asset
@@ -1268,11 +1259,11 @@ mod tests {
             .filter(|(kind, _)| *kind != "file")
             .map(|(_, object)| object.sha256.as_str())
             .collect();
-        assert!(manifest.entries().iter().any(|(_, entry)| match entry {
-            Entry::File(object) => {
+        assert!(manifest
+            .entries()
+            .iter()
+            .any(|(_, entry)| entry.content().is_some_and(|object| {
                 !runtime_ids.contains(object.sha256.as_str()) && refs[&object.sha256].0 == "file"
-            }
-            Entry::CozyTensors(_) => false,
-        }));
+            })));
     }
 }

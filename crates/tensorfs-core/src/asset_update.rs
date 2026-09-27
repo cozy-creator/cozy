@@ -11,7 +11,7 @@ use crate::checkpoint;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::Asset;
 use crate::ids::ObjectRef;
-use crate::manifest::{Entry, Manifest};
+use crate::manifest::Manifest;
 use crate::store::Store;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,13 +42,7 @@ fn source_object(manifest: &Manifest, path: &str) -> Result<ObjectRef> {
         .entries()
         .iter()
         .find_map(|(candidate, entry)| {
-            (candidate == path).then(|| match entry {
-                Entry::File(object) => Ok(object.clone()),
-                Entry::CozyTensors(_) => Err(Refusal {
-                    code: Code::WRONG_TYPE,
-                    detail: format!("asset source {path:?} is a CozyTensors header, not a file"),
-                }),
-            })
+            (candidate == path).then(|| entry.materializable(path).cloned())
         })
         .unwrap_or_else(|| {
             Err(Refusal {
@@ -187,6 +181,7 @@ mod tests {
     use crate::checkpoint;
     use crate::header::{Body, Header, Part, Tensor};
     use crate::manifest::Draft;
+    use crate::manifest::Entry;
     use crate::store::Fault;
     use crate::{dtype::Dtype, registry};
 

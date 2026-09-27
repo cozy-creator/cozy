@@ -96,19 +96,6 @@ fn a_newer_manifest_reads_keeps_its_identity_and_its_named_objects() {
 }
 
 #[test]
-fn an_unknown_entry_kind_is_still_refused() {
-    let file = ObjectRef::of(b"x");
-    let text = format!(
-        r#"{{"entries":[{{"blob":{},"kind":"symlink","path":"a"}}]}}"#,
-        object(&file)
-    );
-    assert_eq!(
-        Manifest::parse(text.as_bytes()).unwrap_err().code,
-        Code::UNKNOWN_FIELD
-    );
-}
-
-#[test]
 fn a_newer_repository_survives_an_older_writers_mutation() {
     let root = temporary("repository");
     let store = Store::init(&root).unwrap();
@@ -163,5 +150,48 @@ fn a_newer_repository_survives_an_older_writers_mutation() {
 
     gc::collect(&root, false).unwrap();
     assert!(store.contains(&pinned.sha256));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_unknown_entry_kind_is_carried_and_kept_and_refuses_only_to_materialize() {
+    let root = temporary("opaque-entry");
+    let store = Store::init(&root).unwrap();
+    let file = blob(&store, b"ordinary");
+    let link = blob(&store, b"target of an entry kind this build does not know");
+    let text = format!(
+        r#"{{"entries":[{{"blob":{},"kind":"file","path":"a.txt"}},{{"blob":{},"kind":"symlink","path":"b"}}]}}"#,
+        object(&file),
+        object(&link)
+    );
+    let manifest = Manifest::parse(text.as_bytes()).unwrap();
+    assert_eq!(manifest.canonical_bytes(), text.as_bytes());
+    let put = store.put_manifest(&manifest).unwrap();
+    store
+        .apply_repository(
+            None,
+            &Mutation::PutCheckpoint {
+                repo: RepositoryName::new("acme", "opaque").unwrap(),
+                manifest: put.obj.clone(),
+            },
+            &Fault::default(),
+        )
+        .unwrap();
+    gc::collect(&root, false).unwrap();
+    assert!(
+        store.contains(&link.sha256),
+        "GC deleted an opaque entry's object"
+    );
+
+    assert_eq!(
+        tensorfs_core::project::ordinary_file(&manifest, "a.txt").unwrap(),
+        &file
+    );
+    assert_eq!(
+        tensorfs_core::project::ordinary_file(&manifest, "b")
+            .unwrap_err()
+            .code,
+        Code::UNKNOWN_FIELD
+    );
     let _ = fs::remove_dir_all(root);
 }

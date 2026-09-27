@@ -12,7 +12,7 @@ use crate::canon::{Fields, Value};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Header};
 use crate::ids::{hex64, Doc, ObjectRef};
-use crate::manifest::{Entry, Manifest};
+use crate::manifest::Manifest;
 use crate::repository::{Checkpoint, Release, ReleaseLane, Repository, RepositoryName};
 
 fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
@@ -412,7 +412,7 @@ impl Census {
         // may skip `file`, so inserting files first would make a required config, model asset,
         // or tensor part disappear from their runtime closure.
         for (_, entry) in manifest.entries() {
-            if let Entry::File(object) = entry {
+            if let Some(object) = entry.content() {
                 insert_ref(&mut objects, "file", object)?;
             }
         }
@@ -1116,7 +1116,7 @@ impl Census {
         }
         if !runtime_only {
             for (_, entry) in manifest.entries() {
-                if let Entry::File(object) = entry {
+                if let Some(object) = entry.content() {
                     insert_ref(&mut objects, "file", object)?;
                 }
             }

@@ -523,17 +523,14 @@ pub fn walk(store: &Store, snap: &Manifest) -> Result<Walk> {
         .map(|r| (r.obj.sha256.clone(), r.obj.length))
         .collect();
     for (path, e) in snap.entries() {
-        match e {
-            crate::manifest::Entry::File(o) => {
-                if !accounted.contains(&(o.sha256.clone(), o.length)) {
-                    w.siblings.push(path.clone());
-                    w.objects.push(Reached {
-                        kind: "asset",
-                        obj: o.clone(),
-                    });
-                }
+        if let Some(o) = e.content() {
+            if !accounted.contains(&(o.sha256.clone(), o.length)) {
+                w.siblings.push(path.clone());
+                w.objects.push(Reached {
+                    kind: "asset",
+                    obj: o.clone(),
+                });
             }
-            crate::manifest::Entry::CozyTensors(_) => {}
         }
     }
     Ok(w)

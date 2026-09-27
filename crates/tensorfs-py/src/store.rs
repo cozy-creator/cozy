@@ -2008,6 +2008,9 @@ impl PyStore {
         let (m, _, _) = self.load(py, hex)?;
         let entry = m.entries().iter().find(|(p, _)| p == path);
         let blob = match entry {
+            Some((_, entry @ Entry::Other { .. })) => {
+                return Err(to_py(py, &entry.materializable(path).unwrap_err()))
+            }
             Some((_, Entry::File(blob))) => blob.clone(),
             Some((_, Entry::CozyTensors(_))) => {
                 return Err(to_py(

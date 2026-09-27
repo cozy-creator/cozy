@@ -941,7 +941,7 @@ fn validate_companion_paths(paths: &mut [String]) -> Result<()> {
 fn companion_files(
     declaration: &Declaration,
     sources: &[SourceData],
-) -> Result<BTreeMap<String, ObjectRef>> {
+) -> Result<BTreeMap<String, Entry>> {
     let mut files = BTreeMap::new();
     let explicit: HashSet<_> = declaration
         .files
@@ -958,7 +958,10 @@ fn companion_files(
             .collect();
         backing.insert((source.fact.header.sha256.clone(), source.fact.header.length));
         for (path, entry) in source.manifest.entries() {
-            let Entry::File(object) = entry else { continue };
+            // Entries a newer TensorFS wrote travel with their kind unchanged.
+            let Some(object) = entry.content() else {
+                continue;
+            };
             // A named asset is an explicit semantic role, even when CAS deduplication
             // makes its bytes identical to a tensor part. Only unindexed backing aliases
             // disappear from the derived manifest.
@@ -972,8 +975,8 @@ fn companion_files(
             {
                 continue;
             }
-            if let Some(previous) = files.insert(path.clone(), object.clone()) {
-                if previous != *object {
+            if let Some(previous) = files.insert(path.clone(), entry.clone()) {
+                if previous != *entry {
                     return refuse(Code::TRANSACTION_CONFLICT,
                         format!("sources disagree on companion {path:?}; explicitly declare replacement bytes"));
                 }
@@ -984,7 +987,7 @@ fn companion_files(
         declaration
             .files
             .iter()
-            .map(|(path, data)| (path.clone(), ObjectRef::of(data))),
+            .map(|(path, data)| (path.clone(), Entry::File(ObjectRef::of(data)))),
     );
     let mut paths: Vec<_> = files
         .keys()
@@ -2063,15 +2066,17 @@ fn build_header(
         configs,
         assets: companion_files(declaration, sources)?
             .into_iter()
-            .filter(|(_, object)| object.length != 0)
-            .map(|(path, object)| {
-                let asset = Asset {
-                    logical_sha256: object.sha256.clone(),
-                    logical_length: object.length,
-                    media_type: "application/octet-stream".into(),
-                    segments: vec![object],
-                };
-                (path, asset)
+            .filter_map(|(path, entry)| match entry {
+                Entry::File(object) if object.length != 0 => {
+                    let asset = Asset {
+                        logical_sha256: object.sha256.clone(),
+                        logical_length: object.length,
+                        media_type: "application/octet-stream".into(),
+                        segments: vec![object],
+                    };
+                    Some((path, asset))
+                }
+                _ => None,
             })
             .collect(),
         encodings,
@@ -3297,11 +3302,9 @@ pub fn commit(
             &crate::store::Fault::default(),
         )?;
     }
-    manifest.entries.extend(
-        companion_files(&declaration, &sources)?
-            .into_iter()
-            .map(|(path, object)| (path, Entry::File(object))),
-    );
+    manifest
+        .entries
+        .extend(companion_files(&declaration, &sources)?);
     manifest.entries.sort_by(|a, b| a.0.cmp(&b.0));
     let manifest = manifest.seal()?;
     let manifest_ref = store.put_manifest(&manifest)?.obj;

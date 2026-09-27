@@ -110,7 +110,7 @@ pub fn checkout(
                 crate::checkpoint::load_header(store, blob)?;
                 (blob, true)
             }
-            Entry::File(blob) => (blob, false),
+            other => (other.materializable(virtual_path)?, false),
         };
         let source = store.blob_path(&blob.sha256);
         let metadata = fs::metadata(&source).map_err(|error| {
@@ -181,11 +181,11 @@ pub fn ordinary_file<'a>(manifest: &'a Manifest, path: &str) -> Result<&'a Objec
         .iter()
         .find(|(candidate, _)| candidate == path)
     {
-        Some((_, Entry::File(blob))) => Ok(blob),
         Some((_, Entry::CozyTensors(_))) => refuse(
             Code::PROJECTION_WEIGHT_PATH,
             "materialize selects ordinary files only",
         ),
+        Some((_, entry)) => entry.materializable(path),
         None => refuse(
             Code::NOT_CONTAINED,
             format!("manifest has no path {path:?}"),
