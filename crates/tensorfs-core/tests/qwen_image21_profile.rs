@@ -160,7 +160,7 @@ fn qwen_image21_refuses_missing_shard_before_payload_transfer() {
 }
 
 #[test]
-fn qwen_image21_refuses_same_keys_with_changed_precision() {
+fn qwen_image21_same_keys_at_another_precision_classify_by_key_set() {
     let mut heads = heads();
     for row in &mut heads {
         if row.member.starts_with("transformer/") && row.member.ends_with(".safetensors") {
@@ -181,15 +181,16 @@ fn qwen_image21_refuses_same_keys_with_changed_precision() {
             row.head[8..].copy_from_slice(&encoded);
         }
     }
+    // Owner ruling: the reviewed key set and component classify; conversion validates dtypes.
     let path = scratch("precision");
-    let error = preflight::plan(
+    let decision = preflight::plan(
         BUILTIN_REGISTRY,
         BUILTIN_REGISTRY_BYTES,
         &heads,
         &[PROFILE.into()],
         &path,
     )
-    .unwrap_err();
-    assert_eq!(error.code, Code::UNREGISTERED_FINGERPRINT);
+    .unwrap();
+    assert_eq!(decision.plans[0].constructs, 1285);
     assert!(!path.exists());
 }
