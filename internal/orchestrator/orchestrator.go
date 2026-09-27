@@ -1040,6 +1040,11 @@ func (c *Orchestrator) reviveQueue() {
 		if machine == "" {
 			machine = req.RequestedRental
 		}
+		if machine == "" && req.Rental {
+			// The fleet places an unassigned --rental request, not a local card: only
+			// requests for the same placement slot wait on one another.
+			machine = "rental/" + requestSlot(*req)
+		}
 		if asked[machine] {
 			continue
 		}

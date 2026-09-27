@@ -708,7 +708,6 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 			req.Worker = ""
 		}
 	}
-	var guards []string
 	if req.Rental && req.Worker == "" {
 		// This request is QUEUED — no lane, local or rental, could take it at routing
 		// time. An attached rental that staged the plan is capacity `drain` routes onto
@@ -739,60 +738,91 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 		if rentalHolds || staging {
 			return false
 		}
-		guards = append(guards, guard)
-		unguard := func() {
-			c.mu.Lock()
-			delete(c.starting, guard)
-			c.mu.Unlock()
-		}
-		line, problem := c.opt.RentalFleet(req)
-		if problem != nil {
-			unguard()
-			if deferred, _ := c.deferUnavailable(req, problem); deferred {
-				return false
+		// The purchase can take a pod's whole boot. It runs on its own goroutine, so
+		// daemon startup, a queue revive and an HTTP activation never wait on it.
+		go func() {
+			if placed, ok := c.placeOnRental(req, guard); ok {
+				c.prepareOn(placed, []string{guard})
 			}
-			c.failPreparation(req, problem, "")
-			return false
-		}
-		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
-		// --rental is permission AND intent to spend (owner ruling 2026-09-03): local
-		// could not take the request now and no ready rental holds its placement, so the
-		// fleet places it by expected time and cost — on an attached rental or a bought
-		// pod (placement-economics.md).
-		decision, after, problem := c.opt.AcquireManagedRental(req)
-		if problem != nil {
-			unguard()
-			// A refusal is a decision too (cl-174): its record is durable before the
-			// request parks or fails, once per distinct park.
-			deferred, news := c.deferUnavailable(req, problem)
-			if len(decision.Candidates) > 0 && (news || !deferred) {
-				c.LogPlacement(req, decision)
-			}
-			if deferred {
-				return false
-			}
-			c.failPreparation(req, problem, "")
-			return false
-		}
-		if after != "" {
-			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": after})
-		}
-		if decision.RentalID == "" {
-			// The fleet waits on a fitting rental whose worker has not attached (cl-170):
-			// the record is written once per distinct wait, and the fleet's next
-			// observation re-asks.
-			unguard()
-			if c.parkFor(req, decision.Line()) {
-				c.LogPlacement(req, decision)
-			}
-			return false
-		}
-		req.Worker = decision.RentalID
-		if decision.Models != nil {
-			req.Models = decision.Models
-		}
-		c.LogPlacement(req, decision)
+		}()
+		return true
 	}
+	return c.prepareOn(req, nil)
+}
+
+// AwaitRental says why a queued request waits while the fleet buys its machine.
+func (c *Orchestrator) AwaitRental(requestID, machine string) {
+	req, problem := c.opt.Store.RequestRow(requestID)
+	position := c.QueuePosition(requestID)
+	if problem != nil || req == nil || position == 0 {
+		return
+	}
+	c.park(*req, position-1, waitFacts{cause: WaitRental, on: machine},
+		"waiting for rental "+machine+" to become ready")
+}
+
+// placeOnRental asks the fleet to place a queued --rental request, buying a pod when
+// that is the choice; the request waits, with its reason said, for as long as that takes.
+// It answers the request pinned to its rental, or false when it waits, parks or fails.
+func (c *Orchestrator) placeOnRental(req records.Request, guard string) (records.Request, bool) {
+	unguard := func() {
+		c.mu.Lock()
+		delete(c.starting, guard)
+		c.mu.Unlock()
+	}
+	line, problem := c.opt.RentalFleet(req)
+	if problem != nil {
+		unguard()
+		if deferred, _ := c.deferUnavailable(req, problem); deferred {
+			return req, false
+		}
+		c.failPreparation(req, problem, "")
+		return req, false
+	}
+	c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
+	// --rental is permission AND intent to spend (owner ruling 2026-09-03): local
+	// could not take the request now and no ready rental holds its placement, so the
+	// fleet places it by expected time and cost — on an attached rental or a bought
+	// pod (placement-economics.md).
+	decision, after, problem := c.opt.AcquireManagedRental(req)
+	if problem != nil {
+		unguard()
+		// A refusal is a decision too (cl-174): its record is durable before the
+		// request parks or fails, once per distinct park.
+		deferred, news := c.deferUnavailable(req, problem)
+		if len(decision.Candidates) > 0 && (news || !deferred) {
+			c.LogPlacement(req, decision)
+		}
+		if deferred {
+			return req, false
+		}
+		c.failPreparation(req, problem, "")
+		return req, false
+	}
+	if after != "" {
+		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": after})
+	}
+	if decision.RentalID == "" {
+		// The fleet waits on a fitting rental whose worker has not attached (cl-170):
+		// the record is written once per distinct wait, and the fleet's next
+		// observation re-asks.
+		unguard()
+		if c.parkFor(req, decision.Line()) {
+			c.LogPlacement(req, decision)
+		}
+		return req, false
+	}
+	req.Worker = decision.RentalID
+	if decision.Models != nil {
+		req.Models = decision.Models
+	}
+	c.LogPlacement(req, decision)
+	return req, true
+}
+
+// prepareOn launches or selects the worker for a request whose venue is decided: local,
+// or the rental it is pinned to. guards are the placement flags it takes over.
+func (c *Orchestrator) prepareOn(req records.Request, guards []string) bool {
 	// A JOB names its own slot — one worker per (package, job function) — so the
 	// "already starting" and "already resident" questions are asked about that slot and
 	// not about the package. Without this, submitting a job while a serving worker of

@@ -694,6 +694,7 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", orchestrator.MachineLabel(sku.Name, sku.AcceleratorCount), skuRate(sku), pinText(c))
 	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
 	m.mu.Unlock()
+	m.owner.AwaitRental(req.ID, purchase.machine)
 	row, bought, _, problem := purchase.complete(context.Background(), func(seen hub.Rental) {
 		// A failure carried by a rental that is BACK in pending_acquisition is the
 		// hub saying "that one did not work; I am buying again". The detail names
