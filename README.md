@@ -194,6 +194,26 @@ the number is the caller's job; refusing against it is TensorFS's.
 never weather: retrying it fails at the same byte forever, which is exactly what the
 generic `IO_FAILED` an out-of-space write used to raise bought on rented hardware.
 
+## Durability
+
+What an admission pays to be crash-safe is decided by the filesystem the Store lives on
+(`statfs` of the root, Linux), never by a flag or an environment variable. `store info` prints
+`durability: <class> (<filesystem>)`.
+
+| class | filesystems | admission |
+|---|---|---|
+| ephemeral | tmpfs, ramfs, overlayfs (a container's disk) | no fsync at all: the disk dies with the pod |
+| persistent | ext4, xfs, btrfs, zfs, anything unrecognised, every non-Linux OS | a pull: no per-object fsync; its own objects are fsynced together, in parallel, every 8 GiB and at its end; anything else: per-object fsync |
+| network | NFS, SMB, FUSE, Ceph, 9p, AFS, Lustre, GPFS, ... | unchanged: each object is flushed before its name is published (close-to-open) |
+
+A persistent pull first writes a durable marker, `tmp/unsynced/<boot-id>.<pid>.<n>.marker`,
+naming when it began. After an unclean shutdown the first open of the Store finds a marker from an
+earlier boot, rehashes every object not older than it, removes the torn ones (the next pull fetches
+them again), and only then returns a handle. A marker a killed process left in the same boot needs
+no rehash; the next pull to finish fsyncs the objects not older than it and retires it. Nothing
+uses `syncfs`: on a shared filesystem it also waits for every other writer's pages. `tfs fetch`'s `pull.streams` event carries
+`durability: {class, filesystem, syncs, sync_seconds, recovery}`.
+
 ## Reclamation
 
 `gc` collects what nothing names. **`reclaim` chooses what to stop naming.** Two acts, two

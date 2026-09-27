@@ -8,7 +8,10 @@
 //!
 //! Admission is `writing → verified-temp → installed`: temp in `tmp/`, hash while writing,
 //! fsync, 0444, then a no-clobber `link()` into place plus a parent-directory fsync. A
-//! crash at any stage leaves a temp, never a partial object under `objects/`.
+//! crash at any stage leaves a temp, never a partial object under `objects/`. Which of those
+//! syncs an admission pays depends on the disk the Store lives on ([`crate::disk`]): none on
+//! an ephemeral one, and on a persistent one none inside a pull, whose batch sync
+//! covers them ([`crate::unsynced`]).
 //!
 //! `contains` is a PRESENCE HINT and nothing more. Trusting bytes requires a durable
 //! verification record bound to object id, length, file identity (dev, ino), size and
@@ -305,6 +308,10 @@ pub struct Store {
     budget: Option<u64>,
     /// This process's verified-blob index for the catalog, shared with every other handle.
     trust: std::sync::Arc<crate::catalog::Trust>,
+    /// The filesystem this Store lives on, and so what a crash can take from it.
+    disk: crate::disk::Filesystem,
+    /// The pull whose batch sync covers this handle's admissions (persistent disk).
+    epoch: Option<std::sync::Arc<crate::unsynced::Epoch>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -313,6 +320,7 @@ impl std::fmt::Debug for Store {
             .field("root", &self.root)
             .field("observed", &self.progress.is_some())
             .field("repo_cache", &self.cache.as_ref().map(|c| c.root()))
+            .field("disk", &self.disk)
             .finish()
     }
 }
@@ -518,6 +526,8 @@ impl Store {
             cache: read_repo_cache_binding(root),
             budget: read_disk_budget(root),
             trust: crate::catalog::Trust::of(root),
+            disk: crate::disk::filesystem(root),
+            epoch: None,
         })
     }
 
@@ -547,6 +557,45 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The filesystem this Store lives on. See [`crate::disk`].
+    pub fn disk(&self) -> crate::disk::Filesystem {
+        self.disk
+    }
+
+    pub fn disk_class(&self) -> crate::disk::DiskClass {
+        self.disk.class
+    }
+
+    /// Whether an admission makes its own bytes and name durable before it reports: not on
+    /// an ephemeral disk, and not under a pull's epoch, whose batch sync covers them.
+    pub(crate) fn flushes(&self) -> bool {
+        match self.disk.class {
+            crate::disk::DiskClass::Ephemeral => false,
+            crate::disk::DiskClass::Network => true,
+            crate::disk::DiskClass::Persistent => self.epoch.is_none(),
+        }
+    }
+
+    /// The same Store, its admissions covered by `epoch`.
+    pub(crate) fn syncing(&self, epoch: Option<std::sync::Arc<crate::unsynced::Epoch>>) -> Store {
+        Store {
+            epoch,
+            ..self.clone()
+        }
+    }
+
+    /// The same Store as if it lived on a disk of `class`: benchmarks of one real disk.
+    #[cfg(test)]
+    pub(crate) fn with_disk_class(self, class: crate::disk::DiskClass) -> Store {
+        Store {
+            disk: crate::disk::Filesystem {
+                class,
+                kind: "injected",
+            },
+            ..self
+        }
     }
 
     pub(crate) fn trust(&self) -> &crate::catalog::Trust {
@@ -867,12 +916,14 @@ impl Store {
                 child
                     .set_permissions(fs::Permissions::from_mode(0o755))
                     .map_err(|error| io("set public Store directory mode", error))?;
-                child
-                    .sync_all()
-                    .map_err(|error| io("sync public Store directory", error))?;
-                parent
-                    .sync_all()
-                    .map_err(|error| io("sync public directory parent", error))?;
+                if self.flushes() {
+                    child
+                        .sync_all()
+                        .map_err(|error| io("sync public Store directory", error))?;
+                    parent
+                        .sync_all()
+                        .map_err(|error| io("sync public directory parent", error))?;
+                }
             } else if metadata.uid() != owner.uid() || metadata.gid() != owner.gid() {
                 return refuse(
                     Code::STORE_ERA,
@@ -1072,8 +1123,10 @@ impl Store {
             .map_err(|error| io("create manifest temp", error))?;
         file.write_all(&bytes)
             .map_err(|error| io("write manifest", error))?;
-        file.sync_all()
-            .map_err(|error| io("fsync manifest", error))?;
+        if self.flushes() {
+            file.sync_all()
+                .map_err(|error| io("fsync manifest", error))?;
+        }
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))
             .map_err(|error| io("chmod manifest", error))?;
         let admitted = match fs::hard_link(&temporary, &path) {
@@ -1082,8 +1135,11 @@ impl Store {
             Err(error) => return cleanup(&temporary, io("install manifest", error)),
         };
         let _ = fs::remove_file(&temporary);
-        if admitted {
+        if admitted && self.flushes() {
             fsync_dir(path.parent().unwrap())?;
+        }
+        if let (true, Some(epoch)) = (admitted, &self.epoch) {
+            epoch.admitted(path.clone(), object.length)?;
         }
         self.read_manifest(&object)?;
         Ok(Put {
@@ -1404,8 +1460,10 @@ impl Store {
             }
         }
         fault.hit("written");
-        if let Err(e) = f.sync_all() {
-            return cleanup(&tmp, io("fsync temp", e));
+        if self.flushes() {
+            if let Err(e) = f.sync_all() {
+                return cleanup(&tmp, io("fsync temp", e));
+            }
         }
         fault.hit("fsync");
 
@@ -1483,13 +1541,18 @@ impl Store {
         };
         let publish = move || {
             let installed = self.link_verified(&verified, fault)?;
-            if let Some(dir) = &installed {
+            if let Some(dir) = installed.as_ref().filter(|_| self.flushes()) {
                 if let Err(error) = fsync_dir(dir) {
                     let _ = fs::remove_file(&verified.tmp);
                     return Err(error);
                 }
             }
-            self.finish_linked(verified, installed.is_some())
+            let length = verified.length;
+            let record = self.finish_linked(verified, installed.is_some())?;
+            if let (Some(epoch), Some(record)) = (&self.epoch, &record) {
+                epoch.admitted(self.object_path(&record.sha256), length)?;
+            }
+            Ok(record)
         };
         let admitted = match operation {
             Some(operation) => catalog.admit_blob(Some(operation), &object, publish)?,
@@ -2143,15 +2206,20 @@ fn creation_lock(root: &Path) -> Result<File> {
     Ok(directory)
 }
 
+/// No handle is returned while an unclean shutdown's unsynced admissions are unverified.
 fn open_validated(root: &Path) -> Result<Store> {
     fs::create_dir_all(root.join("tmp")).map_err(|error| io("mkdir tmp", error))?;
-    Ok(Store {
+    let store = Store {
         root: root.to_path_buf(),
         progress: None,
         cache: read_repo_cache_binding(root),
         budget: read_disk_budget(root),
         trust: crate::catalog::Trust::of(root),
-    })
+        disk: crate::disk::filesystem(root),
+        epoch: None,
+    };
+    crate::unsynced::recover(&store)?;
+    Ok(store)
 }
 
 fn open_real_directory(path: &Path) -> Result<File> {

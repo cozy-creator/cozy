@@ -5766,60 +5766,255 @@ fn speculative_tail_does_not_reclassify_a_local_consumer_pause_as_network_delay(
 }
 
 /// Where the door spends its time at pull concurrency: 64 MiB objects from memory, so no
-/// network, through the same stream_verified -> admit_verified pair every pull uses.
+/// network, through the same stream_verified -> admit_verified pair every pull uses. One
+/// real disk, three durability disciplines: per-object fsync (every admission before, and a
+/// persistent disk outside a pull now), a persistent pull's epoch (its closing sync is in the
+/// wall time), and an ephemeral disk.
 #[test]
 #[ignore = "benchmark; run explicitly with --ignored --nocapture"]
 fn bench_door_concurrency() {
+    use crate::disk::DiskClass;
     const SIZE: usize = 64 << 20;
     let (declared, body) = paced_objects(SIZE, 32);
+    // Interleaved, so the three share whatever else the disk is doing at the time.
     for writers in [1usize, 16, 32] {
-        let root = temporary(&format!("door-{writers}"));
-        let store = Store::init(&root).unwrap();
-        let next = AtomicUsize::new(0);
-        let streamed = Mutex::new(Duration::ZERO);
-        let admitted = Mutex::new(Duration::ZERO);
-        let count = if writers == 1 { 8 } else { declared.len() };
-        let before = crate::stats::snapshot();
-        let started = std::time::Instant::now();
-        std::thread::scope(|scope| {
-            for _ in 0..writers {
-                scope.spawn(|| loop {
-                    let at = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(object) = declared[..count].get(at) else {
-                        return;
-                    };
-                    let bytes = body(&object.sha256);
-                    let t0 = std::time::Instant::now();
-                    let verified = store
-                        .stream_verified(
-                            &mut bytes.as_slice(),
-                            Some(object),
-                            &Default::default(),
-                            crate::store::PUT_TEMP,
-                        )
-                        .unwrap();
-                    let t1 = std::time::Instant::now();
-                    store
-                        .admit_verified(verified, &Default::default(), None)
-                        .unwrap();
-                    let t2 = std::time::Instant::now();
-                    *streamed.lock().unwrap() += t1 - t0;
-                    *admitted.lock().unwrap() += t2 - t1;
-                });
-            }
-        });
-        let seconds = started.elapsed().as_secs_f64();
-        let after = crate::stats::snapshot();
-        println!(
-            "{writers:3} writers: {count} x 64 MiB in {seconds:6.2} s = {:7.1} MB/s; per object: \
-             stream+hash+fsync {:6.0} ms, admission (wait + turn) {:6.0} ms; {} batches, \
-             {:.2} s committing",
-            (count * SIZE) as f64 / 1e6 / seconds,
-            streamed.lock().unwrap().as_secs_f64() * 1e3 / count as f64,
-            admitted.lock().unwrap().as_secs_f64() * 1e3 / count as f64,
-            after.admission_batches - before.admission_batches,
-            (after.admission_nanos - before.admission_nanos) as f64 / 1e9,
-        );
-        let _ = std::fs::remove_dir_all(root);
+        for (discipline, class, epoch) in [
+            ("per-object fsync", DiskClass::Persistent, false),
+            ("persistent pull", DiskClass::Persistent, true),
+            ("ephemeral", DiskClass::Ephemeral, false),
+        ] {
+            let root = temporary(&format!("door-{writers}"));
+            let plain = Store::init(&root).unwrap().with_disk_class(class);
+            let opened = epoch.then(|| crate::unsynced::Epoch::begin(&plain).unwrap().unwrap());
+            let store = plain.syncing(opened.clone());
+            let next = AtomicUsize::new(0);
+            let streamed = Mutex::new(Duration::ZERO);
+            let admitted = Mutex::new(Duration::ZERO);
+            // A busy catalog is re-asked, as a pull re-asks it.
+            let busy = AtomicUsize::new(0);
+            let count = if writers == 1 { 8 } else { declared.len() };
+            let before = crate::stats::snapshot();
+            let started = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..writers {
+                    scope.spawn(|| loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(object) = declared[..count].get(at) else {
+                            return;
+                        };
+                        let bytes = body(&object.sha256);
+                        loop {
+                            let t0 = std::time::Instant::now();
+                            let verified = store
+                                .stream_verified(
+                                    &mut bytes.as_slice(),
+                                    Some(object),
+                                    &Default::default(),
+                                    crate::store::PUT_TEMP,
+                                )
+                                .unwrap();
+                            let t1 = std::time::Instant::now();
+                            let outcome = store.admit_verified(verified, &Default::default(), None);
+                            let t2 = std::time::Instant::now();
+                            *streamed.lock().unwrap() += t1 - t0;
+                            *admitted.lock().unwrap() += t2 - t1;
+                            match outcome {
+                                Ok(_) => break,
+                                Err(refusal) if refusal.code == Code::IO_FAILED => {
+                                    busy.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(refusal) => panic!("{refusal:?}"),
+                            }
+                        }
+                    });
+                }
+            });
+            let sync = opened.map_or(0.0, |epoch| epoch.finish().unwrap().1);
+            let seconds = started.elapsed().as_secs_f64();
+            let after = crate::stats::snapshot();
+            println!(
+                "{discipline:>16} {writers:3} writers: {count} x 64 MiB in {seconds:6.2} s = \
+                 {:7.1} MB/s; per object: stream+hash(+fsync) {:6.0} ms, admission (wait + \
+                 turn) {:6.0} ms; {} batches, {:.2} s committing; closing sync {sync:.2} s; \
+                 {} busy re-asks",
+                (count * SIZE) as f64 / 1e6 / seconds,
+                streamed.lock().unwrap().as_secs_f64() * 1e3 / count as f64,
+                admitted.lock().unwrap().as_secs_f64() * 1e3 / count as f64,
+                after.admission_batches - before.admission_batches,
+                (after.admission_nanos - before.admission_nanos) as f64 / 1e9,
+                busy.load(Ordering::Relaxed),
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
+}
+
+// ---------------------------------------------------------------- durability by disk
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_ephemeral_store_pulls_without_a_sync_or_a_marker() {
+    let root = std::path::Path::new("/dev/shm").join(format!(
+        "tensorfs-ephemeral-pull-{}-{}",
+        std::process::id(),
+        crate::meta::now_nanos_unique()
+    ));
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(6, 32 * 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!(report.fetched, 8);
+    assert_eq!(report.durability.class, crate::disk::DiskClass::Ephemeral);
+    assert_eq!(report.durability.filesystem, "tmpfs");
+    assert_eq!(report.durability.syncs, 0);
+    assert!(!root.join("tmp/unsynced").exists());
+    for object in &checkpoint.objects {
+        assert!(store.record_valid(&object.sha256).is_ok());
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_persistent_store_pulls_under_one_sync_and_retires_its_marker() {
+    let root = crate::unsynced::testing::persistent_root("persistent-pull");
+    let store = Store::init(&root).unwrap();
+    assert_eq!(store.disk_class(), crate::disk::DiskClass::Persistent);
+    let checkpoint = Arc::new(checkpoint(6, 32 * 1024));
+    let origin = hub_origin(Arc::clone(&checkpoint), |_, _| None);
+    let policy = SourcePolicy::default();
+    let cold = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!(cold.fetched, 8);
+    assert_eq!(cold.durability.class, crate::disk::DiskClass::Persistent);
+    assert_eq!(cold.durability.syncs, 1, "one sync at the end of the walk");
+    assert!(crate::unsynced::testing::markers(&root).is_empty());
+    let warm = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!(warm.fetched, 0);
+    assert_eq!(
+        warm.durability.syncs, 0,
+        "a pull that admits nothing syncs nothing"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+const DURABILITY_CHILD: &str = "TENSORFS_DURABILITY_CHILD";
+
+/// The child of `a_pull_killed_mid_walk_is_repaired_after_an_unclean_shutdown`: one serial
+/// pull, run until the parent kills it.
+#[test]
+#[ignore = "child process of a_pull_killed_mid_walk_is_repaired_after_an_unclean_shutdown"]
+fn durability_child_pull() {
+    let Ok(spec) = std::env::var(DURABILITY_CHILD) else {
+        return;
+    };
+    let (root, base) = spec.split_once('\n').unwrap();
+    let store = Store::open(std::path::Path::new(root)).unwrap();
+    let policy = SourcePolicy::default();
+    let mut request = request_for(&store, base, &policy);
+    request.streams = 1;
+    request.streams_start = 1;
+    let _ = pull(&request);
+}
+
+/// A real process is SIGKILLed in the middle of a pull on a persistent disk. Within the
+/// same boot nothing is lost and nothing is rehashed. Across a reboot — here: its marker
+/// renamed to a boot that has ended, and one admitted object torn behind a record that
+/// still binds, which is what a lost page cache can leave — the next open rehashes what the
+/// dead pull admitted and removes the torn object, and the next pull fetches it again.
+#[test]
+fn a_pull_killed_mid_walk_is_repaired_after_an_unclean_shutdown() {
+    use crate::unsynced::testing::{from_an_earlier_boot, markers, persistent_root, tear};
+    let root = persistent_root("killed-pull");
+    let store = Store::init(&root).unwrap();
+    assert_eq!(store.disk_class(), crate::disk::DiskClass::Persistent);
+    let checkpoint = Arc::new(checkpoint(8, 64 * 1024));
+    let served = Arc::new(AtomicUsize::new(0));
+    let stalling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let origin = hub_origin(Arc::clone(&checkpoint), {
+        let served = Arc::clone(&served);
+        let stalling = Arc::clone(&stalling);
+        move |_, _| {
+            if !stalling.load(Ordering::SeqCst) || served.fetch_add(1, Ordering::SeqCst) < 5 {
+                None
+            } else {
+                Some(Serve::StallHead)
+            }
+        }
+    });
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "transport::tests::durability_child_pull",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(
+            DURABILITY_CHILD,
+            format!("{}\n{}", root.display(), origin.base),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let recorded = |store: &Store| {
+        checkpoint
+            .objects
+            .iter()
+            .filter(|object| store.record_valid(&object.sha256).is_ok())
+            .count()
+    };
+    let waited = std::time::Instant::now();
+    while served.load(Ordering::SeqCst) < 6 || recorded(&store) < 4 {
+        assert!(
+            waited.elapsed() < Duration::from_secs(60),
+            "the child admitted {} objects",
+            recorded(&store)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let left = markers(&root);
+    assert_eq!(left.len(), 1, "the dead pull's marker stands");
+    let admitted: Vec<ObjectRef> = checkpoint
+        .objects
+        .iter()
+        .filter(|object| store.record_valid(&object.sha256).is_ok())
+        .cloned()
+        .collect();
+    let victim = admitted[0].clone();
+    tear(&store.blob_path(&victim.sha256));
+    assert!(
+        store.record_valid(&victim.sha256).is_ok(),
+        "without recovery the torn bytes would be trusted"
+    );
+    Store::open(&root).unwrap();
+    assert!(
+        store.blob_path(&victim.sha256).exists(),
+        "the same boot rehashes nothing"
+    );
+
+    from_an_earlier_boot(&left[0]);
+    let before = crate::stats::snapshot();
+    let reopened = Store::open(&root).unwrap();
+    let after = crate::stats::snapshot();
+    assert!(!reopened.blob_path(&victim.sha256).exists());
+    assert!(after.recovery_rehashed - before.recovery_rehashed >= admitted.len() as u64);
+    assert!(after.recovery_removed > before.recovery_removed);
+    assert!(markers(&root).is_empty());
+    for object in &admitted[1..] {
+        assert!(reopened.open_verified(&object.sha256).is_ok());
+    }
+
+    stalling.store(false, Ordering::SeqCst);
+    let policy = SourcePolicy::default();
+    let resumed = pull(&request_for(&reopened, &origin.base, &policy)).unwrap();
+    assert_eq!(resumed.held + resumed.fetched, resumed.declared);
+    assert!(resumed.held >= admitted.len() as u64 - 1);
+    let file = reopened.open_verified(&victim.sha256).unwrap();
+    assert_eq!(file.len(), victim.length);
+    assert_eq!(reopened.hash_object(&victim.sha256).unwrap(), victim.sha256);
+    assert!(markers(&root).is_empty());
+    let _ = std::fs::remove_dir_all(root);
 }

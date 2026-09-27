@@ -257,6 +257,8 @@ fn pull_with_budget(
     flags: &Flags,
     budget: Option<(u64, u64)>,
 ) -> ExitCode {
+    // Before the open, which is where an unclean shutdown's recovery runs.
+    let before = tensorfs_core::stats::snapshot();
     let store = ok!(Store::open(root));
     let Some(base) = flag(flags, "hub") else {
         eprintln!("--hub <base-url> is required");
@@ -302,7 +304,6 @@ fn pull_with_budget(
     let observe = |_object: &ObjectRef, moved: u64, door: ObjectSource| progress.saw(moved, door);
     request.on_plan = Some(&planned);
     request.on_object = Some(&observe);
-    let before = tensorfs_core::stats::snapshot();
     let started = std::time::Instant::now();
     let report = ok!(transport::pull(&request));
     let seconds = started.elapsed().as_secs_f64();
@@ -333,9 +334,12 @@ fn pull_with_budget(
         })
         .collect();
     // And what admitting them cost: a pull whose streams stop growing while its batches
-    // take most of the wall time is held by the disk, not the link.
+    // take most of the wall time is held by the disk, not the link. `durability` says
+    // which syncs the disk the Store lives on made it pay, and what an unclean shutdown
+    // before this pull cost to repair.
+    let durability = &report.durability;
     eprintln!(
-        "{{\"event\":\"pull.streams\",\"model\":{},\"seconds\":{:.3},\"bytes_moved\":{},\"streams\":{},\"levels\":[{}],\"backoffs\":{},\"admission\":{{\"objects\":{},\"batches\":{},\"seconds\":{:.3}}}}}",
+        "{{\"event\":\"pull.streams\",\"model\":{},\"seconds\":{:.3},\"bytes_moved\":{},\"streams\":{},\"levels\":[{}],\"backoffs\":{},\"admission\":{{\"objects\":{},\"batches\":{},\"seconds\":{:.3}}},\"durability\":{{\"class\":{},\"filesystem\":{},\"syncs\":{},\"sync_seconds\":{:.3},\"recovery\":{{\"rehashed\":{},\"removed\":{},\"seconds\":{:.3}}}}}}}",
         quoted(&report.model),
         seconds,
         report.bytes_moved,
@@ -345,6 +349,13 @@ fn pull_with_budget(
         after.admitted_objects - before.admitted_objects,
         after.admission_batches - before.admission_batches,
         (after.admission_nanos - before.admission_nanos) as f64 / 1e9,
+        quoted(durability.class.as_str()),
+        quoted(durability.filesystem),
+        durability.syncs,
+        durability.seconds,
+        after.recovery_rehashed - before.recovery_rehashed,
+        after.recovery_removed - before.recovery_removed,
+        (after.recovery_nanos - before.recovery_nanos) as f64 / 1e9,
     );
     println!(
         "model        {}@{} lane {}",

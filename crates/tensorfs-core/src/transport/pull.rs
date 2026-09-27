@@ -1339,6 +1339,8 @@ pub struct PullReport {
     pub bytes_total: u64,
     pub presence: Vec<(String, &'static str)>,
     pub stamps: Vec<(String, Vec<String>)>,
+    /// The disk the Store lives on and what making this pull durable cost.
+    pub durability: crate::unsynced::SyncCost,
 }
 
 /// Pull one hub checkpoint into a local store: closure, `FetchPlan::of` against the REAL
@@ -1437,6 +1439,10 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     // planning pass condemn the very first mint that followed it.
     ledger.transfer_begins();
     if !plan.wanted.is_empty() {
+        // On a persistent disk the walk admits without fsync and fsyncs its objects in
+        // batches, the last one before anything records the checkpoint.
+        let epoch = crate::unsynced::Epoch::begin(request.store)?;
+        let store = request.store.syncing(epoch.clone());
         let leases = Leases {
             client,
             base: request.base,
@@ -1452,7 +1458,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             minting: Minting::default(),
         };
         let walked = fetch_wanted_bounded(
-            request.store,
+            &store,
             &plan,
             &leases,
             &policy,
@@ -1472,6 +1478,9 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         report.bytes_moved = walked.bytes_moved;
         report.cached = walked.cached;
         report.bytes_cached = walked.bytes_cached;
+        if let Some(epoch) = epoch {
+            (report.durability.syncs, report.durability.seconds) = epoch.finish()?;
+        }
     }
     ledger.check_running()?;
     // Nothing moved and this Store already records the checkpoint, which it does only once
@@ -1522,6 +1531,11 @@ fn plan_against_store(
             .map(|(object, presence)| (object.id(), presence.as_str()))
             .collect(),
         stamps: closure.stamps.clone(),
+        durability: crate::unsynced::SyncCost {
+            class: request.store.disk_class(),
+            filesystem: request.store.disk().kind,
+            ..Default::default()
+        },
         ..Default::default()
     };
     Ok((plan, report))

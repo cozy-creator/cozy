@@ -204,7 +204,9 @@ pub fn stage<R: Read>(store: &Store, r: &mut R, want: &ObjectRef) -> Result<Carr
             return Err(io(format!("link {}", destination.display()), error));
         }
     }
-    crate::store::fsync_dir(&dir)?;
+    if store.flushes() {
+        crate::store::fsync_dir(&dir)?;
+    }
     let _ = fs::remove_file(&verified.tmp);
     drop(verified.file);
     Ok(Carrier {

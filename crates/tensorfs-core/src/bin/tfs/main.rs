@@ -904,6 +904,11 @@ fn cmd_store(root: &Path, verb: &str, flags: &Flags) -> ExitCode {
             None => "(none)".to_string(),
         }
     );
+    println!(
+        "durability: {} ({})",
+        s.disk_class().as_str(),
+        s.disk().kind
+    );
     ExitCode::SUCCESS
 }
 
