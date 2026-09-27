@@ -194,7 +194,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 			return problem
 		}
 		if claim.WorkerBootId != row.WorkerBootID {
-			return exit.Named(exit.Conflict, "rental.worker_boot_changed", "installation worker identity changed before preparation")
+			return exit.Unavailablef("the rental's worker restarted before preparation; the installation is claimed again on its new boot")
 		}
 		models := orchestrator.DownloadModelRefs(row.Selection.Models)
 		if len(models) != len(row.Selection.Models) {

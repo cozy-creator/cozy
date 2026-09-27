@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -19,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
@@ -167,7 +170,7 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 }
 
 func TestRentalInstallQueueRetainsTypedTerminalFailures(t *testing.T) {
-	for _, state := range []string{"failed", "release_requested", "forgotten", "new-boot", "worker-refused"} {
+	for _, state := range []string{"failed", "release_requested", "forgotten", "worker-refused"} {
 		t.Run(state, func(t *testing.T) {
 			_, store := rentalInstallStore(t)
 			machine := rentalInstallMachine("converging")
@@ -187,16 +190,6 @@ func TestRentalInstallQueueRetainsTypedTerminalFailures(t *testing.T) {
 				_, problem = store.ForgetRental(machine.ID)
 				rentalInstallCheck(t, problem)
 				want = "rental.ended"
-			case "new-boot":
-				machine.State = "ready"
-				rentalInstallCheck(t, store.RecordRental(machine))
-				_, problem = store.StartRentalInstall(row.ID, machine.ExpectedWorkerBootID)
-				rentalInstallCheck(t, problem)
-				machine.ExpectedWorkerBootID = "replacement"
-				_, problem = store.ForgetRental(machine.ID)
-				rentalInstallCheck(t, problem)
-				rentalInstallCheck(t, store.RecordRental(machine))
-				want = "rental.worker_boot_changed"
 			case "worker-refused":
 				machine.State = "ready"
 				rentalInstallCheck(t, store.RecordRental(machine))
@@ -363,5 +356,67 @@ func TestRentalInstallQueueSerializesAndRetriesOnlyAfterWake(t *testing.T) {
 	waitRentalInstall(t, store, second.ID, "succeeded")
 	if calls.Load() != 3 {
 		t.Fatalf("prepare calls=%d", calls.Load())
+	}
+}
+
+// The worker restarted after the installation was claimed on its old boot. The daemon
+// claims it again on the rental's current boot and prepares it there over the signed
+// TLS Host; it never fails the queued selection for the restart.
+func TestQueuedRentalInstallReclaimsARestartedWorker(t *testing.T) {
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	identity, problem := rental.PendingCreatorIdentity(layout, "install-restart")
+	fatal(t, problem)
+	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
+	must(t, err)
+	pod := &fakePod{controlKey: public}
+	connection, certPath := startFakePod(t, root, pod)
+	cert, err := os.ReadFile(certPath)
+	must(t, err)
+	peer := newFakeRentalHub(t, 0)
+	peer.add(podRental, "restarted")
+	peer.rentals[podRental]["requested_accelerator_model"] = "fake-4090"
+	release := rentalReleaseFacts()
+	release.PackageInterface = []byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[]}`)
+	peer.packageReleases = map[string]any{"proof/restart@1": release}
+	facts := testPrepareFacts("proof/restart", "1")
+	inventory, err := json.Marshal(map[string]any{"format": "tensorhub.image_inventory/1",
+		"profile": facts.ImageInventory.Profile, "python": facts.ImageInventory.Python, "distributions": []any{}})
+	must(t, err)
+	served := peer.server.Config.Handler
+	peer.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/rentals/"+podRental+"/prepare-facts" {
+			served.ServeHTTP(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: "proof:app", ImageInventory: inventory, LockedRequirements: string(facts.LockedRequirements)})
+	})
+	row := records.Rental{ID: podRental, MachineName: "restarted", State: "ready", SKU: "cpu", AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 100_000, Hub: peer.server.URL, ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: "boot-before-restart"}
+	fatal(t, store.RecordRental(row))
+	queued, problem := store.BeginRentalInstall(podRental, records.RentalInstallSelection{Package: "proof/restart", Release: "1"})
+	fatal(t, problem)
+	_, problem = store.StartRentalInstall(queued.ID, row.ExpectedWorkerBootID)
+	fatal(t, problem)
+	_, problem = store.ForgetRental(podRental)
+	fatal(t, problem)
+	row.Address, row.MediaAddress, row.ExpectedWorkerBootID = connection.Addr, connection.Media.Addr, podBootID
+	fatal(t, rental.Attach(layout, store, row, string(cert), connection.Media.Token, identity))
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+peer.server.URL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
+	startDaemonProcess(t, root)
+	var done *records.RentalInstall
+	waitUntil(t, "the restarted worker's installation settles", func() bool {
+		done, problem = store.RentalInstall(queued.ID)
+		fatal(t, problem)
+		return !done.Active()
+	})
+	pod.mu.Lock()
+	prepares := len(pod.prepares)
+	pod.mu.Unlock()
+	if done.State != "succeeded" || done.WorkerBootID != podBootID || prepares != 1 {
+		t.Fatalf("installation was not claimed again on the new boot: %+v, %d preparations\n%s", done, prepares, tail(filepath.Join(root, "daemon.log")))
 	}
 }
