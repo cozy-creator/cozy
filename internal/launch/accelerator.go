@@ -18,6 +18,15 @@ func AcceleratorRequired(requirements []string) bool {
 	return false
 }
 
+// NeedsAccelerator is one callable's machine class. A job's own `accelerator` declaration
+// decides it; an undeclared callable falls back to its dependency closure.
+func (e *Entrypoint) NeedsAccelerator(closure []string) bool {
+	if e.Kind == "job" && e.Accelerator != nil {
+		return *e.Accelerator
+	}
+	return AcceleratorRequired(closure)
+}
+
 func requirementName(requirement string) string {
 	name, _ := requirementParts(requirement)
 	return name

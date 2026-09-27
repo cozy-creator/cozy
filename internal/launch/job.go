@@ -165,7 +165,10 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		Internal:         declared.Internal,
 		WeightsOutputs:   weightsOutputs,
 		Publishes:        declared.Publishes,
-		NeedsAccelerator: AcceleratorRequired(strings.Split(f.Install.Closure, "\n")) && !(f.CPUOrchestration && !f.SelfCallable[function] && len(declared.Models) == 0 && len(declared.WeightsOutputs) == 0),
+		NeedsAccelerator: declared.NeedsAccelerator(strings.Split(f.Install.Closure, "\n")),
+	}
+	if declared.Accelerator == nil && f.CPUOrchestration && !f.SelfCallable[function] && len(declared.Models) == 0 && len(declared.WeightsOutputs) == 0 {
+		facts.NeedsAccelerator = false
 	}
 	facts.RetainsArtifacts = len(ModelArtifactPaths(declared.Result)) > 0 || len(RetainedAssetPaths(declared)) > 0
 	for _, model := range declared.Models {
