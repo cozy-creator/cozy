@@ -429,7 +429,7 @@ pub(crate) fn checkpoint_bytes(
     policy: &Policy<'_>,
     previous: Option<&ObjectRef>,
     bytes: &[u8],
-    mut objects: Vec<ObjectRef>,
+    objects: Vec<ObjectRef>,
     hold: Option<&str>,
 ) -> Result<CheckpointExport> {
     let prior = previous
@@ -444,17 +444,67 @@ pub(crate) fn checkpoint_bytes(
             "checkpoint belongs to another operation slot",
         );
     }
-    if bytes.len() > limits::DOC_MAX_BYTES {
-        return refuse(
-            Code::COUNT_CAP,
-            "checkpoint progress exceeds the document byte cap",
-        );
-    }
     if bytes.is_empty() {
         return Ok(CheckpointExport {
             head: Head::default(),
             roots: Vec::new(),
         });
+    }
+    let tip = Tip {
+        head: Head {
+            head: previous.cloned(),
+            links: prior.as_ref().map_or(0, |set| set.links),
+            bytes: prior.as_ref().map_or(0, |set| set.bytes),
+        },
+        held: prior
+            .iter()
+            .flat_map(|set| set.blobs.iter().map(|object| object.sha256.clone()))
+            .collect(),
+    };
+    let mut roots = previous
+        .map(|head| local_documents(store, head))
+        .transpose()?
+        .unwrap_or_default();
+    let extended = extend(store, policy, &tip, bytes, objects, hold)?;
+    roots.push(extended.progress);
+    roots.extend(extended.links);
+    Ok(CheckpointExport {
+        head: extended.head,
+        roots,
+    })
+}
+
+/// A chain's tip and every blob digest the chain already names: all a writer needs to
+/// extend it without walking it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Tip {
+    pub head: Head,
+    pub held: std::collections::HashSet<String>,
+}
+
+pub(crate) struct Extended {
+    pub head: Head,
+    pub progress: ObjectRef,
+    /// The progress document and every object the new links name, now held by the chain.
+    pub named: Vec<ObjectRef>,
+    pub links: Vec<ObjectRef>,
+}
+
+/// Write one progress document and the links naming only the objects `tip` does not yet
+/// hold. Only the supplied objects are verified, so the cost is this checkpoint's own.
+pub(crate) fn extend(
+    store: &Store,
+    policy: &Policy<'_>,
+    tip: &Tip,
+    bytes: &[u8],
+    mut objects: Vec<ObjectRef>,
+    hold: Option<&str>,
+) -> Result<Extended> {
+    if bytes.len() > limits::DOC_MAX_BYTES {
+        return refuse(
+            Code::COUNT_CAP,
+            "checkpoint progress exceeds the document byte cap",
+        );
     }
     let progress = store
         .put_stream_held(
@@ -486,24 +536,9 @@ pub(crate) fn checkpoint_bytes(
     }
     objects.push(progress.clone());
     objects = canonical_refs(objects);
-    let held: std::collections::BTreeSet<&str> = prior
-        .iter()
-        .flat_map(|set| set.blobs.iter().map(|object| object.sha256.as_str()))
-        .collect();
-    objects.retain(|object| !held.contains(object.sha256.as_str()));
-    let mut head = Head {
-        head: previous.cloned(),
-        links: prior.as_ref().map_or(0, |set| set.links),
-        bytes: prior.as_ref().map_or(0, |set| set.bytes),
-    };
-    let mut roots = previous
-        .map(|head| local_documents(store, head))
-        .transpose()?
-        .unwrap_or_default();
-    roots.push(progress.clone());
-    if objects.is_empty() {
-        return Ok(CheckpointExport { head, roots });
-    }
+    objects.retain(|object| !tip.held.contains(&object.sha256));
+    let mut head = tip.head.clone();
+    let mut links = Vec::new();
     let pages = objects.chunks(CHECKPOINT_REFS);
     let page_count = pages.len();
     for (index, page) in pages.enumerate() {
@@ -540,11 +575,16 @@ pub(crate) fn checkpoint_bytes(
                 hold,
             )?
             .obj;
-        roots.push(object.clone());
+        links.push(object.clone());
         head.head = Some(object);
         head.links += 1;
     }
-    Ok(CheckpointExport { head, roots })
+    Ok(Extended {
+        head,
+        progress,
+        named: objects,
+        links,
+    })
 }
 
 /// Pin restored chain documents before their journal is installed. Tensor segments are

@@ -2711,6 +2711,158 @@ pub fn completed(
     ))
 }
 
+/// A writer's position in its checkpoint chain: the chain's tip and held blobs, its fixed
+/// plan and work context, and the parts it accepted since. With it a checkpoint writes and
+/// verifies only those parts instead of re-reading the chain it extends.
+#[derive(Debug, Clone)]
+pub struct CheckpointCursor {
+    chain: String,
+    plan: String,
+    work: ObjectRef,
+    tip: crate::durability::Tip,
+    parts: usize,
+    pending: Vec<AddedPart>,
+}
+
+impl CheckpointCursor {
+    /// Seed from a checkpoint the full path just wrote or confirmed. `None` when there is
+    /// no head yet to extend.
+    fn at(
+        store: &Store,
+        meta: &Meta,
+        transaction: &str,
+        writer_session: u64,
+        chain: String,
+        plan: &str,
+        head: &crate::durability::Head,
+    ) -> Result<Option<Self>> {
+        let Some(tip) = head.head.as_ref() else {
+            return Ok(None);
+        };
+        let mut rows: Vec<_> = meta.derived_row(transaction)?.into_iter().collect();
+        let row = open_row(&mut rows, transaction, writer_session)?;
+        let context = progress::context(row);
+        let held = crate::durability::local_chain(store, tip, plan)?
+            .blobs
+            .into_iter()
+            .map(|object| object.sha256)
+            .collect();
+        Ok(Some(Self {
+            chain,
+            plan: plan.to_string(),
+            work: ObjectRef::of(&crate::canon::write(&context.to_value())),
+            tip: crate::durability::Tip {
+                head: head.clone(),
+                held,
+            },
+            parts: row.added_parts.len(),
+            pending: Vec::new(),
+        }))
+    }
+
+    /// Extend the chain by the pending parts, or `None` when anything but this writer's own
+    /// accepted parts moved since the cursor was taken.
+    fn advance(
+        &mut self,
+        store: &Store,
+        meta: &Meta,
+        transaction: &str,
+        writer_session: u64,
+        chain: &str,
+        previous: Option<&ObjectRef>,
+    ) -> Result<Option<(String, crate::durability::Head)>> {
+        let tip = self.tip.head.head.clone();
+        let root = roots::read(store, transaction)?;
+        if self.chain != chain
+            || previous.is_some_and(|previous| Some(previous) != tip.as_ref())
+            || root.as_ref().and_then(|root| root.checkpoint.as_ref()) != tip.as_ref()
+        {
+            return Ok(None);
+        }
+        meta.check_session(transaction, writer_session)?;
+        if meta.part_count(transaction)? != self.parts + self.pending.len() {
+            return Ok(None);
+        }
+        if self.pending.is_empty() {
+            return Ok(Some((self.plan.clone(), self.tip.head.clone())));
+        }
+        let parts = std::mem::take(&mut self.pending);
+        let objects = parts
+            .iter()
+            .flat_map(|added| added.part.segments().iter().cloned())
+            .collect();
+        let count = parts.len();
+        let delta = progress::Delta::accepted(self.work.clone(), parts);
+        let policy = crate::durability::Policy {
+            chain,
+            operation: transaction,
+            plan: &self.plan,
+            interval: crate::durability::INTERVAL_BYTES,
+        };
+        let extended = crate::durability::extend(
+            store,
+            &policy,
+            &self.tip,
+            &crate::canon::write(&delta.to_value()),
+            objects,
+            None,
+        )?;
+        let Some(mut root) = root else {
+            return Ok(None);
+        };
+        root.checkpoint = extended.head.head.clone();
+        roots::write(store, &root)?;
+        self.tip
+            .held
+            .extend(extended.named.into_iter().map(|object| object.sha256));
+        self.tip.head = extended.head;
+        self.parts += count;
+        Ok(Some((self.plan.clone(), self.tip.head.clone())))
+    }
+}
+
+/// Checkpoint through the writer's cursor, which each full checkpoint re-seeds.
+#[allow(clippy::too_many_arguments)]
+pub fn checkpoint_indexed(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    writer_session: u64,
+    operation: &str,
+    slot: &str,
+    previous: Option<&ObjectRef>,
+    cursor: &mut Option<CheckpointCursor>,
+) -> Result<(String, crate::durability::Head)> {
+    let chain = format!("{operation}/{slot}");
+    if let Some(current) = cursor.as_mut() {
+        if let Some(advanced) =
+            current.advance(store, meta, transaction, writer_session, &chain, previous)?
+        {
+            return Ok(advanced);
+        }
+    }
+    *cursor = None;
+    let (plan, head) = checkpoint_progress(
+        store,
+        meta,
+        transaction,
+        writer_session,
+        operation,
+        slot,
+        previous,
+    )?;
+    *cursor = CheckpointCursor::at(
+        store,
+        meta,
+        transaction,
+        writer_session,
+        chain,
+        &plan,
+        &head,
+    )?;
+    Ok((plan, head))
+}
+
 pub fn checkpoint_progress(
     store: &Store,
     meta: &Meta,
@@ -3115,6 +3267,7 @@ pub fn add_part<R: Read>(
         transaction,
         writer_session,
         &additions,
+        None,
         value,
         reader,
     )
@@ -3122,12 +3275,14 @@ pub fn add_part<R: Read>(
 
 /// Accept one part. The cost is this part's bytes plus one indexed SQL row: the
 /// declaration is not re-read and earlier accepted parts are neither read nor rewritten.
+#[allow(clippy::too_many_arguments)]
 pub fn add_indexed_part<R: Read>(
     store: &Store,
     meta: &Meta,
     transaction: &str,
     writer_session: u64,
     additions: &Additions,
+    cursor: Option<&mut CheckpointCursor>,
     value: (&str, &str, &str),
     reader: &mut R,
 ) -> Result<crate::checkpoint::Written> {
@@ -3168,16 +3323,17 @@ pub fn add_indexed_part<R: Read>(
     // The private root names the objects before SQL accepts the part, so GC never
     // observes an accepted part whose bytes it may reclaim.
     roots::append_parts(store, &transaction, written.part.segments())?;
-    meta.accept_part(
-        &transaction,
-        writer_session,
-        &AddedPart {
-            component: component.to_string(),
-            key: tensor_key.to_string(),
-            role: role.to_string(),
-            part: written.part.clone(),
-        },
-    )?;
+    let added = AddedPart {
+        component: component.to_string(),
+        key: tensor_key.to_string(),
+        role: role.to_string(),
+        part: written.part.clone(),
+    };
+    if meta.accept_part(&transaction, writer_session, &added)? {
+        if let Some(cursor) = cursor {
+            cursor.pending.push(added);
+        }
+    }
     Ok(written)
 }
 

@@ -981,6 +981,7 @@ fn profile_derived_transaction_scaling() {
         let mut part_ms = 0.0;
         let mut checkpoint_ms = 0.0;
         let mut prior = None;
+        let mut cursor = None;
         for index in 0..writes {
             let key = format!("weight_{index:04}");
             let started = Instant::now();
@@ -990,15 +991,24 @@ fn profile_derived_transaction_scaling() {
                 &id,
                 1,
                 &writer.additions,
+                cursor.as_mut(),
                 ("model", &key, "value"),
                 &mut [index as u8; 16].as_slice(),
             )
             .unwrap();
             part_ms += started.elapsed().as_secs_f64() * 1000.0;
             let started = Instant::now();
-            let (_, head) =
-                checkpoint_progress(&store, &meta, &id, 1, "profile", "model", prior.as_ref())
-                    .unwrap();
+            let (_, head) = checkpoint_indexed(
+                &store,
+                &meta,
+                &id,
+                1,
+                "profile",
+                "model",
+                prior.as_ref(),
+                &mut cursor,
+            )
+            .unwrap();
             prior = head.head;
             checkpoint_ms += started.elapsed().as_secs_f64() * 1000.0;
         }

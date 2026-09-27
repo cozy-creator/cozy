@@ -2221,6 +2221,7 @@ impl PyStore {
             writer_session_id,
             source_views: begin.source_views,
             additions: begin.additions,
+            cursor: Mutex::new(None),
             guards: Mutex::new(Some(DerivedGuards {
                 writer_hold: begin.writer_hold,
                 source_leases: begin.source_leases,
@@ -2510,6 +2511,7 @@ pub struct PyDerivedWriter {
     writer_session_id: u64,
     source_views: Vec<derived::SourceView>,
     additions: derived::Additions,
+    cursor: Mutex<Option<derived::CheckpointCursor>>,
     guards: Mutex<Option<DerivedGuards>>,
 }
 
@@ -2613,7 +2615,7 @@ impl PyDerivedWriter {
             .transpose()?;
         let (plan, head) = py
             .detach(|| {
-                derived::checkpoint_progress(
+                derived::checkpoint_indexed(
                     &self.store,
                     &self.meta,
                     &self.transaction_id,
@@ -2621,6 +2623,7 @@ impl PyDerivedWriter {
                     operation_id,
                     slot,
                     previous.as_ref(),
+                    &mut self.cursor.lock().unwrap(),
                 )
             })
             .or_refuse(py)?;
@@ -2745,6 +2748,7 @@ impl PyDerivedWriter {
                 &self.transaction_id,
                 self.writer_session_id,
                 &self.additions,
+                self.cursor.lock().unwrap().as_mut(),
                 (component, key, role),
                 &mut source,
             )
@@ -2779,6 +2783,8 @@ impl PyDerivedWriter {
             err: None,
         };
         let result = py.detach(|| {
+            // A config is not a part: the next checkpoint takes the full path.
+            *self.cursor.lock().unwrap() = None;
             derived::add_config(
                 &self.meta,
                 &self.transaction_id,
