@@ -208,9 +208,11 @@ func (s *Store) AcceptMachineExecution(id string, receipt *pb.MachineExecutionRe
 	if err != nil || link == nil {
 		return exit.New(exit.Conflict, "machine acceptance has no client submission")
 	}
+	// A submission recorded before workspaces were fenced names none; the receipt's own
+	// workspace is then the one this execution runs in.
 	var submission pb.MachineExecutionSubmit
 	if proto.Unmarshal(link.Submission, &submission) != nil || submission.Offer == nil ||
-		receipt.ExecutionWorkspaceId != submission.ExpectedExecutionWorkspaceId ||
+		submission.ExpectedExecutionWorkspaceId != "" && receipt.ExecutionWorkspaceId != submission.ExpectedExecutionWorkspaceId ||
 		receipt.SubmissionId != submission.SubmissionId || !bytes.Equal(receipt.CaptureDigest, submission.CaptureDigest) ||
 		!bytes.Equal(receipt.InvocationSpecDigest, submission.Offer.InvocationSpecDigest) ||
 		receipt.PublicationAuthorizationId != submission.PublicationAuthorizationId {
