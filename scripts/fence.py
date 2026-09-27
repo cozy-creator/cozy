@@ -355,10 +355,6 @@ HMAC_DOMAINS = {
 # Kinds another repo authors and this one only reads: the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.package.", "cozy.runtime.", "tensorhub.",
                          "tensorfs.", "cozytensors")
-# Runtime owns this deterministic wheel generator ABI. Creator checks returned
-# metadata; it neither authors a new document nor defines the generator format.
-FOREIGN_ABI_TAGS = {"cozy.interface-generator/5", "cozy.interface-generator/6", "cozy.interface-generator/7",
-                    "cozy.interface-generator/8"}
 # Runtime authors this ephemeral measured executor response; Creator only reads it.
 FOREIGN_DOCUMENT_KINDS = {"cozy.python-interpreters/1"}
 KIND_READERS: dict[str, set[str]] = {}
@@ -376,7 +372,7 @@ def check_document_kinds() -> list[str]:
         rel = p.as_posix()
         for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
             for kind in KIND_LITERAL.findall(line):
-                if kind.startswith(FOREIGN_KIND_PREFIXES) or kind in FOREIGN_ABI_TAGS or kind in FOREIGN_DOCUMENT_KINDS:
+                if kind.startswith(FOREIGN_KIND_PREFIXES) or kind in FOREIGN_DOCUMENT_KINDS:
                     continue
                 owner = DOCUMENT_KINDS.get(kind) or HMAC_DOMAINS.get(kind)
                 if owner is None:

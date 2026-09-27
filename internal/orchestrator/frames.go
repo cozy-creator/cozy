@@ -720,7 +720,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.desiredRefusal = exit.Named(exit.Structural, "placement_config_refused",
 					"the package worker refused its placement: %s — %s", f.Reason, brief(f.Detail, 240)).
 					WithRemedy("the installed package Runtime is incompatible with this Cozy build")
-				c.relayDescriptorDefect(w, desiredRevision, f)
 			}
 		}
 		if r.AcceptedDesiredStateRevision >= desiredRevision {
@@ -2065,43 +2064,6 @@ func shortNone(raw []byte) string {
 		return ""
 	}
 	return s
-}
-
-// descriptorDefectCode is the one pod refusal that falsifies a PUBLISHED
-// descriptor (cr-067): derivation on the pod disagreed with the committed
-// document. Every other preparation refusal is local to that worker.
-const descriptorDefectCode = "package_prepare_interface_disagrees"
-
-// relayDescriptorDefect files one defect report per desired revision when the
-// pod's typed refusal falsifies the published package interface. The orchestrator
-// holds no hub client, so the report goes through the same kind of entrypoint
-// callback the package-set author uses. It carries no chain of authority: the signed
-// delegation that used to prove which download the refusal came from is deleted
-// (owner ruling 2026-09-03), so the hub authorizes by rental ownership alone.
-func (c *Orchestrator) relayDescriptorDefect(w *worker, revision uint64, f *pb.Fault) {
-	if c.opt.ReportReleaseDefect == nil || !strings.Contains(f.Detail, descriptorDefectCode) {
-		return
-	}
-	if w.spec.Connection == nil || w.spec.Connection.RentalID == "" ||
-		w.spec.Placement.InstallID != "" ||
-		len(w.desiredPackages) != 1 || w.defectReportedRevision == revision {
-		return
-	}
-	selected := w.desiredPackages[0]
-	if _, prepared := w.desiredDownloadSets[selected.Package]; !prepared {
-		return
-	}
-	w.defectReportedRevision = revision
-	report := ReleaseDefect{
-		Package:  selected.Package,
-		Release:  selected.Release,
-		RentalID: w.spec.Connection.RentalID,
-		Code:     descriptorDefectCode,
-		Detail:   brief(f.Detail, 2048),
-	}
-	c.logf("relaying package-interface defect for %s@%s from rental %s",
-		report.Package, report.Release, report.RentalID)
-	go c.opt.ReportReleaseDefect(report)
 }
 
 func cloneDownloadAdapters(in []*pb.DownloadAdapterRef) []*pb.DownloadAdapterRef {
