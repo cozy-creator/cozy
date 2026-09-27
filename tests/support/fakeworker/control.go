@@ -314,6 +314,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 
 	var dropAck *pb.AttemptOutcome
+	var divergent *pb.AttemptOffer
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -472,6 +473,12 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				f.outcomeWithOutput(outcome, offer)
 			case "dropack":
 				dropAck = f.outcomeWithOutput(outcome, offer)
+			case "divergentreplay":
+				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
+					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_FAILED, "the first telling")
+				t.PlacementId = offer.PlacementId
+				divergent = offer
+				outcome(t)
 			case "missing-output":
 				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
 					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
@@ -524,6 +531,28 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			if f.arm == "badterminal" {
 				time.Sleep(500 * time.Millisecond)
 				return nil
+			}
+			if f.arm == "divergentreplay" && divergent != nil {
+				// A worker that journaled a DIFFERENT outcome for an attempt the owner
+				// already closed — a restarted runtime re-telling it, say — holds that
+				// outcome and its seat until an ack names it.
+				offer := divergent
+				divergent = nil
+				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
+					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_FAILED, "a second, different telling")
+				t.PlacementId = offer.PlacementId
+				heldMu.Lock()
+				heldOutcome = &pb.HeldAttempt{
+					RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
+					Kind:                 pb.AttemptKind_ATTEMPT_KIND_SERVING,
+					State:                pb.AttemptState_ATTEMPT_STATE_OUTCOME_PENDING_ACK,
+					InvocationSpecDigest: offer.InvocationSpecDigest,
+					PlacementId:          offer.PlacementId, ExecutorEpoch: 1,
+					OutcomeId: t.OutcomeId, OutcomeDigest: t.OutcomeDigest,
+				}
+				heldMu.Unlock()
+				f.say("ARM: a divergent outcome %s is replayed for the closed attempt", t.OutcomeId)
+				outcome(t)
 			}
 			if f.arm == "dropack" && dropAck != nil {
 				// THE DROP. A worker whose ack never arrived keeps replaying its journaled
