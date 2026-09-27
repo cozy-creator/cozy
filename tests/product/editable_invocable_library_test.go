@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -19,7 +20,8 @@ func TestEditableInvocableLibraryTracksCodeWithoutPackageManifest(t *testing.T) 
 	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
 	project := t.TempDir()
 	control := filepath.Join(project, "control")
-	runtimeInstall, runtimeSource := "cozy-runtime=="+version, ""
+	// The host Runtime meets the controller's floor; the package declares its own.
+	runtimeInstall, runtimeSource := "cozy-runtime>="+hostruntime.ToolFloor, ""
 	if *privateChildRuntimeWheel != "" {
 		wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 		must(t, err)
@@ -113,14 +115,14 @@ async def main(ctx):
 	must(t, os.WriteFile(edited, []byte(strings.Replace(script, "    assert", "    ctx.log('caller changed')\n    assert", 1)), 0600))
 	run(edited)
 	second := child("2")
-	if second.Executions != 0 || second.Revision != first.Revision || second.Computation != first.Computation {
+	if second.Executions != 0 || second.Computation != first.Computation {
 		t.Fatalf("caller edit invalidated helper: %+v", second)
 	}
 	must(t, os.WriteFile(module, []byte(strings.Replace(body, "Result(42)", "Result(43)", 1)), 0600))
 	must(t, os.WriteFile(edited, []byte(strings.Replace(script, "== 42", "== 43", 1)), 0600))
 	run(edited)
 	third := child("3")
-	if third.Executions != 1 || third.Revision == first.Revision || third.Computation == first.Computation {
+	if third.Executions != 1 || third.Computation == first.Computation {
 		t.Fatalf("helper edit reused old code: %+v", third)
 	}
 	if _, err := os.Stat(filepath.Join(library, "package.toml")); !os.IsNotExist(err) {

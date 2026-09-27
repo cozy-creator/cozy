@@ -114,7 +114,7 @@ async def main(ctx):
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	var revision string
+	computations := map[int]string{}
 	for i := range 2 {
 		script := filepath.Join(project, fmt.Sprintf("caller%d.py", i))
 		must(t, os.WriteFile(script, []byte(body+fmt.Sprintf("    ctx.log('independent caller %d')\n", i)), 0600))
@@ -130,10 +130,10 @@ async def main(ctx):
 				t.Fatalf("numerical job did not execute: %+v", call)
 			}
 			assertMachineChildScalar(t, call, 4+j*2)
-			if revision == "" {
-				revision = call.Revision
-			} else if revision != call.Revision {
-				t.Fatal("edited caller changed unchanged library revision")
+			if computations[j] == "" {
+				computations[j] = call.Computation
+			} else if computations[j] != call.Computation {
+				t.Fatal("edited caller changed an unchanged library call's identity")
 			}
 		}
 	}

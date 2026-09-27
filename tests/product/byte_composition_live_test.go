@@ -88,7 +88,7 @@ only-include=["byte_tools.py"]
 	fatal(t, problem)
 	defer store.Close()
 	first, second := machineChildren(t, root, store, "1"), machineChildren(t, root, store, "2")
-	if len(first) != 2 || len(second) != 2 || first[0].Executions != 1 || first[1].Executions != 1 || second[0].Executions != 0 || second[1].Executions != 1 || first[0].Computation != second[0].Computation || first[0].Revision != second[0].Revision {
+	if len(first) != 2 || len(second) != 2 || first[0].Executions != 1 || first[1].Executions != 1 || second[0].Executions != 0 || second[1].Executions != 1 || first[0].Computation != second[0].Computation {
 		t.Fatalf("Runtime did not reuse native production and execute both recipient reads: first=%+v second=%+v", first, second)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -19,7 +20,7 @@ import (
 func TestRuntimeBuiltinQuantizeSurvivesCallerEdit(t *testing.T) {
 	integration(t)
 	version := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
-	runtimeInstall, runtimeSource := "cozy-runtime=="+version, ""
+	runtimeInstall, runtimeSource := "cozy-runtime>="+hostruntime.ToolFloor, ""
 	if *privateChildRuntimeWheel != "" {
 		wheel, err := filepath.Abs(*privateChildRuntimeWheel)
 		must(t, err)
@@ -163,7 +164,7 @@ async def main(ctx):
 			t.Fatal("native readback was skipped")
 		}
 		for index, child := range children {
-			t.Logf("Runtime caller %d child %d: request=%s revision=%s computation=%s executions=%d state=%s", i, index, child.Request, child.Revision, child.Computation, child.Executions, child.State)
+			t.Logf("Runtime caller %d child %d: request=%s computation=%s executions=%d state=%s", i, index, child.Request, child.Computation, child.Executions, child.State)
 		}
 		if i == 0 {
 			first = children
@@ -172,7 +173,7 @@ async def main(ctx):
 			}
 		} else {
 			for index := range 2 {
-				if children[index].Executions != 0 || first[index].Revision != children[index].Revision || first[index].Computation == "" || first[index].Computation != children[index].Computation {
+				if children[index].Executions != 0 || first[index].Computation == "" || first[index].Computation != children[index].Computation {
 					t.Fatalf("caller edit invalidated Runtime computation: first=%+v edited=%+v", first, children)
 				}
 			}

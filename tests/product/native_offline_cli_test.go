@@ -221,7 +221,7 @@ sys.exit(main())
 		t.Fatalf("edited caller children: %+v", reused)
 	}
 	for i, child := range reused {
-		if child.Executions != 0 || child.Computation != offline[i].Computation || child.Revision != offline[i].Revision || !bytes.Equal(child.Result, offline[i].Result) {
+		if child.Executions != 0 || child.Computation != offline[i].Computation || !bytes.Equal(child.Result, offline[i].Result) {
 			t.Fatalf("edited caller recomputed/changed child %d: before=%+v after=%+v", i, offline[i], child)
 		}
 	}

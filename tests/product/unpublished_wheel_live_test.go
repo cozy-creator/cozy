@@ -174,7 +174,7 @@ async def main(ctx):
 		t.Fatalf("edited caller lost children: %+v", children)
 	}
 	for n, child := range children {
-		if child.Executions != 0 || child.Computation != before[n].Computation || child.Revision != before[n].Revision || string(child.Result) != string(before[n].Result) {
+		if child.Executions != 0 || child.Computation != before[n].Computation || string(child.Result) != string(before[n].Result) {
 			t.Fatalf("caller edit invalidated wheel computation: %+v", children)
 		}
 	}
@@ -190,7 +190,7 @@ async def main(ctx):
 		t.Fatalf("changed wheel lost children: %+v", children)
 	}
 	for n, child := range children {
-		if child.Executions != 1 || child.Revision == before[n].Revision || child.Computation == before[n].Computation {
+		if child.Executions != 1 || child.Computation == before[n].Computation {
 			t.Fatalf("changed wheel reused old implementation: %+v", children)
 		}
 	}

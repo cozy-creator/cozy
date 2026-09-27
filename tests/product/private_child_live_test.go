@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -25,7 +26,7 @@ var privateChildRuntimeWheel = flag.String("child-runtime-wheel", "", "exact Run
 func TestUnpublishedChildCompositionReusesLocalWorkspace(t *testing.T) {
 	integration(t)
 	runtimeVersion := runtimeFixtureVersion(t, *privateChildRuntimeWheel)
-	runtimeInstall := "cozy-runtime==" + runtimeVersion
+	runtimeInstall := "cozy-runtime>=" + hostruntime.ToolFloor
 	runtimeSource := ""
 	if *privateChildRuntimeWheel != "" {
 		wheel, err := filepath.Abs(*privateChildRuntimeWheel)
@@ -138,7 +139,7 @@ async def main():
 		t.Fatalf("edited parent did not complete [%d]: %s", status, out)
 	}
 	children = machineChildren(t, root, store, "2")
-	if len(children) != 2 || children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[1].Executions != 1 || children[1].Revision != originalB.Revision || children[1].Intent == originalB.Intent {
+	if len(children) != 2 || children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[1].Executions != 1 || children[1].Intent == originalB.Intent {
 		t.Fatalf("local composition did not reuse A and execute changed B: %+v", children)
 	}
 	secondB := children[1]
@@ -152,7 +153,7 @@ async def main():
 		t.Fatalf("same-version library edit did not execute [%d]: %s", status, out)
 	}
 	children = machineChildren(t, root, store, "3")
-	if len(children) != 2 || children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[1].Executions != 1 || children[1].Revision == secondB.Revision || children[1].Intent != secondB.Intent {
+	if len(children) != 2 || children[0].Executions != 0 || children[0].Computation != originalA.Computation || children[1].Executions != 1 || children[1].Computation == secondB.Computation || children[1].Intent != secondB.Intent {
 		t.Fatalf("library edit did not invalidate exactly B: %+v", children)
 	}
 	assertMachineChildScalar(t, children[1], 215)
