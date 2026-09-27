@@ -80,7 +80,7 @@ func handleRent(ctx *Context) *exit.Error {
 		_, developmentSet := ctx.Inv.Bools["--development"]
 		if ctx.Inv.Value("--idempotency-key") != "" || ctx.Inv.Value("--gpus") != "" ||
 			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || developmentSet || ctx.Inv.Value("--ssh-public-key") != "" ||
-			ctx.Inv.Value("--image") != "" {
+			ctx.Inv.Value("--image") != "" || ctx.Inv.Value("--disk-gb") != "" {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
 		}
@@ -212,6 +212,9 @@ func handleRent(ctx *Context) *exit.Error {
 	if note := oddGPUNote(gpus); note != "" {
 		notes = append(notes, note)
 	}
+	if note := rentalDiskNote(st, operationKey, ready); note != "" {
+		notes = append(notes, note)
+	}
 	fields := []output.Field{
 		{K: "machine", V: row.MachineName},
 		{K: "rental", V: ready.ID},
@@ -229,6 +232,9 @@ func handleRent(ctx *Context) *exit.Error {
 	if ready.Development {
 		fields = append(fields, output.Field{K: "ssh_address", V: ready.SSHAddress})
 	}
+	if ready.ContainerDiskGB > 0 {
+		fields = append(fields, output.Field{K: "disk_gb", V: ready.ContainerDiskGB})
+	}
 	rec := compactRecord(fields, "machine", "state", "gpu", "changed")
 	rec.Notes = notes
 	rec.Next = []string{
@@ -236,6 +242,49 @@ func handleRent(ctx *Context) *exit.Error {
 		"cozy rental end " + row.MachineName,
 	}
 	return emit(ctx, rec)
+}
+
+// manualRentalDisk is the explicit --disk-gb request. A paid operation keeps the disk its
+// exact body asked for: resuming it without --disk-gb reuses that, and another size needs
+// a new operation key.
+func manualRentalDisk(ctx *Context, existing *records.RentalOperation) (int, *exit.Error) {
+	disk := 0
+	if raw := ctx.Inv.Value("--disk-gb"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return 0, exit.Usagef("--disk-gb %q is not a positive number of GB", raw)
+		}
+		disk = n
+	}
+	if existing == nil {
+		return disk, nil
+	}
+	request, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
+	if problem != nil {
+		return 0, problem
+	}
+	if disk != 0 && disk != request.ContainerDiskGB {
+		return 0, exit.Named(exit.Conflict, "rental.idempotency_conflict",
+			"rental operation already asks for a %d GB disk", request.ContainerDiskGB).
+			WithRemedy("resume without --disk-gb or use a new operation key")
+	}
+	return request.ContainerDiskGB, nil
+}
+
+// rentalDiskNote says when the Hub did not confirm the requested --disk-gb.
+func rentalDiskNote(st *records.Store, operationKey string, ready hub.Rental) string {
+	op, problem := st.RentalOperation(operationKey)
+	if problem != nil || op == nil {
+		return ""
+	}
+	request, problem := hub.ParseRentalRequestBytes(op.RequestBody)
+	if problem != nil || request.ContainerDiskGB == 0 || ready.ContainerDiskGB >= request.ContainerDiskGB {
+		return ""
+	}
+	if ready.ContainerDiskGB == 0 {
+		return fmt.Sprintf("Tensorhub did not report the pod's disk, so the requested %d GB is unconfirmed", request.ContainerDiskGB)
+	}
+	return fmt.Sprintf("Tensorhub bought a %d GB disk, below the requested %d GB", ready.ContainerDiskGB, request.ContainerDiskGB)
 }
 
 // acquireRental is the one paid mutation used by both `cozy rental new` and
@@ -311,6 +360,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	}
 	if managedRequestID == "" {
 		workload.ServingModels, e = manualRentalModels(ctx, existing)
+		if e != nil {
+			return records.Rental{}, hub.Rental{}, false, e
+		}
+		workload.ContainerDiskGB, e = manualRentalDisk(ctx, existing)
 		if e != nil {
 			return records.Rental{}, hub.Rental{}, false, e
 		}
