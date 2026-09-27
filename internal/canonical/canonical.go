@@ -8,8 +8,8 @@
 // The writer is ADAPTED from worker-protocol's own independent Go canonicalizer
 // (`scripts/crosslang/canon.go`) — the second implementation that proved the rules are
 // written down rather than accidental. The reader serves documents from independently
-// deployed peers: the carried digest fences the exact bytes, and the reader keeps the
-// members this build consumes, ignoring additions from other versions.
+// deployed peers: it refuses bytes no canonical writer produces, and keeps the members this
+// build consumes, ignoring additions from other versions.
 //
 // Conformance is `go test ./tests/product -run TestCanonicalDocuments`, which renders
 // worker-protocol's FROZEN fixture corpus through this codec and compares bytes and ids.
@@ -36,9 +36,8 @@ const (
 	DocMax = 8 << 20
 )
 
-// Value is bool | int64 | string | []Value | map[string]Value. The writer's profile is
-// integer-only printable ASCII; a read document may also hold a float64 in a member this
-// build does not consume.
+// Value is bool | int64 | string | []Value | map[string]Value. No float, no null:
+// the protocol profile is integer-only printable ASCII.
 type Value any
 
 // Doc is a parsed canonical document — the JSON value, deliberately not a re-encoded

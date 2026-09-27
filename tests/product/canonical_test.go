@@ -39,6 +39,7 @@ func TestCanonicalDocuments(t *testing.T) {
 	fixtureDir := corpusDir
 	var manifest struct {
 		Canonical map[string]struct{ ID, Type, Document string } `json:"canonical"`
+		Tolerated map[string]struct{ ID, Type, Document string } `json:"tolerated"`
 		WireMinor uint32                                         `json:"wire_minor"`
 	}
 	data, err := os.ReadFile(filepath.Join(fixtureDir, "MANIFEST.json"))
@@ -100,24 +101,41 @@ func TestCanonicalDocuments(t *testing.T) {
 		t.Fatalf("exercised %d of %d canonical documents", arms, len(manifest.Canonical))
 	}
 
-	// Frozen SEMANTIC TWINS: one frozen document with one writer rule broken. The reader
-	// serves independently deployed peers, so only an ambiguous document refuses; the
-	// others read, and identity stays the digest of their exact bytes.
-	for name, want := range map[string]string{
+	// RED: every frozen SEMANTIC TWIN — one frozen document with exactly one writer rule
+	// broken — is refused by the code the fixture names.
+	for name, code := range map[string]string{
 		"twin_duplicate_key": "duplicate_key",
-		"twin_float":         "",
-		"twin_unknown_key":   "",
-		"twin_whitespace":    "",
+		"twin_float":         "non_integer_number",
+		"twin_whitespace":    "noncanonical_encoding",
 	} {
 		body, err := os.ReadFile(filepath.Join(fixtureDir, "red", name+".json"))
 		must(t, err)
-		doc, rerr := canonical.Read(body, &pb.InvocationSpec{})
-		if got := canonical.Code(rerr); got != want {
-			t.Errorf("%s: read as %q, wanted %q", name, got, want)
+		_, rerr := canonical.Read(body, &pb.InvocationSpec{})
+		if got := canonical.Code(rerr); got != code {
+			t.Errorf("%s: refused as %q, wanted %q", name, got, code)
 		}
-		if want == "" && doc.Str("payload_digest") == "" {
-			t.Errorf("%s: the tolerant read lost the document's consumed members", name)
+		arms++
+	}
+	// TOLERATED: a newer peer's unknown key (top-level or nested) and an absent collection
+	// read, keep the consumed members, and keep the identity of their exact bytes.
+	if len(manifest.Tolerated) == 0 {
+		t.Fatal("the corpus carries no tolerated documents")
+	}
+	for name, row := range manifest.Tolerated {
+		msg := messageFor(row.Type)
+		body, err := os.ReadFile(filepath.Join(fixtureDir, "tolerated", name+".json"))
+		must(t, err)
+		if msg == nil {
+			t.Errorf("%s: no binding for %s", name, row.Type)
+			continue
 		}
+		if _, rerr := canonical.Read(body, msg); rerr != nil {
+			t.Errorf("%s: a tolerated document was refused: %v", name, rerr)
+		}
+		if spelled, _ := canonical.Spell(canonical.Digest(body)); spelled != row.ID {
+			t.Errorf("%s: id %s != frozen %s", name, spelled, row.ID)
+		}
+		must(t, canonical.Unmarshal(body, proto.Clone(msg)))
 		arms++
 	}
 
@@ -144,9 +162,9 @@ func TestCanonicalDocuments(t *testing.T) {
 		t.Errorf("a non-ASCII field was not refused: %v", cerr)
 	}
 	arms += 5 // the wire-minor agreement and the document plane's own refusals, above
-	t.Logf("%s: %d arms at wire minor %d (%d canonical documents, 4 semantic twins, "+
-		"4 plane refusals, 1 wire-minor agreement)",
-		fixtureDir, arms, manifest.WireMinor, len(manifest.Canonical))
+	t.Logf("%s: %d arms at wire minor %d (%d canonical documents, 3 semantic twins, "+
+		"%d tolerated documents, 4 plane refusals, 1 wire-minor agreement)",
+		fixtureDir, arms, manifest.WireMinor, len(manifest.Canonical), len(manifest.Tolerated))
 }
 
 func messageFor(name string) proto.Message {
