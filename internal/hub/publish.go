@@ -302,6 +302,9 @@ func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation str
 		callCtx, cancel := context.WithTimeout(ctx, Timeout)
 		raw, problem = c.readModelFinalization(callCtx, ref, operation)
 		cancel()
+		if transientPoll(ctx, problem) {
+			continue
+		}
 		if problem != nil {
 			return CheckpointPublication{}, problem
 		}
@@ -516,4 +519,11 @@ func (c *Client) CheckpointReads(ctx context.Context, ref Ref, checkpointID stri
 		body: map[string]any{"object_ids": ids},
 	}, &out)
 	return out.Reads, e
+}
+
+// transientPoll: a status read that failed in transit while the caller still waits. The
+// finalization is durable on the Hub, so the next poll asks again instead of abandoning it.
+func transientPoll(ctx context.Context, problem *exit.Error) bool {
+	return problem != nil && ctx.Err() == nil &&
+		(problem.Code == exit.Unavailable || problem.Code == exit.Deadline || problem.Code == exit.Capacity)
 }

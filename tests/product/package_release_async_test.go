@@ -43,7 +43,12 @@ func TestPackageReleaseFinalizeWaitsForQueuedCommit(t *testing.T) {
 			}
 			write(http.StatusAccepted, hub.PackageReleaseCommit{PublicationID: "pub-1", State: "queued", StatusURL: "/v1/packages/paul/demo/publish/1.0.0/status"})
 		case "GET /v1/packages/paul/demo/publish/1.0.0/status":
-			if statusCalls.Add(1) == 1 {
+			switch statusCalls.Add(1) {
+			case 1:
+				// A blip in transit: the durable finalization keeps being polled.
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			case 2:
 				write(http.StatusOK, hub.PackageReleaseCommit{PublicationID: "pub-1", State: "verifying", StatusURL: "/v1/packages/paul/demo/publish/1.0.0/status"})
 				return
 			}
@@ -68,7 +73,7 @@ func TestPackageReleaseFinalizeWaitsForQueuedCommit(t *testing.T) {
 	if problem != nil {
 		t.Fatalf("wait: %s", problem)
 	}
-	if done.State != "committed" || statusCalls.Load() != 2 || len(done.Warnings) != 1 {
+	if done.State != "committed" || statusCalls.Load() != 3 || len(done.Warnings) != 1 {
 		t.Fatalf("unexpected terminal result: %+v, status calls=%d", done, statusCalls.Load())
 	}
 }

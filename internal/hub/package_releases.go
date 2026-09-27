@@ -239,12 +239,15 @@ func (c *Client) WaitPackageRelease(ctx context.Context, ref Ref, release string
 		case <-timer.C:
 		}
 		callCtx, cancel := context.WithTimeout(ctx, Timeout)
-		var problem *exit.Error
-		state, problem = c.PackageReleaseStatus(callCtx, ref, release)
+		next, problem := c.PackageReleaseStatus(callCtx, ref, release)
 		cancel()
+		if transientPoll(ctx, problem) {
+			continue
+		}
 		if problem != nil {
 			return state, problem
 		}
+		state = next
 	}
 }
 
