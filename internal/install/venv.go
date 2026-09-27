@@ -36,30 +36,14 @@ type EnvironmentReceipt struct {
 }
 
 // MaterializeEnvironment is the ONE code-executing step, and it runs only after the source has
-// been verified. The lock is absolute: there is no relaxed fallback and no resolve
-// that could write one — a lock that cannot satisfy this host refuses with uv's
-// exact words.
-//
-// The spelling is `uv sync --locked`, not the design's `uv sync --frozen`. Observed
-// on uv 0.12.7: `--frozen` skips the up-to-date check and happily
-// installs a lock that does not match the release's pyproject, which is exactly the
-// silent-different-closure outcome the rule exists to prevent. `--locked` refuses
-// that, never writes uv.lock, and never falls back to a resolve; a matching lock
-// needs no network at all (verified with UV_OFFLINE=1). The two flags are mutually
-// exclusive in uv, so this is the stronger reading of one rule, not a second one.
+// been verified. Local source is the author's project, so `uv sync` relocks a lock its
+// pyproject has moved past (a version bump) and uv's resolution alone refuses real conflicts.
+// Published releases keep their frozen lock (MaterializePublishedEnvironment).
 func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *exit.Error) {
 	return materializeEnvironment(sourceDir, venvDir, true)
 }
 
 func materializeEnvironment(sourceDir, venvDir string, editable bool) (*EnvironmentReceipt, *exit.Error) {
-	lock := filepath.Join(sourceDir, "uv.lock")
-	_, err := os.Stat(lock)
-	if err != nil {
-		return nil, exit.Named(exit.Structural, "lock_missing",
-			"the release carries no uv.lock at %s", lock).
-			WithRemedy("a package release pins its whole closure; `uv sync --locked` has nothing to install without it")
-	}
-
 	python, problem := hostruntime.ProjectPython(context.Background(), sourceDir)
 	if problem != nil {
 		return nil, problem
@@ -70,7 +54,7 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 	}
 	env.Extra = pickCUDAExtra(sourceDir, &env.Warnings)
 
-	args := []string{"sync", "--locked", "--no-dev", "--no-default-groups", "--no-progress", "--python", python.Executable}
+	args := []string{"sync", "--no-dev", "--no-default-groups", "--no-progress", "--python", python.Executable}
 	if !editable {
 		args = append(args, "--no-editable")
 	}
@@ -85,9 +69,8 @@ func materializeEnvironment(sourceDir, venvDir string, editable bool) (*Environm
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil {
-		return nil, exit.Named(exit.Structural, "locked_sync_refused",
-			"`uv %s` refused for this host — the lock was not resolved, relaxed, or rewritten",
-			strings.Join(args, " ")).
+		return nil, exit.Named(exit.Structural, "package_sync_refused",
+			"`uv %s` could not resolve or install this project for this host", strings.Join(args, " ")).
 			WithRemedy("uv said: %s", condense(out.String())).
 			WithNext("cozy help package install")
 	}
