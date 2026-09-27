@@ -474,9 +474,10 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 	seen := map[string]bool{}
 	for _, product := range products {
 		cpu := product.AcceleratorModel == "CPU"
-		invalidCPU := cpu && (product.ComputeCapability != "" || product.VRAMGB != 0 || product.MinimumRAMPerGPUGB != 0)
-		invalidGPU := !cpu && (!computeCapabilityPattern.MatchString(product.ComputeCapability) ||
-			product.VRAMGB <= 0 || product.MinimumRAMPerGPUGB <= 0)
+		// Host RAM is an informational fact: placement fits GPUs only, so neither a
+		// RAM figure nor its absence decides whether a product can be rented.
+		invalidCPU := cpu && (product.ComputeCapability != "" || product.VRAMGB != 0)
+		invalidGPU := !cpu && (!computeCapabilityPattern.MatchString(product.ComputeCapability) || product.VRAMGB <= 0)
 		if strings.TrimSpace(product.Name) == "" || strings.TrimSpace(product.AcceleratorModel) == "" ||
 			invalidCPU || invalidGPU || seen[product.Name] {
 			continue

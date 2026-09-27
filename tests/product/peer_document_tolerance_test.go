@@ -18,7 +18,8 @@ import (
 )
 
 // Tensorhub, TensorFS and older or newer Creators are peers that evolve independently.
-// An additive field, an unsorted list or one unusable row must not refuse the document.
+// An additive field, an unsorted list or one unusable row must not refuse the document,
+// and a GPU product without a host-RAM figure is still rentable: placement fits GPUs only.
 func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/models/proof/model/publications/op-1/finalize", func(w http.ResponseWriter, _ *http.Request) {
@@ -40,7 +41,7 @@ func TestHubAnswersWithAdditiveFieldsAreRead(t *testing.T) {
 			{"name":"cpu","accelerator_model":"CPU","widths":[{"accelerator_count":1,"price_usd_micros_per_hour":1000}],"region":"future"},
 			{"name":"unpriced","accelerator_model":"NVIDIA H100","compute_capability":"9.0","vram_gb":80,"minimum_ram_per_gpu_gb":100,
 			 "widths":[{"accelerator_count":1,"price_usd_micros_per_hour":0}]},
-			{"name":"h100","accelerator_model":"NVIDIA H100","compute_capability":"9.0","vram_gb":80,"minimum_ram_per_gpu_gb":100,
+			{"name":"h100","accelerator_model":"NVIDIA H100","compute_capability":"9.0","vram_gb":80,
 			 "widths":[{"accelerator_count":1,"price_usd_micros_per_hour":3000000},{"accelerator_count":0,"price_usd_micros_per_hour":1},
 			           {"accelerator_count":2,"price_usd_micros_per_hour":6000000}]},
 			{"name":"cpu","accelerator_model":"CPU","widths":[{"accelerator_count":1,"price_usd_micros_per_hour":1}]}
