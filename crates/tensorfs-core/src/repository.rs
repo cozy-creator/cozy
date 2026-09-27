@@ -154,6 +154,11 @@ impl ReleaseLane {
         &self.lane
     }
 
+    /// Same lane name and manifest, whatever fields a newer writer added.
+    pub fn same_target(&self, other: &ReleaseLane) -> bool {
+        self.lane == other.lane && self.manifest == other.manifest
+    }
+
     fn validate(&self) -> Result<()> {
         ascii_name("Release.lane", &self.lane, 128)?;
         hex64("Release.manifest", &self.manifest.sha256)?;
@@ -503,8 +508,7 @@ impl Repository {
                 .lanes
                 .binary_search_by(|candidate| candidate.key().cmp(lane.key()))
             {
-                Ok(index)
-                    if next.releases[release_index].lanes[index].manifest == lane.manifest => {}
+                Ok(index) if next.releases[release_index].lanes[index].same_target(&lane) => {}
                 Ok(index) => next.releases[release_index].lanes[index] = lane,
                 Err(index) => next.releases[release_index].lanes.insert(index, lane),
             }
