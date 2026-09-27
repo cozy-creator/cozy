@@ -118,3 +118,13 @@ def gpu_sum(payload: SumRequest) -> SumResult:
 	}
 	t.Logf("%s ran on %s (%d device), grant %s: %s", request.ID, model, count, granted, fmt.Sprint(strings.TrimSpace(out)))
 }
+
+// hostAccelerators is this computer's NVIDIA devices as the driver names them.
+func hostAccelerators() (string, int) {
+	out, err := exec.Command("nvidia-smi", "--query-gpu=name", "--format=csv,noheader").Output()
+	names := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if err != nil || names[0] == "" {
+		return "", 0
+	}
+	return strings.TrimSpace(names[0]), len(names)
+}

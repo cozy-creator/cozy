@@ -1248,6 +1248,30 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 	return emit(ctx, rec)
 }
 
+// collectionPendingNote says where a finished result waits and why it cannot be collected.
+func collectionPendingNote(view *api.MachineExecutionView, number int64) string {
+	return fmt.Sprintf("the result stays on machine %s until it can be collected: %s — "+
+		"fix the cause; the daemon collects it on its next observation (`cozy run watch %d`)",
+		view.Machine, view.ObservationError, number)
+}
+
+// custodyOwed is whether a finished machine run's result has yet to settle where it stays.
+func custodyOwed(view *api.MachineExecutionView, status string) bool {
+	return view != nil && status == "completed" && !view.Collected && view.Retained == "" && view.CollectionRefused == ""
+}
+
+// awaitResultCustody follows a finished machine run's events past its terminal until its
+// result's custody settles: collected, refused until its owner acts, kept on the machine,
+// or lost with it. The daemon's observer collects; a client only listens.
+func awaitResultCustody(c *localapi.Client, id string) *exit.Error {
+	terminal, problem := c.Watch(id, 0, func(localapi.Event) bool { return true })
+	if problem != nil || terminal == nil {
+		return problem
+	}
+	_, problem = c.Watch(id, terminal.EventID, func(event localapi.Event) bool { return !records.CustodyEvent(event.Type) })
+	return problem
+}
+
 func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *exit.Error) {
 	// Publication is an obligation of a SUCCESSFUL execution. A failed or canceled run
 	// has no accepted output bytes to publish, so its terminal must reach the caller even
@@ -1256,6 +1280,19 @@ func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *e
 	// absorbing answer and can never become success by waiting on that row.
 	if life.Status == "failed" || life.Status == "canceled" {
 		return life, nil
+	}
+	if custodyOwed(life.MachineExecution, life.Status) {
+		if problem := awaitResultCustody(c, life.RequestID); problem != nil {
+			return life, problem
+		}
+		updated, problem := c.Request(life.RequestID)
+		if problem != nil {
+			return life, problem
+		}
+		life = updated
+	}
+	if view := life.MachineExecution; view != nil && !view.Collected {
+		return life, nil // nothing to export until collected; renderRun says why
 	}
 	for life.OutputExport != nil {
 		export := life.OutputExport
@@ -1552,8 +1589,6 @@ func NewProgress(ctx *Context, rawJSON bool, began time.Time) *RunProgress {
 }
 
 func (p *RunProgress) On(e localapi.Event) bool {
-	// Every machine's progress reaches a client as the one progress event.
-	e = machineProgressEvent(e)
 	if p.rawJSON {
 		data, err := json.Marshal(e)
 		if err == nil {
@@ -1564,6 +1599,7 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	if p.ctx.Mode().JSON {
 		return true // one JSON document on stdout: the run's own, at the end
 	}
+	e = machineProgressEvent(e)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	kind := strings.TrimPrefix(e.Type, "request.")
@@ -2176,6 +2212,11 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if exportOwed {
 		shownStatus = life.Status + " (export pending: " + export.ErrorCode + ")"
 	}
+	pending := life.MachineExecution
+	collectionOwed := pending != nil && pending.CollectionRefused != "" && !pending.Collected && mapTerminal(status) == "succeeded"
+	if collectionOwed {
+		shownStatus = life.Status + " (collection pending: " + pending.CollectionRefused + ")"
+	}
 	if life.Status == "canceled" && life.CanceledBy != "" {
 		shownStatus = humanCancellationStatus(life.CanceledBy)
 	} else if life.Status == "canceled" {
@@ -2205,6 +2246,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		fields = append(fields, output.Field{K: "outputs", V: outs})
 	}
 	notes := []string{}
+	if collectionOwed {
+		notes = append(notes, collectionPendingNote(pending, life.Number))
+	}
 	if exportOwed {
 		notes = append(notes, fmt.Sprintf(
 			"output export to %s failed (%s): %s — fix the recorded destination and repeat "+

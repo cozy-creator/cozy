@@ -255,7 +255,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &event); err != nil || event["type"] == nil {
 			t.Fatalf("stderr is not a typed JSONL event: %q (%v)", line, err)
 		}
-		if event["type"] == "request.progress" {
+		// A run on a machine streams the Runtime's own progress samples.
+		if event["type"] == "request.progress" || event["type"] == "machine.progress" {
 			progressEvents++
 		}
 	}

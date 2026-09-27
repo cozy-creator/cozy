@@ -35,6 +35,10 @@ type MachineExecutionView struct {
 	// Retained says why the finished result stays with the machine: nothing on this host
 	// can receive it, so no observation waits for it.
 	Retained string `json:"retained,omitempty"`
+	// CollectionRefused names why collecting a finished result cannot proceed until the
+	// owner acts (a destination that refuses the files, say); the machine keeps the result
+	// and a later observation collects it once the cause is fixed.
+	CollectionRefused string `json:"collection_refused,omitempty"`
 }
 
 // RetainedOutput is an output held on the machine that produced it, in this host's custody,
@@ -120,6 +124,14 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MediaID: output.MediaID, URL: "/v1/media/" + output.MediaID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
 		}
 	}
+	// The files this client received from the machine, each once.
+	if files, problem := s.store.MachineFileResults(row.ID); problem == nil && len(state.Outputs) == 0 {
+		for _, file := range files {
+			if output := file.Output; file.Copied && output.OutputID != "" {
+				state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MediaID: output.MediaID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
+			}
+		}
+	}
 	if row.ModelTransfer != nil {
 		if transfer, problem := s.store.ModelTransferOf(row.ID); problem == nil && transfer != nil {
 			state.ModelDestination, state.ModelOutputs = transfer.Destination, transfer.Checkpoints
@@ -175,6 +187,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			}
 			if !view.Collected {
 				view.ObservationError = "execution finished; result collection has not established recipient custody"
+				if code, message, problem := s.store.MachineCollectionRefusal(row.ID); problem == nil && code != "" {
+					view.CollectionRefused, view.ObservationError = code, message
+				}
 			}
 		}
 	}

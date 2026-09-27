@@ -37,7 +37,9 @@ func TestAttentionPinSurvivesSubmissionAndConflictingReplayRefuses(t *testing.T)
 	}
 	// The same pin given by flag and by payload term is one pin, not a conflict.
 	twice := append(append([]string(nil), args...), "kernel.attention=flash-attn3-fp8")
-	if _, out := runCozy(t, root, twice...); strings.Contains(out, "pinned") || strings.Contains(out, "different body") {
+	// The run itself may fail on a machine with no device for the kernel; only admission
+	// is under test.
+	if _, out := runCozy(t, root, twice...); strings.Contains(out, "pinned as both") || strings.Contains(out, "different body") {
 		t.Fatalf("an identical repeated pin was refused: %s", out)
 	}
 	args[4] = "--attention-kernel=flash-attn3"
