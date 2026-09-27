@@ -121,7 +121,13 @@ func (m *machineRuns) collectMachineFiles(ctx context.Context, request records.R
 				return false, problem
 			}
 		} else if problem := verifyMachineResultCopy(file); problem != nil {
-			return false, problem
+			// The machine still holds bytes it has not released: receive them again.
+			if file.State != "copied" {
+				return false, problem
+			}
+			if problem := receiveMachineFile(ctx, connection, file); problem != nil {
+				return false, problem
+			}
 		}
 		if recoveredDecodedBound > 0 {
 			if file.Source.OutputID != "value" || file.Source.MimeType != "image/png" {
@@ -243,6 +249,7 @@ func receiveMachineBlob(ctx context.Context, connection *machineConnection, rete
 		if _, err := io.MultiWriter(output, hash).Write(chunk.Data); err != nil {
 			return exit.Internalf("cannot write received file: %s", err)
 		}
+		connection.progress.Advance(int64(len(chunk.Data)))
 		offset += uint64(len(chunk.Data))
 	}
 	if offset != uint64(descriptor.Length) || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != descriptor.Digest {

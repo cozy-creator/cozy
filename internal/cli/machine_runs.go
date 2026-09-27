@@ -16,6 +16,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/transfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -66,6 +67,7 @@ type machineConnection struct {
 	retainBytes        func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
 	releaseBytes       func(context.Context, *pb.NativeByteRetentionRequest) (*pb.NativeByteRetentionResult, error)
 	readBytes          func(context.Context, *pb.NativeByteRetentionRequest, *pb.Ref) (machineByteStream, error)
+	progress           *transfer.Progress
 }
 
 type machineClientConnection struct {
@@ -511,14 +513,19 @@ func (m *machineRuns) observationLock(request string) *sync.Mutex {
 	return lock.(*sync.Mutex)
 }
 
-func (m *machineRuns) refresh(ctx context.Context, request records.Request) *exit.Error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+// refresh observes and, once finished, collects one execution. Collection moves result
+// bytes whose size no clock can predict, so the work is bounded by progress: it ends only
+// when no step completes and no byte arrives for the stall budget.
+func (m *machineRuns) refresh(parent context.Context, request records.Request) *exit.Error {
+	progress := &transfer.Progress{}
+	ctx, cancel := progress.Context(parent)
 	defer cancel()
 	connection, link, query, problem := m.executionConnection(ctx, request)
 	if problem != nil {
 		return problem
 	}
 	defer connection.connection.Close()
+	connection.progress = progress
 	if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
 		return problem
 	}
@@ -531,12 +538,14 @@ func (m *machineRuns) refresh(ctx context.Context, request records.Request) *exi
 	if err != nil {
 		return machineTransport(err)
 	}
+	progress.Advance(1)
 	cursor := uint64(link.RemoteCursor)
 	for {
 		page, err := connection.client.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor, Limit: 128})
 		if err != nil {
 			return machineTransport(err)
 		}
+		progress.Advance(1)
 		if problem := m.store.ObserveMachineExecution(request.ID, state, page); problem != nil {
 			return problem
 		}
@@ -562,6 +571,7 @@ func (m *machineRuns) refresh(ctx context.Context, request records.Request) *exi
 		}
 		return machineTransport(err)
 	}
+	progress.Advance(1)
 	if problem := m.store.RecordMachineOutcome(request.ID, outcome); problem != nil {
 		return problem
 	}
@@ -588,11 +598,11 @@ func (m *machineRuns) refresh(ctx context.Context, request records.Request) *exi
 	return m.store.ObserveMachineExecution(request.ID, collected, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, collected.Sequence)})
 }
 
-func (m *machineRuns) Control(ctx context.Context, request records.Request, action string) *exit.Error {
+func (m *machineRuns) Control(parent context.Context, request records.Request, action string) *exit.Error {
 	lock := m.observationLock(request.ID)
 	lock.Lock()
 	defer lock.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	ctx, cancel := (&transfer.Progress{}).Context(parent)
 	defer cancel()
 	value := map[string]pb.MachineExecutionAction{"pause": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_PAUSE, "resume": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_RESUME, "cancel": pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL}[action]
 	if value == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_UNSPECIFIED {
@@ -609,7 +619,7 @@ func (m *machineRuns) Control(ctx context.Context, request records.Request, acti
 			return problem
 		}
 		if previous == value {
-			return m.refresh(ctx, request)
+			return m.refresh(parent, request)
 		}
 	}
 	state, err := connection.client.GetMachineExecution(ctx, query)
@@ -620,7 +630,7 @@ func (m *machineRuns) Control(ctx context.Context, request records.Request, acti
 	if problem := m.store.RecordMachineControl(request.ID, command); problem != nil {
 		return problem
 	}
-	if problem := m.refresh(ctx, request); problem != nil {
+	if problem := m.refresh(parent, request); problem != nil {
 		return problem
 	}
 	return m.Start(request)

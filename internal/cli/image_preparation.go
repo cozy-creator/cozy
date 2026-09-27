@@ -45,21 +45,14 @@ func imagePreparer(ctx *Context) launch.ImagePreparer {
 		if kind.Preparation == nil || profile.Profile != kind.Preparation.Profile {
 			return source, nil
 		}
+		// Preparation is optional client work: any answer other than a prepared image
+		// under the qualified profile uploads the source unchanged.
 		prepared, problem := tool.PrepareImage(callCtx, source, kind)
-		if problem != nil {
-			return "", problem
+		if callCtx.Err() != nil {
+			return "", exit.New(exit.Canceled, "image preparation was cancelled")
 		}
-		if prepared.Profile != profile.Profile {
-			return "", exit.Internalf("image helper changed its qualified profile")
-		}
-		if prepared.Status == "raw" {
-			if prepared.Path != source {
-				return "", exit.Internalf("image helper changed the raw source path")
-			}
+		if problem != nil || prepared.Profile != profile.Profile || prepared.Status != "prepared" || prepared.Path == "" {
 			return source, nil
-		}
-		if prepared.Status != "prepared" {
-			return "", exit.Internalf("image helper returned unknown status %q", prepared.Status)
 		}
 		return prepared.Path, nil
 	}

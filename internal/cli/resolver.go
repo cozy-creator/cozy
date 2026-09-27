@@ -151,11 +151,10 @@ func (r *Resolver) SnapshotEditable(pkg string) (*EditableSnapshot, *exit.Error)
 	if problem != nil {
 		return snapshot, refreshFailure(pkg, current, problem)
 	}
-	if "local/"+pack.Name != current.Package || pack.Release != current.Version {
+	if "local/"+pack.Name != current.Package {
 		pack.Close()
 		return snapshot, refreshFailure(pkg, current, exit.Named(exit.Conflict, "editable_identity_changed",
-			"editable metadata now names %s/%s@%s, not installed %s@%s",
-			"local", pack.Name, pack.Release, current.Package, current.Version).
+			"editable metadata now names local/%s, not installed %s", pack.Name, current.Package).
 			WithRemedy("install the renamed package directory explicitly"))
 	}
 	stats, bytes, problem := pack.SourceStats()
@@ -164,7 +163,7 @@ func (r *Resolver) SnapshotEditable(pkg string) (*EditableSnapshot, *exit.Error)
 		return snapshot, refreshFailure(pkg, current, problem)
 	}
 	snapshot.pack, snapshot.Files, snapshot.Bytes = pack, len(stats), bytes
-	snapshot.Changed = !packagepublish.SourceStatsUnchanged(current.Dir, stats)
+	snapshot.Changed = pack.Release != current.Version || !packagepublish.SourceStatsUnchanged(current.Dir, stats)
 	return snapshot, nil
 }
 
@@ -207,8 +206,7 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 		if current.SourceKind != "local" {
 			return current.ID, false, nil
 		}
-		if current.SourceRef != pack.Tree || current.Package != "local/"+pack.Name ||
-			current.Version != pack.Release {
+		if current.SourceRef != pack.Tree || current.Package != "local/"+pack.Name {
 			return current.ID, false, refreshFailure(pkg, current, exit.Named(exit.Conflict, "editable_refresh_raced",
 				"the active package changed while its editable source was being checked").
 				WithRemedy("retry against the current install"))
@@ -217,7 +215,7 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 	result, problem := install.Run(layout, r.store, install.Request{
 		Ref: install.Ref{Package: current.Package}, Force: true,
 		Local: &install.LocalSource{Bytes: snapshot.Bytes, Files: snapshot.Files,
-			Package: current.Package, Release: current.Version, Tree: current.SourceRef},
+			Package: current.Package, Release: pack.Release, Tree: current.SourceRef},
 	})
 	if problem != nil {
 		return current.ID, false, refreshFailure(pkg, current, problem)
@@ -453,12 +451,11 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 		// sibling slot the owner bound to the same model release under the same ladder,
 		// so the pod prepares both entrypoints once and a switch between them is a
 		// dispatch. Owner overrides and authored defaults use the same selection here.
-		rows, problem := r.catalog.PackageBindings(ctx, ref)
-		if problem != nil {
-			return empty, nil, problem
+		// Sharing only saves a later preparation, so an unreadable override set skips it.
+		if rows, problem := r.catalog.PackageBindings(ctx, ref); problem == nil {
+			defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows)
+			shareModelSlots(models, entrypoint, packageInterface.Entrypoints, defaults)
 		}
-		defaults := effectiveModelBindings(declaredModelSlots(packageInterface.Entrypoints), rows)
-		shareModelSlots(models, entrypoint, packageInterface.Entrypoints, defaults)
 	}
 	planID := ""
 	if len(models) == 0 {

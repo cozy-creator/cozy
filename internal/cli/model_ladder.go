@@ -163,27 +163,46 @@ func resolveRemoteLadder(ctx *Context, packageName string, slot launch.Slot,
 	if problem != nil {
 		return empty, rebind(problem, packageName, slot.Path)
 	}
-	rungs := make([]records.ModelRung, 0, len(spec.Binding.Ladder))
-	for _, rung := range spec.Binding.Ladder {
-		if !slot.AllowsGPUCount(rung.GPUs) {
-			return empty, exit.Named(exit.Validation, "package_model_default_invalid", "%s does not support %d GPUs", slot.Path, rung.GPUs)
-		}
+	rungs, problem := ladderRungs(ctx, ref, selected, slot, spec.Ref, spec.Binding.Ladder)
+	if problem != nil {
+		return empty, rebind(problem, packageName, slot.Path)
+	}
+	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(), CatalogRepository: ref.String(),
+		Release: selected.Release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
+}
+
+// ladderRungs binds each rung to the release's manifest for its lane. A rung the release
+// cannot serve is skipped with a warning; only a ladder with no usable rung refuses.
+func ladderRungs(ctx *Context, ref hub.Ref, selected *hub.ModelReleaseSummary, slot launch.Slot,
+	spec string, ladder []hub.BindingRung) ([]records.ModelRung, *exit.Error) {
+	rungs := make([]records.ModelRung, 0, len(ladder))
+	var first *exit.Error
+	for _, rung := range ladder {
 		lane, problem := laneOf(ref, selected, rung.Lane)
-		if problem != nil {
-			return empty, rebind(problem, packageName, slot.Path)
+		if problem == nil && !slot.AllowsGPUCount(rung.GPUs) {
+			problem = exit.Named(exit.Validation, "package_model_default_invalid", "%s does not support %d GPUs", slot.Path, rung.GPUs)
 		}
-		if problem := requireCheckpointComponents(spec.Ref+"/"+rung.Lane, slot, lane.Components); problem != nil {
-			return empty, problem
+		if problem == nil {
+			problem = requireCheckpointComponents(spec+"/"+rung.Lane, slot, lane.Components)
 		}
-		if _, err := canonical.Raw(lane.ManifestID); err != nil {
-			return empty, exit.Named(exit.Conflict, "rental.model_manifest_invalid",
+		if _, err := canonical.Raw(lane.ManifestID); problem == nil && err != nil {
+			problem = exit.Named(exit.Conflict, "rental.model_manifest_invalid",
 				"Tensorhub returned an invalid manifest for %s@%s/%s", ref.String(), selected.Release, rung.Lane)
+		}
+		if problem != nil {
+			if first == nil {
+				first = problem
+			}
+			fmt.Fprintf(ctx.Err, "warning: %s skips rung %s: %s\n", slot.Path, rung.String(), problem.Message)
+			continue
 		}
 		rungs = append(rungs, records.ModelRung{GPU: rung.GPU, GPUs: rung.GPUs, Lane: rung.Lane,
 			Manifest: lane.ManifestID, Bytes: lane.Bytes, ComponentBytes: lane.ComponentBytes})
 	}
-	return orchestrator.ModelRef{Package: packageName, Slot: slot.Path, Model: ref.String(), CatalogRepository: ref.String(),
-		Release: selected.Release, ComponentUse: slot.ComponentUse, Ladder: rungs}, nil
+	if len(rungs) == 0 && first != nil {
+		return nil, first
+	}
+	return rungs, nil
 }
 
 // rebind turns a card miss into the early refusal that names its fix: the binding points

@@ -504,19 +504,15 @@ func (u *rentalRuntimeUpdates) reconcile(ctx context.Context, row *records.Runti
 						return problem
 					}
 					_ = control.Close()
+					// The worker finished and answered maintenance control, so it is healthy.
+					// The pair it reports is recorded as observed; a spelling or version it
+					// chose differently never keeps a paid rental closed.
 					if status.Update.State == "succeeded" {
-						if actual.Observed.Runtime.Distribution != selection.Target.RuntimeUpdate.Runtime.Version || actual.Observed.TensorFS != selection.Target.RuntimeUpdate.TensorFS.Version {
-							return exit.New(exit.Conflict, "completed update does not match the worker's actual Runtime/TensorFS pair; maintenance remains closed")
-						}
 						row.State, row.Error = "succeeded", ""
 					} else {
-						var prior runtimeObservation
-						_ = json.Unmarshal(selection.Selection, &prior)
-						if actual.Observed.Runtime.Distribution != prior.Observed.Runtime.Distribution || actual.Observed.TensorFS != prior.Observed.TensorFS {
-							return exit.New(exit.Conflict, "worker did not retain the recorded healthy Runtime/TensorFS pair; maintenance remains closed")
-						}
 						row.State = "failed"
-						row.Error = "the update was refused or rolled back; the previous healthy Runtime/TensorFS pair is retained"
+						row.Error = fmt.Sprintf("the update was refused or rolled back; the worker runs Runtime %s / TensorFS %s",
+							actual.Observed.Runtime.Distribution, actual.Observed.TensorFS)
 						if status.Update.Error != "" {
 							row.Error += ": " + status.Update.Error
 						}

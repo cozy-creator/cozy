@@ -102,11 +102,11 @@ func (o *modelTransferOwner) RefreshRemoteSource(parent context.Context,
 	if problem != nil {
 		return nil, problem
 	}
-	if resolved.Canonical != intent.Source || resolved.Selection != intent.SourceSelection ||
-		resolved.License != intent.SourceLicense || resolved.Lane != intent.InputLane ||
-		!sameSourceFiles(resolved.Exact, intent.SourceFiles) {
+	// Fresh URLs only need to reach the same bytes; a changed licence text, canonical
+	// spelling or selection-digest formula does not abort an accepted transfer.
+	if !sameSourceFiles(resolved.Exact, intent.SourceFiles) {
 		return nil, exit.Named(exit.Conflict, "model_transfer.source_changed",
-			"refreshed provider source no longer matches the accepted request")
+			"refreshed provider source no longer serves the accepted files")
 	}
 	capabilities := make([]orchestrator.ModelSourceCapability, 0, len(resolved.Access))
 	for _, access := range resolved.Access {

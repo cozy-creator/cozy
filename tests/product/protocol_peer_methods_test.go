@@ -35,18 +35,30 @@ func (p *fakePod) SubmitMachineExecution(ctx context.Context, request *pb.Machin
 	return p.UnimplementedWorkerControlServer.SubmitMachineExecution(ctx, request)
 }
 func (p *fakePod) GetMachineExecution(ctx context.Context, request *pb.MachineExecutionQuery) (*pb.MachineExecutionState, error) {
+	if p.machine != nil {
+		return p.machine.GetMachineExecution(ctx, request)
+	}
 	return p.UnimplementedWorkerControlServer.GetMachineExecution(ctx, request)
 }
 func (p *fakePod) ListMachineExecutionEvents(ctx context.Context, request *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error) {
+	if p.machine != nil {
+		return p.machine.ListMachineExecutionEvents(ctx, request)
+	}
 	return p.UnimplementedWorkerControlServer.ListMachineExecutionEvents(ctx, request)
 }
 func (p *fakePod) ControlMachineExecution(ctx context.Context, request *pb.MachineExecutionControl) (*pb.MachineExecutionState, error) {
 	return p.UnimplementedWorkerControlServer.ControlMachineExecution(ctx, request)
 }
 func (p *fakePod) CollectMachineExecution(ctx context.Context, request *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
+	if p.machine != nil {
+		return p.machine.CollectMachineExecution(ctx, request)
+	}
 	return p.UnimplementedWorkerControlServer.CollectMachineExecution(ctx, request)
 }
 func (p *fakePod) AcknowledgeMachineExecutionCollection(ctx context.Context, request *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
+	if p.machine != nil {
+		return p.machine.AcknowledgeMachineExecutionCollection(ctx, request)
+	}
 	return p.UnimplementedWorkerControlServer.AcknowledgeMachineExecutionCollection(ctx, request)
 }
 func (p *standInPod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {

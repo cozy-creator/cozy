@@ -113,7 +113,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			detail = err.Error()
 		}
 		s.refuse(w, r, http.StatusBadRequest, "malformed_body",
-			"the submission is not one closed JSON object: "+detail, "")
+			"the submission is not one closed JSON object: "+detail, staleDaemonRemedy(err))
 		return
 	}
 	passThrough := sub.ModelTransfer != nil && sub.Package == "" && sub.Function == ""

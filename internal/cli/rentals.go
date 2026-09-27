@@ -453,17 +453,16 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, remote, false, exit.New(exit.Canceled,
 			"rental %s was acquired after model transfer cancellation", remote.ID)
 	}
-	// A fresh acceptance must lock the catalog quote the renter agreed to; a
-	// replayed ask for a rental already acquiring may answer with the hub's
-	// reconciled BILLED rate (th-120), and that is truth to adopt, never a
-	// reason to destroy a working pod.
-	if remote.State == "pending_acquisition" && remote.HourlyRateUSDMicros != hourlyRateUSDMicros {
+	// A fresh acceptance may not lock more than the catalog quote the renter agreed
+	// to; a rate at or below it is adopted, as is a replayed ask's reconciled
+	// BILLED rate (th-120). Neither is a reason to destroy a working pod.
+	if remote.State == "pending_acquisition" && remote.HourlyRateUSDMicros > hourlyRateUSDMicros {
 		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)
 		hctx, cancel := hub.Context()
 		_ = c.Release(hctx, remote.ID, "locked Cozy retail rate changed")
 		cancel()
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.hourly_rate_changed",
-			"rental %s locked %d USD micros/hour, not catalog rate %d",
+			"rental %s locked %d USD micros/hour, above catalog rate %d",
 			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros).
 			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
 	}

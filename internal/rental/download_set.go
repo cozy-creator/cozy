@@ -34,6 +34,15 @@ func DownloadSet(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRe
 	}
 	packages = append([]*pb.DownloadPackageRef(nil), packages...)
 	models = append([]*pb.DownloadModelRef(nil), models...)
+	for i, row := range models {
+		// An exact manifest with half a release label is still that manifest: fetch it
+		// as a checkpoint rather than refusing the set.
+		if row != nil && (row.Release == "") != (row.Lane == "") {
+			row = proto.Clone(row).(*pb.DownloadModelRef)
+			row.Release, row.Lane = "", ""
+			models[i] = row
+		}
+	}
 	sort.Slice(packages, func(i, j int) bool {
 		return packages[i].Package+"\x00"+packages[i].Release < packages[j].Package+"\x00"+packages[j].Release
 	})
@@ -42,19 +51,20 @@ func DownloadSet(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRe
 	})
 	prior := ""
 	selectedPackages := map[string]bool{}
+	distinct := packages[:0]
 	for _, row := range packages {
-		key := ""
-		if row != nil {
-			key = row.Package + "\x00" + row.Release
-		}
 		if row == nil || strings.TrimSpace(row.Package) != row.Package || row.Package == "" ||
-			strings.TrimSpace(row.Release) != row.Release || row.Release == "" || key <= prior {
+			strings.TrimSpace(row.Release) != row.Release || row.Release == "" {
 			return nil, exit.Named(exit.Validation, "rental.download_set_package_invalid",
-				"download packages must be complete, unique logical refs")
+				"download packages must be complete logical refs")
 		}
-		selectedPackages[row.Package] = true
-		prior = key
+		if key := row.Package + "\x00" + row.Release; key != prior {
+			selectedPackages[row.Package] = true
+			distinct = append(distinct, row)
+			prior = key
+		}
 	}
+	packages = distinct
 	var kept *pb.DownloadModelRef
 	unique := models[:0]
 	modelOnlyPackage := ""
@@ -74,10 +84,9 @@ func DownloadSet(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRe
 			strings.TrimSpace(row.Release) != row.Release ||
 			strings.TrimSpace(row.Package) != row.Package || !packageSelected ||
 			strings.TrimSpace(row.Slot) != row.Slot || row.Slot == "" && !standalone ||
-			strings.TrimSpace(row.Lane) != row.Lane || (row.Release == "") != (row.Lane == "") ||
-			digestErr != nil {
+			strings.TrimSpace(row.Lane) != row.Lane || digestErr != nil {
 			return nil, exit.Named(exit.Validation, "rental.download_set_model_invalid",
-				"download models need exact manifests and a release/lane pair or neither")
+				"download models need a model, slot and exact manifest")
 		}
 		// Rows sort by package and slot, so one slot's rows are adjacent. The same bytes
 		// selected twice for a slot are one selection; different bytes are a conflict.

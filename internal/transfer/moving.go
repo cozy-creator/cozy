@@ -29,6 +29,9 @@ const stillSamples = 8
 // considers alive registers here as movement.
 const movingSample = 15 * time.Second
 
+// StallBudget is how long a meter may stay still before the work it watches is stalled.
+const StallBudget = stillSamples * movingSample
+
 // mover watches BYTES, so a transfer is bounded by whether it is working rather than
 // by how long it has been working.
 //
@@ -99,3 +102,18 @@ type countedReadCloser struct {
 
 func (c *countedReadCloser) Read(p []byte) (int, error) { return c.counted.Read(p) }
 func (c *countedReadCloser) Close() error               { return c.closer.Close() }
+
+// Progress bounds a multi-step operation by observed movement rather than a clock: its
+// context ends only after `stillSamples` consecutive samples see no step and no byte.
+type Progress struct{ m mover }
+
+func (p *Progress) Context(parent context.Context) (context.Context, context.CancelFunc) {
+	return p.m.context(parent)
+}
+
+// Advance records completed work: bytes received, or one finished step.
+func (p *Progress) Advance(n int64) {
+	if p != nil {
+		p.m.moved.Add(n)
+	}
+}
