@@ -500,6 +500,23 @@ func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 // RentalReadyState answers whether a hub state means the pod is booted and attachable.
 func RentalReadyState(state string) bool { return state == "ready" || state == "attached" }
 
+// RebootRental adopts a new Hub-attested boot of the same rental worker. The boot and
+// its address mapping change; the rental and everything recorded against it stay.
+func (s *Store) RebootRental(id, workerID, boot, address, media string) *exit.Error {
+	if boot == "" || address == "" || media == "" {
+		return exit.New(exit.Validation, "a rebooted rental needs its boot and addresses")
+	}
+	result, err := s.db.Exec(`UPDATE rentals SET expected_worker_boot_id=?,address=?,media_address=?
+		WHERE id=? AND expected_worker_id=? AND state IN ('ready','attached')`, boot, address, media, id, workerID)
+	if err != nil {
+		return exit.Internalf("cannot record rental %s reboot: %s", id, err)
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return exit.Named(exit.Conflict, "rental.reboot_mismatch", "rental %s is not ready on worker %s", id, workerID)
+	}
+	return nil
+}
+
 // rentalTerminalStates are the hub's words for a pod that will never take work again:
 // its acquisition failed, or the rental is being or has been given back. Every OTHER
 // word — the whole pre-ready lifecycle above, and any state this build does not yet

@@ -1234,7 +1234,7 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 		cancel()
 	}
 	m.mu.Lock()
-	released, failed, problem := m.applyRowsLocked(origin, views)
+	released, failed, rebooted, problem := m.applyRowsLocked(origin, views)
 	census := m.censusLocked(origin)
 	switch {
 	case problem != nil:
@@ -1252,7 +1252,26 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 	if detached := m.letGo(released, failed); problem == nil {
 		problem = detached
 	}
+	m.reattach(rebooted)
 	return problem
+}
+
+// reattach moves a rebooted rental's control to its new boot, with the lock released.
+// Work bound to the old boot settles on its own; the rental, its custody, installs and
+// queue continue on the new worker.
+func (m *managedRentals) reattach(ids []string) {
+	for _, id := range ids {
+		if m.owner != nil {
+			m.owner.DetachRental(id)
+			m.owner.ResumeRentalControl(id)
+		}
+	}
+	if len(ids) > 0 {
+		if m.installs != nil {
+			m.installs.Wake()
+		}
+		m.wakeQueueAsync()
+	}
 }
 
 // rentalView is the Hub's answer about one rental row.
@@ -1363,13 +1382,13 @@ func (m *managedRentals) sayUnrecordedLocked() {
 
 // applyRowsLocked records the Hub's answers on the rows as they are now; a row forgotten,
 // or taken by an operation, while the Hub was asked is not this answer's to change. It
-// returns the rentals the Hub released and those it failed, for letGo.
-func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (released, failed []string, problem *exit.Error) {
+// returns the rentals the Hub released and failed, for letGo, and those it re-attested on a new boot.
+func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (released, failed, rebooted []string, problem *exit.Error) {
 	census := m.censusLocked(origin)
 	census.hubUnknown = map[string]bool{}
 	operations, problem := m.store.ActiveRentalOperations()
 	if problem != nil {
-		return nil, nil, problem
+		return nil, nil, nil, problem
 	}
 	pending := map[string]records.RentalOperation{}
 	for _, operation := range operations {
@@ -1381,12 +1400,12 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 	}
 	busy, problem := m.inFlightLocked()
 	if problem != nil {
-		return nil, nil, problem
+		return nil, nil, nil, problem
 	}
 	for _, view := range views {
 		current, problem := m.store.RentalRow(view.id)
 		if problem != nil {
-			return released, failed, problem
+			return released, failed, rebooted, problem
 		}
 		if current == nil || busy[view.id] {
 			continue
@@ -1402,7 +1421,7 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			if row.State != hub.RentalReleased {
 				row.State = hub.RentalReleased
 				if problem := m.store.RecordRental(row); problem != nil {
-					return released, failed, problem
+					return released, failed, rebooted, problem
 				}
 			}
 			released = append(released, row.ID)
@@ -1419,7 +1438,7 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			// while the GET was in flight. Its newer durable state wins.
 			current, problem := m.store.RentalOperation(operation.Key)
 			if problem != nil {
-				return released, failed, problem
+				return released, failed, rebooted, problem
 			}
 			if current == nil || current.State == "attached" || current.State == hub.RentalReleased ||
 				current.State == hub.RentalFailed || current.State == hub.RentalReleaseRequested {
@@ -1427,10 +1446,10 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			}
 			token, creator, problem := rental.RetainedAcquisitionCredentials(m.layout, *current)
 			if problem != nil {
-				return released, failed, problem
+				return released, failed, rebooted, problem
 			}
 			if _, problem := finishRentalAttachment(m.layout, m.store, row, remote, operation.Key, token, creator); problem != nil {
-				return released, failed, problem
+				return released, failed, rebooted, problem
 			}
 			if m.owner != nil {
 				// This method starts the existing reconnect loop asynchronously. No
@@ -1442,11 +1461,21 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			m.wakeQueueAsync()
 			continue
 		}
+		if remote.Attachable() && localRentalAttachable(row) && remote.WorkerID == row.ExpectedWorkerID &&
+			(remote.WorkerBootID != row.ExpectedWorkerBootID || remote.Address != row.Address || remote.MediaAddress != row.MediaAddress) {
+			if problem := rental.Reboot(m.layout, m.store, row.ID, remote); problem != nil {
+				m.sayLocked("reboot:"+row.ID, "rental "+row.ID+" rebooted and is not re-attached: "+problem.Message)
+			} else {
+				fmt.Fprintf(m.ctx.Out, "rental %s (%s) rebooted; attaching its new worker\n", row.ID, row.MachineName)
+				row.ExpectedWorkerBootID, row.Address, row.MediaAddress = remote.WorkerBootID, remote.Address, remote.MediaAddress
+				rebooted = append(rebooted, row.ID)
+			}
+		}
 		wasAttachable := localRentalAttachable(row)
 		row.State = remote.State
 		copyRentalFailure(&row, remote)
 		if problem := m.store.RecordRental(row); problem != nil {
-			return released, failed, problem
+			return released, failed, rebooted, problem
 		}
 		if remote.Attachable() && !wasAttachable {
 			// Reconcile changed the durable local rental to attachable. Wake
@@ -1458,7 +1487,7 @@ func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (rel
 			failed = append(failed, row.ID)
 		}
 	}
-	return released, failed, nil
+	return released, failed, rebooted, nil
 }
 
 // letGo detaches the workers of rentals the hub has failed or released, and forgets the

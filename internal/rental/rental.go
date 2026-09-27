@@ -359,6 +359,32 @@ func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit
 	}
 }
 
+// Reboot re-attaches a rental whose pod came back on a new boot. The Hub authenticated
+// that boot for this rental's attempt; it must still carry this host's media bearer and
+// Creator key. The Hub-verified certificate is pinned and the boot recorded.
+func Reboot(l home.Layout, st *records.Store, id string, remote hub.Rental) *exit.Error {
+	token, problem := MediaToken(l, id)
+	if problem != nil {
+		return problem
+	}
+	creator, problem := loadCreatorIdentity(l.RentalCreatorIdentity(id))
+	if problem != nil {
+		return problem
+	}
+	if remote.ID != id || !remote.Attachable() || !remote.HoldsMediaHash(secret.HashHex(token)) || remote.CreatorPublicKey != creator.PublicKey() {
+		return exit.Named(exit.Conflict, "rental.reboot_unauthenticated",
+			"rental %s came back without this host's credentials; its previous attachment is kept", id)
+	}
+	staged := l.RentalCert(id) + ".reboot"
+	if err := os.WriteFile(staged, []byte(remote.CertPEM), 0o644); err != nil {
+		return exit.Internalf("cannot stage rental %s certificate: %s", id, err)
+	}
+	if err := os.Rename(staged, l.RentalCert(id)); err != nil {
+		return exit.Internalf("cannot pin rental %s certificate: %s", id, err)
+	}
+	return st.RebootRental(id, remote.WorkerID, remote.WorkerBootID, remote.Address, remote.MediaAddress)
+}
+
 func write0600(path string, body []byte) *exit.Error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
