@@ -656,6 +656,11 @@ class Stats(TypedDict):
     admission_batches: int
     admitted_objects: int
     admission_nanos: int
+    syncs: int
+    sync_nanos: int
+    recovery_rehashed: int
+    recovery_removed: int
+    recovery_nanos: int
 
 def stats() -> Stats: ...
 def object_id(data: bytes) -> str: ...

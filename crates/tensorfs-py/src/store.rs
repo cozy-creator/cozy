@@ -3688,6 +3688,12 @@ pub fn pull<'p>(
     result.set_item("bytes_moved", report.bytes_moved)?;
     result.set_item("bytes_held", report.bytes_held)?;
     result.set_item("bytes_total", report.bytes_total)?;
+    let durability = PyDict::new(py);
+    durability.set_item("class", report.durability.class.as_str())?;
+    durability.set_item("filesystem", report.durability.filesystem)?;
+    durability.set_item("syncs", report.durability.syncs)?;
+    durability.set_item("sync_seconds", report.durability.seconds)?;
+    result.set_item("durability", durability)?;
     let presence = PyDict::new(py);
     for (id, why) in &report.presence {
         presence.set_item(id, why)?;

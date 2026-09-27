@@ -65,6 +65,11 @@ fn stats(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     result.set_item("admission_batches", now.admission_batches)?;
     result.set_item("admitted_objects", now.admitted_objects)?;
     result.set_item("admission_nanos", now.admission_nanos)?;
+    result.set_item("syncs", now.syncs)?;
+    result.set_item("sync_nanos", now.sync_nanos)?;
+    result.set_item("recovery_rehashed", now.recovery_rehashed)?;
+    result.set_item("recovery_removed", now.recovery_removed)?;
+    result.set_item("recovery_nanos", now.recovery_nanos)?;
     Ok(result)
 }
 

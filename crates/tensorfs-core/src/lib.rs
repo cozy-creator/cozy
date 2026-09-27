@@ -20,6 +20,7 @@ pub mod checkpoint_root;
 pub mod corpus;
 pub mod derived;
 pub mod descriptors;
+pub mod disk;
 pub mod dtype;
 pub mod durability;
 pub mod err;
@@ -53,6 +54,7 @@ pub mod stats;
 pub mod storage;
 pub mod store;
 pub mod transport;
+pub mod unsynced;
 pub mod vectors;
 
 /// This TensorFS's release version.
