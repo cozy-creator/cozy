@@ -197,8 +197,9 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				lastError = problem.Message
 				// submit may have durably frozen/transmitted its offer after this
 				// loop read link. Only a fresh journal read can prove it was unsent.
+				// A machine lost mid-preparation released the run; it is placed again.
 				latest, readProblem := m.store.MachineExecution(request.ID)
-				if readProblem == nil && latest != nil && problem.Code != exit.Unavailable && problem.Code != exit.Deadline && len(latest.Submission) == 0 {
+				if readProblem == nil && latest != nil && problem.Code != exit.Unavailable && problem.Code != exit.Deadline && len(latest.Submission) == 0 && latest.MachineID == link.MachineID {
 					_, _ = m.store.FailQueuedRequest(request.ID, map[string]any{"error_type": problem.ErrName(), "error": problem.Message})
 					return
 				}

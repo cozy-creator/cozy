@@ -1,6 +1,7 @@
 package records
 
 import (
+	"database/sql"
 	"encoding/json"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -26,7 +27,13 @@ const machineInputOwed = `EXISTS(SELECT 1 FROM request_events intake
  AND json_extract(newer.payload,'$.input_id')=json_extract(intake.payload,'$.input_id')))`
 
 func (s *Store) MachineInputs(request string) ([]MachineInput, *exit.Error) {
-	rows, err := s.db.Query(`SELECT intake.payload FROM request_events intake
+	return machineInputsIn(s.db, request)
+}
+
+func machineInputsIn(q interface {
+	Query(string, ...any) (*sql.Rows, error)
+}, request string) ([]MachineInput, *exit.Error) {
+	rows, err := q.Query(`SELECT intake.payload FROM request_events intake
  WHERE intake.request_id=? AND intake.type='machine.input'
  AND NOT EXISTS(SELECT 1 FROM request_events newer WHERE newer.request_id=intake.request_id
  AND newer.type=intake.type AND newer.seq>intake.seq

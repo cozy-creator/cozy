@@ -673,6 +673,11 @@ func recordRental(tx *sql.Tx, r Rental) *exit.Error {
 		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
 			"rental %s already carries another width, address, media address, certificate pin, or worker identity", r.ID)
 	}
+	// The Hub commits these only after proving provider absence, so the machine's
+	// Runtime work settles in the same transaction that records it.
+	if stored.State == "failed" || stored.State == "released" {
+		return settleLostMachine(tx, r.ID)
+	}
 	return nil
 }
 
@@ -1031,7 +1036,7 @@ func (s *Store) ForgetRental(id string) (bool, *exit.Error) {
 		return false, exit.Internalf("cannot begin forgetting rental %s: %s", id, err)
 	}
 	defer tx.Rollback()
-	if problem := loseMachineExecutions(tx, id); problem != nil {
+	if problem := settleLostMachine(tx, id); problem != nil {
 		return false, problem
 	}
 	if _, err := tx.Exec(`UPDATE rental_operations SET state='released', updated_at=?
@@ -1232,11 +1237,15 @@ func (s *Store) AbandonLostAttempt(requestID string, attempt int64, reason strin
 // the work pinned to a name nothing would ever look at again. There is no observer for an
 // object that does not exist, so the question has to be asked from the REQUEST side, which
 // is the side that still has a row.
+//
+// Runtime-linked work is not here: it settles with its machine (settleLostMachine).
 func (s *Store) OrphanedRentalWork() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests
 		WHERE rental=1 AND worker<>'' AND state IN (` + activeRequestStates + `)
 		  AND NOT EXISTS (SELECT 1 FROM rentals WHERE rentals.id=requests.worker
 		                    AND rentals.state NOT IN ('failed','released'))
+		  AND NOT EXISTS (SELECT 1 FROM machine_executions e
+		                    WHERE e.request_id=requests.id AND e.machine_id<>'')
 		ORDER BY created_at,id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list work pinned to lost rentals: %s", err)

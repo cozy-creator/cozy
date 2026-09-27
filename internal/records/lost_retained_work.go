@@ -19,6 +19,17 @@ func (s *Store) FailLostRetainedWork(id, machine, reason string) (bool, *exit.Er
 		return false, exit.Internalf("cannot begin retained-work loss: %s", err)
 	}
 	defer tx.Rollback()
+	failed, problem := failLostRetainedWorkTx(tx, id, machine, reason)
+	if problem != nil || !failed {
+		return false, problem
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot commit retained-work loss: %s", err)
+	}
+	return true, nil
+}
+
+func failLostRetainedWorkTx(tx *sql.Tx, id, machine, reason string) (bool, *exit.Error) {
 	var state, selected string
 	var ordinal int64
 	var retained bool
@@ -67,7 +78,7 @@ func (s *Store) FailLostRetainedWork(id, machine, reason string) (bool, *exit.Er
 	}
 	var linkedMachine string
 	var accepted, outcome bool
-	err = tx.QueryRow(`SELECT machine_id,length(receipt)>0,length(outcome)>0
+	err := tx.QueryRow(`SELECT machine_id,length(receipt)>0,length(outcome)>0
  FROM machine_executions WHERE request_id=?`, id).Scan(&linkedMachine, &accepted, &outcome)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, exit.Internalf("cannot read lost execution custody: %s", err)
@@ -95,9 +106,6 @@ func (s *Store) FailLostRetainedWork(id, machine, reason string) (bool, *exit.Er
 	}
 	if err := appendLossEventTx(tx, id, "request.failed", ordinal, payload, at); err != nil {
 		return false, exit.Internalf("cannot record retained-work failure: %s", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, exit.Internalf("cannot commit retained-work loss: %s", err)
 	}
 	return true, nil
 }
