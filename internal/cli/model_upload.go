@@ -160,9 +160,13 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 			WithRemedy("run locally until the negotiated weights-read return plane is active")
 	}
 	if invocation == nil && effectiveRental {
-		return exit.Named(exit.Unavailable, "model_transfer.rented_recipe_unavailable",
-			"rented standalone ingest requires a reviewed complete-model recipe").
-			WithRemedy("use a supported full HF repository, or invoke a typed native ingestion script")
+		return exit.Named(exit.Unavailable, "model_transfer.rented_source_unavailable",
+			"a rented worker ingests only Hugging Face and Civitai sources").
+			WithRemedy("upload this source without --rental")
+	}
+	if invocation == nil && len(ctx.Inv.Values["--source-profile"]) > 0 {
+		return exit.Usagef("--source-profile selects the profiles a rented ingest converts").
+			WithRemedy("add --rental=<name>, or omit --source-profile to use the one profile the headers match")
 	}
 	if localOnly {
 		ctx.Inv.Bools["--rental"] = false
