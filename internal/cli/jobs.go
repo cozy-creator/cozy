@@ -104,7 +104,8 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		RetainWork:   strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
-		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory}
+		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory,
+		PlannedSourceBytes: ctx.ingestBytes}
 	if deadline%time.Millisecond != 0 {
 		sub.TimeoutMS++
 	}

@@ -99,6 +99,9 @@ type Submission struct {
 	RentalRequired bool
 	// RentNew requires an acquisition owned by this request, never an existing fleet rental.
 	RentNew bool
+	// PlannedSourceBytes is what a script ingest will pull; a rental bought for it is
+	// sized to it.
+	PlannedSourceBytes int64
 	// OutputDirectory is the caller's explicit --out; empty means the package's store.
 	// It is part of the submission's identity, where the derived intent below is not.
 	OutputDirectory string
@@ -299,7 +302,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		AttentionKernel: s.AttentionKernel,
 		Worker:          s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 		RentalRequired: s.RentalRequired, RentNew: s.RentNew, Models: s.Models,
-		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer,
+		OutputExport: s.OutputExport, ModelTransfer: s.ModelTransfer, PlannedSourceBytes: s.PlannedSourceBytes,
 	}
 	event := map[string]any{
 		"retain_work": s.RetainWork,

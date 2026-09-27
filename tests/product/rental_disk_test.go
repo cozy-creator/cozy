@@ -3,6 +3,7 @@
 package producttest
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -22,8 +23,12 @@ func TestRentalNewRequestsTheContainerDisk(t *testing.T) {
 	stand.rent = func(request map[string]any) map[string]any {
 		posted = append(posted, request)
 		// It never becomes ready: --timeout ends the wait and the operation stays open.
-		return map[string]any{"rental_id": "pr-disk-gb", "name": request["name"], "state": "pending_acquisition",
+		view := map[string]any{"rental_id": fmt.Sprintf("pr-disk-gb-%d", len(posted)), "name": request["name"], "state": "pending_acquisition",
 			"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1, "hourly_rate_usd_micros": 3_190_000}
+		if disk, ok := request["container_disk_gb"].(float64); ok && disk == 700 {
+			view["container_disk_gb"] = 350 // the minimum this Hub would buy
+		}
+		return view
 	}
 	stand.mu.Unlock()
 	asks := func() []map[string]any {
@@ -59,13 +64,18 @@ func TestRentalNewRequestsTheContainerDisk(t *testing.T) {
 	if sent := asks(); len(sent) != 2 {
 		t.Fatalf("a refused disk request reached the Hub: %d asks", len(sent))
 	}
+	// Before purchase the view's disk is the minimum the Hub will buy; below the request, say so.
+	if code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--disk-gb=700", "--idempotency-key", "short-disk", "--timeout=2s"); code == 0 ||
+		!strings.Contains(out, "warning: Tensorhub plans a 350 GB disk, below the requested 700 GB") {
+		t.Fatalf("a planned disk below the request was not named [exit %d]: %s", code, out)
+	}
 	// Undeclared stays off the wire.
 	if code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--idempotency-key", "no-disk", "--timeout=2s", "--json"); code == 0 {
 		t.Fatalf("a rental that never became ready succeeded: %s", out)
 	}
-	if sent := asks(); len(sent) != 3 {
-		t.Fatalf("paid asks = %d, want 3", len(sent))
-	} else if _, present := sent[2]["container_disk_gb"]; present {
-		t.Fatalf("a rental without --disk-gb declared a disk: %+v", sent[2])
+	if sent := asks(); len(sent) != 4 {
+		t.Fatalf("paid asks = %d, want 4", len(sent))
+	} else if _, present := sent[3]["container_disk_gb"]; present {
+		t.Fatalf("a rental without --disk-gb declared a disk: %+v", sent[3])
 	}
 }

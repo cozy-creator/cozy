@@ -72,58 +72,19 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	if destination.Org == "local" {
 		return true, exit.Usagef("local/ is reserved for private aliases")
 	}
-	// The provider resolves moving URL spellings to an immutable identity first. No
-	// weights are downloaded by this inventory.
-	source, problem := resolvePublishSource(ctx, parsed.Canonical, nil)
-	if problem != nil {
-		return true, problem
-	}
-	pinned := source.Resolution.Source
-	profiles := ctx.Inv.Values["--source-profile"]
-	var recipe *launch.ModelIngestionRecipe
-	if parsed.Kind == modelsource.HuggingFace && parsed.Member == "" && len(profiles) == 0 {
-		tool, problem := launch.BuiltinOperationsTool(cwd, ctx.Cfg.Home, ctx.Cfg.Tool())
-		if problem != nil {
-			return true, problem
-		}
-		if recipe, problem = tool.ModelIngestionPlan(context.Background(), pinned.Org+"/"+pinned.Repo, pinned.Revision); problem != nil {
-			return true, problem
-		}
-	}
 	if _, problem := ownedPublication(ctx, destination); problem != nil {
 		return true, problem
 	}
-	if recipe != nil {
-		profiles = []string{recipe.Profile}
-	}
-	if len(profiles) > 0 {
-		if source, problem = narrowSourceToProfiles(ctx, source, profiles); problem != nil {
-			return true, problem
-		}
-	}
-	runCtx, cancel := hub.LongContext()
-	defer cancel()
-	conversion, problem := preflightConversionPlan(runCtx, ctx, source, profileSlots(profiles))
+	plan, problem := planNativeIngest(ctx, cwd, parsed, ctx.Inv.Values["--source-profile"])
 	if problem != nil {
-		if strings.Contains(problem.Message, "AMBIGUOUS_CLASSIFICATION") {
-			problem = problem.WithRemedy("choose the reviewed profile(s) with --source-profile; profiles over different files compose one model")
-		}
 		return true, problem
 	}
-	if !conversion.decided() {
-		return true, exit.Named(exit.Unavailable, "model_source.preflight_unavailable", "source headers must be inspected before ingestion: %s", conversion.Undecided)
-	}
-	if len(profiles) == 0 {
-		profiles = []string{conversion.Plans["model"].Profile}
-		if source, problem = narrowSourceToProfiles(ctx, source, profiles); problem != nil {
-			return true, problem
-		}
-	}
+	ctx.ingestBytes = plan.source.Bytes
 	var script []byte
-	if recipe != nil {
-		script = recipeUploadScript(recipe.Repository, recipe.Revision, destination.String())
+	if plan.recipe != nil {
+		script = recipeUploadScript(plan.recipe.Repository, plan.recipe.Revision, destination.String())
 	} else {
-		script = genericUploadScript(parsed.Kind, pinned, profiles, destination.String())
+		script = genericUploadScript(parsed.Kind, plan.source.Resolution.Source, plan.profiles, destination.String())
 	}
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
@@ -156,6 +117,62 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	// model-slot bindings (slot=profile), which refused every profiled ingest.
 	delete(ctx.Inv.Values, "--source-profile")
 	return true, handleRunExecute(ctx)
+}
+
+// nativeIngestPlan is one provider source as a rented ingest converts it: pinned, narrowed
+// to its reviewed profiles, with the Runtime recipe that owns its metadata when one exists.
+// Upload runs it; `cozy rental new --model` sizes the pod's disk from its bytes.
+type nativeIngestPlan struct {
+	source   publishSource
+	profiles []string
+	recipe   *launch.ModelIngestionRecipe
+}
+
+func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profiles []string) (nativeIngestPlan, *exit.Error) {
+	// The provider resolves moving URL spellings to an immutable identity first. No
+	// weights are downloaded by this inventory.
+	source, problem := resolvePublishSource(ctx, parsed.Canonical, nil)
+	if problem != nil {
+		return nativeIngestPlan{}, problem
+	}
+	pinned := source.Resolution.Source
+	var recipe *launch.ModelIngestionRecipe
+	if parsed.Kind == modelsource.HuggingFace && parsed.Member == "" && len(profiles) == 0 {
+		tool, problem := launch.BuiltinOperationsTool(cwd, ctx.Cfg.Home, ctx.Cfg.Tool())
+		if problem != nil {
+			return nativeIngestPlan{}, problem
+		}
+		if recipe, problem = tool.ModelIngestionPlan(context.Background(), pinned.Org+"/"+pinned.Repo, pinned.Revision); problem != nil {
+			return nativeIngestPlan{}, problem
+		}
+	}
+	if recipe != nil {
+		profiles = []string{recipe.Profile}
+	}
+	if len(profiles) > 0 {
+		if source, problem = narrowSourceToProfiles(ctx, source, profiles); problem != nil {
+			return nativeIngestPlan{}, problem
+		}
+	}
+	runCtx, cancel := hub.LongContext()
+	defer cancel()
+	conversion, problem := preflightConversionPlan(runCtx, ctx, source, profileSlots(profiles))
+	if problem != nil {
+		if strings.Contains(problem.Message, "AMBIGUOUS_CLASSIFICATION") {
+			problem = problem.WithRemedy("choose the reviewed profile(s) with --source-profile; profiles over different files compose one model")
+		}
+		return nativeIngestPlan{}, problem
+	}
+	if !conversion.decided() {
+		return nativeIngestPlan{}, exit.Named(exit.Unavailable, "model_source.preflight_unavailable", "source headers must be inspected before ingestion: %s", conversion.Undecided)
+	}
+	if len(profiles) == 0 {
+		profiles = []string{conversion.Plans["model"].Profile}
+		if source, problem = narrowSourceToProfiles(ctx, source, profiles); problem != nil {
+			return nativeIngestPlan{}, problem
+		}
+	}
+	return nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}, nil
 }
 
 func profileSlots(profiles []string) map[string]string {

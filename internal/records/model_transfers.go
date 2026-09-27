@@ -74,7 +74,11 @@ CREATE TABLE IF NOT EXISTS request_model_transfer_objects (
   PRIMARY KEY(request_id,attempt,output_slot,object_id),
   FOREIGN KEY(request_id,attempt,output_slot)
     REFERENCES request_model_transfer_outputs(request_id,attempt,output_slot)
-)`, modelCheckpointSchema, modelCheckpointPublicationSchema}
+)`, modelCheckpointSchema, modelCheckpointPublicationSchema, `
+CREATE TABLE IF NOT EXISTS request_planned_sources (
+  request_id   TEXT PRIMARY KEY REFERENCES requests(id),
+  source_bytes INTEGER NOT NULL CHECK(source_bytes>0)
+)`}
 
 type ModelTransferSourceFile struct {
 	Member string `json:"member"`
@@ -236,7 +240,8 @@ func recordModelTransferTx(tx *sql.Tx, requestID string, intent *ModelTransferIn
 }
 
 // PlannedSourceBytes is the summed length of every source object this request
-// will pull, or 0 when the request moves no model bytes (th-152).
+// will pull, or 0 when the request moves no model bytes (th-152). A request that
+// ingests through its own script declares the figure at submission instead.
 //
 // It is read from request_model_transfer_files, which is written in the same
 // transaction as the request itself and is the table the length CHECK lives
@@ -251,8 +256,8 @@ func recordModelTransferTx(tx *sql.Tx, requestID string, intent *ModelTransferIn
 // resolved before any pod exists.
 func (s *Store) PlannedSourceBytes(requestID string) (int64, *exit.Error) {
 	var total sql.NullInt64
-	if err := s.db.QueryRow(`SELECT SUM(length) FROM request_model_transfer_files
-		WHERE request_id=?`, requestID).Scan(&total); err != nil {
+	if err := s.db.QueryRow(`SELECT COALESCE((SELECT SUM(length) FROM request_model_transfer_files WHERE request_id=?),0)
+		+ COALESCE((SELECT source_bytes FROM request_planned_sources WHERE request_id=?),0)`, requestID, requestID).Scan(&total); err != nil {
 		return 0, exit.Internalf("cannot total model transfer source bytes for %s: %s",
 			requestID, err)
 	}
@@ -260,6 +265,16 @@ func (s *Store) PlannedSourceBytes(requestID string) (int64, *exit.Error) {
 		return 0, nil
 	}
 	return total.Int64, nil
+}
+
+func recordPlannedSourcesTx(tx *sql.Tx, requestID string, sourceBytes int64) *exit.Error {
+	if sourceBytes <= 0 {
+		return nil
+	}
+	if _, err := tx.Exec(`INSERT INTO request_planned_sources(request_id,source_bytes) VALUES(?,?)`, requestID, sourceBytes); err != nil {
+		return exit.Internalf("cannot record the planned source bytes of %s: %s", requestID, err)
+	}
+	return nil
 }
 
 func (s *Store) ModelTransferOf(requestID string) (*ModelTransfer, *exit.Error) {
