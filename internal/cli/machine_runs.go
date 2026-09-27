@@ -498,8 +498,27 @@ func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *m
 	if problem != nil {
 		return problem
 	}
+	if problem := exactExecutionGPUs(submission, workspace); problem != nil {
+		return problem
+	}
 	submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
 	return m.store.RecordMachineSubmission(requestID, submission)
+}
+
+// exactExecutionGPUs sends a counted group only to a Runtime that runs it exactly. Without
+// that capability a count covering the whole machine is already Runtime's own width; a
+// narrower one cannot be honoured and refuses.
+func exactExecutionGPUs(submission *pb.MachineExecutionSubmit, workspace *pb.MachineExecutionWorkspace) *exit.Error {
+	set := submission.PreparedState.GetPlacementSet()
+	if set.GetExecutionGpus() == 0 || workspace.ExactExecutionGpus {
+		return nil
+	}
+	if devices := len(workspace.Devices); devices == 0 || int(set.ExecutionGpus) < devices {
+		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
+			"this call runs on exactly %d GPUs of the machine, and its Runtime cannot hold a call to an exact GPU count; update the rental Runtime", set.ExecutionGpus)
+	}
+	set.ExecutionGpus = 0
+	return nil
 }
 
 func currentExecutionWorkspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {

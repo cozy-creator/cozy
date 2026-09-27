@@ -88,7 +88,8 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 
 // MachineServingSubmission submits one inference root. The desired state is the placement
 // set the machine prepared, and the offer names the placement holding the root. No device
-// pin is sent: Runtime alone chooses the devices and the group width.
+// pin is sent: Runtime chooses the devices, and the group width unless the request's
+// models name an exact GPU count.
 func MachineServingSubmission(request records.Request, capture localpackage.ExecutionCapture, prepared *pb.DesiredPlacementSet, byteInputs []*pb.InputAccess) (*pb.MachineExecutionSubmit, *exit.Error) {
 	if request.IsJob() || prepared == nil {
 		return nil, exit.New(exit.Conflict, "machine inference needs its prepared placement")
@@ -122,6 +123,7 @@ func MachineServingSubmission(request records.Request, capture localpackage.Exec
 	}
 	state := &pb.DesiredWorkerState{Mode: &pb.DesiredWorkerState_PlacementSet{PlacementSet: &pb.DesiredPlacementSet{
 		PlacementSetDigest: prepared.PlacementSetDigest, PlacementSetCanonicalBytes: prepared.PlacementSetCanonicalBytes,
+		ExecutionGpus: uint32(records.Width(request.Models, 0)),
 	}}}
 	return machineSubmission(request, capture, spec, byteInputs, state, placement.Str("placement_id"))
 }

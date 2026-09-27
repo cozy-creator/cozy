@@ -3120,6 +3120,9 @@ type MachineExecutionWorkspace struct {
 	// the CPU composition slot, beneath which a device child is admissible. False: such a
 	// root holds the ordinary device slot and a job directive marking it orchestration refuses.
 	CpuSlotModelInputs bool `protobuf:"varint,7,opt,name=cpu_slot_model_inputs,json=cpuSlotModelInputs,proto3" json:"cpu_slot_model_inputs,omitempty"`
+	// Runtime runs a machine serving root on exactly DesiredPlacementSet.execution_gpus GPUs,
+	// or refuses it typed. False: Runtime ignores that field; a controller does not send it.
+	ExactExecutionGpus bool `protobuf:"varint,8,opt,name=exact_execution_gpus,json=exactExecutionGpus,proto3" json:"exact_execution_gpus,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -3199,6 +3202,13 @@ func (x *MachineExecutionWorkspace) GetExecutorUidIsolation() bool {
 func (x *MachineExecutionWorkspace) GetCpuSlotModelInputs() bool {
 	if x != nil {
 		return x.CpuSlotModelInputs
+	}
+	return false
+}
+
+func (x *MachineExecutionWorkspace) GetExactExecutionGpus() bool {
+	if x != nil {
+		return x.ExactExecutionGpus
 	}
 	return false
 }
@@ -12344,8 +12354,13 @@ type DesiredPlacementSet struct {
 	// orchestration=true, device_count=0, no device request/memory and no nested parent;
 	// Runtime also verifies its actual frozen job interface has no Model/Weights capability.
 	OrchestrationParent *JobDirective `protobuf:"bytes,5,opt,name=orchestration_parent,json=orchestrationParent,proto3" json:"orchestration_parent,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Machine executions only (MachineExecutionSubmit.prepared_state): the exact width of the
+	// device group Runtime grants the offered placement; Runtime picks the ordinals. Zero lets
+	// Runtime choose the widest degree every model slot declares. Operational and outside the
+	// digest, like device_pins. Sent only to a workspace reporting exact_execution_gpus.
+	ExecutionGpus uint32 `protobuf:"varint,6,opt,name=execution_gpus,json=executionGpus,proto3" json:"execution_gpus,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DesiredPlacementSet) Reset() {
@@ -12404,6 +12419,13 @@ func (x *DesiredPlacementSet) GetOrchestrationParent() *JobDirective {
 		return x.OrchestrationParent
 	}
 	return nil
+}
+
+func (x *DesiredPlacementSet) GetExecutionGpus() uint32 {
+	if x != nil {
+		return x.ExecutionGpus
+	}
+	return 0
 }
 
 // Where a placement sits on THIS worker (proto-024). Ordinals are envelope-local (the worker's
@@ -23112,7 +23134,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16caller_installation_id\x18\a \x01(\tR\x14callerInstallationId\x124\n" +
 	"\x16callee_installation_id\x18\b \x01(\tR\x14calleeInstallationIdJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x05\x10\x06R\x16caller_revision_digestR\x10interface_digestR\x16callee_revision_digest\"M\n" +
 	"\x1eMachineExecutionWorkspaceQuery\x12+\n" +
-	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\"\xe7\x02\n" +
+	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\"\x99\x03\n" +
 	"\x19MachineExecutionWorkspace\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12$\n" +
 	"\x0eworker_boot_id\x18\x02 \x01(\tR\fworkerBootId\x124\n" +
@@ -23120,7 +23142,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\adevices\x18\x04 \x03(\v2\x1d.cozy.worker.v1.MachineDeviceR\adevices\x12/\n" +
 	"\x13accelerator_backend\x18\x05 \x01(\tR\x12acceleratorBackend\x124\n" +
 	"\x16executor_uid_isolation\x18\x06 \x01(\bR\x14executorUidIsolation\x121\n" +
-	"\x15cpu_slot_model_inputs\x18\a \x01(\bR\x12cpuSlotModelInputs\"\xb9\x01\n" +
+	"\x15cpu_slot_model_inputs\x18\a \x01(\bR\x12cpuSlotModelInputs\x120\n" +
+	"\x14exact_execution_gpus\x18\b \x01(\bR\x12exactExecutionGpus\"\xb9\x01\n" +
 	"\rMachineDevice\x12\x18\n" +
 	"\aordinal\x18\x01 \x01(\rR\aordinal\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -23870,13 +23893,14 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x13LocalPackageFileRef\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\fR\x06digest\x12\x1a\n" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x16\n" +
-	"\x06length\x18\x04 \x01(\x04R\x06lengthJ\x04\b\x03\x10\x04R\x04kind\"\xa6\x02\n" +
+	"\x06length\x18\x04 \x01(\x04R\x06lengthJ\x04\b\x03\x10\x04R\x04kind\"\xcd\x02\n" +
 	"\x13DesiredPlacementSet\x120\n" +
 	"\x14placement_set_digest\x18\x01 \x01(\fR\x12placementSetDigest\x12A\n" +
 	"\x1dplacement_set_canonical_bytes\x18\x03 \x01(\fR\x1aplacementSetCanonicalBytes\x12C\n" +
 	"\vdevice_pins\x18\x04 \x03(\v2\".cozy.worker.v1.PlacementDevicePinR\n" +
 	"devicePins\x12O\n" +
-	"\x14orchestration_parent\x18\x05 \x01(\v2\x1c.cozy.worker.v1.JobDirectiveR\x13orchestrationParentJ\x04\b\x02\x10\x03\"`\n" +
+	"\x14orchestration_parent\x18\x05 \x01(\v2\x1c.cozy.worker.v1.JobDirectiveR\x13orchestrationParent\x12%\n" +
+	"\x0eexecution_gpus\x18\x06 \x01(\rR\rexecutionGpusJ\x04\b\x02\x10\x03\"`\n" +
 	"\x12PlacementDevicePin\x12!\n" +
 	"\fplacement_id\x18\x01 \x01(\tR\vplacementId\x12'\n" +
 	"\x0fdevice_ordinals\x18\x02 \x03(\rR\x0edeviceOrdinals\"I\n" +
