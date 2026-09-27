@@ -10,11 +10,12 @@
 //! successful end state for a content-addressed write, not a failure.
 //!
 //! The object is RE-SENT when the socket goes silent or the store answers a retryable
-//! status, `PUT_ATTEMPTS` times, exactly as the pull re-asks for one object. The write
-//! silence bound is the ledger's floor — the same derived noise floor `egress.py` used —
-//! never an invented constant. A retryable answer is re-sent after the wait the store
-//! states (`Retry-After`), which spends no attempt, or after the ledger's patience, which
-//! does. Authority stays where it was: `podweights` (or whoever
+//! status, `PUT_ATTEMPTS` times, exactly as the pull re-asks for one object. Every wait of
+//! the exchange — the answer after the last body byte included — is judged by its own
+//! silence against the ledger's patience (`Judge::Silence`), and one write that moves
+//! nothing by the ledger's floor; never an invented constant. A retryable answer is re-sent
+//! after the wait the store states (`Retry-After`), which spends no attempt, or after the
+//! ledger's patience, which does. Authority stays where it was: `podweights` (or whoever
 //! minted the grant) decided WHETHER these bytes may go; this module only moves them.
 //!
 //! **A grant is a URL AND the headers its signature covers, together.** tensorhub signs
@@ -228,10 +229,9 @@ pub fn push_object(
             Some(payload),
             deadline,
             ledger,
-            // The push plane keeps its own derived write bound below and gains no plane
-            // here: it serves no hub call, so it has no transfer whose stillness could
-            // judge it.
-            http::Judge::Deadline,
+            // A peer that stops answering — during the handshake, a write, or after the
+            // last body byte — is judged by that silence, never waited on forever.
+            http::Judge::Silence,
             Some(ledger.floor()),
             Code::TRANSFER_FAILED,
         );

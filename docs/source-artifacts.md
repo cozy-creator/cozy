@@ -15,11 +15,18 @@ ordinary-file Manifest: logical names, raw SHA-256 and exact lengths. URL, origi
 credential do not appear in that manifest or retained root.
 
 `materialize_source(owner, members, *, allowed_hosts, credential_hosts=[], credential="",
-allow_local=False)` returns `artifact` plus per-call `transferred_bytes`. Artifact fields
-are owner, manifest_digest, manifest_length, complete and released. Owner IDs are prefixed
-SHA-256 identities assigned by the caller's operation journal. They are not user retry IDs.
+allow_local=False, progress=None)` returns `artifact` plus per-call `transferred_bytes`.
+Artifact fields are owner, manifest_digest, manifest_length, complete and released. Owner
+IDs are prefixed SHA-256 identities assigned by the caller's operation journal. They are
+not user retry IDs. `progress(present, total)` is called from download threads as bytes
+become durable: held bytes plus bytes this call retained, over the selection's distinct
+object bytes. An exception it raises stops the download, keeps retained bytes, and is
+re-raised.
 
-The downloader moves up to 16 ranged GETs at once across all members. Each object is one
+The downloader moves up to 16 ranged GETs at once across all members, fewer when the
+memory this process can use (cgroup limit less unreclaimable usage, or MemAvailable) does not
+hold 16 streams' buffers; `tensorfs.transfer_streams(wanted)` answers the same question for
+a caller's own upload window. Each object is one
 sparse file of verified runs; a run is asked for with one GET from its reached byte to its
 end and retains progress every 64 MiB: bytes are fdatasynced before the run's extent and
 digest are recorded by atomic rename. When no whole run is left to start, an idle stream

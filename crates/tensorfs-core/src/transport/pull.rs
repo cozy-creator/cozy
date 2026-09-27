@@ -980,7 +980,7 @@ pub(super) fn fetch_wanted_bounded(
     // invariant it proved — the grant set covers the wanted set exactly — is enforced per
     // mint instead: presign authorizes every digest it was asked or refuses, never a silent
     // subset, and a supplier with no URL for an object refuses in the same words.
-    let streams = streams.clamp(1, 128);
+    let streams = super::memory::transfer_streams(streams.clamp(1, 128));
     let recovery = super::speculate::Recovery::new(store, plan, streams, download_budget);
     // Recovery reserves an object connection, not an authorization worker.
     let workers = streams.min(plan.wanted.len().max(1));

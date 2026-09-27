@@ -19,8 +19,8 @@ use tensorfs_core::{
     providers::{self, Provenance, Pulled, Resolution, ResolvedMember},
     store::{Fault, Store},
     transport::{
-        push_object, Anonymous, Deadline, Ledger, PullCancellation, SourceDownload, SourcePolicy,
-        UploadGrant,
+        memory_available, push_object, streams_within, transfer_streams, Anonymous, Deadline,
+        Ledger, PullCancellation, SourceDownload, SourcePolicy, UploadGrant, STREAM_MEMORY,
     },
 };
 
@@ -55,6 +55,8 @@ enum Act {
     Status(u16, Vec<(String, String)>),
     /// Send the head and this many body bytes, then drop the connection.
     Cut(usize),
+    /// Read a PUT body, then say nothing, ever.
+    Silent,
 }
 
 struct Request {
@@ -177,13 +179,19 @@ impl Origin {
             let number = self.asks.fetch_add(1, Ordering::Relaxed) + 1;
             let act = (self.decide)(&request, number);
             if request.method == "PUT" {
-                let length: usize = header("content-length").unwrap().parse().unwrap();
-                let mut sink = vec![0u8; length];
-                if socket.read_exact(&mut sink).is_err() {
+                let length: u64 = header("content-length").unwrap().parse().unwrap();
+                // Discarded as it arrives: this origin's memory is not the client's.
+                let taken = std::io::copy(&mut (&mut socket).take(length), &mut std::io::sink());
+                if taken.ok() != Some(length) {
                     return;
                 }
                 self.puts.fetch_add(1, Ordering::Relaxed);
                 match act {
+                    Act::Silent => {
+                        // Hold the socket until the client gives up on it.
+                        let _ = socket.read(&mut [0u8; 1]);
+                        return;
+                    }
                     Act::Status(status, extra) => {
                         if !reply(&mut socket, status, &extra, b"retry") {
                             return;
@@ -685,6 +693,45 @@ fn pushed_store(name: &str) -> (std::path::PathBuf, Store, ObjectRef) {
 }
 
 #[test]
+fn a_push_whose_store_goes_silent_after_the_body_is_judged_not_waited_on() {
+    let (dir, store, object) = pushed_store("push-silent");
+    let origin = Origin::start(vec![], 0, |request, _| {
+        if request.method == "PUT" {
+            Act::Silent
+        } else {
+            Act::Serve
+        }
+    });
+    let ledger = Ledger::with_resolution(Duration::from_millis(20));
+    let started = Instant::now();
+    let refusal = push_object(
+        &store,
+        &object.sha256,
+        false,
+        &UploadGrant::to(&format!("{}/put/object", origin.base)),
+        &policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        "",
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code, Code::TRANSFER_FAILED);
+    assert!(refusal.detail.contains("response head"), "{refusal}");
+    assert_eq!(
+        origin.puts.load(Ordering::Relaxed),
+        4,
+        "each attempt sent the whole body"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn a_push_told_to_wait_waits_and_then_lands() {
     let (dir, store, object) = pushed_store("push-wait");
     let origin = Origin::start(vec![], 0, |_, number| {
@@ -711,6 +758,210 @@ fn a_push_told_to_wait_waits_and_then_lands() {
     assert_eq!(origin.puts.load(Ordering::Relaxed), 5);
     assert!(started.elapsed() >= Duration::from_secs(4));
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_admissions_queue_instead_of_refusing() {
+    let dir = root("admissions");
+    let store = Store::init(&dir).unwrap();
+    thread::scope(|scope| {
+        for worker in 0..16u64 {
+            let store = &store;
+            scope.spawn(move || {
+                for index in 0..4 {
+                    let bytes = body(1000 + worker * 4 + index, 64 << 10);
+                    let object = ObjectRef::of(&bytes);
+                    store
+                        .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+                        .unwrap();
+                    assert!(store.record_valid(&object.sha256).is_ok());
+                }
+            });
+        }
+    });
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Peak resident memory since `/proc/self/clear_refs` was last reset, in bytes.
+fn peak_resident() -> u64 {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .unwrap()
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .unwrap();
+    kib * 1024
+}
+
+/// Run one `*_child` test of this binary in its own process, optionally inside `scope`.
+fn run_child(test: &str, dir: &std::path::Path, scope: &[&str]) -> std::process::Output {
+    let exe = std::env::current_exe().unwrap();
+    let mut command = match scope.split_first() {
+        Some((program, args)) => {
+            let mut command = Command::new(program);
+            command.args(args).arg(&exe);
+            command
+        }
+        None => Command::new(&exe),
+    };
+    command
+        .args(["--exact", test, "--nocapture"])
+        .env("TFS_DOWNLOAD_CHILD", dir)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn push_memory_child() {
+    let Some(dir) = std::env::var_os("TFS_DOWNLOAD_CHILD") else {
+        return;
+    };
+    let store = Store::init(std::path::Path::new(&dir)).unwrap();
+    let objects: Vec<ObjectRef> = (0..16u64)
+        .map(|seed| {
+            let bytes = body(300 + seed, 16 * MIB);
+            let object = ObjectRef::of(&bytes);
+            store
+                .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+                .unwrap();
+            object
+        })
+        .collect();
+    let origin = Origin::start(vec![], 0, |_, _| Act::Serve);
+    // Forget the objects' construction; measure only the pushes.
+    fs::write("/proc/self/clear_refs", "5").unwrap();
+    let before = peak_resident();
+    thread::scope(|scope| {
+        for object in &objects {
+            let (store, origin) = (&store, &origin);
+            scope.spawn(move || {
+                push_object(
+                    store,
+                    &object.sha256,
+                    false,
+                    &UploadGrant::to(&format!("{}/put/{}", origin.base, object.sha256)),
+                    &policy(),
+                    &Anonymous,
+                    Deadline::none(),
+                    &Ledger::with_resolution(Duration::from_millis(200)),
+                    "",
+                )
+                .unwrap();
+            });
+        }
+    });
+    let grew = peak_resident().saturating_sub(before);
+    println!("PUSHED 16 x 16 MiB, peak resident grew {grew} B");
+    assert_eq!(origin.puts.load(Ordering::Relaxed), 16);
+    // 256 MiB crossed the sockets; the pushes may hold their streams' buffers and no more.
+    assert!(
+        grew < 16 * STREAM_MEMORY + (16 << 20),
+        "pushes buffered {grew} B"
+    );
+}
+
+#[test]
+fn sixteen_concurrent_pushes_hold_stream_buffers_not_objects() {
+    let dir = root("push-memory");
+    let output = run_child("push_memory_child", &dir, &[]);
+    let text = String::from_utf8_lossy(&output.stdout).to_string()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success() && text.contains("PUSHED"), "{text}");
+    println!(
+        "{}",
+        text.lines().find(|line| line.contains("PUSHED")).unwrap()
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn streams_are_sized_to_the_memory_budget() {
+    assert_eq!(streams_within(16, None), 16);
+    assert_eq!(streams_within(16, Some(1 << 40)), 16);
+    assert_eq!(streams_within(16, Some(5 * STREAM_MEMORY)), 5);
+    assert_eq!(
+        streams_within(16, Some(0)),
+        1,
+        "a starved host still moves one stream"
+    );
+    assert!(memory_available().is_some_and(|bytes| bytes > 0));
+}
+
+#[test]
+fn bounded_memory_child() {
+    let Some(dir) = std::env::var_os("TFS_DOWNLOAD_CHILD") else {
+        return;
+    };
+    let available = memory_available().unwrap();
+    let streams = transfer_streams(1024);
+    println!("BUDGET {available} B allows {streams} streams");
+    // The scope's 64 MiB, not the host's gigabytes, decides.
+    assert!(
+        available < 64 << 20 && streams < 32,
+        "{available} B, {streams} streams"
+    );
+    let name = "model.safetensors";
+    let origin = Origin::start(vec![(name, body(77, 16 * MIB))], 16 << 20, |_, _| {
+        Act::Serve
+    });
+    let store = Store::init(std::path::Path::new(&dir)).unwrap();
+    materialize(
+        &store,
+        &owner("bounded"),
+        &origin.resolution(&[name]),
+        &options(MIB, 1024),
+        &|_, _| {},
+    )
+    .unwrap();
+    verify(&store, &origin, &[name]);
+    let live = origin.most_live.load(Ordering::SeqCst);
+    println!("DOWNLOADED with at most {live} live streams");
+    assert!(
+        live <= streams,
+        "{live} streams against a budget of {streams}"
+    );
+}
+
+#[test]
+fn a_memory_limited_scope_downloads_with_fewer_streams() {
+    let scope = [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "-q",
+        "-p",
+        "MemoryMax=64M",
+    ];
+    let usable = Command::new(scope[0])
+        .args(&scope[1..])
+        .arg("true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !usable {
+        eprintln!("SKIPPED: no systemd user manager to create a memory-limited cgroup");
+        return;
+    }
+    let dir = root("bounded-memory");
+    let output = run_child("bounded_memory_child", &dir, &scope);
+    let text = String::from_utf8_lossy(&output.stdout).to_string()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && text.contains("DOWNLOADED"),
+        "{text}"
+    );
+    for line in text
+        .lines()
+        .filter(|line| line.contains("BUDGET") || line.contains("DOWNLOADED"))
+    {
+        println!("{line}");
+    }
+    let _ = fs::remove_dir_all(dir);
 }
 
 /// Throughput on a paced loopback origin (each connection capped like one CDN stream).

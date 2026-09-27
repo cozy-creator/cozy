@@ -77,9 +77,26 @@ def main() -> None:
             assert hf["selection_sha256"] != civitai["selection_sha256"]
             assert civitai["members"][0][2] == len(body), "rounded Civitai size was used"
             assert all("unselected" not in path for path in requests)
+            class Stop(Exception):
+                pass
+
+            def stop(present: int, total: int) -> None:
+                raise Stop((present, total))
+
+            try:
+                store.materialize_source(owner, hf["members"], allowed_hosts=hf["allowed_hosts"],
+                                         credential_hosts=hf["credential_hosts"], allow_local=True,
+                                         progress=stop)
+            except Stop as raised:
+                assert raised.args[0] == (0, len(body)), raised.args
+            else:
+                raise AssertionError("a raising progress callback did not stop the download")
+            reports: list[tuple[int, int]] = []
             result = store.materialize_source(owner, hf["members"], allowed_hosts=hf["allowed_hosts"],
-                                              credential_hosts=hf["credential_hosts"], allow_local=True)
+                                              credential_hosts=hf["credential_hosts"], allow_local=True,
+                                              progress=lambda present, total: reports.append((present, total)))
             assert result["transferred_bytes"] == len(body)
+            assert reports[0] == (0, len(body)) and reports[-1] == (len(body), len(body)), reports
             assert result["artifact"]["manifest_digest"] == hf["content_manifest_digest"]
             before = len(requests)
             again = store.materialize_source(civitai_owner, civitai["members"], allowed_hosts=civitai["allowed_hosts"],
