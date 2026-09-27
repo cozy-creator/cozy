@@ -318,7 +318,7 @@ def runtime_wire(row: WheelArtifact) -> RuntimeWire | None:
             text = archive.read("cozy/worker/v1/wire_version.py").decode()
         except KeyError:
             return None
-    values = dict(re.findall(r"^(WIRE_MINOR|MIN_COMPATIBLE_WIRE_MINOR) = (\d+)$", text, re.M))
+    values = dict(re.findall(r"^(WIRE_MINOR|MIN_COMPATIBLE_WIRE_MINOR)\s*(?::[^=\n]*)?=\s*(\d+)\s*(?:#.*)?$", text, re.M))
     if set(values) != {"WIRE_MINOR", "MIN_COMPATIBLE_WIRE_MINOR"}:
         return None
     return {"wire_minor": int(values["WIRE_MINOR"]), "minimum_wire_minor": int(values["MIN_COMPATIBLE_WIRE_MINOR"])}

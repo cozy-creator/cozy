@@ -460,7 +460,7 @@ func (c *Client) doOnce(ctx context.Context, cl call, out any) (int, *exit.Error
 		*cl.raw = raw
 		return resp.StatusCode, nil
 	}
-	if out != nil {
+	if out != nil && len(bytes.TrimSpace(raw)) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {
 			return resp.StatusCode, exit.Named(exit.Internal, "hub.unreadable_answer",
 				"%s %s answered %d with a body this client cannot read: %s",

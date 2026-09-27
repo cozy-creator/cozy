@@ -71,26 +71,29 @@ func handleAuthLogout(ctx *Context) *exit.Error {
 	if manager == nil {
 		manager = accountauth.New(ctx.Cfg)
 	}
+	// Logging out locally never waits on the server: the Hub is asked to revoke the key,
+	// and this origin's credential is erased whatever it answers.
 	hctx, cancel := hub.Context()
 	session, problem := manager.Authenticate(hctx)
 	cancel()
-	if problem != nil {
-		return problem
+	if problem == nil {
+		hctx, cancel = hub.Context()
+		problem = client(ctx).WithToken(session.AccessToken, "machine login").RevokeDeviceKey(hctx, session.DeviceKeyID)
+		cancel()
 	}
-	hctx, cancel = hub.Context()
-	problem = client(ctx).WithToken(session.AccessToken, "machine login").RevokeDeviceKey(hctx, session.DeviceKeyID)
-	cancel()
-	if problem != nil {
-		return problem
+	if forgotten := manager.Forget(); forgotten != nil {
+		return forgotten
 	}
-	if problem := manager.DeleteCredential(session.DeviceKeyID); problem != nil {
-		return problem
-	}
-	return emit(ctx, compactRecord([]output.Field{
+	record := compactRecord([]output.Field{
 		{K: "status", V: "logged out"},
 		{K: "email", V: session.Email},
 		{K: "hub", V: ctx.Cfg.HubURL},
-	}, "status", "email"))
+	}, "status", "email")
+	if problem != nil && problem.ErrName() != "auth.machine_key_missing" {
+		record.Notes = append(record.Notes, "Tensorhub did not confirm revoking this machine key ("+problem.Message+
+			"); the local credential is erased. `cozy auth revoke-other-machines` from another login revokes it server-side")
+	}
+	return emit(ctx, record)
 }
 
 func handleAuthRevokeOtherMachines(ctx *Context) *exit.Error {

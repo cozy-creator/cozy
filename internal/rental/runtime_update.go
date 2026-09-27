@@ -15,13 +15,11 @@ type RuntimeWire struct {
 // pinned PodHost does not reach. PodHost reports its intersection with the
 // installed Runtime, so the refusal is conservative: a pod whose Host is newer than
 // its Runtime still reads as the older minor, and gets the newer Runtime from a new
-// worker image instead.
+// worker image instead. A Runtime that declares no readable range is unknown, not
+// incompatible: the update proceeds and each operation checks its own capability.
 func RuntimeUpdateHost(version string, target *RuntimeWire, hostWireMinor uint32) *exit.Error {
-	if target == nil || target.MinimumWireMinor == 0 || target.MinimumWireMinor > target.WireMinor {
-		return exit.Named(exit.Structural, "rental.runtime_update_wire_unknown",
-			"Runtime %s declares no readable worker protocol range — nothing was changed", version)
-	}
-	if hostWireMinor >= target.MinimumWireMinor {
+	if target == nil || target.MinimumWireMinor == 0 || target.MinimumWireMinor > target.WireMinor ||
+		hostWireMinor >= target.MinimumWireMinor {
 		return nil
 	}
 	return exit.Named(exit.Conflict, "rental.runtime_update_host_too_old",

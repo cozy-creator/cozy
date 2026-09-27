@@ -128,19 +128,10 @@ func (m *Manager) FinishEmailProof(ctx context.Context, enrollment *Enrollment, 
 	return session, nil
 }
 
-// DeleteCredential erases exactly the credential whose server revocation was
-// confirmed. A mismatched concurrent login is retained.
-func (m *Manager) DeleteCredential(deviceKeyID string) *exit.Error {
+// Forget erases this Hub origin's local machine credential, whatever the server said.
+func (m *Manager) Forget() *exit.Error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	stored, _, problem := m.load()
-	if problem != nil {
-		return problem
-	}
-	if stored.DeviceKeyID != deviceKeyID {
-		return exit.Named(exit.Internal, "auth.machine_changed",
-			"the local machine credential changed while logout was in progress")
-	}
 	if err := os.Remove(m.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return exit.Internalf("cannot erase the machine credential: %s", err)
 	}

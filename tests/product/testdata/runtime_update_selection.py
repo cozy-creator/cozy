@@ -310,6 +310,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
     def test_runtime_wire_is_read_from_the_selected_wheel(self):
         for body, want in [
             ("WIRE_MINOR = 61\nMIN_COMPATIBLE_WIRE_MINOR = 61\n", {"wire_minor": 61, "minimum_wire_minor": 61}),
+            ("WIRE_MINOR: Final = 63  # current\nMIN_COMPATIBLE_WIRE_MINOR: int=62\n", {"wire_minor": 63, "minimum_wire_minor": 62}),
             ("WIRE_MINOR = 61\n", None), (None, None),
         ]:
             path = self.directory / f"wire-{len(str(body))}.whl"

@@ -444,10 +444,14 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if e := st.AdvanceRentalOperation(operationKey, remote.ID, remote.State); e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
-	if remote.Name != machineName {
-		return records.Rental{}, remote, false, exit.Named(exit.Conflict, "rental.machine_name_changed",
-			"Tensorhub returned private rental name %s, not %s", remote.Name, machineName).
-			WithRemedy("do not attach a provider machine under a different local identity")
+	// The hub's name for the machine wins when it can be this host's name too; the
+	// operation keeps the requested name, so both stay on record.
+	localName := machineName
+	if remote.Name != machineName && rentalid.ValidMachineName(remote.Name) {
+		localName = remote.Name
+		if ctx != nil && ctx.Err != nil {
+			fmt.Fprintf(ctx.Err, "Tensorhub named rental %s %s (requested %s)\n", remote.ID, remote.Name, machineName)
+		}
 	}
 	if lifecycle.Err() != nil {
 		return records.Rental{}, remote, false, exit.New(exit.Canceled,
@@ -467,7 +471,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
 	}
 	row := records.Rental{
-		ID: remote.ID, MachineName: machineName, SKU: skuName,
+		ID: remote.ID, MachineName: localName, SKU: skuName,
 		AcceleratorModel: remote.AcceleratorModel, AcceleratorCount: remote.AcceleratorCount,
 		HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
 		ManagedRequestID:    managedRequestID, State: remote.State, Hub: c.Base(),
@@ -478,11 +482,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, problem
 	}
 	if stored != nil {
-		if machineName != stored.MachineName {
-			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.machine_name_changed",
-				"rental %s is already named %s", remote.ID, stored.MachineName).
-				WithRemedy("resume the original operation; its private rental name is immutable")
-		}
 		if stored.ManagedRequestID != managedRequestID {
 			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.management_changed",
 				"rental %s cannot change between manual and Creator-managed", remote.ID)
@@ -496,15 +495,19 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		}
 		row = *stored
 	} else if e := st.RecordRentalContext(observation, row); e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+		// A hub name another local rental already holds stays with that rental; this
+		// machine keeps the name it was requested under.
+		if e.ErrName() != "rental.machine_name_conflict" || row.MachineName == machineName {
+			return records.Rental{}, hub.Rental{}, false, e
+		}
+		row.MachineName = machineName
+		if e := st.RecordRentalContext(observation, row); e != nil {
+			return records.Rental{}, hub.Rental{}, false, e
+		}
 	}
 	observe := func(seen hub.Rental) *exit.Error {
 		if phase != nil {
 			phase(seen)
-		}
-		if seen.Name != row.MachineName {
-			return exit.Named(exit.Conflict, "rental.machine_name_changed",
-				"rental %s changed its name from %s to %s", seen.ID, row.MachineName, seen.Name)
 		}
 		// The hub's rate is the provider's reconciled billed total once the
 		// pod is read back (th-120); the row and burn line adopt it.
