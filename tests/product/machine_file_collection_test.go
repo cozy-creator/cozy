@@ -10,7 +10,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-func TestMachineAssetResultUsesClosedFinalMetadata(t *testing.T) {
+func TestMachineAssetResultChecksConsumedFinalMetadata(t *testing.T) {
 	schema := json.RawMessage(`{"fields":[{"name":"image","type":{"asset":"image"},"wire":"required","asset_bound":{"max_bytes":100,"media_types":["image/png"]}}]}`)
 	schema, err := canonical.NormalizeJCS(schema)
 	must(t, err)
@@ -23,8 +23,15 @@ func TestMachineAssetResultUsesClosedFinalMetadata(t *testing.T) {
 		return &pb.ResultEnvelope{InlineResult: raw, ResultSchemaDigest: canonical.Digest(schema)}
 	}
 	fatal(t, launch.ValidateMachineResult(schema, envelope(asset)))
+	// A newer Runtime's additive metadata and schema spelling are not this host's facts.
+	additive := map[string]any{"worker_note": "newer runtime"}
+	for k, v := range asset {
+		additive[k] = v
+	}
+	evolved := envelope(additive)
+	evolved.ResultSchemaDigest = canonical.Digest([]byte(`{"fields":[],"newer":true}`))
+	fatal(t, launch.ValidateMachineResult(schema, evolved))
 	for name, change := range map[string]func(map[string]any){
-		"extra field":    func(a map[string]any) { a["path"] = "/worker/private" },
 		"missing digest": func(a map[string]any) { delete(a, "digest") },
 		"changed digest": func(a map[string]any) { a["digest"] = childDigest("5") },
 		"wrong kind":     func(a map[string]any) { a["kind"] = "file" },

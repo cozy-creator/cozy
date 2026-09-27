@@ -44,10 +44,18 @@ func TestMultipleOfInterfaceAndExactPayload(t *testing.T) {
 	}
 }
 
-func TestMultipleOfInvalidSchemaRefusesEarly(t *testing.T) {
-	for _, value := range []string{"0", "-32", "null", `"32"`, "1e400"} {
-		if _, problem := launch.DecodePackageInterface(multipleOfInterface("int", value)); problem == nil {
-			t.Fatalf("invalid multiple_of %s accepted", value)
+// A bound this host cannot evaluate is left to Runtime's execution-time validation; it
+// neither refuses the package nor the request.
+func TestMultipleOfUnreadableBoundIsLeftToRuntime(t *testing.T) {
+	for _, value := range []string{"0", "-32", "null"} {
+		surface, problem := launch.DecodePackageInterface(multipleOfInterface("int", value))
+		if problem != nil {
+			t.Fatalf("multiple_of %s refused the package interface: %s", value, problem.Message)
+		}
+		entry, problem := surface.Function("generate")
+		fatal(t, problem)
+		if problem := launch.ValidatePayload("paul/example", entry, json.RawMessage(`{"value":7}`)); problem != nil {
+			t.Fatalf("multiple_of %s refused the request: %s", value, problem.Message)
 		}
 	}
 }

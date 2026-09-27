@@ -11,11 +11,15 @@
 // TLS over a private network or authenticated overlay remotely. A worker control port is NEVER
 // required to be publicly exposed for topology symmetry.
 //
-// VERSIONING: the MAJOR is the package path (`cozy.worker.v1`). The MINOR is `wire_minor`, an
-// release train number. WIRE_MINIMUM and WIRE_MINOR define the compatible range. Ordinary
-// additive changes preserve the floor; the explicit pre-freeze minor38 hardcut raises it.
-// Clients probe ProtocolInfo before Claim/preparation; servers reject below-floor claims
-// before ownership mutation. After the v1 freeze, breaking changes require a new package major.
+// VERSIONING: the MAJOR is the package path (`cozy.worker.v1`). The MINOR is `wire_minor`, a
+// release train number. Peers are independently deployed and evolve separately: each advertises
+// its [minimum_wire_minor, wire_minor] range and capability booleans through ProtocolInfo.
+// Claim, ProtocolInfo, status, snapshots, keepalive, release and cancellation are never refused
+// over a wire minor. Each OPERATION gates on what it uses: ordinary preparation and execution
+// need the peer at or above WIRE_MINIMUM; a newer feature needs its generated `*WireMinor`
+// constant or its capability boolean. A missing capability fails only that operation with
+// `capability_unavailable`, naming the component to update; other work and rentals continue.
+// After the v1 freeze, breaking changes require a new package major.
 // R7 IS AN AUTHORING RULE ONLY: `reserved` numbers and names are compiler-enforced
 // tombstones against reuse; ordinary proto3 decoders do not refuse them on the wire and no
 // runtime polices them. All generated bindings and fixtures move together for this hardcut.
@@ -45,10 +49,13 @@
 // whatever the field carrying it is called. th-094 retired the last exemption, local package
 // upload, which moved 1 GiB in 1 MiB frames.
 //
-// DOCUMENT VERSIONS. Every current pre-release document is `/1`. A digest-fenced document is NOT
-// additively versioned: an unknown key REFUSES, and shape changes hardcut the `/1` definition
-// across every writer, reader, and stored byte together. The canonical `format` tag is the
-// message's full name plus `/1`; there are no compatibility readers or version aliases.
+// DOCUMENT VERSIONS. The canonical `format` tag is the message's full name plus `/N`. A reader
+// verifies the digest over the carried bytes and their canonical encoding, then reads only the
+// fields it consumes: an unknown key is IGNORED and an absent key means its default (an absent
+// collection is empty). A key whose omission would change results is a capability: senders
+// include it only for peers that advertise it, so ignoring an unknown key is always safe. A
+// reader never re-serializes a parsed document to compare identities. `/N` changes only when a
+// consumed field is removed or retyped.
 //
 // THE ENVELOPE (every message, fields 1-3): the ownership + boot fence, checked BEFORE any body
 // field is read, in this order:
@@ -143,7 +150,7 @@
 // the two phases. `admission_epoch` no longer bumps on executor respawn: a queued attempt is
 // bound to no executor. The four `AttemptAccepted` slots that bound plan and epoch at
 // acceptance (8, 9, 10, 12) are RESERVED — a PRE-LAUNCH HARD CUT, no dual reading, no shim; an
-// owner below 23 is refused typed at Claim (`attempt_queue_unsupported`). RESIDENCY
+// owner below 23 is below the floor. RESIDENCY
 // (residency-aware-routing.md §2/§6, same minor): two observed SETS cross the wire and nothing
 // else — `DeviceLane.resident_placement_ids` (executor holds device bytes on this lane now) and
 // `ObservedWorkerState.held_manifests` (TensorFS manifests the verified store holds complete,

@@ -1,6 +1,6 @@
 // Package mediawire is Cozy's expectation of Tensorhub's pod media HTTP
 // contract. The server ships independently in the base worker image, so the
-// client compares both service identity and revision before moving a byte.
+// client checks service identity and a minimum revision before moving a byte.
 package mediawire
 
 // Service is what the pod's media plane calls itself in every answer that identifies it.
@@ -9,10 +9,10 @@ package mediawire
 // moves and a rename would refuse every pod that had not been rebuilt.
 const Service = "cozy-media"
 
-// ContractRev is the media plane's wire revision. BUMP IT whenever a route, an answer
-// field, a required request parameter, or a published bound changes incompatibly.
-// Both ends compare it before any byte moves; a plane answering a different revision —
-// or none, which is a pod older than this check — is refused at connect.
+// ContractRev is the media plane's wire revision this host speaks. BUMP IT whenever a
+// route, an answer field, a required request parameter, or a published bound changes.
+// A plane at MinContractRev or newer is accepted; a route an older plane lacks fails
+// only the operation that needs it.
 //
 // Rev 2 narrowed the health answer to the two fields that have a reader. Rev 1
 // also published `max_receipt_bytes`, `root`, `used_bytes`, `quota_bytes`,
@@ -28,6 +28,12 @@ const Service = "cozy-media"
 // protocol's 1 MiB. Before it, a pod attempt's bundle stayed on the pod and the owner
 // recorded `bundle_absent` for every remote failure.
 const ContractRev = 3
+
+// MinContractRev is the oldest plane whose upload and download routes this host reads.
+const MinContractRev = 2
+
+// TriageContractRev is the first plane serving triage bundles.
+const TriageContractRev = 3
 
 // Health is the GET /v1/health contract. `contract_rev` is the only negotiation on
 // this plane; route and request shapes belong to it, never to capability flags.

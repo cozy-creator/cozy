@@ -155,12 +155,9 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code, wrongBoot b
 	daemon = crashAndRestartTransactionDaemon(t, daemon)
 	if runtimeFailure != codes.Unavailable {
 		reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/claim", map[string]any{})
-		if runtimeFailure == codes.OK {
-			if reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
-				t.Fatalf("reconnect: %s", reply.brief())
-			}
-		} else if reply.Status == http.StatusOK {
-			t.Fatalf("Runtime admission accepted the incompatible peer: %s", reply.brief())
+		// A refused protocol probe is an unknown range, never a refused Claim.
+		if reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
+			t.Fatalf("reconnect: %s", reply.brief())
 		}
 	}
 	mu.Lock()
@@ -183,10 +180,10 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code, wrongBoot b
 	}
 	if runtimeFailure != codes.OK {
 		pod.mu.Lock()
-		admitted := len(pod.acks) + len(pod.desired) + len(pod.offers)
+		admitted := len(pod.desired) + len(pod.offers)
 		pod.mu.Unlock()
 		if admitted != 0 {
-			t.Fatal("manual keepalive admitted Runtime control or execution")
+			t.Fatal("manual keepalive admitted Runtime preparation or execution")
 		}
 	}
 	reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/keepalive", map[string]any{"request_id": "invalid-duration", "duration": 0})

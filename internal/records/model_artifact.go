@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"io"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -27,11 +26,10 @@ func DecodeModelArtifact(raw []byte) (*ModelArtifact, *exit.Error) {
 	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil, nil
 	}
+	// Runtime and Creator ship independently; members another version adds are ignored.
 	var artifact ModelArtifact
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&artifact) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return nil, exit.New(exit.Validation, "model input is not a closed ModelArtifact reference")
+	if json.Unmarshal(raw, &artifact) != nil {
+		return nil, exit.New(exit.Validation, "model input is not a ModelArtifact reference")
 	}
 	if artifact.ProducerRequestID == "" || len(artifact.ProducerRequestID) > 256 || artifact.OutputSlot == "" || len(artifact.OutputSlot) > 128 || artifact.Manifest.Length <= 0 || artifact.Manifest.Length > (1<<53)-1 {
 		return nil, exit.New(exit.Validation, "model artifact reference has invalid identity or bounds")

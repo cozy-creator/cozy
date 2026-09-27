@@ -7,10 +7,9 @@
 //
 // The writer is ADAPTED from worker-protocol's own independent Go canonicalizer
 // (`scripts/crosslang/canon.go`) — the second implementation that proved the rules are
-// written down rather than accidental. The reader is new here, because a orchestrator
-// reads terminals: it refuses everything the writer could not have produced
-// (non-canonical encoding, unknown key, wrong format), which is what makes a planted
-// key a REFUSAL rather than an ignored unknown field.
+// written down rather than accidental. The reader serves documents from independently
+// deployed peers: it refuses bytes no canonical writer produces, and keeps the members this
+// build consumes, ignoring additions from other versions.
 //
 // Conformance is `go test ./tests/product -run TestCanonicalDocuments`, which renders
 // worker-protocol's FROZEN fixture corpus through this codec and compares bytes and ids.

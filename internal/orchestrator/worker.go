@@ -334,12 +334,19 @@ func (p DesiredPlacement) PlacementID() string {
 	return "plc-" + strings.TrimPrefix(p.InstanceID(), "ins-")
 }
 
-// supportsCurrentProtocol is shared by placement reuse and dispatch. A peer that
-// lacks a compatible protocol range cannot be claimed or take new directives.
-func (w *worker) supportsCurrentProtocol() bool {
-	if w.refusal != nil && w.refusal.ErrName() == "worker.protocol_incompatible" {
-		return false
+func (c *Orchestrator) workerWireMinor(rental string) uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w := c.workers[rentalInstanceID(rental)]; w != nil {
+		return w.wireMinor
 	}
+	return 0
+}
+
+// supportsCurrentProtocol is shared by placement reuse and dispatch. A claimed peer below
+// the execution floor keeps its Claim, snapshots and keepalive; only new preparation and
+// execution route elsewhere.
+func (w *worker) supportsCurrentProtocol() bool {
 	return w.declaredInstance == "" || w.wireMinor >= pb.MinCompatibleWireMinor
 }
 

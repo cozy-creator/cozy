@@ -279,7 +279,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		}
 		c.mu.Unlock()
 	}()
-	if problem := probeWorkerProtocol(ctx, conn, w.spec.Connection != nil); problem != nil {
+	if _, problem := probeWorkerProtocol(ctx, conn, w.spec.Connection != nil); problem != nil {
 		if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
 			c.refuseClaim(w, problem)
 		}
@@ -571,9 +571,6 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 	c.mu.Lock()
 	w.declaredInstance = ack.WorkerInstanceId
 	w.wireMinor = ack.WireMinor
-	if w.refusal != nil && w.refusal.ErrName() == "worker.protocol_incompatible" {
-		w.refusal = nil
-	}
 	if w.spec.Connection != nil {
 		w.remoteWorkerID = ack.WorkerId
 	}

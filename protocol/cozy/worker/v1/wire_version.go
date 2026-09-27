@@ -4,8 +4,13 @@ package workerprotov1
 // Minor62 is the coordinated package-installation hard cut. Future additive changes preserve skew.
 const WireMinor uint32 = 63
 
-// MinCompatibleWireMinor is checked before Claim/preparation side effects.
+// MinCompatibleWireMinor is the oldest peer minor whose ordinary preparation and execution this
+// binding speaks. It gates those operations only; it never refuses a connection or Claim.
 const MinCompatibleWireMinor uint32 = 62
+
+// CapabilityUnavailableCode fails one operation whose peer lacks the minor or capability it
+// needs; the detail names the component to update. Other work continues.
+const CapabilityUnavailableCode = "capability_unavailable"
 
 const AttentionKernelWireMinor uint32 = 49
 const RuntimeRevisionWireMinor uint32 = 49

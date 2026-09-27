@@ -21,9 +21,8 @@ func TestRuntime023ForwardedPNGSchemaRecovery(t *testing.T) {
 	normalized, err := canonical.NormalizeJCS(legacy)
 	must(t, err)
 	envelope := &pb.ResultEnvelope{ResultSchemaDigest: canonical.Digest(normalized), InlineResult: []byte(`{"value":{"asset_ref":"sha256:` + strings.Repeat("a", 64) + `","digest":"sha256:` + strings.Repeat("a", 64) + `","kind":"image","media_type":"image/png","size_bytes":100}}`)}
-	if launch.ValidateMachineResult(captured, envelope) == nil {
-		t.Fatal("strict schema validation ignored decoded bound")
-	}
+	// A released Runtime's differently spelled schema no longer blocks collection.
+	fatal(t, launch.ValidateMachineResult(captured, envelope))
 	projected, maximum, ok := launch.Runtime023PNGResultSchema(captured, envelope, "0.18.23")
 	if !ok || maximum != 20971520 {
 		t.Fatal("exact released projection was not recognized")

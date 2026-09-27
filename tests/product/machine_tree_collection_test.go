@@ -28,7 +28,6 @@ func TestMachineTreeResultUsesClosedFinalMetadata(t *testing.T) {
 	}
 	fatal(t, launch.ValidateMachineResult(schema, envelope(asset)))
 	for name, change := range map[string]func(map[string]any){
-		"extra path":     func(a map[string]any) { a["path"] = "/worker/private" },
 		"missing digest": func(a map[string]any) { delete(a, "digest") },
 		"changed digest": func(a map[string]any) { a["digest"] = childDigest("5") },
 		"changed kind":   func(a map[string]any) { a["kind"] = "file" },
@@ -70,10 +69,16 @@ func TestTreeCollectionRejectsMalformedClosureAndExportsIndependentBytes(t *test
 			}
 		})
 	}
-	bad := entry("file")
-	bad["symlink"] = "/outside"
-	if _, problem := resultfiles.ParseTreeManifest(manifest(bad), int64(len(data))); problem == nil {
-		t.Fatal("unknown manifest field accepted")
+	// A newer Runtime's additive member is ignored; kind alone decides what a member is.
+	additive := entry("file")
+	additive["mode"] = 420
+	if members, problem := resultfiles.ParseTreeManifest(manifest(additive), int64(len(data))); problem != nil || len(members) != 1 {
+		t.Fatalf("an additive manifest member refused the tree: %v", problem)
+	}
+	link := entry("file")
+	link["kind"] = "symlink"
+	if _, problem := resultfiles.ParseTreeManifest(manifest(link), int64(len(data))); problem == nil {
+		t.Fatal("a non-file tree member was accepted")
 	}
 	good := manifest(entry("nested/report.json"), entry("second.txt"))
 	if _, problem := resultfiles.ParseTreeManifest(good, int64(len(data))); problem == nil {

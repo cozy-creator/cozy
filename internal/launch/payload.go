@@ -542,25 +542,25 @@ func validateField(field Field, value any, path string) *exit.Error {
 	return validateFieldInto(field, value, path, nil)
 }
 
+// validateFieldInto is the early check before anything is rented. Runtime validates the
+// payload against the package's own types at execution, so a type or constraint this host
+// cannot read is left to it rather than refused here.
 func validateFieldInto(field Field, value any, path string, assets *[]string) *exit.Error {
-	if len(field.Constraints.Unknown) > 0 {
-		return exit.Named(exit.Structural, "package_interface_constraint_unknown",
-			"request field %s uses unsupported constraints: %s",
-			path, strings.Join(field.Constraints.Unknown, ", "))
-	}
 	if problem := validateRenderedInto(field.Type, value, path, assets); problem != nil {
 		return problem
 	}
 	if field.Constraints.MinLength != nil || field.Constraints.MaxLength != nil {
-		var length int64
+		length := int64(-1)
 		switch typed := value.(type) {
 		case string:
 			length = int64(utf8.RuneCountInString(typed))
 		case []any:
 			length = int64(len(typed))
-		default:
-			return exit.Named(exit.Structural, "package_interface_constraint_unknown",
-				"request field %s has length constraints on a non-string, non-list type", path)
+		case map[string]any:
+			length = int64(len(typed))
+		}
+		if length < 0 {
+			return nil
 		}
 		if minimum := field.Constraints.MinLength; minimum != nil && length < *minimum {
 			return exit.New(exit.Validation,
@@ -574,19 +574,14 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 	if field.Constraints.GT != nil || field.Constraints.GE != nil || field.Constraints.LE != nil || field.Constraints.MultipleOf != nil {
 		number, ok := value.(json.Number)
 		if !ok {
-			return exit.Named(exit.Structural, "package_interface_constraint_unknown",
-				"request field %s has numeric constraints on a non-numeric type", path)
+			return nil
 		}
 		parsed, err := strconv.ParseFloat(number.String(), 64)
 		if err != nil {
 			return exit.New(exit.Validation, "request field %s is not a finite number", path)
 		}
 		if multiple := field.Constraints.MultipleOf; multiple != nil {
-			matches, err := matchesMultipleOf(number, *multiple)
-			if err != nil {
-				return exit.Named(exit.Structural, "package_interface_constraint_invalid", "request field %s: %s", path, err)
-			}
-			if !matches {
+			if matches, err := matchesMultipleOf(number, *multiple); err == nil && !matches {
 				return exit.New(exit.Validation, "request field %s is %s; it must be a multiple of %s", path, number.String(), multiple.String())
 			}
 		}
@@ -635,15 +630,13 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 				return nil
 			}
 		default:
-			return exit.Named(exit.Structural, "package_interface_type_unknown",
-				"request field %s has unsupported package-interface scalar %q", path, scalar)
+			return nil
 		}
 		return exit.New(exit.Validation, "request field %s does not match declared %s", path, scalar)
 	}
 	var schema map[string]json.RawMessage
 	if json.Unmarshal(raw, &schema) != nil {
-		return exit.Named(exit.Structural, "package_interface_type_unknown",
-			"request field %s has an unreadable package-interface type", path)
+		return nil
 	}
 	if _, ok := schema["asset"]; ok {
 		if ref, ok := value.(string); ok && ref != "" {
@@ -677,8 +670,7 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	if literal, ok := schema["literal"]; ok {
 		var members []json.RawMessage
 		if json.Unmarshal(literal, &members) != nil || len(members) == 0 {
-			return exit.Named(exit.Structural, "package_interface_type_unknown",
-				"request field %s has an unreadable literal", path)
+			return nil
 		}
 		actual, err := json.Marshal(value)
 		if err == nil {
@@ -693,9 +685,8 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	}
 	if union, ok := schema["union"]; ok {
 		var branches []json.RawMessage
-		if json.Unmarshal(union, &branches) != nil {
-			return exit.Named(exit.Structural, "package_interface_type_unknown",
-				"request field %s has an unreadable union", path)
+		if json.Unmarshal(union, &branches) != nil || len(branches) == 0 {
+			return nil
 		}
 		for _, branch := range branches {
 			// Tagged unions carry the discriminator name once on the union and
@@ -704,8 +695,7 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 			if tagField := schema["tag_field"]; tagField != nil {
 				var tagged map[string]json.RawMessage
 				if json.Unmarshal(branch, &tagged) != nil || tagged == nil {
-					return exit.Named(exit.Structural, "package_interface_type_unknown",
-						"request field %s has an unreadable tagged branch", path)
+					return nil
 				}
 				tagged["tag_field"] = tagField
 				branch, _ = json.Marshal(tagged)
@@ -736,8 +726,7 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 	if fields, ok := schema["fields"]; ok {
 		var nested Struct
 		if json.Unmarshal(raw, &nested) != nil {
-			return exit.Named(exit.Structural, "package_interface_type_unknown",
-				"request field %s has unreadable nested fields", path)
+			return nil
 		}
 		object, ok := value.(map[string]any)
 		if !ok {
@@ -775,8 +764,7 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 		_ = fields
 		return nil
 	}
-	return exit.Named(exit.Structural, "package_interface_type_unknown",
-		"request field %s has an unsupported package-interface type", path)
+	return nil
 }
 
 // canonicalFieldKey folds one typed argv key onto the PackageInterface's own field spelling

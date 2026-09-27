@@ -2,8 +2,6 @@ package launch
 
 import (
 	"encoding/json"
-	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
 
@@ -35,87 +33,73 @@ type AssetsKind struct {
 	MaxDecodedBytes int64             `json:"max_decoded_bytes,omitempty"`
 }
 
-func validateAssetsSlot(raw, request json.RawMessage) error {
-	value, err := exactKeys(raw, []string{"parameter", "kinds"}, []string{"view"})
-	if err != nil {
-		return err
+// admitAssetsSlot keeps the Assets collection this host can bind. A slot whose request field
+// is not a list of asset records stays an ordinary request field. Client-side image
+// preparation is optional work, so a policy this host cannot apply exactly sends raw bytes.
+func admitAssetsSlot(ep *Entrypoint, raw json.RawMessage) {
+	slot := ep.Assets
+	if slot == nil {
+		return
 	}
-	var slot AssetsSlot
-	if json.Unmarshal(raw, &slot) != nil || slot.Parameter == "" || strings.ContainsAny(slot.Parameter, ". /\\") {
-		return fmt.Errorf("assets parameter must be one field identifier")
+	if !assetsParameter(ep.Request, slot.Parameter) {
+		ep.Assets = nil
+		return
 	}
-	if value["view"] != nil && slot.View != "decoded" {
-		return fmt.Errorf("assets view must be decoded when present")
+	var authored struct {
+		Kinds []struct {
+			Prepare map[string]json.RawMessage `json:"prepare"`
+		} `json:"kinds"`
 	}
-	var schema Struct
-	if json.Unmarshal(request, &schema) != nil {
-		return fmt.Errorf("assets request is invalid")
-	}
-	matches := 0
-	for _, field := range schema.Fields {
-		if field.Name != slot.Parameter {
+	_ = json.Unmarshal(raw, &authored)
+	for i := range slot.Kinds {
+		kind := &slot.Kinds[i]
+		if kind.MaxCount != nil && *kind.MaxCount < 0 {
+			kind.MaxCount = nil
+		}
+		if kind.Preparation == nil {
 			continue
 		}
-		var expected, actual any
-		_ = json.Unmarshal([]byte(`{"list":{"fields":[{"name":"asset","type":{"asset":"file"}},{"name":"label","type":"str","wire":"optional"},{"name":"fidelity","type":{"literal":["auto","high","low","medium"]},"wire":"optional"}]}}`), &expected)
-		if json.Unmarshal(field.Type, &actual) != nil || !reflect.DeepEqual(actual, expected) {
-			return fmt.Errorf("assets parameter must name a list of asset/label records")
-		}
-		matches++
-	}
-	if matches != 1 || len(slot.Kinds) < 1 || len(slot.Kinds) > 4 {
-		return fmt.Errorf("assets needs one request field and 1..4 kinds")
-	}
-	var rows []json.RawMessage
-	if json.Unmarshal(value["kinds"], &rows) != nil {
-		return fmt.Errorf("assets kinds are invalid")
-	}
-	seen, media := map[string]bool{}, map[string]bool{}
-	for i, row := range rows {
-		fields, err := exactKeys(row, []string{"kind", "media_types"}, []string{"max_bytes", "max_decoded_bytes", "max_count", "prepare"})
-		if err != nil {
-			return err
-		}
-		kind := slot.Kinds[i]
-		if raw := fields["prepare"]; raw != nil {
-			if kind.Kind != "image" || slot.View != "decoded" {
-				return fmt.Errorf("image preparation requires decoded image Assets")
-			}
-			caps, err := exactKeys(raw, []string{"profile"}, []string{"max_edge", "max_pixels"})
-			if err != nil {
-				return err
-			}
-			prep := kind.Preparation
-			if prep == nil || prep.Profile != "image-fit/1" || prep.MaxEdge == nil && prep.MaxPixels == nil {
-				return fmt.Errorf("unknown or empty image preparation")
-			}
-			for name, limit := range map[string]*int64{"max_edge": prep.MaxEdge, "max_pixels": prep.MaxPixels} {
-				if caps[name] != nil && (limit == nil || *limit <= 0) {
-					return fmt.Errorf("image preparation caps must be positive integers")
+		prep := kind.Preparation
+		applicable := slot.View == "decoded" && kind.Kind == "image" && i < len(authored.Kinds) &&
+			(prep.MaxEdge != nil || prep.MaxPixels != nil) &&
+			(prep.MaxEdge == nil || *prep.MaxEdge > 0) && (prep.MaxPixels == nil || *prep.MaxPixels > 0)
+		if applicable {
+			for member := range authored.Kinds[i].Prepare {
+				if member != "profile" && member != "max_edge" && member != "max_pixels" {
+					applicable = false
 				}
 			}
 		}
-		if slot.View == "decoded" && kind.Kind == "file" {
-			return fmt.Errorf("decoded assets need image, video or audio kinds")
-		}
-		if seen[kind.Kind] || (kind.Kind != "image" && kind.Kind != "video" && kind.Kind != "audio" && kind.Kind != "file") || (len(kind.MediaTypes) == 0 && kind.Kind != "file") {
-			return fmt.Errorf("assets kinds must be unique media contracts")
-		}
-		if fields["max_count"] != nil && (kind.MaxCount == nil || *kind.MaxCount < 0) {
-			return fmt.Errorf("assets kind max_count must be a nonnegative integer")
-		}
-		seen[kind.Kind] = true
-		for _, mime := range kind.MediaTypes {
-			if mime != strings.TrimSpace(strings.ToLower(mime)) || !strings.Contains(mime, "/") || media[mime] {
-				return fmt.Errorf("assets MIME types must be canonical and disjoint")
-			}
-			media[mime] = true
-		}
-		if fields["max_bytes"] != nil && kind.MaxBytes <= 0 || fields["max_decoded_bytes"] != nil && kind.MaxDecodedBytes <= 0 {
-			return fmt.Errorf("assets byte limits must be positive")
+		if !applicable {
+			kind.Preparation = nil
 		}
 	}
-	return nil
+}
+
+func assetsParameter(request Struct, parameter string) bool {
+	if parameter == "" || strings.ContainsAny(parameter, ". /\\") {
+		return false
+	}
+	matches := 0
+	for _, field := range request.Fields {
+		if field.Name != parameter {
+			continue
+		}
+		var list struct {
+			List struct {
+				Fields []Field `json:"fields"`
+			} `json:"list"`
+		}
+		if json.Unmarshal(field.Type, &list) != nil {
+			return false
+		}
+		for _, member := range list.List.Fields {
+			if kind, _ := typeOf(member.Type); member.Name == "asset" && kind == "asset" {
+				matches++
+			}
+		}
+	}
+	return matches == 1
 }
 
 func (s *AssetsSlot) contains(parts []string) bool {

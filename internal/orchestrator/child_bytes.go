@@ -113,27 +113,38 @@ func readExecutionObservation(doc canonical.Doc) (*pb.ExecutionObservation, *exi
 	if err != nil {
 		return nil, exit.New(exit.Validation, "execution observation is invalid")
 	}
-	// Canonical documents spell digests, while protobuf JSON uses base64 for bytes.
+	// Canonical documents spell digests, while protobuf JSON uses base64 for bytes. The
+	// observation is advisory metadata from an independently shipped Runtime, so members
+	// this build does not declare are dropped.
 	var value map[string]any
 	_ = json.Unmarshal(raw, &value)
-	for field, keys := range map[string][]string{"environment": {"worker_image_digest", "execution_contract_digest"}, "capture": {"content_digest"}} {
-		row, _ := value[field].(map[string]any)
-		for _, key := range keys {
-			if text, ok := row[key].(string); ok {
-				digest, e := canonical.Raw(text)
-				if e != nil {
-					return nil, exit.New(exit.Validation, "execution observation digest is invalid")
-				}
-				row[key] = base64.StdEncoding.EncodeToString(digest)
-			}
-		}
-	}
+	spellDigests(value)
 	raw, _ = json.Marshal(value)
 	var observation pb.ExecutionObservation
-	if err := protojson.Unmarshal(raw, &observation); err != nil {
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(raw, &observation); err != nil {
 		return nil, exit.New(exit.Validation, "execution observation has an unsupported shape")
 	}
 	return &observation, nil
+}
+
+// spellDigests rewrites every canonical `sha256:` spelling to protobuf JSON bytes.
+func spellDigests(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, member := range typed {
+			if text, ok := member.(string); ok && strings.HasPrefix(text, "sha256:") {
+				if digest, err := canonical.Raw(text); err == nil {
+					typed[key] = base64.StdEncoding.EncodeToString(digest)
+				}
+				continue
+			}
+			spellDigests(member)
+		}
+	case []any:
+		for _, member := range typed {
+			spellDigests(member)
+		}
+	}
 }
 
 func (c *Orchestrator) capturedByteOutputs(req records.Request, attempt records.Attempt, doc canonical.Doc) ([]records.ByteOutput, *exit.Error) {

@@ -161,10 +161,10 @@ func TestUnpublishedTransactionRefusesPeerWithoutRetention(t *testing.T) {
 	fatal(t, problem)
 	found := false
 	for _, event := range events {
-		found = found || event.Payload["error_type"] == "worker.protocol_incompatible"
+		found = found || event.Payload["error_type"] == "request.retention_unsupported"
 	}
 	if !found {
-		t.Fatal("the workspace protocol hard cut did not report its incompatible peer")
+		t.Fatalf("the workspace protocol hard cut did not report its incompatible peer: %v", events)
 	}
 	attempts, problem := o.store.Attempts(requestID)
 	fatal(t, problem)

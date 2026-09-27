@@ -31,9 +31,7 @@ func CommittedFileOutput(owner string, row NativeCall, status *pb.NativeSourceSt
 		Size      int64  `json:"size_bytes"`
 		MediaType string `json:"media_type"`
 	}
-	decoder := json.NewDecoder(bytes.NewReader(row.Request))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil || request.Size < 0 || uint64(request.Size) != ref.ContentBytes || len(request.MediaType) == 0 || len(request.MediaType) > 255 {
+	if err := json.Unmarshal(row.Request, &request); err != nil || request.Size < 0 || uint64(request.Size) != ref.ContentBytes || len(request.MediaType) == 0 || len(request.MediaType) > 255 {
 		return fail()
 	}
 	if _, err := canonical.Raw(request.Digest); err != nil {

@@ -69,9 +69,6 @@ func (c *Orchestrator) MaintainRental(ctx context.Context, id string,
 			(!w.snapshotAcknowledged || w.lastReport.IsZero())
 		c.mu.Unlock()
 		if refused != nil {
-			if refused.ErrName() == "worker.protocol_incompatible" {
-				break
-			}
 			return refused
 		}
 		if !waiting {
@@ -91,7 +88,7 @@ func (c *Orchestrator) MaintainRental(ctx context.Context, id string,
 		return exit.Named(exit.Unavailable, "rental.maintenance_busy", "this rental is still preparing or updating; retry after it finishes")
 	}
 	w := c.workers[rentalInstanceID(id)]
-	if w != nil && !c.idleRentalWorkerLocked(w) && !c.unclaimedMaintenanceWorkerLocked(w) {
+	if w != nil && !c.idleRentalWorkerLocked(w) {
 		c.mu.Unlock()
 		return exit.Named(exit.Unavailable, "rental.maintenance_busy", "this rental has active execution or uncollected results; its Runtime was not changed")
 	}
@@ -133,22 +130,4 @@ func (c *Orchestrator) RentalExecutionClaim(ctx context.Context, id string) (*pb
 		return nil, problem
 	}
 	return proto.Clone(session.claim).(*pb.Claim), nil
-}
-
-// A protocol probe refusal precedes Claim. It is not an idle observation: only
-// the maintenance callback's signed snapshot and guardian may establish that.
-// Require zero local custody/reservations before handing that lane to repair.
-func (c *Orchestrator) unclaimedMaintenanceWorkerLocked(w *worker) bool {
-	if w.spec.Connection == nil || w.exited || w.stopping || w.refusal == nil ||
-		w.refusal.ErrName() != "worker.protocol_incompatible" || w.snapshotAcknowledged ||
-		!w.lastReport.IsZero() || w.held != 0 || w.unacked != 0 || w.seats.reserved != 0 || w.reservedJobs != 0 {
-		return false
-	}
-	for _, offer := range c.offers {
-		if offer.worker == w {
-			return false
-		}
-	}
-	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
-	return problem == nil && len(attempts) == 0
 }

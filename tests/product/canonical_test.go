@@ -39,6 +39,7 @@ func TestCanonicalDocuments(t *testing.T) {
 	fixtureDir := corpusDir
 	var manifest struct {
 		Canonical map[string]struct{ ID, Type, Document string } `json:"canonical"`
+		Tolerated map[string]struct{ ID, Type, Document string } `json:"tolerated"`
 		WireMinor uint32                                         `json:"wire_minor"`
 	}
 	data, err := os.ReadFile(filepath.Join(fixtureDir, "MANIFEST.json"))
@@ -100,23 +101,41 @@ func TestCanonicalDocuments(t *testing.T) {
 		t.Fatalf("exercised %d of %d canonical documents", arms, len(manifest.Canonical))
 	}
 
-	// RED: every frozen SEMANTIC TWIN — one frozen document with exactly one rule broken —
-	// is refused by the code the fixture names.
-	for name, want := range map[string]struct {
-		code string
-		msg  proto.Message
-	}{
-		"twin_duplicate_key": {"duplicate_key", &pb.InvocationSpec{}},
-		"twin_float":         {"non_integer_number", &pb.InvocationSpec{}},
-		"twin_unknown_key":   {"unknown_field", &pb.InvocationSpec{}},
-		"twin_whitespace":    {"noncanonical_encoding", &pb.InvocationSpec{}},
+	// RED: every frozen SEMANTIC TWIN — one frozen document with exactly one writer rule
+	// broken — is refused by the code the fixture names.
+	for name, code := range map[string]string{
+		"twin_duplicate_key": "duplicate_key",
+		"twin_float":         "non_integer_number",
+		"twin_whitespace":    "noncanonical_encoding",
 	} {
 		body, err := os.ReadFile(filepath.Join(fixtureDir, "red", name+".json"))
 		must(t, err)
-		_, rerr := canonical.Read(body, want.msg)
-		if got := canonical.Code(rerr); got != want.code {
-			t.Errorf("%s: refused as %q, wanted %q", name, got, want.code)
+		_, rerr := canonical.Read(body, &pb.InvocationSpec{})
+		if got := canonical.Code(rerr); got != code {
+			t.Errorf("%s: refused as %q, wanted %q", name, got, code)
 		}
+		arms++
+	}
+	// TOLERATED: a newer peer's unknown key (top-level or nested) and an absent collection
+	// read, keep the consumed members, and keep the identity of their exact bytes.
+	if len(manifest.Tolerated) == 0 {
+		t.Fatal("the corpus carries no tolerated documents")
+	}
+	for name, row := range manifest.Tolerated {
+		msg := messageFor(row.Type)
+		body, err := os.ReadFile(filepath.Join(fixtureDir, "tolerated", name+".json"))
+		must(t, err)
+		if msg == nil {
+			t.Errorf("%s: no binding for %s", name, row.Type)
+			continue
+		}
+		if _, rerr := canonical.Read(body, msg); rerr != nil {
+			t.Errorf("%s: a tolerated document was refused: %v", name, rerr)
+		}
+		if spelled, _ := canonical.Spell(canonical.Digest(body)); spelled != row.ID {
+			t.Errorf("%s: id %s != frozen %s", name, spelled, row.ID)
+		}
+		must(t, canonical.Unmarshal(body, proto.Clone(msg)))
 		arms++
 	}
 
@@ -143,9 +162,9 @@ func TestCanonicalDocuments(t *testing.T) {
 		t.Errorf("a non-ASCII field was not refused: %v", cerr)
 	}
 	arms += 5 // the wire-minor agreement and the document plane's own refusals, above
-	t.Logf("%s: %d arms at wire minor %d (%d canonical documents, 4 semantic twins, "+
-		"4 plane refusals, 1 wire-minor agreement)",
-		fixtureDir, arms, manifest.WireMinor, len(manifest.Canonical))
+	t.Logf("%s: %d arms at wire minor %d (%d canonical documents, 3 semantic twins, "+
+		"%d tolerated documents, 4 plane refusals, 1 wire-minor agreement)",
+		fixtureDir, arms, manifest.WireMinor, len(manifest.Canonical), len(manifest.Tolerated))
 }
 
 func messageFor(name string) proto.Message {
@@ -265,7 +284,7 @@ func TestNumberProfile(t *testing.T) {
 
 // TestPackageInterface is the OTHER side of the identity plane: the grammar Runtime
 // authors and Cozy consumes at install. Identity is the canonical content and nothing
-// else, and a PackageInterface that cannot be read exactly is refused rather than guessed at.
+// else; unreadable JSON refuses, while members this host does not consume are ignored.
 func TestPackageInterface(t *testing.T) {
 	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`)
 	want, err := canonical.Spell(canonical.Digest(raw))
@@ -307,6 +326,15 @@ func TestPackageInterface(t *testing.T) {
 		"duplicate key": bytes.Replace(raw, []byte(`{"application"`),
 			[]byte(`{"application":"other","application"`), 1),
 		"non-finite number": bytes.Replace(raw, []byte(`"gt":0`), []byte(`"gt":NaN`), 1),
+		"wrong member type": bytes.Replace(raw, []byte(`"name":"run"`), []byte(`"name":7`), 1),
+	} {
+		if _, refusal := launch.DecodePackageInterface(planted); refusal == nil {
+			t.Errorf("%s was accepted at the package-interface boundary", name)
+		}
+	}
+	// Documents from older and newer Runtimes keep loading: members this host does not
+	// consume are ignored, and a constraint or type it cannot check is left to Runtime.
+	for name, evolved := range map[string][]byte{
 		"embedded surface_digest": bytes.Replace(raw, []byte(`{"application"`),
 			[]byte(`{"surface_digest":"sha256:`+strings.Repeat("0", 64)+`","application"`), 1),
 		"redundant callable kind": bytes.Replace(raw, []byte(`{"name":"run"`),
@@ -315,14 +343,24 @@ func TestPackageInterface(t *testing.T) {
 			[]byte(`{"hidden":false,"name":"run"`), 1),
 		"explicit required wire": bytes.Replace(raw, []byte(`"type":"float"`),
 			[]byte(`"type":"float","wire":"required"`), 1),
-		"unsupported constraint": bytes.Replace(raw, []byte(`"gt":0`), []byte(`"lt":1`), 1),
-		"retired enum grammar": bytes.Replace(raw, []byte(`{"literal":["fast","quality"]}`),
+		"newer constraint": bytes.Replace(raw, []byte(`"gt":0`), []byte(`"gt":0,"lt":1`), 1),
+		"newer type grammar": bytes.Replace(raw, []byte(`{"literal":["fast","quality"]}`),
 			[]byte(`{"enum":"Mode","values":["fast","quality"]}`), 1),
 		"retired model production graph": bytes.Replace(raw, []byte(`"jobs":[]`),
 			[]byte(`"jobs":[],"model_productions":[]`), 1),
 	} {
-		if _, refusal := launch.DecodePackageInterface(planted); refusal == nil {
-			t.Errorf("%s was accepted at the package-interface boundary", name)
+		doc, problem := launch.DecodePackageInterface(evolved)
+		if problem != nil {
+			t.Errorf("%s refused an otherwise usable package interface: %s", name, problem.Message)
+			continue
+		}
+		ep, problem := doc.Function("run")
+		fatal(t, problem)
+		if e := launch.ValidatePayload("probe/probe", ep, []byte(`{"strength":0.25,"mode":"quality"}`)); e != nil {
+			t.Errorf("%s: a valid payload was refused: %s", name, e.Message)
+		}
+		if launch.ValidatePayload("probe/probe", ep, []byte(`{"strength":0,"mode":"fast"}`)) == nil {
+			t.Errorf("%s: the readable gt:0 bound was dropped", name)
 		}
 	}
 
@@ -349,10 +387,12 @@ func TestPackageInterface(t *testing.T) {
 	}) {
 		t.Fatal("the H3 release's exact torch requirement did not select accelerator capacity")
 	}
+	// Author-supplied resources are not a fact this host reads: machine class comes from
+	// the release dependency set, so the member is ignored rather than honoured or refused.
 	authoredResources := bytes.Replace(cpuRaw, []byte(`"publishes":false`),
 		[]byte(`"publishes":false,"resources":{"gpu_count":1,"requires":"sm90+"}`), 1)
-	if _, refusal := launch.DecodePackageInterface(authoredResources); refusal == nil {
-		t.Fatal("author-supplied resource requirements were accepted")
+	if _, problem := launch.DecodePackageInterface(authoredResources); problem != nil {
+		t.Fatalf("an ignored resources member refused the interface: %s", problem.Message)
 	}
 }
 
@@ -435,8 +475,9 @@ func TestSuppliedSourceProfiles(t *testing.T) {
 	}
 
 	stale := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"S","component_use":{},"path":"produce.models.source","source_profile":"civitai/sdxl/single-file/1"}],"name":"produce","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1,"mime_type":"application/vnd.cozy.model-manifest","output_id":"bf16"}]}]}`)
-	if _, problem := launch.DecodePackageInterface(stale); problem == nil {
-		t.Fatal("a stale package interface still carrying source_profile must refuse (cr-077 hard cut)")
+	// An older Runtime's retired source_profile is ignored; the caller's intent binds producers.
+	if _, problem := launch.DecodePackageInterface(stale); problem != nil {
+		t.Fatalf("a retired source_profile member refused an older package interface: %s", problem.Message)
 	}
 }
 

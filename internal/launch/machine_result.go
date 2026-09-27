@@ -11,21 +11,16 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// ValidateMachineResult verifies the captured schema against final result
-// metadata. Asset results carry their complete immutable facts, while the
-// ordinary payload validator accepts only an input reference at those positions.
+// ValidateMachineResult checks final result metadata against the captured schema. The
+// worker's own schema digest and byte spelling are another Runtime version's facts, so
+// the result is judged by the values this host consumes. Asset results carry their
+// immutable facts, while the ordinary payload validator accepts only an input reference
+// at those positions.
 func ValidateMachineResult(schema json.RawMessage, envelope *pb.ResultEnvelope) *exit.Error {
 	if envelope == nil || envelope.ResultBlob != nil || len(envelope.InlineResult) == 0 || len(envelope.InlineResult) > pb.MaxInlineControlBytes {
 		return exit.New(exit.Conflict, "machine result requires its bounded inline metadata")
 	}
-	normalized, err := canonical.NormalizeJCS(schema)
-	if err != nil || !bytes.Equal(canonical.Digest(normalized), envelope.ResultSchemaDigest) {
-		return exit.New(exit.Conflict, "machine result differs from its captured schema")
-	}
-	inline, err := canonical.NormalizeJCS(envelope.InlineResult)
-	if err != nil || !bytes.Equal(inline, envelope.InlineResult) {
-		return exit.New(exit.Conflict, "machine result is not canonical JSON")
-	}
+	inline := envelope.InlineResult
 	var declared Struct
 	if json.Unmarshal(schema, &declared) != nil {
 		return exit.New(exit.Conflict, "machine result schema is unreadable")
@@ -60,8 +55,8 @@ func ValidateMachineResult(schema json.RawMessage, envelope *pb.ResultEnvelope) 
 			}
 			asset, ok := child.(map[string]any)
 			spec, declared := ResultAssetSpec(entrypoint, path)
-			if !ok || !declared || asset["kind"] != spec.Kind || spec.Kind == "tree" && len(asset) != 4 || spec.Kind != "tree" && len(asset) != 5 {
-				return exit.New(exit.Conflict, "machine asset result has no closed typed metadata")
+			if !ok || !declared || asset["kind"] != spec.Kind {
+				return exit.New(exit.Conflict, "machine asset result has no typed metadata")
 			}
 			ref, ok := asset["asset_ref"].(string)
 			if !ok || asset["digest"] != ref {

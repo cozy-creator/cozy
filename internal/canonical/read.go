@@ -7,18 +7,17 @@ import (
 	"strings"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Read turns exact canonical bytes into a typed document. It refuses everything the
-// writer could not have produced — that is the reading side of law 4, and the reason a
-// planted `service_class` key on an ExecutionSpec is a REFUSAL and not an ignored field.
-//
-// The refusals, in the order they fire: size cap, JSON grammar (no null, no float,
-// printable ASCII, only \" and \\), duplicate key, the RE-EMIT LAW (the bytes must be
-// the canonical encoding of their own content), the document's `format` tag, and finally
-// the message's closed key set.
+// Read turns canonical bytes from an independently deployed peer into a typed document.
+// It refuses what no canonical writer produces — size cap, JSON grammar (no null, no float,
+// printable ASCII, only \" and \\), duplicate key, the RE-EMIT LAW (the bytes must be the
+// canonical encoding of their own content) — and a `format` tag naming another document.
+// Members the message does not declare are another version's additions: they are ignored,
+// and an absent member reads as its default (worker-protocol DOCUMENT VERSIONS).
 func Read(data []byte, m proto.Message) (Doc, error) {
 	obj, err := ReadObject(data)
 	if err != nil {
@@ -29,15 +28,8 @@ func Read(data []byte, m proto.Message) (Doc, error) {
 	if obj["format"] != want {
 		return nil, refuse("unknown_format", "%v is not %q", obj["format"], want)
 	}
-	known := map[string]bool{"format": true}
-	for i := 0; i < d.Fields().Len(); i++ {
-		known[string(d.Fields().Get(i).Name())] = true
-	}
-	for k := range obj {
-		if !known[k] {
-			return nil, refuse("unknown_field", "%s: unknown field %q", want, k)
-		}
-	}
+	prune(obj, d)
+	obj["format"] = want
 	if err := semantics(string(d.FullName()), obj); err != nil {
 		return nil, err
 	}
@@ -87,6 +79,30 @@ func parseObject(data []byte) (Doc, error) {
 	return Doc(obj), nil
 }
 
+// prune keeps the members a message declares, recursively.
+func prune(obj map[string]Value, d protoreflect.MessageDescriptor) {
+	for key, value := range obj {
+		field := d.Fields().ByName(protoreflect.Name(key))
+		if field == nil {
+			delete(obj, key)
+			continue
+		}
+		if field.Kind() != protoreflect.MessageKind || field.IsMap() {
+			continue
+		}
+		if nested, ok := value.(map[string]Value); ok {
+			prune(nested, field.Message())
+		}
+		if items, ok := value.([]Value); ok {
+			for _, item := range items {
+				if nested, ok := item.(map[string]Value); ok {
+					prune(nested, field.Message())
+				}
+			}
+		}
+	}
+}
+
 // semantics carries the few document rules the KEY SET cannot state. A closed key set says
 // which keys may appear; it cannot say that one of them has exactly one legal spelling of
 // "absent", and #485b makes that a wire law rather than a convention.
@@ -106,14 +122,14 @@ func weightsReceiptList(d Doc) error {
 		return nil
 	}
 	items, ok := raw.([]Value)
-	if !ok || len(items) == 0 {
-		return refuse("weights_receipt_shape", "weights_receipts is a non-empty list when present")
+	if !ok {
+		return refuse("weights_receipt_shape", "weights_receipts is a list")
 	}
 	if len(items) > pb.MaxWeightsReceipts {
 		return refuse("weights_receipt_count_cap", "%d receipts exceeds the %d-item cap",
 			len(items), pb.MaxWeightsReceipts)
 	}
-	aggregate, prior := 0, ""
+	aggregate, slots := 0, map[string]bool{}
 	for _, item := range items {
 		fields, ok := item.(map[string]Value)
 		if !ok {
@@ -125,10 +141,10 @@ func weightsReceiptList(d Doc) error {
 		}
 		aggregate += size
 		slot := receipt.Str("output_slot")
-		if slot <= prior {
-			return refuse("weights_receipt_order", "output slot %q is not strictly after %q", slot, prior)
+		if slots[slot] {
+			return refuse("weights_receipt_duplicate", "output slot %q has two receipts", slot)
 		}
-		prior = slot
+		slots[slot] = true
 	}
 	if aggregate > pb.MaxWeightsReceiptAggregateBytes {
 		return refuse("weights_receipt_aggregate_cap", "%d receipt bytes exceeds the %d-byte cap",
@@ -160,9 +176,8 @@ func weightsReceipt(d Doc) error {
 }
 
 func readWeightsReceiptRef(ref Doc) (Doc, int, error) {
-	if len(ref) != 2 || ref.Str("weights_receipt_digest") == "" ||
-		ref.Str("weights_receipt_canonical_bytes") == "" {
-		return nil, 0, refuse("weights_receipt_ref_shape", "the reference has exactly digest and bytes")
+	if ref.Str("weights_receipt_digest") == "" || ref.Str("weights_receipt_canonical_bytes") == "" {
+		return nil, 0, refuse("weights_receipt_ref_shape", "the reference carries a digest and bytes")
 	}
 	data, err := decodeCanonicalBytes(ref.Str("weights_receipt_canonical_bytes"))
 	if err != nil {

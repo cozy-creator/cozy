@@ -149,7 +149,7 @@ func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 		{name: "old", minor: 60, floor: 59, accepted: true},
 		{name: "current", minor: pb.WireMinor, floor: pb.MinCompatibleWireMinor, accepted: true},
 		{name: "pre keepalive", minor: 59, floor: 59},
-		{name: "future hardcut", minor: pb.WireMinor + 1, floor: pb.WireMinor + 1},
+		{name: "newer floor", minor: pb.WireMinor + 1, floor: pb.WireMinor + 1, accepted: true},
 		{name: "missing activity", minor: 60, floor: 59, unsafe: true},
 		{name: "wrong signer", minor: 60, floor: 59, wrongSigner: true},
 		{name: "active attempt", minor: 60, floor: 59, busy: true},
@@ -167,17 +167,13 @@ func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
-			if row.minor < pb.MinCompatibleWireMinor {
-				control, problem := orchestrator.DialIdleControl(ctx, remote, sign, nil)
-				if control != nil {
-					control.Close()
-				}
-				if problem == nil {
-					t.Fatal("ordinary idle gate accepted old peer")
-				}
-				if peer.claims.Load() != 0 {
-					t.Fatal("ordinary gate sent Claim")
-				}
+			// Owner presence uses the same Claim/snapshot lane; no wire minor refuses it.
+			idle, problem := orchestrator.DialIdleControl(ctx, remote, sign, nil)
+			if idle != nil {
+				idle.Close()
+			}
+			if (problem == nil) != row.accepted {
+				t.Fatalf("idle control accepted=%t problem=%v", row.accepted, problem)
 			}
 			control, problem := orchestrator.DialMaintenanceControl(ctx, remote, sign, nil)
 			if control != nil {

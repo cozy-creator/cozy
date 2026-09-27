@@ -24,10 +24,17 @@ func TestInvocableMemoizeIsTheOnlyPublicOptIn(t *testing.T) {
 			}
 		})
 	}
-	for _, member := range []string{`"reusable":true`, `"memoize":"true"`, `"memoize":true,"reusable":true`} {
-		body := strings.Replace(document, `"memoize":true`, member, 1)
-		if _, problem := launch.DecodePackageInterface([]byte(body)); problem == nil {
-			t.Fatalf("noncanonical public opt-in accepted: %s", member)
+	// Only memoize opts in. A retired or unknown member is ignored, and a mistyped one refuses.
+	for member, memoize := range map[string]bool{`"reusable":true`: false, `"memoize":true,"reusable":true`: true} {
+		surface, problem := launch.DecodePackageInterface([]byte(strings.Replace(document, `"memoize":true`, member, 1)))
+		fatal(t, problem)
+		job, problem := surface.Function("compute")
+		fatal(t, problem)
+		if job.Invocable.Memoize != memoize {
+			t.Fatalf("%s changed the memoize opt-in to %v", member, job.Invocable.Memoize)
 		}
+	}
+	if _, problem := launch.DecodePackageInterface([]byte(strings.Replace(document, `"memoize":true`, `"memoize":"true"`, 1))); problem == nil {
+		t.Fatal("a string memoize opt-in was admitted")
 	}
 }

@@ -21,11 +21,9 @@
 package launch
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -43,8 +41,9 @@ import (
 const PackageInterfaceFile = "package-interface.json"
 const packageInterfaceFormat = "cozy.package.interface/1"
 
-// PackageInterface is the closed PackageInterface/1 this host reads. Unknown fields refuse;
-// Raw is normalized canonical JSON for control-plane transport and semantic identity.
+// PackageInterface is the PackageInterface/1 subset this host consumes. Members it does not
+// read are ignored so documents from older and newer Runtimes keep loading; Raw is the whole
+// normalized canonical JSON for control-plane transport and semantic identity.
 type PackageInterface struct {
 	Format      string          `json:"format"`
 	Application string          `json:"application"`
@@ -203,6 +202,8 @@ func (f *Field) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// FieldConstraints are the bounds this host checks early. Runtime validates every declared
+// constraint at execution, so one this host cannot read is left to it.
 type FieldConstraints struct {
 	MultipleOf *json.Number `json:"multiple_of"`
 	MinLength  *int64       `json:"min_length"`
@@ -210,178 +211,21 @@ type FieldConstraints struct {
 	GT         *float64     `json:"gt"`
 	GE         *float64     `json:"ge"`
 	LE         *float64     `json:"le"`
-	Unknown    []string     `json:"-"`
 }
 
-func (c *FieldConstraints) UnmarshalJSON(data []byte) error {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
+// callableVisibility refuses a present non-boolean "internal": decoding null as false would
+// publish a callable its author hid.
+func callableVisibility(data []byte) error {
+	var root struct {
+		Entrypoints []map[string]json.RawMessage `json:"entrypoints"`
+		Jobs        []map[string]json.RawMessage `json:"jobs"`
+	}
+	if err := json.Unmarshal(data, &root); err != nil {
 		return err
 	}
-	for key := range raw {
-		switch key {
-		case "min_length", "max_length", "gt", "ge", "le", "multiple_of":
-		default:
-			c.Unknown = append(c.Unknown, key)
-		}
-	}
-	if value, present := raw["multiple_of"]; present {
-		if err := validateMultipleOfJSON(value); err != nil {
-			return err
-		}
-	}
-	sort.Strings(c.Unknown)
-	type plain FieldConstraints
-	var decoded plain
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	unknown := c.Unknown
-	*c = FieldConstraints(decoded)
-	c.Unknown = unknown
-	return nil
-}
-
-func exactKeys(raw json.RawMessage, required, optional []string) (map[string]json.RawMessage, error) {
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil {
-		return nil, err
-	}
-	allowed := map[string]bool{}
-	for _, key := range required {
-		allowed[key] = true
-		if _, ok := object[key]; !ok {
-			return nil, fmt.Errorf("missing field %q", key)
-		}
-	}
-	for _, key := range optional {
-		allowed[key] = true
-	}
-	for key := range object {
-		if !allowed[key] {
-			return nil, fmt.Errorf("unknown field %q", key)
-		}
-	}
-	return object, nil
-}
-
-func validateClosedPackageInterface(data []byte) error {
-	root, err := exactKeys(data,
-		[]string{"application", "entrypoints", "format", "jobs"}, nil)
-	if err != nil {
-		return err
-	}
-	for collection, kind := range map[string]string{"entrypoints": "entrypoint", "jobs": "job"} {
-		var rows []json.RawMessage
-		if err := json.Unmarshal(root[collection], &rows); err != nil {
-			return err
-		}
-		for _, row := range rows {
-			required := []string{"name", "request", "result"}
-			optional := []string{"models", "invocable", "assets", "internal"}
-			if kind == "job" {
-				required = append(required, "publishes")
-				optional = append(optional, "weights_outputs")
-			}
-			callable, err := exactKeys(row, required, optional)
-			if err != nil {
-				return err
-			}
-			if raw, present := callable["internal"]; present && string(raw) != "true" && string(raw) != "false" {
-				return fmt.Errorf("internal must be a boolean")
-			}
-			if metadata := callable["invocable"]; metadata != nil {
-				if _, err := exactKeys(metadata, []string{"context", "module", "export", "parameters", "defaults", "type_names", "enum_members"}, []string{"memoize", "capabilities", "operation_identity", "operation_identity_unavailable"}); err != nil {
-					return err
-				}
-				var memo Invocable
-				if json.Unmarshal(metadata, &memo) != nil {
-					return fmt.Errorf("invalid invocable memo metadata")
-				}
-				if memo.OperationIdentity != "" || memo.OperationIdentityUnavailable != "" {
-					if !memo.Memoize || memo.OperationIdentity != "" && memo.OperationIdentityUnavailable != "" || len(memo.OperationIdentityUnavailable) > 512 {
-						return fmt.Errorf("operation memo identity requires memoize and one bounded identity or unavailable reason")
-					}
-					if memo.OperationIdentity != "" {
-						if _, err := canonical.Raw(memo.OperationIdentity); err != nil {
-							return fmt.Errorf("operation memo identity must be SHA-256")
-						}
-					}
-				}
-			}
-			for _, name := range []string{"request", "result"} {
-				if err := validateStructRaw(callable[name]); err != nil {
-					return err
-				}
-			}
-			if metadata := callable["assets"]; metadata != nil {
-				if err := validateAssetsSlot(metadata, callable["request"]); err != nil {
-					return err
-				}
-			}
-			if models := callable["models"]; models != nil {
-				var slots []json.RawMessage
-				if err := json.Unmarshal(models, &slots); err != nil {
-					return err
-				}
-				for _, slot := range slots {
-					members, err := exactKeys(slot,
-						[]string{"class", "component_use", "path"},
-						[]string{"encoded_leaves", "fusion", "sequence_parallel", "default_ladder"})
-					if err != nil {
-						return err
-					}
-					if raw, present := members["default_ladder"]; present {
-						var rungs []json.RawMessage
-						if json.Unmarshal(raw, &rungs) != nil || len(rungs) == 0 || len(rungs) > 32 {
-							return fmt.Errorf("default_ladder must contain 1 through 32 rungs")
-						}
-						for _, rung := range rungs {
-							fields, err := exactKeys(rung, []string{"gpu", "lane"}, []string{"gpus"})
-							if err != nil {
-								return err
-							}
-							for name, field := range fields {
-								if name == "gpus" {
-									var count int
-									if json.Unmarshal(field, &count) != nil || count < 1 {
-										return fmt.Errorf("default_ladder gpus must be a positive integer")
-									}
-									continue
-								}
-								var value string
-								if json.Unmarshal(field, &value) != nil || value == "" {
-									return fmt.Errorf("default_ladder GPU patterns and lane references must be nonempty strings")
-								}
-							}
-						}
-					}
-					for _, consent := range []string{"encoded_leaves", "fusion"} {
-						if raw, ok := members[consent]; ok {
-							var value string
-							if json.Unmarshal(raw, &value) != nil || (value != "refuse" && value != "accept") {
-								return fmt.Errorf("%s must be \"refuse\" or \"accept\"", consent)
-							}
-						}
-					}
-				}
-			}
-			if outputs := callable["weights_outputs"]; outputs != nil {
-				var rows []json.RawMessage
-				if err := json.Unmarshal(outputs, &rows); err != nil {
-					return err
-				}
-				for _, output := range rows {
-					fields, err := exactKeys(output,
-						[]string{"max_bytes", "mime_type", "output_id"}, nil)
-					if err != nil {
-						return err
-					}
-					if bytes.Equal(fields["max_bytes"], []byte("null")) {
-						return fmt.Errorf("weights output max_bytes must be an explicit integer")
-					}
-				}
-			}
+	for _, callable := range append(root.Entrypoints, root.Jobs...) {
+		if raw, present := callable["internal"]; present && string(raw) != "true" && string(raw) != "false" {
+			return fmt.Errorf("internal must be a boolean")
 		}
 	}
 	return nil
@@ -412,154 +256,6 @@ func MissingComponents(slot Slot, available []string) []string {
 	return missing
 }
 
-func validateStructRaw(raw json.RawMessage) error {
-	var native map[string]json.RawMessage
-	if json.Unmarshal(raw, &native) == nil && len(native) == 1 && string(native["input"]) == `"model"` {
-		return nil
-	}
-	object, err := exactKeys(raw, []string{"fields"}, []string{"tag", "tag_field"})
-	if err != nil {
-		return err
-	}
-	tagged := object["tag_field"] != nil || object["tag"] != nil
-	var tagField string
-	if tagged {
-		if object["tag_field"] == nil || object["tag"] == nil ||
-			json.Unmarshal(object["tag_field"], &tagField) != nil || tagField == "" {
-			return fmt.Errorf("tagged struct must carry one non-empty tag_field and tag")
-		}
-	}
-	var fields []json.RawMessage
-	if err := json.Unmarshal(object["fields"], &fields); err != nil {
-		return err
-	}
-	for _, rawField := range fields {
-		field, err := exactKeys(rawField, []string{"name", "type"},
-			[]string{"asset_bound", "constraints", "wire"})
-		if err != nil {
-			return err
-		}
-		if tagged {
-			var name string
-			if json.Unmarshal(field["name"], &name) != nil || name == tagField {
-				return fmt.Errorf("tagged struct repeats its synthetic discriminator field")
-			}
-		}
-		if rawWire := field["wire"]; rawWire != nil {
-			var wire string
-			if json.Unmarshal(rawWire, &wire) != nil || (wire != "optional" && wire != "omissible") {
-				return fmt.Errorf("wire must be absent for required fields or spell optional|omissible")
-			}
-		}
-		if err := validateTypeRaw(field["type"]); err != nil {
-			return err
-		}
-		if bound := field["asset_bound"]; bound != nil {
-			members, err := exactKeys(bound, nil, []string{"max_bytes", "max_decoded_bytes", "media_types"})
-			if err != nil {
-				return err
-			}
-			if raw, present := members["max_decoded_bytes"]; present {
-				var maximum int64
-				if json.Unmarshal(raw, &maximum) != nil || maximum <= 0 || maximum > (1<<53)-1 {
-					return fmt.Errorf("asset max_decoded_bytes must be a positive exact integer")
-				}
-			}
-		}
-		if constraints := field["constraints"]; constraints != nil {
-			values, err := exactKeys(constraints, nil, []string{"ge", "gt", "le", "max_length", "min_length", "multiple_of"})
-			if err != nil {
-				return err
-			}
-			if value, present := values["multiple_of"]; present {
-				if err := validateMultipleOfJSON(value); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func validateTypeRaw(raw json.RawMessage) error {
-	var scalar string
-	if json.Unmarshal(raw, &scalar) == nil {
-		switch scalar {
-		case "bool", "float", "int", "null", "str":
-			return nil
-		}
-		return fmt.Errorf("unsupported package-interface scalar %q", scalar)
-	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil {
-		return err
-	}
-	switch {
-	case object["asset"] != nil:
-		_, err := exactKeys(raw, []string{"asset"}, nil)
-		return err
-	case object["input"] != nil:
-		_, err := exactKeys(raw, []string{"input"}, nil)
-		return err
-	case object["literal"] != nil:
-		_, err := exactKeys(raw, []string{"literal"}, nil)
-		return err
-	case object["list"] != nil:
-		if _, err := exactKeys(raw, []string{"list"}, nil); err != nil {
-			return err
-		}
-		return validateTypeRaw(object["list"])
-	case object["map"] != nil:
-		if _, err := exactKeys(raw, []string{"map"}, nil); err != nil {
-			return err
-		}
-		entry, err := exactKeys(object["map"], []string{"key", "value"}, nil)
-		if err != nil {
-			return err
-		}
-		if err := validateTypeRaw(entry["key"]); err != nil {
-			return fmt.Errorf("map key: %w", err)
-		}
-		if err := validateTypeRaw(entry["value"]); err != nil {
-			return fmt.Errorf("map value: %w", err)
-		}
-		return nil
-	case object["union"] != nil:
-		union, err := exactKeys(raw, []string{"union"}, []string{"tag_field"})
-		if err != nil {
-			return err
-		}
-		var branches []json.RawMessage
-		if err := json.Unmarshal(object["union"], &branches); err != nil || len(branches) == 0 {
-			return fmt.Errorf("empty package-interface union")
-		}
-		for _, branch := range branches {
-			if union["tag_field"] != nil {
-				member, err := exactKeys(branch, []string{"fields", "tag"}, nil)
-				if err != nil {
-					return err
-				}
-				member["tag_field"] = union["tag_field"]
-				expanded, err := json.Marshal(member)
-				if err != nil {
-					return err
-				}
-				if err := validateStructRaw(expanded); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := validateTypeRaw(branch); err != nil {
-				return err
-			}
-		}
-		return nil
-	case object["fields"] != nil:
-		return validateStructRaw(raw)
-	}
-	return fmt.Errorf("unsupported package-interface type")
-}
-
 func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	if ep.Name == "" {
 		return exit.New(exit.Validation, "package interface carries an unnamed %s", ep.Kind)
@@ -584,13 +280,8 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 		body Struct
 	}{{"request", ep.Request}, {"result", ep.Result}} {
 		for _, field := range pair.body.Fields {
-			if field.Name == "" || (field.Wire != "required" && field.Wire != "optional" &&
-				field.Wire != "omissible") {
-				return exit.New(exit.Validation, "%s.%s has an invalid field", ep.Name, pair.name)
-			}
-			if len(field.Constraints.Unknown) > 0 {
-				return exit.New(exit.Validation, "%s.%s uses unsupported constraints: %s",
-					ep.Name, field.Name, strings.Join(field.Constraints.Unknown, ", "))
+			if field.Name == "" {
+				return exit.New(exit.Validation, "%s.%s has an unnamed field", ep.Name, pair.name)
 			}
 		}
 	}
@@ -681,33 +372,31 @@ func ReadPackageInterface(path string) (*PackageInterface, *exit.Error) {
 	return d, nil
 }
 
-// DecodePackageInterface reads the one closed package-interface/1 grammar and derives its canonical
-// interface facts. Collection membership supplies callable kind; the document does not
-// repeat it.
+// DecodePackageInterface reads the package-interface/1 members this host consumes and derives
+// its canonical interface facts. Collection membership supplies callable kind; the document
+// does not repeat it.
 func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 	if len(data) > canonical.DocMax {
 		return nil, exit.New(exit.Validation, "%s exceeds the %d-byte cap", PackageInterfaceFile, canonical.DocMax)
 	}
 	normalized, err := canonical.NormalizeJCS(data)
 	if err != nil {
-		return nil, exit.New(exit.Validation, "%s violates package-interface/1: %s", PackageInterfaceFile, err)
+		return nil, exit.New(exit.Validation, "%s is not canonical JSON: %s", PackageInterfaceFile, err)
 	}
-	if err := validateClosedPackageInterface(normalized); err != nil {
-		return nil, exit.New(exit.Validation, "%s violates package-interface/1: %s", PackageInterfaceFile, err)
-	}
-	decoder := json.NewDecoder(bytes.NewReader(normalized))
-	decoder.DisallowUnknownFields()
 	var d PackageInterface
-	if err := decoder.Decode(&d); err != nil {
+	if err := json.Unmarshal(normalized, &d); err != nil {
 		return nil, exit.New(exit.Validation, "%s is not a package interface document: %s", PackageInterfaceFile, err)
 	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return nil, exit.New(exit.Validation, "%s carries trailing JSON", PackageInterfaceFile)
+	if err := callableVisibility(normalized); err != nil {
+		return nil, exit.New(exit.Validation, "%s is not a package interface document: %s", PackageInterfaceFile, err)
 	}
 	if d.Format != packageInterfaceFormat || d.Application == "" {
 		return nil, exit.New(exit.Validation, "%s format/application is invalid", PackageInterfaceFile)
 	}
 	var raw struct {
+		Entrypoints []struct {
+			Assets json.RawMessage `json:"assets"`
+		} `json:"entrypoints"`
 		Jobs []json.RawMessage `json:"jobs"`
 	}
 	if err := json.Unmarshal(normalized, &raw); err != nil || len(raw.Jobs) != len(d.Jobs) {
@@ -715,12 +404,25 @@ func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 	}
 	for i := range d.Entrypoints {
 		d.Entrypoints[i].Kind = "entrypoint"
+		admitAssetsSlot(&d.Entrypoints[i], raw.Entrypoints[i].Assets)
 		if problem := validateEntrypoint(&d.Entrypoints[i]); problem != nil {
 			return nil, problem
 		}
 	}
 	for i := range d.Jobs {
 		d.Jobs[i].Kind = "job"
+		var job struct {
+			Assets         json.RawMessage              `json:"assets"`
+			WeightsOutputs []map[string]json.RawMessage `json:"weights_outputs"`
+		}
+		_ = json.Unmarshal(raw.Jobs[i], &job)
+		admitAssetsSlot(&d.Jobs[i], job.Assets)
+		// A new-byte budget has no safe default: zero would refuse the job's own output.
+		for _, output := range job.WeightsOutputs {
+			if budget, present := output["max_bytes"]; !present || string(budget) == "null" {
+				return nil, exit.New(exit.Validation, "%s weights outputs need an explicit max_bytes", d.Jobs[i].Name)
+			}
+		}
 		digest := sha256.Sum256(append([]byte("cozy.runtime.job-descriptor\x00"), raw.Jobs[i]...))
 		d.Jobs[i].DescriptorID, err = canonical.Spell(digest[:])
 		if err != nil {

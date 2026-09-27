@@ -11,11 +11,15 @@
 // TLS over a private network or authenticated overlay remotely. A worker control port is NEVER
 // required to be publicly exposed for topology symmetry.
 //
-// VERSIONING: the MAJOR is the package path (`cozy.worker.v1`). The MINOR is `wire_minor`, an
-// release train number. WIRE_MINIMUM and WIRE_MINOR define the compatible range. Ordinary
-// additive changes preserve the floor; the explicit pre-freeze minor38 hardcut raises it.
-// Clients probe ProtocolInfo before Claim/preparation; servers reject below-floor claims
-// before ownership mutation. After the v1 freeze, breaking changes require a new package major.
+// VERSIONING: the MAJOR is the package path (`cozy.worker.v1`). The MINOR is `wire_minor`, a
+// release train number. Peers are independently deployed and evolve separately: each advertises
+// its [minimum_wire_minor, wire_minor] range and capability booleans through ProtocolInfo.
+// Claim, ProtocolInfo, status, snapshots, keepalive, release and cancellation are never refused
+// over a wire minor. Each OPERATION gates on what it uses: ordinary preparation and execution
+// need the peer at or above WIRE_MINIMUM; a newer feature needs its generated `*WireMinor`
+// constant or its capability boolean. A missing capability fails only that operation with
+// `capability_unavailable`, naming the component to update; other work and rentals continue.
+// After the v1 freeze, breaking changes require a new package major.
 // R7 IS AN AUTHORING RULE ONLY: `reserved` numbers and names are compiler-enforced
 // tombstones against reuse; ordinary proto3 decoders do not refuse them on the wire and no
 // runtime polices them. All generated bindings and fixtures move together for this hardcut.
@@ -45,10 +49,13 @@
 // whatever the field carrying it is called. th-094 retired the last exemption, local package
 // upload, which moved 1 GiB in 1 MiB frames.
 //
-// DOCUMENT VERSIONS. Every current pre-release document is `/1`. A digest-fenced document is NOT
-// additively versioned: an unknown key REFUSES, and shape changes hardcut the `/1` definition
-// across every writer, reader, and stored byte together. The canonical `format` tag is the
-// message's full name plus `/1`; there are no compatibility readers or version aliases.
+// DOCUMENT VERSIONS. The canonical `format` tag is the message's full name plus `/N`. A reader
+// verifies the digest over the carried bytes and their canonical encoding, then reads only the
+// fields it consumes: an unknown key is IGNORED and an absent key means its default (an absent
+// collection is empty). A key whose omission would change results is a capability: senders
+// include it only for peers that advertise it, so ignoring an unknown key is always safe. A
+// reader never re-serializes a parsed document to compare identities. `/N` changes only when a
+// consumed field is removed or retyped.
 //
 // THE ENVELOPE (every message, fields 1-3): the ownership + boot fence, checked BEFORE any body
 // field is read, in this order:
@@ -143,7 +150,7 @@
 // the two phases. `admission_epoch` no longer bumps on executor respawn: a queued attempt is
 // bound to no executor. The four `AttemptAccepted` slots that bound plan and epoch at
 // acceptance (8, 9, 10, 12) are RESERVED — a PRE-LAUNCH HARD CUT, no dual reading, no shim; an
-// owner below 23 is refused typed at Claim (`attempt_queue_unsupported`). RESIDENCY
+// owner below 23 is below the floor. RESIDENCY
 // (residency-aware-routing.md §2/§6, same minor): two observed SETS cross the wire and nothing
 // else — `DeviceLane.resident_placement_ids` (executor holds device bytes on this lane now) and
 // `ObservedWorkerState.held_manifests` (TensorFS manifests the verified store holds complete,
@@ -1174,8 +1181,7 @@ const (
 	// The worker cannot yet promise durable ownership: either its journal is unavailable or its
 	// post-bind readiness barrier is still closed. In both cases no ownership state changes and an
 	// authenticated caller may retry. BootFailure(DISK_SHAPE) remains the boot-fatal form.
-	ClaimRejection_CLAIM_REJECTION_UNDURABLE             ClaimRejection = 7
-	ClaimRejection_CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE ClaimRejection = 9 // below compatibility floor; no counter changes
+	ClaimRejection_CLAIM_REJECTION_UNDURABLE ClaimRejection = 7
 )
 
 // Enum value maps for ClaimRejection.
@@ -1188,7 +1194,6 @@ var (
 		4: "CLAIM_REJECTION_WORKER_ID_MISMATCH",
 		5: "CLAIM_REJECTION_RELEASE_ID_MISMATCH",
 		7: "CLAIM_REJECTION_UNDURABLE",
-		9: "CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE",
 	}
 	ClaimRejection_value = map[string]int32{
 		"CLAIM_REJECTION_UNSPECIFIED":              0,
@@ -1198,7 +1203,6 @@ var (
 		"CLAIM_REJECTION_WORKER_ID_MISMATCH":       4,
 		"CLAIM_REJECTION_RELEASE_ID_MISMATCH":      5,
 		"CLAIM_REJECTION_UNDURABLE":                7,
-		"CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE":    9,
 	}
 )
 
@@ -4423,8 +4427,9 @@ func (x *WorkspaceActivationCall) GetMigrationId() string {
 	return ""
 }
 
-// No ownership, credential, readiness or machine state. A missing RPC or disjoint range
-// refuses before any Claim/preparation side effect. Generated constants are the authority.
+// No ownership, credential, readiness or machine state. Callers record the range and
+// capabilities and gate each operation on them; a missing RPC or disjoint range never refuses
+// the connection or Claim. Generated constants are the authority.
 type ProtocolInfoResult struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	WireMinor        uint32                 `protobuf:"varint,1,opt,name=wire_minor,json=wireMinor,proto3" json:"wire_minor,omitempty"`
@@ -19462,8 +19467,8 @@ func (x *AttemptProgress) GetPlacementId() string {
 }
 
 // DOCUMENT SHAPE (not a wire message): the subject of `invocation_spec_digest`. Canonical form
-// `cozy.worker.v1.InvocationSpec/1`. The key set is CLOSED (01 §3 law 4): no human
-// model/adapter ref is spellable; unknown keys refuse on read and are unwritable on author.
+// `cozy.worker.v1.InvocationSpec/1`. No human model/adapter ref is spellable. Readers ignore
+// unknown keys; a result-changing key is sent only to peers advertising its capability.
 // placement_id is DELIBERATELY absent: the same invocation is the same work wherever it routes.
 type InvocationSpec struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
@@ -24477,7 +24482,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x13CANCEL_REASON_DRAIN\x10\x02\x12\x1c\n" +
 	"\x18CANCEL_REASON_SUPERSEDED\x10\x03\x12\x18\n" +
 	"\x14CANCEL_REASON_POLICY\x10\x04\x12\x1a\n" +
-	"\x16CANCEL_REASON_DEADLINE\x10\x05*\x96\x03\n" +
+	"\x16CANCEL_REASON_DEADLINE\x10\x05*\x98\x03\n" +
 	"\x0eClaimRejection\x12\x1f\n" +
 	"\x1bCLAIM_REJECTION_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fCLAIM_REJECTION_UNAUTHENTICATED\x10\x01\x12,\n" +
@@ -24485,8 +24490,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x1aCLAIM_REJECTION_EPOCH_HELD\x10\x03\x12&\n" +
 	"\"CLAIM_REJECTION_WORKER_ID_MISMATCH\x10\x04\x12'\n" +
 	"#CLAIM_REJECTION_RELEASE_ID_MISMATCH\x10\x05\x12\x1d\n" +
-	"\x19CLAIM_REJECTION_UNDURABLE\x10\a\x12)\n" +
-	"%CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE\x10\t\"\x04\b\x06\x10\x06\"\x04\b\b\x10\b*!CLAIM_REJECTION_UNSUPPORTED_MINOR*&CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH*\x80\x05\n" +
+	"\x19CLAIM_REJECTION_UNDURABLE\x10\a\"\x04\b\x06\x10\x06\"\x04\b\b\x10\b\"\x04\b\t\x10\t*!CLAIM_REJECTION_UNSUPPORTED_MINOR*&CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH*%CLAIM_REJECTION_PROTOCOL_INCOMPATIBLE*\x80\x05\n" +
 	"\tFaultKind\x12\x1a\n" +
 	"\x16FAULT_KIND_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eFAULT_KIND_BINDING_UNAVAILABLE\x10\x01\x12\x1f\n" +
