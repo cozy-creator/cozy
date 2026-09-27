@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -153,7 +154,8 @@ func (m *conversionMachine) submitted() []*pb.MachineExecutionSubmit {
 func retainedIngest(t *testing.T, store *records.Store) {
 	t.Helper()
 	request, _, problem := store.Submit(records.Request{ID: "job-retained-ingest", IdemKey: "retained-ingest", Package: "local/upload_model",
-		Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
+		Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true,
+		PlannedSourceBytes: 7_000_000_000})
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(request.ID, podRental))
 	capture, spec := []byte(`{"capture":"ingest"}`), []byte(`{"invocation":"ingest"}`)
@@ -196,7 +198,7 @@ func conversionRental(row *map[string]any, grants *[]map[string]any, mu *sync.Mu
 		detail.Release.PackageInterfaceDigest = assessmentDigest(iface)
 		detail.Release.PackageInterfaceLength = int64(len(iface))
 		inventory := map[string]any{"format": "tensorhub.image_inventory/1", "profile": "python3.12-cpu-linux-x86", "python": "3.12.12",
-			"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.51"}}}
+			"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.52"}}}
 		mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -266,6 +268,14 @@ func newConversionFixture(t *testing.T) *conversionFixture {
 	fatal(t, problem)
 	if !owed || live {
 		t.Fatalf("the retained ingest should be custody only: owed=%v live=%v", owed, live)
+	}
+	// Its converted model holds pod disk that a later ingest there cannot use.
+	retained, problem := f.store.RentalRetainedModelBytes(podRental)
+	fatal(t, problem)
+	var candidate orchestrator.PlacementCandidate
+	if retained != 7_000_000_000 || rental.Standing(&candidate, nil, records.Rental{ID: podRental, State: "ready"}, 0, false, false, true, nil,
+		rental.Disk{HaveGB: 30, RetainedBytes: retained, SourceBytes: 2_000_000_000}) || !strings.Contains(candidate.Verdict, "30 GB disk with 7 GB retained") {
+		t.Fatalf("placement does not count the retained ingest's disk: retained=%d verdict=%q", retained, candidate.Verdict)
 	}
 	identity, problem := rental.PendingCreatorIdentity(f.layout, "rented-conversion")
 	fatal(t, problem)
@@ -391,7 +401,7 @@ func TestRentedConversionPublishesFromTheMachineThatIngestedItsSource(t *testing
 	machine.mu.Unlock()
 	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "steps=8",
 		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
-	if code == 0 || !strings.Contains(out, "publication.destination_unpublished") || !strings.Contains(out, "0.18.51") {
+	if code == 0 || !strings.Contains(out, "publication.destination_unpublished") || !strings.Contains(out, "0.18.52") {
 		t.Fatalf("an unpublished destination was reported as a success [exit %d]: %s", code, out)
 	}
 	// After the Runtime update the same command runs again rather than replaying that run.

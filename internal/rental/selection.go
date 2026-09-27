@@ -391,10 +391,14 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	}
 	// The disk the Hub bought is a fact about the machine, like its class. Too small is
 	// excluded; not reported is chosen only after the rentals known to fit.
-	need := disk.NeedGB()
-	if need > 0 && disk.HaveGB > 0 && disk.HaveGB < need {
-		c.Verdict = fmt.Sprintf("%s%s: %d GB disk, the ingest needs %d GB", orchestrator.VerdictExcluded,
-			orchestrator.ExcludedDiskShort, disk.HaveGB, need)
+	need, retained := disk.NeedGB(), gigabytes(disk.RetainedBytes)
+	if need > 0 && disk.HaveGB > 0 && disk.HaveGB-retained < need {
+		held := ""
+		if retained > 0 {
+			held = fmt.Sprintf(" with %d GB retained", retained)
+		}
+		c.Verdict = fmt.Sprintf("%s%s: %d GB disk%s, the ingest needs %d GB", orchestrator.VerdictExcluded,
+			orchestrator.ExcludedDiskShort, disk.HaveGB, held, need)
 		return false
 	}
 	c.DiskUnknown = need > 0 && disk.HaveGB == 0
@@ -417,11 +421,12 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	return true
 }
 
-// Disk is an existing rental's container disk as the Hub reported it (0: not reported)
-// and the source bytes the request ingests there.
+// Disk is an existing rental's container disk as the Hub reported it (0: not reported),
+// the models its finished ingests retain there, and the source bytes the request ingests.
 type Disk struct {
-	HaveGB      int
-	SourceBytes int64
+	HaveGB        int
+	RetainedBytes int64
+	SourceBytes   int64
 }
 
 // ingestFixedGB is the disk an ingest pod spends beside its workload: the image, the OS
@@ -435,9 +440,14 @@ func (d Disk) NeedGB() int {
 	if d.SourceBytes <= 0 {
 		return 0
 	}
-	const bytesPerGB = 1_000_000_000
-	source := 1 + (d.SourceBytes-1)/bytesPerGB
-	return int(2*source) + ingestFixedGB
+	return 2*gigabytes(d.SourceBytes) + ingestFixedGB
+}
+
+func gigabytes(bytes int64) int {
+	if bytes <= 0 {
+		return 0
+	}
+	return int(1 + (bytes-1)/1_000_000_000)
 }
 
 // Refusal names why nothing could be placed. The FIRST question is not which reason to

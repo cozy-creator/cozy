@@ -109,6 +109,19 @@ func (s *Store) RentalHasLiveMachineExecutions(id string) (bool, *exit.Error) {
 	return live, nil
 }
 
+// RentalRetainedModelBytes estimates the disk the rental's collected machine models hold:
+// each retaining ingest's converted output is at least as large as its planned source.
+func (s *Store) RentalRetainedModelBytes(id string) (int64, *exit.Error) {
+	var total int64
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(COALESCE((SELECT SUM(length) FROM request_model_transfer_files f WHERE f.request_id=r.id),0)
+ + COALESCE((SELECT source_bytes FROM request_planned_sources p WHERE p.request_id=r.id),0)),0)
+ FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE (e.machine_id=? OR r.worker=?) AND `+machineModelRetentionOwed, id, id).Scan(&total)
+	if err != nil {
+		return 0, exit.Internalf("cannot total retained rented model bytes: %s", err)
+	}
+	return total, nil
+}
+
 func (s *Store) RentalHasMachineObligations(id string) (bool, *exit.Error) {
 	var owed bool
 	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE (e.machine_id=? OR r.worker=?) AND `+machineExecutionOwed+`)`, id, id).Scan(&owed)
