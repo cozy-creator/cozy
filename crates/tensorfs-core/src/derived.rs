@@ -1168,11 +1168,19 @@ pub(crate) fn part_bytes(part: &Part) -> Vec<u8> {
 }
 
 impl AddedPart {
-    pub(crate) fn stored(component: String, key: String, role: String, bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn stored(
+        component: String,
+        key: String,
+        role: String,
+        bytes: &[u8],
+    ) -> Result<Self> {
         name("added part component", &component)?;
         self::key("added part tensor", &key)?;
         name("added part role", &role)?;
-        let part = part_from_value(&crate::canon::parse_canonical(bytes, limits::DOC_MAX_BYTES)?)?;
+        let part = part_from_value(&crate::canon::parse_canonical(
+            bytes,
+            limits::DOC_MAX_BYTES,
+        )?)?;
         Ok(Self {
             component,
             key,
@@ -3005,7 +3013,11 @@ impl Additions {
             for tensor in &component.add {
                 for part in &tensor.parts {
                     parts.insert(
-                        (component.target.clone(), tensor.key.clone(), part.role.clone()),
+                        (
+                            component.target.clone(),
+                            tensor.key.clone(),
+                            part.role.clone(),
+                        ),
                         part.clone(),
                     );
                 }
@@ -3025,7 +3037,11 @@ impl Additions {
     fn get(&self, (component, tensor_key, role): (&str, &str, &str)) -> Result<&PartDeclaration> {
         let part = self
             .parts
-            .get(&(component.to_string(), tensor_key.to_string(), role.to_string()))
+            .get(&(
+                component.to_string(),
+                tensor_key.to_string(),
+                role.to_string(),
+            ))
             .ok_or_else(|| Refusal {
                 code: Code::MISSING_FIELD,
                 detail: format!("{component}/{tensor_key}#{role} is not a declared addition"),
@@ -3093,7 +3109,15 @@ pub fn add_part<R: Read>(
     reader: &mut R,
 ) -> Result<crate::checkpoint::Written> {
     let additions = Additions::load(meta, transaction, writer_session)?;
-    add_indexed_part(store, meta, transaction, writer_session, &additions, value, reader)
+    add_indexed_part(
+        store,
+        meta,
+        transaction,
+        writer_session,
+        &additions,
+        value,
+        reader,
+    )
 }
 
 /// Accept one part. The cost is this part's bytes plus one indexed SQL row: the

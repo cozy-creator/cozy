@@ -2,8 +2,8 @@
 //! metadata journals lifecycle; GC never needs that database to discover retained bytes.
 
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::FileExt;
 use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use crate::canon::{Fields, Value};
@@ -164,7 +164,11 @@ pub(super) fn append_parts(store: &Store, transaction: &str, objects: &[ObjectRe
         file.read_exact_at(&mut last, length - 1).map_err(io)?;
     }
     // Terminate a line torn by a dead writer so this one parses on its own.
-    let mut bytes = if last[0] == b'\n' { Vec::new() } else { vec![b'\n'] };
+    let mut bytes = if last[0] == b'\n' {
+        Vec::new()
+    } else {
+        vec![b'\n']
+    };
     bytes.extend(parts_line(objects));
     file.write_all(&bytes)
         .and_then(|()| file.sync_data())
@@ -185,7 +189,11 @@ pub(super) fn rewrite_parts(store: &Store, transaction: &str, objects: &[ObjectR
         .create_new(true)
         .open(&temporary)
         .map_err(io)?;
-    let bytes = if objects.is_empty() { Vec::new() } else { parts_line(objects) };
+    let bytes = if objects.is_empty() {
+        Vec::new()
+    } else {
+        parts_line(objects)
+    };
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(io)?;
@@ -211,8 +219,12 @@ pub(super) fn journaled(store: &Store) -> Result<Vec<ObjectRef>> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(io(error)),
         };
-        for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
-            let Ok(value) = crate::canon::parse_canonical(line, crate::limits::DOC_MAX_BYTES) else {
+        for line in bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let Ok(value) = crate::canon::parse_canonical(line, crate::limits::DOC_MAX_BYTES)
+            else {
                 continue;
             };
             for value in crate::canon::as_arr("PrivateDerivedParts", "objects", &value)? {
