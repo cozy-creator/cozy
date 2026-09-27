@@ -610,14 +610,6 @@ func (c *Orchestrator) startMachineExecution(req records.Request) *exit.Error {
 }
 
 func (c *Orchestrator) selectOrStart(req records.Request) {
-	if current, problem := c.opt.Store.RequestRow(req.ID); problem == nil && current != nil &&
-		scheduledVenue(*current) != "" {
-		if link, problem := c.opt.Store.MachineExecution(req.ID); problem == nil && link == nil {
-			// A rental's serving queue prepares only through its scheduler (schedule.go).
-			go c.drain()
-			return
-		}
-	}
 	c.prepare(req)
 }
 
@@ -771,7 +763,7 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 			// request parks or fails, once per distinct park.
 			deferred, news := c.deferUnavailable(req, problem)
 			if len(decision.Candidates) > 0 && (news || !deferred) {
-				c.logPlacement(req, decision)
+				c.LogPlacement(req, decision)
 			}
 			if deferred {
 				return false
@@ -788,7 +780,7 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 			// observation re-asks.
 			unguard()
 			if c.parkFor(req, decision.Line()) {
-				c.logPlacement(req, decision)
+				c.LogPlacement(req, decision)
 			}
 			return false
 		}
@@ -796,7 +788,7 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 		if decision.Models != nil {
 			req.Models = decision.Models
 		}
-		c.logPlacement(req, decision)
+		c.LogPlacement(req, decision)
 	}
 	// A JOB names its own slot — one worker per (package, job function) — so the
 	// "already starting" and "already resident" questions are asked about that slot and
@@ -816,10 +808,9 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 	rental := req.Worker
 	c.mu.Lock()
 	// ONE DESIRE PER RENTAL: a preparation in flight there owns the rental's desired set
-	// until it ends, and its end re-asks the rental's scheduler.
+	// until it ends.
 	busy := c.starting[slot]
 	if rental != "" {
-		// The scheduler may have reserved the slot for this very request.
 		busy = c.preparing[rental] || (c.desiring[rental] != "" && c.desiring[rental] != req.ID)
 	}
 	if c.closing || busy {
@@ -1038,9 +1029,8 @@ func (c *Orchestrator) prepare(req records.Request) bool {
 		c.mu.Unlock()
 		c.drain()
 		done()
-		// The launch is over and the queue's world has changed: the rental's scheduler
-		// issues its next desire, and whatever is at the head elsewhere gets its own
-		// question asked.
+		// The launch is over and the queue's world has changed: the rental's queue drains
+		// again, and whatever is at the head elsewhere gets its own question asked.
 		if rental != "" {
 			c.drain()
 		}
@@ -1103,24 +1093,18 @@ func (c *Orchestrator) rentalHeld(req records.Request) bool {
 			continue
 		}
 		slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
-		if req.IsJob() {
-			if w.spec.Placement.Package == slot &&
-				w.spec.Placement.Jobs[0].Function == req.Entrypoint && stagedFor(w, req) {
-				return true
-			}
-			continue
-		}
-		if w.remoteStaged(slot, req.PlanID, req.Release, req.LocalInstallationID, req.Models) {
+		if req.IsJob() && w.spec.Placement.Package == slot &&
+			w.spec.Placement.Jobs[0].Function == req.Entrypoint && stagedFor(w, req) {
 			return true
 		}
 	}
 	return false
 }
 
-// logPlacement is the decision log for the capacity half: no worker held the placement,
+// LogPlacement is the decision log for the capacity half: no worker held the placement,
 // so the fleet placed the run on an attached rental or a bought pod (cl-165), and this
 // request is pinned there until its placement reports.
-func (c *Orchestrator) logPlacement(req records.Request, decision PlacementDecision) {
+func (c *Orchestrator) LogPlacement(req records.Request, decision PlacementDecision) {
 	c.logf("%s: %s; candidates: %s", req.ID, decision.Line(), decision.verdicts())
 	c.emit(req.ID, "request.placement", 0, decision.payload())
 }
@@ -1142,10 +1126,6 @@ func stagedFor(w *worker, req records.Request) bool {
 		// Exact job inputs include their count; an unknown older selection
 		// cannot satisfy a requested model through the serving wildcard.
 		return staged(w, req.PlanID) && exactJobSelection(w.spec.Placement, req)
-	}
-	if req.Worker != "" && w.spec.Connection != nil && !req.IsJob() {
-		return w.remoteStaged(pinnedPackage(req.Package, req.Worker), req.PlanID,
-			req.Release, req.LocalInstallationID, req.Models)
 	}
 	return staged(w, req.PlanID) && selectionServes(req.Models, w.spec.Placement.Models)
 }
@@ -1244,31 +1224,6 @@ func rungHolding(m ModelRef, manifest string) (records.ModelRung, bool) {
 	return records.ModelRung{}, false
 }
 
-// pinToPlacement binds a request's unpinned refs to the manifests the placement that
-// won routing already holds. Nil when nothing was unpinned.
-func pinToPlacement(requested, held []ModelRef) []ModelRef {
-	holds := make(map[string]string, len(held))
-	for _, m := range held {
-		holds[m.BindingSlot()] = m.Manifest
-	}
-	var out []ModelRef
-	for i, m := range requested {
-		manifest, ok := holds[m.BindingSlot()]
-		if m.Pinned() || !ok {
-			continue
-		}
-		rung, fits := rungHolding(m, manifest)
-		if !fits {
-			continue
-		}
-		if out == nil {
-			out = append([]ModelRef(nil), requested...)
-		}
-		out[i] = m.Pin(rung)
-	}
-	return out
-}
-
 // settledState answers whether the authority has already recorded this request's outcome.
 func settledState(state string) bool {
 	switch state {
@@ -1337,6 +1292,10 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		}
 		return spec, req.PlanID, e
 	}
+	if !req.IsJob() {
+		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "rental.inference_runtime_owned",
+			"rented inference is submitted to the machine's Runtime, never dispatched by this owner")
+	}
 	if c.opt.Rentals == nil {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef("this Cozy daemon attaches no remote workers")
 	}
@@ -1384,18 +1343,8 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "request.retention_unsupported", "this private work requires worker wire %d; selected worker speaks %d", required, minor)
 		}
 	}
-	// Reusing an observed installation is not preparation. Its next ordinary
-	// offer may use the worker's released seat while earlier output custody is
-	// still settling; mutations and different selections retain the idle fence.
-	if spec, planID, ready := c.preparedPrivateServing(instance, req, logical); ready {
-		return spec, planID, nil
-	}
-	// Published serving on a serving worker only adds to the rental's set: it claims
-	// nothing and fences nothing. Everything else owns the machine while it prepares.
-	if !c.ordinaryServing(instance, req) {
-		if problem := c.claimRentalPreparation(instance, req); problem != nil {
-			return WorkerLaunchSpec{}, "", problem
-		}
+	if problem := c.claimRentalPreparation(instance, req); problem != nil {
+		return WorkerLaunchSpec{}, "", problem
 	}
 	var jobPrepared *pb.DesiredPlacementSet
 	if req.InstallID != "" {
@@ -1414,117 +1363,79 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 				"local_package_installation_changed",
 				"request %s no longer matches its sealed local package revision", req.ID)
 		}
-		if req.IsJob() {
-			jobPrepared, problem = c.prepareLocalJob(instance, req, revision)
-			if problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-		} else if req.ParentRequestID != "" {
-			if problem := c.prepareChildServing(instance, req, revision); problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-		} else if e := c.ConvergeLocalPackage(instance, req.ID, revision,
-			req.LocalPackageUploadedBootID, func(bootID string) *exit.Error {
-				return c.opt.Store.MarkLocalPackageUploaded(req.ID, revision.ID, bootID)
-			}); e != nil {
-			return WorkerLaunchSpec{}, "", e
-		}
-		if !req.IsJob() && len(logical.Models) > 0 && req.ParentRequestID == "" {
-			for _, model := range logical.Models {
-				if !model.Downloadable() {
-					return WorkerLaunchSpec{}, "", exit.Named(exit.Validation,
-						"private_placement_model_unpublished",
-						"unpublished serving requires downloadable checkpoints or retained child inputs")
-				}
-			}
-			models := downloadModelRefs(logical.Models)
-			if e := c.ConvergeUnpublishedPlacement(instance, req.ID,
-				req.LocalInstallationID, models); e != nil {
-				return WorkerLaunchSpec{}, "", e
-			}
+		jobPrepared, problem = c.prepareLocalJob(instance, req, revision)
+		if problem != nil {
+			return WorkerLaunchSpec{}, "", problem
 		}
 	} else {
 		if c.opt.RentalPackageSet == nil || req.LocalInstallationID != "" {
 			return WorkerLaunchSpec{}, "", exit.Unavailablef(
 				"published remote package preparation requires a package_set signer")
 		}
-		c.mu.Lock()
-		held := preparedPlacementServes(c.workers[instance], logical)
-		c.mu.Unlock()
-		if held {
-			c.logf("%s: rental %s already holds %s/%s under this selection; no package prepare",
-				req.ID, req.Worker, logical.Package, logical.Function)
-		} else if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
+		if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
 			Package: logical.Package, Release: logical.Release,
 		}}, downloadModelRefs(logical.Models)); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
 	}
-	if req.IsJob() {
-		preparedSet := ""
-		var preparedBytes []byte
-		if jobPrepared != nil {
-			preparedSet = spellOf(jobPrepared.PlacementSetDigest)
-			preparedBytes = jobPrepared.PlacementSetCanonicalBytes
-		} else {
-			if e := c.waitPackageStaged(instance); e != nil {
-				return WorkerLaunchSpec{}, "", e
-			}
-			c.mu.Lock()
-			if worker := c.workers[instance]; worker != nil {
-				preparedSet = spellOf(worker.setDigest)
-				preparedBytes = append([]byte(nil), worker.setBytes...)
-			}
-			c.mu.Unlock()
-		}
-		if !validDigest(preparedSet) {
-			return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
-				"rental.package_preparation_identity_missing",
-				"the rented worker staged %s without an exact PlacementSet", req.Package)
-		}
-		// The worker staged its own job plan records during that preparation, under its
-		// own placement's identity. The directive names THAT, read back off the same
-		// document — never this owner's set digest, which the worker never saw.
-		buildID, e := JobInstallationID(preparedBytes, req.Package)
-		if e != nil {
+	preparedSet := ""
+	var preparedBytes []byte
+	if jobPrepared != nil {
+		preparedSet = spellOf(jobPrepared.PlacementSetDigest)
+		preparedBytes = jobPrepared.PlacementSetCanonicalBytes
+	} else {
+		if e := c.waitPackageStaged(instance); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
-		weights, e := decodeWeightsOutputs(req.WeightsOutputs)
-		if e != nil {
-			return WorkerLaunchSpec{}, "", e
+		c.mu.Lock()
+		if worker := c.workers[instance]; worker != nil {
+			preparedSet = spellOf(worker.setDigest)
+			preparedBytes = append([]byte(nil), worker.setBytes...)
 		}
-		spec := WorkerLaunchSpec{Connection: remote.Connection, Devices: remote.Devices, Placement: DesiredPlacement{
-			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
-			InstallID: req.InstallID, Models: append([]ModelRef(nil), logical.Models...),
-			InstallationID:     req.LocalInstallationID,
-			PlacementSetDigest: preparedSet,
-			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
-				InstallationID: buildID,
-				Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
-				WeightsOutputs: weights, RSSCap: DefaultJobRSSCap,
-				NeedsAccelerator: req.NeedsAccelerator}},
-		}}
-		spec, e = c.jobExecutionRole(req, spec)
-		if e != nil {
-			return WorkerLaunchSpec{}, "", e
-		}
-		current, problem := c.opt.Store.RequestRow(req.ID)
-		if problem != nil {
-			return WorkerLaunchSpec{}, "", problem
-		}
-		if current == nil || (current.State != "submitted" && current.State != "queued") {
-			return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its unpublished package job was being prepared")
-		}
-		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
-			return WorkerLaunchSpec{}, "", e
-		}
-		return spec, req.PlanID, nil
+		c.mu.Unlock()
 	}
-	spec, planID, e := c.ensureLogicalPackageReady(instance, req.Worker, logical, req.InstallID == "")
+	if !validDigest(preparedSet) {
+		return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
+			"rental.package_preparation_identity_missing",
+			"the rented worker staged %s without an exact PlacementSet", req.Package)
+	}
+	// The worker staged its own job plan records during that preparation, under its
+	// own placement's identity. The directive names THAT, read back off the same
+	// document — never this owner's set digest, which the worker never saw.
+	buildID, e := JobInstallationID(preparedBytes, req.Package)
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
-	return spec, planID, nil
+	weights, e := decodeWeightsOutputs(req.WeightsOutputs)
+	if e != nil {
+		return WorkerLaunchSpec{}, "", e
+	}
+	spec := WorkerLaunchSpec{Connection: remote.Connection, Devices: remote.Devices, Placement: DesiredPlacement{
+		Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
+		InstallID: req.InstallID, Models: append([]ModelRef(nil), logical.Models...),
+		InstallationID:     req.LocalInstallationID,
+		PlacementSetDigest: preparedSet,
+		Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
+			InstallationID: buildID,
+			Outputs:        strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
+			WeightsOutputs: weights, RSSCap: DefaultJobRSSCap,
+			NeedsAccelerator: req.NeedsAccelerator}},
+	}}
+	spec, e = c.jobExecutionRole(req, spec)
+	if e != nil {
+		return WorkerLaunchSpec{}, "", e
+	}
+	current, problem := c.opt.Store.RequestRow(req.ID)
+	if problem != nil {
+		return WorkerLaunchSpec{}, "", problem
+	}
+	if current == nil || (current.State != "submitted" && current.State != "queued") {
+		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its unpublished package job was being prepared")
+	}
+	if e := c.ConvergeRemoteJob(instance, spec); e != nil {
+		return WorkerLaunchSpec{}, "", e
+	}
+	return spec, req.PlanID, nil
 }
 
 func (c *Orchestrator) exactLocalTransferProducer(req records.Request, spec WorkerLaunchSpec,
@@ -1549,10 +1460,6 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error, workerToS
 
 func (c *Orchestrator) failPreparation(expected records.Request, cause *exit.Error, workerToStop string) {
 	c.failQueuedSelection(expected.ID, &expected, cause, workerToStop)
-	if scheduledVenue(expected) != "" {
-		// The rental's desire ended with this request: its scheduler asks for the next.
-		go c.drain()
-	}
 }
 
 func (c *Orchestrator) failQueuedSelection(requestID string, expected *records.Request, cause *exit.Error, workerToStop string) {
@@ -1715,22 +1622,13 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// rental's placement — and everything below reads the pinned request. A request
 		// that settled first has no worker to pin; it is not dispatched.
 		rentalID := w.spec.Connection.RentalID
-		// The placement that won routing holds one rung of the request's ladder; the
-		// pin binds the request to that lane in the same write (cl-166).
-		var models []ModelRef
-		if placement, ok := w.remotePlacements[remotePlanKey(pinnedPackage(req.Package, rentalID), req.PlanID)]; ok {
-			models = pinToPlacement(req.Models, placement.Models)
-		}
-		pinned, e := c.opt.Store.PinRental(req.ID, rentalID, models)
+		pinned, e := c.opt.Store.PinRental(req.ID, rentalID, nil)
 		if e != nil {
 			return 0, e
 		}
 		if !pinned {
 			return 0, exit.New(exit.Conflict, "request %s settled before it could be pinned to rental %s",
 				req.ID, rentalID)
-		}
-		if models != nil {
-			req.Models = models
 		}
 		req.Worker = rentalID
 		target.routed.pinned = rentalID
@@ -1765,9 +1663,6 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	if !req.IsJob() {
 		c.mu.Lock()
 		servingPlacement = w.spec.Placement
-		if selected, ok := w.remotePlacements[remotePlanKey(pinnedPackage(req.Package, req.Worker), req.PlanID)]; ok {
-			servingPlacement = selected
-		}
 		c.mu.Unlock()
 		if servingPlacement.BindingsDigest == "" || len(servingPlacement.PlacementSetBytes) == 0 {
 			return 0, exit.Named(exit.Conflict, "serving.placement_evidence_absent", "serving dispatch needs the exact prepared model bindings")
@@ -1864,7 +1759,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	grant.InvocationSpecDigest = digest
 
 	c.mu.Lock()
-	placementID := w.placementFor(pinnedPackage(req.Package, req.Worker), req.PlanID)
+	placementID := w.placementID
 	laneID := reservation.laneID
 	var laneDevices []string
 	if l := w.lanes.get(laneID); l != nil {
@@ -1973,10 +1868,6 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 	req records.Request) (string, *exit.Error) {
 	c.mu.Lock()
 	placement, remote, instanceID := w.spec.Placement, w.spec.Connection != nil, w.instanceID
-	if selected, ok := w.remotePlacements[remotePlanKey(
-		pinnedPackage(req.Package, req.Worker), req.PlanID)]; remote && ok {
-		placement = selected
-	}
 	c.mu.Unlock()
 	if remote && (placement.Release != req.Release ||
 		(req.LocalInstallationID != "" && placement.InstallationID != req.LocalInstallationID)) {

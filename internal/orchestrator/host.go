@@ -248,7 +248,7 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 			}
 			return classifyPrepareEnd(err)
 		}
-		c.observePrepareEvent(w.instanceID, machine, label, event)
+		c.ObservePrepareEvent(w.instanceID, machine, label, event)
 		if event.Stage != stage {
 			c.recordPrepareStage(w.instanceID, label, stage, began, last)
 			stage, began = event.Stage, time.Now()
@@ -444,33 +444,6 @@ func (c *Orchestrator) setDesiredUnavailable(w *worker, seq uint64, e *exit.Erro
 func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, label string, prepared *pb.DesiredPlacementSet) {
 	setBytes := append([]byte(nil), prepared.PlacementSetCanonicalBytes...)
 	digest := append([]byte(nil), prepared.PlacementSetDigest...)
-	// THE WIDTH IS AUTHORED HERE TOO. This is the rental's own convergence path — the pod
-	// prepared its own bytes and this owner relays them — so the device pin has to be
-	// authored over the SAME rule as a locally prepared set (devicePins).
-	models := w.spec.Placement.Models
-	owner := w.preparingRequest
-	if owner == "" && w.spec.Connection != nil {
-		// Published serving adds to the rental's set without claiming the machine; the
-		// request whose desire this preparation answers still authors its GPU group.
-		c.mu.Lock()
-		owner = c.desiring[w.spec.Connection.RentalID]
-		c.mu.Unlock()
-	}
-	if owner != "" {
-		request, err := c.opt.Store.RequestRow(owner)
-		if err != nil {
-			c.setDesiredRefusal(w, seq, err)
-			return
-		}
-		if request != nil {
-			models = request.Models
-		}
-	}
-	pins, problem := devicePins(setBytes, w.spec.Devices, models)
-	if problem != nil {
-		c.setDesiredRefusal(w, seq, problem)
-		return
-	}
 	c.mu.Lock()
 	if w.hostPrepareSeq != seq {
 		c.mu.Unlock()
@@ -518,7 +491,6 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		// Native checkpoint/workspace custody stays with the supervisor and TensorFS.
 		w.spec.Placement = DesiredPlacement{}
 		w.planIDs = nil
-		w.remotePlacements = map[string]DesiredPlacement{}
 		w.observedRemote = map[string]remotePlacementObservation{}
 		w.dispatchable, w.materializable = map[string]bool{}, map[string]bool{}
 		w.jobReady = nil
@@ -531,21 +503,21 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamEpoch: s.epoch, WorkerBootId: s.bootID,
 		Revision: rev, WireMinor: pb.WireMinor, Posture: pb.Posture_POSTURE_ACCEPTING,
 		Mode: &pb.DesiredWorkerState_PlacementSet{PlacementSet: &pb.DesiredPlacementSet{
-			PlacementSetDigest: digest, PlacementSetCanonicalBytes: setBytes, DevicePins: pins, OrchestrationParent: w.orchestrationParent}},
+			PlacementSetDigest: digest, PlacementSetCanonicalBytes: setBytes, OrchestrationParent: w.orchestrationParent}},
 	}
 	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
 		c.logf("PodHost prepare %s#%d: control stream closed before the placement_set send", label, seq)
 		return
 	}
 	c.logf("DesiredWorkerState revision=%d placement_set=%s (%d canonical bytes, prepared by the host as %s) "+
-		"envelope=[%s] pins=%d -> %s",
+		"envelope=[%s] -> %s",
 		rev, shortDigest(shortNone(digest)), len(setBytes), label,
-		strings.Join(w.spec.Devices, ","), len(pins), s.bootID)
+		strings.Join(w.spec.Devices, ","), s.bootID)
 }
 
 func hostLabel(kind, id string) string { return fmt.Sprintf("%s(%s)", kind, id) }
 
-// observePrepareEvent folds one PrepareEvent into the phase lane. The subject is the
+// ObservePrepareEvent folds one PrepareEvent into the phase lane. The subject is the
 // WORKER, not a request: one preparation serves every request queued behind it, and
 // recording it per request would make the same bytes look like several transfers.
 //
@@ -556,7 +528,7 @@ func hostLabel(kind, id string) string { return fmt.Sprintf("%s(%s)", kind, id) 
 // TotalBytes is 0 until the plan is bounded (worker.proto), so it is forwarded as declared:
 // zero means "no denominator yet", which the renderer shows as bytes and a rate rather
 // than as a fraction of nothing.
-func (c *Orchestrator) observePrepareEvent(instanceID, machine, label string, event *pb.PrepareEvent) {
+func (c *Orchestrator) ObservePrepareEvent(instanceID, machine, label string, event *pb.PrepareEvent) {
 	name := ""
 	switch event.GetStage() {
 	case pb.PrepareStage_PREPARE_STAGE_RESOLVED:

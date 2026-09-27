@@ -451,6 +451,11 @@ func (s *Store) RecordMachineOutcome(id string, outcome *pb.AttemptOutcome) *exi
 	if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,?,?,?,?)`, id, kind, outcome.AttemptOrdinal, string(payload), now()); err != nil {
 		return exit.Internalf("cannot record machine terminal observation: %s", err)
 	}
+	// Runtime's measured memory sizes the next selection exactly as a local attempt's does.
+	if problem := recordDeviceMemoryTx(tx, Terminal{RequestID: id, Attempt: int64(outcome.AttemptOrdinal),
+		Status: strings.TrimPrefix(body.Status.String(), "OUTCOME_STATUS_"), Body: outcome.OutcomeCanonicalBytes}); problem != nil {
+		return problem
+	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit machine terminal observation: %s", err)
 	}

@@ -76,7 +76,11 @@ func (s *Server) freezeMachineInputs(spec *orchestrator.Submission, entry *launc
 	if len(spec.Assets) == 0 && len(wanted) == 0 {
 		return nil, nil
 	}
-	spec.RequestID = records.NewID("job")
+	prefix := "req"
+	if spec.Kind == "job" {
+		prefix = "job"
+	}
+	spec.RequestID = records.NewID(prefix)
 	stage, problem := scratch.Named(s.layout.Tmp, spec.RequestID)
 	if problem != nil {
 		return nil, problem

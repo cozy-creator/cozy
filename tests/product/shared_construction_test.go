@@ -1,8 +1,6 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,16 +8,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // h3a-018: the H3 package serves two entrypoints over ONE construction, and the measured
@@ -32,124 +27,6 @@ const (
 	sharedFirst  = "first_last_frame_to_video"
 	sharedSecond = "reference_media_to_video"
 )
-
-// A request for the second entrypoint routes to the placement the first one prepared:
-// one prepare whose download set names both slots, one placement advertising both
-// bindings, and the second offer carrying its own binding with no prepare in between.
-func TestSharedConstructionEntrypointsSwitchWithoutAPrepare(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public, serve: true, slots: 2,
-		// The Runtime's own rule (package_prepare._entrypoints): an entrypoint is bound
-		// when every slot it declares is selected, so one binding per selected slot.
-		preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
-			placement := podPlacement(download, pkg, release, "")
-			doc, err := canonical.Read(download, &pb.DownloadDelegation{})
-			must(t, err)
-			placement.Entrypoints = nil
-			for _, row := range doc.List("models") {
-				manifest, err := canonical.Raw(row.Str("manifest"))
-				must(t, err)
-				id := "model-" + row.Str("slot")
-				placement.Models = append(placement.Models, &pb.Model{Id: id, Repo: row.Str("model"),
-					Version: row.Str("release"), Lane: row.Str("lane"),
-					Manifest: &pb.Ref{Digest: manifest, Length: 164}})
-				name := strings.TrimSuffix(row.Str("slot"), ".models.model")
-				placement.Entrypoints = append(placement.Entrypoints,
-					&pb.Entrypoint{Name: name,
-						Slots: []*pb.Slot{{Slot: "model", ReferenceModelId: id,
-							Components: []*pb.Component{{Component: "dit", ModelId: id}}}}})
-			}
-			return placement
-		}}
-	connection, _ := startFakePod(t, t.TempDir(), pod)
-	o := hostOwner(t, "shared-construction", rentalWiring(connection, private))
-	submit := func(function, sibling string) {
-		_, _, problem := o.c.Submit(orchestrator.Submission{
-			IdemKey: "shared-" + function, Package: "cozy/h3-package", Entrypoint: function,
-			Release: "1.1.2", Payload: []byte(`{"prompt":"a fox"}`), Outputs: []string{"video"},
-			Worker: podRental, Rental: true, RentalRequired: true,
-			Models: []orchestrator.ModelRef{{Package: "cozy/h3-package", Slot: function + ".models.model",
-				SharedSlots: []string{sibling + ".models.model"},
-				Model:       "source/h3", Release: "1.0.0", Lane: "fp8-adaln-pruned",
-				Manifest: "sha256:" + strings.Repeat("1", 64), ManifestLength: 164}},
-		})
-		fatal(t, problem)
-	}
-	offer := func(n int) *pb.AttemptOffer {
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			pod.mu.Lock()
-			offers := append([]*pb.AttemptOffer(nil), pod.offers...)
-			pod.mu.Unlock()
-			if len(offers) >= n {
-				return offers[n-1]
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("offer %d never arrived: %v", n, o.c.Events())
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-	binding := func(offer *pb.AttemptOffer) string {
-		spec, err := canonical.Read(offer.InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
-		must(t, err)
-		return spec.Sub("serving").Str("entrypoint_binding_digest")
-	}
-	spelled := func(name string) string {
-		pod.mu.Lock()
-		raw := append([]byte(nil), pod.preparedSet...)
-		pod.mu.Unlock()
-		set, err := canonical.Read(raw, &pb.PlacementSet{})
-		must(t, err)
-		for _, entry := range set.List("placements")[0].List("entrypoints") {
-			if entry.Str("name") == name {
-				return entry.Str("entrypoint_binding_digest")
-			}
-		}
-		t.Fatalf("prepared set omitted %s", name)
-		return ""
-	}
-
-	submit(sharedFirst, sharedSecond)
-	first := offer(1)
-	if got := binding(first); got != spelled(sharedFirst) {
-		t.Fatalf("the first request dispatched binding %s, not %s", got, sharedFirst)
-	}
-	pod.mu.Lock()
-	prepares := append([]*pb.PreparePackageSetCall(nil), pod.prepares...)
-	desired := len(pod.desired)
-	pod.mu.Unlock()
-	if len(prepares) != 1 {
-		t.Fatalf("the first request issued %d prepare(s), want one", len(prepares))
-	}
-	doc, err := canonical.Read(prepares[0].PackageSet.DownloadDelegation, &pb.DownloadDelegation{})
-	must(t, err)
-	var slots []string
-	for _, row := range doc.List("models") {
-		slots = append(slots, row.Str("slot"))
-	}
-	want := []string{sharedFirst + ".models.model", sharedSecond + ".models.model"}
-	if !slices.Equal(slots, want) {
-		t.Fatalf("the download set selects %v, want the construction's every slot %v", slots, want)
-	}
-
-	submit(sharedSecond, sharedFirst)
-	second := offer(2)
-	if got := binding(second); got != spelled(sharedSecond) {
-		t.Fatalf("the second request dispatched binding %s, not %s", got, sharedSecond)
-	}
-	if first.PlacementId == "" || second.PlacementId != first.PlacementId {
-		t.Fatalf("the switch left placement %q for %q", first.PlacementId, second.PlacementId)
-	}
-	pod.mu.Lock()
-	again, desiredAgain := len(pod.prepares), len(pod.desired)
-	pod.mu.Unlock()
-	if again != 1 || desiredAgain != desired {
-		t.Fatalf("the switch issued %d prepare(s) and %d desired state(s) after the first %d: "+
-			"a second entrypoint of one construction is a dispatch, not a prepare", again-1, desiredAgain-desired, desired)
-	}
-}
 
 // The daemon derives the shared slots from what the owner bound: the sibling slot's class
 // is the selected slot's, and its hub default names the same model release under the same

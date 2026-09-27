@@ -115,8 +115,6 @@ type fakePod struct {
 	// reobserve re-sends the serving report for the last desired state, as the Runtime's
 	// report cadence would after its seats change.
 	reobserve func() error
-	// runtime61 plays the minor-61 Runtime on the control stream (pod_runtime_test.go).
-	runtime61 *podRuntime
 	// deviceCount is the width this pod's ClaimAck reports — how many accelerators the
 	// worker actually found. Zero reports one card, which is what every pod was until
 	// wide products became buyable. A test sets it to say what the PROVIDER delivered,
@@ -232,18 +230,6 @@ func (p *fakePod) served(d *pb.DesiredWorkerState, epoch uint64) *pb.WorkerFrame
 	}}}
 }
 
-func (p *fakePod) setLatch(fault *pb.Fault) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.latch = fault
-}
-
-func (p *fakePod) reported(reason string) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.reports[reason]
-}
-
 // report is the latch arm's ObservedWorkerState: the desired revision accepted and not
 // converged, the placement absent, and the fault, exactly as a Runtime that latched a
 // materialization refusal reports every ReportCadence.
@@ -317,15 +303,6 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 		}
 		if p.onFrame != nil {
 			handled, err := p.onFrame(frame, send)
-			if err != nil {
-				return err
-			}
-			if handled {
-				continue
-			}
-		}
-		if p.runtime61 != nil {
-			handled, err := p.runtime61.frame(p, frame, send)
 			if err != nil {
 				return err
 			}
@@ -740,6 +717,11 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARING, TotalBytes: total, TransferredBytes: total},
 		&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, TotalBytes: total, TransferredBytes: total,
 			PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: setDigest, PlacementSetCanonicalBytes: setBytes}})
+	if p.machine != nil {
+		// A Runtime that owns executions names the installation it prepared beside the set.
+		events[len(events)-1].InstalledPackage = &pb.InstalledPackage{InstallationId: placement.InstallationId,
+			Package: name, Release: release, PackageInterface: placement.PackageInterface}
+	}
 	for i, event := range events {
 		if p.prepareEvent != nil {
 			p.prepareEvent(event)
@@ -1118,192 +1100,6 @@ func stageLocalRevision(t *testing.T, root string) localpackage.Installation {
 		files[0], files[1] = files[1], files[0]
 	}
 	return localpackage.Installation{ID: "fixture-install", Package: "local/weightless", Release: "1.0.0", PackageInterface: fixturePackageInterface, Files: files, SourceArchive: "source.tar"}
-}
-
-// submitPrivateRental records the editable install the request names and queues the
-// rental-bound request, exactly as `cozy run local/... --rental-only` does.
-func submitPrivateRental(t *testing.T, o *owner, revision localpackage.Installation, idem string) string {
-	t.Helper()
-	install := records.PackageInstall{ID: revision.ID, Package: revision.Package, Major: 1, Version: revision.Release,
-		SourceKind: "local", SourceRef: filepath.Join(o.root, "checkout"),
-		Dir: filepath.Join(o.root, "installs", idem), Python: "/usr/bin/python3", Platform: "linux-x86"}
-	_, e := o.store.Activate(install)
-	fatal(t, e)
-	planID := podPlanID(revision.Package)
-	requestID, _, e := o.c.Submit(orchestrator.Submission{
-		IdemKey: idem, Package: revision.Package, Entrypoint: "tile", PlanID: planID,
-		Release:             revision.Release,
-		LocalInstallationID: revision.ID, Payload: []byte(`{"size":48}`), Outputs: []string{"image"},
-		Worker: podRental, InstallID: install.ID, Rental: true, RentalRequired: true,
-	})
-	fatal(t, e)
-	return requestID
-}
-
-// TestPodHostLocalRevisionGrantsProjectWheel: a rental-bound editable request grants
-// every wheel of its sealed revision to the pod — the project wheel among them — BEFORE
-// the private set is prepared through PodHost, and the placement_set the owner then
-// sends is the exact bytes the host prepared, carrying that wheel.
-func TestPodHostLocalRevisionGrantsProjectWheel(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public}
-	root := t.TempDir()
-	connection, _ := startFakePod(t, root, pod)
-	revision := stageLocalRevision(t, root)
-	pod.serve = true
-	o := hostOwner(t, "podhost-private", rentalWiring(connection, private), func(opt *orchestrator.Options) {
-		opt.Packages = localLauncher{revision: revision}
-	})
-	requestID := submitPrivateRental(t, o, revision, "private-grants")
-
-	waitUntil(t, "the prepared placement_set on WorkerControl", func() bool {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.desired) >= 1
-	})
-	func() {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		if got := strings.Join(pod.lanes, ","); got != "upload,prepare_private,placement_set" {
-			t.Fatalf("the pod saw the lanes in the order %q; want upload, prepare_private, placement_set", got)
-		}
-		project := 0
-		for _, grant := range pod.uploads {
-			spelled, _ := canonical.Spell(grant.Digest)
-			if strings.HasPrefix(grant.Filename, "weightless-1.0.0-") {
-				project++
-				if spelled != revision.Files[0].Digest && spelled != revision.Files[1].Digest ||
-					grant.Length == 0 {
-					t.Fatalf("the project wheel grant names %s %s, not the sealed revision's wheel", spelled, grant.Filename)
-				}
-			}
-		}
-		if len(pod.uploads) != len(revision.Files) || project != 1 {
-			t.Fatalf("%d grant(s) with %d project wheel(s); want %d grants naming exactly one project wheel",
-				len(pod.uploads), project, len(revision.Files))
-		}
-		if len(pod.localPrepares) != 1 || len(pod.localPrepares[0].LocalPackageSet.Files) != len(revision.Files) ||
-			pod.localPrepares[0].LocalPackageSet.OperationId != requestID {
-			t.Fatalf("PodHost.PrepareLocalPackage saw %d call(s) for %v; want one naming request %s and every wheel",
-				len(pod.localPrepares), pod.localPrepares, requestID)
-		}
-		sent := pod.desired[0].GetPlacementSet()
-		if sent == nil || !bytes.Equal(sent.PlacementSetCanonicalBytes, pod.preparedSet) {
-			t.Fatalf("the desired state does not carry the exact bytes the host prepared")
-		}
-		doc, err := canonical.Read(sent.PlacementSetCanonicalBytes, &pb.PlacementSet{})
-		must(t, err)
-		installed := doc.List("placements")[0]
-		if installed.Str("installation_id") != revision.ID || installed.Sub("development").Str("installation_id") != revision.ID {
-			t.Fatal("prepared placement lost the accepted installation")
-		}
-		row, e := o.store.RequestRow(requestID)
-		fatal(t, e)
-		if row.LocalPackageUploadedBootID != podBootID {
-			t.Fatalf("the request row records upload boot %q; want the pod's %s", row.LocalPackageUploadedBootID, podBootID)
-		}
-	}()
-	// THE POD SERVES: the request is DISPATCHED to the rented worker exactly once — the
-	// install that pins a local relaunch never hides the rental — and the spec names the
-	// captured local revision's exact prepared Environment.
-	waitUntil(t, "the attempt offer on the pod", func() bool {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.offers) >= 1
-	})
-	time.Sleep(300 * time.Millisecond)
-	pod.mu.Lock()
-	defer pod.mu.Unlock()
-	if len(pod.offers) != 1 || len(pod.desired) != 1 {
-		t.Fatalf("%d offer(s) over %d desired state(s); want one offer over the one prepared set",
-			len(pod.offers), len(pod.desired))
-	}
-	spec, err := canonical.Read(pod.offers[0].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
-	must(t, err)
-	prepared, err := canonical.Read(pod.desired[0].GetPlacementSet().PlacementSetCanonicalBytes, &pb.PlacementSet{})
-	must(t, err)
-	environment := prepared.List("placements")[0].Str("installation_id")
-	if environment == "" || spec.Str("installation_id") != environment {
-		t.Fatalf("captured serving must name its actual prepared environment: got %q, want %q", spec.Str("installation_id"), environment)
-
-	}
-}
-
-// TestPodPlacementRefusedRepeats: a pod that latches one materialization fault against the
-// desired revision and replays it unchanged on every report is answered by a typed request
-// failure after the fleet's still-factor of identical reports — never a timer, never an
-// unbounded queue. A fault whose text changes starts the count over; the rental stays
-// attached for the idle release; the owner sends no second desired state.
-func TestPodPlacementRefusedRepeats(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public}
-	root := t.TempDir()
-	connection, _ := startFakePod(t, root, pod)
-	revision := stageLocalRevision(t, root)
-	o := hostOwner(t, "podhost-latched", rentalWiring(connection, private), func(opt *orchestrator.Options) {
-		opt.Packages = localLauncher{revision: revision}
-	})
-	missing := "sha256:" + strings.Repeat("2964e74c", 8) + " is reached by PlacementSet/1 and absent locally and from the plan"
-	first := &pb.Fault{Kind: pb.FaultKind_FAULT_KIND_ARTIFACT_FETCH_FAILED, Reason: "download_plan_missing", Detail: missing}
-	pod.setLatch(first)
-	requestID := submitPrivateRental(t, o, revision, "latched")
-
-	state := func() string {
-		row, e := o.store.RequestRow(requestID)
-		fatal(t, e)
-		return row.State
-	}
-	// Six identical reports, then the text changes: the count starts over, and the request
-	// is still queued after fourteen reports that never agreed eight times running.
-	waitUntil(t, "six identical fault reports", func() bool { return pod.reported(first.Reason+"/"+first.Detail) >= 6 })
-	changed := &pb.Fault{Kind: first.Kind, Reason: first.Reason, Detail: missing + " (grant refreshed)"}
-	pod.setLatch(changed)
-	waitUntil(t, "six changed fault reports", func() bool { return pod.reported(changed.Reason+"/"+changed.Detail) >= 6 })
-	if got := state(); got != "submitted" && got != "queued" {
-		t.Fatalf("the request is %s after twelve reports of two different faults; want it still waiting", got)
-	}
-	// The same fault, eight reports running: the worker's final word on this revision.
-	pod.setLatch(first)
-	waitUntil(t, "the typed request failure", func() bool { return state() == "failed" })
-	rows, e := o.store.EventsAfter(requestID, 0, 100)
-	fatal(t, e)
-	var failed map[string]any
-	for _, row := range rows {
-		if row.Type == "request.failed" {
-			failed = row.Payload
-		}
-	}
-	if failed == nil || failed["error_type"] != "worker.placement_refused" ||
-		!strings.HasPrefix(failed["error"].(string), "download_plan_missing: "+missing) {
-		t.Fatalf("request.failed payload = %v; want worker.placement_refused carrying the fault text", failed)
-	}
-	if n := pod.reported(first.Reason + "/" + first.Detail); n < 6+orchestrator.StillFactor {
-		t.Fatalf("the owner failed the request after %d identical reports; want at least %d", n, 6+orchestrator.StillFactor)
-	}
-	pod.mu.Lock()
-	sent := len(pod.desired)
-	pod.mu.Unlock()
-	if sent != 1 {
-		t.Fatalf("the owner sent %d desired states; want the one — a latched fault is never answered by a re-send", sent)
-	}
-	row, e := o.store.RequestRow(requestID)
-	fatal(t, e)
-	if row.Requeues != 0 {
-		t.Fatalf("the request was requeued %d time(s); want 0", row.Requeues)
-	}
-	instance, _, _, e := o.c.EnsureRental(podRental)
-	fatal(t, e)
-	facts := o.c.Worker(instance)
-	if facts == nil || facts.Exited {
-		t.Fatalf("the rented worker is gone (%v); the rental is the idle release's to end", facts)
-	}
-	log, err := os.ReadFile(filepath.Join(o.root, "orchestrator.log"))
-	must(t, err)
-	if !strings.Contains(string(log), "repeated unchanged on "+strconv.Itoa(orchestrator.StillFactor)+" consecutive reports") {
-		t.Errorf("the owner log does not name the repetition verdict")
-	}
 }
 
 // submitPublishedRentalJob queues one published JOB bound to the rented pod, the way

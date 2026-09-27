@@ -218,8 +218,9 @@ func (s *Store) failQueuedRequest(requestID string, expected *Request, payload m
 // one of these instead of one connection per request (the connection-cap reason the
 // local host multiplexes at all).
 func (s *Store) EventsAfter(requestID string, cursor int64, limit int) ([]Event, *exit.Error) {
+	// A kept triage bundle rides beside the events as a document, never as one of them.
 	query := `SELECT seq,request_id,type,attempt,payload,at FROM request_events
-		WHERE seq>?`
+		WHERE seq>? AND type!='machine.triage'`
 	args := []any{cursor}
 	if requestID != "" {
 		query += ` AND request_id=?`
@@ -387,4 +388,61 @@ func (s *Store) LatestMachineProgress(requestID string, attempt int64) (map[stri
 		return nil, exit.Internalf("cannot decode machine progress for %s: %s", requestID, err)
 	}
 	return value, nil
+}
+
+// MachineGPUWait is the newest gpu.wait Runtime reported for this execution whose call has
+// not since been granted or released devices, or nil when nothing waits for a GPU.
+func (s *Store) MachineGPUWait(requestID string) (*MachineGPUWaiting, *exit.Error) {
+	var body string
+	err := s.db.QueryRow(`SELECT payload FROM request_events w WHERE w.request_id=? AND w.type='machine.gpu.wait'
+		AND NOT EXISTS(SELECT 1 FROM request_events g WHERE g.request_id=w.request_id AND g.seq>w.seq
+		AND g.type IN ('machine.gpu.grant','machine.gpu.release') AND json_extract(g.payload,'$.key')=json_extract(w.payload,'$.key'))
+		ORDER BY w.seq DESC LIMIT 1`, requestID).Scan(&body)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read GPU wait for %s: %s", requestID, err)
+	}
+	var wait MachineGPUWaiting
+	if err := json.Unmarshal([]byte(body), &wait); err != nil {
+		return nil, exit.Internalf("cannot decode GPU wait for %s: %s", requestID, err)
+	}
+	return &wait, nil
+}
+
+// MachineGPUWaiting is Runtime's gpu.wait body: the call, the device count it needs and the
+// roots holding the devices ahead of it.
+type MachineGPUWaiting struct {
+	Key       string   `json:"key"`
+	Width     int      `json:"width"`
+	BlockedBy []string `json:"blocked_by"`
+}
+
+// RecordMachineTriage keeps a Runtime execution's triage bundle beside its events, once
+// per attempt; MachineTriage reads the newest back.
+func (s *Store) RecordMachineTriage(requestID string, attempt int64, bundle []byte) *exit.Error {
+	if !json.Valid(bundle) {
+		return exit.New(exit.Conflict, "triage bundle is not a JSON document")
+	}
+	if _, err := s.db.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at)
+		SELECT ?,'machine.triage',?,?,? WHERE NOT EXISTS(SELECT 1 FROM request_events
+		WHERE request_id=? AND type='machine.triage' AND attempt=?)`,
+		requestID, attempt, string(bundle), now(), requestID, attempt); err != nil {
+		return exit.Internalf("cannot keep the triage bundle of %s: %s", requestID, err)
+	}
+	return nil
+}
+
+func (s *Store) MachineTriage(requestID string) (json.RawMessage, *exit.Error) {
+	var bundle string
+	err := s.db.QueryRow(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.triage'
+		ORDER BY seq DESC LIMIT 1`, requestID).Scan(&bundle)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read the triage bundle of %s: %s", requestID, err)
+	}
+	return json.RawMessage(bundle), nil
 }

@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -21,14 +20,8 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// cl-179: WIDTH, carried end to end. A rental is bought at a width, the pod delivers that
-// many cards, and a model-bearing placement on it is pinned to ALL of them — one group
-// lane of degree K, which is what makes a sequence-parallel run possible at all.
-//
-// Everything below the test is the product: the records store's own rental row, the
-// production `rental.Resolver` / `ObserveWorker` / `ClaimProof` wiring the daemon uses, the
-// real control stream, and `tests/support`'s independent pod peer answering it. Nothing is
-// stubbed between the paid width and the `device_pins` the worker receives.
+// cl-179: WIDTH. A rental is bought at a width and the pod must deliver it; Runtime alone
+// decides which of those cards each call uses.
 
 // rentalWidthWiring is daemon_serve's own rental wiring over a rental this host bought at
 // `width`, attached with real credentials. The two facts under test — the persisted width
@@ -93,117 +86,6 @@ func modelBearingPlacement(t *testing.T) func([]byte, string, string) *pb.Placem
 						Components: []*pb.Component{{Component: "dit", ModelId: id}}}}})
 		}
 		return placement
-	}
-}
-
-func submitToWideRental(t *testing.T, o *owner, idem string) {
-	t.Helper()
-	_, _, problem := o.c.Submit(orchestrator.Submission{
-		IdemKey: idem, Package: "cozy/h3-package", Entrypoint: "tile", Release: "1.1.2",
-		Payload: []byte(`{"prompt":"a fox"}`), Outputs: []string{"video"},
-		Worker: podRental, Rental: true, RentalRequired: true,
-		Models: []orchestrator.ModelRef{{Package: "cozy/h3-package", Slot: "tile.models.model",
-			Model: "source/h3", Release: "1.0.0", Lane: "bf16",
-			Manifest: "sha256:" + strings.Repeat("1", 64), ManifestLength: 164}},
-	})
-	fatal(t, problem)
-}
-
-// awaitPlacementSet returns the last desired state the pod received that actually names a
-// placement, and that placement's id. An empty set is a drain, not the convergence the pin
-// rides on.
-func awaitPlacementSet(t *testing.T, o *owner, pod *fakePod) (*pb.DesiredPlacementSet, string) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		pod.mu.Lock()
-		states := append([]*pb.DesiredWorkerState(nil), pod.desired...)
-		pod.mu.Unlock()
-		for i := len(states) - 1; i >= 0; i-- {
-			set := states[i].GetPlacementSet()
-			if set == nil {
-				continue
-			}
-			doc, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
-			if err != nil || len(doc.List("placements")) != 1 {
-				continue
-			}
-			return set, doc.List("placements")[0].Str("placement_id")
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no serving desired state reached the pod: %v", o.c.Events())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// TestRentalWidthPinsThePlacementToEveryPaidCard is the whole plumbing in one line of
-// evidence: what the pod is told to do with its cards is the width the rental was bought
-// at. At one card nothing is pinned — one envelope device is one lane and the worker
-// assigns it by measured fit, exactly as before wide products existed. At two and four the
-// placement carries ONE pin over ALL the ordinals, which is what fuses a group lane of
-// that degree; a pin over fewer would idle paid cards without saying so.
-func TestRentalWidthPinsThePlacementToEveryPaidCard(t *testing.T) {
-	for _, arm := range []struct {
-		name  string
-		width int
-		pin   []uint32
-	}{
-		{"one card pins nothing", 1, nil},
-		{"degree two", 2, []uint32{0, 1}},
-		{"degree four", 4, []uint32{0, 1, 2, 3}},
-	} {
-		t.Run(arm.name, func(t *testing.T) {
-			pod := &fakePod{serve: true, deviceCount: uint32(arm.width),
-				preparedPlacement: modelBearingPlacement(t)}
-			root := t.TempDir()
-			connection, certPath := startFakePod(t, root, pod)
-			o := hostOwner(t, "rental-width-"+arm.name,
-				rentalWidthWiring(t, pod, connection, certPath, arm.width))
-			submitToWideRental(t, o, "width-"+arm.name)
-			set, placementID := awaitPlacementSet(t, o, pod)
-			if len(arm.pin) == 0 {
-				if len(set.DevicePins) != 0 {
-					t.Fatalf("a %d-card rental pinned %v; one device is one lane",
-						arm.width, set.DevicePins)
-				}
-				return
-			}
-			if len(set.DevicePins) != 1 {
-				t.Fatalf("a %d-card rental sent %d pin(s), want exactly one for its one placement",
-					arm.width, len(set.DevicePins))
-			}
-			pin := set.DevicePins[0]
-			if pin.PlacementId != placementID {
-				t.Errorf("the pin names placement %q, not the set's %q", pin.PlacementId, placementID)
-			}
-			if len(pin.DeviceOrdinals) != len(arm.pin) {
-				t.Fatalf("the pin covers %v, want every paid ordinal %v", pin.DeviceOrdinals, arm.pin)
-			}
-			for i, ordinal := range arm.pin {
-				if pin.DeviceOrdinals[i] != ordinal {
-					t.Fatalf("the pin covers %v, want every paid ordinal %v", pin.DeviceOrdinals, arm.pin)
-				}
-			}
-		})
-	}
-}
-
-// TestWeightlessPlacementIsNeverPinnedToAGroup is the other half of the rule. A group
-// shards a model's attention; a placement holding no weights has nothing to shard, and the
-// worker refuses `device_group_unsupported` for a weightless pin. So the owner authors
-// none and the worker places it on its own least-loaded lane — on a four-card pod as on
-// a one-card one.
-func TestWeightlessPlacementIsNeverPinnedToAGroup(t *testing.T) {
-	pod := &fakePod{serve: true, deviceCount: 4}
-	root := t.TempDir()
-	connection, certPath := startFakePod(t, root, pod)
-	o := hostOwner(t, "rental-width-weightless",
-		rentalWidthWiring(t, pod, connection, certPath, 4))
-	submitToWideRental(t, o, "width-weightless")
-	set, _ := awaitPlacementSet(t, o, pod)
-	if len(set.DevicePins) != 0 {
-		t.Fatalf("a weightless placement was pinned to %v", set.DevicePins)
 	}
 }
 
@@ -357,44 +239,5 @@ func TestDeclaredDegreesAreTheIntersectionOverEveryModelSlot(t *testing.T) {
 	}
 	if got := iface.Entrypoints[1].SequenceParallelDegrees(); len(got) != 0 {
 		t.Fatalf("the unshardable function inherited its sibling's degrees: %v", got)
-	}
-}
-
-func TestJobInputModelsNeverPinWeightlessPreparationToAGroup(t *testing.T) {
-	pod := &fakePod{serve: true, jobReady: true, deviceCount: 4, preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
-		placement := podPlacement(download, pkg, release, "")
-		placement.Entrypoints = nil
-		placement.Models = []*pb.Model{{Id: "job-source", Repo: "source/h3", Version: "1.0.0", Lane: "bf16", Manifest: &pb.Ref{Digest: sha256Of([]byte("job-source")), Length: 164}}}
-		return placement
-	}}
-	root := t.TempDir()
-	connection, certPath := startFakePod(t, root, pod)
-	o := hostOwner(t, "job-input-wide-prepare", rentalWidthWiring(t, pod, connection, certPath, 4))
-	submitPublishedRentalJob(t, o, "cozy/h3-package", "1.0.7", "sha256:"+strings.Repeat("35", 32), "job-input-wide-prepare")
-	waitUntil(t, "weightless package preparation followed by ordinary job directive", func() bool { pod.mu.Lock(); defer pod.mu.Unlock(); return len(pod.jobDirectives) > 0 })
-	pod.mu.Lock()
-	defer pod.mu.Unlock()
-	prepared := false
-	for _, desired := range pod.desired {
-		set := desired.GetPlacementSet()
-		if set == nil {
-			continue
-		}
-		document, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
-		must(t, err)
-		if len(document.List("placements")) == 0 {
-			continue
-		}
-		placement := document.List("placements")[0]
-		if len(placement.List("models")) != 1 || len(placement.List("entrypoints")) != 0 {
-			t.Fatal("fixture omitted the actual job-only model metadata shape")
-		}
-		if len(set.DevicePins) > 0 {
-			t.Fatalf("job input inventory became a CP serving group: %+v", set.DevicePins)
-		}
-		prepared = true
-	}
-	if !prepared || pod.jobDirectives[0].DeviceCount > 1 {
-		t.Fatal("ordinary job did not follow ungrouped package preparation")
 	}
 }

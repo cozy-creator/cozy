@@ -1,20 +1,15 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"flag"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 var modeledPackageHub = flag.String("modeled-package-hub", "", "real Tensorhub for read-only published H3 interface validation")
@@ -45,68 +40,5 @@ func TestPublishedH3ModeledEntrypointSelection(t *testing.T) {
 		if _, _, problem := resolver.ResolveRemoteRelease("", "paul/minimax-h3", "1.1.2", function, models); problem == nil {
 			t.Fatal("another callable's model selection was accepted")
 		}
-	}
-}
-
-// The claimed worker prepares two dispatchable bindings in one package. The
-// owner must select by the requested function, including the non-first name.
-func TestModeledRentalSelectsTheNamedPreparedBinding(t *testing.T) {
-	for _, function := range []string{"first_last_frame_to_video", "reference_media_to_video"} {
-		t.Run(function, func(t *testing.T) {
-			public, private, err := ed25519.GenerateKey(rand.Reader)
-			must(t, err)
-			bindings := map[string][]byte{
-				"first_last_frame_to_video": podEntrypoint("first_last_frame_to_video").EntrypointBindingDigest,
-				"reference_media_to_video":  podEntrypoint("reference_media_to_video").EntrypointBindingDigest,
-			}
-			pod := &fakePod{controlKey: public, serve: true,
-				preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
-					placement := podPlacement(download, pkg, release, "")
-					placement.Entrypoints = []*pb.Entrypoint{
-						{Name: "first_last_frame_to_video", EntrypointBindingDigest: bindings["first_last_frame_to_video"]},
-						{Name: "reference_media_to_video", EntrypointBindingDigest: bindings["reference_media_to_video"]},
-					}
-					return placement
-				}}
-			connection, _ := startFakePod(t, t.TempDir(), pod)
-			o := hostOwner(t, "modeled-"+function, rentalWiring(connection, private))
-			requestID, _, problem := o.c.Submit(orchestrator.Submission{
-				IdemKey: "modeled-" + function, Package: "cozy/h3-package", Entrypoint: function,
-				Release: "1.1.2", Payload: []byte(`{"prompt":"a fox"}`), Outputs: []string{"video"},
-				Worker: podRental, Rental: true, RentalRequired: true,
-				Models: []orchestrator.ModelRef{{Package: "cozy/h3-package", Slot: function + ".models.model",
-					Model: "source/h3", Release: "1.0.0", Lane: "bf16-full",
-					Manifest: "sha256:" + strings.Repeat("1", 64), ManifestLength: 164}},
-			})
-			fatal(t, problem)
-			deadline := time.Now().Add(5 * time.Second)
-			for {
-				pod.mu.Lock()
-				offers := append([]*pb.AttemptOffer(nil), pod.offers...)
-				pod.mu.Unlock()
-				if len(offers) > 0 {
-					if len(offers) != 1 {
-						t.Fatalf("one invocation received %d offers", len(offers))
-					}
-					spec, err := canonical.Read(offers[0].InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
-					must(t, err)
-					want, err := canonical.Spell(bindings[function])
-					must(t, err)
-					if got := spec.Sub("serving").Str("entrypoint_binding_digest"); got != want {
-						t.Fatalf("%s dispatched binding %s instead of %s", function, got, want)
-					}
-					row, problem := o.store.RequestRow(requestID)
-					fatal(t, problem)
-					if row.PlanID != want || row.Models[0].Slot != function+".models.model" {
-						t.Fatal("named binding or selected model changed before durable dispatch")
-					}
-					return
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("%s never received its named prepared binding: %v", function, o.c.Events())
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-		})
 	}
 }

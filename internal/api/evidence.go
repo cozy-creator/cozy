@@ -49,6 +49,8 @@ func (s *Server) requestEvidence(w http.ResponseWriter, r *http.Request) {
 		if _, bundle, problem := s.store.TriageBundle(last.AttemptKey); problem == nil && json.Valid(bundle) {
 			out.Triage = bundle
 		}
+	} else if bundle, problem := s.store.MachineTriage(row.ID); problem == nil && bundle != nil {
+		out.Triage = bundle
 	}
 	s.ok(w, r, http.StatusOK, out)
 }

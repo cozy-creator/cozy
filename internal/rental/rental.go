@@ -337,9 +337,8 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		}
 		// THE WIDTH TRAVELS WITH THE DIAL IDENTITY. It is the paid `accelerator_count`,
 		// spelled as the device envelope the pod's worker holds, and a CPU rental holds
-		// none. Everything downstream — the lane breach check, the decision log's device
-		// names, the device pin this owner authors — reads it from here, so there is one
-		// place the width of a machine is decided and it is the record of what was bought.
+		// none. The lane breach check and the decision log's device names read it from
+		// here; which of those devices a call uses is Runtime's.
 		devices := orchestrator.RentalDeviceEnvelope(row.AcceleratorCount)
 		if records.CPUAccelerator(row.AcceleratorModel) {
 			devices = nil

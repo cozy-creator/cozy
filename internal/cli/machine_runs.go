@@ -56,7 +56,7 @@ type machineConnection struct {
 	client             machineExecutionClient
 	claim              *pb.Claim
 	prepare            func(context.Context, string, localpackage.Installation) *exit.Error
-	prepareModels      func(context.Context, records.Request, localpackage.Installation) *exit.Error
+	prepareModels      func(context.Context, records.Request, localpackage.Installation) (*pb.DesiredPlacementSet, *exit.Error)
 	modelDefaultOrigin func(context.Context) (string, *exit.Error)
 	preparePublished   func(context.Context, records.Request) (*publishedPreparation, *exit.Error)
 	wireMinor          uint32
@@ -95,6 +95,7 @@ type machineRuns struct {
 	fleet     *managedRentals
 	mu        sync.Mutex
 	running   map[string]bool
+	placed    map[string]string // the last placement decision recorded per waiting run
 	localMu   sync.Mutex
 	localPID  int
 	observers sync.Map // one collection/control lock per observed request
@@ -103,7 +104,7 @@ type machineRuns struct {
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals) *machineRuns {
 	background, cancel := context.WithCancel(context.Background())
-	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}}
+	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, running: map[string]bool{}, placed: map[string]string{}}
 }
 
 func (m *machineRuns) Start(request records.Request) *exit.Error {
@@ -119,8 +120,8 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 	m.running[request.ID] = true
 	m.mu.Unlock()
 	go func() {
-		defer func() { m.mu.Lock(); delete(m.running, request.ID); m.mu.Unlock() }()
-		lastError := ""
+		defer func() { m.mu.Lock(); delete(m.running, request.ID); delete(m.placed, request.ID); m.mu.Unlock() }()
+		lastError, delay := "", time.Second
 		for m.ctx.Err() == nil {
 			current, problem := m.store.RequestRow(request.ID)
 			if problem != nil || current == nil {
@@ -182,6 +183,13 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					}
 				}
 			}
+			// A wait that repeats itself (no machine yet, one still booting) is asked less
+			// often; anything else is observed again at once.
+			if problem != nil && problem.Message == lastError {
+				delay = min(2*delay, 5*time.Second)
+			} else {
+				delay = time.Second
+			}
 			if problem != nil && problem.Message != lastError && m.ctx.Err() == nil {
 				fmt.Fprintf(m.context.Out, "machine execution %s: %s\n", request.ID, problem.Message)
 				lastError = problem.Message
@@ -192,11 +200,15 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 					_, _ = m.store.FailQueuedRequest(request.ID, map[string]any{"error_type": problem.ErrName(), "error": problem.Message})
 					return
 				}
+				if readProblem == nil && latest != nil && len(latest.Submission) == 0 {
+					// A run still waiting to reach its machine says why, as a queued run does.
+					_ = m.store.AppendEvent(request.ID, "request.parked", 0, map[string]any{"reason": problem.Message, "wait": orchestrator.WaitRental})
+				}
 			}
 			select {
 			case <-m.ctx.Done():
 				return
-			case <-time.After(time.Second):
+			case <-time.After(delay):
 			}
 		}
 	}()
@@ -235,10 +247,10 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		if request.Rental {
 			machine = request.Worker
 			if machine == "" {
-				machine = request.RequestedRental
-			}
-			if machine == "" {
-				decision, _, problem := m.fleet.acquire(request)
+				// The placement decision pins the machine and, for a model ladder, the
+				// lanes that machine takes. Runtime alone decides its devices.
+				decision, line, problem := m.fleet.acquire(request)
+				m.recordPlacement(request, decision, line)
 				if problem != nil {
 					return problem
 				}
@@ -258,6 +270,13 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return problem
 		}
 		link.MachineID = machine
+	}
+	if request.Rental {
+		current, problem := m.store.RequestRow(request.ID)
+		if problem != nil || current == nil {
+			return problem
+		}
+		request.Worker, request.Models, request.PlanID = link.MachineID, current.Models, current.PlanID
 	}
 
 	if len(link.Submission) == 0 && m.updates != nil {
@@ -321,14 +340,19 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			if problem != nil {
 				return problem
 			}
+			var placements *pb.DesiredPlacementSet
 			for index, revision := range capture.Installations {
 				if problem := connection.prepare(m.ctx, request.ID, revision); problem != nil {
 					return problem
 				}
 				capture.Installations[index].PackageInterface = connection.installed[revision.ID].PackageInterface
 				if connection.prepareModels != nil {
-					if problem := connection.prepareModels(m.ctx, request, revision); problem != nil {
+					set, problem := connection.prepareModels(m.ctx, request, revision)
+					if problem != nil {
 						return problem
+					}
+					if revision.ID == request.LocalInstallationID {
+						placements = set
 					}
 				}
 			}
@@ -369,16 +393,23 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			if problem != nil {
 				return problem
 			}
-			if job.Kind != "job" {
-				return exit.New(exit.Conflict, "installed callable is not a job")
+			if (job.Kind == "job") != request.IsJob() {
+				return exit.New(exit.Conflict, "installed callable changed its kind")
 			}
-			request.PlanID = job.DescriptorID
-			plan := machineJobPlan(request, installed.InstallationId, job)
+			if job.Kind == "job" {
+				request.PlanID = job.DescriptorID
+			} else if request, problem = m.bindServingPlan(request, installed.InstallationId, placements); problem != nil {
+				return problem
+			}
 			byteInputs, problem := m.stageMachineInputs(m.ctx, request, connection)
 			if problem != nil {
 				return problem
 			}
-			built, problem = orchestrator.MachineJobSubmission(request, capture, plan, byteInputs)
+			if job.Kind == "job" {
+				built, problem = orchestrator.MachineJobSubmission(request, capture, machineJobPlan(request, installed.InstallationId, job), byteInputs)
+			} else {
+				built, problem = orchestrator.MachineServingSubmission(request, capture, placements, byteInputs)
+			}
 			if problem != nil {
 				return problem
 			}
@@ -413,7 +444,28 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if problem := m.sendMachineSubmission(m.ctx, connection, request.ID, submission); problem != nil {
 		return problem
 	}
+	if m.fleet != nil && m.fleet.owner != nil {
+		m.fleet.owner.ForgetPhase(request.ID) // Runtime reports the run from here on
+	}
 	return m.releaseMachineInputs(m.ctx, request, connection)
+}
+
+// recordPlacement makes a waiting run's placement decision durable, as a queued run's is:
+// the fleet line and the decision record, each once per change.
+func (m *machineRuns) recordPlacement(request records.Request, decision orchestrator.PlacementDecision, line string) {
+	m.mu.Lock()
+	news := m.placed[request.ID] != decision.Line()+"\x00"+line
+	m.placed[request.ID] = decision.Line() + "\x00" + line
+	m.mu.Unlock()
+	if !news {
+		return
+	}
+	if line != "" {
+		_ = m.store.AppendEvent(request.ID, "request.rentals", 0, map[string]any{"line": line})
+	}
+	if len(decision.Candidates) > 0 {
+		m.fleet.owner.LogPlacement(request, decision)
+	}
 }
 
 // freezeMachineSubmission persists authenticated journal identity with the exact
@@ -540,9 +592,6 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 	}
 	defer connection.connection.Close()
 	connection.progress = progress
-	if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
-		return problem
-	}
 	if len(link.PendingControl) > 0 {
 		if _, problem := m.flushMachineControl(ctx, connection, link); problem != nil {
 			return problem
@@ -570,6 +619,9 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 		if page.NextAfter >= page.HeadSequence {
 			break
 		}
+	}
+	if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
+		return problem
 	}
 	if state.Collected || state.State == "canceled" || state.State != "succeeded" && state.State != "failed" {
 		return nil
@@ -600,6 +652,14 @@ func (m *machineRuns) refresh(parent context.Context, request records.Request) *
 	}
 	if problem := m.store.RecordMachineOutcome(request.ID, outcome); problem != nil {
 		return problem
+	}
+	if ref := body.TriageBundle; ref != nil && link.MachineID != "local" && m.fleet != nil {
+		// Evidence, not custody: a bundle the pod cannot hand over leaves the run as it is.
+		if bundle, problem := m.fleet.owner.RentalTriage(link.MachineID, ref); problem != nil {
+			fmt.Fprintf(m.context.Out, "machine execution %s: triage bundle not kept: %s\n", request.ID, problem.Message)
+		} else if problem := m.store.RecordMachineTriage(request.ID, int64(outcome.AttemptOrdinal), bundle); problem != nil {
+			return problem
+		}
 	}
 	models, problem := m.collectMachineModels(ctx, request, connection, outcome, &body)
 	if problem != nil {
@@ -700,20 +760,17 @@ func validateMachinePrepared(result *pb.DesiredPlacementSet) *exit.Error {
 	return nil
 }
 
-func readMachinePreparation(stream grpc.ServerStreamingClient[pb.PrepareEvent]) *exit.Error {
-	_, problem := readMachinePreparedSet(stream)
-	return problem
-}
-
-func readMachinePreparedSet(stream grpc.ServerStreamingClient[pb.PrepareEvent]) (*pb.DesiredPlacementSet, *exit.Error) {
-	event, problem := readMachinePreparationEvent(stream)
+func readMachinePreparedSet(stream grpc.ServerStreamingClient[pb.PrepareEvent], observe func(*pb.PrepareEvent)) (*pb.DesiredPlacementSet, *exit.Error) {
+	event, problem := readMachinePreparationEvent(stream, observe)
 	if problem != nil {
 		return nil, problem
 	}
 	return event.PlacementSet, nil
 }
 
-func readMachinePreparationEvent(stream grpc.ServerStreamingClient[pb.PrepareEvent]) (*pb.PrepareEvent, *exit.Error) {
+// readMachinePreparationEvent reads a preparation to its verified end, handing each event
+// to `observe` (nil for none) so a waiting run can show what its machine is doing.
+func readMachinePreparationEvent(stream grpc.ServerStreamingClient[pb.PrepareEvent], observe func(*pb.PrepareEvent)) (*pb.PrepareEvent, *exit.Error) {
 	for {
 		event, err := stream.Recv()
 		if err != nil {
@@ -724,6 +781,9 @@ func readMachinePreparationEvent(stream grpc.ServerStreamingClient[pb.PrepareEve
 				return nil, problem
 			}
 			return nil, machineTransport(err)
+		}
+		if observe != nil {
+			observe(event)
 		}
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:

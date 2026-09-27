@@ -339,11 +339,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, status, handle)
 }
 
-// Installed local roots and explicitly pinned rentals use Runtime submission
-// once their input shape has a complete machine-side path.
+// Installed local roots and every rented root use Runtime submission. A model
+// transfer has no machine-side staging path and stays with its own coordinator.
 func publishedMachineJob(spec orchestrator.Submission) bool {
-	return ((spec.Rental && (spec.RequestedRental != "" || spec.Worker != "")) || (!spec.Rental && spec.MachineExecutionObserver)) &&
-		spec.ModelTransfer == nil
+	return (spec.Rental || spec.MachineExecutionObserver) && spec.ModelTransfer == nil
 }
 
 func replayJobSubmission(sub JobSubmission,

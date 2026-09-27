@@ -113,7 +113,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		event, problem := readMachinePreparationEvent(stream)
+		event, problem := readMachinePreparationEvent(stream, m.preparationPhase(request.ID))
 		if problem != nil {
 			return nil, problem
 		}
@@ -177,7 +177,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return machineTransport(err)
 		}
-		event, problem := readMachinePreparationEvent(stream)
+		event, problem := readMachinePreparationEvent(stream, m.preparationPhase(request))
 		if problem != nil {
 			return problem
 		}
@@ -186,14 +186,14 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 
 	// Only inference supplies these exact inputs. Installing the captured code
 	// above remains independent of any model, including unused child defaults.
-	result.prepareModels = func(ctx context.Context, request records.Request, revision localpackage.Installation) *exit.Error {
+	result.prepareModels = func(ctx context.Context, request records.Request, revision localpackage.Installation) (*pb.DesiredPlacementSet, *exit.Error) {
 		models := orchestrator.PrivateRevisionModelRefs(request, revision.Package)
-		if len(models) == 0 {
-			return nil
+		if len(models) == 0 && (request.IsJob() || revision.ID != request.LocalInstallationID) {
+			return nil, nil // an inference root always needs its prepared placement
 		}
 		transfer, problem := m.store.MachinePackageTransfer(request.ID, claim.WorkerBootId, revision.ID)
 		if problem != nil {
-			return problem
+			return nil, problem
 		}
 		operation := transfer.Operation
 		if operation == "" {
@@ -201,20 +201,26 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		}
 		downloads, problem := rental.DownloadSet(nil, models)
 		if problem != nil {
-			return problem
+			return nil, problem
 		}
 		selected := &pb.DesiredPrivatePlacementSet{OperationId: operation, InstallationId: revision.ID, DownloadDelegation: downloads}
 		stream, err := host.PreparePrivatePlacement(ctx, &pb.PreparePrivatePlacementCall{
 			Claim: claim, SupportsModelMaterializationRecovery: true, PrivatePlacementSet: selected,
 		})
 		if err != nil {
-			return machineTransport(err)
+			return nil, machineTransport(err)
 		}
-		return readMachinePreparation(stream)
+		return readMachinePreparedSet(stream, m.preparationPhase(request.ID))
 	}
 
 	transferred = true
 	return result, nil
+}
+
+// preparationPhase shows a rented run what its machine's preparation is doing: resolving,
+// downloading its models, installing its package.
+func (m *machineRuns) preparationPhase(request string) func(*pb.PrepareEvent) {
+	return func(event *pb.PrepareEvent) { m.fleet.owner.ObservePrepareEvent(request, "", "", event) }
 }
 
 func machinePackageOperation(request string, revision localpackage.Installation) string {

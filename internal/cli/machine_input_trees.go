@@ -201,6 +201,19 @@ func (m *machineRuns) importMachineInput(ctx context.Context, request string, as
 }
 
 func (m *machineRuns) releaseMachineInputs(ctx context.Context, request records.Request, connection *machineConnection) *exit.Error {
+	if !request.IsJob() {
+		// Runtime adopts a job root's staged bytes; an inference root's stay held here
+		// until its execution has ended.
+		link, problem := m.store.MachineExecution(request.ID)
+		if problem != nil {
+			return problem
+		}
+		var state pb.MachineExecutionState
+		if link != nil && len(link.Submission) > 0 && !link.Collected &&
+			(proto.Unmarshal(link.ObservedState, &state) != nil || !machineEnded(state.State)) {
+			return nil
+		}
+	}
 	inputs, problem := m.store.MachineInputs(request.ID)
 	if problem != nil {
 		return problem
@@ -232,4 +245,8 @@ func (m *machineRuns) releaseMachineInputs(ctx context.Context, request records.
 		}
 	}
 	return nil
+}
+
+func machineEnded(state string) bool {
+	return state == "succeeded" || state == "failed" || state == "canceled"
 }

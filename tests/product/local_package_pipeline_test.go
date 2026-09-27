@@ -3,8 +3,6 @@ package producttest
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"net"
 	"os"
@@ -15,7 +13,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/localpackage"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -505,62 +502,5 @@ func TestUploadCancellationInterruptsBlockedWindow(t *testing.T) {
 	held, err := os.ReadFile(receiver.path)
 	if err != nil || !bytes.Equal(held, data) {
 		t.Fatalf("resumed canceled stream bytes differ: %v", err)
-	}
-}
-
-func TestLocalWheelRequestCancellationInterruptsBlockedUpload(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	receiver := &blockedUploadReceiver{beforeInitial: true, ready: make(chan struct{})}
-	stopped := make(chan struct{})
-	pod := &fakePod{controlKey: public, localUpload: func(stream grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error {
-		defer close(stopped)
-		return receiver.LocalPackageUpload(stream)
-	}, onFrame: func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
-		abort := frame.GetLocalPackageAbort()
-		if abort == nil {
-			return false, nil
-		}
-		return true, send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_LocalPackageAbortStatus{LocalPackageAbortStatus: &pb.LocalPackageAbortStatus{
-			RecordOwnerEpoch: abort.RecordOwnerEpoch, ControlStreamEpoch: abort.ControlStreamEpoch,
-			WorkerBootId: abort.WorkerBootId, OperationId: abort.OperationId,
-
-			Outcome: pb.LocalPackageAbortOutcome_LOCAL_PACKAGE_ABORT_OUTCOME_ABANDONED,
-		}}})
-	}}
-	root := t.TempDir()
-	connection, _ := startFakePod(t, root, pod)
-	revision := stageLocalRevision(t, root)
-	o := hostOwner(t, "upload-cancel", rentalWiring(connection, private), func(opt *orchestrator.Options) {
-		opt.Packages = localLauncher{revision: revision}
-	})
-	requestID := submitPrivateRental(t, o, revision, "upload-cancel")
-	select {
-	case <-receiver.ready:
-	case <-time.After(5 * time.Second):
-		t.Fatal("request did not reach wheel upload")
-	}
-	result := make(chan *exit.Error, 1)
-	go func() { result <- o.c.CancelQueued(requestID, "cancel during wheel upload") }()
-	select {
-	case problem := <-result:
-		fatal(t, problem)
-	case <-time.After(5 * time.Second):
-		t.Fatal("request cancellation did not finish")
-	}
-	select {
-	case <-stopped:
-	case <-time.After(2 * time.Second):
-		t.Fatal("request canceled but upload gRPC context is still live")
-	}
-	row, problem := o.store.RequestRow(requestID)
-	fatal(t, problem)
-	if row.State != "canceled" {
-		t.Fatalf("request did not settle canceled: %s", row.State)
-	}
-	pod.mu.Lock()
-	defer pod.mu.Unlock()
-	if len(pod.localPrepares) != 0 || len(pod.offers) != 0 {
-		t.Fatal("canceled upload reached preparation or execution")
 	}
 }

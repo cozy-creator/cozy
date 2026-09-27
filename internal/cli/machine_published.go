@@ -13,10 +13,10 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Local installed code and explicit rented machines use the same execution path.
-// Rented roots with external placement keep their existing coordinator.
+// Local installed code and rented machines use the same execution path: the machine
+// prepares the release, and a job or an inference root is submitted against that preparation.
 func (m *machineRuns) publishedSubmission(ctx context.Context, request records.Request, connection *machineConnection) (*pb.MachineExecutionSubmit, *exit.Error) {
-	if (request.Rental && request.RequestedRental == "" && request.Worker == "") || connection.preparePublished == nil {
+	if (request.Rental && request.Worker == "") || connection.preparePublished == nil {
 		return nil, exit.New(exit.Conflict, "published machine execution requires a local install or pinned rental")
 	}
 	if connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
@@ -38,10 +38,14 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 	if problem != nil {
 		return nil, problem
 	}
-	if job.Kind != "job" {
-		return nil, exit.New(exit.Conflict, "installed callable is not a job")
+	if (job.Kind == "job") != request.IsJob() {
+		return nil, exit.New(exit.Conflict, "installed callable changed its kind")
 	}
-	request.PlanID = job.DescriptorID
+	if job.Kind == "job" {
+		request.PlanID = job.DescriptorID
+	} else if request, problem = m.bindServingPlan(request, installed.InstallationId, prepared.DesiredPlacementSet); problem != nil {
+		return nil, problem
+	}
 	capture := &pb.MachineExecutionCapture{
 		RootInstallationId: installed.InstallationId,
 		InstalledPackages:  []*pb.InstalledPackage{installed},
@@ -68,12 +72,34 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 	if err != nil {
 		return nil, exit.Internalf("cannot encode published execution capture: %s", err)
 	}
-	plan := machineJobPlan(request, installed.InstallationId, job)
 	byteInputs, problem := m.stageMachineInputs(ctx, request, connection)
 	if problem != nil {
 		return nil, problem
 	}
-	return orchestrator.MachineJobSubmission(request, localpackage.ExecutionCapture{Canonical: raw, Digest: digest}, plan, byteInputs)
+	frozen := localpackage.ExecutionCapture{Canonical: raw, Digest: digest}
+	if !request.IsJob() {
+		return orchestrator.MachineServingSubmission(request, frozen, prepared.DesiredPlacementSet, byteInputs)
+	}
+	return orchestrator.MachineJobSubmission(request, frozen, machineJobPlan(request, installed.InstallationId, job), byteInputs)
+}
+
+// bindServingPlan records the binding the machine authored for the request's callable in
+// the placement it prepared: an inference root is submitted against exactly that binding.
+func (m *machineRuns) bindServingPlan(request records.Request, installationID string, prepared *pb.DesiredPlacementSet) (records.Request, *exit.Error) {
+	if validateMachinePrepared(prepared) != nil {
+		return request, exit.New(exit.Conflict, "machine preparation returned no verified placement for inference")
+	}
+	_, planID, problem := orchestrator.ServingPlacement(prepared.PlacementSetCanonicalBytes, installationID, request)
+	if problem != nil {
+		return request, problem
+	}
+	if planID != request.PlanID {
+		if problem := m.store.BindRequestPlan(request.ID, planID); problem != nil {
+			return request, problem
+		}
+		request.PlanID = planID
+	}
+	return request, nil
 }
 
 // Both published and synced-source jobs use the executing installation's

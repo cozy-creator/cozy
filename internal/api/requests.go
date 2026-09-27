@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
+	"github.com/cozy-creator/cozy/internal/scratch"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -143,12 +144,16 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var spec orchestrator.Submission
+	var inputStage *scratch.Dir
 	if existing != nil {
 		// Resolve an existing key from the durable request identity, not from resources
 		// retained only while it can execute. The caller's asset claims are still hashed
 		// below, so a different body conflicts, but its source is not
 		// opened merely to answer an already-recorded request.
 		spec = replaySubmission(sub, *existing)
+		if link, problem := s.store.MachineExecution(existing.ID); problem == nil && link != nil {
+			spec.MachineExecutionObserver = true
+		}
 		// The digest covers the DERIVED export rows, and a replay resolves no
 		// entrypoint to re-derive them from. The recorded export row is that exact
 		// derivation, frozen at first submit; the caller still asserts directory and
@@ -190,6 +195,17 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
+		// A rented inference root is Runtime's to execute, like every rented job: its
+		// root bytes are frozen for native staging before anything is recorded.
+		if s.machineExecutions != nil && spec.Rental {
+			spec.MachineExecutionObserver = true
+			inputStage, e = s.freezeMachineInputs(&spec, &launch.Entrypoint{Name: spec.Entrypoint})
+			defer inputStage.Release()
+			if e != nil {
+				s.refuseTyped(w, r, e)
+				return
+			}
+		}
 	}
 	spec.IdemKey, spec.Hub = key, selectedHub
 	// THE BODY DIGEST is over the whole submission the key names, not over the payload
@@ -207,6 +223,9 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
+	}
+	if inputStage != nil && recorded.ID == spec.RequestID {
+		inputStage.Detach()
 	}
 	attempt := uint64(recorded.Ordinal)
 	if fresh {
@@ -884,14 +903,22 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		if machine == "" {
 			machine = link.MachineID
 		}
-		life := Lifecycle{Number: row.Number, Kind: "job", RequestID: row.ID, Status: state.Status,
+		kind := "invocation"
+		if row.IsJob() {
+			kind = "job"
+		}
+		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS,
 			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, Outputs: state.Outputs,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
 			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}
+		if phase, ok := s.orchestrator.PhaseOf(row.ID); ok && life.Status == "queued" {
+			fillPhase(&life, phase)
+		}
 		s.fillLifecycleProgress(&life, row)
+		s.fillGPUWait(&life, row)
 		return life
 	}
 	kind := "invocation"
@@ -918,34 +945,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 			life.QueuePosition, life.QueueDepth = &position, &depth
 		}
 		if phase, ok := s.orchestrator.QueuePhase(row.ID); ok {
-			life.Phase, life.PhaseMachine = phase.Name, phase.Machine
-			life.PhaseDetail, life.RentalProgress = phase.Detail, phase.Rental
-			life.PhaseModels = phase.Models
-			if !phase.At.IsZero() {
-				age := phase.SampleAge().Milliseconds()
-				life.PhaseSampleAgeMS = &age
-			}
-			life.WaitingFor = phase.WaitingFor
-			if elapsed := phase.Elapsed(); elapsed > 0 {
-				ms := elapsed.Milliseconds()
-				life.PhaseElapsedMS = &ms
-			}
-			if phase.HasBytes {
-				moved := int64(phase.Moved)
-				life.PhaseMovedBytes = &moved
-				if phase.Total > 0 {
-					total := int64(phase.Total)
-					life.PhaseTotalBytes = &total
-				}
-				if phase.Rate > 0 {
-					rate := phase.Rate
-					life.PhaseRate = &rate
-				}
-				if remaining, ok := phase.Remaining(); ok {
-					ms := remaining.Milliseconds()
-					life.PhaseRemainingMS = &ms
-				}
-			}
+			fillPhase(&life, phase)
 		}
 	}
 	s.fillLifecycleProgress(&life, row)
@@ -1238,6 +1238,61 @@ func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
 		if progress.Estimated {
 			life.RemainingMS = &progress.RemainingMS
 		}
+	}
+}
+
+// fillPhase projects what a queued run is waiting on: the phase, its machine and, for a
+// transfer, the bytes moved and the rate.
+func fillPhase(life *Lifecycle, phase orchestrator.PhaseObservation) {
+	life.Phase, life.PhaseMachine = phase.Name, phase.Machine
+	life.PhaseDetail, life.RentalProgress = phase.Detail, phase.Rental
+	life.PhaseModels = phase.Models
+	if !phase.At.IsZero() {
+		age := phase.SampleAge().Milliseconds()
+		life.PhaseSampleAgeMS = &age
+	}
+	life.WaitingFor = phase.WaitingFor
+	if elapsed := phase.Elapsed(); elapsed > 0 {
+		ms := elapsed.Milliseconds()
+		life.PhaseElapsedMS = &ms
+	}
+	if phase.HasBytes {
+		moved := int64(phase.Moved)
+		life.PhaseMovedBytes = &moved
+		if phase.Total > 0 {
+			total := int64(phase.Total)
+			life.PhaseTotalBytes = &total
+		}
+		if phase.Rate > 0 {
+			rate := phase.Rate
+			life.PhaseRate = &rate
+		}
+		if remaining, ok := phase.Remaining(); ok {
+			ms := remaining.Milliseconds()
+			life.PhaseRemainingMS = &ms
+		}
+	}
+}
+
+// fillGPUWait says an active Runtime execution waits for GPUs, how many, and the first
+// run of this host holding them.
+func (s *Server) fillGPUWait(life *Lifecycle, row records.Request) {
+	if life.Status != "queued" && life.Status != "in_progress" {
+		return
+	}
+	wait, problem := s.store.MachineGPUWait(row.ID)
+	if problem != nil || wait == nil {
+		return
+	}
+	life.Phase, life.PhaseDetail = orchestrator.PhaseGPUWait, fmt.Sprintf("needs %d", wait.Width)
+	for _, root := range wait.BlockedBy {
+		if blocker, problem := s.store.RequestByReference(root); problem == nil && blocker != nil {
+			life.WaitingFor = &orchestrator.WaitingRun{Number: blocker.Number, RequestID: blocker.ID}
+			return
+		}
+	}
+	if len(wait.BlockedBy) > 0 {
+		life.PhaseDetail += ", behind other work"
 	}
 }
 

@@ -129,8 +129,8 @@ func submitH3Reference(t *testing.T, release string) {
 		facts, problem := inputasset.Fingerprint(path, 64<<20)
 		fatal(t, problem)
 		asset := row.Assets[i]
-		if asset.Digest != facts.Digest || asset.Length != facts.Length || asset.MediaType != facts.MediaType || asset.LocalPath != path || asset.Order != uint32(i) || asset.ModTime != facts.ModTime {
-			t.Fatalf("reference image was not borrowed under its exact identity: %+v", asset)
+		if asset.Digest != facts.Digest || asset.Length != facts.Length || asset.MediaType != facts.MediaType || asset.Snapshot == nil || asset.Order != uint32(i) {
+			t.Fatalf("reference image was not frozen under its exact identity: %+v", asset)
 		}
 		fatal(t, inputasset.Verify(asset, 64<<20))
 	}
