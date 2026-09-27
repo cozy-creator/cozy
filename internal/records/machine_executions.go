@@ -78,12 +78,16 @@ func (s *Store) MachinePackageTransfer(request, boot, revision string) (MachineP
 }
 
 // e/r are the observer and request aliases. Explicit Runtime release is stronger
-// than a status projection. A failed or paused root remains owed after its small
+// than a status projection. A failed or paused root remains live after its small
 // error result is collected, and cancellation alone never proves native cleanup.
-const machineExecutionOwed = `(NOT ` + machineExecutionLost + ` AND (` + machineInputOwed + ` OR ` + machineModelRetentionOwed + ` OR ` + machineFileResultOwed + ` OR (NOT EXISTS(SELECT 1 FROM request_events released
+const machineExecutionLive = `(NOT ` + machineExecutionLost + ` AND NOT EXISTS(SELECT 1 FROM request_events released
  WHERE released.request_id=r.id AND released.type='machine.retention_released') AND (
  (length(e.receipt)=0 AND r.state NOT IN ('refused','failed','succeeded','abandoned','pausing','paused','blocked') AND (length(e.submission)>0 OR r.state!='canceled')) OR
- (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))))`
+ (length(e.receipt)>0 AND (r.state!='succeeded' OR e.collected=0 OR e.cancel_requested=1 OR length(e.pending_control)>0))))`
+
+// Recipient custody (staged inputs, collected models and files) outlives the execution.
+// It is owed to the machine, but it is bytes on its disk, not a worker state to preserve.
+const machineExecutionOwed = `((NOT ` + machineExecutionLost + ` AND (` + machineInputOwed + ` OR ` + machineModelRetentionOwed + ` OR ` + machineFileResultOwed + `)) OR ` + machineExecutionLive + `)`
 
 func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 	var owed bool
@@ -92,6 +96,30 @@ func (s *Store) MachineExecutionOwesWork(id string) (bool, *exit.Error) {
 		return false, exit.Internalf("cannot inspect Runtime execution obligations: %s", err)
 	}
 	return owed, nil
+}
+
+// RentalHasLiveMachineExecutions is whether an execution on the rental still needs its
+// worker's current state, which work Creator drives would replace.
+func (s *Store) RentalHasLiveMachineExecutions(id string) (bool, *exit.Error) {
+	var live bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE (e.machine_id=? OR r.worker=?) AND `+machineExecutionLive+`)`, id, id).Scan(&live)
+	if err != nil {
+		return false, exit.Internalf("cannot inspect live rented Runtime executions: %s", err)
+	}
+	return live, nil
+}
+
+// RentalRetainedModelBytes estimates the disk the rental's collected machine models hold:
+// each retaining ingest's converted output is at least as large as its planned source.
+func (s *Store) RentalRetainedModelBytes(id string) (int64, *exit.Error) {
+	var total int64
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(COALESCE((SELECT SUM(length) FROM request_model_transfer_files f WHERE f.request_id=r.id),0)
+ + COALESCE((SELECT source_bytes FROM request_planned_sources p WHERE p.request_id=r.id),0)),0)
+ FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE (e.machine_id=? OR r.worker=?) AND `+machineModelRetentionOwed, id, id).Scan(&total)
+	if err != nil {
+		return 0, exit.Internalf("cannot total retained rented model bytes: %s", err)
+	}
+	return total, nil
 }
 
 func (s *Store) RentalHasMachineObligations(id string) (bool, *exit.Error) {

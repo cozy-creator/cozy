@@ -522,7 +522,11 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 		// Everything decidable from the rental ROW is settled by the chooser, in the one
 		// order that keeps a transient state out of a permanent verdict (cl-185). What
 		// is left are the questions only this host can answer.
-		disk := rental.Disk{HaveGB: m.disks[row.ID], SourceBytes: sourceBytes}
+		retained, problem := m.store.RentalRetainedModelBytes(row.ID)
+		if problem != nil {
+			return nil, problem
+		}
+		disk := rental.Disk{HaveGB: m.disks[row.ID], RetainedBytes: retained, SourceBytes: sourceBytes}
 		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints.Working, disk) {
 			if busy[row.ID] {
 				c.Verdict = orchestrator.VerdictAttaching
@@ -615,7 +619,8 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 	if !runtimeOwned {
 		// Work Creator still drives replaces the worker's whole desired state, which
 		// would retire the executions Runtime owns there; it waits for those to end.
-		owed, problem := m.store.RentalHasMachineObligations(row.ID)
+		// Their collected models and files are only bytes on the pod's disk.
+		live, problem := m.store.RentalHasLiveMachineExecutions(row.ID)
 		if problem != nil {
 			return "", problem
 		}
@@ -623,7 +628,7 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 		if problem != nil {
 			return "", problem
 		}
-		if owed || retained && (!req.IsJob() || !req.RetainWork) {
+		if live || retained && (!req.IsJob() || !req.RetainWork) {
 			return orchestrator.ExcludedModeConflict, nil
 		}
 	}

@@ -124,6 +124,13 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e := jobOutputDestination(ctx, job, &sub); e != nil {
 		return e
 	}
+	if sub.ModelTransfer != nil && sub.Rental && ctx.Inv.Value("--idempotency-key") == "" && sub.RetryOf == "" {
+		key, retryOf, e := conversionRunKey(ctx, sub)
+		if e != nil {
+			return e
+		}
+		ctx.Inv.Values["--idempotency-key"], sub.RetryOf = []string{key}, retryOf
+	}
 	c, e := dial(ctx)
 	if e != nil {
 		return e
@@ -556,6 +563,10 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 			export.Directory, export.ErrorCode, export.Error))
 	}
 	code := exit.JobTerminal(mapTerminal(status))
+	if code == exit.OK && state.ModelDestination != "" && state.ErrorType != "" {
+		return exit.Named(exit.Conflict, state.ErrorType, "job %s completed without publishing to %s: %s",
+			state.JobID, state.ModelDestination, state.Error)
+	}
 	if code == exit.OK {
 		if hint := modelPublishHint(state); hint != "" {
 			rec.Next = []string{hint}

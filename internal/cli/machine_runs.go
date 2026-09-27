@@ -85,6 +85,10 @@ func (c *machineClientConnection) Close() error {
 	return err
 }
 
+// machineDestinationRuntimeFloor is the first Runtime that publishes a job root's weights
+// outputs to its destination; an older one silently ignores the destination.
+const machineDestinationRuntimeFloor = "0.18.52"
+
 // machineRuns is a client transport and observer. Stopping it closes connections
 // and upload/observation work; it never sends an execution cancellation.
 type machineRuns struct {
@@ -799,6 +803,13 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	}
 	if len(body.WeightsReceipts) > 0 && !models || len(body.GetOutputManifest().GetOutputs()) > 0 && !files || body.GetResult().GetResultBlob() != nil || body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ChildArtifacts && !models && !files {
 		return exit.Named(exit.Unavailable, "machine_execution.result_custody_required", "execution finished; referenced output bytes remain retained on the machine until recipient custody is established")
+	}
+	if body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ModelTransfer != nil {
+		if problem := m.store.SettleMachineDestination(request.ID, fmt.Sprintf(
+			"the machine published no checkpoint to %s; its Runtime predates machine destinations. Update the rental's Runtime to %s or newer and run again",
+			request.ModelTransfer.Destination, machineDestinationRuntimeFloor)); problem != nil {
+			return problem
+		}
 	}
 	ack := &pb.AttemptOutcomeAck{RequestId: outcome.RequestId, AttemptOrdinal: outcome.AttemptOrdinal, InvocationSpecDigest: outcome.InvocationSpecDigest, OutcomeId: outcome.OutcomeId, OutcomeDigest: outcome.OutcomeDigest}
 	collected, err := connection.client.AcknowledgeMachineExecutionCollection(ctx, &pb.MachineExecutionCollectionAck{Execution: query, Outcome: ack})

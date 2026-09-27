@@ -1,7 +1,11 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -116,6 +120,29 @@ func jobOutputDestination(ctx *Context, job *launch.Entrypoint, sub *api.JobSubm
 	}
 	sub.Org, sub.ModelTransfer = ref.Org, intent
 	return nil
+}
+
+// conversionRunKey names a rented conversion by what it computes and where it publishes,
+// as a rented ingest is named: a completed one is a memo hit, a running one reattaches and
+// a stopped one resumes on its rental (records.ResumableRun).
+func conversionRunKey(ctx *Context, sub api.JobSubmission) (string, string, *exit.Error) {
+	models := make([]string, 0, len(sub.Models))
+	for _, model := range sub.Models {
+		models = append(models, model.Slot+"="+model.Manifest)
+	}
+	sort.Strings(models)
+	identity, err := json.Marshal([]any{sub.Package, sub.Function, sub.Release, sub.InstallID, sub.Org,
+		sub.Input, models, sub.ModelTransfer.Destination})
+	if err != nil {
+		return "", "", exit.Internalf("cannot name the conversion: %s", err)
+	}
+	digest := sha256.Sum256(identity)
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return "", "", problem
+	}
+	defer store.Close()
+	return store.ResumableRun("conversion-"+hex.EncodeToString(digest[:]), sub.RequestedRental)
 }
 
 // A job grants exact manifest bytes, whereas a serving binding names a model

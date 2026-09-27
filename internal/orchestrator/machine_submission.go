@@ -83,8 +83,23 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 		root.RSSCap = 0
 	}
 	prepared := &pb.DesiredWorkerState{Mode: &pb.DesiredWorkerState_Job{Job: jobDirectiveWithLimit(&root, limit)}}
-	return machineSubmission(request, capture, spec, append(modelInputs, byteInputs...), prepared, "")
+	submission, problem := machineSubmission(request, capture, spec, append(modelInputs, byteInputs...), prepared, "")
+	if problem != nil || request.ModelTransfer == nil {
+		return submission, problem
+	}
+	// Runtime uploads each weights output to the destination under the root's grant.
+	for _, access := range submission.Offer.Grant.Outputs {
+		for _, output := range weights {
+			if access.OutputId == output.OutputID {
+				access.Url = machineDestinationScheme + request.ModelTransfer.Destination
+			}
+		}
+	}
+	return submission, nil
 }
+
+// machineDestinationScheme spells a weights output's destination repository on its grant.
+const machineDestinationScheme = "model://"
 
 // MachineServingSubmission submits one inference root. The desired state is the placement
 // set the machine prepared, and the offer names the placement holding the root. No device
@@ -161,7 +176,7 @@ func machineRoot(request records.Request, capture localpackage.ExecutionCapture,
 	if installationID == "" || request.LocalInstallationID != "" && request.LocalInstallationID != installationID {
 		return nil, "", exit.New(exit.Conflict, "machine execution changed its selected installation")
 	}
-	if request.Trees != "" || request.ModelTransfer != nil {
+	if request.Trees != "" || request.ModelTransfer.HasAcquisition() || request.ModelTransfer != nil && (!request.IsJob() || request.ModelTransfer.Destination == "") {
 		return nil, "", exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; execution was not submitted")
 	}
 	if len(byteInputs) != len(request.Assets) {

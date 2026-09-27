@@ -806,6 +806,63 @@ func (s *Store) CompleteModelTransfer(requestID string, checkpoints map[string]s
 	return exit.New(exit.Conflict, "model transfer %s cannot complete", requestID)
 }
 
+// SettleMachineDestination records what a succeeded machine job published to its
+// destination. Runtime journals a `checkpoint` event for every uploaded output; a declared
+// output without one was never published, and `unpublished` explains why.
+func (s *Store) SettleMachineDestination(requestID, unpublished string) *exit.Error {
+	transfer, problem := s.ModelTransferOf(requestID)
+	if problem != nil || transfer == nil || transfer.HasAcquisition() || transfer.State != "pending" {
+		return problem
+	}
+	published, problem := s.publishedCheckpoints(requestID, transfer.Destination)
+	if problem != nil {
+		return problem
+	}
+	checkpoints := map[string]string{}
+	for _, output := range transfer.Outputs {
+		if published[output.Name] == "" {
+			return s.FailModelTransfer(requestID, "publication.destination_unpublished", unpublished)
+		}
+		checkpoints[output.Name] = published[output.Name]
+	}
+	data, _ := json.Marshal(checkpoints)
+	if _, err := s.db.Exec(`UPDATE request_model_transfers SET state='completed',checkpoints=?,updated_at=?
+		WHERE request_id=? AND state='pending'`, string(data), now(), requestID); err != nil {
+		return exit.Internalf("cannot complete machine destination: %s", err)
+	}
+	return nil
+}
+
+func (s *Store) publishedCheckpoints(requestID, destination string) (map[string]string, *exit.Error) {
+	rows, err := s.db.Query(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.checkpoint' ORDER BY seq`, requestID)
+	if err != nil {
+		return nil, exit.Internalf("cannot read published checkpoints: %s", err)
+	}
+	defer rows.Close()
+	published := map[string]string{}
+	for rows.Next() {
+		var raw string
+		var event struct {
+			Destination string `json:"destination"`
+			Checkpoint  string `json:"checkpoint"`
+			OutputSlot  string `json:"output_slot"`
+		}
+		if err := rows.Scan(&raw); err != nil {
+			return nil, exit.Internalf("cannot read a published checkpoint: %s", err)
+		}
+		if json.Unmarshal([]byte(raw), &event) != nil || event.Destination != destination {
+			continue
+		}
+		if _, err := canonical.Raw(event.Checkpoint); err == nil {
+			published[event.OutputSlot] = event.Checkpoint
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish published checkpoint read: %s", err)
+	}
+	return published, nil
+}
+
 func (s *Store) FailModelTransfer(requestID, code, detail string) *exit.Error {
 	result, err := s.db.Exec(`UPDATE request_model_transfers SET state='failed',error_code=?,safe_error=?,updated_at=?
 		WHERE request_id=? AND state NOT IN ('completed','canceling','canceled')`, code, detail, now(), requestID)
