@@ -166,7 +166,8 @@ pub struct Client {
 type IdlePool = Arc<Mutex<Vec<Idle>>>;
 
 // This bounds retained descriptors, not in-flight transfers (the caller owns those).
-const MAX_IDLE: usize = 8;
+// `descriptors::PER_STREAM` counts one idle socket per stream.
+const MAX_IDLE: usize = 32;
 
 /// A connection belongs to its origin and the credentials sent on it, never to one
 /// request target: a signed CDN URL changes per resolve, and keying on it meant the
@@ -414,7 +415,15 @@ fn connect(
         let socket = match nonblocking_socket(family) {
             Ok(socket) => socket,
             Err(error) => {
-                last = Some(error.into());
+                let error: std::io::Error = error.into();
+                if crate::descriptors::exhausted(&error) {
+                    // Another address needs another descriptor it will not get either.
+                    return refuse(
+                        Code::FD_HEADROOM,
+                        format!("{}: no descriptor for a socket ({error})", checked.host),
+                    );
+                }
+                last = Some(error);
                 continue;
             }
         };
@@ -653,6 +662,15 @@ pub struct BodyReader<'l> {
 
 impl Drop for BodyReader<'_> {
     fn drop(&mut self) {
+        self.recycle_if_consumed();
+    }
+}
+
+impl BodyReader<'_> {
+    /// Hand the connection back the moment its last body byte is read, not when the
+    /// reader is dropped: the consumer may still spend seconds hashing, fsyncing and
+    /// committing what arrived, and the next object's GET should find this socket idle.
+    fn recycle_if_consumed(&mut self) {
         // Only a fully consumed, unambiguous Content-Length response is reusable.
         // Dropped/failed bodies, chunked bodies and EOF-delimited replies close.
         if !matches!(self.framing, Framing::Length { remaining: 0 }) || self.raw_len() != 0 {
@@ -722,6 +740,7 @@ impl BodyReader<'_> {
                     let silent = self.advanced.elapsed();
                     if self.judge.silent_is_stall() && silent > self.ledger.patience() {
                         self.stalled = true;
+                        self.ledger.stalled_stream();
                         let _ = self
                             .wire
                             .as_ref()
@@ -846,6 +865,7 @@ impl BodyReader<'_> {
                 self.framing = Framing::Length {
                     remaining: remaining - n as u64,
                 };
+                self.recycle_if_consumed();
                 Ok(n)
             }
             Framing::Chunked { in_chunk, done } => {
@@ -946,13 +966,11 @@ pub fn request<'l>(
     write_silence: Option<Duration>,
     fail: Code,
 ) -> Result<Response<'l>> {
-    // Retained-source ranges already own their retry/resume budget. Other GETs and
-    // metadata writes keep their one-connection behavior.
-    let ranged = method == "GET"
+    // Every bodiless GET may reuse a connection to its origin: a pull's objects are many
+    // GETs to one host, and a fresh TCP+TLS connection per object spent a descriptor, a
+    // handshake and a slow start on each. Metadata writes keep one connection each.
+    let pooled = method == "GET"
         && body.is_none()
-        && headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("range"))
         && !headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("connection"));
@@ -967,7 +985,7 @@ pub fn request<'l>(
         method,
         headers,
         body.map(Payload::Bytes),
-        ranged.then_some(scoped.as_slice()),
+        pooled.then_some(scoped.as_slice()),
         deadline,
         ledger,
         judge,

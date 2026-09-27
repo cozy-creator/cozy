@@ -26,7 +26,9 @@
 //! metadata read.
 
 use crate::err::{refuse, Code, Result};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 
 /// The address classes no downloader in this tree connects to — the port of
 /// `egress._CLASSES`, same names, same order. Returns why `address` is not fetchable, or
@@ -173,6 +175,36 @@ pub struct SourcePolicy {
     /// Redirect hop budget. 0 refuses every redirect — a presigned GET has no business
     /// redirecting; a provider handler (tfs-052) that needs hops declares them.
     pub max_redirects: u32,
+    /// Answers this policy has already resolved, shared by its clones. One pull asks the
+    /// resolver once per host instead of once per object; every answer is still checked.
+    pub resolved: Resolved,
+}
+
+/// Checked answers by host and port.
+type Answers = HashMap<(String, u16), Vec<SocketAddr>>;
+
+/// One resolution per host and port for as long as the policy that made it lives.
+#[derive(Clone, Default)]
+pub struct Resolved(Arc<Mutex<Answers>>);
+
+impl std::fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resolved")
+    }
+}
+
+impl Resolved {
+    fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        let key = (host.to_string(), port);
+        if let Some(addrs) = self.0.lock().unwrap().get(&key) {
+            return Ok(addrs.clone());
+        }
+        let addrs = resolve(host, port)?;
+        if !addrs.is_empty() {
+            self.0.lock().unwrap().insert(key, addrs.clone());
+        }
+        Ok(addrs)
+    }
 }
 
 impl SourcePolicy {
@@ -219,13 +251,20 @@ impl SourcePolicy {
             );
         }
         let port = port.unwrap_or(if https { 443 } else { 80 });
-        let addrs = resolve(&host, port).map_err(|error| crate::err::Refusal {
-            code: Code::HUB_UNREACHABLE,
-            detail: format!(
-                "{host}: name resolution failed ({error}); an address this module cannot \
+        let addrs = self
+            .resolved
+            .lookup(&host, port)
+            .map_err(|error| crate::err::Refusal {
+                code: if crate::descriptors::exhausted(&error) {
+                    Code::FD_HEADROOM
+                } else {
+                    Code::HUB_UNREACHABLE
+                },
+                detail: format!(
+                    "{host}: name resolution failed ({error}); an address this module cannot \
                  check is not an address it will connect to"
-            ),
-        })?;
+                ),
+            })?;
         if addrs.is_empty() {
             return refuse(Code::HUB_UNREACHABLE, format!("{host} resolved to nothing"));
         }

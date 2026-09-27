@@ -937,6 +937,8 @@ pub struct WalkOutcome {
     pub streams: usize,
     /// Every level `pace` measured, in order.
     pub levels: Vec<Level>,
+    /// Times a stall or a full descriptor table halved the level.
+    pub backoffs: u32,
 }
 
 /// Walk `plan.wanted` with `streams` objects in flight. One is the serial walk and it
@@ -1005,7 +1007,13 @@ pub(super) fn fetch_wanted_bounded(
     // invariant it proved — the grant set covers the wanted set exactly — is enforced per
     // mint instead: presign authorizes every digest it was asked or refuses, never a silent
     // subset, and a supplier with no URL for an object refuses in the same words.
-    let streams = super::memory::transfer_streams(streams.clamp(1, PULL_STREAMS));
+    // Descriptors are a budget like memory: the soft limit is raised to the hard one (a Go
+    // parent hands its children the original), and the walk never grows past what the
+    // table can hold (run 1297: EMFILE under a 1,024 soft limit at 128 streams).
+    crate::descriptors::raise();
+    let streams = crate::descriptors::streams_within(super::memory::transfer_streams(
+        streams.clamp(1, PULL_STREAMS),
+    ));
     let recovery = super::speculate::Recovery::new(store, plan, streams, download_budget);
     // Recovery reserves an object connection, not an authorization worker. A stream's
     // permit is released once its body is in, so its thread may still be fsyncing and
@@ -1016,6 +1024,8 @@ pub(super) fn fetch_wanted_bounded(
     // was handed, so the next, larger pull on this pod does not start below it.
     let pace = Pace::new(start, streams, workers, ledger);
     let next = AtomicUsize::new(0);
+    // Objects between their first byte asked and their admission done.
+    let busy = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let fetched = AtomicU64::new(0);
     let bytes_moved = AtomicU64::new(0);
@@ -1054,8 +1064,7 @@ pub(super) fn fetch_wanted_bounded(
                         }
                         return;
                     };
-                    let permit = Mutex::new(Some(permit));
-                    let received = || drop(permit.lock().unwrap().take());
+                    let mut first_permit = Some(permit);
                     let at = next.fetch_add(1, Ordering::Relaxed);
                     let Some(object) = plan.wanted.get(at) else {
                         return;
@@ -1063,54 +1072,96 @@ pub(super) fn fetch_wanted_bounded(
                     let authorize = |stale: bool, ledger: &Ledger| {
                         urls.url_for_while(at, object, stale, ledger)
                     };
-                    let outcome = DeliveryGrant::mint(plan, object).and_then(|grant| {
-                        // The grant already knows which namespace this object lives in — it
-                        // derives its own storage key from the same bit — so the cache is asked
-                        // the question the grant answers rather than one restated here. A
-                        // carrier has no namespace and no place in an immutable repo cache; it
-                        // also cannot reach here, because this walk mints from a plan and a
-                        // plan never names one.
-                        let kind = match grant.destination {
-                            Destination::Manifest => Some(CacheKind::Manifest),
-                            Destination::Blob => Some(CacheKind::Blob),
-                            Destination::Staging => None,
-                        };
-                        let mut trust = CacheTrust::Name;
-                        if let (Some(kind), Some(cache)) = (kind, cache) {
-                            match cache.admit(store, kind, object)? {
-                                CacheRead::Hit => return Ok(Source::Cache),
-                                // This read proved the cached bytes wrong: the backfill replaces
-                                // them instead of trusting the name.
-                                CacheRead::Corrupt => trust = CacheTrust::Rehash,
-                                CacheRead::Missing | CacheRead::Unavailable => {}
-                            }
-                        }
-                        let one = recovery.fetch(
-                            store,
-                            &grant,
-                            &authorize,
-                            policy,
-                            credential,
-                            deadline,
-                            ledger,
-                            &|| {
-                                (plan.wanted.len() as u64).saturating_sub(
-                                    fetched.load(Ordering::Acquire)
-                                        + cached.load(Ordering::Acquire),
-                                ) < pace.limit() as u64
+                    // A full descriptor table is backpressure, not a verdict about the
+                    // object: the level halves and this object is asked again, until one
+                    // stream still cannot get a descriptor.
+                    let outcome = loop {
+                        let permit = match first_permit.take() {
+                            Some(permit) => permit,
+                            None => match pace.admit(&stop, ledger) {
+                                Some(permit) => permit,
+                                None => {
+                                    break Err(ledger.check_running().err().unwrap_or(Refusal {
+                                        code: Code::TRANSFER_FAILED,
+                                        detail: "the pull stopped".into(),
+                                    }))
+                                }
                             },
-                            Some(&received),
-                        )?;
-                        if let (Some(kind), Some(_cache)) = (kind, cache) {
-                            // Local admission is complete. Optional replication must never
-                            // occupy an origin slot or delay this object's completion report.
-                            backfill
-                                .as_ref()
-                                .expect("bound cache has a backfill batch")
-                                .offer(kind, object, trust);
+                        };
+                        let permit = Mutex::new(Some(permit));
+                        let received = || drop(permit.lock().unwrap().take());
+                        let exhausted = crate::descriptors::exhaustions();
+                        let backoffs = pace.backoffs();
+                        busy.fetch_add(1, Ordering::AcqRel);
+                        let attempt = DeliveryGrant::mint(plan, object).and_then(|grant| {
+                            // The grant already knows which namespace this object lives in — it
+                            // derives its own storage key from the same bit — so the cache is asked
+                            // the question the grant answers rather than one restated here. A
+                            // carrier has no namespace and no place in an immutable repo cache; it
+                            // also cannot reach here, because this walk mints from a plan and a
+                            // plan never names one.
+                            let kind = match grant.destination {
+                                Destination::Manifest => Some(CacheKind::Manifest),
+                                Destination::Blob => Some(CacheKind::Blob),
+                                Destination::Staging => None,
+                            };
+                            let mut trust = CacheTrust::Name;
+                            if let (Some(kind), Some(cache)) = (kind, cache) {
+                                match cache.admit(store, kind, object)? {
+                                    CacheRead::Hit => return Ok(Source::Cache),
+                                    // This read proved the cached bytes wrong: the backfill replaces
+                                    // them instead of trusting the name.
+                                    CacheRead::Corrupt => trust = CacheTrust::Rehash,
+                                    CacheRead::Missing | CacheRead::Unavailable => {}
+                                }
+                            }
+                            let one = recovery.fetch(
+                                store,
+                                &grant,
+                                &authorize,
+                                policy,
+                                credential,
+                                deadline,
+                                ledger,
+                                &|| {
+                                    (plan.wanted.len() as u64).saturating_sub(
+                                        fetched.load(Ordering::Acquire)
+                                            + cached.load(Ordering::Acquire),
+                                    ) < pace.limit() as u64
+                                },
+                                Some(&received),
+                            )?;
+                            if let (Some(kind), Some(_cache)) = (kind, cache) {
+                                // Local admission is complete. Optional replication must never
+                                // occupy an origin slot or delay this object's completion report.
+                                backfill
+                                    .as_ref()
+                                    .expect("bound cache has a backfill batch")
+                                    .offer(kind, object, trust);
+                            }
+                            Ok(Source::Origin(one))
+                        });
+                        drop(permit);
+                        let others = busy.fetch_sub(1, Ordering::AcqRel) - 1;
+                        match attempt {
+                            Err(refusal)
+                                if refusal.code == Code::FD_HEADROOM
+                                    || crate::descriptors::exhaustions() > exhausted =>
+                            {
+                                // Descriptors come back as the objects still in flight
+                                // finish. With nothing else in flight at one stream, the
+                                // shortage is not this walk's to wait out.
+                                if others == 0 && pace.limit() <= 1 {
+                                    break Err(refusal);
+                                }
+                                pace.back_off(backoffs);
+                                if let Err(refusal) = wait_for_descriptors(&busy, ledger) {
+                                    break Err(refusal);
+                                }
+                            }
+                            attempt => break attempt,
                         }
-                        Ok(Source::Origin(one))
-                    });
+                    };
                     match outcome {
                         Ok(source) => {
                             let moved = match &source {
@@ -1153,7 +1204,7 @@ pub(super) fn fetch_wanted_bounded(
     if let Some(backfill) = backfill {
         backfill.finish_offers();
     }
-    let (streams, levels) = pace.outcome();
+    let (streams, levels, backoffs) = pace.outcome();
     Ok(WalkOutcome {
         fetched: fetched.load(Ordering::Relaxed),
         bytes_moved: bytes_moved.load(Ordering::Relaxed),
@@ -1161,7 +1212,23 @@ pub(super) fn fetch_wanted_bounded(
         bytes_cached: bytes_cached.load(Ordering::Relaxed),
         streams,
         levels,
+        backoffs,
     })
+}
+
+/// Wait, at the ledger's resolution, until one stream's worth of descriptors is free or no
+/// other object is left in flight to free them. Either way the caller asks again; the next
+/// failure alone at one stream is final.
+fn wait_for_descriptors(busy: &AtomicUsize, ledger: &Ledger) -> Result<()> {
+    loop {
+        ledger.check_running()?;
+        let free = crate::descriptors::available()
+            .is_none_or(|free| free >= crate::descriptors::PER_STREAM);
+        if free || busy.load(Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(ledger.sample());
+    }
 }
 
 /// A worker's exit, however it leaves, lets the steering thread stop waiting for it.
@@ -1257,6 +1324,8 @@ pub struct PullReport {
     /// Objects in flight when the walk ended, and every level it measured on the way.
     pub streams: usize,
     pub levels: Vec<Level>,
+    /// Times a stall or a full descriptor table halved the level.
+    pub backoffs: u32,
     pub declared: u64,
     pub held: u64,
     pub fetched: u64,
@@ -1294,6 +1363,8 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     // Naming a hub base IS declaring it, and a loopback hub declares a local deployment —
     // the port of pull.py's `local_hub` carve-out. The policy itself stays the caller's.
     let mut policy = request.policy.clone();
+    // One resolution per host for this pull, however many objects it asks for.
+    policy.resolved = Default::default();
     if let Ok(host) = policy::base_host(request.base) {
         if !policy.allows_host(&host) {
             policy.allowed_hosts.push(host);
@@ -1396,6 +1467,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
         )?;
         report.streams = walked.streams;
         report.levels = walked.levels;
+        report.backoffs = walked.backoffs;
         report.fetched = walked.fetched;
         report.bytes_moved = walked.bytes_moved;
         report.cached = walked.cached;

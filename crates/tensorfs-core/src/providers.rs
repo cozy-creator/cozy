@@ -176,6 +176,7 @@ impl Endpoints {
             allowed_hosts,
             allow_local: self.allow_local,
             max_redirects: 5,
+            ..Default::default()
         }
     }
 

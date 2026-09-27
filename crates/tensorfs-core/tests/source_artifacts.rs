@@ -172,6 +172,7 @@ fn accepted_selection_moves_only_its_objects_and_replays_without_network() {
         allowed_hosts: vec!["127.0.0.1".into()],
         allow_local: true,
         max_redirects: 5,
+        ..Default::default()
     };
     let (first, rows) = providers::materialize_selected(
         &store,

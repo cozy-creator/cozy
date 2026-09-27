@@ -1362,7 +1362,16 @@ impl Store {
                 .create_new(true)
                 .mode(0o600)
                 .open(&tmp)
-                .map_err(|e| io(format!("create temp {}", tmp.display()), e))?;
+                .map_err(|e| {
+                    if crate::descriptors::exhausted(&e) {
+                        Refusal {
+                            code: Code::FD_HEADROOM,
+                            detail: format!("create temp {}: {e}", tmp.display()),
+                        }
+                    } else {
+                        io(format!("create temp {}", tmp.display()), e)
+                    }
+                })?;
             match f.try_lock_exclusive() {
                 Ok(()) => break (tmp, f),
                 // Only a reaper can hold the lock on a name this process just minted: it

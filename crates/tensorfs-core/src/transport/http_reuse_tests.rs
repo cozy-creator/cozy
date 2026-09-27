@@ -197,6 +197,7 @@ impl Origin {
             allowed_hosts: vec!["localhost".into()],
             allow_local: true,
             max_redirects: 2,
+            ..Default::default()
         }
     }
     fn count(&self) -> usize {

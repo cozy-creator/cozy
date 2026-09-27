@@ -9,6 +9,10 @@
 //! admits while doing so bought at least `GAIN` more aggregate goodput. A doubling that
 //! bought less settles the walk; one that bought less than nothing returns to the level
 //! before it. Nothing is ended or failed here: this only admits workers to the next object.
+//!
+//! Two signals halve the level and stop its growth for the rest of the walk: a stream the
+//! ledger judged stalled while the level stood, and a full descriptor table (`shrink`).
+//! Both say the pull is asking more of the link or the process than either will give.
 use super::ledger::Ledger;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -32,6 +36,9 @@ struct State {
     limit: usize,
     active: usize,
     settled: bool,
+    /// Times the level was halved on backpressure.
+    backoffs: u32,
+    stalls_seen: u64,
     window_started: Instant,
     moved_at_window: u64,
     history: Vec<Level>,
@@ -67,6 +74,8 @@ impl Pace {
                 limit,
                 active: 0,
                 settled: limit == ceiling,
+                backoffs: 0,
+                stalls_seen: ledger.stalls(),
                 window_started: Instant::now(),
                 moved_at_window: ledger.still().moved,
                 history: Vec::new(),
@@ -82,10 +91,38 @@ impl Pace {
         self.state.lock().unwrap().limit
     }
 
-    /// The level the walk ended at and every level it measured on the way.
-    pub fn outcome(&self) -> (usize, Vec<Level>) {
+    /// The level the walk ended at, every level it measured on the way, and how many
+    /// times backpressure halved it.
+    pub fn outcome(&self) -> (usize, Vec<Level>, u32) {
         let state = self.state.lock().unwrap();
-        (state.limit, state.history.clone())
+        (state.limit, state.history.clone(), state.backoffs)
+    }
+
+    /// Times backpressure has halved the level so far. A caller reads it before an attempt
+    /// and hands it to `back_off`, so one episode that fails many streams at once halves
+    /// the level once, not once per stream.
+    pub fn backoffs(&self) -> u32 {
+        self.state.lock().unwrap().backoffs
+    }
+
+    /// Halve the level unless it was already halved since `seen`.
+    pub fn back_off(&self, seen: u32) {
+        if self.state.lock().unwrap().backoffs == seen {
+            self.shrink();
+        }
+    }
+
+    /// Halve the level and stop growing it. `false` when it is already one stream: there is
+    /// nothing left to give back.
+    pub fn shrink(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.settled = true;
+        if state.limit <= 1 {
+            return false;
+        }
+        state.limit /= 2;
+        state.backoffs += 1;
+        true
     }
 
     pub fn worker_finished(&self) {
@@ -126,10 +163,7 @@ impl Pace {
         loop {
             let mut state = self.state.lock().unwrap();
             loop {
-                if state.settled
-                    || stop.load(Ordering::Relaxed)
-                    || self.live.load(Ordering::Acquire) == 0
-                {
+                if stop.load(Ordering::Relaxed) || self.live.load(Ordering::Acquire) == 0 {
                     return;
                 }
                 let waited = state.window_started.elapsed();
@@ -138,7 +172,19 @@ impl Pace {
                 }
                 state = self.wake.wait_timeout(state, tick - waited).unwrap().0;
             }
+            let stalls = ledger.stalls();
+            let stalled = stalls > state.stalls_seen;
+            state.stalls_seen = stalls;
+            if state.settled && !stalled {
+                state.window_started = Instant::now();
+                continue;
+            }
             drop(state);
+            if stalled {
+                self.shrink();
+                self.state.lock().unwrap().window_started = Instant::now();
+                continue;
+            }
             self.observe(ledger.still().moved, Instant::now(), unclaimed());
         }
     }
@@ -195,7 +241,7 @@ mod tests {
         pace.observe(530, t0 + second * 3, 1000);
         assert_eq!(pace.limit(), 64, "1.15x does not");
         pace.observe(10_000, t0 + second * 4, 1000);
-        let (level, history) = pace.outcome();
+        let (level, history, _) = pace.outcome();
         assert_eq!(level, 64, "a settled walk stays settled");
         assert_eq!(history.len(), 3);
     }
