@@ -317,16 +317,18 @@ func (m *machineRuns) releaseMachineFiles(ctx context.Context, request string, c
 }
 
 func machineResultSchema(surface *launch.PackageInterface, entrypoint string) (json.RawMessage, *exit.Error) {
+	type callable struct {
+		Name   string          `json:"name"`
+		Result json.RawMessage `json:"result"`
+	}
 	var document struct {
-		Jobs []struct {
-			Name   string          `json:"name"`
-			Result json.RawMessage `json:"result"`
-		} `json:"jobs"`
+		Jobs        []callable `json:"jobs"`
+		Entrypoints []callable `json:"entrypoints"`
 	}
 	if json.Unmarshal(surface.Raw, &document) != nil {
 		return nil, exit.New(exit.Conflict, "captured result schema is unreadable")
 	}
-	for _, job := range document.Jobs {
+	for _, job := range append(document.Jobs, document.Entrypoints...) {
 		if job.Name == entrypoint {
 			return job.Result, nil
 		}

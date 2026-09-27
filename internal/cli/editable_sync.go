@@ -18,8 +18,6 @@ package cli
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -35,7 +33,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -348,7 +345,7 @@ func (s *editableSync) refused(pkg, installID string, problem *exit.Error) {
 
 // reprepare gives every worker that held the package its placement under the new install.
 func (s *editableSync) reprepare(pkg string, snapshot *EditableSnapshot, installID string) {
-	locals, rentals := s.owner.PackageHolders(pkg)
+	locals := s.owner.PackageHolders(pkg)
 	var workers []string
 	if len(locals) > 0 {
 		stopped, problem := s.owner.UnloadIdleLocalPackage(pkg, installID)
@@ -378,9 +375,6 @@ func (s *editableSync) reprepare(pkg string, snapshot *EditableSnapshot, install
 			workers = append(workers, "local/"+instance)
 		}
 	}
-	if len(rentals) > 0 {
-		workers = append(workers, s.reprepareRentals(pkg, installID, rentals)...)
-	}
 	if e := s.store.AppendPackageEvent(pkg, "package.refreshed", map[string]any{
 		"install": installID, "files": snapshot.Files,
 		"bytes": snapshot.Bytes, "workers": workers,
@@ -390,59 +384,6 @@ func (s *editableSync) reprepare(pkg string, snapshot *EditableSnapshot, install
 	fmt.Fprintf(s.log, "editable %s: install %s active; %d worker(s) re-prepared\n",
 		pkg, short12(installID), len(workers))
 }
-
-func (s *editableSync) reprepareRentals(pkg, installID string, rentals []orchestrator.RentalHolder) []string {
-	unlock := localpackage.Guard()
-	revision, problem := s.resolver.PrepareLocal(s.ctx, installID)
-	unlock()
-	if problem != nil {
-		fmt.Fprintf(s.log, "editable %s: cannot seal install %s for its rentals: %s\n",
-			pkg, short12(installID), problem.Message)
-		return nil
-	}
-	fmt.Fprintf(s.log, "editable %s: sealed revision %s (%d wheel(s)) for %d rental(s)\n",
-		pkg, digest12(revision.ID), len(revision.Files), len(rentals))
-	var workers []string
-	for _, rental := range rentals {
-		for _, held := range rental.Placements {
-			function := held.Entrypoints[0].Name
-			spec, problem := s.resolver.ResolveInstall(installID, held.Models)
-			if problem != nil {
-				fmt.Fprintf(s.log, "editable %s: cannot resolve install %s: %s\n", pkg, short12(installID), problem.Message)
-				continue
-			}
-			var planID string
-			var outputs []string
-			for _, entrypoint := range spec.Placement.Entrypoints {
-				if entrypoint.Name == function {
-					planID, outputs = entrypoint.Digest, append([]string(nil), entrypoint.Outputs...)
-				}
-			}
-			if planID == "" {
-				fmt.Fprintf(s.log, "editable %s: rental %s held %s, which the new install no longer declares\n",
-					pkg, rental.RentalID, function)
-				continue
-			}
-			var operation [8]byte
-			_, _ = rand.Read(operation[:])
-			placement, problem := s.owner.PrepareRentalRevision(rental.RentalID,
-				"refresh-"+hex.EncodeToString(operation[:]), revision, orchestrator.LogicalPackage{
-					Package: pkg, Release: revision.Release, Function: function, Outputs: outputs,
-					PlanID: planID, Models: held.Models})
-			if problem != nil {
-				fmt.Fprintf(s.log, "editable %s: rental %s not re-prepared for %s (%s); the next run prepares it\n",
-					pkg, rental.RentalID, function, problem.Message)
-				continue
-			}
-			fmt.Fprintf(s.log, "editable %s: rental %s serves %s at revision %s (placement %s)\n",
-				pkg, rental.RentalID, function, digest12(revision.ID), placement.PlacementIDValue)
-			workers = append(workers, "rental/"+rental.RentalID+"/"+function)
-		}
-	}
-	return workers
-}
-
-func digest12(digest string) string { return short12(strings.TrimPrefix(digest, "sha256:")) }
 
 // distinctSelections answers each model selection the local holders were resolved with,
 // once, so one worker per selection comes back under the new install.

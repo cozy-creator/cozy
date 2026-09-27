@@ -68,7 +68,8 @@ func (publishedRouteObserver) Control(context.Context, records.Request, string) 
 	return nil
 }
 
-func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
+// Every rented published job is a Runtime execution, as is a local published install.
+func TestPublishedMachineRoutingOwnsEveryRentedJob(t *testing.T) {
 	o := hostOwner(t, "published-machine-routing")
 	_, problem := o.store.Activate(records.PackageInstall{ID: "published-local-install", Package: "alice/ops", Major: 1, Version: "1.0.0", SourceKind: "tensorhub", Dir: t.TempDir(), Platform: "linux-x86_64"})
 	fatal(t, problem)
@@ -103,7 +104,7 @@ func TestPublishedMachineRoutingRequiresExplicitPin(t *testing.T) {
 		fatal(t, problem)
 		link, problem := o.store.MachineExecution(row.ID)
 		fatal(t, problem)
-		if (link != nil) != (arm == "pinned" || arm == "local") || row.LocalInstallationID != "" {
+		if link == nil || row.LocalInstallationID != "" {
 			t.Fatalf("%s changed published routing or code origin", arm)
 		}
 	}

@@ -1,8 +1,6 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,45 +18,6 @@ type restartLauncher struct {
 	ready *atomic.Bool
 	spec  orchestrator.WorkerLaunchSpec
 	calls atomic.Int64
-}
-
-func TestPodPrepareTransportLossKeepsTheRentalRequestQueued(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public, serve: true, prepareUnavailable: 1}
-	root := t.TempDir()
-	connection, _ := startFakePod(t, root, pod)
-	o := hostOwner(t, "pod-prepare-outage", rentalWiring(connection, private))
-	requestID, _, problem := o.c.Submit(orchestrator.Submission{
-		IdemKey: "pod-prepare-outage-1", Package: "acme/outage", Entrypoint: "tile",
-		PlanID: podPlanID("acme/outage"), Release: "1.0.0",
-		Payload: []byte(`{"size":16}`), Outputs: []string{"image"},
-		Worker: podRental, Rental: true, RentalRequired: true,
-	})
-	fatal(t, problem)
-	waitUntil(t, "the first unavailable PodHost preparation", func() bool {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.prepares) == 1
-	})
-	if _, ok := waitEvent(o, "PARKED at queue position 1 (lanes none, overtaken 0): PodHost prepare", 5*time.Second); !ok {
-		t.Fatal("the transport end did not release the request back to its queue")
-	}
-	if row, _ := o.store.RequestRow(requestID); row == nil || row.State == "failed" {
-		t.Fatalf("transport loss settled the request: %#v", row)
-	}
-
-	o.c.WakeQueue()
-	waitUntil(t, "the re-issued preparation to reach dispatch", func() bool {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.prepares) >= 2 && len(pod.offers) == 1
-	})
-	attempts, problem := o.store.Attempts(requestID)
-	fatal(t, problem)
-	if len(attempts) != 1 || attempts[0].Attempt != 1 {
-		t.Fatalf("preparation retry dispatched %d attempts, want exactly ordinal 1: %#v", len(attempts), attempts)
-	}
 }
 
 func (l *restartLauncher) Resolve(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {

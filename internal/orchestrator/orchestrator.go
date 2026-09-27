@@ -814,8 +814,7 @@ func (c *Orchestrator) enqueue(requestID string) bool {
 //
 // EVERY QUEUED REQUEST IS ASKED AGAINST ITS OWN CANDIDATES (cl-099): a request with no
 // dispatchable candidate right now PARKS — keeps its ordinal and position — and the next
-// is tried. Published serving work on a rental is not walked here: each rental's queue is
-// handed to its own scheduler (schedule.go), which runs what is loaded first.
+// is tried. Rented work is not here at all: Runtime owns its order on the machine.
 //
 // ONE DRAIN AT A TIME. A worker's report and a preparation's own post-launch drain both
 // fire within milliseconds of the same fact, and two concurrent drains read the same queue
@@ -832,8 +831,6 @@ func (c *Orchestrator) drain() {
 	}
 	queued := append([]string(nil), c.pending...)
 	c.mu.Unlock()
-	var venues []string
-	rentals := map[string][]scheduled{}
 	for position, id := range queued {
 		req, e := c.opt.Store.RequestRow(id)
 		if e != nil || req == nil {
@@ -849,13 +846,6 @@ func (c *Orchestrator) drain() {
 			if moved, problem := c.reconsiderAutomaticRental(*req); problem == nil {
 				req = &moved
 			}
-		}
-		if venue := scheduledVenue(*req); venue != "" {
-			if rentals[venue] == nil {
-				venues = append(venues, venue)
-			}
-			rentals[venue] = append(rentals[venue], scheduled{req: *req, position: position})
-			continue
 		}
 		if req.ModelTransfer != nil {
 			transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
@@ -887,9 +877,6 @@ func (c *Orchestrator) drain() {
 		}
 		c.forget(id)
 		c.logf("%s left the dispatch queue as attempt %d", id, attempt)
-	}
-	for _, venue := range venues {
-		c.schedule(venue, rentals[venue])
 	}
 }
 
@@ -1045,9 +1032,8 @@ func (c *Orchestrator) QueueState(requestID string) (position, depth int) {
 }
 
 // reviveQueue re-asks the queue's residency question after the capacity it depends on
-// changed: a worker's process went, a launch finished, a request left. Published serving
-// work on a rental belongs to its rental's scheduler, so one drain re-asks every rental.
-// Everything else asks select-or-start for the HEAD per machine: reviving every waiting
+// changed: a worker's process went, a launch finished, a request left. It asks
+// select-or-start for the HEAD per machine: reviving every waiting
 // request would let two requests needing different plans on one card stop each other's
 // worker in turn. Nothing is dispatched here — `drain` is still the one placement path.
 func (c *Orchestrator) reviveQueue() {
@@ -1058,14 +1044,9 @@ func (c *Orchestrator) reviveQueue() {
 		return
 	}
 	asked := map[string]bool{}
-	scheduling := false
 	for _, id := range queued {
 		req, e := c.opt.Store.RequestRow(id)
 		if e != nil || req == nil {
-			continue
-		}
-		if scheduledVenue(*req) != "" {
-			scheduling = true
 			continue
 		}
 		machine := req.Worker
@@ -1077,9 +1058,6 @@ func (c *Orchestrator) reviveQueue() {
 		}
 		asked[machine] = true
 		c.selectOrStart(*req)
-	}
-	if scheduling {
-		go c.drain()
 	}
 }
 

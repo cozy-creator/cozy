@@ -963,6 +963,13 @@ func PhaseCell(life api.Lifecycle) string {
 	if life.Phase == "" {
 		return ""
 	}
+	if life.Phase == orchestrator.PhaseGPUWait {
+		detail := life.PhaseDetail
+		if life.WaitingFor != nil {
+			detail += fmt.Sprintf(", behind run %d", life.WaitingFor.Number)
+		}
+		return "waiting for GPU (" + detail + ")"
+	}
 	if life.Phase == orchestrator.WaitSlotBusy || life.Phase == orchestrator.WaitQueueAhead {
 		if life.WaitingFor != nil {
 			return fmt.Sprintf("waiting: run %d", life.WaitingFor.Number)
@@ -1022,6 +1029,9 @@ func PhaseCell(life api.Lifecycle) string {
 }
 
 func progressValue(life api.Lifecycle) string {
+	if life.Phase == orchestrator.PhaseGPUWait {
+		return phaseValue(life)
+	}
 	if life.Status == "queued" {
 		if life.RequestedRental != "" && (life.Phase == "" || life.Phase == orchestrator.WaitRental ||
 			life.Phase == orchestrator.WaitSlotBusy || life.Phase == orchestrator.WaitQueueAhead) {

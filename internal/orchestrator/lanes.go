@@ -32,8 +32,8 @@ func LocalDeviceEnvelope() []string { return []string{"0"} }
 // the ordinals its lanes index into. This daemon grants a rental nothing — the pod's cards
 // are the pod's, and its worker was launched over all of them by whoever provisioned it —
 // so this is not a grant but the paid WIDTH read back onto the same space a local grant
-// occupies, which is what lets one lane reader, one breach check and one pin author serve
-// both lanes. A CPU rental holds no device and gets no envelope.
+// occupies, which is what lets one lane reader and one breach check serve both. A CPU
+// rental holds no device and gets no envelope.
 func RentalDeviceEnvelope(count int) []string {
 	out := make([]string, 0, count)
 	for ordinal := 0; ordinal < count; ordinal++ {

@@ -5,12 +5,16 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // cl-174, the runs that filed it (2026-09-08 00:06–00:25Z, req-829410d83cf9a3d7996184dc,
@@ -51,9 +55,13 @@ func plantH100(t *testing.T, root string, h *ladderHub, store *records.Store, id
 	rentals := filepath.Join(root, "rentals")
 	must(t, os.MkdirAll(rentals, 0o700))
 	must(t, os.WriteFile(filepath.Join(rentals, id+".media-token"), []byte("media-"+id), 0o600))
-	must(t, os.WriteFile(filepath.Join(rentals, id+".pem"), []byte("-----BEGIN CERTIFICATE-----\n"), 0o600))
-	_, private, err := ed25519.GenerateKey(rand.Reader)
+	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
+	// A readable pin for a pod that never answers: a run handed to it waits on the machine.
+	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{SerialNumber: big.NewInt(1),
+		NotAfter: time.Now().Add(time.Hour)}, &x509.Certificate{SerialNumber: big.NewInt(1)}, public, private)
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(rentals, id+".pem"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
 	key, err := x509.MarshalPKCS8PrivateKey(private)
 	must(t, err)
 	must(t, os.WriteFile(filepath.Join(rentals, id+".creator.pem"),
@@ -68,14 +76,21 @@ func plantH100(t *testing.T, root string, h *ladderHub, store *records.Store, id
 	return row
 }
 
-// holdQueued pins one queued request to the rental, so a new request waits behind it.
+// holdQueued pins one rented run, already handed to the rental's Runtime and not yet
+// accepted, to the rental, so a new request waits behind it.
 func holdQueued(t *testing.T, store *records.Store, requestID, rentalID string) {
 	t.Helper()
 	if _, _, problem := store.Submit(records.Request{ID: requestID, IdemKey: "idem-" + requestID,
 		BodyDigest: "sha256:" + strings.Repeat("ab", 32), Package: ladderPackage, Entrypoint: "generate",
-		Payload: []byte("{}"), Rental: true, Worker: rentalID}); problem != nil {
+		Payload: []byte("{}"), Rental: true, Worker: rentalID, MachineExecutionObserver: true}); problem != nil {
 		t.Fatal(problem.Message)
 	}
+	fatal(t, store.LinkMachineExecution(requestID, rentalID))
+	capture, spec := []byte(`{"capture":"held"}`), []byte(`{"invocation":"held"}`)
+	fatal(t, store.RecordMachineSubmission(requestID, &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "held",
+		SubmissionId: "idem-" + requestID, CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture),
+		Offer: &pb.AttemptOffer{RequestId: requestID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec,
+			InvocationSpecDigest: canonical.Digest(spec)}}))
 }
 
 func submitExplicit(t *testing.T, root, key string) {

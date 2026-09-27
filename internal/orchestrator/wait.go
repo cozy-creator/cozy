@@ -58,10 +58,6 @@ func (f waitFacts) decorate(payload map[string]any, req records.Request) map[str
 // answer means the routing is not the blocker (a pick exists; the refusal was elsewhere).
 // Callers hold c.mu.
 func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) waitFacts {
-	if ahead := c.rentalQueueAhead(req); ahead != nil {
-		return waitFacts{cause: WaitQueueAhead, on: c.machineWord(rentalInstanceID(scheduledVenue(req))),
-			waitingFor: ahead}
-	}
 	if r.pick() != nil {
 		return waitFacts{}
 	}
@@ -101,31 +97,6 @@ func (c *Orchestrator) classifyCapacityWait(req records.Request, r routing) wait
 	return waitFacts{cause: WaitWorkerStart}
 }
 
-// A rental's scheduler holds a request back for another one on the same rental: the
-// request whose additive desire is in flight, or an older one whose starvation bound is
-// spent. The lane router cannot see that wait. Reuse the scheduler's typed observation,
-// provided its blocker is still queued on the rental. Callers hold c.mu.
-func (c *Orchestrator) rentalQueueAhead(req records.Request) *WaitingRun {
-	venue := scheduledVenue(req)
-	if venue == "" {
-		return nil
-	}
-	parked := c.parked[req.ID]
-	if parked == nil || parked.wait.cause != WaitQueueAhead || parked.wait.waitingFor == nil {
-		return nil
-	}
-	blocker := parked.wait.waitingFor
-	if !c.queued(blocker.RequestID) {
-		return nil
-	}
-	prior, problem := c.opt.Store.RequestRow(blocker.RequestID)
-	if problem == nil && prior != nil && scheduledVenue(*prior) == venue &&
-		(prior.State == "submitted" || prior.State == "queued") {
-		return blocker
-	}
-	return nil
-}
-
 // blockingRun reads the owner's existing open attempts on the actual blocked
 // worker and lane. Unknown work stays unnamed; diagnostic strings are never parsed.
 // Callers hold c.mu, as they do for routing and machineWord.
@@ -145,7 +116,7 @@ func (c *Orchestrator) blockingRun(blocked laneKey) *WaitingRun {
 			continue
 		}
 		if blocked.lane != "" {
-			placement := w.placementFor(pinnedPackage(request.Package, request.Worker), request.PlanID)
+			placement := w.placementID
 			if lane := w.lanes.of(placement); lane == nil || lane.id != blocked.lane {
 				continue
 			}
@@ -155,14 +126,6 @@ func (c *Orchestrator) blockingRun(blocked laneKey) *WaitingRun {
 		}
 	}
 	return first
-}
-
-func (c *Orchestrator) waitingRun(requestID string) *WaitingRun {
-	request, problem := c.opt.Store.RequestByReference(requestID)
-	if problem != nil || request == nil {
-		return nil
-	}
-	return &WaitingRun{Number: request.Number, RequestID: request.ID}
 }
 
 // waitOf classifies a request's blocking condition against the live routing.

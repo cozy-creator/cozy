@@ -41,6 +41,9 @@ const (
 	PhasePreparing = "preparing"
 	// PhaseWarming: the prepared placement is converging toward dispatchable.
 	PhaseWarming = "warming"
+	// PhaseGPUWait: Runtime accepted the execution and holds its call until the GPUs it
+	// needs are free (its gpu.wait event names the width and the roots ahead of it).
+	PhaseGPUWait = "gpu_wait"
 )
 
 // PreparationRateMaxAge bounds the freshness of displayed transfer estimates only.

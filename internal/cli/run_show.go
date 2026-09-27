@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/units"
 )
@@ -28,6 +29,7 @@ type runReport struct {
 	QueuedMS    int64               `json:"queued_ms"`
 	ExecutionMS int64               `json:"execution_ms"`
 	WallMS      int64               `json:"wall_ms,omitempty"`
+	Waiting     string              `json:"waiting,omitempty"`
 	Stages      []reportStage       `json:"stages"`
 	Steps       []reportSteps       `json:"steps,omitempty"`
 	Degree      int                 `json:"degree,omitempty"`
@@ -38,7 +40,7 @@ type runReport struct {
 
 type reportStage struct {
 	Name        string  `json:"name"`
-	Kind        string  `json:"kind"` // setup, inference or transfer
+	Kind        string  `json:"kind"` // setup, gpu, inference or transfer
 	StartUnixMS int64   `json:"start_unix_ms,omitempty"`
 	MS          float64 `json:"ms"`
 	Count       int     `json:"count,omitempty"`
@@ -130,9 +132,27 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		Target: strings.Trim(life.Package+"/"+life.Function, "/"), Machine: life.Machine,
 		CreatedAt: life.CreatedAt, QueuedMS: life.QueuedMS, ExecutionMS: life.ExecutionMS,
 		Events: evidence.Events, Triage: evidence.Triage, Stages: []reportStage{}}
+	if life.Phase == orchestrator.PhaseGPUWait {
+		report.Waiting = PhaseCell(life)
+	}
 	created, _ := time.Parse(time.RFC3339Nano, life.CreatedAt)
+	granted := map[string]int{}
 	for _, event := range evidence.Events {
 		switch event.Type {
+		case "machine.gpu.grant":
+			// Runtime's device lease for one call: the ordinals it granted, held until the
+			// matching release.
+			at, _ := time.Parse(time.RFC3339Nano, event.At)
+			key, _ := event.Payload["key"].(string)
+			granted[key] = len(report.Stages)
+			report.Stages = append(report.Stages, reportStage{Name: "GPU " + key, Kind: "gpu",
+				StartUnixMS: at.UnixMilli(), Detail: "ordinals " + fmt.Sprint(event.Payload["ordinals"])})
+		case "machine.gpu.release":
+			key, _ := event.Payload["key"].(string)
+			if index, ok := granted[key]; ok {
+				at, _ := time.Parse(time.RFC3339Nano, event.At)
+				report.Stages[index].MS = float64(at.UnixMilli() - report.Stages[index].StartUnixMS)
+			}
 		case "request.preparing":
 			report.Stages = append(report.Stages, preparingStage(event.Payload))
 		case "request.outputs_fetched":
@@ -170,7 +190,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		sort.Slice(report.Steps, func(i, j int) bool { return report.Steps[i].Name < report.Steps[j].Name })
 	}
 	// Setup, then inference, then transfer; within a kind, by start (unknown last).
-	order := map[string]int{"setup": 0, "inference": 1, "transfer": 2}
+	order := map[string]int{"setup": 0, "gpu": 1, "inference": 2, "transfer": 3}
 	sort.SliceStable(report.Stages, func(i, j int) bool {
 		a, b := report.Stages[i], report.Stages[j]
 		if order[a.Kind] != order[b.Kind] {
@@ -278,6 +298,9 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	fmt.Fprintf(w, "run %d %s  %s", r.Number, r.Status, r.Target)
 	if r.Machine != "" {
 		fmt.Fprintf(w, "  on %s", r.Machine)
+	}
+	if r.Waiting != "" {
+		fmt.Fprintf(w, "\n%s", r.Waiting)
 	}
 	fmt.Fprintf(w, "\nqueued %s · execution %s", span(float64(r.QueuedMS)), span(float64(r.ExecutionMS)))
 	if r.WallMS > 0 {

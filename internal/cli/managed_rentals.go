@@ -330,6 +330,11 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	}
 	req.Models = records.OneSelectionPerSlot(req.Models, childModels)
 	needsAccelerator = needsAccelerator || req.SizedByOwnModels() || len(childModels) > 0
+	link, problem := m.store.MachineExecution(req.ID)
+	if problem != nil {
+		return none, "", problem
+	}
+	runtimeOwned := link != nil
 	if problem := m.reconcileLocked(origin); problem != nil {
 		return none, "", problem
 	}
@@ -352,7 +357,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if constraints.Working, problem = m.store.WorkingPeaks(req); problem != nil {
 		return none, "", problem
 	}
-	attached, problem := m.attachedLocked(origin, req, bySKU, needsAccelerator, constraints)
+	attached, problem := m.attachedLocked(origin, req, runtimeOwned, bySKU, needsAccelerator, constraints)
 	if problem != nil {
 		return none, "", problem
 	}
@@ -414,7 +419,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		}
 		rental.Conclude(decision.Candidates, i)
 		decision.RentalID, decision.Models = rentalID, c.Models
-		if !decision.Bought && c.Ahead > 0 && req.RequestedRental == "" && !req.RetainWork {
+		if !decision.Bought && c.Ahead > 0 && req.RequestedRental == "" && !req.RetainWork && !runtimeOwned {
 			// Preparation may use this candidate, but its occupied seat is not an
 			// assignment. The local queue can still take another ready rental;
 			// dispatch records the chosen worker when it reserves a free seat.
@@ -444,7 +449,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 // cannot take this request, or, when it can, the attempts ahead of a new one. Nothing
 // is silently dropped (cl-132): a decision reporting no attached candidate while the
 // fleet holds two is the shape that read as waste live.
-func (m *managedRentals) attachedLocked(origin string, req records.Request, bySKU map[machineKey]hub.RentalSKU,
+func (m *managedRentals) attachedLocked(origin string, req records.Request, runtimeOwned bool, bySKU map[machineKey]hub.RentalSKU,
 	needsAccelerator bool, constraints rental.Constraints) ([]orchestrator.PlacementCandidate, *exit.Error) {
 	rows, problem := m.store.Rentals()
 	if problem != nil {
@@ -488,7 +493,7 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, bySK
 				}
 			}
 
-			reason, problem := m.standingLocked(row, req)
+			reason, problem := m.standingLocked(row, req, runtimeOwned)
 			if problem != nil {
 				return nil, problem
 			}
@@ -501,7 +506,8 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, bySK
 					return nil, problem
 				}
 				c.Ahead = queued + held
-				if mode != "" {
+				if mode != "" && !runtimeOwned {
+					// Runtime admits its own executions beside whatever the worker holds.
 					c.Verdict = orchestrator.VerdictExcluded + mode
 				}
 			}
@@ -514,15 +520,21 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, bySK
 // standingLocked is the fleet-side reason an ATTACHED rental cannot take any new
 // placement, or "". Class, geometry and lifecycle are settled by the caller before this
 // is asked, so every answer here is a fact about what the pod is already holding.
-func (m *managedRentals) standingLocked(row records.Rental, req records.Request) (string, *exit.Error) {
-	retained, problem := m.store.RentalHasRetainedJob(row.ID)
-	if problem != nil {
-		return "", problem
-	}
-	// Retained client jobs deliberately share this machine's durable work.
-	// Active execution is fenced separately by RentalStanding and preparation.
-	if retained && (!req.IsJob() || !req.RetainWork) {
-		return orchestrator.ExcludedModeConflict, nil
+func (m *managedRentals) standingLocked(row records.Rental, req records.Request, runtimeOwned bool) (string, *exit.Error) {
+	if !runtimeOwned {
+		// Work Creator still drives replaces the worker's whole desired state, which
+		// would retire the executions Runtime owns there; it waits for those to end.
+		owed, problem := m.store.RentalHasMachineObligations(row.ID)
+		if problem != nil {
+			return "", problem
+		}
+		retained, problem := m.store.RentalHasRetainedJob(row.ID)
+		if problem != nil {
+			return "", problem
+		}
+		if owed || retained && (!req.IsJob() || !req.RetainWork) {
+			return orchestrator.ExcludedModeConflict, nil
+		}
 	}
 	spent, problem := orchestrator.RentalSpent(m.store, row)
 	if problem != nil {

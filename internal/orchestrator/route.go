@@ -195,11 +195,10 @@ func (c *Orchestrator) route(req records.Request) routing {
 		if w.preparingRequest != "" && (!w.preparingReady || w.preparingRequest != req.ID) {
 			continue
 		}
-		slot, ok := c.eligible(w, req, planID)
-		if !ok {
+		if !c.eligible(w, req, planID) {
 			continue
 		}
-		placementID := w.placementFor(slot, planID)
+		placementID := w.placementID
 		laneID, room, held, why := w.roomFor(placementID)
 		lane := laneKey{w.instanceID, laneID}
 		out.lanes = append(out.lanes, lane)
@@ -250,59 +249,34 @@ func laneStrings(lanes []laneKey) string {
 }
 
 // eligible is the placement half of the match: a live claimed worker whose placement
-// advertises the plan as DISPATCHABLE for this request, and the slot that placement sits
-// under. THE SLOT IS PART OF THE MATCH, not only the binding: a rental's placements live
-// under the package name pinned to that rental, so the same plan digest on rental A and
-// rental B are two placements, each presented that rental's own credential — matching on
-// the plan id alone once sent a request to a pod whose credential it never presented.
-func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) (string, bool) {
-	if w.exited || w.stopping || !w.supportsCurrentProtocol() || c.sessions[w.bootID] == nil {
-		return "", false
-	}
-	if req.RentNew && req.Worker == "" {
-		return "", false
-	}
-	if !c.rentalParentAllows(w, req) {
-		return "", false
+// advertises the plan as DISPATCHABLE for this request. A rental's job placement lives
+// under the package name pinned to that rental, so the same plan on two rentals is two
+// placements, each presented its own rental's credential.
+func (c *Orchestrator) eligible(w *worker, req records.Request, planID string) bool {
+	if w.exited || w.stopping || !w.supportsCurrentProtocol() || c.sessions[w.bootID] == nil ||
+		req.RentNew && req.Worker == "" || !c.rentalParentAllows(w, req) {
+		return false
 	}
 	if req.RequestedRental != "" && (w.spec.Connection == nil || w.spec.Connection.RentalID != req.RequestedRental) {
-		return "", false
+		return false
 	}
 	if w.spec.Connection == nil {
-		if req.RentalRequired || req.Worker != "" || w.spec.Placement.Package != req.Package {
-			return "", false
+		if req.RentalRequired || req.Worker != "" || w.spec.Placement.Package != req.Package ||
+			req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
+			return false
 		}
-		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
-			return "", false
-		}
-		if w.spec.IsJob() {
-			// A JOB worker hosts no placement: its dispatchability IS its job capacity.
-			return req.Package, w.dispatchableFor(planID)
-		}
-		// The model selection is part of the match (cl-114): the plan id hashes the
-		// entrypoint's interface, not its weights, so a placement holding the same plan
-		// under a different selection is not this request's capacity.
-		return req.Package, w.dispatchableFor(planID) &&
-			selectionServes(req.Models, w.spec.Placement.Models)
+		// A JOB worker hosts no placement: its dispatchability IS its job capacity. For
+		// serving the model selection is part of the match (cl-114): the plan id hashes the
+		// entrypoint's interface, not its weights.
+		return w.dispatchableFor(planID) && (w.spec.IsJob() || selectionServes(req.Models, w.spec.Placement.Models))
 	}
-	if req.Worker != "" {
-		if w.instanceID != rentalInstanceID(req.Worker) {
-			return "", false
-		}
-	} else if !req.Rental {
-		return "", false
+	if req.Worker != "" && w.instanceID != rentalInstanceID(req.Worker) || req.Worker == "" && !req.Rental {
+		return false
 	}
-	slot := pinnedPackage(req.Package, w.spec.Connection.RentalID)
-	if req.IsJob() {
-		return slot, w.spec.IsJob() && w.spec.Placement.Package == slot &&
-			stagedFor(w, req) && w.dispatchableFor(planID)
-	}
-	placement, ok := w.remotePlacements[remotePlanKey(slot, planID)]
-	return slot, ok && !w.spec.IsJob() && placement.Package == slot &&
-		placement.Release == req.Release &&
-		(req.LocalInstallationID == "" || placement.InstallationID == req.LocalInstallationID) &&
-		selectionServes(req.Models, placement.Models) &&
-		w.remoteDispatchable(placement, planID)
+	// Runtime executes every other rented call; a rental takes only the job it was
+	// prepared for from this owner.
+	return req.IsJob() && w.spec.IsJob() && w.spec.Placement.Package == pinnedPackage(req.Package, w.spec.Connection.RentalID) &&
+		stagedFor(w, req) && w.dispatchableFor(planID)
 }
 
 // roomFor is the capacity half, per worker kind (#486c generalized by proto-024): the
