@@ -1,3 +1,0 @@
-JSON request files can name local files in schema-declared asset fields. Creator resolves relative paths beside the input JSON and uses the same verification, byte grants and transport as --asset. Ordinary strings remain ordinary strings.
-
-Focused file-binding tests pass: JSON-relative paths, mixed generated/supplied references, ordinary text, equivalent --asset identity, duplicate refusal, missing/wrong media, URLs, tagged unions, literal alternatives and existing content references. The isolated CLI builds successfully with one CPU. No full CI or live worker execution was run, and no global CLI or daemon was changed while the user generates videos. Source is ready for integration; end-user qualification with the corresponding H3 revision remains pending.

@@ -5,5 +5,11 @@ __pycache__/
 dist/
 *.egg-info/
 /cozy
-.owner-agent
 *.exe
+
+# Agent task and ownership notes stay out of history
+.task/
+.task-owners/
+.task-owner*.md
+.worktree-owner*.md
+.owner-agent/
