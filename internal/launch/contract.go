@@ -22,7 +22,16 @@ func UsageLine(target string, ep *Entrypoint) string {
 			line += " model." + other.Param + "=<ref>"
 		}
 	}
+	// An invocable job also carries each model parameter as a request field for managed
+	// calls; on the command line that input is the slot binding above, so it is not repeated.
+	params := map[string]bool{}
+	for _, slot := range ep.Models {
+		params[slot.Param] = true
+	}
 	for i := range ep.Request.Fields {
+		if ep.Invocable != nil && params[ep.Request.Fields[i].Name] {
+			continue
+		}
 		line += " " + usageTerm(&ep.Request.Fields[i], ep.Assets)
 	}
 	return line
