@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostgpu"
+	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -76,6 +77,11 @@ func handleUp(ctx *Context) *exit.Error {
 		record.Notes = append(record.Notes, inventory.Diagnostic)
 	} else if len(inventory.GPUs) == 0 {
 		record.Notes = append(record.Notes, "no NVIDIA GPUs detected")
+	}
+	// Rentals and the Hub need no host Runtime; only local runs refuse without a usable one.
+	if _, problem := hostruntime.Path(ctx.Cfg.Tool()); problem != nil && problem.ErrName() != "host_runtime_missing" {
+		record.Notes = append(record.Notes, fmt.Sprintf("local runs refuse with %s until the host Runtime is upgraded: %s; %s",
+			problem.ErrName(), problem.Message, problem.Remedy))
 	}
 	return emit(ctx, record)
 }

@@ -201,6 +201,9 @@ DENY_EMBED = [
     "parse_header", "safetensors", "cozytensor", "tensorbytes", "tensorchunk",
     "loadtensor", "weightbytes", "gguf",
 ]
+# Names a script imports from cozy_runtime ARE the delegation the rule asks for, so they are
+# not scanned as authored vocabulary.
+RUNTIME_IMPORT = re.compile(r"^\s*from cozy_runtime[\w.]* import ([\w, ]+)$", re.M)
 PY_SCAN = "scripts/*.py"
 # fence.py names the vocabulary in order to deny it. No package implementation is kept
 # under scripts/, so it is the only Python source exempt from its own vocabulary scan.
@@ -293,8 +296,12 @@ def check_embedded() -> list[str]:
             opener = raw_lines[start - 1] if start <= len(raw_lines) else ""
             if ALLOW_DOOR in opener:
                 continue
+            verbs = {name.strip() for names in RUNTIME_IMPORT.findall(text) for name in names.split(",")}
             for offset, line in enumerate(text.splitlines()):
-                body = line.split("#", 1)[0].lower()
+                body = line.split("#", 1)[0]
+                for verb in verbs:
+                    body = re.sub(r"\b" + re.escape(verb) + r"\b", "", body)
+                body = body.lower()
                 for d in DENY_EMBED:
                     if d in body:
                         bad.append(

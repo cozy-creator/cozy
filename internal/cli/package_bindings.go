@@ -149,9 +149,11 @@ func handlePackageBind(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if problem := verifyLadderOnCard(hctx, c, modelRef, release, ladder); problem != nil {
+	selected, problem := verifyLadderOnCard(hctx, c, modelRef, release, ladder)
+	if problem != nil {
 		return problem
 	}
+	warnYanked(ctx, modelRef, selected)
 	// CAS: read the row's current revision (0 for an unbound slot), then move. An exact
 	// replay is a hub-side revision-keeping no-op, so this pair never invents a conflict
 	// for the same intent sent twice.
@@ -208,17 +210,20 @@ func handlePackageUnbind(ctx *Context) *exit.Error {
 	}, "package", "slot", "status", "changed"))
 }
 
+// packageBindingRevision reads the rows as written, so an unusable row can still be
+// rebound or unbound: that is its repair.
 func packageBindingRevision(ctx context.Context, c *hub.Client, ref hub.Ref, slot string) (int64, *exit.Error) {
-	rows, problem := c.PackageBindings(ctx, ref)
+	rows, problem := c.PackageBindingRows(ctx, ref)
 	if problem != nil {
 		return 0, problem
 	}
+	var revision int64
 	for _, row := range rows {
 		if row.Slot == slot {
-			return row.Revision, nil
+			revision = max(revision, row.Revision)
 		}
 	}
-	return 0, nil
+	return revision, nil
 }
 
 // verifyPackageSlot refuses a slot path the package's latest published interface does
@@ -257,25 +262,25 @@ func verifyPackageSlot(ctx context.Context, c *hub.Client, ref hub.Ref, slot str
 		orNone(strings.Join(declared, ", ")))
 }
 
-// verifyLadderOnCard refuses a release the card does not offer unyanked, or a rung lane
-// the release does not carry, naming what it does.
+// verifyLadderOnCard refuses a release the card does not carry, or a rung lane the release
+// does not carry, naming what it does.
 func verifyLadderOnCard(ctx context.Context, c *hub.Client, ref hub.Ref, release string,
-	ladder []hub.BindingRung) *exit.Error {
+	ladder []hub.BindingRung) (*hub.ModelReleaseSummary, *exit.Error) {
 	_, selected, problem := modelReleaseCard(ctx, c, ref, release)
 	if problem != nil {
-		return problem
+		return nil, problem
 	}
 	for _, rung := range ladder {
 		lane, problem := laneOf(ref, selected, rung.Lane)
 		if problem != nil {
-			return problem
+			return nil, problem
 		}
 		if _, err := canonical.Raw(lane.ManifestID); err != nil {
-			return exit.Named(exit.Conflict, "rental.model_manifest_invalid",
+			return nil, exit.Named(exit.Conflict, "rental.model_manifest_invalid",
 				"Tensorhub returned an invalid manifest for %s@%s/%s", ref.String(), release, rung.Lane)
 		}
 	}
-	return nil
+	return selected, nil
 }
 
 // parseLadder reads the ordered `--gpu <GPU>=<lane>` rungs.

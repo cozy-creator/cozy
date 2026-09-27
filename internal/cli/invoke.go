@@ -495,9 +495,13 @@ func invocationDefaultBindings(ctx *Context, target Target, slots []launch.Slot)
 	defer cancel()
 	rows, problem := client(ctx).PackageBindings(hctx, ref)
 	if problem != nil {
+		remedy := "choose the model per run: model.<param>=org/model@release"
+		if problem.Remedy != "" {
+			remedy = problem.Remedy + " — or " + remedy
+		}
 		return nil, exit.Named(problem.Code, "package_default_model_unavailable",
 			"%s default bindings are not readable: %s", target.Package, problem.Message).
-			WithRemedy("supply model.<param>=org/model@release to bypass the hub default")
+			WithRemedy("%s", remedy)
 	}
 	return effectiveModelBindings(slots, rows, ref.Org), nil
 }
@@ -572,6 +576,7 @@ func resolveRemoteModel(ctx *Context, packageName string, slot launch.Slot, raw,
 	if problem != nil {
 		return empty, problem
 	}
+	warnYanked(ctx, ref, selected)
 	release = selected.Release
 	if wantedLane != "" {
 		if _, problem := laneOf(ref, selected, wantedLane); problem != nil {
@@ -1453,6 +1458,10 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	kind := strings.TrimPrefix(e.Type, "request.")
+	if kind == "warning" {
+		p.notice(e, warningLine(e.Payload))
+		return true
+	}
 	if !p.ctx.Mode().Full && (kind == "rentals" || kind == "placement") {
 		p.rentalNotice(e)
 		if kind != "placement" || !waitingPlacement(e.Payload) {
@@ -1797,6 +1806,13 @@ func progressLine(e localapi.Event, full bool) string {
 // attemptFailedLine names WHY the attempt failed, not merely that it did. Every one of
 // these causes is deterministic, so an operator who is shown only "retrying" watches a
 // budget burn on a fact that was on the wire the whole time (cl-206).
+func warningLine(payload map[string]any) string {
+	if message, _ := payload["message"].(string); strings.TrimSpace(message) != "" {
+		return "  warning: " + strings.TrimSpace(message)
+	}
+	return ""
+}
+
 func attemptFailedLine(payload map[string]any) string {
 	kind, _ := payload["error_type"].(string)
 	detail, _ := payload["error"].(string)

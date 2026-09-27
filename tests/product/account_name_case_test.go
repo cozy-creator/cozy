@@ -126,7 +126,7 @@ func TestAuthLoginAccountNameIgnoresCase(t *testing.T) {
 		t.Helper()
 		cmd := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "auth", "login", email, "--tensorhub="+hub.URL)
 		cmd.Env = childEnv(t, t.TempDir())
-		cmd.Stdin = strings.NewReader("123456\n" + typed + "\n")
+		cmd.Stdin = strings.NewReader("123456\n" + typed + "\n") //cozy:stdin-value test login code and account name
 		var out bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &out
 		_ = cmd.Run()
