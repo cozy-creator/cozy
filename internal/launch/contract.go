@@ -212,6 +212,9 @@ func fieldNotes(f *Field, path string, invocable *Invocable, assets *AssetsSlot)
 			return notes + " (default = " + string(value) + ")"
 		}
 	}
+	if len(f.Default) > 0 {
+		return notes + " (default = " + string(f.Default) + ")"
+	}
 	if isAssetsField(f, assets) && acceptsEmptyAssets(f) {
 		// ParseAssets supplies an empty bundle when this framework parameter is
 		// omitted. This is input syntax, not a default for arbitrary list fields.

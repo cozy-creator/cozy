@@ -183,6 +183,7 @@ type Field struct {
 	Name        string           `json:"name"`
 	Type        json.RawMessage  `json:"type"`
 	Wire        string           `json:"wire"`
+	Default     json.RawMessage  `json:"default,omitempty"`
 	Constraints FieldConstraints `json:"constraints"`
 	AssetBound  struct {
 		MaxBytes        int64    `json:"max_bytes"`
