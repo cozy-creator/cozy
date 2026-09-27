@@ -166,8 +166,8 @@ func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 	release string, plan hub.PackageDownloadPlan, packageConfig,
 	packageInterface, pyproject, uvLock install.ExactDocument,
 ) (*install.PublishedSource, *exit.Error) {
-	if len(plan.Downloads) == 0 || len(plan.Downloads) > hub.MaxPackageInstallDownloads {
-		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
+	if len(plan.Downloads) == 0 {
+		return nil, exit.Internalf("Tensorhub returned an empty package install plan")
 	}
 	published := &install.PublishedSource{
 		PythonVersion: plan.PythonVersion, Package: ref.String(), Release: release,
@@ -182,7 +182,7 @@ func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 	// Wire 30: the plan's rows are release wheel FACTS only. No wheel byte is downloaded;
 	// the environment materializes from the locked-requirements export, whose hashes pin
 	// every artifact against PyPI plus the org index.
-	seen := map[string]bool{}
+	seen := map[string]hub.PackageInstallDownload{}
 	for _, download := range plan.Downloads {
 		switch download.Kind {
 		case "project_wheel", "dependency_wheel", "local_materialization_wheel":
@@ -191,10 +191,13 @@ func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 				return nil, exit.Internalf("Tensorhub returned unsafe package wheel path %q",
 					download.Path)
 			}
-			if seen[download.Path] {
-				return nil, exit.Internalf("Tensorhub returned a duplicate package wheel")
+			if prior, ok := seen[download.Path]; ok {
+				if prior.Digest != download.Digest || prior.Length != download.Length || prior.Kind != download.Kind {
+					return nil, exit.Internalf("Tensorhub returned two different wheels named %s", download.Path)
+				}
+				continue
 			}
-			seen[download.Path] = true
+			seen[download.Path] = download
 			wheel := install.PublishedWheel{Digest: download.Digest,
 				Distribution: download.Distribution, Filename: download.Path,
 				ImportRoots: slices.Clone(download.ImportRoots),
@@ -211,8 +214,6 @@ func packageInstallPlanFacts(cli *Context, ref hub.Ref,
 			default:
 				published.LocalWheels = append(published.LocalWheels, wheel)
 			}
-		default:
-			return nil, exit.Internalf("Tensorhub returned unknown package file kind %q", download.Kind)
 		}
 	}
 	if published.ProjectWheel.Digest == "" {

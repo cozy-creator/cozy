@@ -177,8 +177,5 @@ func (r *Resolver) publishedChildPreparation(ctx context.Context, command *Conte
 	if problem != nil {
 		return nil, nil, nil, "", problem
 	}
-	if _, problem := detail.Requirements(); problem != nil {
-		return nil, nil, nil, "", problem
-	}
 	return &plan, iface, locked, detail.RequiresPython, nil
 }

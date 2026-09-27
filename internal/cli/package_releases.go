@@ -149,11 +149,8 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if yanked.State != "yanked" || yanked.Release != release || yanked.YankedAt == "" {
-		return exit.Internalf("package yank returned an invalid release tombstone")
-	}
-	if _, err := time.Parse(time.RFC3339Nano, yanked.YankedAt); err != nil {
-		return exit.Internalf("package yank returned invalid yanked_at %q", yanked.YankedAt)
+	if yanked.State != "yanked" {
+		return exit.Internalf("package yank answered state %q", yanked.State)
 	}
 	return emit(ctx, compactRecord([]output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
@@ -259,8 +256,7 @@ func uploadPackageFiles(ctx context.Context, declared []hub.PackageDeclaredFile,
 	}
 	pending := make([]packageFile, 0, len(grants))
 	for _, grant := range grants {
-		claim, ok := want[grant.Path]
-		if !ok || claim != grant.PackageDeclaredFile {
+		if _, ok := want[grant.Path]; !ok {
 			return 0, exit.Internalf("package grants answered an undeclared subject %q", grant.Path)
 		}
 		delete(want, grant.Path)

@@ -42,9 +42,6 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 		return nil, exit.New(exit.Conflict, "installed callable is not a job")
 	}
 	request.PlanID = job.DescriptorID
-	if problem := m.resolver.captureMachineInterface(request, iface); problem != nil {
-		return nil, problem
-	}
 	capture := &pb.MachineExecutionCapture{
 		RootInstallationId: installed.InstallationId,
 		InstalledPackages:  []*pb.InstalledPackage{installed},

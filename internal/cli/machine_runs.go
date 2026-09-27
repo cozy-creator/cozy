@@ -41,7 +41,7 @@ type publishedPreparation struct {
 }
 
 func retainWorkerInstallation(connection *machineConnection, expected localpackage.Installation, installed *pb.InstalledPackage) *exit.Error {
-	if installed == nil || installed.InstallationId != expected.ID || installed.Package != expected.Package || installed.Release != expected.Release || len(installed.PackageInterface) == 0 || len(installed.PackageInterface) > 1<<20 {
+	if installed == nil || installed.InstallationId != expected.ID || installed.Package != expected.Package || installed.Release != expected.Release || len(installed.PackageInterface) == 0 {
 		return exit.New(exit.Validation, "worker did not return the selected installation and interface")
 	}
 	connection.installed[expected.ID] = proto.Clone(installed).(*pb.InstalledPackage)

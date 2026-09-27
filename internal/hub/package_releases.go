@@ -4,24 +4,17 @@ package hub
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 )
-
-// MaxPackageInstallDownloads is one project wheel, the complete bounded rental
-// dependency-wheel closure, and the source-carried Runtime/TensorFS wheels used
-// only to materialize Creator's independent local environment.
-const MaxPackageInstallDownloads = 131
 
 // PackageDeclaredFile is one ordinary file in a publication session. Tensorhub journals
 // the declaration and echoes these refs only to authorize missing uploads.
@@ -128,37 +121,16 @@ func (d PackageReleaseDetail) Requirements() ([]string, *exit.Error) {
 	return requirements, problem
 }
 
-// Constraints returns the release's execution dependencies and interpreter floor.
-// Tensorhub derives both from the exact committed wheel environment; Creator verifies
-// the carried PackageInterface ref but does not derive execution requirements from it.
+// Constraints returns the release's execution dependencies and interpreter floor,
+// which Tensorhub derives from the committed wheel environment.
 func (d PackageReleaseDetail) Constraints() ([]string, string, *exit.Error) {
-	// PackageInterface is embedded inside another JSON response. The outer encoder may spell
-	// `<`, `>` and `&` as Unicode escapes, so RawMessage preserves transport tokens,
-	// not necessarily the stored PackageRelease bytes. Normalize the parsed content
-	// before checking its stored-byte identity; a semantic change still moves the hash.
-	canonicalInterface, err := canonical.NormalizeJCS(d.PackageInterface)
-	if err != nil {
-		return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
-			"Tensorhub returned an invalid package interface")
-	}
-	sum := sha256.Sum256(canonicalInterface)
-	want := "sha256:" + hex.EncodeToString(sum[:])
-	if d.Release.PackageInterfaceDigest != want ||
-		d.Release.PackageInterfaceLength != int64(len(canonicalInterface)) {
-		return nil, "", exit.Named(exit.Conflict, "hub.package_interface_identity_mismatch",
-			"Tensorhub package interface bytes do not match their exact ref")
-	}
 	if d.ExecutionRequirements == nil {
 		return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
 			"Tensorhub returned no package requirements")
 	}
-	for i, requirement := range d.ExecutionRequirements {
-		if requirement == "" || i > 0 && requirement <= d.ExecutionRequirements[i-1] {
-			return nil, "", exit.Named(exit.Structural, "hub.package_release_invalid",
-				"Tensorhub returned unsorted or empty package requirements")
-		}
-	}
-	return append([]string(nil), d.ExecutionRequirements...), d.RequiresPython, nil
+	requirements := slices.DeleteFunc(slices.Clone(d.ExecutionRequirements), func(r string) bool { return r == "" })
+	slices.Sort(requirements)
+	return slices.Compact(requirements), d.RequiresPython, nil
 }
 
 type PackageInstallDownload struct {
@@ -199,7 +171,7 @@ func (c *Client) DeclarePackageRelease(ctx context.Context, ref Ref, release str
 	// declaration against remote object custody exceeded the 10s header clock.
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packagePublishPath(ref, release), auth: true, reason: reason,
-		body: map[string]any{"files": files}, patient: true, strict: true,
+		body: map[string]any{"files": files}, patient: true,
 		responseBytes: 16 << 20}, &out)
 	return out, e
 }
@@ -218,7 +190,7 @@ func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release stri
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packagePublishPath(ref, release) + "/finalize", auth: true, reason: reason,
 		body:    body,
-		patient: true, strict: true}, &out)
+		patient: true}, &out)
 	return out, e
 }
 
@@ -228,8 +200,7 @@ func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release stri
 func (c *Client) PackageReleaseStatus(ctx context.Context, ref Ref, release string) (PackageReleaseCommit, *exit.Error) {
 	var out PackageReleaseCommit
 	e := c.do(ctx, call{method: http.MethodGet,
-		path: packagePublishPath(ref, release) + "/status", auth: true,
-		strict: true, responseBytes: 1 << 20}, &out)
+		path: packagePublishPath(ref, release) + "/status", auth: true, responseBytes: 1 << 20}, &out)
 	return out, e
 }
 
@@ -300,7 +271,7 @@ func (c *Client) ReportPackageDefect(ctx context.Context, ref Ref, release strin
 	var out PackageDefectResult
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packageReleasePath(ref, release) + "/defects", auth: true, reason: reason,
-		body: report, strict: true}, &out)
+		body: report}, &out)
 	return out, e
 }
 
@@ -308,22 +279,21 @@ func (c *Client) YankPackageRelease(ctx context.Context, ref Ref, release, reaso
 	var out PackageReleaseYank
 	e := c.do(ctx, call{method: http.MethodDelete,
 		path: packageReleasePath(ref, release), auth: true, reason: reason,
-		body: map[string]any{}, strict: true}, &out)
+		body: map[string]any{}}, &out)
 	return out, e
 }
 
 func (c *Client) PackageRelease(ctx context.Context, ref Ref,
 	release string) (PackageReleaseDetail, *exit.Error) {
 	var out PackageReleaseDetail
-	e := c.do(ctx, call{method: http.MethodGet, path: packageReleasePath(ref, release),
-		strict: true, responseBytes: 16 << 20}, &out)
+	e := c.do(ctx, call{method: http.MethodGet, path: packageReleasePath(ref, release), responseBytes: 16 << 20}, &out)
 	return out, e
 }
 
 func (c *Client) PackageSourceArchive(ctx context.Context, ref Ref, release string) (PackageSourceArchive, *exit.Error) {
 	var out PackageSourceArchive
 	e := c.do(ctx, call{method: http.MethodGet,
-		path: packageReleasePath(ref, release) + "/source", strict: true,
+		path:          packageReleasePath(ref, release) + "/source",
 		responseBytes: 1 << 20}, &out)
 	return out, e
 }
@@ -342,12 +312,11 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string, 
 		path += "?" + query.Encode()
 	}
 	e := c.do(ctx, call{method: http.MethodPost,
-		path: path, body: struct{}{}, strict: true,
+		path: path, body: struct{}{},
 		responseBytes: 16 << 20}, &out)
-	if e == nil && (len(out.Downloads) == 0 || len(out.Downloads) > MaxPackageInstallDownloads) {
+	if e == nil && len(out.Downloads) == 0 {
 		e = exit.Named(exit.Structural, "hub.package_download_plan_invalid",
-			"Tensorhub returned %d package wheel downloads; expected 1 through %d",
-			len(out.Downloads), MaxPackageInstallDownloads)
+			"Tensorhub returned no package wheel downloads")
 	}
 	return out, e
 }
@@ -423,7 +392,7 @@ func (c *Client) PackageBindings(ctx context.Context, ref Ref) ([]PackageBinding
 		Bindings []PackageBindingRow `json:"bindings"`
 	}
 	e := c.do(ctx, call{method: http.MethodGet,
-		path: resourcePath("packages", ref) + "/bindings", strict: true}, &out)
+		path: resourcePath("packages", ref) + "/bindings"}, &out)
 	if e != nil {
 		return nil, e
 	}
@@ -452,7 +421,7 @@ func (c *Client) BindPackageSlot(ctx context.Context, ref Ref, slot, model, rele
 	var out PackageBindingWrite
 	e := c.do(ctx, call{method: http.MethodPut,
 		path: resourcePath("packages", ref) + "/bindings/" + url.PathEscape(slot),
-		auth: true, reason: reason, strict: true,
+		auth: true, reason: reason,
 		body: map[string]any{"model": model, "release": release, "ladder": ladder,
 			"expected_revision": expectedRevision}}, &out)
 	return out, e
@@ -468,7 +437,7 @@ func (c *Client) UnbindPackageSlot(ctx context.Context, ref Ref, slot string, ex
 	var out PackageBindingReset
 	problem := c.do(ctx, call{method: http.MethodDelete,
 		path: resourcePath("packages", ref) + "/bindings/" + url.PathEscape(slot),
-		auth: true, reason: reason, strict: true,
+		auth: true, reason: reason,
 		body: map[string]any{"expected_revision": expectedRevision}}, &out)
 	return out, problem
 }

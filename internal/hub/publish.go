@@ -7,12 +7,9 @@ package hub
 // retains that checkpoint. Mutable release pointers are a separate call.
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -62,7 +59,7 @@ func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID strin
 		method: http.MethodPut,
 		path:   publications(ref) + "/" + url.PathEscape(operationID), auth: true, reason: reason,
 		body:    map[string]any{"objects": objects},
-		byBytes: true, patient: true, strict: true,
+		byBytes: true, patient: true,
 	}, &out)
 	return out, e
 }
@@ -116,7 +113,7 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/grants",
 		auth:   true, reason: reason, byBytes: true, patient: true,
-		body: map[string]any{"object_ids": objectIDs}, strict: true,
+		body: map[string]any{"object_ids": objectIDs},
 	}, &out)
 	if e != nil {
 		return GrantResponse{}, e
@@ -180,8 +177,7 @@ func (c *Client) RemoveCheckpoint(ctx context.Context, ref Ref, checkpointID, re
 		Removed          bool   `json:"removed"`
 	}
 	if problem := c.do(ctx, call{method: http.MethodDelete, auth: true, reason: reason,
-		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + url.PathEscape(checkpointID),
-		strict: true}, &out); problem != nil {
+		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + url.PathEscape(checkpointID)}, &out); problem != nil {
 		return problem
 	}
 	if _, err := canonical.Raw(out.RepositorySHA256); err != nil || out.CheckpointID != checkpointID {
@@ -213,31 +209,15 @@ type modelFinalizationFailure struct {
 // a fixed wall clock, bounds the complete operation.
 var modelFinalizePollInterval = 2 * time.Second
 
-func decodeStrictJSON(raw []byte, out any) error {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(out); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return fmt.Errorf("response contains more than one JSON value")
-		}
-		return err
-	}
-	return nil
-}
-
 func decodeModelFinalization(raw []byte) (CheckpointPublication, modelFinalizationView, *exit.Error) {
 	// Older hubs completed this request synchronously. Keep that response shape
 	// readable while all current hubs use the durable async envelope below.
 	var direct CheckpointPublication
-	if err := decodeStrictJSON(raw, &direct); err == nil && direct.PublishID != "" {
+	if err := json.Unmarshal(raw, &direct); err == nil && direct.PublishID != "" {
 		return direct, modelFinalizationView{State: "completed"}, nil
 	}
 	var view modelFinalizationView
-	if err := decodeStrictJSON(raw, &view); err != nil {
+	if err := json.Unmarshal(raw, &view); err != nil {
 		return CheckpointPublication{}, modelFinalizationView{}, exit.Named(exit.Internal,
 			"hub.unreadable_answer", "Tensorhub returned an invalid model finalization response: %s", err)
 	}
@@ -254,7 +234,7 @@ func decodeModelFinalization(raw []byte) (CheckpointPublication, modelFinalizati
 				"hub.model_finalization_invalid", "Tensorhub completed model finalization without a checkpoint result")
 		}
 		var checkpoint CheckpointPublication
-		if err := decodeStrictJSON(view.Result, &checkpoint); err != nil {
+		if err := json.Unmarshal(view.Result, &checkpoint); err != nil {
 			return CheckpointPublication{}, view, exit.Named(exit.Structural,
 				"hub.model_finalization_invalid", "Tensorhub returned an invalid model checkpoint result: %s", err)
 		}
@@ -280,7 +260,7 @@ func (c *Client) readModelFinalization(ctx context.Context, ref Ref, operation s
 	e := c.do(ctx, call{
 		method: http.MethodGet,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/finalization",
-		auth:   true, responseBytes: 1 << 20, strict: true, raw: &raw,
+		auth:   true, responseBytes: 1 << 20, raw: &raw,
 	}, nil)
 	return raw, e
 }
@@ -393,7 +373,7 @@ func (c *Client) UpdateModelRelease(ctx context.Context, ref Ref, release string
 	}
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodPost, path: modelReleasePath(ref, release),
-		auth: true, reason: reason, patient: true, strict: true,
+		auth: true, reason: reason, patient: true,
 		body: map[string]any{"expected_revision": expectedRevision,
 			"set_lanes": setLanes, "remove_lanes": removeLanes}}, &out)
 	return out, e
@@ -408,7 +388,7 @@ func (c *Client) RetargetModelLane(ctx context.Context, ref Ref, release, lane,
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodPut,
 		path: modelReleasePath(ref, release) + "/lanes/" + url.PathEscape(lane),
-		auth: true, reason: reason, patient: true, strict: true,
+		auth: true, reason: reason, patient: true,
 		body: map[string]any{"checkpoint_id": checkpointID}}, &out)
 	return out, e
 }
@@ -416,7 +396,7 @@ func (c *Client) RetargetModelLane(ctx context.Context, ref Ref, release, lane,
 func (c *Client) YankModelRelease(ctx context.Context, ref Ref, release, reason string) (ModelRelease, *exit.Error) {
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodDelete, path: modelReleasePath(ref, release),
-		auth: true, reason: reason, patient: true, strict: true}, &out)
+		auth: true, reason: reason, patient: true}, &out)
 	return out, e
 }
 

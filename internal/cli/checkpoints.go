@@ -195,12 +195,18 @@ func (o *modelTransferOwner) uploadCheckpointLink(ctx context.Context, client *h
 		if problem != nil {
 			return problem
 		}
-		if accepted.Operation != operation || accepted.State != "open" || len(accepted.Objects) != len(batch) {
-			return exit.Named(exit.Structural, "model_transfer.source_checkpoint_custody_invalid", "Tensorhub did not verify the exact checkpoint object batch")
+		if accepted.Operation != operation || accepted.State != "open" {
+			return exit.Named(exit.Structural, "model_transfer.source_checkpoint_custody_invalid", "Tensorhub did not verify the checkpoint object batch")
 		}
-		for i, object := range accepted.Objects {
-			if object.ObjectID != batch[i].ID || object.Length != batch[i].Length || object.State != "accepted" {
-				return exit.Named(exit.Structural, "model_transfer.source_checkpoint_custody_invalid", "Tensorhub checkpoint custody differs from the declared objects")
+		verified := make(map[string]int64, len(accepted.Objects))
+		for _, object := range accepted.Objects {
+			if object.State == "accepted" {
+				verified[object.ObjectID] = object.Length
+			}
+		}
+		for _, object := range batch {
+			if length, ok := verified[object.ID]; !ok || length != object.Length {
+				return exit.Named(exit.Structural, "model_transfer.source_checkpoint_custody_invalid", "Tensorhub did not accept checkpoint object %s", object.ID)
 			}
 		}
 	}

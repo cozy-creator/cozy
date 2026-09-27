@@ -4,11 +4,9 @@
 package modeltransfer
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"sort"
 )
@@ -50,33 +48,6 @@ type Instruction struct {
 
 func (i Instruction) Bytes() ([]byte, error) { return json.Marshal(i) }
 
-func ParseInstruction(data []byte) (Instruction, error) {
-	var instruction Instruction
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&instruction); err != nil {
-		return instruction, err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return instruction, fmt.Errorf("model transfer instruction carries trailing JSON")
-	}
-	canonical, err := instruction.Bytes()
-	if err != nil || !bytes.Equal(canonical, data) {
-		return instruction, fmt.Errorf("model transfer instruction is not the one canonical spelling")
-	}
-	return instruction, nil
-}
-
-func (i Instruction) Digest() (string, error) {
-	data, err := i.Bytes()
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(sum[:]), nil
-}
-
 func (i Instruction) ID() string {
 	data, _ := i.Bytes()
 	sum := sha256.Sum256(append([]byte("cozy-model-transfer-instruction/1\x00"), data...))
@@ -97,38 +68,6 @@ type Plan struct {
 	Job               *JobPin
 	SourceProfiles    map[string]string
 	Outputs           []OutputPin
-}
-
-// Bytes is the restart record. It contains only immutable identities and
-// reviewed declarations; URLs, credentials, grants, workers, rentals, prices,
-// clocks, and attempts have no field.
-func (p Plan) Bytes() ([]byte, error) { return json.Marshal(p) }
-
-func Parse(data []byte) (Plan, error) {
-	var plan Plan
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&plan); err != nil {
-		return plan, err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return plan, fmt.Errorf("model transfer plan carries trailing JSON")
-	}
-	canonical, err := plan.Bytes()
-	if err != nil || !bytes.Equal(canonical, data) {
-		return plan, fmt.Errorf("model transfer plan is not the one canonical spelling")
-	}
-	return plan, nil
-}
-
-func (p Plan) Digest() (string, error) {
-	data, err := p.Bytes()
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 // ID is stable across detach/follow, attempts, rental replacement, capability

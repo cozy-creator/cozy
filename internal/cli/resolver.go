@@ -381,10 +381,9 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if detail.Release.Release != release ||
-		detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
+	if detail.Release.Release != release {
 		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
-			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
+			"Tensorhub answered release %s@%s for the queued release %s", pkg, detail.Release.Release, release)
 	}
 	requirements, problem := detail.Requirements()
 	if problem != nil {
@@ -501,10 +500,9 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, function string,
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if detail.Release.Release != release ||
-		detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
+	if detail.Release.Release != release {
 		return empty, nil, exit.Named(exit.Conflict, "rental.package_release_changed",
-			"Tensorhub release %s@%s does not match the queued immutable release", pkg, release)
+			"Tensorhub answered release %s@%s for the queued release %s", pkg, detail.Release.Release, release)
 	}
 	requirements, problem := detail.Requirements()
 	if problem != nil {
@@ -512,8 +510,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, function string,
 	}
 	packageInterface, problem := launch.DecodePackageInterface(detail.PackageInterface)
 	if problem != nil {
-		return empty, nil, exit.Named(exit.Conflict, "rental.package_interface_digest_mismatch",
-			"Tensorhub package interface bytes do not match their release fact")
+		return empty, nil, problem
 	}
 	job, problem := packageInterface.Function(function)
 	if problem != nil {

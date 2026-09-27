@@ -7,17 +7,14 @@ package rental
 // rental's registered image row — and this side fetches that assembly verbatim
 // over the renter's authenticated edge rather than re-deriving any of it.
 // Wire 61 adds field 10: the release's PackageInterface bytes, read from the
-// release record and cross-checked against the assembled facts, so the Runtime
-// never describes a published package.
+// release record, so the Runtime never describes a published package.
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/url"
-	"slices"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -26,8 +23,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
-
-const inventoryFormat = "tensorhub.image_inventory/1"
 
 // PublicOrigin reads the Hub-owned package index endpoint already embedded in
 // authenticated prepare facts. It never changes the control URL or sends a
@@ -83,7 +78,7 @@ func PrepareFactsSource(client *hub.Client) orchestrator.RentalPrepareFactsSourc
 		if problem != nil {
 			return orchestrator.PrepareFacts{}, problem
 		}
-		facts.PackageInterface, problem = ReleaseInterface(detail, facts, ref.Package, ref.Release)
+		facts.PackageInterface, problem = ReleaseInterface(detail, ref.Package, ref.Release)
 		if problem != nil {
 			return orchestrator.PrepareFacts{}, problem
 		}
@@ -91,11 +86,9 @@ func PrepareFactsSource(client *hub.Client) orchestrator.RentalPrepareFactsSourc
 	}
 }
 
-// ReleaseInterface returns the release's canonical PackageInterface bytes once
-// they are proven to be the release's exact interface and to agree with the
-// assembled facts: the same application and the same sorted model-slot paths.
-func ReleaseInterface(detail hub.PackageReleaseDetail, facts orchestrator.PrepareFacts,
-	pkg, release string) ([]byte, *exit.Error) {
+// ReleaseInterface returns the release's canonical PackageInterface bytes. The
+// Runtime that prepares the package owns their agreement with the assembled facts.
+func ReleaseInterface(detail hub.PackageReleaseDetail, pkg, release string) ([]byte, *exit.Error) {
 	refuse := func(format string, args ...any) ([]byte, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "rental.package_interface_invalid",
 			"the hub's package interface for %s %s is unusable: %s",
@@ -104,18 +97,9 @@ func ReleaseInterface(detail hub.PackageReleaseDetail, facts orchestrator.Prepar
 	if detail.Release.Release != release {
 		return refuse("the hub answered release %q", detail.Release.Release)
 	}
-	if _, _, problem := detail.Constraints(); problem != nil {
-		return refuse("%s", problem.Message)
-	}
 	iface, problem := launch.DecodePackageInterface(detail.PackageInterface)
 	if problem != nil {
 		return refuse("%s", problem.Message)
-	}
-	if iface.Application != facts.Application {
-		return refuse("application %q, the prepare facts name %q", iface.Application, facts.Application)
-	}
-	if slots := iface.ModelSlotPaths(); !slices.Equal(slots, facts.ModelSlotPaths) {
-		return refuse("model-slot paths %v, the prepare facts name %v", slots, facts.ModelSlotPaths)
 	}
 	return append([]byte(nil), iface.Raw...), nil
 }
@@ -161,26 +145,16 @@ func ImageInventory(raw json.RawMessage) (*pb.ImageInventory, error) {
 		return nil, fmt.Errorf("the rental's image has no registered inventory")
 	}
 	var doc struct {
-		ProvisionableMinors []string                `json:"provisionable_minors"`
-		Format              string                  `json:"format"`
-		Profile             string                  `json:"profile"`
-		Python              string                  `json:"python"`
-		Interpreters        []*pb.PythonInterpreter `json:"interpreters"`
-		Distributions       []struct {
+		Profile       string                  `json:"profile"`
+		Python        string                  `json:"python"`
+		Interpreters  []*pb.PythonInterpreter `json:"interpreters"`
+		Distributions []struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
 		} `json:"distributions"`
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&doc); err != nil {
+	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("image inventory unreadable: %w", err)
-	}
-	if next := decoder.Decode(new(any)); next != io.EOF {
-		return nil, fmt.Errorf("image inventory has trailing JSON")
-	}
-	if doc.Format != inventoryFormat {
-		return nil, fmt.Errorf("image inventory format %q is not %q", doc.Format, inventoryFormat)
 	}
 	if doc.Profile == "" || doc.Python == "" {
 		return nil, fmt.Errorf("image inventory names no profile or interpreter")
@@ -192,7 +166,7 @@ func ImageInventory(raw json.RawMessage) (*pb.ImageInventory, error) {
 	inventory := &pb.ImageInventory{Profile: doc.Profile, Python: doc.Python, Interpreters: doc.Interpreters}
 	for _, row := range doc.Distributions {
 		if row.Name == "" || row.Version == "" {
-			return nil, fmt.Errorf("image inventory carries an unnamed or unversioned distribution")
+			continue
 		}
 		inventory.Distributions = append(inventory.Distributions,
 			&pb.ImageDistribution{Distribution: row.Name, Version: row.Version})

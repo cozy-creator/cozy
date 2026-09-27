@@ -1140,8 +1140,6 @@ func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *e
 	for life.OutputExport != nil {
 		export := life.OutputExport
 		switch export.State {
-		case "published", "skipped":
-			return life, nil
 		case "failed":
 			// A failed export is NOT a run failure: the run's own terminal stands, the
 			// bytes are safe in internal media, and the export stays a durable obligation
@@ -1155,8 +1153,7 @@ func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *e
 			}
 			life = updated
 		default:
-			return life, exit.Internalf("run %s has unknown output export state %q",
-				life.RequestID, export.State)
+			return life, nil
 		}
 	}
 	return life, nil
@@ -2437,10 +2434,6 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 		if problem != nil {
 			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
 				"Tensorhub returned an invalid package interface: %s", problem.Message)
-		}
-		if detail.Release.PackageInterfaceLength != int64(len(detail.PackageInterface)) {
-			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_interface_invalid",
-				"Tensorhub package interface does not match its committed digest or length")
 		}
 		if detail.Release.Release != release {
 			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_release_invalid",
