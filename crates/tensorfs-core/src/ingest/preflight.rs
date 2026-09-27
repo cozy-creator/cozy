@@ -239,6 +239,26 @@ fn profile_plan(plan: &SourcePlan) -> ProfilePlan {
     }
 }
 
+/// The one reviewed profile these member heads plan under, chosen from their headers alone:
+/// several matching profiles that plan identically are one answer; different plans refuse
+/// `AMBIGUOUS_CLASSIFICATION` naming them, and none refuses `UNREGISTERED_FINGERPRINT`.
+pub fn select_profile(
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    heads: &[MemberHead],
+    scratch: &Path,
+) -> Result<String> {
+    let staged = stage(scratch, heads)?;
+    source::plan_source(
+        registry_locator,
+        registry_bytes,
+        staged.carriers(),
+        None,
+        None,
+    )
+    .map(|plan| plan.profile)
+}
+
 /// Decide the conversion plan for every requested profile, from headers alone.
 ///
 /// One [`source::plan_source`] call per profile, over one carrier set — which is precisely

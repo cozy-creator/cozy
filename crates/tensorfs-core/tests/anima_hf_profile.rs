@@ -164,3 +164,14 @@ fn anima_hf_refuses_a_missing_component_before_payload_transfer() {
     assert_ne!(error.code, Code::IO_FAILED, "{error:?}");
     assert!(!path.exists());
 }
+
+#[test]
+fn anima_hf_selects_its_profile_without_being_named() {
+    let path = scratch("select");
+    assert_eq!(
+        preflight::select_profile(BUILTIN_REGISTRY, BUILTIN_REGISTRY_BYTES, &heads(), &path)
+            .unwrap(),
+        PROFILE
+    );
+    assert!(!path.exists());
+}

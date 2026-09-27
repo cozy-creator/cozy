@@ -704,6 +704,12 @@ def read_source_heads(
     civitai: str | None = None,
     allow_local: bool = False,
 ) -> list[tuple[str, bytes]]: ...
+def select_source_profile(
+    store: Store,
+    heads: Sequence[tuple[str, int, bytes]],
+    *,
+    registry: bytes | None = None,
+) -> str: ...
 def prepare_selected_source(
     store: Store,
     operation_id: str,
