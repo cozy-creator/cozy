@@ -121,7 +121,7 @@ func TestMachinePublicationActualHostAfterClientDisconnect(t *testing.T) {
 	if !bytes.Contains(script, []byte(machinePublicationCanary)) {
 		t.Fatal("publication proof script has no private source canary")
 	}
-	code, out := runCozyPath(t, layout.Root, path, "run", *machinePublicationScript, "--rental", "child-host", "--allow-publish", "machineproof/model", "--json", "--idempotency-key", "machine-publication-offline")
+	code, out := runCozyPath(t, layout.Root, path, "run", *machinePublicationScript, "--rental", "child-host", "--allow-upload", "machineproof/model", "--json", "--idempotency-key", "machine-publication-offline")
 	if code != 0 || !strings.Contains(out, `"machine_accepted":true`) {
 		t.Fatalf("scoped root acceptance [%d]: %s", code, out)
 	}

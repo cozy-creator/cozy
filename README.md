@@ -222,16 +222,16 @@ cozy run paul/minimax-h3-tools/four-lane \
   --model.shared=hf://MiniMaxAI/MiniMax-H3@<full-commit> \
   --source-profile dits=hf/minimax-h3/native-dual-bf16/1 \
   --source-profile shared=hf/minimax-h3/shared-bf16/1 \
-  --publish-to paul/minimax-h3 --rental-only --await
+  --upload-to paul/minimax-h3 --rental-only --await
 
 cozy run org/quantize/convert org/model@release/bf16 org/quantized --rental=otter
 ```
 
 A conversion job — model inputs and at least one declared weight output — reads
 `cozy run <job> <input> [<org/model>]`: the first positional binds its first model input, the
-second is the `--publish-to` destination (it may be the input's own repository), and any
+second is the `--upload-to` destination (it may be the input's own repository), and any
 further input is `model.<param>=<ref>`. Each output
-becomes a checkpoint named by its output slot; publish lanes with `cozy model publish`.
+is uploaded as a private checkpoint named by its output slot; publish a release with `cozy model publish`.
 
 `cozy model upload <hf or civitai source> <org/model> --rental=<name>` ingests on the rental:
 the pod downloads the source, converts it to CozyTensors with reviewed TensorFS profiles and
@@ -261,8 +261,8 @@ through the same asset bindings as `--asset references.0.image=/path/to/hero.png
 Ordinary description/prompt strings are never interpreted as files. Supplying the same
 field in JSON and with `--asset` is an error. These inputs accept local files, not URLs.
 
-`--publish-to` retains each declared weight output as an owner-only immutable checkpoint;
-it does not create public lane pointers. `--source-profile slot=profile` narrows each foreign
+`--upload-to` uploads each declared weight output as an owner-only immutable checkpoint;
+it publishes no release. `--source-profile slot=profile` narrows each foreign
 input to a reviewed TensorFS profile. Currently every foreign input must name the same
 provider source and all model slots must be foreign; mixed inputs and multiple independent
 sources refuse before acquisition. Tensorhub inputs use the ordinary exact model resolver.

@@ -179,7 +179,7 @@ func ordinaryScheduledCheckpoint(t *testing.T) {
 		}
 	}()
 	marker := records.NewID("marker")
-	args := []string{"run", "paul/ordinary-checkpoint-job-proof/produce", "model.source=paul/creator-output-b93c35ccecf8c183@0.0.0-recovery-source-config.20260906/native-source", "encoding=" + bridge.Encoding, "marker=" + marker, "--publish-to", *publicationModel, "--rental-only", "--json", "--full", "--idempotency-key", "ordinary-checkpoint"}
+	args := []string{"run", "paul/ordinary-checkpoint-job-proof/produce", "model.source=paul/creator-output-b93c35ccecf8c183@0.0.0-recovery-source-config.20260906/native-source", "encoding=" + bridge.Encoding, "marker=" + marker, "--upload-to", *publicationModel, "--rental-only", "--json", "--full", "--idempotency-key", "ordinary-checkpoint"}
 	code, cliOutput := runCozy(t, o.root, args...)
 	if code != 0 {
 		t.Fatalf("normal CLI submission failed: %d %s", code, cliOutput)

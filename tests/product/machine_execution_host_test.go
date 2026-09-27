@@ -136,7 +136,7 @@ print(json.dumps(found))
 	}
 
 	status, out = runCozyPath(t, layout.Root, path, "run", *machineExecutionScript,
-		"--rental", "child-host", "--allow-publish", "alice/model", "--json", "--idempotency-key", key+"-publication-refused")
+		"--rental", "child-host", "--allow-upload", "alice/model", "--json", "--idempotency-key", key+"-publication-refused")
 	if status == 0 || !strings.Contains(out, "publication.worker_upgrade_required") {
 		t.Fatalf("Runtime 51 accepted publication authority: [%d] %s", status, out)
 	}

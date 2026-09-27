@@ -20,7 +20,7 @@ import (
 )
 
 // A rented job that writes its declared weights output and returns a plain result, run
-// without --publish-to (upload bench, runs 1280/1283): its weights have no recipient here.
+// without --upload-to (upload bench, runs 1280/1283): its weights have no recipient here.
 // The weights are held on the machine in this host's custody, the run settles with them
 // named as retained on the rental, and the rental is free for maintenance. Before, the
 // collection waited for a custody nothing drove: the follower never settled and each

@@ -13,7 +13,7 @@ import (
 )
 
 // A conversion job (model inputs and weights outputs) reads `cozy run <job> <input> <org/model>`:
-// the same request as model.<first param>= plus --publish-to; later inputs stay model.<param>=.
+// the same request as model.<first param>= plus --upload-to; later inputs stay model.<param>=.
 func TestConversionJobReadsInputAndDestinationPositionals(t *testing.T) {
 	root, _, _, digest, _ := runModelCatalog(t, func(_ *http.ServeMux, detail *hub.PackageReleaseDetail) {
 		iface := []byte(`{"application":"q:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[{"class":"Source","component_use":{},"path":"quantize.models.source"},{"class":"Source","component_use":{},"path":"quantize.models.base"}],"invocable":{"capabilities":["weights"],"context":"ctx","defaults":{"request/base":null,"request/source":null},"enum_members":{},"export":"quantize","memoize":true,"module":"q","parameters":["source","base","steps"],"type_names":{"request":"quantizeRequest"}},"name":"quantize","publishes":false,"request":{"fields":[{"name":"source","type":{"union":["null",{"input":"model"}]},"wire":"optional"},{"name":"base","type":{"union":["null",{"input":"model"}]},"wire":"optional"},{"name":"steps","type":"int"}]},"result":{"fields":[]},"weights_outputs":[{"max_bytes":1048576,"mime_type":"application/vnd.cozy.model-manifest","output_id":"fp8"}]}]}`)
@@ -28,7 +28,7 @@ func TestConversionJobReadsInputAndDestinationPositionals(t *testing.T) {
 		t.Fatalf("a third positional did not refuse with the conversion spelling: %d %s", code, out)
 	}
 	for _, args := range [][]string{
-		{"run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "--publish-to", "proof/other"},
+		{"run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "--upload-to", "proof/other"},
 		{"run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "model.source=proof/source@1.0.0/bf16"},
 	} {
 		if code, out := runCozy(t, root, append(args, "--rental-only", "--json")...); code == 0 {

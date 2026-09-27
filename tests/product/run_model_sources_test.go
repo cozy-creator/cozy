@@ -139,7 +139,7 @@ func TestPinnedCheckpointTransferKeepsReleaseAndLaneConstraints(t *testing.T) {
 func TestRunForeignModelInputsRefuseBeforeAcquisition(t *testing.T) {
 	root, mu, posts, _, _ := runModelCatalog(t)
 	source := "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("4", 40)
-	base := []string{"run", "proof/quantize/quantize", "steps=4", "model.dits=" + source, "model.shared=" + source, "--publish-to", "proof/output", "--rental-only", "--json"}
+	base := []string{"run", "proof/quantize/quantize", "steps=4", "model.dits=" + source, "model.shared=" + source, "--upload-to", "proof/output", "--rental-only", "--json"}
 	for _, test := range []struct {
 		name string
 		args []string
@@ -180,7 +180,7 @@ func TestRunRetainedCheckpointPinsFactsWithoutRelease(t *testing.T) {
 	}
 	args := []string{"run", "proof/quantize/quantize", "steps=7",
 		"model.dits=proof/source#" + digest, "model.shared=proof/source#" + digest,
-		"--publish-to", "proof/output", "--rental-only", "--json", "--idempotency-key", "retained-model-job"}
+		"--upload-to", "proof/output", "--rental-only", "--json", "--idempotency-key", "retained-model-job"}
 	code, out := runCozy(t, root, args...)
 	if code != 0 {
 		t.Fatalf("digest-only job did not queue: %d %s", code, out)
@@ -245,7 +245,7 @@ func TestRunPublishedModelJobKeepsPayloadAndDeclaresRentalClosure(t *testing.T) 
 	root, mu, posts, digest, manifest := runModelCatalog(t)
 	input := filepath.Join(root, "quantize.json")
 	must(t, os.WriteFile(input, []byte(`{"steps":7}`), 0600))
-	args := []string{"run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--in", input, "--publish-to", "proof/output", "--rental-only", "--json", "--full", "--idempotency-key", "published-model-job"}
+	args := []string{"run", "proof/quantize/quantize", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--in", input, "--upload-to", "proof/output", "--rental-only", "--json", "--full", "--idempotency-key", "published-model-job"}
 	startDaemonProcess(t, root)
 	code, out := runCozy(t, root, args...)
 	if code != 0 {

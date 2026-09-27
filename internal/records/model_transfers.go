@@ -836,7 +836,7 @@ func (s *Store) SettleMachineDestination(requestID, unpublished string) *exit.Er
 func (s *Store) publishedCheckpoints(requestID, destination string) (map[string]string, *exit.Error) {
 	rows, err := s.db.Query(`SELECT payload FROM request_events WHERE request_id=? AND type='machine.checkpoint' ORDER BY seq`, requestID)
 	if err != nil {
-		return nil, exit.Internalf("cannot read published checkpoints: %s", err)
+		return nil, exit.Internalf("cannot read uploaded checkpoints: %s", err)
 	}
 	defer rows.Close()
 	published := map[string]string{}
@@ -848,7 +848,7 @@ func (s *Store) publishedCheckpoints(requestID, destination string) (map[string]
 			OutputSlot  string `json:"output_slot"`
 		}
 		if err := rows.Scan(&raw); err != nil {
-			return nil, exit.Internalf("cannot read a published checkpoint: %s", err)
+			return nil, exit.Internalf("cannot read an uploaded checkpoint: %s", err)
 		}
 		if json.Unmarshal([]byte(raw), &event) != nil || event.Destination != destination {
 			continue
@@ -858,7 +858,7 @@ func (s *Store) publishedCheckpoints(requestID, destination string) (map[string]
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, exit.Internalf("cannot finish published checkpoint read: %s", err)
+		return nil, exit.Internalf("cannot finish uploaded checkpoint read: %s", err)
 	}
 	return published, nil
 }
