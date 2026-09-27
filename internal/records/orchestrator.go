@@ -708,35 +708,54 @@ func (r ModelRung) String() string {
 // Pinned says the ref names one exact manifest; an unpinned ref still carries its ladder.
 func (m ModelRef) Pinned() bool { return m.Manifest != "" }
 
-// RungFor is the first rung whose gpu pattern fits `accelerator` and its index; a pinned
-// ref fits every machine as itself (index 0). An empty accelerator — a host without an
-// NVIDIA device — fits only the "*" rung.
-func (m ModelRef) RungFor(accelerator string, count int) (ModelRung, int, bool) {
+// RungAt is the ref's rung, and its index, in a group `width` cards wide on `accelerator`:
+// its first rung of exactly that width, else its first uncounted rung, which serves any
+// width. A pinned ref is its own rung (index 0): at any width when uncounted, else only at
+// its exact group, which its ladder, if any, must author on this accelerator. An empty
+// accelerator — a host without an NVIDIA device — matches only a "*" rung.
+func (m ModelRef) RungAt(accelerator string, width int) (ModelRung, int, bool) {
 	if m.Pinned() {
-		if m.GPUs > 0 && len(m.Ladder) > 0 {
-			supported := false
-			for _, rung := range m.Ladder {
-				supported = supported || (rung.GPUs == m.GPUs && rung.Lane == m.Lane && RungMatches(rung.GPU, accelerator))
-			}
-			if !supported {
-				return ModelRung{}, -1, false
-			}
+		authored := m.GPUs == 0 || len(m.Ladder) == 0
+		for _, rung := range m.Ladder {
+			authored = authored || rung.GPUs == m.GPUs && rung.Lane == m.Lane && RungMatches(rung.GPU, accelerator)
 		}
 		return ModelRung{GPU: "*", GPUs: m.GPUs, Lane: m.Lane, Manifest: m.Manifest, Bytes: m.Bytes,
-			ComponentBytes: m.ComponentBytes}, 0, m.GPUs <= count
+			ComponentBytes: m.ComponentBytes}, 0, authored && (m.GPUs == 0 || m.GPUs == width)
 	}
+	uncounted := -1
 	for i, rung := range m.Ladder {
-		if RungMatches(rung.GPU, accelerator) && rung.GPUs <= count {
+		switch {
+		case !RungMatches(rung.GPU, accelerator):
+		case width > 0 && rung.GPUs == width:
 			return rung, i, true
+		case rung.GPUs == 0 && uncounted < 0:
+			uncounted = i
 		}
 	}
-	return ModelRung{}, -1, false
+	if uncounted < 0 {
+		return ModelRung{}, -1, false
+	}
+	return m.Ladder[uncounted], uncounted, true
+}
+
+// Width is the device group a pinned selection takes on a machine of `machine` cards: its
+// widest exact group, or the whole machine when no ref is counted.
+func Width(models []ModelRef, machine int) int {
+	width := 0
+	for _, model := range models {
+		width = max(width, model.GPUs)
+	}
+	if width == 0 {
+		return machine
+	}
+	return width
 }
 
 // PurchaseRung only buys a wider machine when that exact group is authored.
 func (m ModelRef) PurchaseRung(accelerator string, count int) (ModelRung, int, bool) {
 	if m.Pinned() {
-		return m.RungFor(accelerator, count)
+		rung, index, ok := m.RungAt(accelerator, m.GPUs)
+		return rung, index, ok && m.GPUs <= count
 	}
 	for i, rung := range m.Ladder {
 		if rung.GPUs == count && RungMatches(rung.GPU, accelerator) {

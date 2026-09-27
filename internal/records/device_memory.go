@@ -263,6 +263,7 @@ func recordDeviceMemoryTx(tx *sql.Tx, t Terminal) *exit.Error {
 		} else if err != nil {
 			return exit.Internalf("cannot read rental %s for its measurement: %s", req.Worker, err)
 		}
+		width = Width(req.Models, width)
 	}
 	pkg, release, entrypoint := measurementSubject(req)
 	if _, err := tx.Exec(`INSERT INTO device_memory_measurements(request_id,attempt,package,release,

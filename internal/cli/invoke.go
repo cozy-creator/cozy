@@ -357,6 +357,10 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 	}
 	defer work.Release()
 	root := work.Path
+	rungs, problem := localRungs(ctx, selected)
+	if problem != nil {
+		return nil, problem
+	}
 	hctx, cancel := hub.LongContext()
 	defer cancel()
 	out := make([]orchestrator.ModelRef, 0, len(selected))
@@ -366,24 +370,13 @@ func resolveSelectedInvocationModels(ctx *Context, target Target, ep *launch.Ent
 		if !ok {
 			return nil, exit.Internalf("resolved model slot %s is absent from the package interface", spec.Slot)
 		}
-		lane := spec.Lane
-		count := 0
-		if !spec.Explicit {
-			// GPU-specific defaults take precedence; an unlisted local GPU uses the
-			// first declared lane and still goes through ordinary Runtime admission.
-			rung, problem := localRung(ctx, spec.Binding.Ladder)
-			if problem != nil {
-				return nil, problem
-			}
-			lane, count = rung.Lane, rung.GPUs
-		}
 		model, problem := acquirePublishedModel(hctx, ctx, tool, client(ctx), spec.Ref,
-			lane, target.Package, slot,
+			rungs[index].Lane, target.Package, slot,
 			filepath.Join(root, fmt.Sprintf("%03d", index)))
 		if problem != nil {
 			return nil, problem
 		}
-		out = append(out, orchestrator.ModelRef{Package: target.Package, Slot: spec.Slot, GPUs: count,
+		out = append(out, orchestrator.ModelRef{Package: target.Package, Slot: spec.Slot, GPUs: rungs[index].GPUs,
 			Model: model.Model, CatalogRepository: model.Model, Release: model.Release, Lane: model.Lane,
 			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
 	}

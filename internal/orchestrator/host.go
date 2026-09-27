@@ -446,8 +446,7 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 	digest := append([]byte(nil), prepared.PlacementSetDigest...)
 	// THE WIDTH IS AUTHORED HERE TOO. This is the rental's own convergence path — the pod
 	// prepared its own bytes and this owner relays them — so the device pin has to be
-	// authored over the SAME rule as a locally prepared set, or a wide pod would take a
-	// placement with no pin and refuse `device_group_unsupported` after the hour started.
+	// authored over the SAME rule as a locally prepared set (devicePins).
 	models := w.spec.Placement.Models
 	owner := w.preparingRequest
 	if owner == "" && w.spec.Connection != nil {

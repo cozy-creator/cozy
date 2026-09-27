@@ -30,25 +30,10 @@ import (
 // orchestration role (decision #601), and the runtime cannot inject one because the child
 // payload is converted from the caller's own arguments.
 
-// childModelSelection resolves one declared slot of a captured callee, pinned to
-// `accelerator` — the machine the child will run on, which for a rental composition is the
-// parent's own pod. An empty accelerator is the host without an NVIDIA device and matches
-// only a "*" rung, exactly as a local run of the callee would.
-func (r *Resolver) childModelSelection(pkg, entrypoint string, slot launch.Slot, accelerator string, count int) (orchestrator.ModelRef, *exit.Error) {
-	out, problem := r.childModelLadder(pkg, entrypoint, slot)
-	if problem != nil {
-		return orchestrator.ModelRef{}, problem
-	}
-	// The child runs on ONE known machine, so its rung is decided here rather than left
-	// unpinned for a placement decision the child never enters — it inherits its parent's.
-	fitted, _, ok := out.RungFor(accelerator, count)
-	if !ok {
-		return orchestrator.ModelRef{}, exit.Named(exit.Conflict, "child.model_rung_absent",
-			"%s model %s has no lane declared for %s (ladder: %s)",
-			pkg, slot.Param, orNone(accelerator), rungText(out.Ladder)).
-			WithRemedy("declare a rung for this accelerator, or run the composition on a machine its ladder names")
-	}
-	out = out.Pin(fitted)
+// childManifest completes one captured child slot pinned to the machine the child will run
+// on — for a rental composition the parent's own pod, so the rung is decided here rather
+// than left for a placement decision the child never enters.
+func (r *Resolver) childManifest(out orchestrator.ModelRef) (orchestrator.ModelRef, *exit.Error) {
 	// A JOB's model is an invocation INPUT, so it carries exact manifest bytes the way
 	// `jobManifestInputs` grants them for a top-level job — not a bare model identity.
 	ref, problem := hub.ParseRef(out.Model)
@@ -242,16 +227,6 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 		}
 	}
 	return out, nil
-}
-
-// rungText is one selection's ladder as a readable line, the ModelRung spelling of
-// hub.LadderText: `H100=fp8-adaln-pruned > *=bf16`.
-func rungText(ladder []records.ModelRung) string {
-	parts := make([]string, 0, len(ladder))
-	for _, rung := range ladder {
-		parts = append(parts, rung.String())
-	}
-	return strings.Join(parts, " > ")
 }
 
 // EnsureLocalModels runs after child admission, on the ordinary activation path.

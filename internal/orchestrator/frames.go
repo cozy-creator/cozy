@@ -514,13 +514,10 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // devicePins authors proto-024's `device_pins`: WHERE this owner puts each placement on
 // this worker's devices. It is the whole of Creator's authorship of width.
 //
-// The rule is one line because the width is a property of the machine, not of a request: a
-// model-bearing placement on a K-device envelope is pinned to ALL K ordinals, which fuses
-// one group lane of degree K. There is nothing to choose. The renter
-// bought K cards; the package declares which degrees it can shard at; the worker joins the
-// two and refuses `device_group_unsupported` when they disagree, which is a typed refusal
-// against a machine that is already paid for rather than a silent success that idles K-1
-// cards (group-lanes ruling 3). A degree is never a request parameter and never a fallback.
+// A model-bearing placement on a K-device envelope is pinned to ordinals [0, W), W the
+// selection's group width (records.Width): the widest authored group that fits this
+// machine (rental.Pin), or all K when no rung is counted. The worker runs the largest
+// declared degree within the pin; cards outside it idle, nothing refuses.
 //
 // Width 1 pins nothing: one envelope device is one lane and the worker assigns it by
 // measured fit, which is the behaviour every worker had before there was a wider one. A
@@ -554,15 +551,9 @@ func devicePins(setBytes []byte, envelope []string, models []ModelRef) ([]*pb.Pl
 	if !modelBearing {
 		return nil, nil
 	}
-	count := 0
-	for _, model := range models {
-		count = max(count, model.GPUs)
-	}
+	count := records.Width(models, len(envelope))
 	if count > len(envelope) {
 		return nil, exit.Named(exit.Conflict, "placement_gpu_count_unavailable", "model group needs %d GPUs but machine has %d", count, len(envelope))
-	}
-	if count == 0 {
-		count = len(envelope)
 	}
 	ordinals := make([]uint32, 0, count)
 	for ordinal := range count {

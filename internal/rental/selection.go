@@ -97,7 +97,8 @@ func size(c *orchestrator.PlacementCandidate, models []records.ModelRef, acceler
 	if !device {
 		return
 	}
-	need := WithWorking(records.Resident(c.Models, accelerator, job), working.For(c.Models, c.SKU, c.GPUs))
+	need := WithWorking(records.Resident(c.Models, accelerator, job),
+		working.For(c.Models, c.SKU, records.Width(c.Models, c.GPUs)))
 	c.Fit, c.Verdict = FitNote(need, vramGB), Fit(need, vramGB, c.SKU)
 }
 
@@ -131,18 +132,35 @@ func WithWorking(need records.Residency, peak records.WorkingPeak) records.Resid
 	return need
 }
 
-// Pin selects exact execution groups that fit an existing machine. Rung is the
-// worst selected authored preference, so a singleton child cannot hide another
-// child's fallback. Explicitly pinned selections contribute no ladder rank.
+// Pin selects exact execution groups that fit an existing machine: a rental already paid
+// for, or this host. The refs of one callable are one execution group and share one width,
+// the widest authored count up to the machine's that every one of them has a rung for
+// (ModelRef.RungAt), so H3's base and LoRA on 4×H100 take 4 although both ladders list ×2
+// first. Order among widths is a purchase preference (PurchaseRung); among rungs of one
+// width it still ranks lanes. Rung is the worst selected authored preference, so a
+// singleton child cannot hide another child's fallback. Pinned refs keep their exact
+// group and contribute no ladder rank.
 func Pin(models []records.ModelRef, accelerator string, count int) ([]records.ModelRef, int, bool) {
 	return pin(models, accelerator, count, false)
 }
 
 func pin(models []records.ModelRef, accelerator string, count int, purchase bool) ([]records.ModelRef, int, bool) {
+	width := map[string]int{}
+	widen := func(model records.ModelRef, candidate int) {
+		if candidate > width[model.Callable] && candidate <= count && takes(models, model.Callable, accelerator, candidate) {
+			width[model.Callable] = candidate
+		}
+	}
+	for _, model := range models {
+		widen(model, model.GPUs)
+		for _, rung := range model.Ladder {
+			widen(model, rung.GPUs)
+		}
+	}
 	rung := 0
 	pinned := make([]records.ModelRef, 0, len(models))
 	for _, model := range models {
-		fitted, index, ok := model.RungFor(accelerator, count)
+		fitted, index, ok := model.RungAt(accelerator, width[model.Callable])
 		if purchase {
 			fitted, index, ok = model.PurchaseRung(accelerator, count)
 		}
@@ -155,6 +173,15 @@ func pin(models []records.ModelRef, accelerator string, count int, purchase bool
 		pinned = append(pinned, model.Pin(fitted))
 	}
 	return pinned, rung, true
+}
+
+func takes(models []records.ModelRef, callable, accelerator string, width int) bool {
+	for _, model := range models {
+		if _, _, ok := model.RungAt(accelerator, width); model.Callable == callable && !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Fit is the one VRAM sanity floor a buy, a reuse and an explicit override are held to
@@ -365,7 +392,8 @@ func Standing(c *orchestrator.PlacementCandidate, models []records.ModelRef,
 	// A machine the user already has up is held to the same memory floor as a buy; the
 	// catalog's figure for its product is the fact (a product gone from the catalog this
 	// minute decides nothing). Its GPU count is not held to the package's degrees: the
-	// pod is already paid for, and the worker runs at the best declared degree that fits.
+	// pod is already paid for, and the selection takes the widest authored group that
+	// fits it (Pin). Cards beyond that group idle; nothing refuses.
 	Size(c, models, row.AcceleratorModel, vramGB, needsAccelerator && offered, job, working)
 	switch {
 	case c.Verdict != "":
@@ -495,7 +523,8 @@ func Wait(candidates []orchestrator.PlacementCandidate, attaching int) {
 }
 
 // Measure reads each open candidate's expected time and cost from the row measured for
-// its (lane, sku, gpus) under the first slot's model release, and returns the rows used. An
+// its (lane, sku, group width) under the first slot's model release, and returns the rows
+// used. The width is the group the selection runs on, not the rental's card count. An
 // attached rental runs after the attempts ahead of it and bills this request only the
 // run; a purchase pays its prepare time and bills all of it (placement-economics.md).
 func Measure(candidates []orchestrator.PlacementCandidate, rows []hub.ModelThroughput,
@@ -511,7 +540,7 @@ func Measure(candidates []orchestrator.PlacementCandidate, rows []hub.ModelThrou
 		}
 		for _, row := range rows {
 			if row.Release != models[0].Release || row.Lane != c.Models[0].Lane || row.SKU != c.SKU ||
-				max(row.AcceleratorCount, 1) != max(c.GPUs, 1) {
+				max(row.AcceleratorCount, 1) != max(records.Width(c.Models, c.GPUs), 1) {
 				continue
 			}
 			seconds, billed := row.MedianS+row.PrepareS, row.MedianS+row.PrepareS
