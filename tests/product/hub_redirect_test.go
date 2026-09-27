@@ -5,13 +5,14 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
-	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 )
 
 func TestCapturedHubStorageRedirectRetainsExactWheel(t *testing.T) {

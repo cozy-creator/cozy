@@ -4,11 +4,12 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/exit"
 
 	"github.com/cozy-creator/cozy/internal/records"
 	_ "modernc.org/sqlite"

@@ -5,12 +5,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
-	"google.golang.org/protobuf/proto"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+
+	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/localpackage"

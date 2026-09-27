@@ -44,6 +44,11 @@ type Host struct {
 }
 
 func NewHost(dir string, environ []string) *Host {
+	// A machine moved elsewhere by a symlink (another disk, a shorter path) runs there: the
+	// Runtime's sockets live under the root it is given, and a socket path is bounded.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	h := &Host{dir: dir}
 	for _, value := range environ {
 		name, _, _ := strings.Cut(value, "=")

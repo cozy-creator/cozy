@@ -1,16 +1,17 @@
 package producttest
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
-	"os"
-	"path/filepath"
-	"strings"
-	"testing"
 )
 
 func TestNativeDownloadsCannotHideResolutionInsideMemoizedParents(t *testing.T) {

@@ -60,10 +60,22 @@ func provisionMachine(t *testing.T, root string) {
 		return
 	}
 	dir := filepath.Join(root, "machine")
-	if _, err := os.Stat(filepath.Join(dir, "installed.json")); err == nil {
+	if _, err := os.Lstat(dir); err == nil {
 		return
 	}
 	template := machineTemplateDir(t)
+	// The machine lives at a short path, as a pod's does at /: a test root's own path would
+	// push the Runtime's executor sockets past the kernel's socket path bound.
+	short, err := os.MkdirTemp("", "cm")
+	must(t, err)
+	must(t, os.MkdirAll(root, 0o700))
+	must(t, os.Symlink(short, dir))
+	t.Cleanup(func() {
+		reapMachineRuntimeRoot(root)
+		if !t.Failed() {
+			_ = removeAllForce(short)
+		}
+	})
 	for _, link := range []string{"usr/local/bin/pod-supervisor", "usr/local/bin/tfs", "usr/local/bin/uv", "opt/cozy/bin/cozy-runtime-worker", "opt/cozy/python"} {
 		target, err := filepath.EvalSymlinks(filepath.Join(template, "root", link))
 		must(t, err)
@@ -158,4 +170,10 @@ func stubMachine(t *testing.T, root, script string) {
 	} {
 		must(t, os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600))
 	}
+}
+
+// machineJournal is this computer's machine's execution journal: the Runtime's workspace in
+// the machine's own TensorFS Store.
+func machineJournal(root string) string {
+	return filepath.Join(root, "machine", "root", "var", "lib", "tensorfs", ".cozy-workspace", "journal.sqlite3")
 }

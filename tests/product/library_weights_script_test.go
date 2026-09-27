@@ -129,7 +129,7 @@ def main(ctx: Context, *, source: Model) -> ModelArtifact:
 	if calls := machineChildren(t, root, store, "2"); len(calls) != 0 {
 		t.Fatalf("ordinary helper import dispatched a managed child: %+v", calls)
 	}
-	journal, err := sql.Open("sqlite", "file:"+filepath.Join(root, "tensorfs", ".cozy-workspace", "journal.sqlite3")+"?mode=ro")
+	journal, err := sql.Open("sqlite", "file:"+machineJournal(root)+"?mode=ro")
 	must(t, err)
 	defer journal.Close()
 	var repository, inputState, nativeOwner string

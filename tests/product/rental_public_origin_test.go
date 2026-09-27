@@ -1,8 +1,9 @@
 package producttest
 
 import (
-	"github.com/cozy-creator/cozy/internal/rental"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 func TestRentalPublicOriginUsesOnlyItsHubPackageIndex(t *testing.T) {

@@ -1,10 +1,11 @@
 package producttest
 
 import (
+	"testing"
+
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
-	"testing"
 )
 
 func TestCountedLaddersBuyMaximumChildGroupAndReuseWidestGroup(t *testing.T) {

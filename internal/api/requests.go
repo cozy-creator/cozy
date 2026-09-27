@@ -918,6 +918,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		}
 		s.fillLifecycleProgress(&life, row)
 		s.fillGPUWait(&life, row)
+		life.OutputExport = s.outputExportOf(row.ID)
 		if awaiting, problem := s.store.MachinePublicationsAwaitingOwner(row.ID); problem == nil && len(awaiting) > 0 {
 			life.Phase, life.PhaseDetail = orchestrator.PhaseOwnerReconciliation, awaiting[0].Publication
 		}

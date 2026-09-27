@@ -2,9 +2,10 @@ package producttest
 
 import (
 	"bytes"
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/canonical"
 
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
