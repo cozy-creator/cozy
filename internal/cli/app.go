@@ -55,6 +55,7 @@ type Context struct {
 	Daemon         daemon.State
 	AccountAuth    *accountauth.Manager
 	namespace      packagepublish.NamespaceSource // the caller on Cfg's Tensorhub, asked once
+	ingestBytes    int64                          // planned source bytes a native ingest declares for its rental
 }
 
 func (c *Context) Mode() output.Mode { return c.Inv.Mode }

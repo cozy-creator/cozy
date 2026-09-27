@@ -66,6 +66,9 @@ type JobSubmission struct {
 	// Trees are the typed input trees as `ref=<directory>`. The grant is the read
 	// capability: a `Tree` field naming a ref that is not here never hydrates.
 	Trees []string `json:"trees,omitempty"`
+	// PlannedSourceBytes is what a script ingest will pull, so a rental bought for it
+	// is sized to the ingest.
+	PlannedSourceBytes int64 `json:"planned_source_bytes,omitempty"`
 }
 
 // JobHandle is the 202 answer.
@@ -404,7 +407,7 @@ func replayJobSubmission(sub JobSubmission,
 		NeedsAccelerator: recorded.NeedsAccelerator, Trees: trees, Worker: recorded.Worker,
 		Rental: sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
-		Models: models, ModelTransfer: transfer, ProducerParams: params}, nil
+		Models: models, ModelTransfer: transfer, ProducerParams: params, PlannedSourceBytes: sub.PlannedSourceBytes}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The
@@ -431,7 +434,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission) 
 		Rental: sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
-		ModelTransfer: sub.ModelTransfer,
+		ModelTransfer: sub.ModelTransfer, PlannedSourceBytes: sub.PlannedSourceBytes,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental, hub); problem != nil {
 		return out, nil, problem

@@ -553,6 +553,10 @@ type Request struct {
 	// ModelTransfer is a source materializer/output finalizer attached to this
 	// ordinary request. It owns no lifecycle, placement, attempt, or event identity.
 	ModelTransfer *ModelTransferIntent
+	// PlannedSourceBytes is what a script ingest declares it will pull, so a rental
+	// bought for it is sized to the ingest. Recorded at submission; read back through
+	// Store.PlannedSourceBytes.
+	PlannedSourceBytes int64 `json:"-"`
 }
 
 // AssetBinding ties one payload asset field to the exact local bytes the request owns.
@@ -1715,6 +1719,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		return Request{}, false, problem
 	}
 	if problem := recordModelTransferTx(tx, r.ID, r.ModelTransfer); problem != nil {
+		return Request{}, false, problem
+	}
+	if problem := recordPlannedSourcesTx(tx, r.ID, r.PlannedSourceBytes); problem != nil {
 		return Request{}, false, problem
 	}
 	r.Number, err = requestNumber(tx, r)

@@ -80,7 +80,7 @@ func handleRent(ctx *Context) *exit.Error {
 		_, developmentSet := ctx.Inv.Bools["--development"]
 		if ctx.Inv.Value("--idempotency-key") != "" || ctx.Inv.Value("--gpus") != "" ||
 			ctx.Inv.Value("--timeout") != "" || len(ctx.Inv.Values["--model"]) != 0 || developmentSet || ctx.Inv.Value("--ssh-public-key") != "" ||
-			ctx.Inv.Value("--image") != "" || ctx.Inv.Value("--disk-gb") != "" {
+			ctx.Inv.Value("--image") != "" || ctx.Inv.Value("--disk-gb") != "" || len(ctx.Inv.Values["--source-profile"]) != 0 {
 			return exit.Usagef("rental options require a GPU SKU").
 				WithRemedy("use `cozy rental new` alone to list available machines")
 		}
@@ -171,8 +171,12 @@ func handleRent(ctx *Context) *exit.Error {
 		AcceleratorModel: sku.AcceleratorModel, AcceleratorCount: sku.AcceleratorCount,
 		HourlyRateUSDMicros: sku.PriceUSDMicrosPerHour})
 
+	requestedDisk, e := manualRentalDisk(ctx, existing)
+	if e != nil {
+		return e
+	}
 	row, attachable, replay, e := acquireRentalContext(watchCtx, ctx, l, st, skuName, gpus,
-		operationKey, reason, sku.PriceUSDMicrosPerHour, deadline, "", progress.rentalAcquisition)
+		operationKey, reason, sku.PriceUSDMicrosPerHour, deadline, "", rentalDiskWatch(progress, requestedDisk))
 	if e != nil {
 		if e.Code == exit.Canceled && watchCtx.Err() != nil && !ctx.Mode().JSON {
 			detached = true
@@ -271,7 +275,21 @@ func manualRentalDisk(ctx *Context, existing *records.RentalOperation) (int, *ex
 	return request.ContainerDiskGB, nil
 }
 
-// rentalDiskNote says when the Hub did not confirm the requested --disk-gb.
+// rentalDiskWatch warns once when the Hub's view says less disk than --disk-gb asked for:
+// before purchase the view's disk is the minimum it will buy, after it the disk bought.
+func rentalDiskWatch(progress *RunProgress, requested int) acquisitionPhase {
+	warned := false
+	return func(seen hub.Rental) {
+		if !warned && requested > 0 && seen.ContainerDiskGB > 0 && seen.ContainerDiskGB < requested {
+			warned = true
+			progress.On(localapi.Event{Type: "request.warning", Payload: map[string]any{"message": fmt.Sprintf(
+				"Tensorhub plans a %d GB disk, below the requested %d GB", seen.ContainerDiskGB, requested)}})
+		}
+		progress.rentalAcquisition(seen)
+	}
+}
+
+// rentalDiskNote says when the disk the Hub bought does not confirm the requested --disk-gb.
 func rentalDiskNote(st *records.Store, operationKey string, ready hub.Rental) string {
 	op, problem := st.RentalOperation(operationKey)
 	if problem != nil || op == nil {
@@ -359,11 +377,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	if managedRequestID == "" {
-		workload.ServingModels, e = manualRentalModels(ctx, existing)
-		if e != nil {
-			return records.Rental{}, hub.Rental{}, false, e
-		}
-		workload.ContainerDiskGB, e = manualRentalDisk(ctx, existing)
+		workload, e = manualRentalWorkload(ctx, existing)
 		if e != nil {
 			return records.Rental{}, hub.Rental{}, false, e
 		}

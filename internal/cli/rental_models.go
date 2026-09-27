@@ -2,28 +2,77 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/units"
 )
+
+// manualRentalWorkload is what a manual rental declares so the Hub sizes its disk: Hub
+// models by identity, provider sources not yet on the Hub by their planned ingest bytes,
+// and an explicit --disk-gb. Resuming a paid operation replays its exact declaration.
+func manualRentalWorkload(ctx *Context, existing *records.RentalOperation) (hub.DeclaredWorkload, *exit.Error) {
+	var models, sources []string
+	for _, spec := range ctx.Inv.Values["--model"] {
+		if strings.Contains(spec, "://") {
+			sources = append(sources, spec)
+		} else {
+			models = append(models, spec)
+		}
+	}
+	if len(ctx.Inv.Values["--source-profile"]) > 0 && len(sources) != 1 {
+		return hub.DeclaredWorkload{}, exit.Usagef("--source-profile selects the profiles of one --model provider source")
+	}
+	disk, problem := manualRentalDisk(ctx, existing)
+	if problem != nil {
+		return hub.DeclaredWorkload{}, problem
+	}
+	if existing != nil {
+		request, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
+		if problem != nil {
+			return hub.DeclaredWorkload{}, problem
+		}
+		serving, problem := manualRentalModels(ctx, models, existing, request.ServingModels)
+		return hub.DeclaredWorkload{SourceBytes: request.PlannedSourceBytes, ServingModels: serving,
+			ContainerDiskGB: disk}, problem
+	}
+	workload := hub.DeclaredWorkload{ContainerDiskGB: disk}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return workload, exit.Internalf("cannot resolve working directory: %s", err)
+	}
+	for _, spec := range sources {
+		parsed, problem := modelsource.Parse(spec, cwd)
+		if problem != nil {
+			return workload, problem
+		}
+		if parsed.Kind != modelsource.HuggingFace && parsed.Kind != modelsource.Civitai {
+			return workload, exit.Usagef("--model %q is not a Hugging Face or Civitai source", spec)
+		}
+		plan, problem := planNativeIngest(ctx, cwd, parsed, ctx.Inv.Values["--source-profile"])
+		if problem != nil {
+			return workload, problem
+		}
+		workload.SourceBytes += plan.source.Bytes
+		fmt.Fprintf(ctx.Err, "Sizing rental for %s: %d files, %s (%s)\n", plan.source.Canonical,
+			plan.source.Files, units.Bytes(plan.source.Bytes), strings.Join(plan.profiles, ", "))
+	}
+	serving, problem := manualRentalModels(ctx, models, nil, nil)
+	workload.ServingModels = serving
+	return workload, problem
+}
 
 // manualRentalModels declares identity only. The same Hub resolver used by model
 // downloads chooses the exact checkpoint; the existing rental encoder canonicalizes
 // the set and Hub alone measures its deduplicated closure and disk headroom.
-func manualRentalModels(ctx *Context, existing *records.RentalOperation) ([]hub.ServingModel, *exit.Error) {
-	specs := ctx.Inv.Values["--model"]
-	var pinned []hub.ServingModel
-	if existing != nil {
-		request, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
-		if problem != nil {
-			return nil, problem
-		}
-		pinned = request.ServingModels
-		if len(specs) == 0 {
-			return pinned, nil // resuming the paid operation reuses its exact body
-		}
+func manualRentalModels(ctx *Context, specs []string, existing *records.RentalOperation, pinned []hub.ServingModel) ([]hub.ServingModel, *exit.Error) {
+	if existing != nil && len(specs) == 0 {
+		return pinned, nil // resuming the paid operation reuses its exact body
 	}
 	selected := make([]hub.ServingModel, 0, len(specs))
 	seen := map[hub.ServingModel]bool{}

@@ -517,8 +517,9 @@ runs at the largest parallel degree the package supports and leaves the rest idl
 cozy rental new                   # Cozy GPUs, their GPU counts, VRAM, and hourly prices
 cozy rental new h100-sxm5-80gb     # prints e.g. otter
 cozy rental new h100-sxm5-80gb --gpus 2   # one machine with 2 GPUs; keep counts even
-cozy rental new h100-sxm5-80gb --model paul/minimax-h3@1.0.0/bf16
-cozy rental new h100-sxm5-80gb --disk-gb=600    # rent at least a 600 GB container disk
+cozy rental new h100-sxm5-80gb --model paul/minimax-h3@1.0.0/bf16   # size disk for a Hub model
+cozy rental new h100-sxm5-80gb --model hf://org/repo@<commit>        # or for a source to ingest
+cozy rental new h100-sxm5-80gb --disk-gb=600                         # rent at least a 600 GB disk
 cozy rental new h100-sxm5-80gb \
   --idempotency-key <unique-key>
 cozy rental new h100-sxm5-80gb --image <tag|digest>   # boot a registered candidate image
@@ -527,6 +528,10 @@ cozy rental list                   # current rented machines, live on a terminal
 cozy run org/package/generate --rental=otter prompt="moonlit lake"
 cozy rental end otter
 ```
+
+`--model` sizes the pod's disk. A Hub model is declared by identity. A provider source
+(`hf://`, `civitai://`) is planned the way `cozy model upload --rental` plans it, with
+`--source-profile` for a multi-profile source, and its bytes are declared.
 
 A GPU machine boots the hub's current `cuda` image and the `cpu` machine its current `cpu-torch`
 image. `--image` boots one other image registered with the hub instead (tag, digest, or kind), for
