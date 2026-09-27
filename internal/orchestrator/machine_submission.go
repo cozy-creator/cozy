@@ -68,12 +68,15 @@ func MachineJobSubmission(request records.Request, capture localpackage.Executio
 			isCallee = true
 		}
 	}
-	if hasCallees && !isCallee && len(request.OwnModels()) == 0 && len(root.WeightsOutputs) == 0 {
+	if !root.AcceleratorDeclared && hasCallees && !isCallee && len(request.OwnModels()) == 0 && len(root.WeightsOutputs) == 0 {
 		root.NeedsAccelerator = false
 	}
-	// A captured CPU caller must not occupy the execution lane its managed
-	// model children need. Device-bearing roots keep their declared lane.
-	root.Orchestration = !root.NeedsAccelerator && len(request.OwnModels()) == 0 && len(root.WeightsOutputs) == 0
+	// A device-less root takes the machine's CPU slot, so the managed model children it
+	// calls may hold devices; its own Models are derive-only views. A Runtime that does not
+	// report `cpu_slot_model_inputs` puts a root holding Models or weights on its device
+	// slot and refuses it as orchestration, so that root keeps the device lane there.
+	root.Orchestration = !root.NeedsAccelerator &&
+		(root.CPUSlotModelInputs || len(request.OwnModels()) == 0 && len(root.WeightsOutputs) == 0)
 	if root.Orchestration && root.RSSCap == DefaultJobRSSCap {
 		// The legacy local launch ceiling is not an authored memory demand.
 		// Let Runtime admit a CPU caller using its own measured host policy.

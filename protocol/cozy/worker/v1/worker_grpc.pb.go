@@ -217,6 +217,7 @@ const (
 	WorkerControl_ControlMachineExecution_FullMethodName               = "/cozy.worker.v1.WorkerControl/ControlMachineExecution"
 	WorkerControl_CollectMachineExecution_FullMethodName               = "/cozy.worker.v1.WorkerControl/CollectMachineExecution"
 	WorkerControl_AcknowledgeMachineExecutionCollection_FullMethodName = "/cozy.worker.v1.WorkerControl/AcknowledgeMachineExecutionCollection"
+	WorkerControl_ReadMachineExecutionTriage_FullMethodName            = "/cozy.worker.v1.WorkerControl/ReadMachineExecutionTriage"
 	WorkerControl_Control_FullMethodName                               = "/cozy.worker.v1.WorkerControl/Control"
 	WorkerControl_WatchProgress_FullMethodName                         = "/cozy.worker.v1.WorkerControl/WatchProgress"
 )
@@ -239,6 +240,9 @@ type WorkerControlClient interface {
 	ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	CollectMachineExecution(ctx context.Context, in *MachineExecutionCollect, opts ...grpc.CallOption) (*AttemptOutcome, error)
 	AcknowledgeMachineExecutionCollection(ctx context.Context, in *MachineExecutionCollectionAck, opts ...grpc.CallOption) (*MachineExecutionState, error)
+	// Capability supports_machine_execution_triage. The triage bundle one terminal attempt's
+	// outcome names, read over the same authenticated seam as the outcome.
+	ReadMachineExecutionTriage(ctx context.Context, in *MachineExecutionTriageQuery, opts ...grpc.CallOption) (*MachineExecutionTriage, error)
 	// Durable control: the RecordOwner's request stream carries RecordOwnerFrames, the worker's
 	// response stream carries WorkerFrames. Durable messages are never shed to backpressure.
 	// Outcome authority lives only here. gRPC orders each DIRECTION independently — there is no
@@ -330,6 +334,16 @@ func (c *workerControlClient) AcknowledgeMachineExecutionCollection(ctx context.
 	return out, nil
 }
 
+func (c *workerControlClient) ReadMachineExecutionTriage(ctx context.Context, in *MachineExecutionTriageQuery, opts ...grpc.CallOption) (*MachineExecutionTriage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionTriage)
+	err := c.cc.Invoke(ctx, WorkerControl_ReadMachineExecutionTriage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *workerControlClient) Control(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[RecordOwnerFrame, WorkerFrame], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &WorkerControl_ServiceDesc.Streams[0], WorkerControl_Control_FullMethodName, cOpts...)
@@ -380,6 +394,9 @@ type WorkerControlServer interface {
 	ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error)
 	CollectMachineExecution(context.Context, *MachineExecutionCollect) (*AttemptOutcome, error)
 	AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error)
+	// Capability supports_machine_execution_triage. The triage bundle one terminal attempt's
+	// outcome names, read over the same authenticated seam as the outcome.
+	ReadMachineExecutionTriage(context.Context, *MachineExecutionTriageQuery) (*MachineExecutionTriage, error)
 	// Durable control: the RecordOwner's request stream carries RecordOwnerFrames, the worker's
 	// response stream carries WorkerFrames. Durable messages are never shed to backpressure.
 	// Outcome authority lives only here. gRPC orders each DIRECTION independently — there is no
@@ -421,6 +438,9 @@ func (UnimplementedWorkerControlServer) CollectMachineExecution(context.Context,
 }
 func (UnimplementedWorkerControlServer) AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error) {
 	return nil, status.Error(codes.Unimplemented, "method AcknowledgeMachineExecutionCollection not implemented")
+}
+func (UnimplementedWorkerControlServer) ReadMachineExecutionTriage(context.Context, *MachineExecutionTriageQuery) (*MachineExecutionTriage, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReadMachineExecutionTriage not implemented")
 }
 func (UnimplementedWorkerControlServer) Control(grpc.BidiStreamingServer[RecordOwnerFrame, WorkerFrame]) error {
 	return status.Error(codes.Unimplemented, "method Control not implemented")
@@ -575,6 +595,24 @@ func _WorkerControl_AcknowledgeMachineExecutionCollection_Handler(srv interface{
 	return interceptor(ctx, in, info, handler)
 }
 
+func _WorkerControl_ReadMachineExecutionTriage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionTriageQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerControlServer).ReadMachineExecutionTriage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerControl_ReadMachineExecutionTriage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerControlServer).ReadMachineExecutionTriage(ctx, req.(*MachineExecutionTriageQuery))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _WorkerControl_Control_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(WorkerControlServer).Control(&grpc.GenericServerStream[RecordOwnerFrame, WorkerFrame]{ServerStream: stream})
 }
@@ -627,6 +665,10 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AcknowledgeMachineExecutionCollection",
 			Handler:    _WorkerControl_AcknowledgeMachineExecutionCollection_Handler,
+		},
+		{
+			MethodName: "ReadMachineExecutionTriage",
+			Handler:    _WorkerControl_ReadMachineExecutionTriage_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
@@ -1955,6 +1997,7 @@ const (
 	PodHost_ControlMachineExecution_FullMethodName               = "/cozy.worker.v1.PodHost/ControlMachineExecution"
 	PodHost_CollectMachineExecution_FullMethodName               = "/cozy.worker.v1.PodHost/CollectMachineExecution"
 	PodHost_AcknowledgeMachineExecutionCollection_FullMethodName = "/cozy.worker.v1.PodHost/AcknowledgeMachineExecutionCollection"
+	PodHost_ReadMachineExecutionTriage_FullMethodName            = "/cozy.worker.v1.PodHost/ReadMachineExecutionTriage"
 	PodHost_ProtocolInfo_FullMethodName                          = "/cozy.worker.v1.PodHost/ProtocolInfo"
 	PodHost_NumericalEnvironment_FullMethodName                  = "/cozy.worker.v1.PodHost/NumericalEnvironment"
 	PodHost_PreparePackageSet_FullMethodName                     = "/cozy.worker.v1.PodHost/PreparePackageSet"
@@ -2011,7 +2054,7 @@ const (
 // terminal status, or REPLAYED) or attaches to the operation still in flight. Progress is the
 // owner's observed signal; no lane needs a wall-clock guess.
 //
-// Locally PodHost is not a service: the daemon calls the same host functions in-process.
+// A local machine runs the same Host and serves the same PodHost; only the dial address differs.
 // ---------------------------------------------------------------------------
 type PodHostClient interface {
 	// Explicit owner action only. Connection traffic and status reads do not renew idle time.
@@ -2024,6 +2067,8 @@ type PodHostClient interface {
 	ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	CollectMachineExecution(ctx context.Context, in *MachineExecutionCollect, opts ...grpc.CallOption) (*AttemptOutcome, error)
 	AcknowledgeMachineExecutionCollection(ctx context.Context, in *MachineExecutionCollectionAck, opts ...grpc.CallOption) (*MachineExecutionState, error)
+	// Authenticated forwarding only; Runtime holds the bundle bytes.
+	ReadMachineExecutionTriage(ctx context.Context, in *MachineExecutionTriageQuery, opts ...grpc.CallOption) (*MachineExecutionTriage, error)
 	// Static, read-only compatibility probe over the existing pinned TLS connection.
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(ctx context.Context, in *ProtocolInfoRequest, opts ...grpc.CallOption) (*ProtocolInfoResult, error)
@@ -2138,6 +2183,16 @@ func (c *podHostClient) AcknowledgeMachineExecutionCollection(ctx context.Contex
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MachineExecutionState)
 	err := c.cc.Invoke(ctx, PodHost_AcknowledgeMachineExecutionCollection_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *podHostClient) ReadMachineExecutionTriage(ctx context.Context, in *MachineExecutionTriageQuery, opts ...grpc.CallOption) (*MachineExecutionTriage, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MachineExecutionTriage)
+	err := c.cc.Invoke(ctx, PodHost_ReadMachineExecutionTriage_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2510,7 +2565,7 @@ func (c *podHostClient) WeightsIntentReady(ctx context.Context, in *WeightsInten
 // terminal status, or REPLAYED) or attaches to the operation still in flight. Progress is the
 // owner's observed signal; no lane needs a wall-clock guess.
 //
-// Locally PodHost is not a service: the daemon calls the same host functions in-process.
+// A local machine runs the same Host and serves the same PodHost; only the dial address differs.
 // ---------------------------------------------------------------------------
 type PodHostServer interface {
 	// Explicit owner action only. Connection traffic and status reads do not renew idle time.
@@ -2523,6 +2578,8 @@ type PodHostServer interface {
 	ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error)
 	CollectMachineExecution(context.Context, *MachineExecutionCollect) (*AttemptOutcome, error)
 	AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error)
+	// Authenticated forwarding only; Runtime holds the bundle bytes.
+	ReadMachineExecutionTriage(context.Context, *MachineExecutionTriageQuery) (*MachineExecutionTriage, error)
 	// Static, read-only compatibility probe over the existing pinned TLS connection.
 	// The Host forwards its actual Runtime's loopback result; it does not guess a version.
 	ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error)
@@ -2586,6 +2643,9 @@ func (UnimplementedPodHostServer) CollectMachineExecution(context.Context, *Mach
 }
 func (UnimplementedPodHostServer) AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error) {
 	return nil, status.Error(codes.Unimplemented, "method AcknowledgeMachineExecutionCollection not implemented")
+}
+func (UnimplementedPodHostServer) ReadMachineExecutionTriage(context.Context, *MachineExecutionTriageQuery) (*MachineExecutionTriage, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReadMachineExecutionTriage not implemented")
 }
 func (UnimplementedPodHostServer) ProtocolInfo(context.Context, *ProtocolInfoRequest) (*ProtocolInfoResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProtocolInfo not implemented")
@@ -2829,6 +2889,24 @@ func _PodHost_AcknowledgeMachineExecutionCollection_Handler(srv interface{}, ctx
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PodHostServer).AcknowledgeMachineExecutionCollection(ctx, req.(*MachineExecutionCollectionAck))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PodHost_ReadMachineExecutionTriage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MachineExecutionTriageQuery)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).ReadMachineExecutionTriage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_ReadMachineExecutionTriage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).ReadMachineExecutionTriage(ctx, req.(*MachineExecutionTriageQuery))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3286,6 +3364,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AcknowledgeMachineExecutionCollection",
 			Handler:    _PodHost_AcknowledgeMachineExecutionCollection_Handler,
+		},
+		{
+			MethodName: "ReadMachineExecutionTriage",
+			Handler:    _PodHost_ReadMachineExecutionTriage_Handler,
 		},
 		{
 			MethodName: "ProtocolInfo",

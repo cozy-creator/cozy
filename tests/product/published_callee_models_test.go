@@ -133,9 +133,15 @@ type calleeFacts struct {
 // org index. The callee's `generate` entrypoint holds the ladder's model slot.
 func publishCalleeRelease(t *testing.T, h *ladderHub) map[string]calleeFacts {
 	t.Helper()
+	return publishCalleeReleaseOf(t, h, `{"application":"h3:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[],"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+}
+
+// publishCalleeReleaseOf publishes the same pair with the root's own interface.
+func publishCalleeReleaseOf(t *testing.T, h *ladderHub, root string) map[string]calleeFacts {
+	t.Helper()
 	childWheel := []byte("child wheel")
 	childDigest := strings.TrimPrefix(mustSpell(childWheel), "sha256:")
-	rootIface, err := canonical.NormalizeJCS([]byte(`{"application":"h3:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[],"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`))
+	rootIface, err := canonical.NormalizeJCS([]byte(root))
 	must(t, err)
 	childIface, err := canonical.NormalizeJCS([]byte(`{"application":"child:app","entrypoints":[{"invocable":{"context":"ctx","defaults":{},"enum_members":{},"export":"generate","module":"child","parameters":["steps"],"type_names":{}},"models":[{"class":"H3","component_use":{"condition_text":["text_encoder"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"]},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`))
 	must(t, err)
