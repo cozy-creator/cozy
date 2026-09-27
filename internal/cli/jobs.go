@@ -94,7 +94,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		return e
 	}
 
-	selectedRental, e := requestedRental(ctx, target, job.Name)
+	selectedRental, e := requestedRental(ctx)
 	if e != nil {
 		return e
 	}

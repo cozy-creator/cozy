@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The pod host's REFUSED event for run 862's failure, as the host now composes it: the
@@ -19,13 +18,12 @@ const refusedWheel = "runtime compatibility check failed (Internal): StorageRefu
 	"locked wheel torch-2.14.0-cp312-cp312-manylinux_2_28_x86_64.whl: fetch sha256:ab12: " +
 	"ended at 0 of 851640832 bytes: transfer interrupted: unexpected EOF"
 
-// A rented run whose machine preparation Runtime refuses fails before any attempt, and
-// `cozy run list` and `cozy run watch` both carry the refusal's own code and message.
+// A rented run whose release its machine cannot prepare fails before any attempt, and
+// `cozy run list` and `cozy run watch` both carry the machine's own refusal.
 func TestMachinePrepareRefusalReachesRunListAndWatch(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
-	pod := &fakePod{machine: &runtimeMachine{}, deviceCount: 4, refusePrepare: map[string]*pb.PrepareEvent{
-		ladderPackage: {SafeCode: "wheel_download_failed", SafeDetail: refusedWheel}}}
+	pod := &fakePod{machine: &runtimeMachine{refusal: "wheel_download_failed: " + refusedWheel}, deviceCount: 4}
 	root, _ := rentedLadderMachine(t, h, pod, nil)
 	runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json")
 
@@ -47,12 +45,11 @@ func TestMachinePrepareRefusalReachesRunListAndWatch(t *testing.T) {
 		run = page.Invocations[0]
 		return run.Status == "failed"
 	})
-	if run.ErrorType != "machine_execution.prepare_refused" || run.ErrorCode != "wheel_download_failed" ||
-		run.Error != "wheel_download_failed: "+refusedWheel {
+	if run.ErrorType != "machine_execution.refused" || !strings.Contains(run.Error, "wheel_download_failed: "+refusedWheel) {
 		t.Fatalf("listed failure lost its cause: %+v", run)
 	}
 	code, out := runCozy(t, root, "run", "list", "--no-watch")
-	if code != 0 || !strings.Contains(out, "wheel_download_failed: runtime compatibility check failed (Internal)") {
+	if code != 0 || !strings.Contains(out, "Runtime refused machine execution: wheel_download_failed") {
 		t.Fatalf("human run list shows no reason [%d]:\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "run", "watch", strconv.FormatInt(run.Number, 10), "--json")
@@ -67,8 +64,8 @@ func TestMachinePrepareRefusalReachesRunListAndWatch(t *testing.T) {
 		t.Fatalf("run watch --json of a failed run [%d]: %s", code, out)
 	}
 	details := watched.Error.Details
-	if watched.Error.Code != "failed" || details["error_code"] != "wheel_download_failed" ||
-		details["error_type"] != "machine_execution.prepare_refused" || run.ID == "" || details["request_id"] != run.ID ||
+	if watched.Error.Code != "failed" ||
+		details["error_type"] != "machine_execution.refused" || run.ID == "" || details["request_id"] != run.ID ||
 		details["number"] != float64(run.Number) || details["error"] != run.Error ||
 		!strings.Contains(watched.Error.Message, refusedWheel) {
 		t.Fatalf("run watch --json lost the typed failure: %s", out)

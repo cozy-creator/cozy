@@ -20,22 +20,25 @@ import (
 // series, and which ranks ran it. Every fact comes from the daemon's records (durable
 // events and the kept triage bundle); JSON also carries both sources whole.
 type runReport struct {
-	Number      int64               `json:"number"`
-	RequestID   string              `json:"request_id"`
-	Status      string              `json:"status"`
-	Target      string              `json:"target"`
-	Machine     string              `json:"machine,omitempty"`
-	CreatedAt   string              `json:"created_at"`
-	QueuedMS    int64               `json:"queued_ms"`
-	ExecutionMS int64               `json:"execution_ms"`
-	WallMS      int64               `json:"wall_ms,omitempty"`
-	Waiting     string              `json:"waiting,omitempty"`
-	Stages      []reportStage       `json:"stages"`
-	Steps       []reportSteps       `json:"steps,omitempty"`
-	Degree      int                 `json:"degree,omitempty"`
-	Ranks       []reportRank        `json:"ranks,omitempty"`
-	Events      []api.EvidenceEvent `json:"events"`
-	Triage      json.RawMessage     `json:"triage,omitempty"`
+	Number      int64         `json:"number"`
+	RequestID   string        `json:"request_id"`
+	Status      string        `json:"status"`
+	Target      string        `json:"target"`
+	Machine     string        `json:"machine,omitempty"`
+	CreatedAt   string        `json:"created_at"`
+	QueuedMS    int64         `json:"queued_ms"`
+	ExecutionMS int64         `json:"execution_ms"`
+	WallMS      int64         `json:"wall_ms,omitempty"`
+	Waiting     string        `json:"waiting,omitempty"`
+	Stages      []reportStage `json:"stages"`
+	Steps       []reportSteps `json:"steps,omitempty"`
+	Degree      int           `json:"degree,omitempty"`
+	Ranks       []reportRank  `json:"ranks,omitempty"`
+	// Resolved is what the machine installed and which checkpoint each Model slot ran: the
+	// run's reproducible identity, recorded by the machine that chose it.
+	Resolved map[string]any      `json:"resolved,omitempty"`
+	Events   []api.EvidenceEvent `json:"events"`
+	Triage   json.RawMessage     `json:"triage,omitempty"`
 }
 
 type reportStage struct {
@@ -167,6 +170,8 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				at, _ := time.Parse(time.RFC3339Nano, event.At)
 				report.Stages[index].MS = float64(at.UnixMilli() - report.Stages[index].StartUnixMS)
 			}
+		case "machine.resolved":
+			report.Resolved = event.Payload
 		case "request.preparing":
 			report.Stages = append(report.Stages, preparingStage(event.Payload))
 		case "request.log":
@@ -230,7 +235,7 @@ func preparingStage(payload map[string]any) reportStage {
 	stage, _ := payload["stage"].(string)
 	name := map[string]string{"resolved": "resolve", "downloading": "download",
 		"preparing": "package environment", "connect": "machine connection",
-		"package_preparation": "package preparation", "model_defaults": "model defaults",
+		"package_preparation": "package preparation", "machine": "machine preparation",
 		"inputs": "input staging", "submit": "submission"}[stage]
 	if name == "" {
 		name = stage

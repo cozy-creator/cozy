@@ -3,6 +3,7 @@ package cli
 import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -20,6 +21,20 @@ func (r *Resolver) capturedResultInterface(request records.Request) (*launch.Pac
 	}
 	var submission pb.MachineExecutionSubmit
 	var capture pb.MachineExecutionCapture
+	if link != nil && proto.Unmarshal(link.Submission, &submission) == nil && submission.ReleaseRoot != nil {
+		// The machine installed the committed release, whose interface is its hub document.
+		ref, problem := hub.ParseRef(submission.ReleaseRoot.Package)
+		if problem != nil {
+			return nil, problem
+		}
+		ctx, cancel := hub.Context()
+		defer cancel()
+		detail, problem := r.catalog(request.Hub).PackageRelease(ctx, ref, submission.ReleaseRoot.Release)
+		if problem != nil {
+			return nil, problem
+		}
+		return launch.DecodePackageInterface(detail.PackageInterface)
+	}
 	if link == nil || proto.Unmarshal(link.Submission, &submission) != nil || canonical.Unmarshal(submission.CaptureCanonicalBytes, &capture) != nil {
 		return nil, exit.New(exit.Conflict, "accepted execution metadata is unavailable")
 	}

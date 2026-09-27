@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -432,6 +433,18 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	}
 	models = append([]orchestrator.ModelRef(nil), models...)
 	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
+	if choices(models) {
+		// The machine that runs the call resolves its slots; the caller's own choices ride.
+		for _, model := range models {
+			if model.Package != pkg || !slices.ContainsFunc(entrypoint.Models, func(slot launch.Slot) bool { return slot.Path == model.Slot }) {
+				return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+					"model selection does not bind a slot of %s", function)
+			}
+		}
+		return orchestrator.LogicalPackage{Package: pkg, Release: release, Function: function,
+			Outputs: launch.AssetPaths(entrypoint.Result), Models: models,
+			NeedsAccelerator: launch.AcceleratorRequired(requirements)}, entrypoint, nil
+	}
 	if len(models) != len(entrypoint.Models) {
 		return empty, nil, exit.Named(exit.Validation, "rental.model_selection_incomplete",
 			"%s requires exactly one model for each of its %d slots", function, len(entrypoint.Models))
@@ -510,6 +523,16 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 		Function: function, Outputs: launch.AssetPaths(entrypoint.Result), PlanID: planID,
 		Models: models, NeedsAccelerator: launch.AcceleratorRequired(requirements),
 	}, entrypoint, nil
+}
+
+// choices answers whether every selection is the caller's own, left to the machine.
+func choices(models []orchestrator.ModelRef) bool {
+	for _, model := range models {
+		if !model.Choice {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,

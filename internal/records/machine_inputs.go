@@ -130,3 +130,12 @@ func (s *Store) RecordMachineInput(request string, input MachineInput, result *p
 	}
 	return nil
 }
+
+// MachineInputSent answers whether a machine already took an input with this manifest,
+// so its bytes may be withheld and the machine asked to reuse the ones it holds.
+func (s *Store) MachineInputSent(machine, manifest string) bool {
+	var found int
+	return s.db.QueryRow(`SELECT 1 FROM request_events e JOIN machine_executions x ON x.request_id=e.request_id
+ WHERE x.machine_id=? AND e.type='machine.input' AND json_extract(e.payload,'$.manifest.digest')=?
+ AND json_extract(e.payload,'$.receipt') IS NOT NULL LIMIT 1`, machine, manifest).Scan(&found) == nil
+}

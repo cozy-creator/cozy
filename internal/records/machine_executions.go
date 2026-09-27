@@ -239,11 +239,14 @@ func MachineSubmissionID(idemKey string) string {
 // A connection error thereafter is ambiguous acceptance, never permission to mint
 // another submission identity or start a local attempt.
 func (s *Store) RecordMachineSubmission(id string, submission *pb.MachineExecutionSubmit) *exit.Error {
+	// A root named by its release carries no capture or invocation: the machine mints them.
+	minted := submission != nil && submission.ReleaseRoot != nil && len(submission.CaptureCanonicalBytes) == 0 &&
+		submission.Offer != nil && len(submission.Offer.InvocationSpecCanonicalBytes) == 0
 	if submission == nil || submission.Offer == nil || submission.Offer.RequestId != id ||
 		!machineSubmissionGrammar.MatchString(submission.SubmissionId) ||
 		submission.ExpectedExecutionWorkspaceId == "" || len(submission.ExpectedExecutionWorkspaceId) > 256 ||
-		len(submission.CaptureDigest) != 32 || !bytes.Equal(canonical.Digest(submission.CaptureCanonicalBytes), submission.CaptureDigest) ||
-		len(submission.Offer.InvocationSpecDigest) != 32 || !bytes.Equal(canonical.Digest(submission.Offer.InvocationSpecCanonicalBytes), submission.Offer.InvocationSpecDigest) {
+		!minted && (len(submission.CaptureDigest) != 32 || !bytes.Equal(canonical.Digest(submission.CaptureCanonicalBytes), submission.CaptureDigest) ||
+			len(submission.Offer.InvocationSpecDigest) != 32 || !bytes.Equal(canonical.Digest(submission.Offer.InvocationSpecCanonicalBytes), submission.Offer.InvocationSpecDigest)) {
 		return exit.New(exit.Validation, "machine submission identity is incomplete")
 	}
 	value := proto.Clone(submission).(*pb.MachineExecutionSubmit)
@@ -281,8 +284,10 @@ func (s *Store) AcceptMachineExecution(id string, receipt *pb.MachineExecutionRe
 	var submission pb.MachineExecutionSubmit
 	if proto.Unmarshal(link.Submission, &submission) != nil || submission.Offer == nil ||
 		submission.ExpectedExecutionWorkspaceId != "" && receipt.ExecutionWorkspaceId != submission.ExpectedExecutionWorkspaceId ||
-		receipt.SubmissionId != submission.SubmissionId || !bytes.Equal(receipt.CaptureDigest, submission.CaptureDigest) ||
-		!bytes.Equal(receipt.InvocationSpecDigest, submission.Offer.InvocationSpecDigest) ||
+		receipt.SubmissionId != submission.SubmissionId ||
+		submission.ReleaseRoot == nil && (!bytes.Equal(receipt.CaptureDigest, submission.CaptureDigest) ||
+			!bytes.Equal(receipt.InvocationSpecDigest, submission.Offer.InvocationSpecDigest)) ||
+		submission.ReleaseRoot != nil && (len(receipt.CaptureDigest) != 32 || len(receipt.InvocationSpecDigest) != 32) ||
 		receipt.PublicationAuthorizationId != submission.PublicationAuthorizationId {
 		return exit.New(exit.Conflict, "machine accepted a different capture or invocation")
 	}

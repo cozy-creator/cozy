@@ -8,7 +8,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 )
 
-func requestedRental(ctx *Context, target Target, function string) (string, *exit.Error) {
+func requestedRental(ctx *Context) (string, *exit.Error) {
 	name := strings.TrimSpace(ctx.Inv.Value("--rental"))
 	if name == "" {
 		return "", nil
@@ -34,13 +34,7 @@ func requestedRental(ctx *Context, target Target, function string) (string, *exi
 	if selected.Row == nil || records.RentalTerminalState(selected.Row.State) {
 		return "", exit.Named(exit.NotFound, "rental.selection_unavailable", "--rental=%s does not name an existing usable rental", name)
 	}
-	constraints, problem := RentalConstraints(ctx, records.Request{Package: target.Package, Release: target.Release, InstallID: target.InstallID, Entrypoint: function})
-	if problem != nil {
-		return "", problem
-	}
-	if problem := rentalCompatibility(ctx, selected.RentalID, constraints); problem != nil {
-		return "", problem
-	}
+	// A named rental is where the call goes. What it cannot run, its machine refuses.
 	return selected.RentalID, nil
 }
 

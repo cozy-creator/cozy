@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"time"
 )
 
@@ -22,8 +21,4 @@ func preparedDetail(pkg, release string, prepared *publishedPreparation) string 
 		detail += ", reused the machine's preparation"
 	}
 	return detail
-}
-
-func modelDefaultsDetail(rungs, probes int) string {
-	return fmt.Sprintf("%d rung(s), %d checkpoint probe(s)", rungs, probes)
 }

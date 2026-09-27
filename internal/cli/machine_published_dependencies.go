@@ -117,13 +117,8 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 	sort.Slice(capture.InstalledPackages, func(i, j int) bool {
 		return capture.InstalledPackages[i].InstallationId < capture.InstalledPackages[j].InstallationId
 	})
-	// Every installation's defaults, the root's included, are recorded once the entire
-	// binding inventory exists, probing each exact checkpoint once for the capture.
-	began, reads := time.Now(), modelDefaultReads{}
-	for key, node := range nodes {
-		m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.installationID, node.iface, request, connection.publicOrigin, reads)
-	}
-	m.submissionStage(request.ID, "model_defaults", modelDefaultsDetail(capturedRungs(capture), len(reads)), began)
+	// A callee's omitted Model is resolved by the machine at this origin when called.
+	capture.CatalogOrigin = connection.publicOrigin
 	return nil
 }
 

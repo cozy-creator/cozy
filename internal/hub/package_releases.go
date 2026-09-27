@@ -259,7 +259,14 @@ func (c *Client) YankPackageRelease(ctx context.Context, ref Ref, release, reaso
 func (c *Client) PackageRelease(ctx context.Context, ref Ref,
 	release string) (PackageReleaseDetail, *exit.Error) {
 	var out PackageReleaseDetail
+	kept := c.releaseCachePath("release", ref, release, "")
+	if loadRelease(kept, &out) && out.Release.Release == release {
+		return out, nil
+	}
 	e := c.do(ctx, call{method: http.MethodGet, path: packageReleasePath(ref, release), responseBytes: 16 << 20}, &out)
+	if e == nil && out.Release.Release == release {
+		storeRelease(kept, out)
+	}
 	return out, e
 }
 
@@ -273,6 +280,10 @@ func (c *Client) PackageSourceArchive(ctx context.Context, ref Ref, release stri
 
 func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string, pythonVersion ...string) (PackageDownloadPlan, *exit.Error) {
 	var out PackageDownloadPlan
+	kept := c.releaseCachePath("downloads", ref, release, strings.Join(pythonVersion, ","))
+	if loadRelease(kept, &out) && out.Release == release && len(out.Downloads) > 0 {
+		return out, nil
+	}
 	query := url.Values{}
 	if release != "" {
 		query.Set("release", release)
@@ -290,6 +301,13 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string, 
 	if e == nil && len(out.Downloads) == 0 {
 		e = exit.Named(exit.Structural, "hub.package_download_plan_invalid",
 			"Tensorhub returned no package wheel downloads")
+	}
+	if e == nil && out.Release == release {
+		// The wheel URLs are short-lived capabilities no caller reads; the facts are kept.
+		for i := range out.Downloads {
+			out.Downloads[i].URL = ""
+		}
+		storeRelease(kept, out)
 	}
 	return out, e
 }

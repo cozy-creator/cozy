@@ -39,10 +39,6 @@ func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machin
 	return &machineConnection{Machine: machine, runs: m, installed: map[string]*pb.InstalledPackage{}, placements: map[string]*pb.DesiredPlacementSet{}}, nil
 }
 
-func (c *machineConnection) modelDefaultOrigin(ctx context.Context) (string, *exit.Error) {
-	return c.PublicOrigin(ctx)
-}
-
 func (c *machineConnection) preparePublished(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 	ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
 	facts, problem := c.PrepareFacts(ctx, ref)

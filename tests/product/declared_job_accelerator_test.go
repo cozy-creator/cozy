@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -15,8 +14,8 @@ import (
 // accelerator-class, so the pure-CPU conversions sdxl `prepare`/`fp8` and anima `fp8` read
 // excluded:wrong_class on the owner's CPU pod. A job's own `accelerator` declaration decides
 // its class. The package here names torch, binds its serving slot, and declares one CPU and
-// one GPU conversion of the same shape; each is run on the owner's named CPU rental through
-// the real binary and daemon against the stand-in hub.
+// one GPU conversion of the same shape; each is sent to the owner's named CPU rental through
+// the real binary and daemon against the stand-in hub, which buys nothing.
 func TestDeclaredJobAcceleratorDecidesTheRentalClass(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
@@ -61,29 +60,23 @@ func TestDeclaredJobAcceleratorDecidesTheRentalClass(t *testing.T) {
 		return row
 	}
 
+	// A named rental is where each job goes; what the machine cannot run, it refuses. Each
+	// job's own declaration still decides its class.
 	converted := run("lane", "declared-cpu")
-	waitFor(t, root, "the CPU job pinned", func() bool {
+	tables := run("tables", "declared-gpu")
+	waitFor(t, root, "both jobs pinned to the named rental", func() bool {
 		converted, problem = store.RequestByIdempotencyKey("declared-cpu")
-		return problem == nil && converted.Worker != "" && len(placementEvents(t, store, converted.ID)) > 0
+		if problem != nil || converted == nil {
+			return false
+		}
+		tables, problem = store.RequestByIdempotencyKey("declared-gpu")
+		return problem == nil && tables != nil && converted.Worker != "" && tables.Worker != ""
 	})
 	if converted.NeedsAccelerator || converted.Worker != "pr-karam" {
 		t.Fatalf("the CPU-declared job went to %q (accelerator %v)", converted.Worker, converted.NeedsAccelerator)
 	}
-	if verdict := candidateVerdicts(lastPlacement(t, store, converted.ID))["karam"]; verdict != "chosen" {
-		t.Fatalf("the CPU rental read %q for a CPU-declared job", verdict)
-	}
-
-	tables := run("tables", "declared-gpu")
-	waitFor(t, root, "the GPU job refused", func() bool {
-		tables, problem = store.RequestByIdempotencyKey("declared-gpu")
-		return problem == nil && records.Settled(tables.State) && len(placementEvents(t, store, tables.ID)) > 0
-	})
-	if !tables.NeedsAccelerator || tables.Worker != "" {
-		t.Fatalf("the GPU-declared job was placed on %q (accelerator %v)", tables.Worker, tables.NeedsAccelerator)
-	}
-	want := orchestrator.VerdictExcluded + orchestrator.ExcludedWrongClass
-	if verdict := candidateVerdicts(lastPlacement(t, store, tables.ID))["karam"]; verdict != want {
-		t.Fatalf("the CPU rental read %q for a GPU-declared job; want %s", verdict, want)
+	if !tables.NeedsAccelerator || tables.Worker != "pr-karam" {
+		t.Fatalf("the GPU-declared job went to %q (accelerator %v)", tables.Worker, tables.NeedsAccelerator)
 	}
 	if asks := h.postedSKUs(); len(asks) != 0 {
 		t.Fatalf("a named rental bought %v", asks)

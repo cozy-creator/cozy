@@ -686,11 +686,15 @@ func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
 	_, problem = store.Activate(install)
 	fatal(t, problem)
 	store.Close()
+	// The machine resolves the call's Models; the release it runs is read from the hub the
+	// install came from, never from the current one.
 	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")
-	if _, asked := askedA.Load("proof/alpha/bindings"); !asked {
-		t.Fatalf("the install's hub was not asked for its bindings: %d %s", code, out)
+	if _, asked := askedA.Load("proof/alpha/releases/1.0.0"); !asked {
+		t.Fatalf("the install's hub was not asked for its release: %d %s", code, out)
 	}
-	if _, crossed := askedB.Load("proof/alpha/bindings"); crossed {
+	crossed := false
+	askedB.Range(func(key, _ any) bool { crossed = crossed || strings.HasPrefix(key.(string), "proof/alpha"); return true })
+	if crossed {
 		t.Fatal("the current hub was asked for another hub's install")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -112,6 +113,9 @@ func TestRemoteReleaseSharesSlotsOfOneConstruction(t *testing.T) {
 		detail.PackageInterface = changed
 		detail.Release.PackageInterfaceDigest = assessmentDigest(parsed.Raw)
 		detail.Release.PackageInterfaceLength = int64(len(changed))
+		// A committed release never changes, so its documents are kept; this proof
+		// republishes one in place, so it forgets them.
+		must(t, os.RemoveAll(filepath.Join(root, "releases")))
 	}
 	setInterface()
 	if got := shared(sharedFirst, unpinned); len(got) != 0 {

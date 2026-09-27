@@ -2,15 +2,19 @@ package producttest
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -18,6 +22,11 @@ import (
 // terminalMachines is Runtime on a rented pod: it accepts every submission and has already
 // run it to the terminal `finish` names for its payload.
 type terminalMachines struct {
+	// unavailable is how many submissions the transport loses before one arrives.
+	unavailable atomic.Int32
+	attempts    atomic.Int32
+	// refuse is the refusal this Runtime answers a release root of a package with.
+	refuse map[string]string
 	mu     sync.Mutex
 	finish func(payload map[string]any) *pb.AttemptOutcomeBody
 	runs   map[string]*terminalRun
@@ -35,10 +44,29 @@ func newTerminalMachines(finish func(map[string]any) *pb.AttemptOutcomeBody) *te
 }
 
 func (m *terminalMachines) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
-	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}, nil
+	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace",
+		ReleaseRoots: true, ResolvesModelDefaults: true}, nil
 }
 
-func (m *terminalMachines) SubmitMachineExecution(_ context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
+// minted is what a Runtime names a submission's capture and invocation by: the submitted
+// ones, or for a root by its release the ones it minted itself.
+func minted(submit *pb.MachineExecutionSubmit) ([]byte, []byte) {
+	if submit.ReleaseRoot == nil {
+		return submit.CaptureDigest, submit.Offer.InvocationSpecDigest
+	}
+	digest := sha256.Sum256([]byte(submit.SubmissionId))
+	return digest[:], digest[:]
+}
+
+func (m *terminalMachines) SubmitMachineExecution(ctx context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
+	m.attempts.Add(1)
+	if m.unavailable.Add(-1) >= 0 {
+		return nil, status.Error(codes.Unavailable, "Tensorhub is restarting")
+	}
+	if refusal := m.refuse[submit.GetReleaseRoot().GetPackage()]; refusal != "" {
+		_ = grpc.SetTrailer(ctx, metadata.Pairs("cozy-error-code", "execution_submission_refused"))
+		return nil, status.Error(codes.FailedPrecondition, refusal)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := submit.Offer.RequestId
@@ -52,7 +80,8 @@ func (m *terminalMachines) SubmitMachineExecution(_ context.Context, submit *pb.
 			body.RequestId = id
 		}
 		if body.InvocationSpecDigest == "" {
-			body.InvocationSpecDigest, _ = canonical.Spell(submit.Offer.InvocationSpecDigest)
+			_, invocation := minted(submit)
+			body.InvocationSpecDigest, _ = canonical.Spell(invocation)
 		}
 		body.AttemptOrdinal = 1
 		state := "succeeded"
@@ -64,8 +93,9 @@ func (m *terminalMachines) SubmitMachineExecution(_ context.Context, submit *pb.
 				ExecutionWorkspaceId: "rented-workspace", Generation: 1, AttemptOrdinal: 1, State: state}}
 		m.order = append(m.order, id)
 	}
-	return &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: submit.SubmissionId, CaptureDigest: submit.CaptureDigest,
-		InvocationSpecDigest: submit.Offer.InvocationSpecDigest, AcceptedAtMs: uint64(time.Now().UnixMilli()),
+	capture, invocation := minted(submit)
+	return &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: submit.SubmissionId, CaptureDigest: capture,
+		InvocationSpecDigest: invocation, AcceptedAtMs: uint64(time.Now().UnixMilli()),
 		WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}, nil
 }
 
@@ -101,8 +131,9 @@ func (m *terminalMachines) CollectMachineExecution(_ context.Context, collect *p
 	if err != nil {
 		return nil, err
 	}
+	_, invocation := minted(run.submit)
 	return &pb.AttemptOutcome{RequestId: collect.Execution.RequestId, AttemptOrdinal: 1,
-		InvocationSpecDigest: run.submit.Offer.InvocationSpecDigest, OutcomeId: "outcome-" + collect.Execution.RequestId,
+		InvocationSpecDigest: invocation, OutcomeId: "outcome-" + collect.Execution.RequestId,
 		OutcomeDigest: digest, OutcomeCanonicalBytes: body}, nil
 }
 

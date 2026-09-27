@@ -62,7 +62,12 @@ type machineRuns struct {
 	machines  *machines.Resolver
 	observers sync.Map // one collection/control lock per observed request
 	uploading sync.Map // retained-output uploads in progress, by operation
-	updates   *rentalRuntimeUpdates
+	// workspaces holds each machine lifetime's execution workspace (workspace); awaited
+	// names the runs whose last observation ended on the machine's next event.
+	workspaces sync.Map
+	origins    sync.Map // each machine's public catalog origin, read once
+	awaited    map[string]bool
+	updates    *rentalRuntimeUpdates
 	// ownerReads paces owner finalization reads of publications a machine cannot settle.
 	ownerReads ownerReads
 	// submitting stops each request's submission work in flight (upload, preparation,
@@ -72,7 +77,7 @@ type machineRuns struct {
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals, found *machines.Resolver) *machineRuns {
 	background, cancel := context.WithCancel(context.Background())
-	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, machines: found, running: map[string]bool{}, placed: map[string]string{}, submitting: map[string]context.CancelFunc{}}
+	return &machineRuns{ctx: background, cancel: cancel, context: ctx, layout: layout, store: store, resolver: resolver, fleet: fleet, machines: found, running: map[string]bool{}, awaited: map[string]bool{}, placed: map[string]string{}, submitting: map[string]context.CancelFunc{}}
 }
 
 func (m *machineRuns) Start(request records.Request) *exit.Error {
@@ -128,13 +133,17 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 						return
 					}
 				} else {
+					// An accepted submission is observed at once, not on the next clock.
 					problem = m.submit(*current, link)
+					m.mu.Lock()
+					m.awaited[request.ID] = problem == nil
+					m.mu.Unlock()
 				}
 			} else {
 				if link.CancelRequested {
 					problem = m.control(m.ctx, *current, "cancel", true)
 				} else {
-					problem = m.Refresh(m.ctx, *current)
+					problem = m.follow(m.ctx, *current)
 					if problem != nil && problem.ErrName() == "machine_execution.result_custody_required" {
 						return // the result stays with the machine; nothing here can collect it
 					}
@@ -158,8 +167,14 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 			}
 			// A wait that repeats itself (no machine yet, one still booting) is asked less
 			// often; anything else is observed again at once.
+			m.mu.Lock()
+			awaited := m.awaited[request.ID]
+			delete(m.awaited, request.ID)
+			m.mu.Unlock()
 			if problem != nil && problem.Message == lastError {
 				delay = min(2*delay, 5*time.Second)
+			} else if problem == nil && awaited {
+				delay = 0 // the machine answered with its next event
 			} else {
 				delay = time.Second
 			}
@@ -263,6 +278,10 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		machine := machines.Placement(request)
 		if request.Rental {
 			if machine == "" {
+				// A named rental is where the run goes: no fit is computed for it.
+				machine = request.RequestedRental
+			}
+			if machine == "" {
 				// The placement decision pins the machine and, for a model ladder, the
 				// lanes that machine takes. Runtime alone decides its devices.
 				decision, line, problem := m.fleet.acquire(request)
@@ -313,6 +332,24 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	// cancellation and release reach any peer.
 	if problem := connection.ValidateNewWork(); problem != nil {
 		return problem
+	}
+	if len(link.Submission) == 0 && releaseRoot(request) {
+		workspace, problem := m.workspace(ctx, connection)
+		if problem != nil {
+			return problem
+		}
+		built, problem := m.releaseRootSubmission(ctx, request, connection, workspace)
+		if problem != nil {
+			return problem
+		}
+		built.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
+		if built.PublicationAuthorizationId, problem = m.publicationAuthorization(ctx, request.ID, link.MachineID, connection); problem != nil {
+			return problem
+		}
+		if problem := m.store.RecordMachineSubmission(request.ID, built); problem != nil {
+			return problem
+		}
+		link.Submission, _ = proto.Marshal(built)
 	}
 	if len(link.Submission) == 0 {
 		if request, problem = m.pinToMachine(ctx, request, connection); problem != nil {
@@ -370,22 +407,15 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			for i, installed := range graph.InstalledPackages {
 				graph.InstalledPackages[i] = connection.installed[installed.InstallationId]
 			}
+			// A callee's omitted Model is resolved by the machine at this origin when called.
+			if graph.CatalogOrigin, problem = connection.PublicOrigin(ctx); problem != nil {
+				return problem
+			}
 			var encodeErr error
 			capture.Canonical, capture.Digest, encodeErr = canonical.Identity(&graph)
 			if encodeErr != nil {
 				return exit.Internalf("cannot retain worker installation metadata: %s", encodeErr)
 			}
-			origin, problem := connection.modelDefaultOrigin(ctx)
-			if problem != nil {
-				return problem
-			}
-			began := time.Now()
-			var detail string
-			capture, detail, problem = m.resolver.captureMachineModelDefaults(capture, request, origin)
-			if problem != nil {
-				return problem
-			}
-			m.submissionStage(request.ID, "model_defaults", detail, began)
 			installed := connection.installed[request.LocalInstallationID]
 			if installed == nil {
 				return exit.New(exit.Conflict, "machine root installation is unavailable")
@@ -452,7 +482,11 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 		return problem
 	}
 	began = time.Now()
-	if problem := m.sendMachineSubmission(ctx, connection, request.ID, submission); problem != nil {
+	if submission.ReleaseRoot != nil {
+		if problem := m.sendReleaseRoot(ctx, request, connection, submission); problem != nil {
+			return problem
+		}
+	} else if problem := m.sendMachineSubmission(ctx, connection, request.ID, submission); problem != nil {
 		return problem
 	}
 	m.submissionStage(request.ID, "submit", "", began)
@@ -644,7 +678,19 @@ func (m *machineRuns) runName(request records.Request) string {
 	return "run " + request.ID
 }
 
+// Refresh brings a run's record up to date for a reader. A run the observer is following
+// already is: the observer holds its machine's next event, and the reader takes the record.
 func (m *machineRuns) Refresh(parent context.Context, request records.Request) *exit.Error {
+	m.mu.Lock()
+	following := m.running[request.ID]
+	m.mu.Unlock()
+	if following {
+		return nil
+	}
+	return m.follow(parent, request)
+}
+
+func (m *machineRuns) follow(parent context.Context, request records.Request) *exit.Error {
 	ctx, done := m.observation(request.ID).observe(parent)
 	defer done()
 	problem := m.refresh(ctx, request)
@@ -763,10 +809,13 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem := m.reconcilePublications(ctx, request.ID, request.Hub, connection, query); problem != nil {
 		return problem
 	}
-	if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
-		return problem
-	}
 	if state.Collected || state.State == "canceled" || state.State != "succeeded" && state.State != "failed" {
+		if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
+			return problem
+		}
+		if !state.Collected && !machineEnded(state.State) {
+			m.awaitEvents(ctx, connection, request.ID, query, cursor)
+		}
 		return nil
 	}
 	outcome, err := connection.Host.CollectMachineExecution(ctx, &pb.MachineExecutionCollect{Execution: query, AttemptOrdinal: state.AttemptOrdinal})
@@ -851,7 +900,39 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if err != nil {
 		return machineTransport(err)
 	}
-	return m.store.ObserveMachineExecution(request.ID, collected, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, collected.Sequence)})
+	if problem := m.store.ObserveMachineExecution(request.ID, collected, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, collected.Sequence)}); problem != nil {
+		return problem
+	}
+	// The run is complete for its caller; its inputs are released after, not before.
+	return m.releaseMachineInputs(ctx, request, connection)
+}
+
+// awaitEvents holds one events read open until the machine records the next event, so the
+// observer asks again at once instead of on a clock. A control that takes the turn ends it.
+func (m *machineRuns) awaitEvents(ctx context.Context, connection *machineConnection, request string, query *pb.MachineExecutionQuery, cursor uint64) {
+	workspace, problem := m.workspace(ctx, connection)
+	if problem != nil || !workspace.EventWait {
+		return
+	}
+	if _, err := connection.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor, Limit: 1, Wait: true}); err == nil {
+		m.mu.Lock()
+		m.awaited[request] = true
+		m.mu.Unlock()
+	}
+}
+
+// workspace is the machine's execution workspace and capabilities, read once per worker
+// lifetime; a submission its journal refuses as replaced reads it again.
+func (m *machineRuns) workspace(ctx context.Context, connection *machineConnection) (*pb.MachineExecutionWorkspace, *exit.Error) {
+	key := connection.Name + "\x00" + connection.Claim.WorkerBootId
+	if held, ok := m.workspaces.Load(key); ok {
+		return held.(*pb.MachineExecutionWorkspace), nil
+	}
+	workspace, problem := currentExecutionWorkspace(ctx, connection)
+	if problem == nil {
+		m.workspaces.Store(key, workspace)
+	}
+	return workspace, problem
 }
 
 // retainedResult records, once, that an outcome's result stays with the machine because
