@@ -61,12 +61,18 @@ func TestRentedIngestNeedsNoRecipe(t *testing.T) {
 	planned := func(code int, document map[string]any) bool {
 		failure, _ := json.Marshal(document["error"])
 		return code == 0 || !strings.Contains(string(failure), "AMBIGUOUS_CLASSIFICATION") &&
-			!strings.Contains(string(failure), "model_source") && !strings.Contains(string(failure), "source_profile")
+			!strings.Contains(string(failure), "model_source") && !strings.Contains(string(failure), "source_profile") &&
+			!strings.Contains(string(failure), "slot=profile") && !strings.Contains(string(failure), "UNREGISTERED_FINGERPRINT")
 	}
 	code, document = plan(pdd, "proof/pdd", "--source-profile", "hf/minimax-h3/pdd-fl2va-bf16/1",
 		"--source-profile", "hf/minimax-h3/pdd-ref2va-bf16/1")
 	if !planned(code, document) {
 		t.Fatalf("two reviewed profiles of one source must plan one composed ingest [exit %d]: %v", code, document)
+	}
+	code, document = plan("hf://MiniMaxAI/MiniMax-H3@42ed227ee7df40d41602854ae760620d6eb651fe", "proof/h3",
+		"--source-profile", "hf/minimax-h3/native-dual-bf16/1", "--source-profile", "hf/minimax-h3/shared-bf16/1")
+	if !planned(code, document) {
+		t.Fatalf("H3's two reviewed profiles must plan one composed ingest [exit %d]: %v", code, document)
 	}
 	code, document = plan("civitai://128078", "proof/sdxl", "--source-profile", "civitai/sdxl/single-file/1")
 	if !planned(code, document) {
