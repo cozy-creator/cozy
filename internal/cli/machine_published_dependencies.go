@@ -78,8 +78,8 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 					return exit.New(exit.Conflict, "published child release changed")
 				}
 				sub := request
+				// The callee's own model selections ride its own preparation.
 				sub.Package, sub.Release, sub.InstallID = dependency.Package, dependency.Version, ""
-				sub.Models = nil
 				prepared, problem := connection.preparePublished(ctx, sub)
 				if problem != nil {
 					return problem
