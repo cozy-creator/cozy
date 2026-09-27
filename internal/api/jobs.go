@@ -249,8 +249,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec.IdemKey, spec.Hub = key, selectedHub
-	if len(sub.AllowPublish) > 0 {
-		spec.AllowPublish, e = hub.NormalizePublicationRepositories(sub.AllowPublish)
+	grants := sub.AllowPublish
+	if destination := machineDestination(spec); destination != "" {
+		// The machine publishes the job's outputs itself; the destination is its grant.
+		grants = append(append([]string(nil), grants...), destination)
+	}
+	if len(grants) > 0 {
+		spec.AllowPublish, e = hub.NormalizePublicationRepositories(grants)
 		if e != nil {
 			s.refuseTyped(w, r, e)
 			return
@@ -287,7 +292,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			spec.MachineExecutionObserver = link != nil
 		}
 	}
-	if spec.MachineExecutionObserver && (uncapturedRootBytes(spec.Assets) || len(spec.Trees) > 0 || spec.ModelTransfer != nil) {
+	if spec.MachineExecutionObserver && (uncapturedRootBytes(spec.Assets) || len(spec.Trees) > 0 || spec.ModelTransfer != nil && machineDestination(spec) == "") {
 		s.refuseTyped(w, r, exit.Named(exit.Structural, "machine_execution.inputs_not_staged", "this input shape has no machine-side staging path yet; no execution or rental was submitted"))
 		return
 	}
@@ -342,10 +347,23 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, status, handle)
 }
 
-// Installed local roots and every rented root use Runtime submission. A model
-// transfer has no machine-side staging path and stays with its own coordinator.
+// Installed local roots and every rented root use Runtime submission. A rented job
+// publishes its weights outputs to their destination from the machine. Source
+// acquisition has no machine-side staging path and stays with its own coordinator,
+// as does a local destination, which has no machine identity to publish with.
 func publishedMachineJob(spec orchestrator.Submission) bool {
-	return (spec.Rental || spec.MachineExecutionObserver) && spec.ModelTransfer == nil
+	if spec.ModelTransfer != nil {
+		return machineDestination(spec) != ""
+	}
+	return spec.Rental || spec.MachineExecutionObserver
+}
+
+// machineDestination is the repository a rented job's machine publishes its outputs to.
+func machineDestination(spec orchestrator.Submission) string {
+	if !spec.Rental || spec.ModelTransfer == nil || spec.ModelTransfer.HasAcquisition() {
+		return ""
+	}
+	return spec.ModelTransfer.Destination
 }
 
 func replayJobSubmission(sub JobSubmission,
@@ -970,7 +988,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 					}
 				}
 			}
-			if row.State == "failed" {
+			if row.State == "failed" || transfer.State == "failed" {
 				state.ErrorType, state.Error = transfer.ErrorCode, transfer.SafeError
 			}
 			// READ ONCE, WHATEVER THE STATE. The rows used to be read only while

@@ -615,7 +615,8 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 	if !runtimeOwned {
 		// Work Creator still drives replaces the worker's whole desired state, which
 		// would retire the executions Runtime owns there; it waits for those to end.
-		owed, problem := m.store.RentalHasMachineObligations(row.ID)
+		// Their collected models and files are only bytes on the pod's disk.
+		live, problem := m.store.RentalHasLiveMachineExecutions(row.ID)
 		if problem != nil {
 			return "", problem
 		}
@@ -623,7 +624,7 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 		if problem != nil {
 			return "", problem
 		}
-		if owed || retained && (!req.IsJob() || !req.RetainWork) {
+		if live || retained && (!req.IsJob() || !req.RetainWork) {
 			return orchestrator.ExcludedModeConflict, nil
 		}
 	}

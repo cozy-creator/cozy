@@ -434,8 +434,9 @@ func (s *Store) CompleteRetainedCancellation(id string) (bool, *exit.Error) {
 
 // ResumableRun makes a re-run of the same work reattach to its live or completed run on
 // any machine, or retry a stopped one that retains its work on the requested machine (""
-// is any) so it resumes from its journals; otherwise a fresh run follows. It returns the
-// key to submit and the run that key retries.
+// is any) so it resumes from its journals; otherwise a fresh run follows. A completed run
+// that never reached its destination is not complete. It returns the key to submit and
+// the run that key retries.
 func (s *Store) ResumableRun(base, machine string) (string, string, *exit.Error) {
 	key, retryOf := base, ""
 	for {
@@ -443,10 +444,18 @@ func (s *Store) ResumableRun(base, machine string) (string, string, *exit.Error)
 		if problem != nil || row == nil {
 			return key, retryOf, problem
 		}
+		unpublished := false
+		if row.State == "succeeded" && row.ModelTransfer != nil {
+			transfer, problem := s.ModelTransferOf(row.ID)
+			if problem != nil {
+				return "", "", problem
+			}
+			unpublished = transfer != nil && transfer.State == "failed"
+		}
 		switch {
 		case (machine == "" || row.Worker == machine) && s.RetainedRetryAvailable(*row):
 			key, retryOf = base+"/retry-of/"+row.ID, row.ID
-		case row.State != "succeeded" && settledRequestState(row.State),
+		case row.State != "succeeded" && settledRequestState(row.State), unpublished,
 			RetainedState(row.State) && machine != "" && row.Worker != machine:
 			key, retryOf = base+"/after/"+row.ID, ""
 		default:
