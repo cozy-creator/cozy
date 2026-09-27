@@ -44,6 +44,9 @@ const (
 	// PhaseGPUWait: Runtime accepted the execution and holds its call until the GPUs it
 	// needs are free (its gpu.wait event names the width and the roots ahead of it).
 	PhaseGPUWait = "gpu_wait"
+	// PhaseOwnerReconciliation: a sent publication's machine authorization expired, so the
+	// owner's own Hub read settles it (PhaseDetail names the publication).
+	PhaseOwnerReconciliation = "owner_reconciliation"
 )
 
 // PreparationRateMaxAge bounds the freshness of displayed transfer estimates only.

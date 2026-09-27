@@ -416,6 +416,42 @@ func (s *Store) LatestMachineProgress(requestID string, attempt int64) (map[stri
 	return value, nil
 }
 
+// AwaitingPublication is a sent checkpoint publication its machine can no longer settle:
+// the machine's publication authority stopped answering, so only the owner's Hub read can.
+type AwaitingPublication struct {
+	CallIndex   uint32 `json:"call_index"`
+	Publication string `json:"publication"`
+	Destination string `json:"destination"`
+	Code        string `json:"code"`
+}
+
+// MachinePublicationsAwaitingOwner are the execution's unresolved publications Runtime has
+// reported with no later settlement, oldest first.
+func (s *Store) MachinePublicationsAwaitingOwner(requestID string) ([]AwaitingPublication, *exit.Error) {
+	rows, err := s.db.Query(`SELECT payload FROM request_events u WHERE u.request_id=? AND u.type='machine.publication_unresolved'
+		AND NOT EXISTS(SELECT 1 FROM request_events d WHERE d.request_id=u.request_id AND d.seq>u.seq
+		AND d.type='machine.publication_settled' AND json_extract(d.payload,'$.publication')=json_extract(u.payload,'$.publication'))
+		ORDER BY u.seq`, requestID)
+	if err != nil {
+		return nil, exit.Internalf("cannot read unresolved publications for %s: %s", requestID, err)
+	}
+	defer rows.Close()
+	var out []AwaitingPublication
+	seen := map[string]bool{}
+	for rows.Next() {
+		var body string
+		var awaiting AwaitingPublication
+		if err := rows.Scan(&body); err != nil || json.Unmarshal([]byte(body), &awaiting) != nil || awaiting.Publication == "" || awaiting.Destination == "" {
+			return nil, exit.Internalf("cannot decode an unresolved publication for %s", requestID)
+		}
+		if !seen[awaiting.Publication] {
+			seen[awaiting.Publication] = true
+			out = append(out, awaiting)
+		}
+	}
+	return out, nil
+}
+
 // MachineGPUWait is the newest gpu.wait Runtime reported for this execution whose call has
 // not since been granted or released devices, or nil when nothing waits for a GPU.
 func (s *Store) MachineGPUWait(requestID string) (*MachineGPUWaiting, *exit.Error) {

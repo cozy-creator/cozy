@@ -102,6 +102,8 @@ type machineRuns struct {
 	localPID  int
 	observers sync.Map // one collection/control lock per observed request
 	updates   *rentalRuntimeUpdates
+	// ownerReads paces owner finalization reads of publications a machine cannot settle.
+	ownerReads ownerReads
 }
 
 func newMachineRuns(ctx *Context, layout home.Layout, store *records.Store, resolver *Resolver, fleet *managedRentals) *machineRuns {
@@ -129,7 +131,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 			if problem != nil || current == nil {
 				return
 			}
-			if owed, problem := m.store.MachineExecutionOwesWork(request.ID); problem != nil || !owed {
+			if owed, problem := m.machineWorkOwed(request.ID); problem != nil || !owed {
 				return
 			}
 			if current.State == "refused" {
@@ -172,13 +174,15 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				}
 				if problem == nil {
 					observed, e := m.store.MachineExecution(request.ID)
-					if e == nil && observed != nil && observed.Collected {
+					// A publication only its owner can settle keeps the execution observed.
+					awaiting, awaitingProblem := m.store.MachinePublicationsAwaitingOwner(request.ID)
+					if e == nil && observed != nil && observed.Collected && awaitingProblem == nil && len(awaiting) == 0 {
 						return
 					}
 					if e == nil && observed != nil && len(observed.PendingControl) == 0 {
 						var state pb.MachineExecutionState
 						if proto.Unmarshal(observed.ObservedState, &state) == nil && state.State == "canceled" {
-							if owed, problem := m.store.MachineExecutionOwesWork(request.ID); problem == nil && !owed {
+							if owed, problem := m.machineWorkOwed(request.ID); problem == nil && !owed {
 								return
 							}
 						}
@@ -229,7 +233,7 @@ func (m *machineRuns) Resume() {
 		return
 	}
 	for _, link := range links {
-		if link.Collected && len(link.PendingControl) == 0 {
+		if awaiting, problem := m.store.MachinePublicationsAwaitingOwner(link.RequestID); link.Collected && len(link.PendingControl) == 0 && (problem != nil || len(awaiting) == 0) {
 			continue
 		}
 		request, problem := m.store.RequestRow(link.RequestID)
@@ -237,6 +241,16 @@ func (m *machineRuns) Resume() {
 			_ = m.Start(*request)
 		}
 	}
+}
+
+// machineWorkOwed is whether the execution still owes work or custody, or holds a sent
+// publication only its owner can settle.
+func (m *machineRuns) machineWorkOwed(request string) (bool, *exit.Error) {
+	if owed, problem := m.store.MachineExecutionOwesWork(request); problem != nil || owed {
+		return owed, problem
+	}
+	awaiting, problem := m.store.MachinePublicationsAwaitingOwner(request)
+	return len(awaiting) > 0, problem
 }
 
 func (m *machineRuns) submit(request records.Request, link *records.MachineExecution) (out *exit.Error) {
@@ -711,6 +725,9 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 		if page.NextAfter >= page.HeadSequence {
 			break
 		}
+	}
+	if problem := m.reconcilePublications(ctx, request.ID, request.Hub, connection, query); problem != nil {
+		return problem
 	}
 	if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
 		return problem
