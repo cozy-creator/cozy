@@ -277,14 +277,15 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelUploadCmd struct {
-	Source         string  `arg:"" name:"source" predictor:"file-or-ref" help:"Provider source, Tensorhub model (#lane or @release/lane), local alias, or explicit local file."`
-	Ref            string  `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
-	Lane           string  `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental         *string `predictor:"rental" help:"Use this existing rental name or id; never buy a replacement."`
-	RentalOnly     bool    `help:"Require a remote rental instead of local capacity."`
-	DryRun         bool    `help:"Check conversion and metadata without transferring weights or renting."`
-	Await          bool    `help:"Watch the accepted run until it settles."`
-	IdempotencyKey string  `help:"Stable request identity for exact replay; otherwise start a new run."`
+	Source         string   `arg:"" name:"source" predictor:"file-or-ref" help:"Provider source, Tensorhub model (#lane or @release/lane), local alias, or explicit local file."`
+	Ref            string   `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
+	Lane           string   `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental         *string  `predictor:"rental" help:"Use this existing rental name or id; never buy a replacement."`
+	RentalOnly     bool     `help:"Require a remote rental instead of local capacity."`
+	DryRun         bool     `help:"Check conversion and metadata without transferring weights or renting."`
+	Await          bool     `help:"Watch the accepted run until it settles."`
+	IdempotencyKey string   `help:"Stable request identity for exact replay; otherwise a rented re-run of the same ingest reattaches or resumes."`
+	SourceProfiles []string `name:"source-profile" help:"Reviewed TensorFS source profile to convert on the rental (repeatable; several compose one model). Default: the one profile the source headers match."`
 }
 
 func (c *ModelUploadCmd) Run(r *Runtime) error {
@@ -295,7 +296,8 @@ func (c *ModelUploadCmd) Run(r *Runtime) error {
 	return r.call(handleModelUpload, []string{c.Source, c.Ref}, bools(
 		"--rental-only", c.RentalOnly,
 		"--dry-run", c.DryRun, "--await", c.Await),
-		values("--rental", rentalName, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey), false)
+		values("--rental", rentalName, "--lane", c.Lane, "--idempotency-key", c.IdempotencyKey,
+			"--source-profile", c.SourceProfiles), false)
 }
 
 type ModelPublishCmd struct {
