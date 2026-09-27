@@ -17,6 +17,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -203,6 +204,8 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 	machine := c.machineWord(w.instanceID)
 	c.mu.Unlock()
 	var stage pb.PrepareStage
+	var began time.Time
+	var last *pb.PrepareEvent
 	for {
 		event, err := stream.Recv()
 		if err != nil {
@@ -216,11 +219,13 @@ func (c *Orchestrator) runHostPrepare(s *session, w *worker, seq uint64, label s
 		}
 		c.observePrepareEvent(w.instanceID, machine, label, event)
 		if event.Stage != stage {
-			stage = event.Stage
+			c.recordPrepareStage(w.instanceID, label, stage, began, last)
+			stage, began = event.Stage, time.Now()
 			c.logf("PodHost prepare %s#%d %s (%d/%d B)", label, seq,
 				trimEnum(pb.PrepareStage_name[int32(stage)], "PREPARE_STAGE_"),
 				event.TransferredBytes, event.TotalBytes)
 		}
+		last = event
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:
 			if problem := RuntimeRequirementEvent(event); problem != nil {
@@ -528,6 +533,36 @@ func (c *Orchestrator) observePrepareEvent(instanceID, machine, label string, ev
 	sample.HasBytes = event.GetTotalBytes() > 0 || event.GetTransferredBytes() > 0
 	sample.Moved, sample.Total = event.GetTransferredBytes(), event.GetTotalBytes()
 	c.ObservePhase(instanceID, sample)
+}
+
+// recordPrepareStage makes an ENDED preparation stage durable on every request waiting on
+// this worker (`request.preparing`): when it began, how long it ran, and its final byte
+// counters. The live phase lane shows the stage while it runs; this is what remains after,
+// so a settled run still separates its download from its package-environment install.
+func (c *Orchestrator) recordPrepareStage(instanceID, label string, stage pb.PrepareStage,
+	began time.Time, last *pb.PrepareEvent) {
+	if stage == pb.PrepareStage_PREPARE_STAGE_UNSPECIFIED || last == nil {
+		return
+	}
+	payload := map[string]any{
+		"stage":           strings.ToLower(trimEnum(pb.PrepareStage_name[int32(stage)], "PREPARE_STAGE_")),
+		"label":           label,
+		"started_unix_ms": began.UnixMilli(),
+		"ms":              time.Since(began).Milliseconds(),
+	}
+	if last.GetTotalBytes() > 0 || last.GetTransferredBytes() > 0 {
+		payload["transferred_bytes"], payload["total_bytes"] = last.GetTransferredBytes(), last.GetTotalBytes()
+	}
+	var origin, cached uint64
+	for _, model := range last.GetModelProgress() {
+		origin, cached = origin+model.GetOriginBytes(), cached+model.GetCachedBytes()
+	}
+	if origin > 0 || cached > 0 {
+		payload["origin_bytes"], payload["cached_bytes"] = origin, cached
+	}
+	for _, requestID := range c.phaseAudience(instanceID) {
+		c.emit(requestID, "request.preparing", 0, payload)
+	}
 }
 
 // RuntimeRequirementTrailer preserves authenticated worker dependency facts for both preparation paths.

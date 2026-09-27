@@ -196,6 +196,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"GET /v1/requests/{id}/events":                      s.requestEvents,
 		"GET /v1/media/{media_id}":                          s.media,
 		"GET /v1/local/attempts/{attempt_key}/triage":       s.attemptTriage,
+		"GET /v1/local/requests/{id}/evidence":              s.requestEvidence,
 		"POST /v1/local/rentals/{rental_id}/keepalive":      s.keepRentalAlive,
 		"POST /v1/local/rentals/{rental_id}/claim":          s.claimRental,
 		"GET /v1/local/rentals":                             s.listRentals,
