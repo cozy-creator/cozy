@@ -20,10 +20,12 @@ split -n "r/$jobs" -d "$work/all" "$work/part."
 pids=()
 tmps=()
 trap 'rm -rf "$work" "${tmps[@]}"' EXIT
+# Background jobs of a non-interactive shell start with SIGINT ignored, and Go keeps an
+# inherited ignore; restore the default so the CLIs under test stay interruptible.
 for part in "$work"/part.*; do
   tmp="$(mktemp -d /tmp/cpXXXX)"
   tmps+=("$tmp")
-  TMPDIR="$tmp" "$work/product.test" -test.run "^($(paste -sd'|' "$part"))\$" -test.v -test.timeout 30m "$@" \
+  TMPDIR="$tmp" env --default-signal=INT "$work/product.test" -test.run "^($(paste -sd'|' "$part"))\$" -test.v -test.timeout 30m "$@" \
     > "$part.log" 2>&1 &
   pids+=("$!")
 done
