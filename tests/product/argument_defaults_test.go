@@ -17,6 +17,7 @@ func TestArgumentHelpShowsDeclaredDefaults(t *testing.T) {
 	request["fields"] = append(request["fields"].([]any),
 		map[string]any{"name": "seed", "type": map[string]any{"union": []any{"int", "null"}}, "wire": "optional"},
 		map[string]any{"name": "duration_s", "type": "int", "wire": "optional", "constraints": map[string]any{"ge": 5, "le": 15}},
+		map[string]any{"name": "frames", "type": "int", "constraints": map[string]any{"ge": 1, "le": 8}},
 		map[string]any{"name": "settings", "wire": "optional", "type": map[string]any{"fields": []any{
 			map[string]any{"name": "enabled", "type": "bool", "wire": "optional"},
 			map[string]any{"name": "count", "type": "int", "wire": "optional"},
@@ -28,7 +29,7 @@ func TestArgumentHelpShowsDeclaredDefaults(t *testing.T) {
 	}}
 	ep["invocable"] = map[string]any{
 		"context": "ctx", "module": "assets", "export": "generate",
-		"parameters": []string{"prompt", "assets", "steps", "seed", "duration_s", "settings"},
+		"parameters": []string{"prompt", "assets", "steps", "seed", "duration_s", "frames", "settings"},
 		"defaults": map[string]any{
 			"request/seed": nil, "request/duration_s": 5,
 			"request/settings/enabled": false, "request/settings/count": 0,
@@ -57,6 +58,7 @@ func TestArgumentHelpShowsDeclaredDefaults(t *testing.T) {
 				"steps: int (>=1, <=50) (optional)",
 				"seed: int|null (default = null)",
 				"duration_s: int (>=5, <=15) (default = 5)",
+				"frames: int (>=1, <=8)\n",
 				"enabled: bool (default = false)",
 				"count: int (default = 0)",
 				`label: str (default = "")`,
@@ -72,5 +74,11 @@ func TestArgumentHelpShowsDeclaredDefaults(t *testing.T) {
 				t.Errorf("argument help resolved a model: %s", out)
 			}
 		})
+	}
+	// The refusal itself names each missing field's type and bounds, for --json and API
+	// callers that never see the Arguments listing.
+	code, out := runAdmissionCLI(t, root, path, "--json", "run", ladderPackage+"/generate", "prompt=hello")
+	if code != 1 || !strings.Contains(out, "provide required arguments: [frames: int (>=1, <=8)]") {
+		t.Errorf("the --json refusal omitted the missing field's bounds [exit %d]: %s", code, out)
 	}
 }

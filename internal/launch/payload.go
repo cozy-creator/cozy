@@ -485,13 +485,13 @@ func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) *exit.
 		known[field.Name] = true
 		if field.Wire == "required" {
 			if _, ok := document[field.Name]; !ok {
-				missing = append(missing, strconv.Quote(field.Name))
+				missing = append(missing, fieldSignature(&field))
 			}
 		}
 	}
 	if len(missing) > 0 {
 		problems = append(problems, "missing required "+fieldWord(len(missing))+" "+
-			strings.Join(missing, ", "))
+			strings.Join(missing, "; "))
 	}
 	var unknown []string
 	for name := range document {
@@ -519,7 +519,7 @@ func ValidatePayload(pkg string, ep *Entrypoint, payload json.RawMessage) *exit.
 	}
 	if len(problems) > 0 {
 		if len(missing) > 0 {
-			message := "provide required arguments: [" + strings.Join(missing, ", ") + "]"
+			message := "provide required arguments: [" + strings.Join(missing, "; ") + "]"
 			if len(problems) > 1 {
 				message += "; " + strings.Join(problems[1:], "; ")
 			}

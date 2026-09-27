@@ -95,8 +95,8 @@ func TestSubmitSchemaValidation(t *testing.T) {
 	code, out = runCozy(t, root, "--json", "run", video)
 	refused := refusalOf(t, out)
 	if code != 1 || refused.Code != "request_payload_invalid" ||
-		!strings.Contains(refused.Message, `"prompt"`) ||
-		!strings.Contains(refused.Message, `"first_frame"`) ||
+		!strings.Contains(refused.Message, "prompt: str") ||
+		!strings.Contains(refused.Message, "first_frame: image asset") ||
 		refused.Remedy != usage {
 		t.Fatalf("promptless submit did not refuse typed with the usage line [exit %d]\n%s", code, out)
 	}
@@ -113,8 +113,8 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		code, out = runCozy(t, root, "--json", "run", video, spelling)
 		folded := refusalOf(t, out)
 		if code != 1 || folded.Code != "request_payload_invalid" ||
-			!strings.Contains(folded.Message, `provide required arguments: ["first_frame"]`) ||
-			strings.Contains(folded.Message, `"prompt"`) {
+			!strings.Contains(folded.Message, "provide required arguments: [first_frame: image asset") ||
+			strings.Contains(folded.Message, "prompt:") {
 			t.Fatalf("%s did not fold onto prompt [exit %d]\n%s", spelling, code, out)
 		}
 	}

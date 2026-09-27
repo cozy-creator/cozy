@@ -176,13 +176,22 @@ func writeFields(b *strings.Builder, fields []Field, indent, path string, invoca
 	for i := range fields {
 		field := &fields[i]
 		fieldPath := path + "/" + field.Name
-		b.WriteString(indent + field.Name + ": " + describePhrase(field))
+		b.WriteString(indent + fieldSignature(field))
 		b.WriteString(fieldNotes(field, fieldPath, invocable, assets))
 		b.WriteString("\n")
 		if kind, nested := typeOf(field.Type); kind == "struct" && len(indent) < 12 {
 			writeFields(b, nested.Fields, indent+"  ", fieldPath, invocable, nil)
 		}
 	}
+}
+
+// fieldSignature is one field as a person reads it: name, type and declared bounds.
+func fieldSignature(f *Field) string {
+	signature := f.Name + ": " + describePhrase(f)
+	if c := constraintPhrase(f.Constraints); c != "" {
+		signature += " " + c
+	}
+	return signature
 }
 
 // describePhrase is typePhrase with the asset spelled as a person reads it.
@@ -204,9 +213,6 @@ func describePhrase(f *Field) string {
 
 func fieldNotes(f *Field, path string, invocable *Invocable, assets *AssetsSlot) string {
 	notes := ""
-	if c := constraintPhrase(f.Constraints); c != "" {
-		notes += " " + c
-	}
 	if invocable != nil {
 		if value, ok := invocable.Defaults[path]; ok {
 			return notes + " (default = " + string(value) + ")"
