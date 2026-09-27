@@ -15,7 +15,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,6 +124,8 @@ type values struct {
 	Bootstrap                string `name:"bootstrap"`
 }
 
+// Validate refuses only an empty location. Behaviour settings were admitted per key
+// before resolution (admitBehaviour), so none of them can refuse a command.
 func (v *values) Validate() error {
 	if strings.TrimSpace(v.HubURL) == "" {
 		return fmt.Errorf("tensorhub_url must not be empty")
@@ -129,26 +133,94 @@ func (v *values) Validate() error {
 	if strings.TrimSpace(v.Tfs) == "" {
 		return fmt.Errorf("tfs must not be empty")
 	}
-	if v.LocalRateMicroUSDPerHour < 0 {
-		return fmt.Errorf("local_rate_micro_usd_per_hour must be non-negative")
-	}
-	if v.DaemonIdleShutdownS < 0 {
-		return fmt.Errorf("daemon.idle_shutdown_s must be non-negative; zero disables idle shutdown")
-	}
-	if expr := strings.TrimSpace(v.MaintenanceGCCron); expr != "" {
-		if _, err := cron.ParseStandard(expr); err != nil {
-			return fmt.Errorf("maintenance.gc_cron %q is not a five-field cron schedule: %w", expr, err)
-		}
-	}
-	switch v.PlacementPrefer {
-	case "fast", "balanced", "cheap":
-	default:
-		return fmt.Errorf("placement.prefer %q is not fast, balanced or cheap", v.PlacementPrefer)
-	}
-	if v.Port < 0 || v.Port > 65535 {
-		return fmt.Errorf("port %d is not a TCP port or zero for automatic selection", v.Port)
+	return nil
+}
+
+// behaviour names the settings that only tune how Cozy behaves, each with the check its
+// consumer needs. An unusable value is named once on stderr and the default applies;
+// locations and credentials still refuse, because a guessed location acts somewhere else.
+var behaviour = map[string]struct {
+	spelled string
+	admit   func(string) error
+}{
+	"local_rate_micro_usd_per_hour": {"local_rate_micro_usd_per_hour", nonNegative},
+	"rentals_development":           {"rentals.development", boolean},
+	"daemon_idle_shutdown_s":        {"daemon.idle_shutdown_s", nonNegative},
+	"maintenance_gc_cron":           {"maintenance.gc_cron", cronSchedule},
+	"placement_prefer":              {"placement.prefer", oneOf("fast", "balanced", "cheap")},
+	"port":                          {"port", tcpPort},
+	"yield":                         {"yield", oneOf("smart", "always", "never")},
+}
+
+func nonNegative(raw string) error {
+	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || value < 0 {
+		return fmt.Errorf("is not a non-negative integer")
 	}
 	return nil
+}
+
+func boolean(raw string) error {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true", "1", "yes", "false", "0", "no":
+		return nil
+	}
+	return fmt.Errorf("is not true or false")
+}
+
+func cronSchedule(raw string) error {
+	if expr := strings.TrimSpace(raw); expr != "" {
+		if _, err := cron.ParseStandard(expr); err != nil {
+			return fmt.Errorf("is not a five-field cron schedule")
+		}
+	}
+	return nil
+}
+
+func tcpPort(raw string) error {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value < 0 || value > 65535 {
+		return fmt.Errorf("is not a TCP port or zero for automatic selection")
+	}
+	return nil
+}
+
+func oneOf(words ...string) func(string) error {
+	return func(raw string) error {
+		if slices.Contains(words, raw) {
+			return nil
+		}
+		return fmt.Errorf("is not %s", strings.Join(words[:len(words)-1], ", ")+" or "+words[len(words)-1])
+	}
+}
+
+type unusableSetting struct {
+	name, spelled, raw, reason string
+}
+
+// admitBehaviour removes every unusable behaviour value from the file's settings so its
+// default applies, and returns what it removed.
+func admitBehaviour(file *resolver) []unusableSetting {
+	var out []unusableSetting
+	for name, setting := range behaviour {
+		value, present := file.values[name]
+		if !present {
+			continue
+		}
+		raw := fmt.Sprint(value)
+		reason := ""
+		if file.conflicting[name] {
+			reason = "is set more than once with different values"
+		} else if err := setting.admit(raw); err != nil {
+			reason = err.Error()
+		}
+		if reason != "" {
+			delete(file.values, name)
+			out = append(out, unusableSetting{name: name, spelled: setting.spelled, raw: raw, reason: reason})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].spelled < out[j].spelled })
+	return out
 }
 
 var fileKeys = map[string]bool{
@@ -231,10 +303,15 @@ func load() (Config, *exit.Error) {
 	}
 	environment, inherited := readEnvironment()
 
-	input, err := resolve(file, environment)
+	unusable := admitBehaviour(file)
+	input, defaults, err := resolve(file, environment)
 	if err != nil {
 		return Config{}, exit.Usagef("configuration is invalid: %s", err).
 			WithRemedy("check %s and the admitted COZY_/TENSORHUB_ environment values", filepath.Join(home, FileName))
+	}
+	for _, setting := range unusable {
+		fmt.Fprintf(os.Stderr, "cozy: %s: %s %q %s; using %q\n",
+			filepath.Join(home, FileName), setting.spelled, setting.raw, setting.reason, defaults[setting.name])
 	}
 	hubToken := secret.New(input.HubToken)
 	huggingFaceToken := secret.New(input.HuggingFaceToken)
@@ -284,7 +361,8 @@ func load() (Config, *exit.Error) {
 	return c, nil
 }
 
-func resolve(file, environment *resolver) (values, error) {
+// resolve assigns the typed values and returns each setting's default beside them.
+func resolve(file, environment *resolver) (values, map[string]string, error) {
 	var input values
 	parser, err := kong.New(&input,
 		kong.Name("cozy-config"),
@@ -292,12 +370,16 @@ func resolve(file, environment *resolver) (values, error) {
 		kong.Resolvers(file, environment),
 	)
 	if err != nil {
-		return values{}, fmt.Errorf("cannot construct the configuration grammar: %w", err)
+		return values{}, nil, fmt.Errorf("cannot construct the configuration grammar: %w", err)
+	}
+	defaults := map[string]string{}
+	for _, flag := range parser.Model.Flags {
+		defaults[flag.Name] = flag.Default
 	}
 	if _, err := parser.Parse(nil); err != nil {
-		return values{}, err
+		return values{}, nil, err
 	}
-	return input, nil
+	return input, defaults, nil
 }
 
 func resolveHome() (string, *exit.Error) {
@@ -358,6 +440,8 @@ type resolver struct {
 	values map[string]any
 	// ignored names keys this build does not read: retired or newer settings.
 	ignored []string
+	// conflicting names behaviour settings the file gives two different values.
+	conflicting map[string]bool
 }
 
 func (r *resolver) Resolve(_ *kong.Context, _ *kong.Path, flag *kong.Flag) (any, error) {
@@ -442,10 +526,10 @@ func digestOf(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// fileYAML accepts one flat YAML mapping. Kong remains the typed assignment and
-// validation engine. A key this build does not read — retired by an upgrade or added by
-// a newer build — is ignored and named once, so one stale line never disables every
-// command; a repeated key refuses only when its values disagree.
+// fileYAML accepts one flat YAML mapping. Kong remains the typed assignment engine. A key
+// this build does not read — retired by an upgrade or added by a newer build — is ignored
+// and named once, so one stale line never disables every command. A location or
+// credential repeated with different values refuses; a behaviour setting falls back.
 func fileYAML(reader io.Reader) (*resolver, error) {
 	decoder := yaml.NewDecoder(reader)
 	var document yaml.Node
@@ -470,12 +554,16 @@ func fileYAML(reader io.Reader) (*resolver, error) {
 		return nil, fmt.Errorf("must be one flat key-value mapping")
 	}
 
-	out := &resolver{values: make(map[string]any, len(root.Content)/2)}
+	out := &resolver{values: make(map[string]any, len(root.Content)/2), conflicting: map[string]bool{}}
 	set := func(name, spelled string, value *yaml.Node) error {
 		if value.Kind != yaml.ScalarNode {
 			return fmt.Errorf("line %d value for %q is not a scalar", value.Line, spelled)
 		}
 		if prior, exists := out.values[name]; exists && prior != value.Value {
+			if _, tuning := behaviour[name]; tuning {
+				out.conflicting[name] = true
+				return nil
+			}
 			return fmt.Errorf("line %d names %q twice with different values", value.Line, spelled)
 		}
 		out.values[name] = value.Value

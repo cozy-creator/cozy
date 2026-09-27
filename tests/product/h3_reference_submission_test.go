@@ -126,10 +126,10 @@ func submitH3Reference(t *testing.T, release string) {
 		t.Fatalf("retained request identities differ: %+v", row)
 	}
 	for i, path := range []string{image0, image1} {
-		length, digest, mime, problem := inputasset.Fingerprint(path, 64<<20)
+		facts, problem := inputasset.Fingerprint(path, 64<<20)
 		fatal(t, problem)
 		asset := row.Assets[i]
-		if asset.Digest != digest || asset.Length != length || asset.MediaType != mime || asset.LocalPath != path || asset.Order != uint32(i) {
+		if asset.Digest != facts.Digest || asset.Length != facts.Length || asset.MediaType != facts.MediaType || asset.LocalPath != path || asset.Order != uint32(i) || asset.ModTime != facts.ModTime {
 			t.Fatalf("reference image was not borrowed under its exact identity: %+v", asset)
 		}
 		fatal(t, inputasset.Verify(asset, 64<<20))

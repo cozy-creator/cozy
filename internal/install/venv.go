@@ -235,7 +235,7 @@ func runtimeScratchHome() string {
 
 // writeLockedRequirements merges the export's registry rows with the release's own exact
 // wheel pins into the ONE document Runtime's reader admits: two https index directives,
-// then hash-pinned rows sorted unique by normalized distribution.
+// then hash-pinned rows sorted by normalized distribution.
 func writeLockedRequirements(exported, target, indexURL string,
 	wheels []PublishedWheel,
 ) *exit.Error {
@@ -254,9 +254,15 @@ func writeLockedRequirements(exported, target, indexURL string,
 }
 
 // LockedRequirements renders the same exact wheel inventory for an installed
-// package or a worker-local dependency; it never resolves names or versions.
+// package or a worker-local dependency; it never resolves names or versions. A universal
+// lock forks a distribution by environment marker, so one name may repeat under different
+// markers: every such row is kept, and the installer selects the row whose marker matches
+// its target. Identical rows are one row, and the release's own wheel pins replace any
+// exported row of the same name.
 func LockedRequirements(raw []byte, indexURL string, wheels []PublishedWheel) ([]byte, *exit.Error) {
-	rows := map[string]string{}
+	type locked struct{ name, text string }
+	var rows []locked
+	seen := map[string]bool{}
 	pending := ""
 	for _, line := range strings.Split(string(raw), "\n") {
 		if strings.HasSuffix(line, "\\") {
@@ -269,32 +275,48 @@ func LockedRequirements(raw []byte, indexURL string, wheels []PublishedWheel) ([
 			continue
 		}
 		name := normalizedRequirementName(row)
-		if name == "" || rows[name] != "" {
-			return nil, exit.Internalf("the exported registry closure row %q is not one exact pin", row)
+		if name == "" {
+			return nil, exit.Internalf("the exported registry closure row %q names no distribution", row)
 		}
-		rows[name] = strings.Join(strings.Fields(row), " ")
+		text := strings.Join(strings.Fields(row), " ")
+		if !seen[text] {
+			seen[text] = true
+			rows = append(rows, locked{name, text})
+		}
 	}
-	seen := map[string]bool{}
+	own := map[string]string{}
 	for _, wheel := range wheels {
 		name := normalizedRequirementName(wheel.Distribution)
-		if name == "" || wheel.Version == "" ||
-			!strings.HasPrefix(wheel.Digest, "sha256:") || rows[name] != "" || seen[name] {
-			return nil, exit.Internalf("published wheel fact %q is incomplete or duplicated",
-				wheel.Distribution)
+		if name == "" || wheel.Version == "" || !strings.HasPrefix(wheel.Digest, "sha256:") {
+			return nil, exit.Internalf("published wheel fact %q is incomplete", wheel.Distribution)
 		}
-		seen[name] = true
-		rows[name] = name + "==" + wheel.Version + " --hash=" + wheel.Digest
+		text := name + "==" + wheel.Version + " --hash=" + wheel.Digest
+		if prior, named := own[name]; named && prior != text {
+			return nil, exit.Named(exit.Conflict, "package_wheel_ambiguous",
+				"published package names two different wheels for distribution %q", wheel.Distribution)
+		}
+		own[name] = text
 	}
-	names := make([]string, 0, len(rows))
-	for name := range rows {
-		names = append(names, name)
+	kept := rows[:0]
+	for _, row := range rows {
+		if _, replaced := own[row.name]; !replaced {
+			kept = append(kept, row)
+		}
 	}
-	sort.Strings(names)
+	for name, text := range own {
+		kept = append(kept, locked{name, text})
+	}
+	sort.Slice(kept, func(i, j int) bool {
+		if kept[i].name != kept[j].name {
+			return kept[i].name < kept[j].name
+		}
+		return kept[i].text < kept[j].text
+	})
 	var out strings.Builder
 	out.WriteString("--index-url https://pypi.org/simple\n")
 	out.WriteString("--extra-index-url " + indexURL + "\n")
-	for _, name := range names {
-		out.WriteString(rows[name] + "\n")
+	for _, row := range kept {
+		out.WriteString(row.text + "\n")
 	}
 	return []byte(out.String()), nil
 }

@@ -141,7 +141,7 @@ func TestBothReleasedSchema33RentalShapesMigrateWithoutLosingWork(t *testing.T) 
 	}
 }
 
-func TestSchema33WidthMigrationPreservesExplicitZeroAndRejectsUnknownShape(t *testing.T) {
+func TestSchema33WidthMigrationPreservesExplicitZeroAndAcceptsExtraColumns(t *testing.T) {
 	path, db := retainedWidthDatabase(t, true)
 	store, problem := records.OpenForDaemon(path, "")
 	fatal(t, problem)
@@ -156,15 +156,15 @@ func TestSchema33WidthMigrationPreservesExplicitZeroAndRejectsUnknownShape(t *te
 	defer db.Close()
 	_, err := db.Exec(`ALTER TABLE rentals ADD COLUMN surprise TEXT`)
 	must(t, err)
-	before := tableRows(t, db, "rentals")
-	if store, problem = records.OpenForDaemon(path, ""); problem == nil {
-		store.Close()
-		t.Fatal("unrecognized schema drift was accepted")
+	store, problem = records.OpenForDaemon(path, "")
+	if problem != nil {
+		t.Fatalf("a schema-33 database with an extra column was refused: %s", problem.Message)
 	}
-	var version int
-	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 33 || tableRows(t, db, "rentals") != before {
-		t.Fatal("refused migration changed retained database")
+	defer store.Close()
+	rental, problem = store.RentalRow("rental")
+	fatal(t, problem)
+	if rental == nil || rental.MachineName != "shelly" || rental.AcceleratorCount != 1 {
+		t.Fatalf("the rental did not survive the migration: %+v", rental)
 	}
 }
 

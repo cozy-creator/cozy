@@ -262,11 +262,35 @@ func TestPlacementBuysAroundAStockOut(t *testing.T) {
 	}
 }
 
-func TestPlacementPreferIsValidatedAtLoad(t *testing.T) {
+// An unusable tier is named once and the balanced default places the run.
+func TestUnusablePlacementPreferPlacesBalanced(t *testing.T) {
 	h := newLadderHub(t)
+	h.bind(goodLadder())
+	h.throughput = proofRows()
 	root, _ := placementRoot(t, h, "fastest")
-	code, out := runCozy(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only")
-	if code == 0 || !strings.Contains(out, `placement.prefer "fastest" is not fast, balanced or cheap`) {
-		t.Fatalf("an unknown tier was admitted [exit %d]: %s", code, out)
+	cert := filepath.Join(root, "morgiana.pem")
+	must(t, os.WriteFile(cert, []byte("fixture"), 0600))
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	seed := records.Rental{AcceleratorCount: 1, ID: "pr-morgiana", MachineName: "morgiana", SKU: "h100-80", AcceleratorModel: "NVIDIA H100 80GB HBM3",
+		HourlyRateUSDMicros: 2_490_000, State: "ready", Address: "127.0.0.1:1", CertPath: cert, Hub: h.server.URL}
+	fatal(t, store.RecordRental(seed))
+	h.addReady(seed.ID, seed.MachineName, seed.AcceleratorModel, seed.HourlyRateUSDMicros)
+	store.Close()
+	startDaemonProcess(t, root)
+	_, stdout, stderr := runCozyStreams(t, root, "run", "proof/h3/generate", "steps=1", "--rental-only", "--idempotency-key", "placement-fallback")
+	if !strings.Contains(stderr, `placement.prefer "fastest" is not fast, balanced or cheap; using "balanced"`) {
+		t.Fatalf("the unusable tier was not named:\n%s", stderr)
+	}
+	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	row, problem := store.RequestByIdempotencyKey("placement-fallback")
+	fatal(t, problem)
+	if row == nil || row.Worker != "pr-morgiana" {
+		t.Fatalf("the run was not placed: %+v\n%s\n%s", row, stdout, stderr)
+	}
+	if placement := placementEvent(t, store, row.ID); placement["tier"] != "balanced" {
+		t.Fatalf("the run was placed under tier %v, want balanced", placement["tier"])
 	}
 }

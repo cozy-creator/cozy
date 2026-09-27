@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -131,13 +133,19 @@ func reportingRelease(t *testing.T) (hub.PackageDownloadPlan, []byte) {
 
 // reportingReleaseWith builds the real published fixture with extra pyproject text.
 func reportingReleaseWith(t *testing.T, extra string) (hub.PackageDownloadPlan, []byte) {
+	return reportingReleaseWithDependencies(t, `"cozy-runtime>=0.16.8"`, extra)
+}
+
+// reportingReleaseWithDependencies builds the real published fixture with the given
+// [project] dependency list items and extra pyproject text.
+func reportingReleaseWithDependencies(t *testing.T, dependencies, extra string) (hub.PackageDownloadPlan, []byte) {
 	t.Helper()
 	project := t.TempDir()
 	pyproject := `[project]
 name = "install-reporting"
 version = "1.0.1"
 requires-python = ">=3.12,<3.13"
-dependencies = ["cozy-runtime>=0.16.8"]
+dependencies = [` + dependencies + `]
 [project.entry-points."cozy.application"]
 default = "reporting:app"
 [build-system]
@@ -170,6 +178,43 @@ only-include = ["reporting.py"]
 			Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(wheel)), Length: int64(len(wheel)),
 			Tags: []string{"py3-none-any"}, ImportRoots: []string{"reporting"},
 		}}}, wheel
+}
+
+// A universal lock forks a distribution by environment marker, so its export names one
+// distribution twice under different markers. The release installs, and the row whose
+// marker matches this host is the one installed.
+func TestPublishedInstallSelectsTheForkMatchingThisHost(t *testing.T) {
+	plan, wheel := reportingReleaseWithDependencies(t,
+		`"cozy-runtime>=0.16.8", "idna==3.6; sys_platform == 'win32'", "idna==3.7; sys_platform != 'win32'"`, "")
+	if !strings.Contains(string(plan.UVLock.CanonicalBytes), "resolution-markers") {
+		t.Fatalf("the fixture lock did not fork:\n%s", plan.UVLock.CanonicalBytes)
+	}
+	root := t.TempDir()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/packages/proof/install-reporting/download", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(plan)
+	})
+	mux.HandleFunc("GET /v1/index/proof/simple/install-reporting/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `<a href="/project.whl/%s#sha256=%x">%s</a>`, plan.Downloads[0].Path, sha256.Sum256(wheel), plan.Downloads[0].Path)
+	})
+	mux.HandleFunc("GET /project.whl/{name}", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(wheel) })
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
+	code, stdout, stderr := runCozyStreams(t, root, "package", "install", "proof/install-reporting", "--version=1.0.1", "--json")
+	if code != 0 || !strings.Contains(stdout, `"status":"installed"`) {
+		t.Fatalf("a release whose lock forks by marker did not install: %d %s %s", code, stdout, stderr)
+	}
+	var installed []string
+	must(t, filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err == nil && entry.IsDir() && strings.HasPrefix(entry.Name(), "idna-") && strings.HasSuffix(entry.Name(), ".dist-info") {
+			installed = append(installed, entry.Name())
+		}
+		return nil
+	}))
+	if len(installed) == 0 || slices.ContainsFunc(installed, func(name string) bool { return name != "idna-3.7.dist-info" }) {
+		t.Fatalf("installed idna %v, want only the fork matching this host (3.7)", installed)
+	}
 }
 
 // A release whose pyproject restricts versions with uv constraint-dependencies installs:
