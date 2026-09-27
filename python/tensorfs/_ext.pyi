@@ -465,6 +465,7 @@ class Store:
     def resolve_source(
         self, source_uri: str, carriers: Sequence[str] = ..., *, profiles: Sequence[str] = ..., files: Sequence[str] = ..., credential: str = ...,
         huggingface: str | None = None, civitai: str | None = None, allow_local: bool = False,
+        registry: bytes | None = None,
     ) -> SelectedSource: ...
     # progress(present, total): durable bytes of the selection's distinct objects, called
     # from download threads; an exception it raises stops the download and is re-raised.

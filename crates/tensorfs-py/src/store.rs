@@ -833,8 +833,10 @@ impl PyStore {
     }
 
     /// Resolve immutable provider URIs to reviewed carriers or exact ordinary files.
-    /// Deployment adapters own credentials and optional loopback origins.
-    #[pyo3(signature = (source_uri, carriers=Vec::new(), *, profiles=Vec::new(), files=Vec::new(), credential=String::new(), huggingface=None, civitai=None, allow_local=false))]
+    /// With nothing named, a source of several carriers selects its reviewed profile from
+    /// the provider headers. Deployment adapters own credentials and optional loopback
+    /// origins; `registry` extends the built-in and Store-bound registry.
+    #[pyo3(signature = (source_uri, carriers=Vec::new(), *, profiles=Vec::new(), files=Vec::new(), credential=String::new(), huggingface=None, civitai=None, allow_local=false, registry=None))]
     #[allow(clippy::too_many_arguments)]
     fn resolve_source<'p>(
         &self,
@@ -847,6 +849,7 @@ impl PyStore {
         huggingface: Option<String>,
         civitai: Option<String>,
         allow_local: bool,
+        registry: Option<Vec<u8>>,
     ) -> PyResult<Bound<'p, PyDict>> {
         use tensorfs_core::{providers, transport};
         if [
@@ -887,7 +890,13 @@ impl PyStore {
         let selected = py
             .detach(|| {
                 if !files.is_empty() {
-                    return providers::resolve_files(&uri, &files, &endpoints, &credentials, transport::Deadline::none());
+                    return providers::resolve_files(
+                        &uri,
+                        &files,
+                        &endpoints,
+                        &credentials,
+                        transport::Deadline::none(),
+                    );
                 }
                 let resolution = providers::resolve(
                     &uri,
@@ -895,21 +904,68 @@ impl PyStore {
                     &credentials,
                     transport::Deadline::none(),
                 )?;
+                let candidates: Vec<_> = resolution
+                    .members
+                    .iter()
+                    .filter(|row| row.carrier)
+                    .map(|row| row.member.clone())
+                    .collect();
                 let selected = if !carriers.is_empty() {
                     carriers.clone()
-                } else if !profiles.is_empty() {
-                    let heads = providers::read_heads(&resolution, &uri, &endpoints, &credentials, transport::Deadline::none())?;
-                    if !heads.unread.is_empty() { return refuse(Code::DURABILITY_UNPROVEN, "provider headers cannot establish reviewed profile selection"); }
-                    let (registry_locator, registry_bytes) = model_source::effective_registry(&self.store, None)?;
-                    let planned = tensorfs_core::ingest::preflight::plan(&registry_locator,
-                        &registry_bytes, &heads.heads, &profiles,
-                        &self.store.root().join("tmp").join(format!("source-select-{}", tensorfs_core::meta::now_nanos_unique())))?;
-                    let mut selected: Vec<String> = planned.plans.into_iter().flat_map(|plan| plan.components.into_iter().filter_map(|component| component.member)).collect();
-                    selected.sort(); selected.dedup(); selected
-                } else {
-                    let candidates: Vec<_> = resolution.members.iter().filter(|row| row.carrier).map(|row| row.member.clone()).collect();
-                    if candidates.len() != 1 { return refuse(Code::AMBIGUOUS_CLASSIFICATION, "source has multiple carriers; select a reviewed profile or explicit carrier"); }
+                } else if profiles.is_empty() && candidates.len() == 1 {
                     candidates
+                } else {
+                    use tensorfs_core::ingest::preflight;
+                    let heads = providers::read_heads(
+                        &resolution,
+                        &uri,
+                        &endpoints,
+                        &credentials,
+                        transport::Deadline::none(),
+                    )?;
+                    if !heads.unread.is_empty() {
+                        return refuse(
+                            Code::DURABILITY_UNPROVEN,
+                            "provider headers cannot establish reviewed profile selection",
+                        );
+                    }
+                    let (registry_locator, registry_bytes) =
+                        model_source::effective_registry(&self.store, registry.as_deref())?;
+                    let scratch = || {
+                        self.store.root().join("tmp").join(format!(
+                            "source-select-{}",
+                            tensorfs_core::meta::now_nanos_unique()
+                        ))
+                    };
+                    let profiles = if profiles.is_empty() {
+                        vec![preflight::select_profile(
+                            &registry_locator,
+                            &registry_bytes,
+                            &heads.heads,
+                            &scratch(),
+                        )?]
+                    } else {
+                        profiles.clone()
+                    };
+                    let planned = preflight::plan(
+                        &registry_locator,
+                        &registry_bytes,
+                        &heads.heads,
+                        &profiles,
+                        &scratch(),
+                    )?;
+                    let mut selected: Vec<String> = planned
+                        .plans
+                        .into_iter()
+                        .flat_map(|plan| {
+                            plan.components
+                                .into_iter()
+                                .filter_map(|component| component.member)
+                        })
+                        .collect();
+                    selected.sort();
+                    selected.dedup();
+                    selected
                 };
                 resolution.select(&selected)
             })
