@@ -16,6 +16,7 @@ import (
 )
 
 func TestRentalObservationWaitsForWriterWithoutAnotherPaidOperation(t *testing.T) {
+	fullRun(t, "outwaits SQLite's five-second busy handler")
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
 	fatal(t, problem)

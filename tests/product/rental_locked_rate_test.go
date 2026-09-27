@@ -32,7 +32,7 @@ func TestRentalLockedAtOrBelowTheQuoteIsKept(t *testing.T) {
 					"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1, "hourly_rate_usd_micros": row.locked}
 			}
 			stand.mu.Unlock()
-			code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--idempotency-key", "rate-"+row.name, "--timeout=2s", "--json")
+			code, out := rentUntilRecorded(t, root, id, "h100-nvl", "--idempotency-key", "rate-"+row.name, "--json")
 			if code == 0 {
 				t.Fatalf("a rental that never became ready succeeded: %s", out)
 			}
@@ -77,7 +77,7 @@ func TestRentalRenamedByTheHubIsKept(t *testing.T) {
 					"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1, "hourly_rate_usd_micros": 3_190_000}
 			}
 			stand.mu.Unlock()
-			_, out := runCozy(t, root, "rental", "new", "h100-nvl", "--idempotency-key", "rename-"+row.name, "--timeout=2s", "--json")
+			_, out := rentUntilRecorded(t, root, "pr-rename-"+row.name, "h100-nvl", "--idempotency-key", "rename-"+row.name, "--json")
 			if strings.Contains(out, "machine_name_changed") {
 				t.Fatalf("a renamed rental was refused: %s", out)
 			}

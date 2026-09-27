@@ -22,7 +22,7 @@ func TestRentalNewRequestsTheContainerDisk(t *testing.T) {
 	stand.mu.Lock()
 	stand.rent = func(request map[string]any) map[string]any {
 		posted = append(posted, request)
-		// It never becomes ready: --timeout ends the wait and the operation stays open.
+		// It never becomes ready: an interrupted wait leaves the operation open.
 		view := map[string]any{"rental_id": fmt.Sprintf("pr-disk-gb-%d", len(posted)), "name": request["name"], "state": "pending_acquisition",
 			"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1, "hourly_rate_usd_micros": 3_190_000}
 		if disk, ok := request["container_disk_gb"].(float64); ok && disk == 700 {
@@ -37,22 +37,21 @@ func TestRentalNewRequestsTheContainerDisk(t *testing.T) {
 		return append([]map[string]any(nil), posted...)
 	}
 
-	args := []string{"rental", "new", "h100-nvl", "--disk-gb=600", "--idempotency-key", "disk-gb", "--timeout=2s", "--json"}
-	if code, out := runCozy(t, root, args...); code == 0 {
+	if code, out := rentUntilRecorded(t, root, "pr-disk-gb-1", "h100-nvl", "--disk-gb=600", "--idempotency-key", "disk-gb", "--json"); code == 0 {
 		t.Fatalf("a rental that never became ready succeeded: %s", out)
 	}
 	if sent := asks(); len(sent) != 1 || sent[0]["container_disk_gb"] != float64(600) {
 		t.Fatalf("the Hub did not receive the requested disk: %+v", sent)
 	}
 	// Resuming the operation without the flag replays the same request.
-	if code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--idempotency-key", "disk-gb", "--timeout=2s", "--json"); code == 0 ||
+	if code, out := rentUntilRecorded(t, root, "pr-disk-gb-2", "h100-nvl", "--idempotency-key", "disk-gb", "--json"); code == 0 ||
 		strings.Contains(out, "idempotency_conflict") {
 		t.Fatalf("resuming the operation without --disk-gb was refused or completed: %d %s", code, out)
 	}
 	if sent := asks(); len(sent) != 2 || sent[1]["container_disk_gb"] != float64(600) {
 		t.Fatalf("the resumed request changed its disk: %+v", sent)
 	}
-	code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--disk-gb=900", "--idempotency-key", "disk-gb", "--timeout=2s", "--json")
+	code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--disk-gb=900", "--idempotency-key", "disk-gb", "--timeout=60s", "--json")
 	if code == 0 || !strings.Contains(out, "rental.idempotency_conflict") {
 		t.Fatalf("a changed disk under one operation was not refused: %d %s", code, out)
 	}
@@ -70,7 +69,7 @@ func TestRentalNewRequestsTheContainerDisk(t *testing.T) {
 		t.Fatalf("a planned disk below the request was not named [exit %d]: %s", code, out)
 	}
 	// Undeclared stays off the wire.
-	if code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--idempotency-key", "no-disk", "--timeout=2s", "--json"); code == 0 {
+	if code, out := rentUntilRecorded(t, root, "pr-disk-gb-4", "h100-nvl", "--idempotency-key", "no-disk", "--json"); code == 0 {
 		t.Fatalf("a rental that never became ready succeeded: %s", out)
 	}
 	if sent := asks(); len(sent) != 4 {

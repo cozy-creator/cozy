@@ -238,7 +238,8 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-orphan-daemon")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
-	port := reservePort(t)
+	stand := newFakeRentalHub(t, 0)
+	port := stand.port()
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	// An overdue owned witness proves the sweep ran; the unrecorded pod survives it.
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
@@ -247,7 +248,6 @@ func TestTheDaemonSaysUnrecordedSpendAndDoesNotEndIt(t *testing.T) {
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	logPath := filepath.Join(root, "daemon.log")
 
-	stand := newFakeRentalHub(t, port)
 	stand.publishListing()
 	orphan(stand, "pr-6666666666666666take", "takemikazuchi", 3_190_000)
 

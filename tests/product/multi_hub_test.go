@@ -396,7 +396,7 @@ func TestSchema48RequestsTakeTheirHub(t *testing.T) {
 // history is local and never depends on a hub.
 func TestAllHubsListingIsolatesAnUnreadableHub(t *testing.T) {
 	root, hubA, standA := rentalEndRoot(t, "all-hubs-isolation")
-	standB := newFakeRentalHub(t, reservePort(t))
+	standB := newFakeRentalHub(t, 0)
 	hubB := standB.server.URL
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)

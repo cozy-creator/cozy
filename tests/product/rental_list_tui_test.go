@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -34,7 +33,8 @@ func TestRentalListLiveBoard(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-list-tui")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
-	port := reservePort(t)
+	hub := newFakeRentalHub(t, 0)
+	port := hub.port()
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	// The grace is deliberately NOT the 300s default: the IDLE deadline must come from
 	// the policy the config actually states, never from a spelled-out five minutes.
@@ -42,7 +42,6 @@ func TestRentalListLiveBoard(t *testing.T) {
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"), 0o600))
 
-	hub := newFakeRentalHub(t, port)
 	hub.add("rental-tui", "sparrow")
 	hub.set("rental-tui", "state", "acquiring")
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
@@ -54,28 +53,44 @@ func TestRentalListLiveBoard(t *testing.T) {
 		Address: "127.0.0.1:1", CertPath: filepath.Join(root, "rental-tui.pem"),
 	}))
 
-	// The transitions are planted against the wall clock while the board runs: the hub
-	// moves the pod to ready, then queued work holds it, then the work settles.
-	go func() {
-		// Plant against the daemon's first rental read, not the CLI start: the board's
-		// first fetch starts the daemon and draws only a loading frame until it returns.
-		for deadline := time.Now().Add(10 * time.Second); hub.rentalReads() == 0 && time.Now().Before(deadline); {
-			time.Sleep(20 * time.Millisecond)
+	// Each transition is planted once the board has drawn the one before it: the hub moves
+	// the pod to ready, queued work holds it, the work settles, and the idle clock moves on.
+	countdown := regexp.MustCompile(`(\d+)s / 15m`)
+	firstIdle := ""
+	code, tty := ptyDrive(t, root, 24, 4, func(step int, drawn string) []byte {
+		switch step {
+		case 0:
+			if !regexp.MustCompile(`sparrow\s+cpu\s+—\s+acquiring`).MatchString(drawn) {
+				return nil
+			}
+			hub.set("rental-tui", "state", "ready")
+		case 1:
+			idle := countdown.FindStringSubmatch(drawn)
+			if idle == nil || !regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready`).MatchString(drawn) {
+				return nil
+			}
+			firstIdle = idle[1]
+			_, _, problem := store.Submit(records.Request{
+				ID: "req-rental-tui", IdemKey: "idem-rental-tui",
+				BodyDigest: "sha256:" + strings.Repeat("ef", 32),
+				Package:    "fake/tui", Entrypoint: "generate", Payload: []byte("{}"),
+				Rental: true, Worker: "rental-tui",
+			})
+			fatal(t, problem)
+		case 2:
+			if !regexp.MustCompile(`sparrow\s+cpu\s+—\s+ready\s+\$0\.10\s+\S+\s+0\s+1\s+-`).MatchString(drawn) {
+				return nil
+			}
+			fatal(t, store.SettleRequest("req-rental-tui", "canceled"))
+		case 3:
+			idle := countdown.FindAllStringSubmatch(drawn, -1)
+			if len(idle) == 0 || idle[len(idle)-1][1] == firstIdle {
+				return nil
+			}
+			return []byte("q")
 		}
-		time.Sleep(1200 * time.Millisecond)
-		hub.set("rental-tui", "state", "ready")
-		time.Sleep(3 * time.Second)
-		_, _, _ = store.Submit(records.Request{
-			ID: "req-rental-tui", IdemKey: "idem-rental-tui",
-			BodyDigest: "sha256:" + strings.Repeat("ef", 32),
-			Package:    "fake/tui", Entrypoint: "generate", Payload: []byte("{}"),
-			Rental: true, Worker: "rental-tui",
-		})
-		time.Sleep(2 * time.Second)
-		_ = store.SettleRequest("req-rental-tui", "canceled")
-	}()
-	quiet := make([][]byte, 16)
-	code, tty := ptyRunInput(t, root, 24, append(quiet, []byte("q")), "rental", "list")
+		return []byte{}
+	}, "rental", "list")
 	if code != 0 {
 		t.Fatalf("q did not exit the live rental board cleanly [exit %d]\n%q", code, tty)
 	}
@@ -106,7 +121,6 @@ func TestRentalListLiveBoard(t *testing.T) {
 	if busy == nil {
 		t.Fatalf("queued work did not blank the idle countdown\n%q", tty)
 	}
-	countdown := regexp.MustCompile(`(\d+)s / 15m`)
 	elapsed := countdown.FindAllStringSubmatchIndex(tty, -1)
 	if len(elapsed) < 2 {
 		t.Fatalf("the IDLE cell did not count elapsed over the 15m policy deadline\n%q", tty)

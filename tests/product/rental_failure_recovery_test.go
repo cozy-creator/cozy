@@ -34,7 +34,8 @@ func TestRentalFailureRecovery(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-failure-recovery")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
-	port := reservePort(t)
+	hub := newFakeRentalHub(t, 0)
+	port := hub.port()
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
@@ -42,7 +43,6 @@ func TestRentalFailureRecovery(t *testing.T) {
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	logPath := filepath.Join(root, "daemon.log")
 
-	hub := newFakeRentalHub(t, port)
 	hub.packageReleases = map[string]any{"fake/lost@1": rentalReleaseFacts()}
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)

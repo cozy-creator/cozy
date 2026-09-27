@@ -503,6 +503,10 @@ type Orchestrator struct {
 	// idempotent — harnesses close defensively and twice is not an event.
 	done      chan struct{}
 	closeOnce sync.Once
+	// closingCtx ends when Close begins, so a start still dialing its worker (a rental's
+	// media health) gives up instead of holding Close for its whole stall budget.
+	closingCtx    context.Context
+	cancelClosing context.CancelFunc
 
 	// drainMu serializes the dispatch queue's drain. It is separate from `mu` because a
 	// drain dispatches — it talks to the store and to a session — and holding the state
@@ -624,6 +628,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		localTransfers:       make(map[string]*localTransfer),
 		childWatches:         make(map[string]*session),
 	}
+	c.closingCtx, c.cancelClosing = context.WithCancel(context.Background())
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
 	// report (a latched fault, a declared wedge) or the absence of reports the worker
@@ -653,6 +658,7 @@ func (c *Orchestrator) Close(grace time.Duration) {
 		starting = append(starting, done)
 	}
 	c.mu.Unlock()
+	c.cancelClosing()
 	// A start already crossed the ownership gate. Let it publish its process
 	// before taking the shutdown census; later starts refuse under closing.
 	for _, done := range starting {

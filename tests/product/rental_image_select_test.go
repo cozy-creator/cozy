@@ -27,15 +27,15 @@ func TestRentalNewNamesARegisteredImageAndListShowsIt(t *testing.T) {
 	stand.mu.Lock()
 	stand.rent = func(request map[string]any) map[string]any {
 		posted = append(posted, request)
-		// It never becomes ready: --timeout ends the wait and the operation stays open.
+		// It never becomes ready: an interrupted wait leaves the operation open.
 		return map[string]any{"rental_id": "pr-image-select", "name": request["name"], "state": "pending_acquisition",
 			"requested_accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1,
 			"hourly_rate_usd_micros": 3_190_000, "base_worker_image_digest": candidate, "base_worker_image_tag": tag}
 	}
 	stand.mu.Unlock()
 
-	args := []string{"rental", "new", "h100-nvl", "--image", tag, "--idempotency-key", "image-select", "--timeout=2s", "--json"}
-	if code, out := runCozy(t, root, args...); code == 0 {
+	args := []string{"h100-nvl", "--image", tag, "--idempotency-key", "image-select", "--json"}
+	if code, out := rentUntilRecorded(t, root, "pr-image-select", args...); code == 0 {
 		t.Fatalf("a rental that never became ready succeeded: %s", out)
 	}
 	stand.mu.Lock()
@@ -47,8 +47,8 @@ func TestRentalNewNamesARegisteredImageAndListShowsIt(t *testing.T) {
 
 	// The operation's image is immutable: another --image under the same key
 	// is refused before any second paid ask.
-	args[4] = "cpu"
-	code, out := runCozy(t, root, args...)
+	args[2] = "cpu"
+	code, out := runCozy(t, root, append([]string{"rental", "new"}, args...)...)
 	if code == 0 || !strings.Contains(out, "rental.idempotency_conflict") {
 		t.Fatalf("changed image under one operation was not refused: %d %s", code, out)
 	}

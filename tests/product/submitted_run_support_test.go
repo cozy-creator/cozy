@@ -2,16 +2,19 @@ package producttest
 
 import (
 	"encoding/json"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // submitRun sends a run or transfer through the real CLI and daemon admission and returns the durable
-// request it recorded (nil when the CLI refused first). The run is canceled afterwards so
-// no placement continues once its admitted facts have been read.
+// request it recorded (nil when the CLI refused first). The run is canceled as soon as it is
+// recorded, so no placement continues once its admitted facts are read and the CLI's
+// optimistic observation ends on that terminal instead of waiting out its window.
 func submitRun(t *testing.T, root, key string, args ...string) (*records.Request, int, string) {
 	t.Helper()
 	// The key goes ahead of any literal `--` tail.
@@ -21,15 +24,38 @@ func submitRun(t *testing.T, root, key string, args ...string) (*records.Request
 		at = len(command)
 	}
 	command = slices.Insert(command, at, "--idempotency-key="+key)
-	code, out := runCozy(t, root, command...)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
+	env := childEnv(t, root)
+	cancel := func(request *records.Request) {
+		if request != nil && !records.Settled(request.State) {
+			cmd := exec.Command(cozyBin, "run", "cancel", request.ID)
+			cmd.Env = env
+			_ = cmd.Run()
+		}
+	}
+	submitted, canceled := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(canceled)
+		for {
+			select {
+			case <-submitted:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			if request, problem := store.RequestByIdempotencyKey(key); problem == nil && request != nil {
+				cancel(request)
+				return
+			}
+		}
+	}()
+	code, out := runCozy(t, root, command...)
+	close(submitted)
+	<-canceled
 	request, problem := store.RequestByIdempotencyKey(key)
 	fatal(t, problem)
-	if request != nil && !records.Settled(request.State) {
-		_, _ = runCozy(t, root, "run", "cancel", request.ID)
-	}
+	cancel(request)
 	return request, code, out
 }
 

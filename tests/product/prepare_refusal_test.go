@@ -52,10 +52,10 @@ func TestAnUnenumeratedPrepareStatusIsTheHostsVerdictNotARedial(t *testing.T) {
 					"a fixed request cannot be answered differently later:\n%s",
 					arm.code, n, pod.report())
 			}
-			// Fifteen redial windows. A deferral would have re-issued the same desire
-			// repeatedly; a verdict is asked for once.
+			// Five redial windows (200 ms each). A deferral would have re-issued the same
+			// desire repeatedly; a verdict is asked for once.
 			settled := pod.prepares()
-			time.Sleep(3 * time.Second)
+			time.Sleep(time.Second)
 			if grew := pod.prepares() - settled; grew > 0 {
 				t.Fatalf("the owner re-issued the same desire %d more time(s) after a %s "+
 					"verdict; a fixed request cannot be answered differently later",

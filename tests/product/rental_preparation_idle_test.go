@@ -87,14 +87,14 @@ func TestRentalIdleGraceAfterPreparationSettlementAndRestart(t *testing.T) {
 					t.Log(tail(filepath.Join(root, "daemon.log")))
 				}
 			}()
-			port := reservePort(t)
+			peer := newFakeRentalHub(t, 0)
+			port := peer.port()
 			origin := fmt.Sprintf("http://127.0.0.1:%d", port)
 			const grace = rental.IdleTimeout
 			must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 				"tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\n"+
 					""+
 					"daemon:\n  idle_shutdown_s: 0\n"), 0600))
-			peer := newFakeRentalHub(t, port)
 			peer.publishListing()
 			const rentalID, requestID = "rental-preparation-idle", "job-preparation-idle"
 			peer.add(rentalID, "sherlock")

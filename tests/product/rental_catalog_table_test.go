@@ -52,11 +52,11 @@ func TestRentalLadderReadsAsAGPUList(t *testing.T) {
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	port := reservePort(t)
+	hub := newFakeRentalHub(t, 0)
+	port := hub.port()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		fmt.Sprintf("tensorhub_url: http://127.0.0.1:%d\n", port)+
 			"tensorhub_token: rental-idle-test\n"), 0o600))
-	hub := newFakeRentalHub(t, port)
 	gpuAt := func(name, model, capability string, vram, price int64, count int) map[string]any {
 		return map[string]any{"name": name, "accelerator_model": model,
 			"accelerator_count": count, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",

@@ -50,15 +50,9 @@ func TestDaemonIdleShutdown(t *testing.T) {
 		State: "release_requested", Hub: "https://hub.invalid",
 	}))
 	rented := startDaemonProcess(t, root)
-	select {
-	case code := <-rented.exited:
-		t.Fatalf("the daemon left (exit %d) while it still owned a rental\n%s", code, tail(logPath))
-	case <-time.After(4 * time.Second):
-	}
-	if log, _ := os.ReadFile(logPath); !strings.Contains(string(log),
-		"idle exit held for 1s by: rental rental-idle-arm (release_requested)") {
-		t.Fatalf("the daemon did not say what held it up\n%s", tail(logPath))
-	}
+	// The held line is written only after the debounce passed with the rental present:
+	// the daemon's own decision to stay, not a guess from elapsed time.
+	awaitIdleHold(t, rented, logPath, "rental rental-idle-arm (release_requested)")
 	if _, problem := store.ForgetRental("rental-idle-arm"); problem != nil {
 		t.Fatal(problem.Message)
 	}
@@ -75,11 +69,7 @@ func TestDaemonIdleShutdown(t *testing.T) {
 	}); problem != nil {
 		t.Fatal(problem.Message)
 	}
-	select {
-	case code := <-queued.exited:
-		t.Fatalf("the daemon left (exit %d) while it still owed a request\n%s", code, tail(logPath))
-	case <-time.After(4 * time.Second):
-	}
+	awaitIdleHold(t, queued, logPath, "req-idle-arm")
 	if r := queued.call(t, "POST", "/v1/requests/req-idle-arm/cancel", nil); r.Status != http.StatusOK {
 		t.Fatalf("cancel of the queued request: %s", r.brief())
 	}
@@ -99,5 +89,27 @@ func awaitDaemonExit(t *testing.T, s *daemonProcess, within time.Duration) int {
 	case <-time.After(within):
 		t.Fatalf("the daemon did not leave within %s\n%s", within, tail(filepath.Join(s.root, "daemon.log")))
 		return -1
+	}
+}
+
+// awaitIdleHold waits for the daemon to log that `holder` kept it from its idle exit,
+// failing if it leaves first.
+func awaitIdleHold(t *testing.T, d *daemonProcess, logPath, holder string) {
+	t.Helper()
+	deadline := time.After(15 * time.Second)
+	for {
+		log, _ := os.ReadFile(logPath)
+		for _, line := range strings.Split(string(log), "\n") {
+			if strings.HasPrefix(line, "idle exit held for 1s by: ") && strings.Contains(line, holder) {
+				return
+			}
+		}
+		select {
+		case code := <-d.exited:
+			t.Fatalf("the daemon left (exit %d) while %s still held it\n%s", code, holder, tail(logPath))
+		case <-deadline:
+			t.Fatalf("the daemon never said %s held it\n%s", holder, tail(logPath))
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }

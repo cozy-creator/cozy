@@ -146,6 +146,7 @@ func TestDaemonHeldRecordNeverFallsBackToConfiguredPort(t *testing.T) {
 }
 
 func TestDaemonReadinessWaitFollowsOwnerBeyondTenSeconds(t *testing.T) {
+	fullRun(t, "outwaits the deleted ten-second readiness deadline")
 	layout, lock, pid, ownerDone := compatibilityOwner(t)
 	publishCompatibilityOwner(t, layout, lock, pid, "127.0.0.1:0", "")
 	command := exec.Command(cozyBin, "run", "list", "--json")

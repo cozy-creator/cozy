@@ -22,6 +22,7 @@ import (
 // The runtime here takes six seconds — comfortably past the deleted bound — and its answer
 // is read through a metadata verb Creator still asks the Runtime.
 func TestSlowRuntimeMetadataIsAnswered(t *testing.T) {
+	fullRun(t, "outwaits the deleted five-second metadata deadline")
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtime is a POSIX shell script")
 	}

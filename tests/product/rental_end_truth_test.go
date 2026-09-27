@@ -46,14 +46,15 @@ func rentalEndRoot(t *testing.T, name string) (string, string, *fakeRentalHub) {
 	root, err := os.MkdirTemp(base, name+"-")
 	must(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	port := reservePort(t)
+	stand := newFakeRentalHub(t, 0)
+	port := stand.port()
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
 			""+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	return root, hubURL, newFakeRentalHub(t, port)
+	return root, hubURL, stand
 }
 
 // A complete account listing proves that a mistyped machine name is absent; it

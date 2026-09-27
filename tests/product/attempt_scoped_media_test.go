@@ -78,7 +78,7 @@ func TestMediaHealthFlagsNeverChangeTheRequestShape(t *testing.T) {
 			}))
 			defer server.Close()
 			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-			fatal(t, client.Health())
+			fatal(t, client.Health(t.Context()))
 			if writes.Load() != 0 {
 				t.Fatal("health moved bytes before the handshake settled")
 			}
@@ -130,7 +130,7 @@ func TestMediaPlaneRevisionIsAFloor(t *testing.T) {
 			}))
 			defer server.Close()
 			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-			problem := client.Health()
+			problem := client.Health(t.Context())
 			if !arm.accepted {
 				if problem == nil || problem.ErrName() != "media_contract_mismatch" {
 					t.Fatalf("a plane below the floor was not refused: %v", problem)
@@ -183,7 +183,7 @@ func TestScopedMediaFailureNeverFallsBackToUnscopedUpload(t *testing.T) {
 	}))
 	defer server.Close()
 	client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-	fatal(t, client.Health())
+	fatal(t, client.Health(t.Context()))
 	if path, problem := client.PutInput("attempt-7", "payload", []byte("payload")); problem == nil || path != "" || problem.ErrName() != "media.input_conflict" {
 		t.Fatalf("scoped refusal changed: %s %v", path, problem)
 	}
@@ -289,7 +289,7 @@ func TestMediaInputReceiptEchoMustAgree(t *testing.T) {
 			}))
 			defer server.Close()
 			client := inputMediaClient(t, strings.TrimPrefix(server.URL, "http://"), time.Second)
-			fatal(t, client.Health())
+			fatal(t, client.Health(t.Context()))
 			path, problem := client.PutInput("attempt-1", "payload", []byte("abc"))
 			if accepted != (problem == nil && path != "") {
 				t.Fatalf("receipt echo admission = %q, %v; want accepted=%v", path, problem, accepted)
@@ -306,7 +306,7 @@ func TestAttemptScopedInputsAgainstPodMedia(t *testing.T) {
 		t.Skip("requires disposable Tensorhub podmedia receiver at -pod-media-proof-addr")
 	}
 	client := inputMediaClient(t, address, 2*time.Second)
-	fatal(t, client.Health())
+	fatal(t, client.Health(t.Context()))
 	outputSlot := media.Slot("output-count-proof", 1)
 	defer client.DropAttempt(outputSlot)
 	_, problem := client.ReserveOutputs(outputSlot, 4096, 3)

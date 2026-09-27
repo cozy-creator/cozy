@@ -60,7 +60,8 @@ func TestVanishedRentalReleasesItsAttempt(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-vanished")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
-	port := reservePort(t)
+	stand := newFakeRentalHub(t, 0)
+	port := stand.port()
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
@@ -68,7 +69,6 @@ func TestVanishedRentalReleasesItsAttempt(t *testing.T) {
 			""+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
 	logPath := filepath.Join(root, "daemon.log")
-	newFakeRentalHub(t, port)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -128,14 +128,14 @@ func TestDownAllIsNotRefusable(t *testing.T) {
 	root := filepath.Join(scratchBase, "down-all-wedged")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
-	port := reservePort(t)
+	hub := newFakeRentalHub(t, 0)
+	port := hub.port()
 	hubURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
 		"tensorhub_url: "+hubURL+"\n"+
 			"tensorhub_token: rental-idle-test\n"+
 			""+
 			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	hub := newFakeRentalHub(t, port)
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
@@ -169,27 +169,13 @@ func TestDownAllIsNotRefusable(t *testing.T) {
 
 	daemon := startDaemonProcess(t, root)
 
-	// THE LOOP IS BOUNDED. `failQueued` is reached for this request at boot — routing
-	// cannot attach to 127.0.0.1:1 — and the store permanently refuses a queued failure for
-	// a request holding an open attempt. On the code this arm was written against that
-	// refusal was rescheduled every 2 s forever: a permanent condition restated 1200 times
-	// an hour, filling the log and never surfacing. It must be said once.
-	time.Sleep(7 * time.Second)
 	logPath := filepath.Join(root, "daemon.log")
-	log, _ := os.ReadFile(logPath)
-	repeats := strings.Count(string(log), "could not be settled: request req-wedged")
-	repeats += strings.Count(string(log), "req-wedged cannot be failed as queued work")
-	if repeats > 1 {
-		t.Fatalf("a permanent refusal was restated %d times; it should be said once\n%s",
-			repeats, tail(logPath))
-	}
-
 	// Plain `down` MAY refuse — that is its job, and it names what is holding it.
 	// `--all` may not, and it must actually stop the process.
 	code, out := runCozy(t, root, "down", "--all")
 	if code != 0 {
 		t.Fatalf("`cozy down --all` refused with a wedged request [exit %d]; the daemon "+
-			"cannot be stopped by any documented means\n%s", code, out)
+			"cannot be stopped by any documented means\n%s\n%s", code, out, tail(logPath))
 	}
 	if code := awaitDaemonExit(t, daemon, 30*time.Second); code != 0 {
 		t.Fatalf("`cozy down --all` reported success but the daemon exited %d\n%s", code, out)

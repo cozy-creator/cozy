@@ -25,11 +25,10 @@ import (
 // lock through the whole readiness wait, and every one of those hung behind it.
 func TestStuckRentalPurchaseBlocksOnlyItself(t *testing.T) {
 	root := t.TempDir()
-	port := reservePort(t)
-	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
+	peer := newFakeRentalHub(t, 0)
+	origin := fmt.Sprintf("http://127.0.0.1:%d", peer.port())
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+origin+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	peer := newFakeRentalHub(t, port)
 	// The second package is a real published job, so `cozy run` can submit it.
 	iface := []byte(`{"application":"proof:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"name":"convert","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
 	other := rentalReleaseFacts()
