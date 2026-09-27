@@ -16,55 +16,44 @@ import (
 
 // TestHostRuntimeWireFence is cl-086's follow-up as behaviour. The owner's host carried a
 // 0.0.29 cozy-runtime (wire minor 16) under a minor-22 daemon: the worker launched, never
-// came READY, and `cozy run` sat `queued` with nothing said. The daemon now asks the tool
-// on PATH for its own identity before it exists, and refuses by name with the reinstall.
-// Every arm is the real binary against a real root; the tool is a stand-in that answers
-// only `version`, which is all the fence asks.
+// came READY, and `cozy run` sat `queued` with nothing said. A host tool that cannot serve
+// no longer stops the daemon (rentals and the Hub need none): `cozy up` names the upgrade,
+// and only what needs the host tool refuses by name, with the reinstall. Every arm is the
+// real binary against a real root; the tool is a stand-in that answers only `version`.
 func TestHostRuntimeWireFence(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in runtimes are POSIX shell scripts")
 	}
 	install := fmt.Sprintf("supporting cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)
+	upNames := func(t *testing.T, root, path, code string, says ...string) {
+		t.Helper()
+		exit, out := runCozyPath(t, root, path, "up")
+		if exit != 0 || !strings.Contains(out, "local runs refuse with "+code) || !strings.Contains(out, install) {
+			t.Fatalf("`cozy up` did not start and name the upgrade [exit %d]\n%s", exit, out)
+		}
+		for _, want := range says {
+			if !strings.Contains(out, want) {
+				t.Fatalf("`cozy up` did not say %q\n%s", want, out)
+			}
+		}
+		if exit, out := runCozyPath(t, root, path, "down"); exit != 0 {
+			t.Fatalf("down [exit %d]\n%s", exit, out)
+		}
+	}
 
-	// (a) An older minor cannot serve: `cozy up` refuses under the tool's own words, and
-	// `cozy run` — which starts the same daemon — answers the same code instead of queuing.
+	// (a) An older minor cannot serve: the daemon starts, and `cozy up` names the upgrade.
 	root, path := hostRuntimeRoot(t, "older", stubRuntime(t, "0.0.29", hostruntime.WireFloor-1))
-	code, out := runCozyPath(t, root, path, "up", "--json")
-	refusal := refusalOf(t, out)
-	if code == 0 || refusal.Code != "host_runtime_wire_mismatch" ||
-		!strings.Contains(refusal.Message, fmt.Sprintf("release 0.0.29 and speaks cozy.worker.v1+minor.%d", hostruntime.WireFloor-1)) ||
-		!strings.Contains(refusal.Message, fmt.Sprintf("needs cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor)) ||
-		!strings.Contains(refusal.Remedy, install) {
-		t.Fatalf("an older host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)
-	}
-	if code, out := runCozyPath(t, root, path, "up"); code == 0 ||
-		!strings.Contains(out, "Try: install cozy-runtime "+hostruntime.ToolFloor+" or newer "+install) {
-		t.Fatalf("the human form of the refusal lost its remedy [exit %d]\n%s", code, out)
-	}
-	code, out = runCozyPath(t, root, path, "run", "fake/older/generate", "prompt=fox", "--json")
-	if refusal := refusalOf(t, out); code == 0 || refusal.Code != "host_runtime_wire_mismatch" {
-		t.Fatalf("`cozy run` under an older host tool did not refuse by name [exit %d]\n%s", code, out)
-	}
+	upNames(t, root, path, "host_runtime_wire_mismatch",
+		fmt.Sprintf("release 0.0.29 and speaks cozy.worker.v1+minor.%d", hostruntime.WireFloor-1),
+		fmt.Sprintf("needs cozy.worker.v1+minor.%d or newer", hostruntime.WireFloor))
 
-	// (a′) The wire is right but the release predates static describe (cl-175): a tool
-	// that would import a package to describe it is refused by name, with the floor.
+	// (a′) The wire is right but the release predates static describe (cl-175).
 	root, path = hostRuntimeRoot(t, "below-floor", stubRuntime(t, "0.4.0", pb.WireMinor))
-	code, out = runCozyPath(t, root, path, "up", "--json")
-	refusal = refusalOf(t, out)
-	if code == 0 || refusal.Code != "host_runtime_below_floor" ||
-		!strings.Contains(refusal.Message, "release 0.4.0; this Cozy needs "+hostruntime.ToolFloor+" or newer") ||
-		!strings.Contains(refusal.Remedy, install) {
-		t.Fatalf("a host tool below the describe floor did not refuse `cozy up` by name [exit %d]\n%s", code, out)
-	}
+	upNames(t, root, path, "host_runtime_below_floor", "release 0.4.0; this Cozy needs "+hostruntime.ToolFloor+" or newer")
 
 	// (b) A tool that cannot say what it is.
 	root, path = hostRuntimeRoot(t, "mute", "#!/bin/sh\necho 'usage: cozy-runtime <verb>' >&2\nexit 2\n")
-	code, out = runCozyPath(t, root, path, "up", "--json")
-	if refusal := refusalOf(t, out); code == 0 || refusal.Code != "host_runtime_unreadable" ||
-		!strings.Contains(refusal.Message, "exited 2: usage: cozy-runtime <verb>") ||
-		!strings.Contains(refusal.Remedy, install) {
-		t.Fatalf("a mute host tool did not refuse `cozy up` by name [exit %d]\n%s", code, out)
-	}
+	upNames(t, root, path, "host_runtime_unreadable", "exited 2: usage: cozy-runtime <verb>")
 
 	// (c) The wire is additive: a newer minor serves an older daemon.
 	root, path = hostRuntimeRoot(t, "newer", stubRuntime(t, "9.9.9", pb.WireMinor+1))
@@ -127,13 +116,18 @@ func TestHostRuntimeNativeAPIFloor(t *testing.T) {
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			root, path := hostRuntimeRoot(t, "native-floor-"+arm.name, stubRuntime(t, arm.release, arm.minor))
-			code, out := runCozyPath(t, root, path, "up", "--json")
-			if arm.refusal != "" {
-				if code == 0 || refusalOf(t, out).Code != arm.refusal {
-					t.Fatalf("stale host SDK was not refused before use: %d %s", code, out)
-				}
-			} else if code != 0 {
-				t.Fatalf("native API cohort refused: %d %s", code, out)
+			code, out := runCozyPath(t, root, path, "up")
+			if code != 0 {
+				t.Fatalf("the daemon did not start over the host tool: %d %s", code, out)
+			}
+			if arm.refusal != "" && !strings.Contains(out, "local runs refuse with "+arm.refusal) {
+				t.Fatalf("a stale host SDK was not named: %s", out)
+			}
+			if arm.refusal == "" && strings.Contains(out, "local runs refuse") {
+				t.Fatalf("a native API cohort was named stale: %s", out)
+			}
+			if code, out := runCozyPath(t, root, path, "down"); code != 0 {
+				t.Fatalf("down [exit %d]\n%s", code, out)
 			}
 		})
 	}
