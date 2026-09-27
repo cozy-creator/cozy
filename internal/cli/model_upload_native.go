@@ -20,11 +20,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/scratch"
 )
 
-// Runtime floors for the generated ingest script: 0.18.24 supplies native download,
-// conversion and upload; 0.18.40 composes several reviewed profiles into one model.
+// Floors for the generated ingest script: Runtime 0.18.51 and TensorFS 0.3.60 stream the
+// source through conversion into the publication within the rental's free disk.
 const (
-	ingestRuntimeFloor         = "0.18.24"
-	composedIngestRuntimeFloor = "0.18.40"
+	ingestRuntimeFloor  = "0.18.51"
+	ingestTensorFSFloor = "0.3.60"
 )
 
 // nativeModelUpload runs a rented provider ingest as an ordinary local script on the
@@ -114,8 +114,10 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	ctx.Inv.Args = []string{path}
 	ctx.Inv.Values["--allow-publish"] = []string{destination.String()}
 	// The script already names its profiles; the run must not reread them as job
-	// model-slot bindings (slot=profile), which refused every profiled ingest.
+	// model-slot bindings (slot=profile), which refused every profiled ingest. The
+	// ingest consumed --lane too; the run has nothing left to read from either.
 	delete(ctx.Inv.Values, "--source-profile")
+	delete(ctx.Inv.Values, "--lane")
 	return true, handleRunExecute(ctx)
 }
 
@@ -209,54 +211,50 @@ func ingestRunKey(layout home.Layout, script []byte, rentalID string) (string, s
 
 func quote(value string) string { raw, _ := json.Marshal(value); return string(raw) }
 
-func scriptHeader(floor string) string {
+func scriptHeader() string {
 	return fmt.Sprintf(`# /// script
 # requires-python = ">=3.12"
-# dependencies = ["cozy-runtime>=%s,<1", "tensorfs>=0.3.51,<0.4"]
+# dependencies = ["cozy-runtime>=%s,<1", "tensorfs>=%s,<0.4"]
 # ///
-`, floor)
+`, ingestRuntimeFloor, ingestTensorFSFloor)
 }
 
-func recipeUploadScript(repository, revision, destination string) []byte {
-	return []byte(scriptHeader(ingestRuntimeFloor) + fmt.Sprintf(`from cozy_runtime.author.sources import ingest_huggingface
-from cozy_runtime.author.publication import upload_checkpoint
+func uploadScript(call string) []byte {
+	return []byte(scriptHeader() + fmt.Sprintf(`from cozy_runtime.author.sources import upload_civitai, upload_huggingface
 
 async def main() -> dict[str, str]:
-    model = await ingest_huggingface(%s, revision=%s)
-    checkpoint = await upload_checkpoint(model, destination=%s)
+    checkpoint = await %s
     return {"destination": checkpoint.destination, "checkpoint": checkpoint.checkpoint}
-`, quote(repository), quote(revision), quote(destination)))
+`, call))
 }
 
-// genericUploadScript downloads exactly the reviewed carriers, converts them with the
-// profiles the owner-side header preflight decided, and uploads one checkpoint.
+// recipeUploadScript lets the model's reviewed recipe choose carriers, profile and metadata.
+func recipeUploadScript(repository, revision, destination string) []byte {
+	return uploadScript(fmt.Sprintf("upload_huggingface(%s, revision=%s, destination=%s)",
+		quote(repository), quote(revision), quote(destination)))
+}
+
+// genericUploadScript uploads exactly the reviewed carriers, converted with the profiles
+// the owner-side header preflight decided, as one checkpoint. The rental streams source
+// windows through conversion into the publication, so the model need not fit its disk.
 func genericUploadScript(kind modelsource.Kind, pinned modelsource.Source, profiles []string,
 	destination string,
 ) []byte {
-	download := ""
+	var call string
 	switch {
 	case kind == modelsource.Civitai:
-		download = fmt.Sprintf("download_civitai(%d)", pinned.VersionID)
+		call = fmt.Sprintf("upload_civitai(%d, profiles=%s, destination=%s)",
+			pinned.VersionID, pythonTuple(profiles), quote(destination))
 	case pinned.Member != "":
-		download = fmt.Sprintf("download_huggingface(%s, revision=%s, carriers=(%s,))",
-			quote(pinned.Org+"/"+pinned.Repo), quote(pinned.Revision), quote(pinned.Member))
+		call = fmt.Sprintf("upload_huggingface(%s, revision=%s, carriers=(%s,), profiles=%s, destination=%s)",
+			quote(pinned.Org+"/"+pinned.Repo), quote(pinned.Revision), quote(pinned.Member),
+			pythonTuple(profiles), quote(destination))
 	default:
-		download = fmt.Sprintf("download_huggingface(%s, revision=%s, profiles=%s)",
-			quote(pinned.Org+"/"+pinned.Repo), quote(pinned.Revision), pythonTuple(profiles))
+		call = fmt.Sprintf("upload_huggingface(%s, revision=%s, profiles=%s, destination=%s)",
+			quote(pinned.Org+"/"+pinned.Repo), quote(pinned.Revision), pythonTuple(profiles),
+			quote(destination))
 	}
-	floor, convert := ingestRuntimeFloor, "profile="+quote(profiles[0])
-	if len(profiles) > 1 {
-		floor, convert = composedIngestRuntimeFloor, "profiles="+pythonTuple(profiles)
-	}
-	return []byte(scriptHeader(floor) + fmt.Sprintf(`from cozy_runtime.author.sources import convert_cozytensors, download_civitai, download_huggingface
-from cozy_runtime.author.publication import upload_checkpoint
-
-async def main() -> dict[str, str]:
-    source = await %s
-    model = await convert_cozytensors(source, %s)
-    checkpoint = await upload_checkpoint(model, destination=%s)
-    return {"destination": checkpoint.destination, "checkpoint": checkpoint.checkpoint}
-`, download, convert, quote(destination)))
+	return uploadScript(call)
 }
 
 func pythonTuple(values []string) string {
