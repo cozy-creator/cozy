@@ -617,6 +617,95 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// Tensorhub is a Go peer. `encoding/json` writes raw UTF-8, escapes `&` as `\u0026`, says
+/// `null` for an absent value and may add fields; rows may repeat. A pull reads the fields it
+/// consumes and nothing else stops it.
+fn go_hub(
+    checkpoint: Arc<Checkpoint>,
+    closure: impl Fn(&Checkpoint) -> Serve + Send + Sync + 'static,
+) -> Origin {
+    let base_slot: Arc<Mutex<String>> = Arc::default();
+    let slot = Arc::clone(&base_slot);
+    let dispatch: Dispatch = Arc::new(move |request: &Request| {
+        let base = slot.lock().unwrap().clone();
+        match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/v1/tensorfs/closure") => closure(&checkpoint),
+            ("POST", "/v1/tensorfs/presign") => ok_json(&presign_value(&request.body, &base)),
+            ("GET", path) if path.starts_with("/obj/") => {
+                match checkpoint.bodies.get(&path["/obj/".len()..]) {
+                    Some(body) => status(200, body),
+                    None => status(404, b"no such object"),
+                }
+            }
+            _ => status(404, b"no such route"),
+        }
+    });
+    let origin = origin(dispatch);
+    *base_slot.lock().unwrap() = origin.base.clone();
+    origin
+}
+
+fn go_row(object: &ObjectRef) -> String {
+    format!(
+        "{{\n      \"sha256\": \"{}\",\n      \"length\": {}\n    }}",
+        object.sha256, object.length
+    )
+}
+
+#[test]
+fn a_go_hubs_ordinary_json_pulls() {
+    let root = temporary("go-json");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(4, 1024));
+    let origin = go_hub(Arc::clone(&checkpoint), |c| {
+        let mut rows: Vec<String> = c.objects.iter().rev().map(go_row).collect();
+        rows.push(go_row(&c.objects[0]));
+        rows.push(go_row(&c.manifest));
+        let body = format!(
+            "{{\n  \"model\": \"acme/model\",\n  \"release\": \"r1\",\n  \"lane\": \"public\",\n  \
+             \"scope\": \"runtime\",\n  \"note\": \"weights \\u0026 configs \u{2014} ready\",\n  \
+             \"ratio\": 0.5,\n  \"stamps\": null,\n  \"presign_max_digests\": null,\n  \
+             \"manifest\": {},\n  \"objects\": [\n    {}\n  ]\n}}",
+            go_row(&c.manifest),
+            rows.join(",\n    ")
+        );
+        Serve::Whole {
+            status: 200,
+            body: body.into_bytes(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+        }
+    });
+    let policy = SourcePolicy::default();
+    let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
+    assert_eq!(report.declared, checkpoint.objects.len() as u64 + 1);
+    assert_eq!(report.fetched, checkpoint.objects.len() as u64 + 1);
+    assert!(report.stamps.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Go's `json.MarshalIndent` envelope escapes `<` and writes an em dash raw. It is still the
+/// hub's typed verdict, not weather to retry.
+#[test]
+fn a_go_hub_refusal_envelope_is_its_verdict() {
+    let root = temporary("go-envelope");
+    let store = Store::init(&root).unwrap();
+    let checkpoint = Arc::new(checkpoint(1, 1024));
+    let origin = go_hub(Arc::clone(&checkpoint), |_| {
+        Serve::Whole {
+        status: 403,
+        body: "{\n  \"error\": {\n    \"code\": \"model.private\",\n    \"message\": \"acme/model is private \u{2014} \\u003cowner only\\u003e\",\n    \"remedy\": \"present an org token\"\n  }\n}"
+            .as_bytes()
+            .to_vec(),
+        headers: vec![("Content-Type".into(), "application/json".into())],
+    }
+    });
+    let policy = SourcePolicy::default();
+    let error = pull(&request_for(&store, &origin.base, &policy)).unwrap_err();
+    assert_eq!(error.code, Code::CREDENTIAL_REQUIRED, "{error:?}");
+    assert!(error.detail.contains("<owner only>"), "{}", error.detail);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// proto-061 A: a digest-pinned warm ask the local release index already answers costs
 /// zero hub calls; a moved pointer or an untrusted object sends the ask back to the hub.
 #[test]

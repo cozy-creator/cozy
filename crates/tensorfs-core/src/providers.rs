@@ -460,11 +460,15 @@ fn list_selected_observed(
         );
     }
     members.sort_by(|left, right| left.member.cmp(&right.member));
+    members.dedup();
     if members
         .windows(2)
         .any(|pair| pair[0].member == pair[1].member)
     {
-        return refuse(Code::DUPLICATE_KEY, "the source lists one member twice");
+        return refuse(
+            Code::DUPLICATE_KEY,
+            "the source lists one member twice with different facts",
+        );
     }
     Ok(members)
 }
@@ -1391,6 +1395,7 @@ pub fn resolve_files(
     }
     let mut names = files.to_vec();
     names.sort();
+    names.dedup();
     if names
         .iter()
         .any(|name| !member_path(name) || crate::manifest::check_path(name).is_err())
@@ -1398,12 +1403,6 @@ pub fn resolve_files(
         return refuse(
             Code::PATH_ILLEGAL,
             "ordinary file selection requires exact member paths",
-        );
-    }
-    if names.windows(2).any(|pair| pair[0] == pair[1]) {
-        return refuse(
-            Code::DUPLICATE_KEY,
-            "ordinary file selection names one member twice",
         );
     }
     let ledger = Ledger::new();
@@ -2251,7 +2250,7 @@ mod tests {
                 Code::KEY_GRAMMAR,
             ),
             (
-                r#"{"files":[{"id":92696,"name":"a.safetensors"},{"id":92696,"name":"b.safetensors"}]}"#,
+                r#"{"files":[{"id":92696,"name":"a.safetensors","hashes":{"SHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"id":92696,"name":"b.safetensors","hashes":{"SHA256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]}"#,
                 Code::DUPLICATE_KEY,
             ),
         ] {
@@ -2272,6 +2271,23 @@ mod tests {
             assert_eq!(refusal.code, code);
             handle.join().unwrap();
         }
+        // A provider that lists one file twice with the same facts lists it once.
+        let listing = r#"{"files":[{"id":92696,"name":"a.safetensors"},{"id":92696,"name":"a.safetensors"}]}"#;
+        let (base, _, handle) = origin(1, move |_| ok_body(listing.as_bytes(), "application/json"));
+        let endpoints = Endpoints {
+            civitai: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let members = list(
+            &SourceUri::Civitai { version: 777 },
+            &endpoints,
+            &Anonymous,
+            Deadline::none(),
+        )
+        .unwrap();
+        assert_eq!(members.len(), 1);
+        handle.join().unwrap();
     }
 
     /// The credential is scoped to the host that holds it. A relative redirect stays on
@@ -2557,18 +2573,6 @@ mod tests {
                 Code::PATH_ILLEGAL
             );
         }
-        assert_eq!(
-            resolve_files(
-                &uri,
-                &["config.json".into(), "config.json".into()],
-                &Endpoints::default(),
-                &Anonymous,
-                Deadline::none()
-            )
-            .unwrap_err()
-            .code,
-            Code::DUPLICATE_KEY
-        );
     }
 
     #[test]

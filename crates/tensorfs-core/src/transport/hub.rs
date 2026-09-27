@@ -30,7 +30,8 @@
 //!
 //! Errors travel in the hub's own envelope `{"error":{"code","message","remedy"}}` and
 //! cross verbatim — the hub knows why it refused better than anything restated here.
-//! Responses are I-JSON, ASCII, no HTML escaping (Go: `SetEscapeHTML(false)`).
+//! Responses are ordinary RFC 8259 JSON from a Go peer: any UTF-8, HTML-escaped or not,
+//! `null` for an absent value. Fields this build does not read are ignored.
 //!
 //! **The credential arrives as a provider trait, never a credential type**, so one
 //! implementation serves whatever a caller holds. It is asked per host, so a credential
@@ -42,6 +43,7 @@
 use crate::canon::{self, as_arr, as_obj, as_str, as_uint, Value};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::ids::{hex64, ObjectRef};
+use crate::jcs::{self, Json};
 use crate::limits;
 use crate::transport::http::Client;
 use crate::transport::ledger::{Deadline, Ledger};
@@ -197,24 +199,12 @@ pub fn closure(
     let manifest = object_row("closure.manifest", field("manifest")?)?;
     let mut objects = Vec::new();
     for row in as_arr("closure", "objects", field("objects")?)? {
-        objects.push(object_row("closure.objects", row)?);
+        let object = object_row("closure.objects", row)?;
+        if object.sha256 != manifest.sha256 {
+            objects.push(object);
+        }
     }
-    if objects
-        .windows(2)
-        .any(|pair| pair[0].sha256 >= pair[1].sha256)
-    {
-        return refuse(
-            Code::HUB_REFUSED,
-            "closure.objects must be sorted and unique by digest — the answer is the \
-             content-addressed manifest and has one spelling",
-        );
-    }
-    if objects.iter().any(|o| o.sha256 == manifest.sha256) {
-        return refuse(
-            Code::HUB_REFUSED,
-            "closure.objects repeats the manifest row; the manifest travels once",
-        );
-    }
+    objects = sorted_unique(objects)?;
     let scope = match obj.iter().find(|(k, _)| k == "scope") {
         Some((_, v)) => as_str("closure", "scope", v)?.to_string(),
         None => "runtime".to_string(),
@@ -346,24 +336,37 @@ pub fn closure_all(
                 ),
             );
         }
-        if next
-            .objects
-            .first()
-            .is_some_and(|first| first.sha256 <= last)
-        {
+        if !next.complete && next.objects.last().is_none_or(|end| end.sha256 <= last) {
             return refuse(
                 Code::HUB_REFUSED,
-                format!(
-                    "the closure page after {last} starts at {} — the rows are sorted unique \
-                     by digest and a page must continue the one before it",
-                    next.objects[0].sha256
-                ),
+                format!("the closure page after {last} does not advance past it"),
             );
         }
         whole.complete = next.complete;
         whole.objects.extend(next.objects);
     }
+    whole.objects = sorted_unique(std::mem::take(&mut whole.objects))?;
     Ok(whole)
+}
+
+/// Rows in digest order with identical repeats merged. One digest with two lengths is a
+/// real disagreement about an object and still refuses.
+fn sorted_unique(mut objects: Vec<ObjectRef>) -> Result<Vec<ObjectRef>> {
+    objects.sort_by(|a, b| a.sha256.cmp(&b.sha256).then(a.length.cmp(&b.length)));
+    objects.dedup();
+    if let Some(pair) = objects
+        .windows(2)
+        .find(|pair| pair[0].sha256 == pair[1].sha256)
+    {
+        return refuse(
+            Code::HUB_REFUSED,
+            format!(
+                "closure names sha256:{} at {} B and at {} B",
+                pair[0].sha256, pair[0].length, pair[1].length
+            ),
+        );
+    }
+    Ok(objects)
 }
 
 /// URLs for exactly the asked digests. A digest the hub does not answer is a typed
@@ -601,10 +604,10 @@ fn call_once(
         .read_capped(limits::DOC_MAX_BYTES)
         .map_err(Retryable::from)?;
     if (200..300).contains(&status) {
-        return canon::parse(&raw, limits::DOC_MAX_BYTES).map_err(|refusal| {
+        return read_json(&raw, limits::DOC_MAX_BYTES).map_err(|refusal| {
             Retryable::from(Refusal {
                 code: Code::HUB_REFUSED,
-                detail: format!("the hub's {path} answer is not readable I-JSON: {refusal}"),
+                detail: format!("the hub's {path} answer is not readable JSON: {refusal}"),
             })
         });
     }
@@ -640,10 +643,32 @@ fn call_once(
     })
 }
 
+/// A hub answer as the values this module reads: `null` and fractional numbers read as
+/// absent, strings keep whatever UTF-8 the hub wrote.
+fn read_json(raw: &[u8], max: usize) -> Result<Value> {
+    fn value(json: Json) -> Option<Value> {
+        match json {
+            Json::Null => None,
+            Json::Bool(b) => Some(Value::Bool(b)),
+            Json::Num(n) if n.fract() == 0.0 => Some(Value::Int(n as i64)),
+            Json::Num(_) => None,
+            Json::Str(s) => Some(Value::Str(s)),
+            Json::Arr(items) => Some(Value::Arr(items.into_iter().filter_map(value).collect())),
+            Json::Obj(pairs) => Some(Value::map(
+                pairs
+                    .into_iter()
+                    .filter_map(|(k, v)| value(v).map(|v| (k, v)))
+                    .collect(),
+            )),
+        }
+    }
+    Ok(value(jcs::parse(raw, max)?).unwrap_or(Value::Obj(Vec::new())))
+}
+
 /// How long the HUB says to wait, read off the pair of clocks it sent so a skewed local
 /// clock cannot shorten or lengthen it. `None` when the hub stated nothing.
 fn stated_wait(raw: &[u8]) -> Option<std::time::Duration> {
-    let Ok(Value::Obj(fields)) = canon::parse(raw, 64 * 1024) else {
+    let Ok(Value::Obj(fields)) = read_json(raw, 64 * 1024) else {
         return None;
     };
     let uint = |name: &str| {
@@ -674,7 +699,7 @@ fn envelope(status: u16, raw: &[u8], path: &str) -> Option<Refusal> {
     let mut code = String::new();
     let mut message = String::new();
     let mut remedy = String::new();
-    if let Ok(Value::Obj(fields)) = canon::parse(raw, 64 * 1024) {
+    if let Ok(Value::Obj(fields)) = read_json(raw, 64 * 1024) {
         if let Some((_, Value::Obj(error))) = fields.into_iter().find(|(k, _)| k == "error") {
             for (key, val) in error {
                 if let Value::Str(text) = val {
