@@ -5,9 +5,12 @@ package records
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"math"
+	"regexp"
 	"strings"
 	"time"
 
@@ -167,12 +170,27 @@ func (s *Store) LinkMachineExecution(id, machine string) *exit.Error {
 	return nil
 }
 
+// machineSubmissionGrammar is Runtime's execution identity grammar
+// (workspace_executions.py `_ID`); a submission outside it is refused on the machine.
+var machineSubmissionGrammar = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$`)
+
+// MachineSubmissionID is the machine identity of a request's idempotency key: the key
+// itself when Runtime accepts it, otherwise a stable digest of it, so a resume key such
+// as `<base>/retry-of/<job>` still names one submission.
+func MachineSubmissionID(idemKey string) string {
+	if machineSubmissionGrammar.MatchString(idemKey) {
+		return idemKey
+	}
+	digest := sha256.Sum256([]byte(idemKey))
+	return "idem-" + hex.EncodeToString(digest[:])
+}
+
 // RecordMachineSubmission freezes the exact offer before its first transmission.
 // A connection error thereafter is ambiguous acceptance, never permission to mint
 // another submission identity or start a local attempt.
 func (s *Store) RecordMachineSubmission(id string, submission *pb.MachineExecutionSubmit) *exit.Error {
 	if submission == nil || submission.Offer == nil || submission.Offer.RequestId != id ||
-		submission.SubmissionId == "" || len(submission.SubmissionId) > 256 ||
+		!machineSubmissionGrammar.MatchString(submission.SubmissionId) ||
 		submission.ExpectedExecutionWorkspaceId == "" || len(submission.ExpectedExecutionWorkspaceId) > 256 ||
 		len(submission.CaptureDigest) != 32 || !bytes.Equal(canonical.Digest(submission.CaptureCanonicalBytes), submission.CaptureDigest) ||
 		len(submission.Offer.InvocationSpecDigest) != 32 || !bytes.Equal(canonical.Digest(submission.Offer.InvocationSpecCanonicalBytes), submission.Offer.InvocationSpecDigest) {
