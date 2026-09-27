@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"flag"
 	"io"
 	"net/http"
 	"os"
@@ -29,9 +28,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
-
-var ingestTensorFSFindLinks = flag.String("ingest-tensorfs-find-links", "",
-	"directory holding a TensorFS wheel at the generated ingest script's floor, before PyPI has that release")
 
 // civitaiIngestScript is the one bounded-disk upload call a rented Civitai ingest submits.
 const civitaiIngestScript = `# /// script
@@ -56,20 +52,6 @@ func TestRentedCivitaiIngestSubmitsTheSingleCallScript(t *testing.T) {
 	root, tmp := filepath.Join(base, "home"), filepath.Join(base, "tmp")
 	must(t, os.MkdirAll(tmp, 0o700))
 	must(t, os.MkdirAll(root, 0o700))
-	// The product passes no UV_* variable to uv, but uv reads the nearest ancestor uv.toml:
-	// the script lock under TMPDIR and the capture's sync under the home both see this one.
-	if *ingestTensorFSFindLinks != "" {
-		must(t, os.WriteFile(filepath.Join(base, "uv.toml"), []byte("find-links = ["+
-			quoteTOML(*ingestTensorFSFindLinks)+"]\n"), 0o600))
-	}
-	probe := exec.Command("/usr/bin/nice", "-n", "19", "uv", "pip", "compile", "--no-deps", "--no-header",
-		"--python-version", "3.12", "-")
-	probe.Dir, probe.Env = tmp, childEnv(t, root, "TMPDIR="+tmp)
-	probe.Stdin = strings.NewReader("tensorfs>=0.3.60,<0.4\n")
-	if out, err := probe.CombinedOutput(); err != nil {
-		t.Skipf("tensorfs>=0.3.60 does not resolve, so the generated script cannot lock; "+
-			"pass -ingest-tensorfs-find-links=<dir holding its wheel> until PyPI has it:\n%s", out)
-	}
 	response, err := http.Get("https://civitai.com/api/v1/model-versions/128078")
 	if err != nil {
 		t.Skipf("provider unreachable from this runner: %v", err)
@@ -224,9 +206,4 @@ func tarMember(archive []byte, name string) ([]byte, error) {
 			return io.ReadAll(reader)
 		}
 	}
-}
-
-func quoteTOML(value string) string {
-	raw, _ := json.Marshal(value)
-	return string(raw)
 }
