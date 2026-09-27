@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The pod host's REFUSED event for run 862's failure, as the host now composes it: the
@@ -15,6 +16,62 @@ import (
 const refusedWheel = "runtime compatibility check failed (Internal): StorageRefusal: supervisor refused " +
 	"locked wheel torch-2.14.0-cp312-cp312-manylinux_2_28_x86_64.whl: fetch sha256:ab12: " +
 	"ended at 0 of 851640832 bytes: transfer interrupted: unexpected EOF"
+
+// A rented run whose machine preparation Runtime refuses fails before any attempt, and
+// `cozy run list` and `cozy run watch` both carry the refusal's own code and message.
+func TestMachinePrepareRefusalReachesRunListAndWatch(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	pod := &fakePod{machine: &runtimeMachine{}, deviceCount: 4, refusePrepare: map[string]*pb.PrepareEvent{
+		ladderPackage: {SafeCode: "wheel_download_failed", SafeDetail: refusedWheel}}}
+	root, _ := rentedLadderMachine(t, h, pod, nil)
+	runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json")
+
+	type listed struct {
+		Number    int64  `json:"number"`
+		ID        string `json:"id"`
+		Status    string `json:"status"`
+		ErrorType string `json:"error_type"`
+		ErrorCode string `json:"error_code"`
+		Error     string `json:"error"`
+	}
+	var run listed
+	waitFor(t, root, "the refused run to fail", func() bool {
+		var page struct{ Invocations []listed }
+		_, out := runCozy(t, root, "run", "list", "--json", "--full")
+		if json.Unmarshal([]byte(out), &page) != nil || len(page.Invocations) != 1 {
+			return false
+		}
+		run = page.Invocations[0]
+		return run.Status == "failed"
+	})
+	if run.ErrorType != "machine_execution.prepare_refused" || run.ErrorCode != "wheel_download_failed" ||
+		run.Error != "wheel_download_failed: "+refusedWheel {
+		t.Fatalf("listed failure lost its cause: %+v", run)
+	}
+	code, out := runCozy(t, root, "run", "list", "--no-watch")
+	if code != 0 || !strings.Contains(out, "wheel_download_failed: runtime compatibility check failed (Internal)") {
+		t.Fatalf("human run list shows no reason [%d]:\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "run", "watch", strconv.FormatInt(run.Number, 10), "--json")
+	var watched struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if code == 0 || json.Unmarshal([]byte(out), &watched) != nil {
+		t.Fatalf("run watch --json of a failed run [%d]: %s", code, out)
+	}
+	details := watched.Error.Details
+	if watched.Error.Code != "failed" || details["error_code"] != "wheel_download_failed" ||
+		details["error_type"] != "machine_execution.prepare_refused" || run.ID == "" || details["request_id"] != run.ID ||
+		details["number"] != float64(run.Number) || details["error"] != run.Error ||
+		!strings.Contains(watched.Error.Message, refusedWheel) {
+		t.Fatalf("run watch --json lost the typed failure: %s", out)
+	}
+}
 
 // A failed attempt's kept triage bundle is readable from `cozy run watch --json`.
 func TestFailedRunWatchCarriesItsTriageBundle(t *testing.T) {

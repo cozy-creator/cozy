@@ -135,6 +135,18 @@ func (s *Store) CancelQueuedRequest(requestID string, payload map[string]any) (b
 	return true, nil
 }
 
+// QueuedFailure is the terminal payload of a failure before any attempt: the error's
+// name, its message and, when another component originated it, that component's code.
+func QueuedFailure(cause *exit.Error) map[string]any {
+	payload := map[string]any{"status": "FAILED", "cause": cause.ErrName(),
+		"error_type": cause.ErrName(), "error": cause.Message,
+		"outputs": []any{}, "requeuing": false}
+	if cause.Cause != "" {
+		payload["error_code"] = cause.Cause
+	}
+	return payload
+}
+
 // FailQueuedRequest atomically records the typed pre-attempt failure and its terminal
 // event. After a 202 response, status and watch must never disagree about why activation
 // failed merely because one of two separate writes was lost.

@@ -138,71 +138,25 @@ func (m *runtimeMachine) AcknowledgeMachineExecutionCollection(context.Context, 
 func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
-	publishWorkflowRelease(t, h)
-	var detail hub.PackageReleaseDetail
-	response, err := http.Get(h.server.URL + "/v1/packages/proof/h3/releases/1.0.0")
-	must(t, err)
-	must(t, json.NewDecoder(response.Body).Decode(&detail))
-	response.Body.Close()
-	facts := testPrepareFacts(ladderPackage, "1.0.0")
-	inventory, err := json.Marshal(map[string]any{"format": "tensorhub.image_inventory/1",
-		"profile": facts.ImageInventory.Profile, "python": facts.ImageInventory.Python,
-		"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.41"}}})
-	must(t, err)
-	served := h.server.Config.Handler
-	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/rentals/"+podRental+"/prepare-facts" {
-			served.ServeHTTP(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: "h3:app", ModelSlotPaths: []string{ladderSlot},
-			ImageInventory: inventory, LockedRequirements: string(facts.LockedRequirements)})
-	})
-
-	root := ladderRoot(t, h)
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	holder, _, problem := store.Submit(records.Request{ID: "req-gpu-holder", IdemKey: "gpu-holder", BodyDigest: childDigest("7"),
-		Package: ladderPackage, Entrypoint: "generate", Payload: []byte(`{}`)})
-	fatal(t, problem)
-	_, problem = store.FailQueuedRequest(holder.ID, map[string]any{"error_type": "proof", "error": "held elsewhere"})
-	fatal(t, problem)
-	identity, problem := rental.PendingCreatorIdentity(layout, "rented-inference")
-	fatal(t, problem)
-	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
-	must(t, err)
 	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "runtime-bundle.json"))
 	must(t, err)
-	machine := &runtimeMachine{blocker: holder.ID, triage: bundle}
-	pod := &fakePod{controlKey: public, machine: machine, deviceCount: 4,
+	machine := &runtimeMachine{triage: bundle}
+	pod := &fakePod{machine: machine, deviceCount: 4,
 		mediaRequest: func(w http.ResponseWriter, r *http.Request) bool {
 			if r.Method != http.MethodGet || r.URL.Path != "/v1/triage/trb-rented" {
 				return false
 			}
 			_, _ = w.Write(bundle)
 			return true
-		},
-		preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
-			placement := modelBearingPlacement(t)(download, pkg, release)
-			placement.PackageInterface = detail.PackageInterface
-			return placement
 		}}
-	connection, certPath := startFakePod(t, root, pod)
-	cert, err := os.ReadFile(certPath)
-	must(t, err)
-	h.mu.Lock()
-	h.rentals[podRental] = map[string]any{"rental_id": podRental, "name": "tessa", "state": "ready",
-		"requested_accelerator_model": "fake-4090", "accelerator_count": 4, "hourly_rate_usd_micros": 1,
-		"worker_address": connection.Addr, "media_address": connection.Media.Addr}
-	h.mu.Unlock()
-	fatal(t, rental.Attach(layout, store, records.Rental{ID: podRental, MachineName: "tessa", SKU: "fake-x", State: "ready",
-		AcceleratorModel: "fake-4090", AcceleratorCount: 4, HourlyRateUSDMicros: 1, Hub: h.server.URL,
-		Address: connection.Addr, MediaAddress: connection.Media.Addr,
-		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
-	store.Close()
-	startDaemonProcess(t, root)
+	root, layout := rentedLadderMachine(t, h, pod, func(store *records.Store) {
+		holder, _, problem := store.Submit(records.Request{ID: "req-gpu-holder", IdemKey: "gpu-holder", BodyDigest: childDigest("7"),
+			Package: ladderPackage, Entrypoint: "generate", Payload: []byte(`{}`)})
+		fatal(t, problem)
+		_, problem = store.FailQueuedRequest(holder.ID, map[string]any{"error_type": "proof", "error": "held elsewhere"})
+		fatal(t, problem)
+		machine.blocker = holder.ID
+	})
 
 	// A resume key names its predecessor with slashes; the machine sees an opaque identity.
 	const key = "rented-inference/retry-of/job-1"
@@ -224,7 +178,7 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 		t.Fatalf("run show does not say the run waits for GPUs:\n%s", show)
 	}
 	machine.finish()
-	store, problem = records.Open(layout.DB)
+	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
 	var row *records.Request
@@ -288,4 +242,66 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 	if desired != 0 {
 		t.Fatalf("the Runtime-owned worker was sent %d desired state(s); a full replace retires its replicas", desired)
 	}
+}
+
+// rentedLadderMachine publishes the ladder package and attaches `pod` as the ready rental
+// "tessa", as many fake-4090 cards wide as its deviceCount, then starts the daemon.
+// `before` runs against the store while nothing else holds it.
+func rentedLadderMachine(t *testing.T, h *ladderHub, pod *fakePod, before func(*records.Store)) (string, home.Layout) {
+	t.Helper()
+	publishWorkflowRelease(t, h)
+	var detail hub.PackageReleaseDetail
+	response, err := http.Get(h.server.URL + "/v1/packages/proof/h3/releases/1.0.0")
+	must(t, err)
+	must(t, json.NewDecoder(response.Body).Decode(&detail))
+	response.Body.Close()
+	facts := testPrepareFacts(ladderPackage, "1.0.0")
+	inventory, err := json.Marshal(map[string]any{"format": "tensorhub.image_inventory/1",
+		"profile": facts.ImageInventory.Profile, "python": facts.ImageInventory.Python,
+		"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.41"}}})
+	must(t, err)
+	served := h.server.Config.Handler
+	h.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/rentals/"+podRental+"/prepare-facts" {
+			served.ServeHTTP(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(hub.PrepareFactsView{Application: "h3:app", ModelSlotPaths: []string{ladderSlot},
+			ImageInventory: inventory, LockedRequirements: string(facts.LockedRequirements)})
+	})
+
+	root := ladderRoot(t, h)
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	if before != nil {
+		before(store)
+	}
+	identity, problem := rental.PendingCreatorIdentity(layout, "rented-inference")
+	fatal(t, problem)
+	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
+	must(t, err)
+	pod.controlKey = public
+	pod.preparedPlacement = func(download []byte, pkg, release string) *pb.Placement {
+		placement := modelBearingPlacement(t)(download, pkg, release)
+		placement.PackageInterface = detail.PackageInterface
+		return placement
+	}
+	connection, certPath := startFakePod(t, root, pod)
+	cert, err := os.ReadFile(certPath)
+	must(t, err)
+	cards := int(max(pod.deviceCount, 1))
+	h.mu.Lock()
+	h.rentals[podRental] = map[string]any{"rental_id": podRental, "name": "tessa", "state": "ready",
+		"requested_accelerator_model": "fake-4090", "accelerator_count": cards, "hourly_rate_usd_micros": 1,
+		"worker_address": connection.Addr, "media_address": connection.Media.Addr}
+	h.mu.Unlock()
+	fatal(t, rental.Attach(layout, store, records.Rental{ID: podRental, MachineName: "tessa", SKU: "fake-x", State: "ready",
+		AcceleratorModel: "fake-4090", AcceleratorCount: cards, HourlyRateUSDMicros: 1, Hub: h.server.URL,
+		Address: connection.Addr, MediaAddress: connection.Media.Addr,
+		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
+	store.Close()
+	startDaemonProcess(t, root)
+	return root, layout
 }

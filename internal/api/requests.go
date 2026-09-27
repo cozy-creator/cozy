@@ -919,7 +919,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS,
-			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, Outputs: state.Outputs,
+			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
 			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}

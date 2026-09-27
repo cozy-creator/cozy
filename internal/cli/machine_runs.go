@@ -200,7 +200,7 @@ func (m *machineRuns) Start(request records.Request) *exit.Error {
 				// A machine lost mid-preparation released the run; it is placed again.
 				latest, readProblem := m.store.MachineExecution(request.ID)
 				if readProblem == nil && latest != nil && problem.Code != exit.Unavailable && problem.Code != exit.Deadline && len(latest.Submission) == 0 && latest.MachineID == link.MachineID {
-					_, _ = m.store.FailQueuedRequest(request.ID, map[string]any{"error_type": problem.ErrName(), "error": problem.Message})
+					_, _ = m.store.FailQueuedRequest(request.ID, records.QueuedFailure(problem))
 					return
 				}
 				if readProblem == nil && latest != nil && len(latest.Submission) == 0 {
@@ -894,13 +894,13 @@ func readMachinePreparationEvent(stream grpc.ServerStreamingClient[pb.PrepareEve
 		}
 		switch event.Stage {
 		case pb.PrepareStage_PREPARE_STAGE_REFUSED:
-			if problem := orchestrator.RuntimeRequirementEvent(event); problem != nil {
-				return event, problem
+			problem := orchestrator.RuntimeRequirementEvent(event)
+			if problem == nil && event.SafeCode == "package_environment_dependency_base_conflict" {
+				problem = exit.Named(exit.Structural, "machine_execution.runtime_requirement", "%s", event.SafeDetail)
+			} else if problem == nil {
+				problem = exit.Named(exit.Conflict, "machine_execution.prepare_refused", "%s: %s", event.SafeCode, event.SafeDetail)
 			}
-			if event.SafeCode == "package_environment_dependency_base_conflict" {
-				return event, exit.Named(exit.Structural, "machine_execution.runtime_requirement", "%s", event.SafeDetail)
-			}
-			return event, exit.Named(exit.Conflict, "machine_execution.prepare_refused", "%s: %s", event.SafeCode, event.SafeDetail)
+			return event, problem.WithCause(event.SafeCode)
 		case pb.PrepareStage_PREPARE_STAGE_PREPARED:
 			if event.InstalledPackage != nil {
 				return event, nil

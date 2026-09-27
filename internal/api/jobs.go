@@ -787,6 +787,7 @@ type JobState struct {
 	ExecutionMS      int64             `json:"execution_ms"`
 	Metrics          map[string]any    `json:"metrics,omitempty"`
 	ErrorType        string            `json:"error_type,omitempty"`
+	ErrorCode        string            `json:"error_code,omitempty"`
 	Error            string            `json:"error,omitempty"`
 	CanceledBy       string            `json:"canceled_by,omitempty"`
 	Result           any               `json:"result,omitempty"`
