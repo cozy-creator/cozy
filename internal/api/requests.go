@@ -104,7 +104,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != io.EOF {
 		s.refuse(w, r, http.StatusBadRequest, "malformed_body",
-			"the submission is not a JSON object: "+err.Error(), "")
+			"the submission is not a JSON object: "+err.Error(), staleDaemonRemedy(err))
 		return
 	}
 	if sub.Package == "" || sub.Function == "" {
@@ -1211,4 +1211,13 @@ func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
 			life.RemainingMS = &progress.RemainingMS
 		}
 	}
+}
+
+// staleDaemonRemedy names the recovery for a submission field this running daemon does
+// not implement: it predates the client, and a restart picks up the installed build.
+func staleDaemonRemedy(err error) string {
+	if err == nil || !strings.Contains(err.Error(), "unknown field") {
+		return ""
+	}
+	return "this daemon predates the cozy client that sent the request; run `cozy down` once its work settles, then retry (rentals survive a daemon restart)"
 }
