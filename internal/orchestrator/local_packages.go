@@ -242,7 +242,7 @@ func localSelection(operationID string, revision localpackage.Installation) (
 	*pb.DesiredLocalPackageSet, *localTransfer, *exit.Error,
 ) {
 	if operationID == "" || revision.ID == "" || revision.Package == "" || revision.Release == "" || len(revision.Files) == 0 || len(revision.Files) > pb.MaxLocalPackageFiles {
-		return nil, nil, exit.New(exit.Validation, "private installation inputs are incomplete")
+		return nil, nil, exit.Named(exit.Validation, "local_package_revision_invalid", "private installation inputs are incomplete")
 	}
 	selected := &pb.DesiredLocalPackageSet{PythonRequires: revision.PythonRequires, PythonVersion: revision.PythonVersion, OperationId: operationID,
 		SourceArchive: revision.SourceArchive, DependencyRequirements: revision.DependencyRequirements,

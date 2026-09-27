@@ -14,6 +14,7 @@ import zipfile
 from packaging.markers import default_environment
 
 MODULE = Path(__file__).parents[3] / "internal/cli/runtime_update_transport.py"
+PROBE = MODULE.with_name("runtime_update_probe.py").read_text()
 
 
 class PublishedRuntimeUpdates(unittest.TestCase):
@@ -114,8 +115,8 @@ class PublishedRuntimeUpdates(unittest.TestCase):
             self.resolve()
 
     def test_plan_records_verified_pair_and_unchanged_readback(self):
-        self.api["inspect"] = lambda arguments, python=None: self.observed
-        request = {"ssh_arguments": [], "action": "plan", "directory": str(self.directory)}
+        self.api["inspect"] = lambda arguments, probe, python=None: self.observed
+        request = {"ssh_arguments": [], "probe": PROBE, "action": "plan", "directory": str(self.directory)}
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
             plan = self.api["main"]()
         self.assertFalse(plan["unchanged"])
@@ -134,7 +135,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         self.api["ssh"] = lambda arguments, command: calls.append(command) or json.dumps({"operation": stage, "state": "queued"})
         self.api["fetch"] = lambda *args: self.fail("recovery must not resolve another release")
         for action in ("resume", "status"):
-            request = {"ssh_arguments": [], "action": action, "stage": stage, "selection": {"wheels": wheels}}
+            request = {"ssh_arguments": [], "probe": PROBE, "action": action, "stage": stage, "selection": {"wheels": wheels}}
             with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
                 result = self.api["main"]()
             self.assertEqual(result["update"]["operation"], stage)
@@ -146,13 +147,13 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         _, wheels = self.resolve()
         stage = "b" * 32
         calls = []
-        self.api["inspect"] = lambda arguments, python=None: self.observed
+        self.api["inspect"] = lambda arguments, probe, python=None: self.observed
         self.api["fetch"] = lambda *args: self.fail("recovery must not select another release")
         def remote(arguments, command):
             calls.append(command)
             return json.dumps({"operation": stage, "state": "missing" if " status " in command else "queued"})
         self.api["ssh"] = remote
-        request = {"ssh_arguments": [], "sftp_arguments": [], "host": "fixture",
+        request = {"ssh_arguments": [], "probe": PROBE, "sftp_arguments": [], "host": "fixture",
                    "action": "resume", "stage": stage, "directory": str(self.directory),
                    "selection": {"wheels": wheels}}
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))), patch.object(subprocess, "run") as transfer:
@@ -174,7 +175,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
     def test_resume_never_retransfers_when_status_names_another_operation(self):
         _, wheels = self.resolve()
         self.api["ssh"] = lambda arguments, command: json.dumps({"operation": "b" * 32, "state": "missing"})
-        request = {"ssh_arguments": [], "action": "resume", "stage": "a" * 32,
+        request = {"ssh_arguments": [], "probe": PROBE, "action": "resume", "stage": "a" * 32,
                    "selection": {"wheels": wheels}}
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
             with self.assertRaisesRegex(ValueError, "recorded operation"):
@@ -199,7 +200,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         self.assertNotIn("https://pypi.org/pypi/cozy-runtime/json", self.fetched)
         Path(local["path"]).unlink()
         # Recovery depends on the verified operation copy, not the source path.
-        request = {"ssh_arguments": [], "action": "resume", "stage": "a" * 32,
+        request = {"ssh_arguments": [], "probe": PROBE, "action": "resume", "stage": "a" * 32,
                    "selection": {"wheels": wheels}}
         self.api["fetch"] = lambda *args: self.fail("resume reselected a public wheel")
         self.api["ssh"] = lambda arguments, command: json.dumps({"operation": "a" * 32, "state": "queued"})
@@ -220,7 +221,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         stage = "c" * 32
         self.api["ssh"] = lambda arguments, command: json.dumps({"operation": stage, "state": "queued"})
         for action in ("resume", "status"):
-            request = {"ssh_arguments": [], "action": action, "stage": stage,
+            request = {"ssh_arguments": [], "probe": PROBE, "action": action, "stage": stage,
                        "selection": {"wheels": wheels}}
             with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
                 self.assertEqual(self.api["main"]()["update"]["operation"], stage)
@@ -249,8 +250,7 @@ class PublishedRuntimeUpdates(unittest.TestCase):
             ({"tag": "cp312-cp312-manylinux_2_28_aarch64"}, "platform"),
             ({"metadata_name": "other-project"}, "metadata does not match"),
             ({"requires_python": ">=3.13"}, "different worker Python"),
-            ({"version": "0.18.20"}, "distinct newer version"),
-            ({"version": "0.18.19"}, "distinct newer version"),
+            ({"version": "0.18.19"}, "without downgrading its public release"),
         ]:
             with self.subTest(kwargs=kwargs):
                 local = self.local(**kwargs)
@@ -265,8 +265,8 @@ class PublishedRuntimeUpdates(unittest.TestCase):
         local = self.local()
         _, wheels = self.api["resolve"](self.observed, self.directory, local)
         Path(wheels[0]["path"]).write_bytes(b"changed after plan")
-        self.api["inspect"] = lambda arguments, python=None: self.observed
-        request = {"ssh_arguments": [], "action": "apply", "directory": str(self.directory),
+        self.api["inspect"] = lambda arguments, probe, python=None: self.observed
+        request = {"ssh_arguments": [], "probe": PROBE, "action": "apply", "directory": str(self.directory),
                    "stage": "a" * 32, "selection": {"wheels": wheels}}
         with patch.object(sys, "stdin", io.StringIO(json.dumps(request))):
             with self.assertRaisesRegex(ValueError, "changed after verification"):
@@ -296,11 +296,11 @@ class PublishedRuntimeUpdates(unittest.TestCase):
     def test_probe_does_not_rely_on_ssh_path(self):
         calls = []
         self.api["ssh"] = lambda arguments, command: calls.append(command) or '{}'
-        self.api["inspect"]([])
+        self.api["inspect"]([], PROBE)
         self.assertTrue(calls[0].startswith("/opt/cozy/python/bin/python3 -I -c "))
-        self.assertIn("sys.executable", self.api["PROBE"])
-        self.assertNotIn("['cozy-runtime'", self.api["PROBE"])
-        self.assertNotIn("['python3'", self.api["PROBE"])
+        self.assertIn("sys.executable", PROBE)
+        self.assertNotIn("['cozy-runtime'", PROBE)
+        self.assertNotIn("['python3'", PROBE)
 
     def test_index_cannot_redirect_wheel_to_another_host_or_name(self):
         self.runtime["url"] = "https://untrusted.example/" + self.runtime["filename"]

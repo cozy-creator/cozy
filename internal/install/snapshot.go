@@ -15,7 +15,7 @@ func snapshotSource(installDir string, local *LocalSource) (string, *exit.Error)
 	}
 	defer frozen.Close()
 	if "local/"+frozen.Name != local.Package || frozen.Release != local.Release {
-		return "", exit.New(exit.Conflict, "copied project declares a different package name or version")
+		return "", exit.Named(exit.Conflict, "local_package_source_changed", "copied project declares a different package name or version")
 	}
 	local.Tree = root
 	return root, nil

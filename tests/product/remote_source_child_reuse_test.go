@@ -168,14 +168,14 @@ async def main(payload: Input) -> Result:
 			if _, err := os.Stat(filepath.Join(firstChild.Dir, "venv", "pyvenv.cfg")); err != nil {
 				t.Fatal("initial child did not retain its own preparation environment", err)
 			}
-			// A completed caller may release its snapshot before the ordinary GC
-			// sweep reaches the child. That recorded environment remains usable
-			// for metadata reads under the next capture's writer lock.
+			// A completed caller's GC keeps the newest local environment for its
+			// package/version; the child's recorded environment remains usable for
+			// metadata reads under the next capture's writer lock.
 			fatal(t, store.SettleRequest(row.ID, "canceled"))
 			_, problem = install.Reclaim(layout, store, row.InstallID)
 			fatal(t, problem)
-			if prior, problem := store.Install(row.InstallID); problem != nil || prior != nil {
-				t.Fatalf("old caller did not release: %v", problem)
+			if prior, problem := store.Install(row.InstallID); problem != nil || prior == nil {
+				t.Fatalf("newest local caller environment was not retained: %v", problem)
 			}
 			continue
 		}
