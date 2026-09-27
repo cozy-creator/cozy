@@ -1162,7 +1162,29 @@ fn part_from_value(value: &Value) -> Result<Part> {
     Ok(part)
 }
 
+/// The stored identity of one accepted part: the canonical bytes of its value.
+pub(crate) fn part_bytes(part: &Part) -> Vec<u8> {
+    crate::canon::write(&part_value(part))
+}
+
 impl AddedPart {
+    pub(crate) fn stored(component: String, key: String, role: String, bytes: &[u8]) -> Result<Self> {
+        name("added part component", &component)?;
+        self::key("added part tensor", &key)?;
+        name("added part role", &role)?;
+        let part = part_from_value(&crate::canon::parse_canonical(bytes, limits::DOC_MAX_BYTES)?)?;
+        Ok(Self {
+            component,
+            key,
+            role,
+            part,
+        })
+    }
+
+    pub(crate) fn same_value(&self, other: &AddedPart) -> bool {
+        (&self.component, &self.key, &self.role) == (&other.component, &other.key, &other.role)
+    }
+
     fn from_value(value: &Value) -> Result<Self> {
         let mut fields = Fields::new("DerivedTransaction.added_part", value)?;
         let component = fields.req_str("component")?.to_string();
@@ -1230,6 +1252,37 @@ impl AddedConfig {
 }
 
 impl TransactionRow {
+    /// The row's SQL form: accepted parts are rows of their own, and `open_session`
+    /// names the writer that may add to it.
+    pub(crate) fn stored(&self) -> (Vec<u8>, Option<u64>) {
+        let mut row = self.clone();
+        row.added_parts.clear();
+        let open = match self.state {
+            TransactionState::Open => self.current_session,
+            _ => None,
+        };
+        (crate::canon::write(&row.to_value()), open)
+    }
+
+    /// Join stored part rows onto a row read back; a row written by an older build may
+    /// still carry its parts inline, and the two must agree.
+    pub(crate) fn accept_stored(&mut self, parts: Vec<AddedPart>) -> Result<()> {
+        for added in parts {
+            match self.added_parts.iter().find(|old| old.same_value(&added)) {
+                Some(old) if *old != added => {
+                    return refuse(
+                        Code::TRANSACTION_CONFLICT,
+                        "stored part conflicts with the transaction row",
+                    )
+                }
+                Some(_) => {}
+                None => self.added_parts.push(added),
+            }
+        }
+        self.normalize();
+        Ok(())
+    }
+
     pub(crate) fn normalize(&mut self) {
         self.added_parts
             .sort_by(|a, b| (&a.component, &a.key, &a.role).cmp(&(&b.component, &b.key, &b.role)));
@@ -2090,6 +2143,7 @@ pub struct Begin {
     pub writer_hold: Hold,
     pub source_leases: Vec<(String, ReadLease)>,
     pub source_views: Vec<SourceView>,
+    pub additions: Additions,
 }
 
 #[derive(Debug, Clone)]
@@ -2443,6 +2497,7 @@ pub fn begin(
                 "writer is behind the retained restore epoch",
             );
         }
+        roots::rewrite_parts(store, &transaction, &added_objects(&row))?;
         retain_progress(store, &row, checkpoint)?;
         match current {
             Some(current) => *current = row.clone(),
@@ -2458,6 +2513,7 @@ pub fn begin(
         writer_hold,
         source_leases,
         source_views,
+        additions: Additions::of(&declaration),
     })
 }
 
@@ -2757,7 +2813,8 @@ fn retain_progress(
             transaction: row.id.clone(),
             manifest: None,
             name: None,
-            blobs: added_objects(row),
+            // Accepted parts are named by the append-only parts journal.
+            blobs: Vec::new(),
             sources: row
                 .source_facts
                 .iter()
@@ -2850,6 +2907,14 @@ pub(crate) fn retain_restore(
 
 pub(crate) fn retained_objects(store: &Store) -> Result<Vec<crate::storage::HeldKey>> {
     let mut holds = retention::held_objects(store)?;
+    for object in roots::journaled(store)? {
+        holds.push(crate::storage::HeldKey {
+            key: crate::storage::blob_key(&object.sha256)?,
+            kind: "blob".into(),
+            length: object.length,
+            sha256: object.sha256,
+        });
+    }
     for root in roots::all(store)? {
         let mut blobs = root.blobs;
         let mut manifests = root.sources;
@@ -2880,7 +2945,7 @@ pub(crate) fn retained_objects(store: &Store) -> Result<Vec<crate::storage::Held
     Ok(holds)
 }
 
-fn open_row<'a>(
+pub(crate) fn open_row<'a>(
     rows: &'a mut [TransactionRow],
     transaction: &str,
     writer_session: u64,
@@ -2926,16 +2991,67 @@ fn declaration(row: &TransactionRow) -> Result<Declaration> {
 
 /// The exact native payload limit, checked against the current writer before
 /// an embedding owner admits storage or asks a producer to supply any bytes.
+/// One writer session's parts to write, parsed once from its immutable declaration. A
+/// part costs one lookup here instead of a parse of the whole declaration.
+#[derive(Debug, Clone, Default)]
+pub struct Additions {
+    parts: std::collections::HashMap<(String, String, String), PartDeclaration>,
+}
+
+impl Additions {
+    pub fn of(declaration: &Declaration) -> Self {
+        let mut parts = std::collections::HashMap::new();
+        for component in &declaration.components {
+            for tensor in &component.add {
+                for part in &tensor.parts {
+                    parts.insert(
+                        (component.target.clone(), tensor.key.clone(), part.role.clone()),
+                        part.clone(),
+                    );
+                }
+            }
+        }
+        Self { parts }
+    }
+
+    /// The current writer's additions, for a caller that holds no `Begin`.
+    pub fn load(meta: &Meta, transaction: &str, writer_session: u64) -> Result<Self> {
+        let transaction = transaction_id(transaction)?;
+        let mut rows: Vec<_> = meta.derived_row(&transaction)?.into_iter().collect();
+        let row = open_row(&mut rows, &transaction, writer_session)?;
+        Ok(Self::of(&declaration(row)?))
+    }
+
+    fn get(&self, (component, tensor_key, role): (&str, &str, &str)) -> Result<&PartDeclaration> {
+        let part = self
+            .parts
+            .get(&(component.to_string(), tensor_key.to_string(), role.to_string()))
+            .ok_or_else(|| Refusal {
+                code: Code::MISSING_FIELD,
+                detail: format!("{component}/{tensor_key}#{role} is not a declared addition"),
+            })?;
+        if part.source.is_some() {
+            return refuse(
+                Code::TRANSACTION_CONFLICT,
+                "grafted part cannot receive byte writes",
+            );
+        }
+        Ok(part)
+    }
+}
+
+/// The exact native payload limit, checked against the current writer before
+/// an embedding owner admits storage or asks a producer to supply any bytes.
 pub fn part_write_bound(
     meta: &Meta,
     transaction: &str,
     writer_session: u64,
+    additions: &Additions,
     value: (&str, &str, &str),
 ) -> Result<u64> {
     let transaction = transaction_id(transaction)?;
-    let mut rows: Vec<_> = meta.derived_row(&transaction)?.into_iter().collect();
-    let row = open_row(&mut rows, &transaction, writer_session)?;
-    let part = declared_addition(&declaration(row)?, value)?;
+    meta.check_session(&transaction, writer_session)?;
+    let part = additions.get(value)?;
     checked_bytes("derived part write", &part.shape, part.dtype)
 }
 
@@ -2953,40 +3069,6 @@ pub fn config_write_bound(
     Ok(declaration.max_new_bytes.min(limits::DOC_MAX_BYTES as u64))
 }
 
-fn declared_addition(
-    declaration: &Declaration,
-    (component, tensor_key, role): (&str, &str, &str),
-) -> Result<PartDeclaration> {
-    let part = declaration
-        .components
-        .iter()
-        .find(|candidate| candidate.target == component)
-        .and_then(|candidate| {
-            candidate
-                .add
-                .iter()
-                .find(|candidate| candidate.key == tensor_key)
-        })
-        .and_then(|candidate| {
-            candidate
-                .parts
-                .iter()
-                .find(|candidate| candidate.role == role)
-        })
-        .cloned()
-        .ok_or_else(|| Refusal {
-            code: Code::MISSING_FIELD,
-            detail: format!("{component}/{tensor_key}#{role} is not a declared addition"),
-        })?;
-    if part.source.is_some() {
-        return refuse(
-            Code::TRANSACTION_CONFLICT,
-            "grafted part cannot receive byte writes",
-        );
-    }
-    Ok(part)
-}
-
 fn require_added_config(declaration: &Declaration, name: &str) -> Result<()> {
     if declaration.configs.iter().any(|config| {
         matches!(config, ConfigDeclaration::Add { target }
@@ -3001,6 +3083,7 @@ fn require_added_config(declaration: &Declaration, name: &str) -> Result<()> {
     }
 }
 
+/// Accept one part for a caller without the writer's `Additions`; see [`add_indexed_part`].
 pub fn add_part<R: Read>(
     store: &Store,
     meta: &Meta,
@@ -3009,13 +3092,25 @@ pub fn add_part<R: Read>(
     value: (&str, &str, &str),
     reader: &mut R,
 ) -> Result<crate::checkpoint::Written> {
+    let additions = Additions::load(meta, transaction, writer_session)?;
+    add_indexed_part(store, meta, transaction, writer_session, &additions, value, reader)
+}
+
+/// Accept one part. The cost is this part's bytes plus one indexed SQL row: the
+/// declaration is not re-read and earlier accepted parts are neither read nor rewritten.
+pub fn add_indexed_part<R: Read>(
+    store: &Store,
+    meta: &Meta,
+    transaction: &str,
+    writer_session: u64,
+    additions: &Additions,
+    value: (&str, &str, &str),
+    reader: &mut R,
+) -> Result<crate::checkpoint::Written> {
     let (component, tensor_key, role) = value;
     let transaction = transaction_id(transaction)?;
-    let expected = {
-        let mut txn = meta.txn_for(&transaction)?;
-        let row = open_row(&mut txn.rows, &transaction, writer_session)?;
-        declared_addition(&declaration(row)?, value)?
-    };
+    meta.check_session(&transaction, writer_session)?;
+    let expected = additions.get(value)?;
 
     let written = checkpoint::objectize(
         store,
@@ -3046,33 +3141,22 @@ pub fn add_part<R: Read>(
             );
         }
     }
-
-    let mut txn = meta.txn_for(&transaction)?;
-    let row = open_row(&mut txn.rows, &transaction, writer_session)?;
-    if let Some(existing) = row
-        .added_parts
-        .iter()
-        .find(|added| added.component == component && added.key == tensor_key && added.role == role)
-    {
-        if existing.part == written.part {
-            return Ok(written);
-        }
-        return refuse(
-            Code::TRANSACTION_CONFLICT,
-            format!("added value {component}/{tensor_key}#{role} differs from accepted bytes"),
-        );
-    }
-    row.added_parts.push(AddedPart {
-        component: component.to_string(),
-        key: tensor_key.to_string(),
-        role: role.to_string(),
-        part: written.part.clone(),
-    });
-    row.normalize();
-    retain_progress(store, row, None)?;
-    txn.commit()?;
+    // The private root names the objects before SQL accepts the part, so GC never
+    // observes an accepted part whose bytes it may reclaim.
+    roots::append_parts(store, &transaction, written.part.segments())?;
+    meta.accept_part(
+        &transaction,
+        writer_session,
+        &AddedPart {
+            component: component.to_string(),
+            key: tensor_key.to_string(),
+            role: role.to_string(),
+            part: written.part.clone(),
+        },
+    )?;
     Ok(written)
 }
+
 pub fn add_config<R: Read>(
     meta: &Meta,
     transaction: &str,
@@ -4301,3 +4385,6 @@ mod graft_tests;
 
 #[cfg(test)]
 mod companion_tests;
+
+#[cfg(test)]
+mod part_rows_tests;

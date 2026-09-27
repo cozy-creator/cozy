@@ -2217,6 +2217,7 @@ impl PyStore {
             transaction_id: transaction_id.to_string(),
             writer_session_id,
             source_views: begin.source_views,
+            additions: begin.additions,
             guards: Mutex::new(Some(DerivedGuards {
                 writer_hold: begin.writer_hold,
                 source_leases: begin.source_leases,
@@ -2505,6 +2506,7 @@ pub struct PyDerivedWriter {
     transaction_id: String,
     writer_session_id: u64,
     source_views: Vec<derived::SourceView>,
+    additions: derived::Additions,
     guards: Mutex<Option<DerivedGuards>>,
 }
 
@@ -2554,6 +2556,7 @@ impl PyDerivedWriter {
                 &self.meta,
                 &self.transaction_id,
                 self.writer_session_id,
+                &self.additions,
                 (component, key, role),
             )
         })
@@ -2733,11 +2736,12 @@ impl PyDerivedWriter {
             err: None,
         };
         let result = py.detach(|| {
-            derived::add_part(
+            derived::add_indexed_part(
                 &self.store,
                 &self.meta,
                 &self.transaction_id,
                 self.writer_session_id,
+                &self.additions,
                 (component, key, role),
                 &mut source,
             )

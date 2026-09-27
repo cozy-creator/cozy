@@ -2,6 +2,7 @@
 //! metadata journals lifecycle; GC never needs that database to discover retained bytes.
 
 use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::FileExt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -128,6 +129,111 @@ fn path(store: &Store, transaction: &str) -> Result<PathBuf> {
         "{}.json",
         transaction.trim_start_matches("sha256:")
     )))
+}
+
+/// Accepted-part objects, one appended line per part, beside the private root. Appending
+/// costs that part alone. A line the writer died while appending was never accepted.
+fn parts_path(store: &Store, transaction: &str) -> Result<PathBuf> {
+    Ok(path(store, transaction)?.with_extension("parts"))
+}
+
+fn parts_line(objects: &[ObjectRef]) -> Vec<u8> {
+    let mut line = crate::canon::write(&Value::arr(
+        objects.iter().map(ObjectRef::to_value).collect(),
+    ));
+    line.push(b'\n');
+    line
+}
+
+pub(super) fn append_parts(store: &Store, transaction: &str, objects: &[ObjectRef]) -> Result<()> {
+    if objects.is_empty() {
+        return Ok(());
+    }
+    let path = parts_path(store, transaction)?;
+    fs::create_dir_all(directory(store)).map_err(io)?;
+    let created = !path.exists();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(io)?;
+    let length = file.metadata().map_err(io)?.len();
+    let mut last = [b'\n'];
+    if length > 0 {
+        file.read_exact_at(&mut last, length - 1).map_err(io)?;
+    }
+    // Terminate a line torn by a dead writer so this one parses on its own.
+    let mut bytes = if last[0] == b'\n' { Vec::new() } else { vec![b'\n'] };
+    bytes.extend(parts_line(objects));
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_data())
+        .map_err(io)?;
+    if created {
+        sync_directories(store)?;
+    }
+    Ok(())
+}
+
+/// Replace the journal with exactly these objects (a writer's merged progress).
+pub(super) fn rewrite_parts(store: &Store, transaction: &str, objects: &[ObjectRef]) -> Result<()> {
+    let path = parts_path(store, transaction)?;
+    fs::create_dir_all(directory(store)).map_err(io)?;
+    let temporary = path.with_extension(format!("parts-tmp-{}", crate::meta::now_nanos_unique()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(io)?;
+    let bytes = if objects.is_empty() { Vec::new() } else { parts_line(objects) };
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(io)?;
+    fs::rename(&temporary, &path).map_err(io)?;
+    sync_directories(store)
+}
+
+/// Every object named by any transaction's parts journal.
+pub(super) fn journaled(store: &Store) -> Result<Vec<ObjectRef>> {
+    let entries = match fs::read_dir(directory(store)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io(error)),
+    };
+    let mut objects = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(io)?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("parts") {
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io(error)),
+        };
+        for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+            let Ok(value) = crate::canon::parse_canonical(line, crate::limits::DOC_MAX_BYTES) else {
+                continue;
+            };
+            for value in crate::canon::as_arr("PrivateDerivedParts", "objects", &value)? {
+                objects.push(ObjectRef::from_value("private parts journal", value)?);
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn sync_directories(store: &Store) -> Result<()> {
+    for directory in [
+        directory(store),
+        store.root().join("roots"),
+        store.root().to_path_buf(),
+    ] {
+        File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(io)?;
+    }
+    Ok(())
 }
 
 pub(super) fn read(store: &Store, transaction: &str) -> Result<Option<Root>> {
@@ -272,6 +378,11 @@ pub(super) fn adopt(
 }
 
 pub(super) fn remove(store: &Store, transaction: &str) -> Result<()> {
+    match fs::remove_file(parts_path(store, transaction)?) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(error)),
+    }
     match fs::remove_file(path(store, transaction)?) {
         Ok(()) => File::open(directory(store))
             .and_then(|file| file.sync_all())
