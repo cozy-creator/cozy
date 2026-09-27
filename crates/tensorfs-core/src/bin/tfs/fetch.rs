@@ -273,7 +273,8 @@ fn pull_with_budget(
     let mut request = PullRequest::new(&store, base, refspec, &credential, &policy);
     request.lane = flag(flags, "lane").unwrap_or("");
     request.session = flag(flags, "session").unwrap_or("");
-    request.streams = crate::flag_num(flags, "streams", transport::STREAMS);
+    request.streams = crate::flag_num(flags, "streams", transport::PULL_STREAMS);
+    request.streams_start = crate::flag_num(flags, "streams-start", transport::STREAMS);
     request.deadline = deadline_of(flags);
     request.download_budget = budget;
     // THE WALK REPORTS WHILE IT WALKS.
@@ -300,7 +301,11 @@ fn pull_with_budget(
     let observe = |_object: &ObjectRef, moved: u64, door: ObjectSource| progress.saw(moved, door);
     request.on_plan = Some(&planned);
     request.on_object = Some(&observe);
+    let before = tensorfs_core::stats::snapshot();
+    let started = std::time::Instant::now();
     let report = ok!(transport::pull(&request));
+    let seconds = started.elapsed().as_secs_f64();
+    let after = tensorfs_core::stats::snapshot();
     progress.settle();
     if !tensorfs_core::repo_cache::finish_optional_backfills() {
         eprintln!("repo cache replication incomplete; local fetch remains complete");
@@ -312,6 +317,32 @@ fn pull_with_budget(
         "{{\"event\":\"pull.cache\",\"model\":{},\"manifest\":{},\"scope\":{},\"cache_written_bytes\":{},\"cache_bytes\":{},\"total_bytes\":{}}}",
         quoted(&report.model), quoted(&report.manifest), quoted(&report.scope),
         report.cache_writes.bytes(), report.bytes_cached, report.bytes_total,
+    );
+    // What each stream level bought, so a slow pull says whether more streams helped
+    // (one GET was the limit) or not (the link, disk or origin was).
+    let levels: Vec<String> = report
+        .levels
+        .iter()
+        .map(|level| {
+            format!(
+                "[{},{}]",
+                level.streams,
+                level.bytes_per_second.round() as u64
+            )
+        })
+        .collect();
+    // And what admitting them cost: a pull whose streams stop growing while its batches
+    // take most of the wall time is held by the disk, not the link.
+    eprintln!(
+        "{{\"event\":\"pull.streams\",\"model\":{},\"seconds\":{:.3},\"bytes_moved\":{},\"streams\":{},\"levels\":[{}],\"admission\":{{\"objects\":{},\"batches\":{},\"seconds\":{:.3}}}}}",
+        quoted(&report.model),
+        seconds,
+        report.bytes_moved,
+        report.streams,
+        levels.join(","),
+        after.admitted_objects - before.admitted_objects,
+        after.admission_batches - before.admission_batches,
+        (after.admission_nanos - before.admission_nanos) as f64 / 1e9,
     );
     println!(
         "model        {}@{} lane {}",

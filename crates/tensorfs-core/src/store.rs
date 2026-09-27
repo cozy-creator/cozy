@@ -1437,6 +1437,12 @@ impl Store {
     }
 
     /// Common no-clobber admission after streaming or durable-prefix digest verification.
+    ///
+    /// An unheld admission (every pull) publishes on the caller's thread, in parallel with
+    /// every other, and only its catalog record is serialized: records arriving together
+    /// share one transaction and one commit (`Catalog::record_grouped`). Each object is
+    /// still published before its record is durable, and reported only once that commit
+    /// is. A held admission writes its hold first, so a refused hold publishes nothing.
     pub(crate) fn admit_verified(
         &self,
         verified: Verified,
@@ -1445,47 +1451,29 @@ impl Store {
     ) -> Result<Put> {
         let catalog = crate::catalog::Catalog::open(&self.root)?;
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
-        let Verified {
-            tmp,
-            file: f,
-            sha256: hex,
-            length: len,
-        } = verified;
         let object = ObjectRef {
-            sha256: hex.clone(),
-            length: len,
+            sha256: verified.sha256.clone(),
+            length: verified.length,
         };
-        let admitted = catalog.admit_blob(operation, &object, || {
-            if let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444)) {
-                return cleanup(&tmp, io("chmod 0444", e));
+        let publish = move || {
+            let installed = self.link_verified(&verified, fault)?;
+            if let Some(dir) = &installed {
+                if let Err(error) = fsync_dir(dir) {
+                    let _ = fs::remove_file(&verified.tmp);
+                    return Err(error);
+                }
             }
-            fault.hit("chmod");
-
-            let dst = self.object_path(&hex);
-            let dir = dst.parent().unwrap().to_path_buf();
-            if let Err(error) = self.prepare_owned_directory(&dir) {
-                return cleanup(&tmp, error);
+            self.finish_linked(verified, installed.is_some())
+        };
+        let admitted = match operation {
+            Some(operation) => catalog.admit_blob(Some(operation), &object, publish)?,
+            None => {
+                let record = publish()?;
+                let admitted = record.is_some();
+                catalog.record_grouped(crate::catalog::Recording { record })?;
+                admitted
             }
-            // No-clobber admission: link() refuses to replace an installed object.
-            let admitted = match fs::hard_link(&tmp, &dst) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(e) => return cleanup(&tmp, io(format!("link {}", dst.display()), e)),
-            };
-            fault.hit("linked");
-            if admitted {
-                fsync_dir(&dir)?;
-            }
-            let _ = fs::remove_file(&tmp);
-            drop(f);
-
-            // Losing the no-clobber race does not verify another writer's inode.
-            if admitted {
-                Ok(Some(VRecord::of(&hex, &stat(&dst)?)))
-            } else {
-                Ok(None)
-            }
-        })?;
+        };
         if admitted {
             if let Some(sink) = &self.progress {
                 sink.admitted();
@@ -1493,12 +1481,55 @@ impl Store {
         }
         fault.hit("record");
         Ok(Put {
-            obj: ObjectRef {
-                sha256: hex,
-                length: len,
-            },
+            obj: object,
             admitted,
         })
+    }
+
+    /// Publish one verified temp at its digest, no-clobber. `Some(dir)` when this call
+    /// installed it and `dir` must be fsynced before its record; `None` when another writer's
+    /// inode already stands there. On refusal the temp is gone.
+    pub(crate) fn link_verified(
+        &self,
+        verified: &Verified,
+        fault: &Fault,
+    ) -> Result<Option<PathBuf>> {
+        let tmp = &verified.tmp;
+        if let Err(e) = fs::set_permissions(tmp, fs::Permissions::from_mode(0o444)) {
+            return cleanup(tmp, io("chmod 0444", e));
+        }
+        fault.hit("chmod");
+        let dst = self.object_path(&verified.sha256);
+        let dir = dst.parent().unwrap().to_path_buf();
+        if let Err(error) = self.prepare_owned_directory(&dir) {
+            return cleanup(tmp, error);
+        }
+        // No-clobber admission: link() refuses to replace an installed object.
+        let admitted = match fs::hard_link(tmp, &dst) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => return cleanup(tmp, io(format!("link {}", dst.display()), e)),
+        };
+        fault.hit("linked");
+        Ok(admitted.then_some(dir))
+    }
+
+    /// Drop the temp name and descriptor of a linked object; the record for one this call
+    /// installed. Losing the no-clobber race does not verify another writer's inode.
+    pub(crate) fn finish_linked(
+        &self,
+        verified: Verified,
+        admitted: bool,
+    ) -> Result<Option<VRecord>> {
+        let _ = fs::remove_file(&verified.tmp);
+        drop(verified.file);
+        if !admitted {
+            return Ok(None);
+        }
+        Ok(Some(VRecord::of(
+            &verified.sha256,
+            &stat(&self.object_path(&verified.sha256))?,
+        )))
     }
 
     pub fn put_file(&self, src: &Path, expect: Option<&ObjectRef>, fault: &Fault) -> Result<Put> {

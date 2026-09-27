@@ -66,6 +66,7 @@ use crate::store::Store;
 use crate::transport::http::{self, Client};
 use crate::transport::hub::{self, CredentialProvider};
 use crate::transport::ledger::{Deadline, Ledger, FETCH_ATTEMPTS, STALL_FACTOR, STREAMS};
+use crate::transport::pace::{Level, Pace, PULL_STREAMS};
 use crate::transport::policy::{self, SourcePolicy};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -126,15 +127,18 @@ pub struct Fetched {
     pub transferred: u64,
 }
 
-struct Observed<'l, F> {
+struct Observed<'l, F, G> {
     inner: http::BodyReader<'l>,
     seen: u64,
     limit: u64,
     failure: Option<Refusal>,
     notify: F,
+    /// Called once the last declared byte is in: the socket is done even though the
+    /// object's fsync and admission are not.
+    received: G,
 }
 
-impl<F: FnMut(u64)> std::io::Read for Observed<'_, F> {
+impl<F: FnMut(u64), G: FnMut()> std::io::Read for Observed<'_, F, G> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let remaining = self.limit.saturating_sub(self.seen);
         let bounded = out
@@ -153,6 +157,9 @@ impl<F: FnMut(u64)> std::io::Read for Observed<'_, F> {
         if n > 0 {
             self.seen += n as u64;
             (self.notify)(self.seen);
+            if self.seen == self.limit {
+                (self.received)();
+            }
         }
         Ok(n)
     }
@@ -226,6 +233,7 @@ pub fn fetch_authorized(
         true,
         None,
         shared_client(),
+        None,
     )
 }
 
@@ -243,6 +251,7 @@ pub(super) fn fetch_with_attempts(
     retry: bool,
     slots: Option<&super::speculate::Slots>,
     client: &Client,
+    received: Option<&(dyn Fn() + Sync)>,
 ) -> Result<Fetched> {
     let id = grant.object.id();
     let mut last_refusal: Option<Refusal> = None;
@@ -283,10 +292,10 @@ pub(super) fn fetch_with_attempts(
         stale = None;
         // Grant preparation remains concurrent even when the object stream
         // budget is occupied; a slow mint must not serialize healthy transfers.
-        let _slot = slots
+        let mut slot = slots
             .map(|slots| slots.acquire(ledger, deadline))
             .transpose()?;
-        if _slot.as_ref().is_some_and(|slot| slot.waited) {
+        if slot.as_ref().is_some_and(|slot| slot.waited) {
             // The body permit can outlive a URL. Reconsult its authority after
             // waiting; Leases reuses a fresh grant and remints an expired one.
             url = authorize(false, ledger)?;
@@ -335,7 +344,7 @@ pub(super) fn fetch_with_attempts(
                     // The origin said when to come back; that is not a failed ask.
                     attempts.fetch_sub(1, Ordering::AcqRel);
                 }
-                drop(_slot);
+                drop(slot);
                 ledger.pause(wait, deadline)?;
                 continue;
             }
@@ -366,6 +375,14 @@ pub(super) fn fetch_with_attempts(
             notify: |total| {
                 if let Some(watcher) = observer.as_mut() {
                     watcher.moved(total);
+                }
+            },
+            // Every byte is here: the socket slot is free for the next object while this
+            // one is fsynced and admitted, so a slow disk is not a slow network.
+            received: || {
+                slot.take();
+                if let Some(received) = received {
+                    received();
                 }
             },
         };
@@ -910,12 +927,16 @@ impl Leases<'_> {
 /// actually answered. `cached` objects crossed the same admission door as `fetched` ones;
 /// they simply came off a mounted cache instead of the origin, and saying which is the
 /// only way an operator can tell a warm datacenter from a cold one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WalkOutcome {
     pub fetched: u64,
     pub bytes_moved: u64,
     pub cached: u64,
     pub bytes_cached: u64,
+    /// Objects the walk admitted in flight when it ended.
+    pub streams: usize,
+    /// Every level `pace` measured, in order.
+    pub levels: Vec<Level>,
 }
 
 /// Walk `plan.wanted` with `streams` objects in flight. One is the serial walk and it
@@ -940,6 +961,8 @@ pub struct WalkOutcome {
 /// for the cache. Once acquisition finishes, rejected offers are retried while
 /// cache copies make progress. The CLI drains accepted work and reports incomplete
 /// replication on cache failure. A failed pull does not promise a complete cache.
+/// `streams` is the most objects in flight. The walk starts at `STREAMS` (or `streams`, if
+/// smaller) and grows toward it while the measured aggregate goodput grows (`pace`).
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_wanted(
     store: &Store,
@@ -953,7 +976,8 @@ pub fn fetch_wanted(
     on_object: Option<ObjectObserver<'_>>,
 ) -> Result<WalkOutcome> {
     fetch_wanted_bounded(
-        store, plan, urls, policy, credential, deadline, ledger, streams, on_object, None, None,
+        store, plan, urls, policy, credential, deadline, ledger, STREAMS, streams, on_object, None,
+        None,
     )
 }
 
@@ -966,6 +990,7 @@ pub(super) fn fetch_wanted_bounded(
     credential: &dyn CredentialProvider,
     deadline: Deadline,
     ledger: &Ledger,
+    start: usize,
     streams: usize,
     on_object: Option<ObjectObserver<'_>>,
     download_budget: Option<(u64, u64)>,
@@ -980,10 +1005,16 @@ pub(super) fn fetch_wanted_bounded(
     // invariant it proved — the grant set covers the wanted set exactly — is enforced per
     // mint instead: presign authorizes every digest it was asked or refuses, never a silent
     // subset, and a supplier with no URL for an object refuses in the same words.
-    let streams = super::memory::transfer_streams(streams.clamp(1, 128));
+    let streams = super::memory::transfer_streams(streams.clamp(1, PULL_STREAMS));
     let recovery = super::speculate::Recovery::new(store, plan, streams, download_budget);
-    // Recovery reserves an object connection, not an authorization worker.
-    let workers = streams.min(plan.wanted.len().max(1));
+    // Recovery reserves an object connection, not an authorization worker. A stream's
+    // permit is released once its body is in, so its thread may still be fsyncing and
+    // admitting while another thread uses the permit: twice the threads keeps the permits
+    // busy however slow the disk is.
+    let workers = (2 * streams).min(plan.wanted.len().max(1));
+    // The level is the link's, not this closure's: a seven-object pull reports the level it
+    // was handed, so the next, larger pull on this pod does not start below it.
+    let pace = Pace::new(start, streams, workers, ledger);
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let fetched = AtomicU64::new(0);
@@ -991,101 +1022,126 @@ pub(super) fn fetch_wanted_bounded(
     let cached = AtomicU64::new(0);
     let bytes_cached = AtomicU64::new(0);
     let first: Mutex<Option<Refusal>> = Mutex::new(None);
+    let halt = |refusal: Refusal| {
+        let mut slot = first.lock().unwrap();
+        if slot.is_none() {
+            // Keep the actual failure before waking peers, so their
+            // cancellation errors cannot replace its diagnosis.
+            *slot = Some(refusal);
+            ledger.cancel();
+        }
+        stop.store(true, Ordering::Relaxed);
+        pace.halt();
+    };
     std::thread::scope(|scope| {
+        scope.spawn(|| {
+            pace.steer(ledger, &stop, &|| {
+                plan.wanted
+                    .len()
+                    .saturating_sub(next.load(Ordering::Relaxed))
+            })
+        });
         for _ in 0..workers {
-            scope.spawn(|| loop {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                let at = next.fetch_add(1, Ordering::Relaxed);
-                let Some(object) = plan.wanted.get(at) else {
-                    return;
-                };
-                let authorize =
-                    |stale: bool, ledger: &Ledger| urls.url_for_while(at, object, stale, ledger);
-                let outcome = DeliveryGrant::mint(plan, object).and_then(|grant| {
-                    // The grant already knows which namespace this object lives in — it
-                    // derives its own storage key from the same bit — so the cache is asked
-                    // the question the grant answers rather than one restated here. A
-                    // carrier has no namespace and no place in an immutable repo cache; it
-                    // also cannot reach here, because this walk mints from a plan and a
-                    // plan never names one.
-                    let kind = match grant.destination {
-                        Destination::Manifest => Some(CacheKind::Manifest),
-                        Destination::Blob => Some(CacheKind::Blob),
-                        Destination::Staging => None,
-                    };
-                    let mut trust = CacheTrust::Name;
-                    if let (Some(kind), Some(cache)) = (kind, cache) {
-                        match cache.admit(store, kind, object)? {
-                            CacheRead::Hit => return Ok(Source::Cache),
-                            // This read proved the cached bytes wrong: the backfill replaces
-                            // them instead of trusting the name.
-                            CacheRead::Corrupt => trust = CacheTrust::Rehash,
-                            CacheRead::Missing | CacheRead::Unavailable => {}
-                        }
-                    }
-                    let one = recovery.fetch(
-                        store,
-                        &grant,
-                        &authorize,
-                        policy,
-                        credential,
-                        deadline,
-                        ledger,
-                        &|| {
-                            (plan.wanted.len() as u64).saturating_sub(
-                                fetched.load(Ordering::Acquire) + cached.load(Ordering::Acquire),
-                            ) < streams as u64
-                        },
-                    )?;
-                    if let (Some(kind), Some(_cache)) = (kind, cache) {
-                        // Local admission is complete. Optional replication must never
-                        // occupy an origin slot or delay this object's completion report.
-                        backfill
-                            .as_ref()
-                            .expect("bound cache has a backfill batch")
-                            .offer(kind, object, trust);
-                    }
-                    Ok(Source::Origin(one))
-                });
-                match outcome {
-                    Ok(source) => {
-                        let moved = match &source {
-                            Source::Cache => {
-                                cached.fetch_add(1, Ordering::Relaxed);
-                                bytes_cached.fetch_add(object.length, Ordering::Relaxed);
-                                // THE CACHE DOOR IS PROGRESS TOO (tfs-106). Origin bytes are
-                                // counted where they cross the socket; cached ones never
-                                // reach a socket, so without this a warm datacenter reading
-                                // its own volume would look, to the control plane, exactly
-                                // like a pull that had stopped — and the first mint after a
-                                // run of cache hits would be condemned for the volume's
-                                // honest read time. Per object is fine grained enough: a CAS
-                                // object is bounded by the 64 MiB grid.
-                                ledger.moved(object.length);
-                                object.length
-                            }
-                            Source::Origin(one) => {
-                                fetched.fetch_add(1, Ordering::Relaxed);
-                                bytes_moved.fetch_add(one.transferred, Ordering::Relaxed);
-                                one.transferred
-                            }
-                        };
-                        if let Some(observer) = on_object {
-                            observer(object, moved, source.door());
-                        }
-                    }
-                    Err(refusal) => {
-                        let mut slot = first.lock().unwrap();
-                        if slot.is_none() {
-                            // Keep the actual failure before waking peers, so their
-                            // cancellation errors cannot replace its diagnosis.
-                            *slot = Some(refusal);
-                            ledger.cancel();
-                        }
-                        stop.store(true, Ordering::Relaxed);
+            scope.spawn(|| {
+                let _leaving = Leaving(&pace);
+                loop {
+                    if stop.load(Ordering::Relaxed) {
                         return;
+                    }
+                    let Some(permit) = pace.admit(&stop, ledger) else {
+                        if let Err(refusal) = ledger.check_running() {
+                            halt(refusal);
+                        }
+                        return;
+                    };
+                    let permit = Mutex::new(Some(permit));
+                    let received = || drop(permit.lock().unwrap().take());
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(object) = plan.wanted.get(at) else {
+                        return;
+                    };
+                    let authorize = |stale: bool, ledger: &Ledger| {
+                        urls.url_for_while(at, object, stale, ledger)
+                    };
+                    let outcome = DeliveryGrant::mint(plan, object).and_then(|grant| {
+                        // The grant already knows which namespace this object lives in — it
+                        // derives its own storage key from the same bit — so the cache is asked
+                        // the question the grant answers rather than one restated here. A
+                        // carrier has no namespace and no place in an immutable repo cache; it
+                        // also cannot reach here, because this walk mints from a plan and a
+                        // plan never names one.
+                        let kind = match grant.destination {
+                            Destination::Manifest => Some(CacheKind::Manifest),
+                            Destination::Blob => Some(CacheKind::Blob),
+                            Destination::Staging => None,
+                        };
+                        let mut trust = CacheTrust::Name;
+                        if let (Some(kind), Some(cache)) = (kind, cache) {
+                            match cache.admit(store, kind, object)? {
+                                CacheRead::Hit => return Ok(Source::Cache),
+                                // This read proved the cached bytes wrong: the backfill replaces
+                                // them instead of trusting the name.
+                                CacheRead::Corrupt => trust = CacheTrust::Rehash,
+                                CacheRead::Missing | CacheRead::Unavailable => {}
+                            }
+                        }
+                        let one = recovery.fetch(
+                            store,
+                            &grant,
+                            &authorize,
+                            policy,
+                            credential,
+                            deadline,
+                            ledger,
+                            &|| {
+                                (plan.wanted.len() as u64).saturating_sub(
+                                    fetched.load(Ordering::Acquire)
+                                        + cached.load(Ordering::Acquire),
+                                ) < pace.limit() as u64
+                            },
+                            Some(&received),
+                        )?;
+                        if let (Some(kind), Some(_cache)) = (kind, cache) {
+                            // Local admission is complete. Optional replication must never
+                            // occupy an origin slot or delay this object's completion report.
+                            backfill
+                                .as_ref()
+                                .expect("bound cache has a backfill batch")
+                                .offer(kind, object, trust);
+                        }
+                        Ok(Source::Origin(one))
+                    });
+                    match outcome {
+                        Ok(source) => {
+                            let moved = match &source {
+                                Source::Cache => {
+                                    cached.fetch_add(1, Ordering::Relaxed);
+                                    bytes_cached.fetch_add(object.length, Ordering::Relaxed);
+                                    // THE CACHE DOOR IS PROGRESS TOO (tfs-106). Origin bytes are
+                                    // counted where they cross the socket; cached ones never
+                                    // reach a socket, so without this a warm datacenter reading
+                                    // its own volume would look, to the control plane, exactly
+                                    // like a pull that had stopped — and the first mint after a
+                                    // run of cache hits would be condemned for the volume's
+                                    // honest read time. Per object is fine grained enough: a CAS
+                                    // object is bounded by the 64 MiB grid.
+                                    ledger.moved(object.length);
+                                    object.length
+                                }
+                                Source::Origin(one) => {
+                                    fetched.fetch_add(1, Ordering::Relaxed);
+                                    bytes_moved.fetch_add(one.transferred, Ordering::Relaxed);
+                                    one.transferred
+                                }
+                            };
+                            if let Some(observer) = on_object {
+                                observer(object, moved, source.door());
+                            }
+                        }
+                        Err(refusal) => {
+                            halt(refusal);
+                            return;
+                        }
                     }
                 }
             });
@@ -1097,12 +1153,24 @@ pub(super) fn fetch_wanted_bounded(
     if let Some(backfill) = backfill {
         backfill.finish_offers();
     }
+    let (streams, levels) = pace.outcome();
     Ok(WalkOutcome {
         fetched: fetched.load(Ordering::Relaxed),
         bytes_moved: bytes_moved.load(Ordering::Relaxed),
         cached: cached.load(Ordering::Relaxed),
         bytes_cached: bytes_cached.load(Ordering::Relaxed),
+        streams,
+        levels,
     })
+}
+
+/// A worker's exit, however it leaves, lets the steering thread stop waiting for it.
+struct Leaving<'a>(&'a Pace);
+
+impl Drop for Leaving<'_> {
+    fn drop(&mut self) {
+        self.0.worker_finished();
+    }
 }
 
 /// Which door answered for one object. Both crossed `DeliveryGrant::admit`; only one
@@ -1132,7 +1200,10 @@ pub struct PullRequest<'a> {
     pub credential: &'a dyn CredentialProvider,
     pub policy: &'a SourcePolicy,
     pub deadline: Deadline,
+    /// The most objects in flight. The walk starts at `streams_start` and grows toward
+    /// this while the measured goodput grows.
     pub streams: usize,
+    pub streams_start: usize,
     pub session: &'a str,
     pub sample_seconds: f64,
     /// Remaining admission allowance supplied by the host: new bytes and objects,
@@ -1161,7 +1232,8 @@ impl<'a> PullRequest<'a> {
             credential,
             policy,
             deadline: Deadline::none(),
-            streams: STREAMS,
+            streams: PULL_STREAMS,
+            streams_start: STREAMS,
             session: "",
             sample_seconds: crate::transport::ledger::SAMPLE_SECONDS,
             download_budget: None,
@@ -1182,7 +1254,9 @@ pub struct PullReport {
     pub lane: String,
     pub manifest: String,
     pub session: String,
+    /// Objects in flight when the walk ended, and every level it measured on the way.
     pub streams: usize,
+    pub levels: Vec<Level>,
     pub declared: u64,
     pub held: u64,
     pub fetched: u64,
@@ -1314,11 +1388,14 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             request.credential,
             request.deadline,
             &ledger,
+            request.streams_start,
             request.streams,
             request.on_object,
             request.download_budget,
             Some(&report.cache_writes),
         )?;
+        report.streams = walked.streams;
+        report.levels = walked.levels;
         report.fetched = walked.fetched;
         report.bytes_moved = walked.bytes_moved;
         report.cached = walked.cached;
@@ -1363,7 +1440,7 @@ fn plan_against_store(
         lane: closure.lane.clone(),
         manifest: closure.manifest.id(),
         session,
-        streams: request.streams,
+        streams: request.streams_start.clamp(1, request.streams.max(1)),
         declared: (plan.held.len() + plan.wanted.len()) as u64,
         held: plan.held.len() as u64,
         bytes_held: plan.held_bytes(),

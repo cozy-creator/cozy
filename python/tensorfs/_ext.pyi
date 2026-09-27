@@ -652,6 +652,9 @@ class Stats(TypedDict):
     catalog_opens: int
     presence_passes: int
     repo_cache_verified_reads: int
+    admission_batches: int
+    admitted_objects: int
+    admission_nanos: int
 
 def stats() -> Stats: ...
 def object_id(data: bytes) -> str: ...
@@ -754,6 +757,7 @@ def pull(
     timeout: float | None = None,
     session: str = ...,
     streams: int = ...,
+    streams_start: int = ...,
     allowed_hosts: Sequence[str] = ...,
     allow_local: bool = False,
     sample_seconds: float | None = None,

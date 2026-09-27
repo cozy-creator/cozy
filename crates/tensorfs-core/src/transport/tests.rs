@@ -2836,6 +2836,194 @@ fn bench_walk_16way_parity() {
     );
 }
 
+// ------------------------------------------------- pace: streams follow measured goodput
+
+/// Serves one object's body by digest.
+type Bodies = Arc<dyn Fn(&str) -> Vec<u8> + Send + Sync>;
+
+/// Distinct `size`-byte objects sharing one pseudo-random block, and a way to serve each.
+fn paced_objects(size: usize, count: usize) -> (Vec<ObjectRef>, Bodies) {
+    let mut block = vec![0u8; size];
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    for byte in block.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *byte = (x >> 24) as u8;
+    }
+    let block = Arc::new(block);
+    let body_of = {
+        let block = Arc::clone(&block);
+        move |index: u64| -> Vec<u8> {
+            let mut body = block.as_ref().clone();
+            body[..8].copy_from_slice(&index.to_le_bytes());
+            body
+        }
+    };
+    let mut declared = Vec::new();
+    let mut index_of = HashMap::new();
+    for index in 0..count as u64 {
+        let object = ObjectRef::of(&body_of(index));
+        index_of.insert(object.sha256.clone(), index);
+        declared.push(object);
+    }
+    declared.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    let serve = move |hex: &str| body_of(index_of[hex]);
+    (declared, Arc::new(serve))
+}
+
+/// Walk `subset` from `origin` into a fresh store; the rate and what the walk reports.
+/// Every object is proven local and verified by `plan.complete` before the rate counts.
+fn paced_walk(origin: &Origin, streams: usize, subset: &[ObjectRef]) -> (f64, super::WalkOutcome) {
+    let root = temporary(&format!("paced-{streams}-{}", subset.len()));
+    let store = Store::init(&root).unwrap();
+    let (plan, _) = FetchPlan::of_objects(&store, "paced", subset).unwrap();
+    let urls: std::collections::BTreeMap<String, String> = subset
+        .iter()
+        .map(|o| {
+            (
+                o.sha256.clone(),
+                format!("{}/obj/{}", origin.base, o.sha256),
+            )
+        })
+        .collect();
+    let ledger = Ledger::with_resolution(Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    let walked = super::pull::fetch_wanted(
+        &store,
+        &plan,
+        &urls,
+        &local_policy(),
+        &Anonymous,
+        Deadline::none(),
+        &ledger,
+        streams,
+        None,
+    )
+    .unwrap();
+    let seconds = started.elapsed().as_secs_f64();
+    plan.complete(&store).unwrap();
+    for object in subset {
+        let mut bytes = Vec::new();
+        store
+            .open_verified(&object.sha256)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            ObjectRef::of(&bytes),
+            *object,
+            "the door admitted other bytes"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(walked.fetched as usize, subset.len());
+    (walked.bytes_moved as f64 / 1e6 / seconds, walked)
+}
+
+/// Run 1225's shape: one GET is the limit, not the link. Each connection drips ~0.4 MB/s,
+/// so a walk held at 16 streams is held at 16 times that however fast the link is. The
+/// paced walk measures that each doubling buys goodput, grows past 16, and every object
+/// still crosses the one door and verifies.
+#[test]
+fn a_walk_grows_past_sixteen_while_one_get_is_the_limit() {
+    const SIZE: usize = 512 << 10;
+    const CHUNK: usize = 8 << 10;
+    let gap = Duration::from_millis(20);
+    let (declared, body) = paced_objects(SIZE, 384);
+    let origin = origin(Arc::new(move |request: &Request| Serve::Drip {
+        body: body(request.path.trim_start_matches("/obj/")),
+        chunk: CHUNK,
+        gap,
+        ttfb: Duration::from_millis(20),
+    }));
+    let one_get = CHUNK as f64 / gap.as_secs_f64() / 1e6;
+
+    let (held, fixed) = paced_walk(&origin, 16, &declared[..48]);
+    let (paced, grew) = paced_walk(&origin, super::PULL_STREAMS, &declared);
+    println!(
+        "one GET {one_get:.2} MB/s; held at 16: {held:.1} MB/s; paced: {paced:.1} MB/s, \
+         ended at {} streams via {:?}",
+        grew.streams, grew.levels
+    );
+    assert_eq!(fixed.streams, 16);
+    assert!(fixed.levels.is_empty(), "an explicit 16 is a fixed walk");
+    assert!(
+        held <= 16.0 * one_get * 1.1,
+        "the control is capped by 16 GETs: {held:.1}"
+    );
+    assert!(
+        grew.streams >= 64,
+        "goodput followed every doubling: {grew:?}"
+    );
+    // The socket-side goodput each level measured is the mechanism; the wall rate also
+    // pays this box's disk, which other tests share, so it is only held to beating 16.
+    let (first, last) = (grew.levels[0], grew.levels[grew.levels.len() - 1]);
+    assert!(
+        last.bytes_per_second >= 3.0 * first.bytes_per_second,
+        "the top level moved {:.1} MB/s against {:.1} at 16",
+        last.bytes_per_second / 1e6,
+        first.bytes_per_second / 1e6
+    );
+    assert!(
+        paced > held,
+        "paced {paced:.1} MB/s did not beat 16 streams at {held:.1}"
+    );
+}
+
+/// The other half of the rule: when the LINK is the limit, a doubling buys nothing and the
+/// walk stops growing instead of piling up partial objects. Every connection shares one
+/// ~13 MB/s schedule here, which 16 streams already fill.
+#[test]
+fn a_walk_does_not_grow_when_the_link_is_the_limit() {
+    const SIZE: usize = 512 << 10;
+    const CHUNK: usize = 16 << 10;
+    let slot = Duration::from_micros(1250); // one 16 KiB chunk per slot: ~13 MB/s shared
+    let (declared, body) = paced_objects(SIZE, 96);
+    let link = Arc::new(Mutex::new(std::time::Instant::now()));
+    let origin = origin(Arc::new(move |request: &Request| {
+        let body = body(request.path.trim_start_matches("/obj/"));
+        let link = Arc::clone(&link);
+        Serve::Script(Box::new(move |socket: &mut TcpStream| {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes());
+            for piece in body.chunks(CHUNK) {
+                let due = {
+                    let mut next = link.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    *next = (*next).max(now) + slot;
+                    *next
+                };
+                let now = std::time::Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+                if socket.write_all(piece).is_err() {
+                    return;
+                }
+            }
+        }))
+    }));
+    let (held, _) = paced_walk(&origin, 16, &declared);
+    let (rate, walked) = paced_walk(&origin, super::PULL_STREAMS, &declared);
+    println!(
+        "shared link: held at 16 {held:.1} MB/s; paced {rate:.1} MB/s, ended at {} streams via {:?}",
+        walked.streams, walked.levels
+    );
+    assert!(
+        walked.streams <= 32,
+        "a full link earned no growth: {walked:?}"
+    );
+    let levels = &walked.levels;
+    assert!(
+        levels.len() == 2 && levels[1].bytes_per_second < super::GAIN * levels[0].bytes_per_second,
+        "the one probe past 16 measured the full link and stopped: {levels:?}"
+    );
+}
+
 // ------------------------------------------------- proto-037: the wire does not grow
 
 /// What one emulated hub was ASKED, so a test can assert about the requests and not only
@@ -5006,6 +5194,7 @@ fn measured_speculation_keeps_only_verified_winners_and_preserves_slow_progress(
                     Deadline::none(),
                     &ledger,
                     &|| false,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("{mode}: {e}"));
             if path == "/seed"
@@ -5097,7 +5286,8 @@ fn speculative_and_original_asks_share_one_retry_budget() {
                     attempts,
                     retry,
                     None,
-                    super::pull::shared_client()
+                    super::pull::shared_client(),
+                    None,
                 )
                 .is_err());
             });
@@ -5196,6 +5386,7 @@ fn speculative_winner_cancels_a_loser_refreshing_real_hub_authority() {
             deadline,
             &ledger,
             &|| false,
+            None,
         )
         .unwrap();
     let client = super::http::Client::new();
@@ -5231,6 +5422,7 @@ fn speculative_winner_cancels_a_loser_refreshing_real_hub_authority() {
             deadline,
             &ledger,
             &|| false,
+            None,
         )
         .unwrap();
     assert_eq!(found.admitted.object, object);
@@ -5434,6 +5626,7 @@ fn bounded_warm_tail_speculates_without_a_completed_speed_reference() {
             Deadline::after_seconds(Some(30.0)),
             &ledger,
             3,
+            3,
             Some(&observer),
             Some((
                 plan.wanted_bytes() + plan.wanted.iter().map(|o| o.length).max().unwrap(),
@@ -5522,6 +5715,7 @@ fn speculative_tail_does_not_reclassify_a_local_consumer_pause_as_network_delay(
         Deadline::after_seconds(Some(3.0)),
         &ledger,
         &|| true,
+        None,
     );
     assert_eq!(
         control.join().unwrap(),
@@ -5531,4 +5725,63 @@ fn speculative_tail_does_not_reclassify_a_local_consumer_pause_as_network_delay(
     assert_eq!(result.unwrap().admitted.object, object);
     assert_eq!(source.total_hits(), 1);
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// Where the door spends its time at pull concurrency: 64 MiB objects from memory, so no
+/// network, through the same stream_verified -> admit_verified pair every pull uses.
+#[test]
+#[ignore = "benchmark; run explicitly with --ignored --nocapture"]
+fn bench_door_concurrency() {
+    const SIZE: usize = 64 << 20;
+    let (declared, body) = paced_objects(SIZE, 32);
+    for writers in [1usize, 16, 32] {
+        let root = temporary(&format!("door-{writers}"));
+        let store = Store::init(&root).unwrap();
+        let next = AtomicUsize::new(0);
+        let streamed = Mutex::new(Duration::ZERO);
+        let admitted = Mutex::new(Duration::ZERO);
+        let count = if writers == 1 { 8 } else { declared.len() };
+        let before = crate::stats::snapshot();
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..writers {
+                scope.spawn(|| loop {
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(object) = declared[..count].get(at) else {
+                        return;
+                    };
+                    let bytes = body(&object.sha256);
+                    let t0 = std::time::Instant::now();
+                    let verified = store
+                        .stream_verified(
+                            &mut bytes.as_slice(),
+                            Some(object),
+                            &Default::default(),
+                            crate::store::PUT_TEMP,
+                        )
+                        .unwrap();
+                    let t1 = std::time::Instant::now();
+                    store
+                        .admit_verified(verified, &Default::default(), None)
+                        .unwrap();
+                    let t2 = std::time::Instant::now();
+                    *streamed.lock().unwrap() += t1 - t0;
+                    *admitted.lock().unwrap() += t2 - t1;
+                });
+            }
+        });
+        let seconds = started.elapsed().as_secs_f64();
+        let after = crate::stats::snapshot();
+        println!(
+            "{writers:3} writers: {count} x 64 MiB in {seconds:6.2} s = {:7.1} MB/s; per object: \
+             stream+hash+fsync {:6.0} ms, admission (wait + turn) {:6.0} ms; {} batches, \
+             {:.2} s committing",
+            (count * SIZE) as f64 / 1e6 / seconds,
+            streamed.lock().unwrap().as_secs_f64() * 1e3 / count as f64,
+            admitted.lock().unwrap().as_secs_f64() * 1e3 / count as f64,
+            after.admission_batches - before.admission_batches,
+            (after.admission_nanos - before.admission_nanos) as f64 / 1e9,
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

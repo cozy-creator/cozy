@@ -903,8 +903,9 @@ impl Catalog {
         hold_on(&self.connection()?, operation, key, length)
     }
 
-    /// The object's existing hold and verification become durable together. Filesystem
-    /// publication still precedes its verification record, with FULL synchronization.
+    /// A HELD admission: the hold is written before the object is published, so an
+    /// operation that cannot hold it publishes nothing. Unheld admissions, which is every
+    /// pull, take `record_grouped` instead.
     pub(crate) fn admit_blob(
         &self,
         operation: Option<&str>,
@@ -914,7 +915,7 @@ impl Catalog {
         // One admission at a time per catalog in this process, holding the write lock from
         // before publication: streams landing objects together queue here instead of in
         // SQLite's busy timeout, where a lost race refused bytes already verified.
-        let turn = admissions(&self.path);
+        let turn = held_admissions(&self.path);
         let _turn = turn.lock().unwrap_or_else(|error| error.into_inner());
         let mut connection = self.connection()?;
         let transaction = connection
@@ -939,6 +940,117 @@ impl Catalog {
             trust.remember(row);
         }
         Ok(verified.is_some())
+    }
+
+    /// The object's existing hold and verification become durable together. Filesystem
+    /// publication has already happened, on the caller's thread, and precedes this record,
+    /// which is written with FULL synchronization.
+    ///
+    /// Records queue per catalog in this process, and whichever arrives while no batch is
+    /// committing leads the next one: one immediate transaction and one commit make every
+    /// waiting record durable. One object alone costs what it always did. Before this,
+    /// directory creation, link, directory fsync and commit ran for one object at a time
+    /// under one lock, several fsyncs each, and on a disk busy flushing those same objects'
+    /// bodies that queue, not the network, set a pull's rate.
+    pub(crate) fn record_grouped(&self, recording: Recording) -> Result<()> {
+        let group = admission_group(&self.path);
+        let mut state = group
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let ticket = state.next;
+        state.next += 1;
+        state.queue.push((ticket, recording));
+        loop {
+            if let Some(result) = state.done.remove(&ticket) {
+                return result;
+            }
+            if state.leading {
+                state = group
+                    .turned
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+                continue;
+            }
+            state.leading = true;
+            let batch = std::mem::take(&mut state.queue);
+            let mut lead = Lead {
+                group: &group,
+                tickets: batch.iter().map(|(ticket, _)| *ticket).collect(),
+                results: Vec::new(),
+            };
+            drop(state);
+            let started = std::time::Instant::now();
+            let objects = batch.len();
+            lead.results = self.record_batch(batch);
+            crate::stats::admission_batch(objects, started.elapsed());
+            drop(lead);
+            state = group
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn record_batch(&self, batch: Vec<(u64, Recording)>) -> Vec<(u64, Result<()>)> {
+        let fail_all = |batch: Vec<(u64, Recording)>, error: Refusal| {
+            batch
+                .into_iter()
+                .map(|(ticket, _)| (ticket, Err(error.clone())))
+                .collect::<Vec<_>>()
+        };
+        let mut connection = match self.connection() {
+            Ok(connection) => connection,
+            Err(error) => return fail_all(batch, error),
+        };
+        let mut transaction =
+            match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(transaction) => transaction,
+                Err(error) => return fail_all(batch, sql("begin blob admission", error)),
+            };
+        let mut results = Vec::with_capacity(batch.len());
+        let mut written = Vec::with_capacity(batch.len());
+        // Each object's row sits behind its own savepoint: one refused row refuses that
+        // object, as it did when every object had a transaction of its own.
+        for (ticket, recording) in batch {
+            let outcome = transaction
+                .savepoint()
+                .map_err(|error| sql("begin object admission", error))
+                .and_then(|savepoint| {
+                    if let Some(row) = &recording.record {
+                        write_verification_on(&savepoint, row)?;
+                    }
+                    savepoint
+                        .commit()
+                        .map_err(|error| sql("record object admission", error))
+                });
+            match outcome {
+                Ok(()) => written.push((ticket, recording.record)),
+                Err(error) => results.push((ticket, Err(error))),
+            }
+        }
+        match transaction
+            .commit()
+            .map_err(|error| sql("commit blob admission", error))
+        {
+            Ok(()) => {
+                let trust = Trust::live(&self.path);
+                for (ticket, record) in written {
+                    if let (Some(row), Some(trust)) = (&record, &trust) {
+                        trust.remember(row);
+                    }
+                    results.push((ticket, Ok(())));
+                }
+            }
+            Err(error) => {
+                results.extend(
+                    written
+                        .into_iter()
+                        .map(|(ticket, _)| (ticket, Err(error.clone()))),
+                );
+            }
+        }
+        results
     }
 
     pub fn held_keys(&self) -> Result<Vec<crate::storage::HeldKey>> {
@@ -1084,7 +1196,7 @@ impl Catalog {
     }
 }
 
-fn admissions(path: &Path) -> Arc<Mutex<()>> {
+fn held_admissions(path: &Path) -> Arc<Mutex<()>> {
     static TURNS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     TURNS
         .get_or_init(Default::default)
@@ -1093,6 +1205,73 @@ fn admissions(path: &Path) -> Arc<Mutex<()>> {
         .entry(path.to_path_buf())
         .or_default()
         .clone()
+}
+
+/// One published object's catalog rows, handed to the admission group.
+pub(crate) struct Recording {
+    /// The verification row, when this call installed the object.
+    pub record: Option<crate::store::VRecord>,
+}
+
+#[derive(Default)]
+struct AdmissionGroup {
+    state: Mutex<GroupState>,
+    turned: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GroupState {
+    next: u64,
+    leading: bool,
+    queue: Vec<(u64, Recording)>,
+    done: HashMap<u64, Result<()>>,
+}
+
+fn admission_group(path: &Path) -> Arc<AdmissionGroup> {
+    static GROUPS: OnceLock<Mutex<HashMap<PathBuf, Arc<AdmissionGroup>>>> = OnceLock::new();
+    GROUPS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(path.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+/// A leader hands its batch's results back however it leaves, so a panic inside one batch
+/// cannot strand the admissions queued behind it.
+struct Lead<'a> {
+    group: &'a AdmissionGroup,
+    tickets: Vec<u64>,
+    results: Vec<(u64, Result<()>)>,
+}
+
+impl Drop for Lead<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .group
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.leading = false;
+        let mut answered = std::collections::HashSet::new();
+        for (ticket, result) in self.results.drain(..) {
+            answered.insert(ticket);
+            state.done.insert(ticket, result);
+        }
+        for ticket in &self.tickets {
+            if !answered.contains(ticket) {
+                state.done.insert(
+                    *ticket,
+                    Err(Refusal {
+                        code: Code::IO_FAILED,
+                        detail: "the admission batch holding this object did not finish".into(),
+                    }),
+                );
+            }
+        }
+        self.group.turned.notify_all();
+    }
 }
 
 fn hold_on(connection: &Connection, operation: &str, key: &str, length: u64) -> Result<()> {

@@ -2,7 +2,7 @@
 //! cancels its peer. This is recovery from observed degradation, not a deadline.
 use super::{
     ledger::{Attempt, AttemptData, Deadline, Ledger, STALL_FACTOR, STILL_SAMPLES},
-    pull::{fetch_authorized, fetch_with_attempts, shared_client, Fetched},
+    pull::{fetch_with_attempts, shared_client, Fetched},
     CredentialProvider, SourcePolicy,
 };
 use crate::{
@@ -119,17 +119,23 @@ impl Recovery {
         deadline: Deadline,
         ledger: &Ledger,
         tail: &(dyn Fn() -> bool + Sync),
+        received: Option<&(dyn Fn() + Sync)>,
     ) -> Result<Fetched> {
         if !self.enabled {
-            return fetch_authorized(
+            return fetch_with_attempts(
                 store,
                 grant,
-                &|stale| authorize(stale, ledger),
+                authorize,
                 policy,
                 credential,
                 deadline,
                 ledger,
                 None,
+                &AtomicU32::new(0),
+                true,
+                None,
+                shared_client(),
+                received,
             );
         }
         if grant.destination != Destination::Blob {
@@ -146,6 +152,7 @@ impl Recovery {
                 true,
                 Some(&self.slots),
                 shared_client(),
+                received,
             );
         }
         let attempts = AtomicU32::new(0);
@@ -175,6 +182,7 @@ impl Recovery {
                         retry,
                         if index == 0 { Some(&self.slots) } else { None },
                         client,
+                        received,
                     );
                     let _ = send.send((index, result, started.elapsed()));
                 });
