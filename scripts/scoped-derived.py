@@ -31,6 +31,7 @@ from tensorfs.derived import (
     serve_derived_replay,
     serve_source,
 )
+from tensorfs._derived_channel import _Channel
 
 WORK = "sha256:" + "ab" * 32
 
@@ -497,6 +498,31 @@ def exercise():
         assert owner.client._call("receipt") is None
         owner.finish()
         print("PASS exact-source descriptor, multi-frame config and recorded native replay handoff", flush=True)
+
+        # A newer owner may add fields to its answers; this client reads the ones it uses.
+        left, right = socket.socketpair()
+
+        def newer_owner():
+            channel = _Channel(right.detach())
+            channel.receive()
+            channel.send({"result": None, "served_by": "newer-owner"})
+            channel.receive()
+            channel.send({"error": "TRANSACTION_CONFLICT", "detail": "fenced", "retry_after": 3})
+            channel.close()
+
+        newer = threading.Thread(target=newer_owner, daemon=True)
+        newer.start()
+        client = DerivedTransaction(left.detach())
+        assert client._call("receipt") is None
+        try:
+            client._call("checkpoint")
+        except tensorfs.errors.Refusal as exc:
+            assert exc.code == "TRANSACTION_CONFLICT"
+        else:
+            raise AssertionError("an owner's refusal with an extra field was not raised")
+        newer.join(10)
+        assert not newer.is_alive()
+        print("PASS additive answer fields from a newer owner are ignored", flush=True)
 
         # Selection is a set; inspection preserves the artifact's constructor order.
         plain = dict(tensorfs.seed_digests())["plain/1"]

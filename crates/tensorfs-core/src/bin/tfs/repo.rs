@@ -80,9 +80,6 @@ pub fn cmd_manifest_build(entries_path: &Path, flags: &Flags) -> ExitCode {
             Ok(path) => path.to_string(),
             Err(error) => return bail(error),
         };
-        if let Err(error) = fields.done() {
-            return bail(error);
-        }
         files.push((path, blob));
     }
     let manifest = match Manifest::from_files(files) {

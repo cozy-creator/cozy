@@ -437,6 +437,7 @@ fn source_identity_is_locked_and_source_closure_stays_rooted_after_writer_death(
                     repo: repo.clone(),
                     remove: Vec::new(),
                     set: vec![ReleaseLane {
+                        extra: Default::default(),
                         lane: "main".into(),
                         manifest: receipt.manifest.clone(),
                     }],

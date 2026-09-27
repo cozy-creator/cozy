@@ -123,9 +123,7 @@ class _Channel:
         if not isinstance(value, dict):
             raise ChannelRefusal("WRONG_TYPE", "expected derived metadata")
         if "error" in value:
-            if set(value) != {"error", "detail"}:
-                raise ChannelRefusal("UNKNOWN_FIELD", "invalid derived refusal")
-            raise _error(str(value["error"]), str(value["detail"]))
+            raise _error(str(value["error"]), str(value.get("detail", "")))
         return value
 
 
@@ -170,8 +168,8 @@ class DerivedTransaction:
             try:
                 channel.send({"op": op, **fields})
                 result = channel.reply()
-                if set(result) != {"result"}:
-                    raise ChannelRefusal("UNKNOWN_FIELD", "invalid derived result")
+                if "result" not in result:
+                    raise ChannelRefusal("MISSING_FIELD", "derived answer has no result")
                 return result["result"]
             except BaseException:
                 self.close()
@@ -214,7 +212,7 @@ class DerivedTransaction:
                         "length": len(view),
                     }
                 )
-                if channel.reply() != {"length": len(view)}:
+                if channel.reply().get("length") != len(view):
                     raise ChannelRefusal(
                         "LENGTH_MISMATCH", "derived read length changed"
                     )
@@ -238,10 +236,10 @@ class DerivedTransaction:
                 channel.send({"op": op, **fields})
                 while True:
                     response = channel.reply()
-                    if set(response) == {"result"}:
+                    if "result" in response:
                         return response["result"]
                     if (
-                        set(response) != {"pull"}
+                        "pull" not in response
                         or type(response["pull"]) is not int
                         or not 0 < response["pull"] <= _CHUNK
                     ):

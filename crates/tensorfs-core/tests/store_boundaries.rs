@@ -131,7 +131,9 @@ fn ensure_initializes_only_absent_or_empty_real_roots() {
     Store::init(&corrupt_catalog).unwrap();
     fs::remove_dir_all(corrupt_catalog.join("tmp")).unwrap();
     let connection = rusqlite::Connection::open(corrupt_catalog.join("tensorfs.sqlite")).unwrap();
-    connection.pragma_update(None, "user_version", 999).unwrap();
+    connection
+        .execute_batch("ALTER TABLE tensorfs_verified_blobs DROP COLUMN mtime_ns")
+        .unwrap();
     drop(connection);
     assert_eq!(
         Store::ensure(&corrupt_catalog).unwrap_err().code,
@@ -570,6 +572,7 @@ fn privileged_writer_preserves_the_store_owners_public_directories() {
                     repo: repo.clone(),
                     remove: vec![],
                     set: vec![ReleaseLane {
+                        extra: Default::default(),
                         lane: "original".into(),
                         manifest: admitted.obj.clone(),
                     }],

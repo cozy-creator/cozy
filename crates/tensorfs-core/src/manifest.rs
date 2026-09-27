@@ -1,7 +1,7 @@
 //! One location-typed virtual file tree. A manifest has only ordinary files and one optional
 //! typed CozyTensors entry; directories are inferred from paths and empty directories are not data.
 
-use crate::canon::{as_arr, as_str, Fields, Value};
+use crate::canon::{as_arr, as_str, Extra, Fields, Value};
 use crate::err::{refuse, Code, Result};
 use crate::ids::{Doc, ObjectRef};
 use crate::limits;
@@ -33,12 +33,14 @@ impl Draft {
     }
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        crate::canon::write(&manifest_value(&self.entries))
+        crate::canon::write(&manifest_value(&self.entries, &Extra::default(), &[]))
     }
 
     pub fn seal(self) -> Result<Manifest> {
         let manifest = Manifest {
             entries: self.entries,
+            extra: Extra::default(),
+            entry_extra: Vec::new(),
         };
         manifest.validate()?;
         if manifest.canonical_bytes().len() > Manifest::MAX_BYTES {
@@ -51,6 +53,10 @@ impl Draft {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     entries: Vec<(String, Entry)>,
+    /// Fields a newer writer added, re-emitted unchanged so the manifest keeps its identity.
+    extra: Extra,
+    /// Per-entry unread fields: empty, or exactly one per entry.
+    entry_extra: Vec<Extra>,
 }
 
 /// Traversal and ambiguity only. A manifest path is a key in a VIRTUAL tree: nothing here
@@ -119,6 +125,15 @@ impl Manifest {
         self.object_id()
     }
 
+    /// Objects named only by fields this build does not read. Reachability keeps them.
+    pub fn unread_refs(&self) -> Vec<ObjectRef> {
+        let mut refs = self.extra.refs();
+        self.entry_extra
+            .iter()
+            .for_each(|extra| refs.extend(extra.refs()));
+        refs
+    }
+
     pub fn listings(&self, blob: &ObjectRef) -> Vec<&str> {
         self.entries
             .iter()
@@ -174,6 +189,7 @@ impl Doc for Manifest {
             return refuse(Code::COUNT_CAP, "manifest entry count exceeds cap");
         }
         let mut entries = Vec::with_capacity(raw.len());
+        let mut entry_extra = Vec::with_capacity(raw.len());
         for value in raw {
             let mut item = Fields::new("Manifest.entry", value)?;
             let blob = ObjectRef::from_value("Manifest.entry.blob", item.req("blob")?)?;
@@ -189,40 +205,53 @@ impl Doc for Manifest {
                     )
                 }
             };
-            item.done()?;
+            entry_extra.push(item.rest());
             entries.push((path, entry));
         }
-        fields.done()?;
-        Draft { entries }.seal()
+        let extra = fields.rest();
+        let mut manifest = Draft { entries }.seal()?;
+        manifest.extra = extra;
+        if entry_extra.iter().any(|extra| *extra != Extra::default()) {
+            manifest.entry_extra = entry_extra;
+        }
+        Ok(manifest)
     }
 
     fn to_value(&self) -> Value {
-        manifest_value(&self.entries)
+        manifest_value(&self.entries, &self.extra, &self.entry_extra)
     }
 }
 
-fn manifest_value(entries: &[(String, Entry)]) -> Value {
-    Value::obj(vec![(
-        "entries",
-        Value::arr(
-            entries
-                .iter()
-                .map(|(path, entry)| {
-                    Value::obj(vec![
-                        ("blob", entry.blob().to_value()),
-                        (
-                            "kind",
-                            Value::str(match entry {
-                                Entry::File(_) => "file",
-                                Entry::CozyTensors(_) => "cozytensors",
-                            }),
-                        ),
-                        ("path", Value::str(path.clone())),
-                    ])
-                })
-                .collect(),
-        ),
-    )])
+fn manifest_value(entries: &[(String, Entry)], extra: &Extra, entry_extra: &[Extra]) -> Value {
+    let none = Extra::default();
+    Value::obj_with(
+        vec![(
+            "entries",
+            Value::arr(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (path, entry))| {
+                        Value::obj_with(
+                            vec![
+                                ("blob", entry.blob().to_value()),
+                                (
+                                    "kind",
+                                    Value::str(match entry {
+                                        Entry::File(_) => "file",
+                                        Entry::CozyTensors(_) => "cozytensors",
+                                    }),
+                                ),
+                                ("path", Value::str(path.clone())),
+                            ],
+                            entry_extra.get(index).unwrap_or(&none),
+                        )
+                    })
+                    .collect(),
+            ),
+        )],
+        extra,
+    )
 }
 
 #[cfg(test)]

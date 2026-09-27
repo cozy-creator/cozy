@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 
-use crate::canon::{as_arr, as_str, Fields, Value};
+use crate::canon::{as_arr, as_str, Extra, Fields, Value};
 use crate::err::{refuse, Code, Result};
 use crate::ids::{ascii_name, hex64, Doc, ObjectRef};
 
@@ -70,6 +70,8 @@ pub struct Checkpoint {
     /// digest reads remain meaningful even after every movable lane points elsewhere.
     pub published: bool,
     pub source_selection: Option<String>,
+    /// Fields a newer writer added, carried through every rewrite.
+    pub extra: Extra,
 }
 
 impl Checkpoint {
@@ -113,11 +115,11 @@ impl Checkpoint {
                 )
             })
             .transpose()?;
-        fields.done()?;
         let checkpoint = Self {
             manifest,
             published,
             source_selection,
+            extra: fields.rest(),
         };
         checkpoint.validate()?;
         Ok(checkpoint)
@@ -131,7 +133,12 @@ impl Checkpoint {
         if let Some(source_selection) = &self.source_selection {
             fields.push(("source_selection", Value::str(source_selection.clone())));
         }
-        Value::obj(fields)
+        Value::obj_with(fields, &self.extra)
+    }
+
+    fn same_facts(&self, other: &Checkpoint) -> bool {
+        (&self.manifest, self.published, &self.source_selection)
+            == (&other.manifest, other.published, &other.source_selection)
     }
 }
 
@@ -139,6 +146,7 @@ impl Checkpoint {
 pub struct ReleaseLane {
     pub lane: String,
     pub manifest: ObjectRef,
+    pub extra: Extra,
 }
 
 impl ReleaseLane {
@@ -160,17 +168,23 @@ impl ReleaseLane {
         let lane = fields.req_str("lane")?.to_string();
         let manifest =
             ObjectRef::from_value("Repository.release.lane.manifest", fields.req("manifest")?)?;
-        fields.done()?;
-        let lane = Self { lane, manifest };
+        let lane = Self {
+            lane,
+            manifest,
+            extra: fields.rest(),
+        };
         lane.validate()?;
         Ok(lane)
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
-            ("lane", Value::str(self.lane.clone())),
-            ("manifest", self.manifest.to_value()),
-        ])
+        Value::obj_with(
+            vec![
+                ("lane", Value::str(self.lane.clone())),
+                ("manifest", self.manifest.to_value()),
+            ],
+            &self.extra,
+        )
     }
 }
 
@@ -180,6 +194,7 @@ pub struct Release {
     pub revision: u64,
     pub version: String,
     pub yanked: bool,
+    pub extra: Extra,
 }
 
 impl Release {
@@ -230,27 +245,30 @@ impl Release {
                 )
             }
         };
-        fields.done()?;
         let release = Self {
             lanes,
             revision,
             version,
             yanked,
+            extra: fields.rest(),
         };
         release.validate()?;
         Ok(release)
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
-            (
-                "lanes",
-                Value::arr(self.lanes.iter().map(ReleaseLane::to_value).collect()),
-            ),
-            ("revision", Value::uint(self.revision)),
-            ("version", Value::str(self.version.clone())),
-            ("yanked", Value::Bool(self.yanked)),
-        ])
+        Value::obj_with(
+            vec![
+                (
+                    "lanes",
+                    Value::arr(self.lanes.iter().map(ReleaseLane::to_value).collect()),
+                ),
+                ("revision", Value::uint(self.revision)),
+                ("version", Value::str(self.version.clone())),
+                ("yanked", Value::Bool(self.yanked)),
+            ],
+            &self.extra,
+        )
     }
 }
 
@@ -261,6 +279,7 @@ pub struct Repository {
     pub checkpoints: Vec<Checkpoint>,
     pub releases: Vec<Release>,
     pub repo: RepositoryName,
+    pub extra: Extra,
 }
 
 impl Repository {
@@ -269,7 +288,23 @@ impl Repository {
             checkpoints: Vec::new(),
             releases: Vec::new(),
             repo,
+            extra: Extra::default(),
         }
+    }
+
+    /// Objects named only by fields this build does not read. Reachability keeps them.
+    pub fn unread_refs(&self) -> Vec<ObjectRef> {
+        let mut refs = self.extra.refs();
+        for checkpoint in &self.checkpoints {
+            refs.extend(checkpoint.extra.refs());
+        }
+        for release in &self.releases {
+            refs.extend(release.extra.refs());
+            for lane in &release.lanes {
+                refs.extend(lane.extra.refs());
+            }
+        }
+        refs
     }
 
     fn validate(&self) -> Result<()> {
@@ -347,7 +382,7 @@ impl Repository {
             .checkpoints
             .binary_search_by(|candidate| candidate.key().cmp(checkpoint.key()))
         {
-            Ok(index) if next.checkpoints[index] == checkpoint => return Ok(next),
+            Ok(index) if next.checkpoints[index].same_facts(&checkpoint) => return Ok(next),
             Ok(_) => {
                 return refuse(
                     Code::CHECKPOINT_CONFLICT,
@@ -447,6 +482,7 @@ impl Repository {
                         revision: 0,
                         version: version.to_string(),
                         yanked: false,
+                        extra: Extra::default(),
                     },
                 );
                 index
@@ -467,6 +503,8 @@ impl Repository {
                 .lanes
                 .binary_search_by(|candidate| candidate.key().cmp(lane.key()))
             {
+                Ok(index)
+                    if next.releases[release_index].lanes[index].manifest == lane.manifest => {}
                 Ok(index) => next.releases[release_index].lanes[index] = lane,
                 Err(index) => next.releases[release_index].lanes.insert(index, lane),
             }
@@ -595,28 +633,31 @@ impl Doc for Repository {
             releases.push(Release::from_value(value)?);
         }
         let repo = RepositoryName::from_value(fields.req("repo")?)?;
-        fields.done()?;
         let repository = Self {
             checkpoints,
             releases,
             repo,
+            extra: fields.rest(),
         };
         repository.validate()?;
         Ok(repository)
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
-            (
-                "checkpoints",
-                Value::arr(self.checkpoints.iter().map(Checkpoint::to_value).collect()),
-            ),
-            (
-                "releases",
-                Value::arr(self.releases.iter().map(Release::to_value).collect()),
-            ),
-            ("repo", self.repo.to_value()),
-        ])
+        Value::obj_with(
+            vec![
+                (
+                    "checkpoints",
+                    Value::arr(self.checkpoints.iter().map(Checkpoint::to_value).collect()),
+                ),
+                (
+                    "releases",
+                    Value::arr(self.releases.iter().map(Release::to_value).collect()),
+                ),
+                ("repo", self.repo.to_value()),
+            ],
+            &self.extra,
+        )
     }
 }
 
@@ -760,6 +801,7 @@ pub fn apply(current: Option<&[u8]>, mutation: &Mutation) -> Result<Option<Repos
                 existing
                     .unwrap_or_else(|| Repository::empty(repo.clone()))
                     .put_checkpoint(Checkpoint {
+                        extra: Default::default(),
                         manifest: manifest.clone(),
                         published: false,
                         source_selection: None,
@@ -828,7 +870,9 @@ pub fn apply(current: Option<&[u8]>, mutation: &Mutation) -> Result<Option<Repos
             }
             hex64("local source selection", version)?;
             let repository = Repository {
+                extra: Default::default(),
                 checkpoints: vec![Checkpoint {
+                    extra: Default::default(),
                     manifest: manifest.clone(),
                     published: false,
                     source_selection: Some(version.clone()),
@@ -858,6 +902,7 @@ mod tests {
 
     fn lane(lane: &str, seed: u8) -> ReleaseLane {
         ReleaseLane {
+            extra: Default::default(),
             lane: lane.into(),
             manifest: ObjectRef {
                 sha256: format!("{:02x}", seed + 1).repeat(32),
@@ -868,6 +913,7 @@ mod tests {
 
     fn release(version: &str, lane_name: &str, seed: u8) -> Release {
         Release {
+            extra: Default::default(),
             lanes: vec![lane(lane_name, seed)],
             revision: 1,
             version: version.into(),
@@ -880,6 +926,7 @@ mod tests {
             .iter()
             .flat_map(|release| &release.lanes)
             .map(|lane| Checkpoint {
+                extra: Default::default(),
                 manifest: lane.manifest.clone(),
                 published: true,
                 source_selection: None,
@@ -894,6 +941,7 @@ mod tests {
         let selected = release.lanes[0].clone();
         Repository::empty(repo)
             .put_checkpoint(Checkpoint {
+                extra: Default::default(),
                 manifest: selected.manifest.clone(),
                 published: false,
                 source_selection: None,
@@ -934,6 +982,7 @@ mod tests {
         };
         let repository = Repository::empty(name)
             .put_checkpoint(Checkpoint {
+                extra: Default::default(),
                 manifest: first.manifest.clone(),
                 published: false,
                 source_selection: None,
@@ -973,17 +1022,20 @@ mod tests {
         let first = lane("bf16", 1);
         let peer = lane("fp8", 2);
         let replacement = ReleaseLane {
+            extra: Default::default(),
             lane: "bf16".into(),
             manifest: peer.manifest.clone(),
         };
         let repository = Repository::empty(RepositoryName::new("org", "model").unwrap())
             .put_checkpoint(Checkpoint {
+                extra: Default::default(),
                 manifest: first.manifest.clone(),
                 published: false,
                 source_selection: None,
             })
             .unwrap()
             .put_checkpoint(Checkpoint {
+                extra: Default::default(),
                 manifest: peer.manifest.clone(),
                 published: false,
                 source_selection: None,
@@ -1026,6 +1078,7 @@ mod tests {
             .map(|index| release(&format!("{index:04}"), "X", (index % 200) as u8))
             .collect();
         Repository {
+            extra: Default::default(),
             checkpoints: checkpoints(&releases),
             releases: releases.clone(),
             repo: repo.clone(),
@@ -1036,6 +1089,7 @@ mod tests {
         too_many.push(release("zzzz", "X", 201));
         assert_eq!(
             Repository {
+                extra: Default::default(),
                 checkpoints: checkpoints(&too_many),
                 releases: too_many,
                 repo: repo.clone(),
@@ -1060,6 +1114,7 @@ mod tests {
                     })
                     .collect();
                 Repository {
+                    extra: Default::default(),
                     checkpoints: checkpoints(&releases),
                     releases,
                     repo,

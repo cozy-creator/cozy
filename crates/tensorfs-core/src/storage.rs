@@ -762,6 +762,18 @@ impl Census {
             }
         }
         let mut full_manifests = live_manifests.clone();
+        // A field this build does not read may still name an object: keep it, and walk it
+        // whole if it is a manifest.
+        for repository in &self.repositories {
+            if drop.contains(&repository.0.repo) {
+                continue;
+            }
+            for object in repository.0.unread_refs() {
+                live_blobs.insert(object.sha256.clone());
+                live_manifests.insert(object.sha256.clone());
+                full_manifests.insert(object.sha256);
+            }
+        }
         for hold in holds {
             match hold.kind.as_str() {
                 "blob" => {
@@ -796,8 +808,9 @@ impl Census {
                 _ => unreachable!("HeldKey parser closes the kind"),
             }
         }
-        for sha256 in &live_manifests {
-            let Some((manifest, bytes)) = self.manifests.get(sha256) else {
+        let mut pending: Vec<String> = live_manifests.iter().cloned().collect();
+        while let Some(sha256) = pending.pop() {
+            let Some((manifest, bytes)) = self.manifests.get(&sha256) else {
                 // A held manifest may not have reached its final key yet. Its separately
                 // held blobs remain protected; there are no manifest bytes to traverse.
                 continue;
@@ -807,9 +820,16 @@ impl Census {
                 length: bytes.len() as u64,
             };
             for object in
-                self.manifest_blob_refs(manifest, &reference, !full_manifests.contains(sha256))?
+                self.manifest_blob_refs(manifest, &reference, !full_manifests.contains(&sha256))?
             {
                 live_blobs.insert(object.sha256);
+            }
+            for object in manifest.unread_refs() {
+                live_blobs.insert(object.sha256.clone());
+                full_manifests.insert(object.sha256.clone());
+                if live_manifests.insert(object.sha256.clone()) {
+                    pending.push(object.sha256);
+                }
             }
         }
         let mut plan = Vec::new();
@@ -1660,6 +1680,7 @@ mod tests {
             repo: repo.clone(),
             remove: Vec::new(),
             set: vec![ReleaseLane {
+                extra: Default::default(),
                 lane: lane.into(),
                 manifest: manifest.clone(),
             }],
@@ -2089,10 +2110,12 @@ mod tests {
         let header_ref = manifest.header().unwrap();
         let header_bytes = fs::read(store.blob_path(&header_ref.sha256)).unwrap();
         let lane = ReleaseLane {
+            extra: Default::default(),
             lane: "cpu".into(),
             manifest: manifest_ref.clone(),
         };
         let release = Release {
+            extra: Default::default(),
             lanes: vec![lane.clone()],
             revision: 1,
             version: "1.0.0".into(),
@@ -2100,6 +2123,7 @@ mod tests {
         };
         let repository = Repository::empty(repo)
             .put_checkpoint(Checkpoint {
+                extra: Default::default(),
                 manifest: manifest_ref.clone(),
                 published: false,
                 source_selection: None,

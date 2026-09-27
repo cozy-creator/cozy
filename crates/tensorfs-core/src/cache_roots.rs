@@ -316,6 +316,7 @@ mod tests {
                     expected_revision: 0,
                     remove: vec![],
                     set: vec![crate::repository::ReleaseLane {
+                        extra: Default::default(),
                         lane: "bf16".into(),
                         manifest,
                     }],

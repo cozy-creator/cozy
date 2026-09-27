@@ -35,26 +35,35 @@ pub fn parse_refs_jsonl(bytes: &[u8]) -> Result<Vec<ObjectRef>> {
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
-        let value = canon::parse_canonical(line, 16 * 1024)?;
+        let value = canon::parse(line, 16 * 1024)?;
         let mut fields = Fields::new("FetchRef", &value)?;
         let length = fields.req_uint("length")?;
         let sha256 = hex64("FetchRef.sha256", fields.req_str("sha256")?)?;
-        fields.done()?;
         result.push(ObjectRef { sha256, length });
     }
     if result.is_empty() {
         return refuse(Code::MISSING_FIELD, "fetch refs are empty");
     }
-    if result
+    sorted_refs("fetch refs", result)
+}
+
+/// Digest order with identical repeats merged. One digest at two lengths still refuses.
+fn sorted_refs(what: &str, mut refs: Vec<ObjectRef>) -> Result<Vec<ObjectRef>> {
+    refs.sort_by(|a, b| a.sha256.cmp(&b.sha256).then(a.length.cmp(&b.length)));
+    refs.dedup();
+    if let Some(pair) = refs
         .windows(2)
-        .any(|pair| pair[0].sha256 >= pair[1].sha256)
+        .find(|pair| pair[0].sha256 == pair[1].sha256)
     {
         return refuse(
-            Code::SORT_ORDER,
-            "fetch refs must be strictly sorted and unique by digest",
+            Code::LENGTH_MISMATCH,
+            format!(
+                "{what} name sha256:{} at {} B and at {} B",
+                pair[0].sha256, pair[0].length, pair[1].length
+            ),
         );
     }
-    Ok(result)
+    Ok(refs)
 }
 
 pub fn final_key(sha256: &str) -> Result<String> {
@@ -148,16 +157,7 @@ impl FetchPlan {
                  something a worker can pull",
             );
         }
-        let mut sorted: Vec<ObjectRef> = declared.to_vec();
-        sorted.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-        sorted.dedup_by(|a, b| a.sha256 == b.sha256);
-        if sorted.len() != declared.len() {
-            return refuse(
-                Code::SORT_ORDER,
-                "the declared object set lists one digest twice — two opinions about how many \
-                 bytes this pull moves",
-            );
-        }
+        let mut sorted = sorted_refs("the declared object set", declared.to_vec())?;
         if let Some(manifest) = manifest {
             if !sorted.iter().any(|object| object.sha256 == manifest.sha256) {
                 sorted.push(manifest.clone());
@@ -318,7 +318,7 @@ fn presence(store: &Store, o: &ObjectRef) -> Result<Presence> {
 
 impl FetchPlan {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        Self::from_value(&canon::parse_canonical(bytes, limits::DOC_MAX_BYTES)?)
+        Self::from_value(&canon::parse(bytes, limits::DOC_MAX_BYTES)?)
     }
     pub fn canonical_bytes(&self) -> Vec<u8> {
         canon::write(&self.to_value())
@@ -343,20 +343,9 @@ impl FetchPlan {
         for o in as_arr("FetchPlan", "wanted", f.req("wanted")?)? {
             wanted.push(ObjectRef::from_value("FetchPlan.wanted", o)?);
         }
-        f.done()?;
         ascii_name("FetchPlan.session", &session, limits::MAX_NAME_BYTES)?;
-        for (what, set) in [("held", &held), ("wanted", &wanted)] {
-            let mut ids: Vec<&str> = set.iter().map(|o| o.sha256.as_str()).collect();
-            let given = ids.clone();
-            ids.sort_unstable();
-            ids.dedup();
-            if ids != given {
-                return refuse(
-                    Code::SORT_ORDER,
-                    format!("FetchPlan.{what} must be sorted and unique by digest"),
-                );
-            }
-        }
+        let held = sorted_refs("FetchPlan.held", held)?;
+        let wanted = sorted_refs("FetchPlan.wanted", wanted)?;
         if held.is_empty() && wanted.is_empty() {
             return refuse(Code::MISSING_FIELD, "a fetch plan covers no object");
         }
@@ -921,7 +910,6 @@ impl DeliveryGrant {
         };
         let object = ObjectRef::from_value("DeliveryGrant.object", f.req("object")?)?;
         let session = f.req_str("session")?.to_string();
-        f.done()?;
         ascii_name("DeliveryGrant.session", &session, limits::MAX_NAME_BYTES)?;
         Ok(DeliveryGrant {
             session,

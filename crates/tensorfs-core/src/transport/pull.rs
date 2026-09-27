@@ -1534,6 +1534,7 @@ fn record_locally(store: &Store, closure: &hub::Closure) -> Result<()> {
             repo,
             remove: Vec::new(),
             set: vec![ReleaseLane {
+                extra: Default::default(),
                 lane: closure.lane.clone(),
                 manifest: closure.manifest.clone(),
             }],

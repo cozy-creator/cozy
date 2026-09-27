@@ -326,6 +326,7 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
             repo: repo.clone(),
             remove: Vec::new(),
             set: vec![ReleaseLane {
+                extra: Default::default(),
                 lane: lane.to_string(),
                 manifest,
             }],

@@ -19,6 +19,9 @@ use crate::storage::Projection;
 /// the floor under any patience a supervisor grants a worker that has gone quiet.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The catalog this build writes. A newer build may only ADD tables and columns (an
+/// incompatible change renames the table), so any catalog at this version or later that
+/// holds every table and column below opens.
 const SCHEMA_VERSION: u64 = 2;
 
 const SCHEMA: &[(&str, &[&str])] = &[
@@ -63,50 +66,25 @@ fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
     crate::store::classify_io(what, error)
 }
 
+/// Every table and column this build uses is present. Additions by a newer build are its own.
 fn verify_schema(connection: &Connection) -> Result<()> {
-    let mut statement = connection
-        .prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        )
-        .map_err(|error| sql("prepare catalog schema census", error))?;
-    let tables: Vec<String> = statement
-        .query_map([], |row| row.get(0))
-        .map_err(|error| sql("read catalog schema census", error))?
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|error| sql("collect catalog schema census", error))?;
-    let expected: Vec<String> = SCHEMA.iter().map(|(name, _)| (*name).to_string()).collect();
-    if tables != expected {
-        return refuse(
-            Code::UNKNOWN_FORMAT,
-            "tensorfs.sqlite is not the exact v1 catalog; remove it and rebuild from repository files",
-        );
-    }
     for (table, expected_columns) in SCHEMA {
         let mut columns = connection
-            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .prepare("SELECT name FROM pragma_table_info(?1)")
             .map_err(|error| sql("prepare catalog column census", error))?;
         let actual: Vec<String> = columns
             .query_map([table], |row| row.get(0))
             .map_err(|error| sql("read catalog column census", error))?
             .collect::<std::result::Result<_, _>>()
             .map_err(|error| sql("collect catalog column census", error))?;
-        let expected: Vec<String> = expected_columns
+        if let Some(missing) = expected_columns
             .iter()
-            .map(|name| (*name).to_string())
-            .collect();
-        let strict: u64 = connection
-            .query_row(
-                "SELECT strict FROM pragma_table_list WHERE schema='main' AND name=?1",
-                [table],
-                |row| row.get(0),
-            )
-            .map_err(|error| sql("read catalog strict-table census", error))?;
-        if actual != expected || strict != 1 {
+            .find(|column| !actual.iter().any(|name| name == *column))
+        {
             return refuse(
                 Code::UNKNOWN_FORMAT,
                 format!(
-                    "tensorfs.sqlite table {table} is not the exact v1 shape; remove the catalog and rebuild from repository files"
+                    "tensorfs.sqlite table {table} has no column {missing}; remove the catalog and rebuild from repository files"
                 ),
             );
         }
@@ -162,10 +140,12 @@ fn validated(path: &Path) -> Result<Connection> {
     let version: u64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| sql("read catalog version", error))?;
-    if version != SCHEMA_VERSION {
+    if version < SCHEMA_VERSION {
         return refuse(
             Code::UNKNOWN_FORMAT,
-            format!("tensorfs.sqlite user_version {version} != {SCHEMA_VERSION}"),
+            format!(
+                "tensorfs.sqlite user_version {version} predates {SCHEMA_VERSION}; remove it and rebuild from repository files"
+            ),
         );
     }
     verify_schema(&connection)?;
@@ -410,7 +390,7 @@ impl Catalog {
         let version: u64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|error| sql("read catalog version", error))?;
-        if version == SCHEMA_VERSION {
+        if version >= SCHEMA_VERSION {
             connection
                 .execute_batch("COMMIT")
                 .map_err(|error| sql("commit catalog open", error))?;
@@ -421,7 +401,7 @@ impl Catalog {
             return refuse(
                 Code::UNKNOWN_FORMAT,
                 format!(
-                    "tensorfs.sqlite user_version {version} is not supported; remove it and rebuild from repository files"
+                    "tensorfs.sqlite user_version {version} predates {SCHEMA_VERSION}; remove it and rebuild from repository files"
                 ),
             );
         }
@@ -1418,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_seven_tables_and_refuses_future_versions_without_mutation() {
+    fn catalog_has_seven_tables_and_opens_additive_future_versions() {
         let root = temporary("schema");
         fs::create_dir_all(&root).unwrap();
         let catalog = Catalog::initialize(&root).unwrap();
@@ -1448,17 +1428,41 @@ mod tests {
                 "tensorfs_verified_blobs",
             ]
         );
-        connection.execute_batch("PRAGMA user_version=3").unwrap();
+        // A newer build added a table and a column: this build still opens and uses it.
+        connection
+            .execute_batch(
+                "CREATE TABLE tensorfs_future(value TEXT);
+                 ALTER TABLE tensorfs_holds ADD COLUMN note TEXT;
+                 PRAGMA user_version=3;",
+            )
+            .unwrap();
         drop(connection);
-        assert_eq!(
-            Catalog::initialize(&root).unwrap_err().code,
-            Code::UNKNOWN_FORMAT
-        );
+        let reopened = Catalog::initialize(&root).unwrap();
+        let guard = reopened.begin_operation("op", "org", "repo").unwrap();
+        reopened
+            .hold(
+                "op",
+                &crate::storage::blob_key(&"ab".repeat(32)).unwrap(),
+                7,
+            )
+            .unwrap();
+        drop(guard);
+        drop(reopened);
+        Catalog::open(&root).unwrap();
         let connection = rusqlite::Connection::open(Catalog::path(&root)).unwrap();
         let version: u64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 3);
+        // A catalog without a column this build uses is genuinely unreadable.
+        connection
+            .execute_batch("ALTER TABLE tensorfs_verified_blobs DROP COLUMN mtime_ns")
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            Catalog::initialize(&root).unwrap_err().code,
+            Code::UNKNOWN_FORMAT
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1653,6 +1653,7 @@ impl PyStore {
             .into_iter()
             .map(|(lane, digest, length)| {
                 Ok(ReleaseLane {
+                    extra: Default::default(),
                     lane,
                     manifest: obj_ref(py, &digest, length)?,
                 })
@@ -2431,6 +2432,7 @@ impl PyOperation {
                     repo: self.repo.clone(),
                     remove: Vec::new(),
                     set: vec![ReleaseLane {
+                        extra: Default::default(),
                         lane: lane.to_string(),
                         manifest,
                     }],

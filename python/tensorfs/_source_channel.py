@@ -26,8 +26,8 @@ class SourceClient:
     def _result(self, request: dict[str, Any]) -> Any:
         self.channel.send(request)
         answer = self.channel.reply()
-        if set(answer) != {"result"}:
-            raise ChannelRefusal("WRONG_TYPE", "invalid source response")
+        if "result" not in answer:
+            raise ChannelRefusal("MISSING_FIELD", "source answer has no result")
         return answer["result"]
 
     def _receive_into(self, view: memoryview) -> None:
