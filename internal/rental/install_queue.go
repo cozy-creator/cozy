@@ -88,9 +88,6 @@ func (q *InstallQueue) Run(ctx context.Context) {
 				} else {
 					problem = records.RentalInstallStateProblem(machine.ID, machine.State)
 				}
-				if problem == nil && row.WorkerBootID != "" && machine.ExpectedWorkerBootID != "" && machine.ExpectedWorkerBootID != row.WorkerBootID {
-					problem = exit.Named(exit.Conflict, "rental.worker_boot_changed", "rental %s changed worker boot during installation", row.RentalID)
-				}
 				if problem != nil {
 					q.report(q.store.SettleRentalInstall(row.ID, "failed", problem))
 					if held, ok := running[row.RentalID]; ok && held.id == row.ID {

@@ -134,13 +134,13 @@ func (s *Store) PendingRentalInstalls() ([]RentalInstall, *exit.Error) {
 	return out, nil
 }
 
-// StartRentalInstall pins the first observed ready worker boot. An interrupted
-// stream is safely replayed only against that boot's idempotent preparation ledger.
+// StartRentalInstall claims the installation on the rental's current ready worker
+// boot. A restarted worker re-claims it, and the selection is prepared again there.
 func (s *Store) StartRentalInstall(id, boot string) (*RentalInstall, *exit.Error) {
 	if boot == "" {
 		return nil, exit.New(exit.Unavailable, "rental has not published its worker identity")
 	}
-	result, err := s.db.Exec(`UPDATE rental_installs SET state='installing',worker_boot_id=?,error_code='',error='',updated_at=? WHERE id=? AND state IN ('queued','installing') AND (worker_boot_id='' OR worker_boot_id=?) AND EXISTS(SELECT 1 FROM rentals r WHERE r.id=rental_installs.rental_id AND r.state='ready' AND r.expected_worker_boot_id=?)`, boot, now(), id, boot, boot)
+	result, err := s.db.Exec(`UPDATE rental_installs SET state='installing',worker_boot_id=?,error_code='',error='',updated_at=? WHERE id=? AND state IN ('queued','installing') AND EXISTS(SELECT 1 FROM rentals r WHERE r.id=rental_installs.rental_id AND r.state='ready' AND r.expected_worker_boot_id=?)`, boot, now(), id, boot)
 	if err != nil {
 		return nil, exit.Internalf("cannot start rental installation: %s", err)
 	}
