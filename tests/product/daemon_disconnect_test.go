@@ -262,14 +262,13 @@ def main():
 	fatal(t, problem)
 	defer store.Close()
 	status, out := runCozy(t, root, "run", script, "--json", "--idempotency-key", "disconnect-accepted")
-	if status != 0 || !strings.Contains(out, `"machine_accepted":true`) {
-		t.Fatalf("Runtime acceptance [%d]: %s", status, out)
+	if status != 0 {
+		t.Fatalf("submission [%d]: %s", status, out)
 	}
 	request, problem := store.RequestByIdempotencyKey("disconnect-accepted")
 	fatal(t, problem)
-	before, problem := store.MachineExecution(request.ID)
-	fatal(t, problem)
-	if before == nil || len(before.Receipt) == 0 || before.Collected {
+	before := awaitMachineReceipt(t, store, request.ID)
+	if before.Collected {
 		t.Fatal("execution did not remain live through the receipt boundary")
 	}
 	var submission pb.MachineExecutionSubmit

@@ -139,7 +139,7 @@ func (p *Package) build(ctx context.Context, namespace *Namespace, prebuiltWheel
 	p.Root = root
 	// Declared-metadata refusals and dependency staging run before the project
 	// wheel build, so a doomed publication is refused before the expensive work.
-	dependencies, needsRegistry, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root, python.Executable)
+	dependencies, vendored, problem := collectLocalDependencies(ctx, p.Tree, document, root, python.Executable)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
@@ -162,14 +162,13 @@ func (p *Package) build(ctx context.Context, namespace *Namespace, prebuiltWheel
 			return problem
 		}
 	}
-	registry := []RegistryRow{}
-	if needsRegistry {
-		registry, problem = collectRegistryRows(ctx, project, root, account, dependencies, python)
-		if problem != nil {
-			p.Close()
-			p.Root = ""
-			return problem
-		}
+	// The locked registry closure is recorded whether it is reached directly or only
+	// through a vendored wheel's own requirements.
+	registry, problem := collectRegistryRows(ctx, project, root, account, dependencies, python)
+	if problem != nil {
+		p.Close()
+		p.Root = ""
+		return problem
 	}
 	packageInterface, notice, problem := describe(ctx, p.Tree, root, account)
 	p.InterfaceNotice = notice

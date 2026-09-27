@@ -121,20 +121,26 @@ async def main(ctx):
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	installs, problem := store.Installed()
-	fatal(t, problem)
-	pending, problem := store.Unreferenced()
-	fatal(t, problem)
-	installs = append(installs, pending...)
-	var inst *records.PackageInstall
-	for _, candidate := range installs {
-		if candidate.SourceKind == "wheel" && candidate.Package == "local/unpublished-wheel-proof" {
-			value := candidate
-			inst = &value
-		}
+	status, output = runCozyPath(t, root, path, "run", script, "--await", "--json")
+	if status != 0 {
+		t.Fatalf("wheel helper failed [%d]: %s", status, output)
 	}
-	if inst == nil {
-		t.Fatal("captured wheel has no immutable wheel install")
+	first, problem := store.RequestByReference("1")
+	fatal(t, problem)
+	// The captured wheel is the child implementation the product bound to this script.
+	bindings, problem := store.ChildBindings(first.InstallID)
+	fatal(t, problem)
+	var inst *records.PackageInstall
+	for _, binding := range bindings {
+		if binding.Module != "wheel_proof" {
+			continue
+		}
+		inst, problem = store.Install(binding.ChildInstallID)
+		fatal(t, problem)
+		break
+	}
+	if inst == nil || inst.SourceKind != "wheel" || inst.Package != "local/unpublished-wheel-proof" {
+		t.Fatalf("captured wheel has no immutable wheel install: %+v", inst)
 	}
 	sealed, problem := capturedwheel.Metadata(filepath.Join(inst.Dir, "wheels", filepath.Base(wheel)))
 	fatal(t, problem)
@@ -147,12 +153,6 @@ async def main(ctx):
 	if !bytes.Equal(raw, original) {
 		t.Fatal("original wheel was not captured byte-exactly")
 	}
-	status, output = runCozyPath(t, root, path, "run", script, "--await", "--json")
-	if status != 0 {
-		t.Fatalf("wheel helper failed [%d]: %s", status, output)
-	}
-	first, problem := store.RequestByReference("1")
-	fatal(t, problem)
 	children := machineChildren(t, root, store, "1")
 	if len(children) != 2 || children[0].Executions != 1 || children[1].Executions != 1 {
 		t.Fatalf("wheel helper did not execute two leaves: %+v", children)
@@ -189,10 +189,12 @@ async def main(ctx):
 	if len(children) != 2 {
 		t.Fatalf("changed wheel lost children: %+v", children)
 	}
-	for n, child := range children {
-		if child.Executions != 1 || child.Computation == before[n].Computation {
-			t.Fatalf("changed wheel reused old implementation: %+v", children)
-		}
+	// Operation identity is per function: only `second`, whose body changed, re-executes.
+	if children[0].Executions != 0 || children[0].Computation != before[0].Computation {
+		t.Fatalf("an unchanged function in the changed wheel re-executed: %+v", children)
+	}
+	if children[1].Executions != 1 || children[1].Computation == before[1].Computation {
+		t.Fatalf("changed wheel reused old implementation: %+v", children)
 	}
 	held, problem := store.MachineExecution(first.ID)
 	fatal(t, problem)

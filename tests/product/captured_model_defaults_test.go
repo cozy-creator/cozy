@@ -159,7 +159,7 @@ func TestCapturedModelDefaultsDoNotAcquireUnusedOrInaccessibleModels(t *testing.
 	version := runtimeFixtureVersion(t, wheel)
 	control := filepath.Join(t.TempDir(), "control")
 	python := filepath.Join(control, "bin", "python")
-	for _, args := range [][]string{{"venv", control, "--python", "3.12"}, {"pip", "install", "--python", python, wheel, "tensorfs==0.3.51"}} {
+	for _, args := range [][]string{{"venv", control, "--python", "3.12"}, {"pip", "install", "--python", python, wheel}} {
 		out, err := exec.Command("uv", args...).CombinedOutput()
 		if err != nil {
 			t.Fatalf("SDK: %v %s", err, out)

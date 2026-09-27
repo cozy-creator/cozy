@@ -79,7 +79,9 @@ type Document interface {
 func Write(w io.Writer, document any, mode Mode) error {
 	logical, toonBytes, err := normalize(document)
 	if err != nil {
-		return err
+		// A document TOON cannot round-trip (a traceback whose lines read as list items,
+		// say) is still written: as its JSON value, indented for a person.
+		return writeJSONValue(w, document, mode)
 	}
 	if mode.JSON {
 		encoder := json.NewEncoder(w)
@@ -117,6 +119,15 @@ func normalize(document any) (any, []byte, error) {
 		return nil, nil, err
 	}
 	return logical, toonBytes, nil
+}
+
+func writeJSONValue(w io.Writer, document any, mode Mode) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	if !mode.JSON {
+		encoder.SetIndent("", "  ")
+	}
+	return encoder.Encode(document)
 }
 
 type failure struct {

@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"context"
-	"flag"
 	"strings"
 	"testing"
 
@@ -37,13 +36,9 @@ func TestHuggingFaceFileURLsPreserveSelectionAcrossCanonicalRoundTrip(t *testing
 	}
 }
 
-var liveHuggingFaceFiles = flag.Bool("live-huggingface-files", false, "Resolve pinned public HF tensor files through the production provider client")
-
-// Public-origin proof is opt-in; unit runs never require Hugging Face availability.
+// Public-origin proof through the production provider client.
 func TestHuggingFaceExplicitFilesResolveThroughPublicProvider(t *testing.T) {
-	if !*liveHuggingFaceFiles {
-		t.Skip("pass -live-huggingface-files for public provider proof")
-	}
+	fullRun(t, "resolves pinned files on live HuggingFace")
 	resolver, problem := modelsource.NewResolver(modelsource.HuggingFace, secret.Value{})
 	fatal(t, problem)
 	for _, row := range []struct {
@@ -93,9 +88,7 @@ func TestHuggingFaceSelectedIndexKeepsOnlyItsShardClosure(t *testing.T) {
 // A safetensors member stored outside LFS carries no provider SHA-256. Its identity is
 // measured from the bytes served at the pinned commit instead of refusing the source.
 func TestHuggingFaceNonLFSMemberIsIdentifiedFromItsBytes(t *testing.T) {
-	if !*liveHuggingFaceFiles {
-		t.Skip("pass -live-huggingface-files for public provider proof")
-	}
+	fullRun(t, "reads a pinned member on live HuggingFace")
 	resolver, problem := modelsource.NewResolver(modelsource.HuggingFace, secret.Value{})
 	fatal(t, problem)
 	source, problem := modelsource.Parse("hf://hf-internal-testing/tiny-random-bert@f171d7baecaf37b5da5a3616d8833b9969753535/model.safetensors", "")

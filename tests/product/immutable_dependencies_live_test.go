@@ -45,13 +45,6 @@ func TestEditedScriptsReuseImmutableDependencies(t *testing.T) {
 			t.Fatalf("CPU SDK: %v %s", err, out)
 		}
 	}
-	sdkLibraries, err := filepath.Glob(filepath.Join(control, "lib", "python3.12", "site-packages", "numpy", "_core", "_multiarray_umath*.so"))
-	must(t, err)
-	if len(sdkLibraries) != 1 {
-		t.Fatalf("expected one uv-installed NumPy library: %v", sdkLibraries)
-	}
-	sdkBefore, err := os.Stat(sdkLibraries[0])
-	must(t, err)
 	path := filepath.Join(control, "bin")
 	for _, item := range childEnv(t, root) {
 		if strings.HasPrefix(item, "PATH=") {
@@ -137,38 +130,32 @@ async def main(ctx):
 			}
 		}
 	}
-	libraries, err := filepath.Glob(filepath.Join(root, "runtime", "environments", "contents", "*", "lib", "python3.12", "site-packages", "numpy", "_core", "_multiarray_umath*.so"))
+	// Runtime installs each captured script as an ordinary uv installation; the public
+	// NumPy wheel's bytes come from uv's cache, so every installation links one inode.
+	installations := filepath.Join(root, "runtime", "environments", "installations")
+	libraries, err := filepath.Glob(filepath.Join(installations, "*", "venv", "lib", "python3.12", "site-packages", "numpy", "_core", "_multiarray_umath*.so"))
 	must(t, err)
-	if len(libraries) < 3 {
-		t.Fatalf("expected two script snapshots and one shared library snapshot, found %v", libraries)
+	if len(libraries) < 2 {
+		t.Fatalf("expected an installation per captured script, found %v", libraries)
 	}
-	sdk, err := os.Stat(sdkLibraries[0])
-	must(t, err)
 	first, err := os.Stat(libraries[0])
 	must(t, err)
-	// Public wheel payloads share uv's owned cache inode. Sealing a generation
-	// must not chmod that inode through a hardlink and mutate sibling venvs.
-	if os.SameFile(first, sdk) || sdk.Mode() != sdkBefore.Mode() {
-		t.Fatal("retained NumPy aliases the mutable SDK or changed its permissions")
-	}
 	for _, path := range libraries {
 		current, err := os.Stat(path)
 		must(t, err)
 		if !os.SameFile(first, current) {
 			t.Fatal("edited capture copied immutable NumPy bytes again")
 		}
-		parent, err := os.Stat(filepath.Dir(path))
-		must(t, err)
-		if parent.Mode().Perm()&0222 != 0 {
-			t.Fatal("retained package directory remains writable")
-		}
 	}
 	// Editable author source has a different owner from uv's public wheel cache.
 	// Its frozen executable may never alias that mutable source inode.
 	source, err := os.Stat(filepath.Join(library, "numerical_tools.py"))
 	must(t, err)
-	capturedModules, err := filepath.Glob(filepath.Join(root, "runtime", "environments", "contents", "*", "lib", "python3.12", "site-packages", "numerical_tools.py"))
+	capturedModules, err := filepath.Glob(filepath.Join(installations, "*", "source", "numerical_tools.py"))
 	must(t, err)
+	installed, err := filepath.Glob(filepath.Join(installations, "*", "venv", "lib", "python3.12", "site-packages", "numerical_tools.py"))
+	must(t, err)
+	capturedModules = append(capturedModules, installed...)
 	if len(capturedModules) == 0 {
 		t.Fatal("editable numerical library has no frozen executable")
 	}
@@ -179,7 +166,7 @@ async def main(ctx):
 			t.Fatal("frozen executable aliases mutable editable source")
 		}
 	}
-	t.Logf("%d retained generations share uv's %d-byte NumPy inode; editable source remains separate", len(libraries), first.Size())
+	t.Logf("%d installations share uv's %d-byte NumPy inode; editable source remains separate", len(libraries), first.Size())
 	compositionDown(t, root, path)
 	must(t, removeAllForce(control))
 	must(t, removeAllForce(filepath.Join(root, "local-packages")))

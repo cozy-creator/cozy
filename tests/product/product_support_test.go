@@ -26,11 +26,20 @@ import (
 )
 
 // integration marks a test that builds real Python and Runtime environments. `-short`
-// (the pull-request gate) skips it; the nightly and `integration`-labelled runs do not.
+// (the default dispatched suite) skips it; a dispatch with `full=true` runs it.
 func integration(t *testing.T) {
 	t.Helper()
 	if testing.Short() {
-		t.Skip("integration: builds real Runtime environments; runs nightly")
+		t.Skip("integration: builds real Runtime environments; runs with full=true")
+	}
+}
+
+// fullRun marks a test the default dispatched suite skips because it outwaits a real-time
+// bound or reads a live third-party service. A dispatch with `full=true` runs it.
+func fullRun(t *testing.T, why string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip(why + "; runs with full=true")
 	}
 }
 
@@ -156,6 +165,26 @@ func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *
 	}
 	t.Cleanup(o.close)
 	return o
+}
+
+// awaitMachineReceipt waits for Runtime's durable acceptance of a machine execution. A
+// detached `cozy run` returns once the run is queued; the daemon records the receipt when
+// the machine accepts it. It fails as soon as the run settles without one.
+func awaitMachineReceipt(t *testing.T, store *records.Store, requestID string) *records.MachineExecution {
+	t.Helper()
+	for {
+		link, problem := store.MachineExecution(requestID)
+		fatal(t, problem)
+		if link != nil && len(link.Receipt) > 0 {
+			return link
+		}
+		row, problem := store.RequestRow(requestID)
+		fatal(t, problem)
+		if row != nil && records.Settled(row.State) {
+			t.Fatalf("run %s settled %s before Runtime accepted it", requestID, row.State)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // close releases the root so a later `cozy run list` on the same root is the only owner of it.

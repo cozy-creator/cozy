@@ -2,9 +2,10 @@ name: ci
 
 # Automatic: one ~1 min job on master pushes that touch Go. It compiles and vets the whole
 # module, which targeted local `go test ./pkg` runs do not.
-# On demand, before a release (fence, types, cross-compile, product suite):
+# On demand (fence, types, product suite):
 #   gh workflow run ci.yaml -R cozy-creator/cozy --ref <branch> [-f full=true]
-# `full` adds integration(t) tests and release install/upgrade acceptance.
+# `full`, before a release, adds full-mode tests, the darwin/windows cross-compile and
+# release install/upgrade acceptance.
 on:
   push:
     branches: [master]
@@ -12,12 +13,13 @@ on:
   workflow_dispatch:
     inputs:
       full:
-        description: Also run integration(t) tests and release acceptance
+        description: Also run full-mode tests, cross-compile and release acceptance
         type: boolean
         default: false
 
+# Per event: a master push must not cancel a suite dispatched on master.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -55,21 +57,24 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.12.11'
+      # setup-uv caches and prunes uv's own directory; this one holds Go only.
       - uses: actions/cache/restore@v4
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-            ~/.cache/uv
           key: ci-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: |
             ci-${{ hashFiles('go.sum') }}-
             ci-
       - run: python3 scripts/fence.py
       - run: go build ./... && go vet ./...
-      - name: Cross-compile the shipped targets
+      # Before a release only. One target per other GOOS: no file in this module is
+      # GOARCH-specific, so linux/arm64 and darwin/amd64 compile the same sources.
+      - name: Cross-compile darwin and windows
+        if: env.FULL == 'true'
         run: |
-          for target in darwin/arm64 darwin/amd64 windows/amd64 linux/arm64; do
+          for target in darwin/arm64 windows/amd64; do
             GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null .
           done
       # The released Runtime at exactly the floor this Cozy enforces (hostruntime.ToolFloor).
@@ -83,7 +88,8 @@ jobs:
           curl -fsSLo "$wheel" "$url"
           echo "$sha  $wheel" | sha256sum -c
           uv python install 3.12 3.13 3.14
-          uv tool install --python 3.12 "$wheel[model-execution]"
+          uv tool install --python 3.12 --with-executables-from tensorfs "$wheel[media,model-execution]"
+          uv tool install --python 3.12 cozy-eval
           uv tool dir --bin >> "$GITHUB_PATH"
           echo "RUNTIME_WHEEL=$wheel" >> "$GITHUB_ENV"
       # The runner's service cgroup is not delegated; Runtime's executor containment needs its own subtree.
@@ -100,8 +106,8 @@ jobs:
       - name: Release artifacts install and upgrade
         if: env.FULL == 'true'
         run: |
-          scripts/release.sh --tag "ci-$GITHUB_SHA"
-          scripts/release.sh --tag "ci-$GITHUB_SHA-next"
+          scripts/release.sh --targets linux/amd64 --tag "ci-$GITHUB_SHA"
+          scripts/release.sh --targets linux/amd64 --tag "ci-$GITHUB_SHA-next"
           scripts/accept.sh --dist "dist/ci-$GITHUB_SHA" --asset "cozy-ci-$GITHUB_SHA-linux-amd64.tar.gz" \
             --upgrade "dist/ci-$GITHUB_SHA-next/cozy-ci-$GITHUB_SHA-next-linux-amd64.tar.gz" \
             --prefix "$RUNNER_TEMP/prefix" --home "$RUNNER_TEMP/cozy-home"
@@ -114,12 +120,9 @@ jobs:
           COZY_TYPECHECK_PYTHON="$RUNNER_TEMP/types/bin/python" sh scripts/typecheck.sh
       # Saved from every master run that compiled, pass or fail.
       - if: ${{ !cancelled() && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
-        run: uv cache prune --ci
-      - if: ${{ !cancelled() && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-            ~/.cache/uv
           key: ci-${{ hashFiles('go.sum') }}-${{ github.sha }}

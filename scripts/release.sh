@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Build the cozy CLI release artifacts — cl-013's distribution half.
 #
-#   scripts/release.sh [--tag <tag>] [--out <dir>] [--allow-dirty]
+#   scripts/release.sh [--tag <tag>] [--out <dir>] [--targets "<os/arch> ..."] [--allow-dirty]
+#
+# `--targets` narrows the build to the named platforms (CI's install/upgrade acceptance needs
+# only linux/amd64); a release omits it and builds all five.
 #
 # A release binary must provably carry its commit, so a DIRTY TREE REFUSES by default: the
 # stamp would name a commit whose bytes are not the bytes that were built. `--allow-dirty`
@@ -31,13 +34,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/dist"
 TAG=""
 ALLOW_DIRTY=0
+TARGETS="linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) TAG="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
+    --targets) TARGETS="$2"; shift 2 ;;
     --allow-dirty) ALLOW_DIRTY=1; shift ;;
-    *) echo "usage: $0 [--tag <tag>] [--out <dir>] [--allow-dirty]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--tag <tag>] [--out <dir>] [--targets \"<os/arch> ...\"] [--allow-dirty]" >&2; exit 2 ;;
   esac
 done
 
@@ -64,7 +69,6 @@ LDFLAGS="-s -w -X $STAMP.tag=$TAG -X $STAMP.commit=$COMMIT"
 # through modernc.org/sqlite (SQLite transpiled to Go) and `internal/daemon` holds the
 # liveness lock through a per-OS pair, so there is no C in this binary and every target is
 # a plain cross-compile from this one host.
-TARGETS="linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64"
 BUILT=""
 UNBUILT=""
 

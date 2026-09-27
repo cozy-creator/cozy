@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -258,6 +259,10 @@ org-relative-dep = { index = "tensorhub" }
 	runtime := filepath.Join(filepath.SplitList(path)[0], "cozy-runtime") //cozy:allow the Runtime under test describes the authored source
 	raw, err := exec.Command(runtime, "--json", "--dir", source, "describe").Output()
 	if err != nil {
+		var exited *exec.ExitError
+		if errors.As(err, &exited) {
+			t.Fatalf("describe the org-relative source: %v\n%s\n%s", err, raw, exited.Stderr)
+		}
 		t.Fatalf("describe the org-relative source: %v", err)
 	}
 	if !bytes.Contains(raw, []byte(`"lane":"minimax@1.0.0-rc.1/fp8-adaln-pruned"`)) {

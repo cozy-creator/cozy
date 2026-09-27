@@ -79,7 +79,6 @@ type dependencyCollector struct {
 	stack       map[string]bool
 	total       int64
 	count       int
-	registry    bool
 	scanOnly    bool
 	python      string
 	root        string
@@ -89,7 +88,7 @@ type dependencyCollector struct {
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
 
-func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string, targetPython ...string) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
+func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string, targetPython ...string) ([]DependencyWheel, []VendoredDependency, *exit.Error) {
 	return collectLocalDependenciesForClosure(ctx, root, document, stage, nil, targetPython...)
 }
 
@@ -98,10 +97,10 @@ func collectLocalDependencies(ctx context.Context, root string, document project
 // environment without being part of any callable wheel closure. We still
 // validate its declared identity, but avoid recursively building its wheel
 // unless the selected closure names it.
-func collectLocalDependenciesForClosure(ctx context.Context, root string, document projectMetadata, stage string, selected map[string]string, targetPython ...string) ([]DependencyWheel, bool, []VendoredDependency, *exit.Error) {
+func collectLocalDependenciesForClosure(ctx context.Context, root string, document projectMetadata, stage string, selected map[string]string, targetPython ...string) ([]DependencyWheel, []VendoredDependency, *exit.Error) {
 	canonical, problem := canonicalLocalPath(root)
 	if problem != nil {
-		return nil, false, nil, problem
+		return nil, nil, problem
 	}
 	python := ""
 	if len(targetPython) > 0 {
@@ -117,7 +116,7 @@ func collectLocalDependenciesForClosure(ctx context.Context, root string, docume
 		collector.byName[name] = dependencyRecord{source: canonical, version: document.Project.Version}
 	}
 	if problem := collector.collectProject(canonical, document, nil, true); problem != nil {
-		return nil, false, nil, problem
+		return nil, nil, problem
 	}
 	sort.Slice(collector.wheels, func(i, j int) bool {
 		return collector.wheels[i].Filename < collector.wheels[j].Filename
@@ -125,7 +124,7 @@ func collectLocalDependenciesForClosure(ctx context.Context, root string, docume
 	sort.Slice(collector.vendored, func(i, j int) bool {
 		return collector.vendored[i].Name < collector.vendored[j].Name
 	})
-	return collector.wheels, collector.registry, collector.vendored, nil
+	return collector.wheels, collector.vendored, nil
 }
 
 func (c *dependencyCollector) collectProject(root string, document projectMetadata, extras []string, includeBase bool) *exit.Error {
@@ -165,7 +164,6 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 		}
 		source, exists := sources[req.name]
 		if !exists {
-			c.registry = true
 			continue
 		}
 		if source.unsupported != "" {

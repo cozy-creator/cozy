@@ -48,7 +48,30 @@ func TestSubmitSchemaValidation(t *testing.T) {
 		}
 	}
 	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "--describe")
-	for _, expected := range []string{"(job)", "size: int (>=8, <=256) (default = 64)"} {
+	// A Runtime that publishes each job field's own default (cozy-runtime#778) shows it.
+	size := "size: int (>=8, <=256)"
+	var surface struct {
+		Jobs []struct {
+			Name    string `json:"name"`
+			Request struct {
+				Fields []struct {
+					Name    string          `json:"name"`
+					Default json.RawMessage `json:"default"`
+				} `json:"fields"`
+			} `json:"request"`
+		} `json:"jobs"`
+	}
+	raw, err := os.ReadFile(filepath.Join(project, "metadata", "package-interface.json"))
+	must(t, err)
+	must(t, json.Unmarshal(raw, &surface))
+	for _, job := range surface.Jobs {
+		for _, field := range job.Request.Fields {
+			if job.Name == "tile_job" && field.Name == "size" && len(field.Default) > 0 {
+				size += " (default = " + string(field.Default) + ")"
+			}
+		}
+	}
+	for _, expected := range []string{"(job)", size} {
 		if code != 0 || !strings.Contains(out, expected) {
 			t.Fatalf("a job's --describe omitted %q [exit %d]\n%s", expected, code, out)
 		}

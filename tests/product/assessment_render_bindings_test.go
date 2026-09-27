@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -222,7 +222,15 @@ func assessmentDigest(raw []byte) string {
 
 // The canonical reader remains the numerical/schema authority; Creator consumes
 // its exact association projection and binds the original artifact identity.
-var assessmentEvaluatorPath = flag.String("assessment-v5-evaluator", "", "installed canonical @5 report reader for association proof")
+// installedEvaluator is the cozy-eval report reader the product itself finds on PATH.
+func installedEvaluator(t *testing.T) string {
+	t.Helper()
+	evaluator, err := exec.LookPath("cozy-eval")
+	if err != nil {
+		t.Skip("requires cozy-eval on PATH (uv tool install cozy-eval)")
+	}
+	return evaluator
+}
 
 func TestAssessmentV5ProjectionSchemaBoundary(t *testing.T) {
 	report, err := os.ReadFile("testdata/assessment-v5.json")
@@ -238,10 +246,7 @@ func TestAssessmentV5ProjectionSchemaBoundary(t *testing.T) {
 }
 
 func TestAssessmentV5InspectorIdentityBoundary(t *testing.T) {
-	evaluator := *assessmentEvaluatorPath
-	if evaluator == "" {
-		t.Skip("requires the installed cozy-eval @5 reader")
-	}
+	evaluator := installedEvaluator(t)
 	report, err := os.ReadFile("testdata/assessment-v5.json")
 	if err != nil {
 		t.Fatal(err)
@@ -266,10 +271,7 @@ func TestAssessmentV5InspectorIdentityBoundary(t *testing.T) {
 }
 
 func TestAssessmentV5PreservesUnobservedSaturationVerdict(t *testing.T) {
-	evaluator := *assessmentEvaluatorPath
-	if evaluator == "" {
-		t.Skip("requires the installed cozy-eval @5 reader")
-	}
+	evaluator := installedEvaluator(t)
 	report, err := os.ReadFile("testdata/assessment-v5-unobserved-saturation.json")
 	must(t, err)
 	t.Setenv("PATH", filepath.Dir(evaluator))
@@ -283,10 +285,7 @@ func TestAssessmentV5PreservesUnobservedSaturationVerdict(t *testing.T) {
 }
 
 func TestAssessmentV5PreservesUnobservedExecutionMode(t *testing.T) {
-	evaluator := *assessmentEvaluatorPath
-	if evaluator == "" {
-		t.Skip("requires the installed cozy-eval @5 reader")
-	}
+	evaluator := installedEvaluator(t)
 	report, err := os.ReadFile("testdata/assessment-v5.json")
 	must(t, err)
 	var body any

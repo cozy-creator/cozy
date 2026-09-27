@@ -1,8 +1,10 @@
 package producttest
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -125,9 +127,13 @@ func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 	if !committed {
 		t.Fatal("CLI did not commit")
 	}
-	if _, ok := uploaded["artifacts/source/cozy-weightless-package-1.0.0.tar.gz"]; !ok {
+	// The source distribution is the build backend's standard sdist (PEP 625 name, one
+	// root directory carrying PKG-INFO and pyproject.toml).
+	sdist, ok := uploaded["artifacts/source/cozy_weightless_package-1.0.0.tar.gz"]
+	if !ok {
 		t.Fatal("publication did not upload the standard source distribution")
 	}
+	assertStandardSdist(t, sdist)
 	for name := range uploaded {
 		if strings.HasPrefix(name, "src/") || strings.HasSuffix(name, ".py") {
 			t.Fatalf("publication uploaded loose source file %q", name)
@@ -155,5 +161,34 @@ func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 	compact := strings.ReplaceAll(metadata, " ", "")
 	if !strings.Contains(compact, "Requires-Dist:cozy-runtime[media]<1,>="+matched[1]) || !strings.Contains(compact, "Requires-Dist:tensorfs<0.4,>=0.3.35") {
 		t.Fatalf("published wheel changed the declared compatibility bounds:\n%s", metadata)
+	}
+}
+
+func assertStandardSdist(t *testing.T, raw []byte) {
+	t.Helper()
+	gz, err := gzip.NewReader(bytes.NewReader(raw))
+	must(t, err)
+	archive := tar.NewReader(gz)
+	root, seenPKGInfo, seenPyproject := "", false, false
+	for {
+		header, err := archive.Next()
+		if err == io.EOF {
+			break
+		}
+		must(t, err)
+		parts := strings.SplitN(header.Name, "/", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			t.Fatalf("source distribution member %q is not under one root directory", header.Name)
+		}
+		if root == "" {
+			root = parts[0]
+		} else if root != parts[0] {
+			t.Fatalf("source distribution has multiple roots: %q and %q", root, parts[0])
+		}
+		seenPKGInfo = seenPKGInfo || parts[1] == "PKG-INFO"
+		seenPyproject = seenPyproject || parts[1] == "pyproject.toml"
+	}
+	if !seenPKGInfo || !seenPyproject {
+		t.Fatalf("source distribution is missing standard PKG-INFO or pyproject.toml (root %q)", root)
 	}
 }
