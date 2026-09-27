@@ -327,8 +327,12 @@ func (r *Resolver) resolveHF(ctx context.Context, source Source) (Plan, *exit.Er
 			file.Carrier = true
 		}
 		if !validDigest(file.SHA256) || file.Length <= 0 {
-			return Plan{}, exit.Named(exit.Validation, "model_source_identity_missing",
-				"provider did not supply an exact size and SHA-256 for %s", member)
+			// A member stored outside LFS carries no provider SHA-256. Its identity is
+			// measured from the bytes the provider actually serves at the pinned commit.
+			var problem *exit.Error
+			if file.SHA256, file.Length, problem = r.identify(ctx, file.URL); problem != nil {
+				return Plan{}, problem
+			}
 		}
 		files = append(files, file)
 	}
@@ -495,6 +499,25 @@ func (r *Resolver) measure(ctx context.Context, location string) (int64, *exit.E
 			"provider returned invalid Content-Range %q", raw)
 	}
 	return length, nil
+}
+
+// identify streams one member once and answers the SHA-256 and length of its bytes.
+func (r *Resolver) identify(ctx context.Context, location string) (string, int64, *exit.Error) {
+	response, problem := r.request(ctx, http.MethodGet, location, nil)
+	if problem != nil {
+		return "", 0, problem
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", 0, exit.Named(exit.Validation, "model_source_member_refused",
+			"provider member request answered HTTP %d", response.StatusCode)
+	}
+	hash := sha256.New()
+	length, err := io.Copy(hash, response.Body)
+	if err != nil || length <= 0 {
+		return "", 0, exit.Unavailablef("provider member could not be read to identify it: %v", err)
+	}
+	return hex.EncodeToString(hash.Sum(nil)), length, nil
 }
 
 func (r *Resolver) small(ctx context.Context, location string, limit int64) ([]byte, *exit.Error) {

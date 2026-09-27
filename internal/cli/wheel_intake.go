@@ -73,9 +73,6 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	if len(candidates) == 0 {
 		return nil
 	}
-	if len(candidates) > 32 {
-		return exit.New(exit.Validation, "unpublished parent exceeds 32 callable dependencies")
-	}
 	sourceBindings := map[string][]records.ChildBinding{}
 	for _, binding := range i.Bindings {
 		child, problem := i.store.Install(binding.ChildInstallID)
@@ -91,13 +88,13 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	bindings := map[string][]records.ChildBinding{}
 	overlays := map[string]packagepublish.CapturedDependency{}
 	visiting := map[string]bool{}
-	var prepare func(string, int) *exit.Error
-	prepare = func(name string, depth int) *exit.Error {
+	var prepare func(string) *exit.Error
+	prepare = func(name string) *exit.Error {
 		if _, ok := overlays[name]; ok {
 			return nil
 		}
-		if visiting[name] || depth > 16 {
-			return exit.New(exit.Validation, "unpublished callable wheel graph is cyclic or exceeds 16 levels")
+		if visiting[name] {
+			return exit.New(exit.Validation, "unpublished callable wheel graph is cyclic at %s", name)
 		}
 		visiting[name] = true
 		defer delete(visiting, name)
@@ -124,7 +121,7 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 				return exit.New(exit.Conflict, "callable wheel closure is missing an exact dependency")
 			}
 			if dependency != name && candidates[dependency] {
-				if problem := prepare(dependency, depth+1); problem != nil {
+				if problem := prepare(dependency); problem != nil {
 					return problem
 				}
 				wheel = overlays[dependency]
@@ -132,9 +129,6 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 			}
 			childBindings = append(childBindings, sourceBindings[dependency]...)
 			closure[dependency] = wheel
-		}
-		if len(childBindings) > 32 {
-			return exit.New(exit.Validation, "callable wheel exceeds 32 dependency exports")
 		}
 		surface, problem := install.ReadInstalledInterface(ctx, python, name)
 		if problem != nil {
@@ -204,16 +198,13 @@ func (i *childIntake) prepareWheelIntake(ctx context.Context, sourceOverlays map
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if problem := prepare(name, 0); problem != nil {
+		if problem := prepare(name); problem != nil {
 			return problem
 		}
 		if len(bindings[name]) == 0 {
 			continue
 		}
 		i.Bindings = append(i.Bindings, bindings[name]...)
-		if len(i.Bindings) > 32 {
-			return exit.New(exit.Validation, "unpublished parent exceeds 32 invocable dependency exports")
-		}
 	}
 	return nil
 }

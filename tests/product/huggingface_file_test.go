@@ -89,3 +89,26 @@ func TestHuggingFaceSelectedIndexKeepsOnlyItsShardClosure(t *testing.T) {
 		}
 	}
 }
+
+// A safetensors member stored outside LFS carries no provider SHA-256. Its identity is
+// measured from the bytes served at the pinned commit instead of refusing the source.
+func TestHuggingFaceNonLFSMemberIsIdentifiedFromItsBytes(t *testing.T) {
+	if !*liveHuggingFaceFiles {
+		t.Skip("pass -live-huggingface-files for public provider proof")
+	}
+	resolver, problem := modelsource.NewResolver(modelsource.HuggingFace, secret.Value{})
+	fatal(t, problem)
+	source, problem := modelsource.Parse("hf://hf-internal-testing/tiny-random-bert@f171d7baecaf37b5da5a3616d8833b9969753535/model.safetensors", "")
+	fatal(t, problem)
+	plan, problem := resolver.Resolve(context.Background(), source)
+	fatal(t, problem)
+	if len(plan.Files) != 1 || plan.Files[0].SHA256 != "965f02b6a7e5520fc12f710e4e3b6132f697f1c8f648819553c5ade86752d2de" ||
+		plan.Files[0].Length != 520212 {
+		t.Fatalf("non-LFS member was not identified from its bytes: %+v", plan.Files)
+	}
+	staged, problem := resolver.Stage(context.Background(), plan, t.TempDir(), false, nil)
+	fatal(t, problem)
+	if len(staged) != 1 {
+		t.Fatalf("non-LFS member was not staged: %+v", staged)
+	}
+}

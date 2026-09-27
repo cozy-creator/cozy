@@ -82,12 +82,12 @@ func prepareChildIntake(ctx *Context, pack *packagepublish.Package, layout home.
 	if len(remote) > 0 {
 		environment = remote[0]
 	}
-	return prepareChildIntakeDepth(ctx, pack, layout, store, map[string]bool{}, 0, environment)
+	return prepareChildIntakeGraph(ctx, pack, layout, store, map[string]bool{}, environment)
 }
 
-func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout home.Layout, store *records.Store, stack map[string]bool, depth int, remote *records.PackageInstall) (*childIntake, *exit.Error) {
-	if depth > 16 || stack[pack.Tree] {
-		return nil, exit.New(exit.Validation, "private invocable dependency graph is cyclic or exceeds 16 levels")
+func prepareChildIntakeGraph(ctx *Context, pack *packagepublish.Package, layout home.Layout, store *records.Store, stack map[string]bool, remote *records.PackageInstall) (*childIntake, *exit.Error) {
+	if stack[pack.Tree] {
+		return nil, exit.New(exit.Validation, "private invocable dependency graph is cyclic at %s", pack.Tree)
 	}
 	stack[pack.Tree] = true
 	defer delete(stack, pack.Tree)
@@ -113,14 +113,11 @@ func prepareChildIntakeDepth(ctx *Context, pack *packagepublish.Package, layout 
 		if info, err := os.Stat(filepath.Join(path, "package.toml")); err != nil || !info.Mode().IsRegular() {
 			continue
 		}
-		if len(intake.Bindings) >= 32 {
-			return fail(exit.New(exit.Validation, "unpublished parent exceeds 32 invocable dependency exports"))
-		}
 		dependency, problem := packagepublish.PrepareUnpublishedFrom(context.Background(), path, commandNamespace(ctx), dependencies[name].Extras...)
 		if problem != nil {
 			return fail(problem)
 		}
-		nested, problem := prepareChildIntakeDepth(ctx, dependency, layout, store, stack, depth+1, nil)
+		nested, problem := prepareChildIntakeGraph(ctx, dependency, layout, store, stack, nil)
 		if problem != nil {
 			dependency.Close()
 			return fail(problem)

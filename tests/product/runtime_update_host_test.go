@@ -15,7 +15,8 @@ func TestRuntimeUpdateHostKeepsHostBoundary(t *testing.T) {
 		{60, &rental.RuntimeWire{WireMinor: 62, MinimumWireMinor: 62}, "rental.runtime_update_host_too_old"},
 		{60, &rental.RuntimeWire{WireMinor: 61, MinimumWireMinor: 60}, ""},
 		{62, &rental.RuntimeWire{WireMinor: 62, MinimumWireMinor: 62}, ""},
-		{60, nil, "rental.runtime_update_wire_unknown"},
+		{60, nil, ""},
+		{60, &rental.RuntimeWire{WireMinor: 59, MinimumWireMinor: 61}, ""},
 	} {
 		problem := rental.RuntimeUpdateHost("candidate", row.target, row.host)
 		if row.code == "" {
