@@ -658,7 +658,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 		return e
 	}
 	jobID := ctx.Inv.Args[0]
-	state, e := c.Job(jobID)
+	state, e := c.RecordedJob(jobID) // as handleRunCancel
 	if e != nil {
 		return e
 	}

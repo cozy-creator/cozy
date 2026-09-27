@@ -65,9 +65,6 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 		}
 		return a.Export < b.Export
 	})
-	if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
-		m.resolver.captureDefaultRows(capture, request.Package, installed.InstallationId, iface, request, connection.publicOrigin)
-	}
 	raw, digest, err := canonical.Identity(capture)
 	if err != nil {
 		return nil, exit.Internalf("cannot encode published execution capture: %s", err)

@@ -250,7 +250,7 @@ type daemonProcess struct {
 	exited <-chan int
 }
 
-func startDaemonProcess(t *testing.T, root string) *daemonProcess {
+func startDaemonProcess(t *testing.T, root string, imposed ...string) *daemonProcess {
 	t.Helper()
 	must(t, os.MkdirAll(root, 0o755))
 	// The daemon's words are its own bounded log, <root>/daemon.log (cl-096) — the
@@ -259,7 +259,7 @@ func startDaemonProcess(t *testing.T, root string) *daemonProcess {
 	must(t, err)
 	cmd := exec.Command(cozyBin)
 	cmd.Args[0] = "cozy-daemon"
-	cmd.Env = childEnv(t, root)
+	cmd.Env = childEnv(t, root, imposed...)
 	cmd.Stdout, cmd.Stderr = log, log
 	setProcessGroup(cmd)
 	must(t, cmd.Start())

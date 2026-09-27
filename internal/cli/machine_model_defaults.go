@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"net"
 	"net/url"
 	"sort"
@@ -23,12 +24,13 @@ func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCap
 	if err := canonical.Unmarshal(capture.Canonical, document); err != nil {
 		return capture, exit.New(exit.Conflict, "captured model defaults have no exact code inventory")
 	}
+	reads := modelDefaultReads{}
 	for _, installation := range capture.Installations {
 		iface, problem := launch.DecodePackageInterface(installation.PackageInterface)
 		if problem != nil {
 			return capture, problem
 		}
-		r.captureDefaultRows(document, installation.Package, installation.ID, iface, request, publicOrigin)
+		r.captureDefaultRows(document, installation.Package, installation.ID, iface, request, publicOrigin, reads)
 	}
 	var err error
 	capture.Canonical, capture.Digest, err = canonical.Identity(document)
@@ -38,7 +40,12 @@ func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCap
 	return capture, nil
 }
 
-func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg string, revision string, iface *launch.PackageInterface, request records.Request, publicOrigin string) {
+// modelDefaultReads holds one capture's public read probes. A manifest is content-addressed,
+// so every rung naming the same model and manifest at one origin has one answer: its manifest
+// length, or 0 when the origin cannot serve it. H3's 81 captured rungs name 3 checkpoints.
+type modelDefaultReads map[string]int64
+
+func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg string, revision string, iface *launch.PackageInterface, request records.Request, publicOrigin string, reads modelDefaultReads) {
 	entries := map[string]bool{}
 	for _, binding := range document.Bindings {
 		if binding.CalleeInstallationId == revision {
@@ -51,7 +58,7 @@ func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg 
 		}
 		for _, slot := range entry.Models {
 			row := &pb.MachineModelDefault{CalleeInstallationId: revision, Entrypoint: entry.Name, Parameter: slot.Param}
-			row.PublicOrigin, row.Rungs, row.UnavailableCode = r.captureDefaultLadder(pkg, entry.Name, slot, request, publicOrigin)
+			row.PublicOrigin, row.Rungs, row.UnavailableCode = r.captureDefaultLadder(pkg, entry.Name, slot, request, publicOrigin, reads)
 			document.ModelDefaults = append(document.ModelDefaults, row)
 		}
 	}
@@ -67,7 +74,7 @@ func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg 
 	})
 }
 
-func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot, request records.Request, publicOrigin string) (string, []*pb.MachineModelDefaultRung, string) {
+func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot, request records.Request, publicOrigin string, reads modelDefaultReads) (string, []*pb.MachineModelDefaultRung, string) {
 	selected, problem := r.childModelLadder(request.Hub, pkg, entrypoint, slot)
 	if problem != nil {
 		code := "model_default_unavailable"
@@ -112,23 +119,35 @@ func (r *Resolver) captureDefaultLadder(pkg, entrypoint string, slot launch.Slot
 		if count > 0 && rung.GPUs > 0 && rung.GPUs != count {
 			continue
 		}
-		resolved, problem := public.ResolveModel(ctx, selected.Model+"@"+rung.Manifest, "")
-		if problem != nil || resolved.Model != selected.Model || resolved.ManifestID != rung.Manifest || resolved.ManifestLength <= 0 || resolved.HeaderID == "" {
-			return "", nil, "model_default_unavailable"
-		}
-		reads, problem := public.CheckpointReads(ctx, ref, rung.Manifest, []string{resolved.HeaderID})
-		if problem != nil || len(reads) != 1 || reads[0].ObjectID != resolved.HeaderID || reads[0].Length <= 0 || reads[0].URL == "" {
-			return "", nil, "model_default_unavailable"
+		key := origin + "\x00" + selected.Model + "\x00" + rung.Manifest
+		length, probed := reads[key]
+		if !probed {
+			length = probeModelDefault(ctx, public, ref, selected.Model, rung.Manifest)
+			reads[key] = length
 		}
 		digest, err := canonical.Raw(rung.Manifest)
-		if err != nil {
+		if length <= 0 || err != nil {
 			return "", nil, "model_default_unavailable"
 		}
 		rungs = append(rungs, &pb.MachineModelDefaultRung{Gpu: rung.GPU, Gpus: uint32(rung.GPUs), Repository: selected.Model,
-			Manifest: &pb.Ref{Digest: digest, Length: uint64(resolved.ManifestLength)}})
+			Manifest: &pb.Ref{Digest: digest, Length: uint64(length)}})
 	}
 	if len(rungs) == 0 {
 		return "", nil, "model_default_unavailable"
 	}
 	return origin, rungs, ""
+}
+
+// probeModelDefault answers whether the origin anonymously serves one exact checkpoint's
+// header, and the manifest's length when it does.
+func probeModelDefault(ctx context.Context, public *hub.Client, ref hub.Ref, model, manifest string) int64 {
+	resolved, problem := public.ResolveModel(ctx, model+"@"+manifest, "")
+	if problem != nil || resolved.Model != model || resolved.ManifestID != manifest || resolved.ManifestLength <= 0 || resolved.HeaderID == "" {
+		return 0
+	}
+	reads, problem := public.CheckpointReads(ctx, ref, manifest, []string{resolved.HeaderID})
+	if problem != nil || len(reads) != 1 || reads[0].ObjectID != resolved.HeaderID || reads[0].Length <= 0 || reads[0].URL == "" {
+		return 0
+	}
+	return resolved.ManifestLength
 }

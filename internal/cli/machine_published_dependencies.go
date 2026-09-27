@@ -115,11 +115,11 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 		return capture.InstalledPackages[i].InstallationId < capture.InstalledPackages[j].InstallationId
 	})
 	if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
-		// Root defaults are recorded by the caller after the entire binding inventory exists.
+		// Every installation's defaults, the root's included, are recorded once the entire
+		// binding inventory exists, probing each exact checkpoint once for the capture.
+		reads := modelDefaultReads{}
 		for key, node := range nodes {
-			if key != rootKey {
-				m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.installationID, node.iface, request, connection.publicOrigin)
-			}
+			m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.installationID, node.iface, request, connection.publicOrigin, reads)
 		}
 	}
 	return nil

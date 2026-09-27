@@ -247,6 +247,14 @@ func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 	return life, e
 }
 
+// RecordedRequest reads the request as the daemon recorded it, without observing its
+// machine first.
+func (c *Client) RecordedRequest(id string) (api.Lifecycle, *exit.Error) {
+	var life api.Lifecycle
+	e := c.call("GET", "/v1/requests/"+id+"?observe=false", nil, &life)
+	return life, e
+}
+
 // Requests lists ordinary invocations and jobs through the one request lifecycle
 // authority. Kind distinguishes their execution expectation without creating a
 // second public inventory.
@@ -380,6 +388,13 @@ func (c *Client) SubmitJob(sub api.JobSubmission, key string) (api.JobHandle, *e
 // Job reads one job's state document.
 func (c *Client) Job(id string) (api.JobState, *exit.Error) {
 	return c.JobContext(context.Background(), id)
+}
+
+// RecordedJob is RecordedRequest for a job.
+func (c *Client) RecordedJob(id string) (api.JobState, *exit.Error) {
+	var state api.JobState
+	e := c.call("GET", "/v1/local/jobs/"+id+"?observe=false", nil, &state)
+	return state, e
 }
 
 func (c *Client) JobContext(ctx context.Context, id string) (api.JobState, *exit.Error) {

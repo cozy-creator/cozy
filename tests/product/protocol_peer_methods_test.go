@@ -53,6 +53,9 @@ func (p *fakePod) ListMachineExecutionEvents(ctx context.Context, request *pb.Ma
 	return p.UnimplementedWorkerControlServer.ListMachineExecutionEvents(ctx, request)
 }
 func (p *fakePod) ControlMachineExecution(ctx context.Context, request *pb.MachineExecutionControl) (*pb.MachineExecutionState, error) {
+	if machine, ok := p.machine.(machineControlPeer); ok {
+		return machine.ControlMachineExecution(ctx, request)
+	}
 	return p.UnimplementedWorkerControlServer.ControlMachineExecution(ctx, request)
 }
 func (p *fakePod) CollectMachineExecution(ctx context.Context, request *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {

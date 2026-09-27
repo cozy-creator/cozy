@@ -666,7 +666,9 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	before, problem := client.Request(id)
+	// The recorded run decides the route; the daemon reads the machine's own state right
+	// before it sends the cancel, so this read does not dial the machine first.
+	before, problem := client.RecordedRequest(id)
 	if problem != nil {
 		return problem
 	}

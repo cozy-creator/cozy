@@ -893,7 +893,10 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	problem := s.refreshMachineExecution(r.Context(), row)
+	var problem *exit.Error
+	if r.URL.Query().Get("observe") != "false" { // as getRequest
+		problem = s.refreshMachineExecution(r.Context(), row)
+	}
 	if current, e := s.store.RequestRow(row.ID); e == nil && current != nil {
 		current.Number = row.Number
 		row = *current
