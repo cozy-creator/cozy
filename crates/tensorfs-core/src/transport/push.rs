@@ -212,7 +212,8 @@ pub fn push_object(
             ),
             ("if-none-match".to_string(), "*".to_string()),
         ];
-        headers.extend(credential.headers(&checked.host));
+        let credentials = credential.headers(&checked.host);
+        headers.extend(credentials.iter().cloned());
         // The grant's own spelling is the one the signature covers, so it replaces a
         // default or a credential header of the same name rather than joining it.
         for (name, value) in &grant.headers {
@@ -227,6 +228,9 @@ pub fn push_object(
             "PUT",
             &headers,
             Some(payload),
+            // One origin's pushes share kept-alive sockets: a grant's URL and signed
+            // conditions are per object, the connection is scoped by the credentials.
+            Some(&credentials),
             deadline,
             ledger,
             // A peer that stops answering — during the handshake, a write, or after the
