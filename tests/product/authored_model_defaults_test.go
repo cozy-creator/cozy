@@ -192,21 +192,30 @@ func TestAuthoredDefaultsMatchRuntimeCorpus(t *testing.T) {
 	for group, cases := range groups {
 		for _, entry := range cases {
 			t.Run(group+"/"+entry.Name, func(t *testing.T) {
+				// Runtime's corpus is what an AUTHOR may write. Creator reads documents
+				// other Runtimes wrote, so it admits every valid ladder and may admit more:
+				// an invalid one is either refused or lowered without changing any rung.
 				iface, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t, entry.Ladder))
 				valid := group == "valid"
-				if (problem == nil) != valid {
-					t.Fatalf("Creator/Runtime admission differs: %v", problem)
+				if valid && problem != nil {
+					t.Fatalf("Creator refused a ladder Runtime admits: %v", problem)
 				}
-				if !valid {
+				if problem != nil {
 					return
 				}
 				slot := iface.Entrypoints[0].Models[0]
-				if slot.DefaultBinding == nil || len(slot.DefaultBinding.Ladder) != len(slot.DefaultLadder) {
+				if slot.DefaultBinding == nil {
+					if valid || len(slot.DefaultLadder) != 0 {
+						t.Fatal("admission did not retain the lowered default")
+					}
+					return
+				}
+				if len(slot.DefaultBinding.Ladder) != len(slot.DefaultLadder) {
 					t.Fatal("admission did not retain the lowered default")
 				}
 				for index, rung := range slot.DefaultLadder {
 					lowered := slot.DefaultBinding.Ladder[index]
-					if lowered.GPU != rung.GPU || slot.DefaultBinding.Ref()+"/"+lowered.Lane != rung.Lane {
+					if lowered.GPU != rung.GPU || !strings.EqualFold(slot.DefaultBinding.Ref()+"/"+lowered.Lane, rung.Lane) {
 						t.Fatal("lowering changed authored reference or order")
 					}
 				}

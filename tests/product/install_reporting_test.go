@@ -126,6 +126,11 @@ func TestPublishedInstallDoesNotPrefetchModels(t *testing.T) {
 }
 
 func reportingRelease(t *testing.T) (hub.PackageDownloadPlan, []byte) {
+	return reportingReleaseWith(t, "")
+}
+
+// reportingReleaseWith builds the real published fixture with extra pyproject text.
+func reportingReleaseWith(t *testing.T, extra string) (hub.PackageDownloadPlan, []byte) {
 	t.Helper()
 	project := t.TempDir()
 	pyproject := `[project]
@@ -140,7 +145,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include = ["reporting.py"]
-`
+` + extra
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(pyproject), 0600))
 	must(t, os.WriteFile(filepath.Join(project, "reporting.py"), []byte("from cozy_runtime.author import App\napp = App()\n"), 0600))
 	for _, args := range [][]string{{"lock"}, {"build", "--wheel", "--out-dir", "dist"}} {
@@ -165,4 +170,27 @@ only-include = ["reporting.py"]
 			Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(wheel)), Length: int64(len(wheel)),
 			Tags: []string{"py3-none-any"}, ImportRoots: []string{"reporting"},
 		}}}, wheel
+}
+
+// A release whose pyproject restricts versions with uv constraint-dependencies installs:
+// the lock already applied them, and they are never unpinned rows of the hash-pinned
+// install.
+func TestPublishedInstallWithUVConstraintDependencies(t *testing.T) {
+	plan, wheel := reportingReleaseWith(t, "[tool.uv]\nconstraint-dependencies = [\"packaging<99\", \"numpy<3\"]\n")
+	root := t.TempDir()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/packages/proof/install-reporting/download", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(plan)
+	})
+	mux.HandleFunc("GET /v1/index/proof/simple/install-reporting/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `<a href="/project.whl/%s#sha256=%x">%s</a>`, plan.Downloads[0].Path, sha256.Sum256(wheel), plan.Downloads[0].Path)
+	})
+	mux.HandleFunc("GET /project.whl/{name}", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(wheel) })
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\n"), 0600))
+	code, stdout, stderr := runCozyStreams(t, root, "package", "install", "proof/install-reporting", "--version=1.0.1", "--json")
+	if code != 0 || !strings.Contains(stdout, `"status":"installed"`) {
+		t.Fatalf("a release with uv constraint-dependencies did not install: %d %s %s", code, stdout, stderr)
+	}
 }
