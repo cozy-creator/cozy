@@ -414,6 +414,28 @@ func (c *Client) RetargetModelLane(ctx context.Context, ref Ref, release, lane,
 	return out, e
 }
 
+// ModelDeletion is Tensorhub's account of one deleted model. Reclaimable counts
+// the distinct objects nothing else references; the Hub's next GC deletes them.
+type ModelDeletion struct {
+	Model              string `json:"model"`
+	Checkpoints        int    `json:"checkpoints"`
+	ReclaimableObjects int    `json:"reclaimable_objects"`
+	ReclaimableBytes   int64  `json:"reclaimable_bytes"`
+}
+
+// DeleteModel deletes one model whose releases are all yanked.
+func (c *Client) DeleteModel(ctx context.Context, ref Ref, reason string) (ModelDeletion, *exit.Error) {
+	var out ModelDeletion
+	if e := c.do(ctx, call{method: http.MethodDelete, path: "/v1/models/" + ref.Org + "/" + ref.Name,
+		auth: true, reason: reason, patient: true}, &out); e != nil {
+		return out, e
+	}
+	if out.Model != ref.String() {
+		return out, exit.Internalf("Tensorhub did not confirm deleting %s", ref)
+	}
+	return out, nil
+}
+
 func (c *Client) YankModelRelease(ctx context.Context, ref Ref, release, reason string) (ModelRelease, *exit.Error) {
 	var out ModelRelease
 	e := c.do(ctx, call{method: http.MethodDelete, path: modelReleasePath(ref, release),

@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -234,4 +235,48 @@ func handleModelYank(ctx *Context) *exit.Error {
 		{K: "revision", V: yanked.Revision}, {K: "status", V: "yanked"},
 		{K: "changed", V: yanked.Changed},
 	}, "model", "release", "revision", "status", "changed"))
+}
+
+// handleModelDelete deletes a Tensorhub model or one unreleased checkpoint. Cozy never
+// prompts, so --yes is the confirmation. Objects stay until the Hub's GC finds them
+// unreferenced; content another model shares is never reclaimed.
+func handleModelDelete(ctx *Context) *exit.Error {
+	target := strings.TrimSpace(ctx.Inv.Args[0])
+	name, checkpoint, one := strings.Cut(target, "#")
+	ref, problem := hub.ParseRef(name)
+	if problem != nil {
+		return problem
+	}
+	if _, err := canonical.Raw(checkpoint); one && err != nil {
+		return exit.Usagef("%q names no checkpoint", target).WithRemedy("write org/name#sha256:<64 hex>")
+	}
+	c := client(ctx)
+	if !ctx.Inv.Bool("--yes") {
+		return exit.Named(exit.Usage, "model.delete_unconfirmed",
+			"deleting %s from %s cannot be undone", target, c.Base()).
+			WithRemedy("rerun with --yes to delete it")
+	}
+	c, problem = ownedPublication(ctx, ref)
+	if problem != nil {
+		return problem
+	}
+	hctx, cancel := hub.LongContext()
+	defer cancel()
+	reason := "cozy model delete " + target
+	gc := "Tensorhub's next GC reclaims objects no other model references"
+	if one {
+		if problem := c.RemoveCheckpoint(hctx, ref, checkpoint, reason); problem != nil {
+			return problem
+		}
+		return emit(ctx, output.Record{Fields: []output.Field{{K: "model", V: ref.String()},
+			{K: "checkpoint", V: checkpoint}, {K: "status", V: "deleted"}}, Notes: []string{gc}})
+	}
+	deleted, problem := c.DeleteModel(hctx, ref, reason)
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, output.Record{Fields: []output.Field{{K: "model", V: deleted.Model},
+		{K: "checkpoints", V: deleted.Checkpoints}, {K: "reclaimable_objects", V: deleted.ReclaimableObjects},
+		{K: "reclaimable_bytes", V: deleted.ReclaimableBytes}, {K: "status", V: "deleted"}},
+		Notes: []string{gc + ": about " + output.Bytes(deleted.ReclaimableBytes) + " here"}})
 }

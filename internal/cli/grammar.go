@@ -254,6 +254,7 @@ type ModelCmd struct {
 	Publish  ModelPublishCmd  `cmd:"" help:"Update a release's mutable lane pointers."`
 	Retarget ModelRetargetCmd `cmd:"" help:"Move one existing release lane to another retained checkpoint."`
 	Yank     ModelYankCmd     `cmd:"" help:"Yank a model release."`
+	Delete   ModelDeleteCmd   `cmd:"" help:"Delete a Tensorhub model whose releases are yanked, or one unreleased checkpoint."`
 }
 
 type ModelInfoCmd struct {
@@ -375,6 +376,15 @@ type ModelYankCmd struct {
 
 func (c *ModelYankCmd) Run(r *Runtime) error {
 	return r.call(handleModelYank, []string{c.Ref}, nil, values("--release", c.Release), false)
+}
+
+type ModelDeleteCmd struct {
+	Ref string `arg:"" name:"model" help:"Tensorhub model (org/name), or one unreleased checkpoint (org/name#sha256:<checkpoint>)."`
+	Yes bool   `help:"Confirm the deletion; it cannot be undone."`
+}
+
+func (c *ModelDeleteCmd) Run(r *Runtime) error {
+	return r.call(handleModelDelete, []string{c.Ref}, bools("--yes", c.Yes), nil, false)
 }
 
 type RunCmd struct {
