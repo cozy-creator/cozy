@@ -434,10 +434,10 @@ model headers additionally recover the diagnostic projection emitted by `store r
 
 Foreign carrier paths never name components. A review act may bank one whole-source profile beside
 the existing fingerprint entries; the profile supplies the exact required component set, target
-encodings, and canonical construction traversal for each reviewed key-set variant. The registry may
-bank several exact tensor-schema observations for one `(key set, component)`; the observed header still
-has to match one of them exactly. This lets one SDXL profile cover reviewed FP16, BF16, and mixed
-component tensor schemas without 16 source-specific code paths. An optional canonical provider
+encodings, and canonical construction traversal for each reviewed key-set variant. Classification is by
+`(key set, component)`: an entry banked from the exact tensor schema is preferred, and otherwise the
+reviewed key set suffices while conversion validates the actual shapes and dtypes, so an FP16 upload of
+a model banked in BF16 classifies. An optional canonical provider
 member/slot binds a component only when bytes cannot distinguish it, such as byte-identical H3 DiT
 headers. A reviewed member prefix may admit interchangeable objects from one provider namespace;
 the generic SDXL profile uses `civitai/files/`. Omitting both bindings remains local-only, so a
@@ -481,8 +481,11 @@ sources              [{component, path, projected, source_member?}]
 target               component=encoding,...
 ```
 
-The reviewed product registry is compiled into `tfs`; users do not configure or download it. The
-explicit `--registry` flag remains only for platform review and tests. A provider may present a
+The built-in reviewed registry ships with TensorFS and is extended, never replaced, by reviewed data
+bound to a Store (`Store.bind_fingerprint_registry(bytes)`: a pinned file or the Hub's registry) and by
+bytes a caller supplies to `prepare_model_source(registry=...)`. Newer entries replace older ones
+under the same key and keep their own provenance, so an older TensorFS can ingest models banked after
+it shipped. The CLI `--registry` flag remains for platform review and tests. A provider may present a
 superset of candidate headers. TensorFS selects one exact reviewed subset and refuses if zero or
 multiple profile assignments survive, so adapters never choose a variant by filename. A reviewed
 production may name its exact required source profile; this narrows only the registry profile, while

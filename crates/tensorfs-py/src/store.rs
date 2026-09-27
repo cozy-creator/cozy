@@ -900,8 +900,9 @@ impl PyStore {
                 } else if !profiles.is_empty() {
                     let heads = providers::read_heads(&resolution, &uri, &endpoints, &credentials, transport::Deadline::none())?;
                     if !heads.unread.is_empty() { return refuse(Code::DURABILITY_UNPROVEN, "provider headers cannot establish reviewed profile selection"); }
-                    let planned = tensorfs_core::ingest::preflight::plan(model_source::BUILTIN_REGISTRY,
-                        model_source::BUILTIN_REGISTRY_BYTES, &heads.heads, &profiles,
+                    let (registry_locator, registry_bytes) = model_source::effective_registry(&self.store, None)?;
+                    let planned = tensorfs_core::ingest::preflight::plan(&registry_locator,
+                        &registry_bytes, &heads.heads, &profiles,
                         &self.store.root().join("tmp").join(format!("source-select-{}", tensorfs_core::meta::now_nanos_unique())))?;
                     let mut selected: Vec<String> = planned.plans.into_iter().flat_map(|plan| plan.components.into_iter().filter_map(|component| component.member)).collect();
                     selected.sort(); selected.dedup(); selected
@@ -1035,6 +1036,14 @@ impl PyStore {
     /// deployment fact recorded once by `tfs store ensure --repo-cache`; a Python caller
     /// preparing a model source neither knows nor needs a mount point, and giving it one to
     /// pass would put a filesystem path back into a protocol that has no use for it.
+    /// Bind a reviewed fingerprint registry newer than the built-in one (a pinned file or the
+    /// Hub's), or clear it with `None`. It extends the built-in registry for every ingest.
+    #[pyo3(signature = (data))]
+    fn bind_fingerprint_registry(&self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
+        py.detach(|| model_source::bind_registry(&self.store, data.as_deref()))
+            .or_refuse(py)
+    }
+
     #[getter]
     fn repo_cache(&self) -> Option<String> {
         self.store
@@ -1314,18 +1323,13 @@ impl PyStore {
         };
         let prepared = py
             .detach(|| {
-                let (locator, bytes) = match &registry {
-                    Some(bytes) => ("supplied:native-registry", bytes.as_slice()),
-                    None => (
-                        model_source::BUILTIN_REGISTRY,
-                        model_source::BUILTIN_REGISTRY_BYTES,
-                    ),
-                };
+                let (locator, bytes) =
+                    model_source::effective_registry(&self.store, registry.as_deref())?;
                 model_source::prepare_model_source_with_registry_budget(
                     &self.store,
                     &request,
-                    locator,
-                    bytes,
+                    &locator,
+                    &bytes,
                     write_budget_bytes,
                 )
             })
