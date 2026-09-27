@@ -305,17 +305,6 @@ func rentalDiskNote(st *records.Store, operationKey string, ready hub.Rental) st
 	return fmt.Sprintf("Tensorhub bought a %d GB disk, below the requested %d GB", ready.ContainerDiskGB, request.ContainerDiskGB)
 }
 
-// acquireRental is the one paid mutation used by both `cozy rental new` and
-// `cozy run --rental`. It returns only after the immutable retail rate and the
-// worker's authenticated attach projection are durable locally.
-func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName string, gpus int,
-	operationKey, reason string, hourlyRateUSDMicros int64,
-	deadline time.Time, managedRequestID string, phase acquisitionPhase,
-) (records.Rental, hub.Rental, bool, *exit.Error) {
-	return acquireRentalContext(context.Background(), ctx, l, st, skuName, gpus, operationKey,
-		reason, hourlyRateUSDMicros, deadline, managedRequestID, phase)
-}
-
 // acquisitionPhase reports one readiness observation to whoever is waiting on this
 // acquisition. It exists so the seconds between "renting" and "attachable" are named
 // while they pass instead of being one silent edge (cl-121): the hub is polled the whole
@@ -323,35 +312,63 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName strin
 // with nobody to tell passes nil.
 type acquisitionPhase func(hub.Rental)
 
-// hourlyRateUSDMicros is the LOCKED accepted quote — the hub's GPU list rate,
-// the figure the fresh-acceptance guard compares. Spend admission is the hub's:
-// it refuses a rental past the owner's fleet cap before buying anything.
+// acquireRentalContext is the one paid mutation behind `cozy rental new`. It returns only
+// after the immutable retail rate and the worker's authenticated attach projection are
+// durable locally.
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
 	st *records.Store, skuName string, gpus int, operationKey, reason string, hourlyRateUSDMicros int64,
 	deadline time.Time, managedRequestID string, phase acquisitionPhase,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
-	observation := lifecycle
-	if !deadline.IsZero() {
-		var cancel context.CancelFunc
-		observation, cancel = context.WithDeadline(lifecycle, deadline)
-		defer cancel()
-	}
-	c := client(ctx)
-	existing, e := st.RentalOperation(operationKey)
+	a, e := openRentalAcquisition(ctx, l, st, skuName, gpus, operationKey, reason,
+		hourlyRateUSDMicros, deadline, managedRequestID)
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
+	return a.complete(lifecycle, phase)
+}
+
+// rentalAcquisition is one paid ask whose intent is durable before any Hub call: its
+// operation row, exact request bytes, and the credentials the pod will be held to.
+type rentalAcquisition struct {
+	ctx      *Context
+	layout   home.Layout
+	store    *records.Store
+	client   *hub.Client
+	op       records.RentalOperation
+	machine  string
+	existing *records.RentalOperation
+	token    secret.Value
+	creator  rental.CreatorIdentity
+	replay   bool
+	sku      string
+	rate     int64
+	deadline time.Time
+	managed  string
+}
+
+// openRentalAcquisition records the paid operation and mints its machine word; every Hub
+// call belongs to complete. hourlyRateUSDMicros is the LOCKED accepted quote — the hub's
+// GPU list rate, the figure the fresh-acceptance guard compares. Spend admission is the
+// hub's: it refuses a rental past the owner's fleet cap before buying anything.
+func openRentalAcquisition(ctx *Context, l home.Layout, st *records.Store, skuName string, gpus int,
+	operationKey, reason string, hourlyRateUSDMicros int64, deadline time.Time, managedRequestID string,
+) (*rentalAcquisition, *exit.Error) {
+	c := client(ctx)
+	existing, e := st.RentalOperation(operationKey)
+	if e != nil {
+		return nil, e
+	}
 	if existing != nil && (existing.State == "rejected" || existing.State == "released") {
 		if managedRequestID != "" && existing.State == "released" {
-			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Unavailable, "rental.operation_superseded",
+			return nil, exit.Named(exit.Unavailable, "rental.operation_superseded",
 				"the prior managed rental was released before acquisition; retry its current selection")
 		}
-		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.operation_settled",
+		return nil, exit.Named(exit.Conflict, "rental.operation_settled",
 			"rental operation %s is already %s", operationKey, existing.State).
 			WithRemedy("use a fresh operation key for a new paid rental")
 	}
 	if existing != nil && (existing.State == "failed" || existing.State == "release_requested") {
-		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.release_required",
+		return nil, exit.Named(exit.Conflict, "rental.release_required",
 			"rental operation %s is %s and still names rental %s", operationKey, humanRentalState(existing.State), existing.RentalID).
 			WithRemedy("release the existing rental before starting another operation").
 			WithNext("cozy rental end " + existing.RentalID)
@@ -359,10 +376,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if existing != nil {
 		request, problem := hub.ParseRentalRequestBytes(existing.RequestBody)
 		if problem != nil {
-			return records.Rental{}, hub.Rental{}, false, problem
+			return nil, problem
 		}
 		if request.SKU != skuName || request.AcceleratorCount != gpus {
-			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
+			return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict",
 				"rental operation %s names %s, not %s", operationKey,
 				orchestrator.MachineLabel(request.SKU, request.AcceleratorCount), orchestrator.MachineLabel(skuName, gpus))
 		}
@@ -370,16 +387,16 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	var workload hub.DeclaredWorkload
 	development, e := rentalDevelopment(ctx, existing)
 	if e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+		return nil, e
 	}
 	image, e := rentalImage(ctx, existing)
 	if e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+		return nil, e
 	}
 	if managedRequestID == "" {
 		workload, e = manualRentalWorkload(ctx, existing)
 		if e != nil {
-			return records.Rental{}, hub.Rental{}, false, e
+			return nil, e
 		}
 	}
 	var token secret.Value
@@ -396,7 +413,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		}
 	}
 	if e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+		return nil, e
 	}
 	// A rental bought FOR a request declares that request's workload, so the hub
 	// can size the pod's container disk to the job (th-152). An ingest holds its
@@ -421,11 +438,11 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if managedRequestID != "" {
 		workload.SourceBytes, e = st.PlannedSourceBytes(managedRequestID)
 		if e != nil {
-			return records.Rental{}, hub.Rental{}, false, e
+			return nil, e
 		}
 		models, problem := st.DeclaredServingModels(managedRequestID)
 		if problem != nil {
-			return records.Rental{}, hub.Rental{}, false, problem
+			return nil, problem
 		}
 		for _, model := range models {
 			workload.ServingModels = append(workload.ServingModels, hub.ServingModel{
@@ -447,19 +464,37 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		ManagedRequestID: managedRequestID,
 	}, author)
 	if e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+		return nil, e
 	}
 	if op.RequestDigest != rentalRequestDigest(c.Base(), op.RequestBody) || op.Hub != c.Base() ||
 		op.HourlyRateUSDMicros != hourlyRateUSDMicros || op.ManagedRequestID != managedRequestID {
-		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
+		return nil, exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
 			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
 	}
 	request, e := hub.ParseRentalRequestBytes(op.RequestBody)
 	if e != nil {
-		return records.Rental{}, hub.Rental{}, false, e
+		return nil, e
 	}
-	machineName := request.Name
+	return &rentalAcquisition{ctx: ctx, layout: l, store: st, client: c, op: op, machine: request.Name,
+		existing: existing, token: token, creator: creator, replay: replay, sku: skuName,
+		rate: hourlyRateUSDMicros, deadline: deadline, managed: managedRequestID}, nil
+}
+
+// complete asks the Hub for the pod, then waits on the Hub's word alone until it is
+// attachable or the Hub says it will not be.
+func (a *rentalAcquisition) complete(lifecycle context.Context, phase acquisitionPhase,
+) (records.Rental, hub.Rental, bool, *exit.Error) {
+	ctx, l, st, c, op := a.ctx, a.layout, a.store, a.client, a.op
+	operationKey, machineName, deadline, skuName := op.Key, a.machine, a.deadline, a.sku
+	hourlyRateUSDMicros, managedRequestID := a.rate, a.managed
+	existing, token, creator, replay := a.existing, a.token, a.creator, a.replay
+	observation := lifecycle
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		observation, cancel = context.WithDeadline(lifecycle, deadline)
+		defer cancel()
+	}
 	// The create request is deliberately not canceled with the operation: a lost
 	// create answer can name a billing pod. Cancellation is sampled immediately
 	// after its durable verdict, when the rental id can be released exactly.

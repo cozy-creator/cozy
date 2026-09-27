@@ -39,23 +39,35 @@ func handleRentalKeepalive(ctx *Context) *exit.Error {
 	}, "rental", "acknowledged_at", "release_due"))
 }
 
-// Serialize receipt persistence with Creator's release decision. The Host also
+// Serialize receipt persistence with Creator's release decision: idle release waits out
+// a keepalive in flight, which asks the rental with the lock released. The Host also
 // atomically arbitrates renewal against its independently committed expiry.
 func (m *managedRentals) keepalive(ctx context.Context, id, requestID string) (api.RentalKeepaliveResult, *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	var out api.RentalKeepaliveResult
+	m.mu.Lock()
 	if m.closed || m.owner == nil {
+		m.mu.Unlock()
 		return out, exit.Unavailablef("rental controller is unavailable")
 	}
 	row, problem := m.store.RentalRow(id)
+	if problem == nil && (row == nil || row.State != "ready" || m.settling[id]) {
+		problem = exit.New(exit.Conflict, "keepalive requires a current ready rental")
+	}
 	if problem != nil {
+		m.mu.Unlock()
 		return out, problem
 	}
-	if row == nil || row.State != "ready" {
-		return out, exit.New(exit.Conflict, "keepalive requires a current ready rental")
+	if m.keeping == nil {
+		m.keeping = map[string]int{}
 	}
+	m.keeping[id]++
+	m.mu.Unlock()
 	receipt, problem := m.owner.KeepRentalAlive(ctx, id, requestID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.keeping[id]--; m.keeping[id] == 0 {
+		delete(m.keeping, id)
+	}
 	if problem != nil {
 		return out, problem
 	}

@@ -22,6 +22,11 @@ import (
 // managedRentals serializes fleet admission, acknowledged keepalive and release.
 // Fixed idle expiry counts real work on each machine, never retained bytes or
 // an open controller connection. Durable records survive daemon restarts.
+//
+// mu guards this struct and each decision's read-then-write of the records. It is never
+// held across Hub or provider I/O: an operation snapshots under it, asks with it
+// released, and applies the answer under it again, so an answer that never comes holds
+// up only the operation waiting for it.
 type managedRentals struct {
 	mu     sync.Mutex
 	ctx    *Context
@@ -45,6 +50,13 @@ type managedRentals struct {
 	// disks is each rental's container disk as its Hub last reported it; a rental the
 	// Hub has not reported is absent.
 	disks map[string]int
+	// buying is each managed purchase in flight, by operation key, as the machine it will
+	// be: every other placement waits on it rather than buying around it.
+	buying map[string]records.Rental
+	// settling is each rental whose release is in flight; the sweep and reconcile leave
+	// it to that release. keeping counts keepalives in flight, which idle release waits out.
+	settling map[string]bool
+	keeping  map[string]int
 }
 
 // rentalCensus is one hub's answer to "what does this account own there".
@@ -107,8 +119,8 @@ func (m *managedRentals) censusLocked(origin string) *rentalCensus {
 	return m.census[origin]
 }
 
-// originsLocked is every hub this host holds a rental or open acquisition on.
-func (m *managedRentals) originsLocked() ([]string, *exit.Error) {
+// origins is every hub this host holds a rental or open acquisition on.
+func (m *managedRentals) origins() ([]string, *exit.Error) {
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		return nil, problem
@@ -140,11 +152,11 @@ const idleReleaseRetry = 3 * time.Minute
 
 // status is the fleet line of the request's hub, after reconciling that hub.
 func (m *managedRentals) status(req records.Request) (string, *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if problem := m.reconcileLocked(req.Hub); problem != nil {
+	if problem := m.reconcile(req.Hub); problem != nil {
 		return "", problem
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.lineLocked(req.Hub)
 }
 
@@ -155,17 +167,12 @@ type machineKey struct {
 }
 
 func (m *managedRentals) admit(skuName string, gpus int) (string, hub.RentalSKU, *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	origin := m.ctx.Cfg.HubURL
-	if problem := m.reconcileLocked(origin); problem != nil {
-		return "", hub.RentalSKU{}, problem
-	}
-	line, problem := m.lineLocked(origin)
+	line, problem := m.status(records.Request{Hub: origin})
 	if problem != nil {
 		return "", hub.RentalSKU{}, problem
 	}
-	skus, problem := m.catalogLocked(origin)
+	skus, problem := m.catalog(origin)
 	if problem != nil {
 		return "", hub.RentalSKU{}, problem
 	}
@@ -175,12 +182,12 @@ func (m *managedRentals) admit(skuName string, gpus int) (string, hub.RentalSKU,
 	// An explicit ask is HONOURED OR REFUSED, never widened to a neighbouring card or
 	// count — and the refusal has to say so out loud (cl-132), AND say which absence it
 	// hit (th-150).
-	return "", hub.RentalSKU{}, m.refuseSKULocked(skuName, gpus, skus)
+	return "", hub.RentalSKU{}, m.refuseSKU(skuName, gpus, skus)
 }
 
-// refuseSKULocked distinguishes unknown products, provider stock-outs, and
+// refuseSKU distinguishes unknown products, provider stock-outs, and
 // temporary boot-failure exclusions. Reading status never acquires a rental.
-func (m *managedRentals) refuseSKULocked(skuName string, gpus int, skus []hub.RentalSKU) *exit.Error {
+func (m *managedRentals) refuseSKU(skuName string, gpus int, skus []hub.RentalSKU) *exit.Error {
 	hctx, cancel := hub.Context()
 	status, problem := client(m.ctx).RentalSKUStatus(hctx, skuName, gpus)
 	cancel()
@@ -301,13 +308,12 @@ func offeredNames(skus []hub.RentalSKU) string {
 // permission AND intent to spend (owner ruling 2026-09-03). The chosen machine is pinned
 // to THIS request alone, with the lane its rung names, in one write; a buy the hub
 // refuses for stock drops that product and the choice repeats. A fitting rental whose
-// worker has not attached yet is waited for, never bought around (cl-170) nor queued
-// around (cl-174): the decision returns with no rental and the fleet's next observation
-// re-asks. A refusal returns its record too, so every decision is durable.
+// worker has not attached yet — a purchase in flight included — is waited for, never
+// bought around (cl-170) nor queued around (cl-174): the decision returns with no rental
+// and the fleet's next observation re-asks. A refusal returns its record too, so every
+// decision is durable. Every Hub read happens before the lock is taken.
 func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
 	var none orchestrator.PlacementDecision
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !req.Rental || req.Worker != "" {
 		return none, "", exit.Internalf("request %s is not an unassigned --rental request", req.ID)
 	}
@@ -338,10 +344,10 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		return none, "", problem
 	}
 	runtimeOwned := link != nil
-	if problem := m.reconcileLocked(origin); problem != nil {
+	if problem := m.reconcile(origin); problem != nil {
 		return none, "", problem
 	}
-	skus, problem := m.catalogLocked(origin)
+	skus, problem := m.catalog(origin)
 	if problem != nil {
 		return none, "", problem
 	}
@@ -360,7 +366,11 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	if constraints.Working, problem = m.store.WorkingPeaks(req); problem != nil {
 		return none, "", problem
 	}
-	attached, problem := m.attachedLocked(origin, req, runtimeOwned, bySKU, needsAccelerator, constraints)
+	compatible, problem := m.compatibility(origin, req, constraints)
+	if problem != nil {
+		return none, "", problem
+	}
+	throughput, problem := m.throughput(origin, req)
 	if problem != nil {
 		return none, "", problem
 	}
@@ -369,13 +379,16 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		purchases = rental.Purchases(skus, req.Models, needsAccelerator, req.IsJob(), constraints)
 	}
 	var capped *exit.Error
-	decision.Candidates = append(attached, purchases...)
-	rows, problem := m.throughputLocked(origin, req)
-	if problem != nil {
-		return none, "", problem
-	}
-	decision.Throughput = rental.Measure(decision.Candidates, rows, req.Models)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for {
+		// The fleet is read again on every pass: a refused buy ran with the lock released.
+		attached, problem := m.attachedLocked(origin, req, runtimeOwned, bySKU, needsAccelerator, constraints, compatible)
+		if problem != nil {
+			return none, "", problem
+		}
+		decision.Candidates = append(attached, purchases...)
+		decision.Throughput = rental.Measure(decision.Candidates, throughput, req.Models)
 		i := rental.Place(decision.Tier, decision.Candidates)
 		if w := rental.Attaching(decision.Candidates); w >= 0 &&
 			(i < 0 || !decision.Candidates[i].Attached() || decision.Candidates[i].Ahead > 0) {
@@ -404,17 +417,18 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 		c := &decision.Candidates[i]
 		rentalID := c.Rental
 		if !c.Attached() {
+			purchase := &purchases[i-len(attached)]
 			row, problem := m.buyLocked(req, *c, bySKU[machineKey{c.SKU, c.GPUs}])
 			if problem != nil && problem.ErrName() == "rental.fleet_spend_cap" {
 				// The hub's cap refused this product; a cheaper one may still fit.
-				c.Verdict, capped = orchestrator.VerdictExcluded+problem.ErrName(), problem
+				purchase.Verdict, capped = orchestrator.VerdictExcluded+problem.ErrName(), problem
 				continue
 			}
 			if problem != nil {
 				if problem.ErrName() != "rental.sku_out_of_stock" && problem.ErrName() != "rental.sku_unavailable" {
 					return none, "", problem
 				}
-				c.Verdict = orchestrator.VerdictNoStock
+				purchase.Verdict = orchestrator.VerdictNoStock
 				fmt.Fprintf(m.ctx.Out, "rentals: %s has no inventory; choosing again without it\n", c.Name())
 				continue
 			}
@@ -437,8 +451,14 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 			if !decision.Bought {
 				return none, "", exit.New(exit.Canceled, "request %s settled before rental assignment", req.ID)
 			}
-			if _, releaseProblem := m.releaseLocked(rentalID); releaseProblem != nil {
-				return none, "", releaseProblem
+			_, release, problem := m.releaseLocked(rentalID)
+			if problem == nil && release != nil {
+				m.mu.Unlock()
+				problem = m.settle(release)
+				m.mu.Lock()
+			}
+			if problem != nil {
+				return none, "", problem
 			}
 			return none, "", exit.New(exit.Canceled,
 				"request %s settled while rental %s was starting; the rental was released", req.ID, rentalID)
@@ -451,10 +471,21 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 // attachedLocked is every rental the fleet holds as a candidate: with the reason it
 // cannot take this request, or, when it can, the attempts ahead of a new one. Nothing
 // is silently dropped (cl-132): a decision reporting no attached candidate while the
-// fleet holds two is the shape that read as waste live.
+// fleet holds two is the shape that read as waste live. A purchase in flight is a
+// candidate too, before its pod has a row: the machine on its way.
 func (m *managedRentals) attachedLocked(origin string, req records.Request, runtimeOwned bool, bySKU map[machineKey]hub.RentalSKU,
-	needsAccelerator bool, constraints rental.Constraints) ([]orchestrator.PlacementCandidate, *exit.Error) {
+	needsAccelerator bool, constraints rental.Constraints, compatible map[string]*exit.Error) ([]orchestrator.PlacementCandidate, *exit.Error) {
 	rows, problem := m.store.Rentals()
+	if problem != nil {
+		return nil, problem
+	}
+	reserved, problem := m.reservationsLocked(rows)
+	if problem != nil {
+		return nil, problem
+	}
+	rows = append(rows, reserved...)
+	// A purchase owns its pod until it has pinned its own request, even once attachable.
+	busy, problem := m.inFlightLocked()
 	if problem != nil {
 		return nil, problem
 	}
@@ -493,8 +524,20 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 		// is left are the questions only this host can answer.
 		disk := rental.Disk{HaveGB: m.disks[row.ID], SourceBytes: sourceBytes}
 		if rental.Standing(&c, req.Models, row, sku.VRAMGB, needsAccelerator, offered, req.IsJob(), constraints.Working, disk) {
+			if busy[row.ID] {
+				c.Verdict = orchestrator.VerdictAttaching
+				out = append(out, c)
+				continue
+			}
 			if len(constraints.Requirements) > 0 || constraints.RequiresPython != "" {
-				if problem := rentalCompatibility(m.at(origin), row.ID, constraints); problem != nil {
+				problem, read := compatible[row.ID]
+				if !read {
+					// Ready since this decision read the fleet: the next one reads it.
+					c.Verdict = orchestrator.VerdictAttaching
+					out = append(out, c)
+					continue
+				}
+				if problem != nil {
 					c.Verdict = orchestrator.VerdictExcluded + orchestrator.ExcludedBaseMismatch + ": " + problem.Message
 					out = append(out, c)
 					continue
@@ -521,6 +564,46 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 			}
 		}
 		out = append(out, c)
+	}
+	return out, nil
+}
+
+// reservationsLocked is each purchase in flight whose pod has no row yet.
+func (m *managedRentals) reservationsLocked(rows []records.Rental) ([]records.Rental, *exit.Error) {
+	have := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		have[row.ID] = true
+	}
+	var out []records.Rental
+	for key, machine := range m.buying {
+		op, problem := m.store.RentalOperation(key)
+		if problem != nil {
+			return nil, problem
+		}
+		if op == nil || !have[op.RentalID] {
+			out = append(out, machine)
+		}
+	}
+	return out, nil
+}
+
+// compatibility is whether each attachable rental on origin can run the request's
+// requirements (nil: it can), read from the Hub before the decision takes the lock.
+func (m *managedRentals) compatibility(origin string, req records.Request, constraints rental.Constraints) (map[string]*exit.Error, *exit.Error) {
+	out := map[string]*exit.Error{}
+	if len(constraints.Requirements) == 0 && constraints.RequiresPython == "" {
+		return out, nil
+	}
+	rows, problem := m.store.Rentals()
+	if problem != nil {
+		return nil, problem
+	}
+	for _, row := range rows {
+		if m.origin(row.Hub) != origin || !localRentalAttachable(row) ||
+			req.RequestedRental != "" && row.ID != req.RequestedRental || req.RentNew && row.ManagedRequestID != req.ID {
+			continue
+		}
+		out[row.ID] = rentalCompatibility(m.at(origin), row.ID, constraints)
 	}
 	return out, nil
 }
@@ -554,9 +637,9 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 	return "", nil
 }
 
-// throughputLocked reads the model's published throughput rows once per decision. A
+// throughput reads the model's published throughput rows once per decision. A
 // request binding no model has nothing to look up.
-func (m *managedRentals) throughputLocked(origin string, req records.Request) ([]hub.ModelThroughput, *exit.Error) {
+func (m *managedRentals) throughput(origin string, req records.Request) ([]hub.ModelThroughput, *exit.Error) {
 	if len(req.Models) == 0 {
 		return nil, nil
 	}
@@ -569,9 +652,12 @@ func (m *managedRentals) throughputLocked(origin string, req records.Request) ([
 	return client(m.at(origin)).ModelThroughput(hctx, ref)
 }
 
-// buyLocked is one paid ask for the chosen product. The request's selection is pinned to
-// that machine's lane BEFORE the ask, so the rental POST declares the lane the pod will
-// hold (th-155), and the boot is named while it passes (cl-121).
+// buyLocked is one paid ask for the chosen product. Under the lock the request's
+// selection is pinned to that machine's lane, so the rental POST declares the lane the
+// pod will hold (th-155), and the paid operation is recorded and reserved: every other
+// placement sees the machine on its way. The ask and the boot, named while it passes
+// (cl-121), run with the lock released; a purchase the Hub never finishes holds only
+// its own request.
 func (m *managedRentals) buyLocked(req records.Request, c orchestrator.PlacementCandidate,
 	sku hub.RentalSKU) (records.Rental, *exit.Error) {
 	current, problem := m.store.RequestRow(req.ID)
@@ -584,43 +670,55 @@ func (m *managedRentals) buyLocked(req records.Request, c orchestrator.Placement
 	if problem := m.store.PinRequestModels(req.ID, c.Models); problem != nil {
 		return records.Rental{}, problem
 	}
-	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", orchestrator.MachineLabel(sku.Name, sku.AcceleratorCount), skuRate(sku), pinText(c))
-	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
-	defer m.owner.ForgetPhase(req.ID)
 	operationKey, problem := m.store.ManagedRentalOperationKey(req.ID)
 	if problem != nil {
 		return records.Rental{}, problem
 	}
-	row, bought, _, problem := acquireRental(m.at(req.Hub), m.layout, m.store, sku.Name, sku.AcceleratorCount,
-		operationKey, rental.AcquisitionReason(req),
-		sku.PriceUSDMicrosPerHour, time.Time{}, req.ID,
-		func(seen hub.Rental) {
-			// A failure carried by a rental that is BACK in pending_acquisition is the
-			// hub saying "that one did not work; I am buying again". The detail names
-			// what refused, so a replan is visible AND attributable rather than being
-			// 32 silent seconds inside a longer silence.
-			retrying := seen.Failure != nil
-			detail := seen.Detail
-			if retrying && seen.Failure.Code != "" {
-				detail = seen.Failure.Code
-				if seen.Failure.ProviderHostID != "" {
-					detail += " on " + seen.Failure.ProviderHostID
-				}
+	purchase, problem := openRentalAcquisition(m.at(req.Hub), m.layout, m.store, sku.Name, sku.AcceleratorCount,
+		operationKey, rental.AcquisitionReason(req), sku.PriceUSDMicrosPerHour, time.Time{}, req.ID)
+	if problem != nil {
+		return records.Rental{}, problem
+	}
+	if m.buying == nil {
+		m.buying = map[string]records.Rental{}
+	}
+	m.buying[operationKey] = records.Rental{ID: operationKey, MachineName: purchase.machine, SKU: sku.Name,
+		AcceleratorModel: sku.AcceleratorModel, AcceleratorCount: sku.AcceleratorCount,
+		HourlyRateUSDMicros: sku.PriceUSDMicrosPerHour, ManagedRequestID: req.ID,
+		State: "pending_acquisition", Hub: m.origin(req.Hub)}
+	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s (%s)\n", orchestrator.MachineLabel(sku.Name, sku.AcceleratorCount), skuRate(sku), pinText(c))
+	m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{Name: orchestrator.PhaseAcquiring})
+	m.mu.Unlock()
+	row, bought, _, problem := purchase.complete(context.Background(), func(seen hub.Rental) {
+		// A failure carried by a rental that is BACK in pending_acquisition is the
+		// hub saying "that one did not work; I am buying again". The detail names
+		// what refused, so a replan is visible AND attributable rather than being
+		// 32 silent seconds inside a longer silence.
+		retrying := seen.Failure != nil
+		detail := seen.Detail
+		if retrying && seen.Failure.Code != "" {
+			detail = seen.Failure.Code
+			if seen.Failure.ProviderHostID != "" {
+				detail += " on " + seen.Failure.ProviderHostID
 			}
-			if name := orchestrator.PhaseOfHubRental(seen.State, seen.ProviderState,
-				seen.ContainerState, retrying); name != "" {
-				m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
-					Name: name, Machine: seen.Name, Detail: detail,
-					Rental: &orchestrator.RentalProgress{
-						AcceleratorModel:      seen.AcceleratorModel,
-						AcceleratorCount:      seen.AcceleratorCount,
-						HourlyRateUSDMicros:   seen.HourlyRateUSDMicros,
-						BaseWorkerImageDigest: seen.BaseWorkerImageDigest,
-						BaseWorkerImageTag:    seen.BaseWorkerImageTag,
-						BaseWorkerProfile:     seen.BaseWorkerProfile,
-					}})
-			}
-		})
+		}
+		if name := orchestrator.PhaseOfHubRental(seen.State, seen.ProviderState,
+			seen.ContainerState, retrying); name != "" {
+			m.owner.ObservePhase(req.ID, orchestrator.PhaseSample{
+				Name: name, Machine: seen.Name, Detail: detail,
+				Rental: &orchestrator.RentalProgress{
+					AcceleratorModel:      seen.AcceleratorModel,
+					AcceleratorCount:      seen.AcceleratorCount,
+					HourlyRateUSDMicros:   seen.HourlyRateUSDMicros,
+					BaseWorkerImageDigest: seen.BaseWorkerImageDigest,
+					BaseWorkerImageTag:    seen.BaseWorkerImageTag,
+					BaseWorkerProfile:     seen.BaseWorkerProfile,
+				}})
+		}
+	})
+	m.owner.ForgetPhase(req.ID)
+	m.mu.Lock()
+	delete(m.buying, operationKey)
 	if problem == nil {
 		m.observeDiskLocked(row.ID, bought)
 	}
@@ -647,7 +745,7 @@ func pinText(c orchestrator.PlacementCandidate) string {
 	return text
 }
 
-func (m *managedRentals) catalogLocked(origin string) ([]hub.RentalSKU, *exit.Error) {
+func (m *managedRentals) catalog(origin string) ([]hub.RentalSKU, *exit.Error) {
 	hctx, cancel := hub.Context()
 	defer cancel()
 	return client(m.at(origin)).RentalSKUs(hctx)
@@ -658,15 +756,17 @@ func (m *managedRentals) catalogLocked(origin string) ([]hub.RentalSKU, *exit.Er
 // idle is logged with its deadline. The sweep repeats the same observation from then on.
 func (m *managedRentals) release(id string) (string, *exit.Error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	row, problem := m.store.RentalRow(id)
-	if problem != nil {
+	if problem != nil || row == nil {
+		m.mu.Unlock()
 		return "", problem
 	}
-	if row == nil {
-		return "", nil
+	line, release, problem := m.observeLocked(*row)
+	m.mu.Unlock()
+	if release == nil {
+		return line, problem
 	}
-	return m.observeLocked(*row)
+	return m.settleIdle(release)
 }
 
 // Explicit transaction abandonment is not an idle observation. A manually held
@@ -674,37 +774,41 @@ func (m *managedRentals) release(id string) (string, *exit.Error) {
 // owner before any managed rental reaches the provider DELETE.
 func (m *managedRentals) releaseRetained(id string) (string, *exit.Error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	row, problem := m.store.RentalRow(id)
-	if problem != nil {
+	if problem != nil || row == nil {
+		m.mu.Unlock()
 		return "", problem
 	}
-	if row == nil {
-		return "", nil
-	}
 	if row.ManagedRequestID == "" {
+		defer m.mu.Unlock()
 		return m.lineLocked(row.Hub)
 	}
-	return m.releaseLocked(id)
+	line, release, problem := m.releaseLocked(id)
+	m.mu.Unlock()
+	if release == nil {
+		return line, problem
+	}
+	if problem := m.settle(release); problem != nil {
+		return "", problem
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lineLocked(row.Hub)
 }
 
 // releaseOrphaned resumes the policy after a daemon restart: every rental is reconciled
 // with the hub and then observed as the sweep observes it, so a job's rental releases
 // now and a warm one keeps only the unspent remainder of its grace.
 func (m *managedRentals) releaseOrphaned() {
-	m.mu.Lock()
-	if problems := m.reconcileAllLocked(); len(problems) > 0 {
+	if problems := m.reconcileAll(); len(problems) > 0 {
 		for origin, problem := range problems {
 			fmt.Fprintf(m.ctx.Out, "rental reconciliation deferred%s: %s\n", m.onHub(origin), problem.Message)
 		}
-		m.mu.Unlock()
 		return
 	}
-	m.sweepLocked()
-	owner := m.owner
-	m.mu.Unlock()
-	if owner != nil {
-		owner.RecoverLostWork()
+	m.sweep()
+	if m.owner != nil {
+		m.owner.RecoverLostWork()
 	}
 }
 
@@ -740,6 +844,27 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 	tick := time.NewTicker(pollCadence)
 	defer tick.Stop()
 	reconciled := time.Now()
+	// Re-asking the orchestrator can place work, and placement can buy and wait out a
+	// pod's boot. It runs on its own goroutine, one ask at a time, so the sweep never
+	// waits on a purchase.
+	reask := make(chan struct{}, 1)
+	defer close(reask)
+	if m.owner != nil {
+		go func() {
+			for range reask {
+				// OUTSIDE the lock, always: replanning released work asks the fleet for
+				// capacity and re-enters this object. Under the lock it deadlocks the
+				// daemon, measured on the first cut of this change. It runs every tick
+				// rather than on a rental observation, because a rental whose record is
+				// GONE is observed by nobody — the sweep reads the request side, which
+				// still has rows.
+				m.owner.RecoverLostWork()
+				// Hub recovery is an observed fleet change. Re-ask durable queued work;
+				// selection calls back into this object.
+				m.owner.WakeQueue()
+			}
+		}()
+	}
 	for {
 		select {
 		case <-quit:
@@ -747,10 +872,13 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 		case <-tick.C:
 		}
 		m.mu.Lock()
-		if !m.closed {
+		closed := m.closed
+		m.mu.Unlock()
+		if !closed {
 			if time.Since(reconciled) >= hubReconcileCadence {
 				reconciled = time.Now()
-				problems := m.reconcileAllLocked()
+				problems := m.reconcileAll()
+				m.mu.Lock()
 				for origin, problem := range problems {
 					m.sayLocked("reconcile:"+origin, "rental reconciliation deferred"+m.onHub(origin)+": "+problem.Message)
 				}
@@ -759,35 +887,46 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 						delete(m.said, "reconcile:"+origin)
 					}
 				}
+				m.mu.Unlock()
 			}
-			m.sweepLocked()
+			m.sweep()
 		}
-		owner := m.owner
-		m.mu.Unlock()
 		if m.installs != nil {
 			m.installs.Wake()
 		}
-		if owner != nil {
-			// OUTSIDE the lock, always: replanning released work asks the fleet for
-			// capacity and re-enters this object. Under the lock it deadlocks the daemon,
-			// measured on the first cut of this change. It runs every tick rather than on
-			// a rental observation, because a rental whose record is GONE is observed by
-			// nobody — the sweep reads the request side, which still has rows.
-			owner.RecoverLostWork()
-			// Hub recovery is an observed fleet change. Re-ask durable queued work outside
-			// the fleet lock; selection calls back into this object.
-			owner.WakeQueue()
+		select {
+		case reask <- struct{}{}:
+		default:
 		}
 	}
 }
 
-func (m *managedRentals) sweepLocked() {
+// sweep observes every rental for idle release. Each release it decides runs on its
+// own, so one the Hub never confirms holds up no other rental.
+func (m *managedRentals) sweep() {
+	m.mu.Lock()
+	releases := m.sweepLocked()
+	m.mu.Unlock()
+	for _, release := range releases {
+		go func() {
+			if _, problem := m.settleIdle(release); problem != nil {
+				m.mu.Lock()
+				m.sayLocked(release.row.ID, fmt.Sprintf("rental %s release deferred: %s; retrying every %s",
+					release.row.ID, problem.Message, idleReleaseRetry))
+				m.mu.Unlock()
+			}
+		}()
+	}
+}
+
+func (m *managedRentals) sweepLocked() []*pendingRelease {
 	m.sayUnrecordedLocked()
 	rows, problem := m.store.Rentals()
 	if problem != nil {
 		m.sayLocked("", "idle release deferred: "+problem.Message)
-		return
+		return nil
 	}
+	var releases []*pendingRelease
 	for _, row := range rows {
 		if m.censusLocked(row.Hub).hubUnknown[row.ID] {
 			settle := "kept until its provider release is confirmed"
@@ -797,53 +936,61 @@ func (m *managedRentals) sweepLocked() {
 			m.sayLocked("hub-unknown:"+row.ID, fmt.Sprintf("rental %s is recorded on this host but unknown to %s; %s",
 				row.ID, m.origin(row.Hub), settle))
 		}
-		if _, problem := m.observeLocked(row); problem != nil {
+		_, release, problem := m.observeLocked(row)
+		if problem != nil {
 			m.sayLocked(row.ID, fmt.Sprintf("rental %s release deferred: %s; retrying every %s",
 				row.ID, problem.Message, idleReleaseRetry))
 		}
+		if release != nil {
+			releases = append(releases, release)
+		}
 	}
+	return releases
 }
 
 // observeLocked is the whole idle-release decision for one rental, made from the records
-// alone and acted on through the same paid path `cozy rental end` takes. A failed release
-// is asked again after idleReleaseRetry, and each change of verdict is said once.
-func (m *managedRentals) observeLocked(row records.Rental) (string, *exit.Error) {
-	if m.closed || time.Now().Before(m.retryAt[row.ID]) {
-		return m.lineLocked(row.Hub)
+// alone; a release it decides goes through the same paid path `cozy rental end` takes. A
+// failed release is asked again after idleReleaseRetry, and each change of verdict is
+// said once. A rental whose release or keepalive is in flight is left to it.
+func (m *managedRentals) observeLocked(row records.Rental) (string, *pendingRelease, *exit.Error) {
+	if m.closed || time.Now().Before(m.retryAt[row.ID]) || m.settling[row.ID] || m.keeping[row.ID] > 0 {
+		line, problem := m.lineLocked(row.Hub)
+		return line, nil, problem
 	}
 	idle, problem := m.observeIdle(row)
 	if problem != nil {
-		return "", problem
+		return "", nil, problem
 	}
 	due, eligible := idle.ReleaseAt()
 	if !eligible {
 		delete(m.said, row.ID)
-		return m.lineLocked(row.Hub)
+		line, problem := m.lineLocked(row.Hub)
+		return line, nil, problem
 	}
 	if now := time.Now(); now.Before(due) {
 		m.sayLocked(row.ID, fmt.Sprintf("rental %s (%s) idle since %s; released at %s unless work arrives",
 			row.ID, row.MachineName, idle.Since.UTC().Format("15:04:05"), due.UTC().Format("15:04:05")))
-		return m.lineLocked(row.Hub)
+		line, problem := m.lineLocked(row.Hub)
+		return line, nil, problem
 	}
-	line, problem := m.releaseIdleLocked(row.ID)
+	release, problem := m.releaseIdleLocked(row.ID)
 	if problem != nil {
-		if m.retryAt == nil {
-			m.retryAt = map[string]time.Time{}
-		}
-		m.retryAt[row.ID] = time.Now().Add(idleReleaseRetry)
-		return "", problem
+		m.retryLaterLocked(row.ID)
+		return "", nil, problem
 	}
-	remaining, problem := m.store.RentalRow(row.ID)
-	if problem != nil {
-		return "", problem
+	if release == nil {
+		line, problem := m.lineLocked(row.Hub)
+		return line, nil, problem
 	}
-	if remaining != nil {
-		return line, nil
+	release.idleSince = idle.Since
+	return "", release, nil
+}
+
+func (m *managedRentals) retryLaterLocked(id string) {
+	if m.retryAt == nil {
+		m.retryAt = map[string]time.Time{}
 	}
-	m.forgetIdleLocked(row.ID)
-	fmt.Fprintf(m.ctx.Out, "rental %s (%s) released after %s idle\n",
-		row.ID, row.MachineName, time.Since(idle.Since).Round(time.Second))
-	return line, nil
+	m.retryAt[id] = time.Now().Add(idleReleaseRetry)
 }
 
 func (m *managedRentals) sayLocked(id, line string) {
@@ -868,93 +1015,114 @@ func (m *managedRentals) close() {
 	m.closed = true
 }
 
-// releaseLocked is the paid DELETE, re-observing the row under the lock first: the sweep
-// and the settlement hook both arrive here, and only a pod with nothing queued, running,
-// or owed on it goes. The owed re-check keeps the buy's rollback honest too: acquire
-// releases a rental it just bought only because the buyer settled or routed elsewhere,
-// which is exactly when the debt is gone.
-func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
+// releaseLocked decides the paid DELETE, re-observing the row under the lock first: the
+// sweep and the settlement hook both arrive here, and only a pod with nothing queued,
+// running, or owed on it goes. The owed re-check keeps the buy's rollback honest too:
+// acquire releases a rental it just bought only because the buyer settled or routed
+// elsewhere, which is exactly when the debt is gone. The caller settles the release.
+func (m *managedRentals) releaseLocked(id string) (string, *pendingRelease, *exit.Error) {
 	row, problem := m.store.RentalRow(id)
-	if problem != nil {
-		return "", problem
-	}
-	if row == nil {
-		return "", nil
+	if problem != nil || row == nil {
+		return "", nil, problem
 	}
 	queued, running, problem := m.store.RentalRunCounts(id)
 	if problem != nil {
-		return "", problem
+		return "", nil, problem
 	}
-	if queued != 0 || running != 0 {
-		return m.lineLocked(row.Hub)
+	owed := queued != 0 || running != 0
+	if !owed {
+		if owed, problem = orchestrator.RentalOwedBy(m.store, *row); problem != nil {
+			return "", nil, problem
+		}
 	}
-	owed, problem := orchestrator.RentalOwedBy(m.store, *row)
-	if problem != nil {
-		return "", problem
+	var release *pendingRelease
+	if !owed {
+		if release, problem = m.beginReleaseLocked(*row); problem != nil {
+			return "", nil, problem
+		}
 	}
-	if owed {
-		return m.lineLocked(row.Hub)
+	if release != nil {
+		return "", release, nil
 	}
-	return m.releasePaidLocked(*row)
+	line, problem := m.lineLocked(row.Hub)
+	return line, nil, problem
 }
 
 // Idle expiry intentionally ignores retained custody: paused/failed files are
 // not work. The capacity/purpose cleanup above retains its stronger custody gate.
-func (m *managedRentals) releaseIdleLocked(id string) (string, *exit.Error) {
-	row, problem := m.store.RentalRow(id)
-	if problem != nil {
-		return "", problem
-	}
-	if row == nil {
-		return "", nil
-	}
+func (m *managedRentals) releaseIdleLocked(id string) (*pendingRelease, *exit.Error) {
 	claimed, problem := m.store.ClaimRentalIdleRelease(id, time.Now())
-	if problem != nil {
-		return "", problem
+	if problem != nil || !claimed {
+		return nil, problem
 	}
-	if !claimed {
-		return m.lineLocked(row.Hub)
+	row, problem := m.store.RentalRow(id)
+	if problem != nil || row == nil {
+		return nil, problem
 	}
-	if row, problem = m.store.RentalRow(id); problem != nil || row == nil {
-		return "", problem
-	}
-	return m.releasePaidLocked(*row)
+	return m.beginReleaseLocked(*row)
 }
 
-func (m *managedRentals) releasePaidLocked(row records.Rental) (string, *exit.Error) {
-	id := row.ID
-	operationKey, problem := m.store.RequestRentalRelease(id)
+// pendingRelease is a release decided under the lock and settled without it.
+type pendingRelease struct {
+	row          records.Rental
+	operationKey string
+	confirmed    bool
+	idleSince    time.Time
+}
+
+// beginReleaseLocked records the intent to release a rental and takes it for this
+// release; nil when another release already has it.
+func (m *managedRentals) beginReleaseLocked(row records.Rental) (*pendingRelease, *exit.Error) {
+	if m.settling[row.ID] {
+		return nil, nil
+	}
+	operationKey, problem := m.store.RequestRentalRelease(row.ID)
 	if problem != nil {
-		return "", problem
+		return nil, problem
 	}
 	confirmed := row.State == hub.RentalReleased
 	if operationKey != "" {
 		operation, problem := m.store.RentalOperation(operationKey)
 		if problem != nil {
-			return "", problem
+			return nil, problem
 		}
 		confirmed = confirmed || operation != nil && operation.State == hub.RentalReleased
 	}
 	if !confirmed && row.State != hub.RentalReleaseRequested {
 		row.State = hub.RentalReleaseRequested
 		if problem := m.store.RecordRental(row); problem != nil {
-			return "", problem
+			return nil, problem
 		}
 		if line, lineProblem := m.lineLocked(row.Hub); lineProblem == nil {
 			fmt.Fprintln(m.ctx.Out, line)
 		}
 	}
-	// The release goes to the hub the pod was bought from, with that hub's credential.
+	if m.settling == nil {
+		m.settling = map[string]bool{}
+	}
+	m.settling[row.ID] = true
+	return &pendingRelease{row: row, operationKey: operationKey, confirmed: confirmed}, nil
+}
+
+// settle carries out a release with no lock held: the DELETE to the hub the pod was
+// bought from, with that hub's credential; the Hub's confirmation; then the local half.
+func (m *managedRentals) settle(release *pendingRelease) *exit.Error {
+	row, id, confirmed := release.row, release.row.ID, release.confirmed
+	defer func() {
+		m.mu.Lock()
+		delete(m.settling, id)
+		m.mu.Unlock()
+	}()
 	owner := client(m.at(row.Hub))
 	if !confirmed {
 		hctx, cancel := hub.Context()
-		problem = owner.Release(hctx, id, "")
+		problem := owner.Release(hctx, id, "")
 		cancel()
 		if problem != nil {
 			if problem.Code == exit.NotFound {
-				return "", rentalReleaseUnconfirmed(id)
+				return rentalReleaseUnconfirmed(id)
 			}
-			return "", problem
+			return problem
 		}
 	}
 	for !confirmed {
@@ -968,27 +1136,42 @@ func (m *managedRentals) releasePaidLocked(row records.Rental) (string, *exit.Er
 			row.State = remote.State
 			copyRentalFailure(&row, remote)
 			if update := m.store.RecordRental(row); update != nil {
-				return "", update
+				return update
 			}
 			time.Sleep(pollCadence)
 		case observed.Code == exit.NotFound:
-			return "", rentalReleaseUnconfirmed(id)
+			return rentalReleaseUnconfirmed(id)
 		case transient(observed):
 			time.Sleep(pollCadence)
 		default:
-			return "", observed
+			return observed
 		}
 	}
 	if m.owner != nil {
 		m.owner.DetachRental(id)
 	}
 	if _, problem := rental.Forget(m.layout, m.store, id); problem != nil {
+		return problem
+	}
+	if release.operationKey != "" {
+		rental.ForgetPending(m.layout, release.operationKey)
+	}
+	return nil
+}
+
+// settleIdle settles an idle release and says so.
+func (m *managedRentals) settleIdle(release *pendingRelease) (string, *exit.Error) {
+	problem := m.settle(release)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if problem != nil {
+		m.retryLaterLocked(release.row.ID)
 		return "", problem
 	}
-	if operationKey != "" {
-		rental.ForgetPending(m.layout, operationKey)
-	}
-	return m.lineLocked(row.Hub)
+	m.forgetIdleLocked(release.row.ID)
+	fmt.Fprintf(m.ctx.Out, "rental %s (%s) released after %s idle\n",
+		release.row.ID, release.row.MachineName, time.Since(release.idleSince).Round(time.Second))
+	return m.lineLocked(release.row.Hub)
 }
 
 func localRentalAttachable(row records.Rental) bool {
@@ -1004,50 +1187,137 @@ func (m *managedRentals) wakeQueueAsync() {
 	}
 }
 
-// reconcileLocked converges this host's rental rows on one hub with that hub, and then
-// asks it the question this host cannot answer from its own rows at all: what else does
-// this account own there? The two directions are not the same read and only one of them
-// existed. Local-row reconciliation can correct a row; it can never notice a pod
-// that has no row.
-func (m *managedRentals) reconcileLocked(origin string) *exit.Error {
-	census := m.censusLocked(origin)
-	if problem := m.reconcileRowsLocked(origin); problem != nil {
-		if hub.Unanswered(problem) {
-			// The census is as unknown as the rows: a later cached read must not
-			// present the previous listing as current.
-			census.listed, census.listingProblem, census.unrecorded, census.live = false, problem, nil, nil
-		}
+// reconcile converges this host's rental rows on one hub with that hub, and then asks
+// it the question this host cannot answer from its own rows at all: what else does this
+// account own there? The two directions are not the same read and only one of them
+// existed. Local-row reconciliation can correct a row; it can never notice a pod that
+// has no row. The Hub is asked with the lock released; its answers are applied under
+// the lock to the rows as they are by then.
+func (m *managedRentals) reconcile(origin string) *exit.Error {
+	origin = m.origin(origin)
+	m.mu.Lock()
+	rows, problem := m.reconcilableLocked(origin)
+	m.mu.Unlock()
+	if problem != nil {
 		return problem
 	}
-	m.reconcileListingLocked(origin)
-	return nil
+	owner := client(m.at(origin))
+	views := make([]rentalView, 0, len(rows))
+	var asked *exit.Error
+	for _, row := range rows {
+		if row.State == hub.RentalReleased {
+			views = append(views, rentalView{id: row.ID, released: true})
+			continue
+		}
+		hctx, cancel := hub.Context()
+		remote, observed := owner.Rental(hctx, row.ID)
+		cancel()
+		if observed != nil && observed.ErrName() != "rental.not_found" {
+			asked = observed
+			break
+		}
+		views = append(views, rentalView{id: row.ID, remote: remote, unknown: observed != nil,
+			released: observed == nil && remote.State == hub.RentalReleased})
+	}
+	var listing []hub.Rental
+	var listed bool
+	var listingProblem *exit.Error
+	if asked == nil {
+		hctx, cancel := hub.Context()
+		listing, listed, listingProblem = owner.Rentals(hctx)
+		cancel()
+	}
+	m.mu.Lock()
+	released, failed, problem := m.applyRowsLocked(origin, views)
+	census := m.censusLocked(origin)
+	switch {
+	case problem != nil:
+	case asked != nil:
+		problem = asked
+		if hub.Unanswered(asked) {
+			// The census is as unknown as the rows: a later cached read must not
+			// present the previous listing as current.
+			census.listed, census.listingProblem, census.unrecorded, census.live = false, asked, nil, nil
+		}
+	default:
+		m.applyListingLocked(origin, listing, listed, listingProblem)
+	}
+	m.mu.Unlock()
+	if detached := m.letGo(released, failed); problem == nil {
+		problem = detached
+	}
+	return problem
 }
 
-// reconcileAllLocked reconciles every hub this host holds rentals on. A hub that cannot
+// rentalView is the Hub's answer about one rental row.
+type rentalView struct {
+	id     string
+	remote hub.Rental
+	// unknown is `rental.not_found`: not proof of provider destruction, so the row is
+	// KEPT and shown, and never stops the reconcile of every other rental on the hub.
+	unknown  bool
+	released bool
+}
+
+// reconcileAll reconciles every hub this host holds rentals on. A hub that cannot
 // be reconciled defers only its own rentals; every other hub still converges.
-func (m *managedRentals) reconcileAllLocked() map[string]*exit.Error {
-	origins, problem := m.originsLocked()
+func (m *managedRentals) reconcileAll() map[string]*exit.Error {
+	origins, problem := m.origins()
 	if problem != nil {
 		return map[string]*exit.Error{"": problem}
 	}
 	problems := map[string]*exit.Error{}
 	for _, origin := range origins {
-		if problem := m.reconcileLocked(origin); problem != nil {
+		if problem := m.reconcile(origin); problem != nil {
 			problems[origin] = problem
 		}
 	}
 	return problems
 }
 
-// reconcileListingLocked refreshes one hub's unrecorded set. A listing this hub does
+// reconcilableLocked is origin's rental rows, less those an operation in flight is
+// already observing: a purchase or a release is the one reader of its own rental.
+func (m *managedRentals) reconcilableLocked(origin string) ([]records.Rental, *exit.Error) {
+	rows, problem := m.store.Rentals()
+	if problem != nil {
+		return nil, problem
+	}
+	busy, problem := m.inFlightLocked()
+	if problem != nil {
+		return nil, problem
+	}
+	var out []records.Rental
+	for _, row := range rows {
+		if m.origin(row.Hub) == origin && !busy[row.ID] {
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+// inFlightLocked is every rental a purchase or a release in flight holds.
+func (m *managedRentals) inFlightLocked() (map[string]bool, *exit.Error) {
+	busy := map[string]bool{}
+	for id := range m.settling {
+		busy[id] = true
+	}
+	for key := range m.buying {
+		op, problem := m.store.RentalOperation(key)
+		if problem != nil {
+			return nil, problem
+		}
+		if op != nil && op.RentalID != "" {
+			busy[op.RentalID] = true
+		}
+	}
+	return busy, nil
+}
+
+// applyListingLocked refreshes one hub's unrecorded set. A listing this hub does
 // not publish, or cannot answer right now, leaves the set EMPTY and the reason
 // recorded — never an assertion that there is nothing there.
-func (m *managedRentals) reconcileListingLocked(origin string) {
-	origin = m.origin(origin)
+func (m *managedRentals) applyListingLocked(origin string, remote []hub.Rental, listed bool, problem *exit.Error) {
 	census := m.censusLocked(origin)
-	hctx, cancel := hub.Context()
-	remote, listed, problem := client(m.at(origin)).Rentals(hctx)
-	cancel()
 	census.listed, census.listingProblem, census.unrecorded, census.live = listed, problem, nil, nil
 	if problem != nil || !listed {
 		return
@@ -1085,19 +1355,16 @@ func (m *managedRentals) sayUnrecordedLocked() {
 	}
 }
 
-func (m *managedRentals) reconcileRowsLocked(origin string) *exit.Error {
-	origin = m.origin(origin)
-	owner := client(m.at(origin))
-	rows, problem := m.store.Rentals()
-	if problem != nil {
-		return problem
-	}
-	operations, problem := m.store.ActiveRentalOperations()
-	if problem != nil {
-		return problem
-	}
+// applyRowsLocked records the Hub's answers on the rows as they are now; a row forgotten,
+// or taken by an operation, while the Hub was asked is not this answer's to change. It
+// returns the rentals the Hub released and those it failed, for letGo.
+func (m *managedRentals) applyRowsLocked(origin string, views []rentalView) (released, failed []string, problem *exit.Error) {
 	census := m.censusLocked(origin)
 	census.hubUnknown = map[string]bool{}
+	operations, problem := m.store.ActiveRentalOperations()
+	if problem != nil {
+		return nil, nil, problem
+	}
 	pending := map[string]records.RentalOperation{}
 	for _, operation := range operations {
 		if operation.ManagedRequestID == "" && operation.RentalID != "" &&
@@ -1106,29 +1373,34 @@ func (m *managedRentals) reconcileRowsLocked(origin string) *exit.Error {
 			pending[operation.RentalID] = operation
 		}
 	}
-	for _, row := range rows {
-		if m.origin(row.Hub) != origin {
+	busy, problem := m.inFlightLocked()
+	if problem != nil {
+		return nil, nil, problem
+	}
+	for _, view := range views {
+		current, problem := m.store.RentalRow(view.id)
+		if problem != nil {
+			return released, failed, problem
+		}
+		if current == nil || busy[view.id] {
 			continue
 		}
-		if row.State == hub.RentalReleased {
+		row, remote := *current, view.remote
+		if view.unknown {
+			census.hubUnknown[row.ID] = true
+			continue
+		}
+		if view.released {
+			// Released rows leave the fleet now; letGo forgets them.
 			m.forgetIdleLocked(row.ID)
-			if m.owner != nil {
-				m.owner.DetachRental(row.ID)
+			if row.State != hub.RentalReleased {
+				row.State = hub.RentalReleased
+				if problem := m.store.RecordRental(row); problem != nil {
+					return released, failed, problem
+				}
 			}
-			if _, problem := rental.Forget(m.layout, m.store, row.ID); problem != nil {
-				return problem
-			}
+			released = append(released, row.ID)
 			continue
-		}
-		hctx, cancel := hub.Context()
-		remote, observed := owner.Rental(hctx, row.ID)
-		cancel()
-		if observed != nil {
-			if observed.ErrName() == "rental.not_found" {
-				census.hubUnknown[row.ID] = true
-				continue
-			}
-			return observed
 		}
 		m.observeDiskLocked(row.ID, remote)
 		// Adopt the hub's reconciled billed rate (th-120): the burn this host
@@ -1136,22 +1408,12 @@ func (m *managedRentals) reconcileRowsLocked(origin string) *exit.Error {
 		if remote.HourlyRateUSDMicros > 0 {
 			row.HourlyRateUSDMicros = remote.HourlyRateUSDMicros
 		}
-		if remote.State == hub.RentalReleased {
-			m.forgetIdleLocked(row.ID)
-			if m.owner != nil {
-				m.owner.DetachRental(row.ID)
-			}
-			if _, problem := rental.Forget(m.layout, m.store, row.ID); problem != nil {
-				return problem
-			}
-			continue
-		}
 		if operation, unfinished := pending[row.ID]; unfinished && remote.Attachable() {
 			// A foreground acquisition may have completed or released this operation
 			// while the GET was in flight. Its newer durable state wins.
 			current, problem := m.store.RentalOperation(operation.Key)
 			if problem != nil {
-				return problem
+				return released, failed, problem
 			}
 			if current == nil || current.State == "attached" || current.State == hub.RentalReleased ||
 				current.State == hub.RentalFailed || current.State == hub.RentalReleaseRequested {
@@ -1159,10 +1421,10 @@ func (m *managedRentals) reconcileRowsLocked(origin string) *exit.Error {
 			}
 			token, creator, problem := rental.RetainedAcquisitionCredentials(m.layout, *current)
 			if problem != nil {
-				return problem
+				return released, failed, problem
 			}
 			if _, problem := finishRentalAttachment(m.layout, m.store, row, remote, operation.Key, token, creator); problem != nil {
-				return problem
+				return released, failed, problem
 			}
 			if m.owner != nil {
 				// This method starts the existing reconnect loop asynchronously. No
@@ -1178,7 +1440,7 @@ func (m *managedRentals) reconcileRowsLocked(origin string) *exit.Error {
 		row.State = remote.State
 		copyRentalFailure(&row, remote)
 		if problem := m.store.RecordRental(row); problem != nil {
-			return problem
+			return released, failed, problem
 		}
 		if remote.Attachable() && !wasAttachable {
 			// Reconcile changed the durable local rental to attachable. Wake
@@ -1186,34 +1448,36 @@ func (m *managedRentals) reconcileRowsLocked(origin string) *exit.Error {
 			// retries its existing execution without a second submission.
 			m.wakeQueueAsync()
 		}
-		m.detachLostRentalLocked(row)
+		if row.State == hub.RentalFailed {
+			failed = append(failed, row.ID)
+		}
 	}
-	return nil
+	return released, failed, nil
 }
 
-// recoverLostWorkLocked hands a terminally failed rental's pinned work back to routing.
+// letGo detaches the workers of rentals the hub has failed or released, and forgets the
+// released ones. It runs with the lock released: detaching waits for the worker to quiesce.
 //
-// This sweep is where the daemon LEARNS a rental died — it is the only place that reads
-// the hub's verdict for a rental that was already serving — and until now it recorded that
-// verdict and did nothing else. The requests pinned to the pod stayed pinned to it: never
-// routed, because they named a machine no worker would ever answer for, and never
-// released, because `RentalRunCounts` counted them and fenced the idle release. Meanwhile
-// the fleet bought a second pod for a later request, served it, and released it while the
-// stranded three still waited (observed live 2026-09-04, rental pr-183abac284d1e16f5f0a).
-//
-// detachLostRentalLocked drops the worker record of a rental the hub has failed, so no
-// replan can choose the corpse: `rentalHeld` reads live worker records and a stale one
-// would make `selectOrStart` decide the dead rental still holds the placement.
-//
-// Detaching is ALL that happens under the fleet lock. Handing the work back re-enters this
-// object through the capacity question and deadlocks the daemon under it (measured), and it
-// is the loop's request-side sweep that does it — a rental whose record is gone is observed
-// by nobody, so the work has to be found from the side that still has rows.
-func (m *managedRentals) detachLostRentalLocked(row records.Rental) {
-	if row.State != hub.RentalFailed || m.owner == nil {
-		return
+// This is where the daemon LEARNS a rental died — it is the only place that reads the
+// hub's verdict for a rental that was already serving. A failed rental's worker record is
+// dropped so no replan can choose the corpse: `rentalHeld` reads live worker records and a
+// stale one would make `selectOrStart` decide the dead rental still holds the placement.
+// Handing its pinned work back to routing is the loop's request-side sweep
+// (RecoverLostWork): a rental whose record is gone is observed by nobody, so the work has
+// to be found from the side that still has rows (observed live 2026-09-04, rental
+// pr-183abac284d1e16f5f0a).
+func (m *managedRentals) letGo(released, failed []string) *exit.Error {
+	if m.owner != nil {
+		for _, id := range append(failed, released...) {
+			m.owner.DetachRental(id)
+		}
 	}
-	m.owner.DetachRental(row.ID)
+	for _, id := range released {
+		if _, problem := rental.Forget(m.layout, m.store, id); problem != nil {
+			return problem
+		}
+	}
+	return nil
 }
 
 // lineLocked is one hub's fleet line: that account's machines and burn.

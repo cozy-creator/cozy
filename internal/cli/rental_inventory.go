@@ -15,32 +15,44 @@ import (
 
 // readRentalInventory is one hub's reconciled fleet, or with allHubs every hub's this
 // host holds rentals on. A listing of one hub still counts this host's live rentals
-// on the others, so switching hubs never hides a machine that is billing.
+// on the others, so switching hubs never hides a machine that is billing. The hubs are
+// asked before the fleet lock is taken, so a purchase or release in flight never holds
+// the listing.
 func readRentalInventory(st *records.Store, fleet *managedRentals, origin string, allHubs, reconcile bool) (api.RentalInventory, *exit.Error) {
+	origin = fleet.origin(origin)
+	origins := []string{origin}
+	if allHubs {
+		held, problem := fleet.origins()
+		if problem != nil {
+			return api.RentalInventory{}, problem
+		}
+		if !slices.Contains(held, origin) {
+			held = append(held, origin)
+		}
+		origins = held
+	}
+	asked := map[string]*exit.Error{}
+	if reconcile {
+		for _, each := range origins {
+			asked[each] = fleet.reconcile(each)
+		}
+	}
 	// Keep account totals and the corresponding unrecorded set on one observation.
 	fleet.mu.Lock()
 	defer fleet.mu.Unlock()
-	origin = fleet.origin(origin)
 	if !allHubs {
-		result, problem := fleet.inventoryLocked(st, origin, reconcile, false)
+		result, problem := fleet.inventoryLocked(st, origin, asked[origin], false)
 		if problem != nil {
 			return result, problem
 		}
 		result.OtherHubs, problem = otherHubRentals(st, fleet, origin)
 		return result.Current(), problem
 	}
-	origins, problem := fleet.originsLocked()
-	if problem != nil {
-		return api.RentalInventory{}, problem
-	}
-	if !slices.Contains(origins, origin) {
-		origins = append(origins, origin)
-	}
 	// One hub that cannot be read never hides another: its problem is named, its rows
 	// are this host's records marked unverified, and every other hub is listed as usual.
 	var merged api.RentalInventory
 	for _, each := range origins {
-		result, problem := fleet.inventoryLocked(st, each, reconcile, true)
+		result, problem := fleet.inventoryLocked(st, each, asked[each], true)
 		if problem != nil {
 			return merged, problem
 		}
@@ -82,17 +94,16 @@ func otherHubRentals(st *records.Store, fleet *managedRentals, origin string) ([
 	return out, nil
 }
 
-// inventoryLocked is one hub's fleet. isolated keeps any problem asking that hub in
-// HubUnanswered, with this host's records, so an every-hub read can continue past it.
-func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, reconcile, isolated bool) (api.RentalInventory, *exit.Error) {
+// inventoryLocked is one hub's fleet; asked is what reconciling it just now met, if it
+// was reconciled. isolated keeps any problem asking that hub in HubUnanswered, with this
+// host's records, so an every-hub read can continue past it.
+func (fleet *managedRentals) inventoryLocked(st *records.Store, origin string, asked *exit.Error, isolated bool) (api.RentalInventory, *exit.Error) {
 	var result api.RentalInventory
-	if reconcile {
-		if problem := fleet.reconcileLocked(origin); problem != nil && !hub.Unanswered(problem) {
-			if !isolated {
-				return result, problem
-			}
-			result.HubUnanswered = problem
+	if asked != nil && !hub.Unanswered(asked) {
+		if !isolated {
+			return result, asked
 		}
+		result.HubUnanswered = asked
 	}
 	// totalsLocked propagates a failed Hub census and refuses when the Hub has
 	// no listing route. A Hub that did not answer at all yields this host's own
