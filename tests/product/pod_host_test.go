@@ -35,6 +35,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -127,6 +128,10 @@ type fakePod struct {
 	// phase lane is proven on a stream that ADVANCES, not only on one that is wired.
 	downloadSamples int
 	prepareEvent    func(*pb.PrepareEvent)
+	// retainPrepared answers an identical call with the PREPARED event it already sent,
+	// as the pod host does (workerhost.Host.prepare): keyed by the exact call bytes.
+	retainPrepared bool
+	retained       map[string]*pb.PrepareEvent
 
 	mu                 sync.Mutex
 	acks               []*pb.SnapshotAck
@@ -685,9 +690,17 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 				SafeCode: "runtime_preparation_failed", SafeDetail: "package_prepare_model_selection_mismatch: package"})
 		}
 	}
+	key, err := proto.MarshalOptions{Deterministic: true}.Marshal(call)
+	if err != nil {
+		return err
+	}
 	p.mu.Lock()
 	refusal := p.refusePrepare[name]
+	answer := p.retained[string(key)]
 	p.mu.Unlock()
+	if answer != nil {
+		return stream.Send(answer)
+	}
 	if refusal != "" {
 		for _, event := range []*pb.PrepareEvent{
 			{Stage: pb.PrepareStage_PREPARE_STAGE_RESOLVED, TotalBytes: total},
@@ -736,6 +749,14 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 		// A Runtime that owns executions names the installation it prepared beside the set.
 		events[len(events)-1].InstalledPackage = &pb.InstalledPackage{InstallationId: placement.InstallationId,
 			Package: name, Release: release, PackageInterface: placement.PackageInterface}
+	}
+	if p.retainPrepared {
+		p.mu.Lock()
+		if p.retained == nil {
+			p.retained = map[string]*pb.PrepareEvent{}
+		}
+		p.retained[string(key)] = events[len(events)-1]
+		p.mu.Unlock()
 	}
 	for i, event := range events {
 		if p.prepareEvent != nil {

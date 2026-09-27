@@ -215,12 +215,15 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 func preparingStage(payload map[string]any) reportStage {
 	stage, _ := payload["stage"].(string)
 	name := map[string]string{"resolved": "resolve", "downloading": "download",
-		"preparing": "package environment"}[stage]
+		"preparing": "package environment", "connect": "machine connection",
+		"package_preparation": "package preparation", "model_defaults": "model defaults",
+		"inputs": "input staging", "submit": "submission"}[stage]
 	if name == "" {
 		name = stage
 	}
+	detail, _ := payload["detail"].(string)
 	row := reportStage{Name: name, Kind: "setup", StartUnixMS: payloadInt(payload["started_unix_ms"]),
-		MS: float64(payloadInt(payload["ms"]))}
+		MS: float64(payloadInt(payload["ms"])), Detail: detail}
 	if moved := payloadInt(payload["transferred_bytes"]); moved > 0 && stage == "downloading" {
 		row.Bytes = moved
 		row.Detail = units.Bytes(moved)

@@ -111,11 +111,12 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		event, problem := readMachinePreparationEvent(stream, m.preparationPhase(request.ID))
+		observed := m.preparationPhase(request.ID, request.Package+"@"+request.Release)
+		event, problem := readMachinePreparationEvent(stream, observed.observe)
 		if problem != nil {
 			return nil, problem
 		}
-		return &publishedPreparation{DesiredPlacementSet: event.PlacementSet, InstalledPackage: event.InstalledPackage, LockedRequirements: facts.LockedRequirements}, nil
+		return &publishedPreparation{DesiredPlacementSet: event.PlacementSet, InstalledPackage: event.InstalledPackage, LockedRequirements: facts.LockedRequirements, Retained: observed.retained}, nil
 	}
 
 	result.retainModel = func(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {
@@ -175,7 +176,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return machineTransport(err)
 		}
-		event, problem := readMachinePreparationEvent(stream, m.preparationPhase(request))
+		event, problem := readMachinePreparationEvent(stream, m.preparationPhase(request, revision.Package).observe)
 		if problem != nil {
 			return problem
 		}
@@ -208,7 +209,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		if err != nil {
 			return nil, machineTransport(err)
 		}
-		return readMachinePreparedSet(stream, m.preparationPhase(request.ID))
+		return readMachinePreparedSet(stream, m.preparationPhase(request.ID, revision.Package).observe)
 	}
 
 	transferred = true
@@ -216,9 +217,34 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 }
 
 // preparationPhase shows a rented run what its machine's preparation is doing: resolving,
-// downloading its models, installing its package.
-func (m *machineRuns) preparationPhase(request string) func(*pb.PrepareEvent) {
-	return func(event *pb.PrepareEvent) { m.fleet.owner.ObservePrepareEvent(request, "", "", event) }
+// downloading its models, installing its package. Each ended stage stays on the run.
+func (m *machineRuns) preparationPhase(request, label string) *machinePreparation {
+	return &machinePreparation{machines: m, request: request, label: label}
+}
+
+type machinePreparation struct {
+	machines       *machineRuns
+	request, label string
+	stage          pb.PrepareStage
+	began          time.Time
+	last           *pb.PrepareEvent
+	// retained: the Host answered with the preparation it already holds for these exact
+	// inputs, its only event PREPARED.
+	retained bool
+}
+
+func (p *machinePreparation) observe(event *pb.PrepareEvent) {
+	p.machines.fleet.owner.ObservePrepareEvent(p.request, "", "", event)
+	if event.Stage == p.stage {
+		p.last = event
+		return
+	}
+	if payload := orchestrator.PrepareStagePayload(p.label, p.stage, p.began, p.last); payload != nil {
+		payload["detail"] = p.label
+		_ = p.machines.store.AppendEvent(p.request, "request.preparing", 0, payload)
+	}
+	p.retained = p.stage == pb.PrepareStage_PREPARE_STAGE_UNSPECIFIED && event.Stage == pb.PrepareStage_PREPARE_STAGE_PREPARED
+	p.stage, p.began, p.last = event.Stage, time.Now(), event
 }
 
 func machinePackageOperation(request string, revision localpackage.Installation) string {

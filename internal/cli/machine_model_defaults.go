@@ -19,25 +19,34 @@ import (
 
 // Default selection is an intake fact. No tensor payload is acquired here, and
 // unavailable defaults leave both unused imports and explicit overrides usable.
-func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCapture, request records.Request, publicOrigin string) (localpackage.ExecutionCapture, *exit.Error) {
+// The detail it returns names what was captured and probed, for the run's evidence.
+func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCapture, request records.Request, publicOrigin string) (localpackage.ExecutionCapture, string, *exit.Error) {
 	document := &pb.MachineExecutionCapture{}
 	if err := canonical.Unmarshal(capture.Canonical, document); err != nil {
-		return capture, exit.New(exit.Conflict, "captured model defaults have no exact code inventory")
+		return capture, "", exit.New(exit.Conflict, "captured model defaults have no exact code inventory")
 	}
 	reads := modelDefaultReads{}
 	for _, installation := range capture.Installations {
 		iface, problem := launch.DecodePackageInterface(installation.PackageInterface)
 		if problem != nil {
-			return capture, problem
+			return capture, "", problem
 		}
 		r.captureDefaultRows(document, installation.Package, installation.ID, iface, request, publicOrigin, reads)
 	}
 	var err error
 	capture.Canonical, capture.Digest, err = canonical.Identity(document)
 	if err != nil || len(capture.Canonical) > 1<<20 {
-		return capture, exit.New(exit.Validation, "captured Model defaults exceed the machine capture bound")
+		return capture, "", exit.New(exit.Validation, "captured Model defaults exceed the machine capture bound")
 	}
-	return capture, nil
+	return capture, modelDefaultsDetail(capturedRungs(document), len(reads)), nil
+}
+
+func capturedRungs(capture *pb.MachineExecutionCapture) int {
+	rungs := 0
+	for _, row := range capture.ModelDefaults {
+		rungs += len(row.Rungs)
+	}
+	return rungs
 }
 
 // modelDefaultReads holds one capture's public read probes. A manifest is content-addressed,

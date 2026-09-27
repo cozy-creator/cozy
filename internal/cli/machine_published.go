@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -22,10 +24,12 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 	if connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
 		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires the current installed-package protocol")
 	}
+	began := time.Now()
 	prepared, problem := connection.preparePublished(ctx, request)
 	if problem != nil {
 		return nil, problem
 	}
+	m.submissionStage(request.ID, "package_preparation", preparedDetail(request.Package, request.Release, prepared), began)
 	installed := prepared.InstalledPackage
 	if installed == nil || installed.InstallationId == "" || installed.Package != request.Package || installed.Release != request.Release {
 		return nil, exit.New(exit.Conflict, "published preparation returned another installed package")
@@ -69,9 +73,13 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 	if err != nil {
 		return nil, exit.Internalf("cannot encode published execution capture: %s", err)
 	}
+	began = time.Now()
 	byteInputs, problem := m.stageMachineInputs(ctx, request, connection)
 	if problem != nil {
 		return nil, problem
+	}
+	if len(byteInputs) > 0 {
+		m.submissionStage(request.ID, "inputs", fmt.Sprintf("%d input(s)", len(byteInputs)), began)
 	}
 	frozen := localpackage.ExecutionCapture{Canonical: raw, Digest: digest}
 	if !request.IsJob() {

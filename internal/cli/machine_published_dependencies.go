@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -80,10 +81,12 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 				sub := request
 				// The callee's own model selections ride its own preparation.
 				sub.Package, sub.Release, sub.InstallID = dependency.Package, dependency.Version, ""
+				began := time.Now()
 				prepared, problem := connection.preparePublished(ctx, sub)
 				if problem != nil {
 					return problem
 				}
+				m.submissionStage(request.ID, "package_preparation", preparedDetail(sub.Package, sub.Release, prepared), began)
 				installed := prepared.InstalledPackage
 				if installed == nil || installed.InstallationId == "" || installed.Package != dependency.Package || installed.Release != dependency.Version {
 					return exit.New(exit.Conflict, "published child preparation returned another installation")
@@ -117,10 +120,11 @@ func (m *machineRuns) capturePublishedDependencies(ctx context.Context, request 
 	if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
 		// Every installation's defaults, the root's included, are recorded once the entire
 		// binding inventory exists, probing each exact checkpoint once for the capture.
-		reads := modelDefaultReads{}
+		began, reads := time.Now(), modelDefaultReads{}
 		for key, node := range nodes {
 			m.resolver.captureDefaultRows(capture, strings.SplitN(key, "@", 2)[0], node.installationID, node.iface, request, connection.publicOrigin, reads)
 		}
+		m.submissionStage(request.ID, "model_defaults", modelDefaultsDetail(capturedRungs(capture), len(reads)), began)
 	}
 	return nil
 }
