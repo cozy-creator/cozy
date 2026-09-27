@@ -380,8 +380,16 @@ func (c *Orchestrator) convergePrepared(s *session, w *worker, seq, rev uint64, 
 	// authored over the SAME rule as a locally prepared set, or a wide pod would take a
 	// placement with no pin and refuse `device_group_unsupported` after the hour started.
 	models := w.spec.Placement.Models
-	if w.preparingRequest != "" {
-		request, err := c.opt.Store.RequestRow(w.preparingRequest)
+	owner := w.preparingRequest
+	if owner == "" && w.spec.Connection != nil {
+		// Published serving adds to the rental's set without claiming the machine; the
+		// request whose desire this preparation answers still authors its GPU group.
+		c.mu.Lock()
+		owner = c.desiring[w.spec.Connection.RentalID]
+		c.mu.Unlock()
+	}
+	if owner != "" {
+		request, err := c.opt.Store.RequestRow(owner)
 		if err != nil {
 			c.setDesiredRefusal(w, seq, err)
 			return
