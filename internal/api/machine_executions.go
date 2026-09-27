@@ -73,6 +73,14 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MediaID: output.MediaID, URL: "/v1/media/" + output.MediaID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
 		}
 	}
+	if row.ModelTransfer != nil {
+		if transfer, problem := s.store.ModelTransferOf(row.ID); problem == nil && transfer != nil {
+			state.ModelDestination, state.ModelOutputs = transfer.Destination, transfer.Checkpoints
+			if transfer.State == "failed" {
+				state.ErrorType, state.Error = transfer.ErrorCode, transfer.SafeError
+			}
+		}
+	}
 	if !view.Accepted {
 		if state.Status == "queued" {
 			state.Stage = "waiting for durable machine acceptance"

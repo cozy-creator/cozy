@@ -988,7 +988,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 					}
 				}
 			}
-			if row.State == "failed" || transfer.State == "failed" {
+			if row.State == "failed" {
 				state.ErrorType, state.Error = transfer.ErrorCode, transfer.SafeError
 			}
 			// READ ONCE, WHATEVER THE STATE. The rows used to be read only while

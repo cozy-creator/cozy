@@ -87,7 +87,7 @@ func (c *machineClientConnection) Close() error {
 
 // machineDestinationRuntimeFloor is the first Runtime that publishes a job root's weights
 // outputs to its destination; an older one silently ignores the destination.
-const machineDestinationRuntimeFloor = "0.18.48"
+const machineDestinationRuntimeFloor = "0.18.51"
 
 // machineRuns is a client transport and observer. Stopping it closes connections
 // and upload/observation work; it never sends an execution cancellation.

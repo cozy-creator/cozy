@@ -24,6 +24,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -54,7 +56,8 @@ func (m *conversionMachine) SubmitMachineExecution(_ context.Context, submit *pb
 	id := submit.Offer.RequestId
 	accepted := &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: submit.SubmissionId, CaptureDigest: submit.CaptureDigest,
 		InvocationSpecDigest: submit.Offer.InvocationSpecDigest, AcceptedAtMs: uint64(time.Now().UnixMilli()),
-		WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}
+		WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace",
+		PublicationAuthorizationId: submit.PublicationAuthorizationId}
 	if m.states[id] != nil {
 		return accepted, nil
 	}
@@ -193,7 +196,7 @@ func conversionRental(row *map[string]any, grants *[]map[string]any, mu *sync.Mu
 		detail.Release.PackageInterfaceDigest = assessmentDigest(iface)
 		detail.Release.PackageInterfaceLength = int64(len(iface))
 		inventory := map[string]any{"format": "tensorhub.image_inventory/1", "profile": "python3.12-cpu-linux-x86", "python": "3.12.12",
-			"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.48"}}}
+			"distributions": []map[string]string{{"name": runtimeDistribution, "version": "0.18.51"}}}
 		mux.HandleFunc("GET /v1/rentals/{id}", func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -280,12 +283,12 @@ func newConversionFixture(t *testing.T) *conversionFixture {
 	cert, err := os.ReadFile(certPath)
 	must(t, err)
 	f.mu.Lock()
-	row = map[string]any{"rental_id": podRental, "name": "tessa", "state": "ready", "requested_accelerator_model": "CPU",
+	row = map[string]any{"rental_id": podRental, "name": "tessa", "state": "ready", "requested_accelerator_model": "fake-4090",
 		"accelerator_count": 1, "hourly_rate_usd_micros": 1, "worker_address": connection.Addr, "media_address": connection.Media.Addr,
 		"worker_id": podWorkerID, "worker_boot_id": podBootID, "cert_pem": string(cert)}
 	f.mu.Unlock()
 	fatal(t, rental.Attach(f.layout, f.store, records.Rental{ID: podRental, MachineName: "tessa", SKU: "cpu", State: "ready",
-		AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: origin,
+		AcceleratorModel: "fake-4090", AcceleratorCount: 1, HourlyRateUSDMicros: 1, Hub: origin,
 		Address: connection.Addr, MediaAddress: connection.Media.Addr,
 		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
 	return f
@@ -306,9 +309,6 @@ func (f *conversionFixture) published(t *testing.T, out string) *records.Request
 		ModelOutputs map[string]string `json:"model_outputs"`
 	}
 	must(t, json.Unmarshal([]byte(out), &state))
-	if state.ModelOutputs["fp8"] != childDigest("c") {
-		t.Fatalf("the run does not report the published checkpoint: %s", out)
-	}
 	submissions := f.machine.submitted()
 	if len(submissions) != 1 {
 		t.Fatalf("the conversion was submitted %d times", len(submissions))
@@ -347,6 +347,9 @@ func (f *conversionFixture) published(t *testing.T, out string) *records.Request
 	if !strings.HasPrefix(request.IdemKey, "conversion-") || transfer == nil || transfer.State != "completed" ||
 		transfer.Checkpoints["fp8"] != childDigest("c") || strings.Join(repositories, ",") != "proof/output" {
 		t.Fatalf("the conversion record is not a keyed, settled destination: %+v %+v %v", request, transfer, repositories)
+	}
+	if state.ModelOutputs["fp8"] != childDigest("c") {
+		t.Fatalf("the run does not report the published checkpoint: %s", out)
 	}
 	return request
 }
@@ -388,7 +391,7 @@ func TestRentedConversionPublishesFromTheMachineThatIngestedItsSource(t *testing
 	machine.mu.Unlock()
 	code, out = runCozy(t, root, "run", "proof/quantize/quantize", "proof/source@1.0.0/bf16", "proof/output", "steps=8",
 		"model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
-	if code == 0 || !strings.Contains(out, "publication.destination_unpublished") || !strings.Contains(out, "0.18.48") {
+	if code == 0 || !strings.Contains(out, "publication.destination_unpublished") || !strings.Contains(out, "0.18.51") {
 		t.Fatalf("an unpublished destination was reported as a success [exit %d]: %s", code, out)
 	}
 	// After the Runtime update the same command runs again rather than replaying that run.
@@ -461,6 +464,39 @@ app.job(quantize, weights=(WeightsOutput("fp8", max_new_bytes=1 << 20),))
 func TestRentedConversionOfAnUnpublishedPackagePublishesFromTheMachine(t *testing.T) {
 	f := newConversionFixture(t)
 	surface := installConversionPackage(t, f.layout, f.store)
+	// The pod receives the captured wheels and source archive as it does any private code.
+	f.pod.localUpload = func(stream grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error {
+		frame, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		header := frame.GetHeader()
+		if header == nil || header.File == nil {
+			return status.Error(codes.InvalidArgument, "header required")
+		}
+		if err := f.pod.verifyClaim(header.Claim, false); err != nil {
+			return err
+		}
+		state := &pb.LocalPackageFileStatus{OperationId: header.OperationId, Digest: header.File.Digest, Filename: header.File.Filename,
+			Length: header.File.Length, State: pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_RECEIVING}
+		if err := stream.Send(state); err != nil {
+			return err
+		}
+		for state.ReceivedBytes < header.File.Length {
+			frame, err := stream.Recv()
+			if err != nil {
+				return err
+			}
+			state.ReceivedBytes += uint64(len(frame.GetChunk().GetData()))
+			if state.ReceivedBytes == header.File.Length {
+				state.State = pb.LocalPackageFileState_LOCAL_PACKAGE_FILE_STATE_VERIFIED
+			}
+			if err := stream.Send(state); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	f.pod.localPrepare = func(call *pb.PrepareLocalPackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
 		if err := f.pod.verifyClaim(call.Claim, false); err != nil {
 			return err
