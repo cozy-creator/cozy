@@ -111,17 +111,6 @@ async def main(ctx):
 	if len(bindings) != 0 {
 		t.Fatal("unrelated script eagerly prepared a numerical operation")
 	}
-	assertBaseUnchanged := func() {
-		t.Helper()
-		if _, err := os.Stat(filepath.Join(control, "lib", "python3.12", "site-packages", "numpy")); !os.IsNotExist(err) {
-			t.Fatal("operation preparation changed the NumPy-free base SDK")
-		}
-	}
-	assertBaseUnchanged()
-	builtinRoot := filepath.Join(root, "runtime", "environments", "runtime-builtins")
-	if _, err := os.Stat(filepath.Join(builtinRoot, "numerical")); !os.IsNotExist(err) {
-		t.Fatal("unrelated script eagerly prepared a numerical Runtime environment")
-	}
 	var first []machineChildProof
 	for i := range 2 {
 		script := filepath.Join(project, fmt.Sprintf("caller%d.py", i))
@@ -180,25 +169,37 @@ async def main(ctx):
 		}
 	}
 
-	assertBaseUnchanged()
-	// Runtime owns the on-demand numerical environment, while the caller SDK
-	// remains NumPy-free. Inspect its installed carrier metadata independently.
-	interpreters, err := filepath.Glob(filepath.Join(builtinRoot, "numerical", "contents", "*", "bin", "python"))
+	// Runtime prepares its builtin operations once, in its own interpreter: NumPy is a core
+	// Runtime dependency, so the operations need no separate numerical environment.
+	descriptors, err := filepath.Glob(filepath.Join(root, "runtime", "environments", "installations", "*", "installation.json"))
 	must(t, err)
-	if len(interpreters) != 1 {
-		t.Fatalf("expected one Runtime numerical environment, got %v", interpreters)
+	interpreter := ""
+	for _, descriptor := range descriptors {
+		raw, err := os.ReadFile(descriptor)
+		must(t, err)
+		var installation struct {
+			Package string `json:"package"`
+			Python  string `json:"python"`
+		}
+		must(t, json.Unmarshal(raw, &installation))
+		if installation.Package == "runtime/operations" {
+			interpreter = installation.Python
+		}
 	}
-	out, err := exec.Command(interpreters[0], "-I", "-c", `import importlib.metadata as m
+	if interpreter != filepath.Join(control, "bin", "python") {
+		t.Fatalf("builtin operations were not prepared in the Runtime's interpreter %s: %q (of %v)",
+			filepath.Join(control, "bin", "python"), interpreter, descriptors)
+	}
+	out, err := exec.Command(interpreter, "-I", "-c", `import importlib.metadata as m, sys
 import numpy
 from cozy_runtime.derive.operations import app
 from cozy_runtime.author import describe
 assert describe(app)
-requirements = m.requires("cozy-runtime-operations")
-assert [item for item in requirements if item.startswith("numpy")] == ["numpy>=1.26"], requirements
+assert [item for item in m.requires(sys.argv[1]) if item.startswith("numpy")], m.requires(sys.argv[1])
 print("numpy==" + m.version("numpy"))
-`).CombinedOutput()
+`, hostruntime.Distribution).CombinedOutput()
 	t.Logf("Runtime numerical callee: %s", out)
 	if err != nil || !strings.Contains(string(out), "numpy==") {
-		t.Fatalf("Runtime quantizer lost its numerical dependency or authored range: %v\n%s", err, out)
+		t.Fatalf("Runtime quantizer lost its numerical dependency: %v\n%s", err, out)
 	}
 }

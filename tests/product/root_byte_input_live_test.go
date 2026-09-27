@@ -59,10 +59,8 @@ func TestOrdinaryScriptNativeRootBytesSurviveOriginalEditAndClientExit(t *testin
 	if request == nil {
 		t.Fatal("CLI omitted root request")
 	}
-	link, problem := store.MachineExecution(request.ID)
-	fatal(t, problem)
-	if link == nil || len(link.Receipt) == 0 || link.Collected {
-		t.Fatalf("root input has no live durable receipt: %s", out)
+	if link := awaitMachineReceipt(t, store, request.ID); link.Collected {
+		t.Fatalf("root input's execution was collected before the client left: %s", out)
 	}
 	inputs, problem := store.MachineInputs(request.ID)
 	fatal(t, problem)

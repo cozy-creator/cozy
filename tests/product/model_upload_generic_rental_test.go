@@ -19,6 +19,7 @@ import (
 // names them, and several profiles of one source compose one model. The stand-in hub serves
 // nothing, so a source that passes the preflight goes on to submission and nothing is rented.
 func TestRentedIngestNeedsNoRecipe(t *testing.T) {
+	fullRun(t, "plans ingests against live HuggingFace and Civitai")
 	probe := &http.Client{Timeout: 10 * time.Second}
 	for _, url := range []string{"https://huggingface.co/api/models/alibaba-pai/MiniMax-H3-Acc-LoRAs",
 		"https://civitai.com/api/v1/model-versions/128078"} {

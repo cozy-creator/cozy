@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import argparse
-import io
+import hashlib
+import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
-import tarfile
 import tempfile
-
-import tomllib
+import urllib.request
+import zipfile
 
 FIXTURE = pathlib.Path(__file__).with_name("weightless")
 
@@ -22,54 +23,69 @@ def run(
     subprocess.run(args, cwd=cwd, env=env, check=True)
 
 
+def released_wheel(version: str, into: pathlib.Path) -> pathlib.Path:
+    """Download the released pure wheel of cozy-runtime `version`, checked against PyPI's digest."""
+    with urllib.request.urlopen(f"https://pypi.org/pypi/cozy-runtime/{version}/json") as reply:
+        urls = json.load(reply)["urls"]
+    wheels = [u for u in urls if u["filename"].endswith("py3-none-any.whl")]
+    if len(wheels) != 1:
+        raise RuntimeError(f"cozy-runtime {version} has {len(wheels)} pure wheels on PyPI")
+    with urllib.request.urlopen(wheels[0]["url"]) as reply:
+        raw = reply.read()
+    if hashlib.sha256(raw).hexdigest() != wheels[0]["digests"]["sha256"]:
+        raise RuntimeError(f"{wheels[0]['filename']} does not match PyPI's sha256")
+    path = into / wheels[0]["filename"]
+    path.write_bytes(raw)
+    return path
+
+
+def embedded_commit(wheel: pathlib.Path) -> str:
+    with zipfile.ZipFile(wheel) as archive:
+        text = archive.read("cozy_runtime/_build_provenance.py").decode()
+    found = re.search(r'COMMIT = "([0-9a-f]{40})"', text)
+    if found is None:
+        raise RuntimeError(f"{wheel.name} embeds no source commit")
+    return found.group(1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--runtime-wheel", help="exact Runtime wheel to vendor")
+    source.add_argument("--runtime-version", help="released Runtime version to fetch from PyPI")
     parser.add_argument(
-        "--runtime-repo", default=os.getenv("RUNTIME_REPO", "~/cozy_v2/cozy-runtime")
+        "--expect-commit", required=True,
+        help="the host cozy-runtime's commit; the vendored wheel must embed it",
     )
-    parser.add_argument("--runtime-sha", default=os.getenv("RUNTIME_SHA", "HEAD"))
     parser.add_argument("--out", required=True)
     parser.add_argument("--source-out")
     parser.add_argument("--tensorfs-wheel", default="")
     parser.add_argument("--version", default="1.0.0")
     args = parser.parse_args()
 
-    runtime_repo = pathlib.Path(args.runtime_repo).expanduser().resolve()
     out = pathlib.Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    full_sha = subprocess.check_output(
-        ["git", "-C", str(runtime_repo), "rev-parse", args.runtime_sha], text=True
-    ).strip()
 
     with tempfile.TemporaryDirectory(prefix="weightless-", dir=out) as scratch:
         work = pathlib.Path(scratch)
-        runtime = work / "runtime"
         tree = work / "tree"
         vendor = tree / "vendor"
-        runtime.mkdir()
         vendor.mkdir(parents=True)
 
-        archived = subprocess.check_output(
-            ["git", "-C", str(runtime_repo), "archive", full_sha]
-        )
-        with tarfile.open(fileobj=io.BytesIO(archived)) as source:
-            source.extractall(runtime)
-
-        run(
-            "uv",
-            "build",
-            "--wheel",
-            "--project",
-            str(runtime),
-            "--out-dir",
-            str(vendor),
-        )
-        runtime_version = tomllib.loads((runtime / "pyproject.toml").read_text())[
-            "project"
-        ]["version"]
-        wheels = list(vendor.glob("cozy_runtime-*.whl"))
-        if len(wheels) != 1:
-            raise RuntimeError(f"expected one cozy-runtime wheel, found {len(wheels)}")
+        if args.runtime_wheel:
+            wheel = vendor / pathlib.Path(args.runtime_wheel).name
+            shutil.copy2(pathlib.Path(args.runtime_wheel).resolve(), wheel)
+        else:
+            wheel = released_wheel(args.runtime_version, vendor)
+        # The package runs the Runtime the host runs, never a neighbour of it.
+        full_sha = embedded_commit(wheel)
+        if not full_sha.startswith(args.expect_commit):
+            raise RuntimeError(
+                f"{wheel.name} embeds {full_sha} and the host cozy-runtime is {args.expect_commit}; "
+                "pass -script-runtime-wheel with the wheel the host Runtime was installed from"
+            )
+        runtime_version = wheel.name.split("-")[1]
+        wheels = [wheel]
         native = pathlib.Path(args.tensorfs_wheel).resolve() if args.tensorfs_wheel else None
         if native is not None:
             shutil.copy2(native, vendor / native.name)
@@ -129,7 +145,7 @@ def main() -> int:
                 ignore=shutil.ignore_patterns(".venv", "__pycache__", "dist"),
             )
         print(f"source:   {source_out if args.source_out else tree}")
-        print(f"runtime: {full_sha} (git archive, read-only)")
+        print(f"runtime: {full_sha} ({wheel.name})")
     return 0
 
 

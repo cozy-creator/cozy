@@ -68,8 +68,9 @@ func TestImagePreparationDescriptorAppliesOnlyExactDecodedPolicies(t *testing.T)
 }
 
 func TestImagePreparationActualCLI(t *testing.T) {
-	if *assetsRuntimeWheel == "" {
-		t.Skip("supply -assets-runtime-wheel for the actual image preparation product proof")
+	integration(t)
+	if *privateScriptRuntimeWheel == "" {
+		t.Skip("supply -script-runtime-wheel for the actual image preparation product proof")
 	}
 	root, err := os.MkdirTemp("", "cozy-image-preparation-")
 	must(t, err)
@@ -77,7 +78,7 @@ func TestImagePreparationActualCLI(t *testing.T) {
 	prefix := filepath.Join(t.TempDir(), "host-runtime")
 	for _, command := range [][]string{
 		{"uv", "venv", "--python", "3.12", prefix},
-		{"uv", "pip", "install", "--python", filepath.Join(prefix, "bin", "python"), *assetsRuntimeWheel + "[media]"},
+		{"uv", "pip", "install", "--python", filepath.Join(prefix, "bin", "python"), *privateScriptRuntimeWheel + "[media]"},
 	} {
 		if out, err := exec.Command(command[0], command[1:]...).CombinedOutput(); err != nil {
 			t.Fatalf("qualified helper prefix: %v %s", err, out)
@@ -111,7 +112,7 @@ def inspect(payload: Request, assets: Pictures) -> Result:
     info = assets.info("reference")
     return Result(assets[0].width, assets[0].height, info.media_type, info.size_bytes)
 `), 0600))
-	version := runtimeFixtureVersion(t, *assetsRuntimeWheel)
+	version := runtimeFixtureVersion(t, *privateScriptRuntimeWheel)
 	metadata := `[project]
 name = "prepared-input"
 version = "1.0.0"
@@ -125,7 +126,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include = ["prepared_input.py"]
 [tool.uv.sources]
-cozy-runtime = {path = ` + strconv.Quote(*assetsRuntimeWheel) + `}
+cozy-runtime = {path = ` + strconv.Quote(*privateScriptRuntimeWheel) + `}
 `
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0600))
 	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject = \"prepared_input:app\"\n"), 0600))

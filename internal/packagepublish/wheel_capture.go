@@ -41,7 +41,7 @@ func CaptureWheelDependencies(ctx context.Context, tree, project, installed, sta
 	// Only source projects in a selected callable closure need local wheel
 	// capture. Other editable packages may be installed in the parent for its
 	// own execution and should not trigger another source build here.
-	existing, _, _, problem := collectLocalDependenciesForClosure(ctx, tree, metadata, stage, wanted, targetPython...)
+	existing, _, problem := collectLocalDependenciesForClosure(ctx, tree, metadata, stage, wanted, targetPython...)
 	if problem != nil {
 		return nil, problem
 	}

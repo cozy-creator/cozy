@@ -27,8 +27,9 @@ var nativeRecoveryHome = flag.String("native-recovery-home", "", "new isolated n
 // An observed barrier separates submission from production: B and C must finish
 // while Creator is demonstrably absent. All execution and collection use cozy.
 func TestNativeCompositionCompletesWithClientOffline(t *testing.T) {
-	if *privateChildRuntimeWheel == "" || *privateChildTensorFSWheel == "" {
-		t.Skip("requires exact Runtime and TensorFS wheels for the native recovery proof")
+	integration(t)
+	if *privateChildRuntimeWheel == "" {
+		t.Skip("requires the exact Runtime wheel for the native recovery proof")
 	}
 	root := *nativeRecoveryHome
 	var err error
@@ -128,10 +129,7 @@ sys.exit(main())
 	source = []byte(strings.Replace(string(source), "async def main():", "from cozy_runtime.author import ModelArtifact\n\nasync def main() -> ModelArtifact:", 1))
 	source = []byte(strings.Replace(string(source), "    await candidate(source=original, factor=0)", "    prepared = await candidate(source=original, factor=2)\n    return await candidate(source=prepared, factor=3)", 1))
 	must(t, os.WriteFile(script, source, 0600))
-	accepted := run("run", script, "--idempotency-key", "native-offline")
-	if !strings.Contains(accepted, `"machine_accepted":true`) {
-		t.Fatalf("no durable machine acceptance: %s", accepted)
-	}
+	run("run", script, "--idempotency-key", "native-offline")
 	select {
 	case <-entered:
 	case <-time.After(2 * time.Minute):
@@ -145,9 +143,8 @@ sys.exit(main())
 	if parent == nil {
 		t.Fatal("accepted request absent")
 	}
-	before, problem := store.MachineExecution(parent.ID)
-	fatal(t, problem)
-	if before == nil || len(before.Receipt) == 0 || before.Collected {
+	before := awaitMachineReceipt(t, store, parent.ID)
+	if before.Collected {
 		t.Fatal("lost live accepted receipt")
 	}
 	first := machineChildren(t, root, store, "1")

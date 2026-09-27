@@ -22,9 +22,8 @@ func TestAdmissionRequiresNativeIngestionRuntimeAndAcceptsSourceDevWheel(t *test
 		version  string
 		admitted bool
 	}{
-		{"0.18.0", false}, {"0.18.14", false}, {"0.18.20", false}, {"0.18.21rc1", false},
-		{"0.18.21", false}, {"0.18.22", false}, {"0.18.23", false},
-		{"0.18.24rc1", false}, {"0.18.24", true}, {"0.18.24+dev.h687ee141", true}, {"0.18.25", true},
+		{"0.18.0", false}, {"0.18.24", false}, {"0.18.32", false}, {"0.18.39", false},
+		{"0.18.41rc1", false}, {"0.18.41", true}, {"0.18.41+dev.h687ee141", true}, {"0.18.42", true},
 	} {
 		t.Run(test.version, func(t *testing.T) {
 			tool := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow stand-in Runtime command for host admission
@@ -40,7 +39,7 @@ func TestAdmissionRequiresNativeIngestionRuntimeAndAcceptsSourceDevWheel(t *test
 				}
 				return
 			}
-			if problem == nil || problem.Name != "host_runtime_below_floor" || !strings.Contains(problem.Error(), "native model ingestion") || !strings.Contains(problem.Remedy, "cozy-runtime[media,model-execution]>=0.18.24") {
+			if problem == nil || problem.Name != "host_runtime_below_floor" || !strings.Contains(problem.Error(), "native model ingestion") || !strings.Contains(problem.Remedy, "cozy-runtime[media,model-execution]>="+hostruntime.ToolFloor) {
 				t.Fatalf("missing early upgrade refusal: %+v", problem)
 			}
 		})

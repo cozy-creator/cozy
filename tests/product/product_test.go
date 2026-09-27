@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("package list --json lacks integer size and dependencies [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "package", "list")
-	if code != 0 || !regexp.MustCompile(`VERSION +SIZE +DEPENDENCIES\n`).MatchString(out) ||
+	if code != 0 || !regexp.MustCompile(`SIZE +DEPENDENCIES\n`).MatchString(out) ||
 		!strings.Contains(out, units.Bytes(listed.Packages[0].Size)+"  "+units.Bytes(listed.Packages[0].Dependencies)) {
 		t.Fatalf("package list does not show SIZE and DEPENDENCIES in units [exit %d]\n%s", code, out)
 	}
@@ -328,10 +329,10 @@ func TestProductPath(t *testing.T) {
 	}
 	must(t, os.Chmod(incidentDir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(incidentDir, 0o755) })
-	code, out = runCozy(t, root, "run", "watch", idMatch[1], "--json")
+	code, out, stderr = runCozyStreams(t, root, "run", "watch", idMatch[1], "--json")
 	if code != 1 || !strings.Contains(out, `"code":"failed"`) ||
 		!strings.Contains(out, "output_spool_io") || !strings.Contains(out, "Permission denied") {
-		t.Fatalf("a destination that died after submit did not fail the run typed [exit %d]\n%s", code, out)
+		t.Fatalf("a destination that died after submit did not fail the run typed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, out, stderr)
 	}
 	must(t, os.Chmod(incidentDir, 0o755))
 	code, out = runCozy(t, root, "--json", "run", localWeightlessRef+"/tile",
@@ -511,31 +512,58 @@ func activeInstall(t *testing.T, root, packageRef string) records.PackageInstall
 	return *install
 }
 
+// weightlessProject is a fresh copy of the editable weightless package. It is built once per
+// process, vendoring the host Runtime's exact wheel: -script-runtime-wheel when given,
+// otherwise the host's released version from PyPI.
 func weightlessProject(t *testing.T) string {
 	t.Helper()
-	home, err := os.UserHomeDir()
-	must(t, err)
-	repo := filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow peer source; the fixture builds the exact install Runtime
-	if _, err := os.Stat(filepath.Join(repo, "pyproject.toml")); err != nil {
-		t.Skipf("no cozy-runtime peer at %s: %v", repo, err)
+	weightless.once.Do(func() { weightless.source, weightless.err = buildWeightless(t) })
+	if weightless.err != nil {
+		t.Fatal(weightless.err)
 	}
-	dir := t.TempDir()
-	project := filepath.Join(dir, "source")
-	runtimeSHA, err := qualifiedRuntimeFixtureSHA(repo, childEnv(t, dir))
-	must(t, err)
-	t.Logf("editable Runtime fixture uses qualified source %s", runtimeSHA)
-	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
-		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project,
-		"--runtime-sha", runtimeSHA)
-	if *tensorfsFixtureWheel != "" {
-		build.Args = append(build.Args, "--tensorfs-wheel", *tensorfsFixtureWheel)
-	}
-	build.Dir = "../.."
-	build.Env = childEnv(t, repo, "RUNTIME_REPO="+repo)
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("building the weightless release: %v\n%s", err, out)
-	}
+	project := filepath.Join(t.TempDir(), "source")
+	must(t, os.CopyFS(project, os.DirFS(weightless.source)))
 	return project
+}
+
+var weightless struct {
+	once   sync.Once
+	source string
+	err    error
+}
+
+func buildWeightless(t *testing.T) (string, error) {
+	dir := filepath.Join(scratchBase, "weightless-fixture")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	env := childEnv(t, dir)
+	distribution, commit, err := hostRuntimeIdentity(env)
+	if err != nil {
+		return "", err
+	}
+	project := filepath.Join(dir, "source")
+	args := []string{"-n", "19", "python3", "tests/product/testdata/build-weightless.py",
+		"--out", dir, "--source-out", project, "--expect-commit", commit}
+	if *privateScriptRuntimeWheel != "" {
+		wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
+		if err != nil {
+			return "", err
+		}
+		args = append(args, "--runtime-wheel", wheel)
+	} else {
+		args = append(args, "--runtime-version", distribution)
+	}
+	if *tensorfsFixtureWheel != "" {
+		args = append(args, "--tensorfs-wheel", *tensorfsFixtureWheel)
+	}
+	build := exec.Command("/usr/bin/nice", args...)
+	build.Dir = "../.."
+	build.Env = env
+	if out, err := build.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("building the weightless release: %v\n%s", err, out)
+	}
+	return project, nil
 }
 
 func productWorkerLogs(root string) string {

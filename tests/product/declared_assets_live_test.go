@@ -1,8 +1,9 @@
 package producttest
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"image"
 	"image/png"
 	"os"
@@ -11,21 +12,21 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/records"
 	"testing"
+
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
-var assetsRuntimeWheel = flag.String("assets-runtime-wheel", "", "Exact Runtime wheel with the explicit Assets input contract for composed CLI proof")
-
 func TestDeclaredAssetsActualCallable(t *testing.T) {
-	if *assetsRuntimeWheel == "" {
-		t.Skip("supply -assets-runtime-wheel for the composed Runtime Assets proof")
+	integration(t)
+	if *privateScriptRuntimeWheel == "" {
+		t.Skip("supply -script-runtime-wheel for the composed Runtime Assets proof")
 	}
 	root, err := os.MkdirTemp("", "cozy-assets-")
 	must(t, err)
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all"); _ = os.RemoveAll(root) })
 	project := t.TempDir()
-	version := runtimeFixtureVersion(t, *assetsRuntimeWheel)
+	version := runtimeFixtureVersion(t, *privateScriptRuntimeWheel)
 	script := filepath.Join(project, "assets_app.py")
 	code := `
 from typing import Annotated
@@ -78,7 +79,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 only-include = ["assets_app.py"]
 [tool.uv.sources]
-cozy-runtime = {path = ` + strconv.Quote(*assetsRuntimeWheel) + `}
+cozy-runtime = {path = ` + strconv.Quote(*privateScriptRuntimeWheel) + `}
 `
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(metadata), 0600))
 	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte(`[application]
@@ -128,11 +129,31 @@ object = "assets_app:app"
 			row, problem := store.RequestByReference(reference)
 			fatal(t, problem)
 			if row == nil || len(row.Assets) != 2 {
-				t.Fatal("completed request lost borrowed input identity")
+				t.Fatal("completed request lost its input identity")
 			}
+			photoBytes, err := os.ReadFile(photo)
+			must(t, err)
+			photoDigest := sha256.Sum256(photoBytes)
 			for _, asset := range row.Assets {
-				if asset.LocalPath != photo {
-					t.Fatalf("input was copied instead of borrowed: %s", asset.LocalPath)
+				if function == "collect" {
+					// Local inference borrows the caller's file in place.
+					if asset.LocalPath != photo {
+						t.Fatalf("input was copied instead of borrowed: %s", asset.LocalPath)
+					}
+					continue
+				}
+				// A machine job freezes its inputs into a request-owned stage at admission,
+				// so later edits of the original cannot reach Runtime.
+				if asset.Snapshot == nil || !strings.HasPrefix(asset.LocalPath, filepath.Join(root, "tmp", row.ID)+string(filepath.Separator)) ||
+					asset.Digest != "sha256:"+hex.EncodeToString(photoDigest[:]) {
+					t.Fatalf("machine job input was not frozen in its request stage: %+v", asset)
+				}
+			}
+			if function == "main" {
+				inputs, problem := store.MachineInputs(row.ID)
+				fatal(t, problem)
+				if len(inputs) != 2 {
+					t.Fatalf("machine job recorded %d input receipts, want 2", len(inputs))
 				}
 			}
 			if _, err := os.Stat(filepath.Join(root, "inputs")); !os.IsNotExist(err) {
@@ -171,7 +192,7 @@ object = "assets_app:app"
 		defer st.Close()
 		prior, problem := st.RequestByReference("3")
 		fatal(t, problem)
-		if prior == nil || prior.State != "blocked" || len(prior.Assets) != 2 {
+		if prior == nil || prior.State != "failed" || !st.RetainedRetryAvailable(*prior) || len(prior.Assets) != 2 {
 			t.Fatalf("failed job lost retained assets: %+v", prior)
 		}
 		code, out, _ = runCozyStreams(t, root, "--json", "run", "local/cozy-assets-proof/main", "fail=false", "--retry", prior.ID)

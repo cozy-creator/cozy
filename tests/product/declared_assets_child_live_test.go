@@ -19,10 +19,11 @@ import (
 // A real parent forwards a reordered Assets collection to an independent child
 // executor. Labels participate in memo identity without changing content hashes.
 func TestDeclaredAssetsManagedLabelsAndMemo(t *testing.T) {
-	if *assetsRuntimeWheel == "" {
-		t.Skip("supply -assets-runtime-wheel for the composed Runtime Assets proof")
+	integration(t)
+	if *privateScriptRuntimeWheel == "" {
+		t.Skip("supply -script-runtime-wheel for the composed Runtime Assets proof")
 	}
-	wheel, err := filepath.Abs(*assetsRuntimeWheel)
+	wheel, err := filepath.Abs(*privateScriptRuntimeWheel)
 	must(t, err)
 	version := runtimeFixtureVersion(t, wheel)
 	root, err := os.MkdirTemp("", "cozy-assets-child-")
@@ -113,7 +114,7 @@ app.job(run)
 	st, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer st.Close()
-	var original, labelChanged records.Request
+	var previous machineChildProof
 	for index, item := range []struct{ label, fidelity string }{{"alice", "high"}, {"alice", "high"}, {"carol", "high"}, {"carol", "low"}} {
 		label := item.label
 		code, out, stderr := runCozyStreams(t, root, "--json", "run", "local/labelled-assets-parent/run", "--asset", label+"="+photo, "--asset", "bob="+photo, "--asset-fidelity", label+"="+item.fidelity, "--asset-fidelity", "bob=medium", "--await")
@@ -132,31 +133,22 @@ app.job(run)
 		if len(answer.Result.Labels) != 2 || answer.Result.Labels[0] != "bob" || answer.Result.Labels[1] != label || answer.Result.IDs[0] != "assets.0.asset" || answer.Result.IDs[1] != "assets.1.asset" || answer.Result.RGB[0] != strings.Repeat("ff0000", 4) || answer.Result.RGB[1] != answer.Result.RGB[0] || len(answer.Result.Fidelities) != 2 || answer.Result.Fidelities[0] != "medium" || answer.Result.Fidelities[1] != item.fidelity {
 			t.Fatalf("child lost labels/order/decode: %+v", answer.Result)
 		}
-		parent, problem := st.RequestByReference(strconv.Itoa(index*2 + 1))
-		fatal(t, problem)
-		children, problem := st.Children(parent.ID)
-		fatal(t, problem)
-		if len(children) != 1 || children[0].State != "succeeded" || len(children[0].Assets) != 2 {
+		// The parent is a machine execution; its managed child lives in Runtime's journal.
+		children := machineChildren(t, root, st, strconv.Itoa(index+1))
+		if len(children) != 1 || children[0].State != "succeeded" || children[0].Computation == "" {
 			t.Fatalf("child custody missing: %+v", children)
 		}
 		current := children[0]
-		if index == 0 {
-			original = current
-		}
-		if index == 1 && (current.ReusedFrom != original.ID || current.Ordinal != 0) {
+		switch {
+		case index == 0 && current.Executions != 1:
+			t.Fatalf("first labelled child did not execute: %+v", current)
+		case index == 1 && (current.Executions != 0 || current.Computation != previous.Computation):
 			t.Fatalf("same labelled inputs recomputed: %+v", current)
-		}
-		if index == 2 && (current.ReusedFrom != "" || current.Ordinal != 1 || current.BodyDigest == original.BodyDigest) {
+		case index == 2 && (current.Executions != 1 || current.Computation == previous.Computation):
 			t.Fatalf("changed label reused prior child: %+v", current)
-		}
-		if index == 2 {
-			labelChanged = current
-		}
-		if index == 3 && (current.ReusedFrom != "" || current.Ordinal != 1 || current.BodyDigest == labelChanged.BodyDigest) {
+		case index == 3 && (current.Executions != 1 || current.Computation == previous.Computation):
 			t.Fatalf("changed fidelity reused prior child: %+v", current)
 		}
-		if current.Assets[0].Digest != current.Assets[1].Digest || current.Assets[0].Order != 0 || current.Assets[1].Order != 1 {
-			t.Fatalf("duplicate content lost occurrence identity: %+v", current.Assets)
-		}
+		previous = current
 	}
 }

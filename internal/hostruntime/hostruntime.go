@@ -20,13 +20,15 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// ToolFloor includes native ingestion, rented builtin admission and canonical media
-// result identities. Installers upgrade this tool before replacing Cozy.
+// ToolFloor is the first released Runtime with everything this Cozy drives: the worker
+// wire it requires (MinCompatibleWireMinor), org-relative default lanes, and installed
+// public structs returned through managed callers. Installers upgrade this tool before
+// replacing Cozy.
 // WireFloor independently checks the installed execution ownership capability.
 // Distribution is the Runtime's Python distribution and executable name.
 const Distribution = "cozy-runtime"
 
-const ToolFloor = "0.18.24"
+const ToolFloor = "0.18.41"
 
 // PackageFloor is the existing package SDK contract. Controller provisioning
 // features do not raise requirements on captured package environments.

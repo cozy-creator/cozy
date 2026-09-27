@@ -92,6 +92,9 @@ func TestCapturedLocalDefaultDownloadsColdModel(t *testing.T) {
 	must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(installed.Dir)), 0700))
 	must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), raw, 0444))
 	fatal(t, store.RecordInstall(installed))
+	// A captured child is a local installation this host owns.
+	must(t, os.MkdirAll(filepath.Join(layout.LocalPackages, installed.ID), 0o700))
+	must(t, os.WriteFile(filepath.Join(layout.LocalPackages, installed.ID, "installation.json"), []byte(`{"ID":"`+installed.ID+`"}`), 0o600))
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID, ChildInstallID: installed.ID, Module: "captured", Export: "judge", Entrypoint: "judge"}}))
 	cfg := config.Config{Home: layout.Root, HubURL: server.URL, HubToken: secret.New("fixture"), Tfs: binary, TensorFSRoot: filepath.Join(layout.Root, "native-store")}
 	resolver := cli.NewResolver(store, cfg, nil)

@@ -22,7 +22,7 @@
 # an update server would be a second distribution authority nobody signed.
 set -euo pipefail
 
-HOST_TOOLS=(uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.24')
+HOST_TOOLS=(uv tool install --force --python 3.12 --with-executables-from tensorfs 'cozy-runtime[media,model-execution]>=0.18.41')
 
 ASSET=""; BINARY=""; SUMS=""; WANT=""; PREFIX="${COZY_PREFIX:-$HOME/.local}"
 usage="usage: $0 (--asset <tar.gz> [--sums <file> | --sha256 <hex>] | --binary <cozy>) [--prefix <dir>]"
