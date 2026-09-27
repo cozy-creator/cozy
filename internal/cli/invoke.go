@@ -266,7 +266,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	var terminal *localapi.Event
 	stopped := ""
 	if ctx.Inv.Bool("--await") {
-		terminal, stopped, e = watch(ctx, c, c.Cancel, handle.RequestID, deadline, began)
+		notice := &reattachNotice{ctx: ctx}
+		c = c.Following(notice.say)
+		terminal, stopped, e = watch(ctx, c, c.Cancel, handle.RequestID, deadline, began, notice)
 	} else {
 		terminal, e = observe(ctx, c, handle.RequestID, optimisticObservation, began)
 	}
@@ -1315,7 +1317,7 @@ type invocationEventObserver interface {
 }
 
 func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) *exit.Error, requestID string,
-	deadline time.Duration, began time.Time) (*localapi.Event, string, *exit.Error) {
+	deadline time.Duration, began time.Time, notice *reattachNotice) (*localapi.Event, string, *exit.Error) {
 	interrupt, restoreInput, _, problem := liveSignals(ctx, nil)
 	if problem != nil {
 		return nil, "", problem
@@ -1387,6 +1389,7 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 	}()
 
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
+	notice.lines = lines
 	var manualStop *localapi.Event
 	terminal, e := c.WatchContext(watchCtx, requestID, 0, func(event localapi.Event) bool {
 		if event.Type == "request.blocked" {
@@ -1405,6 +1408,7 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 		terminal = manualStop
 	}
 	lines.Done()
+	notice.lines = nil
 	select {
 	case problem := <-cancelFailed:
 		return nil, "cancel_failed", problem

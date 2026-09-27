@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/config"
@@ -43,6 +44,49 @@ type Client struct {
 	hub string
 	// allHubs widens history reads from the command's hub to every hub.
 	allHubs bool
+	// cfg locates the daemon record, so a following client can find a restarted daemon.
+	cfg config.Config
+	// reattached is set on a following client: it is told once per re-attachment.
+	reattached func()
+}
+
+// reattachPoll is how often a following client re-reads the daemon record while no
+// daemon answers. It is a sampling rate, not a deadline: the wait ends only when a
+// daemon answers or the caller stops.
+const reattachPoll = 250 * time.Millisecond
+
+// Following returns this client re-attaching across a daemon restart: a read or an event
+// stream that loses the daemon waits until a daemon answers again, adopts its address and
+// credential, and continues. reattached is called once each time that happens.
+func (c *Client) Following(reattached func()) *Client {
+	following := *c
+	following.reattached = reattached
+	return &following
+}
+
+// reattach waits for a live daemon's record and credential and adopts them. It returns
+// false only when the caller stops.
+func (c *Client) reattach(ctx context.Context) bool {
+	for {
+		if st := daemon.Probe(c.cfg); st.Up && st.Addr != "" {
+			if next, e := Open(c.cfg, st); e == nil {
+				c.base, c.token = next.base, next.token
+				return true
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(reattachPoll):
+		}
+	}
+}
+
+// lostDaemon answers whether a failed exchange means the daemon went away: the
+// connection failed, or, once a restart is suspected, the new daemon does not yet
+// accept the credential this client last read.
+func lostDaemon(problem *exit.Error, recovering bool) bool {
+	return problem != nil && (problem.ErrName() == "daemon_unreachable" || recovering && problem.ErrName() == "unauthenticated")
 }
 
 // AllHubs widens this client's run history to every hub's runs.
@@ -72,6 +116,7 @@ func Open(cfg config.Config, st daemon.State) (*Client, *exit.Error) {
 		// no-progress facts decide operational failure.
 		http: &http.Client{},
 		hub:  cfg.HubURL,
+		cfg:  cfg,
 	}, nil
 }
 
@@ -134,6 +179,25 @@ func (c *Client) call(method, path string, body, out any, headers ...string) *ex
 func (c *Client) callContext(ctx context.Context, method, path string, body, out any,
 	headers ...string,
 ) *exit.Error {
+	recovering := false
+	for {
+		problem := c.exchange(ctx, method, path, body, out, headers...)
+		if c.reattached == nil || method != http.MethodGet || !lostDaemon(problem, recovering) {
+			if recovering && problem == nil {
+				c.reattached()
+			}
+			return problem
+		}
+		if !c.reattach(ctx) {
+			return problem
+		}
+		recovering = true
+	}
+}
+
+func (c *Client) exchange(ctx context.Context, method, path string, body, out any,
+	headers ...string,
+) *exit.Error {
 	req, e := c.request(method, path, body, headers...)
 	if e != nil {
 		return e
@@ -168,7 +232,7 @@ func (c *Client) callContext(ctx context.Context, method, path string, body, out
 // refusal document, a transport failure. It carries the SAME remedy every server-backed
 // verb's exit-9 gate carries, because it is the same condition arriving later.
 func (c *Client) unreachable(err error) *exit.Error {
-	return exit.Unavailablef("the Cozy daemon stopped answering on %s: %s", c.Addr(), err).
+	return exit.Named(exit.Unavailable, "daemon_unreachable", "the Cozy daemon stopped answering on %s: %s", c.Addr(), err).
 		WithRemedy("it may have stopped mid-request; retry or run `cozy up`").
 		WithNext("cozy up", "cozy run list")
 }

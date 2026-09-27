@@ -10,6 +10,7 @@ import (
 	"golang.org/x/text/width"
 
 	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -114,6 +115,26 @@ func (p *RunProgress) rentalNotice(e localapi.Event) {
 	}
 	*previous = line
 	p.notice(e, line)
+}
+
+// reattachNotice says, once per daemon restart, that a follower re-attached: through the
+// live progress block while one is drawing, plainly otherwise.
+type reattachNotice struct {
+	ctx   *Context
+	lines *RunProgress
+}
+
+func (n *reattachNotice) say() {
+	const line = "daemon restarted; reattached"
+	// Later dials in this command address the restarted daemon, not the one that stopped.
+	n.ctx.Daemon = daemon.Probe(n.ctx.Cfg)
+	if n.lines != nil {
+		n.lines.mu.Lock()
+		defer n.lines.mu.Unlock()
+		n.lines.notice(localapi.Event{}, line)
+		return
+	}
+	fmt.Fprintln(n.ctx.Err, line)
 }
 
 // notice prints one line above the live block, which is redrawn beneath it.

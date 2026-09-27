@@ -432,6 +432,8 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	}()
 
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
+	notice := &reattachNotice{ctx: ctx, lines: lines}
+	c = c.Following(notice.say)
 	var stopped *localapi.Event
 	terminal, e := c.WatchContext(watchCtx, jobID, 0, func(event localapi.Event) bool {
 		if event.Type == "request.blocked" {
@@ -460,6 +462,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		terminal = stopped
 	}
 	lines.Done()
+	notice.lines = nil
 	if e != nil {
 		return e
 	}
@@ -701,6 +704,7 @@ func awaitMachineCollection(ctx *Context, state api.JobState) (api.JobState, *ex
 	if problem != nil {
 		return state, problem
 	}
+	client = client.Following((&reattachNotice{ctx: ctx}).say)
 	const poll = time.Second
 	last, since := "", time.Now()
 	for state.Status == "completed" && state.MachineExecution != nil && !state.MachineExecution.Collected {
