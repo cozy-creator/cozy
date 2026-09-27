@@ -127,43 +127,59 @@ func handleModelRemove(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	store, problem := records.Open(layout.DB)
-	if problem != nil {
+	if problem := modelRemovalRefusal(layout, ctx.Inv.Args); problem != nil {
 		return problem
 	}
-	live, problem := store.LiveWorkers()
-	if problem != nil {
-		store.Close()
-		return problem
-	}
-	for _, worker := range live {
-		if worker.WorkerID != "remote" {
-			store.Close()
-			return exit.New(exit.Conflict, "local worker %s may still hold model residency", worker.InstanceID).
-				WithRemedy("run `cozy unload`, then remove the model repository").
-				WithNext("cozy unload")
-		}
-	}
-	active, problem := store.ActiveRequests()
-	store.Close()
+	fence, problem := readReclamationFence(layout)
 	if problem != nil {
 		return problem
-	}
-	for _, request := range active {
-		if request.Worker == "" {
-			return exit.New(exit.Conflict, "active invocation %s may still need local model bytes", request.ID).
-				WithRemedy("cancel active local work before removing a model repository").
-				WithNext("cozy run cancel " + request.ID)
-		}
 	}
 	tool, _, problem := localTensorFS(ctx)
 	if problem != nil {
 		return problem
 	}
-	return removeModels(ctx, tool, layout, len(active) == 0)
+	return removeModels(ctx, tool, layout, fence)
 }
 
-func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, quiet bool) *exit.Error {
+// modelRemovalRefusal refuses only for what still holds a named model: a local worker's
+// residency, or a live local request that reads or writes it.
+func modelRemovalRefusal(layout home.Layout, names []string) *exit.Error {
+	store, problem := records.Open(layout.DB)
+	if problem != nil {
+		return problem
+	}
+	defer store.Close()
+	live, problem := store.LiveWorkers()
+	if problem != nil {
+		return problem
+	}
+	for _, worker := range live {
+		if worker.WorkerID != "remote" {
+			return exit.New(exit.Conflict, "local worker %s may still hold model residency", worker.InstanceID).
+				WithRemedy("run `cozy unload`, then remove the model repository").
+				WithNext("cozy unload")
+		}
+	}
+	for _, name := range names {
+		ref, problem := hub.ParseRef(name)
+		if problem != nil {
+			return problem
+		}
+		users, problem := store.LocalModelUsers(ref.String())
+		if problem != nil {
+			return problem
+		}
+		if len(users) > 0 {
+			first := users[0]
+			return exit.New(exit.Conflict, "%s still uses %s", runsPhrase(users), ref.String()).
+				WithRemedy("let it settle, or cancel it, then remove the model repository").
+				WithNext("cozy run cancel " + runReference(first.Number, first.ID))
+		}
+	}
+	return nil
+}
+
+func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, fence reclamationFence) *exit.Error {
 	work, problem := scratch.Temp(layout.Tmp, "repo-remove-")
 	if problem != nil {
 		return problem
@@ -212,22 +228,22 @@ func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, quiet bool) 
 		delete(held, ref.String())
 	}
 	removed.Aggregates = []output.Field{{K: "changed", V: len(removed.Rows) > 0}}
-	// Reclamation is part of the act: the name is gone, so its bytes go now — unless the
-	// daemon owes a request that may still be moving bytes into the store (a download's
-	// admitted objects are unnamed until its commit), or the byte plane names a live
-	// holder. Either keeps the name removed and says what deferred it; `cozy model gc`
-	// finishes the job.
-	if !quiet {
-		removed.Notes = []string{"reclamation deferred: an active request may still be moving bytes into the store"}
+	// Reclamation is part of the act: the name is gone, so its bytes go now, unless a local
+	// request may still be moving bytes into the store (a download's admitted objects are
+	// unnamed until its commit) or the byte plane names a live holder. Either keeps the name
+	// removed and says what deferred it; `cozy model gc` finishes the job.
+	if problem := fence.busy(); problem != nil {
+		removed.Notes = []string{"reclamation deferred: " + problem.Message}
 		removed.Next = []string{"cozy model gc"}
 		return emit(ctx, removed)
 	}
-	report, problem := tool.GC(true)
+	report, notes, problem := fence.collect(tool)
 	if problem != nil {
 		removed.Notes = []string{"reclamation deferred: " + problem.Message}
 		removed.Next = []string{"cozy model gc"}
 		return emit(ctx, removed)
 	}
+	removed.Notes = notes
 	removed.Aggregates = append(removed.Aggregates, reclaimFields(report)...)
 	return emit(ctx, removed)
 }

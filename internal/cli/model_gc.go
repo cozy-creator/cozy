@@ -7,44 +7,35 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 // `cozy model gc`: reclaim what no local model names. `model remove` already does this
 // as part of removing; this is the verb for a store that carries unreferenced bytes for
 // any other reason — a crashed download, an abandoned ingest — and the pass the daemon
-// runs on maintenance.gc_cron. The decision is TensorFS's, from its filesystem census.
+// runs on maintenance.gc_cron. The decision is TensorFS's, from its filesystem census;
+// only a local request still moving bytes in defers it (reclamationFence).
 func handleModelGC(ctx *Context) *exit.Error {
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
 		return problem
 	}
-	store, problem := records.Open(layout.DB)
+	fence, problem := readReclamationFence(layout)
 	if problem != nil {
 		return problem
 	}
-	active, problem := store.ActiveRequests()
-	store.Close()
-	if problem != nil {
+	if problem := fence.busy(); problem != nil {
 		return problem
-	}
-	// A download's admitted objects are unnamed until its commit: a pass beside an active
-	// request could take bytes that request is still moving in.
-	if len(active) > 0 {
-		return exit.New(exit.Conflict, "%d active request(s) may still be moving bytes into the store", len(active)).
-			WithRemedy("let them settle, or cancel them, then reclaim").
-			WithNext("cozy run list")
 	}
 	tool, _, problem := localTensorFS(ctx)
 	if problem != nil {
 		return problem
 	}
-	report, problem := tool.GC(true)
+	report, notes, problem := fence.collect(tool)
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, output.Record{Fields: reclaimFields(report)})
+	return emit(ctx, output.Record{Fields: reclaimFields(report), Notes: notes})
 }
 
 // reclaimed is the `reclaimed` field: a program gets the pass, a person gets the bytes.

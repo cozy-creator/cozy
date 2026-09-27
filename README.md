@@ -198,11 +198,13 @@ cozy model gc
 `model remove` deletes the repository name and reclaims its bytes in the same act, printing
 `reclaimed: 5.2GiB`; `model list` shows `unreferenced 0` after it. `model gc` reclaims what no
 local model names for any other reason (a crashed download, an abandoned ingest), and the daemon
-runs the same pass on `maintenance.gc_cron` (default `0 3 * * *`, while it is up and manages
-nothing). What is reclaimed is TensorFS's decision from its filesystem census — repos, manifests,
-blobs — never a database's. A pass never runs beside an active request (a download's bytes are
-unnamed until its commit): `remove` defers reclamation to `model gc`, `model gc` refuses, the
-cron logs `gc: deferred`. A live worker holding a model refuses by name (`cozy unload` first).
+runs the same pass on `maintenance.gc_cron` (default `0 3 * * *`, while it is up). What is
+reclaimed is TensorFS's decision from its filesystem census — repos, manifests, blobs — never a
+database's. A pass never runs beside a local run still moving bytes in (a download's bytes are
+unnamed until its commit): `remove` defers reclamation to `model gc`, `model gc` refuses naming
+the run, the cron logs `gc: deferred`. A paused or failed run that retains its work keeps only
+the ingest sessions its retry may resume. `remove` refuses only for a live worker holding a
+model (`cozy unload` first) or a queued or running local run that uses it.
 
 Upload an already canonical local alias, or ingest a provider source with `model download`.
 Run quantization and other weight-producing jobs through the ordinary package command.

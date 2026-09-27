@@ -323,7 +323,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// stops carrying this daemon's claim has taken away every way to reach it or stop it.
 	go claimWatch{held: held, root: l.Root, managed: idle.managed, log: ctx.Out,
 		stop: func() { stop <- syscall.SIGTERM }}.run(quit)
-	if sweep, ok := newGCCron(ctx.Cfg, l, idle, ctx.Out); ok {
+	if sweep, ok := newGCCron(ctx.Cfg, l, ctx.Out); ok {
 		go sweep.run(quit)
 	}
 
