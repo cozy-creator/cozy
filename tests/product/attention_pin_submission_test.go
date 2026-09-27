@@ -3,7 +3,6 @@ package producttest
 import (
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -126,7 +125,7 @@ func TestJobAttentionOverrideCannotBeSilentlyIgnored(t *testing.T) {
 }
 
 // A version bump in editable metadata is a new revision of the same package: the next
-// run refreshes onto it instead of refusing until a manual reinstall.
+// run relocks and refreshes onto it instead of refusing the stale lock or a manual reinstall.
 func TestEditableVersionBumpRefreshesTheInstall(t *testing.T) {
 	root := t.TempDir()
 	project := weightlessProject(t)
@@ -141,11 +140,6 @@ func TestEditableVersionBumpRefreshesTheInstall(t *testing.T) {
 		t.Fatal("editable fixture declares no 1.0.0 version")
 	}
 	must(t, os.WriteFile(pyproject, []byte(bumped), 0o644))
-	relock := exec.Command("uv", "lock")
-	relock.Dir, relock.Env = project, childEnv(t, project)
-	if out, err := relock.CombinedOutput(); err != nil {
-		t.Fatalf("relock the bumped fixture: %v\n%s", err, out)
-	}
 	_, out := runCozy(t, root, "--json", "run", localWeightlessRef+"/echo", "why=version-bump", "--idempotency-key=version-bump")
 	if strings.Contains(out, "editable_refresh_failed") || strings.Contains(out, "editable_identity_changed") {
 		t.Fatalf("editable version bump refused: %s", out)
