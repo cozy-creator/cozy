@@ -1,11 +1,19 @@
 name: Publish to PyPI
 
 # Publication IS the tag push (cozy-eval's pattern). No local publish —
-# this workflow is the single release procedure.
+# this workflow is the single release procedure. Manual run for an existing tag
+# (the tag's tree must carry this dispatch trigger):
+#   gh workflow run publish.yaml -R cozy-creator/tensorfs --ref vX.Y.Z
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+
+# Never cancel a publication midway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # The tag must name the version the tree declares before anything is built.
@@ -23,6 +31,7 @@ jobs:
       - run: python3 scripts/version_contract.py source
       - name: Version matches tag
         run: |
+          [ "$GITHUB_REF_TYPE" = tag ] || { echo "publish runs on a v* tag, not $GITHUB_REF"; exit 1; }
           TAG="${GITHUB_REF_NAME#v}"
           VER="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
           if [ "$TAG" != "$VER" ]; then

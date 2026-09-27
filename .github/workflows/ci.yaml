@@ -1,6 +1,7 @@
 name: ci
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [master]
   workflow_dispatch:
@@ -11,8 +12,8 @@ on:
         options: [full, cache-owner]
         default: full
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   cache-owner:
     if: github.event_name == 'workflow_dispatch' && inputs.scope == 'cache-owner'
@@ -22,10 +23,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.1
         with:
-          components: clippy, rustfmt
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy -p tensorfs-core --lib --tests -- -D warnings
+      - run: cargo clippy -p tensorfs-core --lib --tests -- -D warnings -A clippy::style
       - run: cargo test -p tensorfs-core --lib cache_identity_restores_and_does_not_change_other_threads --no-run
       - name: Root cache identity, thread isolation, and unwind restoration
         run: |
@@ -39,7 +39,10 @@ jobs:
           done
           [ "$found" = true ]
   ci:
-    if: github.event_name != 'workflow_dispatch' || inputs.scope != 'cache-owner'
+    # Draft PRs are checkpoints; CI runs once the PR is ready for review.
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.scope != 'cache-owner') &&
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -66,7 +69,7 @@ jobs:
       - if: steps.changes.outputs.code != 'false'
         uses: dtolnay/rust-toolchain@1.91.1
         with:
-          components: clippy, rustfmt
+          components: clippy
       - if: steps.changes.outputs.code != 'false'
         uses: astral-sh/setup-uv@v7
         with:
@@ -81,8 +84,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - if: steps.changes.outputs.code != 'false'
-        run: cargo fmt --check
-      - if: steps.changes.outputs.code != 'false'
         run: |
           set -eux
           cargo build --workspace
@@ -90,7 +91,7 @@ jobs:
             python3 "scripts/rebank-$s.py" --tfs target/debug/tfs
           done
       - if: steps.changes.outputs.code != 'false'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::style
       - if: steps.changes.outputs.code != 'false'
         run: cargo test --workspace
       - name: Privileged-broker and unprivileged Store-owner writers

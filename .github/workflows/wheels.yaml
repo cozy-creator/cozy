@@ -1,28 +1,18 @@
 name: wheels
 # Every wheel the release publishes, each built and proven on a runner of its own platform.
-# publish.yaml calls this and uploads exactly these artifacts. Pull requests run it only
-# when the build could change, because macOS minutes bill at 10x on a private repo;
-# ci.yaml's `wheel` job keeps the deep Linux x86_64 proof on every push.
+# Release-only: publish.yaml calls this and uploads exactly these artifacts. macOS bills at
+# 10x, so pull requests never run it; ci.yaml keeps the deep Linux x86_64 wheel proof on
+# every change. Manual build of every wheel for a branch or tag:
+#   gh workflow run wheels.yaml -R cozy-creator/tensorfs --ref <branch-or-tag>
 # No Windows wheel: the Store's POSIX model (owner uid/gid, modes, O_NOFOLLOW, *at
 # publication, positional I/O) has no Windows implementation yet.
 on:
-  pull_request:
-    paths:
-      - "crates/**"
-      - "python/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "pyproject.toml"
-      - "scripts/build-wheel.sh"
-      - "scripts/wheel-proof.sh"
-      - "scripts/wheel-platform.py"
-      - "scripts/version_contract.py"
-      - ".github/workflows/wheels.yaml"
-      - ".github/workflows/publish.yaml"
   workflow_call:
+  workflow_dispatch:
+# A literal prefix: a called workflow sees the caller's github.workflow.
 concurrency:
   group: wheels-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   wheel:
@@ -79,9 +69,8 @@ jobs:
           for wheel in dist/*.whl; do
             bash scripts/wheel-proof.sh "$wheel" "${RUNNER_TEMP}/proof"
           done
-      # Consumed only by publish.yaml in the same run.
-      - if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+      # Consumed by publish.yaml in the same run.
+      - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
           path: dist/*.whl
