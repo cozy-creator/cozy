@@ -42,6 +42,9 @@ type Machine struct {
 	CertificateDigest []byte
 	// SupportsTriage is whether the Host reads a retained triage bundle for its owner.
 	SupportsTriage bool
+	// ClaimSurvivesRestart is what this dial's ClaimAck said: the boot's Runtime keeps its
+	// owner across Host and Runtime restarts, so later dials need no Control Claim.
+	ClaimSurvivesRestart bool
 
 	claimAck  *pb.ClaimAck
 	hub       *hub.Client
@@ -128,9 +131,10 @@ type Resolver struct {
 	RentalKey     func(string) (rental.CreatorIdentity, *exit.Error)
 
 	mu sync.Mutex
-	// claimed names the worker lifetimes this daemon has Claimed. A Runtime learns its
-	// owner's protocol level only from a Control Claim, and forgets it when it restarts.
-	claimed map[string]bool
+	// claimed names the worker lifetimes this daemon has Control Claimed. An older Runtime
+	// forgets its owner's protocol level when it restarts, so each lifetime Claims again;
+	// durable names the boots whose Runtime reported claim_survives_restart, Claimed once.
+	claimed, durable map[string]bool
 	// kept is one open, claimed connection per machine lifetime: every call to a machine
 	// rides it, so a call costs its own round trip and never a TLS handshake or probe.
 	kept map[string]*keptMachine
@@ -216,7 +220,8 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 		use.release, use.kept = machine.release, true
 		return &use, nil
 	}
-	claimed := r.claimed[lifetime]
+	boot := name + "\x00" + t.bootID
+	claimed := r.claimed[lifetime] || r.durable[boot]
 	r.mu.Unlock()
 	if problem := machine.dial(ctx, t, !claimed); problem != nil {
 		if machine.release != nil {
@@ -226,9 +231,12 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 	}
 	r.mu.Lock()
 	if r.claimed == nil {
-		r.claimed, r.kept = map[string]bool{}, map[string]*keptMachine{}
+		r.claimed, r.durable, r.kept = map[string]bool{}, map[string]bool{}, map[string]*keptMachine{}
 	}
 	r.claimed[lifetime] = true
+	if machine.ClaimSurvivesRestart {
+		r.durable[boot] = true
+	}
 	if previous := r.kept[name]; previous != nil {
 		previous.Conn.Close() // the machine's earlier lifetime
 	}
@@ -267,13 +275,14 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 		connection.Close()
 		return problem
 	}
-	m.Claim, m.claimAck = claim, ack
+	m.Claim, m.claimAck, m.ClaimSurvivesRestart = claim, ack, ack.GetClaimSurvivesRestart()
 	return nil
 }
 
 // claim authenticates this owner to the worker lifetime the target names: the owner key's
 // Ed25519 signature over ClaimProof/1, presented on every call. The first connection to a
 // lifetime also opens one Control Claim, which records the owner and its protocol level.
+// A boot whose Runtime reported claim_survives_restart is Claimed once, not per lifetime.
 func claim(ctx context.Context, connection *grpc.ClientConn, t target, wireMinor uint32, control bool) (*pb.Claim, *pb.ClaimAck, *exit.Error) {
 	transcript, err := canonical.Bytes(&pb.ClaimProof{RecordOwnerEpoch: orchestrator.RecordOwnerEpoch,
 		WorkerId: t.workerID, WorkerBootId: t.bootID, WorkerTlsCertificateDigest: t.pin.Digest()})
