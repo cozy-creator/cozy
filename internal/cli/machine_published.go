@@ -21,9 +21,6 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 	if (request.Rental && request.Worker == "") || connection.preparePublished == nil {
 		return nil, exit.New(exit.Conflict, "published machine execution requires a local install or pinned rental")
 	}
-	if connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
-		return nil, exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires the current installed-package protocol")
-	}
 	began := time.Now()
 	prepared, problem := connection.preparePublished(ctx, request)
 	if problem != nil {

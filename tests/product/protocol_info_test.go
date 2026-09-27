@@ -63,7 +63,7 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 			}
 			if row.floor > 0 && row.floor <= row.minor && (row.minor < pb.MinCompatibleWireMinor || row.floor > pb.WireMinor) {
 				// Execution on a peer outside the range fails that operation alone, naming both ranges.
-				problem := orchestrator.ValidateWorkerProtocol(&pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor, SupportsRentalKeepalive: true}, true)
+				problem := orchestrator.ValidateWorkerProtocol(&pb.ProtocolInfoResult{WireMinor: row.minor, MinimumWireMinor: row.floor, SupportsRentalKeepalive: true}, podRental)
 				if problem == nil || problem.ErrName() != pb.CapabilityUnavailableCode ||
 					!strings.Contains(problem.Message, fmt.Sprintf("%d–%d", row.floor, row.minor)) ||
 					!strings.Contains(problem.Message, fmt.Sprintf("%d–%d", pb.MinCompatibleWireMinor, pb.WireMinor)) {
@@ -85,10 +85,10 @@ func TestProtocolRangeProbeHasNoOwnershipSideEffect(t *testing.T) {
 
 func TestLocalRuntimeSkewDoesNotRequireRentalFeatures(t *testing.T) {
 	info := &pb.ProtocolInfoResult{WireMinor: pb.MinCompatibleWireMinor, MinimumWireMinor: pb.MinCompatibleWireMinor}
-	if problem := orchestrator.ValidateWorkerProtocol(info, false); problem != nil {
+	if problem := orchestrator.ValidateWorkerProtocol(info, ""); problem != nil {
 		t.Fatalf("local floor Runtime required a Host-only feature: %v", problem)
 	}
-	if problem := orchestrator.ValidateWorkerProtocol(info, true); problem == nil || problem.ErrName() != "worker.rental_idle_guard_required" {
+	if problem := orchestrator.ValidateWorkerProtocol(info, podRental); problem == nil || problem.ErrName() != "worker.rental_idle_guard_required" {
 		t.Fatalf("an old rental Host bypassed its mandatory idle guard: %v", problem)
 	}
 }

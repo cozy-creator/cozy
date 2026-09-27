@@ -23,11 +23,6 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 	if machine == "local" || len(connection.certificateDigest) != sha256.Size {
 		return "", exit.Named(exit.Structural, "publication.machine_identity_required", "publication authority requires the rented machine's pinned certificate identity")
 	}
-	// PodHost.ProtocolInfo intersects its range with the currently running
-	// Runtime. A Host compiled at 52 with Runtime 51 cannot pass this check.
-	if connection.wireMinor < 52 {
-		return "", exit.Named(exit.Structural, "publication.worker_upgrade_required", "publication authority requires actual Runtime protocol 52; this machine reports %d", connection.wireMinor)
-	}
 	raw, problem := m.store.MachinePublicationIntent(request)
 	if problem != nil {
 		return "", problem

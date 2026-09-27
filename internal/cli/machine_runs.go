@@ -57,6 +57,7 @@ type machineConnection struct {
 	connection         *machineClientConnection
 	client             machineExecutionClient
 	claim              *pb.Claim
+	protocol           *pb.ProtocolInfoResult
 	prepare            func(context.Context, string, localpackage.Installation) *exit.Error
 	prepareModels      func(context.Context, records.Request, localpackage.Installation) (*pb.DesiredPlacementSet, *exit.Error)
 	modelDefaultOrigin func(context.Context) (string, *exit.Error)
@@ -314,22 +315,18 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if len(link.Submission) == 0 {
 		m.submissionStage(request.ID, "connect", link.MachineID, began)
 	}
-	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
-		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
+	// Only a new submission needs the current contract; observation, collection,
+	// cancellation and release reach any peer.
+	rental := link.MachineID
+	if rental == "local" {
+		rental = ""
 	}
-	if request.Rental && connection.wireMinor < pb.RentalExecutionAdmissionWireMinor {
-		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
-			"this request uses detached execution, which requires Runtime protocol %d with typed execution lookup for safe idle shutdown; this worker reports %d. Update the rental Runtime; existing result collection remains compatible",
-			pb.RentalExecutionAdmissionWireMinor, connection.wireMinor)
+	if problem := orchestrator.ValidateWorkerProtocol(connection.protocol, rental); problem != nil {
+		return problem
 	}
-	if len(request.Models) > 0 {
-		if connection.wireMinor < pb.NativeRootInputsWireMinor {
-			return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "durable root Model inputs require Runtime protocol 55")
-		}
-		if !request.Rental {
-			if problem := m.resolver.EnsureLocalModels(request.Hub, request.Models); problem != nil {
-				return problem
-			}
+	if len(request.Models) > 0 && !request.Rental {
+		if problem := m.resolver.EnsureLocalModels(request.Hub, request.Models); problem != nil {
+			return problem
 		}
 	}
 	submission := &pb.MachineExecutionSubmit{}
@@ -345,9 +342,6 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 				return problem
 			}
 			submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
-		}
-		if submission.PublicationAuthorizationId != "" && connection.wireMinor < 52 {
-			return exit.Named(exit.Structural, "publication.worker_upgrade_required", "the frozen publication authorization requires actual Runtime protocol 52")
 		}
 	} else {
 		authorization, problem := m.publicationAuthorization(m.ctx, request.ID, link.MachineID, connection)
@@ -393,22 +387,20 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			if encodeErr != nil {
 				return exit.Internalf("cannot retain worker installation metadata: %s", encodeErr)
 			}
-			if connection.wireMinor >= pb.CapturedModelDefaultsWireMinor {
-				origin := ""
-				if connection.modelDefaultOrigin != nil {
-					origin, problem = connection.modelDefaultOrigin(m.ctx)
-					if problem != nil {
-						return problem
-					}
-				}
-				began := time.Now()
-				var detail string
-				capture, detail, problem = m.resolver.captureMachineModelDefaults(capture, request, origin)
+			origin := ""
+			if connection.modelDefaultOrigin != nil {
+				origin, problem = connection.modelDefaultOrigin(m.ctx)
 				if problem != nil {
 					return problem
 				}
-				m.submissionStage(request.ID, "model_defaults", detail, began)
 			}
+			began := time.Now()
+			var detail string
+			capture, detail, problem = m.resolver.captureMachineModelDefaults(capture, request, origin)
+			if problem != nil {
+				return problem
+			}
+			m.submissionStage(request.ID, "model_defaults", detail, began)
 			installed := connection.installed[request.LocalInstallationID]
 			if installed == nil {
 				return exit.New(exit.Conflict, "machine root installation is unavailable")
@@ -429,7 +421,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			} else if request, problem = m.bindServingPlan(request, installed.InstallationId, placements); problem != nil {
 				return problem
 			}
-			began := time.Now()
+			began = time.Now()
 			byteInputs, problem := m.stageMachineInputs(m.ctx, request, connection)
 			if problem != nil {
 				return problem
@@ -474,9 +466,6 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	if _, problem := m.resolver.capturedResultInterface(request); problem != nil {
 		return problem
 	}
-	if request.LocalInstallationID == "" && connection.wireMinor < pb.PublishedMachineCaptureWireMinor {
-		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "published machine execution requires Runtime protocol 54")
-	}
 	began = time.Now()
 	if problem := m.sendMachineSubmission(m.ctx, connection, request.ID, submission); problem != nil {
 		return problem
@@ -509,9 +498,6 @@ func (m *machineRuns) recordPlacement(request records.Request, decision orchestr
 // freezeMachineSubmission persists authenticated journal identity with the exact
 // offer before any Submit RPC. Only a never-transmitted submission may discover it.
 func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, submission *pb.MachineExecutionSubmit) *exit.Error {
-	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
-		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
-	}
 	workspace, problem := currentExecutionWorkspace(ctx, connection)
 	if problem != nil {
 		return problem
@@ -553,9 +539,6 @@ func currentExecutionWorkspace(ctx context.Context, connection *machineConnectio
 }
 
 func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, submission *pb.MachineExecutionSubmit) *exit.Error {
-	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
-		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
-	}
 	if submission.ExpectedExecutionWorkspaceId == "" {
 		return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; its acceptance cannot safely be retried")
 	}
