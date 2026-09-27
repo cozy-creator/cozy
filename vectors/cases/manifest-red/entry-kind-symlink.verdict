@@ -1,4 +1,0 @@
-doc: manifest
-expect: refuse
-code: UNKNOWN_FIELD
-note: only file and cozytensors entries exist

@@ -2207,16 +2207,17 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "carrier no longer equals the logical dtype",
     ));
 
-    // --- location-typed Manifest reds
+    // A kind a newer TensorFS wrote is opaque here: it parses, and only materializing refuses.
     let manifest_bytes = snap2.canonical_bytes();
-    cases.push(red_case(
-        "manifest-red",
-        "entry-kind-symlink",
+    cases.push(ok_case(
+        "manifest",
+        "entry-kind-future",
         "manifest",
         sub(&manifest_bytes, "\"kind\":\"file\"", "\"kind\":\"symlink\""),
-        "UNKNOWN_FIELD",
-        "only file and cozytensors entries exist",
+        "an entry kind from a newer TensorFS is carried opaquely",
     ));
+
+    // --- location-typed Manifest reds
     let mut draft = Draft::of(&snap);
     draft.entries.clear();
     cases.push(red_case(
@@ -2259,6 +2260,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     // --- the border's own documents (tfs-003)
     let g = "ingest";
     let session = tensorfs_core::ingest::transaction::IngestSession {
+        tensorfs: None,
         session: "e3b0c44298fc1c14".to_string(),
         tenant: "acme".to_string(),
         candidates: vec![ObjectRef::of(b"a candidate header")],

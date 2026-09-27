@@ -22,6 +22,8 @@ pub struct RetainedResult {
     pub receipt_digest: String,
     pub manifest: Option<ObjectRef>,
     pub released: bool,
+    /// The newest TensorFS that wrote this root.
+    pub tensorfs: Option<String>,
 }
 
 impl Plain for RetainedResult {
@@ -40,11 +42,18 @@ impl Plain for RetainedResult {
             Value::Bool(value) => *value,
             _ => return refuse(Code::WRONG_TYPE, "retained result release must be boolean"),
         };
-        f.done()?;
+        let tensorfs = f
+            .opt("tensorfs")
+            .map(|value| {
+                crate::canon::as_str("RetainedResult", "tensorfs", value).map(str::to_string)
+            })
+            .transpose()?;
+        f.done_written_by(tensorfs.as_deref())?;
         if !released && manifest.is_none() {
             return refuse(Code::MISSING_FIELD, "held result has no manifest");
         }
         Ok(Self {
+            tensorfs,
             retention_id,
             transaction_id,
             receipt_digest,
@@ -62,6 +71,9 @@ impl Plain for RetainedResult {
         ];
         if let Some(manifest) = &self.manifest {
             fields.push(("manifest", manifest.to_value()));
+        }
+        if let Some(tensorfs) = &self.tensorfs {
+            fields.push(("tensorfs", Value::str(tensorfs.clone())));
         }
         Value::obj(fields)
     }
@@ -104,6 +116,10 @@ fn read(store: &Store, id: &str) -> Result<Option<RetainedResult>> {
 }
 
 fn write(store: &Store, root: &RetainedResult) -> Result<()> {
+    let root = &RetainedResult {
+        tensorfs: Some(crate::VERSION.into()),
+        ..root.clone()
+    };
     let path = path(store, &root.retention_id)?;
     fs::create_dir_all(directory(store)).map_err(io)?;
     let temp = path.with_extension(format!("tmp-{}", crate::meta::now_nanos_unique()));
@@ -128,6 +144,7 @@ fn write(store: &Store, root: &RetainedResult) -> Result<()> {
 
 fn identity(transaction: &str, receipt: &str, id: &str) -> Result<RetainedResult> {
     Ok(RetainedResult {
+        tensorfs: Some(crate::VERSION.into()),
         retention_id: prefixed("retention", id)?,
         transaction_id: prefixed("transaction", transaction)?,
         receipt_digest: prefixed("receipt", receipt)?,

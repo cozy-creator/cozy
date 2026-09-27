@@ -44,6 +44,8 @@ pub struct IngestSession {
     pub session: String,
     pub tenant: String,
     pub candidates: Vec<ObjectRef>,
+    /// The newest TensorFS that wrote this root.
+    pub tensorfs: Option<String>,
 }
 
 impl Plain for IngestSession {
@@ -57,10 +59,17 @@ impl Plain for IngestSession {
         }
         let session = f.req_str("session")?.to_string();
         let tenant = f.req_str("tenant")?.to_string();
-        f.done()?;
+        let tensorfs = f
+            .opt("tensorfs")
+            .map(|value| {
+                crate::canon::as_str("IngestSession", "tensorfs", value).map(str::to_string)
+            })
+            .transpose()?;
+        f.done_written_by(tensorfs.as_deref())?;
         ascii_name("IngestSession.session", &session, limits::MAX_NAME_BYTES)?;
         ascii_name("IngestSession.tenant", &tenant, limits::MAX_NAME_BYTES)?;
         Ok(IngestSession {
+            tensorfs,
             session,
             tenant,
             candidates,
@@ -68,14 +77,18 @@ impl Plain for IngestSession {
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             (
                 "candidates",
                 Value::arr(self.candidates.iter().map(|c| c.to_value()).collect()),
             ),
             ("session", Value::str(self.session.clone())),
             ("tenant", Value::str(self.tenant.clone())),
-        ])
+        ];
+        if let Some(tensorfs) = &self.tensorfs {
+            fields.push(("tensorfs", Value::str(tensorfs.clone())));
+        }
+        Value::obj(fields)
     }
 }
 
@@ -109,6 +122,7 @@ pub fn open_root(
     }
     fs::create_dir_all(&dir).map_err(|e| io("mkdir ingest candidate", e))?;
     let root = IngestSession {
+        tensorfs: Some(crate::VERSION.into()),
         session: session.to_string(),
         tenant: tenant.to_string(),
         candidates: Vec::new(),
@@ -147,6 +161,10 @@ pub fn resume_operation(
 }
 
 pub fn write_session(store_root: &Path, root: &IngestSession) -> Result<()> {
+    let root = &IngestSession {
+        tensorfs: Some(crate::VERSION.into()),
+        ..root.clone()
+    };
     let dir = candidate_dir(store_root, &root.session);
     fs::create_dir_all(&dir).map_err(|e| io("mkdir ingest candidate", e))?;
     fs::write(dir.join("session.json"), root.canonical_bytes())
@@ -503,6 +521,7 @@ pub fn ensure_session_root(store_root: &Path, session: &str, tenant: &str) -> Re
         write_session(
             store_root,
             &IngestSession {
+                tensorfs: Some(crate::VERSION.into()),
                 session: session.to_string(),
                 tenant: tenant.to_string(),
                 candidates: Vec::new(),
@@ -1170,8 +1189,11 @@ mod tests {
         let store = Store::init(&path).unwrap();
         let (root, writer) = open_root(&store, "session", "tenant").unwrap();
         assert_eq!(
-            root.canonical_bytes(),
-            br#"{"candidates":[],"session":"session","tenant":"tenant"}"#
+            String::from_utf8(root.canonical_bytes()).unwrap(),
+            format!(
+                r#"{{"candidates":[],"session":"session","tenant":"tenant","tensorfs":"{}"}}"#,
+                crate::VERSION
+            )
         );
 
         let (gone, kept) = reap(&store).unwrap();

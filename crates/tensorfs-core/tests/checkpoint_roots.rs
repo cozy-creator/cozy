@@ -395,3 +395,29 @@ fn completed_pin_survives_actual_process_exit() {
     );
     assert!(reopened.contains(&fixture.data.sha256));
 }
+
+#[test]
+fn a_root_written_by_a_newer_tensorfs_is_refused_naming_that_version() {
+    let fixture = Fixture::new();
+    let owner = object_id(b"newer-writer");
+    checkpoint_root::retain(&fixture.store, &owner, REPOSITORY, fixture.manifest.clone()).unwrap();
+    let path = fixture
+        .root
+        .join("roots/checkpoints")
+        .join(format!("{}.json", &owner[7..]));
+    let text = fs::read_to_string(&path).unwrap();
+    let ours = format!("\"tensorfs\":\"{}\"}}", tensorfs_core::VERSION);
+    assert!(text.ends_with(&ours), "{text}");
+    fs::write(
+        &path,
+        text.replace(&ours, "\"tensorfs\":\"9.9.9\",\"zones\":[]}"),
+    )
+    .unwrap();
+    let refusal = checkpoint_root::read(&fixture.store, &owner).unwrap_err();
+    assert_eq!(refusal.code, Code::UNKNOWN_FIELD);
+    assert!(
+        refusal.detail.contains("TensorFS 9.9.9") && refusal.detail.contains("tensorfs>=9.9.9"),
+        "{}",
+        refusal.detail
+    );
+}

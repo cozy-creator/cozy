@@ -19,6 +19,8 @@ pub(super) struct Root {
     pub checkpoint: Option<ObjectRef>,
     pub name: Option<String>,
     pub restore_epoch: Option<u64>,
+    /// The newest TensorFS that wrote this root.
+    pub tensorfs: Option<String>,
 }
 
 impl Plain for Root {
@@ -66,8 +68,13 @@ impl Plain for Root {
                 Ok(name.to_string())
             })
             .transpose()?;
-        fields.done()?;
+        let tensorfs = fields
+            .opt("tensorfs")
+            .map(|value| crate::canon::as_str("Root", "tensorfs", value).map(str::to_string))
+            .transpose()?;
+        fields.done_written_by(tensorfs.as_deref())?;
         Ok(Self {
+            tensorfs,
             transaction,
             manifest,
             blobs,
@@ -98,6 +105,9 @@ impl Plain for Root {
         }
         if let Some(epoch) = self.restore_epoch {
             fields.push(("restore_epoch", Value::uint(epoch)));
+        }
+        if let Some(tensorfs) = &self.tensorfs {
+            fields.push(("tensorfs", Value::str(tensorfs.clone())));
         }
         Value::obj(fields)
     }
@@ -164,6 +174,10 @@ pub(super) fn all(store: &Store) -> Result<Vec<Root>> {
 }
 
 pub(super) fn write(store: &Store, root: &Root) -> Result<()> {
+    let root = &Root {
+        tensorfs: Some(crate::VERSION.into()),
+        ..root.clone()
+    };
     let bytes = root.canonical_bytes();
     if bytes.len() > Root::MAX_BYTES {
         return refuse(Code::COUNT_CAP, "private derived root exceeds its byte cap");
@@ -201,6 +215,7 @@ pub(super) fn pending(store: &Store, transaction: &str, manifest: &ObjectRef) ->
         );
     }
     let mut root = previous.unwrap_or_else(|| Root {
+        tensorfs: Some(crate::VERSION.into()),
         transaction: transaction.into(),
         manifest: None,
         name: None,
@@ -244,6 +259,7 @@ pub(super) fn adopt(
     write(
         store,
         &Root {
+            tensorfs: Some(crate::VERSION.into()),
             transaction: transaction.into(),
             manifest: Some(manifest.clone()),
             name: Some(name.into()),

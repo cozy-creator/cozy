@@ -2753,6 +2753,7 @@ fn retain_progress(
     roots::write(
         store,
         &roots::Root {
+            tensorfs: Some(crate::VERSION.into()),
             transaction: row.id.clone(),
             manifest: None,
             name: None,
@@ -2815,6 +2816,7 @@ pub(crate) fn retain_restore(
         false
     };
     let mut root = roots::read(store, &transaction)?.unwrap_or_else(|| roots::Root {
+        tensorfs: Some(crate::VERSION.into()),
         transaction: transaction.clone(),
         manifest: None,
         blobs: Vec::new(),
