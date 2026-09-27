@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1204,6 +1205,10 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 	origin = m.origin(origin)
 	m.mu.Lock()
 	rows, problem := m.reconcilableLocked(origin)
+	var asks []records.RentalOperation
+	if problem == nil {
+		asks, problem = m.rowlessAsksLocked(origin)
+	}
 	m.mu.Unlock()
 	if problem != nil {
 		return problem
@@ -1226,6 +1231,22 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 		views = append(views, rentalView{id: row.ID, remote: remote, unknown: observed != nil,
 			released: observed == nil && remote.State == hub.RentalReleased})
 	}
+	// An ask whose answer was refused has no row to reconcile; the Hub still settles it.
+	var gone []records.RentalOperation
+	for _, op := range asks {
+		if asked != nil {
+			break
+		}
+		hctx, cancel := hub.Context()
+		remote, observed := owner.RentalView(hctx, op.RentalID)
+		cancel()
+		switch {
+		case observed == nil && hub.RentalAbsent(remote.State):
+			gone = append(gone, op)
+		case observed != nil && observed.Code != exit.NotFound:
+			asked = observed
+		}
+	}
 	var listing []hub.Rental
 	var listed bool
 	var listingProblem *exit.Error
@@ -1236,6 +1257,9 @@ func (m *managedRentals) reconcile(origin string) *exit.Error {
 	}
 	m.mu.Lock()
 	released, failed, rebooted, problem := m.applyRowsLocked(origin, views)
+	if problem == nil {
+		problem = m.settleAsksLocked(origin, gone)
+	}
 	census := m.censusLocked(origin)
 	switch {
 	case problem != nil:
@@ -1319,6 +1343,55 @@ func (m *managedRentals) reconcilableLocked(origin string) ([]records.Rental, *e
 		}
 	}
 	return out, nil
+}
+
+// rowlessAsksLocked is origin's open paid asks that name a rental with no local row: an
+// answer this host refused to record, or a row already gone. No row reconcile reads them.
+func (m *managedRentals) rowlessAsksLocked(origin string) ([]records.RentalOperation, *exit.Error) {
+	operations, problem := m.store.ActiveRentalOperations()
+	if problem != nil {
+		return nil, problem
+	}
+	busy, problem := m.inFlightLocked()
+	if problem != nil {
+		return nil, problem
+	}
+	var out []records.RentalOperation
+	for _, op := range operations {
+		if op.RentalID == "" || busy[op.RentalID] || m.origin(op.Hub) != origin {
+			continue
+		}
+		row, problem := m.store.RentalRow(op.RentalID)
+		if problem != nil {
+			return nil, problem
+		}
+		if row == nil {
+			out = append(out, op)
+		}
+	}
+	return out, nil
+}
+
+// settleAsksLocked closes the rowless asks the Hub reported gone, unless a row or an
+// operation in flight took them while the Hub was asked.
+func (m *managedRentals) settleAsksLocked(origin string, gone []records.RentalOperation) *exit.Error {
+	if len(gone) == 0 {
+		return nil
+	}
+	current, problem := m.rowlessAsksLocked(origin)
+	if problem != nil {
+		return problem
+	}
+	for _, op := range gone {
+		if !slices.ContainsFunc(current, func(each records.RentalOperation) bool { return each.Key == op.Key }) {
+			continue
+		}
+		if problem := m.store.AdvanceRentalOperation(op.Key, op.RentalID, hub.RentalReleased); problem != nil {
+			return problem
+		}
+		rental.ForgetPending(m.layout, op.Key)
+	}
+	return nil
 }
 
 // inFlightLocked is every rental a purchase or a release in flight holds.

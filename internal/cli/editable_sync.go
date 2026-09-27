@@ -18,6 +18,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -50,6 +51,7 @@ type editableSync struct {
 	rescan   chan struct{}
 	mu       sync.Mutex
 	trees    map[string]*editableTree // by source root
+	said     map[string]string        // last watch refusal logged per source root
 }
 
 type editableTree struct {
@@ -76,7 +78,7 @@ func startEditableSync(layout home.Layout, store *records.Store, resolver *Resol
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &editableSync{layout: layout, store: store, resolver: resolver, owner: owner, log: log,
 		watcher: watcher, ctx: ctx, quit: quit, rescan: make(chan struct{}, 1),
-		trees: map[string]*editableTree{}}
+		trees: map[string]*editableTree{}, said: map[string]string{}}
 	go func() {
 		<-quit
 		cancel()
@@ -207,11 +209,17 @@ func (s *editableSync) reconcile() {
 		if row.SourceKind != "local" || row.SourceRef == "" {
 			continue
 		}
+		// A deleted source tree is not watched; its install stays usable until removed.
+		if _, err := os.Stat(row.SourceRef); errors.Is(err, fs.ErrNotExist) {
+			s.sayOnce(row.SourceRef, fmt.Sprintf("editable %s: source %s is gone; not watching it (install %s stays usable until removed)",
+				row.Package, row.SourceRef, short12(row.ID)))
+			continue
+		}
 		want[row.SourceRef] = row.Package
 		roots[row.SourceRef] = []string{row.SourceRef}
 		dependencies, problem := packagepublish.LocalDependencyPaths(row.SourceRef)
 		if problem != nil {
-			fmt.Fprintf(s.log, "editable %s: dependency watch scan refused: %s\n", row.Package, problem.Message)
+			s.sayOnce(row.SourceRef, fmt.Sprintf("editable %s: dependency watch scan refused: %s", row.Package, problem.Message))
 			// A temporarily missing file or half-written pyproject must not remove
 			// the watches that can observe its repair.
 			s.mu.Lock()
@@ -221,6 +229,7 @@ func (s *editableSync) reconcile() {
 			s.mu.Unlock()
 			continue
 		}
+		s.sayOnce(row.SourceRef, "")
 		for _, path := range dependencies {
 			roots[row.SourceRef] = append(roots[row.SourceRef], path)
 		}
@@ -267,6 +276,20 @@ func (s *editableSync) reconcile() {
 		// The daemon has not read this tree yet: what changed while nobody watched is
 		// found by reading it once now.
 		wake(tree.kick)
+	}
+}
+
+// sayOnce logs line for root unless it is what was last logged there; "" clears it. The
+// database changes on every write, and each change rescans every source.
+func (s *editableSync) sayOnce(root, line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.said[root] == line {
+		return
+	}
+	s.said[root] = line
+	if line != "" {
+		fmt.Fprintln(s.log, line)
 	}
 }
 

@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	_ "modernc.org/sqlite"
 )
 
 // PackageInstall is one immutable install: a materialized environment plus the exact files
@@ -133,11 +132,11 @@ func init() {
 // re-dialled connection with foreign_keys OFF would silently accept the delete Forget
 // exists to refuse. The driver replays them on every connection it opens.
 //
-//	busy_timeout  transient lock contention waits instead of failing immediately
+//	busy_timeout  one round of waiting for another writer (driverName waits out the rest)
 //	foreign_keys  the pin -> install reference is enforced, not decorative
 //	txlock        writers reserve the lock before reading, so two processes cannot both
 //	              read and then fail immediately while upgrading a deferred transaction
-const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
+const pragmas = "?_pragma=busy_timeout(100)&_pragma=foreign_keys(1)&_txlock=immediate"
 
 func Open(path string) (*Store, *exit.Error) {
 	return open(path, false, "")
@@ -164,7 +163,7 @@ func OpenForDaemon(path, triageDir string) (*Store, *exit.Error) {
 func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error) {
 	// No `file:` prefix: the driver hands an unprefixed name to SQLite verbatim, so a
 	// local root containing `%` or `#` stays a path instead of becoming a URI to decode.
-	db, err := sql.Open("sqlite", path+pragmas)
+	db, err := sql.Open(driverName, path+pragmas)
 	if err != nil {
 		return nil, exit.Internalf("cannot open the local records database %s: %s", path, err)
 	}
