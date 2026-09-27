@@ -474,6 +474,14 @@ func (c *Client) RetryJobPublication(id, actor string) (api.JobState, *exit.Erro
 	return state, problem
 }
 
+// UploadJobOutput uploads a job's retained output from the rental holding it to a private
+// checkpoint in destination; the answer carries the upload's state.
+func (c *Client) UploadJobOutput(id, output, destination string) (api.JobState, *exit.Error) {
+	var state api.JobState
+	problem := c.call("POST", "/v1/local/jobs/"+id+"/uploads", api.OutputUploadRequest{Output: output, Destination: destination}, &state)
+	return state, problem
+}
+
 // CancelJob REQUESTS cancellation. A running job's own journaled terminal settles it; a
 // queued one leaves the queue and settles here. The actor names who is canceling.
 func (c *Client) CancelJob(id, actor string) *exit.Error {

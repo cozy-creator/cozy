@@ -37,11 +37,13 @@ type MachineExecutionView struct {
 	Retained string `json:"retained,omitempty"`
 }
 
-// RetainedOutput is an output held on the machine that produced it, in this host's custody.
+// RetainedOutput is an output held on the machine that produced it, in this host's custody,
+// with each upload of it to a private checkpoint.
 type RetainedOutput struct {
-	Output   string `json:"output"`
-	Machine  string `json:"machine"`
-	Manifest string `json:"manifest,omitempty"`
+	Output   string                 `json:"output"`
+	Machine  string                 `json:"machine"`
+	Manifest string                 `json:"manifest,omitempty"`
+	Uploads  []records.OutputUpload `json:"uploads,omitempty"`
 }
 
 // providerRefusal is TensorFS reporting that a provider refused a machine's source call for
@@ -85,9 +87,16 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		if rented, _ := s.store.RentalRow(link.MachineID); row.Machine == "" && rented != nil && rented.MachineName != "" {
 			holder = rented.MachineName
 		}
+		uploads, _ := s.store.OutputUploads(row.ID)
 		for _, hold := range holds {
 			if artifact, _ := records.DecodeModelArtifact(hold.Artifact); hold.State == "held" && artifact != nil {
-				retained = append(retained, RetainedOutput{Output: artifact.OutputSlot, Machine: holder, Manifest: artifact.Manifest.Digest})
+				output := RetainedOutput{Output: artifact.OutputSlot, Machine: holder, Manifest: artifact.Manifest.Digest}
+				for _, upload := range uploads {
+					if upload.Output == artifact.OutputSlot {
+						output.Uploads = append(output.Uploads, upload)
+					}
+				}
+				retained = append(retained, output)
 			}
 		}
 	}

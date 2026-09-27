@@ -262,7 +262,10 @@ Ordinary description/prompt strings are never interpreted as files. Supplying th
 field in JSON and with `--asset` is an error. These inputs accept local files, not URLs.
 
 `--upload-to` uploads each declared weight output as an owner-only immutable checkpoint;
-it publishes no release. `--source-profile slot=profile` narrows each foreign
+it publishes no release. A rented job run without it keeps those outputs retained on its
+rental until `cozy rental end`; `cozy run upload <run>[#<output>] <org/model>` uploads one
+later, straight from the rental and without running again, and a repeat resumes or returns
+the same checkpoint. `--source-profile slot=profile` narrows each foreign
 input to a reviewed TensorFS profile. Currently every foreign input must name the same
 provider source and all model slots must be foreign; mixed inputs and multiple independent
 sources refuse before acquisition. Tensorhub inputs use the ordinary exact model resolver.
@@ -275,7 +278,7 @@ through their recorded intent after an upgrade. `--producer` on model upload/dow
 removed; jobs have one invocation surface.
 
 A successful producer with blocked publication retains its receipts and worker bytes.
-`cozy run retry-publication <run-id>` retries publication without rerunning the producer;
+`cozy run retry-upload <run-id>` retries the checkpoint upload without rerunning the producer;
 explicit cancellation abandons unfinished output custody through the same finalizer.
 
 Publish, repoint, add, or remove release lanes separately. Omitted lanes stay unchanged:

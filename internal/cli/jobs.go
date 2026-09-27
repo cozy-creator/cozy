@@ -574,7 +574,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 	if len(state.RetainedOutputs) > 0 {
 		machine := state.RetainedOutputs[0].Machine
 		rec.Notes = append(rec.Notes, fmt.Sprintf("retained outputs stay on %s until `cozy rental end %s`; "+
-			"to upload them, run again there with --upload-to <org/model>", machine, machine))
+			"`cozy run upload` sends one to a private checkpoint without running again", machine, machine))
 	}
 	if export := state.OutputExport; export != nil && export.State == "failed" {
 		rec.Notes = append(rec.Notes, fmt.Sprintf("output export to %s failed (%s): %s; accepted output bytes remain in internal custody",
@@ -589,7 +589,7 @@ func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Even
 		if hint := modelPublishHint(state); hint != "" {
 			rec.Next = []string{hint}
 		} else if len(state.RetainedOutputs) > 0 {
-			rec.Next = []string{"cozy run <script-or-package> --rental=" + state.RetainedOutputs[0].Machine + " --upload-to <org/model>"}
+			rec.Next = []string{"cozy run upload " + runReference(state.Number, state.JobID) + "#" + state.RetainedOutputs[0].Output + " <org/model> --await"}
 		} else if len(state.NativeOutputs) > 0 {
 			rec.Next = []string{"cozy run watch " + runReference(state.Number, state.JobID) + " --full"}
 		} else if state.Publication != nil {

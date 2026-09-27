@@ -61,6 +61,7 @@ type machineRuns struct {
 	placed    map[string]string // the last placement decision recorded per waiting run
 	machines  *machines.Resolver
 	observers sync.Map // one collection/control lock per observed request
+	uploading sync.Map // retained-output uploads in progress, by operation
 	updates   *rentalRuntimeUpdates
 	// ownerReads paces owner finalization reads of publications a machine cannot settle.
 	ownerReads ownerReads
@@ -208,6 +209,16 @@ func (m *machineRuns) Resume() {
 		request, problem := m.store.RequestRow(link.RequestID)
 		if problem == nil && request != nil {
 			_ = m.Start(*request)
+		}
+	}
+	uploads, problem := m.store.UnfinishedOutputUploads()
+	if problem != nil {
+		fmt.Fprintf(m.context.Out, "output upload recovery: %s\n", problem.Message)
+		return
+	}
+	for request, pending := range uploads {
+		for _, upload := range pending {
+			m.startUpload(request, upload)
 		}
 	}
 }
@@ -623,10 +634,14 @@ func (m *machineRuns) executionConnection(ctx context.Context, request records.R
 
 // runHolder names a run and what it is doing on its machine.
 func (m *machineRuns) runHolder(request records.Request, doing string) string {
+	return m.runName(request) + " " + doing
+}
+
+func (m *machineRuns) runName(request records.Request) string {
 	if numbered, problem := m.store.RequestByReference(request.ID); problem == nil && numbered != nil && numbered.Number > 0 {
-		return fmt.Sprintf("run %d %s", numbered.Number, doing)
+		return fmt.Sprintf("run %d", numbered.Number)
 	}
-	return "run " + request.ID + " " + doing
+	return "run " + request.ID
 }
 
 func (m *machineRuns) Refresh(parent context.Context, request records.Request) *exit.Error {

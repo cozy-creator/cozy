@@ -821,7 +821,7 @@ func (s *Store) SettleMachineDestination(requestID, unpublished string) *exit.Er
 	checkpoints := map[string]string{}
 	for _, output := range transfer.Outputs {
 		if published[output.Name] == "" {
-			return s.FailModelTransfer(requestID, "publication.destination_unpublished", unpublished)
+			return s.FailModelTransfer(requestID, "upload.destination_missing", unpublished)
 		}
 		checkpoints[output.Name] = published[output.Name]
 	}
