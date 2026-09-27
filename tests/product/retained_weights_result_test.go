@@ -62,7 +62,10 @@ func TestRentedWeightsOutputSettlesRetainedOnTheRental(t *testing.T) {
 	must(t, err)
 
 	// The job wrote its declared weights output and returned a plain dict.
-	native := []byte(`{"receipt":"native"}`)
+	// The native receipt names what the write added: 5 GB of objects, header and manifest.
+	native := []byte(`{"added_objects":[{"length":1000000000,"sha256":"` + strings.Repeat("a", 64) + `"},` +
+		`{"length":4000000000,"sha256":"` + strings.Repeat("b", 64) + `"}],"header":{"length":2048,"sha256":"` + strings.Repeat("c", 64) +
+		`"},"manifest":{"length":321,"sha256":"` + strings.Repeat("9", 64) + `"}}`)
 	nativeDigest, err := canonical.Spell(canonical.Digest(native))
 	must(t, err)
 	weights, weightsDigest, err := canonical.Identity(&pb.WeightsReceipt{OwnerAuthorityScope: "owner", RequestId: request.ID,
@@ -118,6 +121,12 @@ func TestRentedWeightsOutputSettlesRetainedOnTheRental(t *testing.T) {
 	fatal(t, problem)
 	if len(holds) != 1 || holds[0].ResultPointer != "weights/model" || holds[0].State != "held" || held.Load() == 0 {
 		t.Fatalf("the weights output is not held on the machine: %+v", holds)
+	}
+	// The rental's disk counts what the write actually added, not its declared maximum.
+	retained, problem := store.RentalRetainedModelBytes(podRental)
+	fatal(t, problem)
+	if retained != 5_000_002_369 {
+		t.Fatalf("the rental counts %d retained bytes, want the 5000002369 the write added", retained)
 	}
 
 	// The retained bytes are custody, not a use: maintenance goes past the fence to the

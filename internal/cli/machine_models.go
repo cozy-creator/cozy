@@ -67,7 +67,7 @@ func (p *machineModelPlan) covers(receipt *pb.WeightsReceipt) bool {
 // bytes then stay retained on the rental, counted as its disk, until released or the
 // rental ends, and collection completes: nothing waits on a transfer nobody drives.
 func (m *machineRuns) retainMachineWeights(ctx context.Context, request records.Request, connection *machineConnection,
-	outcome *pb.AttemptOutcome, body *pb.AttemptOutcomeBody, plan *machineModelPlan) *exit.Error {
+	outcome *pb.AttemptOutcome, body *pb.AttemptOutcomeBody, plan *machineModelPlan, written map[string]int64) *exit.Error {
 	for _, ref := range body.WeightsReceipts {
 		var receipt pb.WeightsReceipt
 		if ref == nil || !bytes.Equal(canonical.Digest(ref.WeightsReceiptCanonicalBytes), ref.WeightsReceiptDigest) ||
@@ -84,7 +84,7 @@ func (m *machineRuns) retainMachineWeights(ctx context.Context, request records.
 		}
 		artifact := records.ModelArtifact{ProducerRequestID: request.ID, OutputSlot: receipt.OutputSlot, TensorFSReceiptDigest: receipt.TensorfsReceiptDigest}
 		hold := records.MachineModelRetention{OutcomeID: outcome.OutcomeId, ResultPointer: "weights/" + receipt.OutputSlot,
-			TransactionID: receipt.WeightsTransactionId, ReceiptDigest: digest,
+			TransactionID: receipt.WeightsTransactionId, ReceiptDigest: digest, Bytes: written[receipt.WeightsTransactionId],
 			RetentionID: records.ArtifactRetentionID(request.ID, "machine-weights", receipt.OutputSlot, artifact)}
 		// The retention id is fixed by the output, so an ask repeated after a lost answer
 		// holds the same bytes once; the root hold is released only after this is recorded.
@@ -111,7 +111,33 @@ func (m *machineRuns) retainMachineWeights(ctx context.Context, request records.
 	return nil
 }
 
-func (m *machineRuns) collectMachineModels(ctx context.Context, request records.Request, connection *machineConnection, outcome *pb.AttemptOutcome, plan *machineModelPlan) (bool, *exit.Error) {
+// writtenBytes is, per weights transaction, what the write added to the machine's disk:
+// its added objects, header and manifest, as the native receipt names them.
+func writtenBytes(body *pb.AttemptOutcomeBody) map[string]int64 {
+	written := map[string]int64{}
+	for _, ref := range body.WeightsReceipts {
+		var receipt pb.WeightsReceipt
+		if ref == nil || canonical.Unmarshal(ref.WeightsReceiptCanonicalBytes, &receipt) != nil {
+			continue
+		}
+		var native struct {
+			Added    []struct{ Length int64 } `json:"added_objects"`
+			Header   struct{ Length int64 }   `json:"header"`
+			Manifest struct{ Length int64 }   `json:"manifest"`
+		}
+		if json.Unmarshal(receipt.TensorfsReceiptCanonicalBytes, &native) != nil {
+			continue
+		}
+		total := native.Header.Length + native.Manifest.Length
+		for _, object := range native.Added {
+			total += object.Length
+		}
+		written[receipt.WeightsTransactionId] = total
+	}
+	return written
+}
+
+func (m *machineRuns) collectMachineModels(ctx context.Context, request records.Request, connection *machineConnection, outcome *pb.AttemptOutcome, plan *machineModelPlan, written map[string]int64) (bool, *exit.Error) {
 	if plan == nil || !plan.native {
 		return plan != nil && plan.native, nil
 	}
@@ -121,6 +147,7 @@ func (m *machineRuns) collectMachineModels(ctx context.Context, request records.
 			TransactionID: model.Retention.WeightsTransactionId, ReceiptDigest: model.Retention.TensorfsReceiptDigest,
 			SourceRetentionID: model.Retention.RetentionId,
 			RetentionID:       records.ArtifactRetentionID(request.ID, "machine-result", model.Pointer, model.Artifact),
+			Bytes:             written[model.Retention.WeightsTransactionId],
 		}
 		if hold.RetentionID == hold.SourceRetentionID {
 			return false, exit.New(exit.Conflict, "model recipient custody must be independent of the Runtime root hold")

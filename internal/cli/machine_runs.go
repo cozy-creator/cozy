@@ -805,7 +805,8 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if modelProblem != nil {
 		return modelProblem
 	}
-	models, problem := m.collectMachineModels(ctx, request, connection, outcome, modelPlan)
+	written := writtenBytes(&body)
+	models, problem := m.collectMachineModels(ctx, request, connection, outcome, modelPlan, written)
 	if problem != nil {
 		return problem
 	}
@@ -816,7 +817,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem != nil {
 		return problem
 	}
-	if problem := m.retainMachineWeights(ctx, request, connection, outcome, &body, modelPlan); problem != nil {
+	if problem := m.retainMachineWeights(ctx, request, connection, outcome, &body, modelPlan, written); problem != nil {
 		return m.retainedResult(request, outcome, problem)
 	}
 	if len(body.GetOutputManifest().GetOutputs()) > 0 && !files || body.GetResult().GetResultBlob() != nil || body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ChildArtifacts && !models && !files {

@@ -21,6 +21,9 @@ type MachineModelRetention struct {
 	SourceRetentionID string          `json:"source_retention_id"`
 	RetentionID       string          `json:"retention_id"`
 	State             string          `json:"state"`
+	// Bytes is what the output's write added to the machine's disk, as its native
+	// receipt reports it; inherited payload is its sources' and is not counted again.
+	Bytes int64 `json:"bytes,omitempty"`
 }
 
 const machineModelRetentionOwed = `EXISTS(SELECT 1 FROM request_events hold
