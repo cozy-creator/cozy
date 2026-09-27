@@ -1358,6 +1358,7 @@ struct PullProgress {
 struct PullProgressState {
     total_bytes: u64,
     held_bytes: u64,
+    wanted_objects: u64,
     origin_bytes: u64,
     cache_bytes: u64,
     origin_objects: u64,
@@ -1371,6 +1372,7 @@ impl PullProgress {
             state: Mutex::new(PullProgressState {
                 total_bytes: 0,
                 held_bytes: 0,
+                wanted_objects: 0,
                 origin_bytes: 0,
                 cache_bytes: 0,
                 origin_objects: 0,
@@ -1385,6 +1387,7 @@ impl PullProgress {
         let mut state = self.state.lock().unwrap();
         state.total_bytes = plan.declared_bytes();
         state.held_bytes = plan.held_bytes();
+        state.wanted_objects = plan.wanted.len() as u64;
         state.last = Some(Instant::now());
         print_progress(&state);
     }
@@ -1447,11 +1450,12 @@ impl PullProgress {
 ///
 /// Every counter is always present, including a zero. A consumer that reads an absent key
 /// as zero cannot tell a cache that answered nothing from a build that never reported the
-/// door at all, and those are the two states worth telling apart.
+/// door at all, and those are the two states worth telling apart. `wanted_objects` is the
+/// plan's count of objects to land; a pod host sizes this pull's storage reservation from it.
 fn print_progress(state: &PullProgressState) {
     eprintln!(
-        "{{\"event\":\"pull.progress\",\"total_bytes\":{},\"held_bytes\":{},\"origin_bytes\":{},\"cache_bytes\":{},\"origin_objects\":{},\"cache_objects\":{}}}",
-        state.total_bytes, state.held_bytes, state.origin_bytes, state.cache_bytes,
+        "{{\"event\":\"pull.progress\",\"total_bytes\":{},\"held_bytes\":{},\"wanted_objects\":{},\"origin_bytes\":{},\"cache_bytes\":{},\"origin_objects\":{},\"cache_objects\":{}}}",
+        state.total_bytes, state.held_bytes, state.wanted_objects, state.origin_bytes, state.cache_bytes,
         state.origin_objects, state.cache_objects
     );
 }
