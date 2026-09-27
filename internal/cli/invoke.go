@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -2594,6 +2595,17 @@ func emitDescribe(ctx *Context, target Target, packageInterface *launch.PackageI
 		raw, ok := packageInterface.RawRequest(ep.Name)
 		if !ok {
 			return exit.Internalf("the package interface does not carry %s's request struct", ep.Name)
+		}
+		// A job's accelerator declaration rides beside its request: true, false, or null.
+		var doc map[string]json.RawMessage
+		if ep.Kind == "job" && json.Unmarshal(raw, &doc) == nil {
+			doc["accelerator"], _ = json.Marshal(ep.Accelerator)
+			var out bytes.Buffer
+			encoder := json.NewEncoder(&out)
+			encoder.SetEscapeHTML(false)
+			if encoder.Encode(doc) == nil {
+				raw = bytes.TrimSpace(out.Bytes())
+			}
 		}
 		fmt.Fprintln(ctx.Out, string(raw))
 		return nil

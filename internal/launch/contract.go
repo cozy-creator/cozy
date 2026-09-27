@@ -136,7 +136,7 @@ func DescribeContract(target string, ep *Entrypoint, bindings map[string]string)
 	var b strings.Builder
 	b.WriteString(target)
 	if ep.Kind == "job" {
-		b.WriteString(" (job)")
+		b.WriteString(" (job)\n  runs on: " + ep.RunsOn())
 	}
 	b.WriteString("\n")
 	if len(ep.Request.Fields) == 0 {

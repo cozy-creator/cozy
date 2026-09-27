@@ -27,6 +27,17 @@ func (e *Entrypoint) NeedsAccelerator(closure []string) bool {
 	return AcceleratorRequired(closure)
 }
 
+// RunsOn renders a job's accelerator declaration; an undeclared job follows its closure.
+func (e *Entrypoint) RunsOn() string {
+	switch {
+	case e.Accelerator == nil:
+		return "GPU if its dependencies include torch, else CPU (undeclared)"
+	case *e.Accelerator:
+		return "GPU"
+	}
+	return "CPU"
+}
+
 func requirementName(requirement string) string {
 	name, _ := requirementParts(requirement)
 	return name
