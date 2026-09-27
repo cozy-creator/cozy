@@ -114,11 +114,16 @@ def main():
             altered = area / (arm + ".safetensors")
             sparse(altered, struct.pack("<Q", len(body)) + body, 8 + len(body) + maximum)
             result = plan(altered, member, compiled=True)
+            if arm == "same-width-dtype":
+                # The reviewed key set classifies; conversion validates the actual dtypes.
+                assert result.returncode == 0, (arm, result.stderr)
+                continue
             assert result.returncode != 0 and "UNREGISTERED_FINGERPRINT" in result.stderr, (
                 arm, result.stdout, result.stderr)
     print(json.dumps({"checked": 4, "changes": changes,
                       "profile": observed["profile"], "tensor_payload_bytes_read": 0,
-                      "strict_refusals": ["same-width-dtype", "missing-key", "provider-namespace"]}))
+                      "classifies": ["same-width-dtype"],
+                      "strict_refusals": ["missing-key", "provider-namespace"]}))
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ pub struct TreeRoot {
     pub objects: Vec<ObjectRef>,
     pub complete: bool,
     pub released: bool,
+    /// The newest TensorFS that wrote this root.
+    pub tensorfs: Option<String>,
 }
 impl Plain for TreeRoot {
     const MAX_BYTES: usize = 1 << 20;
@@ -45,8 +47,13 @@ impl Plain for TreeRoot {
         };
         let complete = boolean(f.req("complete")?)?;
         let released = boolean(f.req("released")?)?;
-        f.done()?;
+        let tensorfs = f
+            .opt("tensorfs")
+            .map(|value| crate::canon::as_str("TreeRoot", "tensorfs", value).map(str::to_string))
+            .transpose()?;
+        f.done_written_by(tensorfs.as_deref())?;
         Ok(Self {
+            tensorfs,
             owner,
             producer,
             manifest,
@@ -56,7 +63,7 @@ impl Plain for TreeRoot {
         })
     }
     fn to_value(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             ("owner", Value::str(&self.owner)),
             ("producer", Value::str(&self.producer)),
             ("manifest", self.manifest.to_value()),
@@ -66,7 +73,11 @@ impl Plain for TreeRoot {
             ),
             ("complete", Value::Bool(self.complete)),
             ("released", Value::Bool(self.released)),
-        ])
+        ];
+        if let Some(tensorfs) = &self.tensorfs {
+            fields.push(("tensorfs", Value::str(tensorfs.clone())));
+        }
+        Value::obj(fields)
     }
 }
 impl TreeRoot {
@@ -125,6 +136,10 @@ pub fn read(store: &Store, owner: &str) -> Result<Option<TreeRoot>> {
     Ok(Some(root))
 }
 fn write(store: &Store, root: &TreeRoot) -> Result<()> {
+    let root = &TreeRoot {
+        tensorfs: Some(crate::VERSION.into()),
+        ..root.clone()
+    };
     let bytes = root.canonical_bytes();
     if bytes.len() > TreeRoot::MAX_BYTES {
         return refuse(Code::SIZE_CAP, "retained tree root exceeds metadata bound");
@@ -209,6 +224,7 @@ impl<'a> Writer<'a> {
             }
             None => {
                 let root = TreeRoot {
+                    tensorfs: Some(crate::VERSION.into()),
                     owner: owner.into(),
                     producer: owner.into(),
                     manifest,
@@ -553,6 +569,7 @@ pub fn check_roster(owner: &str, tree: &Manifest) -> Result<()> {
     objects.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     objects.dedup();
     let root = TreeRoot {
+        tensorfs: Some(crate::VERSION.into()),
         owner: owner.into(),
         producer: owner.into(),
         manifest: tree.object_ref(),

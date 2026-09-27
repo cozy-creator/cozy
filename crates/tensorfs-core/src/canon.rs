@@ -456,6 +456,31 @@ impl<'a> Fields<'a> {
         }
     }
 
+    /// End a record whose unread field could keep bytes alive (a GC root): refuse, naming the
+    /// newer TensorFS that wrote it, rather than drop what that version may rely on.
+    pub fn done_written_by(self, writer: Option<&str>) -> Result<()> {
+        let Some((k, _)) = self.left.first() else {
+            return Ok(());
+        };
+        let by = writer.map_or_else(
+            || "a newer TensorFS".to_string(),
+            |writer| format!("TensorFS {writer}"),
+        );
+        let upgrade = writer.map_or_else(
+            || "upgrade TensorFS".to_string(),
+            |writer| format!("upgrade to tensorfs>={writer}"),
+        );
+        refuse(
+            Code::UNKNOWN_FIELD,
+            format!(
+                "{}: field {k:?} was written by {by}; this is TensorFS {} — {upgrade}. It is \
+                 refused rather than dropped because it may keep bytes alive",
+                self.what,
+                crate::VERSION
+            ),
+        )
+    }
+
     /// End a document that tolerates additive fields, keeping them for re-emission.
     pub fn rest(self) -> Extra {
         Extra(

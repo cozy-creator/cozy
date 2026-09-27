@@ -22,6 +22,8 @@ pub struct CheckpointRoot {
     pub repository: RepositoryName,
     pub manifest: ObjectRef,
     pub released: bool,
+    /// The newest TensorFS that wrote this root.
+    pub tensorfs: Option<String>,
 }
 
 impl Plain for CheckpointRoot {
@@ -36,11 +38,18 @@ impl Plain for CheckpointRoot {
             Value::Bool(value) => *value,
             _ => return refuse(Code::WRONG_TYPE, "checkpoint root release must be boolean"),
         };
-        fields.done()?;
+        let tensorfs = fields
+            .opt("tensorfs")
+            .map(|value| {
+                crate::canon::as_str("CheckpointRoot", "tensorfs", value).map(str::to_string)
+            })
+            .transpose()?;
+        fields.done_written_by(tensorfs.as_deref())?;
         if manifest.length == 0 || manifest.length > crate::limits::INT_MAX as u64 {
             return refuse(Code::LENGTH_MISMATCH, "checkpoint root manifest is empty");
         }
         Ok(Self {
+            tensorfs,
             owner,
             repository,
             manifest,
@@ -49,7 +58,7 @@ impl Plain for CheckpointRoot {
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             ("owner", Value::str(self.owner.clone())),
             (
                 "repository",
@@ -57,7 +66,11 @@ impl Plain for CheckpointRoot {
             ),
             ("manifest", self.manifest.to_value()),
             ("released", Value::Bool(self.released)),
-        ])
+        ];
+        if let Some(tensorfs) = &self.tensorfs {
+            fields.push(("tensorfs", Value::str(tensorfs.clone())));
+        }
+        Value::obj(fields)
     }
 }
 
@@ -126,6 +139,10 @@ fn lock(store: &Store, owner: &str) -> Result<File> {
 }
 
 fn write(store: &Store, root: &CheckpointRoot) -> Result<()> {
+    let root = &CheckpointRoot {
+        tensorfs: Some(crate::VERSION.into()),
+        ..root.clone()
+    };
     let path = path(store, &root.owner)?;
     let temporary = path.with_extension(format!("tmp-{}", crate::meta::now_nanos_unique()));
     let result = (|| {
@@ -159,6 +176,7 @@ fn identity(owner: &str, source: &str, manifest: ObjectRef) -> Result<Checkpoint
         return refuse(Code::LENGTH_MISMATCH, "checkpoint root manifest is empty");
     }
     Ok(CheckpointRoot {
+        tensorfs: Some(crate::VERSION.into()),
         owner: prefixed("checkpoint root owner", owner)?,
         repository: repository(source)?,
         manifest,

@@ -54,5 +54,8 @@ pub mod store;
 pub mod transport;
 pub mod vectors;
 
+/// This TensorFS's release version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Conservative identity of the actual native converter build, not its version label.
 pub const IMPLEMENTATION_SHA256: &str = env!("TENSORFS_IMPLEMENTATION_SHA256");
