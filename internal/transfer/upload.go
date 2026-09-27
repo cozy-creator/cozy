@@ -56,7 +56,6 @@ type Upload struct {
 	ManifestID string
 	Session    string
 	Reason     string
-	DryRun     bool
 	// Progress receives one line per phase. It is where the honest accounting is
 	// printed as the work happens; the returned Result carries the same numbers.
 	Progress func(string)
@@ -224,11 +223,6 @@ func (p *Upload) Run(ctx context.Context) (Result, *exit.Error) {
 	p.say("publication %s: %d transfers need upload (%s) · %d already resident (%s)",
 		res.PublishID, len(toUpload), size(res.Totals.MissingBytes),
 		res.Totals.HeldObjects, size(res.Deduped))
-
-	if p.DryRun {
-		p.say("--dry-run: transfers claimed, no grant requested and no byte sent")
-		return res, nil
-	}
 
 	// 4. Grants and writes. Nothing uploads without an exact transfer grant.
 	if len(toUpload) > 0 {

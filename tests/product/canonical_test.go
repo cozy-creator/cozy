@@ -410,7 +410,7 @@ func TestPackageInterfaceComponentLowerBound(t *testing.T) {
 	}
 }
 
-// TestDynamicProducerOutputs is the model-upload dry-run boundary. The selected
+// TestDynamicProducerOutputs is the model-upload submission boundary. The selected
 // source determines the exact header; the PackageInterface and intent agree only on
 // output slot names, never a duplicate topology contract.
 func TestDynamicProducerOutputs(t *testing.T) {

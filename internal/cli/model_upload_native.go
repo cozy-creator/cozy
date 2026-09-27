@@ -15,7 +15,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelsource"
-	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/scratch"
@@ -46,9 +45,6 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 	}
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return true, problem
-	}
-	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--await") {
-		return true, exit.Usagef("--dry-run and --await conflict")
 	}
 	if ctx.Inv.Value("--lane") != "" {
 		return true, exit.Usagef("--lane selects only a Tensorhub model release")
@@ -128,23 +124,6 @@ func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
 		script = recipeUploadScript(recipe.Repository, recipe.Revision, destination.String())
 	} else {
 		script = genericUploadScript(parsed.Kind, pinned, profiles, destination.String())
-	}
-	if ctx.Inv.Bool("--dry-run") {
-		fields := []output.Field{
-			{K: "kind", V: "model-upload"}, {K: "model", V: destination.String()},
-			{K: "source", V: source.Canonical}, {K: "source_profiles", V: profiles},
-			{K: "source_files", V: source.Files}, {K: "source_bytes", V: output.Bytes(source.Bytes)},
-			{K: "conversion", V: "planned"}, {K: "conversion_sessions", V: conversion.Sessions()},
-			{K: "rental", V: ctx.Inv.Value("--rental")},
-			{K: "steps", V: []string{"download", "convert", "upload-checkpoint"}},
-			{K: "status", V: "planned"}, {K: "changed", V: false},
-		}
-		if recipe != nil {
-			fields = append(fields, output.Field{K: "recipe", V: recipe.Name},
-				output.Field{K: "metadata", V: recipe.Metadata},
-				output.Field{K: "steps", V: []string{"download", "convert", "prepare-metadata", "upload-checkpoint"}})
-		}
-		return true, emit(ctx, compactRecord(fields, "kind", "model", "source", "source_profiles", "conversion", "status", "changed"))
 	}
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {

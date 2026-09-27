@@ -101,7 +101,6 @@ type Fetch struct {
 	Lane       string
 	Ref        hub.Ref
 	ManifestID string
-	DryRun     bool
 	Progress   func(string)
 	Scratch    string
 	// Locks is the caller-supplied model-acquisition flock directory (the Creator
@@ -176,10 +175,6 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	if err := os.MkdirAll(f.Scratch, 0o700); err != nil {
 		return out, exit.Internalf("cannot create the transfer scratch at %s: %s", f.Scratch, err)
 	}
-	if f.DryRun {
-		return f.plan(ctx, row, out)
-	}
-
 	// Round 1 — the manifest. It proves its own identity before entering the typed
 	// manifest namespace.
 	t0 := time.Now()
@@ -254,65 +249,6 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 		return out, e
 	}
 	f.say("Model files ready: %s", f.Ref.String())
-	return out, nil
-}
-
-// plan answers what a fetch WOULD move, and moves nothing at all — not even the
-// manifest. What it can be exact about depends on what is already local: with the
-// manifest's own blobs in the store the closure is computable and the answer is
-// object-for-object; without them the answer is the hub's row, and it says so. A plan
-// that fetched documents to sharpen its own numbers would be a transfer with a
-// misleading name.
-func (f *Fetch) plan(ctx context.Context, row hub.ModelManifest, out Fetched) (Fetched, *exit.Error) {
-	out.Objects, out.Bytes = row.Objects, row.Bytes
-	f.say("the hub's row: %d objects, %s", row.Objects, size(row.Bytes))
-
-	resident := false
-	if row.Release == "" {
-		length, problem := f.Tool.RetainedCheckpoint(f.Ref.Org, f.Ref.Name, row.ManifestID, f.Scratch)
-		if problem != nil {
-			return out, problem
-		}
-		resident = length > 0
-	} else {
-		releases, problem := f.Tool.Releases(filepath.Join(f.Scratch, "plan-releases.jsonl"))
-		if problem != nil {
-			return out, problem
-		}
-		for _, release := range releases {
-			if "sha256:"+release.ManifestSHA256 == row.ManifestID {
-				resident = true
-				break
-			}
-		}
-	}
-	if !resident {
-		out.Moved = row.Bytes
-		f.say("this store does not retain the manifest: its whole closure would move")
-		return out, nil
-	}
-	objects, e := f.Tool.ManifestObjects(row.ManifestID, filepath.Join(f.Scratch, "plan-objects.jsonl"))
-	if e != nil {
-		return out, e
-	}
-	var need, have int64
-	var missing int
-	for _, o := range objects {
-		h, e := f.Tool.Held(o.ID)
-		if e != nil {
-			return out, e
-		}
-		if h {
-			have += o.Length
-			continue
-		}
-		need += o.Length
-		missing++
-	}
-	out.Objects, out.Bytes = len(objects), need+have
-	out.Moved, out.Held = need, have
-	f.say("%d of %d objects to fetch: %s to move, %s already verified here",
-		missing, len(objects), size(need), size(have))
 	return out, nil
 }
 

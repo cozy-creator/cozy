@@ -16,7 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
-	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -119,35 +118,16 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 				WithRemedy("run without --rental or --rental-only; tracked remote-return support is not landed")
 		}
 	}
-	if ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--await") {
-		return exit.Usagef("--dry-run and --await conflict: a dry-run creates no durable run")
-	}
 	preflightLocalOnly := localOnlyModelSource(sourceArg)
 	if !(preflightLocalOnly && ctx.Inv.Bool("--rental") && !ctx.Inv.Bool("--rental-only")) {
 		if problem := validateRunPlacement(ctx); problem != nil {
 			return problem
 		}
 	}
-	callable := ""
 	var suppliedProfiles map[string]string
 	if invocation != nil {
-		callable = invocation.Target.Package + "/" + invocation.Target.Function
 		suppliedProfiles = invocation.Profiles
 	}
-	instructionSource, problem := canonicalProductionSource(ctx, sourceArg)
-	if problem != nil {
-		return problem
-	}
-	placement := ""
-	if ctx.Inv.Bool("--rental") {
-		placement = "rental"
-	} else if ctx.Inv.Bool("--rental-only") {
-		placement = "rental-only"
-	}
-	instruction := modeltransfer.Instruction{Kind: kind, Destination: destination,
-		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
-		Producer: callable, Placement: placement, SourceProfiles: suppliedProfiles}
-	// The canonical file: identity is not a user filesystem spelling to parse again.
 	localOnly := preflightLocalOnly
 	if localOnly && (ctx.Inv.Bool("--rental-only") || ctx.Inv.Value("--rental") != "") {
 		return exit.Usagef("a local model source cannot run under --rental-only").
@@ -183,18 +163,12 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 			WithRemedy("run locally or use the original pinned provider source until the tracked catalog binding lands")
 	}
 	plan := modeltransfer.Plan{
-		Instruction: instruction,
-		Destination: destination,
-		Source:      source.Canonical, SourceSelection: source.Selection,
+		Kind: kind, Destination: destination,
+		Source: source.Canonical, SourceSelection: source.Selection,
 		SourceLicense: source.License, InputLane: source.Lane,
 		SourceFiles: source.Exact,
 	}
 	if invocation != nil {
-		target := invocation.Target
-		plan.Producer, plan.ProducerInstallID, plan.ProducerRelease = callable, target.InstallID, target.Release
-		plan.Job = &modeltransfer.JobPin{Callable: callable, Package: target.Package,
-			Function: target.Function, InstallID: target.InstallID, Release: target.Release,
-			DescriptorID: invocation.Job.DescriptorID}
 		plan.SourceProfiles = suppliedProfiles
 		for _, output := range invocation.Job.WeightsOutputs {
 			plan.Outputs = append(plan.Outputs, modeltransfer.OutputPin{Name: output.OutputID})
@@ -206,16 +180,13 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 	// decidable HERE — owner-side, before a rental is requested, before a byte of payload
 	// moves, and before this process submits anything. Runs 290, 294 and 309 each moved
 	// 210.3 GB and then refused on facts that were in the first few kilobytes of each
-	// member; a `--dry-run` in front of each of them reported `status: planned`, because
-	// it validated the dispatch plan and never the conversion plan.
+	// member.
 	//
-	// Placed on the two paths that pay for the omission: a DRY RUN, whose whole job is to
-	// answer this question, and a RENTED transfer, which is the one that spends money to
-	// find out. A local transfer already plans from headers itself, in
-	// prepareLocalTransferSources, and paying for a second header read here would be the
-	// same work twice.
+	// Placed on the RENTED transfer, which is the one that spends money to find out. A
+	// local transfer already plans from headers itself, in prepareLocalTransferSources,
+	// and paying for a second header read here would be the same work twice.
 	conversion := conversionPreflight{Undecided: "not run on this path"}
-	if ctx.Inv.Bool("--dry-run") || effectiveRental {
+	if effectiveRental {
 		pctx, cancel := hub.LongContext()
 		decided, problem := preflightConversionPlan(pctx, ctx, source, plan.SourceProfiles)
 		cancel()
@@ -230,51 +201,6 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 		}
 	}
 
-	id := plan.ID()
-	if ctx.Inv.Bool("--dry-run") {
-		if kind == "model-upload" && !privateOutputs {
-			ref, _ := hub.ParseRef(destination)
-			if _, problem := ownedPublication(ctx, ref); problem != nil {
-				return problem
-			}
-		}
-		fields := []output.Field{
-			{K: "id", V: id}, {K: "kind", V: kind},
-			{K: "model", V: destination},
-			{K: "source", V: source.Canonical}, {K: "source_selection", V: source.Selection},
-			{K: "source_files", V: source.Files}, {K: "source_bytes", V: output.Bytes(source.Bytes)},
-			{K: "status", V: "planned"}, {K: "changed", V: false},
-		}
-		if invocation != nil {
-			fields = fields[1:] // ordinary jobs have no transfer-instruction identity
-			fields = append(fields,
-				output.Field{K: "target", V: callable},
-				output.Field{K: "release", V: invocation.Target.Release},
-				output.Field{K: "input", V: submission.Input},
-				output.Field{K: "source_profiles", V: plan.ProfileNames()},
-				output.Field{K: "steps", V: 1},
-				output.Field{K: "outputs", V: plan.OutputNames()},
-			)
-			// What the dispatch plan cannot say and this can: the reviewed headers admit a
-			// conversion, and these are the journal keys the pod will open.
-			if conversion.decided() {
-				fields = append(fields,
-					output.Field{K: "conversion", V: "planned"},
-					output.Field{K: "conversion_sessions", V: conversion.Sessions()})
-			} else {
-				fields = append(fields,
-					output.Field{K: "conversion", V: "undecided"},
-					output.Field{K: "conversion_undecided", V: conversion.Undecided})
-			}
-		}
-		defaults := []string{"id", "kind", "model", "source"}
-		if invocation != nil {
-			defaults = defaults[1:]
-			defaults = append(defaults, "target", "release", "outputs", "conversion")
-		}
-		defaults = append(defaults, "status", "changed")
-		return emit(ctx, compactRecord(fields, defaults...))
-	}
 	if kind == "model-upload" && !privateOutputs {
 		ref, _ := hub.ParseRef(destination)
 		if _, problem := ownedPublication(ctx, ref); problem != nil {
@@ -296,7 +222,7 @@ func submitSourceTransfer(ctx *Context, kind, sourceArg, destinationArg string,
 		return problem
 	}
 	submission.ModelTransfer = &intent
-	submission.Rental, submission.RentalRequired = effectiveRental, placement == "rental-only" || submission.RequestedRental != ""
+	submission.Rental, submission.RentalRequired = effectiveRental, ctx.Inv.Bool("--rental-only") || submission.RequestedRental != ""
 	if invocation != nil && kind == "model-upload" && !privateOutputs {
 		org := strings.Split(destination, "/")[0]
 		if submission.Org != "" && submission.Org != org {
@@ -343,52 +269,10 @@ func modelTransferIntent(plan modeltransfer.Plan) records.ModelTransferIntent {
 	for _, output := range plan.Outputs {
 		outputs = append(outputs, records.ModelTransferOutput{Name: output.Name})
 	}
-	return records.ModelTransferIntent{Kind: plan.Instruction.Kind, Destination: plan.Destination,
+	return records.ModelTransferIntent{Kind: plan.Kind, Destination: plan.Destination,
 		Source: plan.Source, SourceSelection: plan.SourceSelection, SourceLicense: plan.SourceLicense,
 		SourceFiles: files, InputLane: plan.InputLane, SourceProfiles: plan.SourceProfiles,
 		Outputs: outputs}
-}
-
-func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
-	raw = strings.TrimSpace(raw)
-	if name, local, problem := modelsource.LocalAlias(raw); local {
-		return "local/" + name, problem
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", exit.Internalf("cannot resolve the current directory: %s", err)
-	}
-	if parsed, problem := modelsource.Parse(raw, cwd); problem == nil {
-		return parsed.Canonical, nil
-	}
-	if !catalogModelSpelling(raw) {
-		_, problem := modelsource.Parse(raw, cwd)
-		return "", problem
-	}
-	if strings.Contains(raw, "#") {
-		model, release, lane, manifest, problem := hub.ParseModelRef(raw)
-		if problem != nil {
-			return "", problem
-		}
-		if release == "" {
-			return model + "@" + manifest, nil
-		}
-		selected := model + "@" + release
-		if lane != "" {
-			selected += "/" + lane
-		}
-		return selected + "#" + manifest, nil
-	}
-	name, release, pinned := strings.Cut(raw, "@")
-	if !pinned || strings.TrimSpace(release) == "" {
-		return "", exit.Usagef("model transfer source %q is not pinned to one Tensorhub release", raw).
-			WithRemedy("use org/model@release; mutable source latest cannot enter operation identity")
-	}
-	ref, problem := hub.ParseRef(name)
-	if problem != nil {
-		return "", problem
-	}
-	return ref.String() + "@" + strings.TrimSpace(release), nil
 }
 
 func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (publishSource, *exit.Error) {

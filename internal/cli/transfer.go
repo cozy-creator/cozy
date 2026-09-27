@@ -261,8 +261,5 @@ func handleRentalModelDownload(ctx *Context) *exit.Error {
 		return problem
 	}
 	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}}
-	if ctx.Inv.Bool("--dry-run") {
-		return emit(ctx, compactRecord([]output.Field{{K: "rental", V: ctx.Inv.Value("--rental")}, {K: "model", V: model.Model}, {K: "release", V: model.Release}, {K: "lane", V: model.Lane}, {K: "manifest", V: model.Manifest}, {K: "status", V: "planned"}}, "rental", "model", "release", "lane", "manifest", "status"))
-	}
 	return enqueueRentalInstall(ctx, ctx.Inv.Value("--rental"), selection)
 }
