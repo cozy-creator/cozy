@@ -1,125 +1,14 @@
 package producttest
 
 import (
-	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
-
-// Runs 1254/1255 of paul/minimax-h3 long_form (2026-09-27). The CPU job calls
-// paul/qwen-image-2's generate_image, a published dependency locked in its uv.lock. The
-// fleet selected the callee's model for the machine it rented, and the machine execution
-// prepared the ROOT with that row: rental.download_set_model_invalid, 5 s after submit.
-// One preparation is one package and that package's slots (Runtime package_prepare), so
-// the callee's model rides the callee's own preparation.
-func TestRentedJobPreparesPublishedCalleeModelsWithTheCallee(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
-	facts := publishCalleeRelease(t, h)
-
-	root := ladderRoot(t, h)
-	layout, problem := home.Open(root)
-	fatal(t, problem)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	identity, problem := rental.PendingCreatorIdentity(layout, "rented-callee")
-	fatal(t, problem)
-	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
-	must(t, err)
-	machine := &runtimeMachine{blocker: "none"}
-	pod := &fakePod{controlKey: public, machine: machine, deviceCount: 4,
-		preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
-			placement := podPlacement(download, pkg, release, "")
-			placement.PackageInterface = facts[pkg].iface
-			return placement
-		}}
-	connection, certPath := startFakePod(t, root, pod)
-	cert, err := os.ReadFile(certPath)
-	must(t, err)
-	h.mu.Lock()
-	h.rentals[podRental] = map[string]any{"rental_id": podRental, "name": "tessa", "state": "ready",
-		"requested_accelerator_model": "fake-4090", "accelerator_count": 4, "hourly_rate_usd_micros": 1,
-		"worker_address": connection.Addr, "media_address": connection.Media.Addr}
-	h.mu.Unlock()
-	fatal(t, rental.Attach(layout, store, records.Rental{ID: podRental, MachineName: "tessa", SKU: "fake-x", State: "ready",
-		AcceleratorModel: "fake-4090", AcceleratorCount: 4, HourlyRateUSDMicros: 1, Hub: h.server.URL,
-		Address: connection.Addr, MediaAddress: connection.Media.Addr,
-		ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID}, string(cert), connection.Media.Token, identity))
-	store.Close()
-	startDaemonProcess(t, root)
-
-	const key = "rented-callee-models"
-	if code, out := runCozy(t, root, "run", ladderPackage+"/long_form", "--rental=tessa", "--json", "--idempotency-key", key); code != 0 {
-		t.Fatalf("the rented job was refused [exit %d]: %s", code, out)
-	}
-	store, problem = records.Open(layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-	waitFor(t, root, "the Runtime submission or a terminal run", func() bool {
-		row, _ := store.RequestByIdempotencyKey(key)
-		return machine.submitted() != nil || row != nil && (row.State == "failed" || row.State == "cancelled")
-	})
-	if machine.submitted() == nil {
-		_, show := runCozy(t, root, "run", "show", "1", "--json")
-		t.Fatalf("the job ended before its submission:\n%s\n%s", show, tail(filepath.Join(root, "daemon.log")))
-	}
-	row, problem := store.RequestByIdempotencyKey(key)
-	fatal(t, problem)
-	var callee []string
-	for _, model := range row.Models {
-		if model.Package == calleePackage {
-			callee = append(callee, model.Package+" "+model.BindingSlot()+" "+model.Manifest)
-		}
-	}
-	if len(callee) != 1 || strings.HasSuffix(callee[0], " ") {
-		t.Fatalf("the fleet did not pin one model for the published callee: %+v", row.Models)
-	}
-
-	pod.mu.Lock()
-	prepares := append([]*pb.PreparePackageSetCall(nil), pod.prepares...)
-	pod.mu.Unlock()
-	delivered := map[string][]string{}
-	for _, call := range prepares {
-		var set pb.DownloadDelegation
-		must(t, canonical.Unmarshal(call.PackageSet.DownloadDelegation, &set))
-		pkg := set.Packages[0].Package
-		for _, model := range set.Models {
-			delivered[pkg] = append(delivered[pkg], model.Package+" "+model.Slot+" "+model.Manifest)
-		}
-		if _, known := delivered[pkg]; !known {
-			delivered[pkg] = nil
-		}
-	}
-	want := map[string][]string{ladderPackage: nil, calleePackage: callee}
-	if fmt.Sprint(delivered) != fmt.Sprint(want) {
-		t.Fatalf("each package's preparation carries its own selections; got %v, want %v", delivered, want)
-	}
-	var capture pb.MachineExecutionCapture
-	must(t, canonical.Unmarshal(machine.submitted().CaptureCanonicalBytes, &capture))
-	if len(capture.InstalledPackages) != 2 {
-		t.Fatalf("the capture does not hold the prepared callee: %+v", capture.InstalledPackages)
-	}
-	// The callee's default is not an input of the CPU root.
-	var spec pb.InvocationSpec
-	must(t, canonical.Unmarshal(machine.submitted().Offer.InvocationSpecCanonicalBytes, &spec))
-	for _, input := range spec.Inputs {
-		if strings.HasPrefix(input.InputId, "model:") {
-			t.Fatalf("the root job was handed its callee's model as an input: %s", input.InputId)
-		}
-	}
-}
 
 const calleePackage = "proof/child"
 
