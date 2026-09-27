@@ -55,7 +55,7 @@ func (m *ingestMachine) ListMachineExecutionEvents(_ context.Context, query *pb.
 	defer m.mu.Unlock()
 	page := &pb.MachineExecutionEventPage{NextAfter: query.After, HeadSequence: uint64(m.released)}
 	for _, event := range m.events[:m.released] {
-		if event.Sequence > query.After {
+		if event.Sequence > query.After && uint32(len(page.Events)) < query.Limit {
 			page.Events = append(page.Events, event)
 			page.NextAfter = event.Sequence
 		}
@@ -106,7 +106,11 @@ func ingestJournal(t *testing.T) []*pb.MachineExecutionEvent {
 	}
 	for _, stage := range []string{"Downloading source", "Converting to cozytensors", "Uploading checkpoint"} {
 		sample(stage, nil)
-		sample(stage, map[string]any{"position": 400 << 20, "total": gib, "unit": "bytes", "rate": float64(100 << 20)})
+		// A multi-hour stage journals a sample a second; more than run show's evidence
+		// bound precede the download's phase record.
+		for range map[bool]int{true: 4200, false: 1}[stage == "Downloading source"] {
+			sample(stage, map[string]any{"position": 400 << 20, "total": gib, "unit": "bytes", "rate": float64(100 << 20)})
+		}
 		sample(stage, map[string]any{"position": gib, "total": gib, "unit": "bytes", "rate": float64(120 << 20)})
 		phase(stage, 9500, gib)
 	}
@@ -156,7 +160,7 @@ func TestRentedIngestReportsStageBytesAndRate(t *testing.T) {
 			OutcomeId: "ingest-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body},
 		events: ingestJournal(t),
 	}
-	machine.release(2)
+	machine.release(3)
 
 	pod := &fakePod{controlKey: public, machine: machine}
 	connection, certPath := startFakePod(t, root, pod)

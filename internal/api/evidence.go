@@ -5,7 +5,8 @@ import (
 	"net/http"
 )
 
-// maxEvidenceEvents bounds one run's durable history in a single read.
+// maxEvidenceEvents bounds one run's durable history in a single read. Imported progress
+// samples are not evidence and do not count against it.
 const maxEvidenceEvents = 4096
 
 // Evidence is one run's execution record read from records alone: its durable events in
@@ -34,7 +35,7 @@ func (s *Server) requestEvidence(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+reference+" on this host", "")
 		return
 	}
-	events, e := s.store.EventsAfter(row.ID, 0, maxEvidenceEvents)
+	events, e := s.store.EvidenceEvents(row.ID, maxEvidenceEvents)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
