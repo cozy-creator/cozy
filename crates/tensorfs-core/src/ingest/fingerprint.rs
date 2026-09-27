@@ -16,7 +16,7 @@
 //!   only under other components refuses by naming them.
 
 use super::carrier::SourceHeader;
-use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
+use crate::canon::{as_arr, as_str, Fields, Value};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
 use crate::header::{tensor_schema_digest_of, tensor_schema_value};
@@ -867,7 +867,7 @@ pub fn validate_source_member_prefix(prefix: &str) -> Result<()> {
 }
 
 /// Decoded `__metadata__` facts the border is willing to carry as EVIDENCE STAMPS. Foreign
-/// JSON is decoded through this strict list or discarded — it never survives as itself.
+/// JSON is decoded through this list; a value it cannot carry is discarded.
 pub fn evidence_stamps(h: &SourceHeader) -> Result<Vec<(String, String)>> {
     const KEPT: [&str; 5] = [
         "modelspec.architecture",
@@ -883,13 +883,10 @@ pub fn evidence_stamps(h: &SourceHeader) -> Result<Vec<(String, String)>> {
         {
             return refuse_bnb("__metadata__.quantization_config");
         }
-        if KEPT.contains(&k.as_str()) {
-            if v.len() > limits::MAX_NAME_BYTES {
-                return refuse(
-                    Code::SIZE_CAP,
-                    format!("__metadata__.{k}: stamp value over the byte cap"),
-                );
-            }
+        if KEPT.contains(&k.as_str())
+            && v.len() <= limits::MAX_NAME_BYTES
+            && v.bytes().all(|b| (0x20..=0x7e).contains(&b))
+        {
             out.push((k.clone(), v.clone()));
         }
     }
@@ -897,8 +894,9 @@ pub fn evidence_stamps(h: &SourceHeader) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// What a `.comfy_quant` marker actually says, decoded through the SAME bounded reader as
-/// everything else. It never survives into the canonical header.
+/// What a `.comfy_quant` marker actually says. The payload is ComfyUI's JSON, read by the
+/// bounded RFC 8259 reader; fields other than the two below are ignored. It never survives
+/// into the canonical header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComfyQuant {
     /// The carrier format the producer named, e.g. `float8_e4m3fn`.
@@ -924,13 +922,23 @@ pub fn decode_comfy_quant(key: &str, bytes: &[u8]) -> Result<ComfyQuant> {
             format!("{key}: marker payload {} B over the text cap", bytes.len()),
         );
     }
-    // The payload is a NUL-padded JSON blob inside a U8 tensor. Take the text, then the one
-    // bounded reader; every field but the two below is discarded by construction.
+    // The payload is a NUL-padded JSON blob inside a U8 tensor.
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-    let v = crate::canon::parse(&bytes[..end], limits::MAX_DOC_TEXT_BYTES)?;
-    let fields = as_obj("comfy_quant", key, &v)?;
+    let v = crate::jcs::parse(&bytes[..end], limits::MAX_DOC_TEXT_BYTES)?;
+    let crate::jcs::Json::Obj(fields) = &v else {
+        return refuse(
+            Code::WRONG_TYPE,
+            format!("{key}: marker payload is not a JSON object"),
+        );
+    };
     let format = match fields.iter().find(|(k, _)| k == "format") {
-        Some((_, x)) => as_str("comfy_quant", "format", x)?.to_string(),
+        Some((_, crate::jcs::Json::Str(format))) => format.clone(),
+        Some(_) => {
+            return refuse(
+                Code::WRONG_TYPE,
+                format!("{key}: marker `format` is not a string"),
+            )
+        }
         None => {
             return refuse(
                 Code::MISSING_FIELD,
@@ -942,14 +950,11 @@ pub fn decode_comfy_quant(key: &str, bytes: &[u8]) -> Result<ComfyQuant> {
         .iter()
         .find(|(k, _)| k == "full_precision_matrix_mult")
     {
-        Some((_, crate::canon::Value::Bool(b))) => *b,
-        Some((_, o)) => {
+        Some((_, crate::jcs::Json::Bool(b))) => *b,
+        Some(_) => {
             return refuse(
                 Code::WRONG_TYPE,
-                format!(
-                    "{key}: full_precision_matrix_mult is a bool, got {}",
-                    o.kind()
-                ),
+                format!("{key}: full_precision_matrix_mult is not a bool"),
             )
         }
         None => false,

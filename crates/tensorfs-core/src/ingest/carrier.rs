@@ -7,12 +7,10 @@
 //! 1. **Refuse before allocation.** The 8-byte length prefix is compared with the cap AND
 //!    with the file's real length before `Vec::with_capacity` is ever reached. A header
 //!    claiming 2^63 bytes costs one `read_exact` of 8 bytes.
-//! 2. **One JSON reader.** The foreign header goes through `canon::parse` — the same
-//!    bounded, integer-only, ASCII-only, duplicate-key-refusing reader every canonical
-//!    document uses. A second tolerant parser at the border is exactly the drift this repo
-//!    is built against. The foreign header is NOT required to be canonically ENCODED (it is
-//!    someone else's file, pretty-printed as they please); it is required to be inside the
-//!    canonical GRAMMAR.
+//! 2. **The format's own grammar.** A foreign header is someone else's RFC 8259 JSON, read
+//!    by the bounded, duplicate-key-refusing `jcs` reader: any UTF-8, any escape, any number
+//!    inside the interoperable range. Only what TensorFS consumes is typed; foreign metadata
+//!    it cannot carry is dropped, never a reason to refuse the carrier.
 //! 3. **Geometry is arithmetic, not trust.** Every tensor's declared byte run must equal
 //!    `checked_prod(shape) x sizeof(dtype)`, must lie inside the file, and must not overlap
 //!    its neighbour. A lying header is refused by multiplication, never by a failed read.
@@ -22,15 +20,87 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::canon::{self, as_arr, as_str, Fields, Value};
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
+use crate::jcs::{self, Json};
 use crate::limits;
 
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     Refusal {
         code: Code::IO_FAILED,
         detail: format!("{}: {e}", what.as_ref()),
+    }
+}
+
+fn kind(v: &Json) -> &'static str {
+    match v {
+        Json::Null => "null",
+        Json::Bool(_) => "bool",
+        Json::Num(_) => "number",
+        Json::Str(_) => "string",
+        Json::Arr(_) => "array",
+        Json::Obj(_) => "object",
+    }
+}
+
+fn object<'a>(what: &str, v: &'a Json) -> Result<&'a [(String, Json)]> {
+    match v {
+        Json::Obj(m) => Ok(m),
+        o => refuse(
+            Code::WRONG_TYPE,
+            format!("{what}: expected object, got {}", kind(o)),
+        ),
+    }
+}
+
+fn array<'a>(what: &str, v: &'a Json) -> Result<&'a [Json]> {
+    match v {
+        Json::Arr(a) => Ok(a),
+        o => refuse(
+            Code::WRONG_TYPE,
+            format!("{what}: expected array, got {}", kind(o)),
+        ),
+    }
+}
+
+fn string<'a>(what: &str, v: &'a Json) -> Result<&'a str> {
+    match v {
+        Json::Str(s) => Ok(s),
+        o => refuse(
+            Code::WRONG_TYPE,
+            format!("{what}: expected string, got {}", kind(o)),
+        ),
+    }
+}
+
+fn uint(what: &str, v: &Json) -> Result<u64> {
+    match v {
+        Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 => Ok(*n as u64),
+        o => refuse(
+            Code::WRONG_TYPE,
+            format!("{what}: expected non-negative integer, got {}", kind(o)),
+        ),
+    }
+}
+
+fn field<'a>(what: &str, entry: &'a [(String, Json)], name: &str) -> Result<&'a Json> {
+    entry
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v)
+        .ok_or_else(|| Refusal {
+            code: Code::MISSING_FIELD,
+            detail: format!("{what}: missing {name:?}"),
+        })
+}
+
+/// Foreign metadata is advisory. Strings and integers are carried as text; anything else is
+/// dropped rather than refused.
+fn metadata(v: &Json) -> Option<String> {
+    match v {
+        Json::Str(s) => Some(s.clone()),
+        Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 => Some((*n as u64).to_string()),
+        _ => None,
     }
 }
 
@@ -274,16 +344,8 @@ pub fn read_header(path: &Path) -> Result<SourceHeader> {
 /// be exactly what the runs declare, which is the only honest reading when there is no file
 /// to measure. Every other check is identical.
 pub fn parse_header(bytes: &[u8], data_start: u64, file_len: Option<u64>) -> Result<SourceHeader> {
-    let v = canon::parse(bytes, limits::CARRIER_HEADER_MAX_BYTES)?;
-    let entries = match &v {
-        Value::Obj(m) => m,
-        o => {
-            return refuse(
-                Code::WRONG_TYPE,
-                format!("carrier header: expected object, got {}", o.kind()),
-            )
-        }
-    };
+    let v = jcs::parse(bytes, limits::CARRIER_HEADER_MAX_BYTES)?;
+    let entries = object("carrier header", &v)?;
     if entries.len() > limits::MAX_TENSORS {
         return refuse(
             Code::COUNT_CAP,
@@ -304,21 +366,12 @@ pub fn parse_header(bytes: &[u8], data_start: u64, file_len: Option<u64>) -> Res
 
     for (key, ev) in entries {
         if key == "__metadata__" {
-            for (mk, mv) in canon::as_obj("carrier", "__metadata__", ev)? {
-                out.metadata.push((
-                    mk.clone(),
-                    match mv {
-                        Value::Str(s) => s.clone(),
-                        // Foreign metadata is decoded as flat strings under a strict schema
-                        // or discarded. A nested blob is not silently carried forward.
-                        o => {
-                            return refuse(
-                                Code::WRONG_TYPE,
-                                format!("__metadata__.{mk}: expected string, got {}", o.kind()),
-                            )
-                        }
-                    },
-                ));
+            if let Json::Obj(pairs) = ev {
+                for (mk, mv) in pairs {
+                    if let Some(value) = metadata(mv) {
+                        out.metadata.push((mk.clone(), value));
+                    }
+                }
             }
             continue;
         }
@@ -328,14 +381,28 @@ pub fn parse_header(bytes: &[u8], data_start: u64, file_len: Option<u64>) -> Res
                 format!("carrier key length {} out of bounds", key.len()),
             );
         }
-        let mut f = Fields::new("carrier.tensor", ev)?;
-        let offsets = as_arr("carrier.tensor", "data_offsets", f.req("data_offsets")?)?;
-        let dtype = foreign_dtype(key, as_str("carrier.tensor", "dtype", f.req("dtype")?)?)?;
-        let shape = as_arr("carrier.tensor", "shape", f.req("shape")?)?
+        // The one grammar limit that is TensorFS's own: a CozyTensors key is printable ASCII.
+        if !key.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+            return refuse(
+                Code::KEY_GRAMMAR,
+                format!(
+                    "carrier key {key:?} is not printable ASCII; a CozyTensors key cannot name it"
+                ),
+            );
+        }
+        let f = object("carrier.tensor", ev)?;
+        let offsets = array(
+            "carrier.tensor.data_offsets",
+            field("carrier.tensor", f, "data_offsets")?,
+        )?;
+        let dtype = foreign_dtype(
+            key,
+            string("carrier.tensor.dtype", field("carrier.tensor", f, "dtype")?)?,
+        )?;
+        let shape = array("carrier.tensor.shape", field("carrier.tensor", f, "shape")?)?
             .iter()
-            .map(|x| canon::as_uint("carrier.tensor", "shape", x))
+            .map(|x| uint("carrier.tensor.shape", x))
             .collect::<Result<Vec<u64>>>()?;
-        f.done()?;
 
         if offsets.len() != 2 {
             return refuse(
@@ -343,8 +410,8 @@ pub fn parse_header(bytes: &[u8], data_start: u64, file_len: Option<u64>) -> Res
                 format!("{key}: data_offsets holds {} values, not 2", offsets.len()),
             );
         }
-        let begin = canon::as_uint("carrier.tensor", "data_offsets", &offsets[0])?;
-        let end = canon::as_uint("carrier.tensor", "data_offsets", &offsets[1])?;
+        let begin = uint("carrier.tensor.data_offsets", &offsets[0])?;
+        let end = uint("carrier.tensor.data_offsets", &offsets[1])?;
         if end < begin {
             return refuse(
                 Code::CARRIER_GEOMETRY,
@@ -510,45 +577,21 @@ fn locate_shard(index_path: &Path, shards: Shards<'_>, name: &str) -> Result<Pat
 pub fn read_sharded(index_path: &Path, shards: Shards<'_>) -> Result<(SourceHeader, Vec<u8>)> {
     let index_bytes =
         std::fs::read(index_path).map_err(|e| io(format!("read {}", index_path.display()), e))?;
-    let v = canon::parse(&index_bytes, limits::CARRIER_HEADER_MAX_BYTES)?;
-    let top = match &v {
-        Value::Obj(m) => m,
-        o => {
-            return refuse(
-                Code::WRONG_TYPE,
-                format!("shard index: expected object, got {}", o.kind()),
-            )
-        }
-    };
-    let mut weight_map: Option<&Vec<(String, Value)>> = None;
+    let v = jcs::parse(&index_bytes, limits::CARRIER_HEADER_MAX_BYTES)?;
+    let top = object("shard index", &v)?;
+    let mut weight_map: Option<&[(String, Json)]> = None;
     let mut index_meta: Vec<(String, String)> = Vec::new();
     for (k, ev) in top {
-        match k.as_str() {
-            "weight_map" => weight_map = Some(canon::as_obj("shard index", "weight_map", ev)?),
-            "metadata" => {
-                for (mk, mv) in canon::as_obj("shard index", "metadata", ev)? {
-                    let s = match mv {
-                        Value::Str(s) => s.clone(),
-                        Value::Int(n) => n.to_string(),
-                        o => {
-                            return refuse(
-                                Code::WRONG_TYPE,
-                                format!(
-                                    "shard index metadata.{mk}: expected string or uint, got {}",
-                                    o.kind()
-                                ),
-                            )
-                        }
-                    };
-                    index_meta.push((mk.clone(), s));
+        match (k.as_str(), ev) {
+            ("weight_map", _) => weight_map = Some(object("shard index weight_map", ev)?),
+            ("metadata", Json::Obj(pairs)) => {
+                for (mk, mv) in pairs {
+                    if let Some(value) = metadata(mv) {
+                        index_meta.push((mk.clone(), value));
+                    }
                 }
             }
-            other => {
-                return refuse(
-                    Code::WRONG_TYPE,
-                    format!("shard index: unknown top-level field {other:?}"),
-                )
-            }
+            _ => {}
         }
     }
     let weight_map = match weight_map {
@@ -568,7 +611,7 @@ pub fn read_sharded(index_path: &Path, shards: Shards<'_>) -> Result<(SourceHead
         std::collections::HashMap::with_capacity(weight_map.len());
     let mut names: Vec<&str> = Vec::new();
     for (k, v) in weight_map {
-        let name = as_str("shard index", "weight_map value", v)?;
+        let name = string("shard index weight_map value", v)?;
         if name.is_empty() {
             return refuse(
                 Code::KEY_GRAMMAR,
@@ -656,18 +699,10 @@ pub fn read_sharded(index_path: &Path, shards: Shards<'_>) -> Result<(SourceHead
                 end: virtual_base + t.end,
             });
         }
-        for (mk, mv) in &h.metadata {
-            match out.metadata.iter().find(|(k, _)| k == mk) {
-                Some((_, prev)) if prev == mv => {}
-                Some((_, prev)) => {
-                    return refuse(
-                        Code::CARRIER_GEOMETRY,
-                        format!(
-                            "shard metadata {mk:?} disagrees across shards ({prev:?} vs {mv:?})"
-                        ),
-                    )
-                }
-                None => out.metadata.push((mk.clone(), mv.clone())),
+        // Advisory metadata that differs across shards is kept as both values, never refused.
+        for pair in &h.metadata {
+            if !out.metadata.contains(pair) {
+                out.metadata.push(pair.clone());
             }
         }
         out.header_bytes += h.header_bytes;
