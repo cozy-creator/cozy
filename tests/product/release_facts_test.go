@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -64,36 +62,23 @@ func releaseFactsHub(t *testing.T, application string) (*httptest.Server, []byte
 }
 
 // The owner's PodHost prepare carries the hub release's exact PackageInterface bytes
-// (wire 61 field 10), fetched and cross-checked by the production facts source.
+// (wire 61 field 10), fetched by the production facts source. Agreement between the
+// interface and the assembled facts is the preparing Runtime's check, not Creator's:
+// a fact the hub spells differently still reaches the pod that owns the decision.
 func TestPrepareFactsCarryReleaseInterfaceToPodHost(t *testing.T) {
-	for _, test := range []struct {
-		name, application string
-		refused           bool
-	}{{"agreeing", "h3:app", false}, {"disagreeing", "other:app", true}} {
-		t.Run(test.name, func(t *testing.T) {
-			server, normalized := releaseFactsHub(t, test.application)
+	for _, application := range []string{"h3:app", "other:app"} {
+		t.Run(application, func(t *testing.T) {
+			server, normalized := releaseFactsHub(t, application)
 			client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "")
 			public, private, err := ed25519.GenerateKey(rand.Reader)
 			must(t, err)
 			pod := &fakePod{controlKey: public}
 			connection, _ := startFakePod(t, t.TempDir(), pod)
-			o := hostOwner(t, "release-facts-"+test.name, rentalWiring(connection, private),
+			o := hostOwner(t, "release-facts-"+strings.ReplaceAll(application, ":", "-"), rentalWiring(connection, private),
 				func(options *orchestrator.Options) { options.RentalPrepareFacts = rental.PrepareFactsSource(client) })
 			instance, _, _, problem := o.c.EnsureRental(podRental)
 			fatal(t, problem)
 			fatal(t, o.c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{Package: "proof/h3", Release: "1.0.0"}}, nil))
-			if test.refused {
-				waitUntil(t, "the refused release facts", func() bool {
-					log, err := os.ReadFile(filepath.Join(o.root, "orchestrator.log"))
-					return err == nil && strings.Contains(string(log), `is unusable: application "h3:app", the prepare facts name "other:app"`)
-				})
-				pod.mu.Lock()
-				defer pod.mu.Unlock()
-				if len(pod.prepares) != 0 {
-					t.Fatalf("a prepare with disagreeing facts reached PodHost: %d", len(pod.prepares))
-				}
-				return
-			}
 			waitUntil(t, "the PodHost prepare", func() bool {
 				pod.mu.Lock()
 				defer pod.mu.Unlock()
@@ -108,9 +93,6 @@ func TestPrepareFactsCarryReleaseInterfaceToPodHost(t *testing.T) {
 	}
 }
 
-// A succeeded outcome's working_peak_device_bytes (wire 61 field 14) lands in the
-// ledger in the terminal's own transaction, and the next selection for the same
-// release entrypoint is sized by it.
 func TestWorkingMemoryLedgerSizesTheNextSelection(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)

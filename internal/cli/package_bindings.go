@@ -163,15 +163,13 @@ func handlePackageBind(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if written.Binding.Slot != slot || written.Binding.Model != model ||
-		written.Binding.Release != release || written.Binding.Revision < 1 ||
-		hub.LadderText(written.Binding.Ladder) != hub.LadderText(ladder) {
+	if written.Binding.Slot != slot || written.Binding.Revision < 1 {
 		return exit.Internalf("Tensorhub returned a different binding row")
 	}
 	return emit(ctx, compactRecord([]output.Field{
 		{K: "package", V: ref.String()}, {K: "slot", V: slot},
-		{K: "model", V: model}, {K: "release", V: release},
-		{K: "ladder", V: hub.LadderText(ladder)},
+		{K: "model", V: written.Binding.Model}, {K: "release", V: written.Binding.Release},
+		{K: "ladder", V: hub.LadderText(written.Binding.Ladder)},
 		{K: "revision", V: written.Binding.Revision}, {K: "status", V: "bound"},
 		{K: "changed", V: written.Changed},
 	}, "package", "slot", "model", "release", "ladder", "revision", "status", "changed"))

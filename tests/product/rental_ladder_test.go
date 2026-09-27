@@ -98,7 +98,7 @@ func fp8Exact() records.ModelRef {
 func market20260907() []hub.RentalSKU {
 	gpu := func(name, model string, vram int64, price int64) hub.RentalSKU {
 		return hub.RentalSKU{Name: name, AcceleratorModel: model, AcceleratorCount: 1, VRAMGB: vram,
-			ComputeCapability: "9.0", MinimumRAMPerGPUGB: 64,
+			ComputeCapability:     "9.0",
 			PriceUSDMicrosPerHour: price, StorageUSDMicrosPerHour: 213_504,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"}
 	}

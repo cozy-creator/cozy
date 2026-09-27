@@ -47,7 +47,8 @@ func TestPackageReleaseFinalizeWaitsForQueuedCommit(t *testing.T) {
 				write(http.StatusOK, hub.PackageReleaseCommit{PublicationID: "pub-1", State: "verifying", StatusURL: "/v1/packages/paul/demo/publish/1.0.0/status"})
 				return
 			}
-			write(http.StatusOK, hub.PackageReleaseCommit{PublicationID: "pub-1", State: "committed"})
+			write(http.StatusOK, hub.PackageReleaseCommit{PublicationID: "pub-1", State: "committed",
+				Warnings: []string{"exact pin advice"}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -67,7 +68,7 @@ func TestPackageReleaseFinalizeWaitsForQueuedCommit(t *testing.T) {
 	if problem != nil {
 		t.Fatalf("wait: %s", problem)
 	}
-	if done.State != "committed" || statusCalls.Load() != 2 {
+	if done.State != "committed" || statusCalls.Load() != 2 || len(done.Warnings) != 1 {
 		t.Fatalf("unexpected terminal result: %+v, status calls=%d", done, statusCalls.Load())
 	}
 }

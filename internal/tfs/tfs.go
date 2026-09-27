@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -323,7 +324,7 @@ func (t *Tool) Releases(outPath string) ([]Release, *exit.Error) {
 				return nil, exit.Internalf("tfs returned an invalid local alias row at line %d", line+1)
 			}
 		default:
-			return nil, exit.Internalf("tfs returned a repository row of unknown kind %q at line %d", row.Kind, line+1)
+			continue
 		}
 		rows = append(rows, row)
 	}
@@ -385,8 +386,6 @@ func (t *Tool) Usage(outPath string) (StoreUsage, *exit.Error) {
 				return StoreUsage{}, exit.Internalf("tfs returned an invalid store usage row at line %d", line+1)
 			}
 			store = true
-		default:
-			return StoreUsage{}, exit.Internalf("tfs returned an unknown usage row kind %q at line %d", kind.Kind, line+1)
 		}
 	}
 	if !store {
@@ -442,15 +441,11 @@ func (t *Tool) SourceProfileMembers(registry string, profiles []string) ([]strin
 		return nil, exit.Internalf("tfs returned an invalid source-member selection")
 	}
 	members := strings.Split(out, "\n")
-	if len(members) > 4096 {
-		return nil, exit.Internalf("tfs returned too many source members")
+	if len(members) > 4096 || slices.Contains(members, "") {
+		return nil, exit.Internalf("tfs returned an invalid source-member selection")
 	}
-	for index, member := range members {
-		if member == "" || index > 0 && members[index-1] >= member {
-			return nil, exit.Internalf("tfs returned unsorted or duplicate source members")
-		}
-	}
-	return members, nil
+	slices.Sort(members)
+	return slices.Compact(members), nil
 }
 
 // SameSelection ignores transient paths and sessions while binding the exact

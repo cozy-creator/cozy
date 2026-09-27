@@ -105,15 +105,20 @@ func TestPublishCLIPreservesMajorMinorCompatibility(t *testing.T) {
 			return
 		}
 		committed = true
-		_ = json.NewEncoder(w).Encode(hub.PackageReleaseCommit{PublicationID: "proof-publication", State: "committed"})
+		_ = json.NewEncoder(w).Encode(hub.PackageReleaseCommit{PublicationID: "proof-publication", State: "committed",
+			Warnings: []string{"tensorfs is pinned narrowly; prefer a >= floor"}})
 	})
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+server.URL+"\ntensorhub_token: publication-proof\n"), 0600))
 	command := exec.Command(cozyBin, "package", "publish", "--json")
 	command.Dir = project
 	command.Env = childEnv(t, root)
-	if output, err := command.CombinedOutput(); err != nil {
+	output, err := command.CombinedOutput()
+	if err != nil {
 		t.Fatalf("normal CLI publication: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "warning: tensorfs is pinned narrowly; prefer a >= floor") {
+		t.Fatalf("publication advice was not shown: %s", output)
 	}
 	mu.Lock()
 	defer mu.Unlock()

@@ -17,7 +17,7 @@ func (c *Client) VerifyPublicationObjects(ctx context.Context, ref Ref, operatio
 	}
 	problem := c.do(ctx, call{method: http.MethodPost,
 		path: publications(ref) + "/" + url.PathEscape(operation) + "/verify",
-		auth: true, reason: "retain source preparation progress", byBytes: true, patient: true, strict: true,
+		auth: true, reason: "retain source preparation progress", byBytes: true, patient: true,
 		body: map[string]any{"object_ids": objectIDs}}, &out)
 	return out.Publication, problem
 }
@@ -33,7 +33,7 @@ func (c *Client) ReadPublicationObjects(ctx context.Context, ref Ref, operation 
 	var out PublicationReads
 	problem := c.do(ctx, call{method: http.MethodPost,
 		path: publications(ref) + "/" + url.PathEscape(operation) + "/reads",
-		auth: true, reason: "restore source preparation progress", byBytes: true, patient: true, strict: true,
+		auth: true, reason: "restore source preparation progress", byBytes: true, patient: true,
 		body: map[string]any{"object_ids": objectIDs}}, &out)
 	return out, problem
 }
@@ -44,7 +44,7 @@ func (c *Client) AbandonPublication(ctx context.Context, ref Ref, operation stri
 	}
 	problem := c.do(ctx, call{method: http.MethodDelete,
 		path: publications(ref) + "/" + url.PathEscape(operation), auth: true,
-		reason: "release canceled or finished publication holds", byBytes: true, patient: true, strict: true}, &out)
+		reason: "release canceled or finished publication holds", byBytes: true, patient: true}, &out)
 	if problem != nil {
 		return problem
 	}

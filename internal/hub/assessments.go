@@ -3,9 +3,10 @@ package hub
 import (
 	"bytes"
 	"context"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"net/http"
 	"net/url"
+
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // AttachAssessment stores and reads back the exact canonical report. The caller
@@ -26,7 +27,7 @@ func (c *Client) AttachAssessment(ctx context.Context, ref Ref, checkpoint, dige
 		} `json:"assessment"`
 		Verdict string `json:"publisher_reported_verdict"`
 	}
-	if problem := c.do(ctx, call{method: http.MethodPut, path: path, auth: true, reason: "attach verified assessment", bodyBytes: raw, strict: true}, &out); problem != nil {
+	if problem := c.do(ctx, call{method: http.MethodPut, path: path, auth: true, reason: "attach verified assessment", bodyBytes: raw}, &out); problem != nil {
 		return problem
 	}
 	if out.Assessment.Checkpoint != checkpoint || out.Assessment.Scope != "publisher_assessment" || out.Assessment.Report.Digest != digest || out.Assessment.Report.Length != int64(len(raw)) || out.Assessment.Verdict != expectedVerdict || out.Verdict != expectedVerdict {

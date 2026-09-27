@@ -19,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 type machineByteStream interface {
@@ -197,7 +196,11 @@ func fileRetentionRequest(file records.MachineFileResult) *pb.NativeByteRetentio
 	return &pb.NativeByteRetentionRequest{RetentionId: file.RetentionID, Source: file.Source.NativeRef()}
 }
 func verifyFileRetention(file records.MachineFileResult, result *pb.NativeByteRetentionResult, released bool) *exit.Error {
-	if result == nil || result.RetentionId != file.RetentionID || result.Released != released || !proto.Equal(result.Source, file.Source.NativeRef()) {
+	want, got := file.Source.NativeRef(), result.GetSource()
+	if result == nil || result.RetentionId != file.RetentionID || result.Released != released ||
+		got.GetProducerRootId() != want.ProducerRootId || !bytes.Equal(got.GetReceiptDigest(), want.ReceiptDigest) ||
+		!bytes.Equal(got.GetManifest().GetDigest(), want.Manifest.Digest) || got.GetManifest().GetLength() != want.Manifest.Length ||
+		got.GetContentBytes() != want.ContentBytes {
 		return exit.New(exit.Conflict, "machine returned a different native file custody receipt")
 	}
 	return nil

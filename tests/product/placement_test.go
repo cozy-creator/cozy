@@ -30,10 +30,10 @@ const fp8Lane = "fp8-adaln-pruned"
 func exampleMarket() []hub.RentalSKU {
 	return []hub.RentalSKU{
 		{Name: "h100-sxm5-80gb", AcceleratorModel: "NVIDIA H100 80GB HBM3", AcceleratorCount: 1, VRAMGB: 80, ComputeCapability: "9.0",
-			MinimumRAMPerGPUGB: 64, PriceUSDMicrosPerHour: 3_306_496, StorageUSDMicrosPerHour: 213_504,
+			PriceUSDMicrosPerHour: 3_306_496, StorageUSDMicrosPerHour: 213_504,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"},
 		{Name: "rtx-5090", AcceleratorModel: "NVIDIA GeForce RTX 5090", AcceleratorCount: 1, VRAMGB: 32, ComputeCapability: "12.0",
-			MinimumRAMPerGPUGB: 64, PriceUSDMicrosPerHour: 776_496, StorageUSDMicrosPerHour: 213_504,
+			PriceUSDMicrosPerHour: 776_496, StorageUSDMicrosPerHour: 213_504,
 			BaseWorkerProfile: "torch2.13.0-cu130-cp312-linux-x86"},
 	}
 }

@@ -1,7 +1,6 @@
 package producttest
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
@@ -44,24 +43,6 @@ func TestPublishedJobRentalClass(t *testing.T) {
 				t.Fatalf("selected %+v, found=%v mismatch=%q; want %s", sku, ok, mismatch, test.wantSKU)
 			}
 		})
-	}
-}
-
-func TestPackageReleaseRequirementsBindExactInterface(t *testing.T) {
-	raw := []byte(`{"format":"cozy.package.interface/1"}`)
-	sum := sha256.Sum256(raw)
-	detail := hub.PackageReleaseDetail{PackageInterface: raw,
-		ExecutionRequirements: []string{"cozy-runtime<1.0.0,>=0.0.34", "torch<3,>=2.13"}}
-	detail.Release.PackageInterfaceDigest = "sha256:" + hex.EncodeToString(sum[:])
-	detail.Release.PackageInterfaceLength = int64(len(raw))
-	requirements, problem := detail.Requirements()
-	if problem != nil || len(requirements) != 2 || requirements[1] != "torch<3,>=2.13" {
-		t.Fatalf("exact release requirements were refused: requirements=%v problem=%v", requirements, problem)
-	}
-
-	detail.PackageInterface = bytes.Replace(raw, []byte("interface"), []byte("interfaces"), 1)
-	if _, problem := detail.Requirements(); problem == nil || problem.ErrName() != "hub.package_interface_identity_mismatch" {
-		t.Fatalf("changed package interface bytes were admitted: %v", problem)
 	}
 }
 

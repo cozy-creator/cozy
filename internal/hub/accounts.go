@@ -17,7 +17,7 @@ type Account struct {
 func (c *Client) CurrentAccount(ctx context.Context) (Account, *exit.Error) {
 	var out Account
 	problem := c.do(ctx, call{
-		method: http.MethodGet, path: "/v1/accounts/current", auth: true, strict: true,
+		method: http.MethodGet, path: "/v1/accounts/current", auth: true,
 	}, &out)
 	if problem == nil && !resourceSlug.MatchString(out.Name) {
 		problem = exit.Named(exit.Internal, "account.current_invalid",
@@ -35,7 +35,7 @@ func (c *Client) RegisterAccount(ctx context.Context, name string) (Account, *ex
 	}
 	problem := c.do(ctx, call{
 		method: http.MethodPut, path: "/v1/accounts/" + url.PathEscape(name),
-		auth: true, body: struct{}{}, strict: true,
+		auth: true, body: struct{}{},
 	}, &out)
 	if problem == nil && out.Name != name {
 		problem = exit.Named(exit.Internal, "account.registration_invalid",

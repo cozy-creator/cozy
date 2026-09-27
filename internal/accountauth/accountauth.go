@@ -368,10 +368,8 @@ func (m *Manager) load() (credential, ed25519.PrivateKey, *exit.Error) {
 		return credential{}, nil, exit.Named(exit.Credential, "auth.machine_key_unreadable",
 			"the machine credential cannot be read: %s", err)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	var stored credential
-	if err := decoder.Decode(&stored); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+	if err := json.Unmarshal(data, &stored); err != nil {
 		return credential{}, nil, exit.Named(exit.Credential, "auth.machine_key_invalid",
 			"the stored machine credential is invalid").WithNext("cozy auth login <email>")
 	}
@@ -447,9 +445,7 @@ func (m *Manager) post(ctx context.Context, path string, body, out any) *exit.Er
 	if response.StatusCode >= 300 {
 		return authRefusal(response.StatusCode, data)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(out); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+	if err := json.Unmarshal(data, out); err != nil {
 		return exit.Named(exit.Internal, "auth.unreadable_answer", "Tensorhub returned an invalid authentication answer")
 	}
 	return nil

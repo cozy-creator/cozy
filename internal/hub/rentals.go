@@ -1,11 +1,9 @@
 package hub
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -339,28 +337,15 @@ func RentalRequestBytes(name, sku string, gpus int, mediaTokenSHA256, creatorPub
 	return raw, nil
 }
 
-// ParseRentalRequestBytes reopens the exact persisted paid intent. Acquisition replay
-// derives the paid machine choice only from these bytes; mutable caller arguments never
-// replace the SKU decision that was durably recorded before the POST.
+// ParseRentalRequestBytes reopens the persisted paid intent. Acquisition replay
+// resends the persisted bytes unchanged, so a record written by an older or newer
+// Creator only needs the fields this build reads: name, SKU and width.
 func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 	var req RentalRequest
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := json.Unmarshal(raw, &req); err != nil || !rentalid.ValidMachineName(req.Name) ||
+		req.SKU == "" || req.AcceleratorCount < 1 {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
-			"persisted rental intent is not the closed request document")
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
-			"persisted rental intent has trailing data")
-	}
-	canonical, problem := RentalRequestBytes(req.Name, req.SKU, req.AcceleratorCount, req.MediaTokenSHA256,
-		req.CreatorPublicKey, DeclaredWorkload{SourceBytes: req.PlannedSourceBytes,
-			ServingModels: req.ServingModels}, req.Development, req.Image)
-	if problem != nil || !bytes.Equal(canonical, raw) {
-		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
-			"persisted rental intent is not its exact canonical request")
+			"persisted rental intent names no machine, SKU and GPU count")
 	}
 	return req, nil
 }
@@ -387,7 +372,6 @@ type RentalSKU struct {
 	BaseWorkerProfile         string                  `json:"base_worker_profile"`
 	ComputeCapability         string                  `json:"compute_capability"`
 	VRAMGB                    int64                   `json:"vram_gb"`
-	MinimumRAMPerGPUGB        int64                   `json:"minimum_ram_per_gpu_gb"`
 	// PriceUSDMicrosPerHour is the per-machine GPU list rate at this count — the unit the
 	// hub's offer matching and replan cap run on, and the accepted quote this client locks.
 	PriceUSDMicrosPerHour int64 `json:"price_usd_micros_per_hour"`
@@ -408,7 +392,6 @@ type RentalProduct struct {
 	BaseWorkerProfile         string                  `json:"base_worker_profile"`
 	ComputeCapability         string                  `json:"compute_capability"`
 	VRAMGB                    int64                   `json:"vram_gb"`
-	MinimumRAMPerGPUGB        int64                   `json:"minimum_ram_per_gpu_gb"`
 	Widths                    []RentalWidth           `json:"widths"`
 }
 
@@ -426,7 +409,7 @@ func (p RentalProduct) Machines() []RentalSKU {
 		out = append(out, RentalSKU{Name: p.Name, AcceleratorModel: p.AcceleratorModel,
 			AcceleratorCount: width.AcceleratorCount, PythonProvisionableMinors: p.PythonProvisionableMinors,
 			PythonInterpreters: p.PythonInterpreters, BaseWorkerProfile: p.BaseWorkerProfile,
-			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB, MinimumRAMPerGPUGB: p.MinimumRAMPerGPUGB,
+			ComputeCapability: p.ComputeCapability, VRAMGB: p.VRAMGB,
 			PriceUSDMicrosPerHour: width.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: width.StorageUSDMicrosPerHour})
 	}
 	return out
@@ -445,7 +428,7 @@ func RentalProducts(skus []RentalSKU) []RentalProduct {
 			out = append(out, RentalProduct{Name: sku.Name, AcceleratorModel: sku.AcceleratorModel,
 				PythonProvisionableMinors: sku.PythonProvisionableMinors, PythonInterpreters: sku.PythonInterpreters,
 				BaseWorkerProfile: sku.BaseWorkerProfile, ComputeCapability: sku.ComputeCapability,
-				VRAMGB: sku.VRAMGB, MinimumRAMPerGPUGB: sku.MinimumRAMPerGPUGB})
+				VRAMGB: sku.VRAMGB})
 		}
 		out[i].Widths = append(out[i].Widths, RentalWidth{AcceleratorCount: sku.AcceleratorCount,
 			PriceUSDMicrosPerHour: sku.PriceUSDMicrosPerHour, StorageUSDMicrosPerHour: sku.StorageUSDMicrosPerHour})
@@ -478,6 +461,8 @@ func FindRentalSKU(skus []RentalSKU, name string, gpus int) (RentalSKU, bool) {
 }
 
 // RentalSKUs reads Tensorhub's public product catalog, flattened to one machine per width.
+// A product or width this build cannot price or size is left out; one bad row never
+// hides the rest of the catalog.
 func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 	var products []RentalProduct
 	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rental-skus"}, &products); e != nil {
@@ -487,24 +472,29 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 	seen := map[string]bool{}
 	for _, product := range products {
 		cpu := product.AcceleratorModel == "CPU"
-		invalidCPU := cpu && (product.ComputeCapability != "" || product.VRAMGB != 0 || product.MinimumRAMPerGPUGB != 0)
-		invalidGPU := !cpu && (!computeCapabilityPattern.MatchString(product.ComputeCapability) ||
-			product.VRAMGB <= 0 || product.MinimumRAMPerGPUGB <= 0)
-		widths := map[int]bool{}
-		invalidWidth := len(product.Widths) == 0
-		for _, width := range product.Widths {
-			invalidWidth = invalidWidth || width.AcceleratorCount < 1 || widths[width.AcceleratorCount] ||
-				cpu && width.AcceleratorCount != 1 ||
-				width.PriceUSDMicrosPerHour <= 0 || width.StorageUSDMicrosPerHour < 0
-			widths[width.AcceleratorCount] = true
-		}
+		// Host RAM is an informational fact: placement fits GPUs only, so neither a
+		// RAM figure nor its absence decides whether a product can be rented.
+		invalidCPU := cpu && (product.ComputeCapability != "" || product.VRAMGB != 0)
+		invalidGPU := !cpu && (!computeCapabilityPattern.MatchString(product.ComputeCapability) || product.VRAMGB <= 0)
 		if strings.TrimSpace(product.Name) == "" || strings.TrimSpace(product.AcceleratorModel) == "" ||
-			invalidCPU || invalidGPU || invalidWidth || seen[product.Name] {
-			return nil, exit.Named(exit.Conflict, "hub.rental_catalog_invalid",
-				"the hub returned an invalid or duplicate rental SKU %q", product.Name).
-				WithRemedy("Tensorhub must publish unique CPU SKUs without GPU fields, or GPU SKUs with compute capability and positive VRAM/RAM, each with unique positive-price GPU counts")
+			invalidCPU || invalidGPU || seen[product.Name] {
+			continue
+		}
+		widths := map[int]bool{}
+		valid := product.Widths[:0:0]
+		for _, width := range product.Widths {
+			if width.AcceleratorCount < 1 || widths[width.AcceleratorCount] || cpu && width.AcceleratorCount != 1 ||
+				width.PriceUSDMicrosPerHour <= 0 || width.StorageUSDMicrosPerHour < 0 {
+				continue
+			}
+			widths[width.AcceleratorCount] = true
+			valid = append(valid, width)
+		}
+		if len(valid) == 0 {
+			continue
 		}
 		seen[product.Name] = true
+		product.Widths = valid
 		out = append(out, product.Machines()...)
 	}
 	return out, nil
