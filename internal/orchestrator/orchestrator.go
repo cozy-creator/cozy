@@ -266,6 +266,9 @@ type PlacementCandidate struct {
 	TimeS         float64 `json:"time_s,omitempty"`
 	CostUSDMicros int64   `json:"cost_usd_micros,omitempty"`
 	Score         float64 `json:"score,omitempty"`
+	// DiskUnknown marks an attached rental whose Hub reported no disk while the request
+	// needs one; it is chosen only after the rentals known to fit.
+	DiskUnknown bool `json:"disk_unknown,omitempty"`
 	// Verdict is one of the constants below; empty only while the choice is still open.
 	Verdict string     `json:"verdict"`
 	Models  []ModelRef `json:"-"`
@@ -434,6 +437,9 @@ const (
 	// across it. The worker would refuse `device_group_unsupported` on arrival, so the
 	// exclusion belongs here, before the pod is paid for (cl-179).
 	ExcludedWidthUndeclared = "width_undeclared"
+	// ExcludedDiskShort is spelled with the rental's disk and the need appended: the
+	// container disk the Hub bought cannot hold the request's ingest.
+	ExcludedDiskShort = "disk_short"
 )
 
 // RentalStanding is what this owner knows live about one ready rental a placement could
