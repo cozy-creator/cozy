@@ -919,6 +919,12 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		s.fillLifecycleProgress(&life, row)
 		s.fillGPUWait(&life, row)
 		life.OutputExport = s.outputExportOf(row.ID)
+		if life.Status == "canceled" {
+			// A canceled run says WHO (cl-108), whichever machine ran it.
+			if actor, _, _, problem := s.store.CancelAttribution(row.ID); problem == nil {
+				life.CanceledBy = actor
+			}
+		}
 		if awaiting, problem := s.store.MachinePublicationsAwaitingOwner(row.ID); problem == nil && len(awaiting) > 0 {
 			life.Phase, life.PhaseDetail = orchestrator.PhaseOwnerReconciliation, awaiting[0].Publication
 		}
@@ -1227,6 +1233,7 @@ func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
 		if value, problem := s.store.LatestMachineProgress(row.ID, int64(life.Attempt)); problem == nil {
 			progress, ok = orchestrator.DecodeProgressSnapshot(value)
 		}
+		progress.RemainingMS, progress.Estimated = s.store.MachineProgressEstimate(row.ID, int64(life.Attempt))
 	}
 	if !ok {
 		return

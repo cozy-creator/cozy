@@ -61,6 +61,9 @@ func ptyDrive(t *testing.T, root string, rows uint16, steps int,
 		chunk := make([]byte, 4096)
 		for {
 			n, err := master.Read(chunk)
+			if n > 0 {
+				touchPTY(cmd)
+			}
 			mu.Lock()
 			out.Write(chunk[:n])
 			mu.Unlock()
@@ -101,6 +104,18 @@ func ptyDrive(t *testing.T, root string, rows uint16, steps int,
 	return code, out.String()
 }
 
+// ptyStall is how long a pseudo-terminal child may draw nothing before it is stopped.
+const ptyStall = 20 * time.Second
+
+var ptyStops sync.Map // *exec.Cmd -> *time.Timer
+
+// touchPTY renews a child's stuck-terminal stop after it drew.
+func touchPTY(cmd *exec.Cmd) {
+	if timer, ok := ptyStops.Load(cmd); ok {
+		timer.(*time.Timer).Reset(ptyStall)
+	}
+}
+
 func startPTY(t *testing.T, root string, rows, columns uint16, args ...string) (*os.File, *exec.Cmd) {
 	return startPTYSetup(t, root, rows, columns, nil, args...)
 }
@@ -125,10 +140,12 @@ func startPTYSetup(t *testing.T, root string, rows, columns uint16, setup func(*
 	}
 	must(t, cmd.Start())
 	must(t, slave.Close()) // the child holds the slave now; EOF/EIO on master ends the read
-	// The kill is a stuck-terminal stop for a child that never answers its inputs; the
-	// proofs' own bounds are their input cadences, so the stop stays far behind them.
-	timedOut := time.AfterFunc(20*time.Second, func() { _ = cmd.Process.Kill() })
+	// The kill is a stuck-terminal stop for a child that stops drawing: a reader that sees
+	// output renews it (touchPTY), so a long run that keeps drawing is never cut off.
+	timedOut := time.AfterFunc(ptyStall, func() { _ = cmd.Process.Kill() })
+	ptyStops.Store(cmd, timedOut)
 	t.Cleanup(func() {
+		ptyStops.Delete(cmd)
 		timedOut.Stop()
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()

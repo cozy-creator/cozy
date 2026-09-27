@@ -133,7 +133,7 @@ func TestProductPath(t *testing.T) {
 	assertNoAttemptRoot(t, root)
 
 	// An unseeded run draws fresh entropy, so its bytes — and its name — differ.
-	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32")
+	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32", "--await")
 	if code != 0 {
 		t.Fatalf("second human invocation failed [exit %d]\n%s", code, stderr)
 	}
@@ -280,7 +280,9 @@ func TestProductPath(t *testing.T) {
 	detachedDir := filepath.Join(root, "detached-output")
 	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
 		"size=32", "seed=9", "delay_ms=4500", "--out", detachedDir)
-	if code != 0 || !strings.Contains(stdout, `"status":"running"`) ||
+	// Detached before its machine accepted it (queued) or after (running); either way it names
+	// its durable destination.
+	if code != 0 || !regexp.MustCompile(`"status":"(queued|running)"`).MatchString(stdout) ||
 		!strings.Contains(stdout, `"output":"`+detachedDir+`"`) {
 		t.Fatalf("default run did not detach with its durable destination [exit %d]\nstdout:\n%s\nstderr:\n%s",
 			code, stdout, stderr)

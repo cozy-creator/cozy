@@ -1552,6 +1552,8 @@ func NewProgress(ctx *Context, rawJSON bool, began time.Time) *RunProgress {
 }
 
 func (p *RunProgress) On(e localapi.Event) bool {
+	// Every machine's progress reaches a client as the one progress event.
+	e = machineProgressEvent(e)
 	if p.rawJSON {
 		data, err := json.Marshal(e)
 		if err == nil {
@@ -1562,7 +1564,6 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	if p.ctx.Mode().JSON {
 		return true // one JSON document on stdout: the run's own, at the end
 	}
-	e = machineProgressEvent(e)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	kind := strings.TrimPrefix(e.Type, "request.")

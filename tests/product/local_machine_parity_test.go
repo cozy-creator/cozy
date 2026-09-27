@@ -317,7 +317,13 @@ func TestLocalAndRentedMachinesRunOneBody(t *testing.T) {
 				if link == nil || link.MachineID != want || !link.Collected {
 					t.Fatalf("%s on %s was not a collected execution on %s: %+v", call.function, venue.name, want, link)
 				}
-				journals[venue.name] = append(journals[venue.name], journal(t, store, request.ID))
+				// Collection's own record lands after the run's terminal the client returned on.
+				var events []string
+				waitFor(t, root, "the collection record", func() bool {
+					events = journal(t, store, request.ID)
+					return slices.Contains(events, "machine.collected")
+				})
+				journals[venue.name] = append(journals[venue.name], events)
 			}
 		})
 	}
