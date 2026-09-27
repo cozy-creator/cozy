@@ -1069,8 +1069,12 @@ func renderRentalList(inventory api.RentalInventory) output.List {
 		if r.HubUnknown {
 			haveHubUnknown = true
 			typed["hub_unknown"] = true
-			list.Trail = append(list.Trail, fmt.Sprintf("Rental %s (%s) is recorded here but unknown to Tensorhub; "+
-				"its record is kept until its provider release is confirmed.", r.ID, r.MachineName))
+			settle := "its record is kept until its provider release is confirmed."
+			if r.State == hub.RentalFailed {
+				settle = "Tensorhub reported it failed (provider absent) before losing it; `cozy rental end " + r.ID + "` forgets it."
+			}
+			list.Trail = append(list.Trail, fmt.Sprintf("Rental %s (%s) is recorded here but unknown to Tensorhub; %s",
+				r.ID, r.MachineName, settle))
 		}
 		if r.Failure.Code != "" {
 			haveFailure = true
@@ -1406,7 +1410,9 @@ func handleRentRelease(ctx *Context) *exit.Error {
 				"This hub publishes no rental listing (th-199), so name the rental id instead").
 			WithNext("cozy rental", "cozy rental end <rental-id>")
 	}
-	if verdict == rentalAbsent && (known.Operation == nil || known.Operation.State != hub.RentalReleased) {
+	recordedFailed := row != nil && row.State == hub.RentalFailed
+	if verdict == rentalAbsent && !recordedFailed &&
+		(known.Operation == nil || known.Operation.State != hub.RentalReleased) {
 		return rentalReleaseUnconfirmed(id)
 	}
 	if problem := st.RequestRetainedRentalAbandonment(id, "cozy rental end"); problem != nil {
@@ -1417,8 +1423,11 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		if releaseProblem != nil {
 			return releaseProblem
 		}
-		return w.finish(l, st, operationKey, row != nil, false, known.Operation,
-			"the hub already reported this rental gone")
+		note := "the hub already reported this rental gone"
+		if verdict == rentalAbsent && recordedFailed {
+			note = "Tensorhub reported this rental failed, which it records only after provider absence is proven, and has since lost the record"
+		}
+		return w.finish(l, st, operationKey, row != nil, false, known.Operation, note)
 	}
 
 	operationKey, e := st.RequestRentalRelease(id)
