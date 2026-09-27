@@ -200,7 +200,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e := validateInvocationPayload(ctx, target.Package, ep, input); e != nil {
 		return e
 	}
-	selectedRental, e := requestedRental(ctx, target, ep.Name)
+	selectedRental, e := requestedRental(ctx)
 	if e != nil {
 		return e
 	}
@@ -215,12 +215,19 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	} else {
 		packagePublishStatus(ctx, "Finding a rental machine...")
 	}
-	models, e := resolveInvocationModels(ctx, target, ep, overrides.Models)
+	models, chosen, e := modelChoices(target, ep, overrides.Models, loras)
 	if e != nil {
 		return e
 	}
-	if e = resolveInvocationLoRAs(ctx, target, models, loras); e != nil {
-		return e
+	if !chosen || managedRental && selectedRental == "" {
+		// Choosing a machine to rent reads the ladders; so do editable code, provider
+		// sources and adapters.
+		if models, e = resolveInvocationModels(ctx, target, ep, overrides.Models); e != nil {
+			return e
+		}
+		if e = resolveInvocationLoRAs(ctx, target, models, loras); e != nil {
+			return e
+		}
 	}
 	outputDirectory, e := requestedOutputDirectory(ctx)
 	if e != nil {
@@ -290,6 +297,32 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	}
 	saved := exportedOutputs(life)
 	return renderRun(ctx, life, terminal, stopped, saved, submitted)
+}
+
+// modelChoices are a published call's explicit `model.<param>=` selections, parsed and
+// nothing more: the machine that runs the call resolves them and every other slot for its
+// own devices. It answers false for a call the machine cannot take that way.
+func modelChoices(target Target, ep *launch.Entrypoint, overrides map[string]string, loras []launch.LoRAOverride) ([]orchestrator.ModelRef, bool, *exit.Error) {
+	if strings.HasPrefix(target.Package, "local/") || target.Snapshot || len(loras) > 0 {
+		return nil, false, nil
+	}
+	var out []orchestrator.ModelRef
+	for _, slot := range ep.Models {
+		raw, chosen := overrides[slot.Path]
+		if !chosen {
+			continue
+		}
+		if strings.Contains(raw, "://") {
+			return nil, false, nil
+		}
+		model, release, lane, manifest, problem := hub.ParseModelRef(raw)
+		if problem != nil {
+			return nil, false, problem
+		}
+		out = append(out, orchestrator.ModelRef{Choice: true, Package: target.Package, Slot: slot.Path,
+			BindingPath: slot.Path, Model: model, CatalogRepository: model, Release: release, Lane: lane, Manifest: manifest})
+	}
+	return out, true, nil
 }
 
 // invocationModelSpec is one slot's selection before the card is read: an explicit

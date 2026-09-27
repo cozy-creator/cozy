@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -19,7 +20,9 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -44,12 +47,13 @@ type runtimeMachine struct {
 
 	submissions []*pb.MachineExecutionSubmit // every submission as sent, resubmissions included
 	failure     string                       // a failed terminal's safe message; empty succeeds
+	refusal     string                       // a release root this Runtime cannot prepare
 }
 
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	workspace := &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
 		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs, ExactExecutionGpus: m.exactGPUs,
-		SourceCredentials: m.sourceCredentials}
+		SourceCredentials: m.sourceCredentials, ReleaseRoots: true, ResolvesModelDefaults: true}
 	for ordinal := range m.devices {
 		workspace.Devices = append(workspace.Devices, &pb.MachineDevice{Ordinal: uint32(ordinal), Name: "fake-4090"})
 	}
@@ -59,9 +63,14 @@ func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *
 // runtimeExecutionID is Runtime's execution identity grammar (workspace_executions.py `_ID`).
 var runtimeExecutionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$`)
 
-func (m *runtimeMachine) SubmitMachineExecution(_ context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
+func (m *runtimeMachine) SubmitMachineExecution(ctx context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.refusal != "" && submit.ReleaseRoot != nil {
+		// Nothing was journaled: the refusal is definitive.
+		_ = grpc.SetTrailer(ctx, metadata.Pairs("cozy-error-code", "execution_submission_refused"))
+		return nil, status.Error(codes.FailedPrecondition, m.refusal)
+	}
 	if !runtimeExecutionID.MatchString(submit.SubmissionId) {
 		return nil, status.Error(codes.InvalidArgument, "execution identity must be a bounded opaque ID")
 	}
@@ -71,8 +80,14 @@ func (m *runtimeMachine) SubmitMachineExecution(_ context.Context, submit *pb.Ma
 	}
 	id := submit.Offer.RequestId
 	m.submission = proto.Clone(submit).(*pb.MachineExecutionSubmit)
-	m.receipt = &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: submit.SubmissionId, CaptureDigest: submit.CaptureDigest,
-		InvocationSpecDigest: submit.Offer.InvocationSpecDigest, AcceptedAtMs: uint64(time.Now().UnixMilli()),
+	capture, invocation := submit.CaptureDigest, submit.Offer.InvocationSpecDigest
+	if submit.ReleaseRoot != nil {
+		// A root by its release: this Runtime installs, resolves and mints what it names.
+		minted := sha256.Sum256([]byte(submit.SubmissionId))
+		capture, invocation = minted[:], minted[:]
+	}
+	m.receipt = &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: submit.SubmissionId, CaptureDigest: capture,
+		InvocationSpecDigest: invocation, AcceptedAtMs: uint64(time.Now().UnixMilli()),
 		WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}
 	m.state = &pb.MachineExecutionState{RequestId: id, WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId,
 		ExecutionWorkspaceId: "rented-workspace", Generation: 1, AttemptOrdinal: 1, State: "running"}
@@ -225,29 +240,17 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 		return problem == nil && linkProblem == nil && row.State == "succeeded" && link != nil && link.Collected
 	})
 
+	// The machine took the root by its release: it prepared, resolved and minted it.
 	submission := machine.submitted()
-	set := submission.PreparedState.GetPlacementSet()
-	if set == nil || len(set.DevicePins) != 0 || set.ExecutionGpus != 0 {
-		t.Fatalf("the root was not submitted against its prepared placement alone: %+v", submission.PreparedState)
+	if root := submission.ReleaseRoot; root == nil || root.Package != ladderPackage || root.Entrypoint != "generate" ||
+		len(submission.CaptureCanonicalBytes) != 0 || submission.PreparedState != nil || len(row.Models) != 0 {
+		t.Fatalf("the rented root was not submitted by its release: %+v (models %+v)", submission, row.Models)
 	}
-	placements, err := canonical.Read(set.PlacementSetCanonicalBytes, &pb.PlacementSet{})
-	must(t, err)
-	if id := placements.List("placements")[0].Str("placement_id"); submission.Offer.PlacementId != id {
-		t.Fatalf("the offer names placement %q, not the prepared %q", submission.Offer.PlacementId, id)
-	}
-	var spec pb.InvocationSpec
-	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
-	if spec.GetServing() == nil || spec.GetServing().EntrypointBindingDigest != row.PlanID {
-		t.Fatalf("the root is not the prepared inference binding %s: %+v", row.PlanID, spec.Spec)
-	}
-	if len(row.Models) != 1 || row.Models[0].Manifest == "" {
-		t.Fatalf("the rental's lane was not pinned before preparation: %+v", row.Models)
-	}
-	// Runtime's measured working memory sizes the next selection.
-	peaks, problem := store.WorkingPeaks(*row)
-	fatal(t, problem)
-	if peak := peaks[records.ModelsDigest(row.Models)]; peak.Bytes != 30<<30 || peak.Runs != 1 {
-		t.Fatalf("the measured working peak was not kept: %+v", peaks)
+	pod.mu.Lock()
+	prepares := len(pod.prepares)
+	pod.mu.Unlock()
+	if prepares != 0 {
+		t.Fatalf("the client prepared the machine %d time(s) for a root it takes by release", prepares)
 	}
 	if _, show := runCozy(t, root, "run", "show", "2"); !strings.Contains(show, "ordinals [0 1 2 3]") {
 		t.Fatalf("run show does not name the GPUs Runtime granted:\n%s", show)

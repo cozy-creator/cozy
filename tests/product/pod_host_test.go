@@ -140,6 +140,7 @@ type fakePod struct {
 	acks               []*pb.SnapshotAck
 	desired            []*pb.DesiredWorkerState
 	prepares           []*pb.PreparePackageSetCall
+	protocolReads      int // each dial of the pod probes it once
 	localPrepares      []*pb.PrepareLocalPackageCall
 	uploads            []*pb.LocalPackageFileRef
 	uploadEnds         []codes.Code
@@ -167,6 +168,9 @@ type fakePod struct {
 }
 
 func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error) {
+	p.mu.Lock()
+	p.protocolReads++
+	p.mu.Unlock()
 	if p.protocolInfo != nil {
 		return p.protocolInfo(ctx, request)
 	}

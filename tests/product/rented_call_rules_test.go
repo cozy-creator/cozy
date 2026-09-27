@@ -22,7 +22,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 )
 
 // Owner rules of rented calls, restated for Runtime-owned machine execution (#758).
@@ -113,15 +112,16 @@ func TestRentedScalarResultCreatesNoOutputDirectory(t *testing.T) {
 	}
 }
 
-// A transport loss while the pod prepares a rented call leaves the run queued, saying
-// why; the next attempt prepares again and the call is submitted once.
+// A transport loss while a rented call is submitted leaves the run queued; the same frozen
+// submission is sent again and accepted once, with nothing prepared by the client.
 func TestRentedPreparationTransportLossKeepsTheRunQueued(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
 	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
 		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
 	})
-	pod := &fakePod{machine: machines, prepareUnavailable: 1}
+	machines.unavailable.Store(1)
+	pod := &fakePod{machine: machines}
 	root, layout := rentedLadderMachine(t, h, pod, nil)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
@@ -132,10 +132,7 @@ func TestRentedPreparationTransportLossKeepsTheRunQueued(t *testing.T) {
 	}
 	events, problem := store.EventsAfter(row.ID, 0, 200)
 	fatal(t, problem)
-	parked := false
 	for _, event := range events {
-		reason, _ := event.Payload["reason"].(string)
-		parked = parked || event.Type == "request.parked" && strings.Contains(reason, "Tensorhub is restarting")
 		if event.Type == "request.failed" {
 			t.Fatalf("the transport loss failed the run: %v", event.Payload)
 		}
@@ -143,8 +140,8 @@ func TestRentedPreparationTransportLossKeepsTheRunQueued(t *testing.T) {
 	pod.mu.Lock()
 	prepares := len(pod.prepares)
 	pod.mu.Unlock()
-	if !parked || prepares != 2 || len(machines.submitted()) != 1 {
-		t.Fatalf("parked %v after the loss, %d preparation(s), %d submission(s); want parked, 2, 1", parked, prepares, len(machines.submitted()))
+	if prepares != 0 || machines.attempts.Load() != 2 || len(machines.submitted()) != 1 {
+		t.Fatalf("%d preparation(s), %d submit attempt(s), %d accepted; want 0, 2, 1", prepares, machines.attempts.Load(), len(machines.submitted()))
 	}
 }
 
@@ -206,6 +203,14 @@ func TestRentedLoRAStackMustBeEchoedBeforeSubmission(t *testing.T) {
 				loras = []string{"--lora", "model:fl2va_dit=proof/style#" + style + ",0", "--lora", "model:fl2va_dit=proof/style#" + style + ",-0.25"}
 			}
 			row, out := rentedRun(t, root, store, arm, "generate", append([]string{"steps=1"}, loras...)...)
+			if arm == "unexpected" {
+				// No stack was asked for: the machine takes the call by its release, and
+				// nothing the client prepared can add one.
+				if submitted := machines.submitted(); row.State != "succeeded" || len(submitted) != 1 || submitted[0].ReleaseRoot == nil {
+					t.Fatalf("a call with no stack was not taken by its release: %s\n%s", row.State, out)
+				}
+				return
+			}
 			if arm == "matched" {
 				if row.State != "succeeded" || len(machines.submitted()) != 1 {
 					t.Fatalf("the echoed stack was not submitted: %s\n%s", row.State, out)
@@ -228,12 +233,6 @@ func TestRentedLoRAStackMustBeEchoedBeforeSubmission(t *testing.T) {
 		})
 	}
 }
-
-// constructionInterface is H3's shape: two serving entrypoints over one construction.
-const constructionInterface = `{"application":"h3:app","entrypoints":[` +
-	`{"models":[{"class":"H3","component_use":{"sample_fl2va":["fl2va_dit"]},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}},` +
-	`{"models":[{"class":"H3","component_use":{"sample_ref2va":["ref2va_dit"]},"path":"extend.models.model"}],"name":"extend","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}` +
-	`],"format":"cozy.package.interface/1","jobs":[]}`
 
 const tenantPackage = "proof/tenant"
 
@@ -282,108 +281,8 @@ func publishTenant(t *testing.T, h *ladderHub) []byte {
 	return iface
 }
 
-// A warm pod serves what it already prepared (run 864: every alternation was a ~100 GB
-// prepare for zero new bytes) and stacks packages without limit. The binding is the one
-// the pod authored for the requested function — `generate` is the second entrypoint the
-// placement lists — and the sibling entrypoint, a repeat, and a repeat after another
-// package joined the pod each send the byte-identical preparation the pod already holds.
-func TestRentedPodServesNamedSiblingsRepeatsAndCoTenants(t *testing.T) {
-	h := newLadderHub(t)
-	h.workflow = []byte(constructionInterface)
-	sibling := goodLadder()
-	sibling.Slot = "extend.models.model"
-	h.mu.Lock()
-	h.bindings = []hub.PackageBindingRow{goodLadder(), sibling}
-	h.mu.Unlock()
-	tenant := publishTenant(t, h)
-	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
-		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
-	})
-	pod := &fakePod{machine: machines, retainPrepared: true, preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
-		placement := modelBearingPlacement(t)(download, pkg, release)
-		if pkg == tenantPackage {
-			placement.PackageInterface = tenant
-		}
-		return placement
-	}}
-	root, layout := rentedLadderMachine(t, h, pod, nil)
-	store, problem := records.Open(layout.DB)
-	fatal(t, problem)
-	defer store.Close()
-
-	runs := []struct{ key, target string }{{"generate", "generate"}, {"extend", "extend"},
-		{"tenant", tenantPackage + "/generate"}, {"generate-again", "generate"}}
-	for _, run := range runs {
-		argv := []string{"run", ladderPackage + "/" + run.target, "steps=1"}
-		if strings.Contains(run.target, "/") {
-			argv[1] = run.target
-		}
-		if code, out := runCozy(t, root, append(argv, "--rental=tessa", "--json", "--idempotency-key", run.key)...); code != 0 {
-			t.Fatalf("rented run %s was refused [exit %d]: %s", run.key, code, out)
-		}
-	}
-	submitted := machines.submitted()
-	if len(submitted) != len(runs) {
-		t.Fatalf("the pod accepted %d of %d calls", len(submitted), len(runs))
-	}
-	placement := ""
-	for index, run := range runs {
-		row, problem := store.RequestByIdempotencyKey(run.key)
-		fatal(t, problem)
-		submission := submitted[index]
-		if submission.Offer.RequestId != row.ID {
-			t.Fatalf("call %d reached the pod out of order", index)
-		}
-		if row.Package != ladderPackage {
-			continue
-		}
-		set, err := canonical.Read(submission.PreparedState.GetPlacementSet().PlacementSetCanonicalBytes, &pb.PlacementSet{})
-		must(t, err)
-		authored := map[string]string{}
-		var names []string
-		for _, entrypoint := range set.List("placements")[0].List("entrypoints") {
-			authored[entrypoint.Str("name")] = entrypoint.Str("entrypoint_binding_digest")
-			names = append(names, entrypoint.Str("name"))
-		}
-		var spec pb.InvocationSpec
-		must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
-		binding := spec.GetServing().GetEntrypointBindingDigest()
-		if names[0] != "extend" || authored["generate"] == authored["extend"] ||
-			binding != authored[row.Entrypoint] || row.PlanID != binding {
-			t.Fatalf("%s was submitted under binding %s; the pod authored %v in order %v", row.Entrypoint, binding, authored, names)
-		}
-		if placement == "" {
-			placement = submission.Offer.PlacementId
-		}
-		if submission.Offer.PlacementId != placement {
-			t.Fatalf("%s left the warm placement %s for %s", run.key, placement, submission.Offer.PlacementId)
-		}
-	}
-	pod.mu.Lock()
-	defer pod.mu.Unlock()
-	var h3 []*pb.PreparePackageSetCall
-	for _, call := range pod.prepares {
-		var set pb.DownloadDelegation
-		must(t, canonical.Unmarshal(call.PackageSet.DownloadDelegation, &set))
-		if len(set.Packages) != 1 {
-			t.Fatalf("one preparation named %d packages", len(set.Packages))
-		}
-		if set.Packages[0].Package == ladderPackage {
-			h3 = append(h3, call)
-		}
-	}
-	if len(h3) != 3 || len(pod.prepares) != 4 {
-		t.Fatalf("%d preparations, %d of them proof/h3; want 4 and 3", len(pod.prepares), len(h3))
-	}
-	for _, call := range h3[1:] {
-		if !proto.Equal(call, h3[0]) {
-			t.Fatal("a sibling or repeated call sent a preparation the pod does not hold; it restages the construction")
-		}
-	}
-}
-
-// A package whose preparation the pod refuses fails its own run with the pod's code; a
-// co-tenant package on the same pod runs before it and again after it.
+// A package whose release the machine cannot prepare fails its own run with the machine's
+// refusal; a co-tenant package on the same pod runs before it and again after it.
 func TestRentedRefusedPackageFailsAloneOnASharedPod(t *testing.T) {
 	h := newLadderHub(t)
 	h.bind(goodLadder())
@@ -391,14 +290,14 @@ func TestRentedRefusedPackageFailsAloneOnASharedPod(t *testing.T) {
 	machines := newTerminalMachines(func(map[string]any) *pb.AttemptOutcomeBody {
 		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
 	})
-	pod := &fakePod{machine: machines, refusePrepare: map[string]*pb.PrepareEvent{
-		tenantPackage: {SafeCode: "wheel_download_failed", SafeDetail: "tenant-0.1.0-py3-none-any.whl: transfer interrupted"}}}
+	machines.refuse = map[string]string{tenantPackage: "wheel_download_failed: tenant-0.1.0-py3-none-any.whl: transfer interrupted"}
+	pod := &fakePod{machine: machines}
 	root, layout := rentedLadderMachine(t, h, pod, nil)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
 	for _, run := range []struct{ key, target, state string }{{"before", ladderPackage + "/generate", "succeeded"},
-		{"refused", tenantPackage + "/generate", "failed"}, {"after", ladderPackage + "/generate", "succeeded"}} {
+		{"refused", tenantPackage + "/generate", "refused"}, {"after", ladderPackage + "/generate", "succeeded"}} {
 		_, out := runCozy(t, root, "run", run.target, "steps=1", "--rental=tessa", "--json", "--idempotency-key", run.key)
 		var row *records.Request
 		waitFor(t, root, "run "+run.key+" to settle ("+out+")", func() bool {
@@ -408,11 +307,11 @@ func TestRentedRefusedPackageFailsAloneOnASharedPod(t *testing.T) {
 		if row.State != run.state {
 			t.Fatalf("run %s settled %s, want %s: %s", run.key, row.State, run.state, out)
 		}
-		if run.state == "failed" {
-			errType, errCode, message, problem := store.SettledFailure(row.ID)
+		if run.state == "refused" {
+			errType, _, message, problem := store.SettledFailure(row.ID)
 			fatal(t, problem)
-			if errType != "machine_execution.prepare_refused" || errCode != "wheel_download_failed" || !strings.Contains(message, "transfer interrupted") {
-				t.Fatalf("the refused package's run lost the pod's refusal: %s %s %s", errType, errCode, message)
+			if errType != "machine_execution.refused" || !strings.Contains(message, "wheel_download_failed") || !strings.Contains(message, "transfer interrupted") {
+				t.Fatalf("the refused package's run lost the machine's refusal: %s %s", errType, message)
 			}
 		}
 	}
@@ -433,9 +332,14 @@ type intakeMachines struct {
 	*terminalMachines
 	received  sync.Map // input id -> []byte
 	committed sync.Map // retention id -> *pb.NativeByteTreeRef
+	// hold, when set, runs as each intake begins: a test holds the upload there.
+	hold func()
 }
 
 func (m *intakeMachines) ImportInputTree(stream grpc.ClientStreamingServer[pb.InputTreeImportFrame, pb.NativeByteRetentionResult]) error {
+	if m.hold != nil {
+		m.hold()
+	}
 	frame, err := stream.Recv()
 	if err != nil {
 		return err
@@ -485,13 +389,14 @@ func TestRentedCallReceivesDeclaredAssetsInOrder(t *testing.T) {
 		return outcome(pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "", nil)
 	})}
 	entered, held := make(chan struct{}, 1), make(chan struct{})
-	root, layout := rentedLadderMachine(t, h, &fakePod{machine: machines, prepareEvent: func(*pb.PrepareEvent) {
+	machines.hold = func() {
 		select {
 		case entered <- struct{}{}:
 		default:
 		}
 		<-held
-	}}, nil)
+	}
+	root, layout := rentedLadderMachine(t, h, &fakePod{machine: machines}, nil)
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
@@ -506,7 +411,7 @@ func TestRentedCallReceivesDeclaredAssetsInOrder(t *testing.T) {
 			"--asset", "alice="+photo, "--asset", photo, "--rental=tessa", "--json", "--idempotency-key", "assets")
 		printed <- out
 	}()
-	waitFor(t, root, "the pod to begin preparing the run", func() bool {
+	waitFor(t, root, "the pod to begin taking the run's inputs", func() bool {
 		select {
 		case <-entered:
 			return true
@@ -527,11 +432,9 @@ func TestRentedCallReceivesDeclaredAssetsInOrder(t *testing.T) {
 		t.Fatalf("the rented call with Assets did not run: %s\n%s", row.State, out)
 	}
 	submission := machines.submitted()[0]
-	var spec pb.InvocationSpec
-	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
 	digest := mustSpell(encoded.Bytes())
 	bound := map[string]*pb.InputBinding{}
-	for _, input := range spec.Inputs {
+	for _, input := range submission.GetReleaseRoot().GetInputs() {
 		bound[input.InputId] = input
 	}
 	for order, field := range []string{"assets.0.asset", "assets.1.asset"} {
@@ -575,9 +478,21 @@ func TestRentedMeasuredMemorySizesTheNextSelection(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
+	// The fleet chooses the machine, so the ladder is read and the selection sized; a named
+	// rental's call is resolved by its machine and sizes nothing.
 	var rows []*records.Request
 	for steps := 1; steps <= 4; steps++ {
-		row, _ := rentedRun(t, root, store, fmt.Sprint("measured-", steps), "generate", fmt.Sprint("steps=", steps))
+		key := fmt.Sprint("measured-", steps)
+		_, out := runCozy(t, root, "run", ladderPackage+"/generate", fmt.Sprint("steps=", steps), "--rental-only", "--json", "--idempotency-key", key)
+		var row *records.Request
+		waitFor(t, root, "run "+key+" to settle ("+out+")", func() bool {
+			row, problem = store.RequestByIdempotencyKey(key)
+			if problem != nil || row == nil {
+				return false
+			}
+			link, _ := store.MachineExecution(row.ID)
+			return records.Settled(row.State) && (link == nil || len(link.Receipt) == 0 || link.Collected)
+		})
 		rows = append(rows, row)
 	}
 	measured, later := rows[0], rows[3]

@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -98,53 +95,6 @@ func startRentedPod(t *testing.T, h *ladderHub, pod *fakePod, machine func(block
 	store.Close()
 	startDaemonProcess(t, root, daemonEnv...)
 	return root
-}
-
-// Every rung of a captured default ladder is probed at the public origin, but a checkpoint
-// is content-addressed: one capture asks the origin about each checkpoint once.
-func TestRentedSubmissionProbesEachDefaultCheckpointOnce(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(hub.PackageBindingRow{Slot: ladderSlot, Model: ladderModel, Release: ladderRelease,
-		Ladder: []hub.BindingRung{{GPU: "H100", Lane: "bf16-full"}, {GPU: "B200", Lane: "bf16-full"}, {GPU: "*", Lane: "bf16-full"}}, Revision: 3})
-	header := "sha256:" + strings.Repeat("e", 64)
-	var resolves, reads atomic.Int32
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/resolve" && r.URL.Query().Get("ref") == ladderModel+"@"+bf16Manifest:
-			resolves.Add(1)
-			_ = json.NewEncoder(w).Encode(hub.ModelResolution{Model: ladderModel, ManifestID: bf16Manifest, ManifestLength: 161, HeaderID: header})
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/"+ladderModel+"/checkpoints/"+bf16Manifest+"/reads" && r.Header.Get("Authorization") == "":
-			reads.Add(1)
-			_ = json.NewEncoder(w).Encode(map[string]any{"reads": []hub.Read{{ObjectID: header, Length: 64, URL: "https://" + r.Host + "/objects/header"}}})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer origin.Close()
-	trust := filepath.Join(t.TempDir(), "public-origin.pem")
-	must(t, os.WriteFile(trust, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: origin.Certificate().Raw}), 0o600))
-	machine := &runtimeMachine{}
-	root := startRentedFixture(t, h, func(blocker string) machineExecutionPeer { machine.blocker = blocker; return machine },
-		"--extra-index-url "+origin.URL+"/v1/index/proof/simple/\n", "SSL_CERT_FILE="+trust)
-
-	if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json"); code != 0 {
-		t.Fatalf("the rented run was refused [exit %d]: %s", code, out)
-	}
-	waitFor(t, root, "the Runtime submission", func() bool { return machine.submitted() != nil })
-	var capture pb.MachineExecutionCapture
-	must(t, canonical.Unmarshal(machine.submitted().CaptureCanonicalBytes, &capture))
-	var row *pb.MachineModelDefault
-	for _, candidate := range capture.ModelDefaults {
-		if candidate.Entrypoint == "generate" {
-			row = candidate
-		}
-	}
-	if row == nil || len(row.Rungs) != 3 || row.PublicOrigin != origin.URL || row.UnavailableCode != "" {
-		t.Fatalf("the capture does not carry the three probed rungs: %+v", capture.ModelDefaults)
-	}
-	if resolves.Load() != 1 || reads.Load() != 1 {
-		t.Fatalf("three rungs of one checkpoint cost %d resolves and %d header reads; want one each", resolves.Load(), reads.Load())
-	}
 }
 
 // heldMachine is runtimeMachine whose journal reads can be held open, as a slow machine
@@ -299,67 +249,4 @@ func (m *acceptingMachines) accepted(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.states[id] != nil
-}
-
-// `cozy run show` attributes the time before machine acceptance: the connection, each
-// package's preparation, captured defaults and the submission itself. A second identical
-// submission is answered by the preparation the machine already holds, in one reply.
-func TestRentedSubmissionAttributesItsTimeAndReusesThePreparation(t *testing.T) {
-	h := newLadderHub(t)
-	h.bind(goodLadder())
-	machines := &acceptingMachines{states: map[string]*pb.MachineExecutionState{}}
-	pod := &fakePod{retainPrepared: true}
-	root := startRentedPod(t, h, pod, func(string) machineExecutionPeer { return machines }, "")
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	for _, key := range []string{"first", "second"} {
-		if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", key); code != 0 {
-			t.Fatalf("the %s rented run was refused [exit %d]: %s", key, code, out)
-		}
-		waitFor(t, root, "the "+key+" Runtime submission", func() bool {
-			row, problem := store.RequestByIdempotencyKey(key)
-			return problem == nil && row != nil && machines.accepted(row.ID)
-		})
-	}
-	stages := func(run string) map[string]string {
-		_, out := runCozy(t, root, "run", "show", run, "--json")
-		var report struct {
-			Stages []struct{ Name, Kind, Detail string } `json:"stages"`
-		}
-		must(t, json.Unmarshal([]byte(out), &report))
-		rows := map[string]string{}
-		for _, stage := range report.Stages {
-			if stage.Kind == "setup" {
-				rows[stage.Name] = stage.Detail
-			}
-		}
-		return rows
-	}
-	first, second := stages("2"), stages("3")
-	for _, name := range []string{"machine connection", "package preparation", "model defaults", "submission"} {
-		if _, ok := first[name]; !ok {
-			t.Fatalf("the first run does not attribute %q: %v", name, first)
-		}
-		if _, ok := second[name]; !ok {
-			t.Fatalf("the second run does not attribute %q: %v", name, second)
-		}
-	}
-	if first["package environment"] != ladderPackage+"@1.0.0" || strings.Contains(first["package preparation"], "reused") {
-		t.Fatalf("the first run's preparation was not the machine's own work: %v", first)
-	}
-	if second["package preparation"] != ladderPackage+"@1.0.0, reused the machine's preparation" {
-		t.Fatalf("the second run did not reuse the identical preparation: %v", second)
-	}
-	for _, name := range []string{"resolve", "download", "package environment"} {
-		if _, ok := second[name]; ok {
-			t.Fatalf("the second run prepared again (%s): %v", name, second)
-		}
-	}
-	pod.mu.Lock()
-	calls := len(pod.prepares)
-	pod.mu.Unlock()
-	if calls != 2 {
-		t.Fatalf("two identical submissions made %d preparation calls; want one each", calls)
-	}
 }

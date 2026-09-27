@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -65,8 +66,19 @@ func (m *machineRuns) stageMachineInputs(ctx context.Context, request records.Re
 	if len(request.Assets) == 0 {
 		return nil, nil
 	}
-	access := make([]*pb.InputAccess, 0, len(request.Assets))
-	for _, asset := range request.Assets {
+	reuse := false
+	if workspace, problem := m.workspace(ctx, connection); problem == nil {
+		reuse = workspace.InputObjectReuse
+	}
+	type staged struct {
+		header  *pb.InputTreeImportHeader
+		members []resultfiles.TreeMember
+		input   records.MachineInput
+		held    *pb.NativeByteRetentionResult
+		problem *exit.Error
+	}
+	rows := make([]staged, len(request.Assets))
+	for index, asset := range request.Assets {
 		header, members, problem := inputTreeHeader(request, asset, connection.Claim)
 		if problem != nil {
 			return nil, problem
@@ -75,28 +87,52 @@ func (m *machineRuns) stageMachineInputs(ctx context.Context, request records.Re
 		if problem != nil {
 			return nil, problem
 		}
-		held := &pb.NativeByteRetentionResult{}
 		if input.State == "released" {
 			return nil, exit.New(exit.Canceled, "native input was already released")
 		}
+		rows[index] = staged{header: header, members: members, input: input}
 		if len(input.Receipt) > 0 {
-			if proto.Unmarshal(input.Receipt, held) != nil {
+			rows[index].held = &pb.NativeByteRetentionResult{}
+			if proto.Unmarshal(input.Receipt, rows[index].held) != nil {
 				return nil, exit.New(exit.Conflict, "recorded input receipt is unreadable")
 			}
-		} else {
-			received, problem := m.importMachineInput(ctx, request.ID, asset, header, members, connection, false)
-			if problem != nil {
-				return nil, problem
+		}
+	}
+	// Every input moves at once. One the machine already took is committed without its
+	// bytes; the machine reuses the objects it holds, or refuses and the bytes follow.
+	var wait sync.WaitGroup
+	for index := range rows {
+		row, asset := &rows[index], request.Assets[index]
+		if row.held != nil {
+			continue
+		}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if reuse && m.store.MachineInputSent(connection.Name, asset.Snapshot.Manifest.Digest) {
+				if held, problem := m.importMachineInput(ctx, request.ID, asset, row.header, nil, connection, false); problem == nil {
+					row.held = held
+					return
+				}
 			}
-			held = received
-			if problem := m.store.RecordMachineInput(request.ID, input, held); problem != nil {
+			row.held, row.problem = m.importMachineInput(ctx, request.ID, asset, row.header, row.members, connection, false)
+		}()
+	}
+	wait.Wait()
+	access := make([]*pb.InputAccess, 0, len(rows))
+	for index, row := range rows {
+		if row.problem != nil {
+			return nil, row.problem
+		}
+		if len(row.input.Receipt) == 0 {
+			if problem := m.store.RecordMachineInput(request.ID, row.input, row.held); problem != nil {
 				return nil, problem
 			}
 		}
-		if problem := verifyMachineInput(header, held, false); problem != nil {
+		if problem := verifyMachineInput(row.header, row.held, false); problem != nil {
 			return nil, problem
 		}
-		access = append(access, &pb.InputAccess{InputId: asset.FieldPath, NativeTree: &pb.NativeByteRetentionRequest{Source: held.Source, RetentionId: held.RetentionId}})
+		access = append(access, &pb.InputAccess{InputId: request.Assets[index].FieldPath, NativeTree: &pb.NativeByteRetentionRequest{Source: row.held.Source, RetentionId: row.held.RetentionId}})
 	}
 	return access, nil
 }

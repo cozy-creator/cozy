@@ -49,10 +49,15 @@ type Machine struct {
 	owned     bool
 	release   func()
 	publicOrg string
+	kept      bool // the connection is the Resolver's, kept for the machine's next call
 }
 
+// Close ends this use of the machine. A kept connection stays open for the next one.
 func (m *Machine) Close() error {
-	err := m.Conn.Close()
+	var err error
+	if !m.kept {
+		err = m.Conn.Close()
+	}
 	if m.release != nil {
 		m.release()
 	}
@@ -126,6 +131,14 @@ type Resolver struct {
 	// claimed names the worker lifetimes this daemon has Claimed. A Runtime learns its
 	// owner's protocol level only from a Control Claim, and forgets it when it restarts.
 	claimed map[string]bool
+	// kept is one open, claimed connection per machine lifetime: every call to a machine
+	// rides it, so a call costs its own round trip and never a TLS handshake or probe.
+	kept map[string]*keptMachine
+}
+
+type keptMachine struct {
+	*Machine
+	identity string
 }
 
 // target is a machine's dial identity before its Claim.
@@ -195,7 +208,14 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 		t = target{name: name, addr: identity.Addr, workerID: identity.WorkerID, bootID: identity.WorkerBootID, pin: pin, key: key}
 	}
 	lifetime := name + "\x00" + t.bootID + "\x00" + t.lifetime
+	identity := lifetime + "\x00" + t.addr + "\x00" + t.workerID + "\x00" + string(t.pin.Digest())
 	r.mu.Lock()
+	if kept := r.kept[name]; kept != nil && kept.identity == identity {
+		r.mu.Unlock()
+		use := *kept.Machine
+		use.release, use.kept = machine.release, true
+		return &use, nil
+	}
 	claimed := r.claimed[lifetime]
 	r.mu.Unlock()
 	if problem := machine.dial(ctx, t, !claimed); problem != nil {
@@ -206,9 +226,16 @@ func (r *Resolver) Dial(ctx context.Context, name, holder string) (*Machine, *ex
 	}
 	r.mu.Lock()
 	if r.claimed == nil {
-		r.claimed = map[string]bool{}
+		r.claimed, r.kept = map[string]bool{}, map[string]*keptMachine{}
 	}
 	r.claimed[lifetime] = true
+	if previous := r.kept[name]; previous != nil {
+		previous.Conn.Close() // the machine's earlier lifetime
+	}
+	kept := *machine
+	kept.release, kept.claimAck = nil, nil
+	r.kept[name] = &keptMachine{Machine: &kept, identity: identity}
+	machine.kept = true
 	r.mu.Unlock()
 	if ack := machine.claimAck; ack != nil && !machine.owned && r.ObserveRental != nil {
 		// The first Claim of a rented worker's lifetime reads back what the pod is.

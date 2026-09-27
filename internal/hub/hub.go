@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -70,6 +71,8 @@ type Client struct {
 	patient *http.Client // paid/proof operations: caller envelope bounds work, not a header clock
 	agent   string
 	tokens  TokenSource
+	// releases keeps committed release documents (release_cache.go); empty keeps none.
+	releases string
 }
 
 // TokenSource silently turns a persisted machine key into a short AuthKit bearer.
@@ -88,6 +91,12 @@ func New(cfg config.Config, agent string) *Client {
 		slow:    &http.Client{Transport: slowTransport()},
 		patient: &http.Client{Transport: patientTransport()},
 		agent:   agent,
+		releases: func() string {
+			if cfg.Home == "" {
+				return ""
+			}
+			return filepath.Join(cfg.Home, "releases")
+		}(),
 	}
 }
 
