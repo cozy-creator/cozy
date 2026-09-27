@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,6 +122,7 @@ func (m *releaseMachine) GetMachineExecutionWorkspace(ctx context.Context, query
 	workspace, err := m.acceptingMachines.GetMachineExecutionWorkspace(ctx, query)
 	if workspace != nil {
 		workspace.ReleaseRoots, workspace.ResolvesModelDefaults, workspace.InputObjectReuse = true, true, true
+		workspace.ReleaseRootSources = true
 		workspace.EventWait = m.changed != nil
 	}
 	return workspace, err
@@ -241,10 +243,10 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 	must(t, os.WriteFile(launch.PackageInterfacePath(installed.Dir), iface, 0o444))
 	_, problem = store.Activate(installed)
 	fatal(t, problem)
-	run := func(key string) time.Duration {
+	run := func(key string, extra ...string) time.Duration {
 		began := time.Now()
-		if code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--asset", "image="+picture,
-			"--rental=tessa", "--json", "--idempotency-key", key); code != 0 {
+		if code, out := runCozy(t, root, append([]string{"run", ladderPackage + "/generate", "steps=1", "--asset", "image=" + picture,
+			"--rental=tessa", "--json", "--idempotency-key", key}, extra...)...); code != 0 {
 			t.Fatalf("the %s run was refused [exit %d]: %s", key, code, out)
 		}
 		var id string
@@ -315,6 +317,29 @@ func TestWarmReleaseRootSubmitMakesNoHubCallsAndOneMachineRoundTrip(t *testing.T
 			strings.HasPrefix(report.Resolved.Models[0].Manifest.Digest, "sha256:1111")
 	})
 	t.Logf("CLI start to machine acceptance: cold %s, warm %s", cold.Round(time.Millisecond), warm.Round(time.Millisecond))
+
+	// A provider source named at its commit is the machine's to resolve, narrow and convert:
+	// no Hub call, no provider call here, one submission, and the identical root again.
+	source := "hf://example/diffusers@" + strings.Repeat("c", 40)
+	for _, key := range []string{"source-cold", "source-warm"} {
+		hubCalls.Store(0)
+		hubPaths.Clear()
+		machine.submits.Store(0)
+		run(key, "model.model="+source, "--source-profile", "model=fixture/diffusers/1")
+		if calls := hubCalls.Load(); calls != 0 {
+			var paths []string
+			hubPaths.Range(func(key, _ any) bool { paths = append(paths, key.(string)); return true })
+			t.Fatalf("the %s source run made %d hub calls; want none: %v", key, calls, paths)
+		}
+		if machine.submits.Load() != 1 {
+			t.Fatalf("the %s source run took %d submits; want one", key, machine.submits.Load())
+		}
+		last := machine.roots[len(machine.roots)-1]
+		if len(last.Models) != 1 || last.Models[0].Parameter != "model" || last.Models[0].Source != source ||
+			!slices.Equal(last.Models[0].Profiles, []string{"fixture/diffusers/1"}) || last.Models[0].Repository != "" {
+			t.Fatalf("the %s root does not name the source for the machine: %+v", key, last.Models)
+		}
+	}
 }
 
 // The observer holds one events read open on its kept connection: a run's next machine

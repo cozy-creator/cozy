@@ -249,6 +249,31 @@ type hfModel struct {
 	} `json:"siblings"`
 }
 
+// Pin names a Hugging Face revision by its commit with one metadata read. A Civitai
+// version or a revision that is already a commit is returned as given, with no request.
+func (r *Resolver) Pin(ctx context.Context, source Source) (Source, *exit.Error) {
+	if source.Kind != HuggingFace || fullCommit(source.Revision) {
+		return source, nil
+	}
+	reference := source.Reference
+	if reference == "" {
+		reference = "main"
+	}
+	var metadata hfModel
+	if problem := r.json(ctx, "https://huggingface.co/api/models/"+url.PathEscape(source.Org)+"/"+
+		url.PathEscape(source.Repo)+"/revision/"+url.PathEscape(reference), &metadata); problem != nil {
+		return Source{}, problem
+	}
+	if !fullCommit(metadata.SHA) {
+		return Source{}, exit.Named(exit.Validation, "model_source_metadata_incomplete",
+			"Hugging Face metadata names no full commit for %s", reference)
+	}
+	source.Revision = strings.ToLower(metadata.SHA)
+	source.Reference = source.Revision
+	source.Canonical = source.hfCanonical()
+	return source, nil
+}
+
 func (r *Resolver) resolveHF(ctx context.Context, source Source) (Plan, *exit.Error) {
 	reference := source.Reference
 	if reference == "" {

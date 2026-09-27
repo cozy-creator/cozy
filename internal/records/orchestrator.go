@@ -593,7 +593,11 @@ type AssetBinding struct {
 type ModelRef struct {
 	// Choice is the caller's own `model.<param>=` selection, left for the machine that runs
 	// the call to resolve (worker-protocol ModelChoice); no ladder or rung is read for it.
-	Choice   bool              `json:"choice,omitempty"`
+	Choice bool `json:"choice,omitempty"`
+	// Source is a Choice naming a provider checkpoint (hf://org/repo@commit, civitai://id)
+	// that the machine resolves, narrows to Profiles (or the one it selects) and converts.
+	Source   string            `json:"source,omitempty"`
+	Profiles []string          `json:"profiles,omitempty"`
 	Callable string            `json:"callable,omitempty"` // independently scheduled captured callable, qualified by package
 	GPUs     int               `json:"gpus,omitempty"`     // exact selected execution group, zero is unspecified
 	Adapters []ModelAdapterRef `json:"adapters,omitempty"`
