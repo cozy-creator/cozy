@@ -294,7 +294,13 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			return exit.Internalf("recorded machine submission is unreadable: %s", err)
 		}
 		if submission.ExpectedExecutionWorkspaceId == "" {
-			return exit.Named(exit.Conflict, "machine_execution.workspace_required", "recorded submission has no workspace identity; its acceptance cannot safely be retried")
+			// A submission recorded before workspace fencing defaults to the machine's
+			// current workspace; the receipt then pins the one that accepted it.
+			workspace, problem := currentExecutionWorkspace(m.ctx, connection)
+			if problem != nil {
+				return problem
+			}
+			submission.ExpectedExecutionWorkspaceId = workspace
 		}
 		if submission.PublicationAuthorizationId != "" && connection.wireMinor < 52 {
 			return exit.Named(exit.Structural, "publication.worker_upgrade_required", "the frozen publication authorization requires actual Runtime protocol 52")
@@ -416,17 +422,25 @@ func (m *machineRuns) freezeMachineSubmission(ctx context.Context, connection *m
 	if connection.wireMinor < pb.WorkspaceFencedExecutionWireMinor {
 		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "workspace-fenced execution requires Runtime protocol %d", pb.WorkspaceFencedExecutionWireMinor)
 	}
+	workspace, problem := currentExecutionWorkspace(ctx, connection)
+	if problem != nil {
+		return problem
+	}
+	submission.ExpectedExecutionWorkspaceId = workspace
+	return m.store.RecordMachineSubmission(requestID, submission)
+}
+
+func currentExecutionWorkspace(ctx context.Context, connection *machineConnection) (string, *exit.Error) {
 	workspace, err := connection.client.GetMachineExecutionWorkspace(ctx, &pb.MachineExecutionWorkspaceQuery{Claim: connection.claim})
 	if err != nil {
-		return machineTransport(err)
+		return "", machineTransport(err)
 	}
 	if workspace == nil || workspace.WorkerId != connection.claim.WorkerId || workspace.WorkerBootId == "" ||
 		(connection.claim.WorkerBootId != "" && workspace.WorkerBootId != connection.claim.WorkerBootId) ||
 		workspace.ExecutionWorkspaceId == "" || len(workspace.ExecutionWorkspaceId) > 256 {
-		return exit.New(exit.Conflict, "machine returned an invalid execution workspace identity")
+		return "", exit.New(exit.Conflict, "machine returned an invalid execution workspace identity")
 	}
-	submission.ExpectedExecutionWorkspaceId = workspace.ExecutionWorkspaceId
-	return m.store.RecordMachineSubmission(requestID, submission)
+	return workspace.ExecutionWorkspaceId, nil
 }
 
 func (m *machineRuns) sendMachineSubmission(ctx context.Context, connection *machineConnection, requestID string, submission *pb.MachineExecutionSubmit) *exit.Error {
