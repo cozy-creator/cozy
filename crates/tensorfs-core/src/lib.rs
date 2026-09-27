@@ -19,6 +19,7 @@ pub mod checkpoint;
 pub mod checkpoint_root;
 pub mod corpus;
 pub mod derived;
+pub mod descriptors;
 pub mod dtype;
 pub mod durability;
 pub mod err;

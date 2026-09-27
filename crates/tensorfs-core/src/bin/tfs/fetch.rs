@@ -182,6 +182,7 @@ fn policy_of(flags: &Flags) -> SourcePolicy {
             .unwrap_or_default(),
         allow_local: crate::flag_on(flags, "allow-local"),
         max_redirects: crate::flag_num(flags, "max-redirects", 0u32),
+        ..Default::default()
     }
 }
 
@@ -334,12 +335,13 @@ fn pull_with_budget(
     // And what admitting them cost: a pull whose streams stop growing while its batches
     // take most of the wall time is held by the disk, not the link.
     eprintln!(
-        "{{\"event\":\"pull.streams\",\"model\":{},\"seconds\":{:.3},\"bytes_moved\":{},\"streams\":{},\"levels\":[{}],\"admission\":{{\"objects\":{},\"batches\":{},\"seconds\":{:.3}}}}}",
+        "{{\"event\":\"pull.streams\",\"model\":{},\"seconds\":{:.3},\"bytes_moved\":{},\"streams\":{},\"levels\":[{}],\"backoffs\":{},\"admission\":{{\"objects\":{},\"batches\":{},\"seconds\":{:.3}}}}}",
         quoted(&report.model),
         seconds,
         report.bytes_moved,
         report.streams,
         levels.join(","),
+        report.backoffs,
         after.admitted_objects - before.admitted_objects,
         after.admission_batches - before.admission_batches,
         (after.admission_nanos - before.admission_nanos) as f64 / 1e9,

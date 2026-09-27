@@ -197,6 +197,7 @@ impl Origin {
             allowed_hosts: vec!["localhost".into()],
             allow_local: true,
             max_redirects: 2,
+            ..Default::default()
         }
     }
     fn count(&self) -> usize {
@@ -364,20 +365,23 @@ fn only_complete_unambiguous_http11_length_bodies_enter_the_pool() {
 }
 
 #[test]
-fn idle_descriptor_retention_is_bounded_and_non_range_gets_do_not_pool() {
+fn idle_descriptor_retention_is_bounded_and_plain_gets_pool_too() {
     let origin = Origin::new(false, Duration::ZERO, |_, _| Reply::body(b"bytes"));
     let client = origin.client();
-    for index in 0..32 {
+    let scopes = MAX_IDLE + 8;
+    for index in 0..scopes {
         let mut headers = ranged();
         headers.push(("authorization".into(), format!("Bearer {index}")));
         ask(&client, &origin.checked("/object"), &headers).unwrap();
     }
     assert_eq!(client.idle.lock().unwrap().len(), MAX_IDLE);
-    assert_eq!(origin.count(), 32);
+    assert_eq!(origin.count(), scopes);
+    // A whole-object GET is a pull's common case: the second rides the first's socket.
     for _ in 0..2 {
-        ask(&client, &origin.checked("/metadata"), &[]).unwrap();
+        ask(&client, &origin.checked("/object"), &[]).unwrap();
     }
-    assert_eq!(origin.count(), 34);
+    assert_eq!(origin.count(), scopes + 1);
+    assert_eq!(client.idle.lock().unwrap().len(), MAX_IDLE);
 }
 
 #[test]

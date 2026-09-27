@@ -31,7 +31,7 @@
 //! paid H100s sat at exactly zero for fifteen minutes with neither plane complaining.
 
 use crate::err::{refuse, Code, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -151,6 +151,8 @@ impl PullCancellation {
 pub struct Ledger {
     caller_cancellation: Option<PullCancellation>,
     cancelled: Arc<AtomicBool>,
+    /// Streams this pull has judged stalled, a backpressure signal for its pace.
+    stalls: Arc<AtomicU64>,
     sample: Duration,
     worst_gap: Arc<Mutex<Duration>>,
     progress: Arc<Mutex<Progress>>,
@@ -170,6 +172,7 @@ impl Ledger {
         Ledger {
             caller_cancellation: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            stalls: Arc::new(AtomicU64::new(0)),
             sample: sample.max(Duration::from_millis(1)),
             worst_gap: Arc::new(Mutex::new(Duration::ZERO)),
             progress: Arc::new(Mutex::new(Progress {
@@ -243,6 +246,16 @@ impl Ledger {
         self.sample
     }
 
+    /// A stream of this pull was judged stalled.
+    pub(super) fn stalled_stream(&self) {
+        self.stalls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Streams this pull has judged stalled so far.
+    pub(super) fn stalls(&self) -> u64 {
+        self.stalls.load(Ordering::Relaxed)
+    }
+
     /// The smallest patience ever granted: `STILL_SAMPLES` intervals of the resolution.
     pub fn floor(&self) -> Duration {
         self.sample * STILL_SAMPLES
@@ -280,6 +293,7 @@ impl Ledger {
         Self {
             caller_cancellation: self.caller_cancellation.clone(),
             cancelled: Arc::clone(&self.cancelled),
+            stalls: Arc::clone(&self.stalls),
             sample: self.sample,
             worst_gap: Arc::clone(&self.worst_gap),
             progress: Arc::clone(&self.progress),

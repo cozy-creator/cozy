@@ -131,6 +131,7 @@ fn an_object_larger_than_the_memory_budget_uploads_and_downloads() {
         allowed_hosts: vec!["127.0.0.1".into()],
         allow_local: true,
         max_redirects: 0,
+        ..Default::default()
     };
 
     let pushed = push_object(

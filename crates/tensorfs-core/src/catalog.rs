@@ -1473,7 +1473,16 @@ impl WriterGuard {
             .read(true)
             .write(true)
             .open(&path)
-            .map_err(|error| io("create writer marker", error))?;
+            .map_err(|error| {
+                if crate::descriptors::exhausted(&error) {
+                    Refusal {
+                        code: Code::FD_HEADROOM,
+                        detail: format!("create writer marker: {error}"),
+                    }
+                } else {
+                    io("create writer marker", error)
+                }
+            })?;
         file.try_lock_exclusive()
             .map_err(|error| io("lock writer marker", error))?;
         Ok(Self {

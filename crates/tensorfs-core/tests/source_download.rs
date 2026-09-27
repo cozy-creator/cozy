@@ -305,6 +305,7 @@ fn policy() -> SourcePolicy {
         allowed_hosts: vec!["127.0.0.1".into()],
         allow_local: true,
         max_redirects: 5,
+        ..Default::default()
     }
 }
 

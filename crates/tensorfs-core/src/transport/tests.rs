@@ -568,6 +568,7 @@ fn local_policy() -> SourcePolicy {
         allowed_hosts: vec!["127.0.0.1".into()],
         allow_local: true,
         max_redirects: 0,
+        ..Default::default()
     }
 }
 
@@ -2170,6 +2171,7 @@ fn the_policy_fails_closed() {
         allowed_hosts: vec!["bucket.example.com".into(), ".cdn.example.net".into()],
         allow_local: false,
         max_redirects: 0,
+        ..Default::default()
     };
     // Host outside the declaration.
     let refused = policy.check("https://evil.example.org/x").unwrap_err();
@@ -2206,6 +2208,7 @@ fn the_policy_fails_closed() {
         allowed_hosts: vec!["localhost".into(), "169.254.169.254".into()],
         allow_local: false,
         max_redirects: 0,
+        ..Default::default()
     };
     let refused = localhost_allowed.check("https://localhost/x").unwrap_err();
     assert_eq!(refused.code, Code::SOURCE_NOT_ALLOWED);
@@ -2690,6 +2693,7 @@ fn the_tls_pump_carries_a_real_exchange() {
         allowed_hosts: vec!["localhost".into()],
         allow_local: true,
         max_redirects: 0,
+        ..Default::default()
     };
     let checked = policy
         .check(&format!("https://localhost:{port}/object"))
@@ -5497,6 +5501,7 @@ fn attempt_cancellation_interrupts_a_partial_tls_record() {
         allowed_hosts: vec!["localhost".into()],
         allow_local: true,
         max_redirects: 0,
+        ..Default::default()
     };
     let checked = policy
         .check(&format!("https://localhost:{port}/object"))

@@ -987,6 +987,7 @@ impl PyStore {
             allowed_hosts,
             allow_local,
             max_redirects: 5,
+            ..Default::default()
         };
         let cancellation = transport::PullCancellation::default();
         let raised: Mutex<Option<PyErr>> = Mutex::new(None);
@@ -1503,6 +1504,7 @@ impl PyStore {
             allowed_hosts: vec![transport::base_host(&grant.url).or_refuse(py)?],
             allow_local,
             max_redirects: 0,
+            ..Default::default()
         };
         let pushed = py
             .detach(|| {
@@ -1570,6 +1572,7 @@ impl PyStore {
             allowed_hosts: vec![transport::base_host(url).or_refuse(py)?],
             allow_local,
             max_redirects: 0,
+            ..Default::default()
         };
         let (transferred, held) = py
             .detach(|| {
@@ -3585,6 +3588,7 @@ pub fn pull<'p>(
         allowed_hosts,
         allow_local,
         max_redirects: 0,
+        ..Default::default()
     };
     let report = py.detach(|| {
         let mut request = transport::PullRequest::new(&store.store, hub, refspec, &scoped, &policy);
