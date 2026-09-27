@@ -441,6 +441,19 @@ impl Journal {
 /// makes no part true either: `convert` re-checks each one against `segments_still_stand`
 /// before reusing it, so a journal restored beside objects that did not survive re-converts
 /// exactly those ops.
+/// Remove one plan's journal and cursor: work that can no longer be continued.
+pub fn discard(dir: &Path, plan_digest: &str) -> Result<()> {
+    let journal = journal_path(dir, plan_digest);
+    for path in [journal.with_extension("head.json"), journal] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io("discard conversion journal", error)),
+        }
+    }
+    Ok(())
+}
+
 pub fn install(dir: &Path, plan_digest: &str, bytes: &[u8]) -> Result<()> {
     hex64("conversion journal plan", plan_digest)?;
     for line in bytes.split(|byte| *byte == b'\n') {

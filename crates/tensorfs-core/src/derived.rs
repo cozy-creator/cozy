@@ -2342,14 +2342,21 @@ pub fn begin(
         })
         .collect();
 
+    // A checkpoint this work cannot continue (another plan or work context, or no longer
+    // whole) is discarded: the work re-derives what it lost instead of refusing.
+    let mut checkpoint = checkpoint;
     let incoming = match checkpoint
         .map(|head| read_progress(store, head, &transaction, &declaration_text, &source_facts))
-        .transpose()
     {
-        Ok(incoming) => incoming,
-        Err(error) => {
+        None => None,
+        Some(Ok(row)) => Some(row),
+        Some(Err(error)) if error.code == Code::IO_FAILED => {
             release_guards(meta, Some(writer_hold), source_leases);
             return Err(error);
+        }
+        Some(Err(_)) => {
+            checkpoint = None;
+            None
         }
     };
     // Byte verification can update the verification catalog. Keep it outside the SQL

@@ -505,7 +505,7 @@ fn cmd_repo_cache_restore(store: &Path, object: &str, length: &str, flags: &Flag
 /// The chain head names links that live on the cache; each is read at its exact digest, and
 /// the chain is DISCARDED WHOLE unless every link was written under the plan `--plan` names
 /// — the plan a resuming run re-derives from the source headers alone, for zero tensor
-/// bytes. That is what makes a stale chain harmless rather than dangerous.
+/// bytes. A discarded chain restores nothing and succeeds: the run converts afresh.
 ///
 /// The objects come back exactly as a checkpoint's closure does. The conversion journal the
 /// newest link points at is installed beside them under `--session`, so the next
@@ -548,7 +548,15 @@ fn cmd_repo_cache_resume(store: &Path, object: &str, length: &str, flags: &Flags
     };
     let set = match durability::fold(&chain, plan) {
         Ok(set) => set,
-        Err(error) => return bail(error),
+        Err(error) if error.code == tensorfs_core::err::Code::IO_FAILED => return bail(error),
+        Err(error) => {
+            println!(
+                "chain        DISCARDED {}: {} — nothing restored; the conversion starts a new chain",
+                error.code.as_str(),
+                error.detail
+            );
+            return ExitCode::SUCCESS;
+        }
     };
     println!(
         "chain        {} link(s) over operation {} — {} B declared durable",

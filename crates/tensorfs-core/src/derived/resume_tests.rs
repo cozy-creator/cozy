@@ -351,7 +351,7 @@ fn missing_corrupt_and_changed_work_cannot_be_reused() {
 }
 
 #[test]
-fn recovery_refuses_old_writer_authority_and_malformed_part_geometry() {
+fn recovery_discards_old_writer_authority_and_malformed_part_geometry() {
     let (store, meta, id, declaration) = fixture("authority");
     let writer = begin(&store, &meta, &id, 9, declaration.clone(), None).unwrap();
     data(&store, &meta, &id, 9, 0x31);
@@ -359,7 +359,8 @@ fn recovery_refuses_old_writer_authority_and_malformed_part_geometry() {
     let plan = progress_plan(&row);
     let mut geometry = progress_row(&row);
     geometry.added_parts[0].part.shape = vec![16, 31];
-    for snapshot in [row, geometry] {
+    let mut writers = vec![writer];
+    for (epoch, snapshot) in [(10, row), (11, geometry)] {
         let bytes = crate::canon::write(&snapshot.to_value());
         let head = crate::durability::checkpoint_bytes(
             &store,
@@ -378,11 +379,20 @@ fn recovery_refuses_old_writer_authority_and_malformed_part_geometry() {
         .head
         .head
         .unwrap();
-        assert!(begin(&store, &meta, &id, 10, declaration.clone(), Some(&head)).is_err());
-        check_writer(&meta, &id, 9).unwrap();
+        // The checkpoint cannot be continued: it is discarded, nothing of it is imported,
+        // and the new writer proceeds from the work this Store already holds.
+        writers.push(begin(&store, &meta, &id, epoch, declaration.clone(), Some(&head)).unwrap());
+        check_writer(&meta, &id, epoch).unwrap();
+        let current = meta.derived_rows().unwrap().remove(0);
+        assert!(current
+            .added_parts
+            .iter()
+            .all(|added| added.part.shape != vec![16, 31]));
     }
-    fence(&meta, &id, 9).unwrap();
-    release(&meta, writer);
+    fence(&meta, &id, 11).unwrap();
+    for writer in writers {
+        release(&meta, writer);
+    }
     abandon(&store, &meta, &id).unwrap();
     std::fs::remove_dir_all(store.root()).unwrap();
 }
@@ -489,7 +499,7 @@ fn source_identity_is_locked_and_source_closure_stays_rooted_after_writer_death(
 }
 
 #[test]
-fn wrong_document_lengths_refuse_before_parsing_or_importing_work() {
+fn wrong_document_lengths_refuse_to_validate_and_are_discarded_on_resume() {
     let (store, meta, id, declaration) = fixture("lengths");
     let writer = begin(&store, &meta, &id, 1, declaration.clone(), None).unwrap();
     data(&store, &meta, &id, 1, 0x31);
@@ -528,16 +538,13 @@ fn wrong_document_lengths_refuse_before_parsing_or_importing_work() {
             .code,
         Code::LENGTH_MISMATCH
     );
-    assert_eq!(
-        begin(&store, &meta, &id, 2, declaration, Some(&forged))
-            .err()
-            .unwrap()
-            .code,
-        Code::LENGTH_MISMATCH
-    );
-    check_writer(&meta, &id, 1).unwrap();
-    fence(&meta, &id, 1).unwrap();
+    // A forged checkpoint is discarded, not imported; this begin then meets the live writer.
+    // Resuming from it discards it instead of refusing: the next writer proceeds.
+    let next = begin(&store, &meta, &id, 2, declaration, Some(&forged)).unwrap();
+    check_writer(&meta, &id, 2).unwrap();
+    fence(&meta, &id, 2).unwrap();
     release(&meta, writer);
+    release(&meta, next);
     abandon(&store, &meta, &id).unwrap();
     std::fs::remove_dir_all(store.root()).unwrap();
 }
