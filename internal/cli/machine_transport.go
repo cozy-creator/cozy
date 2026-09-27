@@ -43,13 +43,14 @@ func (c *machineConnection) modelDefaultOrigin(ctx context.Context) (string, *ex
 	return c.PublicOrigin(ctx)
 }
 
-func (c *machineConnection) preparePublished(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
+// publishedRequest is one release's preparation without running it: what the machine
+// installs now, or on first selection for a deferred callee.
+func (c *machineConnection) publishedRequest(ctx context.Context, request records.Request) (*pb.PreparePackageSetRequest, *exit.Error) {
 	ref := &pb.DownloadPackageRef{Package: request.Package, Release: request.Release}
 	facts, problem := c.PrepareFacts(ctx, ref)
 	if problem != nil {
 		return nil, problem
 	}
-	c.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
 	// The package's exact model bindings ride its own download set, so TensorFS holds
 	// each checkpoint before execution admits it. A published callee's bindings ride
 	// the callee's preparation (capturePublishedDependencies).
@@ -57,8 +58,19 @@ func (c *machineConnection) preparePublished(ctx context.Context, request record
 	if problem != nil {
 		return nil, problem
 	}
+	return &pb.PreparePackageSetRequest{DownloadDelegation: downloads, Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
+		PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion, ImageInventory: facts.ImageInventory,
+		LockedRequirements: facts.LockedRequirements, PackageInterface: facts.PackageInterface}, nil
+}
+
+func (c *machineConnection) preparePublished(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
+	facts, problem := c.publishedRequest(ctx, request)
+	if problem != nil {
+		return nil, problem
+	}
+	c.publicOrigin = rental.PublicOrigin(facts.LockedRequirements, request.Package)
 	stream, err := c.Host.PreparePackageSet(ctx, &pb.PreparePackageSetCall{
-		Claim: c.Claim, SupportsModelMaterializationRecovery: true, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: downloads},
+		Claim: c.Claim, SupportsModelMaterializationRecovery: true, PackageSet: &pb.DesiredPackageSet{DownloadDelegation: facts.DownloadDelegation},
 		Application: facts.Application, ModelSlotPaths: facts.ModelSlotPaths,
 		PythonRequires: facts.PythonRequires, PythonVersion: facts.PythonVersion, ImageInventory: facts.ImageInventory, LockedRequirements: facts.LockedRequirements,
 		PackageInterface: facts.PackageInterface,

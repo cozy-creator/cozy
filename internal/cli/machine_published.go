@@ -51,15 +51,15 @@ func (m *machineRuns) publishedSubmission(ctx context.Context, request records.R
 		RootInstallationId: installed.InstallationId,
 		InstalledPackages:  []*pb.InstalledPackage{installed},
 	}
-	addPublishedBindings(capture, installed.InstallationId, installed.InstallationId, iface, true)
+	addPublishedBindings(capture, captureName{ID: installed.InstallationId}, captureName{ID: installed.InstallationId}, iface, true)
 	if problem := m.capturePublishedDependencies(ctx, request, connection, capture, prepared.LockedRequirements); problem != nil {
 		return nil, problem
 	}
 
 	sort.Slice(capture.Bindings, func(i, j int) bool {
 		a, b := capture.Bindings[i], capture.Bindings[j]
-		if a.CallerInstallationId != b.CallerInstallationId {
-			return a.CallerInstallationId < b.CallerInstallationId
+		if bindingCaller(a) != bindingCaller(b) {
+			return bindingCaller(a) < bindingCaller(b)
 		}
 		if a.Module != b.Module {
 			return a.Module < b.Module

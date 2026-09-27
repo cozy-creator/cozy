@@ -31,7 +31,7 @@ func (r *Resolver) captureMachineModelDefaults(capture localpackage.ExecutionCap
 		if problem != nil {
 			return capture, "", problem
 		}
-		r.captureDefaultRows(document, installation.Package, installation.ID, iface, request, publicOrigin, reads)
+		r.captureDefaultRows(document, installation.Package, captureName{ID: installation.ID}, iface, request, publicOrigin, reads)
 	}
 	var err error
 	capture.Canonical, capture.Digest, err = canonical.Identity(document)
@@ -54,10 +54,10 @@ func capturedRungs(capture *pb.MachineExecutionCapture) int {
 // length, or 0 when the origin cannot serve it. H3's 81 captured rungs name 3 checkpoints.
 type modelDefaultReads map[string]int64
 
-func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg string, revision string, iface *launch.PackageInterface, request records.Request, publicOrigin string, reads modelDefaultReads) {
+func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg string, callee captureName, iface *launch.PackageInterface, request records.Request, publicOrigin string, reads modelDefaultReads) {
 	entries := map[string]bool{}
 	for _, binding := range document.Bindings {
-		if binding.CalleeInstallationId == revision {
+		if binding.CalleeInstallationId+binding.CalleeDeferredKey == callee.String() {
 			entries[binding.Entrypoint] = true
 		}
 	}
@@ -66,15 +66,15 @@ func (r *Resolver) captureDefaultRows(document *pb.MachineExecutionCapture, pkg 
 			continue
 		}
 		for _, slot := range entry.Models {
-			row := &pb.MachineModelDefault{CalleeInstallationId: revision, Entrypoint: entry.Name, Parameter: slot.Param}
+			row := &pb.MachineModelDefault{CalleeInstallationId: callee.ID, CalleeDeferredKey: callee.Key, Entrypoint: entry.Name, Parameter: slot.Param}
 			row.PublicOrigin, row.Rungs, row.UnavailableCode = r.captureDefaultLadder(pkg, entry.Name, slot, request, publicOrigin, reads)
 			document.ModelDefaults = append(document.ModelDefaults, row)
 		}
 	}
 	sort.Slice(document.ModelDefaults, func(i, j int) bool {
 		a, b := document.ModelDefaults[i], document.ModelDefaults[j]
-		if a.CalleeInstallationId != b.CalleeInstallationId {
-			return a.CalleeInstallationId < b.CalleeInstallationId
+		if a.CalleeInstallationId+a.CalleeDeferredKey != b.CalleeInstallationId+b.CalleeDeferredKey {
+			return a.CalleeInstallationId+a.CalleeDeferredKey < b.CalleeInstallationId+b.CalleeDeferredKey
 		}
 		if a.Entrypoint != b.Entrypoint {
 			return a.Entrypoint < b.Entrypoint

@@ -39,6 +39,7 @@ type runtimeMachine struct {
 	// cpuSlotModelInputs, exactGPUs and devices are what this Runtime reports in its workspace.
 	cpuSlotModelInputs bool
 	exactGPUs          bool
+	deferred           bool
 	devices            int
 	sourceCredentials  bool
 
@@ -49,7 +50,7 @@ type runtimeMachine struct {
 func (m *runtimeMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	workspace := &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
 		ExecutionWorkspaceId: "rented-workspace", CpuSlotModelInputs: m.cpuSlotModelInputs, ExactExecutionGpus: m.exactGPUs,
-		SourceCredentials: m.sourceCredentials}
+		SourceCredentials: m.sourceCredentials, DeferredInstallations: m.deferred}
 	for ordinal := range m.devices {
 		workspace.Devices = append(workspace.Devices, &pb.MachineDevice{Ordinal: uint32(ordinal), Name: "fake-4090"})
 	}

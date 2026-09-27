@@ -25,9 +25,106 @@ import (
 // One preparation is one package and that package's slots (Runtime package_prepare), so
 // the callee's model rides the callee's own preparation.
 func TestRentedJobPreparesPublishedCalleeModelsWithTheCallee(t *testing.T) {
+	// The machine installs code-only callees on first selection; a callee whose own
+	// preparation carries a model is still prepared before acceptance.
+	machine, pod, store := runRentedCallee(t, modelCallee, true)
+	row, problem := store.RequestByIdempotencyKey(rentedCalleeKey)
+	fatal(t, problem)
+	var callee []string
+	for _, model := range row.Models {
+		if model.Package == calleePackage {
+			callee = append(callee, model.Package+" "+model.BindingSlot()+" "+model.Manifest)
+		}
+	}
+	if len(callee) != 1 || strings.HasSuffix(callee[0], " ") {
+		t.Fatalf("the fleet did not pin one model for the published callee: %+v", row.Models)
+	}
+	want := map[string][]string{ladderPackage: nil, calleePackage: callee}
+	if delivered := preparedPackages(pod); fmt.Sprint(delivered) != fmt.Sprint(want) {
+		t.Fatalf("each package's preparation carries its own selections; got %v, want %v", delivered, want)
+	}
+	var capture pb.MachineExecutionCapture
+	must(t, canonical.Unmarshal(machine.submitted().CaptureCanonicalBytes, &capture))
+	if len(capture.InstalledPackages) != 2 || len(capture.DeferredInstallations) != 0 {
+		t.Fatalf("the capture does not hold the prepared callee: %+v", capture.InstalledPackages)
+	}
+	// The callee's default is not an input of the CPU root.
+	var spec pb.InvocationSpec
+	must(t, canonical.Unmarshal(machine.submitted().Offer.InvocationSpecCanonicalBytes, &spec))
+	for _, input := range spec.Inputs {
+		if strings.HasPrefix(input.InputId, "model:") {
+			t.Fatalf("the root job was handed its callee's model as an input: %s", input.InputId)
+		}
+	}
+}
+
+// A machine that installs callees on first selection receives a code-only callee as a
+// deferred row and prepares only the root before acceptance; one that does not prepares
+// both, as before.
+func TestRentedJobDefersACodeOnlyCallee(t *testing.T) {
+	for _, supported := range []bool{true, false} {
+		t.Run(fmt.Sprint(supported), func(t *testing.T) {
+			machine, pod, _ := runRentedCallee(t, codeOnlyCallee, supported)
+			var capture pb.MachineExecutionCapture
+			must(t, canonical.Unmarshal(machine.submitted().CaptureCanonicalBytes, &capture))
+			prepared := preparedPackages(pod)
+			if !supported {
+				if len(prepared) != 2 || len(capture.InstalledPackages) != 2 || len(capture.DeferredInstallations) != 0 {
+					t.Fatalf("an eager machine did not get both preparations: %v %+v", prepared, capture.DeferredInstallations)
+				}
+				return
+			}
+			if _, rooted := prepared[ladderPackage]; len(prepared) != 1 || !rooted || len(capture.InstalledPackages) != 1 {
+				t.Fatalf("acceptance waited for the callee: prepared %v, installed %d", prepared, len(capture.InstalledPackages))
+			}
+			key := calleePackage + "@0.1.0"
+			if len(capture.DeferredInstallations) != 1 || capture.DeferredInstallations[0].Key != key ||
+				capture.DeferredInstallations[0].Preparation.GetApplication() == "" ||
+				len(capture.DeferredInstallations[0].Preparation.GetLockedRequirements()) == 0 {
+				t.Fatalf("the callee is not a complete deferred row: %+v", capture.DeferredInstallations)
+			}
+			bound := false
+			for _, binding := range capture.Bindings {
+				bound = bound || binding.CalleeDeferredKey == key && binding.CallerInstallationId == capture.RootInstallationId && binding.Export == "tile"
+			}
+			if !bound {
+				t.Fatalf("the root's import of the callee is not bound by key: %+v", capture.Bindings)
+			}
+		})
+	}
+}
+
+const rentedCalleeKey = "rented-callee-models"
+
+// preparedPackages is each package the pod prepared, with the models its download set carried.
+func preparedPackages(pod *fakePod) map[string][]string {
+	pod.mu.Lock()
+	prepares := append([]*pb.PreparePackageSetCall(nil), pod.prepares...)
+	pod.mu.Unlock()
+	delivered := map[string][]string{}
+	for _, call := range prepares {
+		var set pb.DownloadDelegation
+		if canonical.Unmarshal(call.PackageSet.DownloadDelegation, &set) != nil {
+			continue
+		}
+		pkg := set.Packages[0].Package
+		if _, seen := delivered[pkg]; !seen {
+			delivered[pkg] = nil
+		}
+		for _, model := range set.Models {
+			delivered[pkg] = append(delivered[pkg], model.Package+" "+model.Slot+" "+model.Manifest)
+		}
+	}
+	return delivered
+}
+
+// runRentedCallee submits the CPU root through the real daemon to a fake rented pod whose
+// Runtime reports (or not) deferred installations, and waits for the submission.
+func runRentedCallee(t *testing.T, child string, deferred bool) (*runtimeMachine, *fakePod, *records.Store) {
+	t.Helper()
 	h := newLadderHub(t)
 	h.bind(goodLadder())
-	facts := publishCalleeRelease(t, h)
+	facts := publishCalleeReleaseWith(t, h, rentedCalleeRoot, child)
 
 	root := ladderRoot(t, h)
 	layout, problem := home.Open(root)
@@ -38,7 +135,7 @@ func TestRentedJobPreparesPublishedCalleeModelsWithTheCallee(t *testing.T) {
 	fatal(t, problem)
 	public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
 	must(t, err)
-	machine := &runtimeMachine{blocker: "none"}
+	machine := &runtimeMachine{blocker: "none", deferred: deferred}
 	pod := &fakePod{controlKey: public, machine: machine, deviceCount: 4,
 		preparedPlacement: func(download []byte, pkg, release string) *pb.Placement {
 			placement := podPlacement(download, pkg, release, "")
@@ -60,13 +157,13 @@ func TestRentedJobPreparesPublishedCalleeModelsWithTheCallee(t *testing.T) {
 	store.Close()
 	startDaemonProcess(t, root)
 
-	const key = "rented-callee-models"
+	key := rentedCalleeKey
 	if code, out := runCozy(t, root, "run", ladderPackage+"/long_form", "--rental=tessa", "--json", "--idempotency-key", key); code != 0 {
 		t.Fatalf("the rented job was refused [exit %d]: %s", code, out)
 	}
 	store, problem = records.Open(layout.DB)
 	fatal(t, problem)
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 	waitFor(t, root, "the Runtime submission or a terminal run", func() bool {
 		row, _ := store.RequestByIdempotencyKey(key)
 		return machine.submitted() != nil || row != nil && (row.State == "failed" || row.State == "cancelled")
@@ -75,50 +172,7 @@ func TestRentedJobPreparesPublishedCalleeModelsWithTheCallee(t *testing.T) {
 		_, show := runCozy(t, root, "run", "show", "1", "--json")
 		t.Fatalf("the job ended before its submission:\n%s\n%s", show, tail(filepath.Join(root, "daemon.log")))
 	}
-	row, problem := store.RequestByIdempotencyKey(key)
-	fatal(t, problem)
-	var callee []string
-	for _, model := range row.Models {
-		if model.Package == calleePackage {
-			callee = append(callee, model.Package+" "+model.BindingSlot()+" "+model.Manifest)
-		}
-	}
-	if len(callee) != 1 || strings.HasSuffix(callee[0], " ") {
-		t.Fatalf("the fleet did not pin one model for the published callee: %+v", row.Models)
-	}
-
-	pod.mu.Lock()
-	prepares := append([]*pb.PreparePackageSetCall(nil), pod.prepares...)
-	pod.mu.Unlock()
-	delivered := map[string][]string{}
-	for _, call := range prepares {
-		var set pb.DownloadDelegation
-		must(t, canonical.Unmarshal(call.PackageSet.DownloadDelegation, &set))
-		pkg := set.Packages[0].Package
-		for _, model := range set.Models {
-			delivered[pkg] = append(delivered[pkg], model.Package+" "+model.Slot+" "+model.Manifest)
-		}
-		if _, known := delivered[pkg]; !known {
-			delivered[pkg] = nil
-		}
-	}
-	want := map[string][]string{ladderPackage: nil, calleePackage: callee}
-	if fmt.Sprint(delivered) != fmt.Sprint(want) {
-		t.Fatalf("each package's preparation carries its own selections; got %v, want %v", delivered, want)
-	}
-	var capture pb.MachineExecutionCapture
-	must(t, canonical.Unmarshal(machine.submitted().CaptureCanonicalBytes, &capture))
-	if len(capture.InstalledPackages) != 2 {
-		t.Fatalf("the capture does not hold the prepared callee: %+v", capture.InstalledPackages)
-	}
-	// The callee's default is not an input of the CPU root.
-	var spec pb.InvocationSpec
-	must(t, canonical.Unmarshal(machine.submitted().Offer.InvocationSpecCanonicalBytes, &spec))
-	for _, input := range spec.Inputs {
-		if strings.HasPrefix(input.InputId, "model:") {
-			t.Fatalf("the root job was handed its callee's model as an input: %s", input.InputId)
-		}
-	}
+	return machine, pod, store
 }
 
 const calleePackage = "proof/child"
@@ -131,19 +185,27 @@ type calleeFacts struct {
 // publishCalleeRelease replaces proof/h3@1.0.0 with a torch-free release whose CPU
 // `long_form` job has no model of its own and whose lock pins proof/child@0.1.0 from the
 // org index. The callee's `generate` entrypoint holds the ladder's model slot.
-func publishCalleeRelease(t *testing.T, h *ladderHub) map[string]calleeFacts {
+const rentedCalleeRoot = `{"application":"h3:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[],"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`
+
+// The callee's `generate` entrypoint holds the ladder's model slot; `tile` is code only.
+const (
+	modelCallee    = `{"application":"child:app","entrypoints":[{"invocable":{"context":"ctx","defaults":{},"enum_members":{},"export":"generate","module":"child","parameters":["steps"],"type_names":{}},"models":[{"class":"H3","component_use":{"condition_text":["text_encoder"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"]},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`
+	codeOnlyCallee = `{"application":"child:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"invocable":{"context":"ctx","defaults":{},"enum_members":{},"export":"tile","module":"child","parameters":[],"type_names":{}},"models":[],"name":"tile","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`
+)
+
+// publishCalleeReleaseOf publishes the model-bearing pair with the root's own interface.
+func publishCalleeReleaseOf(t *testing.T, h *ladderHub, root string) map[string]calleeFacts {
 	t.Helper()
-	return publishCalleeReleaseOf(t, h, `{"application":"h3:app","entrypoints":[],"format":"cozy.package.interface/1","jobs":[{"models":[],"name":"long_form","publishes":false,"request":{"fields":[]},"result":{"fields":[]}}]}`)
+	return publishCalleeReleaseWith(t, h, root, modelCallee)
 }
 
-// publishCalleeReleaseOf publishes the same pair with the root's own interface.
-func publishCalleeReleaseOf(t *testing.T, h *ladderHub, root string) map[string]calleeFacts {
+func publishCalleeReleaseWith(t *testing.T, h *ladderHub, root, child string) map[string]calleeFacts {
 	t.Helper()
 	childWheel := []byte("child wheel")
 	childDigest := strings.TrimPrefix(mustSpell(childWheel), "sha256:")
 	rootIface, err := canonical.NormalizeJCS([]byte(root))
 	must(t, err)
-	childIface, err := canonical.NormalizeJCS([]byte(`{"application":"child:app","entrypoints":[{"invocable":{"context":"ctx","defaults":{},"enum_members":{},"export":"generate","module":"child","parameters":["steps"],"type_names":{}},"models":[{"class":"H3","component_use":{"condition_text":["text_encoder"],"decode_video":["video_vae"],"sample_fl2va":["fl2va_dit"]},"path":"generate.models.model"}],"name":"generate","request":{"fields":[{"name":"steps","type":"int"}]},"result":{"fields":[]}}],"format":"cozy.package.interface/1","jobs":[]}`))
+	childIface, err := canonical.NormalizeJCS([]byte(child))
 	must(t, err)
 	index := h.server.URL + "/v1/index/proof/simple/"
 	rootLock := "version = 1\nrequires-python = \">=3.12\"\n\n" +
