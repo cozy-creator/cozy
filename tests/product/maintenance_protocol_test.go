@@ -185,7 +185,7 @@ func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 			if peer.extra.Load() != 0 {
 				t.Fatal("maintenance sent dispatch/admission frames")
 			}
-			if row.minor < pb.MinCompatibleWireMinor && orchestrator.ValidateWorkerProtocol(peer.info, true) == nil {
+			if row.minor < pb.MinCompatibleWireMinor && orchestrator.ValidateWorkerProtocol(peer.info, podRental) == nil {
 				t.Fatal("maintenance weakened execution gate")
 			}
 		})

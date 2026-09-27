@@ -42,30 +42,32 @@ func rentalIdleGuardRequired() *exit.Error {
 		"this rental worker lacks the reliable active-work reporting or manual keepalive required by the mandatory 15-minute idle shutdown; update the rental worker image")
 }
 
-// ValidateWorkerProtocol gates ordinary preparation and execution on the peer's range.
-// A peer outside it fails only that operation, naming the component to update.
-func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental bool) *exit.Error {
+// ValidateWorkerProtocol gates a NEW preparation or execution on the peer's range and, on
+// a rental, its idle guard. Observation, collection, cancellation and release never call it.
+// A peer outside the range fails only that operation, and the failure names its update.
+func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental string) *exit.Error {
+	update := "update the local Runtime"
+	if rental != "" {
+		update = "run `cozy rental update " + rental + "`"
+	}
+	refuse := func(format string, args ...any) *exit.Error {
+		return exit.Named(exit.Conflict, pb.CapabilityUnavailableCode,
+			format+"; %s to run new work there (its other work continues)", append(args, update)...)
+	}
 	if info == nil || info.MinimumWireMinor == 0 || info.MinimumWireMinor > info.WireMinor {
-		return exit.Named(exit.Conflict, pb.CapabilityUnavailableCode, "worker reported no usable protocol range").
-			WithRemedy("update the worker Runtime (`cozy rental update <rental>` for a rental)")
+		return refuse("worker reported no usable protocol range")
 	}
 	if info.WireMinor < pb.MinCompatibleWireMinor || pb.WireMinor < info.MinimumWireMinor {
-		return exit.Named(exit.Conflict, pb.CapabilityUnavailableCode,
-			"Creator executes worker protocol %d–%d; this worker supports %d–%d",
-			pb.MinCompatibleWireMinor, pb.WireMinor, info.MinimumWireMinor, info.WireMinor).
-			WithRemedy("update %s; other work on this machine continues", protocolUpgradeTarget(info.MinimumWireMinor))
+		if info.MinimumWireMinor > pb.WireMinor {
+			update = "update the local cozy CLI"
+		}
+		return refuse("Creator executes worker protocol %d–%d; this worker supports %d–%d",
+			pb.MinCompatibleWireMinor, pb.WireMinor, info.MinimumWireMinor, info.WireMinor)
 	}
-	if rental && !info.SupportsRentalKeepalive {
+	if rental != "" && !info.SupportsRentalKeepalive {
 		return rentalIdleGuardRequired()
 	}
 	return nil
-}
-
-func protocolUpgradeTarget(peerMinimum uint32) string {
-	if peerMinimum > pb.WireMinor {
-		return "the local cozy CLI"
-	}
-	return "the worker Runtime (`cozy rental update <rental>` for a rental)"
 }
 
 // RentalProtocolInfo reads the pinned PodHost's supported range without a Claim.

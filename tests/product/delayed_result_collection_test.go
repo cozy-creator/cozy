@@ -3,6 +3,7 @@ package producttest
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,8 +69,16 @@ func (m *finishedMachine) AcknowledgeMachineExecutionCollection(context.Context,
 }
 
 // A run whose terminal is observed before its result is collected is followed through
-// collection instead of refusing with the daemon's in-flight observation error.
+// collection instead of refusing with the daemon's in-flight observation error. Accepted
+// work never needs the current wire contract: on a Runtime below the execution floor it is
+// still observed and collected, and only a new submission there is refused, naming its update.
 func TestWatchFollowsDelayedResultCollection(t *testing.T) {
+	for _, minor := range []uint32{pb.WireMinor, pb.MinCompatibleWireMinor - 1} {
+		t.Run(fmt.Sprint(minor), func(t *testing.T) { proveDelayedResultCollection(t, minor) })
+	}
+}
+
+func proveDelayedResultCollection(t *testing.T, minor uint32) {
 	root := t.TempDir()
 	layout, problem := home.Open(root)
 	fatal(t, problem)
@@ -107,7 +116,14 @@ func TestWatchFollowsDelayedResultCollection(t *testing.T) {
 			OutcomeId: "delayed-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body},
 	}
 
-	pod := &fakePod{controlKey: public, machine: machine}
+	pod := &fakePod{controlKey: public, machine: machine, wireMinor: minor}
+	const fresh = "job-new-submission"
+	if minor < pb.MinCompatibleWireMinor {
+		_, _, problem := store.Submit(records.Request{ID: fresh, IdemKey: fresh, Package: "local/example", Entrypoint: "main",
+			Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("2"), MachineExecutionObserver: true})
+		fatal(t, problem)
+		fatal(t, store.LinkMachineExecution(fresh, podRental))
+	}
 	connection, certPath := startFakePod(t, root, pod)
 	cert, err := os.ReadFile(certPath)
 	must(t, err)
@@ -122,6 +138,12 @@ func TestWatchFollowsDelayedResultCollection(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+hub.server.URL+
 		"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
 	startDaemonProcess(t, root)
+	if minor < pb.MinCompatibleWireMinor {
+		waitFor(t, root, "collection from the older Runtime", func() bool {
+			link, problem := store.MachineExecution(request.ID)
+			return problem == nil && link != nil && link.Collected
+		})
+	}
 
 	code, out := runCozy(t, root, "run", "watch", request.ID, "--json")
 	if code != 0 || strings.Contains(out, "result_collection_pending") || !strings.Contains(out, `"status":"completed"`) {
@@ -131,5 +153,16 @@ func TestWatchFollowsDelayedResultCollection(t *testing.T) {
 	fatal(t, problem)
 	if link == nil || !link.Collected {
 		t.Fatal("the result was not collected")
+	}
+	if minor >= pb.MinCompatibleWireMinor {
+		return
+	}
+	waitFor(t, root, "the new submission's refusal", func() bool {
+		row, problem := store.RequestRow(fresh)
+		return problem == nil && row != nil && row.State == "failed"
+	})
+	if _, out := runCozy(t, root, "run", "show", fresh, "--json"); !strings.Contains(out, pb.CapabilityUnavailableCode) ||
+		!strings.Contains(out, "cozy rental update "+podRental) {
+		t.Fatalf("the refused submission does not name its update: %s", out)
 	}
 }

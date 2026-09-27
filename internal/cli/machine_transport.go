@@ -78,12 +78,7 @@ func (m *machineRuns) connect(ctx context.Context, machine string) (*machineConn
 		connection.Close()
 		return nil, machineTransport(err)
 	}
-	if problem := orchestrator.ValidateWorkerProtocol(info, true); problem != nil {
-		connection.Close()
-		return nil, problem
-	}
-
-	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
+	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection, release: release}, client: host, claim: claim, protocol: info, wireMinor: info.WireMinor, certificateDigest: pin.Digest()}
 	result.modelDefaultOrigin = func(ctx context.Context) (string, *exit.Error) {
 		facts, problem := client(m.fleet.atRental(identity.RentalID)).RentalImageInventory(ctx, identity.RentalID)
 		return facts.PublicOrigin, problem
@@ -371,10 +366,6 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		connection.Close()
 		return nil, machineTransport(err)
 	}
-	if problem := orchestrator.ValidateWorkerProtocol(info, false); problem != nil {
-		connection.Close()
-		return nil, problem
-	}
 	client := pb.NewWorkerControlClient(connection)
 	claim := &pb.Claim{RecordOwnerEpoch: 1, RecordOwnerId: "cozy-local-client", WorkerId: workerID, WireMinor: pb.WireMinor, Proof: bootstrap}
 	if m.localPID != process.PID {
@@ -384,7 +375,7 @@ func (m *machineRuns) connectLocalMachine(ctx context.Context) (*machineConnecti
 		}
 		m.localPID = process.PID
 	}
-	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, wireMinor: info.WireMinor}
+	result := &machineConnection{installed: map[string]*pb.InstalledPackage{}, connection: &machineClientConnection{ClientConn: connection}, client: client, claim: claim, protocol: info, wireMinor: info.WireMinor}
 	result.preparePublished = func(ctx context.Context, request records.Request) (*publishedPreparation, *exit.Error) {
 		if request.InstallID == "" {
 			plan, iface, locked, requires, problem := m.resolver.publishedChildPreparation(ctx, m.context.forHub(request.Hub), request)

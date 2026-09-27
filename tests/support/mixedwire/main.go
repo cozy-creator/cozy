@@ -62,13 +62,15 @@ func main() {
 		must(err)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		var info *pb.ProtocolInfoResult
+		rental := ""
 		if peer.name == "host" {
+			rental = "mixed-wire"
 			info, err = pb.NewPodHostClient(conn).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
 		} else {
 			info, err = pb.NewRuntimePreparationClient(conn).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
 		}
 		must(err)
-		if problem := orchestrator.ValidateWorkerProtocol(info, peer.name == "host"); problem != nil {
+		if problem := orchestrator.ValidateWorkerProtocol(info, rental); problem != nil {
 			panic(problem)
 		}
 		observed[peer.name] = map[string]any{"current": info.WireMinor, "minimum": info.MinimumWireMinor, "supports_rental_keepalive": info.SupportsRentalKeepalive}

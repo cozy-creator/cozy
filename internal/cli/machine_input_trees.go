@@ -65,8 +65,8 @@ func (m *machineRuns) stageMachineInputs(ctx context.Context, request records.Re
 	if len(request.Assets) == 0 {
 		return nil, nil
 	}
-	if connection.wireMinor < pb.NativeRootInputsWireMinor || connection.importInputTree == nil {
-		return nil, exit.Named(exit.Structural, "machine_execution.input_upgrade_required", "root File/Tree inputs require actual Runtime wire55")
+	if connection.importInputTree == nil {
+		return nil, exit.Named(exit.Structural, "machine_execution.input_upgrade_required", "this machine cannot import root File/Tree inputs")
 	}
 	access := make([]*pb.InputAccess, 0, len(request.Assets))
 	for _, asset := range request.Assets {
