@@ -550,7 +550,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 // contention. Cancellation stops waiting; the pre-existing paid operation remains
 // available for reconciliation under its original idempotency key.
 func (s *Store) RecordRentalContext(ctx context.Context, r Rental) *exit.Error {
-	tx, release, err := s.beginRentalObservation(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return exit.New(exit.Canceled, "recording rental %s: %s", r.ID, err)
@@ -560,7 +560,6 @@ func (s *Store) RecordRentalContext(ctx context.Context, r Rental) *exit.Error {
 		}
 		return exit.Internalf("cannot begin recording rental %s: %s", r.ID, err)
 	}
-	defer release()
 	defer tx.Rollback()
 	if problem := recordRental(tx, r); problem != nil {
 		return problem
