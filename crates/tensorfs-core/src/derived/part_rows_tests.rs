@@ -25,7 +25,12 @@ fn fixture(label: &str) -> (Store, Meta, String, Declaration) {
         .map(|index| ("model".into(), format!("weight_{index}")))
         .collect();
     declaration.max_new_bytes = 3 * 512;
-    (store, meta, format!("sha256:{}", "7a".repeat(32)), declaration)
+    (
+        store,
+        meta,
+        format!("sha256:{}", "7a".repeat(32)),
+        declaration,
+    )
 }
 
 fn catalog(store: &Store) -> rusqlite::Connection {
@@ -55,9 +60,16 @@ fn stored_rows(store: &Store, id: &str) -> (usize, Option<i64>, i64) {
         )
         .unwrap();
     let value = crate::canon::parse_canonical(&bytes, limits::DOC_MAX_BYTES).unwrap();
-    let inline = TransactionRow::from_value(&value).unwrap().added_parts.len();
+    let inline = TransactionRow::from_value(&value)
+        .unwrap()
+        .added_parts
+        .len();
     let parts = connection
-        .query_row("SELECT count(*) FROM tensorfs_derived_parts WHERE id=?1", [id], |row| row.get(0))
+        .query_row(
+            "SELECT count(*) FROM tensorfs_derived_parts WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
         .unwrap();
     (inline, open, parts)
 }
@@ -74,14 +86,18 @@ fn parts_are_rows_that_resume_refuse_conflicts_and_stay_retained() {
     add(&store, &meta, &id, &writer, "weight_0", 1).unwrap();
     assert_eq!(stored_rows(&store, &id).2, 2);
     assert_eq!(
-        add(&store, &meta, &id, &writer, "weight_0", 9).unwrap_err().code,
+        add(&store, &meta, &id, &writer, "weight_0", 9)
+            .unwrap_err()
+            .code,
         Code::TRANSACTION_CONFLICT
     );
     // A fenced writer cannot add. Once it is gone, GC keeps its accepted bytes through
     // the append-only journal alone, and its successor resumes with both parts.
     fence(&meta, &id, 1).unwrap();
     assert_eq!(
-        add(&store, &meta, &id, &writer, "weight_2", 3).unwrap_err().code,
+        add(&store, &meta, &id, &writer, "weight_2", 3)
+            .unwrap_err()
+            .code,
         Code::WRITER_FENCED
     );
     release_guards(&meta, Some(writer.writer_hold), writer.source_leases);
@@ -135,7 +151,9 @@ fn an_older_builds_inline_row_and_a_torn_journal_line_are_read() {
     std::fs::write(&journal, torn).unwrap();
 
     assert_eq!(
-        add(&store, &meta, &id, &writer, "weight_0", 9).unwrap_err().code,
+        add(&store, &meta, &id, &writer, "weight_0", 9)
+            .unwrap_err()
+            .code,
         Code::TRANSACTION_CONFLICT
     );
     add(&store, &meta, &id, &writer, "weight_1", 2).unwrap();

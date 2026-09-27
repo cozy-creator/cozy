@@ -172,9 +172,11 @@ impl Meta {
             .optional()
             .map_err(|error| sql("read accepted part", error))?
             .or_else(|| {
-                legacy.iter().flatten().find(|old| old.same_value(added)).map(|old| {
-                    crate::derived::part_bytes(&old.part)
-                })
+                legacy
+                    .iter()
+                    .flatten()
+                    .find(|old| old.same_value(added))
+                    .map(|old| crate::derived::part_bytes(&old.part))
             });
         match existing {
             Some(existing) if existing == bytes => {
