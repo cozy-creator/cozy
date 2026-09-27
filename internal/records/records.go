@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -199,15 +200,22 @@ func open(path string, migratePrior bool, triageDir string) (*Store, *exit.Error
 			return nil, e
 		}
 	} else if version > schemaVersion {
-		db.Close()
-		return nil, exit.Named(exit.Conflict, "records_schema_newer",
-			"records database has schema %d; this Creator supports schema %d",
-			version, schemaVersion).
-			WithRemedy("upgrade Cozy Creator to a version that supports schema %d; keep %s in place", version, path)
+		// A newer Creator wrote this database. This build reads and writes only the tables
+		// and columns it knows, and it changes nothing else: no re-stamp, no added or
+		// dropped table or column, no rebuilt row.
+		if e := verifyNewerSchema(db, path, version); e != nil {
+			db.Close()
+			return nil, e
+		}
+		compatibilityNotice.Do(func() {
+			fmt.Fprintf(os.Stderr, "records written by a newer Creator (v%d); running in compatibility mode, upgrade for full features\n", version)
+		})
 	}
-	if e := verifySchema(db, path); e != nil {
-		db.Close()
-		return nil, e
+	if version <= schemaVersion {
+		if e := verifySchema(db, path); e != nil {
+			db.Close()
+			return nil, e
+		}
 	}
 	// The database retains request payloads, rental facts and triage bundles; 0600 is
 	// the same boundary the daemon record carries, and the WAL/SHM siblings SQLite
@@ -1209,6 +1217,33 @@ func initialize(db *sql.DB, path string) *exit.Error {
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit records initialization in %s: %s", path, err)
+	}
+	return nil
+}
+
+// compatibilityNotice names a newer database once per process.
+var compatibilityNotice sync.Once
+
+// verifyNewerSchema admits a newer Creator's database when every table and column this build
+// requires is present with a compatible type. It never changes the database.
+func verifyNewerSchema(db *sql.DB, path string, version int) *exit.Error {
+	required, err := requiredCurrentShape()
+	if err != nil {
+		return exit.Internalf("cannot derive current records schema: %s", err)
+	}
+	lacking, err := missing(db, required)
+	if err == nil {
+		var mismatched []string
+		mismatched, err = incompatible(db, required)
+		lacking = append(lacking, mismatched...)
+	}
+	if err != nil {
+		return exit.Internalf("cannot inspect records schema in %s: %s", path, err)
+	}
+	if len(lacking) > 0 {
+		return exit.Named(exit.Conflict, "records_schema_newer",
+			"records written by a newer Creator (v%d) lack what this build requires: %s", version, strings.Join(lacking, ", ")).
+			WithRemedy("upgrade Cozy Creator to a version that supports schema %d; keep %s in place", version, path)
 	}
 	return nil
 }

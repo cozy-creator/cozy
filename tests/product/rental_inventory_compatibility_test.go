@@ -161,11 +161,10 @@ func TestRentalListOldDaemonFallbackRequiresCompatibleStore(t *testing.T) {
 			}
 			publishCompatibilityOwner(t, layout, lock, pid, strings.TrimPrefix(server.URL, "http://"), "")
 			output, err := compatibilityCLI(t, layout.Root, "rental", "list", "--json")
-			if newer {
-				if err == nil || !strings.Contains(output, "records_schema_newer") {
-					t.Fatalf("unsafe old-route fallback: %v %s", err, output)
-				}
-			} else if err != nil || !strings.Contains(output, `"machines_running":0`) {
+			if newer && !strings.Contains(output, "records written by a newer Creator (v999); running in compatibility mode, upgrade for full features") {
+				t.Fatalf("a newer store was not read in compatibility mode: %v %s", err, output)
+			}
+			if err != nil || !strings.Contains(output, `"machines_running":0`) {
 				t.Fatalf("compatible old daemon fallback failed: %v %s", err, output)
 			}
 			select {
