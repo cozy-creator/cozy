@@ -1,8 +1,11 @@
 name: ci
 
+# Ready (non-draft) PRs and master pushes run the short product suite. The nightly (only
+# when master moved), `gh workflow run ci.yaml -R cozy-creator/cozy --ref <branch>`, and
+# PRs labelled `integration` add integration(t) tests and release acceptance.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     paths: ['**', '!**.md', 'README.md', 'docs/exit-matrix.md', 'docs/client-contract.md', 'docs/package-publication.md']
   push:
     branches: [master]
@@ -12,7 +15,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}-${{ github.event_name == 'schedule' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' }}
   cancel-in-progress: true
 
 permissions:
@@ -22,22 +25,9 @@ permissions:
 env:
   CGO_ENABLED: '0'
   UV_TORCH_BACKEND: cpu
-  # Pull requests and master pushes skip integration(t) tests and release acceptance;
-  # nightly, dispatch and PRs labelled `integration` run everything.
   FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'integration') }}
 
 jobs:
-  python-types:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
-      - name: Install typed Python helper contracts
-        run: |
-          uv venv --python 3.12
-          uv pip install --python .venv/bin/python packaging 'cozy-runtime>=0.18.28' 'cozy-eval>=0.7.2' 'tensorfs>=0.3.54'
-      - run: sh scripts/typecheck.sh
-
   nightly:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -53,9 +43,12 @@ jobs:
 
   ci:
     needs: nightly
+    # Draft PRs are checkpoints; CI runs once the PR is ready for review.
     if: >-
       !cancelled() && (needs.nightly.result == 'skipped' || needs.nightly.outputs.new == 'true') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'integration')
+      (github.event_name != 'pull_request' ||
+       (!github.event.pull_request.draft &&
+        (github.event.action != 'labeled' || github.event.label.name == 'integration')))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -86,6 +79,7 @@ jobs:
           done
       # The released Runtime at exactly the floor this Cozy enforces (hostruntime.ToolFloor).
       - name: Runtime and Python
+        id: toolchain
         run: |
           floor=$(sed -n 's/^const ToolFloor = "\(.*\)"$/\1/p' internal/hostruntime/hostruntime.go)
           read -r url sha < <(curl -fsS "https://pypi.org/pypi/cozy-runtime/$floor/json" |
@@ -116,9 +110,18 @@ jobs:
           scripts/accept.sh --dist "dist/ci-$GITHUB_SHA" --asset "cozy-ci-$GITHUB_SHA-linux-amd64.tar.gz" \
             --upgrade "dist/ci-$GITHUB_SHA-next/cozy-ci-$GITHUB_SHA-next-linux-amd64.tar.gz" \
             --prefix "$RUNNER_TEMP/prefix" --home "$RUNNER_TEMP/cozy-home"
-      - if: github.ref == 'refs/heads/master'
+      # Independent of the Go result, so one red check does not hide the other.
+      - name: Python types
+        if: ${{ !cancelled() }}
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/types"
+          uv pip install --python "$RUNNER_TEMP/types/bin/python" packaging 'cozy-runtime>=0.18.28' 'cozy-eval>=0.7.2' 'tensorfs>=0.3.54'
+          COZY_TYPECHECK_PYTHON="$RUNNER_TEMP/types/bin/python" sh scripts/typecheck.sh
+      # Saved from every master run that compiled, pass or fail: a red master must not
+      # leave every later run compiling cold.
+      - if: ${{ !cancelled() && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
         run: uv cache prune --ci
-      - if: github.ref == 'refs/heads/master'
+      - if: ${{ !cancelled() && github.ref == 'refs/heads/master' && steps.toolchain.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: |
