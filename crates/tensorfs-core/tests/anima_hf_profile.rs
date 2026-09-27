@@ -6,6 +6,7 @@ use tensorfs_core::{
     canon::{self, Value},
     dtype::Dtype,
     err::Code,
+    header::{Header, Part, Tensor},
     ids::ObjectRef,
     ingest::{
         fingerprint, preflight,
@@ -13,6 +14,7 @@ use tensorfs_core::{
     },
     limits,
     providers::MemberHead,
+    read, registry,
 };
 
 const PROFILE: &str = "hf/circlestone-labs/anima-base-v1.0-diffusers/bf16/1";
@@ -174,4 +176,94 @@ fn anima_hf_selects_its_profile_without_being_named() {
         PROFILE
     );
     assert!(!path.exists());
+}
+
+/// The checkpoint stores the transformer in its files' order; Runtime constructs it in module
+/// order and run 1404 asked for `patch_embed.proj.weight` first. Over the real 567 keys the
+/// planner fills the caller's order and refuses only a traversal naming different tensors.
+#[test]
+fn anima_transformer_reads_in_the_callers_construction_order() {
+    let recorded = canon::parse(
+        &fs::read(root().join("construction_order.json")).unwrap(),
+        limits::DOC_MAX_BYTES,
+    )
+    .unwrap();
+    let Value::Arr(rows) = recorded else {
+        panic!("rows")
+    };
+    let stored: Vec<String> = rows
+        .iter()
+        .filter_map(|row| match row {
+            Value::Arr(pair) if text(&pair[0]) == "transformer" => Some(text(&pair[1]).into()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored.len(), 567);
+    let plain = registry::seeds()
+        .into_iter()
+        .find(|seed| seed.alias == "plain/1")
+        .unwrap()
+        .spec;
+    let tensors = stored
+        .iter()
+        .map(|key| {
+            let tensor = Tensor {
+                dtype: Dtype::Bf16,
+                shape: vec![1],
+                encoding: plain.object_id(),
+                parts: vec![("value".into(), Part::plan(Dtype::Bf16, vec![1], &[0, 0]))],
+            };
+            (key.clone(), tensor)
+        })
+        .collect();
+    let header = Header {
+        configs: Vec::new(),
+        assets: Vec::new(),
+        encodings: vec![plain],
+        components: vec![("transformer".into(), tensors)],
+    };
+    let header = Header::parse(&header.canonical_bytes().unwrap()).unwrap();
+    let modules = [
+        "patch_embed",
+        "time_embed",
+        "transformer_blocks",
+        "norm_out",
+        "proj_out",
+    ];
+    let rank = |key: &String| {
+        let mut parts = key.split('.');
+        let first = parts.next().unwrap();
+        let module = modules.iter().position(|m| *m == first).unwrap();
+        let block = parts
+            .next()
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0);
+        (module, block, key.clone())
+    };
+    let mut constructed = stored.clone();
+    constructed.sort_by_key(rank);
+    assert_ne!(constructed, stored, "a real permutation");
+    let traversal: Vec<(String, String)> = constructed
+        .iter()
+        .map(|key| ("transformer".into(), key.clone()))
+        .collect();
+    let scope = ["transformer".to_string()];
+    let plan = read::plan_for_traversal(&header, &traversal, &scope, 1 << 20).unwrap();
+    let order: Vec<&str> = plan.items.iter().map(|item| item.what.as_str()).collect();
+    let expected: Vec<String> = constructed
+        .iter()
+        .map(|key| format!("transformer/{key}#value"))
+        .collect();
+    assert_eq!(order, expected);
+    assert_eq!(order[0], "transformer/patch_embed.proj.weight#value");
+    assert_eq!(plan.bytes, 2 * 567);
+
+    let mut holed = traversal.clone();
+    holed.remove(100);
+    let error = read::plan_for_traversal(&header, &holed, &scope, 1 << 20).unwrap_err();
+    assert_eq!(error.code, Code::TRAVERSAL_INCOMPLETE);
+    let mut repeated = traversal.clone();
+    repeated[100] = repeated[0].clone();
+    let error = read::plan_for_traversal(&header, &repeated, &scope, 1 << 20).unwrap_err();
+    assert_eq!(error.code, Code::TRAVERSAL_INCOMPLETE);
 }
