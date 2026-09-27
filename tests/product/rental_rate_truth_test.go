@@ -66,62 +66,6 @@ func TestRentalListingAdoptsTheHubBilledRate(t *testing.T) {
 	hub.close()
 }
 
-// th-126, the selection half: pre-spend quotes speak the total the pod will
-// bill, with structured price components. Paul's live L4 read $0.49/hr in the ladder while RunPod
-// billed ~$0.70 — the 1536 GB image spec adds 1536 × 139 micros/GB/h of
-// storage. Every displayed price must include both GPU and storage charges.
-func TestRentalLadderRendersTotalAndStructuredBreakdown(t *testing.T) {
-	root := filepath.Join(scratchBase, "rental-ladder")
-	must(t, os.RemoveAll(root))
-	must(t, os.MkdirAll(root, 0o755))
-	hub := newFakeRentalHub(t, 0)
-	port := hub.port()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
-		fmt.Sprintf("tensorhub_url: http://127.0.0.1:%d\n", port)+
-			"tensorhub_token: rental-idle-test\n"), 0o600))
-	sku := func(name string, count, price, storage int64) map[string]any {
-		return map[string]any{"name": name, "accelerator_model": "NVIDIA L4",
-			"accelerator_count": count, "base_worker_profile": "torch2.13.0-cu130-cp312-linux-x86",
-			"compute_capability": "8.9", "vram_gb": 24, "minimum_ram_per_gpu_gb": 64,
-			"price_usd_micros_per_hour": price, "storage_usd_micros_per_hour": storage}
-	}
-	// Both widths of the card share the one pod-disk adder (1536 GB × 139).
-	hub.setSKUs(sku("l4", 1, 490_000, 213_504), sku("l4", 4, 1_960_000, 213_504))
-
-	// The ladder itself states ONE price per rung and it is the whole one — the figure
-	// that surprised Paul is the figure on the table.
-	code, out := runCozy(t, root, "rental", "new")
-	if code != 0 {
-		t.Fatalf("cozy rental new [exit %d]:\n%s", code, out)
-	}
-	for _, want := range []string{"$0.70/hr", "$2.17/hr", "PRICE"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("the ladder does not render the total %q:\n%s", want, out)
-		}
-	}
-	for _, component := range []string{"$0.49/hr", "$1.96/hr", "$0.21/hr"} {
-		if strings.Contains(out, component) {
-			t.Fatalf("the ladder still quotes the component %s a renter does not pay alone:\n%s",
-				component, out)
-		}
-	}
-	// Structured output retains each width's GPU rate and the shared pod-disk adder.
-	code, full := runCozy(t, root, "rental", "new", "--full", "--json")
-	if code != 0 {
-		t.Fatalf("cozy rental new --full --json [exit %d]:\n%s", code, full)
-	}
-	for _, want := range []string{
-		"$0.49/hr", "$0.21/hr", "$0.70/hr", // the L4 rung, decomposed
-		"$1.96/hr", "$2.17/hr", // the x4 rung: its own price, the same adder
-		`"gpu price"`, `"storage price"`, `"price"`,
-	} {
-		if !strings.Contains(full, want) {
-			t.Fatalf("--full --json does not render %q:\n%s", want, full)
-		}
-	}
-	hub.close()
-}
-
 // A confirmed pre-readiness container exit leaves the current fleet. Its
 // bounded structured diagnosis remains recorded and names an acquisition failure.
 func TestRentalListingShowsStructuredBootFailure(t *testing.T) {

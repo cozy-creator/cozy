@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/cli"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -103,4 +104,20 @@ func TestCanceledRemoteSourceStopsThePod(t *testing.T) {
 	if rental.State != "ready" {
 		t.Fatalf("canceling one transfer ended the named rental: %s", rental.State)
 	}
+}
+
+// Provider access is fixture metadata. Custody, recovery and native conversion are the
+// real production owners; no provider body is reachable at these deliberately inert URLs.
+type sourceFixtureAccess struct {
+	orchestrator.ModelTransferOwner
+	files []*pb.LocalModelSourceFile
+}
+
+func (s sourceFixtureAccess) RefreshRemoteSource(context.Context, records.ModelTransferIntent) ([]orchestrator.ModelSourceCapability, *exit.Error) {
+	var rows []orchestrator.ModelSourceCapability
+	for _, file := range s.files {
+		rows = append(rows, orchestrator.ModelSourceCapability{Member: file.Member, ObjectID: file.ObjectId, Length: int64(file.Length),
+			Provider: pb.ModelSourceProvider_MODEL_SOURCE_PROVIDER_HUGGING_FACE, URL: "https://source-body.invalid/" + file.Member})
+	}
+	return rows, nil
 }

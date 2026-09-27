@@ -158,38 +158,6 @@ func TestEndingAnUnrecordedMachineByItsHubNameReleasesIt(t *testing.T) {
 	}
 }
 
-// TestUnrecordedSpendRefusesTheNextPurchase: the hub's owner cap counts every live
-// rental it bills, recorded on this host or not, and Creator relays its refusal
-// without ending a machine on its own.
-func TestUnrecordedSpendRefusesTheNextPurchase(t *testing.T) {
-	root, stand := orphanHub(t, "rental-orphan-cap")
-	orphan(stand, "pr-3333333333333333sem", "semiu", 3_190_000)
-	orphan(stand, "pr-4444444444444444ursu", "ursula", 3_190_000)
-	stand.setSKUs(map[string]any{
-		"name": "h100-nvl", "accelerator_model": "NVIDIA H100 NVL", "accelerator_count": 1,
-		"base_worker_profile": "proof", "compute_capability": "9.0", "vram_gb": 94,
-		"minimum_ram_per_gpu_gb": 64, "price_usd_micros_per_hour": 3_190_000,
-		"storage_usd_micros_per_hour": 30_000,
-	})
-	stand.mu.Lock()
-	stand.spendCap = 5_000_000
-	stand.mu.Unlock()
-
-	code, out := runCozy(t, root, "rental", "new", "h100-nvl", "--json")
-	if code == 0 {
-		t.Fatalf("a purchase was admitted over a ceiling the account has already breached\n%s", out)
-	}
-	if !strings.Contains(out, "rental.fleet_spend_cap") {
-		t.Fatalf("the refusal is not the spend ceiling: %s", out)
-	}
-	if strings.Contains(out, "holds no record") || strings.Contains(out, "recorded only at the hub") {
-		t.Fatalf("the ceiling refusal exposes controller bookkeeping: %s", out)
-	}
-	if stand.releases("pr-3333333333333333sem") != 0 {
-		t.Fatalf("a spend refusal ended a machine on its own")
-	}
-}
-
 // TestAHubWithNoListingIsNotAnEmptyFleet is the honesty arm. A hub older than th-199
 // answers this GET from net/http's own router, and reading that as "the account owns
 // nothing" would rebuild the exact silence this work exists to remove.

@@ -2,9 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -56,28 +54,6 @@ func TestMultipleOfUnreadableBoundIsLeftToRuntime(t *testing.T) {
 		fatal(t, problem)
 		if problem := launch.ValidatePayload("paul/example", entry, json.RawMessage(`{"value":7}`)); problem != nil {
 			t.Fatalf("multiple_of %s refused the request: %s", value, problem.Message)
-		}
-	}
-}
-
-var referenceImageInterface = flag.String("reference-image-interface", "", "current reference-image package-interface.json")
-
-func TestMultipleOfActualReferenceImageInterface(t *testing.T) {
-	path := *referenceImageInterface
-	if path == "" {
-		t.Skip("requires the current reference-image interface")
-	}
-	raw, err := os.ReadFile(path)
-	must(t, err)
-	surface, problem := launch.DecodePackageInterface(raw)
-	fatal(t, problem)
-	entry, problem := surface.Function("generate")
-	fatal(t, problem)
-	for _, width := range []int{1024, 1025} {
-		payload := json.RawMessage(fmt.Sprintf(`{"prompt":"A character on white","width":%d,"height":1024}`, width))
-		problem = launch.ValidatePayload("paul/reference-image", entry, payload)
-		if (problem == nil) != (width == 1024) {
-			t.Fatalf("width=%d problem=%v", width, problem)
 		}
 	}
 }

@@ -97,6 +97,14 @@ func TestHubSpendCapRefusalBuysNothing(t *testing.T) {
 			if asks.Load() != 0 || code == 0 || !strings.Contains(out, "rental.fleet_spend_cap") {
 				t.Fatalf("observed 0.14 + new 0.11 must be refused by the hub: asks=%d exit=%d %s", asks.Load(), code, out)
 			}
+			// The live rental is known only to the hub; the refusal neither exposes that
+			// bookkeeping nor ends the machine on its own.
+			if strings.Contains(out, "holds no record") || strings.Contains(out, "recorded only at the hub") {
+				t.Fatalf("the ceiling refusal exposes controller bookkeeping: %s", out)
+			}
+			if peer.releases("rental-old") != 0 {
+				t.Fatal("a spend refusal ended a machine on its own")
+			}
 			if op == nil || op.State != "rejected" {
 				t.Fatalf("a refused ask must leave a rejected operation: %+v", op)
 			}

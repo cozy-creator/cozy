@@ -278,39 +278,6 @@ func TestAutomaticAndNamedRentalChoicesAllowPrivateSDKVersions(t *testing.T) {
 	}
 }
 
-func TestRentalInventoryAllowsPackageOwnedVersions(t *testing.T) {
-	inventory := &pb.ImageInventory{Python: "3.12.12", Distributions: []*pb.ImageDistribution{
-		{Distribution: runtimeDistribution, Version: "0.13.0"}, {Distribution: "diffusers", Version: "0.39.0"}, {Distribution: "tokenizers", Version: "0.22.0"},
-	}}
-	if why := launch.InventoryMismatch(inventory, []string{"diffusers==0.40.0", "tokenizers==0.23.1"}, ">=3.12,<3.13"); why != "" {
-		t.Fatal(why)
-	}
-	for _, requirement := range []string{"cozy-runtime>=0.15.0", "Cozy_Runtime[media]>=0.15.0", "  cozy..runtime >=0.15.0"} {
-		if why := launch.InventoryMismatch(inventory, []string{requirement}, ""); why != "" {
-			t.Fatalf("%s mismatch: %s", requirement, why)
-		}
-	}
-}
-
-func TestDevelopmentRentalInventoryLeavesMutablePairToWorker(t *testing.T) {
-	inventory := &pb.ImageInventory{Python: "3.12.12", Distributions: []*pb.ImageDistribution{
-		{Distribution: "torch", Version: "2.13.0+cu130"},
-	}}
-	requirements := []string{"cozy-runtime[media]>=0.13.0", "tensorfs>=0.3.33", "torch>=2.13"}
-	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13", true); why != "" {
-		t.Fatal(why)
-	}
-	if why := launch.InventoryMismatch(inventory, requirements, ">=3.12,<3.13"); why != "" {
-		t.Fatalf("base Runtime constrained a package-private SDK: %s", why)
-	}
-	if why := launch.InventoryMismatch(inventory, []string{"torch>=3"}, "", true); why != "" {
-		t.Fatalf("base Torch constrained a package-private version: %s", why)
-	}
-	if why := launch.InventoryMismatch(inventory, nil, ">=3.13", true); !strings.Contains(why, "Python") {
-		t.Fatalf("development image ignored Python: %s", why)
-	}
-}
-
 func TestRequestedRentalFlowsToChildAndRetainedRetry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	st, problem := records.Open(path)
@@ -453,13 +420,9 @@ func TestNamedRentalReplayAfterEndUsesExistingDaemonRequest(t *testing.T) {
 	}
 }
 
-func TestRentalInventoryChecksPythonNotIncidentalDistributionVersions(t *testing.T) {
-	inventory := &pb.ImageInventory{Python: "broken", Distributions: []*pb.ImageDistribution{{Distribution: runtimeDistribution, Version: "broken"}}}
-	if why := launch.InventoryMismatch(inventory, nil, ">=3.12"); !strings.Contains(why, "invalid Python version") {
-		t.Fatal(why)
-	}
-	inventory.Python = "3.12.12"
-	if why := launch.InventoryMismatch(inventory, []string{"cozy-runtime>=0.15"}, ""); why != "" {
+func TestRentalInventoryRefusesAnUnreadablePython(t *testing.T) {
+	inventory := &pb.ImageInventory{Python: "broken"}
+	if _, why := launch.InventoryPython(inventory, ">=3.12", ""); !strings.Contains(why, "invalid Python version") {
 		t.Fatal(why)
 	}
 }

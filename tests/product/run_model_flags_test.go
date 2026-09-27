@@ -16,9 +16,16 @@ func TestDashedModelFlagsReuseExistingResolver(t *testing.T) {
 	if want == nil {
 		t.Fatalf("canonical run was not admitted: %s", out)
 	}
+	// Dashed or positional, before, after, or interleaved with the run's own flags.
+	interleaved := func(model string) []string {
+		return []string{"--json", "run", "proof/quantize/quantize", "steps=7", "--rental-only", model,
+			"--upload-to", "proof/output", "model.shared=proof/source@1.0.0/bf16"}
+	}
 	for i, args := range [][]string{
 		append(append([]string{}, base...), "--model.dits=proof/source@1.0.0/bf16", "--model.shared=proof/source@1.0.0/bf16"),
 		append([]string{"--json", "run", "--model.dits=proof/source@1.0.0/bf16", "--model.shared=proof/source@1.0.0/bf16"}, base[2:]...),
+		interleaved("model.dits=proof/source@1.0.0/bf16"),
+		interleaved("--model.dits=proof/source@1.0.0/bf16"),
 	} {
 		got, _, out := submitRun(t, root, fmt.Sprintf("model-flags-dashed-%d", i), args...)
 		if got == nil || !reflect.DeepEqual(got.Models, want.Models) || !bytes.Equal(got.Payload, want.Payload) {

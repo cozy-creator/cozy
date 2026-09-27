@@ -16,13 +16,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
 // integration marks a test that builds real Python and Runtime environments. `-short`
@@ -165,6 +168,30 @@ func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *
 	}
 	t.Cleanup(o.close)
 	return o
+}
+
+// publicationControlAPI serves an in-process owner through the ordinary authenticated
+// API and daemon record, so the built CLI reaches it exactly as it reaches a daemon.
+func publicationControlAPI(t *testing.T, o *owner, configure ...func(*api.Options)) func() {
+	t.Helper()
+	v4, v6, addr, problem := api.Listeners(0)
+	fatal(t, problem)
+	if v6 != nil {
+		_ = v6.Close()
+	}
+	held, problem := daemon.Hold(o.l, addr, "")
+	fatal(t, problem)
+	creds, problem := api.Mint(o.l)
+	fatal(t, problem)
+	options := api.Options{Orchestrator: o.c, Cfg: o.cfg, Creds: creds, Addr: addr, Web: cozyweb.Handler()}
+	for _, apply := range configure {
+		apply(&options)
+	}
+	handler, problem := api.New(options).Handler()
+	fatal(t, problem)
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = server.Serve(v4) }()
+	return func() { _ = server.Close(); held.Release() }
 }
 
 // awaitMachineReceipt waits for Runtime's durable acceptance of a machine execution. A

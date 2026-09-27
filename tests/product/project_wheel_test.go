@@ -4,8 +4,6 @@ package producttest
 // Editable installations transport source and are built by their consuming uv environment.
 
 import (
-	"archive/zip"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,24 +100,4 @@ func brokenWeightlessProject(t *testing.T, project string) string {
 	// this arm exists to catch.
 	must(t, os.RemoveAll(filepath.Join(broken, "metadata")))
 	return broken
-}
-
-func wheelRecord(t *testing.T, path string) string {
-	t.Helper()
-	archive, err := zip.OpenReader(path)
-	must(t, err)
-	defer archive.Close()
-	for _, member := range archive.File {
-		if !strings.HasSuffix(member.Name, ".dist-info/RECORD") {
-			continue
-		}
-		body, err := member.Open()
-		must(t, err)
-		defer body.Close()
-		record, err := io.ReadAll(body)
-		must(t, err)
-		return string(record)
-	}
-	t.Fatalf("%s carries no RECORD", path)
-	return ""
 }

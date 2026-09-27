@@ -2,8 +2,6 @@ package producttest
 
 import (
 	"bytes"
-	"encoding/base64"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -13,10 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 var privateChildRuntimeWheel = flag.String("child-runtime-wheel", "", "exact Runtime wheel for actual private child composition")
@@ -182,25 +178,5 @@ async def main():
 		if _, err := os.Stat(filepath.Join(project, name, "uv.lock")); !os.IsNotExist(err) {
 			t.Fatal("private child intake modified the author's lock files")
 		}
-	}
-}
-
-func assertChildScalar(t *testing.T, store *records.Store, id string, value int) {
-	t.Helper()
-	attempts, problem := store.Attempts(id)
-	fatal(t, problem)
-	if len(attempts) != 1 {
-		t.Fatalf("child result has %d executions", len(attempts))
-	}
-	doc, err := canonical.Read(attempts[0].TerminalBody, &pb.AttemptOutcomeBody{})
-	must(t, err)
-	raw, err := base64.StdEncoding.DecodeString(doc.Sub("result").Str("inline_result"))
-	must(t, err)
-	var result struct {
-		Value int `json:"value"`
-	}
-	must(t, json.Unmarshal(raw, &result))
-	if result.Value != value {
-		t.Fatalf("child returned %d, want %d", result.Value, value)
 	}
 }

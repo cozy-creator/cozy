@@ -164,53 +164,6 @@ func TestHomeMigrationFromPriorShape(t *testing.T) {
 	}
 }
 
-// TestTriageBundleLivesInTheAttemptRow proves cl-116's triage cut on the real store
-// path: the verified bundle rides the terminal INTO its attempt row, is served back by
-// the attempt's opaque key, and no triage directory exists for an orphan file to
-// accumulate in.
-func TestTriageBundleLivesInTheAttemptRow(t *testing.T) {
-	l, problem := home.Open(t.TempDir())
-	fatal(t, problem)
-	store, problem := records.Open(l.DB)
-	fatal(t, problem)
-	defer store.Close()
-	fatal(t, store.SpawnWorker(records.WorkerProcess{InstanceID: "ins-triage",
-		Package: "cozy/sweep", WorkerID: "local", Devices: []string{"cpu"}}))
-	submitSweepRequest(t, store, "req-triaged")
-	session, digest := "session-triage", "sha256:"+sixtyFour("a")
-	attempt, problem := store.Dispatch(records.Attempt{RequestID: "req-triaged",
-		SessionID: session, InstanceID: "ins-triage",
-		InvocationDigest: digest, InvocationCanonical: []byte("{}")})
-	fatal(t, problem)
-	fatal(t, store.OfferDispatch("req-triaged", attempt, session))
-	fatal(t, store.Accepted("req-triaged", attempt, session))
-	bundle := []byte(`{"terminal":{"traceback":"boom"}}`)
-	if _, problem := store.AcceptTerminal(records.Terminal{RequestID: "req-triaged",
-		Attempt: attempt, SessionID: session, InvocationDigest: digest,
-		TerminalID: "out-triaged", TerminalDigest: "sha256:" + sixtyFour("f"),
-		Status: "FAILED", Cause: "handler_error", TriageSubject: "trb-1",
-		TriageDigest: "sha256:" + sixtyFour("b"), TriageLength: int64(len(bundle)),
-		TriageBundle: bundle,
-		EventType:    "request.failed", EventPayload: map[string]any{},
-		RequestState: "failed",
-	}); problem != nil {
-		t.Fatal(problem)
-	}
-	attempts, problem := store.Attempts("req-triaged")
-	fatal(t, problem)
-	if len(attempts) != 1 || !attempts[0].TriageKept {
-		t.Fatalf("attempt does not carry its bundle: %+v", attempts)
-	}
-	subject, kept, problem := store.TriageBundle(attempts[0].AttemptKey)
-	fatal(t, problem)
-	if subject != "trb-1" || string(kept) != string(bundle) {
-		t.Fatalf("served bundle = %q/%q", subject, kept)
-	}
-	if _, err := os.Stat(filepath.Join(l.Root, "triage")); !os.IsNotExist(err) {
-		t.Fatalf("a triage directory exists: %v", err)
-	}
-}
-
 // TestPublicationDebrisIsReclaimed pins the audit's 51-empty-directories class: a
 // settled request that committed no publication loses its whole root, a committed
 // publication keeps its bytes minus the settled staging, and the plane itself

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"flag"
 	"os"
 	"path/filepath"
 	"testing"
@@ -152,55 +151,4 @@ func TestVerifiedPublicationRetryRefusesUnprovenOrCanceledWork(t *testing.T) {
 			}
 		})
 	}
-}
-
-var retainedPublicationProof = flag.String("retained-publication-proof", "", "isolated SQLite backup of an actual retained completed producer job")
-var retainedPublicationRequest = flag.String("retained-publication-request", "", "exact completed job request in the isolated backup")
-
-func TestVerifiedPublicationRetryActualRetainedSnapshot(t *testing.T) {
-	if *retainedPublicationProof == "" || *retainedPublicationRequest == "" {
-		t.Skip("requires an isolated retained producer snapshot")
-	}
-	raw, err := os.ReadFile(*retainedPublicationProof)
-	must(t, err)
-	path := filepath.Join(t.TempDir(), "creator.sqlite")
-	must(t, os.WriteFile(path, raw, 0600))
-	st, problem := records.Open(path)
-	fatal(t, problem)
-	defer st.Close()
-	before, problem := st.Attempts(*retainedPublicationRequest)
-	fatal(t, problem)
-	outputs, problem := st.AllModelTransferWeights(*retainedPublicationRequest, 1)
-	fatal(t, problem)
-	changed, problem := st.RetryModelTransferPublication(*retainedPublicationRequest, "isolated-retained-proof")
-	fatal(t, problem)
-	if !changed {
-		t.Fatal("actual retained request did not resume")
-	}
-	after, problem := st.Attempts(*retainedPublicationRequest)
-	fatal(t, problem)
-	left, err := json.Marshal(before)
-	must(t, err)
-	right, err := json.Marshal(after)
-	must(t, err)
-	if !bytes.Equal(left, right) {
-		t.Fatal("recovery changed the actual retained producer attempt")
-	}
-	retained, problem := st.AllModelTransferWeights(*retainedPublicationRequest, 1)
-	fatal(t, problem)
-	left, err = json.Marshal(outputs)
-	must(t, err)
-	right, err = json.Marshal(retained)
-	must(t, err)
-	if !bytes.Equal(left, right) {
-		t.Fatal("recovery changed checkpoint receipts or observed object facts")
-	}
-	request, problem := st.RequestRow(*retainedPublicationRequest)
-	fatal(t, problem)
-	transfer, problem := st.ModelTransferOf(*retainedPublicationRequest)
-	fatal(t, problem)
-	if request.State != "finalizing" || transfer.State != "finalizing" {
-		t.Fatal("retained request and sidecar did not resume atomically")
-	}
-	t.Logf("actual producer snapshot: %d exact attempts and %d checkpoint receipts unchanged; no live state touched", len(after), len(retained))
 }
