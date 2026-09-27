@@ -1942,11 +1942,15 @@ func outputDest(req records.Request, dir string, entry canonical.Doc) (string, *
 func (c *Orchestrator) fetchOutputs(req records.Request, attempt uint64,
 	list []canonical.Value, dir string, holder *worker) *exit.Error {
 	slot := media.Slot(req.ID, attempt)
+	started := time.Now()
+	fetched := make([]map[string]any, 0, len(list))
+	var total int64
 	for _, item := range list {
 		entry, ok := item.(map[string]canonical.Value)
 		if !ok {
 			continue
 		}
+		began := time.Now()
 		id := canonical.Doc(entry).Str("output_id")
 		destination, e := outputDest(req, dir, canonical.Doc(entry))
 		if e != nil {
@@ -1963,7 +1967,14 @@ func (c *Orchestrator) fetchOutputs(req records.Request, attempt uint64,
 		}
 		c.logf("mirrored %s#%d/%s: %d B from %s", req.ID, attempt, id, written,
 			holder.media.Addr())
+		fetched = append(fetched, map[string]any{"output_id": id, "bytes": written,
+			"ms": time.Since(began).Milliseconds()})
+		total += written
 	}
+	// The transfer's own durable record: when it ran and what it moved, per output.
+	c.emit(req.ID, "request.outputs_fetched", attempt, map[string]any{
+		"started_unix_ms": started.UnixMilli(), "ms": time.Since(started).Milliseconds(),
+		"bytes": total, "outputs": fetched})
 	return nil
 }
 

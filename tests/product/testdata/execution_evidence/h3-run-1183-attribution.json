@@ -1,0 +1,102 @@
+{
+ "measurements": {
+  "attribution": {
+   "folded_names": 0,
+   "method": "perf_counter deltas accumulated in place: count/total/min/max/first/last per named span, never one row per step",
+   "stages": {
+    "check_output": {
+     "count": 1,
+     "first_ms": 165.886,
+     "last_ms": 165.886,
+     "max_ms": 165.886,
+     "mean_ms": 165.886,
+     "min_ms": 165.886,
+     "total_ms": 165.886
+    },
+    "condition_media": {
+     "count": 1,
+     "first_ms": 1860.328,
+     "last_ms": 1860.328,
+     "max_ms": 1860.328,
+     "mean_ms": 1860.328,
+     "min_ms": 1860.328,
+     "total_ms": 1860.328
+    },
+    "condition_text": {
+     "count": 1,
+     "first_ms": 5409.496,
+     "last_ms": 5409.496,
+     "max_ms": 5409.496,
+     "mean_ms": 5409.496,
+     "min_ms": 5409.496,
+     "total_ms": 5409.496
+    },
+    "decode_audio": {
+     "count": 1,
+     "first_ms": 517.247,
+     "last_ms": 517.247,
+     "max_ms": 517.247,
+     "mean_ms": 517.247,
+     "min_ms": 517.247,
+     "total_ms": 517.247
+    },
+    "decode_video": {
+     "count": 1,
+     "first_ms": 14772.203,
+     "last_ms": 14772.203,
+     "max_ms": 14772.203,
+     "mean_ms": 14772.203,
+     "min_ms": 14772.203,
+     "total_ms": 14772.203
+    },
+    "denoise": {
+     "count": 1,
+     "first_ms": 51143.99,
+     "last_ms": 51143.99,
+     "max_ms": 51143.99,
+     "mean_ms": 51143.99,
+     "min_ms": 51143.99,
+     "total_ms": 51143.99
+    },
+    "encode_outputs": {
+     "count": 1,
+     "first_ms": 1.118,
+     "last_ms": 1.118,
+     "max_ms": 1.118,
+     "mean_ms": 1.118,
+     "min_ms": 1.118,
+     "total_ms": 1.118
+    },
+    "prepare": {
+     "count": 1,
+     "first_ms": 91.631,
+     "last_ms": 91.631,
+     "max_ms": 91.631,
+     "mean_ms": 91.631,
+     "min_ms": 91.631,
+     "total_ms": 91.631
+    }
+   },
+   "steps": {
+    "decode_video": {
+     "count": 15,
+     "first_ms": 2089.922,
+     "last_ms": 10.653,
+     "max_ms": 2089.922,
+     "mean_ms": 908.699,
+     "min_ms": 10.653,
+     "total_ms": 13630.478
+    },
+    "denoise": {
+     "count": 8,
+     "first_ms": 11581.056,
+     "last_ms": 5627.82,
+     "max_ms": 11581.056,
+     "mean_ms": 6392.586,
+     "min_ms": 5625.563,
+     "total_ms": 51140.688
+    }
+   }
+  }
+ }
+}

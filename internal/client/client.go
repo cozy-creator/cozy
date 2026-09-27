@@ -211,6 +211,13 @@ func (c *Client) Triage(attemptKey string) ([]byte, *exit.Error) {
 	return data, nil
 }
 
+// Evidence reads one run's durable events and its last attempt's kept triage bundle.
+func (c *Client) Evidence(id string) (api.Evidence, *exit.Error) {
+	var evidence api.Evidence
+	e := c.call("GET", "/v1/local/requests/"+url.PathEscape(id)+"/evidence", nil, &evidence)
+	return evidence, e
+}
+
 func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 	var life api.Lifecycle
 	e := c.call("GET", "/v1/requests/"+id, nil, &life)
