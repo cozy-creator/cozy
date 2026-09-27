@@ -145,6 +145,19 @@ pub struct CheckedUrl {
     pub addrs: Vec<SocketAddr>,
 }
 
+impl CheckedUrl {
+    /// The URL this check admitted, as a string a later ask can start from.
+    pub fn url(&self) -> String {
+        let scheme = if self.https { "https" } else { "http" };
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{scheme}://{host}:{}{}", self.port, self.target)
+    }
+}
+
 /// The deployment's declared egress bound. Carried by every caller that hands this module
 /// a URL; enforced on the first URL and on every redirect hop, because the hops are only
 /// visible here.
