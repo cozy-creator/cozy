@@ -9,7 +9,7 @@ import (
 )
 
 // Unfinished work that only the retired classic worker session could run ends once,
-// named, at daemon start; machine executions are untouched.
+// named, at daemon start; machine executions and the daemon's own model transfers stay.
 func TestDaemonStartRetiresClassicWork(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "creator.sqlite")
 	store, problem := records.Open(path)
@@ -28,6 +28,11 @@ func TestDaemonStartRetiresClassicWork(t *testing.T) {
 	_, _, problem = store.Submit(machine)
 	fatal(t, problem)
 	fatal(t, store.LinkMachineExecution(machine.ID, "local"))
+	transfer := records.Request{ID: "req-pass-through", IdemKey: "idem-pass-through", BodyDigest: blocked.BodyDigest,
+		Package: "cozy/platform", Entrypoint: "model-pass-through", Kind: "job", Org: "local",
+		PlanID: "sha256:" + strings.Repeat("0", 64), Payload: []byte("{}")}
+	_, _, problem = store.Submit(transfer)
+	fatal(t, problem)
 	store.Close()
 
 	store, problem = records.OpenForDaemon(path)
@@ -43,9 +48,15 @@ func TestDaemonStartRetiresClassicWork(t *testing.T) {
 	if len(pending) != 0 {
 		t.Fatalf("classic local custody stayed held: %+v", pending)
 	}
-	for id, want := range map[string]string{blocked.ID: "failed", queued.ID: "failed", canceling.ID: "canceled", machine.ID: ""} {
+	for id, want := range map[string]string{blocked.ID: "failed", queued.ID: "failed", canceling.ID: "canceled", machine.ID: "", transfer.ID: "submitted"} {
 		row, problem := store.RequestRow(id)
 		fatal(t, problem)
+		if id == transfer.ID {
+			if row == nil || row.State != want {
+				t.Fatalf("the daemon's own model transfer was retired: %+v", row)
+			}
+			continue
+		}
 		if want == "" {
 			if row == nil || row.State == "failed" || !row.RetainWork {
 				t.Fatalf("machine work was retired: %+v", row)
