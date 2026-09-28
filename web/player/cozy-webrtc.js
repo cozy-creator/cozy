@@ -279,7 +279,7 @@ export class Player extends EventTarget {
     this.#held = verify ? [] : null; // what the follow delivered, to check against the final sha256
     video.disableRemotePlayback = true; // ManagedMediaSource never opens without it
     video.addEventListener("seeking", () => this.#seek(false));
-    video.addEventListener("waiting", () => this.#seek(true));
+    video.addEventListener("waiting", () => this.gap() || this.#seek(true));
     video.addEventListener("timeupdate", () => this.#media.pump());
     this.#media = new Media(this);
     this.#run();
@@ -290,6 +290,18 @@ export class Player extends EventTarget {
   get finished() { return this.final !== null && this.pos === this.final.length && !this.#get; }
 
   close() { this.fail(new CozyError("closed", "Closed.")); }
+
+  /** Steps over a hole under half a second ahead of the playhead: a B-frame offset at the start, a seam between segments. */
+  gap() {
+    const v = this.#video, b = v.buffered, t = v.currentTime;
+    for (let i = 0; i < b.length; i++) {
+      if (b.end(i) <= t) continue;
+      if (b.start(i) <= t || b.start(i) - t >= 0.5) return false;
+      v.currentTime = b.start(i);
+      return true;
+    }
+    return false;
+  }
 
   fail(error) {
     if (this.error) return;
@@ -490,6 +502,7 @@ class Media {
       this.#buffer.addEventListener("updateend", () => {
         for (const {bytes, session} of this.#appending) session.release(bytes.length);
         this.#appending = [];
+        this.#player.gap();
         this.pump();
       });
       this.pump();
