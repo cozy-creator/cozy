@@ -26,24 +26,7 @@ func (c *Orchestrator) workspaceControlContext(ctx context.Context, rental strin
 		}
 		return c.rentalControl(rental)
 	}
-	find := func() *session {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		var selected *session
-		for _, current := range c.sessions {
-			worker := c.workers[current.instanceID]
-			if current.host != nil || current.preparation == nil || current.claim == nil || current.ctx.Err() != nil ||
-				worker == nil || worker.exited || worker.stopping || !worker.snapshotAcknowledged ||
-				worker.spec.TensorFSRoot == "" || filepath.Clean(worker.spec.TensorFSRoot) != filepath.Clean(c.opt.Cfg.TensorFSRoot) {
-				continue
-			}
-			if selected == nil || current.instanceID < selected.instanceID {
-				selected = current
-			}
-		}
-		return selected
-	}
-	if current := find(); current != nil {
+	if current := c.localWorkspace(); current != nil {
 		return current, nil
 	}
 	resolver, ok := c.opt.Packages.(interface {
@@ -67,8 +50,27 @@ func (c *Orchestrator) workspaceControlContext(ctx context.Context, rental strin
 	if problem := c.ensureWorkerClaimedContext(ctx, instance); problem != nil {
 		return nil, exit.Named(exit.Unavailable, "workspace.control_unavailable", "the local Runtime workspace service could not accept its claim: %s", problem.Message)
 	}
-	if current := find(); current != nil {
+	if current := c.localWorkspace(); current != nil {
 		return current, nil
 	}
 	return nil, exit.Unavailablef("local Runtime workspace service lost its claim")
+}
+
+// localWorkspace is a claimed local worker on this store, if one is connected.
+func (c *Orchestrator) localWorkspace() *session {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var selected *session
+	for _, current := range c.sessions {
+		worker := c.workers[current.instanceID]
+		if current.host != nil || current.preparation == nil || current.claim == nil || current.ctx.Err() != nil ||
+			worker == nil || worker.exited || worker.stopping || !worker.snapshotAcknowledged ||
+			worker.spec.TensorFSRoot == "" || filepath.Clean(worker.spec.TensorFSRoot) != filepath.Clean(c.opt.Cfg.TensorFSRoot) {
+			continue
+		}
+		if selected == nil || current.instanceID < selected.instanceID {
+			selected = current
+		}
+	}
+	return selected
 }

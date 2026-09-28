@@ -33,6 +33,9 @@ func (c *Orchestrator) finishRequestedCancellation(id string) *exit.Error {
 	return nil
 }
 
+// runRetainedCancellation releases what the machine holds for the request, then cancels
+// it. A cancel never starts a worker: local custody that no connected worker can release
+// stays recorded, and the request is canceled the moment nothing of it executes.
 func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 	request, problem := c.opt.Store.RequestRow(id)
 	if problem != nil || request == nil || (request.State != "canceling" && request.State != "releasing") {
@@ -44,6 +47,11 @@ func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 	}
 	if problem := c.cancelChildCalls(id, id); problem != nil {
 		c.retryRetainedCancellation(id)
+		return
+	}
+	local := request.Worker == ""
+	if local && c.localWorkspace() == nil {
+		c.settleIdleCancellation(*request)
 		return
 	}
 	ready, problem := c.releaseCompletedChildCalls(ctx, id, id)
@@ -61,6 +69,10 @@ func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 	ready, problem = c.releaseAbandonedWork(ctx, *request, attempts, "")
 	if problem != nil || !ready {
 		_ = c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_CLIENT)
+		if local && problem == nil {
+			c.settleIdleCancellation(*request)
+			return
+		}
 		c.retryRetainedCancellation(id)
 		return
 	}
@@ -215,6 +227,32 @@ func (c *Orchestrator) finishRetainedRelease(request records.Request) {
 	c.cleanupPublication(request)
 	c.RetryOutputExport(id)
 	c.signalClosed(requestWaitKey(id), exit.New(exit.Canceled, "request %s was canceled", id))
+}
+
+// settleIdleCancellation cancels the request once nothing of it executes; until then the
+// ordinary pass keeps stopping it.
+func (c *Orchestrator) settleIdleCancellation(request records.Request) {
+	c.mu.Lock()
+	transferring := c.transferDispatching[request.ID] || c.transferRunning[request.ID] || c.localTransfers[request.ID] != nil || c.checkpointUploads[request.ID] != nil
+	c.mu.Unlock()
+	settled := false
+	if !transferring {
+		var problem *exit.Error
+		if settled, problem = c.opt.Store.SettleIdleCancellation(request.ID); problem != nil {
+			c.logf("request %s cancellation: %s", request.ID, problem.Message)
+		}
+	}
+	if !settled {
+		_ = c.stopRetainedAttempt(request.ID, pb.CancelReason_CANCEL_REASON_CLIENT)
+		c.retryRetainedCancellation(request.ID)
+		return
+	}
+	request.State = "canceled"
+	c.cleanupRequestAssets(request)
+	c.reclaimTmp(request.ID)
+	c.cleanupPublication(request)
+	c.RetryOutputExport(request.ID)
+	c.signalClosed(requestWaitKey(request.ID), exit.New(exit.Canceled, "request %s was canceled", request.ID))
 }
 
 func (c *Orchestrator) retryRetainedCancellation(id string) {

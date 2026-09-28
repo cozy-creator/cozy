@@ -409,6 +409,38 @@ func (s *Store) ReleaseRetainedWork(id string) (bool, *exit.Error) {
 	return true, nil
 }
 
+// SettleIdleCancellation cancels a canceling request at once when nothing of it executes:
+// no attempt awaiting its outcome, no native lookup in flight and no descendant still
+// running. Custody the machine still holds for it stays recorded.
+func (s *Store) SettleIdleCancellation(id string) (bool, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot begin cancellation settlement: %s", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(requestDescendantsCTE+`UPDATE requests SET state='canceled' WHERE id=? AND state='canceling'
+		AND NOT EXISTS(SELECT 1 FROM attempts WHERE request_id=requests.id AND state IN ('preparing','offered','accepted','recovered_open'))
+		AND NOT EXISTS(SELECT 1 FROM request_operation_lookups WHERE request_id=requests.id AND state='pending')
+		AND NOT EXISTS(SELECT 1 FROM requests d JOIN descendants x ON x.id=d.id
+		  WHERE d.state IN ('submitted','queued','dispatching','requeue_pending','finalizing','pausing','canceling','releasing'))`, id, id)
+	if err != nil {
+		return false, exit.Internalf("cannot settle cancellation: %s", err)
+	}
+	if changed, _ := result.RowsAffected(); changed == 0 {
+		return false, nil
+	}
+	if _, err := tx.Exec(`UPDATE request_model_transfers SET state='canceled',updated_at=? WHERE request_id=? AND state!='completed'`, now(), id); err != nil {
+		return false, exit.Internalf("cannot abandon retained source transfer: %s", err)
+	}
+	if err := appendEventTx(tx, id, "request.canceled", 0, map[string]any{"status": "CANCELED", "cause": "CLIENT_CANCELED"}); err != nil {
+		return false, exit.Internalf("cannot journal canceled request: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot commit canceled request: %s", err)
+	}
+	return true, nil
+}
+
 func (s *Store) CompleteRetainedCancellation(id string) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
