@@ -5,8 +5,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use super::{
-    checkpoint, receipt_from, require_payload_record, roots, Disposition, ReceiptDeclaration,
-    TransactionState,
+    checkpoint, receipt_from, require_payload_record, roots, Disposition, TransactionState,
 };
 use crate::canon::{Fields, Value};
 use crate::catalog::WriterGuard;
@@ -218,12 +217,7 @@ pub fn retain_result(
         );
     }
     let facts = receipt_from(store, row)?;
-    // A receipt's identity is the digest of whichever form its caller was handed.
-    let forms = [ReceiptDeclaration::Inline, ReceiptDeclaration::Digest];
-    if !forms
-        .iter()
-        .any(|form| object_id(&crate::canon::write(&facts.value(*form))) == receipt)
-    {
+    if object_id(&crate::canon::write(&facts.to_value())) != receipt {
         return refuse(
             Code::OBJECT_ID_MISMATCH,
             "retained result receipt differs from committed computation",
@@ -376,20 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn a_result_is_retained_under_either_receipt_form_and_nothing_else() {
+    fn a_result_is_retained_under_its_receipt_and_nothing_else() {
         let f = fixture();
-        let facts = derived::lookup(&f.store, &f.meta, &f.transaction).unwrap();
-        let derived::Lookup::Committed(committed) = facts else {
-            panic!("committed result expected")
-        };
-        let digest_form = object_id(&crate::canon::write(
-            &committed.receipt().value(ReceiptDeclaration::Digest),
-        ));
-        assert_ne!(digest_form, f.receipt);
-        let retained =
-            retain_result(&f.store, &f.meta, &f.transaction, &digest_form, &id("b1")).unwrap();
-        assert_eq!(retained.receipt_digest, digest_form);
-        retain_result(&f.store, &f.meta, &f.transaction, &f.receipt, &id("b2")).unwrap();
+        retain_result(&f.store, &f.meta, &f.transaction, &f.receipt, &id("b1")).unwrap();
         assert_eq!(
             retain_result(&f.store, &f.meta, &f.transaction, &id("99"), &id("b3"))
                 .unwrap_err()

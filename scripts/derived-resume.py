@@ -194,7 +194,7 @@ def main():
         clean.add_part("model", "weight", "data", io.BytesIO(DATA))
         expected = finish(clean)
         assert recovered == local == expected
-        assert recovered["declaration"] == json.loads(declaration)
+        assert recovered["declaration_digest"] == tensorfs.object_id(declaration)
         document = expected["manifest"]
         identity, length = "sha256:" + document["sha256"], document["length"]
         document_store = tensorfs.Store.init(area / "manifest-only")

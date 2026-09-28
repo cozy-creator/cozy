@@ -460,26 +460,8 @@ fn source_component<'p>(
     Ok(rows)
 }
 
-fn receipt<'p>(
-    py: Python<'p>,
-    receipt: &derived::ReceiptFacts,
-    form: derived::ReceiptDeclaration,
-) -> PyResult<Bound<'p, PyAny>> {
-    marshal(py, &receipt.value(form))
-}
-
-fn receipt_form(py: Python<'_>, name: &str) -> PyResult<derived::ReceiptDeclaration> {
-    match name {
-        "inline" => Ok(derived::ReceiptDeclaration::Inline),
-        "digest" => Ok(derived::ReceiptDeclaration::Digest),
-        _ => Err(to_py(
-            py,
-            &Refusal {
-                code: Code::UNKNOWN_FIELD,
-                detail: format!("receipts must be \"inline\" or \"digest\", not {name:?}"),
-            },
-        )),
-    }
+fn receipt<'p>(py: Python<'p>, receipt: &derived::ReceiptFacts) -> PyResult<Bound<'p, PyAny>> {
+    marshal(py, &receipt.to_value())
 }
 
 // ---------------------------------------------------------------- store
@@ -583,48 +565,42 @@ fn checkpoint_root_dict<'p>(
 pub struct PyStore {
     pub store: Arc<CoreStore>,
     pub meta: Arc<Meta>,
-    /// How derived receipts from this handle name their declaration. A caller that reads
-    /// the digest form opts in; the default keeps the declaration inline.
-    receipts: derived::ReceiptDeclaration,
 }
 
 fn open_store(
     py: Python<'_>,
     root: PathBuf,
     open: fn(&Path) -> tensorfs_core::err::Result<CoreStore>,
-    receipts: &str,
 ) -> PyResult<PyStore> {
-    let receipts = receipt_form(py, receipts)?;
     let s = open(&root).or_refuse(py)?;
     let m = Meta::open(&s).or_refuse(py)?;
     Ok(PyStore {
         store: Arc::new(s),
         meta: Arc::new(m),
-        receipts,
     })
 }
 
 #[pymethods]
 impl PyStore {
     #[staticmethod]
-    #[pyo3(signature = (root = None, *, receipts = "inline"))]
-    fn ensure(py: Python<'_>, root: Option<PathBuf>, receipts: &str) -> PyResult<PyStore> {
+    #[pyo3(signature = (root = None))]
+    fn ensure(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
         let root = tensorfs_core::home::store_root(root.as_deref()).or_refuse(py)?;
-        open_store(py, root, CoreStore::ensure, receipts)
+        open_store(py, root, CoreStore::ensure)
     }
 
     #[staticmethod]
-    #[pyo3(signature = (root = None, *, receipts = "inline"))]
-    fn open(py: Python<'_>, root: Option<PathBuf>, receipts: &str) -> PyResult<PyStore> {
+    #[pyo3(signature = (root = None))]
+    fn open(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
         let root = tensorfs_core::home::store_root(root.as_deref()).or_refuse(py)?;
-        open_store(py, root, CoreStore::open, receipts)
+        open_store(py, root, CoreStore::open)
     }
 
     #[staticmethod]
-    #[pyo3(signature = (root = None, *, receipts = "inline"))]
-    fn init(py: Python<'_>, root: Option<PathBuf>, receipts: &str) -> PyResult<PyStore> {
+    #[pyo3(signature = (root = None))]
+    fn init(py: Python<'_>, root: Option<PathBuf>) -> PyResult<PyStore> {
         let root = tensorfs_core::home::store_root(root.as_deref()).or_refuse(py)?;
-        open_store(py, root, CoreStore::init, receipts)
+        open_store(py, root, CoreStore::init)
     }
 
     #[getter]
@@ -2311,7 +2287,6 @@ impl PyStore {
             source_views: begin.source_views,
             additions: begin.additions,
             cursor: Mutex::new(None),
-            receipts: self.receipts,
             guards: Mutex::new(Some(DerivedGuards {
                 writer_hold: begin.writer_hold,
                 source_leases: begin.source_leases,
@@ -2381,7 +2356,7 @@ impl PyStore {
             }
             derived::Lookup::Committed(value) => {
                 out.set_item("state", "committed")?;
-                out.set_item("receipt", receipt(py, value.receipt(), self.receipts)?)?;
+                out.set_item("receipt", receipt(py, value.receipt())?)?;
                 out.set_item("disposition", marshal(py, &value.disposition_value())?)?;
             }
             derived::Lookup::Abandoned => out.set_item("state", "abandoned")?,
@@ -2415,7 +2390,7 @@ impl PyStore {
             None => out.set_item("state", "abandoned")?,
             Some(value) => {
                 out.set_item("state", "committed")?;
-                out.set_item("receipt", receipt(py, &value, self.receipts)?)?;
+                out.set_item("receipt", receipt(py, &value)?)?;
             }
         }
         Ok(out)
@@ -2433,7 +2408,7 @@ impl PyStore {
             .or_refuse(py)?;
         let out = marshal(py, &value.to_value())?;
         out.cast::<PyDict>()?
-            .set_item("receipt", receipt(py, value.receipt(), self.receipts)?)?;
+            .set_item("receipt", receipt(py, value.receipt())?)?;
         Ok(out)
     }
 
@@ -2492,7 +2467,7 @@ impl PyStore {
             .or_refuse(py)?;
         let out = marshal(py, &value.to_value())?;
         let out_dict = out.cast::<PyDict>()?;
-        out_dict.set_item("receipt", receipt(py, value.receipt(), self.receipts)?)?;
+        out_dict.set_item("receipt", receipt(py, value.receipt())?)?;
         Ok(out)
     }
 
@@ -2602,7 +2577,6 @@ pub struct PyDerivedWriter {
     source_views: Vec<derived::SourceView>,
     additions: derived::Additions,
     cursor: Mutex<Option<derived::CheckpointCursor>>,
-    receipts: derived::ReceiptDeclaration,
     guards: Mutex<Option<DerivedGuards>>,
 }
 
@@ -2910,7 +2884,7 @@ impl PyDerivedWriter {
             })
             .or_refuse(py)?;
         self.release_holds(py);
-        receipt(py, &value, self.receipts)
+        receipt(py, &value)
     }
 
     fn fence(&self, py: Python<'_>) -> PyResult<bool> {

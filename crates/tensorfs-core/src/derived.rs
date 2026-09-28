@@ -3497,44 +3497,29 @@ pub struct ReceiptFacts {
     pub inherited_payload_bytes: u64,
 }
 
-/// How a receipt names its declaration: the whole document, or its digest and length.
-/// The whole document grows with the tensors declared; a digest keeps receipts constant.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ReceiptDeclaration {
-    #[default]
-    Inline,
-    Digest,
-}
-
 impl ReceiptFacts {
+    /// The receipt names its declaration by digest and length: the declaration grows with the
+    /// tensors declared, and the receipt stays constant.
     pub fn to_value(&self) -> Value {
-        self.value(ReceiptDeclaration::Inline)
+        let bytes = crate::canon::write(&self.declaration.to_value());
+        let Value::Obj(mut fields) = self.facts() else {
+            unreachable!("receipt facts are an object")
+        };
+        fields.push((
+            "declaration_digest".into(),
+            Value::str(ObjectRef::of(&bytes).id()),
+        ));
+        fields.push(("declaration_length".into(), Value::uint(bytes.len() as u64)));
+        fields.sort_by(|left, right| left.0.cmp(&right.0));
+        Value::Obj(fields)
     }
 
-    pub fn value(&self, form: ReceiptDeclaration) -> Value {
-        let mut value = self.inline_value();
-        if form == ReceiptDeclaration::Digest {
-            if let Value::Obj(fields) = &mut value {
-                let bytes = crate::canon::write(&self.declaration.to_value());
-                fields.retain(|(key, _)| key != "declaration");
-                fields.push((
-                    "declaration_digest".into(),
-                    Value::str(ObjectRef::of(&bytes).id()),
-                ));
-                fields.push(("declaration_length".into(), Value::uint(bytes.len() as u64)));
-                fields.sort_by(|left, right| left.0.cmp(&right.0));
-            }
-        }
-        value
-    }
-
-    fn inline_value(&self) -> Value {
+    fn facts(&self) -> Value {
         Value::obj(vec![
             (
                 "added_objects",
                 Value::arr(self.added_objects.iter().map(ObjectRef::to_value).collect()),
             ),
-            ("declaration", self.declaration.to_value()),
             ("header", self.header.to_value()),
             (
                 "inherit_observation",

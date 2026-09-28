@@ -629,6 +629,9 @@ whose writer is gone is abandoned only by the explicit `tfs ingest reap`. `--dry
 deleting; `gc holds` + `gc plan` are the same plan as separate documents, which is how a cloud
 caller (tensorhub) supplies its own holds against a staged census.
 
+A derived receipt names its declaration by `declaration_digest` and `declaration_length`, so it
+stays constant however many tensors the declaration lists.
+
 A derived commit creates a pending private root before releasing its writer. The owner's
 `Store.derived_adopt(transaction_id, scratch_root_id)` names that root without creating a model
 repository; the name is opaque to TensorFS. Same-name adoption replays, changing the name or

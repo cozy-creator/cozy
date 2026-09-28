@@ -3,7 +3,6 @@
 
 import copy
 import io
-import json
 import os
 import signal
 import subprocess
@@ -58,7 +57,7 @@ def main():
             writer.add_part("model", "weight", "value", io.BytesIO(bytes([byte]) * 2048))
             writer.commit()
         args = request(store)
-        expected = json.loads(store.derived_declaration(*args, work_fingerprint=WORK))
+        expected = tensorfs.object_id(store.derived_declaration(*args, work_fingerprint=WORK))
         malformed = copy.deepcopy(args)
         malformed[1]["model"]["add"]["table"]["parts"]["value"]["source"]["object"] = {"sha256": "ff" * 32, "length": 2048}
         try:
@@ -71,7 +70,7 @@ def main():
         child = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker", root], check=False)
         assert child.returncode == -signal.SIGKILL, child.returncode
         receipt = tensorfs.Store.open(root).derived_lookup(TRANSACTION)["receipt"]
-        assert receipt["declaration"] == expected
+        assert receipt["declaration_digest"] == expected
         assert receipt["added_objects"] == []
         assert receipt["inherit_observation"] == {"bytes": 4096, "objects": 2, "reads": 0, "hashes": 0}
         for suffix in ("95", "96"):
