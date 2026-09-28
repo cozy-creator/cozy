@@ -31,6 +31,7 @@ type Grant struct {
 	WorkerToken   string
 	WorkerPort    int
 	MediaPort     int // a pre-M6 Hub probes the receipt here; 0 when none was granted
+	WebRTCPort    int // browsers reach media over WebRTC here; 0 when none was granted
 	HubOrigin     string
 	HubCA         []byte // DER
 	PublicOrigin  string
@@ -59,7 +60,7 @@ const receiptKeyName = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL"
 var grantNames = map[string]bool{
 	"COZY_MACHINE_ROOT": true, "COZY_TENSORFS_ROOT": true, "COZY_LISTEN_HOST": true,
 	"COZY_WORKER_ID": true, "COZY_WORKER_AUTH_TOKEN": true, "COZY_WORKER_INTERNAL_PORT": true,
-	"COZY_MEDIA_INTERNAL_PORT": true, "COZY_RECORD_OWNER_AUTH_JSON": true, "COZY_AUTHORIZED_KEYS": true,
+	"COZY_MEDIA_INTERNAL_PORT": true, "COZY_WEBRTC_INTERNAL_PORT": true, "COZY_RECORD_OWNER_AUTH_JSON": true, "COZY_AUTHORIZED_KEYS": true,
 	"COZY_REPO_CACHE_ROOT": true, receiptKeyName: true, "TENSORHUB_ORIGIN": true,
 	"TENSORHUB_CA_DER_B64URL": true, "TENSORHUB_PUBLIC_ORIGIN": true, "TENSORHUB_OBJECT_STORAGE_HOSTS": true,
 }
@@ -112,6 +113,9 @@ func ReadGrant(environ []string) (*Grant, error) {
 		return nil, err
 	}
 	if g.MediaPort, err = port(env, "COZY_MEDIA_INTERNAL_PORT", false); err != nil {
+		return nil, err
+	}
+	if g.WebRTCPort, err = port(env, "COZY_WEBRTC_INTERNAL_PORT", false); err != nil {
 		return nil, err
 	}
 	if g.MediaPort == g.WorkerPort {
