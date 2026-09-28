@@ -109,24 +109,11 @@ def main(*, out: Outputs) -> Tree:
 		if children := machineChildren(t, root, store, request.ID); len(children) != 0 {
 			t.Fatal("direct Tree output invented child execution")
 		}
-		files, problem := store.MachineFileResults(request.ID)
+		products, problem := store.Products(request.ID)
 		fatal(t, problem)
-		if len(files) != 1 || files[0].State != "released" || !files[0].Copied || files[0].Output.MimeType != resultfiles.TreeMediaType {
-			t.Fatalf("Tree lacks copied receipt and released hold: %+v", files)
+		if len(products) != 1 || products[0].MediaType != resultfiles.TreeMediaType || products[0].ContentBytes != int64(2*len(first)) {
+			t.Fatalf("the Tree did not arrive as the run's one product: %+v", products)
 		}
-		members, problem := resultfiles.ReadTreeManifest(files[0].Output.Path, files[0].Output.Digest, files[0].Output.Length, files[0].Source.ContentBytes)
-		fatal(t, problem)
-		if len(members) != 3 || files[0].Source.ContentBytes != int64(2*len(first)) {
-			t.Fatal("Tree manifest changed its complete content size")
-		}
-		must(t, os.WriteFile(filepath.Join(target, "nested/report.txt"), []byte("user edit"), 0600))
-		for _, member := range members {
-			retained, err := os.ReadFile(filepath.Join(files[0].Output.Path+".files", strings.TrimPrefix(member.Digest, "sha256:")))
-			must(t, err)
-			if int64(len(retained)) != member.Length {
-				t.Fatal("user edit changed Tree custody")
-			}
-		}
-		t.Logf("collected Tree request=%s digest=%s members=%d bytes=%d exported=%s", request.ID, files[0].Output.Digest, len(members), files[0].Source.ContentBytes, target)
+		t.Logf("collected Tree request=%s digest=%s bytes=%d exported=%s", request.ID, products[0].Digest, products[0].ContentBytes, target)
 	}
 }

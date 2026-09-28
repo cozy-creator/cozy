@@ -63,10 +63,6 @@ func (m *ingestMachine) ListMachineExecutionEvents(_ context.Context, query *pb.
 	return page, nil
 }
 
-func (m *ingestMachine) CollectMachineExecution(context.Context, *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	return proto.Clone(m.outcome).(*pb.AttemptOutcome), nil
-}
-
 func (m *ingestMachine) AcknowledgeMachineExecutionCollection(context.Context, *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -160,6 +156,7 @@ func TestRentedIngestReportsStageBytesAndRate(t *testing.T) {
 			OutcomeId: "ingest-outcome", OutcomeDigest: digest, OutcomeCanonicalBytes: body},
 		events: ingestJournal(t),
 	}
+	machine.events = append(machine.events, outcomeEvent(uint64(len(machine.events)+1), "succeeded", machine.outcome))
 	machine.release(3)
 
 	pod := &fakePod{controlKey: public, machine: machine}

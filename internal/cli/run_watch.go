@@ -93,6 +93,7 @@ func watchRunStream(ctx *Context, client runEventObserver, life api.Lifecycle, n
 	defer restoreInput()
 	lines := NewProgress(ctx, ctx.Mode().JSON, recordedRunStart(life.CreatedAt))
 	lines.describeRun(life)
+	lines.streamFrom(client, life.Stream)
 	detached := make(chan struct{}, 1)
 	done := make(chan struct{})
 	defer close(done)

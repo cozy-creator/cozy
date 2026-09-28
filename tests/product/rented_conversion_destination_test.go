@@ -107,11 +107,11 @@ func (m *conversionMachine) SubmitMachineExecution(_ context.Context, submit *pb
 	if err != nil {
 		return nil, err
 	}
-	m.events[id] = events
 	m.outcomes[id] = &pb.AttemptOutcome{RequestId: id, AttemptOrdinal: 1, InvocationSpecDigest: submit.Offer.InvocationSpecDigest,
 		OutcomeId: "outcome-" + id, OutcomeDigest: digest, OutcomeCanonicalBytes: body}
+	m.events[id] = append(events, outcomeEvent(uint64(len(events)+1), "succeeded", m.outcomes[id]))
 	m.states[id] = &pb.MachineExecutionState{RequestId: id, WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "rented-workspace", Generation: 1, AttemptOrdinal: 1, State: "succeeded", Sequence: uint64(len(events))}
+		ExecutionWorkspaceId: "rented-workspace", Generation: 1, AttemptOrdinal: 1, State: "succeeded", Sequence: uint64(len(events) + 1)}
 	return accepted, nil
 }
 
@@ -132,12 +132,6 @@ func (m *conversionMachine) ListMachineExecutionEvents(_ context.Context, query 
 		}
 	}
 	return page, nil
-}
-
-func (m *conversionMachine) CollectMachineExecution(_ context.Context, collect *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return proto.Clone(m.outcomes[collect.Execution.RequestId]).(*pb.AttemptOutcome), nil
 }
 
 func (m *conversionMachine) AcknowledgeMachineExecutionCollection(_ context.Context, ack *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {

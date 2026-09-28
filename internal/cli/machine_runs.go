@@ -538,6 +538,11 @@ func currentExecutionWorkspace(ctx context.Context, connection *machineConnectio
 		workspace.ExecutionWorkspaceId == "" || len(workspace.ExecutionWorkspaceId) > 256 {
 		return nil, exit.New(exit.Conflict, "machine returned an invalid execution workspace identity")
 	}
+	if !workspace.RunOutputLog {
+		return nil, exit.Named(exit.Unavailable, "machine.runtime_update_required",
+			"this machine's Runtime predates the run output log (wire 65), so its run could not report its outputs").
+			WithRemedy("update the machine's Runtime: `cozy rental update <rental>`, or `cozy machine install` for this computer")
+	}
 	return workspace, nil
 }
 
@@ -769,13 +774,24 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	}
 	progress.Advance(1)
 	cursor := uint64(link.RemoteCursor)
+	var terminal *pb.AttemptOutcome
 	for {
 		page, err := connection.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor, Limit: 128})
 		if err != nil {
 			return machineTransport(err)
 		}
 		progress.Advance(1)
-		if problem := m.store.ObserveMachineExecution(request.ID, state, page); problem != nil {
+		// A product becomes an event only once its bytes are here.
+		held, problem := m.holdProducts(ctx, request, connection, page, cursor)
+		if problem != nil {
+			return problem
+		}
+		for _, event := range page.Events {
+			if event.GetKind() == "outcome" && event.GetOutcome() != nil && event.Sequence > cursor {
+				terminal = event.Outcome
+			}
+		}
+		if problem := m.store.ObserveMachinePage(request.ID, state, page, held); problem != nil {
 			return problem
 		}
 		if problem := m.answerMemoLookups(ctx, request, connection, query, page); problem != nil {
@@ -802,12 +818,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem := m.reconcilePublications(ctx, request.ID, request.Hub, connection, query); problem != nil {
 		return problem
 	}
-	if state.Collected || state.State == "canceled" || state.State != "succeeded" && state.State != "failed" {
-		if state.Collected {
-			if problem := m.releaseMachineFiles(ctx, request.ID, connection); problem != nil {
-				return problem
-			}
-		}
+	if state.Collected || state.State != "succeeded" && state.State != "failed" && state.State != "canceled" {
 		if problem := m.releaseMachineInputs(ctx, request, connection); problem != nil {
 			return problem
 		}
@@ -816,29 +827,22 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 		}
 		return nil
 	}
-	outcome, err := connection.Host.CollectMachineExecution(ctx, &pb.MachineExecutionCollect{Execution: query, AttemptOrdinal: state.AttemptOrdinal})
-	if err != nil {
-		// Another observer may have completed the same collection after our
-		// status read. Its ACK releases the original root hold, so re-read the
-		// authority before treating that now-stale collect as a custody failure.
-		latest, readError := connection.Host.GetMachineExecution(ctx, query)
-		if readError == nil && latest.Collected && latest.AttemptOrdinal == state.AttemptOrdinal {
-			return m.store.ObserveMachineExecution(request.ID, latest, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, latest.Sequence)})
+	// The log's terminal entry carries the outcome: the result is the fold of its products.
+	outcome := terminal
+	if outcome == nil {
+		var problem *exit.Error
+		if outcome, problem = m.terminalEntry(ctx, connection, query, cursor, state.AttemptOrdinal); problem != nil {
+			return problem
 		}
-		return machineTransport(err)
 	}
 	progress.Advance(1)
 	var body pb.AttemptOutcomeBody
 	if err := canonical.Unmarshal(outcome.OutcomeCanonicalBytes, &body); err != nil {
 		return exit.New(exit.Conflict, "machine outcome is not its canonical document")
 	}
-	plan, planProblem := m.planMachineFiles(request, outcome, &body)
 	modelPlan, modelProblem := m.planMachineModels(request, connection, &body)
 	if len(link.Outcome) == 0 {
 		var warnings []string
-		if plan != nil {
-			warnings = append(warnings, plan.warnings...)
-		}
 		if modelPlan != nil {
 			warnings = append(warnings, modelPlan.warnings...)
 		}
@@ -869,15 +873,12 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 		}()
 	}
 	written := writtenBytes(&body)
-	models, files, problem := false, false, modelProblem
+	models, problem := false, modelProblem
 	if problem == nil {
 		models, problem = m.collectMachineModels(ctx, request, connection, outcome, modelPlan, written)
 	}
 	if problem == nil {
-		problem = planProblem
-	}
-	if problem == nil {
-		files, problem = m.collectMachineFiles(ctx, request, connection, plan)
+		problem = m.exportProducts(request)
 	}
 	triage.Wait()
 	if body.TriageBundle != nil && triageProblem != nil {
@@ -893,7 +894,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem := m.retainMachineWeights(ctx, request, connection, outcome, &body, modelPlan, written); problem != nil {
 		return m.retainedResult(request, outcome, problem)
 	}
-	if len(body.GetOutputManifest().GetOutputs()) > 0 && !files || body.GetResult().GetResultBlob() != nil || body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ChildArtifacts && !models && !files {
+	if body.GetResult().GetResultBlob() != nil || body.Status == pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED && request.ChildArtifacts && !models && len(body.GetOutputManifest().GetOutputs()) == 0 {
 		return m.retainedResult(request, outcome, exit.Named(exit.Unavailable, "machine_execution.result_custody_required",
 			"execution finished; referenced output bytes remain retained on the machine: this Creator has no recipient for them"))
 	}
@@ -912,12 +913,27 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 	if problem := m.store.ObserveMachineExecution(request.ID, collected, &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, collected.Sequence)}); problem != nil {
 		return problem
 	}
-	// The run is complete for its caller; its output retentions and inputs are released
-	// after, not before.
-	if problem := m.releaseMachineFiles(ctx, request.ID, connection); problem != nil {
-		return problem
-	}
+	// The run is complete for its caller; its inputs are released after, not before.
 	return m.releaseMachineInputs(ctx, request, connection)
+}
+
+// terminalEntry reads the log's terminal entry again: an earlier observation recorded it and
+// stopped before the outcome was kept. It is among the log's last few entries.
+func (m *machineRuns) terminalEntry(ctx context.Context, connection *machineConnection, query *pb.MachineExecutionQuery, cursor, attempt uint64) (*pb.AttemptOutcome, *exit.Error) {
+	page, err := connection.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: cursor - min(cursor, 64), Limit: 256})
+	if err != nil {
+		return nil, machineTransport(err)
+	}
+	var found *pb.AttemptOutcome
+	for _, event := range page.Events {
+		if event.GetKind() == "outcome" && event.GetOutcome().GetAttemptOrdinal() == attempt {
+			found = event.Outcome
+		}
+	}
+	if found == nil {
+		return nil, exit.New(exit.Conflict, "the machine's log has no terminal entry carrying its outcome")
+	}
+	return found, nil
 }
 
 // awaitEvents holds one events read open until the machine records the next event, so the
@@ -1035,9 +1051,7 @@ func (m *machineRuns) flushMachineControl(ctx context.Context, connection *machi
 		}
 	}
 	if command.Action == pb.MachineExecutionAction_MACHINE_EXECUTION_ACTION_CANCEL {
-		if problem := m.releaseMachineFiles(ctx, link.RequestID, connection); problem != nil {
-			return command.Action, problem
-		}
+		// A canceled run keeps its products: its log holds them until the terminal is acked.
 		if problem := m.releaseMachineModels(ctx, link.RequestID, connection); problem != nil {
 			return command.Action, problem
 		}

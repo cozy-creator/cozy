@@ -46,7 +46,7 @@ func newTerminalMachines(finish func(map[string]any) *pb.AttemptOutcomeBody) *te
 }
 
 func (m *terminalMachines) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
-	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace"}, nil
+	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace", RunOutputLog: true}, nil
 }
 
 // minted is what a Runtime names a submission's capture and invocation by: the submitted
@@ -91,7 +91,7 @@ func (m *terminalMachines) SubmitMachineExecution(ctx context.Context, submit *p
 		}
 		m.runs[id] = &terminalRun{submit: proto.Clone(submit).(*pb.MachineExecutionSubmit), body: body,
 			state: &pb.MachineExecutionState{RequestId: id, WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId,
-				ExecutionWorkspaceId: "rented-workspace", Generation: 1, AttemptOrdinal: 1, State: state}}
+				ExecutionWorkspaceId: "rented-workspace", Generation: 1, AttemptOrdinal: 1, State: state, Sequence: 1}}
 		m.order = append(m.order, id)
 	}
 	capture, invocation := minted(submit)
@@ -119,12 +119,10 @@ func (m *terminalMachines) GetMachineExecution(_ context.Context, query *pb.Mach
 	return proto.Clone(run.state).(*pb.MachineExecutionState), nil
 }
 
-func (m *terminalMachines) ListMachineExecutionEvents(context.Context, *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error) {
-	return &pb.MachineExecutionEventPage{}, nil
-}
-
-func (m *terminalMachines) CollectMachineExecution(_ context.Context, collect *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	run, err := m.run(collect.Execution.RequestId)
+// ListMachineExecutionEvents is the run's log: it has already ended, in its terminal entry.
+func (m *terminalMachines) ListMachineExecutionEvents(_ context.Context, query *pb.MachineExecutionEventsQuery) (*pb.MachineExecutionEventPage, error) {
+	id := query.GetExecution().GetRequestId()
+	run, err := m.run(id)
 	if err != nil {
 		return nil, err
 	}
@@ -133,9 +131,9 @@ func (m *terminalMachines) CollectMachineExecution(_ context.Context, collect *p
 		return nil, err
 	}
 	_, invocation := minted(run.submit)
-	return &pb.AttemptOutcome{RequestId: collect.Execution.RequestId, AttemptOrdinal: 1,
-		InvocationSpecDigest: invocation, OutcomeId: "outcome-" + collect.Execution.RequestId,
-		OutcomeDigest: digest, OutcomeCanonicalBytes: body}, nil
+	outcome := &pb.AttemptOutcome{RequestId: id, AttemptOrdinal: 1, InvocationSpecDigest: invocation,
+		OutcomeId: "outcome-" + id, OutcomeDigest: digest, OutcomeCanonicalBytes: body}
+	return outcomePage(query.After, 1, run.state.State, outcome), nil
 }
 
 func (m *terminalMachines) AcknowledgeMachineExecutionCollection(_ context.Context, ack *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {

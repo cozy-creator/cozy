@@ -362,7 +362,7 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 			}
 		}
 		return orchestrator.LogicalPackage{Package: pkg, Release: release, Function: function,
-			Outputs: launch.AssetPaths(entrypoint.Result), Models: models,
+			Outputs: launch.OutputSlots(entrypoint.Result), Models: models,
 			NeedsAccelerator: launch.AcceleratorRequired(requirements)}, entrypoint, nil
 	}
 	if len(models) != len(entrypoint.Models) {
@@ -442,7 +442,7 @@ func (r *Resolver) ResolveRemoteRelease(origin, pkg, release, function string,
 	}
 	return orchestrator.LogicalPackage{
 		Package: pkg, Release: release,
-		Function: function, Outputs: launch.AssetPaths(entrypoint.Result), PlanID: planID,
+		Function: function, Outputs: launch.OutputSlots(entrypoint.Result), PlanID: planID,
 		Models: models, NeedsAccelerator: launch.AcceleratorRequired(requirements),
 	}, entrypoint, nil
 }
@@ -529,7 +529,7 @@ func (r *Resolver) ResolveRemoteJob(origin, pkg, release, function string,
 	for _, model := range job.Models {
 		params = append(params, model.Param)
 	}
-	outputs := launch.AssetPaths(job.Result)
+	outputs := launch.OutputSlots(job.Result)
 	for _, output := range job.WeightsOutputs {
 		weights = append(weights, orchestrator.WeightsOutput{
 			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,

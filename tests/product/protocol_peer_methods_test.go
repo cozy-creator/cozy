@@ -14,6 +14,9 @@ func (p *fakePod) GetMachineExecutionWorkspace(ctx context.Context, request *pb.
 		return p.UnimplementedWorkerControlServer.GetMachineExecutionWorkspace(ctx, request)
 	}
 	workspace, err := machine.GetMachineExecutionWorkspace(ctx, request)
+	if err == nil {
+		workspace.RunOutputLog = true // every fake machine is a wire-65 Runtime
+	}
 	if err == nil && request.Describe != nil && workspace.DescribedRelease == nil {
 		// The machine reads a release at its own Hub; this pod's Hub is the fixture's.
 		p.mu.Lock()
@@ -61,12 +64,6 @@ func (p *fakePod) ControlMachineExecution(ctx context.Context, request *pb.Machi
 		return machine.ControlMachineExecution(ctx, request)
 	}
 	return p.UnimplementedWorkerControlServer.ControlMachineExecution(ctx, request)
-}
-func (p *fakePod) CollectMachineExecution(ctx context.Context, request *pb.MachineExecutionCollect) (*pb.AttemptOutcome, error) {
-	if p.machine != nil {
-		return p.machine.CollectMachineExecution(ctx, request)
-	}
-	return p.UnimplementedWorkerControlServer.CollectMachineExecution(ctx, request)
 }
 func (p *fakePod) AcknowledgeMachineExecutionCollection(ctx context.Context, request *pb.MachineExecutionCollectionAck) (*pb.MachineExecutionState, error) {
 	if p.machine != nil {

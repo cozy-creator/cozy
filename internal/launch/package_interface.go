@@ -312,7 +312,8 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 }
 
 // Result grants name exact field paths. Collections and unions cannot supply those
-// paths before execution; scalar collections and fixed native fields remain valid.
+// paths before execution; scalar collections, fixed native fields and a list of assets at a
+// fixed path (a list output) remain valid.
 // The closed type grammar has already been validated before this semantic walk.
 func ungrantedCollectionOutput(raw json.RawMessage, path string, dynamic bool) string {
 	var object map[string]json.RawMessage
@@ -332,6 +333,11 @@ func ungrantedCollectionOutput(raw json.RawMessage, path string, dynamic bool) s
 		}
 	}
 	if item := object["list"]; item != nil {
+		// A list of assets at a fixed path is a list output: each product the function
+		// publishes into it is appended, and its one `path.*` grant covers every item.
+		if kind, _ := typeOf(item); kind == "asset" && !dynamic {
+			return ""
+		}
 		return ungrantedCollectionOutput(item, path+"[]", true)
 	}
 	if mapping := object["map"]; mapping != nil {
@@ -519,6 +525,33 @@ func assetPaths(s Struct, prefix string) []string {
 			out = append(out, name)
 		case "struct":
 			out = append(out, assetPaths(nested, name+".")...)
+		}
+	}
+	return out
+}
+
+// OutputSlots are a result's output grants: each asset field's path, and `<field>.*` for a
+// list of assets, whose one grant covers every item the function publishes into it.
+func OutputSlots(s Struct) []string {
+	out := AssetPaths(s)
+	for _, name := range AssetLists(s) {
+		out = append(out, name+".*")
+	}
+	return out
+}
+
+// AssetLists names every result field that is a list of assets: an output that grows by one
+// product each time the function publishes into it.
+func AssetLists(s Struct) []string {
+	var out []string
+	for _, f := range s.Fields {
+		var object struct {
+			List json.RawMessage `json:"list"`
+		}
+		if json.Unmarshal(f.Type, &object) == nil && len(object.List) > 0 {
+			if kind, _ := typeOf(object.List); kind == "asset" {
+				out = append(out, f.Name)
+			}
 		}
 	}
 	return out

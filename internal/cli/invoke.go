@@ -250,6 +250,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		RequestedRental: selectedRental,
 		Models:          models,
 		OutputDirectory: outputDirectory,
+		NoPartials:      ctx.Inv.Bool("--no-partials"),
 		AttentionKernel: overrides.AttentionKernel,
 	}, key)
 	releaseSnapshotReader(target)
@@ -1293,8 +1294,10 @@ func collectedOrCollecting(life api.Lifecycle) bool {
 	return view != nil && life.Status == "completed" && view.Retained == "" && view.CollectionRefused == ""
 }
 
-func custodyOwed(view *api.MachineExecutionView, status string) bool {
-	return view != nil && status == "completed" && !view.Collected && view.Retained == "" && view.CollectionRefused == ""
+func custodyOwed(view *api.MachineExecutionView, status string, products int) bool {
+	// A failed or canceled run's result is what it published: nothing to wait for without.
+	ended := status == "completed" || products > 0 && (status == "failed" || status == "canceled")
+	return view != nil && view.Accepted && ended && !view.Collected && view.Retained == "" && view.CollectionRefused == ""
 }
 
 // awaitResultCustody follows a finished machine run's events past its terminal until its
@@ -1310,15 +1313,13 @@ func awaitResultCustody(c *localapi.Client, id string) *exit.Error {
 }
 
 func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *exit.Error) {
-	// Publication is an obligation of a SUCCESSFUL execution. A failed or canceled run
-	// has no accepted output bytes to publish, so its terminal must reach the caller even
-	// if an older daemon left the separately-settled export row pending. This is also the
-	// client-side fence for the terminal/export race: execution failure is already an
-	// absorbing answer and can never become success by waiting on that row.
-	if life.Status == "failed" || life.Status == "canceled" {
+	// A machine run's result is the fold of its products whatever its terminal, so a failed
+	// or canceled one exports what it made too. Otherwise publication is an obligation of a
+	// SUCCESSFUL execution: failure is an absorbing answer, never success by waiting.
+	if life.MachineExecution == nil && (life.Status == "failed" || life.Status == "canceled") {
 		return life, nil
 	}
-	if custodyOwed(life.MachineExecution, life.Status) {
+	if custodyOwed(life.MachineExecution, life.Status, len(life.Products)) {
 		if problem := awaitResultCustody(c, life.RequestID); problem != nil {
 			return life, problem
 		}
@@ -1462,8 +1463,9 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
-	if lines.liveMode() {
-		if life, e := c.Request(requestID); e == nil {
+	if life, e := c.Request(requestID); e == nil {
+		lines.streamFrom(c, life.Stream)
+		if lines.liveMode() {
 			lines.describeRun(life)
 		}
 	}
@@ -1618,9 +1620,50 @@ type RunProgress struct {
 	sparseAt      time.Time
 	sparseStarted time.Time
 
+	// stream is where a player reads the run's growing videos; streamed names those told.
+	stream   string
+	streamed map[string]bool
+
 	// Injected clock and measure, so tests drive the REAL renderer deterministically.
 	now   func() time.Time
 	width func() int
+}
+
+// streamFrom points the product lines at the daemon serving this run's products.
+func (p *RunProgress) streamFrom(client any, path string) {
+	if daemon, ok := client.(interface{ Addr() string }); ok && path != "" {
+		p.stream = "http://" + daemon.Addr() + path
+	}
+}
+
+// productLines are one product as it lands: `+` a list output's new item, `~` a single
+// output's new revision, and once per growing video where a player can follow it.
+func (p *RunProgress) productLines(payload map[string]any) []string {
+	var product records.Product
+	raw, _ := json.Marshal(payload)
+	if json.Unmarshal(raw, &product) != nil {
+		return nil
+	}
+	mark, name := "~", product.Output
+	if product.Op == records.ProductAppend {
+		mark, name = "+", fmt.Sprintf("%s[%d]", product.Output, product.Index)
+	}
+	if product.Label != "" {
+		name = product.Label
+	}
+	line := fmt.Sprintf("  %s %s  %s", mark, name, output.Bytes(product.Length))
+	if product.Path != "" {
+		line += "  " + p.ctx.Mode().Hyperlink(product.Path)
+	}
+	lines := []string{line}
+	if len(product.Parts) > 1 && p.stream != "" && !p.streamed[product.Output] {
+		if p.streamed == nil {
+			p.streamed = map[string]bool{}
+		}
+		p.streamed[product.Output] = true
+		lines = append(lines, "    play it as it grows: "+p.stream+product.Output+".m3u8")
+	}
+	return lines
 }
 
 func NewProgress(ctx *Context, rawJSON bool, began time.Time) *RunProgress {
@@ -1647,6 +1690,12 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	kind := strings.TrimPrefix(e.Type, "request.")
 	if kind == "warning" {
 		p.notice(e, warningLine(e.Payload))
+		return true
+	}
+	if kind == "product" {
+		for _, line := range p.productLines(e.Payload) {
+			p.notice(e, line)
+		}
 		return true
 	}
 	if !p.ctx.Mode().Full && (kind == "rentals" || kind == "placement") {
@@ -2359,6 +2408,17 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	errType, errCode, why := life.ErrorType, life.ErrorCode, life.Error
 	e.Cause = errCode
 	e.Details = failureDetails(ctx, life, errType, errCode, why, terminal)
+	defer func() {
+		// What it made before it ended is its result: keep it in view.
+		if len(saved) > 0 {
+			kept := make([]string, 0, len(saved))
+			for _, file := range saved {
+				kept = append(kept, file.Path)
+			}
+			e.Details["saved"] = saved
+			e.Message += "; kept " + strings.Join(kept, ", ")
+		}
+	}()
 	if why != "" {
 		e.Message = fmt.Sprintf("request %s ended %s: %s — %s",
 			life.RequestID, humanStatus, errType, why)

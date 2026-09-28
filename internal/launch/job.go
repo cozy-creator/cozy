@@ -70,7 +70,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "job_descriptor_id_absent",
 			"installed job %s has no descriptor identity", function)
 	}
-	assets := AssetPaths(declared.Result)
+	assets := OutputSlots(declared.Result)
 	if len(assets) > 0 && len(declared.WeightsOutputs) > 0 {
 		return nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
 			"job %s mixes %d result asset output(s) with %d weights output(s); rev5 OutputBinding cannot distinguish them",

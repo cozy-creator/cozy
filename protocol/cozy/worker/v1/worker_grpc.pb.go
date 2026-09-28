@@ -232,7 +232,9 @@ type WorkerControlClient interface {
 	GetMachineExecution(ctx context.Context, in *MachineExecutionQuery, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	ListMachineExecutionEvents(ctx context.Context, in *MachineExecutionEventsQuery, opts ...grpc.CallOption) (*MachineExecutionEventPage, error)
 	ControlMachineExecution(ctx context.Context, in *MachineExecutionControl, opts ...grpc.CallOption) (*MachineExecutionState, error)
+	// Retired at wire 65: the terminal entry of ListMachineExecutionEvents carries the outcome.
 	CollectMachineExecution(ctx context.Context, in *MachineExecutionCollect, opts ...grpc.CallOption) (*AttemptOutcome, error)
+	// The owner holds every product of the log and the terminal: Runtime releases the log's holds.
 	AcknowledgeMachineExecutionCollection(ctx context.Context, in *MachineExecutionCollectionAck, opts ...grpc.CallOption) (*MachineExecutionState, error)
 	// The triage bundle one terminal attempt's outcome names, read over the same authenticated
 	// seam as the outcome.
@@ -386,7 +388,9 @@ type WorkerControlServer interface {
 	GetMachineExecution(context.Context, *MachineExecutionQuery) (*MachineExecutionState, error)
 	ListMachineExecutionEvents(context.Context, *MachineExecutionEventsQuery) (*MachineExecutionEventPage, error)
 	ControlMachineExecution(context.Context, *MachineExecutionControl) (*MachineExecutionState, error)
+	// Retired at wire 65: the terminal entry of ListMachineExecutionEvents carries the outcome.
 	CollectMachineExecution(context.Context, *MachineExecutionCollect) (*AttemptOutcome, error)
+	// The owner holds every product of the log and the terminal: Runtime releases the log's holds.
 	AcknowledgeMachineExecutionCollection(context.Context, *MachineExecutionCollectionAck) (*MachineExecutionState, error)
 	// The triage bundle one terminal attempt's outcome names, read over the same authenticated
 	// seam as the outcome.
