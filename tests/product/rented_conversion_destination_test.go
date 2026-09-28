@@ -2,8 +2,10 @@ package producttest
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -40,6 +42,7 @@ const conversionInterface = `{"application":"q:app","entrypoints":[],"format":"c
 type conversionMachine struct {
 	mu          sync.Mutex
 	publishes   bool
+	jobRoots    bool // a Runtime that takes jobs by their release (release_root_jobs)
 	submissions []*pb.MachineExecutionSubmit
 	states      map[string]*pb.MachineExecutionState
 	events      map[string][]*pb.MachineExecutionEvent
@@ -47,14 +50,27 @@ type conversionMachine struct {
 }
 
 func (m *conversionMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
+	m.mu.Lock()
+	roots := m.jobRoots
+	m.mu.Unlock()
 	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "rented-workspace"}, nil
+		ExecutionWorkspaceId: "rented-workspace", ReleaseRoots: roots, ResolvesModelDefaults: roots,
+		ReleaseRootJobs: roots, ReleaseRootSources: roots}, nil
 }
 
 func (m *conversionMachine) SubmitMachineExecution(_ context.Context, submit *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := submit.Offer.RequestId
+	if root := submit.ReleaseRoot; root != nil {
+		// The machine mints the job: its identity, and its grant from the root's destination.
+		minted := sha256.Sum256([]byte(submit.SubmissionId))
+		submit = proto.Clone(submit).(*pb.MachineExecutionSubmit)
+		submit.CaptureDigest, submit.Offer.InvocationSpecDigest = minted[:], minted[:]
+		if root.Job && root.WeightsDestination != "" {
+			submit.Offer.Grant = &pb.DeliveryGrant{Outputs: []*pb.OutputAccess{{OutputId: "fp8", Url: "model://" + root.WeightsDestination}}}
+		}
+	}
 	accepted := &pb.MachineExecutionReceipt{RequestId: id, SubmissionId: submit.SubmissionId, CaptureDigest: submit.CaptureDigest,
 		InvocationSpecDigest: submit.Offer.InvocationSpecDigest, AcceptedAtMs: uint64(time.Now().UnixMilli()),
 		WorkerId: submit.Claim.WorkerId, WorkerBootId: submit.Claim.WorkerBootId, ExecutionWorkspaceId: "rented-workspace",
@@ -64,7 +80,7 @@ func (m *conversionMachine) SubmitMachineExecution(_ context.Context, submit *pb
 	}
 	m.submissions = append(m.submissions, proto.Clone(submit).(*pb.MachineExecutionSubmit))
 	events := []*pb.MachineExecutionEvent{{Sequence: 1, AttemptOrdinal: 1, AtMs: uint64(time.Now().UnixMilli()), Kind: "running", BodyCanonicalBytes: []byte(`{}`)}}
-	for _, access := range submit.Offer.Grant.Outputs {
+	for _, access := range submit.Offer.GetGrant().GetOutputs() {
 		destination, granted := strings.CutPrefix(access.Url, "model://")
 		if !granted || !m.publishes || submit.PublicationAuthorizationId == "" {
 			continue
@@ -540,5 +556,27 @@ func TestRentedConversionOfAnUnpublishedPackagePublishesFromTheMachine(t *testin
 	}
 	if request := f.published(t, out); request.LocalInstallationID == "" {
 		t.Fatalf("the unpublished conversion did not run its captured code: %+v", request)
+	}
+}
+
+// F18 on a machine that takes jobs by their release: `cozy run <pkg/fn> <input> <org/model>
+// --rental=<pod>` is one root naming the job, its input choice and the upload destination, and
+// its checkpoint is published, for a release input and an exact checkpoint input alike.
+func TestRentedConversionOnAMachineThatTakesJobsByRelease(t *testing.T) {
+	f := newConversionFixture(t)
+	f.machine.jobRoots = true
+	f.start(t)
+	for index, input := range []string{"proof/source@1.0.0/bf16", "proof/source#" + f.source} {
+		code, out := runCozy(t, f.root, "run", "proof/quantize/quantize", input, "proof/output",
+			fmt.Sprintf("steps=%d", 10+index), "model.base=proof/source@1.0.0/bf16", "--rental=tessa", "--await", "--json")
+		if code != 0 || !strings.Contains(out, childDigest("c")) {
+			t.Fatalf("%s: the release-root conversion did not publish [exit %d]: %s\n%s", input, code, out, tail(filepath.Join(f.root, "daemon.log")))
+		}
+		submissions := f.machine.submitted()
+		root := submissions[len(submissions)-1].ReleaseRoot
+		if len(submissions) != index+1 || root == nil || !root.Job || root.WeightsDestination != "proof/output" ||
+			len(root.Models) != 2 || submissions[len(submissions)-1].PublicationAuthorizationId == "" {
+			t.Fatalf("%s: the conversion is not one release root with its destination and grant: %+v", input, root)
+		}
 	}
 }
