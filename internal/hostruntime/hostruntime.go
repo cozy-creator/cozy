@@ -25,7 +25,7 @@ import (
 // Distribution is the Runtime's Python distribution and executable name.
 const Distribution = "cozy-runtime"
 
-const ToolFloor = "0.18.41"
+const ToolFloor = "0.18.67"
 
 // PackageFloor is the first package SDK whose executor states its protocol revision and native
 // interfaces in its hello.
