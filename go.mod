@@ -30,7 +30,10 @@ require (
 
 require (
 	github.com/aquasecurity/go-version v0.0.1 // indirect
+	github.com/deckarep/golang-set/v2 v2.8.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/go-jose/go-jose/v3 v3.0.4 // indirect
+	github.com/go-stack/stack v1.8.1 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pion/interceptor v0.1.49 // indirect
 	github.com/pion/mdns/v2 v2.2.1 // indirect
@@ -41,6 +44,7 @@ require (
 	github.com/pion/srtp/v3 v3.1.0 // indirect
 	github.com/pion/transport/v5 v5.1.1 // indirect
 	github.com/pion/turn/v5 v5.1.2 // indirect
+	github.com/playwright-community/playwright-go v0.5700.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.50.0 // indirect

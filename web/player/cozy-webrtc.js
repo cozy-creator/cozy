@@ -269,7 +269,7 @@ export class Player extends EventTarget {
   pos = 0;
   final = null;
   error = null;
-  stats = {bytes: 0, gets: 0, connects: 0, resets: 0, type: "", verified: null};
+  stats = {bytes: 0, gets: 0, connects: 0, resets: 0, type: "", verified: null}; // bytes: what the follows received
   #video; #link; #options; #media; #session = null; #running = false; #held;
   #follow = 0; #get = 0; #seekTo = null; #waiting = [];
 
@@ -371,13 +371,13 @@ export class Player extends EventTarget {
 
   #bytes(offset, bytes, session) {
     if (offset > this.pos) return this.fail(new CozyError("protocol", `The machine skipped bytes ${this.pos}–${offset}.`));
+    this.stats.bytes += bytes.length;
     const skip = Math.min(this.pos - offset, bytes.length);
     if (skip) session.release(skip);
     bytes = bytes.subarray(skip);
     if (!bytes.length) return;
     this.#held?.push(bytes.slice());
     this.pos += bytes.length;
-    this.stats.bytes += bytes.length;
     this.seq = Math.max(this.seq, this.entries.findLast(e => e.length <= this.pos)?.seq ?? 0);
     if (this.#get) this.#waiting.push([bytes, session]); else this.#media.push(bytes, session);
   }
