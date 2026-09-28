@@ -77,7 +77,6 @@ print("import tensorfs OK ->", tensorfs.__file__, tensorfs.__version__)
 
 with tempfile.TemporaryDirectory(prefix="tensorfs-default-home-") as default_root:
     os.environ["TENSORFS_HOME"] = default_root
-    os.environ["COZY_HOME"] = str(pathlib.Path(default_root) / "must-not-be-read")
     assert tensorfs.home() == default_root
     assert tensorfs.home(pathlib.Path(default_root) / "explicit") == str(
         pathlib.Path(default_root) / "explicit"
@@ -87,9 +86,7 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-default-home-") as default_roo
     default_store.prepare_readers()
     assert default_store.complete_cozytensors_manifests() == []
     assert tensorfs.Store.ensure().root == default_root
-    assert not pathlib.Path(os.environ["COZY_HOME"]).exists()
     del os.environ["TENSORFS_HOME"]
-    del os.environ["COZY_HOME"]
 
 assert "torch" not in sys.modules, "torch leaked into sys.modules"
 print("torch in sys.modules:", "torch" in sys.modules, "| dtypes:", len(tensorfs.DTYPES))

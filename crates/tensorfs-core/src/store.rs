@@ -220,12 +220,6 @@ impl VRecord {
         if self.dev != md.dev() {
             return Some(format!("file device {} != {}", self.dev, md.dev()));
         }
-        self.portable_disagreement(hex, md)
-    }
-
-    /// Everything stable across a remount of the same NFS object. Used only by the explicit
-    /// record migration; normal reads continue to require exact mount-local device identity.
-    fn portable_disagreement(&self, hex: &str, md: &fs::Metadata) -> Option<String> {
         let now = VRecord::of(hex, md);
         if self.sha256 != now.sha256 {
             return Some(format!("object id {} != {}", self.sha256, now.sha256));
@@ -2066,7 +2060,7 @@ fn validate_store_root(root: &Path) -> Result<()> {
                 return refuse(
                     Code::STORE_ERA,
                     format!(
-                        "{} lacks a real {name}/ namespace; old or partial stores require an offline migration",
+                        "{} lacks a real {name}/ namespace: not a TensorFS Store",
                         root.display()
                     ),
                 )
@@ -2075,7 +2069,7 @@ fn validate_store_root(root: &Path) -> Result<()> {
                 return refuse(
                     Code::STORE_ERA,
                     format!(
-                        "{} lacks a real {name}/ namespace; old or partial stores require an offline migration",
+                        "{} lacks a real {name}/ namespace: not a TensorFS Store",
                         root.display()
                     ),
                 )

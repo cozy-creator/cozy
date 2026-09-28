@@ -5,7 +5,6 @@ optionally the production Rust codec, over the same frozen green and red vectors
 from __future__ import annotations
 
 import argparse
-import base64
 import copy
 import gzip
 import hashlib
@@ -430,89 +429,6 @@ def check_vectors(tfs: Path | None) -> None:
     )
 
 
-def convert_legacy(header_path: Path, order_path: Path) -> dict[str, Any]:
-    old = canonical_json(header_path)
-    order = canonical_json(order_path)
-    if set(order) != {"components"} or not isinstance(order["components"], list):
-        raise ValueError(
-            "order must be {components:[[name,[[tensor,[roles...]],...]],...]} exactly"
-        )
-    old_components = old.get("components")
-    if not isinstance(old_components, dict):
-        raise TypeError("legacy header has no component map")
-    encodings = [["sha256:" + row["sha256"], row["length"]] for row in old["encodings"]]
-    by_encoding = {row[0]: i for i, row in enumerate(encodings)}
-    components: list[Any] = []
-    seen_components: set[str] = set()
-    for component, tensor_order in order["components"]:
-        if component in seen_components or component not in old_components:
-            raise ValueError(f"order repeats or invents component {component!r}")
-        seen_components.add(component)
-        table = old_components[component]
-        tensors: list[Any] = []
-        seen_tensors: set[str] = set()
-        for key, role_order in tensor_order:
-            if key in seen_tensors or key not in table:
-                raise ValueError(f"order repeats or invents tensor {component}/{key}")
-            seen_tensors.add(key)
-            tensor = table[key]
-            parts: list[Any] = []
-            seen_roles: set[str] = set()
-            for role in role_order:
-                if role in seen_roles or role not in tensor["parts"]:
-                    raise ValueError(
-                        f"order repeats or invents role {component}/{key}#{role}"
-                    )
-                seen_roles.add(role)
-                part = tensor["parts"][role]
-                if "inline" in part:
-                    body = {
-                        "inline_hex": base64.b64decode(
-                            part["inline"], validate=True
-                        ).hex()
-                    }
-                else:
-                    body = {
-                        "segments": [
-                            ["sha256:" + r["sha256"], r["length"]]
-                            for r in part["segments"]
-                        ]
-                    }
-                parts.append([role, part["dtype"], part["shape"], body])
-            if seen_roles != set(tensor["parts"]):
-                raise ValueError(f"order omits roles from {component}/{key}")
-            encoding = tensor["encoding"]
-            if encoding not in by_encoding:
-                raise ValueError(f"{component}/{key} cites an absent encoding")
-            tensors.append(
-                [
-                    key,
-                    tensor["logical"]["dtype"],
-                    tensor["logical"]["shape"],
-                    by_encoding[encoding],
-                    parts,
-                ]
-            )
-        if seen_tensors != set(table):
-            raise ValueError(f"order omits tensors from {component}")
-        components.append([component, tensors])
-    if seen_components != set(old_components):
-        raise ValueError("order omits components")
-    configs = [
-        [name, "sha256:" + row["sha256"], row["length"], row["media_type"]]
-        for name, row in sorted(old.get("configs", {}).items())
-    ]
-    result = {
-        "format": codec.FORMAT,
-        "configs": configs,
-        "assets": [],
-        "encodings": encodings,
-        "components": components,
-    }
-    codec.normalize_diagnostic(result)
-    return result
-
-
 def benchmark(diagnostic: Path, tfs: Path | None, reps: int) -> None:
     with tempfile.TemporaryDirectory(prefix="cozy-cbor-bench-") as tmp:
         work = Path(tmp)
@@ -564,10 +480,6 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     conform = sub.add_parser("conform")
     conform.add_argument("--update", action="store_true")
-    convert = sub.add_parser("convert-legacy")
-    convert.add_argument("header", type=Path)
-    convert.add_argument("order", type=Path)
-    convert.add_argument("--out", type=Path, required=True)
     bench = sub.add_parser("benchmark")
     bench.add_argument("diagnostic", type=Path)
     bench.add_argument("--reps", type=int, default=7)
@@ -576,8 +488,6 @@ def main() -> int:
         if args.update:
             update_vectors(args.tfs)
         check_vectors(args.tfs)
-    elif args.command == "convert-legacy":
-        write_json(args.out, convert_legacy(args.header, args.order))
     else:
         benchmark(args.diagnostic, args.tfs, args.reps)
     return 0

@@ -137,7 +137,6 @@ jobs:
           fi
           "$tfs" conform
           uv run --python 3.12 --project conformance/cbor/python python scripts/cbor-conformance.py --tfs "$tfs" conform
-          uv run --python 3.12 --project conformance/cbor/python python scripts/migration-smoke.py "$tfs"
 
       # The CLI rides the wheel (tfs-051), built in the manylinux container so its glibc
       # floor matches the extension beside it.

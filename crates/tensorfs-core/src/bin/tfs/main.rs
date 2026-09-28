@@ -22,7 +22,6 @@
 //!   tfs store prepare-readers [<root>]
 //!   tfs store complete-cozytensors [<root>]
 //!   tfs home                     print TENSORFS_HOME or ~/.tensorfs
-//!   tfs home migrate <old-root> [--to <new-root>]
 //!   tfs store rebuild <census> --rows <jsonl> [--sqlite <tensorfs.sqlite>]
 //!   tfs store admit-file <store> blob|manifest <id> <length> <source>
 //!   tfs repo-cache admit <cache> <store> blob|manifest <id> <length>
@@ -208,7 +207,6 @@ fn main() -> ExitCode {
     match a.as_slice() {
         ["version"] => cmd_version(),
         ["home"] => cmd_home(None),
-        ["home", "migrate", source] => cmd_home_migrate(Path::new(source), &flags),
         ["home", r] => cmd_home(Some(Path::new(r))),
         ["store", "init"] => cmd_store_default("init", &flags),
         ["store", "info"] => cmd_store_default("info", &flags),
@@ -814,17 +812,6 @@ mod watch;
 
 fn cmd_home(explicit: Option<&Path>) -> ExitCode {
     println!("{}", ok!(tensorfs_core::home::resolve(explicit)).display());
-    ExitCode::SUCCESS
-}
-
-fn cmd_home_migrate(source: &Path, flags: &Flags) -> ExitCode {
-    let destination = flag(flags, "to").map(Path::new);
-    let report = ok!(tensorfs_core::home::move_store(source, destination));
-    println!(
-        "moved {} -> {} (device/inode/mtime preserved by same-filesystem rename)",
-        report.source.display(),
-        report.destination.display(),
-    );
     ExitCode::SUCCESS
 }
 

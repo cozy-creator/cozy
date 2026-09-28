@@ -44,33 +44,14 @@ red vectors must be refused by every seat.
 
 ## Real-header scaffold
 
-The retired JSON header did not carry construction order, so conversion never guesses it.
-Supply an explicit order document:
-
-```json
-{
-  "components": [
-    ["component_name", [["tensor.key", ["role_a", "role_b"]]]]
-  ]
-}
-```
-
-Then convert and measure codec process/size scaffolding:
+Measure codec process/size scaffolding over a real header's diagnostic JSON
+(`tfs cbor decode <header>`):
 
 ```bash
-uv run --python 3.12 --project conformance/cbor/python \
-  python scripts/cbor-conformance.py convert-legacy OLD_HEADER.json ORDER.json \
-  --out h3-diagnostic.json
-
 uv run --python 3.12 --project conformance/cbor/python \
   python scripts/cbor-conformance.py --tfs target/release/tfs benchmark \
   h3-diagnostic.json --reps 7
 ```
-
-The current local H3 source for that command is
-`/home/fidika/cozy_v2/.artifacts/h3-bf16-adaln-pruned-evidence/header.json`
-(3,547 tensors). Its order input must come from tfs-026's exact construction traversal;
-this tool deliberately has no lexical, natural-sort, or carrier-order fallback.
 
 The scaffold reports process-start-inclusive times. It is not the tfs-027 production Rust or
 full-fill benchmark and must never be cited as such.

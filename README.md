@@ -281,19 +281,6 @@ other = tensorfs.Store.open("/srv/tensorfs")
 root to be a real current Store with a valid `tensorfs.sqlite`. Neither operation follows a root
 or namespace symlink, merges foreign files into a Store, or recognizes an older layout.
 
-Move a stopped Store into the new home once, on the same filesystem:
-
-```bash
-tfs home migrate ~/.cozy/cas
-# or: tfs home migrate /old/store --to /var/lib/tensorfs
-```
-
-This is an offline operator command: stop every process that could open the Store first. The
-destination must not exist. TensorFS also refuses already-active holders, source symlinks, and
-cross-filesystem moves, performs one atomic rename, and leaves no redirect or fallback at the old
-path. A same-filesystem rename preserves device, inode, and mtime, so the existing verification
-catalog opens without rehashing payloads.
-
 ## Build and test
 
 The native wheel is `cp312-abi3`, so CPython 3.12 is the floor and every later CPython loads
@@ -325,20 +312,6 @@ Each named construction config is one bounded RFC 8785 JSON-object byte string s
 the CozyTensors header. Header parsing refuses duplicate keys, trailing bytes, non-finite numbers,
 non-object JSON, oversized values, and any noncanonical spelling. TensorFS stores no separate
 config objects or aggregate config digest.
-
-TensorFS 0.3.0 intentionally has no pre-0.3.0 header reader. Existing 0.1.2 roots migrate
-directly, and intermediate 0.2.x roots use the same standalone tool:
-
-```bash
-uv run tools/migrate-to-0.3.0.py /var/lib/tensorfs \
-  --tfs /path/to/tensorfs-0.3.0/tfs
-uv run tools/migrate-to-0.3.0.py /var/lib/tensorfs \
-  --tfs /path/to/tensorfs-0.3.0/tfs --apply
-```
-
-It stages and validates all new headers, Manifests, and repositories before changing a root;
-repository documents remain under `migration-backup-0.3.0/`, and the prior SQLite catalog remains
-as `tensorfs.sqlite.pre-0.3.0.bak`.
 
 Everything below is what CI runs, in the same order.
 
