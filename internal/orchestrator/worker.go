@@ -2226,8 +2226,7 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	}
 	// AND THE ATTEMPTS THAT OWE A TERMINAL. Remote rentals reconnect to pod-supervisor,
 	// whose worker-local ledger replays their exact state. Local Runtime is stateless, so
-	// Creator settles its own persisted assignment as ABANDONED (requeued only if it never
-	// began executing); restarting
+	// Creator settles its own persisted assignment as ABANDONED; restarting
 	// an execution child to ask it what happened would recreate the duplicate journal this
 	// boundary removes.
 	unsettled, e := c.opt.Store.Unsettled()
@@ -2272,8 +2271,8 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		return killed, forgotten, e
 	}
 	for _, req := range ready {
-		c.logf("%s committed and acknowledged a retry before restart; resuming its requeue", req.ID)
-		c.Requeue(req.ID, "restart-after-terminal-ack")
+		c.logf("%s committed and acknowledged a requeue before restart; resuming it", req.ID)
+		c.RequeueForCapacity(req.ID, "restart-after-terminal-ack")
 	}
 	if problem := c.ResumeOutputExports(); problem != nil {
 		return killed, forgotten, problem

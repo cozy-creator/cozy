@@ -109,7 +109,7 @@ var Routes = []Route{
 		"submit one bounded job; 202 with the job handle and its publication repo",
 		"`cozy run` for a job callable"},
 	{"GET", "/v1/local/jobs/{id}", Local, true, false, false, "",
-		"one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists",
+		"one job: state, queue position, publication, checkpoints, bill where a rate exists",
 		"`cozy run` follow and cancel"},
 	{"POST", "/v1/local/jobs/{id}/pause", Local, true, true, false, "",
 		"stop attempts while retaining the exact request and its work",

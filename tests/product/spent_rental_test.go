@@ -100,7 +100,7 @@ func TestSpentJobRentalIsPreservedWhileUnstartedWorkReplans(t *testing.T) {
 			fatal(t, problem)
 			a, _ := json.Marshal(before.ModelTransfer)
 			b, _ := json.Marshal(after.ModelTransfer)
-			if after.ID != next || after.Worker == retained || after.State == "failed" || after.Requeues != 0 || after.BodyDigest != before.BodyDigest || !bytes.Equal(a, b) {
+			if after.ID != next || after.Worker == retained || after.State == "failed" || after.BodyDigest != before.BodyDigest || !bytes.Equal(a, b) {
 				t.Fatalf("unstarted replan changed its request: %+v", after)
 			}
 			attempts, problem := store.Attempts(next)

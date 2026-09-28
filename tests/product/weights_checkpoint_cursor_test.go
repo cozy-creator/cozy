@@ -94,7 +94,7 @@ func TestWeightsCheckpointCursorPreservesCustodyAcrossOwnerAndWorkerReplacement(
 	_, problem = store.AcceptTerminal(records.Terminal{RequestID: request, Attempt: ordinal, SessionID: session, InvocationDigest: digest, TerminalID: "lost-worker", TerminalDigest: "sha256:" + strings.Repeat("e", 64), Status: "FAILED", Cause: "worker_lost", RequestState: "requeue_pending"})
 	fatal(t, problem)
 	fatal(t, store.Closed(request, ordinal))
-	_, started, _, problem := store.BeginRequeue(request, 2, false)
+	started, problem := store.BeginRequeue(request)
 	fatal(t, problem)
 	if !started {
 		t.Fatal("request did not requeue")

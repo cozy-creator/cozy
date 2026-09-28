@@ -352,9 +352,6 @@ func jobFields(mode output.Mode, state api.JobState, full bool) []output.Field {
 	if rows := modelSourceLines(state.ModelSources); len(rows) > 0 {
 		fields = append(fields, output.Field{K: "model_sources", V: rows})
 	}
-	if state.Requeues > 0 {
-		fields = append(fields, output.Field{K: "requeued", V: fmt.Sprintf("%d (before execution began)", state.Requeues)})
-	}
 	if state.Bill != nil {
 		fields = append(fields, output.Field{K: "bill", V: microUSD(state.Bill.MicroUSD)})
 	}

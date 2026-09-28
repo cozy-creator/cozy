@@ -820,11 +820,8 @@ type JobState struct {
 	Attempts         int                   `json:"attempts"`
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
-	QueuePosition *int `json:"queue_position,omitempty"`
-	QueueDepth    *int `json:"queue_depth,omitempty"`
-	// Requeues counts attempts re-offered because they never began executing. Started
-	// work is never run again.
-	Requeues         int64             `json:"requeues"`
+	QueuePosition    *int              `json:"queue_position,omitempty"`
+	QueueDepth       *int              `json:"queue_depth,omitempty"`
 	Progress         map[string]any    `json:"progress,omitempty"`
 	Stage            string            `json:"stage,omitempty"`
 	QueuedMS         int64             `json:"queued_ms"`
@@ -985,8 +982,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		RetryOf:        row.RetryOf, ReuseScope: row.ReuseScope,
 		Number: row.Number, JobID: row.ID, Status: s.publicStatusOf(row), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
-		Requeues: row.Requeues,
-		Outputs:  []MediaRef{}, CreatedAt: row.CreatedAt,
+		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
 		EventsURL:    "/v1/requests/" + row.ID + "/events",
 		OutputExport: s.outputExportOf(row.ID),
 	}

@@ -1115,12 +1115,9 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		triage = c.captureTriage(s, t.RequestId, ordinal, doc.Sub("triage_bundle"))
 	}
 	// WHETHER THIS ATTEMPT ENDS THE REQUEST is decided BEFORE the event is written, not
-	// after. An ABANDONED attempt that the requeue projection will re-dispatch has ended
-	// an ATTEMPT, not a REQUEST — and the contract's terminal-stop rule means a client
-	// that saw `request.failed` would close its stream and report a failure for a request
-	// that goes on to succeed. Found live by the orchestrator-kill arm: the killed
-	// attempt's ABANDONED terminal stopped the client's stream while attempt 2 was still
-	// being minted.
+	// after. A refusal the requeue projection will re-offer has ended an ATTEMPT, not a
+	// REQUEST — and the contract's terminal-stop rule means a client that saw
+	// `request.failed` would close its stream on a request that is still waiting.
 	requeuing := requeueable(status, cause, origin, executionStarted)
 	retaining := req.RetainWork && status != "SUCCEEDED" && req.State != "canceling" &&
 		(req.State == "pausing" || req.State == "paused" || req.State == "blocked" || !requeuing)
@@ -1319,35 +1316,29 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 		verdict = exit.New(exit.Canceled, "model transfer %s finalization was canceled", req.ID)
 	}
 	c.signalClosed(key(req.ID, uint64(attempt.Attempt)), verdict)
-	if requeue {
-		if req.IsJob() && attempt.TerminalStatus == "REFUSED" &&
-			attempt.TerminalCause == "PLACEMENT_NOT_DISPATCHABLE" &&
-			strings.HasPrefix(attempt.SafeMessage, "model_materialization_required:") {
-			// A newer native admission result revoked the old preparation's
-			// readiness. Keep the exact desired input; requeue must re-enter
-			// its normal TensorFS preparation instead of borrowing old credit.
-			c.mu.Lock()
-			if holder != nil && holder.spec.Connection != nil && stagedFor(holder, req) {
-				plans := holder.planIDs[:0]
-				for _, plan := range holder.planIDs {
-					if plan != req.PlanID {
-						plans = append(plans, plan)
-					}
+	if req.IsJob() && attempt.TerminalStatus == "REFUSED" &&
+		attempt.TerminalCause == "PLACEMENT_NOT_DISPATCHABLE" &&
+		strings.HasPrefix(attempt.SafeMessage, "model_materialization_required:") {
+		// A newer native admission result revoked the old preparation's readiness. The
+		// next run re-enters its normal TensorFS preparation instead of borrowing old credit.
+		c.mu.Lock()
+		if holder != nil && holder.spec.Connection != nil && stagedFor(holder, req) {
+			plans := holder.planIDs[:0]
+			for _, plan := range holder.planIDs {
+				if plan != req.PlanID {
+					plans = append(plans, plan)
 				}
-				holder.planIDs = plans
 			}
-			if holder != nil {
-				// Nothing prepared earlier on this boot answers for the absent bytes.
-				holder.preparedSets, holder.desiredDownloadSets = nil, nil
-			}
-			c.mu.Unlock()
+			holder.planIDs = plans
 		}
-		why := attempt.TerminalStatus + "/" + attempt.TerminalCause
-		if CapacityRefusal(attempt.TerminalStatus, attempt.TerminalCause) {
-			c.RequeueForCapacity(req.ID, why)
-			return
+		if holder != nil {
+			// Nothing prepared earlier on this boot answers for the absent bytes.
+			holder.preparedSets, holder.desiredDownloadSets = nil, nil
 		}
-		c.Requeue(req.ID, why)
+		c.mu.Unlock()
+	}
+	if requeue {
+		c.RequeueForCapacity(req.ID, attempt.TerminalStatus+"/"+attempt.TerminalCause)
 		return
 	}
 	if req.ModelTransfer != nil {
@@ -1701,51 +1692,15 @@ func (c *Orchestrator) captureTriage(s *session, requestID string, attempt uint6
 	return tr
 }
 
-// requeueable is the record owner's projection. Only an attempt that never began executing
-// earns a new ordinal: work that started and failed ends failed with its reason, and is
-// never run again (owner ruling 2026-09-28). `execution_started` is the structural bit the
-// worker sets (#480c), never inferred from a cause-code list.
-//
-// Among the unstarted, a lost or infra-class attempt and a WORKER pre-execution refusal
-// are re-offered; an author/runtime refusal settles, because re-offering it would only be
-// refused again. The re-offer still charges the request's durable requeue budget, so a
-// worker that refuses forever still terminates.
+// requeueable is the record owner's projection. Only a worker saying "not now" before it
+// admitted anything puts the request back in the queue: NO_CAPACITY, and
+// ADMISSION_EPOCH_STALE, the worker's fence against an offer built from this owner's
+// out-of-date picture of it. Neither judged the work. Both wait, uncharged, until a worker
+// reports again. Every other outcome ends the request with its own reason: a typed
+// refusal, and a failure or loss whether or not execution began (owner rulings 2026-09-28).
 func requeueable(status, cause, origin string, executionStarted bool) bool {
-	if executionStarted {
-		return false
-	}
-	switch status {
-	case "ABANDONED":
-		return true
-	case "REFUSED":
-		return origin == "WORKER" && preExecution(cause)
-	case "FAILED":
-		switch cause {
-		case "EXECUTOR_FAULT", "GRANT_EXPIRED", "WEIGHTS_UNFETCHABLE", "CAPABILITY_UNAVAILABLE":
-			return true
-		}
-	}
-	return false
-}
-
-// CapacityRefusal names the pre-execution refusals that mean THERE WAS NO ROOM RIGHT NOW,
-// as distinct from the ones that mean something about this request.
-//
-// It exists because the requeue budget was spending a life on both. The budget's job is to
-// terminate a request whose attempts keep faulting; a worker that answered NO_CAPACITY has
-// not attempted anything, so three of those in a row settled a run that had executed
-// nothing — measured live as four attempts on one request, every one refused before
-// execution reached the device.
-//
-// It is an ALLOW-LIST of one, and deliberately so. `NO_CAPACITY` is unambiguously "not
-// now" and matches a line the local path has always drawn (`device_envelope_held` keeps
-// the request queued and charges nothing). Its three siblings are not: a stale admission
-// epoch, an unknown placement and a placement that is not dispatchable can all be
-// permanent, and a request that waits forever on one of those is the failure mode the
-// budget exists to prevent. So they keep paying, and a cause added later pays until
-// someone shows it should not.
-func CapacityRefusal(status, cause string) bool {
-	return status == "REFUSED" && cause == "NO_CAPACITY"
+	return status == "REFUSED" && origin == "WORKER" && !executionStarted &&
+		(cause == "NO_CAPACITY" || cause == "ADMISSION_EPOCH_STALE")
 }
 
 // preExecution names the four causes rev-2 §6/§7 defines as worker pre-execution
@@ -1988,13 +1943,10 @@ func outcomeError(status, cause, message string) *exit.Error {
 		return nil
 	case "REFUSED":
 		if preExecution(cause) {
-			// A PRE-EXECUTION refusal is not a judgment about the work: nothing about the
-			// request was wrong, the worker simply could not take it. Rendering it as a
-			// validation failure would tell a user to change a payload that is fine.
+			// A PRE-EXECUTION refusal is not a judgment about the payload. Rendering it as
+			// a validation failure would tell a user to change a payload that is fine.
 			return exit.Named(exit.Unavailable, "attempt_not_admitted",
-				"the worker did not admit this attempt (%s): %s", cause, message).
-				WithRemedy("the ordinal is consumed and no execution budget was spent; the " +
-					"next ordinal may be dispatched immediately, here or elsewhere")
+				"the worker did not admit this attempt (%s): %s", cause, message)
 		}
 		return exit.New(exit.Validation, "the attempt was refused (%s): %s", cause, message)
 	case "CANCELED":

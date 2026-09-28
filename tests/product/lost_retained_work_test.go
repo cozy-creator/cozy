@@ -170,7 +170,7 @@ func TestConfirmedRentalLossFailsLiveRetainedWorkWithoutReplacement(t *testing.T
 	o.c.RecoverLostWork()
 	after, problem := o.store.RequestRow(request.ID)
 	fatal(t, problem)
-	if after.State != "failed" || after.RetainWork || after.Worker != request.Worker || after.Requeues != 0 {
+	if after.State != "failed" || after.RetainWork || after.Worker != request.Worker {
 		t.Fatalf("confirmed loss retained or rerouted work: %+v", after)
 	}
 	attempts, problem := o.store.Attempts(request.ID)

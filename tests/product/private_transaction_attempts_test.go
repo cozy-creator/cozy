@@ -106,8 +106,8 @@ func TestUnpublishedTransactionPauseFencesAttemptBeforeResume(t *testing.T) {
 	after, problem := o.store.RequestByReference(requestID)
 	fatal(t, problem)
 	if after.ID != before.ID || after.Number != before.Number || after.BodyDigest != before.BodyDigest ||
-		after.Ordinal != 2 || after.Requeues != before.Requeues || !bytes.Equal(after.Payload, before.Payload) {
-		t.Fatalf("resume replaced the request or consumed automatic retry budget: before=%+v after=%+v", before, after)
+		after.Ordinal != 2 || !bytes.Equal(after.Payload, before.Payload) {
+		t.Fatalf("resume replaced the request: before=%+v after=%+v", before, after)
 	}
 	firstAfter, problem := o.store.AttemptRow(requestID, 1)
 	fatal(t, problem)

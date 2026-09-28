@@ -133,7 +133,7 @@ func TestNativeSourceRetryPreservesCancellationAndOriginalByteProducer(t *testin
 			_, problem = store.AcceptTerminal(records.Terminal{RequestID: parent.ID, Attempt: 1, SessionID: "private-boot", InvocationDigest: childDigest("1"), TerminalID: "failed", TerminalDigest: childDigest("a"), Status: "FAILED", RequestState: "requeue_pending", Body: []byte(`{}`)})
 			fatal(t, problem)
 			fatal(t, store.Closed(parent.ID, 1))
-			_, _, _, problem = store.BeginRequeue(parent.ID, 3, false)
+			_, problem = store.BeginRequeue(parent.ID)
 			fatal(t, problem)
 			ordinal, problem := store.Dispatch(records.Attempt{RequestID: parent.ID, InstanceID: "private-worker", SessionID: "private-boot", InvocationDigest: childDigest("2"), InvocationCanonical: []byte(`{}`)})
 			fatal(t, problem)

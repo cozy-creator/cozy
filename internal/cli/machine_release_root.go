@@ -122,7 +122,7 @@ func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records
 	}
 	return &pb.MachineExecutionSubmit{SubmissionId: records.MachineSubmissionID(request.IdemKey),
 		Offer: &pb.AttemptOffer{RequestId: request.ID}, PayloadCanonicalBytes: request.Payload,
-		MaxAttempts: uint32(orchestrator.MaxRequeues + 1), ReleaseRoot: root}, nil
+		ReleaseRoot: root}, nil
 }
 
 // sendReleaseRoot replays the one frozen submission until the machine answers a receipt. The

@@ -224,7 +224,7 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 | `request.dispatched` | `instance_id`, `invocation_digest` |
 | `request.accepted` | `plan_digest`, `construction_digest`, `plan` |
 | `request.attempt_failed` | one ATTEMPT ended and the request did NOT — `status`, `cause`, `requeuing: true`, optional last measured `overall_fraction` |
-| `request.requeued` | `cause`, `requeues`, `budget` |
+| `request.requeued` | `cause` |
 | `request.completed` | `status`, `cause`, `outputs[]` (media ids), `triage_subject`, optional last measured `overall_fraction` |
 | `request.failed` | the above plus `error_type`, `error` |
 | `request.canceled` | the above |
@@ -248,9 +248,9 @@ Three rules a client may rely on:
 1. **Terminal-stop.** On the per-request stream a terminal event is ABSORBING: the host
    closes and the client must not reconnect. The terminal set is exactly
    `request.completed` · `request.failed` · `request.canceled`. **An attempt ending is
-   not a request ending**: an attempt the host will requeue emits `request.attempt_failed`
-   — deliberately outside that set — because a client that stopped there would report a
-   failure for a request that goes on to succeed.
+   not a request ending**: an attempt a worker could not admit yet (`NO_CAPACITY`,
+   `ADMISSION_EPOCH_STALE`) emits `request.attempt_failed` — deliberately outside that set
+   — and the request waits in the queue.
 2. **A close is not a verdict.** A stream that ends without a terminal means reconnect
    from the cursor. It never means the request failed.
 3. **A flood cannot delay a terminal.** Live frames are shed at a bounded buffer; durable
@@ -337,7 +337,7 @@ Only a daemon holding the root lock may migrate an older database.
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | non-destructive disconnect guarded by required online work; `{force:true}` overrides that guard without canceling work; mutually exclusive `{all:true}` requests cancellation and paid teardown |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job (CLI-authenticated `local_assets` use the same immutable staging and input grants as requests); `Idempotency-Key`; 202 with the handle and its publication repo |
-| `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, requeues, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
+| `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
 | `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
 | `POST /v1/local/jobs/{id}/retry-publication` | local | yes | retry failed output publication using the retained successful attempt and receipts; never rerun the producer |
@@ -399,10 +399,10 @@ producer. `cozy run cancel <job>` abandons unfinished destination holds and then
 cancellation; already uploaded checkpoints remain uploaded. Both decisions survive a
 daemon restart. A failed request from an older build is not silently resurrected.
 
-`queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot;
-`requeues` counts attempts re-offered because they never began executing; an attempt that
-started and failed ends the request failed with its reason and is never run again. Several
-jobs submitted at once queue against one worker and drain in submission order.
+`queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot. Nothing
+is retried: a typed refusal, a failure or a loss after the machine took the work ends the
+request with its reason. Only work the machine never took is placed again. Several jobs
+submitted at once queue against one worker and drain in submission order.
 
 ### Private transactions and child calls
 

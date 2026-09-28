@@ -316,8 +316,8 @@ func TestMachineInvocationCarriesFrozenDeadlineAndRefusesUnstagedInputs(t *testi
 	fatal(t, problem)
 	var spec pb.InvocationSpec
 	must(t, canonical.Unmarshal(submission.Offer.InvocationSpecCanonicalBytes, &spec))
-	if spec.DeadlineUnixMs != request.DeadlineUnixMS || submission.MaxAttempts != uint32(orchestrator.MaxRequeues+1) {
-		t.Fatal("machine execution dropped its deadline or retry bound")
+	if spec.DeadlineUnixMs != request.DeadlineUnixMS {
+		t.Fatal("machine execution dropped its deadline")
 	}
 	if !submission.PreparedState.GetJob().Orchestration {
 		t.Fatal("CPU captured root occupied its managed children's device lane")

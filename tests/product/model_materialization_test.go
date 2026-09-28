@@ -108,17 +108,16 @@ func TestAcceptedModelCacheMissReensuresTheSameSelectionOnce(t *testing.T) {
 	}
 }
 
-func TestJobModelCacheMissRepreparesBeforeBudgetedRetry(t *testing.T) {
-	for _, broken := range []bool{false, true} {
-		t.Run(map[bool]string{false: "refetched", true: "budget-exhausted"}[broken], func(t *testing.T) { proveJobModelCacheMiss(t, broken) })
-	}
-}
-
-func proveJobModelCacheMiss(t *testing.T, broken bool) {
+// A machine that finds a selected model's bytes gone refuses the job before admission
+// (model_materialization_required). That typed refusal ends the run at once with its reason
+// and one attempt; the next run of the same model prepares it again instead of borrowing
+// the revoked readiness.
+func TestJobModelCacheMissFailsAndTheNextRunReprepares(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	must(t, err)
 	const pkg = "cozy/h3-package"
 	const plan = "sha256:3535353535353535353535353535353535353535353535353535353535353535"
+	const refusal = "model_materialization_required: cache was evicted"
 	manifest := childDigest("8")
 	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
 	var prepares, offers atomic.Int64
@@ -128,7 +127,7 @@ func proveJobModelCacheMiss(t *testing.T, broken bool) {
 		doc, err := canonical.Read(raw, &pb.DownloadDelegation{})
 		must(t, err)
 		if len(doc.List("models")) != 1 || doc.List("models")[0].Str("manifest") != manifest {
-			t.Error("retry changed exact model selection")
+			t.Error("preparation changed exact model selection")
 		}
 		return podPlacement(raw, name, version, "h3-package")
 	}
@@ -149,7 +148,7 @@ func proveJobModelCacheMiss(t *testing.T, broken bool) {
 		if n == 1 {
 			firstPreparation = prepares.Load()
 		} else if prepares.Load() <= firstPreparation {
-			t.Error("retry reused PREPARED instead of ensuring model bytes")
+			t.Error("the next run reused the revoked preparation instead of ensuring model bytes")
 		}
 		identity, err := canonical.Spell(offer.InvocationSpecDigest)
 		if err != nil {
@@ -157,10 +156,8 @@ func proveJobModelCacheMiss(t *testing.T, broken bool) {
 		}
 		result := &pb.AttemptOutcomeBody{RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal, InvocationSpecDigest: identity,
 			Status: pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, ExecutionStarted: true, Cause: &pb.OutcomeCause{Origin: pb.CauseOrigin_CAUSE_ORIGIN_RUNTIME}}
-		if n == 1 || broken {
-			result.Status = pb.OutcomeStatus_OUTCOME_STATUS_REFUSED
-			result.ExecutionStarted = false
-			result.SafeMessage = "model_materialization_required: cache was evicted"
+		if n == 1 {
+			result.Status, result.ExecutionStarted, result.SafeMessage = pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, false, refusal
 			result.Cause = &pb.OutcomeCause{Code: pb.CauseCode_CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE, Origin: pb.CauseOrigin_CAUSE_ORIGIN_WORKER}
 		}
 		body, digest, err := canonical.Identity(result)
@@ -169,28 +166,27 @@ func proveJobModelCacheMiss(t *testing.T, broken bool) {
 	}
 	connection, _ := startFakePod(t, t.TempDir(), pod)
 	o := hostOwner(t, "job-model-reensure", rentalWiring(connection, private))
-	id, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "job-model-reensure", Package: pkg, Release: "1.0.7", Entrypoint: "four-lane", PlanID: plan, Kind: "job", Org: "paul", Payload: []byte("{}"), Worker: podRental, Rental: true, RentalRequired: true,
-		Models: []orchestrator.ModelRef{{Package: pkg, Slot: "source", BindingPath: "four-lane.models.source", Model: "proof/model", Release: "1.0.0", Lane: "native", Manifest: manifest, ManifestLength: 164, Bytes: 4096}}})
-	fatal(t, problem)
-	wantState, wantAttempts, wantRequeues := "succeeded", 2, 1
-	if broken {
-		wantState = "failed"
-		wantAttempts = orchestrator.MaxRequeues + 1
-		wantRequeues = orchestrator.MaxRequeues
+	submit := func(key string) string {
+		id, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: key, Package: pkg, Release: "1.0.7", Entrypoint: "four-lane", PlanID: plan, Kind: "job", Org: "paul", Payload: []byte("{}"), Worker: podRental, Rental: true, RentalRequired: true,
+			Models: []orchestrator.ModelRef{{Package: pkg, Slot: "source", BindingPath: "four-lane.models.source", Model: "proof/model", Release: "1.0.0", Lane: "native", Manifest: manifest, ManifestLength: 164, Bytes: 4096}}})
+		fatal(t, problem)
+		return id
 	}
-	waitUntil(t, "same logical job settles after bounded model re-ensure", func() bool {
-		row, e := o.store.RequestRow(id)
-		fatal(t, e)
-		return row != nil && row.State == wantState
-	})
-	rows, problem := o.store.Attempts(id)
-	fatal(t, problem)
-	if len(rows) != wantAttempts || offers.Load() != int64(wantAttempts) {
-		t.Fatal("retry changed request or failed to create exactly one new attempt", len(rows), offers.Load())
+	settles := func(id, state string) {
+		waitUntil(t, id+" settles "+state, func() bool {
+			row, e := o.store.RequestRow(id)
+			fatal(t, e)
+			return row != nil && row.State == state
+		})
 	}
-	req, problem := o.store.RequestRow(id)
+	first := submit("job-model-miss")
+	settles(first, "refused")
+	rows, problem := o.store.Attempts(first)
 	fatal(t, problem)
-	if req.Requeues != int64(wantRequeues) {
-		t.Fatal("cache miss bypassed the existing durable retry budget", req.Requeues)
+	_, _, message, problem := o.store.SettledFailure(first)
+	fatal(t, problem)
+	if len(rows) != 1 || offers.Load() != 1 || message != refusal {
+		t.Fatalf("the refused run made %d attempt(s) and %d offer(s), ending %q", len(rows), offers.Load(), message)
 	}
+	settles(submit("job-model-after-miss"), "succeeded")
 }

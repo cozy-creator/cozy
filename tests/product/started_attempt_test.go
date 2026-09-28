@@ -16,10 +16,12 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Started work is never run again (owner ruling 2026-09-28): an attempt that began
-// executing and then failed or was abandoned ends its request with the attempt's own cause
-// and message. Only an attempt that never began is offered again.
-func TestAStartedAttemptEndsTheRequestWithItsReason(t *testing.T) {
+// Nothing is retried (owner rulings 2026-09-28). An attempt that failed or was lost, begun
+// or not, and every typed refusal end the request at once with their own cause and message
+// and one attempt. Only a worker's "not now" puts the request back in the queue:
+// ADMISSION_EPOCH_STALE refuses an offer built from this owner's out-of-date picture of the
+// worker, and the next offer, made from its fresh report, runs.
+func TestAnAttemptOutcomeEndsTheRequestWithItsReason(t *testing.T) {
 	for _, c := range []struct {
 		name     string
 		status   pb.OutcomeStatus
@@ -30,7 +32,11 @@ func TestAStartedAttemptEndsTheRequestWithItsReason(t *testing.T) {
 	}{
 		{"failed after starting", pb.OutcomeStatus_OUTCOME_STATUS_FAILED, pb.CauseCode_CAUSE_CODE_EXECUTOR_FAULT, true, "failed", 1},
 		{"abandoned after starting", pb.OutcomeStatus_OUTCOME_STATUS_ABANDONED, pb.CauseCode_CAUSE_CODE_EXECUTOR_INVALIDATED, true, "abandoned", 1},
-		{"lost before starting", pb.OutcomeStatus_OUTCOME_STATUS_FAILED, pb.CauseCode_CAUSE_CODE_EXECUTOR_FAULT, false, "succeeded", 2},
+		{"executor fault before starting", pb.OutcomeStatus_OUTCOME_STATUS_FAILED, pb.CauseCode_CAUSE_CODE_EXECUTOR_FAULT, false, "failed", 1},
+		{"abandoned before starting", pb.OutcomeStatus_OUTCOME_STATUS_ABANDONED, pb.CauseCode_CAUSE_CODE_EXECUTOR_INVALIDATED, false, "abandoned", 1},
+		{"typed refusal", pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, pb.CauseCode_CAUSE_CODE_CAPABILITY_UNAVAILABLE, false, "refused", 1},
+		{"unknown placement", pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, pb.CauseCode_CAUSE_CODE_UNKNOWN_PLACEMENT, false, "refused", 1},
+		{"stale admission epoch", pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, pb.CauseCode_CAUSE_CODE_ADMISSION_EPOCH_STALE, false, "succeeded", 2},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -89,10 +95,10 @@ func TestAStartedAttemptEndsTheRequestWithItsReason(t *testing.T) {
 			fatal(t, problem)
 			row, problem := o.store.RequestRow(id)
 			fatal(t, problem)
-			if len(attempts) != c.attempts || offers.Load() != int64(c.attempts) || row.Requeues != int64(c.attempts-1) {
-				t.Fatalf("%d attempt(s), %d offer(s), %d requeue(s); want %d attempt(s)", len(attempts), offers.Load(), row.Requeues, c.attempts)
+			if len(attempts) != c.attempts || offers.Load() != int64(c.attempts) {
+				t.Fatalf("%s: %d attempt(s), %d offer(s); want %d", row.State, len(attempts), offers.Load(), c.attempts)
 			}
-			if !c.started {
+			if c.state == "succeeded" {
 				return
 			}
 			errorType, _, message, problem := o.store.SettledFailure(id)
@@ -131,10 +137,10 @@ func TestALostRentalFailsItsStartedAttempt(t *testing.T) {
 	fatal(t, problem)
 	errorType, _, message, problem := o.store.SettledFailure(id)
 	fatal(t, problem)
-	if row.State != "failed" || row.Requeues != 0 || len(attempts) != 1 || purchases.Load() != 0 ||
+	if row.State != "failed" || len(attempts) != 1 || purchases.Load() != 0 ||
 		errorType != "rental.lost" || !strings.Contains(message, "the rented machine gone was lost") {
-		t.Fatalf("a lost started attempt was not failed with its loss: %s, %d requeue(s), %d attempt(s), %d purchase(s), %s: %s",
-			row.State, row.Requeues, len(attempts), purchases.Load(), errorType, message)
+		t.Fatalf("a lost started attempt was not failed with its loss: %s, %d attempt(s), %d purchase(s), %s: %s",
+			row.State, len(attempts), purchases.Load(), errorType, message)
 	}
 }
 

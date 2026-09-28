@@ -206,7 +206,7 @@ func machineSubmission(request records.Request, capture localpackage.ExecutionCa
 	prepared.Revision, prepared.WireMinor, prepared.Posture = 1, pb.WireMinor, pb.Posture_POSTURE_ACCEPTING
 	return &pb.MachineExecutionSubmit{
 		SubmissionId: records.MachineSubmissionID(request.IdemKey), CaptureCanonicalBytes: capture.Canonical, CaptureDigest: capture.Digest,
-		PayloadCanonicalBytes: request.Payload, MaxAttempts: uint32(MaxRequeues + 1),
+		PayloadCanonicalBytes: request.Payload,
 		Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, PlacementId: placementID,
 			InvocationSpecCanonicalBytes: raw, InvocationSpecDigest: digest,
 			Grant: &pb.DeliveryGrant{InvocationSpecDigest: digest, Inputs: inputs, Outputs: access}},

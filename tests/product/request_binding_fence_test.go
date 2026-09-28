@@ -51,7 +51,7 @@ func TestRequestBindingChangesOnlyBeforeAnyAttempt(t *testing.T) {
 							Status: "REFUSED", Cause: "NO_CAPACITY", RequestState: "requeue_pending"})
 						fatal(t, problem)
 						fatal(t, store.Closed(request.ID, ordinal))
-						_, started, _, problem := store.BeginRequeue(request.ID, 3, false)
+						started, problem := store.BeginRequeue(request.ID)
 						fatal(t, problem)
 						if !started {
 							t.Fatal("refused attempt did not return to the queue")

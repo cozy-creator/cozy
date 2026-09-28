@@ -138,8 +138,8 @@ func TestRentalFailureRecovery(t *testing.T) {
 		for _, event := range events {
 			said[event.Type] = event.Payload
 		}
-		if errType == "rental.inference_runtime_owned" || row.Requeues != 0 {
-			t.Fatalf("%s: failed as classic dispatch or was charged a life: %+v %s", id, row, errType)
+		if errType == "rental.inference_runtime_owned" {
+			t.Fatalf("%s: failed as classic dispatch: %+v %s", id, row, errType)
 		}
 		switch {
 		case !arm.sent && arm.selected == "":

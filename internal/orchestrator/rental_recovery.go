@@ -28,9 +28,7 @@ import (
 //
 // THE TWO CASES ARE NOT THE SAME, and they get different answers:
 //
-//	queued, never dispatched   the pin is released and routing replans it. Nothing ran, so
-//	                           no requeue life is charged — the same rule `RequeueForCapacity`
-//	                           already applies to a worker that answered "not now".
+//	queued, never dispatched   the pin is released and routing replans it. Nothing ran.
 //	accepted by a worker       the attempt is closed as lost and the request FAILS naming
 //	                           the loss. It may have executed, and started work is never
 //	                           run again.

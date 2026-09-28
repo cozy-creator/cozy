@@ -138,11 +138,6 @@ type Result struct {
 	Body       []byte // the TerminalBody document, exactly as it was digested
 }
 
-// MaxRequeues is the durable per-request bound on re-offering attempts that never began
-// executing. The bound is a ROW, not a counter in memory: a worker that loses every offer
-// exhausts it instead of dispatching forever.
-const MaxRequeues = 3
-
 // Submit records the request and dispatches its FIRST attempt. It is idempotent in the
 // strong sense: the same key with the same body answers with the recorded request and
 // its current attempt, and never starts a second execution. Re-dispatch is the
@@ -467,86 +462,15 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 	return attempt, nil
 }
 
-// Requeue is the orchestrator's PROJECTION over an attempt that never began executing: it
-// earns a NEW ordinal and a fresh grant, charged against the request's durable budget.
-func (c *Orchestrator) Requeue(requestID, why string) { c.requeue(requestID, why, true) }
-
-// RequeueForCapacity returns a request to the queue WITHOUT spending a life.
-//
-// The two are not the same event and treating them as one killed healthy runs. The budget
-// exists so a worker that faults on every attempt terminates the request rather than
-// dispatching forever. A worker that answered NO_CAPACITY has not attempted anything: it
-// said "not now", which is a fact about the machine's moment and not about the request.
-// Charging it means three "not now"s in a row settle a run that executed nothing —
-// observed as four attempts on one request, every one of them refused before execution.
-//
-// The local path has always drawn this line: `device_envelope_held` in selectOrStart keeps
-// the durable request on the queue and charges nothing, because "a later idle-capacity
-// report re-enters select-or-start". This is the same rule reaching the remote path.
-//
-// It is not an unbounded retry. The request returns to the queue and PARKS; only a worker
-// reporting capacity re-dispatches it, so the loop is driven by an observation rather than
-// by a cadence — and while it waits, the phase lane says so instead of showing silence.
+// RequeueForCapacity returns a request a worker could not admit right now to the queue.
+// It PARKS there: only a worker reporting capacity re-dispatches it, so the wait is driven
+// by an observation rather than a cadence, and it spends nothing — the worker has not
+// attempted anything. The local path draws the same line: `device_envelope_held` keeps the
+// request queued until a later idle-capacity report re-enters select-or-start.
 func (c *Orchestrator) RequeueForCapacity(requestID, why string) {
-	c.requeue(requestID, why, false)
-}
-
-func (c *Orchestrator) requeue(requestID, why string, charge bool) {
-	n, started, canceled, e := c.opt.Store.BeginRequeue(requestID, MaxRequeues, charge)
+	started, e := c.opt.Store.BeginRequeue(requestID)
 	if e != nil {
-		// THE REQUEST ENDS HERE, and it has to SAY so. Settling the row without emitting a
-		// terminal event left a client watching the durable stream with `attempt_failed
-		// (requeuing: true)` as its last frame and nothing after it — the contract's
-		// terminal-stop rule never fired, and `cozy run` waited on a request that had been
-		// settled for ten minutes. Observed live, in cl-003's ARM 3.
 		c.logf("%s NOT requeued (%s): %s", requestID, why, e.Message)
-		c.forget(requestID)
-		payload := map[string]any{
-			"status": "FAILED", "cause": "REQUEUE_BUDGET_EXHAUSTED",
-			"error_type": e.ErrName(), "error": e.Message,
-			"outputs": []any{}, "requeuing": false,
-		}
-		row, read := c.opt.Store.RequestRow(requestID)
-		if read == nil && row != nil && row.RetainWork {
-			_, _ = c.opt.Store.BlockRetainedWork(requestID, "REQUEUE_BUDGET_EXHAUSTED", e.Message)
-			return
-		}
-		if read == nil && row != nil && row.ModelTransfer != nil {
-			if problem := c.releaseManagedNow(*row); problem != nil {
-				c.logf("%s model transfer provider cleanup remains pending: %s", requestID, problem.Message)
-				time.AfterFunc(2*time.Second, func() { c.Requeue(requestID, why) })
-				return
-			}
-			_, _ = c.opt.Store.FailModelTransferRequest(requestID, e.ErrName(), e.Message, payload)
-		} else {
-			_ = c.opt.Store.SettleRequest(requestID, "failed")
-			c.emit(requestID, "request.failed", 0, payload)
-		}
-		c.RetryOutputExport(requestID)
-		if row != nil && row.ModelTransfer != nil {
-			c.forgetTransferProgress(requestID)
-		} else {
-			c.frames.forget(requestID)
-		}
-		c.signalClosed(requestWaitKey(requestID), e)
-		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
-			go c.cleanupRequestAssets(*row)
-		}
-		return
-	}
-	if canceled {
-		c.forget(requestID)
-		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil &&
-			row.ModelTransfer != nil {
-			c.forgetTransferProgress(requestID)
-		} else {
-			c.frames.forget(requestID)
-		}
-		c.signalClosed(requestWaitKey(requestID),
-			exit.New(exit.Canceled, "%s was canceled before its requeue", requestID))
-		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
-			go c.cleanupRequestAssets(*row)
-		}
 		return
 	}
 	if !started {
@@ -556,27 +480,21 @@ func (c *Orchestrator) requeue(requestID, why string, charge bool) {
 	if e != nil || req == nil {
 		return
 	}
-	// THE REQUEUE IS A FACT THE MOMENT THE BUDGET IS CHARGED, and it is announced here —
-	// before dispatch, which may or may not find capacity. Announcing it only on the
-	// successful branch lost the fact exactly when it mattered most: the orchestrator-kill
-	// arm requeued into a worker that was still loading, so the stream said `queued` and
-	// never said WHY, and a client could not tell a first dispatch from a retry.
-	c.emit(requestID, "request.requeued", 0, map[string]any{
-		"cause": why, "requeues": n, "budget": MaxRequeues,
-	})
+	// Announced before dispatch, which may or may not find capacity, so a client can tell
+	// a first dispatch from a re-offer.
+	c.emit(requestID, "request.requeued", 0, map[string]any{"cause": why})
 	attempt, e := c.dispatch(*req)
 	if e != nil {
-		// No capacity yet: the request WAITS. A requeue that cannot be placed is queued,
-		// never dropped — dispatch resumes the moment a worker reports the binding ready.
+		// No capacity yet: the request WAITS, and dispatch resumes the moment a worker
+		// reports the binding ready.
 		c.enqueue(requestID)
 		c.emit(requestID, "request.queued", 0,
-			c.waitOf(*req).decorate(map[string]any{"reason": e.Message, "requeues": n}, *req))
-		c.logf("%s requeued %d/%d and QUEUED for capacity: %s", requestID, n, MaxRequeues, e.Message)
+			c.waitOf(*req).decorate(map[string]any{"reason": e.Message}, *req))
+		c.logf("%s requeued and QUEUED for capacity: %s", requestID, e.Message)
 		c.selectOrStart(*req)
 		return
 	}
-	c.logf("%s requeued as attempt %d (%d/%d of the budget, cause %s)",
-		requestID, attempt, n, MaxRequeues, why)
+	c.logf("%s requeued as attempt %d (cause %s)", requestID, attempt, why)
 }
 
 // selectOrStart makes a queued request's package resident. It is the half of `cozy run`

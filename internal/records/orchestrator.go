@@ -475,7 +475,6 @@ type Request struct {
 	Outputs   string
 	State     string
 	Ordinal   int64
-	Requeues  int64
 	CreatedAt string
 	// Kind is the ATTEMPT CLASS: `serving` or `job`. It is the one discriminator the
 	// whole job branch hangs off, and it lives on the request because a requeue must
@@ -952,7 +951,7 @@ func Lanes(models []ModelRef) string {
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	local_installation_id,local_package_uploaded_boot_id,
 	installation_id,payload,outputs,
-	state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
+	state,ordinal,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,
 	COALESCE(install_id,''),assets,capture,attention_kernel,models,weights_outputs,retain_work,retry_of,reuse_scope,control_revision,
 	parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub`
 
@@ -960,7 +959,7 @@ func requestScanTargets(r *Request, assets, models *string) []any {
 	return []any{&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.Release, &r.LocalInstallationID,
 		&r.LocalPackageUploadedBootID, &r.InstallationID, &r.Payload, &r.Outputs,
-		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
+		&r.State, &r.Ordinal, &r.CreatedAt,
 		&r.Kind, &r.NeedsAccelerator, &r.Org, &r.Trees, &r.Worker, &r.Machine, &r.Rental, &r.RentalRequired,
 		&r.InstallID, assets, &r.Capture, &r.AttentionKernel, models, &r.WeightsOutputs, &r.RetainWork, &r.RetryOf, &r.ReuseScope, &r.ControlRevision,
 		&r.ParentRequestID, &r.ParentCallIndex, &r.ChildIntentDigest, &r.ChildTargetDigest, &r.ChildReusable, &r.ReusedFrom, &r.OrchestrationDirective, &r.ChildArtifacts, &r.RequestedRental, &r.RentNew, &r.Hub}
@@ -1566,46 +1565,16 @@ func (s *Store) SettleRequest(id, state string) *exit.Error {
 	return nil
 }
 
-// BeginRequeue crosses the post-ack boundary and charges the durable retry budget in one
-// transition. Replays after that transition are harmless: only `requeue_pending` can be
-// charged, so a duplicate terminal ack cannot spend twice or mint two ordinals.
-// `charge` is false for a requeue that is CAPACITY PRESSURE rather than a failed attempt.
-// The budget exists so a worker that dies on every attempt terminates the request; a
-// worker that had no room has not tried, and spending a life on being told "not now" is
-// how a request queued behind a busy machine dies having executed nothing.
-func (s *Store) BeginRequeue(id string, max int64, charge bool) (count int64, started, canceled bool, e *exit.Error) {
-	tx, err := s.db.Begin()
+// BeginRequeue crosses the post-ack boundary in one transition. Replays after it are
+// harmless: only `requeue_pending` moves, so a duplicate terminal ack cannot mint two
+// ordinals.
+func (s *Store) BeginRequeue(id string) (bool, *exit.Error) {
+	result, err := s.db.Exec(`UPDATE requests SET state='queued' WHERE id=? AND state='requeue_pending'`, id)
 	if err != nil {
-		return 0, false, false, exit.Internalf("cannot begin the requeue transaction: %s", err)
+		return false, exit.Internalf("cannot requeue %s: %s", id, err)
 	}
-	defer tx.Rollback()
-	var state string
-	if err := tx.QueryRow(`SELECT state,requeues FROM requests WHERE id=?`, id).
-		Scan(&state, &count); err != nil {
-		return 0, false, false, exit.Internalf("cannot read requeue state for %s: %s", id, err)
-	}
-	if state != "requeue_pending" {
-		return count, false, false, nil
-	}
-	if charge && count >= max {
-		return count, false, false, exit.New(exit.Failed, "%s exhausted its requeue budget of %d", id, max)
-	}
-	statement := `UPDATE requests SET state='queued',requeues=requeues+1
-		WHERE id=? AND state='requeue_pending'`
-	if !charge {
-		statement = `UPDATE requests SET state='queued'
-			WHERE id=? AND state='requeue_pending'`
-	}
-	if _, err := tx.Exec(statement, id); err != nil {
-		return 0, false, false, exit.Internalf("cannot charge a requeue for %s: %s", id, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, false, false, exit.Internalf("cannot commit requeue %s: %s", id, err)
-	}
-	if !charge {
-		return count, true, false, nil
-	}
-	return count + 1, true, false, nil
+	n, _ := result.RowsAffected()
+	return n == 1, nil
 }
 
 // Submit records one durable request under its idempotency key. The same key with the
@@ -1723,9 +1692,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,local_installation_id,
 		local_package_uploaded_boot_id,installation_id,
-		payload,outputs,state,ordinal,requeues,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
+		payload,outputs,state,ordinal,created_at,kind,needs_accelerator,org,trees,worker,machine,rental,rental_required,install_id,assets,attention_kernel,models,
 		weights_outputs,retain_work,retry_of,reuse_scope,control_revision,parent_request_id,parent_call_index,child_intent_digest,child_target_digest,child_reusable,reused_from,orchestration_directive,child_artifacts,requested_rental,rent_new,hub)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?, ?,0,?,?,?,?,?,?,
 		COALESCE((SELECT machine_name FROM rentals WHERE id=?),''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.LocalInstallationID,
@@ -2330,9 +2299,8 @@ func (s *Store) OpenAttemptsOf(instanceID string) ([]Attempt, *exit.Error) {
 	return s.attemptsWhere(`instance_id=? AND state IN (`+openAttemptStates+`)`, instanceID)
 }
 
-// ReadyRequeues are committed retry decisions whose old terminal has crossed the
-// acknowledgement boundary. BeginRequeue changes them to queued and charges the budget
-// atomically.
+// ReadyRequeues are committed requeue decisions whose old terminal has crossed the
+// acknowledgement boundary. BeginRequeue changes them to queued.
 func (s *Store) ReadyRequeues() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests
 		WHERE state='requeue_pending' AND EXISTS (
