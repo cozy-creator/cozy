@@ -58,10 +58,6 @@ func (m *machineRuns) reconcilePublications(ctx context.Context, request string,
 	if problem != nil || len(awaiting) == 0 {
 		return problem
 	}
-	workspace, problem := currentExecutionWorkspace(ctx, connection)
-	if problem != nil || !workspace.OwnerPublicationReconciliation {
-		return problem
-	}
 	owner := client(m.context.forHub(hubOrigin))
 	for _, publication := range awaiting {
 		if !m.ownerReads.due(publication.Publication) {

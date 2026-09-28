@@ -75,10 +75,7 @@ func dialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 	if err != nil {
 		return nil, idleControlEnd(err)
 	}
-	if problem := validateMaintenanceProtocol(info); problem != nil {
-		return nil, problem
-	}
-	wireMinor, minimumMinor := min(info.WireMinor, pb.WireMinor), pb.RentalKeepaliveWireMinor
+	wireMinor := min(info.WireMinor, pb.WireMinor)
 	stream, err := pb.NewWorkerControlClient(conn).Control(ctx)
 	if err != nil {
 		return nil, idleControlEnd(err)
@@ -99,7 +96,7 @@ func dialIdleControl(parent context.Context, remote *WorkerConnection, sign Rent
 		switch message := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
 			ack := message.ClaimAck
-			if !ack.Accepted || ack.RecordOwnerEpoch != recordOwnerEpoch || ack.WorkerId != remote.WorkerID || ack.WorkerBootId != remote.WorkerBootID || ack.ControlStreamEpoch == 0 || ack.WireMinor < minimumMinor {
+			if !ack.Accepted || ack.RecordOwnerEpoch != recordOwnerEpoch || ack.WorkerId != remote.WorkerID || ack.WorkerBootId != remote.WorkerBootID || ack.ControlStreamEpoch == 0 {
 				return nil, exit.New(exit.Conflict, "operator control claim was refused or changed the pinned worker")
 			}
 			epoch = ack.ControlStreamEpoch

@@ -180,9 +180,7 @@ func (p *fakePod) ProtocolInfo(ctx context.Context, request *pb.ProtocolInfoRequ
 	if version == 0 {
 		version = pb.WireMinor
 	}
-	_, triage := p.machine.(machineTriagePeer)
-	return &pb.ProtocolInfoResult{WireMinor: version, MinimumWireMinor: min(version, pb.MinCompatibleWireMinor), SupportsRentalKeepalive: true,
-		SupportsMachineExecutionTriage: triage}, nil
+	return &pb.ProtocolInfoResult{WireMinor: version, MinimumWireMinor: min(version, pb.MinCompatibleWireMinor)}, nil
 }
 
 // served is the serve arm's ObservedWorkerState: the exact set accepted and converged,
@@ -478,8 +476,6 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 			p.mu.Lock()
 			p.finalizations = append(p.finalizations, m.WeightsFinalizeRequest)
 			p.mu.Unlock()
-		case *pb.RecordOwnerFrame_LocalPackageFetchRequest:
-			return status.Error(codes.PermissionDenied, "captured wheels must use direct upload")
 		}
 	}
 }
@@ -641,12 +637,6 @@ func (p *fakePod) PreparePackageSet(call *pb.PreparePackageSetCall, stream grpc.
 	downloadSet, err := canonical.Read(call.PackageSet.DownloadDelegation, &pb.DownloadDelegation{})
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "download set: %v", err)
-	}
-	// The pod host's capability check (workerhost/prepare.go checkModelRecovery): a caller
-	// that does not declare materialization recovery cannot prepare downloadable models.
-	if len(downloadSet.List("models")) > 0 && !call.SupportsModelMaterializationRecovery {
-		return status.Error(codes.FailedPrecondition,
-			"model_materialization_recovery_unsupported: update Creator before preparing downloadable models on this Host")
 	}
 	p.mu.Lock()
 	p.prepares = append(p.prepares, call)
@@ -1020,11 +1010,6 @@ func TestPodHostThreeStepSequence(t *testing.T) {
 	}
 	if first := pod.prepares[0]; first.Application != "" || len(first.LockedRequirements) != 0 || len(first.PackageInterface) != 0 {
 		t.Fatalf("the host call carries release facts the machine reads itself: app=%q", first.Application)
-	}
-	for _, d := range pod.desired {
-		if d.GetPackageSet() != nil || d.GetLocalPackageSet() != nil || d.GetPrivatePlacementSet() != nil {
-			t.Fatalf("a host mode crossed WorkerControl: %T", d.Mode)
-		}
 	}
 	sent := pod.desired[0].GetPlacementSet()
 	if sent == nil || !bytes.Equal(sent.PlacementSetCanonicalBytes, pod.preparedSet) ||

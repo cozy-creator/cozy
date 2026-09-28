@@ -20,23 +20,16 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// ToolFloor is the first released Runtime with everything this Cozy drives: the worker
-// wire it requires (MinCompatibleWireMinor), org-relative default lanes, and installed
-// public structs returned through managed callers. Installers upgrade this tool before
-// replacing Cozy.
-// WireFloor independently checks the installed execution ownership capability.
+// ToolFloor is the first released Runtime with everything this Cozy drives. Installers
+// upgrade this tool before replacing Cozy; the tool's worker wire minor is checked apart.
 // Distribution is the Runtime's Python distribution and executable name.
 const Distribution = "cozy-runtime"
 
 const ToolFloor = "0.18.41"
 
-// PackageFloor is the existing package SDK contract. Controller provisioning
-// features do not raise requirements on captured package environments.
-const PackageFloor = "0.18.0"
-
-// WireFloor covers the native Context/TensorFS surface and published captures.
-// Root native inputs require their newer capability at the call site.
-const WireFloor uint32 = 54
+// PackageFloor is the first package SDK whose executor states its protocol revision and native
+// interfaces in its hello.
+const PackageFloor = "0.18.51"
 
 var floor = pep440.MustParse(ToolFloor)
 
@@ -49,7 +42,7 @@ var InstallCommand = fmt.Sprintf(
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
 var hostRuntimeInstall = fmt.Sprintf(
 	"install cozy-runtime %s or newer supporting %s+minor.%d or newer: %s — then retry",
-	ToolFloor, wirePackage(), WireFloor, InstallCommand)
+	ToolFloor, wirePackage(), pb.MinCompatibleWireMinor, InstallCommand)
 
 func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }
 
@@ -63,7 +56,7 @@ var hostRuntimeVerdicts = struct {
 }{admitted: map[string]bool{}}
 
 // Path is the admitted tool. A cozy-runtime on PATH is not yet a tool this daemon can drive. It must vendor this daemon's
-// wire package at WireFloor or newer — the minor is additive, so a newer tool serves
+// wire package at MinCompatibleWireMinor or newer — the minor is additive, so a newer tool serves
 // an older daemon and an older tool cannot (cl-086's live run: a 0.0.29 tool (minor 16) under
 // a minor-22 daemon launched, never came READY, and the request sat `queued` with nothing
 // said). ToolFloor also requires the static script and managed-operation metadata contract.
@@ -126,10 +119,10 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 		return unreadableHostRuntime(path, "`cozy-runtime --json version` names wire_protocol %q, "+
 			"not <package>+minor.<n>", answer.WireProtocol)
 	}
-	if spoken != wirePackage() || uint32(minor) < WireFloor {
+	if spoken != wirePackage() || uint32(minor) < pb.MinCompatibleWireMinor {
 		return exit.Named(exit.Structural, "host_runtime_wire_mismatch",
 			"cozy-runtime %s is release %s and speaks %s; this Cozy needs %s+minor.%d or newer",
-			path, answer.Distribution, answer.WireProtocol, wirePackage(), WireFloor).
+			path, answer.Distribution, answer.WireProtocol, wirePackage(), pb.MinCompatibleWireMinor).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
 	release, err := pep440.Parse(answer.Distribution)

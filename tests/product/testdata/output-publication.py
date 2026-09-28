@@ -68,7 +68,9 @@ def read_input():
                 message = json.loads(line)
                 if "upload" in message:
                     request = pb.WeightsUploadRequest.FromString(base64.b64decode(message["upload"], validate=True))
-                    emit(exchange.upload(request))
+                    answer = exchange.upload(request)
+                    with output_lock:
+                        print(json.dumps({"upload": base64.b64encode(answer.SerializeToString()).decode()}), flush=True)
                 else:
                     raise RuntimeError("unexpected Host bridge message")
             else:
@@ -165,7 +167,7 @@ try:
                     weights_transaction_id=request.weights_transaction_id, writer_epoch=writer_epoch,
                     operation_id=request.operation_id, object_id=obj.object_id,
                     source_ref=obj.source_ref, length=obj.length, grant=grant,
-                    grant_revision=request.grant_revision)).weights_upload_result
+                    grant_revision=request.grant_revision))
                 assert result.outcome in (pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED,
                     pb.WEIGHTS_UPLOAD_OUTCOME_ALREADY_PRESENT), result.safe_detail
                 status.state = (pb.WEIGHTS_TRANSFER_STATE_UPLOADED if result.outcome == pb.WEIGHTS_UPLOAD_OUTCOME_UPLOADED

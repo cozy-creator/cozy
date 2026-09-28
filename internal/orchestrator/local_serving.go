@@ -52,9 +52,6 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 	if s.preparation == nil || w.spec.Connection != nil || spec.Preparation == nil {
 		return WorkerLaunchSpec{}, "", exit.Internalf("local serving preparation has no local worker connection")
 	}
-	if problem := requireMixedModelInputs(s, mixedModelInputs(req.Models)); problem != nil {
-		return WorkerLaunchSpec{}, "", problem
-	}
 	if req.ParentRequestID != "" && len(downloadModelRefs(req.Models)) > 0 {
 		acquirer, ok := c.opt.Packages.(localModelAcquirer)
 		if !ok {
@@ -98,9 +95,6 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 		if root == "" {
 			return WorkerLaunchSpec{}, "", exit.New(exit.Structural, "published local preparation has no worker environment store")
 		}
-		if problem := requireAdapterDownloadPeer(s, selected); problem != nil {
-			return WorkerLaunchSpec{}, "", problem
-		}
 		result, rpcError = s.preparation.PreparePackageSet(s.ctx, &pb.PreparePackageSetRequest{
 			PythonRequires: prep.PythonRequires, PythonVersion: hostruntime.PythonMinor(prep.PythonVersion), InstallRoot: root, DownloadDelegation: selected, Application: prep.Application,
 			ModelSlotPaths: prep.ModelSlotPaths, LockedRequirements: locked,
@@ -141,12 +135,6 @@ func (c *Orchestrator) prepareLocalServing(req records.Request, spec WorkerLaunc
 				}
 			}
 			if problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-			if problem := requireAdapterDownloadPeer(s, call.DownloadDelegation); problem != nil {
-				return WorkerLaunchSpec{}, "", problem
-			}
-			if problem := requireAdapterPeer(s, hasModelAdapters(req.Models)); problem != nil {
 				return WorkerLaunchSpec{}, "", problem
 			}
 			result, rpcError = s.preparation.PreparePrivatePlacement(s.ctx, call, grpc.Trailer(&trailer))

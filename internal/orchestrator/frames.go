@@ -587,7 +587,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 					materialization: p.Materialization, serving: p.Serving,
 					dispatchablePlanIDs: map[string]bool{}, knownPlanIDs: map[string]bool{},
 					loadedPlanIDs: map[string]bool{},
-					loadedKnown:   w.wireMinor >= pb.ExecutionLifecycleWireMinor,
 				}
 				for _, digest := range p.LoadedBindingDigests {
 					row.loadedPlanIDs[spellOf(digest)] = true
@@ -705,12 +704,12 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			// A newer Runtime cannot read a set an older one prepared. Nothing is wrong
 			// with the request: the rental prepares its desired packages again.
 			if f.Reason == placementSetReprepareRequired && w.spec.Connection != nil &&
-				r.AcceptedDesiredStateRevision < desiredRevision && f.Subject == fmt.Sprintf("revision %d", desiredRevision) {
+				r.AcceptedDesiredStateRevision < desiredRevision && f.DesiredStateRevision == desiredRevision {
 				reprepare = true
 				continue
 			}
 			if r.AcceptedDesiredStateRevision < desiredRevision &&
-				f.Subject == fmt.Sprintf("revision %d", desiredRevision) && permanentDesiredRefusal(f.Kind) {
+				f.DesiredStateRevision == desiredRevision && permanentDesiredRefusal(f.Kind) {
 				w.desiredRefusal = exit.Named(exit.Structural, "placement_config_refused",
 					"the package worker refused its placement: %s — %s", f.Reason, brief(f.Detail, 240)).
 					WithRemedy("the installed package Runtime is incompatible with this Cozy build")

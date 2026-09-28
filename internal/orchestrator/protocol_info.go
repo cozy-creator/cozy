@@ -6,45 +6,12 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// Probe the pinned peer before Claim. Its range is recorded, never a reason to refuse the
-// connection or Claim (worker-protocol VERSIONING): each operation gates on what it uses,
-// and a peer without the probe answers an unknown range. Only the rental idle guard is a
-// connection-level requirement, because idle release is unsafe without it.
-func probeWorkerProtocol(ctx context.Context, connection grpc.ClientConnInterface, remote bool) (*pb.ProtocolInfoResult, *exit.Error) {
-	ctx, cancel := context.WithTimeout(ctx, hub.Timeout)
-	defer cancel()
-	var info *pb.ProtocolInfoResult
-	var err error
-	if remote {
-		info, err = pb.NewPodHostClient(connection).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
-	} else {
-		info, err = pb.NewRuntimePreparationClient(connection).ProtocolInfo(ctx, &pb.ProtocolInfoRequest{})
-	}
-	if err != nil {
-		if status.Code(err) != codes.Unimplemented && status.Code(err) != codes.FailedPrecondition {
-			return nil, exit.Unavailablef("worker protocol probe is temporarily unavailable")
-		}
-		return nil, nil
-	}
-	if remote && !info.SupportsRentalKeepalive {
-		return info, rentalIdleGuardRequired()
-	}
-	return info, nil
-}
-
-func rentalIdleGuardRequired() *exit.Error {
-	return exit.Named(exit.Conflict, "worker.rental_idle_guard_required",
-		"this rental worker lacks the reliable active-work reporting or manual keepalive required by the mandatory 15-minute idle shutdown; update the rental worker image")
-}
-
-// ValidateWorkerProtocol gates a NEW preparation or execution on the peer's range and, on
-// a rental, its idle guard. Observation, collection, cancellation and release never call it.
-// A peer outside the range fails only that operation, and the failure names its update.
+// ValidateWorkerProtocol gates a NEW preparation or execution on the peer's range.
+// Observation, collection, cancellation and release never call it. A peer outside the
+// range fails only that operation, and the failure names its update.
 func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental string) *exit.Error {
 	update := "update the local Runtime"
 	if rental != "" {
@@ -64,15 +31,12 @@ func ValidateWorkerProtocol(info *pb.ProtocolInfoResult, rental string) *exit.Er
 		return refuse("Creator executes worker protocol %d–%d; this worker supports %d–%d",
 			pb.MinCompatibleWireMinor, pb.WireMinor, info.MinimumWireMinor, info.WireMinor)
 	}
-	if rental != "" && !info.SupportsRentalKeepalive {
-		return rentalIdleGuardRequired()
-	}
 	return nil
 }
 
 // RentalProtocolInfo reads the pinned PodHost's supported range without a Claim.
-// PodHost answers its intersection with the installed Runtime. This maintenance
-// probe does not admit execution or require the Creator execution range.
+// PodHost answers its intersection with the installed Runtime, or its own range when
+// they share none. This maintenance probe admits no execution.
 func RentalProtocolInfo(ctx context.Context, remote *WorkerConnection) (*pb.ProtocolInfoResult, *exit.Error) {
 	if remote == nil || remote.CACert == "" {
 		return nil, exit.New(exit.Credential, "the protocol probe requires a pinned rental")
@@ -88,14 +52,5 @@ func RentalProtocolInfo(ctx context.Context, remote *WorkerConnection) (*pb.Prot
 	if err != nil {
 		return nil, exit.Unavailablef("the rental's protocol probe failed: %s", status.Convert(err).Message())
 	}
-	return info, validateMaintenanceProtocol(info)
-}
-
-// Maintenance uses only the signed Claim and snapshot surfaces, which no wire minor
-// refuses. It needs the keepalive capability that makes idle release safe.
-func validateMaintenanceProtocol(info *pb.ProtocolInfoResult) *exit.Error {
-	if info == nil || info.WireMinor < pb.RentalKeepaliveWireMinor || !info.SupportsRentalKeepalive {
-		return exit.Named(exit.Conflict, "worker.rental_idle_guard_required", "rental maintenance requires reliable active-work reporting and manual keepalive")
-	}
-	return nil
+	return info, nil
 }

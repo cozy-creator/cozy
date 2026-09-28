@@ -62,8 +62,6 @@ type Client struct {
 	// the same number the DeliveryGrant bounds the write by, so both ends of one object
 	// are held to one figure.
 	maxObject int64
-	// rev is the plane's declared contract revision, learned by Health.
-	rev int
 }
 
 // Budget is the I/O stall allowance: how long one call may go with no byte moving in either
@@ -302,15 +300,9 @@ func (c *Client) Health(ctx context.Context) *exit.Error {
 		return c.skew("calls itself %q and this host dials %q",
 			brief(said.Service), mediawire.Service)
 	}
-	if said.ContractRev == nil {
-		return c.skew("declares NO media contract revision and this host reads rev %d or newer",
-			mediawire.MinContractRev)
+	if said.ContractRev == nil || *said.ContractRev < mediawire.ContractRev {
+		return c.skew("speaks a media contract before rev %d", mediawire.ContractRev)
 	}
-	if *said.ContractRev < mediawire.MinContractRev {
-		return c.skew("speaks media contract rev %d and this host reads rev %d or newer",
-			*said.ContractRev, mediawire.MinContractRev)
-	}
-	c.rev = *said.ContractRev
 	return nil
 }
 
@@ -323,7 +315,7 @@ func (c *Client) skew(format string, args ...any) *exit.Error {
 			"two ends can differ. Rebuild "+
 			"the pod image from a commit that speaks rev %d or newer. Nothing is uploaded "+
 			"to a plane whose answers this host cannot read.",
-			mediawire.MinContractRev).
+			mediawire.ContractRev).
 		WithNext("cozy rental")
 }
 
@@ -522,10 +514,6 @@ const MaxTriageBundle = 1 << 20
 // GetOutputTo this is a transport check of the pod's own declaration; whether the bundle
 // is KEPT is the orchestrator's decision against the terminal it accepted.
 func (c *Client) GetTriage(subject, wantDigest string, wantLength int64) ([]byte, *exit.Error) {
-	if c.rev != 0 && c.rev < mediawire.TriageContractRev {
-		return nil, exit.Named(exit.Unavailable, "triage_unsupported",
-			"the pod's media plane speaks rev %d, before triage bundles (rev %d)", c.rev, mediawire.TriageContractRev)
-	}
 	if wantLength <= 0 || wantLength > MaxTriageBundle {
 		return nil, exit.Named(exit.Validation, "triage_length_invalid",
 			"the terminal declares triage bundle %s as %d B; the protocol bounds one at %d B",

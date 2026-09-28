@@ -12,8 +12,8 @@ import (
 )
 
 // `cozy rental update` reads the pinned PodHost's protocol range over the real TLS
-// probe and refuses a Runtime whose declared wire minimum that host does not reach. A
-// Runtime that declares no readable range is attempted; each operation gates itself.
+// probe and refuses a Runtime whose declared wire minimum that host does not reach, or
+// that declares no readable range.
 func TestRuntimeUpdateRefusesRuntimeAheadOfHost(t *testing.T) {
 	for _, test := range []struct {
 		host   uint32
@@ -24,8 +24,8 @@ func TestRuntimeUpdateRefusesRuntimeAheadOfHost(t *testing.T) {
 		{60, &rental.RuntimeWire{WireMinor: 61, MinimumWireMinor: 60}, ""},
 		{61, &rental.RuntimeWire{WireMinor: 61, MinimumWireMinor: 61}, ""},
 		{61, &rental.RuntimeWire{WireMinor: 62, MinimumWireMinor: 62}, "rental.runtime_update_host_too_old"},
-		{61, nil, ""},
-		{61, &rental.RuntimeWire{WireMinor: 60, MinimumWireMinor: 61}, ""},
+		{61, nil, "rental.runtime_update_range_unreadable"},
+		{61, &rental.RuntimeWire{WireMinor: 60, MinimumWireMinor: 61}, "rental.runtime_update_range_unreadable"},
 	} {
 		public, _, err := ed25519.GenerateKey(rand.Reader)
 		must(t, err)
@@ -40,7 +40,7 @@ func TestRuntimeUpdateRefusesRuntimeAheadOfHost(t *testing.T) {
 		if got != test.code {
 			t.Fatalf("host %d target %+v: %v, want %q", test.host, test.target, problem, test.code)
 		}
-		if got != "" && !strings.Contains(problem.Message, "do not replace the pod Host") {
+		if got == "rental.runtime_update_host_too_old" && !strings.Contains(problem.Message, "do not replace the pod Host") {
 			t.Fatal("refusal did not explain the Host replacement boundary")
 		}
 	}

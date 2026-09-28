@@ -46,7 +46,7 @@ func (m *reconcilingMachine) record(kind string, body map[string]any) {
 
 func (m *reconcilingMachine) GetMachineExecutionWorkspace(_ context.Context, query *pb.MachineExecutionWorkspaceQuery) (*pb.MachineExecutionWorkspace, error) {
 	return &pb.MachineExecutionWorkspace{WorkerId: query.Claim.WorkerId, WorkerBootId: query.Claim.WorkerBootId,
-		ExecutionWorkspaceId: "workspace", OwnerPublicationReconciliation: m.capable}, nil
+		ExecutionWorkspaceId: "workspace"}, nil
 }
 
 func (m *reconcilingMachine) SubmitMachineExecution(context.Context, *pb.MachineExecutionSubmit) (*pb.MachineExecutionReceipt, error) {

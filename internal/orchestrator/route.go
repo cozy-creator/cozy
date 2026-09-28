@@ -89,7 +89,7 @@ func (w *worker) costOn(laneID, placementID, planID string, models []records.Mod
 		resident = l.residentIDs()
 	}
 	observed, remote := w.observedRemote[placementID]
-	if remote && observed.loadedKnown {
+	if remote {
 		if observed.loaded(planID) {
 			return costResident, 0, resident
 		}

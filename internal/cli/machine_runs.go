@@ -454,21 +454,7 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 			}
 
 		}
-		if connection.WireMinor < pb.ModelDefaultGPUCountWireMinor {
-			var capture pb.MachineExecutionCapture
-			if err := canonical.Unmarshal(built.CaptureCanonicalBytes, &capture); err != nil {
-				return exit.Internalf("cannot read captured model preferences: %s", err)
-			}
-			for _, row := range capture.ModelDefaults {
-				for _, rung := range row.Rungs {
-					if rung.Gpus > 0 {
-						return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required", "this call has an explicit model GPU group count and requires Runtime protocol63")
-					}
-				}
-			}
-		}
 		built.PublicationAuthorizationId, built.OwnerMemo = authorization, true
-		built.PreparedState.WireMinor = min(built.PreparedState.WireMinor, connection.WireMinor)
 		if problem := m.freezeMachineSubmission(ctx, connection, request.ID, link.MachineID, built); problem != nil {
 			return problem
 		}
