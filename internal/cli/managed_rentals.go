@@ -602,9 +602,9 @@ func (m *managedRentals) standingLocked(row records.Rental, req records.Request,
 }
 
 // throughput reads the model's published throughput rows once per decision. A
-// request binding no model has nothing to look up.
+// request binding no catalog model (none, or a provider source) has nothing to look up.
 func (m *managedRentals) throughput(origin string, req records.Request) ([]hub.ModelThroughput, *exit.Error) {
-	if len(req.Models) == 0 {
+	if len(req.Models) == 0 || req.Models[0].Model == "" {
 		return nil, nil
 	}
 	ref, problem := hub.ParseRef(req.Models[0].Model)

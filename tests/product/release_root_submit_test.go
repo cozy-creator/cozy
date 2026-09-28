@@ -560,6 +560,45 @@ func TestAJobsProviderSourceGoesByReleaseRootWhereTheMachineMakesIt(t *testing.T
 	}
 }
 
+// A provider-source job with no machine named goes by release root too: the source's
+// reviewed carriers size the rental that placement picks (provider reads only; no transfer is
+// recorded), and the machine it lands on makes the source.
+func TestAnAutoRentedProviderSourceJobGoesByReleaseRoot(t *testing.T) {
+	const source = "hf://alibaba-pai/MiniMax-H3-Acc-LoRAs@335001fb9e5455d68a0caa18ec2e319072150328"
+	probe, err := (&http.Client{Timeout: 20 * time.Second}).Get("https://huggingface.co/api/models/alibaba-pai/MiniMax-H3-Acc-LoRAs")
+	if err != nil {
+		t.Skipf("provider unreachable from this runner: %v", err)
+	}
+	probe.Body.Close()
+	root, machine, store, _ := sourceJobHome(t)
+	code, out := runCozy(t, root, "run", ladderPackage+"/long_form", "model.source="+source,
+		"--source-profile", "source=hf/minimax-h3/pdd-fl2va-bf16/1", "--rental-only", "--json", "--idempotency-key", "source-auto")
+	if code != 0 {
+		t.Fatalf("the auto-rented source job was refused [exit %d]: %s", code, out)
+	}
+	var id string
+	waitFor(t, root, "the auto-rented source job's acceptance", func() bool {
+		row, problem := store.RequestByIdempotencyKey("source-auto")
+		if problem == nil && row != nil {
+			id = row.ID
+		}
+		return id != "" && machine.accepted(id)
+	})
+	row, problem := store.RequestRow(id)
+	fatal(t, problem)
+	planned, problem := store.PlannedSourceBytes(id)
+	fatal(t, problem)
+	machine.mu.Lock()
+	last := machine.roots[len(machine.roots)-1]
+	machine.mu.Unlock()
+	sourced := slices.IndexFunc(last.Models, func(choice *pb.ModelChoice) bool { return choice.Parameter == "source" })
+	if row.ModelTransfer != nil || row.Worker != "pr-test-0001" || planned <= 0 || !last.Job || sourced < 0 ||
+		last.Models[sourced].Source != source || !slices.Equal(last.Models[sourced].Profiles, []string{"hf/minimax-h3/pdd-fl2va-bf16/1"}) {
+		t.Fatalf("the auto-rented source job did not go by release root: worker %q, transfer %+v, planned %d, root %+v",
+			row.Worker, row.ModelTransfer, planned, last)
+	}
+}
+
 // A terminal the machine journals between the observer's state read and its event read is
 // taken at once: the observer reads the state again instead of holding a read open for an
 // event after the machine's last one.

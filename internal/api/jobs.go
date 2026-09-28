@@ -1372,12 +1372,9 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// chosenModels is a job on a named machine whose slots that machine resolves (release
-// roots), or the daemon does at dispatch for one without: nothing is resolved on record.
+// chosenModels is a job whose slots the machine that runs it resolves (release roots): this
+// computer's, a named rental, or the one placement picks. Nothing is resolved on record.
 func chosenModels(sub JobSubmission) bool {
-	if sub.RequestedRental == "" {
-		return false
-	}
 	for _, model := range sub.Models {
 		if !model.Choice {
 			return false

@@ -118,6 +118,11 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		}
 	}
 	sub.Models = models
+	if chosen && selectedRental == "" && rentalRequested(ctx) {
+		if sub.PlannedSourceBytes, e = sourceRentalBytes(ctx, models); e != nil {
+			return e
+		}
+	}
 	if source != "" {
 		if len(trees) > 0 {
 			return exit.Usagef("foreign model inputs cannot also use local input trees")

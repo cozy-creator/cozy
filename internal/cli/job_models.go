@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -93,16 +94,46 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 	return source, profiles, nil, nil
 }
 
-// jobModelChoices are a published job's explicit Model choices, unresolved, when it runs on a
-// known machine (this computer's or a named rental): that machine resolves them, provider
-// sources included. It answers false when the client must resolve them itself: choosing a
-// machine to rent reads the ladders.
+// jobModelChoices are a published job's explicit Model choices, unresolved, for the machine
+// that runs it to resolve, provider sources included. It answers false when the client must
+// resolve them itself: choosing a machine to rent reads the ladders, unless every slot names
+// one provider source, whose rental the source sizes (sourceRentalBytes).
 func jobModelChoices(ctx *Context, target Target, job *launch.Entrypoint, overrides map[string]string,
 	rental string) ([]orchestrator.ModelRef, bool, *exit.Error) {
-	if rental == "" && rentalRequested(ctx) {
+	models, chosen, problem := modelChoices(ctx, target, job, overrides)
+	if problem != nil || !chosen || rental != "" || !rentalRequested(ctx) {
+		return models, chosen, problem
+	}
+	if len(models) == 0 || len(models) != len(job.Models) {
 		return nil, false, nil
 	}
-	return modelChoices(ctx, target, job, overrides)
+	for _, model := range models {
+		if model.Source == "" || model.Source != models[0].Source {
+			return nil, false, nil
+		}
+	}
+	return models, true, nil
+}
+
+// sourceRentalBytes sizes a rental bought for a provider-source job as `cozy rental new
+// --model` does: the source's reviewed carriers, after the header preflight that refuses
+// before anything is bought (tfs-076). Provider reads only; the machine makes the source.
+func sourceRentalBytes(ctx *Context, models []orchestrator.ModelRef) (int64, *exit.Error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return 0, exit.Internalf("cannot resolve the current directory: %s", err)
+	}
+	parsed, problem := modelsource.Parse(models[0].Source, cwd)
+	if problem != nil {
+		return 0, problem
+	}
+	var profiles []string
+	for _, model := range models {
+		profiles = append(profiles, model.Profiles...)
+	}
+	slices.Sort(profiles)
+	plan, problem := planNativeIngest(ctx, cwd, parsed, slices.Compact(profiles))
+	return plan.source.Bytes, problem
 }
 
 func jobOutputDestination(ctx *Context, job *launch.Entrypoint, sub *api.JobSubmission) *exit.Error {

@@ -725,6 +725,9 @@ func (m ModelRef) Pinned() bool { return m.Manifest != "" }
 // its exact group, which its ladder, if any, must author on this accelerator. An empty
 // accelerator — a host without an NVIDIA device — matches only a "*" rung.
 func (m ModelRef) RungAt(accelerator string, width int) (ModelRung, int, bool) {
+	if m.Source != "" {
+		return m.sourceRung()
+	}
 	if m.Pinned() {
 		authored := m.GPUs == 0 || len(m.Ladder) == 0
 		for _, rung := range m.Ladder {
@@ -764,6 +767,9 @@ func Width(models []ModelRef, machine int) int {
 
 // PurchaseRung only buys a wider machine when that exact group is authored.
 func (m ModelRef) PurchaseRung(accelerator string, count int) (ModelRung, int, bool) {
+	if m.Source != "" {
+		return m.sourceRung()
+	}
 	if m.Pinned() {
 		rung, index, ok := m.RungAt(accelerator, m.GPUs)
 		return rung, index, ok && m.GPUs <= count
@@ -779,6 +785,12 @@ func (m ModelRef) PurchaseRung(accelerator string, count int) (ModelRung, int, b
 		}
 	}
 	return ModelRung{}, -1, false
+}
+
+// sourceRung is a provider source's only rung: it has no ladder, and the machine that makes
+// it sizes it, so it fits any accelerator at its authored width.
+func (m ModelRef) sourceRung() (ModelRung, int, bool) {
+	return ModelRung{GPU: "*", GPUs: m.GPUs}, 0, true
 }
 
 // Pin returns the ref bound to one rung, its ladder kept.
