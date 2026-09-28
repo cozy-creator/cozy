@@ -41,7 +41,8 @@
 //! The ONE transport (tfs-048/tfs-049/tfs-050). The credential is `--credential-file` or
 //! TFS_CREDENTIAL (`bearer <token>`, `worker <id> <token>`, or empty for anonymous), never
 //! bare argv; a URL of `-` arrives on stdin. Flags: --hub <base> --lane --session --streams <n>
-//! --streams-start <n> --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>.
+//! --streams-start <n> --timeout <s> --allow-hosts a,b,.c --allow-local --max-redirects <n>
+//! --ca-file <pem> (a private hub's CA, trusted beside the webpki set).
 //! `--streams` is the most objects in flight (default 128, memory-bounded); the walk starts
 //! at `--streams-start` (default 16) and doubles while measured goodput follows.
 //! `tfs fetch` reads and backfills the Store's bound repo cache between the local Store
@@ -202,6 +203,17 @@ fn accept_printed_ids(args: Vec<String>) -> Vec<String> {
 
 fn main() -> ExitCode {
     let (args, flags) = split_flags(std::env::args().skip(1).collect());
+    if let Some(path) = flag(&flags, "ca-file") {
+        let trusted = fs::read(path)
+            .map_err(|e| format!("IO_FAILED: read {path}: {e}"))
+            .and_then(|pem| {
+                tensorfs_core::transport::trust_roots(&pem).map_err(|r| format!("{r} ({path})"))
+            });
+        if let Err(refusal) = trusted {
+            eprintln!("REFUSED {refusal}");
+            return ExitCode::FAILURE;
+        }
+    }
     let args = accept_printed_ids(args);
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match a.as_slice() {

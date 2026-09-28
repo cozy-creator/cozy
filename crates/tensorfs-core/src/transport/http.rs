@@ -30,10 +30,11 @@
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::transport::ledger::{Deadline, Ledger};
 use crate::transport::policy::CheckedUrl;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const HEAD_MAX_BYTES: usize = 64 * 1024;
@@ -211,13 +212,35 @@ struct Idle {
     wire: Wire,
 }
 
+/// Authorities this process trusts beside the webpki set: a private hub's CA, named by its
+/// caller as a location (`tfs --ca-file`). Set once, before the first exchange.
+static EXTRA_ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
+
+/// Trust the PEM certificates in `pem` for every client this process builds.
+pub fn trust_roots(pem: &[u8]) -> Result<usize> {
+    let roots: Vec<_> = CertificateDer::pem_slice_iter(pem)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Refusal {
+            code: Code::UNKNOWN_FORMAT,
+            detail: format!("not a PEM certificate bundle: {e}"),
+        })?;
+    let (usable, _) = rustls::RootCertStore::empty().add_parsable_certificates(roots.clone());
+    if roots.is_empty() || usable != roots.len() {
+        return refuse(Code::UNKNOWN_FORMAT, "holds no usable CA certificate");
+    }
+    EXTRA_ROOTS.set(roots).map_err(|_| Refusal {
+        code: Code::UNKNOWN_FORMAT,
+        detail: "this process already chose its trust roots".into(),
+    })?;
+    Ok(usable)
+}
+
 impl Client {
     pub fn new() -> Client {
-        Client::with_extra_roots(&[])
+        Client::with_extra_roots(EXTRA_ROOTS.get().map_or(&[], Vec::as_slice))
     }
 
-    /// `extra_roots` exists for tests that stand up a loopback TLS origin under a
-    /// self-signed authority; production callers pass none and trust the webpki set.
+    /// Trusts the webpki set plus `extra_roots`.
     pub fn with_extra_roots(extra_roots: &[CertificateDer<'static>]) -> Client {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -482,7 +505,9 @@ fn connect(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tls_handshake(
+    host: &str,
     sock: &mut TcpStream,
     conn: &mut rustls::ClientConnection,
     deadline: Deadline,
@@ -516,10 +541,18 @@ fn tls_handshake(
             Ok(0) => return refuse(fail, "origin closed the connection mid-handshake"),
             Ok(_) => {
                 advanced = Instant::now();
-                conn.process_new_packets().map_err(|e| Refusal {
-                    code: fail,
-                    detail: format!("TLS refused: {e}"),
-                })?;
+                // A certificate or protocol verdict is this client's, and re-asking reaches
+                // it again: refused typed, never retried as weather. The alert goes out so
+                // the origin logs why.
+                if let Err(e) = conn.process_new_packets() {
+                    let _ = conn.write_tls(sock);
+                    return refuse(
+                        Code::TLS_UNTRUSTED,
+                        format!(
+                            "{host}: TLS refused: {e}; a private hub names its CA with --ca-file"
+                        ),
+                    );
+                }
             }
             Err(e) if would_block(&e) => {
                 stream_verdict(judge, ledger, advanced, "TLS handshake")?;
@@ -1041,7 +1074,16 @@ pub fn send<'l>(
                 })?;
             let mut sock = sock;
             let mut conn = Box::new(conn);
-            tls_handshake(&mut sock, &mut conn, deadline, ledger, judge, opened, fail)?;
+            tls_handshake(
+                &checked.host,
+                &mut sock,
+                &mut conn,
+                deadline,
+                ledger,
+                judge,
+                opened,
+                fail,
+            )?;
             Wire::Tls { sock, conn }
         } else {
             Wire::Plain(sock)
