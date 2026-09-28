@@ -604,7 +604,7 @@ class Store:
     def derived_declaration(
         self, sources: dict[str, Any], targets: dict[str, Any], configs: dict[str, Any],
         order: Sequence[tuple[str, str]], max_new_bytes: int,
-        files: Mapping[str, str] | None = None, *, work_fingerprint: str,
+        files: Mapping[str, str | tuple[str, int]] | None = None, *, work_fingerprint: str,
     ) -> bytes: ...
     def validate_derived_checkpoint(
         self, transaction_id: str, declaration: bytes, head_id: str, head_length: int, *,
@@ -619,7 +619,7 @@ class Store:
         configs: dict[str, Any],
         order: Sequence[tuple[str, str]],
         max_new_bytes: int,
-        files: Mapping[str, str] | None = None,
+        files: Mapping[str, str | tuple[str, int]] | None = None,
         *,
         work_fingerprint: str,
         checkpoint: tuple[str, int] | None = None,
@@ -633,7 +633,7 @@ class Store:
         configs: dict[str, Any],
         order: Sequence[tuple[str, str]],
         max_new_bytes: int,
-        files: Mapping[str, str] | None = None,
+        files: Mapping[str, str | tuple[str, int]] | None = None,
         *,
         work_fingerprint: str,
         checkpoint: tuple[str, int] | None = None,
