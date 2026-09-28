@@ -7,15 +7,10 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/capability"
 	"google.golang.org/grpc"
 )
 
@@ -57,7 +52,6 @@ func (m *Machine) listen() (*listeners, error) {
 	routes := http.NewServeMux()
 	routes.HandleFunc("GET /v1/bootstrap/receipt", m.serveReceipt)
 	routes.HandleFunc("GET /v1/health", serveHealth)
-	routes.HandleFunc("GET /v1/objects/{digest}", m.serveObject)
 	main := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ProtoMajor == 2 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
 			grpcServer.ServeHTTP(w, r)
@@ -106,44 +100,4 @@ func serveHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-var sha256Digest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-
-// serveObject streams one object of the machine's TensorFS store with full Range semantics:
-// the digest is its ETag, so If-Range holds exactly. A capability in the Authorization header
-// (`Cozy-Cap <token>`) grants it.
-func (m *Machine) serveObject(w http.ResponseWriter, r *http.Request) {
-	digest := r.PathValue("digest")
-	token, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Cozy-Cap ")
-	grant, err := capability.Verify(token, m.grant.WorkerID, m.claims.authorized, time.Now())
-	switch {
-	case err != nil:
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	case !sha256Digest.MatchString(digest) || !grant.AllowsObject(digest):
-		http.Error(w, capability.ErrScope.Error(), http.StatusForbidden)
-		return
-	}
-	hex := strings.TrimPrefix(digest, "sha256:")
-	file, err := os.OpenFile(filepath.Join(m.layout.Store, "blobs", hex[:2], hex[2:4], hex), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		http.Error(w, "this machine holds no such object", http.StatusNotFound)
-		return
-	}
-	defer file.Close()
-	w.Header().Set("ETag", `"`+digest+`"`)
-	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
-	w.Header().Set("Content-Type", contentType(r.URL.Query().Get("type")))
-	http.ServeContent(w, r, "", time.Time{}, file)
-}
-
-// contentType is the media type a client asks for, from a small closed set.
-func contentType(asked string) string {
-	switch asked {
-	case "video/mp4", "audio/mp4", "audio/mpeg", "audio/wav", "image/png", "image/jpeg", "image/webp",
-		"video/mp2t", "application/json", "text/plain":
-		return asked
-	}
-	return "application/octet-stream"
 }
