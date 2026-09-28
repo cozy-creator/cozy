@@ -9,16 +9,23 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // hostIdleClock is a Host's own idle release: it releases once its granted deadline
 // passes without a renewal. Its Runtime reports nothing here, as after the Runtime
-// restart on denken, so a keepalive is the only renewal it gets.
+// restart on denken, so a keepalive is the only renewal it gets. Like the Host, it
+// answers a replayed request id with the original receipt and no renewal, and refuses
+// a keepalive at or after the deadline.
 type hostIdleClock struct {
 	mu       sync.Mutex
 	window   time.Duration
 	deadline time.Time
 	renewals []time.Time
+	receipts map[string]*pb.KeepRentalAliveResult
+	replays  int
+	early    int
 	lapsed   time.Time
 }
 
@@ -26,13 +33,28 @@ func (h *hostIdleClock) keepalive(request *pb.KeepRentalAliveRequest) (*pb.KeepR
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	now := time.Now()
-	if !h.deadline.IsZero() && now.After(h.deadline) && h.lapsed.IsZero() {
-		h.lapsed = h.deadline
+	if receipt, replayed := h.receipts[request.RequestId]; replayed {
+		h.replays++
+		return receipt, nil
+	}
+	if !h.deadline.IsZero() && !now.Before(h.deadline) {
+		if h.lapsed.IsZero() {
+			h.lapsed = h.deadline
+		}
+		return nil, status.Error(codes.FailedPrecondition, "rental idle release is already due or committed")
+	}
+	if n := len(h.renewals); n > 0 && now.Sub(h.renewals[n-1]) < h.window/2 {
+		h.early++
 	}
 	h.deadline = now.Add(h.window)
 	h.renewals = append(h.renewals, now)
-	return &pb.KeepRentalAliveResult{RequestId: request.RequestId, WorkerId: request.Claim.WorkerId, WorkerBootId: request.Claim.WorkerBootId,
-		AcknowledgedAtUnixMs: now.UnixMilli(), IdleDeadlineUnixMs: h.deadline.UnixMilli()}, nil
+	receipt := &pb.KeepRentalAliveResult{RequestId: request.RequestId, WorkerId: request.Claim.WorkerId, WorkerBootId: request.Claim.WorkerBootId,
+		AcknowledgedAtUnixMs: now.UnixMilli(), IdleDeadlineUnixMs: h.deadline.UnixMilli()}
+	if h.receipts == nil {
+		h.receipts = map[string]*pb.KeepRentalAliveResult{}
+	}
+	h.receipts[request.RequestId] = receipt
+	return receipt, nil
 }
 
 // start sets the deadline the Host holds when work arrives it does not itself observe.
@@ -95,6 +117,13 @@ func TestAcceptedExecutionHoldsTheRentalAgainstTheHostIdleRelease(t *testing.T) 
 	}
 	if renewals, _, _ := host.state(); renewals < 3 {
 		t.Fatalf("the executing run renewed the Host deadline only %d time(s) over three windows", renewals)
+	}
+	// Each renewal is a fresh request, sent once half the granted window has passed.
+	host.mu.Lock()
+	replays, early := host.replays, host.early
+	host.mu.Unlock()
+	if replays != 0 || early != 0 {
+		t.Fatalf("renewals replayed %d request id(s) and came %d time(s) before half the window", replays, early)
 	}
 	if _, list := cozyWithin(t, root, time.Minute, "rental", "list"); !strings.Contains(list, "tessa") {
 		t.Fatalf("the rental was released while its run executed:\n%s", list)
