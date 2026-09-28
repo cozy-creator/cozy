@@ -46,7 +46,7 @@ func TestNamedRentalCLIUsesActualInventoryAndNeverAcquires(t *testing.T) {
 	st.Close()
 	installedHere(t, root, hubURL, "proof/quantize", "1.0.0")
 	args := []string{"run", "proof/quantize/quantize", "steps=7", "model.dits=proof/source@1.0.0/bf16", "model.shared=proof/source@1.0.0/bf16", "--json", "--full"}
-	for _, name := range []string{"isao", current} {
+	for _, name := range []string{"isao", "Isao", current} {
 		request, _, out := submitRun(t, root, "named-"+name, append(append([]string{}, args...), "--rental="+name)...)
 		if request == nil || request.RequestedRental != current {
 			t.Fatalf("named rental %s: %+v %s", name, request, out)

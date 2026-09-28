@@ -16,9 +16,9 @@ type Account struct {
 	Name string `json:"name"`
 }
 
-// CurrentAccount is the authenticated user's immutable Tensorhub account name. It is read
-// once per credential and kept beside it: a later command reads no Hub. Another login or
-// operator token is another credential, and asks once.
+// CurrentAccount is the authenticated user's immutable Tensorhub account name, in its one
+// lowercase spelling. It is read once per credential and kept beside it: a later command
+// reads no Hub. Another login or operator token is another credential, and asks once.
 func (c *Client) CurrentAccount(ctx context.Context) (Account, *exit.Error) {
 	var out Account
 	kept := c.accountPath()
@@ -28,6 +28,7 @@ func (c *Client) CurrentAccount(ctx context.Context) (Account, *exit.Error) {
 	problem := c.do(ctx, call{
 		method: http.MethodGet, path: "/v1/accounts/current", auth: true,
 	}, &out)
+	out.Name = CanonicalName(out.Name)
 	if problem == nil && !resourceSlug.MatchString(out.Name) {
 		problem = exit.Named(exit.Internal, "account.current_invalid",
 			"Tensorhub returned an invalid current account name")
@@ -67,6 +68,7 @@ func (c *Client) RegisterAccount(ctx context.Context, name string) (Account, *ex
 		method: http.MethodPut, path: "/v1/accounts/" + url.PathEscape(name),
 		auth: true, body: struct{}{},
 	}, &out)
+	out.Name = CanonicalName(out.Name)
 	if problem == nil && out.Name != name {
 		problem = exit.Named(exit.Internal, "account.registration_invalid",
 			"Tensorhub registered account %q, not %q", out.Name, name)

@@ -23,7 +23,7 @@ func requestedRental(ctx *Context) (string, *exit.Error) {
 		if problem != nil {
 			return "", problem
 		}
-		if prior != nil && prior.RequestedRental != "" && (name == prior.RequestedRental || name == prior.Machine) {
+		if prior != nil && prior.RequestedRental != "" && (name == prior.RequestedRental || strings.EqualFold(name, prior.Machine)) {
 			return prior.RequestedRental, nil
 		}
 	}

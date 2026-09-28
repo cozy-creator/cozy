@@ -47,10 +47,11 @@ func runInputJSONRoot(t *testing.T) string {
 func TestRunInputJSONFileAndAliasPreserveNestedPayload(t *testing.T) {
 	root := runInputJSONRoot(t)
 	infile := filepath.Join(root, "scene=shots.json")
-	payload := `{"shots":[{"prompt":"First shot","seed":101},{"prompt":"Second shot","seed":102}],"steps":30}`
+	// Field names fold onto the declared spelling, as CLI terms do.
+	payload := `{"Shots":[{"prompt":"First shot","seed":101},{"prompt":"Second shot","seed":102}],"STEPS":30}`
 	must(t, os.WriteFile(infile, []byte(payload), 0600))
 	var expected any
-	must(t, json.Unmarshal([]byte(payload), &expected))
+	must(t, json.Unmarshal([]byte(strings.NewReplacer(`"Shots"`, `"shots"`, `"STEPS"`, `"steps"`).Replace(payload)), &expected))
 	expected.(map[string]any)["steps"] = float64(7)
 	for _, flag := range []string{"--input"} {
 		for _, inline := range []bool{false, true} {

@@ -277,13 +277,14 @@ func TestHubContextsSelectTheCurrentHub(t *testing.T) {
 		!strings.Contains(out, `"url":"`+config.DefaultHubURL+`"`) {
 		t.Fatalf("a fresh install does not list the default hub: %d %s", code, out)
 	}
-	if code, out := runCozy(t, root, "hub", "add", "local", "http://127.0.0.1:1/", "--json"); code != 0 {
+	// A hub name is one identity in any case.
+	if code, out := runCozy(t, root, "hub", "add", "Local", "http://127.0.0.1:1/", "--json"); code != 0 {
 		t.Fatalf("hub add: %d %s", code, out)
 	}
 	if code, out := runCozy(t, root, "hub", "add", "Bad Name", "http://127.0.0.1:1", "--json"); code == 0 {
 		t.Fatalf("an invalid hub name was accepted: %s", out)
 	}
-	if code, out := runCozy(t, root, "hub", "use", "local", "--json"); code != 0 {
+	if code, out := runCozy(t, root, "hub", "use", "LOCAL", "--json"); code != 0 {
 		t.Fatalf("hub use: %d %s", code, out)
 	}
 	raw, err := os.ReadFile(filepath.Join(root, config.FileName))
@@ -315,11 +316,19 @@ func TestHubContextsSelectTheCurrentHub(t *testing.T) {
 	if code, out := runCozy(t, root, "hub", "use", config.DefaultHubName, "--json"); code != 0 {
 		t.Fatalf("hub use %s: %d %s", config.DefaultHubName, code, out)
 	}
-	if code, out := runCozy(t, root, "hub", "remove", "local", "--json"); code != 0 {
+	if code, out := runCozy(t, root, "hub", "remove", "Local", "--json"); code != 0 {
 		t.Fatalf("hub remove: %d %s", code, out)
 	}
-	// An operator token names no hub of its own, so switching would carry it along.
+	// A capital in a hand-written hubs: key names the same hub, and every command still loads.
 	path := filepath.Join(root, config.FileName)
+	raw, err = os.ReadFile(path)
+	must(t, err)
+	must(t, os.WriteFile(path, append(raw, []byte("hubs:\n  Staging: http://127.0.0.1:2\n")...), 0o600))
+	if code, out := runCozy(t, root, "--tensorhub=STAGING", "hub", "list", "--json"); code != 0 || !strings.Contains(out, `"name":"staging"`) {
+		t.Fatalf("a capital hub name did not load: %d %s", code, out)
+	}
+	must(t, os.WriteFile(path, raw, 0o600))
+	// An operator token names no hub of its own, so switching would carry it along.
 	raw, err = os.ReadFile(path)
 	must(t, err)
 	must(t, os.WriteFile(path, append(raw, []byte("tensorhub_token: operator-token\n")...), 0o600))

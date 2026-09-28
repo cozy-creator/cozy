@@ -2,6 +2,7 @@ package rental
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -68,7 +69,7 @@ func Resolve(st *records.Store, typed string) (Subject, *exit.Error) {
 		name := operationMachineName(op)
 		match := op.RentalID != "" && op.RentalID == found.RentalID
 		if found.Row == nil {
-			match = match || op.RentalID != "" && op.RentalID == typed || name == typed
+			match = match || op.RentalID != "" && op.RentalID == typed || strings.EqualFold(name, typed)
 		}
 		if !match {
 			continue

@@ -375,11 +375,11 @@ func (c Config) HubLabel(origin string) string {
 	return origin
 }
 
-// ResolveHub turns a hub name or URL into its origin and name.
+// ResolveHub turns a hub name, in any case, or URL into its origin and name.
 func ResolveHub(value string, hubs map[string]string) (string, string, *exit.Error) {
 	value = strings.TrimSpace(value)
-	if origin, named := hubs[value]; named {
-		return origin, value, nil
+	if origin, named := hubs[strings.ToLower(value)]; named {
+		return origin, strings.ToLower(value), nil
 	}
 	origin, problem := HubOrigin(value)
 	if problem != nil {
@@ -683,8 +683,8 @@ var hubName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 // selection is always unambiguous.
 func ValidHubName(name string) bool { return hubName.MatchString(name) }
 
-// hubsSection reads `hubs:`, the named Tensorhubs: each key a hub name, each value
-// that hub's base URL.
+// hubsSection reads `hubs:`, the named Tensorhubs: each key a hub name, in any case, each
+// value that hub's base URL.
 func hubsSection(value *yaml.Node) (map[string]string, error) {
 	if value.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("line %d value for \"hubs\" is not a mapping of names to URLs", value.Line)
@@ -692,8 +692,9 @@ func hubsSection(value *yaml.Node) (map[string]string, error) {
 	hubs := make(map[string]string, len(value.Content)/2)
 	for j := 0; j < len(value.Content); j += 2 {
 		name, url := value.Content[j], value.Content[j+1]
+		name.Value = strings.ToLower(name.Value)
 		if name.Kind != yaml.ScalarNode || !ValidHubName(name.Value) {
-			return nil, fmt.Errorf("line %d hub name %q is not lowercase letters, digits, '.', '_' or '-'", name.Line, name.Value)
+			return nil, fmt.Errorf("line %d hub name %q is not letters, digits, '.', '_' or '-'", name.Line, name.Value)
 		}
 		if _, exists := hubs[name.Value]; exists {
 			return nil, fmt.Errorf("line %d names hub %q twice", name.Line, name.Value)
@@ -865,17 +866,25 @@ func UseHub(home, selection string, hubs map[string]string) (string, *exit.Error
 	})
 }
 
-// AddHub names one Tensorhub URL (`hubs.<name>`), replacing an earlier URL for the name.
+// AddHub names one Tensorhub URL (`hubs.<name>`, the name in any case), replacing an earlier
+// URL for the name.
 func AddHub(home, name, rawURL string) (string, *exit.Error) {
+	name = strings.ToLower(name)
 	if !ValidHubName(name) {
-		return "", exit.Usagef("hub name %q is not lowercase letters, digits, '.', '_' or '-'", name)
+		return "", exit.Usagef("hub name %q is not letters, digits, '.', '_' or '-'", name)
 	}
 	origin, problem := HubOrigin(rawURL)
 	if problem != nil {
 		return "", problem
 	}
 	return origin, editFile(home, func(root *yaml.Node) bool {
-		setScalar(mapping(root, "hubs"), name, origin)
+		section := mapping(root, "hubs")
+		for i := 0; i < len(section.Content); i += 2 {
+			if strings.EqualFold(section.Content[i].Value, name) {
+				section.Content[i].Value = name
+			}
+		}
+		setScalar(section, name, origin)
 		return true
 	})
 }
@@ -885,14 +894,14 @@ func RemoveHub(home, name string) *exit.Error {
 	found, current := false, false
 	problem := editFile(home, func(root *yaml.Node) bool {
 		for i := 0; i < len(root.Content); i += 2 {
-			if root.Content[i].Value == "tensorhub_url" && root.Content[i+1].Value == name {
+			if root.Content[i].Value == "tensorhub_url" && strings.EqualFold(root.Content[i+1].Value, name) {
 				current = true
 				return false
 			}
 		}
 		section := mapping(root, "hubs")
 		for i := 0; i < len(section.Content); i += 2 {
-			if section.Content[i].Value == name {
+			if strings.EqualFold(section.Content[i].Value, name) {
 				section.Content = append(section.Content[:i], section.Content[i+2:]...)
 				found = true
 				break

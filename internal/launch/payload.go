@@ -76,6 +76,18 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		if err := json.Unmarshal(data, &loaded); err != nil {
 			return nil, RunKeys{}, exit.New(exit.Validation, "--input %s does not hold one JSON object: %s", infile, err)
 		}
+		// Field names fold onto the declared spelling, as terms do; an exact spelling wins.
+		folded := make(map[string]json.RawMessage, len(loaded))
+		for k, v := range loaded {
+			key, problem := canonicalFieldKey(ep, k)
+			if problem != nil {
+				return nil, RunKeys{}, problem
+			}
+			if _, exact := loaded[key]; !exact || key == k {
+				folded[key] = v
+			}
+		}
+		data, _ = json.Marshal(folded)
 		// Only declared media fields are filenames; ordinary prompt strings are untouched.
 		data, problem := mapAssetFilenames(ep, data, func(path, source string) (any, *exit.Error) {
 			if strings.Contains(source, "://") {
@@ -94,6 +106,7 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (
 		if problem != nil {
 			return nil, RunKeys{}, problem
 		}
+		loaded = nil
 		if err := json.Unmarshal(data, &loaded); err != nil {
 			return nil, RunKeys{}, exit.Internalf("cannot read normalized JSON inputs: %s", err)
 		}
