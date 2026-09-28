@@ -2,9 +2,17 @@ package producttest
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -140,7 +149,7 @@ var workerDoors struct {
 func suiteWorkerDoors(t *testing.T) map[string]string {
 	t.Helper()
 	workerDoors.once.Do(func() {
-		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server, ca := hubTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
 				w.WriteHeader(http.StatusNoContent)
@@ -149,9 +158,37 @@ func suiteWorkerDoors(t *testing.T) map[string]string {
 			}
 		}))
 		workerDoors.environment = map[string]string{"TENSORHUB_ORIGIN": server.URL, "TENSORHUB_PUBLIC_ORIGIN": server.URL,
-			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(server.Certificate().Raw)}
+			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)}
 	})
 	return workerDoors.environment
+}
+
+// hubTLSServer serves handler as a Hub with a private CA does: the CA signs a 127.0.0.1 leaf
+// and a grant names the CA's DER. uv, like any WebPKI client, refuses a CA as a leaf.
+func hubTLSServer(t *testing.T, handler http.Handler) (*httptest.Server, []byte) {
+	t.Helper()
+	certificate := func(template, parent *x509.Certificate, key *ecdsa.PrivateKey, signer *ecdsa.PrivateKey) []byte {
+		template.NotBefore, template.NotAfter = time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour)
+		der, err := x509.CreateCertificate(rand.Reader, template, parent, &key.PublicKey, signer)
+		must(t, err)
+		return der
+	}
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	must(t, err)
+	caTemplate := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test Hub CA"},
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	caDER := certificate(caTemplate, caTemplate, caKey, caKey)
+	ca, err := x509.ParseCertificate(caDER)
+	must(t, err)
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	must(t, err)
+	leaf := certificate(&x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)}, KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}, ca, leafKey, caKey)
+	server := httptest.NewUnstartedServer(handler)
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{leaf}, PrivateKey: leafKey}}}
+	server.StartTLS()
+	return server, caDER
 }
 
 // skipWithoutMachine turns a local execution this run cannot host into a skip: the suite

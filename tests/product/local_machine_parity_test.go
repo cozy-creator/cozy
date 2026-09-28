@@ -40,6 +40,7 @@ const (
 type machineHub struct {
 	*fakeRentalHub
 	worker   *httptest.Server
+	ca       []byte // the worker doors' private CA
 	mu       sync.Mutex
 	machines map[string]string
 }
@@ -47,7 +48,7 @@ type machineHub struct {
 func newMachineHub(t *testing.T) *machineHub {
 	t.Helper()
 	h := &machineHub{fakeRentalHub: newFakeRentalHub(t, 0), machines: map[string]string{}}
-	h.worker = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.worker, h.ca = hubTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/worker/rental/release", "/v1/worker/rental/cache-observations":
 			w.WriteHeader(http.StatusNoContent)
@@ -79,7 +80,7 @@ func newMachineHub(t *testing.T) *machineHub {
 func (h *machineHub) environment() map[string]string {
 	return map[string]string{
 		"TENSORHUB_ORIGIN": h.worker.URL, "TENSORHUB_PUBLIC_ORIGIN": h.worker.URL,
-		"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(h.worker.Certificate().Raw),
+		"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(h.ca),
 	}
 }
 
