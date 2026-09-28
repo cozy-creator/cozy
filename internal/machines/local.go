@@ -36,23 +36,20 @@ import (
 // its controller, and it exits by itself after the same fixed idle period; the next use
 // launches it again.
 type Host struct {
-	dir string
-	// store is the box's one TensorFS store, the location this machine's Host uses for
-	// its own, so models are never held twice on one disk. Empty keeps the pod layout.
-	store  string
+	dir    string
 	mu     sync.Mutex
 	cached *cachedLaunch
 	// inherited are the locale and trust-store values a Host may carry from its launcher.
 	inherited []string
 }
 
-func NewHost(dir, store string, environ []string) *Host {
+func NewHost(dir string, environ []string) *Host {
 	// A machine moved elsewhere by a symlink (another disk, a shorter path) runs there: the
 	// Runtime's sockets live under the root it is given, and a socket path is bounded.
 	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
 		dir = resolved
 	}
-	h := &Host{dir: dir, store: store}
+	h := &Host{dir: dir}
 	for _, value := range environ {
 		name, _, _ := strings.Cut(value, "=")
 		switch name {
@@ -349,9 +346,6 @@ func (h *Host) launchLocked(ctx context.Context, hubOrigin string, client *hub.C
 		"COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL=" + base64.RawURLEncoding.EncodeToString(key),
 		"COZY_RECORD_OWNER_AUTH_JSON=" + string(auth),
 	}, h.inherited...)
-	if h.store != "" {
-		base = append(base, "COZY_TENSORFS_ROOT="+h.store)
-	}
 	names := make([]string, 0, len(environment))
 	for name := range environment {
 		names = append(names, name)
