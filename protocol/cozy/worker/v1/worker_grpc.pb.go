@@ -696,7 +696,6 @@ const (
 	RuntimePreparation_WorkspaceNativeArtifactTransfer_FullMethodName  = "/cozy.worker.v1.RuntimePreparation/WorkspaceNativeArtifactTransfer"
 	RuntimePreparation_WorkspaceForgetPackage_FullMethodName           = "/cozy.worker.v1.RuntimePreparation/WorkspaceForgetPackage"
 	RuntimePreparation_ImportInputTree_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportInputTree"
-	RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady"
 	RuntimePreparation_PreparePackageSet_FullMethodName                = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
 	RuntimePreparation_PrepareModelSource_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
 	RuntimePreparation_ReleaseModelSource_FullMethodName               = "/cozy.worker.v1.RuntimePreparation/ReleaseModelSource"
@@ -744,7 +743,6 @@ type RuntimePreparationClient interface {
 	WorkspaceForgetPackage(ctx context.Context, in *ForgetPackageCall, opts ...grpc.CallOption) (*ForgetPackageResult, error)
 	// Authenticated root input intake; native bytes commit before a receipt.
 	ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error)
-	WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
 	ReleaseModelSource(ctx context.Context, in *ReleaseModelSourceRequest, opts ...grpc.CallOption) (*ReleaseModelSourceResult, error)
@@ -919,16 +917,6 @@ func (c *runtimePreparationClient) ImportInputTree(ctx context.Context, opts ...
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RuntimePreparation_ImportInputTreeClient = grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult]
 
-func (c *runtimePreparationClient) WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WeightsHostAck)
-	err := c.cc.Invoke(ctx, RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *runtimePreparationClient) PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PreparePackageSetResult)
@@ -1082,7 +1070,6 @@ type RuntimePreparationServer interface {
 	WorkspaceForgetPackage(context.Context, *ForgetPackageCall) (*ForgetPackageResult, error)
 	// Authenticated root input intake; native bytes commit before a receipt.
 	ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error
-	WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
 	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
 	ReleaseModelSource(context.Context, *ReleaseModelSourceRequest) (*ReleaseModelSourceResult, error)
@@ -1146,9 +1133,6 @@ func (UnimplementedRuntimePreparationServer) WorkspaceForgetPackage(context.Cont
 }
 func (UnimplementedRuntimePreparationServer) ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error {
 	return status.Error(codes.Unimplemented, "method ImportInputTree not implemented")
-}
-func (UnimplementedRuntimePreparationServer) WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error) {
-	return nil, status.Error(codes.Unimplemented, "method WorkspaceWeightsIntentReady not implemented")
 }
 func (UnimplementedRuntimePreparationServer) PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
@@ -1441,24 +1425,6 @@ func _RuntimePreparation_ImportInputTree_Handler(srv interface{}, stream grpc.Se
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RuntimePreparation_ImportInputTreeServer = grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]
 
-func _RuntimePreparation_WorkspaceWeightsIntentReady_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(WeightsIntentReadyCall)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RuntimePreparationServer).WorkspaceWeightsIntentReady(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RuntimePreparationServer).WorkspaceWeightsIntentReady(ctx, req.(*WeightsIntentReadyCall))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _RuntimePreparation_PreparePackageSet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PreparePackageSetRequest)
 	if err := dec(in); err != nil {
@@ -1731,10 +1697,6 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimePreparation_WorkspaceForgetPackage_Handler,
 		},
 		{
-			MethodName: "WorkspaceWeightsIntentReady",
-			Handler:    _RuntimePreparation_WorkspaceWeightsIntentReady_Handler,
-		},
-		{
 			MethodName: "PreparePackageSet",
 			Handler:    _RuntimePreparation_PreparePackageSet_Handler,
 		},
@@ -1945,9 +1907,6 @@ const (
 	PodHost_CheckpointPage_FullMethodName                        = "/cozy.worker.v1.PodHost/CheckpointPage"
 	PodHost_CheckpointTransfer_FullMethodName                    = "/cozy.worker.v1.PodHost/CheckpointTransfer"
 	PodHost_LocalPackageUpload_FullMethodName                    = "/cozy.worker.v1.PodHost/LocalPackageUpload"
-	PodHost_LocalPackageAbort_FullMethodName                     = "/cozy.worker.v1.PodHost/LocalPackageAbort"
-	PodHost_WeightsTransfer_FullMethodName                       = "/cozy.worker.v1.PodHost/WeightsTransfer"
-	PodHost_WeightsIntentReady_FullMethodName                    = "/cozy.worker.v1.PodHost/WeightsIntentReady"
 )
 
 // PodHostClient is the client API for PodHost service.
@@ -2022,9 +1981,6 @@ type PodHostClient interface {
 	CheckpointPage(ctx context.Context, in *CheckpointPageCall, opts ...grpc.CallOption) (*CheckpointPageResult, error)
 	CheckpointTransfer(ctx context.Context, in *CheckpointTransferCall, opts ...grpc.CallOption) (*CheckpointTransferStatus, error)
 	LocalPackageUpload(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus], error)
-	LocalPackageAbort(ctx context.Context, in *LocalPackageAbortCall, opts ...grpc.CallOption) (*LocalPackageAbortStatus, error)
-	WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error)
-	WeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
 }
 
 type podHostClient struct {
@@ -2426,45 +2382,6 @@ func (c *podHostClient) LocalPackageUpload(ctx context.Context, opts ...grpc.Cal
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_LocalPackageUploadClient = grpc.BidiStreamingClient[LocalPackageUploadFrame, LocalPackageFileStatus]
 
-func (c *podHostClient) LocalPackageAbort(ctx context.Context, in *LocalPackageAbortCall, opts ...grpc.CallOption) (*LocalPackageAbortStatus, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(LocalPackageAbortStatus)
-	err := c.cc.Invoke(ctx, PodHost_LocalPackageAbort_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *podHostClient) WeightsTransfer(ctx context.Context, in *WeightsTransferCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WeightsTransferStatus], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[7], PodHost_WeightsTransfer_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[WeightsTransferCall, WeightsTransferStatus]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PodHost_WeightsTransferClient = grpc.ServerStreamingClient[WeightsTransferStatus]
-
-func (c *podHostClient) WeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(WeightsHostAck)
-	err := c.cc.Invoke(ctx, PodHost_WeightsIntentReady_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // PodHostServer is the server API for PodHost service.
 // All implementations must embed UnimplementedPodHostServer
 // for forward compatibility.
@@ -2537,9 +2454,6 @@ type PodHostServer interface {
 	CheckpointPage(context.Context, *CheckpointPageCall) (*CheckpointPageResult, error)
 	CheckpointTransfer(context.Context, *CheckpointTransferCall) (*CheckpointTransferStatus, error)
 	LocalPackageUpload(grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]) error
-	LocalPackageAbort(context.Context, *LocalPackageAbortCall) (*LocalPackageAbortStatus, error)
-	WeightsTransfer(*WeightsTransferCall, grpc.ServerStreamingServer[WeightsTransferStatus]) error
-	WeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
 	mustEmbedUnimplementedPodHostServer()
 }
 
@@ -2651,15 +2565,6 @@ func (UnimplementedPodHostServer) CheckpointTransfer(context.Context, *Checkpoin
 }
 func (UnimplementedPodHostServer) LocalPackageUpload(grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]) error {
 	return status.Error(codes.Unimplemented, "method LocalPackageUpload not implemented")
-}
-func (UnimplementedPodHostServer) LocalPackageAbort(context.Context, *LocalPackageAbortCall) (*LocalPackageAbortStatus, error) {
-	return nil, status.Error(codes.Unimplemented, "method LocalPackageAbort not implemented")
-}
-func (UnimplementedPodHostServer) WeightsTransfer(*WeightsTransferCall, grpc.ServerStreamingServer[WeightsTransferStatus]) error {
-	return status.Error(codes.Unimplemented, "method WeightsTransfer not implemented")
-}
-func (UnimplementedPodHostServer) WeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error) {
-	return nil, status.Error(codes.Unimplemented, "method WeightsIntentReady not implemented")
 }
 func (UnimplementedPodHostServer) mustEmbedUnimplementedPodHostServer() {}
 func (UnimplementedPodHostServer) testEmbeddedByValue()                 {}
@@ -3237,53 +3142,6 @@ func _PodHost_LocalPackageUpload_Handler(srv interface{}, stream grpc.ServerStre
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_LocalPackageUploadServer = grpc.BidiStreamingServer[LocalPackageUploadFrame, LocalPackageFileStatus]
 
-func _PodHost_LocalPackageAbort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(LocalPackageAbortCall)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(PodHostServer).LocalPackageAbort(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: PodHost_LocalPackageAbort_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PodHostServer).LocalPackageAbort(ctx, req.(*LocalPackageAbortCall))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _PodHost_WeightsTransfer_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(WeightsTransferCall)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(PodHostServer).WeightsTransfer(m, &grpc.GenericServerStream[WeightsTransferCall, WeightsTransferStatus]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type PodHost_WeightsTransferServer = grpc.ServerStreamingServer[WeightsTransferStatus]
-
-func _PodHost_WeightsIntentReady_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(WeightsIntentReadyCall)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(PodHostServer).WeightsIntentReady(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: PodHost_WeightsIntentReady_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(PodHostServer).WeightsIntentReady(ctx, req.(*WeightsIntentReadyCall))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // PodHost_ServiceDesc is the grpc.ServiceDesc for PodHost service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -3399,14 +3257,6 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "CheckpointTransfer",
 			Handler:    _PodHost_CheckpointTransfer_Handler,
 		},
-		{
-			MethodName: "LocalPackageAbort",
-			Handler:    _PodHost_LocalPackageAbort_Handler,
-		},
-		{
-			MethodName: "WeightsIntentReady",
-			Handler:    _PodHost_WeightsIntentReady_Handler,
-		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -3444,11 +3294,6 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 			Handler:       _PodHost_LocalPackageUpload_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
-		},
-		{
-			StreamName:    "WeightsTransfer",
-			Handler:       _PodHost_WeightsTransfer_Handler,
-			ServerStreams: true,
 		},
 	},
 	Metadata: "cozy/worker/v1/worker.proto",

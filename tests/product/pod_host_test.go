@@ -67,7 +67,6 @@ type fakePod struct {
 	mediaRequest     func(http.ResponseWriter, *http.Request) bool
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime pb.RuntimePreparationClient
-	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
 	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	watchProgress func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
 	derivedRetain func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
@@ -104,8 +103,6 @@ type fakePod struct {
 	localUpload    func(grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error
 	// onJobReady can delay and sequence the independent peer's readiness facts.
 	onJobReady func(*pb.WorkerFrame, func(*pb.WorkerFrame) error) error
-	// answerOffer supplies a protocol outcome when a test exercises settlement.
-	answerOffer func(*pb.AttemptOffer) (*pb.AttemptOutcome, error)
 	// machine answers Runtime-owned machine execution observation and collection.
 	machine machineExecutionPeer
 	// onFrame lets a product test delegate selected frames to a real Runtime peer.
@@ -155,8 +152,6 @@ type fakePod struct {
 	preparedSet        []byte
 	preparedDig        []byte
 	reports            map[string]int // fault text -> reports that carried it
-	offers             []*pb.AttemptOffer
-	finalizations      []*pb.WeightsFinalizeRequest
 	// stagedJobBuild is what THIS pod wrote into the job plan records it staged during
 	// preparation — `build_id`, its own placement's environment identity, exactly as
 	// `package_prepare.py::_stage_job_plans` writes it. A JobDirective naming anything
@@ -455,23 +450,6 @@ func (p *fakePod) Control(stream grpc.BidiStreamingServer[pb.RecordOwnerFrame, p
 					}
 				}(m.DesiredState)
 			}
-		case *pb.RecordOwnerFrame_AttemptOffer:
-			p.mu.Lock()
-			p.offers = append(p.offers, m.AttemptOffer)
-			p.mu.Unlock()
-			if p.answerOffer != nil {
-				outcome, err := p.answerOffer(m.AttemptOffer)
-				if err != nil {
-					return err
-				}
-				if err := send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptOutcome{AttemptOutcome: outcome}}); err != nil {
-					return err
-				}
-			}
-		case *pb.RecordOwnerFrame_WeightsFinalizeRequest:
-			p.mu.Lock()
-			p.finalizations = append(p.finalizations, m.WeightsFinalizeRequest)
-			p.mu.Unlock()
 		}
 	}
 }
@@ -957,15 +935,6 @@ func (p *fakePod) CheckpointPage(ctx context.Context, call *pb.CheckpointPageCal
 	return p.sourceRuntime.CheckpointPage(ctx, call.GetRequest())
 }
 
-func (p *fakePod) WeightsIntentReady(_ context.Context, call *pb.WeightsIntentReadyCall) (*pb.WeightsHostAck, error) {
-	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
-		return nil, err
-	}
-	if p.weightsReady == nil {
-		return nil, status.Error(codes.Unimplemented, "no weights Ready peer")
-	}
-	return p.weightsReady(call.GetRequest())
-}
 func (p *fakePod) CheckpointTransfer(ctx context.Context, call *pb.CheckpointTransferCall) (*pb.CheckpointTransferStatus, error) {
 	if err := p.verifyClaim(call.GetClaim(), false); err != nil {
 		return nil, err
