@@ -78,12 +78,8 @@ func jobDirectiveWithLimit(plan *JobPlan, outputLimit uint64) *pb.JobDirective {
 			GrantId: home.ScratchRepo("local", "queue"),
 			Outputs: invocationOutputBindings(plan.Outputs, plan.WeightsOutputs, outputLimit),
 		},
-		// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
-		// running one bounded attempt; deep queueing is the orchestrator's dispatch
-		// queue, not a warm worker (audit-adopted, 2026-08-26).
-		ReclaimOnTerminal: true,
-		DeviceCount:       uint32(gpuCountOf(plan)),
-		Orchestration:     plan.Orchestration,
+		DeviceCount:   uint32(gpuCountOf(plan)),
+		Orchestration: plan.Orchestration,
 	}
 	if plan.OrchestrationParent != nil {
 		directive.OrchestrationParent = jobDirectiveWithLimit(plan.OrchestrationParent, outputLimit)

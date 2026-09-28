@@ -13172,7 +13172,6 @@ type JobDirective struct {
 	JobDescriptorId     string                 `protobuf:"bytes,2,opt,name=job_descriptor_id,json=jobDescriptorId,proto3" json:"job_descriptor_id,omitempty"`
 	ResourceCaps        *ResourceCaps          `protobuf:"bytes,3,opt,name=resource_caps,json=resourceCaps,proto3" json:"resource_caps,omitempty"`
 	PublicationContract *PublicationContract   `protobuf:"bytes,4,opt,name=publication_contract,json=publicationContract,proto3" json:"publication_contract,omitempty"`
-	ReclaimOnTerminal   bool                   `protobuf:"varint,5,opt,name=reclaim_on_terminal,json=reclaimOnTerminal,proto3" json:"reclaim_on_terminal,omitempty"`
 	DeviceCount         uint32                 `protobuf:"varint,6,opt,name=device_count,json=deviceCount,proto3" json:"device_count,omitempty"`
 	// Exactly one CPU orchestration slot may coexist with the serial
 	// ordinary job envelope. The selected parent must have frozen interface
@@ -13237,13 +13236,6 @@ func (x *JobDirective) GetPublicationContract() *PublicationContract {
 		return x.PublicationContract
 	}
 	return nil
-}
-
-func (x *JobDirective) GetReclaimOnTerminal() bool {
-	if x != nil {
-		return x.ReclaimOnTerminal
-	}
-	return false
 }
 
 func (x *JobDirective) GetDeviceCount() uint32 {
@@ -20739,6 +20731,98 @@ func (x *TriageBundleRef) GetLength() uint64 {
 	return 0
 }
 
+// A machine reads a package at its own Hub once and keeps the answer: its newest release, and
+// each installation's Model resolutions (the owner's bindings, each lane's checkpoint). A warm
+// run reads nothing. The owner's rebinding or new release is the change it cannot see, so the
+// controller that made it names the package here.
+type ForgetPackageCall struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Claim         *Claim                 `protobuf:"bytes,1,opt,name=claim,proto3" json:"claim,omitempty"`
+	Package       string                 `protobuf:"bytes,2,opt,name=package,proto3" json:"package,omitempty"` // org/name
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForgetPackageCall) Reset() {
+	*x = ForgetPackageCall{}
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[206]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForgetPackageCall) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForgetPackageCall) ProtoMessage() {}
+
+func (x *ForgetPackageCall) ProtoReflect() protoreflect.Message {
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[206]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForgetPackageCall.ProtoReflect.Descriptor instead.
+func (*ForgetPackageCall) Descriptor() ([]byte, []int) {
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{206}
+}
+
+func (x *ForgetPackageCall) GetClaim() *Claim {
+	if x != nil {
+		return x.Claim
+	}
+	return nil
+}
+
+func (x *ForgetPackageCall) GetPackage() string {
+	if x != nil {
+		return x.Package
+	}
+	return ""
+}
+
+type ForgetPackageResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForgetPackageResult) Reset() {
+	*x = ForgetPackageResult{}
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[207]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForgetPackageResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForgetPackageResult) ProtoMessage() {}
+
+func (x *ForgetPackageResult) ProtoReflect() protoreflect.Message {
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[207]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForgetPackageResult.ProtoReflect.Descriptor instead.
+func (*ForgetPackageResult) Descriptor() ([]byte, []int) {
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{207}
+}
+
 // A NativeArtifactTransfer over the machine connection. The claim authorizes it; the
 // command's epoch and stream fields are unused there.
 type NativeArtifactTransferCall struct {
@@ -20751,7 +20835,7 @@ type NativeArtifactTransferCall struct {
 
 func (x *NativeArtifactTransferCall) Reset() {
 	*x = NativeArtifactTransferCall{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[206]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[208]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20763,7 +20847,7 @@ func (x *NativeArtifactTransferCall) String() string {
 func (*NativeArtifactTransferCall) ProtoMessage() {}
 
 func (x *NativeArtifactTransferCall) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[206]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[208]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20776,7 +20860,7 @@ func (x *NativeArtifactTransferCall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeArtifactTransferCall.ProtoReflect.Descriptor instead.
 func (*NativeArtifactTransferCall) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{206}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{208}
 }
 
 func (x *NativeArtifactTransferCall) GetClaim() *Claim {
@@ -20819,7 +20903,7 @@ type NativeArtifactTransfer struct {
 
 func (x *NativeArtifactTransfer) Reset() {
 	*x = NativeArtifactTransfer{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[207]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[209]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20831,7 +20915,7 @@ func (x *NativeArtifactTransfer) String() string {
 func (*NativeArtifactTransfer) ProtoMessage() {}
 
 func (x *NativeArtifactTransfer) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[207]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[209]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20844,7 +20928,7 @@ func (x *NativeArtifactTransfer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeArtifactTransfer.ProtoReflect.Descriptor instead.
 func (*NativeArtifactTransfer) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{207}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{209}
 }
 
 func (x *NativeArtifactTransfer) GetRecordOwnerEpoch() uint64 {
@@ -20966,7 +21050,7 @@ type NativeArtifactTransferStatus struct {
 
 func (x *NativeArtifactTransferStatus) Reset() {
 	*x = NativeArtifactTransferStatus{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[208]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[210]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20978,7 +21062,7 @@ func (x *NativeArtifactTransferStatus) String() string {
 func (*NativeArtifactTransferStatus) ProtoMessage() {}
 
 func (x *NativeArtifactTransferStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[208]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[210]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20991,7 +21075,7 @@ func (x *NativeArtifactTransferStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeArtifactTransferStatus.ProtoReflect.Descriptor instead.
 func (*NativeArtifactTransferStatus) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{208}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{210}
 }
 
 func (x *NativeArtifactTransferStatus) GetRecordOwnerEpoch() uint64 {
@@ -21150,7 +21234,7 @@ type NativeByteTreeRef struct {
 
 func (x *NativeByteTreeRef) Reset() {
 	*x = NativeByteTreeRef{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[209]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[211]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21162,7 +21246,7 @@ func (x *NativeByteTreeRef) String() string {
 func (*NativeByteTreeRef) ProtoMessage() {}
 
 func (x *NativeByteTreeRef) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[209]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[211]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21175,7 +21259,7 @@ func (x *NativeByteTreeRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeByteTreeRef.ProtoReflect.Descriptor instead.
 func (*NativeByteTreeRef) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{209}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{211}
 }
 
 func (x *NativeByteTreeRef) GetProducerRootId() string {
@@ -21216,7 +21300,7 @@ type NativeByteRetentionRequest struct {
 
 func (x *NativeByteRetentionRequest) Reset() {
 	*x = NativeByteRetentionRequest{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[210]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[212]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21228,7 +21312,7 @@ func (x *NativeByteRetentionRequest) String() string {
 func (*NativeByteRetentionRequest) ProtoMessage() {}
 
 func (x *NativeByteRetentionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[210]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[212]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21241,7 +21325,7 @@ func (x *NativeByteRetentionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeByteRetentionRequest.ProtoReflect.Descriptor instead.
 func (*NativeByteRetentionRequest) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{210}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{212}
 }
 
 func (x *NativeByteRetentionRequest) GetSource() *NativeByteTreeRef {
@@ -21268,7 +21352,7 @@ type NativeByteRetentionCall struct {
 
 func (x *NativeByteRetentionCall) Reset() {
 	*x = NativeByteRetentionCall{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[211]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[213]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21280,7 +21364,7 @@ func (x *NativeByteRetentionCall) String() string {
 func (*NativeByteRetentionCall) ProtoMessage() {}
 
 func (x *NativeByteRetentionCall) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[211]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[213]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21293,7 +21377,7 @@ func (x *NativeByteRetentionCall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeByteRetentionCall.ProtoReflect.Descriptor instead.
 func (*NativeByteRetentionCall) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{211}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{213}
 }
 
 func (x *NativeByteRetentionCall) GetClaim() *Claim {
@@ -21321,7 +21405,7 @@ type NativeByteRetentionResult struct {
 
 func (x *NativeByteRetentionResult) Reset() {
 	*x = NativeByteRetentionResult{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[212]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[214]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21333,7 +21417,7 @@ func (x *NativeByteRetentionResult) String() string {
 func (*NativeByteRetentionResult) ProtoMessage() {}
 
 func (x *NativeByteRetentionResult) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[212]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[214]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21346,7 +21430,7 @@ func (x *NativeByteRetentionResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeByteRetentionResult.ProtoReflect.Descriptor instead.
 func (*NativeByteRetentionResult) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{212}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{214}
 }
 
 func (x *NativeByteRetentionResult) GetSource() *NativeByteTreeRef {
@@ -21383,7 +21467,7 @@ type ChildByteResultGrant struct {
 
 func (x *ChildByteResultGrant) Reset() {
 	*x = ChildByteResultGrant{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[213]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[215]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21395,7 +21479,7 @@ func (x *ChildByteResultGrant) String() string {
 func (*ChildByteResultGrant) ProtoMessage() {}
 
 func (x *ChildByteResultGrant) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[213]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[215]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21408,7 +21492,7 @@ func (x *ChildByteResultGrant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChildByteResultGrant.ProtoReflect.Descriptor instead.
 func (*ChildByteResultGrant) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{213}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{215}
 }
 
 func (x *ChildByteResultGrant) GetOutputId() string {
@@ -21457,7 +21541,7 @@ type InputTreeImportHeader struct {
 
 func (x *InputTreeImportHeader) Reset() {
 	*x = InputTreeImportHeader{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[214]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[216]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21469,7 +21553,7 @@ func (x *InputTreeImportHeader) String() string {
 func (*InputTreeImportHeader) ProtoMessage() {}
 
 func (x *InputTreeImportHeader) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[214]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[216]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21482,7 +21566,7 @@ func (x *InputTreeImportHeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputTreeImportHeader.ProtoReflect.Descriptor instead.
 func (*InputTreeImportHeader) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{214}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{216}
 }
 
 func (x *InputTreeImportHeader) GetClaim() *Claim {
@@ -21538,7 +21622,7 @@ type InputTreeImportBlob struct {
 
 func (x *InputTreeImportBlob) Reset() {
 	*x = InputTreeImportBlob{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[215]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[217]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21550,7 +21634,7 @@ func (x *InputTreeImportBlob) String() string {
 func (*InputTreeImportBlob) ProtoMessage() {}
 
 func (x *InputTreeImportBlob) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[215]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[217]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21563,7 +21647,7 @@ func (x *InputTreeImportBlob) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputTreeImportBlob.ProtoReflect.Descriptor instead.
 func (*InputTreeImportBlob) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{215}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{217}
 }
 
 func (x *InputTreeImportBlob) GetObject() *Ref {
@@ -21599,7 +21683,7 @@ type InputTreeImportCommit struct {
 
 func (x *InputTreeImportCommit) Reset() {
 	*x = InputTreeImportCommit{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[216]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[218]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21611,7 +21695,7 @@ func (x *InputTreeImportCommit) String() string {
 func (*InputTreeImportCommit) ProtoMessage() {}
 
 func (x *InputTreeImportCommit) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[216]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[218]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21624,7 +21708,7 @@ func (x *InputTreeImportCommit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputTreeImportCommit.ProtoReflect.Descriptor instead.
 func (*InputTreeImportCommit) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{216}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{218}
 }
 
 func (x *InputTreeImportCommit) GetAbort() bool {
@@ -21648,7 +21732,7 @@ type InputTreeImportFrame struct {
 
 func (x *InputTreeImportFrame) Reset() {
 	*x = InputTreeImportFrame{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[217]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[219]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21660,7 +21744,7 @@ func (x *InputTreeImportFrame) String() string {
 func (*InputTreeImportFrame) ProtoMessage() {}
 
 func (x *InputTreeImportFrame) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[217]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[219]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21673,7 +21757,7 @@ func (x *InputTreeImportFrame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InputTreeImportFrame.ProtoReflect.Descriptor instead.
 func (*InputTreeImportFrame) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{217}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{219}
 }
 
 func (x *InputTreeImportFrame) GetBody() isInputTreeImportFrame_Body {
@@ -21744,7 +21828,7 @@ type NativeByteReadCall struct {
 
 func (x *NativeByteReadCall) Reset() {
 	*x = NativeByteReadCall{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[218]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[220]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21756,7 +21840,7 @@ func (x *NativeByteReadCall) String() string {
 func (*NativeByteReadCall) ProtoMessage() {}
 
 func (x *NativeByteReadCall) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[218]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[220]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21769,7 +21853,7 @@ func (x *NativeByteReadCall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeByteReadCall.ProtoReflect.Descriptor instead.
 func (*NativeByteReadCall) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{218}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{220}
 }
 
 func (x *NativeByteReadCall) GetClaim() *Claim {
@@ -21810,7 +21894,7 @@ type NativeByteReadChunk struct {
 
 func (x *NativeByteReadChunk) Reset() {
 	*x = NativeByteReadChunk{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[219]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[221]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21822,7 +21906,7 @@ func (x *NativeByteReadChunk) String() string {
 func (*NativeByteReadChunk) ProtoMessage() {}
 
 func (x *NativeByteReadChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[219]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[221]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21835,7 +21919,7 @@ func (x *NativeByteReadChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NativeByteReadChunk.ProtoReflect.Descriptor instead.
 func (*NativeByteReadChunk) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{219}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{221}
 }
 
 func (x *NativeByteReadChunk) GetOffset() uint64 {
@@ -21863,7 +21947,7 @@ type ActivationCapture struct {
 
 func (x *ActivationCapture) Reset() {
 	*x = ActivationCapture{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[220]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[222]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21875,7 +21959,7 @@ func (x *ActivationCapture) String() string {
 func (*ActivationCapture) ProtoMessage() {}
 
 func (x *ActivationCapture) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[220]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[222]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21888,7 +21972,7 @@ func (x *ActivationCapture) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActivationCapture.ProtoReflect.Descriptor instead.
 func (*ActivationCapture) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{220}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{222}
 }
 
 func (x *ActivationCapture) GetComponents() []string {
@@ -21923,7 +22007,7 @@ type ExecutionEnvironment struct {
 
 func (x *ExecutionEnvironment) Reset() {
 	*x = ExecutionEnvironment{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[221]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[223]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21935,7 +22019,7 @@ func (x *ExecutionEnvironment) String() string {
 func (*ExecutionEnvironment) ProtoMessage() {}
 
 func (x *ExecutionEnvironment) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[221]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[223]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21948,7 +22032,7 @@ func (x *ExecutionEnvironment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionEnvironment.ProtoReflect.Descriptor instead.
 func (*ExecutionEnvironment) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{221}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{223}
 }
 
 func (x *ExecutionEnvironment) GetRuntimeVersion() string {
@@ -22024,7 +22108,7 @@ type ActivationCaptureResult struct {
 
 func (x *ActivationCaptureResult) Reset() {
 	*x = ActivationCaptureResult{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[222]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[224]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22036,7 +22120,7 @@ func (x *ActivationCaptureResult) String() string {
 func (*ActivationCaptureResult) ProtoMessage() {}
 
 func (x *ActivationCaptureResult) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[222]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[224]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22049,7 +22133,7 @@ func (x *ActivationCaptureResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ActivationCaptureResult.ProtoReflect.Descriptor instead.
 func (*ActivationCaptureResult) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{222}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{224}
 }
 
 func (x *ActivationCaptureResult) GetOutputId() string {
@@ -22076,7 +22160,7 @@ type ExecutionObservation struct {
 
 func (x *ExecutionObservation) Reset() {
 	*x = ExecutionObservation{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[223]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[225]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22088,7 +22172,7 @@ func (x *ExecutionObservation) String() string {
 func (*ExecutionObservation) ProtoMessage() {}
 
 func (x *ExecutionObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[223]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[225]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22101,7 +22185,7 @@ func (x *ExecutionObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionObservation.ProtoReflect.Descriptor instead.
 func (*ExecutionObservation) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{223}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{225}
 }
 
 func (x *ExecutionObservation) GetEnvironment() *ExecutionEnvironment {
@@ -22136,7 +22220,7 @@ type RuntimeRevision struct {
 
 func (x *RuntimeRevision) Reset() {
 	*x = RuntimeRevision{}
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[224]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[226]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22148,7 +22232,7 @@ func (x *RuntimeRevision) String() string {
 func (*RuntimeRevision) ProtoMessage() {}
 
 func (x *RuntimeRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_cozy_worker_v1_worker_proto_msgTypes[224]
+	mi := &file_cozy_worker_v1_worker_proto_msgTypes[226]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22161,7 +22245,7 @@ func (x *RuntimeRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeRevision.ProtoReflect.Descriptor instead.
 func (*RuntimeRevision) Descriptor() ([]byte, []int) {
-	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{224}
+	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{226}
 }
 
 func (x *RuntimeRevision) GetWheelDigest() []byte {
@@ -23121,16 +23205,15 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x05Stamp\x12\x1c\n" +
 	"\tcomponent\x18\x01 \x01(\tR\tcomponent\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x16\n" +
-	"\x06values\x18\x03 \x03(\tR\x06values\"\xd8\x03\n" +
+	"\x06values\x18\x03 \x03(\tR\x06values\"\xc3\x03\n" +
 	"\fJobDirective\x12*\n" +
 	"\x11job_descriptor_id\x18\x02 \x01(\tR\x0fjobDescriptorId\x12A\n" +
 	"\rresource_caps\x18\x03 \x01(\v2\x1c.cozy.worker.v1.ResourceCapsR\fresourceCaps\x12V\n" +
-	"\x14publication_contract\x18\x04 \x01(\v2#.cozy.worker.v1.PublicationContractR\x13publicationContract\x12.\n" +
-	"\x13reclaim_on_terminal\x18\x05 \x01(\bR\x11reclaimOnTerminal\x12!\n" +
+	"\x14publication_contract\x18\x04 \x01(\v2#.cozy.worker.v1.PublicationContractR\x13publicationContract\x12!\n" +
 	"\fdevice_count\x18\x06 \x01(\rR\vdeviceCount\x12$\n" +
 	"\rorchestration\x18\a \x01(\bR\rorchestration\x12O\n" +
 	"\x14orchestration_parent\x18\b \x01(\v2\x1c.cozy.worker.v1.JobDirectiveR\x13orchestrationParent\x12'\n" +
-	"\x0finstallation_id\x18\t \x01(\tR\x0einstallationIdJ\x04\b\x01\x10\x02R\bbuild_id\"\xec\b\n" +
+	"\x0finstallation_id\x18\t \x01(\tR\x0einstallationIdJ\x04\b\x01\x10\x02J\x04\b\x05\x10\x06R\bbuild_idR\x13reclaim_on_terminal\"\xec\b\n" +
 	"\x13ObservedWorkerState\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x120\n" +
 	"\x14control_stream_epoch\x18\x02 \x01(\x04R\x12controlStreamEpoch\x12$\n" +
@@ -23885,7 +23968,11 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\n" +
 	"subject_id\x18\x01 \x01(\tR\tsubjectId\x120\n" +
 	"\x14write_receipt_digest\x18\x04 \x01(\fR\x12writeReceiptDigest\x12\x16\n" +
-	"\x06length\x18\x03 \x01(\x04R\x06lengthJ\x04\b\x02\x10\x03\"\x8b\x01\n" +
+	"\x06length\x18\x03 \x01(\x04R\x06lengthJ\x04\b\x02\x10\x03\"Z\n" +
+	"\x11ForgetPackageCall\x12+\n" +
+	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12\x18\n" +
+	"\apackage\x18\x02 \x01(\tR\apackage\"\x15\n" +
+	"\x13ForgetPackageResult\"\x8b\x01\n" +
 	"\x1aNativeArtifactTransferCall\x12+\n" +
 	"\x05claim\x18\x01 \x01(\v2\x15.cozy.worker.v1.ClaimR\x05claim\x12@\n" +
 	"\arequest\x18\x02 \x01(\v2&.cozy.worker.v1.NativeArtifactTransferR\arequest\"\xd2\x04\n" +
@@ -24264,7 +24351,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"%AcknowledgeMachineExecutionCollection\x12-.cozy.worker.v1.MachineExecutionCollectionAck\x1a%.cozy.worker.v1.MachineExecutionState\x12q\n" +
 	"\x1aReadMachineExecutionTriage\x12+.cozy.worker.v1.MachineExecutionTriageQuery\x1a&.cozy.worker.v1.MachineExecutionTriage\x12L\n" +
 	"\aControl\x12 .cozy.worker.v1.RecordOwnerFrame\x1a\x1b.cozy.worker.v1.WorkerFrame(\x010\x01\x12P\n" +
-	"\rWatchProgress\x12\x1c.cozy.worker.v1.ProgressOpen\x1a\x1f.cozy.worker.v1.AttemptProgress0\x012\x9e\x16\n" +
+	"\rWatchProgress\x12\x1c.cozy.worker.v1.ProgressOpen\x1a\x1f.cozy.worker.v1.AttemptProgress0\x012\x80\x17\n" +
 	"\x12RuntimePreparation\x12W\n" +
 	"\fProtocolInfo\x12#.cozy.worker.v1.ProtocolInfoRequest\x1a\".cozy.worker.v1.ProtocolInfoResult\x12o\n" +
 	"\x14NumericalEnvironment\x12+.cozy.worker.v1.NumericalEnvironmentRequest\x1a*.cozy.worker.v1.NumericalEnvironmentResult\x12o\n" +
@@ -24277,7 +24364,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x17WorkspaceRetainByteTree\x12'.cozy.worker.v1.NativeByteRetentionCall\x1a).cozy.worker.v1.NativeByteRetentionResult\x12n\n" +
 	"\x18WorkspaceReleaseByteTree\x12'.cozy.worker.v1.NativeByteRetentionCall\x1a).cozy.worker.v1.NativeByteRetentionResult\x12h\n" +
 	"\x1bWorkspaceReadByteTreeObject\x12\".cozy.worker.v1.NativeByteReadCall\x1a#.cozy.worker.v1.NativeByteReadChunk0\x01\x12{\n" +
-	"\x1fWorkspaceNativeArtifactTransfer\x12*.cozy.worker.v1.NativeArtifactTransferCall\x1a,.cozy.worker.v1.NativeArtifactTransferStatus\x12d\n" +
+	"\x1fWorkspaceNativeArtifactTransfer\x12*.cozy.worker.v1.NativeArtifactTransferCall\x1a,.cozy.worker.v1.NativeArtifactTransferStatus\x12`\n" +
+	"\x16WorkspaceForgetPackage\x12!.cozy.worker.v1.ForgetPackageCall\x1a#.cozy.worker.v1.ForgetPackageResult\x12d\n" +
 	"\x0fImportInputTree\x12$.cozy.worker.v1.InputTreeImportFrame\x1a).cozy.worker.v1.NativeByteRetentionResult(\x01\x12e\n" +
 	"\x1bWorkspaceWeightsIntentReady\x12&.cozy.worker.v1.WeightsIntentReadyCall\x1a\x1e.cozy.worker.v1.WeightsHostAck\x12f\n" +
 	"\x11PreparePackageSet\x12(.cozy.worker.v1.PreparePackageSetRequest\x1a'.cozy.worker.v1.PreparePackageSetResult\x12i\n" +
@@ -24293,7 +24381,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x13PrepareLocalPackage\x12*.cozy.worker.v1.PrepareLocalPackageRequest\x1a'.cozy.worker.v1.PreparePackageSetResult\x12r\n" +
 	"\x17PreparePrivatePlacement\x12..cozy.worker.v1.PreparePrivatePlacementRequest\x1a'.cozy.worker.v1.PreparePackageSetResult2e\n" +
 	"\x0eRuntimeWeights\x12S\n" +
-	"\x06Upload\x12$.cozy.worker.v1.WeightsUploadRequest\x1a#.cozy.worker.v1.WeightsUploadResult2\x9d\x1d\n" +
+	"\x06Upload\x12$.cozy.worker.v1.WeightsUploadRequest\x1a#.cozy.worker.v1.WeightsUploadResult2\xf6\x1d\n" +
 	"\aPodHost\x12`\n" +
 	"\x0fKeepRentalAlive\x12&.cozy.worker.v1.KeepRentalAliveRequest\x1a%.cozy.worker.v1.KeepRentalAliveResult\x12y\n" +
 	"\x1cGetMachineExecutionWorkspace\x12..cozy.worker.v1.MachineExecutionWorkspaceQuery\x1a).cozy.worker.v1.MachineExecutionWorkspace\x12i\n" +
@@ -24319,7 +24407,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0eRetainByteTree\x12'.cozy.worker.v1.NativeByteRetentionCall\x1a).cozy.worker.v1.NativeByteRetentionResult\x12e\n" +
 	"\x0fReleaseByteTree\x12'.cozy.worker.v1.NativeByteRetentionCall\x1a).cozy.worker.v1.NativeByteRetentionResult\x12_\n" +
 	"\x12ReadByteTreeObject\x12\".cozy.worker.v1.NativeByteReadCall\x1a#.cozy.worker.v1.NativeByteReadChunk0\x01\x12r\n" +
-	"\x16NativeArtifactTransfer\x12*.cozy.worker.v1.NativeArtifactTransferCall\x1a,.cozy.worker.v1.NativeArtifactTransferStatus\x12d\n" +
+	"\x16NativeArtifactTransfer\x12*.cozy.worker.v1.NativeArtifactTransferCall\x1a,.cozy.worker.v1.NativeArtifactTransferStatus\x12W\n" +
+	"\rForgetPackage\x12!.cozy.worker.v1.ForgetPackageCall\x1a#.cozy.worker.v1.ForgetPackageResult\x12d\n" +
 	"\x0fImportInputTree\x12$.cozy.worker.v1.InputTreeImportFrame\x1a).cozy.worker.v1.NativeByteRetentionResult(\x01\x12o\n" +
 	"\x15RecordOperationResult\x12).cozy.worker.v1.RecordOperationResultCall\x1a+.cozy.worker.v1.RecordOperationResultResult\x12]\n" +
 	"\x0fLookupOperation\x12#.cozy.worker.v1.LookupOperationCall\x1a%.cozy.worker.v1.LookupOperationResult\x12i\n" +
@@ -24346,7 +24435,7 @@ func file_cozy_worker_v1_worker_proto_rawDescGZIP() []byte {
 }
 
 var file_cozy_worker_v1_worker_proto_enumTypes = make([]protoimpl.EnumInfo, 36)
-var file_cozy_worker_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 225)
+var file_cozy_worker_v1_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 227)
 var file_cozy_worker_v1_worker_proto_goTypes = []any{
 	(MachineExecutionAction)(0),              // 0: cozy.worker.v1.MachineExecutionAction
 	(ChildCallState)(0),                      // 1: cozy.worker.v1.ChildCallState
@@ -24590,25 +24679,27 @@ var file_cozy_worker_v1_worker_proto_goTypes = []any{
 	(*OutputEntry)(nil),                      // 239: cozy.worker.v1.OutputEntry
 	(*AttemptMetrics)(nil),                   // 240: cozy.worker.v1.AttemptMetrics
 	(*TriageBundleRef)(nil),                  // 241: cozy.worker.v1.TriageBundleRef
-	(*NativeArtifactTransferCall)(nil),       // 242: cozy.worker.v1.NativeArtifactTransferCall
-	(*NativeArtifactTransfer)(nil),           // 243: cozy.worker.v1.NativeArtifactTransfer
-	(*NativeArtifactTransferStatus)(nil),     // 244: cozy.worker.v1.NativeArtifactTransferStatus
-	(*NativeByteTreeRef)(nil),                // 245: cozy.worker.v1.NativeByteTreeRef
-	(*NativeByteRetentionRequest)(nil),       // 246: cozy.worker.v1.NativeByteRetentionRequest
-	(*NativeByteRetentionCall)(nil),          // 247: cozy.worker.v1.NativeByteRetentionCall
-	(*NativeByteRetentionResult)(nil),        // 248: cozy.worker.v1.NativeByteRetentionResult
-	(*ChildByteResultGrant)(nil),             // 249: cozy.worker.v1.ChildByteResultGrant
-	(*InputTreeImportHeader)(nil),            // 250: cozy.worker.v1.InputTreeImportHeader
-	(*InputTreeImportBlob)(nil),              // 251: cozy.worker.v1.InputTreeImportBlob
-	(*InputTreeImportCommit)(nil),            // 252: cozy.worker.v1.InputTreeImportCommit
-	(*InputTreeImportFrame)(nil),             // 253: cozy.worker.v1.InputTreeImportFrame
-	(*NativeByteReadCall)(nil),               // 254: cozy.worker.v1.NativeByteReadCall
-	(*NativeByteReadChunk)(nil),              // 255: cozy.worker.v1.NativeByteReadChunk
-	(*ActivationCapture)(nil),                // 256: cozy.worker.v1.ActivationCapture
-	(*ExecutionEnvironment)(nil),             // 257: cozy.worker.v1.ExecutionEnvironment
-	(*ActivationCaptureResult)(nil),          // 258: cozy.worker.v1.ActivationCaptureResult
-	(*ExecutionObservation)(nil),             // 259: cozy.worker.v1.ExecutionObservation
-	(*RuntimeRevision)(nil),                  // 260: cozy.worker.v1.RuntimeRevision
+	(*ForgetPackageCall)(nil),                // 242: cozy.worker.v1.ForgetPackageCall
+	(*ForgetPackageResult)(nil),              // 243: cozy.worker.v1.ForgetPackageResult
+	(*NativeArtifactTransferCall)(nil),       // 244: cozy.worker.v1.NativeArtifactTransferCall
+	(*NativeArtifactTransfer)(nil),           // 245: cozy.worker.v1.NativeArtifactTransfer
+	(*NativeArtifactTransferStatus)(nil),     // 246: cozy.worker.v1.NativeArtifactTransferStatus
+	(*NativeByteTreeRef)(nil),                // 247: cozy.worker.v1.NativeByteTreeRef
+	(*NativeByteRetentionRequest)(nil),       // 248: cozy.worker.v1.NativeByteRetentionRequest
+	(*NativeByteRetentionCall)(nil),          // 249: cozy.worker.v1.NativeByteRetentionCall
+	(*NativeByteRetentionResult)(nil),        // 250: cozy.worker.v1.NativeByteRetentionResult
+	(*ChildByteResultGrant)(nil),             // 251: cozy.worker.v1.ChildByteResultGrant
+	(*InputTreeImportHeader)(nil),            // 252: cozy.worker.v1.InputTreeImportHeader
+	(*InputTreeImportBlob)(nil),              // 253: cozy.worker.v1.InputTreeImportBlob
+	(*InputTreeImportCommit)(nil),            // 254: cozy.worker.v1.InputTreeImportCommit
+	(*InputTreeImportFrame)(nil),             // 255: cozy.worker.v1.InputTreeImportFrame
+	(*NativeByteReadCall)(nil),               // 256: cozy.worker.v1.NativeByteReadCall
+	(*NativeByteReadChunk)(nil),              // 257: cozy.worker.v1.NativeByteReadChunk
+	(*ActivationCapture)(nil),                // 258: cozy.worker.v1.ActivationCapture
+	(*ExecutionEnvironment)(nil),             // 259: cozy.worker.v1.ExecutionEnvironment
+	(*ActivationCaptureResult)(nil),          // 260: cozy.worker.v1.ActivationCaptureResult
+	(*ExecutionObservation)(nil),             // 261: cozy.worker.v1.ExecutionObservation
+	(*RuntimeRevision)(nil),                  // 262: cozy.worker.v1.RuntimeRevision
 }
 var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	136, // 0: cozy.worker.v1.KeepRentalAliveRequest.claim:type_name -> cozy.worker.v1.Claim
@@ -24631,7 +24722,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	51,  // 17: cozy.worker.v1.ReleaseRoot.models:type_name -> cozy.worker.v1.ModelChoice
 	223, // 18: cozy.worker.v1.ReleaseRoot.inputs:type_name -> cozy.worker.v1.InputBinding
 	229, // 19: cozy.worker.v1.ReleaseRoot.input_access:type_name -> cozy.worker.v1.InputAccess
-	256, // 20: cozy.worker.v1.ReleaseRoot.capture:type_name -> cozy.worker.v1.ActivationCapture
+	258, // 20: cozy.worker.v1.ReleaseRoot.capture:type_name -> cozy.worker.v1.ActivationCapture
 	158, // 21: cozy.worker.v1.ModelChoice.manifest:type_name -> cozy.worker.v1.Ref
 	3,   // 22: cozy.worker.v1.SourceCredential.provider:type_name -> cozy.worker.v1.NativeSourceOperation
 	136, // 23: cozy.worker.v1.MachineExecutionQuery.claim:type_name -> cozy.worker.v1.Claim
@@ -24676,7 +24767,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	136, // 62: cozy.worker.v1.LookupOperationCall.claim:type_name -> cozy.worker.v1.Claim
 	178, // 63: cozy.worker.v1.LookupOperationResult.source:type_name -> cozy.worker.v1.AttemptOutcome
 	84,  // 64: cozy.worker.v1.LookupOperationResult.retentions:type_name -> cozy.worker.v1.DerivedRetentionResult
-	248, // 65: cozy.worker.v1.LookupOperationResult.byte_retentions:type_name -> cozy.worker.v1.NativeByteRetentionResult
+	250, // 65: cozy.worker.v1.LookupOperationResult.byte_retentions:type_name -> cozy.worker.v1.NativeByteRetentionResult
 	136, // 66: cozy.worker.v1.PruneOperationCacheCall.claim:type_name -> cozy.worker.v1.Claim
 	136, // 67: cozy.worker.v1.ModelSourceAdoptCall.claim:type_name -> cozy.worker.v1.Claim
 	203, // 68: cozy.worker.v1.ModelSourceAdoptCall.request:type_name -> cozy.worker.v1.ModelSourcePrepareRequest
@@ -24741,7 +24832,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	206, // 127: cozy.worker.v1.RecordOwnerFrame.local_package_abort:type_name -> cozy.worker.v1.LocalPackageAbort
 	131, // 128: cozy.worker.v1.RecordOwnerFrame.child_call_result:type_name -> cozy.worker.v1.ChildCallResult
 	134, // 129: cozy.worker.v1.RecordOwnerFrame.native_source_command:type_name -> cozy.worker.v1.NativeSourceCommand
-	243, // 130: cozy.worker.v1.RecordOwnerFrame.native_artifact_transfer:type_name -> cozy.worker.v1.NativeArtifactTransfer
+	245, // 130: cozy.worker.v1.RecordOwnerFrame.native_artifact_transfer:type_name -> cozy.worker.v1.NativeArtifactTransfer
 	191, // 131: cozy.worker.v1.RecordOwnerFrame.weights_transaction_refused:type_name -> cozy.worker.v1.WeightsTransactionRefused
 	138, // 132: cozy.worker.v1.WorkerFrame.claim_ack:type_name -> cozy.worker.v1.ClaimAck
 	168, // 133: cozy.worker.v1.WorkerFrame.observed_state:type_name -> cozy.worker.v1.ObservedWorkerState
@@ -24763,11 +24854,11 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	129, // 149: cozy.worker.v1.WorkerFrame.child_call_request:type_name -> cozy.worker.v1.ChildCallRequest
 	130, // 150: cozy.worker.v1.WorkerFrame.child_call_cancel:type_name -> cozy.worker.v1.ChildCallCancel
 	135, // 151: cozy.worker.v1.WorkerFrame.native_source_status:type_name -> cozy.worker.v1.NativeSourceStatus
-	244, // 152: cozy.worker.v1.WorkerFrame.native_artifact_transfer_status:type_name -> cozy.worker.v1.NativeArtifactTransferStatus
-	256, // 153: cozy.worker.v1.ChildCallRequest.capture:type_name -> cozy.worker.v1.ActivationCapture
+	246, // 152: cozy.worker.v1.WorkerFrame.native_artifact_transfer_status:type_name -> cozy.worker.v1.NativeArtifactTransferStatus
+	258, // 153: cozy.worker.v1.ChildCallRequest.capture:type_name -> cozy.worker.v1.ActivationCapture
 	1,   // 154: cozy.worker.v1.ChildCallResult.state:type_name -> cozy.worker.v1.ChildCallState
-	249, // 155: cozy.worker.v1.ChildCallResult.byte_result_grants:type_name -> cozy.worker.v1.ChildByteResultGrant
-	259, // 156: cozy.worker.v1.ChildCallResult.observation:type_name -> cozy.worker.v1.ExecutionObservation
+	251, // 155: cozy.worker.v1.ChildCallResult.byte_result_grants:type_name -> cozy.worker.v1.ChildByteResultGrant
+	261, // 156: cozy.worker.v1.ChildCallResult.observation:type_name -> cozy.worker.v1.ExecutionObservation
 	158, // 157: cozy.worker.v1.NativeSourceMember.object:type_name -> cozy.worker.v1.Ref
 	158, // 158: cozy.worker.v1.NativeSourceSelection.content_manifest:type_name -> cozy.worker.v1.Ref
 	132, // 159: cozy.worker.v1.NativeSourceSelection.members:type_name -> cozy.worker.v1.NativeSourceMember
@@ -24777,7 +24868,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	133, // 163: cozy.worker.v1.NativeSourceCommand.selection:type_name -> cozy.worker.v1.NativeSourceSelection
 	4,   // 164: cozy.worker.v1.NativeSourceStatus.state:type_name -> cozy.worker.v1.NativeSourceState
 	133, // 165: cozy.worker.v1.NativeSourceStatus.selection:type_name -> cozy.worker.v1.NativeSourceSelection
-	245, // 166: cozy.worker.v1.NativeSourceStatus.byte_output:type_name -> cozy.worker.v1.NativeByteTreeRef
+	247, // 166: cozy.worker.v1.NativeSourceStatus.byte_output:type_name -> cozy.worker.v1.NativeByteTreeRef
 	16,  // 167: cozy.worker.v1.ClaimAck.rejection:type_name -> cozy.worker.v1.ClaimRejection
 	234, // 168: cozy.worker.v1.ClaimAck.resources:type_name -> cozy.worker.v1.WorkerResources
 	18,  // 169: cozy.worker.v1.BootFailure.reason:type_name -> cozy.worker.v1.BootFailureReason
@@ -24792,7 +24883,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	5,   // 178: cozy.worker.v1.DesiredWorkerState.posture:type_name -> cozy.worker.v1.Posture
 	167, // 179: cozy.worker.v1.DesiredWorkerState.job:type_name -> cozy.worker.v1.JobDirective
 	150, // 180: cozy.worker.v1.DesiredWorkerState.placement_set:type_name -> cozy.worker.v1.DesiredPlacementSet
-	260, // 181: cozy.worker.v1.DesiredWorkerState.runtime_revision:type_name -> cozy.worker.v1.RuntimeRevision
+	262, // 181: cozy.worker.v1.DesiredWorkerState.runtime_revision:type_name -> cozy.worker.v1.RuntimeRevision
 	160, // 182: cozy.worker.v1.DesiredLocalPackageSet.package:type_name -> cozy.worker.v1.DevelopmentPackage
 	149, // 183: cozy.worker.v1.DesiredLocalPackageSet.files:type_name -> cozy.worker.v1.LocalPackageFileRef
 	148, // 184: cozy.worker.v1.DesiredPrivatePlacementSet.native_models:type_name -> cozy.worker.v1.NativeModelBinding
@@ -24842,7 +24933,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	213, // 228: cozy.worker.v1.AttemptOutcomeBody.cause:type_name -> cozy.worker.v1.OutcomeCause
 	210, // 229: cozy.worker.v1.AttemptOutcomeBody.result:type_name -> cozy.worker.v1.ResultEnvelope
 	180, // 230: cozy.worker.v1.AttemptOutcomeBody.weights_receipts:type_name -> cozy.worker.v1.WeightsReceiptRef
-	259, // 231: cozy.worker.v1.AttemptOutcomeBody.observation:type_name -> cozy.worker.v1.ExecutionObservation
+	261, // 231: cozy.worker.v1.AttemptOutcomeBody.observation:type_name -> cozy.worker.v1.ExecutionObservation
 	22,  // 232: cozy.worker.v1.WeightsHostAck.stage:type_name -> cozy.worker.v1.WeightsHostStage
 	23,  // 233: cozy.worker.v1.WeightsHostAck.outcome:type_name -> cozy.worker.v1.WeightsHostOutcome
 	24,  // 234: cozy.worker.v1.WeightsHostAck.refusal:type_name -> cozy.worker.v1.WeightsHostRefusal
@@ -24899,198 +24990,203 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	224, // 285: cozy.worker.v1.InvocationSpec.outputs:type_name -> cozy.worker.v1.OutputBinding
 	225, // 286: cozy.worker.v1.InvocationSpec.serving:type_name -> cozy.worker.v1.ServingInvocationSpec
 	226, // 287: cozy.worker.v1.InvocationSpec.job:type_name -> cozy.worker.v1.JobInvocationSpec
-	256, // 288: cozy.worker.v1.InvocationSpec.capture:type_name -> cozy.worker.v1.ActivationCapture
+	258, // 288: cozy.worker.v1.InvocationSpec.capture:type_name -> cozy.worker.v1.ActivationCapture
 	233, // 289: cozy.worker.v1.JobInvocationSpec.publication_contract:type_name -> cozy.worker.v1.PublicationContract
 	231, // 290: cozy.worker.v1.DeliveryGrant.credential:type_name -> cozy.worker.v1.DeliveryAccessCredential
 	229, // 291: cozy.worker.v1.DeliveryGrant.inputs:type_name -> cozy.worker.v1.InputAccess
 	230, // 292: cozy.worker.v1.DeliveryGrant.outputs:type_name -> cozy.worker.v1.OutputAccess
-	246, // 293: cozy.worker.v1.InputAccess.native_tree:type_name -> cozy.worker.v1.NativeByteRetentionRequest
+	248, // 293: cozy.worker.v1.InputAccess.native_tree:type_name -> cozy.worker.v1.NativeByteRetentionRequest
 	228, // 294: cozy.worker.v1.InputAccess.catalog_model:type_name -> cozy.worker.v1.CatalogModelSource
 	224, // 295: cozy.worker.v1.PublicationContract.outputs:type_name -> cozy.worker.v1.OutputBinding
 	10,  // 296: cozy.worker.v1.HeldAttempt.kind:type_name -> cozy.worker.v1.AttemptKind
 	11,  // 297: cozy.worker.v1.HeldAttempt.state:type_name -> cozy.worker.v1.AttemptState
 	17,  // 298: cozy.worker.v1.Fault.kind:type_name -> cozy.worker.v1.FaultKind
 	239, // 299: cozy.worker.v1.OutputManifest.outputs:type_name -> cozy.worker.v1.OutputEntry
-	245, // 300: cozy.worker.v1.OutputEntry.native_tree:type_name -> cozy.worker.v1.NativeByteTreeRef
-	136, // 301: cozy.worker.v1.NativeArtifactTransferCall.claim:type_name -> cozy.worker.v1.Claim
-	243, // 302: cozy.worker.v1.NativeArtifactTransferCall.request:type_name -> cozy.worker.v1.NativeArtifactTransfer
-	83,  // 303: cozy.worker.v1.NativeArtifactTransfer.source:type_name -> cozy.worker.v1.DerivedRetentionRequest
-	158, // 304: cozy.worker.v1.NativeArtifactTransfer.manifest:type_name -> cozy.worker.v1.Ref
-	196, // 305: cozy.worker.v1.NativeArtifactTransfer.grant:type_name -> cozy.worker.v1.WeightsUploadGrant
-	246, // 306: cozy.worker.v1.NativeArtifactTransfer.byte_source:type_name -> cozy.worker.v1.NativeByteRetentionRequest
-	83,  // 307: cozy.worker.v1.NativeArtifactTransferStatus.source:type_name -> cozy.worker.v1.DerivedRetentionRequest
-	158, // 308: cozy.worker.v1.NativeArtifactTransferStatus.manifest:type_name -> cozy.worker.v1.Ref
-	194, // 309: cozy.worker.v1.NativeArtifactTransferStatus.objects:type_name -> cozy.worker.v1.WeightsObjectRef
-	26,  // 310: cozy.worker.v1.NativeArtifactTransferStatus.outcome:type_name -> cozy.worker.v1.WeightsUploadOutcome
-	246, // 311: cozy.worker.v1.NativeArtifactTransferStatus.byte_source:type_name -> cozy.worker.v1.NativeByteRetentionRequest
-	158, // 312: cozy.worker.v1.NativeByteTreeRef.manifest:type_name -> cozy.worker.v1.Ref
-	245, // 313: cozy.worker.v1.NativeByteRetentionRequest.source:type_name -> cozy.worker.v1.NativeByteTreeRef
-	136, // 314: cozy.worker.v1.NativeByteRetentionCall.claim:type_name -> cozy.worker.v1.Claim
-	246, // 315: cozy.worker.v1.NativeByteRetentionCall.request:type_name -> cozy.worker.v1.NativeByteRetentionRequest
-	245, // 316: cozy.worker.v1.NativeByteRetentionResult.source:type_name -> cozy.worker.v1.NativeByteTreeRef
-	245, // 317: cozy.worker.v1.ChildByteResultGrant.source:type_name -> cozy.worker.v1.NativeByteTreeRef
-	136, // 318: cozy.worker.v1.InputTreeImportHeader.claim:type_name -> cozy.worker.v1.Claim
-	158, // 319: cozy.worker.v1.InputTreeImportHeader.manifest:type_name -> cozy.worker.v1.Ref
-	158, // 320: cozy.worker.v1.InputTreeImportBlob.object:type_name -> cozy.worker.v1.Ref
-	250, // 321: cozy.worker.v1.InputTreeImportFrame.header:type_name -> cozy.worker.v1.InputTreeImportHeader
-	251, // 322: cozy.worker.v1.InputTreeImportFrame.blob:type_name -> cozy.worker.v1.InputTreeImportBlob
-	252, // 323: cozy.worker.v1.InputTreeImportFrame.commit:type_name -> cozy.worker.v1.InputTreeImportCommit
-	136, // 324: cozy.worker.v1.NativeByteReadCall.claim:type_name -> cozy.worker.v1.Claim
-	246, // 325: cozy.worker.v1.NativeByteReadCall.source:type_name -> cozy.worker.v1.NativeByteRetentionRequest
-	158, // 326: cozy.worker.v1.NativeByteReadCall.object:type_name -> cozy.worker.v1.Ref
-	257, // 327: cozy.worker.v1.ExecutionObservation.environment:type_name -> cozy.worker.v1.ExecutionEnvironment
-	258, // 328: cozy.worker.v1.ExecutionObservation.capture:type_name -> cozy.worker.v1.ActivationCaptureResult
-	45,  // 329: cozy.worker.v1.WorkerControl.GetMachineExecutionWorkspace:input_type -> cozy.worker.v1.MachineExecutionWorkspaceQuery
-	49,  // 330: cozy.worker.v1.WorkerControl.SubmitMachineExecution:input_type -> cozy.worker.v1.MachineExecutionSubmit
-	54,  // 331: cozy.worker.v1.WorkerControl.GetMachineExecution:input_type -> cozy.worker.v1.MachineExecutionQuery
-	57,  // 332: cozy.worker.v1.WorkerControl.ListMachineExecutionEvents:input_type -> cozy.worker.v1.MachineExecutionEventsQuery
-	60,  // 333: cozy.worker.v1.WorkerControl.ControlMachineExecution:input_type -> cozy.worker.v1.MachineExecutionControl
-	63,  // 334: cozy.worker.v1.WorkerControl.CollectMachineExecution:input_type -> cozy.worker.v1.MachineExecutionCollect
-	64,  // 335: cozy.worker.v1.WorkerControl.AcknowledgeMachineExecutionCollection:input_type -> cozy.worker.v1.MachineExecutionCollectionAck
-	65,  // 336: cozy.worker.v1.WorkerControl.ReadMachineExecutionTriage:input_type -> cozy.worker.v1.MachineExecutionTriageQuery
-	127, // 337: cozy.worker.v1.WorkerControl.Control:input_type -> cozy.worker.v1.RecordOwnerFrame
-	220, // 338: cozy.worker.v1.WorkerControl.WatchProgress:input_type -> cozy.worker.v1.ProgressOpen
-	36,  // 339: cozy.worker.v1.RuntimePreparation.ProtocolInfo:input_type -> cozy.worker.v1.ProtocolInfoRequest
-	77,  // 340: cozy.worker.v1.RuntimePreparation.NumericalEnvironment:input_type -> cozy.worker.v1.NumericalEnvironmentRequest
-	88,  // 341: cozy.worker.v1.RuntimePreparation.RecordOperationResult:input_type -> cozy.worker.v1.RecordOperationResultCall
-	90,  // 342: cozy.worker.v1.RuntimePreparation.LookupOperation:input_type -> cozy.worker.v1.LookupOperationCall
-	92,  // 343: cozy.worker.v1.RuntimePreparation.PruneOperationCache:input_type -> cozy.worker.v1.PruneOperationCacheCall
-	82,  // 344: cozy.worker.v1.RuntimePreparation.WorkspaceRetainDerivedResult:input_type -> cozy.worker.v1.DerivedRetentionCall
-	82,  // 345: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseDerivedRetention:input_type -> cozy.worker.v1.DerivedRetentionCall
-	85,  // 346: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseDerivedResult:input_type -> cozy.worker.v1.DerivedResultReleaseCall
-	247, // 347: cozy.worker.v1.RuntimePreparation.WorkspaceRetainByteTree:input_type -> cozy.worker.v1.NativeByteRetentionCall
-	247, // 348: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseByteTree:input_type -> cozy.worker.v1.NativeByteRetentionCall
-	254, // 349: cozy.worker.v1.RuntimePreparation.WorkspaceReadByteTreeObject:input_type -> cozy.worker.v1.NativeByteReadCall
-	242, // 350: cozy.worker.v1.RuntimePreparation.WorkspaceNativeArtifactTransfer:input_type -> cozy.worker.v1.NativeArtifactTransferCall
-	253, // 351: cozy.worker.v1.RuntimePreparation.ImportInputTree:input_type -> cozy.worker.v1.InputTreeImportFrame
-	188, // 352: cozy.worker.v1.RuntimePreparation.WorkspaceWeightsIntentReady:input_type -> cozy.worker.v1.WeightsIntentReadyCall
-	105, // 353: cozy.worker.v1.RuntimePreparation.PreparePackageSet:input_type -> cozy.worker.v1.PreparePackageSetRequest
-	125, // 354: cozy.worker.v1.RuntimePreparation.PrepareModelSource:input_type -> cozy.worker.v1.PrepareModelSourceRequest
-	76,  // 355: cozy.worker.v1.RuntimePreparation.ReleaseModelSource:input_type -> cozy.worker.v1.ReleaseModelSourceRequest
-	83,  // 356: cozy.worker.v1.RuntimePreparation.RetainDerivedResult:input_type -> cozy.worker.v1.DerivedRetentionRequest
-	83,  // 357: cozy.worker.v1.RuntimePreparation.ReleaseDerivedRetention:input_type -> cozy.worker.v1.DerivedRetentionRequest
-	86,  // 358: cozy.worker.v1.RuntimePreparation.ReleaseDerivedResult:input_type -> cozy.worker.v1.DerivedResultReleaseRequest
-	94,  // 359: cozy.worker.v1.RuntimePreparation.CollectStoreGarbage:input_type -> cozy.worker.v1.CollectStoreGarbageRequest
-	189, // 360: cozy.worker.v1.RuntimePreparation.ValidateWeightsCheckpoint:input_type -> cozy.worker.v1.ValidateWeightsCheckpointRequest
-	121, // 361: cozy.worker.v1.RuntimePreparation.CheckpointPage:input_type -> cozy.worker.v1.CheckpointPageRequest
-	123, // 362: cozy.worker.v1.RuntimePreparation.CheckpointTransfer:input_type -> cozy.worker.v1.CheckpointTransferRequest
-	110, // 363: cozy.worker.v1.RuntimePreparation.PrepareLocalPackage:input_type -> cozy.worker.v1.PrepareLocalPackageRequest
-	112, // 364: cozy.worker.v1.RuntimePreparation.PreparePrivatePlacement:input_type -> cozy.worker.v1.PreparePrivatePlacementRequest
-	198, // 365: cozy.worker.v1.RuntimeWeights.Upload:input_type -> cozy.worker.v1.WeightsUploadRequest
-	37,  // 366: cozy.worker.v1.PodHost.KeepRentalAlive:input_type -> cozy.worker.v1.KeepRentalAliveRequest
-	45,  // 367: cozy.worker.v1.PodHost.GetMachineExecutionWorkspace:input_type -> cozy.worker.v1.MachineExecutionWorkspaceQuery
-	49,  // 368: cozy.worker.v1.PodHost.SubmitMachineExecution:input_type -> cozy.worker.v1.MachineExecutionSubmit
-	54,  // 369: cozy.worker.v1.PodHost.GetMachineExecution:input_type -> cozy.worker.v1.MachineExecutionQuery
-	57,  // 370: cozy.worker.v1.PodHost.ListMachineExecutionEvents:input_type -> cozy.worker.v1.MachineExecutionEventsQuery
-	60,  // 371: cozy.worker.v1.PodHost.ControlMachineExecution:input_type -> cozy.worker.v1.MachineExecutionControl
-	63,  // 372: cozy.worker.v1.PodHost.CollectMachineExecution:input_type -> cozy.worker.v1.MachineExecutionCollect
-	64,  // 373: cozy.worker.v1.PodHost.AcknowledgeMachineExecutionCollection:input_type -> cozy.worker.v1.MachineExecutionCollectionAck
-	65,  // 374: cozy.worker.v1.PodHost.ReadMachineExecutionTriage:input_type -> cozy.worker.v1.MachineExecutionTriageQuery
-	36,  // 375: cozy.worker.v1.PodHost.ProtocolInfo:input_type -> cozy.worker.v1.ProtocolInfoRequest
-	80,  // 376: cozy.worker.v1.PodHost.NumericalEnvironment:input_type -> cozy.worker.v1.NumericalEnvironmentCall
-	68,  // 377: cozy.worker.v1.PodHost.PreparePackageSet:input_type -> cozy.worker.v1.PreparePackageSetCall
-	69,  // 378: cozy.worker.v1.PodHost.PrepareLocalPackage:input_type -> cozy.worker.v1.PrepareLocalPackageCall
-	70,  // 379: cozy.worker.v1.PodHost.PreparePrivatePlacement:input_type -> cozy.worker.v1.PreparePrivatePlacementCall
-	73,  // 380: cozy.worker.v1.PodHost.ModelSourceFile:input_type -> cozy.worker.v1.ModelSourceFileCall
-	74,  // 381: cozy.worker.v1.PodHost.ModelSourcePrepare:input_type -> cozy.worker.v1.ModelSourcePrepareCall
-	75,  // 382: cozy.worker.v1.PodHost.ModelSourceRelease:input_type -> cozy.worker.v1.ModelSourceReleaseCall
-	78,  // 383: cozy.worker.v1.PodHost.ModelSourceControl:input_type -> cozy.worker.v1.ModelSourceControlCall
-	82,  // 384: cozy.worker.v1.PodHost.RetainDerivedResult:input_type -> cozy.worker.v1.DerivedRetentionCall
-	82,  // 385: cozy.worker.v1.PodHost.ReleaseDerivedRetention:input_type -> cozy.worker.v1.DerivedRetentionCall
-	85,  // 386: cozy.worker.v1.PodHost.ReleaseDerivedResult:input_type -> cozy.worker.v1.DerivedResultReleaseCall
-	247, // 387: cozy.worker.v1.PodHost.RetainByteTree:input_type -> cozy.worker.v1.NativeByteRetentionCall
-	247, // 388: cozy.worker.v1.PodHost.ReleaseByteTree:input_type -> cozy.worker.v1.NativeByteRetentionCall
-	254, // 389: cozy.worker.v1.PodHost.ReadByteTreeObject:input_type -> cozy.worker.v1.NativeByteReadCall
-	242, // 390: cozy.worker.v1.PodHost.NativeArtifactTransfer:input_type -> cozy.worker.v1.NativeArtifactTransferCall
-	253, // 391: cozy.worker.v1.PodHost.ImportInputTree:input_type -> cozy.worker.v1.InputTreeImportFrame
-	88,  // 392: cozy.worker.v1.PodHost.RecordOperationResult:input_type -> cozy.worker.v1.RecordOperationResultCall
-	90,  // 393: cozy.worker.v1.PodHost.LookupOperation:input_type -> cozy.worker.v1.LookupOperationCall
-	92,  // 394: cozy.worker.v1.PodHost.PruneOperationCache:input_type -> cozy.worker.v1.PruneOperationCacheCall
-	97,  // 395: cozy.worker.v1.PodHost.ModelSourceAdopt:input_type -> cozy.worker.v1.ModelSourceAdoptCall
-	98,  // 396: cozy.worker.v1.PodHost.CheckpointPage:input_type -> cozy.worker.v1.CheckpointPageCall
-	99,  // 397: cozy.worker.v1.PodHost.CheckpointTransfer:input_type -> cozy.worker.v1.CheckpointTransferCall
-	100, // 398: cozy.worker.v1.PodHost.LocalPackageUpload:input_type -> cozy.worker.v1.LocalPackageUploadFrame
-	103, // 399: cozy.worker.v1.PodHost.LocalPackageAbort:input_type -> cozy.worker.v1.LocalPackageAbortCall
-	104, // 400: cozy.worker.v1.PodHost.WeightsTransfer:input_type -> cozy.worker.v1.WeightsTransferCall
-	188, // 401: cozy.worker.v1.PodHost.WeightsIntentReady:input_type -> cozy.worker.v1.WeightsIntentReadyCall
-	46,  // 402: cozy.worker.v1.WorkerControl.GetMachineExecutionWorkspace:output_type -> cozy.worker.v1.MachineExecutionWorkspace
-	53,  // 403: cozy.worker.v1.WorkerControl.SubmitMachineExecution:output_type -> cozy.worker.v1.MachineExecutionReceipt
-	55,  // 404: cozy.worker.v1.WorkerControl.GetMachineExecution:output_type -> cozy.worker.v1.MachineExecutionState
-	59,  // 405: cozy.worker.v1.WorkerControl.ListMachineExecutionEvents:output_type -> cozy.worker.v1.MachineExecutionEventPage
-	55,  // 406: cozy.worker.v1.WorkerControl.ControlMachineExecution:output_type -> cozy.worker.v1.MachineExecutionState
-	178, // 407: cozy.worker.v1.WorkerControl.CollectMachineExecution:output_type -> cozy.worker.v1.AttemptOutcome
-	55,  // 408: cozy.worker.v1.WorkerControl.AcknowledgeMachineExecutionCollection:output_type -> cozy.worker.v1.MachineExecutionState
-	66,  // 409: cozy.worker.v1.WorkerControl.ReadMachineExecutionTriage:output_type -> cozy.worker.v1.MachineExecutionTriage
-	128, // 410: cozy.worker.v1.WorkerControl.Control:output_type -> cozy.worker.v1.WorkerFrame
-	221, // 411: cozy.worker.v1.WorkerControl.WatchProgress:output_type -> cozy.worker.v1.AttemptProgress
-	67,  // 412: cozy.worker.v1.RuntimePreparation.ProtocolInfo:output_type -> cozy.worker.v1.ProtocolInfoResult
-	81,  // 413: cozy.worker.v1.RuntimePreparation.NumericalEnvironment:output_type -> cozy.worker.v1.NumericalEnvironmentResult
-	89,  // 414: cozy.worker.v1.RuntimePreparation.RecordOperationResult:output_type -> cozy.worker.v1.RecordOperationResultResult
-	91,  // 415: cozy.worker.v1.RuntimePreparation.LookupOperation:output_type -> cozy.worker.v1.LookupOperationResult
-	93,  // 416: cozy.worker.v1.RuntimePreparation.PruneOperationCache:output_type -> cozy.worker.v1.PruneOperationCacheResult
-	84,  // 417: cozy.worker.v1.RuntimePreparation.WorkspaceRetainDerivedResult:output_type -> cozy.worker.v1.DerivedRetentionResult
-	84,  // 418: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseDerivedRetention:output_type -> cozy.worker.v1.DerivedRetentionResult
-	87,  // 419: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseDerivedResult:output_type -> cozy.worker.v1.DerivedResultReleaseResult
-	248, // 420: cozy.worker.v1.RuntimePreparation.WorkspaceRetainByteTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
-	248, // 421: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseByteTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
-	255, // 422: cozy.worker.v1.RuntimePreparation.WorkspaceReadByteTreeObject:output_type -> cozy.worker.v1.NativeByteReadChunk
-	244, // 423: cozy.worker.v1.RuntimePreparation.WorkspaceNativeArtifactTransfer:output_type -> cozy.worker.v1.NativeArtifactTransferStatus
-	248, // 424: cozy.worker.v1.RuntimePreparation.ImportInputTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
-	184, // 425: cozy.worker.v1.RuntimePreparation.WorkspaceWeightsIntentReady:output_type -> cozy.worker.v1.WeightsHostAck
-	109, // 426: cozy.worker.v1.RuntimePreparation.PreparePackageSet:output_type -> cozy.worker.v1.PreparePackageSetResult
-	126, // 427: cozy.worker.v1.RuntimePreparation.PrepareModelSource:output_type -> cozy.worker.v1.PrepareModelSourceResult
-	96,  // 428: cozy.worker.v1.RuntimePreparation.ReleaseModelSource:output_type -> cozy.worker.v1.ReleaseModelSourceResult
-	84,  // 429: cozy.worker.v1.RuntimePreparation.RetainDerivedResult:output_type -> cozy.worker.v1.DerivedRetentionResult
-	84,  // 430: cozy.worker.v1.RuntimePreparation.ReleaseDerivedRetention:output_type -> cozy.worker.v1.DerivedRetentionResult
-	87,  // 431: cozy.worker.v1.RuntimePreparation.ReleaseDerivedResult:output_type -> cozy.worker.v1.DerivedResultReleaseResult
-	95,  // 432: cozy.worker.v1.RuntimePreparation.CollectStoreGarbage:output_type -> cozy.worker.v1.CollectStoreGarbageResult
-	190, // 433: cozy.worker.v1.RuntimePreparation.ValidateWeightsCheckpoint:output_type -> cozy.worker.v1.ValidateWeightsCheckpointResult
-	122, // 434: cozy.worker.v1.RuntimePreparation.CheckpointPage:output_type -> cozy.worker.v1.CheckpointPageResult
-	124, // 435: cozy.worker.v1.RuntimePreparation.CheckpointTransfer:output_type -> cozy.worker.v1.CheckpointTransferStatus
-	109, // 436: cozy.worker.v1.RuntimePreparation.PrepareLocalPackage:output_type -> cozy.worker.v1.PreparePackageSetResult
-	109, // 437: cozy.worker.v1.RuntimePreparation.PreparePrivatePlacement:output_type -> cozy.worker.v1.PreparePackageSetResult
-	199, // 438: cozy.worker.v1.RuntimeWeights.Upload:output_type -> cozy.worker.v1.WeightsUploadResult
-	38,  // 439: cozy.worker.v1.PodHost.KeepRentalAlive:output_type -> cozy.worker.v1.KeepRentalAliveResult
-	46,  // 440: cozy.worker.v1.PodHost.GetMachineExecutionWorkspace:output_type -> cozy.worker.v1.MachineExecutionWorkspace
-	53,  // 441: cozy.worker.v1.PodHost.SubmitMachineExecution:output_type -> cozy.worker.v1.MachineExecutionReceipt
-	55,  // 442: cozy.worker.v1.PodHost.GetMachineExecution:output_type -> cozy.worker.v1.MachineExecutionState
-	59,  // 443: cozy.worker.v1.PodHost.ListMachineExecutionEvents:output_type -> cozy.worker.v1.MachineExecutionEventPage
-	55,  // 444: cozy.worker.v1.PodHost.ControlMachineExecution:output_type -> cozy.worker.v1.MachineExecutionState
-	178, // 445: cozy.worker.v1.PodHost.CollectMachineExecution:output_type -> cozy.worker.v1.AttemptOutcome
-	55,  // 446: cozy.worker.v1.PodHost.AcknowledgeMachineExecutionCollection:output_type -> cozy.worker.v1.MachineExecutionState
-	66,  // 447: cozy.worker.v1.PodHost.ReadMachineExecutionTriage:output_type -> cozy.worker.v1.MachineExecutionTriage
-	67,  // 448: cozy.worker.v1.PodHost.ProtocolInfo:output_type -> cozy.worker.v1.ProtocolInfoResult
-	81,  // 449: cozy.worker.v1.PodHost.NumericalEnvironment:output_type -> cozy.worker.v1.NumericalEnvironmentResult
-	71,  // 450: cozy.worker.v1.PodHost.PreparePackageSet:output_type -> cozy.worker.v1.PrepareEvent
-	71,  // 451: cozy.worker.v1.PodHost.PrepareLocalPackage:output_type -> cozy.worker.v1.PrepareEvent
-	71,  // 452: cozy.worker.v1.PodHost.PreparePrivatePlacement:output_type -> cozy.worker.v1.PrepareEvent
-	202, // 453: cozy.worker.v1.PodHost.ModelSourceFile:output_type -> cozy.worker.v1.ModelSourceFileStatus
-	204, // 454: cozy.worker.v1.PodHost.ModelSourcePrepare:output_type -> cozy.worker.v1.ModelSourcePrepared
-	96,  // 455: cozy.worker.v1.PodHost.ModelSourceRelease:output_type -> cozy.worker.v1.ReleaseModelSourceResult
-	79,  // 456: cozy.worker.v1.PodHost.ModelSourceControl:output_type -> cozy.worker.v1.ModelSourceControlResult
-	84,  // 457: cozy.worker.v1.PodHost.RetainDerivedResult:output_type -> cozy.worker.v1.DerivedRetentionResult
-	84,  // 458: cozy.worker.v1.PodHost.ReleaseDerivedRetention:output_type -> cozy.worker.v1.DerivedRetentionResult
-	87,  // 459: cozy.worker.v1.PodHost.ReleaseDerivedResult:output_type -> cozy.worker.v1.DerivedResultReleaseResult
-	248, // 460: cozy.worker.v1.PodHost.RetainByteTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
-	248, // 461: cozy.worker.v1.PodHost.ReleaseByteTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
-	255, // 462: cozy.worker.v1.PodHost.ReadByteTreeObject:output_type -> cozy.worker.v1.NativeByteReadChunk
-	244, // 463: cozy.worker.v1.PodHost.NativeArtifactTransfer:output_type -> cozy.worker.v1.NativeArtifactTransferStatus
-	248, // 464: cozy.worker.v1.PodHost.ImportInputTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
-	89,  // 465: cozy.worker.v1.PodHost.RecordOperationResult:output_type -> cozy.worker.v1.RecordOperationResultResult
-	91,  // 466: cozy.worker.v1.PodHost.LookupOperation:output_type -> cozy.worker.v1.LookupOperationResult
-	93,  // 467: cozy.worker.v1.PodHost.PruneOperationCache:output_type -> cozy.worker.v1.PruneOperationCacheResult
-	204, // 468: cozy.worker.v1.PodHost.ModelSourceAdopt:output_type -> cozy.worker.v1.ModelSourcePrepared
-	122, // 469: cozy.worker.v1.PodHost.CheckpointPage:output_type -> cozy.worker.v1.CheckpointPageResult
-	124, // 470: cozy.worker.v1.PodHost.CheckpointTransfer:output_type -> cozy.worker.v1.CheckpointTransferStatus
-	205, // 471: cozy.worker.v1.PodHost.LocalPackageUpload:output_type -> cozy.worker.v1.LocalPackageFileStatus
-	207, // 472: cozy.worker.v1.PodHost.LocalPackageAbort:output_type -> cozy.worker.v1.LocalPackageAbortStatus
-	200, // 473: cozy.worker.v1.PodHost.WeightsTransfer:output_type -> cozy.worker.v1.WeightsTransferStatus
-	184, // 474: cozy.worker.v1.PodHost.WeightsIntentReady:output_type -> cozy.worker.v1.WeightsHostAck
-	402, // [402:475] is the sub-list for method output_type
-	329, // [329:402] is the sub-list for method input_type
-	329, // [329:329] is the sub-list for extension type_name
-	329, // [329:329] is the sub-list for extension extendee
-	0,   // [0:329] is the sub-list for field type_name
+	247, // 300: cozy.worker.v1.OutputEntry.native_tree:type_name -> cozy.worker.v1.NativeByteTreeRef
+	136, // 301: cozy.worker.v1.ForgetPackageCall.claim:type_name -> cozy.worker.v1.Claim
+	136, // 302: cozy.worker.v1.NativeArtifactTransferCall.claim:type_name -> cozy.worker.v1.Claim
+	245, // 303: cozy.worker.v1.NativeArtifactTransferCall.request:type_name -> cozy.worker.v1.NativeArtifactTransfer
+	83,  // 304: cozy.worker.v1.NativeArtifactTransfer.source:type_name -> cozy.worker.v1.DerivedRetentionRequest
+	158, // 305: cozy.worker.v1.NativeArtifactTransfer.manifest:type_name -> cozy.worker.v1.Ref
+	196, // 306: cozy.worker.v1.NativeArtifactTransfer.grant:type_name -> cozy.worker.v1.WeightsUploadGrant
+	248, // 307: cozy.worker.v1.NativeArtifactTransfer.byte_source:type_name -> cozy.worker.v1.NativeByteRetentionRequest
+	83,  // 308: cozy.worker.v1.NativeArtifactTransferStatus.source:type_name -> cozy.worker.v1.DerivedRetentionRequest
+	158, // 309: cozy.worker.v1.NativeArtifactTransferStatus.manifest:type_name -> cozy.worker.v1.Ref
+	194, // 310: cozy.worker.v1.NativeArtifactTransferStatus.objects:type_name -> cozy.worker.v1.WeightsObjectRef
+	26,  // 311: cozy.worker.v1.NativeArtifactTransferStatus.outcome:type_name -> cozy.worker.v1.WeightsUploadOutcome
+	248, // 312: cozy.worker.v1.NativeArtifactTransferStatus.byte_source:type_name -> cozy.worker.v1.NativeByteRetentionRequest
+	158, // 313: cozy.worker.v1.NativeByteTreeRef.manifest:type_name -> cozy.worker.v1.Ref
+	247, // 314: cozy.worker.v1.NativeByteRetentionRequest.source:type_name -> cozy.worker.v1.NativeByteTreeRef
+	136, // 315: cozy.worker.v1.NativeByteRetentionCall.claim:type_name -> cozy.worker.v1.Claim
+	248, // 316: cozy.worker.v1.NativeByteRetentionCall.request:type_name -> cozy.worker.v1.NativeByteRetentionRequest
+	247, // 317: cozy.worker.v1.NativeByteRetentionResult.source:type_name -> cozy.worker.v1.NativeByteTreeRef
+	247, // 318: cozy.worker.v1.ChildByteResultGrant.source:type_name -> cozy.worker.v1.NativeByteTreeRef
+	136, // 319: cozy.worker.v1.InputTreeImportHeader.claim:type_name -> cozy.worker.v1.Claim
+	158, // 320: cozy.worker.v1.InputTreeImportHeader.manifest:type_name -> cozy.worker.v1.Ref
+	158, // 321: cozy.worker.v1.InputTreeImportBlob.object:type_name -> cozy.worker.v1.Ref
+	252, // 322: cozy.worker.v1.InputTreeImportFrame.header:type_name -> cozy.worker.v1.InputTreeImportHeader
+	253, // 323: cozy.worker.v1.InputTreeImportFrame.blob:type_name -> cozy.worker.v1.InputTreeImportBlob
+	254, // 324: cozy.worker.v1.InputTreeImportFrame.commit:type_name -> cozy.worker.v1.InputTreeImportCommit
+	136, // 325: cozy.worker.v1.NativeByteReadCall.claim:type_name -> cozy.worker.v1.Claim
+	248, // 326: cozy.worker.v1.NativeByteReadCall.source:type_name -> cozy.worker.v1.NativeByteRetentionRequest
+	158, // 327: cozy.worker.v1.NativeByteReadCall.object:type_name -> cozy.worker.v1.Ref
+	259, // 328: cozy.worker.v1.ExecutionObservation.environment:type_name -> cozy.worker.v1.ExecutionEnvironment
+	260, // 329: cozy.worker.v1.ExecutionObservation.capture:type_name -> cozy.worker.v1.ActivationCaptureResult
+	45,  // 330: cozy.worker.v1.WorkerControl.GetMachineExecutionWorkspace:input_type -> cozy.worker.v1.MachineExecutionWorkspaceQuery
+	49,  // 331: cozy.worker.v1.WorkerControl.SubmitMachineExecution:input_type -> cozy.worker.v1.MachineExecutionSubmit
+	54,  // 332: cozy.worker.v1.WorkerControl.GetMachineExecution:input_type -> cozy.worker.v1.MachineExecutionQuery
+	57,  // 333: cozy.worker.v1.WorkerControl.ListMachineExecutionEvents:input_type -> cozy.worker.v1.MachineExecutionEventsQuery
+	60,  // 334: cozy.worker.v1.WorkerControl.ControlMachineExecution:input_type -> cozy.worker.v1.MachineExecutionControl
+	63,  // 335: cozy.worker.v1.WorkerControl.CollectMachineExecution:input_type -> cozy.worker.v1.MachineExecutionCollect
+	64,  // 336: cozy.worker.v1.WorkerControl.AcknowledgeMachineExecutionCollection:input_type -> cozy.worker.v1.MachineExecutionCollectionAck
+	65,  // 337: cozy.worker.v1.WorkerControl.ReadMachineExecutionTriage:input_type -> cozy.worker.v1.MachineExecutionTriageQuery
+	127, // 338: cozy.worker.v1.WorkerControl.Control:input_type -> cozy.worker.v1.RecordOwnerFrame
+	220, // 339: cozy.worker.v1.WorkerControl.WatchProgress:input_type -> cozy.worker.v1.ProgressOpen
+	36,  // 340: cozy.worker.v1.RuntimePreparation.ProtocolInfo:input_type -> cozy.worker.v1.ProtocolInfoRequest
+	77,  // 341: cozy.worker.v1.RuntimePreparation.NumericalEnvironment:input_type -> cozy.worker.v1.NumericalEnvironmentRequest
+	88,  // 342: cozy.worker.v1.RuntimePreparation.RecordOperationResult:input_type -> cozy.worker.v1.RecordOperationResultCall
+	90,  // 343: cozy.worker.v1.RuntimePreparation.LookupOperation:input_type -> cozy.worker.v1.LookupOperationCall
+	92,  // 344: cozy.worker.v1.RuntimePreparation.PruneOperationCache:input_type -> cozy.worker.v1.PruneOperationCacheCall
+	82,  // 345: cozy.worker.v1.RuntimePreparation.WorkspaceRetainDerivedResult:input_type -> cozy.worker.v1.DerivedRetentionCall
+	82,  // 346: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseDerivedRetention:input_type -> cozy.worker.v1.DerivedRetentionCall
+	85,  // 347: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseDerivedResult:input_type -> cozy.worker.v1.DerivedResultReleaseCall
+	249, // 348: cozy.worker.v1.RuntimePreparation.WorkspaceRetainByteTree:input_type -> cozy.worker.v1.NativeByteRetentionCall
+	249, // 349: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseByteTree:input_type -> cozy.worker.v1.NativeByteRetentionCall
+	256, // 350: cozy.worker.v1.RuntimePreparation.WorkspaceReadByteTreeObject:input_type -> cozy.worker.v1.NativeByteReadCall
+	244, // 351: cozy.worker.v1.RuntimePreparation.WorkspaceNativeArtifactTransfer:input_type -> cozy.worker.v1.NativeArtifactTransferCall
+	242, // 352: cozy.worker.v1.RuntimePreparation.WorkspaceForgetPackage:input_type -> cozy.worker.v1.ForgetPackageCall
+	255, // 353: cozy.worker.v1.RuntimePreparation.ImportInputTree:input_type -> cozy.worker.v1.InputTreeImportFrame
+	188, // 354: cozy.worker.v1.RuntimePreparation.WorkspaceWeightsIntentReady:input_type -> cozy.worker.v1.WeightsIntentReadyCall
+	105, // 355: cozy.worker.v1.RuntimePreparation.PreparePackageSet:input_type -> cozy.worker.v1.PreparePackageSetRequest
+	125, // 356: cozy.worker.v1.RuntimePreparation.PrepareModelSource:input_type -> cozy.worker.v1.PrepareModelSourceRequest
+	76,  // 357: cozy.worker.v1.RuntimePreparation.ReleaseModelSource:input_type -> cozy.worker.v1.ReleaseModelSourceRequest
+	83,  // 358: cozy.worker.v1.RuntimePreparation.RetainDerivedResult:input_type -> cozy.worker.v1.DerivedRetentionRequest
+	83,  // 359: cozy.worker.v1.RuntimePreparation.ReleaseDerivedRetention:input_type -> cozy.worker.v1.DerivedRetentionRequest
+	86,  // 360: cozy.worker.v1.RuntimePreparation.ReleaseDerivedResult:input_type -> cozy.worker.v1.DerivedResultReleaseRequest
+	94,  // 361: cozy.worker.v1.RuntimePreparation.CollectStoreGarbage:input_type -> cozy.worker.v1.CollectStoreGarbageRequest
+	189, // 362: cozy.worker.v1.RuntimePreparation.ValidateWeightsCheckpoint:input_type -> cozy.worker.v1.ValidateWeightsCheckpointRequest
+	121, // 363: cozy.worker.v1.RuntimePreparation.CheckpointPage:input_type -> cozy.worker.v1.CheckpointPageRequest
+	123, // 364: cozy.worker.v1.RuntimePreparation.CheckpointTransfer:input_type -> cozy.worker.v1.CheckpointTransferRequest
+	110, // 365: cozy.worker.v1.RuntimePreparation.PrepareLocalPackage:input_type -> cozy.worker.v1.PrepareLocalPackageRequest
+	112, // 366: cozy.worker.v1.RuntimePreparation.PreparePrivatePlacement:input_type -> cozy.worker.v1.PreparePrivatePlacementRequest
+	198, // 367: cozy.worker.v1.RuntimeWeights.Upload:input_type -> cozy.worker.v1.WeightsUploadRequest
+	37,  // 368: cozy.worker.v1.PodHost.KeepRentalAlive:input_type -> cozy.worker.v1.KeepRentalAliveRequest
+	45,  // 369: cozy.worker.v1.PodHost.GetMachineExecutionWorkspace:input_type -> cozy.worker.v1.MachineExecutionWorkspaceQuery
+	49,  // 370: cozy.worker.v1.PodHost.SubmitMachineExecution:input_type -> cozy.worker.v1.MachineExecutionSubmit
+	54,  // 371: cozy.worker.v1.PodHost.GetMachineExecution:input_type -> cozy.worker.v1.MachineExecutionQuery
+	57,  // 372: cozy.worker.v1.PodHost.ListMachineExecutionEvents:input_type -> cozy.worker.v1.MachineExecutionEventsQuery
+	60,  // 373: cozy.worker.v1.PodHost.ControlMachineExecution:input_type -> cozy.worker.v1.MachineExecutionControl
+	63,  // 374: cozy.worker.v1.PodHost.CollectMachineExecution:input_type -> cozy.worker.v1.MachineExecutionCollect
+	64,  // 375: cozy.worker.v1.PodHost.AcknowledgeMachineExecutionCollection:input_type -> cozy.worker.v1.MachineExecutionCollectionAck
+	65,  // 376: cozy.worker.v1.PodHost.ReadMachineExecutionTriage:input_type -> cozy.worker.v1.MachineExecutionTriageQuery
+	36,  // 377: cozy.worker.v1.PodHost.ProtocolInfo:input_type -> cozy.worker.v1.ProtocolInfoRequest
+	80,  // 378: cozy.worker.v1.PodHost.NumericalEnvironment:input_type -> cozy.worker.v1.NumericalEnvironmentCall
+	68,  // 379: cozy.worker.v1.PodHost.PreparePackageSet:input_type -> cozy.worker.v1.PreparePackageSetCall
+	69,  // 380: cozy.worker.v1.PodHost.PrepareLocalPackage:input_type -> cozy.worker.v1.PrepareLocalPackageCall
+	70,  // 381: cozy.worker.v1.PodHost.PreparePrivatePlacement:input_type -> cozy.worker.v1.PreparePrivatePlacementCall
+	73,  // 382: cozy.worker.v1.PodHost.ModelSourceFile:input_type -> cozy.worker.v1.ModelSourceFileCall
+	74,  // 383: cozy.worker.v1.PodHost.ModelSourcePrepare:input_type -> cozy.worker.v1.ModelSourcePrepareCall
+	75,  // 384: cozy.worker.v1.PodHost.ModelSourceRelease:input_type -> cozy.worker.v1.ModelSourceReleaseCall
+	78,  // 385: cozy.worker.v1.PodHost.ModelSourceControl:input_type -> cozy.worker.v1.ModelSourceControlCall
+	82,  // 386: cozy.worker.v1.PodHost.RetainDerivedResult:input_type -> cozy.worker.v1.DerivedRetentionCall
+	82,  // 387: cozy.worker.v1.PodHost.ReleaseDerivedRetention:input_type -> cozy.worker.v1.DerivedRetentionCall
+	85,  // 388: cozy.worker.v1.PodHost.ReleaseDerivedResult:input_type -> cozy.worker.v1.DerivedResultReleaseCall
+	249, // 389: cozy.worker.v1.PodHost.RetainByteTree:input_type -> cozy.worker.v1.NativeByteRetentionCall
+	249, // 390: cozy.worker.v1.PodHost.ReleaseByteTree:input_type -> cozy.worker.v1.NativeByteRetentionCall
+	256, // 391: cozy.worker.v1.PodHost.ReadByteTreeObject:input_type -> cozy.worker.v1.NativeByteReadCall
+	244, // 392: cozy.worker.v1.PodHost.NativeArtifactTransfer:input_type -> cozy.worker.v1.NativeArtifactTransferCall
+	242, // 393: cozy.worker.v1.PodHost.ForgetPackage:input_type -> cozy.worker.v1.ForgetPackageCall
+	255, // 394: cozy.worker.v1.PodHost.ImportInputTree:input_type -> cozy.worker.v1.InputTreeImportFrame
+	88,  // 395: cozy.worker.v1.PodHost.RecordOperationResult:input_type -> cozy.worker.v1.RecordOperationResultCall
+	90,  // 396: cozy.worker.v1.PodHost.LookupOperation:input_type -> cozy.worker.v1.LookupOperationCall
+	92,  // 397: cozy.worker.v1.PodHost.PruneOperationCache:input_type -> cozy.worker.v1.PruneOperationCacheCall
+	97,  // 398: cozy.worker.v1.PodHost.ModelSourceAdopt:input_type -> cozy.worker.v1.ModelSourceAdoptCall
+	98,  // 399: cozy.worker.v1.PodHost.CheckpointPage:input_type -> cozy.worker.v1.CheckpointPageCall
+	99,  // 400: cozy.worker.v1.PodHost.CheckpointTransfer:input_type -> cozy.worker.v1.CheckpointTransferCall
+	100, // 401: cozy.worker.v1.PodHost.LocalPackageUpload:input_type -> cozy.worker.v1.LocalPackageUploadFrame
+	103, // 402: cozy.worker.v1.PodHost.LocalPackageAbort:input_type -> cozy.worker.v1.LocalPackageAbortCall
+	104, // 403: cozy.worker.v1.PodHost.WeightsTransfer:input_type -> cozy.worker.v1.WeightsTransferCall
+	188, // 404: cozy.worker.v1.PodHost.WeightsIntentReady:input_type -> cozy.worker.v1.WeightsIntentReadyCall
+	46,  // 405: cozy.worker.v1.WorkerControl.GetMachineExecutionWorkspace:output_type -> cozy.worker.v1.MachineExecutionWorkspace
+	53,  // 406: cozy.worker.v1.WorkerControl.SubmitMachineExecution:output_type -> cozy.worker.v1.MachineExecutionReceipt
+	55,  // 407: cozy.worker.v1.WorkerControl.GetMachineExecution:output_type -> cozy.worker.v1.MachineExecutionState
+	59,  // 408: cozy.worker.v1.WorkerControl.ListMachineExecutionEvents:output_type -> cozy.worker.v1.MachineExecutionEventPage
+	55,  // 409: cozy.worker.v1.WorkerControl.ControlMachineExecution:output_type -> cozy.worker.v1.MachineExecutionState
+	178, // 410: cozy.worker.v1.WorkerControl.CollectMachineExecution:output_type -> cozy.worker.v1.AttemptOutcome
+	55,  // 411: cozy.worker.v1.WorkerControl.AcknowledgeMachineExecutionCollection:output_type -> cozy.worker.v1.MachineExecutionState
+	66,  // 412: cozy.worker.v1.WorkerControl.ReadMachineExecutionTriage:output_type -> cozy.worker.v1.MachineExecutionTriage
+	128, // 413: cozy.worker.v1.WorkerControl.Control:output_type -> cozy.worker.v1.WorkerFrame
+	221, // 414: cozy.worker.v1.WorkerControl.WatchProgress:output_type -> cozy.worker.v1.AttemptProgress
+	67,  // 415: cozy.worker.v1.RuntimePreparation.ProtocolInfo:output_type -> cozy.worker.v1.ProtocolInfoResult
+	81,  // 416: cozy.worker.v1.RuntimePreparation.NumericalEnvironment:output_type -> cozy.worker.v1.NumericalEnvironmentResult
+	89,  // 417: cozy.worker.v1.RuntimePreparation.RecordOperationResult:output_type -> cozy.worker.v1.RecordOperationResultResult
+	91,  // 418: cozy.worker.v1.RuntimePreparation.LookupOperation:output_type -> cozy.worker.v1.LookupOperationResult
+	93,  // 419: cozy.worker.v1.RuntimePreparation.PruneOperationCache:output_type -> cozy.worker.v1.PruneOperationCacheResult
+	84,  // 420: cozy.worker.v1.RuntimePreparation.WorkspaceRetainDerivedResult:output_type -> cozy.worker.v1.DerivedRetentionResult
+	84,  // 421: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseDerivedRetention:output_type -> cozy.worker.v1.DerivedRetentionResult
+	87,  // 422: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseDerivedResult:output_type -> cozy.worker.v1.DerivedResultReleaseResult
+	250, // 423: cozy.worker.v1.RuntimePreparation.WorkspaceRetainByteTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
+	250, // 424: cozy.worker.v1.RuntimePreparation.WorkspaceReleaseByteTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
+	257, // 425: cozy.worker.v1.RuntimePreparation.WorkspaceReadByteTreeObject:output_type -> cozy.worker.v1.NativeByteReadChunk
+	246, // 426: cozy.worker.v1.RuntimePreparation.WorkspaceNativeArtifactTransfer:output_type -> cozy.worker.v1.NativeArtifactTransferStatus
+	243, // 427: cozy.worker.v1.RuntimePreparation.WorkspaceForgetPackage:output_type -> cozy.worker.v1.ForgetPackageResult
+	250, // 428: cozy.worker.v1.RuntimePreparation.ImportInputTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
+	184, // 429: cozy.worker.v1.RuntimePreparation.WorkspaceWeightsIntentReady:output_type -> cozy.worker.v1.WeightsHostAck
+	109, // 430: cozy.worker.v1.RuntimePreparation.PreparePackageSet:output_type -> cozy.worker.v1.PreparePackageSetResult
+	126, // 431: cozy.worker.v1.RuntimePreparation.PrepareModelSource:output_type -> cozy.worker.v1.PrepareModelSourceResult
+	96,  // 432: cozy.worker.v1.RuntimePreparation.ReleaseModelSource:output_type -> cozy.worker.v1.ReleaseModelSourceResult
+	84,  // 433: cozy.worker.v1.RuntimePreparation.RetainDerivedResult:output_type -> cozy.worker.v1.DerivedRetentionResult
+	84,  // 434: cozy.worker.v1.RuntimePreparation.ReleaseDerivedRetention:output_type -> cozy.worker.v1.DerivedRetentionResult
+	87,  // 435: cozy.worker.v1.RuntimePreparation.ReleaseDerivedResult:output_type -> cozy.worker.v1.DerivedResultReleaseResult
+	95,  // 436: cozy.worker.v1.RuntimePreparation.CollectStoreGarbage:output_type -> cozy.worker.v1.CollectStoreGarbageResult
+	190, // 437: cozy.worker.v1.RuntimePreparation.ValidateWeightsCheckpoint:output_type -> cozy.worker.v1.ValidateWeightsCheckpointResult
+	122, // 438: cozy.worker.v1.RuntimePreparation.CheckpointPage:output_type -> cozy.worker.v1.CheckpointPageResult
+	124, // 439: cozy.worker.v1.RuntimePreparation.CheckpointTransfer:output_type -> cozy.worker.v1.CheckpointTransferStatus
+	109, // 440: cozy.worker.v1.RuntimePreparation.PrepareLocalPackage:output_type -> cozy.worker.v1.PreparePackageSetResult
+	109, // 441: cozy.worker.v1.RuntimePreparation.PreparePrivatePlacement:output_type -> cozy.worker.v1.PreparePackageSetResult
+	199, // 442: cozy.worker.v1.RuntimeWeights.Upload:output_type -> cozy.worker.v1.WeightsUploadResult
+	38,  // 443: cozy.worker.v1.PodHost.KeepRentalAlive:output_type -> cozy.worker.v1.KeepRentalAliveResult
+	46,  // 444: cozy.worker.v1.PodHost.GetMachineExecutionWorkspace:output_type -> cozy.worker.v1.MachineExecutionWorkspace
+	53,  // 445: cozy.worker.v1.PodHost.SubmitMachineExecution:output_type -> cozy.worker.v1.MachineExecutionReceipt
+	55,  // 446: cozy.worker.v1.PodHost.GetMachineExecution:output_type -> cozy.worker.v1.MachineExecutionState
+	59,  // 447: cozy.worker.v1.PodHost.ListMachineExecutionEvents:output_type -> cozy.worker.v1.MachineExecutionEventPage
+	55,  // 448: cozy.worker.v1.PodHost.ControlMachineExecution:output_type -> cozy.worker.v1.MachineExecutionState
+	178, // 449: cozy.worker.v1.PodHost.CollectMachineExecution:output_type -> cozy.worker.v1.AttemptOutcome
+	55,  // 450: cozy.worker.v1.PodHost.AcknowledgeMachineExecutionCollection:output_type -> cozy.worker.v1.MachineExecutionState
+	66,  // 451: cozy.worker.v1.PodHost.ReadMachineExecutionTriage:output_type -> cozy.worker.v1.MachineExecutionTriage
+	67,  // 452: cozy.worker.v1.PodHost.ProtocolInfo:output_type -> cozy.worker.v1.ProtocolInfoResult
+	81,  // 453: cozy.worker.v1.PodHost.NumericalEnvironment:output_type -> cozy.worker.v1.NumericalEnvironmentResult
+	71,  // 454: cozy.worker.v1.PodHost.PreparePackageSet:output_type -> cozy.worker.v1.PrepareEvent
+	71,  // 455: cozy.worker.v1.PodHost.PrepareLocalPackage:output_type -> cozy.worker.v1.PrepareEvent
+	71,  // 456: cozy.worker.v1.PodHost.PreparePrivatePlacement:output_type -> cozy.worker.v1.PrepareEvent
+	202, // 457: cozy.worker.v1.PodHost.ModelSourceFile:output_type -> cozy.worker.v1.ModelSourceFileStatus
+	204, // 458: cozy.worker.v1.PodHost.ModelSourcePrepare:output_type -> cozy.worker.v1.ModelSourcePrepared
+	96,  // 459: cozy.worker.v1.PodHost.ModelSourceRelease:output_type -> cozy.worker.v1.ReleaseModelSourceResult
+	79,  // 460: cozy.worker.v1.PodHost.ModelSourceControl:output_type -> cozy.worker.v1.ModelSourceControlResult
+	84,  // 461: cozy.worker.v1.PodHost.RetainDerivedResult:output_type -> cozy.worker.v1.DerivedRetentionResult
+	84,  // 462: cozy.worker.v1.PodHost.ReleaseDerivedRetention:output_type -> cozy.worker.v1.DerivedRetentionResult
+	87,  // 463: cozy.worker.v1.PodHost.ReleaseDerivedResult:output_type -> cozy.worker.v1.DerivedResultReleaseResult
+	250, // 464: cozy.worker.v1.PodHost.RetainByteTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
+	250, // 465: cozy.worker.v1.PodHost.ReleaseByteTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
+	257, // 466: cozy.worker.v1.PodHost.ReadByteTreeObject:output_type -> cozy.worker.v1.NativeByteReadChunk
+	246, // 467: cozy.worker.v1.PodHost.NativeArtifactTransfer:output_type -> cozy.worker.v1.NativeArtifactTransferStatus
+	243, // 468: cozy.worker.v1.PodHost.ForgetPackage:output_type -> cozy.worker.v1.ForgetPackageResult
+	250, // 469: cozy.worker.v1.PodHost.ImportInputTree:output_type -> cozy.worker.v1.NativeByteRetentionResult
+	89,  // 470: cozy.worker.v1.PodHost.RecordOperationResult:output_type -> cozy.worker.v1.RecordOperationResultResult
+	91,  // 471: cozy.worker.v1.PodHost.LookupOperation:output_type -> cozy.worker.v1.LookupOperationResult
+	93,  // 472: cozy.worker.v1.PodHost.PruneOperationCache:output_type -> cozy.worker.v1.PruneOperationCacheResult
+	204, // 473: cozy.worker.v1.PodHost.ModelSourceAdopt:output_type -> cozy.worker.v1.ModelSourcePrepared
+	122, // 474: cozy.worker.v1.PodHost.CheckpointPage:output_type -> cozy.worker.v1.CheckpointPageResult
+	124, // 475: cozy.worker.v1.PodHost.CheckpointTransfer:output_type -> cozy.worker.v1.CheckpointTransferStatus
+	205, // 476: cozy.worker.v1.PodHost.LocalPackageUpload:output_type -> cozy.worker.v1.LocalPackageFileStatus
+	207, // 477: cozy.worker.v1.PodHost.LocalPackageAbort:output_type -> cozy.worker.v1.LocalPackageAbortStatus
+	200, // 478: cozy.worker.v1.PodHost.WeightsTransfer:output_type -> cozy.worker.v1.WeightsTransferStatus
+	184, // 479: cozy.worker.v1.PodHost.WeightsIntentReady:output_type -> cozy.worker.v1.WeightsHostAck
+	405, // [405:480] is the sub-list for method output_type
+	330, // [330:405] is the sub-list for method input_type
+	330, // [330:330] is the sub-list for extension type_name
+	330, // [330:330] is the sub-list for extension extendee
+	0,   // [0:330] is the sub-list for field type_name
 }
 
 func init() { file_cozy_worker_v1_worker_proto_init() }
@@ -25167,7 +25263,7 @@ func file_cozy_worker_v1_worker_proto_init() {
 		(*InvocationSpec_Serving)(nil),
 		(*InvocationSpec_Job)(nil),
 	}
-	file_cozy_worker_v1_worker_proto_msgTypes[217].OneofWrappers = []any{
+	file_cozy_worker_v1_worker_proto_msgTypes[219].OneofWrappers = []any{
 		(*InputTreeImportFrame_Header)(nil),
 		(*InputTreeImportFrame_Blob)(nil),
 		(*InputTreeImportFrame_Commit)(nil),
@@ -25178,7 +25274,7 @@ func file_cozy_worker_v1_worker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_cozy_worker_v1_worker_proto_rawDesc), len(file_cozy_worker_v1_worker_proto_rawDesc)),
 			NumEnums:      36,
-			NumMessages:   225,
+			NumMessages:   227,
 			NumExtensions: 0,
 			NumServices:   4,
 		},
