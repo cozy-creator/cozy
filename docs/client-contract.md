@@ -328,6 +328,7 @@ Only a daemon holding the root lock may migrate an older database.
 | `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | explicit acknowledged fixed fifteen-minute reset; request ID only |
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one generic empty private worker and directly claim WorkerControl |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
+| `GET /v1/local/rentals/{rental_id}/lanes` | local | yes | which submission lanes the claimed worker's Runtime takes: release-root jobs and provider-source Models |
 | `POST /v1/local/rentals/{rental_id}/prune` | local | yes | prune unused operation cache roots on the claimed Host; report `removed_entries`, `reclaimed_bytes`, and whether native GC is still `store_busy` |
 | `POST /v1/local/rentals/{rental_id}/prepare` | local | yes | durably accept exact package or model installation; return 202 with the queued intent before the rental is ready |
 | `POST /v1/local/rentals/{rental_id}/runtime-update` | local | yes | start or rejoin a durable per-rental Runtime update; the CLI may disconnect without canceling it |

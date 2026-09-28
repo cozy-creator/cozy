@@ -41,6 +41,7 @@ func TestNativeCompositionCompletesWithClientOffline(t *testing.T) {
 		err = os.Mkdir(root, 0700) // Existing homes are never reused or removed.
 	}
 	must(t, err)
+	unpressuredMachine(t, root)
 	control := filepath.Join(root, "control")
 	uv := func(args ...string) {
 		t.Helper()
@@ -100,28 +101,30 @@ func TestNativeCompositionCompletesWithClientOffline(t *testing.T) {
 		barrier.Close()
 	}()
 	// The barrier belongs to the trusted test Runtime, not package Python. Package
-	// networking remains forbidden. Pause the real native source read for B;
-	// after Creator is offline, allow that read and C's subsequent read through.
-	wrapper := fmt.Sprintf(`#!%s
+	// networking remains forbidden. The machine's worker entry is replaced by the same
+	// `main` with its native source read paused for B; after Creator is offline, that read
+	// and C's subsequent read go through.
+	machineRoot := filepath.Join(root, "machine", "root")
+	worker := filepath.Join(machineRoot, "opt", "cozy", "bin", "cozy-runtime-worker")
+	must(t, os.Remove(worker))
+	must(t, os.WriteFile(worker, []byte(fmt.Sprintf(`#!%s
 import sys
-if "serve" in sys.argv:
-    import urllib.request
-    import tensorfs.derived as derived
-    native = derived.serve_derived
-    class ObservedWriter:
-        def __init__(self, writer): self.writer = writer
-        def __getattr__(self, name): return getattr(self.writer, name)
-        def source_read_into(self, *args):
-            with urllib.request.urlopen(%q, timeout=120) as response:
-                response.read()
-            return self.writer.source_read_into(*args)
-    def observed(writer, *args, **kwargs):
-        return native(ObservedWriter(writer), *args, **kwargs)
-    derived.serve_derived = observed
-from cozy_runtime.cli.main import main
-sys.exit(main())
-`, filepath.Join(control, "bin", "python"), barrier.URL)
-	must(t, os.WriteFile(filepath.Join(control, "bin", "cozy-runtime"), []byte(wrapper), 0700)) //cozy:allow isolated Runtime fault instrumentation; all invocation still uses the ordinary CLI and worker protocol
+import urllib.request
+import tensorfs.derived as derived
+native = derived.serve_derived
+class ObservedWriter:
+    def __init__(self, writer): self.writer = writer
+    def __getattr__(self, name): return getattr(self.writer, name)
+    def source_read_into(self, *args):
+        with urllib.request.urlopen(%q, timeout=120) as response:
+            response.read()
+        return self.writer.source_read_into(*args)
+def observed(writer, *args, **kwargs):
+    return native(ObservedWriter(writer), *args, **kwargs)
+derived.serve_derived = observed
+from cozy_runtime.cli import runtime_worker
+sys.exit(runtime_worker.main([]))
+`, filepath.Join(machineRoot, "opt", "cozy", "python", "bin", "python"), barrier.URL)), 0o755)) //cozy:allow isolated Runtime fault instrumentation; all invocation still uses the ordinary CLI and worker protocol
 	project := copyPrivateTensorProject(t, root, "")
 	script := filepath.Join(project, "recipe.py")
 	source, err := os.ReadFile(script)
@@ -196,7 +199,7 @@ sys.exit(main())
 	if artifact == nil {
 		t.Fatal("final native artifact absent")
 	}
-	check := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "private_child_read.py"), artifact.Manifest.Digest, strconv.Itoa(42), filepath.Join(root, "tensorfs"))
+	check := exec.Command(filepath.Join(control, "bin", "python"), filepath.Join("testdata", "private_child_read.py"), artifact.Manifest.Digest, strconv.Itoa(42), machineStore(root))
 	check.Env = childEnv(t, root, "PATH="+path)
 	verified, err := check.CombinedOutput()
 	if err != nil {

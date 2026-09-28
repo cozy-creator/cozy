@@ -36,6 +36,7 @@ func TestRuntimeBuiltinQuantizeSurvivesCallerEdit(t *testing.T) {
 	}
 	root, err := os.MkdirTemp("", "cozy-builtin-")
 	must(t, err)
+	unpressuredMachine(t, root)
 	path := filepath.Join(control, "bin")
 	for _, item := range childEnv(t, root) {
 		if strings.HasPrefix(item, "PATH=") {
@@ -169,9 +170,9 @@ async def main(ctx):
 		}
 	}
 
-	// Runtime prepares its builtin operations once, in its own interpreter: NumPy is a core
-	// Runtime dependency, so the operations need no separate numerical environment.
-	descriptors, err := filepath.Glob(filepath.Join(root, "runtime", "environments", "installations", "*", "installation.json"))
+	// The machine's Runtime prepares its builtin operations once, in its own interpreter:
+	// NumPy is a core Runtime dependency, so the operations need no separate environment.
+	descriptors, err := filepath.Glob(filepath.Join(machineInstallations(root), "*", "installation.json"))
 	must(t, err)
 	interpreter := ""
 	for _, descriptor := range descriptors {
@@ -186,9 +187,11 @@ async def main(ctx):
 			interpreter = installation.Python
 		}
 	}
-	if interpreter != filepath.Join(control, "bin", "python") {
-		t.Fatalf("builtin operations were not prepared in the Runtime's interpreter %s: %q (of %v)",
-			filepath.Join(control, "bin", "python"), interpreter, descriptors)
+	runtimePython, err := filepath.EvalSymlinks(filepath.Join(root, "machine", "root", "opt", "cozy", "python"))
+	must(t, err)
+	if interpreter != filepath.Join(runtimePython, "bin", "python") {
+		t.Fatalf("builtin operations were not prepared in the machine Runtime's interpreter %s: %q (of %v)",
+			filepath.Join(runtimePython, "bin", "python"), interpreter, descriptors)
 	}
 	out, err := exec.Command(interpreter, "-I", "-c", `import importlib.metadata as m, sys
 import numpy

@@ -56,6 +56,33 @@ func machineTemplateDir(t *testing.T) string {
 // own stand-in hub registers through that hub.
 func provisionMachine(t *testing.T, root string) {
 	t.Helper()
+	provisionMachineIn(t, root, "")
+}
+
+// unpressuredMachine gives root its machine on a filesystem the machine's own Runtime finds
+// free of storage pressure. Under pressure the Runtime evicts every unused memo entry, as it
+// should; a test of memo reuse needs the headroom a user's machine would have.
+func unpressuredMachine(t *testing.T, root string) {
+	t.Helper()
+	if *machineHostBinary == "" {
+		return
+	}
+	python := filepath.Join(machineTemplateDir(t), "root", "opt", "cozy", "python", "bin", "python")
+	for _, parent := range []string{os.TempDir(), "/dev/shm"} {
+		out, err := exec.Command(python, "-I", "-c", `import sys
+from pathlib import Path
+from cozy_runtime.internal.local_storage_admission import pressure_target
+print(pressure_target(Path(sys.argv[1])))`, parent).Output()
+		if err == nil && strings.TrimSpace(string(out)) == "0" {
+			provisionMachineIn(t, root, parent)
+			return
+		}
+	}
+	t.Fatal("every filesystem for the machine is under storage pressure; its Runtime would evict the memo entries this test reuses")
+}
+
+func provisionMachineIn(t *testing.T, root, parent string) {
+	t.Helper()
 	if *machineHostBinary == "" {
 		return
 	}
@@ -66,7 +93,7 @@ func provisionMachine(t *testing.T, root string) {
 	template := machineTemplateDir(t)
 	// The machine lives at a short path, as a pod's does at /: a test root's own path would
 	// push the Runtime's executor sockets past the kernel's socket path bound.
-	short, err := os.MkdirTemp("", "cm")
+	short, err := os.MkdirTemp(parent, "cm")
 	must(t, err)
 	must(t, os.MkdirAll(root, 0o700))
 	must(t, os.Symlink(short, dir))
@@ -172,8 +199,19 @@ func stubMachine(t *testing.T, root, script string) {
 	}
 }
 
+// machineStore is this computer's machine's TensorFS Store: where its Runtime keeps every
+// model, checkpoint and result, as a pod's does at /var/lib/tensorfs.
+func machineStore(root string) string {
+	return filepath.Join(root, "machine", "root", "var", "lib", "tensorfs")
+}
+
+// machineInstallations holds the package environments this computer's machine prepared.
+func machineInstallations(root string) string {
+	return filepath.Join(root, "machine", "root", "var", "lib", "cozy", "installs", "installations")
+}
+
 // machineJournal is this computer's machine's execution journal: the Runtime's workspace in
 // the machine's own TensorFS Store.
 func machineJournal(root string) string {
-	return filepath.Join(root, "machine", "root", "var", "lib", "tensorfs", ".cozy-workspace", "journal.sqlite3")
+	return filepath.Join(machineStore(root), ".cozy-workspace", "journal.sqlite3")
 }

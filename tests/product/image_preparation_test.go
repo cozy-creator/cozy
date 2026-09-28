@@ -2,6 +2,8 @@ package producttest
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -181,13 +183,18 @@ cozy-runtime = {path = ` + strconv.Quote(*privateScriptRuntimeWheel) + `}
 	if request == nil || len(request.Assets) != 1 {
 		t.Fatal("prepared request lost input")
 	}
+	// The prepared derivative, not the original, is what the request froze into its own
+	// stage and handed the machine.
 	asset := request.Assets[0]
-	if filepath.Dir(asset.LocalPath) != filepath.Join(os.TempDir(), "cozy") ||
-		filepath.Base(asset.LocalPath) != strings.TrimPrefix(asset.Digest, "sha256:")+".webp" {
-		t.Fatalf("derivative is not Runtime's hash-addressed temporary file: %s", asset.LocalPath)
+	original := sha256.Sum256(before)
+	if asset.Snapshot == nil || !strings.HasPrefix(asset.LocalPath, filepath.Join(root, "tmp", request.ID)+string(filepath.Separator)) ||
+		asset.MediaType != "image/webp" || asset.Length > 16384 || asset.Digest == "sha256:"+hex.EncodeToString(original[:]) {
+		t.Fatalf("the prepared derivative was not frozen in the request stage: %+v", asset)
 	}
-	if _, err := os.Stat(asset.LocalPath); err != nil {
-		t.Fatalf("temporary derivative was removed while request could retry: %v", err)
+	inputs, problem := store.MachineInputs(request.ID)
+	fatal(t, problem)
+	if len(inputs) != 1 {
+		t.Fatalf("the machine recorded %d input receipts, want 1", len(inputs))
 	}
 	if _, err := os.Stat(filepath.Join(root, "inputs")); !os.IsNotExist(err) {
 		t.Fatalf("prepared image was copied into an input store: %v", err)

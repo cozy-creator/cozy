@@ -1,2 +1,0 @@
-[application]
-object = "serving_fixture:app"

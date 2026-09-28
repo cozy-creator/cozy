@@ -8,10 +8,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
@@ -106,14 +106,10 @@ func TestRentalRequirementsIncludeTheWholeSelectedClosure(t *testing.T) {
 
 }
 
-// This exercises actual script capture and named-rental admission through the
-// normal CLI. The HTTP peer supplies inventory only; it never buys a machine.
+// Private dependency versions never constrain a named rental: the machine prepares the
+// captured environment itself. The HTTP peer names the rentals only; it never buys one.
 func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 	integration(t)
-	inventory, problem := hostruntime.PythonExecutors(context.Background())
-	fatal(t, problem)
-	captured, problem := inventory.Select(">=3.12,<3.13", "")
-	fatal(t, problem)
 	version := runtimeFixtureVersion(t, *privateScriptRuntimeWheel)
 	const current, old, earlierPython = "pr-11111111111111111111", "pr-22222222222222222222", "pr-33333333333333333333"
 	root, mu, posts, _, _ := runModelCatalog(t, func(mux *http.ServeMux, _ *hub.PackageReleaseDetail) {
@@ -124,20 +120,6 @@ func TestUnpublishedNamedRentalUsesPrivateDependencyVersions(t *testing.T) {
 				"rental_id": id, "name": name, "state": "ready", "accelerator_count": 1,
 				"requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 100000,
 			})
-		})
-		mux.HandleFunc("GET /v1/rentals/{id}/image-inventory", func(w http.ResponseWriter, r *http.Request) {
-			msgspec := "0.21.0"
-			if r.PathValue("id") != current {
-				msgspec = "0.20.0"
-			}
-			python := captured.Version
-			if r.PathValue("id") == earlierPython {
-				python = "3.12.3"
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"image_inventory": map[string]any{
-				"format": "tensorhub.image_inventory/1", "profile": "python3.12-cpu-linux-x86", "python": python,
-				"distributions": []map[string]string{{"name": runtimeDistribution, "version": version}, {"name": "msgspec", "version": msgspec}},
-			}})
 		})
 	})
 	t.Cleanup(func() { must(t, removeAllForce(root)) })
@@ -166,26 +148,40 @@ def main(ctx):
 	must(t, os.WriteFile(script, []byte(code), 0600))
 	request, _, out := submitRun(t, root, "requirements-isao", "run", script, "--rental=isao", "--json", "--full")
 	if request == nil || request.RequestedRental != current {
-		t.Fatalf("compatible image was held to the local exact pin: %s", out)
+		t.Fatalf("the local exact pin kept the run from its named rental: %s", out)
 	}
 	if request, _, out := submitRun(t, root, "requirements-giriko", "run", script, "--rental=giriko", "--json"); request == nil {
-		t.Fatalf("private msgspec version constrained the image: %s", out)
+		t.Fatalf("a private msgspec version kept the run from its named rental: %s", out)
 	}
 	patchCode := strings.Replace(code, "msgspec>=0.21,<0.22", "msgspec>=0.21,<0.22; python_full_version >= '3.12.5' and (python_full_version >= '3.12.12' or sys_platform == 'win32' or python_full_version < '3.12.4')", 1)
 	must(t, os.WriteFile(script, []byte(patchCode), 0600))
 	if request, _, out := submitRun(t, root, "requirements-marked", "run", script, "--rental=giriko", "--json"); request == nil {
-		t.Fatalf("private marked requirement constrained the image: %s", out)
+		t.Fatalf("a private marked requirement kept the run from its named rental: %s", out)
 	}
-	// Source transport carries the Python minor; another patch that satisfies the authored
-	// Requires-Python runs the script, and only an authored patch floor excludes it.
 	if request, _, out := submitRun(t, root, "requirements-patch", "run", script, "--rental=priorpython", "--json"); request == nil || request.RequestedRental != earlierPython {
-		t.Fatalf("another patch of the captured Python minor was refused: %s", out)
+		t.Fatalf("a script within its captured Python minor was refused: %s", out)
 	}
 	pythonCode := strings.Replace(patchCode, `requires-python = ">=3.12,<3.13"`, `requires-python = ">=3.12.5,<3.13"`, 1)
 	must(t, os.WriteFile(script, []byte(pythonCode), 0600))
-	status, out := runCozy(t, root, "run", script, "--rental=priorpython", "--json")
-	if status == 0 || !strings.Contains(out, "rental.dependency_mismatch") || !strings.Contains(out, ">=3.12.5") {
-		t.Fatalf("authored Python patch floor was replaced by the default minor range [%d]: %s", status, out)
+	// The machine prepares the script's environment from its capture, so the authored patch
+	// floor is what it enforces; the pinned rental's image is judged at placement, once the
+	// rental is attachable, never at submission.
+	floored, _, out := submitRun(t, root, "requirements-python-floor", "run", script, "--rental=priorpython", "--json")
+	if floored == nil || floored.RequestedRental != earlierPython {
+		t.Fatalf("a patch-floored script was not admitted to its pinned machine: %s", out)
+	}
+	store, problem = records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	capture, problem := store.Install(floored.InstallID)
+	store.Close()
+	fatal(t, problem)
+	if capture == nil {
+		t.Fatal("the patch-floored script has no captured install")
+	}
+	selection, problem := install.InstalledRequirements(context.Background(), *capture)
+	fatal(t, problem)
+	if clauses := strings.Split(selection.RequiresPython, ","); !slices.Contains(clauses, ">=3.12.5") || !slices.Contains(clauses, "<3.13") || len(clauses) != 2 {
+		t.Fatalf("authored Python patch floor was replaced in the capture: %q", selection.RequiresPython)
 	}
 	library := filepath.Join(filepath.Dir(script), "library")
 	must(t, os.Mkdir(library, 0700))
@@ -232,7 +228,7 @@ app.job(value)
 		extraCode = strings.Replace(extraCode, "# [tool.uv.sources]\n", "# [tool.uv.sources]\n# marker-library = {path = '"+source+"'}\n", 1)
 		must(t, os.WriteFile(script, []byte(extraCode), 0600))
 		if request, _, out := submitRun(t, root, fmt.Sprintf("requirements-extra-%d", i), "run", script, "--rental=giriko", "--json"); request == nil {
-			t.Fatalf("private library extra constrained the image (selected=%v, wheel=%v): %s", selected, test.wheel, out)
+			t.Fatalf("a private library extra kept the run from its named rental (selected=%v, wheel=%v): %s", selected, test.wheel, out)
 		}
 	}
 	mu.Lock()
