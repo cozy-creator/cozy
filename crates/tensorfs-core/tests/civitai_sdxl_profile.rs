@@ -1,11 +1,12 @@
 //! The Civitai SDXL base checkpoint (version 128078) plans under two reviewed profiles, a
 //! version-bound one and the generic SDXL single-file one, and both plan identically. That is
-//! one answer, so no profile has to be named.
+//! one answer, so no profile has to be named. Both plan the routed SDXL converter straight
+//! to the Diffusers constructor's keys, in its order.
 use std::{fs, path::PathBuf};
 use tensorfs_core::{
     canon::{self, Value},
     ingest::{
-        preflight,
+        preflight, routes,
         source::{self, BUILTIN_REGISTRY, BUILTIN_REGISTRY_BYTES},
     },
     limits,
@@ -79,6 +80,21 @@ fn equivalent_profiles_select_the_most_specific_without_being_named() {
     assert_eq!(plans[1].profile, "civitai/sdxl/single-file/1");
     assert_eq!(plans[0].session, plans[1].session);
     assert_eq!(plans[0].construction_order, plans[1].construction_order);
+    let table = routes::table(routes::SDXL).unwrap();
+    let canonical: Vec<(String, String)> = table
+        .components
+        .iter()
+        .flat_map(|c| c.routes.iter().map(|r| (c.name.clone(), r.target.clone())))
+        .collect();
+    for plan in &plans {
+        assert_eq!(plan.converter, routes::SDXL);
+        assert_eq!(plan.construction_order, canonical);
+    }
+    assert_eq!(canonical.len(), 2641);
+    assert!(canonical.contains(&(
+        "text_encoder_2".into(),
+        "text_model.encoder.layers.31.self_attn.v_proj.weight".into()
+    )));
     drop(staged);
     assert!(!path.exists());
 }

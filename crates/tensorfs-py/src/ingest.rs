@@ -119,6 +119,33 @@ pub fn select_source_profile(
     .or_refuse(py)
 }
 
+/// `(converter, reference)` for every converter the named profiles bind, sorted and unique.
+/// A reference is the pinned repository whose configs and tokenizers the output needs.
+#[pyfunction]
+#[pyo3(signature = (store, profiles, *, registry=None))]
+pub fn source_profile_converters(
+    py: Python<'_>,
+    store: &PyStore,
+    profiles: Vec<String>,
+    registry: Option<Vec<u8>>,
+) -> PyResult<Vec<(String, Option<String>)>> {
+    py.detach(|| {
+        let (_, bytes) = model_source::effective_registry(&store.store, registry.as_deref())?;
+        let mut out = Vec::new();
+        for profile in &profiles {
+            for conv in model_source::profile_converters(&bytes, profile)? {
+                let row = (conv.name.to_string(), conv.reference.map(str::to_string));
+                if !out.contains(&row) {
+                    out.push(row);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    })
+    .or_refuse(py)
+}
+
 /// Advance one exact selection against whatever bodies the Store holds now. `members` are
 /// `(member, object id, length, header)`; the result is `prepare_model_source`'s plus the
 /// members counted as landed.

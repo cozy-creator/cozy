@@ -181,6 +181,9 @@ pub struct Declaration {
     pub configs: Vec<ConfigDeclaration>,
     /// Bounded immutable ordinary companion files, locked into the work intent.
     pub files: Vec<(String, Vec<u8>)>,
+    /// Companion files that are already verified Store objects (a pinned tokenizer), named
+    /// by reference: no bytes in the intent, none new in the output.
+    pub objects: Vec<(String, ObjectRef)>,
     pub order: Vec<(String, String)>,
     pub max_new_bytes: u64,
 }
@@ -248,6 +251,19 @@ impl Declaration {
         }
 
         validate_files(&mut self.files)?;
+        self.objects.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut paths: Vec<String> = self
+            .files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .chain(std::iter::once("model.cozytensors".to_string()))
+            .collect();
+        for (path, object) in &self.objects {
+            crate::manifest::check_path(path)?;
+            crate::ids::hex64("companion object", &object.sha256)?;
+            paths.push(path.clone());
+        }
+        validate_companion_paths(&mut paths)?;
 
         for source in &self.sources {
             name("source alias", &source.alias)?;
@@ -563,6 +579,15 @@ impl Declaration {
                 ));
             }
         }
+        let mut objects = Vec::new();
+        if let Some(value) = f.opt("objects") {
+            for (path, value) in as_obj("DerivedDeclaration", "objects", value)? {
+                objects.push((
+                    path.clone(),
+                    ObjectRef::from_value("companion object", value)?,
+                ));
+            }
+        }
         let work_fingerprint = f
             .opt("work_fingerprint")
             .map(|value| {
@@ -710,6 +735,7 @@ impl Declaration {
             components,
             configs,
             files,
+            objects,
             order,
             max_new_bytes,
         })
@@ -873,6 +899,17 @@ impl Declaration {
                 ),
             ));
         }
+        if !self.objects.is_empty() {
+            fields.push((
+                "objects",
+                Value::map(
+                    self.objects
+                        .iter()
+                        .map(|(path, object)| (path.clone(), object.to_value()))
+                        .collect(),
+                ),
+            ));
+        }
         if let Some(fingerprint) = &self.work_fingerprint {
             fields.push(("work_fingerprint", Value::str(fingerprint.clone())));
         }
@@ -947,6 +984,7 @@ fn companion_files(
         .files
         .iter()
         .map(|(path, _)| path.as_str())
+        .chain(declaration.objects.iter().map(|(path, _)| path.as_str()))
         .collect();
     for source in sources {
         let mut backing: HashSet<_> = source
@@ -988,6 +1026,12 @@ fn companion_files(
             .files
             .iter()
             .map(|(path, data)| (path.clone(), Entry::File(ObjectRef::of(data)))),
+    );
+    files.extend(
+        declaration
+            .objects
+            .iter()
+            .map(|(path, object)| (path.clone(), Entry::File(object.clone()))),
     );
     let mut paths: Vec<_> = files
         .keys()
@@ -2197,6 +2241,7 @@ fn inspect_retained_source(
     let alias = "source".to_string();
     let mut declaration = Declaration {
         files: Vec::new(),
+        objects: Vec::new(),
         work_fingerprint: None,
         sources: vec![Source {
             alias: alias.clone(),
@@ -3932,6 +3977,7 @@ mod tests {
             .object_id();
         Declaration {
             files: Vec::new(),
+            objects: Vec::new(),
             work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
             sources: Vec::new(),
             components: vec![ComponentDeclaration {
@@ -3961,6 +4007,7 @@ mod tests {
     fn inherited_declaration(manifest: ObjectRef) -> Declaration {
         Declaration {
             files: Vec::new(),
+            objects: Vec::new(),
             work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
             sources: vec![Source {
                 alias: "source".into(),
@@ -4574,6 +4621,7 @@ mod tests {
             1,
             Declaration {
                 files: Vec::new(),
+                objects: Vec::new(),
                 work_fingerprint: Some(format!("sha256:{}", "44".repeat(32))),
                 sources: vec![Source {
                     alias: "source".into(),

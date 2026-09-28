@@ -9,12 +9,13 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::canon::{as_arr, Fields, Value};
 use crate::checkpoint::{self as ck, build_manifest};
-use crate::dtype::checked_bytes;
+use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Closure, Header, Part, Tensor};
 use crate::ids::{ascii_name, hex64, Doc, ObjectRef, Plain};
@@ -26,8 +27,62 @@ use crate::spec::EncodingSpec;
 use crate::store::{Store, Verdict};
 
 use super::carrier::{self, SourceHeader};
-use super::convert::{check_permute_size, Bytes, Plan};
+use super::convert::{check_permute_size, Bytes, Plan, RolePlan};
 use super::journal::{self, Journal};
+use super::narrow::Narrow;
+
+/// Store one role from its source bytes, narrowing when the plan declares a lane dtype the
+/// carrier does not have (`Converter::lane`).
+fn store_role<R: Read>(
+    store: &Store,
+    what: &str,
+    role: &RolePlan,
+    from: Dtype,
+    mut src: R,
+    operation: &str,
+) -> Result<ck::StoredPart> {
+    if from == role.dtype {
+        return ck::store_part_held(
+            store,
+            what,
+            role.dtype,
+            role.shape.clone(),
+            &mut src,
+            Some(operation),
+        );
+    }
+    let narrowed = (role.dtype == Dtype::F16)
+        .then(|| Narrow::new(src, from))
+        .flatten();
+    let Some(mut narrow) = narrowed else {
+        return refuse(
+            Code::DTYPE_MISMATCH,
+            format!(
+                "{what}: no reviewed narrowing from {} to {}",
+                from.name(),
+                role.dtype.name()
+            ),
+        );
+    };
+    let stored = ck::store_part_held(
+        store,
+        what,
+        role.dtype,
+        role.shape.clone(),
+        &mut narrow,
+        Some(operation),
+    );
+    match narrow.overflow {
+        Some(element) if stored.is_err() => refuse(
+            Code::NUMBER_RANGE,
+            format!(
+                "{what}: element {element} is a finite {} value outside the f16 range",
+                from.name()
+            ),
+        ),
+        _ => stored,
+    }
+}
 
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     Refusal {
@@ -695,15 +750,8 @@ fn convert_bounded(
                         }
                     };
                     let (rp, abs) = carrier::resolve(&f.path, &f.header, t)?;
-                    let mut region = carrier::Region::open(rp, abs, t.nbytes())?;
-                    let w = ck::store_part_held(
-                        store,
-                        &what,
-                        r.dtype,
-                        r.shape.clone(),
-                        &mut region,
-                        Some(operation),
-                    )?;
+                    let region = carrier::Region::open(rp, abs, t.nbytes())?;
+                    let w = store_role(store, &what, r, t.dtype, region, operation)?;
                     progress.written += w.bytes;
                     progress.hashed += w.bytes;
                     progress.deduped += w.deduped;
@@ -726,15 +774,19 @@ fn convert_bounded(
                     // memory an identity stream does. Holding the fused tensor would make
                     // peak RSS a function of the artifact (231 MB on the real H3 QKV).
                     let (rp, abs) = carrier::resolve(&f.path, &f.header, t)?;
-                    let mut region = carrier::RunRegion::open(rp, abs, xform.runs())?;
-                    let w = ck::store_part_held(
-                        store,
-                        &what,
-                        r.dtype,
-                        r.shape.clone(),
-                        &mut region,
-                        Some(operation),
-                    )?;
+                    let w = if xform.streams() {
+                        let region = carrier::RunRegion::open(rp, abs, xform.runs())?;
+                        store_role(store, &what, r, t.dtype, region, operation)?
+                    } else {
+                        // Bounded by `check_permute_size`: read once, reorder in memory.
+                        let mut source = Vec::with_capacity(t.nbytes() as usize);
+                        carrier::Region::open(rp, abs, t.nbytes())?
+                            .read_to_end(&mut source)
+                            .map_err(|e| io(format!("{what}: read"), e))?;
+                        let mut moved = Vec::new();
+                        xform.apply(&source, &mut moved)?;
+                        store_role(store, &what, r, t.dtype, moved.as_slice(), operation)?
+                    };
                     progress.written += w.bytes;
                     progress.hashed += w.bytes;
                     progress.deduped += w.deduped;

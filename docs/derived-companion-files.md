@@ -30,6 +30,12 @@ against the output grant and the native write estimate. Paths use the normal
 manifest grammar and cannot collide with the checkpoint header or traverse another
 file. Streaming larger assets is outside this bounded metadata API.
 
+A companion may instead name a verified Store object: the native `begin_derived` binding
+takes `files={path: (object_id, length)}` beside base64 values. Nothing is copied into the
+intent and no byte is new; the object becomes the same manifest entry and header asset,
+and a commit refuses when the Store does not hold it. Uploads attach a pipeline's pinned
+tokenizers this way, since they exceed the inline bound.
+
 TensorFS inherits existing ordinary companions by exact reference from source
 checkpoints. Header/tensor backing objects listed redundantly as ordinary source
 files are excluded unless that same path is a declared header asset with matching content.

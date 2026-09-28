@@ -32,6 +32,8 @@ def main():
     assert hashlib.sha256(raw).hexdigest() == observed["header_sha256"]
     registry_path = ROOT / "vectors/fingerprints/registry.json"
     registry = json.loads(registry_path.read_text())
+    routes = json.loads((ROOT / "crates/tensorfs-core/src/ingest/routes/sdxl.routes.json").read_text())
+    converter = routes["converter"]
     components = ("text_encoder", "text_encoder_2", "unet", "vae")
     changes = []
     with tempfile.TemporaryDirectory(prefix="civitai-sdxl-header-") as temporary:
@@ -39,7 +41,7 @@ def main():
         carrier = area / "header-only.safetensors"
         sparse(carrier, raw, observed["full_bytes"])
         bank = area / "bank.json"
-        command = [binary, "ingest", "bank", "safetensors.single_file", "single_file.identity/1",
+        command = [binary, "ingest", "bank", "safetensors.single_file", converter,
                    "--registry", str(bank), "--source-name", observed["source_name"]]
         for component in components:
             command.extend(("--source", f"{component}={carrier}"))
@@ -79,8 +81,9 @@ def main():
         assert accepted.returncode == 0, accepted.stderr
         planned = json.loads(accepted.stdout)
         assert planned["profile"] == observed["profile"]
-        assert planned["converter"] == "single_file.identity/1"
-        assert len(planned["construction_order"]) == observed["tensors"]
+        assert planned["converter"] == converter
+        assert planned["construction_order"] == [
+            [c["component"], row[0]] for c in routes["components"] for row in c["routes"]]
         assert {row["component"] for row in planned["sources"]} == set(components)
         assert all(row["projected"] and row["source_member"] == observed["member"]
                    for row in planned["sources"])

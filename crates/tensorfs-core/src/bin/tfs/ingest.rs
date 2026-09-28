@@ -445,7 +445,7 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
     let mut reviewed = Vec::new();
     for (component, path) in &srcs {
         let (full, raw) = ok!(source_core::read_carrier_at(path));
-        let h = if conv.name == "single_file.identity/1" {
+        let h = if conv.dialect == "safetensors.single_file" {
             ok!(convert::single_file_component(component, &full))
         } else {
             full

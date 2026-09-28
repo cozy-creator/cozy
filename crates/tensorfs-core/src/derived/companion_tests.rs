@@ -197,6 +197,50 @@ fn ordinary_companions_survive_derivation_without_copying_tensor_backing_files()
 }
 
 #[test]
+fn a_verified_store_object_is_a_companion_by_reference_and_never_a_new_byte() {
+    let (store, meta, id) = fixture();
+    let vocab = vec![0x7b; 256 << 10]; // over the inline bound: references have none
+    let object = store
+        .put_stream(
+            &mut vocab.as_slice(),
+            Some(&ObjectRef::of(&vocab)),
+            &Fault::default(),
+        )
+        .unwrap()
+        .obj;
+    let mut d = super::tests::created_declaration();
+    d.objects = vec![("tokenizer/vocab.json".into(), object.clone())];
+    let encoded = d.canonical_work_bytes().unwrap();
+    assert_eq!(
+        Declaration::parse_text(std::str::from_utf8(&encoded).unwrap()).unwrap(),
+        d
+    );
+    let writer = begin(&store, &meta, &id, 1, d.clone(), None).unwrap();
+    write_weight(&store, &meta, &id);
+    let receipt = commit(&store, &meta, &id, 1).unwrap();
+    release(&meta, writer);
+    assert!(!receipt.added_objects.contains(&object));
+    let header = checkpoint::load_header(&store, &receipt.header).unwrap();
+    let (name, asset) = &header.assets[0];
+    assert_eq!(
+        (name.as_str(), &asset.segments),
+        ("tokenizer/vocab.json", &vec![object])
+    );
+    let mut read = Vec::new();
+    checkpoint::read_asset(&store, name, asset, &mut read).unwrap();
+    assert_eq!(read, vocab);
+
+    // An object this Store does not hold is refused at commit, never published.
+    let next = format!("sha256:{}", "c3".repeat(32));
+    d.objects = vec![("tokenizer/vocab.json".into(), ObjectRef::of(b"absent"))];
+    let writer = begin(&store, &meta, &next, 1, d, None).unwrap();
+    write_weight(&store, &meta, &next);
+    assert!(commit(&store, &meta, &next, 1).is_err());
+    release(&meta, writer);
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
 fn companion_paths_size_count_and_quotas_are_native_refusals() {
     for path in [
         "../LICENSE",

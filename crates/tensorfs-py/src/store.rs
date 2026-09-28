@@ -376,23 +376,29 @@ fn parse_declaration(
             }
         }
     }
-    let mut companion_files = Vec::new();
+    // A companion is base64 bytes, or `(object_id, length)` naming a verified Store object.
+    let (mut companion_files, mut companion_objects) = (Vec::new(), Vec::new());
     if let Some(files) = files {
-        if files.len() > derived::MAX_COMPANION_FILES {
+        for (path, value) in files.iter() {
+            let path: String = path.extract()?;
+            if let Ok((object, length)) = value.extract::<(String, u64)>() {
+                companion_objects.push((path, obj_ref(py, &object, length)?));
+                continue;
+            }
+            let encoded: String = value.extract()?;
+            companion_files.push((path, derived::decode_file(&encoded).or_refuse(py)?));
+        }
+        if companion_files.len() > derived::MAX_COMPANION_FILES {
             return tensorfs_core::err::refuse(
                 tensorfs_core::err::Code::COUNT_CAP,
                 "at most 16 companion files may be declared",
             )
             .or_refuse(py);
         }
-        for (path, value) in files.iter() {
-            let path: String = path.extract()?;
-            let encoded: String = value.extract()?;
-            companion_files.push((path, derived::decode_file(&encoded).or_refuse(py)?));
-        }
     }
     let mut declaration = Declaration {
         files: companion_files,
+        objects: companion_objects,
         work_fingerprint: None,
         sources: source_rows,
         components,

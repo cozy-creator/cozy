@@ -237,6 +237,16 @@ pub fn plan_digest(plan: &Plan, headers: &[(PathBuf, &SourceHeader)]) -> String 
                             field(&mut hash, b"swap-halves");
                             field(&mut hash, &half_bytes.to_le_bytes());
                         }
+                        Xform::Transpose {
+                            rows,
+                            cols,
+                            elem_bytes,
+                        } => {
+                            field(&mut hash, b"transpose");
+                            for n in [rows, cols, elem_bytes] {
+                                field(&mut hash, &n.to_le_bytes());
+                            }
+                        }
                     }
                 }
             }

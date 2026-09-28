@@ -255,7 +255,8 @@ fn profile_assignments(
                 entry.component == component.component
                     && entry.keyset_digest == variant.keyset_digest
             }) {
-                let projected = entry.converter == "single_file.identity/1";
+                let projected = convert::converter(&entry.converter)
+                    .is_ok_and(|c| c.dialect == "safetensors.single_file");
                 for (index, header) in headers.iter().enumerate() {
                     let member_matches = match (
                         component.source_member.as_deref(),
@@ -345,6 +346,42 @@ pub fn bind_registry(store: &Store, bytes: Option<&[u8]>) -> Result<()> {
         return refuse(Code::IO_FAILED, format!("bind registry: {error}"));
     }
     Ok(())
+}
+
+/// The converters a reviewed profile's components bind to, from registry data alone, so an
+/// uploader keys its memo and fetches each converter's reference before reading a header.
+pub fn profile_converters(registry: &[u8], profile: &str) -> Result<Vec<&'static Converter>> {
+    if profile == AS_IS {
+        return Ok(vec![convert::converter(convert::IDENTITY)?]);
+    }
+    let registry = FingerprintRegistry::parse(registry)?;
+    let Some(found) = registry.source_profiles.iter().find(|p| p.name == profile) else {
+        return refuse(
+            Code::UNREGISTERED_FINGERPRINT,
+            format!("reviewed source profile {profile:?} is absent"),
+        );
+    };
+    let mut out: Vec<&'static Converter> = Vec::new();
+    for component in &found.components {
+        for variant in &component.variants {
+            for entry in registry.entries.iter().filter(|e| {
+                e.component == component.component && e.keyset_digest == variant.keyset_digest
+            }) {
+                let conv = convert::converter(&entry.converter)?;
+                if !out.iter().any(|c| c.name == conv.name) {
+                    out.push(conv);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return refuse(
+            Code::UNREGISTERED_FINGERPRINT,
+            format!("source profile {profile:?} binds no reviewed converter"),
+        );
+    }
+    out.sort_by_key(|c| c.name);
+    Ok(out)
 }
 
 /// The registry an ingest on this Store classifies with: the built-in one, extended by the

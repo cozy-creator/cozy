@@ -55,6 +55,13 @@ pub struct Converter {
     /// `raw` keys need a consumer that reads that dialect, `normalized` ones are canonical.
     /// `None` records nothing (reviewed outputs that predate the record).
     pub normalization: Option<(&'static str, &'static str)>,
+    /// The one declared value change a converter may make: floating sources narrow to this
+    /// dtype, IEEE round-to-nearest-even, and a finite value it cannot hold refuses
+    /// NUMBER_RANGE. `None` moves bytes only.
+    pub lane: Option<Dtype>,
+    /// The pinned repository (`hf://org/repo@<commit>`, a Diffusers pipeline) whose index,
+    /// configs, scheduler and tokenizers the output needs when its source carries none.
+    pub reference: Option<&'static str>,
 }
 
 /// The header config an output's [`Converter::normalization`] is recorded under.
@@ -62,7 +69,7 @@ pub const NORMALIZATION: &str = "normalization";
 /// The converter for a source no reviewed profile recognizes: its keys, stored as they are.
 pub const IDENTITY: &str = "identity/1";
 
-pub const CONVERTERS: [Converter; 6] = [
+pub const CONVERTERS: [Converter; 7] = [
     Converter {
         name: "diffusers.identity/1",
         dialect: "safetensors.diffusers",
@@ -72,6 +79,8 @@ pub const CONVERTERS: [Converter; 6] = [
               encoding ROLES; marker tensors are dropped. Bytes stream through untouched.",
         validated_on_real_bytes: true,
         normalization: None,
+        lane: None,
+        reference: None,
     },
     Converter {
         name: "single_file.identity/1",
@@ -81,6 +90,8 @@ pub const CONVERTERS: [Converter; 6] = [
               map. Same byte path as the diffusers converter — packaging is not identity.",
         validated_on_real_bytes: true,
         normalization: None,
+        lane: None,
+        reference: None,
     },
     Converter {
         name: "cozytensors.inherit/1",
@@ -90,6 +101,8 @@ pub const CONVERTERS: [Converter; 6] = [
               REFERENCE; nothing is re-hashed and nothing is re-uploaded.",
         validated_on_real_bytes: true,
         normalization: None,
+        lane: None,
+        reference: None,
     },
     Converter {
         name: "h3.lora/1",
@@ -98,6 +111,8 @@ pub const CONVERTERS: [Converter; 6] = [
         doc: "Native H3 LoRA A/B and Kohya down/up factors: split head-interleaved QKV B rows, swap SwiGLU B halves, preserve A and alpha without arithmetic.",
         validated_on_real_bytes: false,
         normalization: None,
+        lane: None,
+        reference: None,
     },
     Converter {
         name: "h3.native/2",
@@ -120,6 +135,8 @@ pub const CONVERTERS: [Converter; 6] = [
         // fc1 (308281344 B) converted to e7cf97ae...3b19; fc2 stayed byte-identical.
         validated_on_real_bytes: true,
         normalization: None,
+        lane: None,
+        reference: None,
     },
     Converter {
         name: IDENTITY,
@@ -130,20 +147,43 @@ pub const CONVERTERS: [Converter; 6] = [
               consumer that needs another spelling normalizes it.",
         validated_on_real_bytes: true,
         normalization: Some(("raw", "safetensors")),
+        lane: None,
+        reference: None,
+    },
+    Converter {
+        name: super::routes::SDXL,
+        dialect: "safetensors.single_file",
+        class: Class::Permutation,
+        doc: "An SDXL single-file checkpoint becomes the Diffusers constructor's checkpoint: \
+              the generated route table rekeys every tensor into constructor order, splits \
+              OpenCLIP's fused in_proj into q|k|v runs, transposes its text_projection, \
+              squeezes 1x1-conv attention to linear and drops CLIP position IDs and \
+              logit_scale. bf16/f32 sources narrow to f16. Pipeline index, configs and \
+              tokenizers come from the pinned SDXL base reference.",
+        // The generated table equals packages-v2 sdxl normalization.json route for route, the
+        // mapping the sdxl normalize job served real Civitai checkpoints with.
+        validated_on_real_bytes: true,
+        normalization: Some(("normalized", "diffusers")),
+        lane: Some(Dtype::F16),
+        reference: Some(
+            "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b",
+        ),
     },
 ];
 
 /// The `normalization` config the output of `converter` carries, if it records one.
 pub fn normalization_config(converter: &str) -> Option<(String, Vec<u8>)> {
-    let (state, dialect) = CONVERTERS
-        .iter()
-        .find(|c| c.name == converter)?
-        .normalization?;
-    let record = crate::canon::Value::obj(vec![
+    let converter_row = CONVERTERS.iter().find(|c| c.name == converter)?;
+    let (state, dialect) = converter_row.normalization?;
+    let mut fields = vec![
         ("converter", crate::canon::Value::str(converter)),
         ("dialect", crate::canon::Value::str(dialect)),
         ("state", crate::canon::Value::str(state)),
-    ]);
+    ];
+    if let Some(reference) = converter_row.reference {
+        fields.push(("reference", crate::canon::Value::str(reference)));
+    }
+    let record = crate::canon::Value::obj(fields);
     Some((NORMALIZATION.to_string(), crate::canon::write(&record)))
 }
 
@@ -397,11 +437,11 @@ impl Plan {
         for o in &self.ops {
             for r in &o.roles {
                 if let Bytes::Permute { xform, .. } = &r.bytes {
-                    let d = xform.runs();
+                    let (moved, count, class) = xform.census();
                     ops += 1;
-                    bytes += d.bytes;
-                    runs += d.runs.len();
-                    gather |= d.class == crate::fill::Class::Gather;
+                    bytes += moved;
+                    runs += count;
+                    gather |= class == crate::fill::Class::Gather;
                 }
             }
         }
@@ -1008,6 +1048,9 @@ fn plan_carrier(
     }
     if conv.name == IDENTITY {
         return plan_as_is(component, file, h, allowed, cands.plain, p);
+    }
+    if let Some(table) = super::routes::table(conv.name) {
+        return super::routes::plan(conv, table, component, file, h, allowed, cands.plain, p);
     }
     let alias = Allowed(allowed);
     p.header_bytes += h.header_bytes;
@@ -1854,6 +1897,25 @@ pub fn golden_cases(c: &Converter) -> Vec<(&'static str, Xform)> {
                     shares: [1, 1, 1],
                     take: 0,
                     unit_bytes: H3_HEAD_DIM * 16 * 2,
+                },
+            ),
+        ],
+        name if name == super::routes::SDXL => vec![
+            (
+                "OpenCLIP in_proj_bias, row block 2 of 3 (1280 x f16)",
+                Xform::QkvSplit {
+                    groups: 1,
+                    shares: [2, 1, 0],
+                    take: 1,
+                    unit_bytes: 1280 * 2,
+                },
+            ),
+            (
+                "OpenCLIP text_projection 3 x 5 x f32 transpose",
+                Xform::Transpose {
+                    rows: 3,
+                    cols: 5,
+                    elem_bytes: 4,
                 },
             ),
         ],

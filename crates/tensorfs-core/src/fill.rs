@@ -109,6 +109,13 @@ pub enum Xform {
         /// Bytes in one share unit — derived from the source run, never assumed.
         unit_bytes: u64,
     },
+    /// A row-major `[rows, cols]` matrix becomes `[cols, rows]`. Every element moves on its
+    /// own, so this is gather-class by construction: it is applied buffered, never as runs.
+    Transpose {
+        rows: u64,
+        cols: u64,
+        elem_bytes: u64,
+    },
 }
 
 impl Xform {
@@ -122,6 +129,11 @@ impl Xform {
                 unit_bytes,
                 ..
             } => groups * (shares[0] + shares[1] + shares[2]) * unit_bytes,
+            Xform::Transpose {
+                rows,
+                cols,
+                elem_bytes,
+            } => rows * cols * elem_bytes,
         }
     }
 
@@ -135,6 +147,36 @@ impl Xform {
                 take,
                 unit_bytes,
             } => groups * shares[*take as usize] * unit_bytes,
+            Xform::Transpose { .. } => self.in_bytes(),
+        }
+    }
+
+    /// Whether the transform streams its source runs straight out of the carrier. A
+    /// transpose reads its bounded source once and reorders it in memory instead.
+    pub fn streams(&self) -> bool {
+        !matches!(self, Xform::Transpose { .. })
+    }
+
+    /// `(bytes, runs, class)` of the decomposition, without materializing element runs.
+    pub fn census(&self) -> (u64, usize, Class) {
+        match self {
+            Xform::Transpose {
+                rows,
+                cols,
+                elem_bytes,
+            } => (
+                rows * cols * elem_bytes,
+                (rows * cols) as usize,
+                if *elem_bytes >= GATHER_FLOOR_BYTES {
+                    Class::LongRun
+                } else {
+                    Class::Gather
+                },
+            ),
+            _ => {
+                let d = self.runs();
+                (d.bytes, d.runs.len(), d.class)
+            }
         }
     }
 
@@ -175,6 +217,21 @@ impl Xform {
                         .collect(),
                 )
             }
+            Xform::Transpose {
+                rows,
+                cols,
+                elem_bytes,
+            } => Decomposition::of(
+                (0..*cols)
+                    .flat_map(|j| {
+                        (0..*rows).map(move |i| Run {
+                            src_off: (i * cols + j) * elem_bytes,
+                            dest_off: (j * rows + i) * elem_bytes,
+                            len: *elem_bytes,
+                        })
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -206,6 +263,24 @@ impl Xform {
                 ),
             );
         }
+        if let Xform::Transpose {
+            rows,
+            cols,
+            elem_bytes,
+        } = *self
+        {
+            let (rows, cols, e) = (rows as usize, cols as usize, elem_bytes as usize);
+            for (i, row) in src.chunks_exact(cols * e).enumerate() {
+                for (j, value) in row.chunks_exact(e).enumerate() {
+                    dest[(j * rows + i) * e..][..e].copy_from_slice(value);
+                }
+            }
+            return Ok(Decomposition {
+                runs: Vec::new(),
+                class: Class::Gather,
+                bytes: self.out_bytes(),
+            });
+        }
         let d = self.runs();
         for r in &d.runs {
             let (s, o, n) = (r.src_off as usize, r.dest_off as usize, r.len as usize);
@@ -229,6 +304,26 @@ impl Xform {
     /// indexing and the three members must reassemble the source bit-for-bit.
     pub fn reassembles(&self, src: &[u8]) -> Result<bool> {
         match self {
+            Xform::Transpose {
+                rows,
+                cols,
+                elem_bytes,
+            } => {
+                let mut once = Vec::new();
+                self.apply(src, &mut once)?;
+                let mut back = Vec::new();
+                Xform::Transpose {
+                    rows: *cols,
+                    cols: *rows,
+                    elem_bytes: *elem_bytes,
+                }
+                .apply(&once, &mut back)?;
+                Ok(back == src
+                    && self.runs().runs.iter().all(|r| {
+                        once[r.dest_off as usize..][..r.len as usize]
+                            == src[r.src_off as usize..][..r.len as usize]
+                    }))
+            }
             Xform::SwapHalves { .. } => {
                 let mut swapped = Vec::new();
                 self.apply(src, &mut swapped)?;

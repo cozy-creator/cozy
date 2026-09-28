@@ -1390,6 +1390,9 @@ pub fn resolve(
 /// No suffix has special meaning here: selecting Python bytes never executes them,
 /// and selecting an index does not expand it into tensor shards. Tensor carriers
 /// continue to use `resolve` and reviewed profile/carrier selection.
+///
+/// A name ending in `/` selects every ordinary file under that folder (a tokenizer or
+/// processor, whose file set varies by class); tensor carriers there are never selected.
 pub fn resolve_files(
     uri: &SourceUri,
     files: &[String],
@@ -1414,22 +1417,49 @@ pub fn resolve_files(
             "ordinary file selection count is outside the bound",
         );
     }
-    let mut names = files.to_vec();
+    let (folders, mut names): (Vec<String>, Vec<String>) =
+        files.iter().cloned().partition(|name| name.ends_with('/'));
     names.sort();
     names.dedup();
     if names
         .iter()
+        .chain(&folders)
+        .map(|name| name.trim_end_matches('/'))
         .any(|name| !member_path(name) || crate::manifest::check_path(name).is_err())
     {
         return refuse(
             Code::PATH_ILLEGAL,
-            "ordinary file selection requires exact member paths",
+            "ordinary file selection requires exact member or folder paths",
         );
     }
     let ledger = Ledger::new();
     let policy = endpoints.policy(uri);
-    let listed =
-        list_selected_observed(uri, endpoints, credentials, deadline, &ledger, Some(&names))?;
+    let filter = folders.is_empty().then_some(names.as_slice());
+    let listed = list_selected_observed(uri, endpoints, credentials, deadline, &ledger, filter)?;
+    for folder in &folders {
+        let before = names.len();
+        names.extend(
+            listed
+                .iter()
+                .filter(|m| m.member.starts_with(folder.as_str()))
+                .filter(|m| !is_safetensors(&m.member) && !is_index(&m.member))
+                .map(|m| m.member.clone()),
+        );
+        if names.len() == before {
+            return refuse(
+                Code::MISSING_FIELD,
+                format!("the source has no ordinary file under {folder:?}"),
+            );
+        }
+    }
+    names.sort();
+    names.dedup();
+    if names.len() > MEMBER_MAX {
+        return refuse(
+            Code::COUNT_CAP,
+            "ordinary file selection count is outside the bound",
+        );
+    }
     // Establish the whole roster before fetching any body. A missing later member
     // must not turn a partial requested tree into a successful smaller selection.
     let selected = names
@@ -2594,6 +2624,65 @@ mod tests {
                 Code::PATH_ILLEGAL
             );
         }
+    }
+
+    #[test]
+    fn a_folder_selects_its_ordinary_files_and_never_a_carrier() {
+        let listing = br#"[
+            {"type":"file","path":"tokenizer/vocab.json","size":2},
+            {"type":"file","path":"tokenizer/merges.txt","size":2},
+            {"type":"file","path":"tokenizer/model.safetensors","size":2},
+            {"type":"file","path":"tokenizer_2/vocab.json","size":2},
+            {"type":"file","path":"unet/config.json","size":2}
+        ]"#;
+        let (base, seen, handle) = origin(5, move |request| {
+            if request.path.contains("/tree/") {
+                ok_body(listing, "application/json")
+            } else {
+                ok_body(b"{}", "application/json")
+            }
+        });
+        let uri = SourceUri::parse(&format!("hf://org/repo@{}", "ab".repeat(20))).unwrap();
+        let endpoints = Endpoints {
+            huggingface: base,
+            allow_local: true,
+            ..Endpoints::default()
+        };
+        let selected = resolve_files(
+            &uri,
+            &["tokenizer/".into(), "unet/config.json".into()],
+            &endpoints,
+            &Anonymous,
+            Deadline::none(),
+        )
+        .unwrap();
+        let members: Vec<&str> = selected.members.iter().map(|m| m.member.as_str()).collect();
+        assert_eq!(
+            members,
+            [
+                "tokenizer/merges.txt",
+                "tokenizer/vocab.json",
+                "unet/config.json"
+            ]
+        );
+        assert_eq!(
+            resolve_files(
+                &uri,
+                &["vae/".into()],
+                &endpoints,
+                &Anonymous,
+                Deadline::none()
+            )
+            .unwrap_err()
+            .code,
+            Code::MISSING_FIELD
+        );
+        handle.join().unwrap();
+        assert!(!seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.ends_with(".safetensors")));
     }
 
     #[test]

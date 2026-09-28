@@ -722,6 +722,12 @@ def select_source_profile(
     *,
     registry: bytes | None = None,
 ) -> str: ...
+def source_profile_converters(
+    store: Store,
+    profiles: Sequence[str],
+    *,
+    registry: bytes | None = None,
+) -> list[tuple[str, str | None]]: ...
 def prepare_selected_source(
     store: Store,
     operation_id: str,
