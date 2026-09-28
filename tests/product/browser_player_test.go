@@ -67,16 +67,16 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			}
 
 			t.Run("live", func(t *testing.T) {
-				m.machine.Append("7", "video", -1, []byte(film[0]), false)
+				m.machine.Append("7", "video", -1, []byte(film[0]), 500_000, false)
 				page := open(m.link(nil, "video"))
-				waitPage(t, page, "segment 1 plays", `playing(0.5, 12)`)
+				waitPage(t, page, "segment 1 plays", `playing(0.5, 10)`)
 				_, err := page.Reload() // a reload mid-run follows from the start again
 				must(t, err)
-				waitPage(t, page, "segment 1 plays after a reload", `playing(0.5, 12)`)
-				m.machine.Append("7", "video", -1, []byte(film[1]), false)
-				waitPage(t, page, "segment 2 plays", `playing(1.0, 24)`)
+				waitPage(t, page, "segment 1 plays after a reload", `playing(0.5, 10)`)
+				m.machine.Append("7", "video", -1, []byte(film[1]), 500_000, false)
+				waitPage(t, page, "segment 2 plays", `playing(1.0, 22)`)
 				m.relay.cut() // the connection is lost mid-run: the page resumes at its cursor
-				m.machine.Append("7", "video", -1, []byte(film[2]), true)
+				m.machine.Append("7", "video", -1, []byte(film[2]), 500_000, true)
 				m.machine.End("7", "completed")
 				waitPage(t, page, "the finished film ends", `video().ended && frames() >= 36 && player().stats.connects === 2`)
 				if got := evaluate(t, page, `player().stats.bytes`); int(got.(float64)) != len(strings.Join(film, "")) {
@@ -85,8 +85,12 @@ func TestPlayerPagePlaysAGrowingOutput(t *testing.T) {
 			})
 
 			t.Run("seek", func(t *testing.T) {
+				for k, segment := range film {
+					m.machine.Append("8", "video", -1, []byte(segment), 500_000, k == 2)
+				}
+				m.machine.End("8", "completed")
 				// A small window and lookahead: the film's end is not held when the seek lands.
-				page := open(m.link(nil, "video"))
+				page := open(m.link(func(g *capability.Grant) { g.Run = "8" }, "video"))
 				result := evaluate(t, page, `(async () => {
 					const {play, parseLink} = await import("./cozy-webrtc.js");
 					player().close();
@@ -137,7 +141,7 @@ func newPlayerMachine(t *testing.T, ip string) *playerMachine {
 	return &playerMachine{t: t, machine: m, server: server, relay: newRelay(t, ip, server.Addr.String()), key: key}
 }
 
-// link is the fragment `cozy run play` prints, for run 7's output.
+// link is the fragment `cozy run play` prints: run 7's output, unless edit says otherwise.
 func (m *playerMachine) link(edit func(*capability.Grant), output string) string {
 	g := capability.Grant{Machine: m.server.Machine, Run: "7", Expires: time.Now().Add(time.Hour).Unix()}
 	if edit != nil {
@@ -146,7 +150,7 @@ func (m *playerMachine) link(edit func(*capability.Grant), output string) string
 	token, err := capability.Mint(m.key, g)
 	must(m.t, err)
 	pin := strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(m.server.Fingerprint, "sha-256 "), ":", ""))
-	return fmt.Sprintf("v=1&a=%s&f=%s&c=%s&r=7&o=%s", m.relay.addr, pin, token, output)
+	return fmt.Sprintf("v=1&a=%s&f=%s&c=%s&r=%s&o=%s", m.relay.addr, pin, token, g.Run, output)
 }
 
 func (m *playerMachine) linkWith(edit func(map[string]string)) string {

@@ -345,8 +345,9 @@ export class Player extends EventTarget {
 
   #entry(m) {
     if (this.entries.some(e => e.seq === m.seq)) return;
-    const t0 = m.appended_from != null ? this.entries.at(-1)?.t1 ?? 0 : 0;
-    this.entries.push({seq: m.seq, from: m.appended_from ?? 0, length: m.length, t0, t1: t0 + (m.duration_us ?? 0) / 1e6});
+    // duration_us is the output's whole duration at this revision.
+    const t0 = m.appended_from != null ? this.entries.findLast(e => e.length === m.appended_from)?.t1 ?? 0 : 0;
+    this.entries.push({seq: m.seq, from: m.appended_from ?? 0, length: m.length, t0, t1: (m.duration_us ?? 0) / 1e6});
     this.dispatchEvent(new CustomEvent("entry", {detail: m}));
     this.#media.pump();
   }
