@@ -2631,16 +2631,20 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 			return Target{}, nil, problem
 		}
 		described, problem := c.DescribeRelease(machine, target.Package, "")
-		if problem != nil {
+		if problem == nil {
+			packageInterface, problem := launch.DecodePackageInterface(described.PackageInterface)
+			if problem != nil {
+				return Target{}, nil, exit.Named(exit.Conflict, "machine.package_interface_invalid",
+					"the machine described an invalid package interface: %s", problem.Message)
+			}
+			target.Release = described.Release
+			return target, packageInterface, nil
+		}
+		if problem.Code != exit.Unavailable {
 			return Target{}, nil, problem
 		}
-		packageInterface, problem := launch.DecodePackageInterface(described.PackageInterface)
-		if problem != nil {
-			return Target{}, nil, exit.Named(exit.Conflict, "machine.package_interface_invalid",
-				"the machine described an invalid package interface: %s", problem.Message)
-		}
-		target.Release = described.Release
-		return target, packageInterface, nil
+		// The machine cannot answer now (a Runtime update): the run is still recorded and
+		// waits on it, and its release is read once at the Hub instead.
 	}
 	// Choosing a machine to rent reads the release at the Hub.
 	ref, problem := hub.ParseRef(target.Package)
@@ -2672,6 +2676,8 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageInterface, *exit.Err
 			"Tensorhub returned no immutable package release identity")
 	}
 	target.Release = release
+	// The run's results are read against this immutable release with no further Hub call.
+	keepReleaseInterface(home.Paths(ctx.Cfg.Home).Root, target.Package, release, detail.PackageInterface)
 	return target, packageInterface, nil
 }
 
