@@ -326,11 +326,13 @@ func TestPackageInterface(t *testing.T) {
 		"duplicate key": bytes.Replace(raw, []byte(`{"application"`),
 			[]byte(`{"application":"other","application"`), 1),
 		"non-finite number": bytes.Replace(raw, []byte(`"gt":0`), []byte(`"gt":NaN`), 1),
-		"wrong member type": bytes.Replace(raw, []byte(`"name":"run"`), []byte(`"name":7`), 1),
 	} {
 		if _, refusal := launch.DecodePackageInterface(planted); refusal == nil {
 			t.Errorf("%s was accepted at the package-interface boundary", name)
 		}
+	}
+	if _, refusal := callableOf(t, bytes.Replace(raw, []byte(`"name":"run"`), []byte(`"name":7`), 1), "run"); refusal == nil {
+		t.Error("a callable with a wrong member type was accepted")
 	}
 	// Documents from older and newer Runtimes keep loading: members this host does not
 	// consume are ignored, and a constraint or type it cannot check is left to Runtime.

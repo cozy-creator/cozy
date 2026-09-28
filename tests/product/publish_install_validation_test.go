@@ -12,7 +12,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/launch"
 )
 
 // minimax-h3 1.18.17 published a result field `context: FileAsset | None` that every install
@@ -62,7 +61,7 @@ def optional_context(payload: RefuseInput) -> OptionalContextOutput:
 	pack := buildForPublish(t, project)
 	staged, err := os.ReadFile(pack.PackageInterface)
 	must(t, err)
-	_, installed := launch.DecodePackageInterface(staged)
+	_, installed := callableOf(t, staged, "optional_context")
 	if installed == nil || installed.Name != "output_collection_unsupported" {
 		t.Fatalf("install decoder answered %v, want output_collection_unsupported", installed)
 	}

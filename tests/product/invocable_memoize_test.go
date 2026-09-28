@@ -34,7 +34,7 @@ func TestInvocableMemoizeIsTheOnlyPublicOptIn(t *testing.T) {
 			t.Fatalf("%s changed the memoize opt-in to %v", member, job.Invocable.Memoize)
 		}
 	}
-	if _, problem := launch.DecodePackageInterface([]byte(strings.Replace(document, `"memoize":true`, `"memoize":"true"`, 1))); problem == nil {
+	if _, problem := callableOf(t, []byte(strings.Replace(document, `"memoize":true`, `"memoize":"true"`, 1)), "compute"); problem == nil {
 		t.Fatal("a string memoize opt-in was admitted")
 	}
 }

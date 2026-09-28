@@ -181,8 +181,8 @@ func TestAuthoredModelDefaultDescriptorTolerance(t *testing.T) {
 	if binding := iface.Entrypoints[0].Models[0].DefaultBinding; binding == nil || binding.Model != "proof/m" || len(binding.Ladder) != 1 {
 		t.Fatalf("an additive rung member dropped the authored default: %+v", binding)
 	}
-	if _, problem := launch.DecodePackageInterface(authoredInterfaceDocument(t,
-		json.RawMessage(`[{"gpu":1,"lane":"proof/m@1.0.0/fp8"}]`))); problem == nil {
+	if _, problem := callableOf(t, authoredInterfaceDocument(t,
+		json.RawMessage(`[{"gpu":1,"lane":"proof/m@1.0.0/fp8"}]`)), "generate"); problem == nil {
 		t.Fatal("a mistyped GPU pattern was admitted")
 	}
 }
@@ -195,7 +195,7 @@ func TestAuthoredDefaultRefusesMixedOrUnpinnedTargetsBeforeRental(t *testing.T) 
 		root := ladderRoot(t, h)
 		t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 		code, out := runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental-only", "--json")
-		if code == 0 || !strings.Contains(out, "rental.package_interface_invalid") {
+		if code == 0 || !strings.Contains(out, "package_model_default_invalid") {
 			t.Fatalf("invalid authored target reached resolution: %q %d %s", wrong, code, out)
 		}
 		h.mu.Lock()

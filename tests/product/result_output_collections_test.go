@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	"github.com/cozy-creator/cozy/internal/launch"
 )
 
 func TestResultCollectionsRequireFixedNativeOutputPaths(t *testing.T) {
@@ -38,7 +36,7 @@ func TestResultCollectionsRequireFixedNativeOutputPaths(t *testing.T) {
 					jobFields = ""
 				}
 				body := fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"control:app","%s":[],"%s":[{"name":"main","models":[],"request":{"fields":[{"name":"inputs","type":{"list":{"asset":"file"}}}]},"result":{"fields":[{"name":"value","type":%s}]}%s}]}`, other, kind, arm.result, jobFields)
-				_, problem := launch.DecodePackageInterface([]byte(body))
+				_, problem := callableOf(t, []byte(body), "main")
 				if arm.refusedPath == "" {
 					fatal(t, problem)
 					continue

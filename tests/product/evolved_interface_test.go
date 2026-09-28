@@ -6,14 +6,19 @@ import (
 	"testing"
 )
 
-// A package interface written by a newer Runtime carries members, constraints and type
-// grammar this CLI has never seen (h3a-054: one unknown asset_bound member refused every
-// run of a published release). The real run path still reaches the machine, and the
-// readable bounds are still enforced before anything is submitted.
+// A package interface written by a newer Runtime carries a newer format, members, constraints,
+// type grammar and a callable this CLI has never seen (h3a-054: one unknown asset_bound member
+// refused every run of a published release). The real run path still reaches the machine, the
+// readable bounds are still enforced before anything is submitted, and only the callable this
+// CLI cannot read refuses, saying why.
 func TestRunAcceptsInterfaceMembersFromANewerRuntime(t *testing.T) {
 	var doc map[string]any
 	must(t, json.Unmarshal(admissionInterface(t, false, false), &doc))
+	doc["format"] = "cozy.package.interface/2"
 	doc["capabilities"] = []any{"streaming"}
+	doc["entrypoints"] = append(doc["entrypoints"].([]any), map[string]any{"name": "tune",
+		"models":  []any{map[string]any{"class": "H3", "path": "tune.weights.model", "component_use": map[string]any{}}},
+		"request": map[string]any{"fields": []any{}}, "result": map[string]any{"fields": []any{}}})
 	ep := doc["entrypoints"].([]any)[0].(map[string]any)
 	ep["timeout_s"] = 600
 	ep["models"].([]any)[0].(map[string]any)["stamps"] = map[string]any{}
@@ -41,4 +46,9 @@ func TestRunAcceptsInterfaceMembersFromANewerRuntime(t *testing.T) {
 	if code == 0 || !strings.Contains(out, `"machine":"local"`) {
 		t.Fatalf("a newer Runtime's interface members refused the run before it reached the machine [exit %d]: %s", code, out)
 	}
+	code, out = runAdmissionCLI(t, root, path, "run", ladderPackage+"/tune", "--json", "--idempotency-key", "evolved-tune")
+	if code == 0 || !strings.Contains(out, `tune has invalid model path \"tune.weights.model\"`) {
+		t.Fatalf("the callable this CLI cannot read did not refuse with its reason [exit %d]: %s", code, out)
+	}
+	assertAdmissionDidNotSubmit(t, root, "evolved-tune")
 }

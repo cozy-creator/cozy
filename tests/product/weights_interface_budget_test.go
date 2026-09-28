@@ -32,6 +32,10 @@ func TestWeightsInterfaceAcceptsExplicitZeroNewBytes(t *testing.T) {
 			row := fmt.Sprintf(`{"output_id":"model","mime_type":%q%s}`, orchestrator.WeightsManifestMime, arm.cap)
 			body := fmt.Sprintf(`{"format":"cozy.package.interface/1","application":"graft:app","entrypoints":[],"jobs":[{"name":"project","publishes":false,"request":{"fields":[]},"result":{"fields":[]},"weights_outputs":[%s]}]}`, row)
 			parsed, problem := launch.DecodePackageInterface([]byte(body))
+			var job *launch.Entrypoint
+			if problem == nil {
+				job, problem = parsed.Function("project")
+			}
 			if (problem == nil) != arm.ok {
 				t.Fatalf("admission = %v, want accepted=%v", problem, arm.ok)
 			}
@@ -40,7 +44,7 @@ func TestWeightsInterfaceAcceptsExplicitZeroNewBytes(t *testing.T) {
 			}
 			var expected launch.WeightsOutput
 			must(t, json.Unmarshal([]byte(row), &expected))
-			if got := parsed.Jobs[0].WeightsOutputs[0]; got != expected {
+			if got := job.WeightsOutputs[0]; got != expected {
 				t.Fatalf("admission changed the output contract: %+v != %+v", got, expected)
 			}
 		})
