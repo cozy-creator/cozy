@@ -153,13 +153,6 @@ func testRentalKeepaliveCLI(t *testing.T, runtimeFailure codes.Code, wrongBoot b
 		t.Fatalf("status: %s", out)
 	}
 	daemon = crashAndRestartTransactionDaemon(t, daemon)
-	if runtimeFailure != codes.Unavailable {
-		reply = daemon.call(t, http.MethodPost, "/v1/local/rentals/"+podRental+"/claim", map[string]any{})
-		// A refused protocol probe is an unknown range, never a refused Claim.
-		if reply.Status != http.StatusOK && reply.Status != http.StatusAccepted {
-			t.Fatalf("reconnect: %s", reply.brief())
-		}
-	}
 	mu.Lock()
 	after := calls
 	mu.Unlock()

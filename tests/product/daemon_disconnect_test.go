@@ -49,6 +49,10 @@ func TestDaemonDownPreservesInactiveRetainedWork(t *testing.T) {
 	must(t, err)
 	_, err = db.Exec("UPDATE requests SET state='succeeded',child_artifacts=1 WHERE id=?", completed.ID)
 	must(t, err)
+	for _, id := range []string{paused.ID, blocked.ID, completed.ID} {
+		_, err = db.Exec("INSERT INTO machine_executions(request_id,machine_id) VALUES(?,'pr-retained-disconnect')", id)
+		must(t, err)
+	}
 	_, err = db.Exec("INSERT INTO request_output_exports(request_id,directory,outputs,state,updated_at) VALUES(?,?,'[]','pending',?)", paused.ID, filepath.Join(root, "paused-output"), time.Now().UTC().Format(time.RFC3339Nano))
 	must(t, err)
 	db.Close()

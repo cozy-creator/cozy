@@ -20,20 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func awaitRentalGone(t *testing.T, store *records.Store, id string, within time.Duration, logPath string) {
-	t.Helper()
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		row, problem := store.RentalRow(id)
-		fatal(t, problem)
-		if row == nil {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("rental %s was not released within %s\n%s", id, within, tail(logPath))
-}
-
 func awaitLog(t *testing.T, logPath, substr string, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)

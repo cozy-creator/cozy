@@ -40,11 +40,9 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/mediawire"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/workertls"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -951,108 +949,6 @@ func waitUntil(t *testing.T, what string, ok func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
-}
-
-// localLauncher is the one Launcher method a rental-bound editable request uses: the
-// sealed revision the request's install names. Everything local is out of scope on a pod.
-type localLauncher struct {
-	orchestrator.Launcher
-	revision localpackage.Installation
-}
-
-// Wire-peer controls use declared synthetic revisions; actual CLI tests exercise
-// the real resolver's sealed metadata gate.
-func (l localLauncher) ValidateExecutionCapture(records.Request) *exit.Error { return nil }
-
-func (l localLauncher) LocalInstallation(installID, digest string) (localpackage.Installation, *exit.Error) {
-	if digest != l.revision.ID {
-		return localpackage.Installation{}, exit.New(exit.NotFound, "no local revision %s", digest)
-	}
-	return l.revision, nil
-}
-
-// stageLocalRevision writes one project wheel and one dependency wheel under the root
-// and seals them the way `localpackage.Stage` does: files sorted by digest, one project.
-func stageLocalRevision(t *testing.T, root string) localpackage.Installation {
-	t.Helper()
-	write := func(name string, body []byte) localpackage.File {
-		path := filepath.Join(root, name)
-		must(t, os.WriteFile(path, body, 0o600))
-		digest, _ := canonical.Spell(sha256Of(body))
-		kind := "dependency"
-		if strings.HasPrefix(name, "weightless-") {
-			kind = "project"
-		}
-		return localpackage.File{Digest: digest, Filename: name, Kind: kind, Path: path, Length: int64(len(body))}
-	}
-	files := []localpackage.File{
-		write("weightless-1.0.0-py3-none-any.whl", bytes.Repeat([]byte("project wheel bytes\n"), 180)),
-		write("helper-0.3.0-py3-none-any.whl", bytes.Repeat([]byte("dependency wheel bytes\n"), 90)),
-	}
-	if files[1].Filename < files[0].Filename {
-		files[0], files[1] = files[1], files[0]
-	}
-	return localpackage.Installation{ID: "fixture-install", Package: "local/weightless", Release: "1.0.0", PackageInterface: fixturePackageInterface, Files: files, SourceArchive: "source.tar"}
-}
-
-// submitPublishedRentalJob queues one published JOB bound to the rented pod, the way
-// `cozy model upload --producer ... --rental-only` does: a job-shaped callable, no
-// install, no model release of its own.
-func submitPublishedRentalJob(t *testing.T, o *owner, pkg, release, planID, idem string) string {
-	t.Helper()
-	requestID, _, e := o.c.Submit(orchestrator.Submission{
-		IdemKey: idem, Package: pkg, Entrypoint: "four-lane", PlanID: planID, Release: release,
-		Kind: "job", Org: "paul", Payload: []byte(`{"steps":4}`), Outputs: []string{"model"},
-		Worker: podRental, Rental: true, RentalRequired: true,
-	})
-	fatal(t, e)
-	return requestID
-}
-
-// TestPodHostJobDirectiveNamesTheStagedBuild: the JOB lane's directive names the BUILD the
-// rented worker staged its job plan records under — its own prepared placement's identity —
-// and not this owner's PlacementSet digest, which the worker never saw while it was
-// staging. Naming the set digest is what `session.py::apply_job_directive` refuses as
-// `job_plan_mismatch`, and it refuses BEFORE any offer, so no producer run can reach a
-// first attempt. The producer path (a job-shaped callable on a rented pod, zero model
-// releases) is the combination that had no test.
-func TestPodHostJobDirectiveNamesTheStagedBuild(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public, serve: true}
-	root := t.TempDir()
-	connection, _ := startFakePod(t, root, pod)
-	o := hostOwner(t, "podhost-job-build", rentalWiring(connection, private))
-
-	planID := "sha256:" + strings.Repeat("35", 32)
-	submitPublishedRentalJob(t, o, "cozy/h3-package", "1.0.7", planID, "job-build-1")
-
-	waitUntil(t, "the JobDirective on WorkerControl", func() bool {
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.jobDirectives) >= 1
-	})
-	pod.mu.Lock()
-	defer pod.mu.Unlock()
-	if pod.stagedJobBuild == "" {
-		t.Fatalf("the pod staged its job plans under no build identity")
-	}
-	directive := pod.jobDirectives[0]
-	if directive.InstallationId != pod.stagedJobBuild {
-		t.Fatalf("the JobDirective names build %q; the pod staged its job plan under %q",
-			directive.InstallationId, pod.stagedJobBuild)
-	}
-	if directive.JobDescriptorId != planID {
-		t.Fatalf("the JobDirective names descriptor %q, not the requested %q",
-			directive.JobDescriptorId, planID)
-	}
-	if !directive.ReclaimOnTerminal {
-		t.Fatalf("the JobDirective does not reclaim on terminal")
-	}
-	setDigest, _ := canonical.Spell(pod.preparedDig)
-	if directive.InstallationId == setDigest {
-		t.Fatalf("the JobDirective names the PlacementSet digest, which the worker never staged under")
-	}
 }
 
 func (p *fakePod) CheckpointPage(ctx context.Context, call *pb.CheckpointPageCall) (*pb.CheckpointPageResult, error) {

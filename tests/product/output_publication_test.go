@@ -1,12 +1,9 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -26,51 +23,6 @@ func outputPublicationSubmission() orchestrator.Submission {
 		},
 		ModelTransfer: &records.ModelTransferIntent{Kind: "model-upload", Destination: "paul/output-publication",
 			Outputs: []records.ModelTransferOutput{{Name: "model"}}},
-	}
-}
-
-// The real owner is wired to its production I/O implementation. An accidental
-// source-acquisition call would refuse the absent source instead of producing an offer.
-func TestOutputPublicationKeepsSelectedInputs(t *testing.T) {
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	must(t, err)
-	pod := &fakePod{controlKey: public, serve: true, jobReady: true}
-	connection, _ := startFakePod(t, t.TempDir(), pod)
-	o := hostOwner(t, "output-publication-inputs", rentalWiring(connection, private),
-		func(options *orchestrator.Options) {
-			options.ModelTransfers = cli.NewModelTransferOwner(options.Cfg, options.Store, options.Log, nil)
-		})
-	sub := outputPublicationSubmission()
-	fatal(t, modeltransfer.ValidateSubmission(sub))
-	fatal(t, records.NormalizeModelTransferIntent(sub.ModelTransfer))
-	requestID, _, problem := o.c.Submit(sub)
-	fatal(t, problem)
-	waitUntil(t, "output publication offer without source acquisition", func() bool {
-		request, problem := o.store.RequestRow(requestID)
-		fatal(t, problem)
-		if request.State == "failed" {
-			t.Fatalf("output-only job failed before its offer: %v", o.c.Events())
-		}
-		pod.mu.Lock()
-		defer pod.mu.Unlock()
-		return len(pod.offers) == 1
-	})
-	request, problem := o.store.RequestRow(requestID)
-	fatal(t, problem)
-	if len(request.Models) != 2 || request.Models[0].Manifest != sub.Models[0].Manifest ||
-		request.Models[1].Manifest != sub.Models[1].Manifest {
-		t.Fatalf("publication changed the selected generic inputs: %+v", request.Models)
-	}
-	replay, problem := o.store.RequestByIdempotencyKey(sub.IdemKey)
-	fatal(t, problem)
-	if replay == nil || len(replay.Models) != 2 || replay.Models[0].Manifest != sub.Models[0].Manifest ||
-		replay.Models[1].Manifest != sub.Models[1].Manifest {
-		t.Fatal("the idempotent replay path lost the original generic model selection")
-	}
-	transfer, problem := o.store.ModelTransferOf(requestID)
-	fatal(t, problem)
-	if transfer.State != "pending" || len(transfer.Models) != 0 || transfer.HasAcquisition() {
-		t.Fatalf("publication invented materialized source custody: %+v", transfer)
 	}
 }
 

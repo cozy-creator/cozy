@@ -1,8 +1,6 @@
 package producttest
 
 import (
-	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"os"
 	"strconv"
@@ -10,53 +8,15 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // cl-179: WIDTH. A rental is bought at a width and the pod must deliver it; Runtime alone
 // decides which of those cards each call uses.
-
-// rentalWidthWiring is daemon_serve's own rental wiring over a rental this host bought at
-// `width`, attached with real credentials. The two facts under test — the persisted width
-// and the pod's reported one — are the arguments; everything else is production code.
-func rentalWidthWiring(t *testing.T, pod *fakePod, connection *orchestrator.WorkerConnection,
-	certPath string, width int) func(*orchestrator.Options) {
-	t.Helper()
-	return func(o *orchestrator.Options) {
-		identity, problem := rental.PendingCreatorIdentity(o.Layout, "width-proof")
-		fatal(t, problem)
-		public, err := base64.RawURLEncoding.DecodeString(identity.PublicKey())
-		must(t, err)
-		pod.controlKey = ed25519.PublicKey(public)
-		certificate, err := os.ReadFile(certPath)
-		must(t, err)
-		fatal(t, rental.Attach(o.Layout, o.Store, records.Rental{
-			ID: podRental, MachineName: "wide-machine", SKU: "fake-x", Hub: "https://hub.invalid",
-			AcceleratorModel: "fake-4090", AcceleratorCount: width,
-			HourlyRateUSDMicros: 1, State: "ready",
-			Address:          connection.Addr,
-			MediaAddress:     connection.Media.Addr,
-			ExpectedWorkerID: podWorkerID, ExpectedWorkerBootID: podBootID,
-		}, string(certificate), connection.Media.Token, identity))
-		o.Rentals = rental.Resolver(o.Layout, o.Store)
-		o.ObserveRental = rental.ObserveWorker(o.Store)
-		o.RentalClaimProof = rental.ClaimProof(o.Layout)
-		o.RentalPackageSet = func(packages []*pb.DownloadPackageRef,
-			models []*pb.DownloadModelRef) ([]byte, *exit.Error) {
-			body, err := canonical.Bytes(&pb.DownloadDelegation{Models: models, Packages: packages})
-			if err != nil {
-				return nil, exit.Internalf("%v", err)
-			}
-			return body, nil
-		}
-	}
-}
 
 // modelBearingPlacement is a prepared placement that HOLDS WEIGHTS: one model, one
 // entrypoint binding it. Weight is the whole question a pin turns on — a group shards a

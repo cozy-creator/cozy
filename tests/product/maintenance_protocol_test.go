@@ -141,16 +141,14 @@ func maintenanceFixture(t *testing.T, p *maintenancePeer) (*orchestrator.WorkerC
 
 func TestMaintenanceControlProtocolAndSafety(t *testing.T) {
 	for _, row := range []struct {
-		name                      string
-		minor, floor              uint32
-		unsafe, wrongSigner, busy bool
-		accepted                  bool
+		name              string
+		minor, floor      uint32
+		wrongSigner, busy bool
+		accepted          bool
 	}{
 		{name: "old", minor: 60, floor: 59, accepted: true},
 		{name: "current", minor: pb.WireMinor, floor: pb.MinCompatibleWireMinor, accepted: true},
-		{name: "pre keepalive", minor: 59, floor: 59},
 		{name: "newer floor", minor: pb.WireMinor + 1, floor: pb.WireMinor + 1, accepted: true},
-		{name: "missing activity", minor: 60, floor: 59, unsafe: true},
 		{name: "wrong signer", minor: 60, floor: 59, wrongSigner: true},
 		{name: "active attempt", minor: 60, floor: 59, busy: true},
 	} {

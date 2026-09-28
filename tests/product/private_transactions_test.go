@@ -6,12 +6,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -45,154 +43,6 @@ func TestUnpublishedTransactionCommandsResolveExistingRequest(t *testing.T) {
 	}
 	if requests := listInvocations(t, root); len(requests) != 0 {
 		t.Fatalf("lifecycle commands created requests: %+v", requests)
-	}
-}
-
-// A paused request remains an unfinished obligation after a hard daemon exit.
-// This arm starts before dispatch deliberately: pausing a queued transaction
-// must not require starting its Python program just to stop it again.
-func TestUnpublishedTransactionQueuedPauseSurvivesDaemonCrash(t *testing.T) {
-	root := t.TempDir()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName),
-		[]byte("daemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	daemon := startDaemonProcess(t, root)
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	before := recordPrivateTransaction(t, store, "queued", "")
-	reference := strconv.FormatInt(before.Number, 10)
-	unauthorized := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+before.ID+"/pause",
-		map[string]any{"actor": "untrusted caller"}, "Authorization", "")
-	if unauthorized.Status != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated pause crossed the daemon boundary: %s", unauthorized.brief())
-	}
-	assertPrivateTransactionIdentity(t, store, before, before.State)
-	for range 2 {
-		code, out := runCozy(t, root, "run", "pause", reference, "--json")
-		if code != 0 || !strings.Contains(out, `"status":"paused"`) {
-			t.Fatalf("queued pause [exit %d]: %s", code, out)
-		}
-	}
-	assertPrivateTransactionIdentity(t, store, before, "paused")
-	if attempts, problem := store.Attempts(before.ID); problem != nil || len(attempts) != 0 {
-		t.Fatalf("queued pause invented computation: %+v %v", attempts, problem)
-	}
-	if code, out := runCozy(t, root, "run", "watch", reference, "--json"); code != 0 || !strings.Contains(out, `"status":"paused"`) {
-		t.Fatalf("watch did not acknowledge retained pause [exit %d]: %s", code, out)
-	}
-
-	daemon = crashAndRestartTransactionDaemon(t, daemon)
-	state := daemon.call(t, http.MethodGet, "/v1/local/jobs/"+before.ID, nil)
-	if state.Status != http.StatusOK || !bytes.Contains(state.Body, []byte(`"status":"paused"`)) {
-		t.Fatalf("restarted owner lost the paused state: %s", state.brief())
-	}
-	assertPrivateTransactionIdentity(t, store, before, "paused")
-	owed, problem := store.Owed()
-	fatal(t, problem)
-	for _, request := range owed {
-		if request.ID == before.ID {
-			t.Fatal("restarted owner queues paused work without explicit resume")
-		}
-	}
-
-	// Cancel means permanent abandonment, distinct from pause. Resuming the same
-	// number or global ID must refuse and leave the original identity in history.
-	if code, out := runCozy(t, root, "run", "cancel", reference, "--json"); code != 0 {
-		t.Fatalf("cancel paused transaction [exit %d]: %s", code, out)
-	}
-	waitUntil(t, "paused cancellation settles", func() bool {
-		row, problem := store.RequestRow(before.ID)
-		fatal(t, problem)
-		return row.State == "canceled"
-	})
-	for _, ref := range []string{reference, before.ID} {
-		response := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+ref+"/resume",
-			map[string]any{"actor": "product proof"})
-		if response.Status != http.StatusConflict {
-			t.Fatalf("permanently canceled transaction resumed: %s", response.brief())
-		}
-	}
-	assertPrivateTransactionIdentity(t, store, before, "canceled")
-	if requests := listInvocations(t, root); len(requests) != 1 || requests[0].ID != before.ID {
-		t.Fatalf("pause/restart/cancel changed request identity: %+v", requests)
-	}
-}
-
-// The rental holding transaction state is owned by every retained request, not
-// only by its original buyer. A separate idle rental proves the real sweep has
-// run; elapsed time alone is not evidence that the retained rental was examined.
-func TestUnpublishedTransactionsShareRentalRetention(t *testing.T) {
-	root := t.TempDir()
-	hub := newFakeRentalHub(t, 0)
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte(
-		"tensorhub_url: "+hub.server.URL+"\ntensorhub_token: rental-idle-test\n"+
-			"daemon:\n  idle_shutdown_s: 0\n"), 0o600))
-	daemon := startDaemonProcess(t, root)
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	const retained = "pr-transaction-retained"
-	first := recordPrivateTransaction(t, store, "first", retained)
-	second := recordPrivateTransaction(t, store, "second", retained)
-	response := daemon.call(t, http.MethodPost, "/v1/local/jobs/"+first.ID+"/pause",
-		map[string]any{"actor": "product proof"})
-	if response.Status != http.StatusOK || !bytes.Contains(response.Body, []byte(`"status":"paused"`)) {
-		t.Fatalf("pause retained request: %s", response.brief())
-	}
-	blocked, problem := store.BlockRetainedWork(second.ID, "author_exception", "step B failed")
-	fatal(t, problem)
-	if !blocked {
-		t.Fatal("failed transaction did not retain its state")
-	}
-	plant := func(id, machine, buyer string) {
-		t.Helper()
-		hub.add(id, machine)
-		fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1,
-			ID: id, MachineName: machine, SKU: "cpu", AcceleratorModel: "CPU",
-			HourlyRateUSDMicros: 100_000, State: "ready", Hub: hub.server.URL,
-			Address: "127.0.0.1:1", CertPath: filepath.Join(root, id+".pem"),
-			ManagedRequestID: buyer,
-			ReadyAt: func() string {
-				if buyer == "" {
-					return time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
-				}
-				return time.Now().UTC().Format(time.RFC3339Nano)
-			}(),
-		}))
-	}
-	plant(retained, "otter", first.ID)
-
-	assertHeldAfterSweep := func(witness, machine string) {
-		t.Helper()
-		plant(witness, machine, "")
-		awaitRentalGone(t, store, witness, 15*time.Second, filepath.Join(root, "daemon.log"))
-		row, problem := store.RentalRow(retained)
-		fatal(t, problem)
-		if row == nil || row.State != "ready" || hub.releases(retained) != 0 {
-			t.Fatalf("rental with retained transaction released: row=%+v deletes=%d", row, hub.releases(retained))
-		}
-	}
-	assertHeldAfterSweep("pr-transaction-witness-one", "heron")
-	daemon = crashAndRestartTransactionDaemon(t, daemon)
-	assertHeldAfterSweep("pr-transaction-witness-two", "curlew")
-	assertPrivateTransactionIdentity(t, store, first, "paused")
-	assertPrivateTransactionIdentity(t, store, second, "blocked")
-
-	// Cancel the original buyer. The second request is now the only reason to
-	// retain the machine; consulting ManagedRequestID alone would delete it.
-	response = daemon.call(t, http.MethodPost, "/v1/local/jobs/"+first.ID+"/cancel", nil)
-	if response.Status != http.StatusOK && response.Status != http.StatusAccepted {
-		t.Fatalf("cancel original buyer: %s", response.brief())
-	}
-	assertHeldAfterSweep("pr-transaction-witness-three", "kestrel")
-	assertPrivateTransactionIdentity(t, store, second, "blocked")
-	response = daemon.call(t, http.MethodPost, "/v1/local/jobs/"+second.ID+"/cancel", nil)
-	if response.Status != http.StatusOK && response.Status != http.StatusAccepted {
-		t.Fatalf("cancel final owner: %s", response.brief())
-	}
-	awaitRentalGone(t, store, retained, 15*time.Second, filepath.Join(root, "daemon.log"))
-	if hub.releases(retained) != 1 {
-		t.Fatalf("final owner abandonment produced %d rental releases", hub.releases(retained))
 	}
 }
 

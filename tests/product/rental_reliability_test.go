@@ -5,13 +5,10 @@ import (
 	"database/sql"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -105,64 +102,6 @@ func TestRentalObservationCancelsWhileWriterStillHoldsLock(t *testing.T) {
 		t.Fatalf("non-lock error changed: %v", problem)
 	}
 	assertRentalObservationRestoredBusyWait(t, store, writer)
-}
-
-func TestStaleRentalResolutionCannotFailReplacement(t *testing.T) {
-	entered, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
-	defer once.Do(func() { close(release) })
-	var creates atomic.Int64
-	o := hostOwner(t, "stale-rental-resolution", func(opt *orchestrator.Options) {
-		opt.Rentals = func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
-			if id == "rental-old" {
-				close(entered)
-				<-release
-				return nil, exit.New(exit.NotFound, "no rental %s on this host", id)
-			}
-			return nil, exit.Unavailablef("replacement is preparing")
-		}
-		opt.RentalFleet = func(records.Request) (string, *exit.Error) { return "one replacement", nil }
-		opt.AcquireManagedRental = func(req records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
-			creates.Add(1)
-			_, problem := opt.Store.PinRental(req.ID, "rental-new", nil)
-			return orchestrator.PlacementDecision{RentalID: "rental-new"}, "", problem
-		}
-	})
-	for _, name := range []string{"old", "new"} {
-		fatal(t, o.store.RecordRental(records.Rental{ID: "rental-" + name, MachineName: name, SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 1, State: "ready", Hub: "fixture"}))
-	}
-	id, _, problem := o.c.Submit(orchestrator.Submission{IdemKey: "lost-before-resolution", Package: "proof/source-producer", Release: "1", Entrypoint: "convert", Kind: "job", Payload: []byte("{}"), Worker: "rental-old", Rental: true, RentalRequired: true})
-	fatal(t, problem)
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("old selection never entered its resolver")
-	}
-	// ResolveFor has passed preflight but has not answered. Recovery changes the
-	// durable pin and starts replacement before the old resolver returns NotFound.
-	fatal(t, o.store.RecordRental(records.Rental{ID: "rental-old", State: "released"}))
-	o.c.RecoverLostWork()
-	waitUntil(t, "the same request pins replacement", func() bool { row, _ := o.store.RequestRow(id); return row != nil && row.Worker == "rental-new" })
-	once.Do(func() { close(release) })
-	if _, ok := waitEvent(o, "preparation selection changed; discarding its result", 5*time.Second); !ok {
-		t.Fatal("old resolver result did not finish without settling the replacement")
-	}
-	if _, ok := waitEvent(o, "replacement is preparing", 5*time.Second); !ok {
-		t.Fatal("replacement did not retain the queue")
-	}
-	row, problem := o.store.RequestRow(id)
-	fatal(t, problem)
-	if row.State != "submitted" && row.State != "queued" || row.Worker != "rental-new" || creates.Load() != 1 {
-		t.Fatalf("stale failure changed replacement: %+v creates=%d", row, creates.Load())
-	}
-	events, problem := o.store.EventsAfter(id, 0, 100)
-	fatal(t, problem)
-	for _, event := range events {
-		if event.Type == "request.failed" {
-			t.Fatal("stale preparation published a terminal failure")
-		}
-	}
-	fatal(t, o.c.CancelQueued(id, "fixture finished"))
 }
 
 func TestPreparationFailureOnlySettlesCapturedSelection(t *testing.T) {

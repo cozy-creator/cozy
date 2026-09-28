@@ -225,21 +225,6 @@ func submission(planID, pkg, idem string, body map[string]any) orchestrator.Subm
 	}
 }
 
-// waitEvent watches the orchestrator's OWN event log for a line — the owner's words, not
-// the suite's inference about them.
-func waitEvent(o *owner, substr string, timeout time.Duration) (string, bool) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		for _, line := range o.c.Events() {
-			if strings.Contains(line, substr) {
-				return line, true
-			}
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	return "", false
-}
-
 // ------------------------------------------------------------- a real hidden daemon process
 
 // daemonProcess is one Cozy daemon this suite owns. The separate process is the point:
