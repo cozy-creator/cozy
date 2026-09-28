@@ -61,6 +61,7 @@ pub fn read_source_heads<'p>(
                     provenance: providers::Provenance::Declared,
                     carrier: true,
                     requires: vec![],
+                    companion: false,
                 })
             })
             .collect::<PyResult<Vec<_>>>()?,

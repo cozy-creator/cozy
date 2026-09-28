@@ -145,6 +145,7 @@ fn resolution(url: &str) -> Resolution {
             provenance: Provenance::Declared,
             carrier: true,
             requires: vec![],
+            companion: false,
         }],
     }
 }

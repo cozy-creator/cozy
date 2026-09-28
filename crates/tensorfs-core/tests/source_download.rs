@@ -136,6 +136,7 @@ impl Origin {
                     provenance: Provenance::Declared,
                     carrier: true,
                     requires: vec![],
+                    companion: false,
                 })
                 .collect(),
         }
@@ -480,6 +481,7 @@ fn download_child() {
                 provenance: Provenance::Declared,
                 carrier: true,
                 requires: vec![],
+                companion: false,
             })
             .collect(),
     };

@@ -36,6 +36,11 @@ pub fn f32_to_f16(f: u32) -> u16 {
     sign + ((sig >> 13) as u16 + ((exp - 0x3800_0000) >> 13) as u16)
 }
 
+/// Whether this border narrows `from` to `to`: bf16/f32 to f16 only.
+pub fn narrows(from: Dtype, to: Dtype) -> bool {
+    to == Dtype::F16 && matches!(from, Dtype::F32 | Dtype::Bf16)
+}
+
 /// Streams `inner`'s `from` elements out as little-endian f16.
 pub struct Narrow<R> {
     inner: R,

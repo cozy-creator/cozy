@@ -7,6 +7,7 @@ on:
       - "scripts/single-file-routes.py"
       - "crates/tensorfs-core/src/ingest/routes/**"
       - "vectors/civitai-sdxl-headers/**"
+      - "vectors/anima-civitai-headers/**"
       - ".github/workflows/routes.yaml"
   push:
     branches: [master]
@@ -14,6 +15,7 @@ on:
       - "scripts/single-file-routes.py"
       - "crates/tensorfs-core/src/ingest/routes/**"
       - "vectors/civitai-sdxl-headers/**"
+      - "vectors/anima-civitai-headers/**"
       - ".github/workflows/routes.yaml"
 jobs:
   regenerate:

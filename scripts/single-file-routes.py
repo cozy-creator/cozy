@@ -15,9 +15,11 @@
     uv run scripts/single-file-routes.py --write   # rewrite the tables
 
 A family is one spec, `crates/tensorfs-core/src/ingest/routes/<family>.spec.json`: the
-reviewed carrier header, the pinned reference pipeline whose configs build the target
+reviewed carrier header(s), the pinned reference pipeline whose configs build the target
 census, and per component the source prefix, target class and the diffusers
-`single_file_utils` conversion. The conversion runs over coordinate-tracking stand-ins, never
+`single_file_utils` conversion (`null` when the upstream mapping only strips the prefix). A
+component sees the keys of its header whose longest matching family prefix is its own, the
+view the converter projects. The conversion runs over coordinate-tracking stand-ins, never
 tensor values, and the target models are constructed on the meta device. Every census key
 becomes one route: a rekey, squeeze, row-block split or transpose of one source run. Any
 other operation is recorded as an explicit `materialize` route, which the converter refuses
@@ -195,20 +197,27 @@ def target(spec: dict[str, Any], config: dict[str, Any]) -> Any:
 
 def generate(spec_path: Path, base: str) -> bytes:
     spec = json.loads(spec_path.read_text())
-    shapes = header(ROOT / spec["header"])
-    checkpoint = {
-        key: Route(key, shape, 0, contiguous(shape)) for key, shape in shapes.items()
-    }
+    prefixes = [component["prefix"] for component in spec["components"]]
     components = []
     for component in spec["components"]:
         name, prefix = component["component"], component["prefix"]
+        shapes = header(ROOT / component.get("header", spec.get("header")))
+        checkpoint = {
+            key: Route(key, shape, 0, contiguous(shape))
+            for key, shape in shapes.items()
+            if max((p for p in prefixes if key.startswith(p)), key=len, default=None) == prefix
+        }
         config = reference_file(base, spec["reference"], component["config"])
         model = target(component, config)
         census = [(key, tuple(value.shape)) for key, value in model.state_dict().items()]
         arguments = {"checkpoint": checkpoint, "config": config, "model": model, "prefix": prefix}
-        convert = getattr(single_file_utils, component["convert"])
+        if component["convert"] is None:
+            converted = {key.removeprefix(prefix): route for key, route in checkpoint.items()}
+        else:
+            convert = getattr(single_file_utils, component["convert"])
+            converted = convert(*(arguments[a] for a in component["arguments"]))
         mapped: dict[str, Any] = {}
-        for key, value in convert(*(arguments[a] for a in component["arguments"])).items():
+        for key, value in converted.items():
             for old, new in component["rename"].items():
                 key = new + key.removeprefix(old) if key.startswith(old) else key
             mapped[key] = value
@@ -225,7 +234,7 @@ def generate(spec_path: Path, base: str) -> bytes:
             else:
                 routes.append([key, local, *classify(route, ())])
         assert sorted(mapped) == sorted(component["discard"]), (name, sorted(mapped))
-        present = {key.removeprefix(prefix) for key in shapes if key.startswith(prefix)}
+        present = {key.removeprefix(prefix) for key in checkpoint}
         optional = sorted(component["optional"])
         assert not used & set(optional), (name, "an optional source is routed")
         components.append(

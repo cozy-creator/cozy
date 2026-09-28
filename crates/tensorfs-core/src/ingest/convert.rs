@@ -69,7 +69,7 @@ pub const NORMALIZATION: &str = "normalization";
 /// The converter for a source no reviewed profile recognizes: its keys, stored as they are.
 pub const IDENTITY: &str = "identity/1";
 
-pub const CONVERTERS: [Converter; 7] = [
+pub const CONVERTERS: [Converter; 8] = [
     Converter {
         name: "diffusers.identity/1",
         dialect: "safetensors.diffusers",
@@ -167,6 +167,26 @@ pub const CONVERTERS: [Converter; 7] = [
         lane: Some(Dtype::F16),
         reference: Some(
             "hf://stabilityai/stable-diffusion-xl-base-1.0@462165984030d82259a11f4367a4eed129e94a7b",
+        ),
+    },
+    Converter {
+        name: super::routes::ANIMA,
+        dialect: "safetensors.single_file",
+        class: Class::Identity,
+        doc: "Anima's ComfyUI files (the `net.` DiT carrying its `net.llm_adapter.` text \
+              conditioner, the Qwen3 text encoder under `model.`, the Qwen-Image VAE) become \
+              the Diffusers constructors' checkpoints: the generated route table rekeys every \
+              tensor into constructor order and moves no byte. Sources stay bf16. Pipeline \
+              index, configs and tokenizers come from the pinned Anima Base v1.0 Diffusers \
+              reference.",
+        // Every route's dtype, shape and leading 16 KiB equal the reference repository's
+        // tensor on Civitai 2945208's real bytes (1,189 routes, 409 whole), and the table
+        // equals diffusers v0.40.0 scripts/convert_anima_to_diffusers.py route for route.
+        validated_on_real_bytes: true,
+        normalization: Some(("normalized", "diffusers")),
+        lane: Some(Dtype::Bf16),
+        reference: Some(
+            "hf://circlestone-labs/Anima-Base-v1.0-Diffusers@073c3a9db359c31ad0e8aa268d15775473c2176c",
         ),
     },
 ];
@@ -1747,25 +1767,42 @@ pub const SINGLE_FILE_PREFIXES: [(&str, &str, &str); 4] = [
 
 /// Project one reviewed component out of a multi-component single-file carrier. The
 /// source offsets remain those of the original file; only the key set presented to
-/// fingerprinting and planning narrows. A caller cannot invent a prefix: the closed map
-/// above is the sole authority and an absent component refuses.
-pub fn single_file_component(component: &str, source: &SourceHeader) -> Result<SourceHeader> {
-    let prefix = match SINGLE_FILE_PREFIXES
-        .iter()
-        .find(|(_, target, _)| *target == component)
-    {
-        Some((prefix, _, _)) => *prefix,
-        None => {
-            return refuse(
-                Code::MISSING_TENSOR,
-                format!("single-file carriers define no reviewed component {component:?}"),
-            )
-        }
+/// fingerprinting and planning narrows. The converter's prefixes are the sole authority (a
+/// routed converter's table, else the closed map above): a key belongs to the component
+/// whose prefix is the longest it starts with, and an absent component refuses.
+pub fn single_file_component(
+    conv: &Converter,
+    component: &str,
+    source: &SourceHeader,
+) -> Result<SourceHeader> {
+    let prefixes: Vec<(&str, &str)> = match super::routes::table(conv.name) {
+        Some(table) => table
+            .components
+            .iter()
+            .map(|c| (c.name.as_str(), c.prefix.as_str()))
+            .collect(),
+        None => SINGLE_FILE_PREFIXES
+            .iter()
+            .map(|(prefix, name, _)| (*name, *prefix))
+            .collect(),
+    };
+    let Some(&(_, prefix)) = prefixes.iter().find(|(name, _)| *name == component) else {
+        return refuse(
+            Code::MISSING_TENSOR,
+            format!("{} defines no reviewed component {component:?}", conv.name),
+        );
+    };
+    let owner = |key: &str| {
+        prefixes
+            .iter()
+            .map(|(_, p)| *p)
+            .filter(|p| key.starts_with(p))
+            .max_by_key(|p| p.len())
     };
     let tensors: Vec<_> = source
         .tensors
         .iter()
-        .filter(|tensor| tensor.key.starts_with(prefix))
+        .filter(|tensor| owner(&tensor.key) == Some(prefix))
         .cloned()
         .collect();
     if tensors.is_empty() {

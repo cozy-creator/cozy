@@ -583,6 +583,7 @@ fn retained_source_redirect_ranges_reduce_connections_without_changing_asks_or_b
                 provenance: Provenance::Declared,
                 carrier: true,
                 requires: vec![],
+                companion: false,
             }],
         };
         let owner = ObjectRef::of(format!("reuse-{close}").as_bytes()).id();

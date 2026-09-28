@@ -201,6 +201,9 @@ pub struct SourceMember {
     /// HuggingFace declares no such thing (a repository is a tree, and the selection rule
     /// is the file suffix), so its rows leave this false.
     pub primary: bool,
+    /// Another SafeTensors file of the same Civitai version with a declared digest (a text
+    /// encoder, a VAE): a carrier only a reviewed profile composes the model from.
+    pub companion: bool,
 }
 
 fn json_get<'j>(value: &'j Json, key: &str) -> Option<&'j Json> {
@@ -367,6 +370,7 @@ fn list_selected_observed(
                             path.replace(' ', "%20")
                         ),
                         primary: false,
+                        companion: false,
                     });
                 }
                 match next {
@@ -433,9 +437,10 @@ fn list_selected_observed(
                     Some(format) => format.eq_ignore_ascii_case("SafeTensor"),
                     None => true,
                 };
-                let primary = matches!(json_get(file, "primary"), Some(Json::Bool(true)))
-                    && format_ok
-                    && name.to_ascii_lowercase().ends_with(".safetensors");
+                let safetensors = format_ok && name.to_ascii_lowercase().ends_with(".safetensors");
+                let flagged = matches!(json_get(file, "primary"), Some(Json::Bool(true)));
+                let primary = flagged && safetensors;
+                let companion = !flagged && safetensors && sha256.is_some();
                 // sizeKB is kilobytes as a float — an approximation, not a length.
                 // The exact length is probed from the origin at pull time.
                 members.push(SourceMember {
@@ -446,6 +451,7 @@ fn list_selected_observed(
                     sha256,
                     url,
                     primary,
+                    companion,
                 });
             }
             members
@@ -658,6 +664,9 @@ pub struct ResolvedMember {
     pub carrier: bool,
     /// For an index member, the shard members its `weight_map` names. Sorted and unique.
     pub requires: Vec<String>,
+    /// A Civitai companion carrier (see [`SourceMember::companion`]): selected only when the
+    /// provider's own selection plans as nothing reviewed and it composes one that does.
+    pub companion: bool,
 }
 
 /// What one pinned source resolves to.
@@ -1134,7 +1143,7 @@ pub(crate) fn join_member(member: &str, relative: &str) -> Option<String> {
 ///
 /// 1. **List** what the pinned revision reaches (`list_observed`).
 /// 2. **Select** the tensor carriers — `*.safetensors` and `*.safetensors.index.json` for
-///    HuggingFace, the one primary SafeTensors file for Civitai.
+///    HuggingFace, the one primary SafeTensors file for Civitai plus its companions.
 /// 3. **Expand and identify.** Every index is read (it is JSON, tens of kilobytes) and its
 ///    `weight_map` expanded into the shards it names, which must be present in the
 ///    listing. Reading it is also what gives it an identity: an index is a plain git blob,
@@ -1162,19 +1171,20 @@ pub fn resolve(
             .filter(|member| is_safetensors(&member.member) || is_index(&member.member))
             .collect(),
         SourceUri::Civitai { .. } => {
-            let primary: Vec<SourceMember> =
-                listed.into_iter().filter(|member| member.primary).collect();
-            if primary.len() != 1 {
+            let primary = listed.iter().filter(|member| member.primary).count();
+            if primary != 1 {
                 return refuse(
                     Code::COUNT_CAP,
                     format!(
-                        "the Civitai version declares {} primary SafeTensors files; exactly \
-                         one is required",
-                        primary.len()
+                        "the Civitai version declares {primary} primary SafeTensors files; \
+                         exactly one is required"
                     ),
                 );
             }
-            primary
+            listed
+                .into_iter()
+                .filter(|member| member.primary || member.companion)
+                .collect()
         }
     };
     if selected.is_empty() {
@@ -1297,6 +1307,7 @@ pub fn resolve(
             provenance,
             carrier: true,
             requires: Vec::new(),
+            companion: member.companion,
         });
     }
 
@@ -1540,6 +1551,7 @@ pub fn resolve_files(
             provenance,
             carrier: false,
             requires: Vec::new(),
+            companion: false,
         });
     }
     let canonical = format!("hf://{org}/{repo}@{revision}");
@@ -2189,11 +2201,12 @@ mod tests {
         handle.join().unwrap();
     }
 
-    /// Civitai: one version is a bag of files, and the one to take is the primary
-    /// SafeTensors. Its digest is declared but its length is only approximate kilobytes,
-    /// so the exact length comes from a ranged probe through the same fence.
+    /// Civitai: one version is a bag of files. The primary SafeTensors is the model and the
+    /// version's other declared SafeTensors are companions a reviewed profile may compose it
+    /// with. Digests are declared but lengths only approximate kilobytes, so each exact
+    /// length comes from a ranged probe through the same fence.
     #[test]
-    fn resolve_takes_the_one_primary_civitai_safetensors() {
+    fn resolve_takes_the_primary_civitai_safetensors_and_its_companions() {
         let header =
             br#"{"model.diffusion_model.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
         let mut body = (header.len() as u64).to_le_bytes().to_vec();
@@ -2209,7 +2222,7 @@ mod tests {
             "11".repeat(32)
         );
         let length = object.length;
-        let (base, _, handle) = origin(2, move |request| {
+        let (base, _, handle) = origin(3, move |request| {
             if request.path == "/api/v1/model-versions/777" {
                 ok_body(listing.as_bytes(), "application/json")
             } else {
@@ -2226,7 +2239,19 @@ mod tests {
             ..Endpoints::default()
         };
         let resolved = resolve(&uri, &endpoints, &Anonymous, Deadline::none()).unwrap();
-        assert_eq!(resolved.members.len(), 1);
+        let rows: Vec<(&str, bool)> = resolved
+            .members
+            .iter()
+            .map(|row| (row.member.as_str(), row.companion))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("civitai/files/92696", false),
+                ("civitai/files/92697", true)
+            ]
+        );
+        let resolved = resolved.select(&["civitai/files/92696".into()]).unwrap();
         assert_eq!(resolved.members[0].member, "civitai/files/92696");
         assert_eq!(resolved.members[0].object, object);
         assert_eq!(resolved.members[0].provenance, Provenance::Declared);

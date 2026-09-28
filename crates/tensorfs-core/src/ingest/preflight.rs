@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 
 use crate::canon::Value;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::providers::MemberHead;
+use crate::providers::{MemberHead, Resolution};
 
 use super::source::{self, CarrierInput, SourcePlan};
 
@@ -317,4 +317,65 @@ pub fn plan(
         header_bytes: heads.iter().map(|head| head.head.len() as u64).sum(),
         member_bytes: heads.iter().map(|head| head.length).sum(),
     })
+}
+
+/// The carriers one model takes from a resolved source, decided from headers: those the
+/// reviewed `profiles` plan from or, none named, those of the profile the headers select.
+/// Civitai companions join only when the version's primary alone plans as nothing reviewed
+/// and they compose a reviewed model with it, so an unrecognized version stays its primary.
+pub fn select_members(
+    registry_locator: &str,
+    registry_bytes: &[u8],
+    resolution: &Resolution,
+    profiles: &[String],
+    read_heads: impl Fn(&Resolution) -> Result<Vec<MemberHead>>,
+    scratch: &Path,
+) -> Result<Vec<String>> {
+    let carriers = |companions: bool| -> Vec<String> {
+        resolution
+            .members
+            .iter()
+            .filter(|row| row.carrier && (companions || !row.companion))
+            .map(|row| row.member.clone())
+            .collect()
+    };
+    let (own, all) = (carriers(false), carriers(true));
+    if profiles.is_empty() && all.len() == 1 {
+        return Ok(all);
+    }
+    let heads = read_heads(&resolution.select(&all)?)?;
+    let plan_over = |carriers: &[String]| -> Result<(Vec<String>, bool)> {
+        let members = resolution.select(carriers)?.members;
+        let heads: Vec<MemberHead> = heads
+            .iter()
+            .filter(|head| members.iter().any(|row| row.member == head.member))
+            .cloned()
+            .collect();
+        let profiles = match profiles {
+            [] => vec![select_profile(
+                registry_locator,
+                registry_bytes,
+                &heads,
+                scratch,
+            )?],
+            named => named.to_vec(),
+        };
+        let planned = plan(registry_locator, registry_bytes, &heads, &profiles, scratch)?;
+        let mut selected: Vec<String> = planned
+            .plans
+            .into_iter()
+            .flat_map(|plan| plan.components.into_iter().filter_map(|c| c.member))
+            .collect();
+        selected.sort();
+        selected.dedup();
+        Ok((selected, !profiles.iter().any(|p| p == source::AS_IS)))
+    };
+    let first = plan_over(&own);
+    if own.len() == all.len() || matches!(first, Ok((_, true))) {
+        return first.map(|(selected, _)| selected);
+    }
+    match plan_over(&all) {
+        Ok((selected, true)) if selected.iter().any(|member| own.contains(member)) => Ok(selected),
+        _ => first.map(|(selected, _)| selected),
+    }
 }

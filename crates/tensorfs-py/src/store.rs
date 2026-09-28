@@ -921,57 +921,34 @@ impl PyStore {
                 } else if profiles.is_empty() && candidates.len() == 1 {
                     candidates
                 } else {
-                    use tensorfs_core::ingest::preflight;
-                    let heads = providers::read_heads(
-                        &resolution,
-                        &uri,
-                        &endpoints,
-                        &credentials,
-                        transport::Deadline::none(),
-                    )?;
-                    if !heads.unread.is_empty() {
-                        return refuse(
-                            Code::DURABILITY_UNPROVEN,
-                            "provider headers cannot establish reviewed profile selection",
-                        );
-                    }
                     let (registry_locator, registry_bytes) =
                         model_source::effective_registry(&self.store, registry.as_deref())?;
-                    let scratch = || {
-                        self.store.root().join("tmp").join(format!(
-                            "source-select-{}",
-                            tensorfs_core::meta::now_nanos_unique()
-                        ))
-                    };
-                    let profiles = if profiles.is_empty() {
-                        vec![preflight::select_profile(
-                            &registry_locator,
-                            &registry_bytes,
-                            &heads.heads,
-                            &scratch(),
-                        )?]
-                    } else {
-                        profiles.clone()
-                    };
-                    let planned = preflight::plan(
+                    tensorfs_core::ingest::preflight::select_members(
                         &registry_locator,
                         &registry_bytes,
-                        &heads.heads,
+                        &resolution,
                         &profiles,
-                        &scratch(),
-                    )?;
-                    let mut selected: Vec<String> = planned
-                        .plans
-                        .into_iter()
-                        .flat_map(|plan| {
-                            plan.components
-                                .into_iter()
-                                .filter_map(|component| component.member)
-                        })
-                        .collect();
-                    selected.sort();
-                    selected.dedup();
-                    selected
+                        |selection| {
+                            let heads = providers::read_heads(
+                                selection,
+                                &uri,
+                                &endpoints,
+                                &credentials,
+                                transport::Deadline::none(),
+                            )?;
+                            if !heads.unread.is_empty() {
+                                return refuse(
+                                    Code::DURABILITY_UNPROVEN,
+                                    "provider headers cannot establish reviewed profile selection",
+                                );
+                            }
+                            Ok(heads.heads)
+                        },
+                        &self.store.root().join("tmp").join(format!(
+                            "source-select-{}",
+                            tensorfs_core::meta::now_nanos_unique()
+                        )),
+                    )?
                 };
                 resolution.select(&selected)
             })
@@ -1035,6 +1012,7 @@ impl PyStore {
                     provenance: providers::Provenance::Declared,
                     carrier: true,
                     requires: vec![],
+                    companion: false,
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;

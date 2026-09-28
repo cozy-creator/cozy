@@ -255,8 +255,10 @@ fn profile_assignments(
                 entry.component == component.component
                     && entry.keyset_digest == variant.keyset_digest
             }) {
-                let projected = convert::converter(&entry.converter)
-                    .is_ok_and(|c| c.dialect == "safetensors.single_file");
+                let projector = convert::converter(&entry.converter)
+                    .ok()
+                    .filter(|c| c.dialect == "safetensors.single_file");
+                let projected = projector.is_some();
                 for (index, header) in headers.iter().enumerate() {
                     let member_matches = match (
                         component.source_member.as_deref(),
@@ -273,13 +275,15 @@ fn profile_assignments(
                     if !member_matches {
                         continue;
                     }
-                    let view = if projected {
-                        match convert::single_file_component(&component.component, header) {
-                            Ok(view) => view,
-                            Err(_) => continue,
+                    let view = match projector {
+                        Some(conv) => {
+                            match convert::single_file_component(conv, &component.component, header)
+                            {
+                                Ok(view) => view,
+                                Err(_) => continue,
+                            }
                         }
-                    } else {
-                        header.clone()
+                        None => header.clone(),
                     };
                     let observed = match fingerprint::fingerprint(&component.component, &view) {
                         Ok(observed) => observed,
@@ -573,12 +577,23 @@ pub fn prepare(
             });
             continue;
         };
-        let projected = convert::single_file_component(component, &full).ok();
+        // A single-file converter's view of the carrier authorizes only under that converter.
         let mut selected = None;
-        if let Some(view) = projected {
-            let observed = fingerprint::fingerprint(component, &view)?;
+        for conv in convert::CONVERTERS
+            .iter()
+            .filter(|c| c.dialect == "safetensors.single_file")
+        {
+            let Ok(view) = convert::single_file_component(conv, component, &full) else {
+                continue;
+            };
+            let Ok(observed) = fingerprint::fingerprint(component, &view) else {
+                continue;
+            };
             if let Ok(banked) = registry.authorize(component, &observed) {
-                selected = Some((view, observed, banked));
+                if banked.converter == conv.name {
+                    selected = Some((view, observed, banked));
+                    break;
+                }
             }
         }
         let (header, observed, banked) = match selected {

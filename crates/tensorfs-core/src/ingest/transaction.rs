@@ -51,7 +51,7 @@ fn store_role<R: Read>(
             Some(operation),
         );
     }
-    let narrowed = (role.dtype == Dtype::F16)
+    let narrowed = super::narrow::narrows(from, role.dtype)
         .then(|| Narrow::new(src, from))
         .flatten();
     let Some(mut narrow) = narrowed else {

@@ -446,7 +446,7 @@ pub fn cmd_bank(dialect: &str, converter: &str, f: &Flags) -> ExitCode {
     for (component, path) in &srcs {
         let (full, raw) = ok!(source_core::read_carrier_at(path));
         let h = if conv.dialect == "safetensors.single_file" {
-            ok!(convert::single_file_component(component, &full))
+            ok!(convert::single_file_component(conv, component, &full))
         } else {
             full
         };

@@ -281,6 +281,7 @@ fn resolution(base: &str, bodies: &BTreeMap<String, (Vec<u8>, u64)>) -> Resoluti
                 provenance: Provenance::Declared,
                 carrier: member.ends_with(".index.json"),
                 requires: Vec::new(),
+                companion: false,
             })
             .collect(),
         selection_sha256: "0".repeat(64),

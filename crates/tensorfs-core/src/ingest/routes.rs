@@ -10,14 +10,16 @@
 //!   split k n — row block `k` of `n` equal blocks (OpenCLIP's fused q|k|v), one run
 //!   transpose — a matrix becomes `[cols, rows]`
 //! A key outside the table refuses; its `drop`/`optional` source keys are not constructed.
-//! Floating sources narrow to the converter's lane. Configs and tokenizers come from the
-//! converter's pinned reference, fetched by the uploader; nothing model-owned lives here.
+//! A carrier's keys belong to the component with the longest matching prefix (Anima's `net.`
+//! DiT and its `net.llm_adapter.` conditioner share one file). Floating sources narrow to the
+//! converter's lane. Configs and tokenizers come from the converter's pinned reference,
+//! fetched by the uploader; nothing model-owned lives here.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::canon::{self, as_arr, as_str, as_uint, Fields, Value};
-use crate::dtype::{checked_bytes, Dtype};
+use crate::dtype::checked_bytes;
 use crate::err::{refuse, Code, Result};
 use crate::limits;
 use crate::spec::EncodingSpec;
@@ -26,8 +28,12 @@ use super::carrier::SourceHeader;
 use super::convert::{check_permute_size, Bytes, Converter, Effect, Op, Plan, RolePlan, Xform};
 
 pub const SDXL: &str = "sdxl.single_file/1-diffusers0.40.0-transformers5.16.1";
+pub const ANIMA: &str = "anima.single_file/1-diffusers0.40.0-transformers5.16.1";
 
-const TABLES: [(&str, &[u8]); 1] = [(SDXL, include_bytes!("routes/sdxl.routes.json"))];
+const TABLES: [(&str, &[u8]); 2] = [
+    (SDXL, include_bytes!("routes/sdxl.routes.json")),
+    (ANIMA, include_bytes!("routes/anima.routes.json")),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -238,10 +244,15 @@ pub fn plan(
     p.header_bytes += h.header_bytes;
     for r in &routes.routes {
         let t = source[r.source.as_str()];
-        if !matches!(t.dtype, Dtype::F16 | Dtype::Bf16 | Dtype::F32) {
+        if t.dtype != lane && !super::narrow::narrows(t.dtype, lane) {
             return refuse(
                 Code::DTYPE_MISMATCH,
-                format!("{}: {} is not a floating weight", t.key, t.dtype.name()),
+                format!(
+                    "{}: no reviewed narrowing from {} to the {} lane",
+                    t.key,
+                    t.dtype.name(),
+                    lane.name()
+                ),
             );
         }
         let bad = |why: &str| {
@@ -378,5 +389,27 @@ mod tests {
         assert_eq!(count(|k| matches!(k, Kind::Split { blocks: 3, .. })), 192);
         assert_eq!(count(|k| k == Kind::Transpose), 1);
         assert_eq!(count(|k| k == Kind::Squeeze), 8);
+    }
+
+    #[test]
+    fn the_anima_table_rekeys_every_constructor_key() {
+        let table = table(ANIMA).unwrap();
+        let shape: Vec<(&str, &str, usize)> = table
+            .components
+            .iter()
+            .map(|c| (c.name.as_str(), c.prefix.as_str(), c.routes.len()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("text_conditioner", "net.llm_adapter.", 118),
+                ("text_encoder", "model.", 310),
+                ("transformer", "net.", 567),
+                ("vae", "", 194),
+            ]
+        );
+        assert!(table.components.iter().all(|c| c.drop.is_empty()
+            && c.optional.is_empty()
+            && c.routes.iter().all(|r| r.kind == Kind::Rekey)));
     }
 }

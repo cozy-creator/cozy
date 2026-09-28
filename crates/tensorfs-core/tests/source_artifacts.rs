@@ -119,6 +119,7 @@ fn resolution(base: &str, name: &str, bytes: &[u8]) -> Resolution {
             provenance: Provenance::Declared,
             carrier: true,
             requires: vec![],
+            companion: false,
         }],
     }
 }
