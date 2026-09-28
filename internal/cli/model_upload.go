@@ -252,8 +252,9 @@ func resolvePublishSource(ctx *Context, raw string, sourceProfiles []string) (pu
 		// checkpoint). Multi-carrier provider repositories must be narrowed by
 		// TensorFS's reviewed profiles before any body is persisted or granted.
 		// An as-is plan narrows itself from the headers, as an unnamed selection does.
-		if len(resolved.Files) > 1 && len(sourceProfiles) > 0 &&
-			!slices.Contains(sourceProfiles, tfs.AsIsProfile) {
+		// A Civitai primary with its companions is narrowed by its header plan instead.
+		if len(resolved.Files) > 1 && len(sourceProfiles) > 0 && !slices.Contains(sourceProfiles, tfs.AsIsProfile) &&
+			!slices.ContainsFunc(resolved.Files, func(file modelsource.File) bool { return file.Companion }) {
 			tool, _, problem := localTensorFS(ctx)
 			if problem != nil {
 				return publishSource{}, problem

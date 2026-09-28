@@ -180,25 +180,11 @@ func planNativeIngest(ctx *Context, cwd string, parsed modelsource.Source, profi
 	if !conversion.decided() {
 		return nativeIngestPlan{}, exit.Named(exit.Unavailable, "model_source.preflight_unavailable", "source headers must be inspected before ingestion: %s", conversion.Undecided)
 	}
-	if plan, ok := conversion.Plans["model"]; asIs || ok && plan.Profile == tfs.AsIsProfile {
-		// Stored as-is: sized by what this host would keep, while the rental's TensorFS,
-		// which may recognize more, decides unless as-is was named.
-		members := []string{}
-		for _, plan := range conversion.Plans {
-			for _, planned := range plan.Sources {
-				members = append(members, planned.SourceMember)
-			}
-		}
-		if source, problem = selectPublishMembers(source, members); problem != nil {
-			return nativeIngestPlan{}, problem
-		}
-		return nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}, nil
-	}
-	if len(profiles) == 0 {
-		profiles = []string{conversion.Plans["model"].Profile}
-		if source, problem = narrowSourceToProfiles(ctx, source, profiles); problem != nil {
-			return nativeIngestPlan{}, problem
-		}
+	// Sized by exactly the members this host's plan uses. The rental's TensorFS, which may
+	// know more or less than this host's, selects and plans on its own registry: it is told
+	// only the profiles the owner named.
+	if source, problem = selectPublishMembers(source, conversion.Members); problem != nil {
+		return nativeIngestPlan{}, problem
 	}
 	return nativeIngestPlan{source: source, profiles: profiles, recipe: recipe}, nil
 }
@@ -241,10 +227,10 @@ func profileSlots(profiles []string) map[string]string {
 	return slots
 }
 
-// narrowSourceToProfiles keeps only the members the reviewed profiles name; a single
-// carrier is already exact.
+// narrowSourceToProfiles keeps only the members the reviewed profiles name. A single carrier
+// is already exact, and a Civitai primary with its companions is narrowed by its header plan.
 func narrowSourceToProfiles(ctx *Context, source publishSource, profiles []string) (publishSource, *exit.Error) {
-	if len(source.Resolution.Files) <= 1 {
+	if len(source.Resolution.Files) <= 1 || slices.ContainsFunc(source.Resolution.Files, func(file modelsource.File) bool { return file.Companion }) {
 		return source, nil
 	}
 	return narrowPublishSource(ctx, source, profiles)

@@ -38,6 +38,9 @@ type File struct {
 	Inline   []byte
 	Carrier  bool
 	Requires []string
+	// Companion is a Civitai version's other declared SafeTensors file: a carrier a reviewed
+	// profile may compose with the primary, selected only as TensorFS's select_members does.
+	Companion bool
 }
 
 type Plan struct {
@@ -454,10 +457,14 @@ func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *ex
 	if problem := r.json(ctx, "https://civitai.com/api/v1/models/"+strconv.FormatUint(version.ModelID, 10), &model); problem != nil {
 		return Plan{}, problem
 	}
+	// TensorFS's rule: the one primary SafeTensors file, and each other declared SafeTensors
+	// file with a declared SHA-256 as a companion (preflight narrows them, select_members).
+	carrierFile := func(name, format string) bool {
+		return strings.HasSuffix(strings.ToLower(name), ".safetensors") && (format == "" || strings.EqualFold(format, "SafeTensor"))
+	}
 	primary := 0
 	for _, remote := range version.Files {
-		if remote.Primary && strings.HasSuffix(strings.ToLower(remote.Name), ".safetensors") &&
-			(remote.Metadata.Format == "" || strings.EqualFold(remote.Metadata.Format, "SafeTensor")) {
+		if remote.Primary && carrierFile(remote.Name, remote.Metadata.Format) {
 			primary++
 		}
 	}
@@ -466,19 +473,22 @@ func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *ex
 			"Civitai version %d declares %d primary SafeTensor files; exactly one is required",
 			version.ID, primary)
 	}
-	files := make([]File, 0, 1)
+	files := make([]File, 0, len(version.Files))
 	for _, remote := range version.Files {
-		if !remote.Primary || remote.ID == 0 || !strings.HasSuffix(strings.ToLower(remote.Name), ".safetensors") ||
-			(remote.Metadata.Format != "" && !strings.EqualFold(remote.Metadata.Format, "SafeTensor")) {
+		sha := strings.ToLower(remote.Hashes.SHA256)
+		companion := !remote.Primary && validDigest(sha)
+		if remote.ID == 0 || !carrierFile(remote.Name, remote.Metadata.Format) || !remote.Primary && !companion {
 			continue
 		}
-		sha := strings.ToLower(remote.Hashes.SHA256)
 		if !validDigest(sha) {
 			return Plan{}, exit.Named(exit.Validation, "model_source_identity_missing",
 				"Civitai file %d lacks exact SHA-256/size facts", remote.ID)
 		}
 		if remote.DownloadURL == "" {
 			remote.DownloadURL = "https://civitai.com/api/download/models/" + strconv.FormatUint(version.ID, 10)
+			if companion {
+				remote.DownloadURL += "?fileId=" + strconv.FormatUint(remote.ID, 10)
+			}
 		}
 		length, exact := civitaiLength(remote.SizeKB)
 		if !exact {
@@ -489,7 +499,7 @@ func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *ex
 			}
 		}
 		files = append(files, File{Member: "civitai/files/" + strconv.FormatUint(remote.ID, 10),
-			URL: remote.DownloadURL, SHA256: sha, Length: length, Carrier: true})
+			URL: remote.DownloadURL, SHA256: sha, Length: length, Carrier: true, Companion: companion})
 	}
 	if len(files) == 0 {
 		return Plan{}, exit.Named(exit.Validation, "model_source_files_absent",

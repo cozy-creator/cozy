@@ -37,8 +37,9 @@ import (
 //     never "this is bad". A rented invocation waits for a retry before acquisition;
 //     an undecided header read cannot authorize paying for a conversion gamble.
 type conversionPreflight struct {
-	// Plans by producer slot, when the headers decided.
-	Plans map[string]tfs.SourcePlan
+	// Plans by producer slot, when the headers decided, and the source members they use.
+	Plans   map[string]tfs.SourcePlan
+	Members []string
 	// Exact inspected prefixes survive the temporary sparse files and enter the durable request.
 	Headers map[string][]byte
 	// Why the headers could not be read, when they could not. Non-empty means UNDECIDED,
@@ -92,7 +93,7 @@ func preflightConversionPlan(runCtx context.Context, ctx *Context, source publis
 	}
 
 	// From here the answer is about the MODEL, and a refusal is the answer.
-	plans, _, problem := planLocalSourceProfiles(tool, ctx, slots, staged, true,
+	plans, members, problem := planLocalSourceProfiles(tool, ctx, slots, staged, true,
 		filepath.Join(work.Path, "preflight-plans"))
 	if problem != nil {
 		return conversionPreflight{}, problem
@@ -101,5 +102,5 @@ func preflightConversionPlan(runCtx context.Context, ctx *Context, source publis
 	for _, file := range staged {
 		headers[file.Member] = file.Header
 	}
-	return conversionPreflight{Plans: plans, Headers: headers}, nil
+	return conversionPreflight{Plans: plans, Members: members, Headers: headers}, nil
 }

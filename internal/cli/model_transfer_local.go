@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -161,7 +162,45 @@ func stageLocalTransferHeaders(runCtx context.Context, ctx *Context, source mode
 	return plan, staged, resolver, problem
 }
 
+// planLocalSourceProfiles plans each slot over the source's carriers, narrowed as TensorFS's
+// select_members narrows a Civitai version: the primary alone, unless it plans nothing
+// reviewed and its companions compose a reviewed model with it (an SDXL primary stays alone).
 func planLocalSourceProfiles(tool *tfs.Tool, ctx *Context, slots map[string]string,
+	files []modelsource.StagedFile, labelled bool, root string,
+) (map[string]tfs.SourcePlan, []string, *exit.Error) {
+	own := slices.DeleteFunc(slices.Clone(files), func(file modelsource.StagedFile) bool { return file.Companion })
+	plans, selected, problem := planCarriers(tool, ctx, slots, own, labelled, filepath.Join(root, "own"))
+	if len(own) < len(files) && (problem != nil || asIs(plans)) {
+		composed, members, composedProblem := planCarriers(tool, ctx, slots, files, labelled, filepath.Join(root, "companions"))
+		primary := slices.ContainsFunc(members, func(member string) bool {
+			return slices.ContainsFunc(own, func(file modelsource.StagedFile) bool { return file.Member == member })
+		})
+		if composedProblem == nil && !asIs(composed) && primary {
+			plans, selected, problem = composed, members, nil
+		}
+	}
+	if problem != nil {
+		return nil, nil, problem
+	}
+	for _, slot := range sortedMapKeys(slots) {
+		if plans[slot].Profile == tfs.AsIsProfile {
+			fmt.Fprintf(ctx.Err, "note: %s (%s)\n", tfs.AsIsNote, strings.Join(sourcePlanMembers(plans[slot], files), ", "))
+		}
+	}
+	return plans, selected, nil
+}
+
+func asIs(plans map[string]tfs.SourcePlan) bool {
+	for _, plan := range plans {
+		if plan.Profile == tfs.AsIsProfile {
+			return true
+		}
+	}
+	return false
+}
+
+// planCarriers plans each slot over exactly these carriers: its plans and the members they use.
+func planCarriers(tool *tfs.Tool, ctx *Context, slots map[string]string,
 	files []modelsource.StagedFile, labelled bool, root string,
 ) (map[string]tfs.SourcePlan, []string, *exit.Error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -186,11 +225,7 @@ func planLocalSourceProfiles(tool *tfs.Tool, ctx *Context, slots map[string]stri
 			return nil, nil, problem
 		}
 		plans[slot] = plan
-		planned := sourcePlanMembers(plan, files)
-		if plan.Profile == tfs.AsIsProfile {
-			fmt.Fprintf(ctx.Err, "note: %s (%s)\n", tfs.AsIsNote, strings.Join(planned, ", "))
-		}
-		for _, member := range planned {
+		for _, member := range sourcePlanMembers(plan, files) {
 			members[member] = true
 		}
 	}
