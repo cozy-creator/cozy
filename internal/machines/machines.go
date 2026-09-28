@@ -388,7 +388,10 @@ func (m *Machine) ValidateNewWork() *exit.Error {
 func Transport(err error) *exit.Error {
 	code := status.Code(err)
 	if code == codes.Unimplemented {
-		return exit.Named(exit.Unavailable, "machine_execution.worker_upgrade_required", "the worker does not implement machine execution; update its Runtime")
+		// The worker has no such call; redialing never installs one, so the run ends here.
+		return exit.Named(exit.Structural, "machine_execution.worker_upgrade_required",
+			"the worker does not implement machine execution (%s); update its Runtime", status.Convert(err).Message()).
+			WithRemedy("update the machine's Runtime, then run it again")
 	}
 	if code == codes.Unavailable || code == codes.DeadlineExceeded || code == codes.Canceled || code == codes.ResourceExhausted || code == codes.Aborted {
 		return exit.Named(exit.Unavailable, "machine_execution.transport_unavailable", "machine execution observation is unavailable: %s", status.Convert(err).Message())

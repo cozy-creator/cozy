@@ -547,6 +547,13 @@ func (p *fakePod) LocalPackageUpload(stream grpc.BidiStreamingServer[pb.LocalPac
 	return nil
 }
 
+func (p *fakePod) PreparePrivatePlacement(call *pb.PreparePrivatePlacementCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
+	if p.privatePrepare == nil {
+		return status.Error(codes.Unimplemented, "private model preparation was not configured")
+	}
+	return p.privatePrepare(call, stream)
+}
+
 func (p *fakePod) PrepareLocalPackage(call *pb.PrepareLocalPackageCall, stream grpc.ServerStreamingServer[pb.PrepareEvent]) error {
 	if p.localPrepare != nil {
 		return p.localPrepare(call, stream)
