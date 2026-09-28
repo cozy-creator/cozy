@@ -332,6 +332,11 @@ func (s *Server) controlMachineExecution(ctx context.Context, row records.Reques
 	if link == nil {
 		return false, nil
 	}
+	if action == "cancel" && records.Settled(row.State) && !row.RetainWork {
+		// Already terminal and holding nothing a cancel would release: the same answer
+		// again, without asking the machine.
+		return true, nil
+	}
 	if action == "cancel" && len(link.Receipt) == 0 {
 		_, problem = s.store.CancelMachineBeforeAcceptance(row.ID)
 		if problem == nil && s.machineExecutions != nil {

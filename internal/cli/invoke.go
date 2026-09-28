@@ -742,7 +742,10 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if before.Kind == "job" {
 		return handleJobCancel(ctx)
 	}
-	if invocationSettled(before.Status) && !before.Retaining {
+	// A settled run holding nothing is final. A completed machine run holds nothing a cancel
+	// would release unless its machine keeps the result: this host's own collection, in
+	// flight or done, releases the rest.
+	if invocationSettled(before.Status) && (!before.Retaining || collectedOrCollecting(before)) {
 		fields := append(invocationFields(before), output.Field{K: "changed", V: false})
 		return emit(ctx, compactRecord(fields, "number", "target", "status", "changed"))
 	}
@@ -756,7 +759,10 @@ func handleRunCancel(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	fields := append(invocationFields(after), output.Field{K: "changed", V: true})
+	// Changed is what the cancel did: the run ended canceled, or the work it held was
+	// released. A run that finished first keeps its own terminal.
+	changed := after.Status != before.Status || (before.Retaining && !after.Retaining)
+	fields := append(invocationFields(after), output.Field{K: "changed", V: changed})
 	defaults := []string{"number", "target", "status", "changed"}
 	if after.CanceledBy != "" {
 		defaults = append(defaults, "canceled_by")
@@ -1263,6 +1269,11 @@ func collectionPendingNote(view *api.MachineExecutionView, number int64) string 
 }
 
 // custodyOwed is whether a finished machine run's result has yet to settle where it stays.
+func collectedOrCollecting(life api.Lifecycle) bool {
+	view := life.MachineExecution
+	return view != nil && life.Status == "completed" && view.Retained == "" && view.CollectionRefused == ""
+}
+
 func custodyOwed(view *api.MachineExecutionView, status string) bool {
 	return view != nil && status == "completed" && !view.Collected && view.Retained == "" && view.CollectionRefused == ""
 }
