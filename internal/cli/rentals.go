@@ -1059,32 +1059,72 @@ func handleRentalList(ctx *Context) *exit.Error {
 	return emit(ctx, list)
 }
 
+// handleRentalShow is `cozy rental show <rental>`: one rental's row of the every-hub
+// listing, a fact per line.
+func handleRentalShow(ctx *Context) *exit.Error {
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	inventory, problem := client.RentalInventory(context.Background(), true, true)
+	if problem != nil {
+		return problem
+	}
+	subject := strings.TrimSpace(ctx.Inv.Args[0])
+	list := renderRentalList(ctx.Cfg, inventory, true)
+	for i, row := range list.Rows {
+		if row["rental"] != subject && row["machine"] != subject {
+			continue
+		}
+		fields, all, value := append([]string{"rental"}, list.Fields...), list.AllFields,
+			func(name string) (any, bool) { return row[name], true }
+		if mode := ctx.Mode(); !mode.Human || mode.JSON {
+			fields, all = list.TypedFields, list.TypedAllFields
+			value = func(name string) (any, bool) { v, ok := list.TypedRows[i][name]; return v, ok }
+		}
+		pick := func(names []string) (out []output.Field) {
+			for _, name := range names {
+				if v, ok := value(name); ok {
+					out = append(out, output.Field{K: name, V: v})
+				}
+			}
+			return out
+		}
+		return emit(ctx, output.Record{Fields: pick(fields), AllFields: pick(all), Next: []string{"cozy rental list"}})
+	}
+	return exit.Named(exit.NotFound, "rental.unknown", "no listed rental is named %q", subject).
+		WithNext("cozy rental list --all-hubs")
+}
+
 // renderRentalList formats the daemon's public read model; it never opens SQLite.
 func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs bool) output.List {
 	count, burn := inventory.MachinesRunning, inventory.HourlySpendUSDMicros
 	rows, unrecorded := inventory.Rentals, inventory.Unrecorded
+	spend, spendFacts := accruedSpend(inventory)
 	list := output.List{
 		Name:   "rentals",
-		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "uptime", "running", "queued", "idle"},
-		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "failure", "uptime", "running", "queued", "idle",
+		Fields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "uptime", "running", "queued", "idle"},
+		AllFields: []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "failure", "uptime", "running", "queued", "idle",
 			"rental", "bought for", "accelerator", "address", "media", "hub", "rented", "ready",
 			"idle_since", "release_due", "image", "provider", "provider resource",
 			"provider host", "provider state", "container state"},
 		// The machine document carries the underlying facts, never the table's
 		// spellings: counts as numbers, moments as timestamps, absences omitted.
 		TypedFields: []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
-			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest"},
+			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest",
+			"spend_usd_micros", "spend_basis"},
 		TypedAllFields: []string{"machine", "sku", "gpus", "state", "rental_id", "bought_for",
 			"accelerator", "accelerator_count", "address", "media_address", "hub", "rented_at", "ready_at",
 			"running", "queued", "idle_s", "idle_since_at", "release_due_at",
-			"hourly_rate_usd_micros", "failure_code", "base_worker_image_digest", "base_worker_image_tag",
+			"hourly_rate_usd_micros", "spend_usd_micros", "spend_basis", "failure_code",
+			"base_worker_image_digest", "base_worker_image_tag",
 			"provider", "provider_resource_id", "provider_host_id", "provider_state",
 			"container_state", "boot"},
 		TypedRows: make([]map[string]any, 0, len(rows)),
 		Lead: []string{fmt.Sprintf("Remote machines running: %d", count),
-			"Current spend per hour: " + usdPerHourBare(burn)},
-		Aggregates: []output.Field{{K: "machines_running", V: jsonFact{count}},
-			{K: "hourly_spend_usd_micros", V: jsonFact{burn}}},
+			"Current spend per hour: " + usdPerHourBare(burn) + spend},
+		Aggregates: append([]output.Field{{K: "machines_running", V: jsonFact{count}},
+			{K: "hourly_spend_usd_micros", V: jsonFact{burn}}}, spendFacts...),
 		Trail: []string{idleShutdownNote()},
 		Next:  []string{"cozy help rental"},
 	}
@@ -1142,7 +1182,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"image": either(r.BaseWorkerImageTag, either(r.BaseWorkerImageDigest, r.Failure.BaseWorkerImageDigest)), "provider": r.Failure.Provider,
 			"provider resource": r.Failure.ProviderResourceID, "provider host": r.Failure.ProviderHostID,
 			"provider state": r.Failure.ProviderState, "container state": r.Failure.ContainerState,
-			"$/hour": rentalHourlyRate(r.HourlyRateUSDMicros),
+			"$/hour": rentalHourlyRate(r.HourlyRateUSDMicros), "spent": rentalSpend(r),
 		})
 		typed := map[string]any{
 			"machine": r.MachineName, "state": r.State, "rental_id": r.ID,
@@ -1159,6 +1199,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if r.Boot != nil {
 			typed["boot"] = r.Boot
 		}
+		spendFields(typed, r)
 		for key, value := range map[string]string{"sku": r.SKU, "accelerator": r.AcceleratorModel,
 			"address": r.Address, "media_address": r.MediaAddress, "hub": r.Hub, "runtime_update": r.RuntimeUpdate,
 			"rented_at": r.RentedAt, "ready_at": r.ReadyAt, "bought_for": r.BoughtFor,
@@ -1192,9 +1233,8 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		list.TypedRows = append(list.TypedRows, typed)
 	}
 	if haveFailure {
-		list.Fields = []string{"machine", "sku", "gpus", "state", "$/hour", "failure", "uptime", "running", "queued", "idle"}
-		list.TypedFields = []string{"machine", "sku", "gpus", "state", "rental_id", "rented_at",
-			"running", "queued", "idle_s", "release_due_at", "base_worker_image_tag", "base_worker_image_digest", "failure_code"}
+		list.Fields = []string{"machine", "sku", "gpus", "state", "$/hour", "spent", "failure", "uptime", "running", "queued", "idle"}
+		list.TypedFields = append(list.TypedFields, "failure_code")
 	}
 	if haveHubUnknown {
 		list.TypedFields = append(list.TypedFields, "hub_unknown")
@@ -1230,7 +1270,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"rented": orNone(seen.RentedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": either(seen.BaseWorkerImageTag, seen.BaseWorkerImageDigest), "provider": "", "provider resource": "", "provider host": "",
 			"provider state": "", "container state": "",
-			"$/hour": rentalHourlyRate(seen.HourlyRateUSDMicros),
+			"$/hour": rentalHourlyRate(seen.HourlyRateUSDMicros), "spent": rentalSpend(seen),
 		})
 		typed := map[string]any{
 			"machine": seen.MachineName, "state": seen.State, "rental_id": seen.ID,
@@ -1243,6 +1283,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 		if seen.Boot != nil {
 			typed["boot"] = seen.Boot
 		}
+		spendFields(typed, seen)
 		for key, value := range map[string]string{"accelerator": seen.AcceleratorModel,
 			"address": seen.Address, "media_address": seen.MediaAddress,
 			"hub": seen.Hub, "rented_at": seen.RentedAt,
@@ -1285,7 +1326,7 @@ func renderRentalList(cfg config.Config, inventory api.RentalInventory, allHubs 
 			"rented": stamp(op.RentedAt), "ready": "—", "idle_since": "", "release_due": "",
 			"image": "", "provider": "", "provider resource": "", "provider host": "",
 			"provider state": "", "container state": "",
-			"$/hour": rentalHourlyRate(op.HourlyRateUSDMicros),
+			"$/hour": rentalHourlyRate(op.HourlyRateUSDMicros), "spent": rentalSpend(op),
 		})
 		typed := map[string]any{
 			"machine": machine, "state": op.State, "rental_id": op.ID,
@@ -1389,6 +1430,55 @@ func rentalHourlyRate(micros int64) string {
 		return "unknown"
 	}
 	return usdPerHourBare(micros)
+}
+
+// rentalSpend is what a rental has cost so far. RunPod posts charges about an hour late, so
+// until they settle the Hub's figure is an estimate and says so; an older Hub says nothing.
+func rentalSpend(r api.RentalSummary) string {
+	switch r.SpendBasis {
+	case "":
+		return "-"
+	case "provider_billed":
+		return usdPerHourBare(r.SpendUSDMicros)
+	}
+	return usdPerHourBare(r.SpendUSDMicros) + " est."
+}
+
+func spendFields(typed map[string]any, r api.RentalSummary) {
+	if r.SpendBasis != "" {
+		typed["spend_usd_micros"], typed["spend_basis"] = r.SpendUSDMicros, r.SpendBasis
+	}
+}
+
+// accruedSpend is the listed rentals' total for the spend line, and as JSON facts only when
+// every one of them said: a rental whose Hub did not makes the total a lower bound.
+func accruedSpend(inventory api.RentalInventory) (string, []output.Field) {
+	total := api.RentalSummary{SpendBasis: "provider_billed"}
+	listed, unknown := 0, 0
+	for _, rows := range [][]api.RentalSummary{inventory.Rentals, inventory.Unrecorded, inventory.Pending} {
+		for _, r := range rows {
+			listed++
+			total.SpendUSDMicros += r.SpendUSDMicros
+			switch r.SpendBasis {
+			case "":
+				unknown++
+			case "provider_billed":
+			default:
+				total.SpendBasis = "estimate"
+			}
+		}
+	}
+	switch {
+	case listed == 0:
+		return "", nil
+	case unknown == listed:
+		return " · accrued -", nil
+	case unknown > 0:
+		total.SpendBasis = "estimate"
+		return " · accrued at least " + rentalSpend(total), nil
+	}
+	return " · accrued " + rentalSpend(total), []output.Field{{K: "spend_usd_micros", V: jsonFact{total.SpendUSDMicros}},
+		{K: "spend_basis", V: jsonFact{total.SpendBasis}}}
 }
 
 // jsonFact is an aggregate only a program reads: the terminal already says it in the lead.

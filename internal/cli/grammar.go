@@ -552,6 +552,7 @@ type RentalCmd struct {
 	Update    RentalUpdateCmd    `cmd:"" help:"Update this private rental's Runtime while retaining its files; active work is never interrupted."`
 	SSHInfo   RentalSSHInfoCmd   `cmd:"" name:"ssh-info" help:"Read the current SSH endpoint of an attached development rental."`
 	List      RentalListCmd      `cmd:"" help:"List rented machines, live on a terminal."`
+	Show      RentalShowCmd      `cmd:"" help:"Show one rental: state, rate, accrued spend and every other fact."`
 	New       RentalNewCmd       `cmd:"" help:"Start a private rental, or list available machine types."`
 	End       RentalEndCmd       `cmd:"" help:"End a private rental and stop billing."`
 	Prune     RentalPruneCmd     `cmd:"" help:"Free unused cached operation results on a private rental."`
@@ -622,6 +623,14 @@ type RentalListCmd struct {
 
 func (c *RentalListCmd) Run(r *Runtime) error {
 	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch, "--all-hubs", c.AllHubs), nil, false)
+}
+
+type RentalShowCmd struct {
+	Rental string `arg:"" name:"rental" predictor:"rental" help:"Rental machine name or id."`
+}
+
+func (c *RentalShowCmd) Run(r *Runtime) error {
+	return r.call(handleRentalShow, []string{c.Rental}, nil, nil, false)
 }
 
 type UpCmd struct{}

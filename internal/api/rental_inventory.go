@@ -86,6 +86,9 @@ type RentalSummary struct {
 
 	// Unverified marks a row whose hub could not be asked: this host's last record only.
 	Unverified bool `json:"unverified,omitempty"`
+	// SpendUSDMicros and SpendBasis are the Hub's accrued spend; a blank basis is unknown.
+	SpendUSDMicros int64  `json:"spend_usd_micros,omitempty"`
+	SpendBasis     string `json:"spend_basis,omitempty"`
 }
 
 // Activity is absent for machines known only to the Hub: this daemon cannot
