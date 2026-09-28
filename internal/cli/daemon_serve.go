@@ -128,15 +128,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	machines.updates = updates
 	transfers := NewModelTransferOwner(ctx.Cfg, st, ctx.Out, ctx.AccountAuth)
 	c, e := orchestrator.Open(orchestrator.Options{
-		StartMachineExecution:  machines.Start,
-		RentalRuntimePreflight: machines.updates.preflight,
-		Cfg:                    ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
-		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
-		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSource(),
-		RentalFleet: fleet.status, AcquireManagedRental: fleet.acquire,
-		ReleaseManagedRental:  fleet.release,
-		ReleaseRetainedRental: fleet.releaseRetained,
-		ModelTransfers:        transfers,
+		StartMachineExecution: machines.Start,
+		Cfg:                   ctx.Cfg, Layout: l, Store: st, Log: ctx.Out,
+		Rentals: rentals, RentalClaimProof: rental.ClaimProof(l),
+		ModelTransfers: transfers,
 		ReclaimInstall: func(id string) *exit.Error {
 			// Background cleanup and editable refresh are mutations by this same daemon.
 			// Serialize them before the cross-process writer claim so cleanup cannot
@@ -174,7 +169,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	installsStopped := make(chan struct{})
 	defer cancelInstalls()
 
-	killed, forgotten, e := c.Reconcile()
+	e = c.Reconcile()
 	if e != nil {
 		closeListeners()
 		return e
@@ -240,8 +235,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		fmt.Fprintf(ctx.Out, "  lifecycle sweep: %d publication root(s) settled%s · %d stale rental secret(s) erased%s\n",
 			publications.Removed, publicationsNote, rentalSecrets.Removed, rentalSecretsNote)
 	}
-	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
-		l.DB, yield, killed, forgotten)
+	fmt.Fprintf(ctx.Out, "  records %s · yield %s\n", l.DB, yield)
 	fmt.Fprintf(ctx.Out, "  client credential %s (carried in %s, mode 0600)\n", creds.CLI.Digest(), l.Daemon)
 	fmt.Fprintln(ctx.Out, "  rentals: released after 15 minutes without active work; manual cozy rental keepalive resets once")
 	if ctx.Cfg.MaintenanceGCCron != "" {

@@ -1126,14 +1126,6 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	}
 	state.QueuedMS = queuedMS(row, attempts, terminalAt)
 	state.ExecutionMS = executionMS(row, attempts, terminalAt)
-	if frame, ok := s.orchestrator.LatestFrame(row.ID); ok {
-		if value, ok := frame.Value.(map[string]any); ok {
-			state.Progress = value
-			if stage, ok := value["stage"].(string); ok {
-				state.Stage = stage
-			}
-		}
-	}
 	// THE BILL. Absent unless a rate was configured — see JobBill. `$0.00` for a job
 	// that cost real electricity is a fabricated fact, and this host does not make one.
 	if rate := s.cfg.LocalRateMicroUSDPerHour; rate > 0 {
@@ -1276,95 +1268,22 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if s.machineJobControl(w, r, row, "cancel", actor) {
 		return
 	}
-	retaining, problem := s.store.RequestRetaining(row)
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	if retaining && row.State != "finalizing" {
-		if e := s.orchestrator.CancelRetainedRequest(row.ID, actor); e != nil {
-			s.refuseTyped(w, r, e)
-			return
-		}
-		updated, e := s.store.RequestRow(row.ID)
-		if e != nil || updated == nil {
-			s.refuse(w, r, http.StatusInternalServerError, "internal", "canceled request cannot be read", "")
-			return
-		}
-		s.ok(w, r, http.StatusAccepted, s.jobStateOf(*updated))
-		return
-	}
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
 		return
 	}
-	attempts, e := s.store.Attempts(row.ID)
-	if e != nil {
+	// No machine executes it: the daemon's own model transfer, which has no attempt.
+	if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if len(attempts) == 0 {
-		// A QUEUED job has nothing running, and cancelling it is still a real act: it
-		// leaves the queue and settles, so a client that asked never has to wonder.
-		if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
-			s.refuseTyped(w, r, e)
-			return
-		}
-		updated, e := s.store.RequestRow(row.ID)
-		if e != nil || updated == nil {
-			s.refuse(w, r, http.StatusInternalServerError, "internal",
-				"the queued job was canceled and cannot be read back", "")
-			return
-		}
-		s.ok(w, r, http.StatusOK, s.jobStateOf(*updated))
+	updated, e := s.store.RequestRow(row.ID)
+	if e != nil || updated == nil {
+		s.refuse(w, r, http.StatusInternalServerError, "internal",
+			"the job was canceled and cannot be read back", "")
 		return
 	}
-	last := attempts[len(attempts)-1]
-	if row.ModelTransfer != nil && row.State == "finalizing" {
-		if e := s.orchestrator.CancelModelTransferFinalization(row.ID, actor); e != nil {
-			s.refuseTyped(w, r, e)
-			return
-		}
-		s.ok(w, r, http.StatusAccepted, map[string]any{
-			"job_id": row.ID, "attempt": last.Attempt, "status": "cancel_requested",
-			"note": "destination finalization is stopping; provider teardown precedes the canceled terminal",
-		})
-		return
-	}
-	if last.State == "closed" || last.State == "dispatch_aborted" {
-		if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
-			s.refuseTyped(w, r, e)
-			return
-		}
-		updated, e := s.store.RequestRow(row.ID)
-		if e != nil || updated == nil {
-			s.refuse(w, r, http.StatusInternalServerError, "internal",
-				"the queued job was canceled and cannot be read back", "")
-			return
-		}
-		s.ok(w, r, http.StatusOK, s.jobStateOf(*updated))
-		return
-	}
-	if last.State == "terminal" {
-		s.refuse(w, r, http.StatusConflict, "terminal_ack_pending",
-			"the current job attempt has a terminal whose retry/settlement projection is not acknowledged yet",
-			"retry cancellation after the terminal ack")
-		return
-	}
-	grace := orchestrator.ClientCancelGraceMS
-	if v := r.URL.Query().Get("grace_ms"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 120000 {
-			grace = n
-		}
-	}
-	if e := s.orchestrator.CancelClient(row.ID, uint64(last.Attempt), grace, actor); e != nil {
-		s.refuseTyped(w, r, e)
-		return
-	}
-	s.ok(w, r, http.StatusAccepted, map[string]any{
-		"job_id": row.ID, "attempt": last.Attempt, "status": "cancel_requested",
-		"note": "the attempt's own journaled terminal settles it; watch the event stream",
-	})
+	s.ok(w, r, http.StatusOK, s.jobStateOf(*updated))
 }
 
 // chosenModels is a job whose slots the machine that runs it resolves (release roots): this

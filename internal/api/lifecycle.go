@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -115,7 +114,7 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			changed, cancelProblem := s.cancelForDown(*row)
+			changed, cancelProblem := s.cancelForDown(r.Context(), *row)
 			if cancelProblem != nil {
 				refused = append(refused, identity.ID+": "+cancelProblem.Message)
 				continue
@@ -123,14 +122,6 @@ func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 			if changed {
 				requested = append(requested, identity)
 			}
-		}
-		if len(requested) == 0 {
-			// No new request does not mean its asynchronous native cleanup has
-			// finished. Give accepted cleanup the existing shutdown grace, then
-			// sample its durable result. Unreachable peers still cannot veto --all.
-			drain, cancel := context.WithTimeout(r.Context(), orchestrator.StopGrace)
-			s.orchestrator.WaitRetainedCancellations(drain)
-			cancel()
 		}
 		// Re-read rather than trusting the pre-pass sample: what a client is told is still
 		// holding the daemon has to be what IS.
@@ -239,40 +230,11 @@ func (s *Server) newDownRentals(rentals []LifecycleIdentity) bool {
 	return !same && len(ids) > 0
 }
 
-// cancelForDown reuses the request authority's existing queued/live cancellation
-// boundaries. A terminal awaiting acknowledgement is already on its way to settlement;
-// it remains in Active and makes the caller retry rather than receiving a second verdict.
-func (s *Server) cancelForDown(row records.Request) (bool, *exit.Error) {
-	if row.RetainWork && (row.IsJob() || row.ParentRequestID != "") && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) && row.State != "finalizing" {
-		return row.State != "canceling" && row.State != "releasing", s.orchestrator.CancelRetainedRequest(row.ID, "cozy down --all")
+// cancelForDown asks each request's owner to stop it: the machine executing it, or the
+// daemon for its own model transfer.
+func (s *Server) cancelForDown(ctx context.Context, row records.Request) (bool, *exit.Error) {
+	if owned, problem := s.controlMachineExecution(ctx, row, "cancel", "cozy down --all"); owned {
+		return problem == nil && row.State != "canceling", problem
 	}
-	attempts, problem := s.store.Attempts(row.ID)
-	if problem != nil {
-		return false, problem
-	}
-	if len(attempts) == 0 {
-		return true, s.orchestrator.CancelQueued(row.ID, "cozy down --all")
-	}
-	last := attempts[len(attempts)-1]
-	switch last.State {
-	case "closed", "dispatch_aborted":
-		return true, s.orchestrator.CancelQueued(row.ID, "cozy down --all")
-	case "terminal":
-		return false, nil
-	default:
-		problem := s.orchestrator.CancelClient(
-			row.ID, uint64(last.Attempt), orchestrator.ClientCancelGraceMS, "cozy down --all")
-		if problem == nil || problem.Code != exit.Unavailable {
-			return true, problem
-		}
-		// THE STREAM IS GONE, so there is nobody to ask and there never will be. Cancelling
-		// an attempt normally means telling its worker to stop; when this process no longer
-		// holds a session or a worker for it, the execution context is already lost and the
-		// only honest thing left is to record that. Teardown must not depend on anything
-		// remote being reachable — a pod that is gone cannot answer, and waiting for it is
-		// exactly the failure this branch exists to end.
-		return true, s.orchestrator.CancelLostAttempt(row.ID, last.Attempt,
-			"the daemon was torn down with `cozy down --all` while this attempt's execution "+
-				"context was already gone: "+problem.Message)
-	}
+	return true, s.orchestrator.CancelQueued(row.ID, "cozy down --all")
 }

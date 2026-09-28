@@ -146,8 +146,7 @@ func hostOwner(t *testing.T, name string, with ...func(*orchestrator.Options)) *
 	log, err := os.Create(filepath.Join(root, "orchestrator.log"))
 	must(t, err)
 	options := orchestrator.Options{
-		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
-		MaxOutputMiB: 8,
+		Cfg: cfg, Layout: l, Store: st, Log: log,
 	}
 	for _, mutate := range with {
 		mutate(&options)

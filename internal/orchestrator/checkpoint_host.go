@@ -7,7 +7,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -17,28 +16,6 @@ type CheckpointHost struct {
 	BootID   string
 	Page     func(context.Context, *pb.CheckpointPageRequest) (*pb.CheckpointPageResult, *exit.Error)
 	Transfer func(context.Context, *pb.CheckpointTransferRequest) (*pb.CheckpointTransferStatus, *exit.Error)
-}
-
-func (c *Orchestrator) checkpointHost(request records.Request) (CheckpointHost, *exit.Error) {
-	// A rental row is forgotten only once the Hub proves the machine gone: its checkpoints
-	// are lost, not waiting for a worker.
-	if request.Worker != "" {
-		if row, problem := c.opt.Store.RentalRow(request.Worker); problem != nil || row == nil {
-			if problem == nil {
-				problem = exit.Named(exit.Failed, "model_transfer.rental_lost",
-					"rental %s is gone; its checkpoints on that machine are lost", request.Worker)
-			}
-			return CheckpointHost{}, problem
-		}
-	}
-	s, problem := c.rentalControl(request.Worker)
-	if problem != nil {
-		return CheckpointHost{}, problem
-	}
-	if s.host == nil {
-		return CheckpointHost{}, exit.Unavailablef("source checkpoint has no claimed PodHost lane")
-	}
-	return checkpointAdapter(s.host, s.claim), nil
 }
 
 func checkpointAdapter(host pb.PodHostClient, claim *pb.Claim) CheckpointHost {

@@ -97,21 +97,15 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 	fmt.Fprintf(w, ":ok\n\nretry: %d\n\n", retryHintMS)
 	flusher.Flush()
 
-	frames, unsubscribe := s.orchestrator.Subscribe(requestID)
-	defer unsubscribe()
 	machineOwned := false
 	if requestID != "" {
 		link, problem := s.store.MachineExecution(requestID)
 		machineOwned = problem == nil && link != nil
 	}
 
-	// The latest tick, immediately. A subscriber attaching to a running attempt sees
-	// where it IS, not where it goes next.
+	// What a queued request is doing, immediately, so a first render is current.
 	if requestID != "" && !machineOwned {
-		if frame, ok := s.orchestrator.LatestFrame(requestID); ok {
-			writeEvent(w, 0, liveEnvelope(frame))
-			flusher.Flush()
-		} else if row, problem := s.store.RequestRow(requestID); problem == nil && row != nil && s.publicStatusOf(*row) == "queued" {
+		if row, problem := s.store.RequestRow(requestID); problem == nil && row != nil && s.publicStatusOf(*row) == "queued" {
 			if phase, ok := s.orchestrator.QueuePhase(requestID); ok {
 				writeEvent(w, 0, liveEnvelope(phase.Frame(requestID)))
 				flusher.Flush()
@@ -161,12 +155,6 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 		select {
 		case <-ctx.Done():
 			return
-		case frame, ok := <-frames:
-			if !ok {
-				return
-			}
-			writeEvent(w, 0, liveEnvelope(frame))
-			flusher.Flush()
 		case <-beat.C:
 			// A comment, not an event: it cannot be parsed as one and cannot move a
 			// cursor. It exists so a dead connection is discovered by writing.

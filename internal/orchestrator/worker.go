@@ -2,17 +2,10 @@ package orchestrator
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
-	"io"
-	"os"
-	"os/exec"
 	"sort"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -20,10 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/media"
-	"github.com/cozy-creator/cozy/internal/processtree"
-	"github.com/cozy-creator/cozy/internal/reclaim"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/units"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -316,249 +306,6 @@ func (p DesiredPlacement) PlacementID() string {
 	return "plc-" + strings.TrimPrefix(p.InstanceID(), "ins-")
 }
 
-// supportsCurrentProtocol is shared by placement reuse and dispatch. A claimed peer below
-// the execution floor keeps its Claim, snapshots and keepalive; only new preparation and
-// execution route elsewhere.
-func (w *worker) supportsCurrentProtocol() bool {
-	return w.declaredInstance == "" || w.wireMinor >= pb.MinCompatibleWireMinor
-}
-
-type worker struct {
-	instanceID string
-	spec       WorkerLaunchSpec
-	cmd        *exec.Cmd
-	logPath    string
-	planIDs    []string
-	// media is the pod's byte plane, dialled once at connect. Nil for a locally spawned
-	// worker: it shares this host's filesystem, so its grant IS a path and there is
-	// nothing to transport.
-	media *media.Client
-	// cancelControl closes the active owner stream for an attached worker. Local
-	// processes also exit through their process waiter; remote workers have no local
-	// process to signal, so retirement must explicitly close this connection.
-	cancelControl func()
-	// stopping makes one teardown the sole owner of this worker's process, control stream,
-	// durable row, and recovery decision. Other callers wait for stopped instead of racing
-	// a replacement under the same deterministic instance id.
-	stopping    bool
-	stopped     chan struct{}
-	attachDone  chan struct{}
-	processDone chan struct{}
-
-	// declaredInstance is the worker's self-minted process-lifetime identity. Creator
-	// names the stable slot; every local or attached worker names its own incarnation and
-	// must keep that identity stable across a control-stream reconnect.
-	declaredInstance string
-	wireMinor        uint32 // negotiated in ClaimAck, not inferred from the image profile
-	remoteWorkerID   string
-	// desiredPackages/models are Creator's logical private-rental intent. They survive a
-	// control-stream reconnect so the new authenticated stream does not reset a loaded
-	// worker to the empty package_set. They are refs only, never download locations or a
-	// locally reconstructed placement.
-	desiredPackages []*pb.DownloadPackageRef
-	desiredModels   []*pb.DownloadModelRef
-	// desiredDownloadSets hold, PER PACKAGE, the exact canonical download-set bytes the
-	// current package_set is prepared under. Prepare is a per-package operation (the
-	// Runtime's package_prepare takes exactly one package), and the Runtime seeds the
-	// package's placement_id from these bytes. They are a pure function of content, so
-	// an unchanged selection re-authors identical bytes and adding package B cannot
-	// retire package A's serving placement.
-	desiredDownloadSets map[string][]byte
-	// packageRefusals hold one package's verdict on its own preparation. The package
-	// leaves the desired set and only its requests fail; the rental's other packages
-	// keep preparing and serving. A later desire naming the package asks again.
-	packageRefusals map[string]*exit.Error
-	// preparedSets holds the pod host's PREPARED answer for each download set it prepared
-	// on boot preparedBoot and the rental still desires, keyed by downloadSetKey.
-	preparedSets map[string]*pb.DesiredPlacementSet
-	preparedBoot string
-	desiredMu    sync.Mutex
-	// A rental is one machine and may host several package environments. Keep the
-	// worker-reported placement for every binding instead of overwriting package A when
-	// package B joins the same desired set.
-	observedRemote map[string]remotePlacementObservation
-	// sentSets are the canonical PlacementSet bytes this owner sent on the live boot, by
-	// spelled digest. The worker reports the digest each placement was accepted under;
-	// these are the bytes that digest names, so "holds" is read off what is resident.
-	sentSets     map[string][]byte
-	sentSetsBoot string
-	// desiredLocal is the exact command-scoped local wheel inventory. It survives
-	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
-	desiredLocal *pb.DesiredLocalPackageSet
-	// desiredUnpublishedPlacement is the model-only join for the already-prepared private
-	// revision. It survives a control reconnect so pod-supervisor can replay its exact journal.
-	desiredUnpublishedPlacement *pb.DesiredPrivatePlacementSet
-	orchestrationParent         *pb.JobDirective
-	preparingRequest            string // the one request whose private preparation owns this worker
-	preparingReady              bool   // its exact desired state is ready for the dispatch at the end of preparation
-	// desiredEpoch is the control-stream epoch the local desire above was issued on. A
-	// desire issued on the live session and not refused is in flight or done; the same one
-	// asked again waits on the pod's report rather than asking the pod to prepare twice.
-	desiredEpoch uint64
-	// localMu serializes ConvergeLocalPackage on this worker. It is never held by the
-	// control stream's receive loop, whose reports the holder waits on.
-	localMu sync.Mutex
-	// hostPrepareSeq numbers the logical desires issued through PodHost (proto-025); a
-	// prepare that completes for an older number sends nothing.
-	hostPrepareSeq uint64
-	// One bounded cache-miss recovery for a desired selection. Only in-flight
-	// coordination; Creator keeps no model residency or download journal here.
-	modelEnsureFromRevision uint64
-	modelEnsureRevision     uint64
-
-	// what the worker itself reported; the orchestrator echoes, never invents
-	exited bool
-	// refusal is a claim-time verdict this owner reached about the thing at the other end —
-	// a pod serving a different release than the one this host pinned, say. It is kept so a
-	// waiter gets the ANSWER instead of waiting out the silence window for a worker this
-	// owner has already decided not to talk to (#505's carried-not-verified gap).
-	refusal *exit.Error
-	// desiredRefusal is the worker's permanent verdict on the exact desired revision this
-	// owner issued. It is distinct from a claim refusal and from capacity: a config or
-	// placement-set refusal can never become dispatchable by waiting longer.
-	desiredRefusal *exit.Error
-	// refusedRevision is the desired revision the worker ended a control stream over with
-	// FailedPrecondition. A redial does not restate it; the next desire this owner issues
-	// is sent as usual.
-	refusedRevision uint64
-	// exitCode is the process's own disposition. RECYCLE is not a death (cr-009): a
-	// run-once job worker exits with it the moment its terminal is acknowledged, and
-	// reading that as "the worker died" turns a completed job into a failed request.
-	exitCode int
-	// placementID is the RecordOwner-minted routing key for the ONE placement this worker
-	// hosts (#481). Routing, never identity.
-	placementID string
-	bootID      string
-
-	// THE OBSERVED STATE, on rev-2's own axes. Nothing here is inferred: every field is
-	// the worker's own last word, and the two axes exist because ONE enum cannot say
-	// "staged on disk but offline" — the exact state an outgoing spec holds under
-	// fallback-retention (#473/#482).
-	phase             pb.WorkerPhase          // machine lifecycle, out of the placement enum
-	materialization   pb.MaterializationState // axis 1: what is on disk
-	serving           pb.ServingState         // axis 2: what it will take
-	executorEpoch     uint64                  // THIS placement's executor epoch
-	dispatchable      map[string]bool         // dispatchable_plan_ids
-	jobReady          map[string]bool         // prepared job executors, including occupied slots
-	materializable    map[string]bool         // DISJOINT from dispatchable
-	heldSetDigest     []byte                  // parent set the placement actually holds
-	fallbackSetDigest []byte                  // predecessor set kept for restore; empty = replacement PAUSED
-
-	// THE ADMISSION FENCE (#472e/#482/#486c), ONE COUNTER PER SERIALIZED RESOURCE. Per-
-	// placement credits are DELETED: N counters over ONE serialized device advertise N x
-	// the real capacity. With proto-024 the serialized resource is a device LANE and a
-	// worker may have several, so `seats` is the worker-level window (the reported sum)
-	// and `lanes` holds one window per reported lane; an offer for a placement draws from
-	// its lane's and the worker's. Dispatchability stays a PLACEMENT property.
-	admission      pb.AdmissionState
-	admissionEpoch uint64 // echoed on every offer; a stale echo refuses deterministically
-	seats          seatLedger
-	lanes          laneTable
-	// held is how many attempts the worker last reported holding, in every state from
-	// admission to ack; the lanes carry their own share (route.go reads both).
-	held int
-	// heldManifests is the worker's last word on which TensorFS manifests its verified
-	// store holds complete (`held_manifests`, proto-026), placed or not — the disk-tier
-	// fact the capacity decision prefers a rental by (residency-aware-routing.md §3.2).
-	heldManifests map[string]bool
-	// unacked is how many outcomes this owner HOLDS without having acked. The worker
-	// counts them against its own available_attempt_slots (#480d), so an owner that stops
-	// acking starves its own admission — boundedness is structural, and this is the number
-	// that makes it VISIBLE here instead of only on the worker.
-	unacked int
-
-	// acceptedRevision is what the worker durably ACCEPTED; convergedRevision advances
-	// only when its observed state SATISFIES that intent (#473). `applied_revision` is
-	// retired as dishonest — it advanced on acceptance, so a reader learned only that its
-	// own message arrived. converged < accepted is the normal, readable state of a
-	// convergence in progress or a latched failure, never an error.
-	acceptedRevision     uint64
-	convergedRevision    uint64
-	acceptedSetDigest    []byte
-	snapshotAcknowledged bool
-	installationID       string
-	// The job lane uses the same reported-versus-pre-offer split as serving. jobsAvail is
-	// the effective number dispatch reads.
-	reportedJobs int
-	reservedJobs int
-	jobsAvail    int
-	// revision is the desired-state revision THIS owner last issued, with the placement
-	// set it issued. The set travels as bytes, so the owner keeps the bytes it authored:
-	// a worker's accepted digest is compared against these, never re-canonicalized.
-	revision    uint64
-	acquisition PlacementAcquisitionFacts
-	setDigest   []byte
-	setBytes    []byte
-	// The worker's last diagnostic fault and the first report that carried it. The FAILED
-	// axes, not this text, decide terminality: BINDING_DEGRADED may coexist with service.
-	fault      string
-	faulted    bool
-	errorSince time.Time
-	// The fault the worker keeps against the desired revision it accepted, and how many
-	// consecutive reports have carried it unchanged (observeLatchedFault).
-	latchedFault         string
-	latchedFaultRevision uint64
-	latchedFaultReports  int
-	// refused is, per attempt this worker holds, the outcome this owner could not honour
-	// and how many consecutive worker reports have restated it unchanged
-	// (observeRefusedOutcome).
-	refused map[string]*refusedOutcome
-	// lastReport is telemetry only. Elapsed time since it never settles or retires work.
-	lastReport time.Time
-	// activitySeq is the last activity entry logged from this worker's reports; a report
-	// whose newest entry is below it is a restarted worker whose lane starts over.
-	activitySeq uint64
-	// loggedFaults is every fault line this owner has logged from the worker's reports
-	// and not yet seen absent, so a fault repeating on the report cadence logs once.
-	loggedFaults map[string]bool
-	// LRU is dispatch-based, not report-based: reports say the worker lives, while an
-	// accepted attempt says a user actually used it.
-	lastUseRevision uint64
-}
-
-type remotePlacementObservation struct {
-	placementID         string
-	placementSetDigest  string
-	installationID      string
-	materialization     pb.MaterializationState
-	serving             pb.ServingState
-	dispatchablePlanIDs map[string]bool
-	knownPlanIDs        map[string]bool
-	// loadedPlanIDs are the bindings whose construction the live executor holds.
-	loadedPlanIDs map[string]bool
-	fault         *pb.Fault
-}
-
-func (o remotePlacementObservation) loaded(planID string) bool {
-	return o.loadedPlanIDs[planID]
-}
-
-// dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).
-// DISPATCHABILITY is a PLACEMENT property: the serving axis says DISPATCHABLE and the
-// placement advertises this plan. ADMISSION is a WORKER property: the fence is OPEN and a
-// seat is free. A placement that is STAGED but OFFLINE is not capacity, however much of it
-// is on disk.
-func (w *worker) dispatchableFor(planID string) bool {
-	if w.spec.IsJob() {
-		// Job capacity is the readiness axis. A serving convergence or serving
-		// status does not exist, but credits must describe the current directive.
-		return w.acceptedRevision >= w.revision && w.dispatchable[planID]
-	}
-	if w.spec.Connection != nil {
-		return false // a rental serves inference through Runtime executions only
-	}
-	// THE ISSUED REVISION GATES DISPATCH (cl-114 follow-up). Between this owner issuing a
-	// new desired set and the worker converging to it, every observed fact — serving
-	// DISPATCHABLE, the plan advertised — describes the placement being REPLACED. Run 168
-	// proved the window live: the fp8 re-stage was accepted, the runtime kept the bf16
-	// placement serving through the handoff, and an offer dispatched on the pre-converge
-	// observation executed on the vacating selection. The remote ready path already
-	// requires accepted and converged to reach the issued revision; the local one now
-	// does too, so an offer is only made against the placement the owner last asked for.
-	return w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision &&
-		w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE && w.dispatchable[planID]
-}
-
 // entrypointServes answers whether a placement row binds the request's function to its
 // exact selection (h3a-018): every slot the pod bound for the function references a
 // manifest the request accepts for that slot — its pin, or a rung of its ladder — under
@@ -605,111 +352,6 @@ func entrypointServes(row canonical.Doc, logical LogicalPackage) (string, bool) 
 	return "", false
 }
 
-// rememberSet keeps the bytes of a set sent on this boot, so a report naming it can be
-// read. Callers hold c.mu.
-func (w *worker) rememberSet(boot string, digest, body []byte) {
-	if w.sentSetsBoot != boot || w.sentSets == nil {
-		w.sentSets, w.sentSetsBoot = map[string][]byte{}, boot
-	}
-	w.sentSets[spellOf(digest)] = append([]byte(nil), body...)
-}
-
-// forgetUnheldSets drops the set bytes no reported placement is held under.
-// Callers hold c.mu.
-func (w *worker) forgetUnheldSets() {
-	keep := map[string]bool{spellOf(w.setDigest): true, spellOf(w.acceptedSetDigest): true}
-	for _, observed := range w.observedRemote {
-		keep[observed.placementSetDigest] = true
-	}
-	for digest := range w.sentSets {
-		if !keep[digest] {
-			delete(w.sentSets, digest)
-		}
-	}
-}
-
-func (w *worker) observeSlots(n int) { w.seats.observe(n) }
-
-// observeHeld records the worker's held attempts, worker-wide and per lane, from the
-// placement each names.
-func (w *worker) observeHeld(placementIDs []string) {
-	w.held = len(placementIDs)
-	w.lanes.observeHeld(placementIDs)
-}
-
-func (w *worker) observeJobs(n int) {
-	w.reportedJobs = n
-	w.jobsAvail = max(0, n-w.reservedJobs)
-}
-
-// retryRentalReadback is an explicit caller's retry of an unreadable hardware
-// observation, not a retry of an identity mismatch. Re-enter the normal claim
-// and snapshot handshake; missing observations never authorize maintenance or
-// execution. Background dispatch keeps the refusal instead of spinning claims.
-func (c *Orchestrator) retryRentalReadback(ctx context.Context, id string) (bool, *exit.Error) {
-	c.mu.Lock()
-	w := c.workers[rentalInstanceID(id)]
-	if w == nil || w.exited || w.stopping || c.closing || w.spec.Connection == nil ||
-		w.spec.Connection.RentalID != id || w.refusal == nil ||
-		w.refusal.ErrName() != "rental.worker_readback_incomplete" {
-		c.mu.Unlock()
-		return false, nil
-	}
-	refusal, done := w.refusal, w.attachDone
-	c.mu.Unlock()
-	// Only one attach goroutine may own a boot. The refused conversation must
-	// finish before its completion channel can be replaced.
-	select {
-	case <-done:
-	case <-ctx.Done():
-		return false, exit.Unavailablef("rental readback retry canceled")
-	case <-c.done:
-		return false, exit.Unavailablef("worker owner closed")
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.workers[w.instanceID] != w || w.exited || w.stopping || c.closing ||
-		w.refusal != refusal || w.attachDone != done {
-		return false, nil
-	}
-	w.refusal = nil
-	w.snapshotAcknowledged = false
-	w.attachDone = make(chan struct{})
-	c.logf("rental %s: explicit retry of incomplete worker readback; requiring a fresh claim and snapshot", id)
-	go c.attach(w)
-	return true, nil
-}
-
-func (c *Orchestrator) ensureWorkerClaimedContext(ctx context.Context, instanceID string) *exit.Error {
-	for {
-		c.mu.Lock()
-		w := c.workers[instanceID]
-		claimed := w != nil && !w.exited && w.bootID != "" && !w.lastReport.IsZero() &&
-			w.snapshotAcknowledged
-		gone := w == nil || w.exited
-		var refused *exit.Error
-		if w != nil {
-			refused = w.refusal
-		}
-		c.mu.Unlock()
-		switch {
-		case claimed:
-			return nil
-		case refused != nil:
-			return refused
-		case gone:
-			return exit.New(exit.Failed, "the rented worker exited before accepting this Creator claim")
-		}
-		select {
-		case <-ctx.Done():
-			return exit.Unavailablef("worker claim wait canceled")
-		case <-c.done:
-			return exit.Unavailablef("worker owner closed")
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-}
-
 func validDigest(value string) bool {
 	_, err := canonical.Raw(value)
 	return err == nil
@@ -728,318 +370,10 @@ const ReportCadence = 2 * time.Second
 // only silence that repeats can.
 const StillFactor = 8
 
-// observeLatchedFault reads the fault a worker keeps against the desired revision it has
-// accepted but not converged. The Runtime LATCHES a materialization refusal for a desired
-// revision — in its own words, "retry is a RecordOwner act: a NEW revision, or a grant
-// refresh" — and reports it unchanged on every ReportCadence until one arrives. Neither
-// is this owner's to give from here: a rental's local wheels travelled as capabilities
-// the pod has already spent, and a local plan has nothing to refresh. So the same fault
-// repeating across StillFactor consecutive reports, with no revision issued in between
-// and no placement progressing, is the worker's final word on that revision, and the
-// request waiting on it fails typed instead of sitting queued behind a report loop.
-//
-// COUNTED, NOT TIMED. A materialization that is landing bytes reports MATERIALIZING and
-// never trips this; a fault whose text changes starts the count over; a new desired
-// revision clears it. A fault against a placement that still serves (fallback retention,
-// a degraded binding) is an explanation, not a stall, and is never counted.
-func (w *worker) observeLatchedFault(r *pb.ObservedWorkerState) *exit.Error {
-	reset := func() *exit.Error {
-		w.latchedFault, w.latchedFaultRevision, w.latchedFaultReports = "", 0, 0
-		return nil
-	}
-	if w.revision == 0 || r.AcceptedDesiredStateRevision != w.revision ||
-		r.ConvergedRevision >= w.revision || len(w.setDigest) == 0 ||
-		!bytes.Equal(r.AcceptedPlacementSetDigest, w.setDigest) {
-		return reset()
-	}
-	// Only the exact desired set can identify the placement this request is
-	// waiting for. The worker may still report its outgoing fallback beside it.
-	desired, err := canonical.Read(w.setBytes, &pb.PlacementSet{})
-	if err != nil {
-		return reset()
-	}
-	current := make(map[string]bool)
-	for _, p := range desired.List("placements") {
-		current[p.Str("placement_id")] = true
-	}
-	reported := make(map[string]*pb.PlacementStatus, len(r.Placements))
-	seen := make(map[string]bool, len(r.Placements))
-	for _, p := range r.Placements {
-		if p != nil {
-			seen[p.PlacementId] = true
-		}
-		if p == nil || !current[p.PlacementId] || !bytes.Equal(p.PlacementSetDigest, w.setDigest) {
-			continue
-		}
-		// Historical diagnostics can survive a cutover. Downloading, activating
-		// or draining is a current transition, never proof of a latched failure.
-		if p.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING ||
-			p.Serving == pb.ServingState_SERVING_STATE_ACTIVATING ||
-			p.Serving == pb.ServingState_SERVING_STATE_DRAINING {
-			return reset()
-		}
-		reported[p.PlacementId] = p
-	}
-	offline := func(p *pb.PlacementStatus) bool {
-		return p != nil && p.Serving == pb.ServingState_SERVING_STATE_OFFLINE
-	}
-	var fault *pb.Fault
-	var placement *pb.PlacementStatus
-	for _, p := range r.Placements {
-		if p != nil && reported[p.PlacementId] == p && offline(p) {
-			for _, f := range p.Faults {
-				if f != nil {
-					fault, placement = f, p
-					break
-				}
-			}
-		}
-		if fault != nil {
-			break
-		}
-	}
-	for _, f := range r.Faults {
-		if fault != nil || f == nil || !current[f.Subject] {
-			continue
-		}
-		p := reported[f.Subject]
-		// A pending replacement can fail before it has a PlacementStatus row,
-		// while the predecessor still serves. Only its exact incoming ID from
-		// the owned set can associate that global failure. A present row from a
-		// different set cannot use this absence case.
-		if offline(p) || p == nil && !seen[f.Subject] {
-			fault, placement = f, p
-		}
-	}
-	if fault == nil {
-		return reset()
-	}
-	placementID, executorEpoch := fault.Subject, uint64(0)
-	if placement != nil {
-		placementID, executorEpoch = placement.PlacementId, placement.ExecutorEpoch
-	}
-	key := fmt.Sprintf("%x\x00%s\x00%d\x00%d\x00%s\x00%s\x00%s",
-		w.setDigest, placementID, executorEpoch, fault.Kind, fault.Subject, fault.Reason, fault.Detail)
-	if key != w.latchedFault || w.latchedFaultRevision != w.revision {
-		w.latchedFault, w.latchedFaultRevision, w.latchedFaultReports = key, w.revision, 0
-	}
-	w.latchedFaultReports++
-	if w.latchedFaultReports < StillFactor {
-		return nil
-	}
-	return exit.Named(exit.Failed, "worker.placement_refused", "%s: %s",
-		fault.Reason, brief(fault.Detail, 1024))
-}
-
-// Jobs have no placement set, so placement-fault reconciliation cannot settle
-// their preparation. This explicit safety refusal means no executor was created.
-// A stale revision or any usable/live job slot is never preparation-failure proof.
-func (w *worker) jobExecutorRefusal(r *pb.ObservedWorkerState) *exit.Error {
-	capacity := r.GetJobCapacity()
-	if !w.spec.IsJob() || w.revision == 0 || r.AcceptedDesiredStateRevision != w.revision ||
-		capacity.GetJobsAvailable() != 0 || capacity.GetJobsInFlight() != 0 ||
-		capacity.GetOrchestrationAvailable() != 0 || capacity.GetOrchestrationInFlight() != 0 {
-		return nil
-	}
-	for _, fault := range r.Faults {
-		if fault != nil && fault.Kind == pb.FaultKind_FAULT_KIND_LOCAL_SAFETY_REFUSAL && fault.Reason == "job_executor_absent" {
-			return exit.Named(exit.Structural, "job_executor_absent",
-				"the worker cannot create its contained job executor; run it within a delegated cgroup or use a configured private rental")
-		}
-	}
-	return nil
-}
-
-// EnsurePlacementReady blocks until the placement's SERVING AXIS says DISPATCHABLE for
-// this plan — a real activation completed, never merely "connected" and never merely
-// "materialized". The two axes are why this can now be said precisely: a placement that is
-// STAGED on disk and OFFLINE is not ready, and under the retired single enum it was
-// indistinguishable from one that was still fetching.
-//
-// It waits on OBSERVATIONS and on nothing else. It used to carry a `timeout` — 30 minutes
-// from `dispatch`, 10 from `cozy warm`, two different ceilings on the same cold start —
-// and that number was a ceiling on how large a model may be, not a bound on anything that
-// had gone wrong. Every way this can actually fail is already visible: the worker EXITS,
-// reports a FAILED axis, or its process/stream exits. A worker that is materializing is none
-// of those, however long it takes.
-//
-// `requestID` is the request this wait exists FOR, and the wait ends when it does (cl-186).
-// That is not a timeout — it is the observation that the only reason to keep waiting has
-// gone. Without it a wedged preparation held `starting[slot]` forever: the request could be
-// cancelled and the loop went on spinning, every later request for the slot returned early
-// from selectOrStart and parked on "no attached rental has a DISPATCHABLE placement", and
-// the only recovery anyone found was `cozy rental end`. Two H100s were surrendered that way
-// on 2026-09-08. The guard two paragraphs down already refuses one particular version of
-// this wedge (`plan_not_staged`) and says so in those words; this is the general case.
-//
-// An empty `requestID` is a wait no request owns — `cozy install --sync`'s foreground
-// relaunch, which the operator interrupts directly.
-func (c *Orchestrator) EnsurePlacementReady(instanceID, planID, requestID string) *exit.Error {
-	settledCheck := time.Time{}
-	for {
-		c.mu.Lock()
-		w := c.workers[instanceID]
-		ok := w != nil && !w.exited && w.dispatchableFor(planID)
-		if w != nil && w.spec.IsJob() {
-			// Jobs have no serving axis or placement convergence. An occupied
-			// executor is ready too: its accepted attempt must not be killed by
-			// the preparation waiter racing with dispatch.
-			ok = !w.exited && w.acceptedRevision >= w.revision && w.jobReady[planID]
-		}
-		gone := w == nil || w.exited
-		logPath, fault, code := "", "", 0
-		workerFaulted := false
-		unstaged, holds := false, ""
-		var refused, desiredRefusal *exit.Error
-		if w != nil {
-			logPath, fault, code, refused = w.logPath, w.fault, w.exitCode, w.refusal
-			desiredRefusal = w.desiredRefusal
-			workerFaulted = w.faulted
-			if !w.exited && !staged(w, planID) {
-				unstaged, holds = true, strings.Join(w.planIDs, ", ")
-			}
-		}
-		c.mu.Unlock()
-		if ok {
-			return nil
-		}
-		// THIS OWNER'S OWN VERDICT COMES FIRST. A worker whose claim was refused here has
-		// already received an identity verdict from this side.
-		if refused != nil {
-			return refused
-		}
-		if desiredRefusal != nil {
-			return desiredRefusal
-		}
-		// THE WAIT ENDS WHEN ITS REQUEST DOES (cl-186), and it is asked here — after
-		// readiness and after this owner's own verdicts, so a placement that became
-		// dispatchable still wins and a real refusal is still the answer. The durable row
-		// is read on entry and then no oftener than the fact can usefully change; the
-		// loop's 20 ms cadence is for in-memory observations, not for SQLite.
-		if requestID != "" && time.Since(settledCheck) >= time.Second {
-			settledCheck = time.Now()
-			if row, problem := c.opt.Store.RequestRow(requestID); problem == nil &&
-				(row == nil || records.Settled(row.State)) {
-				return exit.Named(exit.Canceled, "request.settled_while_preparing",
-					"request %s settled while worker %s was still preparing %s; the wait it "+
-						"started is over", requestID, instanceID, planID)
-			}
-		}
-		// A PLAN THE LAUNCHER NEVER STAGED CAN NEVER BECOME DISPATCHABLE (cl-022's
-		// corollary guard). The live case: submit, then an install --force moves the
-		// active pin before the launch goroutine runs — selectOrStart replaces the stale
-		// worker with one launched for the NEW pin, and this wait would watch it for the
-		// OLD plan forever, holding `starting[slot]` and wedging the package slot until
-		// restart. A structural mismatch is an answer, not a longer wait.
-		if unstaged {
-			return exit.Named(exit.Conflict, "plan_not_staged",
-				"worker %s was launched holding [%s] and will never advertise %s: the "+
-					"binding this request froze is not one its worker was staged with",
-				instanceID, holds, planID).
-				WithRemedy("the active pin moved after this request was accepted; " +
-					"re-submit against the current install")
-		}
-		if gone {
-			if code == RecycleExit {
-				// NOT A DEATH. The worker finished its bounded attempt and recycled; the
-				// request this wait was started for is either settled already or back on
-				// the queue, and its exit has ALREADY asked the queue for a replacement.
-				// Calling this a failure settled a requeued job as `failed` after ONE of
-				// its three budgeted attempts (observed live).
-				return exit.Named(exit.Unavailable, "worker_recycled",
-					"the job worker recycled (exit %d) after its bounded attempt", RecycleExit)
-			}
-			// The runtime's own typed refusal is already on stderr, which is this log.
-			// Saying only "read the log" turned a launch-grammar mismatch (cl-120's
-			// `--artifact-store`) into a mute death; the tool's last words are the answer.
-			return exit.New(exit.Failed,
-				"the package worker exited (%d) before reporting ready: %s",
-				code, lastWords(logPath)).
-				WithRemedy("its log is %s", logPath)
-		}
-		if workerFaulted {
-			// FAILED/fault is the worker's settled typed answer, not a timer start.
-			// Transient work remains MATERIALIZING/ACTIVATING and keeps reporting progress.
-			return workerError(fault).WithRemedy("its log is %s", logPath)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// lastWords is the tail of a dead worker's log, condensed to one line. A worker that
-// refuses its own launch says why on stderr and then exits; this is that sentence, read
-// at the only moment anyone needs it.
-func lastWords(path string) string {
-	if path == "" {
-		return "it wrote no log"
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "its log is unreadable: " + err.Error()
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return "its log is unreadable: " + err.Error()
-	}
-	const window = 4 << 10
-	at := info.Size() - window
-	if at < 0 {
-		at = 0
-	}
-	buf := make([]byte, info.Size()-at)
-	if _, err := f.ReadAt(buf, at); err != nil && err != io.EOF {
-		return "its log is unreadable: " + err.Error()
-	}
-	var said []string
-	for _, line := range strings.Split(string(buf), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			said = append(said, line)
-		}
-	}
-	if len(said) == 0 {
-		return "it said nothing"
-	}
-	if len(said) > 3 {
-		said = said[len(said)-3:]
-	}
-	tail := strings.Join(strings.Fields(strings.Join(said, " · ")), " ")
-	if len(tail) > 400 {
-		return "…" + tail[len(tail)-400:]
-	}
-	return tail
-}
-
 // RecycleExit is the run-once COMPLETION disposition (cr-009, v1 rc 75). A job worker
 // exits with it after its terminal is acknowledged: the process ending is the successful
 // end of the work, and it is deliberately distinct from any death.
 const RecycleExit = 75
-
-// workerError is the orchestrator's PROJECTION over a worker's fault reason. The reasons
-// are the runtime's neutral vocabulary; deciding what a user should do about one is this
-// side's job, exactly as it is for a terminal's (status, cause).
-func workerError(fault string) *exit.Error {
-	said := fault
-	if said == "" {
-		said = "no reason reported"
-	}
-	if strings.Contains(fault, "shortfall") || strings.Contains(fault, "capacity") {
-		return exit.New(exit.Capacity,
-			"the package worker cannot make its binding resident on this device: %s", said)
-	}
-	return exit.New(exit.Failed,
-		"the package worker's placement reported a terminal fault and cannot become "+
-			"dispatchable: %s", said)
-}
-
-func (c *Orchestrator) WorkerLog(instanceID string) string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if w := c.workers[instanceID]; w != nil {
-		return w.logPath
-	}
-	return ""
-}
 
 // WorkerFacts is what status renders: the protocol's own identities and its own state
 // vocabulary. There is no local synonym tuple.
@@ -1106,70 +440,6 @@ type WorkerFacts struct {
 	Refusal string `json:"refusal"`
 }
 
-func (c *Orchestrator) Worker(instanceID string) *WorkerFacts {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	w := c.workers[instanceID]
-	if w == nil {
-		return nil
-	}
-	f := factsOf(w)
-	return &f
-}
-
-func factsOf(w *worker) WorkerFacts {
-	f := WorkerFacts{
-		InstanceID: w.instanceID, Package: w.spec.Placement.Package,
-		Release: w.spec.Placement.Release, BootID: w.bootID,
-		PlacementID: w.placementID, ExecutorEpoch: w.executorEpoch,
-		Exited: w.exited, Devices: w.spec.Devices,
-
-		Phase:           trimEnum(pb.WorkerPhase_name[int32(w.phase)], "WORKER_PHASE_"),
-		Materialization: trimEnum(pb.MaterializationState_name[int32(w.materialization)], "MATERIALIZATION_STATE_"),
-		Serving:         trimEnum(pb.ServingState_name[int32(w.serving)], "SERVING_STATE_"),
-		Dispatchable:    keysOf(w.dispatchable),
-		Materializable:  keysOf(w.materializable),
-
-		Admission:       trimEnum(pb.AdmissionState_name[int32(w.admission)], "ADMISSION_STATE_"),
-		AdmissionEpoch:  w.admissionEpoch,
-		AvailableSlots:  w.seats.slots,
-		HeldAttempts:    w.held,
-		UnackedOutcomes: w.unacked,
-		Lanes:           laneFactsOf(w),
-		PlacementLane:   w.laneOf(w.placementID),
-
-		DesiredRevision:   w.revision,
-		AcceptedRevision:  w.acceptedRevision,
-		ConvergedRevision: w.convergedRevision,
-		Acquisition:       w.acquisition,
-
-		Fault: w.fault,
-	}
-	if w.spec.Connection != nil {
-		f.RentalID = w.spec.Connection.RentalID
-	}
-	f.PlacementSetDigest, _ = canonical.Spell(w.heldSetDigest)
-	f.RetainedFallbackSetDigest, _ = canonical.Spell(w.fallbackSetDigest)
-	f.AcceptedPlacementSetDigest, _ = canonical.Spell(w.acceptedSetDigest)
-	// THIS OWNER'S OWN VERDICT IS A FACT ABOUT THE WORKER, so it is reported as one — in
-	// its own field. A claim this side refused is the answer a poller of
-	// `/v1/local/workers` needs; without it the only observable was a readiness wait that
-	// timed out, which reads as "slow" for something that has already been decided.
-	if w.refusal != nil {
-		f.Refusal = w.refusal.ErrName() + ": " + w.refusal.Message
-	}
-	if !w.lastReport.IsZero() {
-		f.QuietMS = time.Since(w.lastReport).Milliseconds()
-	}
-	if !w.errorSince.IsZero() {
-		f.ErrorForMS = time.Since(w.errorSince).Milliseconds()
-	}
-	if w.cmd != nil && w.cmd.Process != nil {
-		f.PID = w.cmd.Process.Pid
-	}
-	return f
-}
-
 type AcquisitionLegFacts struct {
 	StartedNS       uint64 `json:"started_monotonic_ns"`
 	EndedNS         uint64 `json:"ended_monotonic_ns"`
@@ -1192,17 +462,6 @@ func trimEnum(name, prefix string) string {
 	return strings.TrimPrefix(name, prefix)
 }
 
-func keysOf(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k, ok := range m {
-		if ok {
-			out = append(out, k)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
 // ClassicRetired names work accepted for the retired classic worker session, local or
 // rented. Every machine now runs work as a machine execution; such work is never revived.
 func ClassicRetired() *exit.Error {
@@ -1220,177 +479,8 @@ func ClassicRetired() *exit.Error {
 // SIGTERM deserved three budgets.
 const StopGrace = 30 * time.Second
 
-// retireWorker is the epoch-fenced retirement used by the stall path. A recovered
-// worker intentionally reuses instance and placement ids; only the exact object whose
-// observations established the retirement ground may receive the empty desired set.
-func (c *Orchestrator) retireWorker(w *worker) *exit.Error {
-	c.mu.Lock()
-	if c.workers[w.instanceID] != w || w.exited || w.stopping {
-		c.mu.Unlock()
-		return exit.New(exit.NotFound, "worker %s is no longer the observed epoch", w.instanceID)
-	}
-	s := c.sessions[w.bootID]
-	c.mu.Unlock()
-	if s == nil {
-		return exit.Unavailablef("worker %s holds no claimed control stream to retire", w.instanceID)
-	}
-	c.logf("retiring placement %s from %s: the desired set becomes empty and it drains",
-		w.placementID, w.instanceID)
-	return c.converge(s, w, nil)
-}
-
-// ShutdownWorker drains and stops the WHOLE worker process group — the only yield
-// mechanism there is. An attempt is never killed to improve queue latency, and no suspend
-// path exists anywhere in this package. The wait for the process to go uses its process handle,
-// the kernel's own answer, polled until `StopGrace` is spent.
-func (c *Orchestrator) ShutdownWorker(instanceID string, grace time.Duration) {
-	c.mu.Lock()
-	w := c.workers[instanceID]
-	c.mu.Unlock()
-	c.shutdownWorker(w, grace)
-}
-
-// shutdownWorker stops exactly the worker object the caller observed. Instance ids are
-// deterministic and reused across child restarts, so an id-only teardown can otherwise close
-// the replacement's row after the old process exits. The caller that wins stopping owns all
-// four acts: close control, reap process, close the row, remove the in-memory worker.
-func (c *Orchestrator) shutdownWorker(w *worker, grace time.Duration) bool {
-	if w == nil {
-		return false
-	}
-	c.mu.Lock()
-	if c.workers[w.instanceID] != w {
-		c.mu.Unlock()
-		return false
-	}
-	if w.stopping {
-		stopped := w.stopped
-		c.mu.Unlock()
-		<-stopped
-		return false
-	}
-	w.stopping = true
-	c.mu.Unlock()
-	return c.stopClaimedWorker(w, grace)
-}
-
-// stopClaimedWorker completes teardown after the caller has atomically withdrawn the
-// worker from selection by setting stopping.
-func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
-	c.mu.Lock()
-	cancelControl := w.cancelControl
-	attachDone, processDone := w.attachDone, w.processDone
-	pid, exited := 0, w.exited
-	if w.cmd != nil && w.cmd.Process != nil {
-		pid = w.cmd.Process.Pid
-	}
-	c.mu.Unlock()
-	if cancelControl != nil {
-		cancelControl()
-	}
-	if pid != 0 && !exited {
-		// The cooperative tier: SIGTERM to the group, CTRL_BREAK to the job's console
-		// group on Windows. A failure here is loud but not an escalation by itself —
-		// the bounded wait below is what separates asking from insisting.
-		if err := processtree.Kill(pid, syscall.SIGTERM); err != nil {
-			c.logf("worker %s: the cooperative stop could not be delivered (%s); "+
-				"the forced tier follows the grace window", w.instanceID, err)
-		}
-		timer := time.NewTimer(grace)
-		select {
-		case <-processDone:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-		case <-timer.C:
-			_ = processtree.Kill(pid, syscall.SIGKILL)
-			<-processDone // process reaping is an observed fact, not another timeout
-		}
-	} else if processDone != nil {
-		<-processDone
-	}
-	if attachDone != nil {
-		<-attachDone
-	}
-	if w.media == nil {
-		c.reclaimWorker(w.instanceID) // before the row closes; see the exit path
-	}
-	closeProblem := c.opt.Store.CloseWorker(w.instanceID)
-	c.mu.Lock()
-	if c.workers[w.instanceID] == w {
-		w.exited = true
-		delete(c.workers, w.instanceID)
-		if w.bootID != "" {
-			delete(c.sessions, w.bootID)
-		}
-	}
-	close(w.stopped)
-	c.mu.Unlock()
-	if closeProblem != nil {
-		c.logf("worker %s stopped but its durable row could not close: %s",
-			w.instanceID, closeProblem.Message)
-	} else {
-		c.logf("worker %s stopped; its device grant is released", w.instanceID)
-	}
-	return true
-}
-
-// reclaimWorker removes an exited local worker's root — its runtime home, scratch and
-// model-ingest copies — once its process is reaped and before its row closes. The log
-// stays until the next daemon start for the person the exit message pointed at it.
-func (c *Orchestrator) reclaimWorker(instanceID string) {
-	freed, problem := reclaim.Worker(c.opt.Layout, instanceID, true)
-	if problem != nil {
-		c.logf("worker %s root reclaim deferred: %s", instanceID, problem.Message)
-		return
-	}
-	if freed > 0 {
-		c.logf("worker %s root reclaimed: %s", instanceID, units.Bytes(freed))
-	}
-}
-
-func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request) bool {
-	return c.idleLocalProcessLocked(w, active, false)
-}
-
-func (c *Orchestrator) idleLocalProcessLocked(w *worker, active []records.Request, allowJob bool) bool {
-	if w == nil || c.workers[w.instanceID] != w || w.exited || w.stopping ||
-		w.spec.Connection != nil || (!allowJob && w.spec.IsJob()) || w.seats.reserved != 0 || w.unacked != 0 {
-		return false
-	}
-	for _, reservation := range c.offers {
-		if reservation.worker == w {
-			return false
-		}
-	}
-	for _, req := range active {
-		// Submitted/queued requests own a FIFO position, not this worker. Counting a
-		// same-package request behind a different-package head as active would protect
-		// the current holder forever while FIFO prevents that later request dispatching.
-		if req.State != "dispatching" && req.State != "requeue_pending" {
-			continue
-		}
-		// Binding-plan digests are content identities, not package identities. Two
-		// packages can legitimately expose byte-identical bindings; treating the plan
-		// digest alone as ownership made a queued package B protect package A's idle
-		// worker from eviction. Match the local package slot and immutable install too.
-		if req.Worker == "" && req.Package == w.spec.Placement.Package &&
-			(req.InstallID == "" || req.InstallID == w.spec.Placement.InstallID) &&
-			staged(w, req.PlanID) {
-			return false
-		}
-	}
-	return true
-}
-
-// Reconcile runs at boot, before anything is served. Rows describing processes from a
-// previous life are checked against their OS BIRTH identity: a matching birth is a real
-// orphan and is killed (it holds a device grant and a socket this daemon no longer
-// knows); a mismatch is a REUSED PID and is never signalled — only its row is closed.
-func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
+// Reconcile rebuilds the daemon's work from its records before anything is served.
+func (c *Orchestrator) Reconcile() *exit.Error {
 	writer, problem := home.LockWriter(c.opt.Layout)
 	if problem != nil {
 		// A CLI may be starting this daemon while handing off a captured run.
@@ -1398,104 +488,46 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		c.logf("local package sweep deferred: %s", problem.Message)
 	} else {
 		unlockLocal := localpackage.Guard()
-		e = localpackage.Sweep(c.opt.Layout, c.opt.Store)
+		e := localpackage.Sweep(c.opt.Layout, c.opt.Store)
 		unlockLocal()
 		writer.Unlock()
 		if e != nil {
-			return 0, 0, e
-		}
-	}
-	rows, e := c.opt.Store.LiveWorkers()
-	if e != nil {
-		return 0, 0, e
-	}
-	for _, row := range rows {
-		if row.PID > 0 && birthOf(row.PID) == row.Birth && row.Birth != "" {
-			_ = processtree.Kill(row.PID, syscall.SIGKILL)
-			killed++
-			c.logf("orphan worker %s (pid %d, birth %s) killed on reconcile",
-				row.InstanceID, row.PID, row.Birth)
-		} else {
-			forgotten++
-			c.logf("worker row %s forgotten: pid %d is gone or reused (birth %q != %q)",
-				row.InstanceID, row.PID, birthOf(row.PID), row.Birth)
-		}
-		if e := c.opt.Store.CloseWorker(row.InstanceID); e != nil {
-			return killed, forgotten, e
+			return e
 		}
 	}
 	// Work accepted for the retired classic worker session ends here, named, and custody no
 	// store can release any more (classic work, ended rentals) is forgotten.
 	retired, e := c.opt.Store.RetireClassicWork()
 	if e != nil {
-		return killed, forgotten, e
+		return e
 	}
 	for _, id := range retired {
 		c.logf("%s was accepted for the retired classic worker; ended as %s", id, records.ClassicRetiredCode)
 	}
 	if e := c.opt.Store.ForgetEndedRentalCustody(); e != nil {
-		return killed, forgotten, e
+		return e
 	}
-	// THE DISPATCH QUEUE IS MEMORY, AND THE AUTHORITY IS NOT. A request recorded as owed
-	// work before the crash has no attempt and no queue entry after it — it simply stopped
-	// existing as far as scheduling was concerned, while its row went on saying `queued`
-	// forever. Found live by cl-004's crash arm: a job submitted moments before the
-	// orchestrator was `kill -9`ed never ran again. Rebuilding the queue from the authority
-	// is the only place the two can be made to agree, and it happens before anything is
-	// served. Order is the authority's own (created_at), so FIFO survives a crash too.
+	// THE QUEUE IS MEMORY, AND THE AUTHORITY IS NOT. A request recorded as owed work before
+	// the crash has no queue entry after it; rebuilding the queue from the authority, in
+	// its own created_at order, happens before anything is served.
 	owed, e := c.opt.Store.Owed()
 	if e != nil {
-		return killed, forgotten, e
+		return e
 	}
 	for _, req := range owed {
 		c.enqueue(req.ID)
-		c.logf("%s was owed work before the restart; it is back on the dispatch queue", req.ID)
+		c.logf("%s was owed work before the restart; it is back on the queue", req.ID)
 	}
 	if len(owed) > 0 {
 		go c.reviveQueue()
 	}
-	// AND THE ATTEMPTS THAT OWE A TERMINAL. Remote rentals reconnect to pod-supervisor,
-	// whose worker-local ledger replays their exact state.
-	unsettled, e := c.opt.Store.Unsettled()
-	if e != nil {
-		return killed, forgotten, e
-	}
-	for _, req := range unsettled {
-		if req.Worker == "" {
-			continue
-		}
-		// RECONNECTING ONLY WORKS IF THERE IS SOMETHING TO RECONNECT TO. pod-supervisor's
-		// ledger is what replays a remote attempt, and it lives on the pod: once the rental
-		// is gone or terminally failed, that ledger was destroyed with it and no amount of
-		// reconnecting will ever produce the terminal this attempt owes.
-		if !c.rentalCanServe(req.Worker) {
-			c.recoverPinned(req, req.Worker, c.lostRentalCause(req.Worker))
-			continue
-		}
-		c.logf("%s holds a remote attempt with no terminal; reconnecting to its supervisor ledger", req.ID)
-		c.selectOrStart(req)
-	}
-	ready, e := c.opt.Store.ReadyRequeues()
-	if e != nil {
-		return killed, forgotten, e
-	}
-	for _, req := range ready {
-		c.logf("%s committed and acknowledged a requeue before restart; resuming it", req.ID)
-		c.RequeueForCapacity(req.ID, "restart-after-terminal-ack")
-	}
 	if problem := c.ResumeOutputExports(); problem != nil {
-		return killed, forgotten, problem
+		return problem
 	}
 	if problem := c.ResumeModelTransfers(); problem != nil {
-		return killed, forgotten, problem
+		return problem
 	}
-	if problem := c.ResumeQueuedRequests(); problem != nil {
-		return killed, forgotten, problem
-	}
-	if problem := c.restoreRetainedWork(); problem != nil {
-		return killed, forgotten, problem
-	}
-	return killed, forgotten, nil
+	return c.ResumeQueuedRequests()
 }
 
 // ResumeQueuedRequests re-enters the one placement path for every request a
@@ -1512,57 +544,9 @@ func (c *Orchestrator) ResumeQueuedRequests() *exit.Error {
 	}
 	for _, req := range queued {
 		c.logf("%s was queued when a prior daemon exited; resuming its placement", req.ID)
-		c.selectOrStart(req)
+		c.start(req)
 	}
 	return nil
-}
-
-// freshActivity is the report's activity entries this owner has not logged yet, in
-// order. Callers hold c.mu.
-func (w *worker) freshActivity(entries []*pb.ActivityEvent) []*pb.ActivityEvent {
-	var newest uint64
-	for _, a := range entries {
-		if a != nil && a.Seq > newest {
-			newest = a.Seq
-		}
-	}
-	if newest < w.activitySeq {
-		w.activitySeq = 0
-	}
-	var out []*pb.ActivityEvent
-	for _, a := range entries {
-		if a == nil || a.Seq <= w.activitySeq {
-			continue
-		}
-		w.activitySeq = a.Seq
-		out = append(out, a)
-	}
-	return out
-}
-
-// freshFaults is the report's worker and placement faults this owner has not logged
-// since they last appeared. A fault absent from a report is forgotten, so its return is
-// news again. Callers hold c.mu.
-func (w *worker) freshFaults(worker, placement []*pb.Fault) (fresh, freshPlacement []*pb.Fault) {
-	seen := map[string]bool{}
-	pick := func(scope string, faults []*pb.Fault) []*pb.Fault {
-		var out []*pb.Fault
-		for _, f := range faults {
-			if f == nil {
-				continue
-			}
-			key := fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s", scope, f.Kind, f.Subject, f.Reason, f.Detail)
-			seen[key] = true
-			if !w.loggedFaults[key] {
-				out = append(out, f)
-			}
-		}
-		return out
-	}
-	fresh = pick("worker", worker)
-	freshPlacement = pick("placement", placement)
-	w.loggedFaults = seen
-	return fresh, freshPlacement
 }
 
 func logicalOf(req records.Request) LogicalPackage {

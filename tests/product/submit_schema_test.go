@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/cli"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -282,10 +281,8 @@ func ownerAtRoot(t *testing.T, root string) *owner {
 	log, err := os.Create(filepath.Join(root, "owner.log"))
 	must(t, err)
 	options := orchestrator.Options{
-		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
-		MaxOutputMiB: 8,
+		Cfg: cfg, Layout: l, Store: st, Log: log,
 	}
-	options.Packages = cli.NewResolver(st, cfg)
 	c, e := orchestrator.Open(options)
 	fatal(t, e)
 	go func() { _ = c.Serve() }()

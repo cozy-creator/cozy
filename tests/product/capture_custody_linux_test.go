@@ -52,7 +52,7 @@ func TestCapturePublicationExcludesTerminalCleanupAcrossProcesses(t *testing.T) 
 	if _, err := os.Stat(root); err != nil {
 		t.Fatal("terminal cleanup deleted a revision held by another publication process", err)
 	}
-	_, _, problem = o.c.Reconcile()
+	problem = o.c.Reconcile()
 	fatal(t, problem)
 	if _, err := os.Stat(root); err != nil {
 		t.Fatal("boot sweep deleted an in-progress publication", err)

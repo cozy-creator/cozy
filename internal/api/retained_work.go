@@ -39,20 +39,13 @@ func (s *Server) pauseJob(w http.ResponseWriter, r *http.Request) {
 	if s.machineJobControl(w, r, row, "pause", "") {
 		return
 	}
-	if problem := s.orchestrator.PauseRequest(row.ID, requestActor(r)); problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	updated, problem := s.store.RequestRow(row.ID)
-	if problem != nil || updated == nil {
-		s.refuse(w, r, http.StatusInternalServerError, "internal", "paused request cannot be read", "")
-		return
-	}
-	status := http.StatusAccepted
-	if updated.State == "paused" {
-		status = http.StatusOK
-	}
-	s.ok(w, r, status, s.jobStateOf(*updated))
+	s.refuseTyped(w, r, notOnAMachine("pause"))
+}
+
+// notOnAMachine refuses control of work no machine executes: the daemon's own model
+// transfer only cancels.
+func notOnAMachine(action string) *exit.Error {
+	return exit.Named(exit.Conflict, "request.not_on_a_machine", "only work a machine executes can %s", action)
 }
 
 func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
@@ -63,22 +56,5 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 	if s.machineJobControl(w, r, row, "resume", "") {
 		return
 	}
-	s.shutdownAdmission.RLock()
-	if s.shuttingDown {
-		s.shutdownAdmission.RUnlock()
-		s.refuse(w, r, http.StatusServiceUnavailable, "daemon_shutting_down", "the daemon is shutting down", "")
-		return
-	}
-	problem := s.orchestrator.ResumeRequest(row.ID, requestActor(r))
-	s.shutdownAdmission.RUnlock()
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	updated, problem := s.store.RequestRow(row.ID)
-	if problem != nil || updated == nil {
-		s.refuse(w, r, http.StatusInternalServerError, "internal", "resumed request cannot be read", "")
-		return
-	}
-	s.ok(w, r, http.StatusAccepted, s.jobStateOf(*updated))
+	s.refuseTyped(w, r, notOnAMachine("resume"))
 }

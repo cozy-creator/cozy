@@ -4,31 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostruntime"
-	"github.com/cozy-creator/cozy/internal/records"
 )
-
-// InstallToolEnv makes one installed package's exact Runtime discoverable through the
-// already-frozen child environment without reading ambient process state.
-func InstallToolEnv(inst records.PackageInstall, env []string) []string {
-	out := append([]string(nil), env...)
-	prefix := filepath.Dir(Binary(inst))
-	for index, value := range out {
-		if strings.HasPrefix(value, "PATH=") {
-			out[index] = "PATH=" + prefix + string(os.PathListSeparator) + strings.TrimPrefix(value, "PATH=")
-			return out
-		}
-	}
-	return append(out, "PATH="+prefix)
-}
 
 // NO CLOCK BOUNDS A RUNTIME QUESTION (xs-007 row 10). `describe` and `bindings` used to run
 // under a 5-second deadline whose expiry raised `runtime_query_stalled` and refused the job
@@ -64,16 +46,6 @@ type RuntimeCLI struct {
 	PackageInterface  string   // exact installed interface; empty only for live editable source
 	Home              string   // COZY_HOME the runtime reads its artifact index out of
 	Env               []string // the allowlisted child environment (config.Tool)
-}
-
-// Binary is the runtime an install carries. The install transaction already refused a
-// venv that provides none (cl-009's `runtime_missing`), so this is the same claim,
-// re-asserted where it is used.
-func Binary(inst records.PackageInstall) string {
-	if inst.Runtime != "" {
-		return inst.Runtime
-	}
-	return home.VenvTool(filepath.Join(inst.Dir, "venv"), "cozy-runtime")
 }
 
 func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {

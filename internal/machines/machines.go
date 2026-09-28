@@ -326,6 +326,22 @@ func claim(ctx context.Context, connection *grpc.ClientConn, t target, wireMinor
 func controlClaim(parent context.Context, client pb.WorkerControlClient, claim *pb.Claim) (*pb.ClaimAck, *exit.Error) {
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
+	for {
+		ack, problem := controlClaimOnce(ctx, client, claim)
+		if problem != nil || ack.Rejection != pb.ClaimRejection_CLAIM_REJECTION_UNDURABLE {
+			return ack, problem
+		}
+		// Not durable yet: its readiness barrier is still committing, or it is restarting
+		// to reopen its store. It is claimed again rather than refused.
+		select {
+		case <-ctx.Done():
+			return nil, Transport(status.FromContextError(ctx.Err()).Err())
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func controlClaimOnce(ctx context.Context, client pb.WorkerControlClient, claim *pb.Claim) (*pb.ClaimAck, *exit.Error) {
 	stream, err := client.Control(ctx)
 	if err != nil {
 		return nil, Transport(err)
@@ -345,6 +361,9 @@ func controlClaim(parent context.Context, client pb.WorkerControlClient, claim *
 		ack := frame.GetClaimAck()
 		if ack == nil {
 			continue
+		}
+		if !ack.Accepted && ack.Rejection == pb.ClaimRejection_CLAIM_REJECTION_UNDURABLE {
+			return ack, nil
 		}
 		if !ack.Accepted || ack.WorkerId != claim.WorkerId || ack.WorkerBootId != claim.WorkerBootId {
 			return nil, exit.New(exit.Credential, "the machine refused its owner's Claim (%s)", ack.Rejection)

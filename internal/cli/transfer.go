@@ -142,25 +142,14 @@ func handleModelRemove(ctx *Context) *exit.Error {
 	return removeModels(ctx, tool, layout, fence)
 }
 
-// modelRemovalRefusal refuses only for what still holds a named model: a local worker's
-// residency, or a live local request that reads or writes it.
+// modelRemovalRefusal refuses only for a live local request that reads or writes a named
+// model.
 func modelRemovalRefusal(layout home.Layout, names []string) *exit.Error {
 	store, problem := records.Open(layout.DB)
 	if problem != nil {
 		return problem
 	}
 	defer store.Close()
-	live, problem := store.LiveWorkers()
-	if problem != nil {
-		return problem
-	}
-	for _, worker := range live {
-		if worker.WorkerID != "remote" {
-			return exit.New(exit.Conflict, "local worker %s may still hold model residency", worker.InstanceID).
-				WithRemedy("run `cozy machine stop`, then remove the model repository").
-				WithNext("cozy machine stop")
-		}
-	}
 	for _, name := range names {
 		ref, problem := hub.ParseRef(name)
 		if problem != nil {

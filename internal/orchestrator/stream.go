@@ -1,11 +1,7 @@
 package orchestrator
 
 import (
-	"encoding/json"
 	"math"
-	"sync"
-
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The LOSSY half of the client contract's event stream (cl-006), beside records/events.go's
@@ -36,61 +32,6 @@ type Frame struct {
 	Value     any    `json:"value"`
 }
 
-// frameBuffer is one subscriber's depth. A slow SSE client is a slow client, never a
-// slow worker: past this depth its frames are shed and the protocol reader moves on.
-const frameBuffer = 64
-
-type subscriber struct {
-	requestID string // "" subscribes to every request (the multiplexed stream)
-	ch        chan Frame
-}
-
-type fanout struct {
-	mu       sync.Mutex
-	next     uint64
-	subs     map[uint64]*subscriber
-	latest   map[string]Frame // the most recent progress tick per request
-	progress map[string]progressAccumulator
-}
-
-func newFanout() *fanout {
-	return &fanout{
-		subs: map[uint64]*subscriber{}, latest: map[string]Frame{},
-		progress: map[string]progressAccumulator{},
-	}
-}
-
-// Subscribe opens a live frame feed. An empty requestID takes every request's frames.
-// The returned function must be called; it is the only way a subscriber is forgotten.
-func (c *Orchestrator) Subscribe(requestID string) (<-chan Frame, func()) {
-	f := c.frames
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.next++
-	id := f.next
-	s := &subscriber{requestID: requestID, ch: make(chan Frame, frameBuffer)}
-	f.subs[id] = s
-	return s.ch, func() {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		if held, ok := f.subs[id]; ok && held == s {
-			delete(f.subs, id)
-			close(s.ch)
-		}
-	}
-}
-
-// LatestFrame is the most recent tick for one request, or false when none has arrived.
-// A subscriber that attaches mid-attempt gets this immediately so its first render shows
-// where the attempt actually is.
-func (c *Orchestrator) LatestFrame(requestID string) (Frame, bool) {
-	f := c.frames
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	frame, ok := f.latest[requestID]
-	return frame, ok
-}
-
 // ProgressSnapshot is the latest real work coordinate Runtime reported and an optional
 // whole-job estimate from sampled step intervals per overall-fraction advance. It is
 // observational; the final overall fraction is copied into the attempt-end event.
@@ -107,45 +48,6 @@ type ProgressSnapshot struct {
 	Rate        *float64
 	RemainingMS int64
 	Estimated   bool
-}
-
-type progressAccumulator struct {
-	attempt uint64
-	progressCoordinate
-	overallDelta float64
-	overallMSSum float64
-}
-
-func (c *Orchestrator) LatestProgress(requestID string, attempt uint64) (ProgressSnapshot, bool) {
-	f := c.frames
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	progress, ok := f.progress[requestID]
-	if !ok || progress.attempt != attempt {
-		return ProgressSnapshot{}, false
-	}
-	snapshot := progress.progressCoordinate.snapshot()
-	if progress.hasOverall && progress.overallDelta > 0 && progress.overallMSSum > 0 {
-		remaining := max(0.0, 1-progress.overallFraction)
-		snapshot.RemainingMS = int64(remaining * progress.overallMSSum / progress.overallDelta)
-		snapshot.Estimated = true
-	}
-	return snapshot, true
-}
-
-// withProgressSummary preserves one measured fraction in the existing outcome
-// transaction. Progress ticks themselves remain lossy and never write the journal.
-func (c *Orchestrator) withProgressSummary(requestID string, attempt uint64, payload map[string]any) map[string]any {
-	progress, ok := c.LatestProgress(requestID, attempt)
-	if !ok || progress.OverallFraction == nil {
-		return payload
-	}
-	summary := make(map[string]any, len(payload)+1)
-	for key, value := range payload {
-		summary[key] = value
-	}
-	summary["overall_fraction"] = *progress.OverallFraction
-	return summary
 }
 
 type progressCoordinate struct {
@@ -252,104 +154,4 @@ func progressCoordinates(value any) (progressCoordinate, bool) {
 		out.stageFraction, out.hasStageFraction = position/total, true
 	}
 	return out, true
-}
-
-func (f *fanout) observeProgress(frame Frame) {
-	coordinate, ok := progressCoordinates(frame.Value)
-	if !ok {
-		return
-	}
-	progress := f.progress[frame.RequestID]
-	if progress.attempt != frame.Attempt {
-		progress = progressAccumulator{attempt: frame.Attempt}
-	}
-	if coordinate.hasOverall && progress.hasOverall &&
-		coordinate.overallFraction < progress.overallFraction {
-		return
-	}
-	if coordinate.hasOverall && progress.hasOverall &&
-		coordinate.overallFraction > progress.overallFraction && coordinate.stepMS > 0 {
-		elapsed := coordinate.stepMS
-		if coordinate.hasPosition {
-			advanced := coordinate.position
-			if progress.stage == coordinate.stage && progress.hasPosition && progress.total == coordinate.total {
-				advanced -= progress.position
-			}
-			// The stream is lossy: the last interval samples one step, while the
-			// coordinate can advance by several. Estimate the missing intervals at
-			// that sampled rate; do not price all of their work as a single step.
-			elapsed *= float64(max(0, advanced))
-		}
-		progress.overallDelta += coordinate.overallFraction - progress.overallFraction
-		progress.overallMSSum += elapsed
-	}
-	if coordinate.hasOverall {
-		progress.overallFraction, progress.hasOverall = coordinate.overallFraction, true
-	}
-	if progress.stage != coordinate.stage {
-		progress.stepMS = 0
-	}
-	progress.stage = coordinate.stage
-	if coordinate.stepMS > 0 {
-		progress.stepMS = coordinate.stepMS
-	}
-	progress.stageFraction, progress.hasStageFraction =
-		coordinate.stageFraction, coordinate.hasStageFraction
-	progress.position, progress.total, progress.hasPosition =
-		coordinate.position, coordinate.total, coordinate.hasPosition
-	progress.unit, progress.rate, progress.hasRate = coordinate.unit, coordinate.rate, coordinate.hasRate
-	f.progress[frame.RequestID] = progress
-}
-
-// count is how many clients are attached right now — the API's open SSE streams.
-func (f *fanout) count() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.subs)
-}
-
-// publish hands a frame to every matching subscriber, shedding rather than blocking.
-func (f *fanout) publish(frame Frame) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if frame.Type == "progress" {
-		f.latest[frame.RequestID] = frame
-		f.observeProgress(frame)
-	}
-	for _, s := range f.subs {
-		if s.requestID != "" && s.requestID != frame.RequestID {
-			continue
-		}
-		select {
-		case s.ch <- frame:
-		default: // the one loss this lane may incur, and the reason it is the lossy lane
-		}
-	}
-}
-
-// forget drops a settled request's live telemetry. Its last measured overall
-// fraction has already committed with the attempt-end event.
-func (f *fanout) forget(requestID string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.latest, requestID)
-	delete(f.progress, requestID)
-}
-
-// frameOf decodes one AttemptProgress into the live shape. The runtime's payload is a
-// JSON object it owns; an unreadable one becomes a frame with no value rather than a
-// dropped tick, because the SEQUENCE still tells a client the attempt is alive.
-func frameOf(p *pb.AttemptProgress) Frame {
-	frame := Frame{RequestID: p.RequestId, Attempt: p.AttemptOrdinal, Seq: p.Seq, Type: "progress"}
-	var body struct {
-		Type    string `json:"type"`
-		Payload any    `json:"payload"`
-	}
-	if err := json.Unmarshal(p.Data, &body); err == nil {
-		if body.Type != "" {
-			frame.Type = body.Type
-		}
-		frame.Value = body.Payload
-	}
-	return frame
 }

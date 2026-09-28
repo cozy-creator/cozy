@@ -83,11 +83,12 @@ func TestPodRefusesAMergedDownloadSet(t *testing.T) {
 	}
 }
 
-// rentalWiringDownloadSet authors a download set exactly as rentalWiring's
-// RentalPackageSet does, callable outside an Options mutation.
-func rentalWiringDownloadSet(connection *orchestrator.WorkerConnection, signer ed25519.PrivateKey,
+// rentalWiringDownloadSet authors the unsigned download-set document a rental prepares.
+func rentalWiringDownloadSet(_ *orchestrator.WorkerConnection, _ ed25519.PrivateKey,
 	packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRef) ([]byte, *exit.Error) {
-	var options orchestrator.Options
-	rentalWiring(connection, signer)(&options)
-	return options.RentalPackageSet(packages, models)
+	body, err := canonical.Bytes(&pb.DownloadDelegation{Models: models, Packages: packages})
+	if err != nil {
+		return nil, exit.Internalf("%v", err)
+	}
+	return body, nil
 }

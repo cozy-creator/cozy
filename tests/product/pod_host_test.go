@@ -913,7 +913,6 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 			}
 			return &orchestrator.RemoteTarget{Connection: connection}, nil
 		}
-		o.ObserveRental = func(orchestrator.RentalObservation) *exit.Error { return nil }
 		o.RentalClaimProof = func(c *orchestrator.WorkerConnection, epoch uint64) ([]byte, *exit.Error) {
 			pin, err := workertls.LoadPin(c.CACert)
 			if err != nil {
@@ -925,14 +924,6 @@ func rentalWiring(connection *orchestrator.WorkerConnection, signer ed25519.Priv
 				return nil, exit.Internalf("%v", err)
 			}
 			return ed25519.Sign(signer, body), nil
-		}
-		o.RentalPackageSet = func(packages []*pb.DownloadPackageRef,
-			models []*pb.DownloadModelRef) ([]byte, *exit.Error) {
-			body, err := canonical.Bytes(&pb.DownloadDelegation{Models: models, Packages: packages})
-			if err != nil {
-				return nil, exit.Internalf("%v", err)
-			}
-			return body, nil
 		}
 	}
 }

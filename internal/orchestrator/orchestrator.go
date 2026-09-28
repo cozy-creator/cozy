@@ -24,13 +24,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -44,51 +41,19 @@ import (
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
 	// StartMachineExecution transfers and observes an execution owned by Runtime.
-	// It never offers an attempt through this legacy cross-machine dispatcher.
-	StartMachineExecution  func(records.Request) *exit.Error
-	RentalRuntimePreflight func(context.Context, records.Request, string) *exit.Error
-	RentalRuntimeMismatch  func(records.Request, string, *exit.Error) *exit.Error
+	StartMachineExecution func(records.Request) *exit.Error
 	// ReclaimInstall delegates unpinned snapshot cleanup to the existing package owner.
 	ReclaimInstall func(string) *exit.Error
 	Cfg            config.Config
 	Layout         home.Layout
 	Store          *records.Store
-	// Yield is the GPU yield policy: smart | always | never.
-	Yield string
-	Log   io.Writer
-
-	// Packages resolves `org/name` to the spec that makes its worker resident. It is the
-	// START-OR-SELECT half of the one execution path (cl-010): a request whose binding no
-	// live worker advertises MAKES one, so a cold invocation and a warm one traverse the
-	// same states and differ only in latency. Without it a cold request queues for
-	// capacity that nothing would ever create.
-	Packages Launcher
-
-	// Rentals resolves an attached-worker id (`cozy rental new`'s persisted triple) to its
-	// dial spec. Wired by the entrypoint; nil = this daemon attaches no remote workers.
+	Log            io.Writer
+	// Rentals resolves an attached rental id to its dial spec; nil = this daemon attaches
+	// no rentals.
 	Rentals func(id string) (*RemoteTarget, *exit.Error)
-	// ObserveRental persists the remote worker's ClaimAck readback. Selection intent is
-	// not hardware evidence: a rented worker is not dispatchable until this callback has
-	// durably joined its actual accelerator and worker identity to the rental.
-	ObserveRental func(RentalObservation) *exit.Error
 	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
 	RentalClaimProof RentalClaimProofSource
-	// RentalPackageSet signs Creator's logical package/model download authority.
-	RentalPackageSet RentalPackageSetSource
-	// RentalFleet renders the request's hub's fleet burn line after reconciling that
-	// hub's rentals with it. AcquireManagedRental is the placement decision for a --rental
-	// request no rental holds a placement for (placement-economics.md): it pins the
-	// request to an attached ready rental or BUYS a pod (owner ruling 2026-09-03:
-	// --rental is permission AND intent to spend) and records what it chose over what.
-	// ReleaseManagedRental observes a rental as a request pinned to it settles and tears
-	// it down once nothing is left on it.
-	RentalFleet          func(records.Request) (string, *exit.Error)
-	AcquireManagedRental func(req records.Request) (PlacementDecision, string, *exit.Error)
-	ReleaseManagedRental func(string) (string, *exit.Error)
-	// ReleaseRetainedRental is explicit owner abandonment, independent of idle policy.
-	ReleaseRetainedRental func(string) (string, *exit.Error)
-	ModelTransfers        ModelTransferOwner
-	MaxOutputMiB          int64
+	ModelTransfers   ModelTransferOwner
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
@@ -112,16 +77,9 @@ type RentalObservation struct {
 	WorkerBootID           string
 }
 
+// ModelTransferOwner moves the daemon's own model transfers.
 type ModelTransferOwner interface {
-	MaterializeLocal(context.Context, string, records.ModelTransferIntent) ([]ModelRef, *exit.Error)
-	RefreshRemoteSource(context.Context, records.ModelTransferIntent) ([]ModelSourceCapability, *exit.Error)
-	Finalize(context.Context, string, ModelTransferMover) *exit.Error
-	AbandonModelTransferPublications(context.Context, string) *exit.Error
 	PassThrough(context.Context, string, records.ModelTransferIntent) *exit.Error
-	SyncCheckpoints(context.Context, string, CheckpointHost) *exit.Error
-	RestoreWeightsCheckpoint(context.Context, string, CheckpointHost, *pb.WeightsCheckpointSubject) (*pb.CheckpointRef, *exit.Error)
-	RestoreSourceCheckpoints(context.Context, string, CheckpointHost) *exit.Error
-	ReleaseCheckpoints(context.Context, string) *exit.Error
 }
 
 type ModelTransferMover func(context.Context, records.ModelTransferWeights,
@@ -389,158 +347,45 @@ const (
 	ExcludedDiskShort = "disk_short"
 )
 
-// RentalStanding is what this owner knows live about one ready rental a placement could
-// go to: the reason its worker cannot take this request's MODE, or the attempts the
-// worker holds and has been offered — what a new request waits behind, with the
-// requests still queued for it. DesiredWorkerState is a full-replace `oneof mode` — a
-// JobDirective or a serving placement set — so a pod worker cannot host both at once:
-// converging a job onto a worker with a serving desire (or the reverse) would unload the
-// other tenant mid-flight. An unattached rental has no mode yet and holds nothing.
-func (c *Orchestrator) RentalStanding(id string, job bool) (reason string, held int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	w := c.workers[rentalInstanceID(id)]
-	if w == nil {
-		return "", 0
-	}
-	if !w.supportsCurrentProtocol() {
-		return ExcludedProtocol, 0
-	}
-	if w.exited || w.stopping {
-		return "", 0
-	}
-	serving := len(w.desiredPackages) > 0 || w.desiredLocal != nil ||
-		w.desiredUnpublishedPlacement != nil || len(w.observedRemote) > 0
-	if (job && serving || !job && w.spec.IsJob()) && (!c.idleRentalWorkerLocked(w) || c.modeClaimedLocked(w, job)) {
-		return ExcludedModeConflict, 0
-	}
-	if c.sessions[w.bootID] == nil {
-		return "", 0
-	}
-	return "", w.held + w.seats.reserved
-}
-
-// A completed job does not consume the rental forever. This fence uses observed
-// custody plus every owner-side reservation, so a delayed idle report cannot hide
-// an offer that has already crossed the dispatch boundary. Callers hold c.mu.
-func (c *Orchestrator) idleRentalWorkerLocked(w *worker) bool {
-	if w == nil || w.spec.Connection == nil || w.exited || w.stopping ||
-		!w.snapshotAcknowledged || w.lastReport.IsZero() || w.held != 0 ||
-		w.unacked != 0 || w.seats.reserved != 0 || w.reservedJobs != 0 {
-		return false
-	}
-	for _, offer := range c.offers {
-		if offer.worker == w {
-			return false
-		}
-	}
-	attempts, problem := c.opt.Store.OpenAttemptsOf(w.instanceID)
-	return problem == nil && len(attempts) == 0
-}
-
-// modeClaimedLocked is whether work pinned to this rental in its worker's current mode
-// holds that mode against a request of the other mode; `exempt` names that request and
-// the parent it may run under. A pin claims the mode from submission, before any attempt
-// or offer exists, until the request settles. Callers hold c.mu.
-func (c *Orchestrator) modeClaimedLocked(w *worker, job bool, exempt ...string) bool {
-	if w == nil || w.spec.Connection == nil || job == w.spec.IsJob() {
-		return false
-	}
-	pinned, problem := c.opt.Store.PinnedRentalWork(w.spec.Connection.RentalID)
-	if problem != nil {
-		return true
-	}
-	for _, request := range pinned {
-		if request.IsJob() == w.spec.IsJob() && !slices.Contains(exempt, request.ID) {
-			return true
-		}
-	}
-	return false
-}
-
 // Orchestrator is the Cozy daemon's scheduling role.
 type Orchestrator struct {
 	opt Options
 
-	// done closes when the daemon is closing; Serve blocks on it (the owner DIALS
-	// workers, so there is no server here to run, #436). closeOnce makes Close
+	// done closes when the daemon is closing; Serve blocks on it. closeOnce makes Close
 	// idempotent — harnesses close defensively and twice is not an event.
 	done      chan struct{}
 	closeOnce sync.Once
-	// closingCtx ends when Close begins, so a start still dialing its worker (a rental's
-	// media health) gives up instead of holding Close for its whole stall budget.
+	// closingCtx ends when Close begins, so work still dialing a machine gives up.
 	closingCtx    context.Context
 	cancelClosing context.CancelFunc
 
-	// drainMu serializes the dispatch queue's drain. It is separate from `mu` because a
-	// drain dispatches — it talks to the store and to a session — and holding the state
-	// lock across that would serialize every report behind one 4.8 GiB fill.
-	drainMu  sync.Mutex
-	mu       sync.Mutex
-	sessions map[string]*session // by worker_boot_id (the live claimed stream per worker)
-	workers  map[string]*worker  // by instance_id
-	waits    map[string]*wait    // by request#attempt
-	// offers are seats reserved for emitted offers that have not yet produced the causal
-	// Accepted or pre-execution Refused frame. Reports cannot reopen these seats.
-	offers map[string]*dispatchReservation
-	// mediaCleaning prevents overlapping retries of one durable cleanup obligation. It
-	// contains only calls in flight; success is recorded on the attempt row.
-	mediaCleaning    map[string]bool
-	retainedCleaning map[string]*retainedCleanup
+	mu    sync.Mutex
+	waits map[string]*wait // by request#attempt
 	// outputExporting serializes retries of one durable local --out obligation.
 	outputExporting map[string]bool
-	// pending is the dispatch queue: requests that have no ready worker YET. A requeue
-	// with nowhere to go WAITS for capacity instead of evaporating — the alternative is
-	// a request that quietly stops existing because a worker was still loading.
+	// pending is the queue of machine executions owed a start, in submission order.
 	pending []string
-	// parked is what the drain knows about each queued request it skipped, by id
-	// (route.go `parking`). An entry lives exactly as long as its request is in `pending`.
-	parked map[string]*parking
-	// desiring names, per rental, the one request whose preparation is in flight there.
-	// A rental takes one additive desire at a time; schedule issues the next when it ends.
-	desiring  map[string]string
-	preparing map[string]bool // the rental's desire is running, not only reserved
-	// closing is set by Close: a worker stopped during shutdown must not make the queue
-	// ask for a replacement, because the daemon that would run it is going away.
+	// parked is the last wait each queued request announced, by id. An entry lives
+	// exactly as long as its request is in `pending`.
+	parked map[string]string
+	// closing is set by Close: nothing new starts on a daemon that is going away.
 	closing bool
-	// starting names the packages a select-or-start is already making resident. One
-	// launch per package: three cold requests for one package must not spawn three
-	// workers and three device grants for a card that serves one attempt at a time.
+	// starting names the machine executions whose start is in flight.
 	starting map[string]bool
-	// ensuring is the per-instance creation fence beneath every caller, including child
-	// recovery. `starting` serializes queue policy; this prevents two callers that already
-	// chose the same deterministic slot from spawning two processes into it.
-	ensuring map[string]chan struct{}
 	// rentalUses names each transport or preparation using a rental, so maintenance can
 	// say what it waits for.
 	rentalUses        map[string]map[uint64]string
 	rentalUseSeq      uint64
 	rentalMaintenance map[string]bool
-	revision          uint64 // hub-owned, monotonic; every Directive bumps it
-	lastUseRevision   uint64 // successful local serving dispatch order
 	events            []string
 
-	// frames is the LOSSY live lane's fanout (stream.go). The durable lane is rows in
-	// the records authority; these two are the whole event surface cl-006 serves.
-	frames *fanout
 	// phases is the preparation-phase lane (phase.go): what a request is doing before
-	// its first attempt exists. Live-only and observational, exactly like `frames`.
+	// its first attempt exists. Live-only and observational.
 	phases *phases
 	// transferWake is a lossy nudge over durable request-attached transfer rows.
-	transferWake         map[string]chan struct{}
-	transferRunning      map[string]bool
-	sourcePauseRunning   map[string]bool
-	transferDispatching  map[string]bool
-	transferWork         map[string]*transferWork
-	transferProgressSeq  map[string]uint64
-	sourcePrepareReplies map[string]uint64
-	sourcePrepareBlocked map[string]sourcePreparationBackoff
-	checkpointUploads    map[string]*checkpointUpload
-	// localTransfers is command-scoped, lossy progress over Creator's durable request
-	// row and sealed revision. A restart simply replays exact chunks from those authorities.
-	localTransfers   map[string]*localTransfer
-	childWatches     map[string]*session
-	operationLookups map[string]bool // one native lookup in flight per request; not a result cache
+	transferWake    map[string]chan struct{}
+	transferRunning map[string]bool
+	transferWork    map[string]*transferWork
 }
 
 type wait struct {
@@ -558,45 +403,21 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 	if opt.Log == nil {
 		opt.Log = io.Discard
 	}
-	if opt.Yield == "" {
-		opt.Yield = "smart"
-	}
 	c := &Orchestrator{
-		opt:                  opt,
-		done:                 make(chan struct{}),
-		sessions:             map[string]*session{},
-		workers:              map[string]*worker{},
-		waits:                map[string]*wait{},
-		offers:               map[string]*dispatchReservation{},
-		mediaCleaning:        map[string]bool{},
-		outputExporting:      map[string]bool{},
-		starting:             map[string]bool{},
-		parked:               map[string]*parking{},
-		desiring:             map[string]string{},
-		preparing:            map[string]bool{},
-		ensuring:             map[string]chan struct{}{},
-		rentalUses:           map[string]map[uint64]string{},
-		rentalMaintenance:    map[string]bool{},
-		frames:               newFanout(),
-		phases:               newPhases(),
-		transferWake:         make(map[string]chan struct{}),
-		transferRunning:      make(map[string]bool),
-		sourcePauseRunning:   make(map[string]bool),
-		transferDispatching:  make(map[string]bool),
-		transferWork:         make(map[string]*transferWork),
-		transferProgressSeq:  make(map[string]uint64),
-		sourcePrepareReplies: make(map[string]uint64),
-		sourcePrepareBlocked: make(map[string]sourcePreparationBackoff),
-		checkpointUploads:    make(map[string]*checkpointUpload),
-		localTransfers:       make(map[string]*localTransfer),
-		childWatches:         make(map[string]*session),
+		opt:               opt,
+		done:              make(chan struct{}),
+		waits:             map[string]*wait{},
+		outputExporting:   map[string]bool{},
+		starting:          map[string]bool{},
+		parked:            map[string]string{},
+		rentalUses:        map[string]map[uint64]string{},
+		rentalMaintenance: map[string]bool{},
+		phases:            newPhases(),
+		transferWake:      make(map[string]chan struct{}),
+		transferRunning:   make(map[string]bool),
+		transferWork:      make(map[string]*transferWork),
 	}
 	c.closingCtx, c.cancelClosing = context.WithCancel(context.Background())
-	// The retirement watch samples on the worker report cadence. The cadence is a
-	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
-	// report (a latched fault, a declared wedge) or the absence of reports the worker
-	// owes on that same cadence.
-	go c.retirementLoop()
 	return c, nil
 }
 
@@ -607,49 +428,13 @@ func (c *Orchestrator) Serve() error {
 	return nil
 }
 
-// Close stops every worker this daemon owns. A worker outliving its launcher is exactly
-// the class of bug the birth identity exists to catch, so `down` stops what it started
-// rather than orphaning it.
+// Close ends the daemon's own work: machines keep running theirs.
 func (c *Orchestrator) Close(grace time.Duration) {
 	c.mu.Lock()
 	c.closing = true
-	for _, cleanup := range c.retainedCleaning {
-		cleanup.cancel()
-	}
-	starting := make([]chan struct{}, 0, len(c.ensuring))
-	for _, done := range c.ensuring {
-		starting = append(starting, done)
-	}
 	c.mu.Unlock()
 	c.cancelClosing()
-	// A start already crossed the ownership gate. Let it publish its process
-	// before taking the shutdown census; later starts refuse under closing.
-	for _, done := range starting {
-		<-done
-	}
-	// Workers drain IN PARALLEL: each gets the same grace, and the whole close costs one
-	// grace window, not one per worker — a serial loop here could outlive the deadline
-	// its own caller was waiting under (#449).
-	var wg sync.WaitGroup
-	for _, w := range c.workerList() {
-		wg.Add(1)
-		go func(worker *worker) {
-			defer wg.Done()
-			c.shutdownWorker(worker, grace)
-		}(w)
-	}
-	wg.Wait()
 	c.closeOnce.Do(func() { close(c.done) })
-}
-
-func (c *Orchestrator) workerList() []*worker {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]*worker, 0, len(c.workers))
-	for _, w := range c.workers {
-		out = append(out, w)
-	}
-	return out
 }
 
 func (c *Orchestrator) logf(format string, args ...any) {
@@ -687,19 +472,6 @@ func (c *Orchestrator) emit(requestID, eventType string, attempt uint64, payload
 	}
 }
 
-// nextRevision mints the Directive revision. The record owner owns it; it is monotonic, and a
-// changed body always carries a new one.
-func (c *Orchestrator) nextRevision() uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.nextRevisionLocked()
-}
-
-func (c *Orchestrator) nextRevisionLocked() uint64 {
-	c.revision++
-	return c.revision
-}
-
 func key(requestID string, attempt uint64) string {
 	return fmt.Sprintf("%s#%d", requestID, attempt)
 }
@@ -722,15 +494,6 @@ func (c *Orchestrator) acquireWait(k string) (*wait, func()) {
 			delete(c.waits, k)
 		}
 		c.mu.Unlock()
-	}
-}
-
-func (c *Orchestrator) signalAccepted(k string) {
-	c.mu.Lock()
-	w := c.waits[k]
-	c.mu.Unlock()
-	if w != nil {
-		w.markAccepted()
 	}
 }
 
@@ -765,176 +528,6 @@ func (c *Orchestrator) enqueue(requestID string) bool {
 	}
 	c.pending = append(c.pending, requestID)
 	return true
-}
-
-// drain dispatches everything the ready capacity can now take. Called when a worker
-// reports DISPATCHABLE (or job capacity), which is the only event that can change the
-// answer.
-//
-// EVERY QUEUED REQUEST IS ASKED AGAINST ITS OWN CANDIDATES (cl-099): a request with no
-// dispatchable candidate right now PARKS — keeps its ordinal and position — and the next
-// is tried. Rented work is not here at all: Runtime owns its order on the machine.
-//
-// ONE DRAIN AT A TIME. A worker's report and a preparation's own post-launch drain both
-// fire within milliseconds of the same fact, and two concurrent drains read the same queue
-// snapshot: the durable ordinal law is what refuses the duplicate, but doing the work
-// twice and relying on a refusal is not a design. The lock makes the second drain read a
-// queue the first one has already emptied.
-func (c *Orchestrator) drain() {
-	c.drainMu.Lock()
-	defer c.drainMu.Unlock()
-	c.mu.Lock()
-	if c.closing {
-		c.mu.Unlock()
-		return
-	}
-	queued := append([]string(nil), c.pending...)
-	c.mu.Unlock()
-	for position, id := range queued {
-		req, e := c.opt.Store.RequestRow(id)
-		if e != nil || req == nil {
-			c.forget(id)
-			continue
-		}
-		if req.State != "submitted" && req.State != "queued" {
-			c.forget(id)
-			continue
-		}
-		if req.Worker != "" && req.RequestedRental == "" {
-			// An automatic pin may yield to another rental that already serves it.
-			if moved, problem := c.reconsiderAutomaticRental(*req); problem == nil {
-				req = &moved
-			}
-		}
-		if req.ModelTransfer != nil {
-			transfer, problem := c.opt.Store.ModelTransferOf(req.ID)
-			if problem == nil && transfer != nil && transfer.State != "materialized" {
-				// The transfer's own dispatch runs outside drainMu: its source lands on the
-				// worker before the ordinal exists. Meanwhile the request holds its place
-				// and its lanes like any other parked request.
-				c.kickQueuedTransferDispatch(*req)
-				c.park(*req, position, waitFacts{cause: WaitModelTransfer},
-					"model transfer "+transfer.State+" on the selected worker")
-				continue
-			}
-		}
-		attempt, e := c.dispatch(*req)
-		if e != nil {
-			// NO CAPACITY and AN ORDINAL THE LAW WILL NOT MINT YET are both "wait"; every
-			// other refusal is the request's ANSWER, and leaving it queued would be the
-			// failure mode this queue exists to prevent. Found live by cl-004's
-			// publication-escape arm: a request whose GRANT can never be built (a
-			// destination outside its own publication root) queued forever, because
-			// `dispatch` refuses AFTER `pick` succeeded and the only branch here was
-			// `continue`.
-			if e.Code == exit.Unavailable || e.Code == exit.Conflict {
-				c.park(*req, position, waitFacts{}, e.Message)
-				continue
-			}
-			c.failQueued(id, e, "")
-			continue
-		}
-		c.forget(id)
-		c.logf("%s left the dispatch queue as attempt %d", id, attempt)
-	}
-}
-
-// park records that the drain skipped a queued request and why. The lanes it is eligible
-// for are read fresh every time (a worker may have appeared). Only a CHANGE is logged and
-// emitted (`request.parked`): the drain runs on every worker report, and a parked request
-// that is still parked is not news. A caller that knows the blocking condition passes it;
-// an empty waitFacts means "a capacity refusal" and the condition is read from the same
-// routing that names the lanes.
-func (c *Orchestrator) park(req records.Request, position int, facts waitFacts, reason string) bool {
-	c.mu.Lock()
-	if !c.queued(req.ID) {
-		c.mu.Unlock()
-		return false
-	}
-	p := c.parked[req.ID]
-	if p == nil {
-		p = &parking{}
-		c.parked[req.ID] = p
-	}
-	r := c.route(req)
-	if facts.cause == "" {
-		facts = c.classifyCapacityWait(req, r)
-	}
-	p.wait = facts
-	lanes := r.lanes
-	sort.Slice(lanes, func(i, j int) bool { return lanes[i].String() < lanes[j].String() })
-	p.lanes = lanes
-	blocking := ""
-	if facts.waitingFor != nil {
-		blocking = facts.waitingFor.RequestID
-	}
-	state := fmt.Sprintf("%s|%s|%s|%s|%s", reason, facts.cause, facts.on, laneStrings(lanes), blocking)
-	changed := state != p.logged
-	p.logged = state
-	overtaken := p.overtaken
-	c.mu.Unlock()
-	if !changed {
-		return false
-	}
-	c.logf("%s PARKED at queue position %d (lanes %s, overtaken %d): %s",
-		req.ID, position+1, orNone(laneStrings(lanes)), overtaken, reason)
-	rows := make([]string, 0, len(lanes))
-	for _, l := range lanes {
-		rows = append(rows, l.String())
-	}
-	c.emit(req.ID, "request.parked", 0, facts.decorate(map[string]any{
-		"reason": reason, "position": position + 1, "lanes": rows, "overtaken": overtaken,
-	}, req))
-	return true
-}
-
-// queued answers whether a request is still in the dispatch queue. Callers hold c.mu.
-func (c *Orchestrator) queued(requestID string) bool {
-	for _, id := range c.pending {
-		if id == requestID {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *Orchestrator) kickQueuedTransferDispatch(req records.Request) {
-	current, problem := c.opt.Store.RequestRow(req.ID)
-	if problem != nil || current == nil || (current.State != "submitted" && current.State != "queued") {
-		return
-	}
-	req = *current
-	c.mu.Lock()
-	if c.transferDispatching[req.ID] {
-		c.mu.Unlock()
-		return
-	}
-	c.transferDispatching[req.ID] = true
-	c.mu.Unlock()
-	go func() {
-		defer func() {
-			c.mu.Lock()
-			delete(c.transferDispatching, req.ID)
-			c.mu.Unlock()
-		}()
-		attempt, problem := c.dispatch(req)
-		if problem == nil {
-			c.forget(req.ID)
-			c.logf("%s left the dispatch queue as attempt %d", req.ID, attempt)
-			go c.drain()
-			return
-		}
-		if problem.Code != exit.Unavailable && (problem.Code != exit.Conflict || req.RetainWork) {
-			c.failQueued(req.ID, problem, "")
-			go c.drain()
-			return
-		}
-		current, readProblem := c.opt.Store.RequestRow(req.ID)
-		if readProblem == nil && current != nil && (current.State == "submitted" || current.State == "queued") {
-			c.selectOrStart(*current)
-			time.AfterFunc(2*time.Second, func() { c.kickQueuedTransferDispatch(*current) })
-		}
-	}()
 }
 
 // QueuePosition is where a waiting request sits in the dispatch queue, counted from 1.
@@ -1021,7 +614,7 @@ func (c *Orchestrator) reviveQueue() {
 			continue
 		}
 		asked[machine] = true
-		c.selectOrStart(*req)
+		c.start(*req)
 	}
 }
 
@@ -1030,253 +623,6 @@ func (c *Orchestrator) reviveQueue() {
 // duplicate wakes cannot mint duplicate attempts.
 func (c *Orchestrator) WakeQueue() {
 	c.reviveQueue()
-	go c.drain()
-}
-
-// recoverWorker settles the local process death from Creator's existing records
-// authority. Runtime is a disposable execution child: it owns neither a journal nor a
-// recovery decision. An unoffered assignment returns to the queue; an offer that may have
-// crossed the process boundary closes as ABANDONED, and earns a fresh ordinal only if it
-// was never accepted. Work that may have started is never executed again.
-func (c *Orchestrator) recoverWorker(spec WorkerLaunchSpec) {
-	c.mu.Lock()
-	closing := c.closing
-	c.mu.Unlock()
-	if closing {
-		return
-	}
-	open, e := c.opt.Store.OpenAttemptsOf(spec.InstanceID())
-	if e != nil {
-		c.logf("cannot read the open attempts of %s: %s", spec.InstanceID(), e.Message)
-	}
-	if len(open) == 0 {
-		c.reviveQueue()
-		return
-	}
-	c.logf("worker %s died owing %d attempt(s); Creator is settling its local authority",
-		spec.InstanceID(), len(open))
-	for _, attempt := range open {
-		c.settleLocalProcessDeath(attempt)
-	}
-	c.reviveQueue()
-}
-
-func (c *Orchestrator) settleLocalProcessDeath(attempt records.Attempt) {
-	if attempt.State == "preparing" {
-		c.settleDispatch(attempt.RequestID, uint64(attempt.Attempt), false)
-		if e := c.opt.Store.AbortDispatch(attempt.RequestID, attempt.Attempt,
-			attempt.SessionID, "local Runtime exited before the offer boundary"); e != nil {
-			c.logf("local Runtime death could not abort %s#%d: %s",
-				attempt.RequestID, attempt.Attempt, e.Message)
-			return
-		}
-		c.enqueue(attempt.RequestID)
-		return
-	}
-	if attempt.State == "terminal" {
-		if req, read := c.opt.Store.RequestRow(attempt.RequestID); read == nil && req != nil &&
-			req.ModelTransfer != nil && req.State == "finalizing" {
-			c.kickRecoveredLocalTransfer(attempt.RequestID, attempt.Attempt)
-			return
-		}
-		if e := c.opt.Store.Closed(attempt.RequestID, attempt.Attempt); e != nil {
-			c.logf("local Runtime death could not close %s#%d: %s",
-				attempt.RequestID, attempt.Attempt, e.Message)
-			return
-		}
-		req, e := c.opt.Store.RequestRow(attempt.RequestID)
-		if e == nil && req != nil {
-			c.afterAck(*req, attempt, nil)
-		}
-		return
-	}
-	if attempt.State != "offered" && attempt.State != "accepted" &&
-		attempt.State != "recovered_open" {
-		c.logf("local Runtime death left %s#%d in unexpected state %s",
-			attempt.RequestID, attempt.Attempt, attempt.State)
-		return
-	}
-	specDigest, err := canonical.Raw(attempt.InvocationDigest)
-	if err != nil {
-		c.logf("local Runtime death cannot settle %s#%d: malformed invocation digest",
-			attempt.RequestID, attempt.Attempt)
-		return
-	}
-	message := "local Runtime exited; its execution context is gone and this ordinal will not run again"
-	body, digest, err := canonical.Identity(&pb.AttemptOutcomeBody{
-		RequestId: attempt.RequestID, AttemptOrdinal: uint64(attempt.Attempt),
-		InvocationSpecDigest: attempt.InvocationDigest,
-		Status:               pb.OutcomeStatus_OUTCOME_STATUS_ABANDONED,
-		SafeMessage:          message,
-		Cause: &pb.OutcomeCause{Code: pb.CauseCode_CAUSE_CODE_EXECUTOR_INVALIDATED,
-			Origin: pb.CauseOrigin_CAUSE_ORIGIN_RECORD_OWNER, Detail: message},
-		ExecutionStarted: attempt.State != "offered",
-	})
-	if err != nil {
-		c.logf("local Runtime death cannot author %s#%d outcome: %s",
-			attempt.RequestID, attempt.Attempt, err)
-		return
-	}
-	// onOutcome remains the one terminal validator/transaction. The synthetic local
-	// session has one buffered slot solely so its now-meaningless worker ACK can cross the
-	// existing closure boundary without another execution-specific store path.
-	s := &session{ctx: context.Background(), bootID: attempt.SessionID,
-		instanceID: attempt.InstanceID, out: make(chan *pb.RecordOwnerFrame, 1)}
-	c.onOutcome(s, &pb.AttemptOutcome{
-		RequestId: attempt.RequestID, AttemptOrdinal: uint64(attempt.Attempt),
-		InvocationSpecDigest: specDigest,
-		OutcomeId:            records.NewID("out"), OutcomeDigest: digest, OutcomeCanonicalBytes: body,
-	})
-}
-
-// retirementLoop samples typed worker/refusal grounds. The ticker schedules observation;
-// elapsed time and a count of unchanged reports grant no retirement authority.
-func (c *Orchestrator) retirementLoop() {
-	tick := time.NewTicker(ReportCadence)
-	defer tick.Stop()
-	for {
-		select {
-		case <-c.done:
-			return
-		case <-tick.C:
-			c.checkRetirement()
-		}
-	}
-}
-
-// checkRetirement replaces a worker that either blocks the head of the queue or owes an
-// active attempt, and has ANSWERED that it cannot progress. `StallGrace` and its timer are DELETED, not
-// resized (cl-025, decisions #613): no wall-clock number here may race a legitimate
-// workload, because any constant sized to one workload kills the next — H3's cold fill
-// runs minutes by construction and was killed at 90 s forever. A worker is retired on
-// exactly three grounds, each an observation rather than a schedule:
-//
-//  1. WORKER-DECLARED FAILURE — a FAILED axis is the worker saying "I cannot" and is
-//     acted on immediately. Fault rows only explain an axis: BINDING_DEGRADED explicitly
-//     coexists with service. A claim this owner REFUSED is the same terminal class.
-//
-// Stream/process exit is observed by the worker owner elsewhere. A worker that is merely
-// silent or slow is not failed or replaced by this loop.
-func (c *Orchestrator) checkRetirement() {
-	c.mu.Lock()
-	head, closing := "", c.closing
-	if len(c.pending) > 0 {
-		head = c.pending[0]
-	}
-	c.mu.Unlock()
-	if closing {
-		return
-	}
-	type candidate struct {
-		worker *worker
-		state  string
-	}
-	snapshot := func(eligible func(*worker) bool) []candidate {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		out := []candidate{}
-		for _, w := range c.workers {
-			if w.exited || w.stopping || !eligible(w) {
-				continue
-			}
-			if retirementGround(w) != "" {
-				out = append(out, candidate{worker: w,
-					state: fmt.Sprintf("%s/%s",
-						trimEnum(pb.MaterializationState_name[int32(w.materialization)], "MATERIALIZATION_STATE_"),
-						trimEnum(pb.ServingState_name[int32(w.serving)], "SERVING_STATE_"))})
-			}
-		}
-		sort.Slice(out, func(i, j int) bool {
-			return out[i].worker.instanceID < out[j].worker.instanceID
-		})
-		return out
-	}
-	retire := func(victim candidate, subject string) bool {
-		w := victim.worker
-		c.mu.Lock()
-		current := c.workers[w.instanceID] == w && !w.exited && !w.stopping
-		ground := retirementGround(w)
-		c.mu.Unlock()
-		if !current || ground == "" {
-			return false
-		}
-		c.logf("worker %s is %s while %s depends on it; retiring it: %s",
-			w.instanceID, victim.state, subject, ground)
-		if e := c.retireWorker(w); e != nil {
-			c.logf("worker %s could not be told to retire %s (%s); the stop follows",
-				w.instanceID, w.placementID, e.Message)
-		}
-		if !c.shutdownWorker(w, StopGrace) {
-			return false
-		}
-		go c.recoverWorker(w.spec)
-		return true
-	}
-
-	active := snapshot(func(w *worker) bool {
-		return retirementGround(w) != ""
-	})
-	for _, victim := range active {
-		open, e := c.opt.Store.OpenAttemptsOf(victim.worker.instanceID)
-		if e != nil || len(open) == 0 {
-			continue
-		}
-		if retire(victim, open[0].RequestID) {
-			return
-		}
-	}
-
-	if head == "" {
-		return
-	}
-	req, e := c.opt.Store.RequestRow(head)
-	if e != nil || req == nil {
-		return
-	}
-	c.mu.Lock()
-	for _, w := range c.workers {
-		if w.exited || w.stopping || !staged(w, req.PlanID) {
-			continue
-		}
-		if w.dispatchableFor(req.PlanID) ||
-			w.spec.IsJob() && w.dispatchable[req.PlanID] {
-			// Dispatchable. The queue is waiting on placement, not on this worker.
-			c.mu.Unlock()
-			return
-		}
-	}
-	c.mu.Unlock()
-	queued := snapshot(func(w *worker) bool {
-		return staged(w, req.PlanID) && !w.dispatchableFor(req.PlanID) &&
-			!(w.spec.IsJob() && w.dispatchable[req.PlanID])
-	})
-	for _, victim := range queued {
-		if retire(victim, head) {
-			return
-		}
-	}
-}
-
-func retirementGround(w *worker) string {
-	if w.refusal != nil {
-		return fmt.Sprintf("this owner refused its claim (%s: %s)",
-			w.refusal.ErrName(), w.refusal.Message)
-	}
-	if w.spec.Connection == nil && w.desiredRefusal != nil {
-		return fmt.Sprintf("it refused the desired placement (%s: %s)",
-			w.desiredRefusal.ErrName(), w.desiredRefusal.Message)
-	}
-	if w.faulted {
-		return fmt.Sprintf("it reported a FAILED worker/placement axis: %s", w.fault)
-	}
-	return ""
-}
-
-// queueDepth is how many requests are waiting for capacity right now.
-func (c *Orchestrator) queueDepth() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.pending)
 }
 
 // CancelQueued settles a request that is WAITING and has no attempt to cancel. It leaves
@@ -1291,15 +637,12 @@ func (c *Orchestrator) CancelQueued(requestID, actor string) *exit.Error {
 		"status": "CANCELED", "cause": "CLIENT_CANCELED",
 		"error_type": "CLIENT_CANCELED", "actor": actor,
 		"error": fmt.Sprintf(
-			"canceled by %s from the dispatch queue before any attempt was dispatched", actor),
+			"canceled by %s before any attempt was dispatched", actor),
 		"outputs": []any{}, "requeuing": false,
 	}
 	applied, e := c.opt.Store.CancelQueuedRequest(requestID, payload)
-	if e != nil {
+	if e != nil || !applied {
 		return e
-	}
-	if !applied {
-		return nil
 	}
 	// CancelQueuedRequest committed the request terminal and its event together. Settle
 	// the independent --out obligation too: attempt zero can never produce publishable
@@ -1312,29 +655,19 @@ func (c *Orchestrator) CancelQueued(requestID, actor string) *exit.Error {
 		}
 		return exit.Internalf("canceled request %s cannot be read back", requestID)
 	}
-	abortProblem := c.cancelLocalTransfer(requestID)
-	c.forget(requestID)
 	// The canceled terminal is only honest once nothing moves this request's bytes.
 	c.stopTransfer(requestID)
-	c.releaseCanceledSource(*row)
 	if row.ModelTransfer != nil {
 		c.forgetTransferProgress(requestID)
 		c.signalTransfer(requestID)
-		c.kickCheckpointUpload(requestID)
-	} else {
-		c.frames.forget(requestID)
 	}
-	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
+	c.forget(requestID)
+	c.logf("%s canceled before any attempt", requestID)
 	c.signalClosed(requestWaitKey(requestID),
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
 	c.cleanupRequestAssets(*row)
-	// If this was the FIFO head, the next request inherits the scheduling question now;
-	// it must not wait for an unrelated worker report merely because the old head left.
 	c.reviveQueue()
-	if problem := c.releaseManagedNow(*row); problem != nil {
-		return problem
-	}
-	return abortProblem
+	return nil
 }
 
 func (c *Orchestrator) forget(requestID string) {

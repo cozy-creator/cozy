@@ -331,7 +331,6 @@ installed build. Records at an older schema are refused, never migrated.
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, publication, checkpoints, bill where a rate exists; `model_sources` names every selected source file that has NOT verified, with the worker's own `safe_code`/`safe_detail` |
 | `POST /v1/local/jobs/{id}/pause` | local | yes | fence active attempts while preserving the same request and retained work |
 | `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
-| `POST /v1/local/jobs/{id}/retry-publication` | local | yes | retry failed output publication using the retained successful attempt and receipts; never rerun the producer |
 | `POST /v1/local/jobs/{id}/uploads` | local | yes | upload a run's retained output from the rental holding it as a private checkpoint; never rerun the producer |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
@@ -379,16 +378,6 @@ rental. Exact manifest lengths are metadata sizes and cannot size the input clos
 the producer's output working set, so this form does not purchase a new rental. A normal
 source-transfer intent still declares its source and selection, profile bindings and
 inspected headers, and uses the existing source preparation and checkpoint-custody path.
-
-A successful model producer remains `finalizing` while output publication is incomplete,
-including after an upload failure. Its receipts, worker custody and rental remain held;
-no outcome acknowledgement or automatic rental release occurs before publication succeeds
-or explicit cancellation finishes cleanup. `cozy run retry-upload <job>` (or the
-retry-publication route with an optional `actor`) retries the failed upload with the
-same request, attempt, receipts and per-object transfer identities. It does not rerun the
-producer. `cozy run cancel <job>` abandons unfinished destination holds and then settles
-cancellation; already uploaded checkpoints remain uploaded. Both decisions survive a
-daemon restart. A failed request from an older build is not silently resurrected.
 
 `queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot. Nothing
 is retried: a typed refusal, a failure or a loss after the machine took the work ends the

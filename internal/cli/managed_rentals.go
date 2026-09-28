@@ -535,16 +535,11 @@ func (m *managedRentals) attachedLocked(origin string, req records.Request, runt
 			if reason != "" {
 				c.Verdict = orchestrator.VerdictExcluded + reason
 			} else {
-				mode, held := m.owner.RentalStanding(row.ID, req.IsJob())
 				queued, problem := m.store.RentalQueueAhead(row.ID, req.ID)
 				if problem != nil {
 					return nil, problem
 				}
-				c.Ahead = queued + held
-				if mode != "" && !runtimeOwned {
-					// Runtime admits its own executions beside whatever the worker holds.
-					c.Verdict = orchestrator.VerdictExcluded + mode
-				}
+				c.Ahead = queued
 			}
 		}
 		out = append(out, c)
@@ -720,45 +715,6 @@ func (m *managedRentals) catalog(origin string) ([]hub.RentalSKU, *exit.Error) {
 	return client(m.at(origin)).RentalSKUs(hctx)
 }
 
-// release is the settlement hook the orchestrator calls as each request pinned to a rental
-// settles. The machine releases itself when idle; this reports the fleet line.
-func (m *managedRentals) release(id string) (string, *exit.Error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	row, problem := m.store.RentalRow(id)
-	if problem != nil || row == nil {
-		return "", problem
-	}
-	return m.lineLocked(row.Hub)
-}
-
-// Explicit transaction abandonment is not an idle observation. A manually held
-// rental stays reserved; the existing releaseLocked guard checks every other
-// owner before any managed rental reaches the provider DELETE.
-func (m *managedRentals) releaseRetained(id string) (string, *exit.Error) {
-	m.mu.Lock()
-	row, problem := m.store.RentalRow(id)
-	if problem != nil || row == nil {
-		m.mu.Unlock()
-		return "", problem
-	}
-	if row.ManagedRequestID == "" {
-		defer m.mu.Unlock()
-		return m.lineLocked(row.Hub)
-	}
-	line, release, problem := m.releaseLocked(id)
-	m.mu.Unlock()
-	if release == nil {
-		return line, problem
-	}
-	if problem := m.settle(release); problem != nil {
-		return "", problem
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.lineLocked(row.Hub)
-}
-
 // releaseOrphaned resumes after a daemon restart: every rental is reconciled with the hub
 // and lost work is recovered.
 func (m *managedRentals) releaseOrphaned() {
@@ -769,9 +725,6 @@ func (m *managedRentals) releaseOrphaned() {
 		return
 	}
 	m.report()
-	if m.owner != nil {
-		m.owner.RecoverLostWork()
-	}
 }
 
 // hubReconcileCadence is how often the idle loop re-asks Tensorhub what each rental IS,
@@ -814,15 +767,8 @@ func (m *managedRentals) watch(quit <-chan struct{}) {
 	if m.owner != nil {
 		go func() {
 			for range reask {
-				// OUTSIDE the lock, always: replanning released work asks the fleet for
-				// capacity and re-enters this object. Under the lock it deadlocks the
-				// daemon, measured on the first cut of this change. It runs every tick
-				// rather than on a rental observation, because a rental whose record is
-				// GONE is observed by nobody — the sweep reads the request side, which
-				// still has rows.
-				m.owner.RecoverLostWork()
-				// Hub recovery is an observed fleet change. Re-ask durable queued work;
-				// selection calls back into this object.
+				// OUTSIDE the lock, always: hub recovery is an observed fleet change, and
+				// re-asking durable queued work calls back into this object.
 				m.owner.WakeQueue()
 			}
 		}()

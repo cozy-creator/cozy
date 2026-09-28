@@ -7,34 +7,11 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func childDigest(letter string) string { return "sha256:" + strings.Repeat(letter, 64) }
-
-func TestJobInstallationUsesRuntimeOwnedHandle(t *testing.T) {
-	development := &pb.DevelopmentPackage{Package: "local/script", Release: "0.0.0"}
-	placement := &pb.Placement{PackageMode: &pb.Placement_Development{Development: development}}
-	set := &pb.PlacementSet{Placements: []*pb.Placement{placement}}
-	for _, id := range []string{"installed-original", "installed-edited"} {
-		placement.InstallationId = id
-		raw, _, err := canonical.Identity(set)
-		must(t, err)
-		got, problem := orchestrator.JobInstallationID(raw, "local/script")
-		fatal(t, problem)
-		if got != id {
-			t.Fatalf("prepared installation changed: %s", got)
-		}
-	}
-	placement.InstallationId = ""
-	raw, _, err := canonical.Identity(set)
-	must(t, err)
-	if _, problem := orchestrator.JobInstallationID(raw, "local/script"); problem == nil {
-		t.Fatal("missing installed resource acquired an invented identity")
-	}
-}
 
 func offerChildParent(t *testing.T, store *records.Store, parent records.Request) records.Request {
 	t.Helper()

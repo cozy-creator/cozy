@@ -204,8 +204,8 @@ reclaimed is TensorFS's decision from its filesystem census — repos, manifests
 database's. A pass never runs beside a local run still moving bytes in (a download's bytes are
 unnamed until its commit): `remove` defers reclamation to `model gc`, `model gc` refuses naming
 the run, the cron logs `gc: deferred`. A paused or failed run that retains its work keeps only
-the ingest sessions its retry may resume. `remove` refuses only for a live worker holding a
-model (`cozy machine stop` first) or a queued or running local run that uses it.
+the ingest sessions its retry may resume. `remove` refuses only for a queued or running local run
+that uses the model.
 
 Upload an already canonical local alias, or ingest a provider source with `model download`.
 Run quantization and other weight-producing jobs through the ordinary package command.
@@ -277,10 +277,6 @@ Submission records an ordinary `job-*` run; `--await` watches it and `cozy run w
 Use `--idempotency-key` to replay the same request. Existing source operations continue
 through their recorded intent after an upgrade. `--producer` on model upload/download is
 removed; jobs have one invocation surface.
-
-A successful producer with blocked publication retains its receipts and worker bytes.
-`cozy run retry-upload <run-id>` retries the checkpoint upload without rerunning the producer;
-explicit cancellation abandons unfinished output custody through the same finalizer.
 
 Publish, repoint, add, or remove release lanes separately. Omitted lanes stay unchanged:
 

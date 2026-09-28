@@ -425,15 +425,14 @@ func (c *ModelDeleteCmd) Run(r *Runtime) error {
 }
 
 type RunCmd struct {
-	RetryUpload RunRetryUploadCmd `cmd:"" help:"Retry a blocked checkpoint upload without rerunning its producer."`
-	Upload      RunUploadCmd      `cmd:"" help:"Upload a run's retained output, from the rental holding it, as a private checkpoint in org/model without running it again."`
-	Execute     RunExecuteCmd     `cmd:"" default:"withargs" hidden:""`
-	Cancel      RunCancelCmd      `cmd:"" help:"Cancel a queued or running run."`
-	Pause       RunPauseCmd       `cmd:"" help:"Pause a private transaction and retain its work. Rentals still shut down after 15 idle minutes; cozy rental keepalive <name> resets the deadline once."`
-	Resume      RunResumeCmd      `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
-	List        RunListCmd        `cmd:"" help:"List current and past runs."`
-	Watch       RunWatchCmd       `cmd:"" help:"Watch one recorded run until it settles."`
-	Show        RunShowCmd        `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, ranks, and each rank's attention kernels (served, or why not, and compile time)."`
+	Upload  RunUploadCmd  `cmd:"" help:"Upload a run's retained output, from the rental holding it, as a private checkpoint in org/model without running it again."`
+	Execute RunExecuteCmd `cmd:"" default:"withargs" hidden:""`
+	Cancel  RunCancelCmd  `cmd:"" help:"Cancel a queued or running run."`
+	Pause   RunPauseCmd   `cmd:"" help:"Pause a private transaction and retain its work. Rentals still shut down after 15 idle minutes; cozy rental keepalive <name> resets the deadline once."`
+	Resume  RunResumeCmd  `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
+	List    RunListCmd    `cmd:"" help:"List current and past runs."`
+	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
+	Show    RunShowCmd    `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, ranks, and each rank's attention kernels (served, or why not, and compile time)."`
 }
 
 type RunExecuteCmd struct {
@@ -474,14 +473,6 @@ func (c *RunExecuteCmd) Run(r *Runtime) error {
 		"--in", c.PayloadFile, "--asset", c.Assets, "--asset-fidelity", c.AssetFidelity,
 		"--idempotency-key", c.IdempotencyKey, "--retry", c.Retry, "--input", c.Trees, "--org", c.Org,
 		"--upload-to", c.UploadTo, "--allow-upload", c.AllowUpload, "--source-profile", c.SourceProfiles), !c.Describe)
-}
-
-type RunRetryUploadCmd struct {
-	ID string `arg:"" name:"run" help:"Run id with a retained failed checkpoint upload."`
-}
-
-func (c *RunRetryUploadCmd) Run(r *Runtime) error {
-	return r.call(handleRunRetryPublication, []string{c.ID}, nil, nil, true)
 }
 
 type RunUploadCmd struct {

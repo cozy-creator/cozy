@@ -8,7 +8,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -128,10 +127,4 @@ func selectionText(row *pb.DownloadModelRef) string {
 		return row.Model + "@" + row.Manifest
 	}
 	return row.Model + "@" + row.Release + "/" + row.Lane
-}
-
-func PackageSetSource() orchestrator.RentalPackageSetSource {
-	return func(packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRef) ([]byte, *exit.Error) {
-		return DownloadSet(packages, models)
-	}
 }

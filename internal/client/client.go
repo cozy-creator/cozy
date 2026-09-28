@@ -451,13 +451,6 @@ func (c *Client) JobContext(ctx context.Context, id string) (api.JobState, *exit
 	return state, e
 }
 
-// RetryJobPublication retries only destination retention of an already successful producer.
-func (c *Client) RetryJobPublication(id, actor string) (api.JobState, *exit.Error) {
-	var state api.JobState
-	problem := c.call("POST", "/v1/local/jobs/"+id+"/retry-publication", map[string]string{"actor": actor}, &state)
-	return state, problem
-}
-
 // UploadJobOutput uploads a job's retained output from the rental holding it to a private
 // checkpoint in destination; the answer carries the upload's state.
 func (c *Client) UploadJobOutput(id, output, destination string) (api.JobState, *exit.Error) {

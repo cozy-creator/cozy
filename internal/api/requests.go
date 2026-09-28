@@ -1134,81 +1134,22 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 	if s.machineRequestControl(w, r, *row, "cancel", actor) {
 		return
 	}
-	id := row.ID
-	if row.RetainWork && (row.IsJob() || row.ParentRequestID != "") && row.State != "finalizing" && (!records.Settled(row.State) || (row.State == "succeeded" && row.RetainsLocalOutputs())) {
-		if e := s.orchestrator.CancelRetainedRequest(id, actor); e != nil {
-			s.refuseTyped(w, r, e)
-			return
-		}
-		updated, e := s.store.RequestRow(id)
-		if e != nil || updated == nil {
-			s.refuse(w, r, http.StatusInternalServerError, "internal", "canceled request cannot be read", "")
-			return
-		}
-		s.ok(w, r, http.StatusAccepted, s.lifecycleOf(*updated))
-		return
-	}
 	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
 		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
 		return
 	}
-	attempts, e := s.store.Attempts(id)
-	if e != nil {
+	// No machine executes it: the daemon's own model transfer, which has no attempt.
+	if e := s.orchestrator.CancelQueued(row.ID, actor); e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if len(attempts) == 0 {
-		if e := s.orchestrator.CancelQueued(id, actor); e != nil {
-			s.refuseTyped(w, r, e)
-			return
-		}
-		updated, e := s.store.RequestRow(id)
-		if e != nil || updated == nil {
-			s.refuse(w, r, http.StatusInternalServerError, "internal",
-				"the queued request was canceled and cannot be read back", "")
-			return
-		}
-		s.ok(w, r, http.StatusOK, s.lifecycleOf(*updated))
+	updated, e := s.store.RequestRow(row.ID)
+	if e != nil || updated == nil {
+		s.refuse(w, r, http.StatusInternalServerError, "internal",
+			"the request was canceled and cannot be read back", "")
 		return
 	}
-	last := attempts[len(attempts)-1]
-	if last.State == "closed" || last.State == "dispatch_aborted" {
-		if e := s.orchestrator.CancelQueued(id, actor); e != nil {
-			s.refuseTyped(w, r, e)
-			return
-		}
-		updated, e := s.store.RequestRow(id)
-		if e != nil || updated == nil {
-			s.refuse(w, r, http.StatusInternalServerError, "internal",
-				"the queued request was canceled and cannot be read back", "")
-			return
-		}
-		s.ok(w, r, http.StatusOK, s.lifecycleOf(*updated))
-		return
-	}
-	if last.State == "terminal" {
-		s.refuse(w, r, http.StatusConflict, "terminal_ack_pending",
-			"the current attempt has a terminal whose retry/settlement projection is not acknowledged yet",
-			"retry cancellation after the terminal ack; no new attempt can dispatch before that projection")
-		return
-	}
-	grace := orchestrator.ClientCancelGraceMS
-	if v := r.URL.Query().Get("grace_ms"); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 120000 {
-			grace = n
-		}
-	}
-	if e := s.orchestrator.CancelClient(id, uint64(last.Attempt), grace, actor); e != nil {
-		s.refuseTyped(w, r, e)
-		return
-	}
-	// A cancel is a REQUEST for cancellation, never a verdict. The attempt's own
-	// journaled terminal is what settles it, and a non-cooperative handler may still
-	// succeed. Saying "canceled" here would be exactly the lie the protocol refuses.
-	s.ok(w, r, http.StatusAccepted, map[string]any{
-		"request_id": id, "attempt": last.Attempt, "status": "cancel_requested",
-		"note": "the attempt's own journaled terminal settles it; watch the event stream",
-	})
+	s.ok(w, r, http.StatusOK, s.lifecycleOf(*updated))
 }
 
 // All execution venues expose the same work coordinates. Machine observations
@@ -1228,16 +1169,18 @@ func (s *Server) fillLifecycleProgress(life *Lifecycle, row records.Request) {
 	default:
 		return
 	}
-	progress, ok := s.orchestrator.LatestProgress(row.ID, life.Attempt)
-	if !ok && life.MachineExecution != nil {
-		if value, problem := s.store.LatestMachineProgress(row.ID, int64(life.Attempt)); problem == nil {
-			progress, ok = orchestrator.DecodeProgressSnapshot(value)
-		}
-		progress.RemainingMS, progress.Estimated = s.store.MachineProgressEstimate(row.ID, int64(life.Attempt))
+	if life.MachineExecution == nil {
+		return
 	}
+	value, problem := s.store.LatestMachineProgress(row.ID, int64(life.Attempt))
+	if problem != nil {
+		return
+	}
+	progress, ok := orchestrator.DecodeProgressSnapshot(value)
 	if !ok {
 		return
 	}
+	progress.RemainingMS, progress.Estimated = s.store.MachineProgressEstimate(row.ID, int64(life.Attempt))
 	life.OverallFraction = progress.OverallFraction
 	if life.Status == "in_progress" {
 		life.ProgressStage = progress.Stage

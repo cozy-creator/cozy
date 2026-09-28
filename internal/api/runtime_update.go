@@ -2,9 +2,10 @@ package api
 
 import (
 	"encoding/json"
-	"github.com/cozy-creator/cozy/internal/records"
 	"io"
 	"net/http"
+
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 type RuntimeUpdate = records.RuntimeUpdate

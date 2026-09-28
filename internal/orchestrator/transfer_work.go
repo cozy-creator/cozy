@@ -2,10 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"time"
-
-	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // transferWork is everything moving one request's model bytes right now: Hub fetches,
@@ -66,38 +62,4 @@ func (c *Orchestrator) stopTransfer(requestID string) {
 	if work := c.cancelTransfer(requestID); work != nil {
 		<-work.idle
 	}
-}
-
-// releaseCanceledSource tells the pod to stop a canceled request's source download and
-// conversion: its Host cancels the fetches and drains them before it answers. A pod that
-// cannot answer yet is asked again until it does or its rental is gone. Retained work
-// releases its source through its own cancellation instead.
-func (c *Orchestrator) releaseCanceledSource(request records.Request) {
-	if request.RetainWork || request.Worker == "" || !request.ModelTransfer.HasAcquisition() {
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		go func() {
-			select {
-			case <-c.done:
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
-		problem := c.releaseRetainedSource(ctx, request)
-		if problem == nil {
-			c.logf("canceled model transfer %s: rental %s stopped its source work", request.ID, request.Worker)
-			return
-		}
-		c.logf("canceled model transfer %s: source release on rental %s pending: %s",
-			request.ID, request.Worker, problem.Message)
-		c.mu.Lock()
-		closing := c.closing
-		c.mu.Unlock()
-		if problem.Code == exit.Unavailable && !closing {
-			time.AfterFunc(ReportCadence, func() { c.releaseCanceledSource(request) })
-		}
-	}()
 }

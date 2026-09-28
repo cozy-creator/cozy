@@ -112,17 +112,6 @@ func TestPublicRunStatusProjectsStoppedFailuresAndPendingAcceptanceConsistently(
 	if o.store.RetainedRetryAvailable(*row) {
 		t.Fatal("ambiguous acceptance advertised retry")
 	}
-	// Public failure remains cancellable when it still holds private work.
-	code, out := runCozy(t, o.root, "run", "cancel", strconv.FormatInt(manual.Number, 10), "--json")
-	var canceled struct{ Changed bool }
-	if code != 0 || json.Unmarshal([]byte(out), &canceled) != nil || !canceled.Changed {
-		t.Fatalf("failed retained work could not be released [%d]: %s", code, out)
-	}
-	row, problem = o.store.RequestRow(manual.ID)
-	fatal(t, problem)
-	if row.State != "canceled" {
-		t.Fatalf("retained work cancellation did not reach store: %s", row.State)
-	}
 }
 
 func TestPublicRunStatusFreezesStoppedExecutionAtOriginalEvent(t *testing.T) {

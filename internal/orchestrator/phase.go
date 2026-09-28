@@ -253,38 +253,8 @@ func (p *phases) forget(subject string) {
 // rental acquisition, the pod host's prepare stream, and the placement convergence all
 // report through it, so there is one accumulator and one set of rules about what a
 // missing number means.
-//
-// It also FANS THE SAMPLE OUT to whoever is attached to a request the subject is
-// preparing for, over the lossy live lane. Without that, an attached `cozy run` learns
-// nothing until the next durable queue event, and during a materialization there is no
-// next durable queue event: the drain runs on worker reports, and a worker mid-download
-// reports nothing for hours. That is precisely how a healthy run became indistinguishable
-// from a hung one.
 func (c *Orchestrator) ObservePhase(subject string, sample PhaseSample) {
 	c.phases.observe(subject, sample)
-	for _, requestID := range c.phaseAudience(subject) {
-		// A shared worker observation must not replace this request's FIFO or
-		// capacity wait. Live frames and newly attached watchers use one view.
-		if observed, ok := c.QueuePhase(requestID); ok {
-			c.frames.publish(observed.Frame(requestID))
-		}
-	}
-}
-
-// phaseAudience names the queued requests this subject's phase describes. A request-scoped
-// subject describes exactly itself; a worker-scoped one may affect queued requests
-// waiting on that worker. Each recipient still projects its own current queue wait
-// before the observation is broadcast; it does not inherit raw worker preparation.
-func (c *Orchestrator) phaseAudience(subject string) []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	audience := make([]string, 0, len(c.pending))
-	for _, requestID := range c.pending {
-		if requestID == subject || c.preparingFor(requestID) == subject {
-			audience = append(audience, requestID)
-		}
-	}
-	return audience
 }
 
 // Frame uses the same phase document for live updates and initial SSE snapshots.
@@ -332,29 +302,23 @@ func (p PhaseObservation) wire() map[string]any {
 	return out
 }
 
-// QueuePhase answers what a request that has not yet dispatched is doing, for the surfaces
-// that render it. A current capacity wait wins over old preparation observations;
-// otherwise a real preparation observation wins and the routing's wait cause stands in
-// so the column is never blank while the request is genuinely waiting on capacity. The
-// stand-in carries no timing, because a wait cause is a classification and not a
-// measurement — and inventing an elapsed for it would be exactly the fabrication this lane
-// refuses everywhere else.
+// QueuePhase answers what a request that has not yet started is doing, for the surfaces
+// that render it: its observed preparation, or else the wait it is in — for a machine to be
+// bought, or to start. The stand-in carries no timing, because a wait cause is a
+// classification and not a measurement.
 func (c *Orchestrator) QueuePhase(requestID string) (PhaseObservation, bool) {
 	row, problem := c.opt.Store.RequestRow(requestID)
 	if problem != nil || row == nil || (row.State != "submitted" && row.State != "queued") {
 		return PhaseObservation{}, false
 	}
-	facts := c.waitOf(*row)
-	if facts.cause != WaitSlotBusy && facts.cause != WaitQueueAhead {
-		if observed, ok := c.PhaseOf(requestID); ok {
-			return c.phaseRental(requestID, observed), true
-		}
+	if observed, ok := c.PhaseOf(requestID); ok {
+		return c.phaseRental(requestID, observed), true
 	}
-	if facts.cause == "" {
-		return PhaseObservation{}, false
+	wait := WaitWorkerStart
+	if row.Rental && row.Worker == "" {
+		wait = WaitRental
 	}
-	return c.phaseRental(requestID, PhaseObservation{Name: facts.cause, Machine: facts.on,
-		WaitingFor: facts.waitingFor}), true
+	return c.phaseRental(requestID, PhaseObservation{Name: wait}), true
 }
 
 // PreparationPhase is one subject's observation read directly — the worker instance a
@@ -368,56 +332,13 @@ func (c *Orchestrator) PreparationPhase(subject string) (PhaseObservation, bool)
 // request settles, a worker exits, a preparation ends.
 func (c *Orchestrator) ForgetPhase(subject string) { c.phases.forget(subject) }
 
-// PhaseOf answers what a not-yet-dispatched request is actually doing, or false when
+// PhaseOf answers what a not-yet-started request is actually doing, or false when
 // nothing has been observed about it.
-//
-// Two subjects can hold an answer and the order between them is the point: a phase
-// recorded against the REQUEST is about getting it a machine, and one recorded against
-// the WORKER is about making that machine serve it. The request's own phase wins while it
-// exists, because a request that has not been bound to a worker cannot be described by
-// any worker's phase.
 func (c *Orchestrator) PhaseOf(requestID string) (PhaseObservation, bool) {
 	if requestID == "" {
 		return PhaseObservation{}, false
 	}
-	if observed, ok := c.phases.snapshot(requestID); ok {
-		return observed, true
-	}
-	c.mu.Lock()
-	instance := c.preparingFor(requestID)
-	c.mu.Unlock()
-	if instance == "" {
-		return PhaseObservation{}, false
-	}
-	return c.phases.snapshot(instance)
-}
-
-// preparingFor names the worker whose preparation this queued request is waiting on. It
-// is the same question `classifyCapacityWait` asks and is answered the same way — the
-// worker pinned by the request's rental, or the live worker in the request's own slot —
-// so the phase shown can never belong to a machine the request is not waiting for.
-// Callers hold c.mu.
-func (c *Orchestrator) preparingFor(requestID string) string {
-	row, problem := c.opt.Store.RequestRow(requestID)
-	if problem != nil || row == nil {
-		return ""
-	}
-	slot := pinnedPackage(row.Package, row.Worker)
-	for _, w := range c.workers {
-		if w.exited || w.stopping {
-			continue
-		}
-		if row.Worker != "" && w.spec.Connection != nil {
-			if w.instanceID == rentalInstanceID(row.Worker) {
-				return w.instanceID
-			}
-			continue
-		}
-		if w.spec.Connection == nil && w.spec.Placement.Package == slot {
-			return w.instanceID
-		}
-	}
-	return ""
+	return c.phases.snapshot(requestID)
 }
 
 // PhaseOfHubRental maps what the hub says about a rental onto this vocabulary, and only

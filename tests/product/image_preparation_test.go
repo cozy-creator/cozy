@@ -89,7 +89,7 @@ func TestImagePreparationActualCLI(t *testing.T) {
 	runtimeBin := filepath.Join(prefix, "bin", "cozy-runtime") //cozy:allow exact Runtime wheel in the isolated product fixture
 	run := func(args ...string) (int, string, string) {
 		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-		cmd.Env = launch.InstallToolEnv(records.PackageInstall{Runtime: runtimeBin}, childEnv(t, root))
+		cmd.Env = withPathPrefix(childEnv(t, root), filepath.Dir(runtimeBin))
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		_ = cmd.Run()
@@ -222,4 +222,16 @@ func TestImageSourceProbeDoesNotHashTheLargeSource(t *testing.T) {
 	if _, problem := inputasset.Fingerprint(path, 1024); problem == nil {
 		t.Fatal("admitted byte bound was widened by the header probe")
 	}
+}
+
+// withPathPrefix puts prefix first on PATH, so a child finds that Runtime.
+func withPathPrefix(env []string, prefix string) []string {
+	out := append([]string(nil), env...)
+	for index, value := range out {
+		if strings.HasPrefix(value, "PATH=") {
+			out[index] = "PATH=" + prefix + string(os.PathListSeparator) + strings.TrimPrefix(value, "PATH=")
+			return out
+		}
+	}
+	return append(out, "PATH="+prefix)
 }

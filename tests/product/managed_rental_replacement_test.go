@@ -2,18 +2,13 @@ package producttest
 
 import (
 	"bytes"
-	"encoding/json"
-	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -107,70 +102,5 @@ func TestReleasedManagedRentalGetsOneConcurrentReplacement(t *testing.T) {
 	fatal(t, problem)
 	if saved.State != "released" || !bytes.Equal(saved.RequestBody, first.RequestBody) {
 		t.Fatal("replacement overwrote the old paid obligation")
-	}
-}
-
-func TestLostOnlyRentalReacquiresForTheSameSourceJob(t *testing.T) {
-	root := t.TempDir()
-	peer := newFakeRentalHub(t, 0)
-	port := peer.port()
-	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+origin+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
-	peer.packageReleases = map[string]any{"proof/source-producer@1": rentalReleaseFacts()}
-	peer.setSKUs(map[string]any{"name": "cpu", "accelerator_model": "CPU", "accelerator_count": 1, "price_usd_micros_per_hour": 100000, "base_worker_profile": "python3.12-cpu-linux-x86"})
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	const request = "job-source-replacement"
-	replacementRequest(t, store, request, "rental-lost-only")
-	before, problem := store.RequestRow(request)
-	fatal(t, problem)
-	original, _, problem := store.BeginRentalOperation(records.RentalOperation{Key: "managed-rental-" + request, Hub: origin, HourlyRateUSDMicros: 100000, ManagedRequestID: request}, replacementAuthor)
-	fatal(t, problem)
-	fatal(t, store.AdvanceRentalOperation(original.Key, "rental-lost-only", "attached"))
-	var oldBody struct{ Name string }
-	must(t, json.Unmarshal(original.RequestBody, &oldBody))
-	peer.add("rental-lost-only", oldBody.Name)
-	peer.setState("rental-lost-only", "released", "")
-	fatal(t, store.RecordRental(records.Rental{AcceleratorCount: 1, ID: "rental-lost-only", MachineName: oldBody.Name, SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 100000, ManagedRequestID: request, State: "ready", Hub: origin}))
-	var creates atomic.Int64
-	peer.rent = func(body map[string]any) map[string]any {
-		creates.Add(1)
-		return map[string]any{"rental_id": "pr-replacement-only", "name": body["name"], "state": "acquiring", "requested_accelerator_model": "CPU", "accelerator_count": 1, "hourly_rate_usd_micros": 100000}
-	}
-	startDaemonProcess(t, root)
-	defer peer.setState("pr-replacement-only", "failed", "fixture_finished")
-	deadline := time.After(20 * time.Second)
-	for creates.Load() == 0 {
-		select {
-		case <-deadline:
-			t.Fatalf("original source job did not create replacement; %s", tail(filepath.Join(root, "daemon.log")))
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-	next, problem := store.ManagedRentalOperationKey(request)
-	fatal(t, problem)
-	op, problem := store.RentalOperation(next)
-	fatal(t, problem)
-	if op == nil || op.Key == original.Key || op.ManagedRequestID != request {
-		t.Fatalf("replacement lost request lineage: %+v", op)
-	}
-	// A queued source job has not reached any byte/preparation/producer boundary;
-	// this arm proves real owner recovery and paid-create identity, not native custody.
-	after, problem := store.RequestRow(request)
-	fatal(t, problem)
-	a, _ := json.Marshal(before.ModelTransfer)
-	b, _ := json.Marshal(after.ModelTransfer)
-	if after.ID != request || after.State == "failed" || after.BodyDigest != before.BodyDigest || !bytes.Equal(a, b) {
-		t.Fatalf("replacement changed or failed the original source request: %+v", after)
-	}
-	attempts, problem := store.Attempts(request)
-	fatal(t, problem)
-	if len(attempts) != 0 {
-		t.Fatal("provider acquisition invented a producer attempt")
-	}
-	time.Sleep(200 * time.Millisecond)
-	if creates.Load() != 1 {
-		t.Fatalf("one lost rental created %d replacements", creates.Load())
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -126,47 +125,6 @@ func TestRequestedRentalSurvivesRecordsAndRejectsReassignment(t *testing.T) {
 	fatal(t, problem)
 	if row.RequestedRental != "wanted" || row.Worker != "wanted" {
 		t.Fatalf("affinity lost after reopen: %+v", row)
-	}
-}
-
-func TestRequestedRentalLossSettlesWithoutFallback(t *testing.T) {
-	var purchases atomic.Int32
-	o := hostOwner(t, "explicit-rental-loss", func(opt *orchestrator.Options) {
-		opt.AcquireManagedRental = func(records.Request) (orchestrator.PlacementDecision, string, *exit.Error) {
-			purchases.Add(1)
-			return orchestrator.PlacementDecision{}, "", nil
-		}
-	})
-	for _, id := range []string{"queued", "running"} {
-		_, _, problem := o.store.Submit(records.Request{ID: id, IdemKey: id, BodyDigest: "sha256:" + strings.Repeat("1", 64), Package: "proof/model", Entrypoint: "run", Payload: []byte("{}"), Rental: true, RentalRequired: true, Worker: "gone", RequestedRental: "gone"})
-		fatal(t, problem)
-	}
-	fatal(t, o.store.SpawnWorker(records.WorkerProcess{InstanceID: "lost", Package: "proof/model", WorkerID: "lost", Devices: []string{"cpu"}}))
-	ordinal, problem := o.store.Dispatch(records.Attempt{RequestID: "running", SessionID: "session", InstanceID: "lost", InvocationDigest: "sha256:" + strings.Repeat("2", 64), InvocationCanonical: []byte("{}")})
-	fatal(t, problem)
-	fatal(t, o.store.OfferDispatch("running", ordinal, "session"))
-	fatal(t, o.store.Accepted("running", ordinal, "session"))
-	o.c.RecoverLostWork()
-	for _, id := range []string{"queued", "running"} {
-		row, problem := o.store.RequestRow(id)
-		fatal(t, problem)
-		if row.State != "failed" || row.Worker != "gone" || row.RequestedRental != "gone" {
-			t.Fatalf("fixed rental loss replanned %s: %+v", id, row)
-		}
-	}
-	events, problem := o.store.EventsAfter("running", 0, 100)
-	fatal(t, problem)
-	terminal := false
-	for _, event := range events {
-		if event.Type == "request.failed" && event.Payload["error_type"] == "rental.selected_lost" && event.Payload["requeuing"] == false {
-			terminal = true
-		}
-	}
-	if !terminal {
-		t.Fatal("lost active attempt has no terminal event")
-	}
-	if purchases.Load() != 0 {
-		t.Fatal("loss bought replacement")
 	}
 }
 

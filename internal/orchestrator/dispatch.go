@@ -3,21 +3,12 @@ package orchestrator
 import (
 	"encoding/base64"
 	"encoding/json"
-	"math"
-	"net/url"
-	"os"
-	"path/filepath"
-	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/inputasset"
-	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -408,107 +399,21 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 	if current.State != "submitted" && current.State != "queued" {
 		return uint64(current.Ordinal), nil
 	}
-	req = *current
-	if req.ModelTransfer != nil && req.Package == "cozy/platform" &&
-		req.Entrypoint == "model-pass-through" {
-		// Narrow attempt-zero exception: an unchanged verified Manifest has no code
-		// to execute and no bytes to reproduce. The boundary hooks settle the same
-		// ordinary request/events/watch/cancel surface; producer transfers never enter here.
-		go c.runModelPassThrough(req)
+	if passThrough(*current) {
+		// An unchanged verified Manifest has no code to execute and no bytes to
+		// reproduce; the daemon moves it and settles the ordinary request.
+		go c.runModelPassThrough(*current)
 		return 0, nil
 	}
-	// A SUBMISSION NEVER OVERTAKES WORK ALREADY WAITING. Dispatching straight from submit
-	// is what keeps a warm request fast, and it is exactly what breaks FIFO when a queue
-	// exists: a request arriving while six are parked would take the free slot the head of
-	// the queue is waiting for. Found live by cl-004's depth pass — the LAST of six
-	// submissions settled FIRST. So: with a queue, join it; the drain below still runs
-	// immediately, so the head goes out now rather than at the next Report (cr-019).
-	if c.queueDepth() > 0 {
-		if !c.enqueue(req.ID) {
-			return 0, nil
-		}
-		position, depth := c.QueueState(req.ID)
-		c.emit(req.ID, "request.queued", 0, waitFacts{cause: WaitQueueAhead}.decorate(map[string]any{
-			"reason":   "the dispatch queue is not empty; this request joins it in submission order",
-			"position": position, "depth": depth,
-		}, req))
-		c.logf("%s QUEUED behind %d waiting request(s)", req.ID, c.QueuePosition(req.ID)-1)
-		c.selectOrStart(req)
-		go c.drain()
-		return 0, nil
-	}
-	attempt, e := c.dispatch(req)
-	if e != nil {
-		// NO CAPACITY is a STATE, not a failure (cl-006): the request row is already
-		// durable, so refusing it here would mean the client holds an id for something
-		// that never runs. It waits for capacity exactly as a requeue does — one queue,
-		// one projection. Every OTHER refusal (an open recovered obligation, a live
-		// attempt) is a real conflict and still refuses.
-		if e.Code != exit.Unavailable {
-			c.failQueued(req.ID, e, "")
-			return 0, e
-		}
-		if !c.enqueue(req.ID) {
-			return 0, nil
-		}
-		c.emit(req.ID, "request.queued", 0,
-			c.waitOf(req).decorate(map[string]any{"reason": e.Message}, req))
-		c.logf("%s QUEUED for capacity: %s", req.ID, e.Message)
-		c.selectOrStart(req)
-		go c.drain()
-		return 0, nil
-	}
-	return attempt, nil
+	c.retireClassic(*current)
+	return 0, ClassicRetired()
 }
 
-// RequeueForCapacity returns a request a worker could not admit right now to the queue.
-// It PARKS there: only a worker reporting capacity re-dispatches it, so the wait is driven
-// by an observation rather than a cadence, and it spends nothing — the worker has not
-// attempted anything. The local path draws the same line: `device_envelope_held` keeps the
-// request queued until a later idle-capacity report re-enters select-or-start.
-func (c *Orchestrator) RequeueForCapacity(requestID, why string) {
-	started, e := c.opt.Store.BeginRequeue(requestID)
-	if e != nil {
-		c.logf("%s NOT requeued (%s): %s", requestID, why, e.Message)
-		return
-	}
-	if !started {
-		return
-	}
-	req, e := c.opt.Store.RequestRow(requestID)
-	if e != nil || req == nil {
-		return
-	}
-	// Announced before dispatch, which may or may not find capacity, so a client can tell
-	// a first dispatch from a re-offer.
-	c.emit(requestID, "request.requeued", 0, map[string]any{"cause": why})
-	attempt, e := c.dispatch(*req)
-	if e != nil {
-		// No capacity yet: the request WAITS, and dispatch resumes the moment a worker
-		// reports the binding ready.
-		c.enqueue(requestID)
-		c.emit(requestID, "request.queued", 0,
-			c.waitOf(*req).decorate(map[string]any{"reason": e.Message}, *req))
-		c.logf("%s requeued and QUEUED for capacity: %s", requestID, e.Message)
-		c.selectOrStart(*req)
-		return
-	}
-	c.logf("%s requeued as attempt %d (cause %s)", requestID, attempt, why)
+// passThrough is the daemon's own model transfer: no machine executes it.
+func passThrough(req records.Request) bool {
+	return req.ModelTransfer != nil && req.Package == "cozy/platform" && req.Entrypoint == "model-pass-through"
 }
 
-// selectOrStart makes a queued request's package resident. It is the half of `cozy run`
-// that "cold and warm traverse the same states" rests on: SELECT the worker that already
-// advertises the binding, or START one — never a second invocation mechanism, and never a
-// client's job. `cozy run` is the same act made explicit for prewarming.
-//
-// It runs off the caller's goroutine because a cold start is a 4.782 GiB fill, and the
-// submitting client is already watching the event stream that will say when it lands. The
-// dispatch itself is still `drain`'s, triggered by the worker reporting READY: this
-// function never dispatches, so there is exactly one placement path.
-//
-// A worker that cannot become dispatchable is a TERMINAL condition for the request, not a
-// longer wait. A request that queues forever behind a worker that died on boot is the
-// worst of both: no output and no answer.
 // startMachineExecution admits the async observer before releasing the closing
 // fence. A delayed activation after HTTP admission may not cross a later down.
 func (c *Orchestrator) startMachineExecution(req records.Request) *exit.Error {
@@ -528,32 +433,30 @@ func (c *Orchestrator) startMachineExecution(req records.Request) *exit.Error {
 	return c.opt.StartMachineExecution(req)
 }
 
-func (c *Orchestrator) selectOrStart(req records.Request) {
-	c.prepare(req)
-}
-
-// prepare is select-or-start's body: a machine execution starts on its machine.
-func (c *Orchestrator) prepare(req records.Request) bool {
+// start begins owed work: a machine execution on its machine; anything else was
+// accepted for the retired classic worker and ends, named.
+func (c *Orchestrator) start(req records.Request) {
 	c.mu.Lock()
 	closing := c.closing
 	c.mu.Unlock()
 	if closing {
-		return false
+		return
 	}
 	if link, problem := c.opt.Store.MachineExecution(req.ID); problem != nil || link != nil {
 		if problem == nil && c.opt.StartMachineExecution != nil {
 			_ = c.startMachineExecution(req)
 		}
-		return false
+		return
 	}
-	// Every request runs as a machine execution; one without its link was accepted for the
-	// retired classic worker and ends here, named.
+	if passThrough(req) {
+		go c.runModelPassThrough(req)
+		return
+	}
 	current, problem := c.opt.Store.RequestRow(req.ID)
 	if problem != nil || current == nil || (current.State != "submitted" && current.State != "queued") {
-		return false
+		return
 	}
-	c.failPreparation(*current, ClassicRetired(), "")
-	return false
+	c.retireClassic(*current)
 }
 
 // AwaitRental says why a queued request waits while the fleet buys its machine.
@@ -563,8 +466,18 @@ func (c *Orchestrator) AwaitRental(requestID, machine string) {
 	if problem != nil || req == nil || position == 0 {
 		return
 	}
-	c.park(*req, position-1, waitFacts{cause: WaitRental, on: machine},
-		"waiting for rental "+machine+" to become ready")
+	reason := "waiting for rental " + machine + " to become ready"
+	c.mu.Lock()
+	changed := c.parked[requestID] != reason
+	c.parked[requestID] = reason
+	c.mu.Unlock()
+	if !changed {
+		return
+	}
+	c.logf("%s PARKED at queue position %d: %s", requestID, position, reason)
+	c.emit(requestID, "request.parked", 0, waitFacts{cause: WaitRental, on: machine}.decorate(map[string]any{
+		"reason": reason, "position": position,
+	}, *req))
 }
 
 // requestSlot names what a request needs resident before assignment. Explicit
@@ -589,48 +502,6 @@ func requestSlot(req records.Request) string {
 func (c *Orchestrator) LogPlacement(req records.Request, decision PlacementDecision) {
 	c.logf("%s: %s; candidates: %s", req.ID, decision.Line(), decision.verdicts())
 	c.emit(req.ID, "request.placement", 0, decision.payload())
-}
-
-// staged answers whether this worker was launched with the given plan id staged for it.
-// It reads what the LAUNCHER wrote, not what the worker has got around to advertising: a
-// worker still filling is capacity, a worker holding a different digest is not.
-func staged(w *worker, planID string) bool {
-	for _, id := range w.planIDs {
-		if id == planID {
-			return true
-		}
-	}
-	return false
-}
-
-func stagedFor(w *worker, req records.Request) bool {
-	if req.IsJob() && w.spec.Connection != nil {
-		// Exact job inputs include their count; an unknown older selection
-		// cannot satisfy a requested model through the serving wildcard.
-		return staged(w, req.PlanID) && exactJobSelection(w.spec.Placement, req)
-	}
-	return staged(w, req.PlanID) && selectionServes(req.Models, w.spec.Placement.Models)
-}
-
-func exactJobSelection(placement DesiredPlacement, req records.Request) bool {
-	if req.InstallID != "" && placement.InstallID != req.InstallID ||
-		req.LocalInstallationID != "" && placement.InstallationID != req.LocalInstallationID ||
-		req.Release != "" && placement.Release != req.Release || len(placement.Models) != len(req.Models) {
-		return false
-	}
-	for _, requested := range req.Models {
-		found := false
-		for _, held := range placement.Models {
-			if held.Slot == requested.Slot && held.Manifest == requested.Manifest && held.ManifestLength == requested.ManifestLength {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
 }
 
 // selectionServes is the model half of the match (cl-114): a placement that holds a slot
@@ -677,20 +548,6 @@ func requireAdapterEcho(requested, observed []ModelRef) *exit.Error {
 	return nil
 }
 
-func requireAdapterPlacementEcho(requested []ModelRef, placement DesiredPlacement) *exit.Error {
-	doc, err := canonical.Read(placement.PlacementSetBytes, &pb.PlacementSet{})
-	if err != nil {
-		return exit.Named(exit.Structural, "model_adapters_preparation_mismatch", "prepared model bindings are not readable")
-	}
-	for _, row := range doc.List("placements") {
-		if row.Str("bindings_digest") == placement.BindingsDigest &&
-			(placement.PlacementIDValue == "" || row.Str("placement_id") == placement.PlacementIDValue) {
-			return requireAdapterEcho(requested, placementModels(placement.Package, row))
-		}
-	}
-	return exit.Named(exit.Structural, "model_adapters_preparation_mismatch", "prepared model binding identity is absent")
-}
-
 // rungHolding answers whether a held manifest is one the request's ref accepts: its own
 // pin, or — unpinned — any rung of its ladder (cl-166). The rung is what a dispatch onto
 // that placement pins the request to.
@@ -718,422 +575,27 @@ func settledState(state string) bool {
 // failQueued settles a request that can never be placed. It is a request-level terminal:
 // no offer crossed to a worker, so there is no worker terminal to replay and the request
 // row is what settles. A closed dispatch_aborted row may remain as preparation history.
-func (c *Orchestrator) failQueued(requestID string, cause *exit.Error, workerToStop string) {
-	c.failQueuedSelection(requestID, nil, cause, workerToStop)
-}
-
-func (c *Orchestrator) failPreparation(expected records.Request, cause *exit.Error, workerToStop string) {
-	c.failQueuedSelection(expected.ID, &expected, cause, workerToStop)
-}
-
-func (c *Orchestrator) failQueuedSelection(requestID string, expected *records.Request, cause *exit.Error, workerToStop string) {
-	payload := records.QueuedFailure(cause)
-	// The preparation waiter can outlive an accepted attempt or its successful
-	// finalization. The store is the sole authority to fail queued work; neither
-	// cleanup nor worker/provider teardown may run before that transaction wins.
-	var applied bool
-	var problem *exit.Error
-	if expected == nil {
-		applied, problem = c.opt.Store.FailQueuedRequest(requestID, payload)
-	} else {
-		applied, problem = c.opt.Store.FailQueuedPreparation(*expected, payload)
-	}
-	if problem != nil {
-		if problem.Code == exit.Conflict {
-			c.logf("%s preparation failure no longer applies: %s", requestID, problem.Message)
-			return
-		}
-		c.logf("%s could not be settled: %s", requestID, problem.Message)
-		time.AfterFunc(2*time.Second, func() { c.failQueuedSelection(requestID, expected, cause, workerToStop) })
+// retireClassic ends a request no machine executes and that is not the daemon's own
+// transfer: it was accepted for the retired classic worker.
+func (c *Orchestrator) retireClassic(req records.Request) {
+	cause := ClassicRetired()
+	applied, problem := c.opt.Store.FailQueuedPreparation(req, records.QueuedFailure(cause))
+	if problem != nil || !applied {
 		return
 	}
-	if !applied {
-		c.logf("%s preparation failure no longer applies: %s", requestID, cause.Message)
-		return
-	}
-	c.forget(requestID)
-	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil && row.RetainWork {
-		c.logf("%s BLOCKED (%s): %s", requestID, cause.ErrName(), cause.Message)
-		c.signalClosed(requestWaitKey(requestID), cause)
-		return
-	}
-	// A local worker that cannot make this binding resident would hold its device grant
-	// forever. A rental's worker is the shared control lane for every package on that
-	// machine; one request's preparation failure never detaches it.
-	if workerToStop != "" {
-		c.mu.Lock()
-		w := c.workers[workerToStop]
-		shared := w != nil && w.spec.Connection != nil
-		c.mu.Unlock()
-		if !shared {
-			c.ShutdownWorker(workerToStop, StopGrace)
-		}
-	}
+	c.forget(req.ID)
 	// An output obligation exists before attempt one. Settle it as skipped so
-	// the caller does not wait for bytes a failed preparation cannot produce.
-	c.RetryOutputExport(requestID)
-	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil {
-		go c.cleanupRequestAssets(*row)
-		if row.ModelTransfer != nil {
-			c.forgetTransferProgress(requestID)
-		}
-		c.releaseManaged(*row)
-	}
-	c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
-	c.signalClosed(requestWaitKey(requestID), cause)
-}
-
-func (c *Orchestrator) releaseManaged(req records.Request) {
-	if !req.Rental || req.Worker == "" || c.opt.ReleaseManagedRental == nil {
-		return
-	}
-	go func() {
-		if problem := c.releaseManagedNow(req); problem != nil {
-			c.logf("rental %s release deferred: %s", req.Worker, problem.Message)
-		}
-	}()
-}
-
-func (c *Orchestrator) releaseManagedNow(req records.Request) *exit.Error {
-	if !req.Rental || req.Worker == "" || c.opt.ReleaseManagedRental == nil {
-		return nil
-	}
-	line, problem := c.opt.ReleaseManagedRental(req.Worker)
-	if problem != nil {
-		return problem
-	}
-	if line != "" {
-		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
-		c.logf("%s", line)
-	}
-	return nil
-}
-
-func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
-	if link, problem := c.opt.Store.MachineExecution(req.ID); problem != nil {
-		return 0, problem
-	} else if link != nil {
-		return 0, exit.New(exit.Conflict, "Runtime-owned execution cannot create a local attempt")
-	}
-	current, problem := c.opt.Store.RequestRow(req.ID)
-	if problem != nil {
-		return 0, problem
-	}
-	if current == nil || (current.State != "submitted" && current.State != "queued") {
-		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request %s is not queued for execution", req.ID)
-	}
-	req = *current
-
-	// A warm worker must not bypass the same immutable-capture check used by
-	// preparation. Replays of already terminal/live attempts never enter here.
-	if (req.Rental || req.Worker != "") && req.InstallID != "" && req.LocalInstallationID != "" {
-		if c.opt.Packages == nil {
-			return 0, exit.Unavailablef("captured package owner is unavailable")
-		}
-		if problem := c.opt.Packages.ValidateExecutionCapture(req); problem != nil {
-			return 0, problem
-		}
-	}
-
-	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
-	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
-	// is open. `pick` also returns the admission epoch it OBSERVED, which is what
-	// makes a stale offer refuse deterministically rather than race.
-	target, e := c.pick(req)
-	if e != nil {
-		return 0, e
-	}
-	w, sess, admissionEpoch, reservation := target.worker, target.sess, target.admissionEpoch, target.reservation
-	reserved := true
-	defer func() {
-		if reserved {
-			c.releaseDispatch(reservation)
-		}
-	}()
-	if hit, problem := c.lookupOperationOn(req, sess); hit || problem != nil {
-		return 0, problem
-	}
-	current, problem = c.opt.Store.RequestRow(req.ID)
-	if problem != nil {
-		return 0, problem
-	}
-	if current == nil || (current.State != "submitted" && current.State != "queued") {
-		return 0, exit.Named(exit.Conflict, "request.execution_stopped", "request stopped while its operation lookup was in progress")
-	}
-	if req.ParentRequestID != "" {
-		if problem := c.retainChildInputs(req); problem != nil {
-			return 0, problem
-		}
-	}
-	if w.spec.Connection != nil && req.Worker == "" {
-		// THE PIN IS ROUTING'S OUTPUT (cl-092 step 4): the argmin was a rental, so the
-		// request is pinned to it now — durably, before its identity is bound to that
-		// rental's placement — and everything below reads the pinned request. A request
-		// that settled first has no worker to pin; it is not dispatched.
-		rentalID := w.spec.Connection.RentalID
-		pinned, e := c.opt.Store.PinRental(req.ID, rentalID, nil)
-		if e != nil {
-			return 0, e
-		}
-		if !pinned {
-			return 0, exit.New(exit.Conflict, "request %s settled before it could be pinned to rental %s",
-				req.ID, rentalID)
-		}
-		req.Worker = rentalID
-		target.routed.pinned = rentalID
-	}
-	if req.ModelTransfer != nil && req.Rental && w.spec.Connection == nil && req.Release != "" &&
-		w.spec.Placement.Release != req.Release {
-		return 0, exit.Unavailablef("ready local producer does not exactly match frozen %s@%s",
-			req.Package, req.Release)
-	}
-	// A model transfer materializes its verified model inputs only after ordinary
-	// placement selected the exact worker, but before InvocationSpec identity is minted.
-	req, e = c.materializeModelTransfer(req, w)
-	if e != nil {
-		return 0, e
-	}
-
-	// The InvocationSpec DOCUMENT (#439): everything that gives the invocation meaning —
-	// the payload digest, the ORDERED input identities, the output contracts, the
-	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
-	// service class, no local extension has a slot.
-	installationID, e := c.invocationIdentity(w, req)
-	if e != nil {
-		return 0, e
-	}
-	weightsOutputs, e := decodeWeightsOutputs(req.WeightsOutputs)
-	if e != nil {
-		return 0, e
-	}
-	payloadDigest := spellOf(canonical.Digest(req.Payload))
-	outputLimit := c.maxOutputBytes()
-	var servingPlacement DesiredPlacement
-	if !req.IsJob() {
-		c.mu.Lock()
-		servingPlacement = w.spec.Placement
-		c.mu.Unlock()
-		if servingPlacement.BindingsDigest == "" || len(servingPlacement.PlacementSetBytes) == 0 {
-			return 0, exit.Named(exit.Conflict, "serving.placement_evidence_absent", "serving dispatch needs the exact prepared model bindings")
-		}
-	}
-	if !req.IsJob() {
-		if problem := requireAdapterPlacementEcho(req.Models, servingPlacement); problem != nil {
-			return 0, problem
-		}
-	}
-	spec := &pb.InvocationSpec{
-		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
-		// for a native install with no OCI image at all. The value is the same one this
-		// daemon was frozen with — a request cannot choose the environment it runs under.
-		InstallationId:  installationID,
-		PayloadDigest:   payloadDigest,
-		Inputs:          inputBindings(req, payloadDigest),
-		Outputs:         invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
-		AttentionKernel: req.AttentionKernel,
-		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
-			EntrypointBindingDigest: req.PlanID,
-			BindingsDigest:          servingPlacement.BindingsDigest,
-			// With no adapters the binding IS the plan, so the two ids are equal by
-			// construction rather than by copying a value around.
-			AttemptBindingId: req.PlanID,
-		}},
-	}
-	if req.IsJob() {
-		if !w.spec.IsJob() {
-			return 0, exit.Internalf(
-				"worker %s holds no job plan to dispatch job request %s against", w.instanceID, req.ID)
-		}
-		// ONE mode names ONE spec. The per-attempt publication contract names THIS
-		// request's scratch repo, which is why a queue-serving worker can hold one
-		// directive and still publish each attempt into its own place.
-		spec.Spec = &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{
-			InstallationId:  w.spec.Placement.Jobs[0].InstallationID,
-			JobDescriptorId: req.PlanID,
-			PublicationContract: &pb.PublicationContract{
-				GrantId: home.ScratchRepo(req.Org, req.ID),
-				Outputs: invocationOutputBindings(splitList(req.Outputs), weightsOutputs, outputLimit),
-			},
-		}}
-	}
-	if req.Capture != "" {
-		var capture pb.ActivationCapture
-		if err := json.Unmarshal([]byte(req.Capture), &capture); err != nil {
-			return 0, exit.New(exit.Validation, "recorded capture options are invalid")
-		}
-		spec.Capture = &capture
-	}
-	canonicalBytes, digest, err := canonical.Identity(spec)
-	if err != nil {
-		return 0, exit.Internalf("cannot mint the InvocationSpec document: %s", err)
-	}
-	spelled, _ := canonical.Spell(digest)
-
-	// THE LAW AND THE ORDINAL, in ONE transaction that also journals the assignment: a
-	// terminal crossing a restart is authorized by the persisted assignment, and an ordinal
-	// that is minted outside the write that records it is a race (cl-003's finding — two
-	// `drain()` goroutines minted 1 and 2 for one request across the old split call).
-	ordinal, e := c.opt.Store.Dispatch(records.Attempt{
-		RequestID: req.ID, InstanceID: w.instanceID,
-		SessionID: w.bootID, InvocationDigest: spelled, InvocationCanonical: canonicalBytes,
-		WeightsOutputs:      req.WeightsOutputs,
-		ServingPlacementSet: servingPlacement.PlacementSetBytes,
-	})
-	if e != nil {
-		return 0, e
-	}
-	attempt := uint64(ordinal)
-	c.logRouting(req.ID, attempt, target.routed)
-
-	// The grant names this attempt's own directory, so it is built after the ordinal is
-	// real. ACCESS ONLY (#439): urls under the ids the spec declares — a refresh can
-	// re-derive access and structurally cannot substitute meaning.
-	//
-	// A JOB's grant names the DURABLE PUBLICATION ROOT instead, and the destination fence
-	// runs HERE — before the offer, so an escaping destination is never a capability
-	// anybody held.
-	grant, e := c.grantFor(req, attempt, w)
-	if e != nil {
-		return 0, c.abortDispatch(req.ID, attempt, w.bootID, e)
-	}
-	grant.InvocationSpecDigest = digest
-
-	c.mu.Lock()
-	placementID := w.placementID
-	laneID := reservation.laneID
-	var laneDevices []string
-	if l := w.lanes.get(laneID); l != nil {
-		laneDevices = devicesOf(l, w.spec.Devices)
-	}
-	c.mu.Unlock()
-	if req.IsJob() {
-		placementID = "" // job mode routes by the directive, not a placement (#446/#481)
-	}
-	// AN OFFER, NOT A START (#481): receiving one begins VALIDATION, not execution, which
-	// is why refusing it is an ordinary journaled outcome rather than an exception. EVERY
-	// offer gets AttemptAccepted or a journaled AttemptOutcome(REFUSED) — never silence.
-	offer := &pb.AttemptOffer{
-		RequestId: req.ID, AttemptOrdinal: attempt, InvocationSpecDigest: digest,
-		Grant: grant, InvocationSpecCanonicalBytes: canonicalBytes, PlacementId: placementID,
-		// THE EPOCH THIS OWNER OBSERVED WHEN IT DISPATCHED. The worker admits only if
-		// this is still current; a stale echo refuses deterministically — same input, same
-		// verdict, no race window — instead of running under capacity meaning that moved.
-		AdmissionEpoch: admissionEpoch,
-	}
-	offer.RecordOwnerEpoch, offer.ControlStreamEpoch, offer.WorkerBootId =
-		recordOwnerEpoch, sess.epoch, sess.bootID
-	if !c.commitDispatch(reservation, req.ID, attempt) {
-		cause := exit.Unavailablef("the worker selected for %s#%d left before its offer", req.ID, attempt)
-		c.rollbackGrant(req, attempt, w)
-		return 0, c.abortDispatch(req.ID, attempt, w.bootID, cause)
-	}
-	reserved = false
-	if e := c.opt.Store.OfferDispatch(req.ID, int64(attempt), w.bootID); e != nil {
-		c.settleDispatch(req.ID, attempt, false)
-		c.rollbackGrant(req, attempt, w)
-		return 0, c.abortDispatch(req.ID, attempt, w.bootID, e)
-	}
-	if !sess.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_AttemptOffer{AttemptOffer: offer}}) {
-		c.settleDispatch(req.ID, attempt, false)
-		c.rollbackGrant(req, attempt, w)
-		cause := exit.Unavailablef("the control stream for %s#%d closed before its offer", req.ID, attempt)
-		return 0, c.abortDispatch(req.ID, attempt, w.bootID, cause)
-	}
-	c.logf("AttemptOffer %s#%d spec=%s (%d canonical bytes) placement=%s lane=%s devices=%s "+
-		"admission=%d outputs=%s on %s", req.ID, attempt, shortDigest(spelled),
-		len(canonicalBytes), placementID, orNone(laneID), strings.Join(laneDevices, ","),
-		admissionEpoch, req.Outputs, w.instanceID)
-	event := map[string]any{"instance_id": w.instanceID, "invocation_digest": spelled}
-	if placementID != "" {
-		event["placement_id"] = placementID
-	}
-	// THE LANE THE OFFER DRAWS FROM, and the granted devices it covers, ride the durable
-	// event (proto-024): a run's device is a fact a user can read back, not a log line.
-	if laneID != "" {
-		event["device_lane"] = laneID
-		event["devices"] = laneDevices
-	}
-	c.emit(req.ID, "request.dispatched", attempt, event)
-	return attempt, nil
-}
-
-func (c *Orchestrator) abortDispatch(requestID string, attempt uint64, sessionID string, cause *exit.Error) *exit.Error {
-	if abort := c.opt.Store.AbortDispatch(requestID, int64(attempt), sessionID, cause.Message); abort != nil {
-		c.logf("%s#%d preparation failed (%s), and its dispatch could not be aborted: %s",
-			requestID, attempt, cause.Message, abort.Message)
-		return abort
-	}
-	c.emit(requestID, "request.dispatch_aborted", attempt, map[string]any{
-		"cause": cause.ErrName(), "error": cause.Message,
-	})
-	c.logf("%s#%d dispatch ABORTED before offer: %s", requestID, attempt, cause.Message)
-	return cause
-}
-
-// rollbackGrant undoes what minting the grant created. A local serving grant creates
-// nothing — it names the store directory and carries the payload inline — so only a
-// remote reservation or a job's publication stage has anything to roll back.
-func (c *Orchestrator) rollbackGrant(req records.Request, attempt uint64, w *worker) {
-	if w.media != nil {
-		c.cleanupRemote(req.ID, attempt, w)
-		return
-	}
-	if !req.IsJob() {
-		return
-	}
-	if err := os.RemoveAll(c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)); err != nil {
-		c.logf("%s#%d local grant rollback failed: %s", req.ID, attempt, err)
-		return
-	}
-	_ = os.Remove(filepath.Join(c.opt.Layout.PublicationRoot(req.Org, req.ID), ".staging"))
-	prunePublicationParents(c.opt.Layout, c.opt.Layout.PublicationRoot(req.Org, req.ID))
+	// the caller does not wait for bytes that will never exist.
+	c.RetryOutputExport(req.ID)
+	go c.cleanupRequestAssets(req)
+	c.logf("%s FAILED before any offer: %s", req.ID, cause.Message)
+	c.signalClosed(requestWaitKey(req.ID), cause)
 }
 
 // DefaultMaxOutputMiB is the per-output bound when Options.MaxOutputMiB is unset. It
 // matches the Runtime/package media object envelope; attempt and pod quotas still bound
 // the aggregate.
 const DefaultMaxOutputMiB int64 = 512
-
-func (c *Orchestrator) maxOutputBytes() uint64 {
-	maxBytes := c.opt.MaxOutputMiB
-	if maxBytes <= 0 {
-		maxBytes = DefaultMaxOutputMiB
-	}
-	return uint64(maxBytes) << 20
-}
-
-// invocationIdentity selects the installed environment retained for this attempt.
-// The handle orders updates and routes execution; it is not a content or memo key.
-func (c *Orchestrator) invocationIdentity(w *worker,
-	req records.Request) (string, *exit.Error) {
-	c.mu.Lock()
-	placement, remote, instanceID := w.spec.Placement, w.spec.Connection != nil, w.instanceID
-	c.mu.Unlock()
-	if remote && (placement.Release != req.Release ||
-		(req.LocalInstallationID != "" && placement.InstallationID != req.LocalInstallationID)) {
-		return "", exit.Named(exit.Conflict, "request_installation_changed",
-			"worker %s no longer holds the installation selected for request %s", instanceID, req.ID)
-	}
-	identifier := placement.InstallationID
-	if req.IsJob() && len(placement.Jobs) == 1 {
-		identifier = placement.Jobs[0].InstallationID
-	}
-	if identifier == "" {
-		return "", exit.Named(exit.Structural, "placement_installation_missing",
-			"worker %s carries no installed package handle", instanceID)
-	}
-	if remote {
-		if req.InstallationID == "" {
-			if problem := c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID, identifier); problem != nil {
-				return "", problem
-			}
-		} else if req.InstallationID != identifier {
-			return "", exit.Named(exit.Conflict, "request_installation_changed",
-				"worker %s no longer holds the installation retained for request %s", instanceID, req.ID)
-		}
-	}
-	return identifier, nil
-}
 
 func spellOf(raw []byte) string {
 	s, err := canonical.Spell(raw)
@@ -1231,247 +693,6 @@ func invocationOutputBindings(ids []string, weights []WeightsOutput, defaultMax 
 	return out
 }
 
-// pick resolves the worker and lane an offer for this request draws from: `route`'s
-// argmin over every claimed worker whose PLACEMENT is DISPATCHABLE for the binding and
-// whose lane has room (route.go), with the seat reserved. Compatibility and capacity
-// matching stay here, in the orchestrator, exactly as they do in the cloud.
-//
-// TWO GATES, TWO OWNERS (#472e/#482). Dispatchability is a PLACEMENT property — the
-// serving axis and `dispatchable_plan_ids`. Capacity is a WORKER property — the admission
-// state, its epoch, and the one shared seat window. Per-placement `attempt_credits`
-// are DELETED because N counters over ONE serialized device advertise N times the real
-// capacity, and that defect is arithmetic rather than a race.
-type dispatchReservation struct {
-	worker *worker
-	job    bool
-	planID string
-	// laneID is the lane the reserved seat draws from, "" for a worker that reports none.
-	laneID string
-}
-
-// offerTarget is pick's answer: the worker, its live session, the admission epoch this
-// owner observed, the reservation the offer holds, and the routing that chose it.
-type offerTarget struct {
-	worker         *worker
-	sess           *session
-	admissionEpoch uint64
-	reservation    *dispatchReservation
-	routed         routing
-}
-
-func (c *Orchestrator) pick(req records.Request) (offerTarget, *exit.Error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closing {
-		return offerTarget{}, exit.Named(exit.Unavailable, "daemon.closing", "the daemon is closing; no attempt can be dispatched")
-	}
-	routed := c.route(req)
-	pick := routed.pick()
-	if pick == nil {
-		return offerTarget{}, routed.noCapacity(req)
-	}
-	w := pick.worker
-	target := offerTarget{worker: w, sess: c.sessions[w.bootID], admissionEpoch: w.admissionEpoch,
-		routed: routed}
-	if w.spec.IsJob() {
-		// RESERVE the seat this dispatch is about to consume. The worker's own next
-		// observed state is still the authority — this only stops ONE drain pass from
-		// handing two queued jobs to a one-attempt worker on one reading.
-		w.reservedJobs++
-		w.jobsAvail = max(0, w.reportedJobs-w.reservedJobs)
-		if w.jobsAvail <= 0 {
-			w.dispatchable[req.PlanID] = false
-		}
-		target.reservation = &dispatchReservation{worker: w, job: true, planID: req.PlanID}
-		return target, nil
-	}
-	// THE SEAT IS THE PLACEMENT'S LANE'S (proto-024). CLOSED, OPEN-with-no-seat and a
-	// saturated lane are ALL "not now", distinguished on the worker facts rather than
-	// here: this side's answer is the same either way — the request parks in the deep
-	// queue, which is this owner's and never the worker's.
-	w.reserveSeat(pick.laneID)
-	target.reservation = &dispatchReservation{worker: w, laneID: pick.laneID}
-	return target, nil
-}
-
-// A reservation starts while an offer is prepared and remains subtracted after emission
-// until the worker causally answers Accepted or Refused. A Report can race an upload or an
-// outbound frame, so it is never evidence that this particular offer has been observed.
-func (c *Orchestrator) commitDispatch(r *dispatchReservation, requestID string, attempt uint64) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if r == nil || c.workers[r.worker.instanceID] != r.worker {
-		return false
-	}
-	c.offers[key(requestID, attempt)] = r
-	return true
-}
-
-func (c *Orchestrator) releaseDispatch(r *dispatchReservation) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if r == nil || c.workers[r.worker.instanceID] != r.worker {
-		return
-	}
-	if r.job {
-		r.worker.reservedJobs = max(0, r.worker.reservedJobs-1)
-		r.worker.observeJobs(r.worker.reportedJobs)
-		if r.worker.jobsAvail > 0 {
-			r.worker.dispatchable[r.planID] = true
-		}
-		return
-	}
-	r.worker.releaseSeat(r.laneID)
-}
-
-// settleDispatch consumes a seat on Accepted/executed outcome and returns it on a
-// pre-execution Refused outcome. It is idempotent because only the first causal answer
-// finds the offer reservation.
-func (c *Orchestrator) settleDispatch(requestID string, attempt uint64, consumed bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	k := key(requestID, attempt)
-	r := c.offers[k]
-	delete(c.offers, k)
-	if r == nil || c.workers[r.worker.instanceID] != r.worker {
-		return
-	}
-	if r.job {
-		r.worker.reservedJobs = max(0, r.worker.reservedJobs-1)
-		if consumed {
-			r.worker.reportedJobs = max(0, r.worker.reportedJobs-1)
-			r.worker.held++
-		}
-		r.worker.observeJobs(r.worker.reportedJobs)
-		if !consumed && r.worker.jobsAvail > 0 {
-			r.worker.dispatchable[r.planID] = true
-		}
-		return
-	}
-	r.worker.settleSeat(r.laneID, consumed)
-}
-
-// grantFor picks the lane's grant. The lanes differ in exactly one thing that matters —
-// WHERE the destinations are — and every one of those differences is a fact about a
-// machine: a bounded job's writes must outlive the reclaim that ends it, and a REMOTE
-// attempt's destinations must be on the pod, because that is where the process writing
-// them is.
-func (c *Orchestrator) grantFor(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
-	if w.media == nil {
-		if e := localGrantSupport(runtime.GOOS); e != nil {
-			return nil, e
-		}
-	}
-	if req.IsJob() && w.media == nil {
-		g, _, e := c.jobGrant(req, attempt)
-		return g, e
-	}
-	if w.media != nil {
-		return c.remoteGrant(req, attempt, w)
-	}
-	return c.grant(req.ID, attempt, req)
-}
-
-func localGrantSupport(goos string) *exit.Error {
-	if goos != "windows" {
-		return nil
-	}
-	return exit.Named(exit.Structural, "local_file_grant_unsupported",
-		"local worker grants are not yet supported on Windows").
-		WithRemedy("use --rental; local file URL authorization is currently POSIX-only")
-}
-
-// MediaReservationBytes prices only file outputs. Native Weights are written to
-// TensorFS under Runtime admission, so their slot cannot reserve the media byte
-// ceiling as well. File-count/OutputAccess identities remain unchanged.
-func MediaReservationBytes(req records.Request, perOutput uint64) (int64, *exit.Error) {
-	weights, problem := decodeWeightsOutputs(req.WeightsOutputs)
-	if problem != nil {
-		return 0, problem
-	}
-	native := make(map[string]bool, len(weights))
-	for _, row := range weights {
-		native[row.OutputID] = true
-	}
-	count := uint64(0)
-	for _, id := range splitList(req.Outputs) {
-		if !native[id] {
-			count++
-		}
-	}
-	if count > 0 && perOutput > uint64(math.MaxInt64)/count {
-		return 0, exit.New(exit.Validation, "the output grant for %s exceeds the media plane's byte range", req.ID)
-	}
-	return int64(perOutput * count), nil
-}
-
-// remoteGrant builds the grant for an attempt that will run on a POD (cl-014/#506b).
-//
-// It is the same grant the local lane mints and every address in it is on the other
-// machine: the payload is UPLOADED to the pod's media server first and the grant names
-// where the pod says it landed; the output destinations are a directory the pod reserved.
-// Nothing here composes a pod path — every one of them is an answer from the pod — and
-// nothing falls back to this host's disk, because a `file://` rooted here is a destination
-// the pod cannot reach and the whole class of defect #493.3 found.
-//
-// The BYTES MOVE BEFORE THE ATTEMPT EXISTS. `dispatch` calls this after the ordinal is
-// journaled and before `StartAttempt` is sent, so a pod that cannot be fed refuses the
-// dispatch rather than accepting an attempt whose inputs are unreachable.
-func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
-	slot := media.Slot(req.ID, attempt)
-	outputIDs := splitList(req.Outputs)
-	reservedOutputBytes, problem := MediaReservationBytes(req, c.maxOutputBytes())
-	if problem != nil {
-		return nil, problem
-	}
-	complete := false
-	defer func() {
-		if !complete {
-			c.cleanupRemote(req.ID, attempt, w)
-		}
-	}()
-	dir, e := w.media.ReserveOutputs(slot, reservedOutputBytes, len(outputIDs))
-	if e != nil {
-		return nil, e
-	}
-	path, e := w.media.PutInput(slot, "payload", req.Payload)
-	if e != nil {
-		return nil, e
-	}
-	c.logf("%s#%d: %d payload bytes crossed to %s at %s; outputs reserved at %s",
-		req.ID, attempt, len(req.Payload), w.media.Addr(), path, dir)
-	g := &pb.DeliveryGrant{
-		FileBaseUrl:   "file://" + dir,
-		ExpiresAtUnix: 0,
-		Inputs:        []*pb.InputAccess{{InputId: "payload", Url: "file://" + path}},
-	}
-	g.Inputs = append(g.Inputs, modelAccess(req)...)
-	for index, asset := range req.Assets {
-		if asset.Native != nil {
-			g.Inputs = append(g.Inputs, &pb.InputAccess{InputId: asset.FieldPath, NativeTree: &pb.NativeByteRetentionRequest{Source: asset.Native.Output.NativeRef(), RetentionId: asset.Native.RetentionID}})
-			continue
-		}
-		path, e := w.media.PutInputFile(slot, "input-"+strconv.Itoa(index),
-			asset.LocalPath, asset.Digest, asset.Length)
-		if e != nil {
-			return nil, e
-		}
-		g.Inputs = append(g.Inputs, &pb.InputAccess{InputId: asset.FieldPath, Url: "file://" + path})
-		c.logf("%s#%d: input asset %s (%d B, %s) crossed to %s at %s",
-			req.ID, attempt, asset.FieldPath, asset.Length, asset.Digest, w.media.Addr(), path)
-	}
-	for _, id := range outputIDs {
-		if e := FenceOutputID(id); e != nil {
-			return nil, e
-		}
-		g.Outputs = append(g.Outputs, &pb.OutputAccess{
-			OutputId: id, Url: "file://" + dir + "/" + id,
-		})
-	}
-	complete = true
-	return g, nil
-}
-
 // jobModels is the set of Model inputs a request declares: a job's bound models with an
 // exact manifest; none for a serving request (see inputBindings).
 func jobModels(req records.Request) []ModelRef {
@@ -1498,96 +719,6 @@ func modelAccess(req records.Request) []*pb.InputAccess {
 		})
 	}
 	return rows
-}
-
-// grant builds the LOCAL delivery grant: the payload INLINE, every bound model, every
-// input asset at its borrowed original path, and one destination per result field path —
-// the store directory itself (`outputs/<org>-<package>/` or the caller's --out), which
-// the worker names the file in by its content digest, `<sha256>.<ext>`. Nothing is
-// staged on this side and nothing is copied afterwards: the granted directory is where
-// the file lives for good, and the terminal is verified against exactly that name. There
-// is no credential — a local grant is a CAS root plus a directory, and a fabricated
-// token would be a lie about authority nobody issued.
-func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Request) (*pb.DeliveryGrant, *exit.Error) {
-	dir, e := c.outputDirectory(req)
-	if e != nil {
-		return nil, e
-	}
-	g := &pb.DeliveryGrant{
-		FileBaseUrl: "file://" + dir + "/",
-		// NO EXPIRY, because this host mints no deadline to derive one from. A grant lasts
-		// as long as the attempt it was minted for (cr-009), and the attempt's bound is the
-		// caller's deadline — which `dispatch` never sets, because there is no wire field
-		// for it here and `--timeout` is enforced client-side by CANCELLING. 10 minutes was
-		// therefore a ceiling on how long a local attempt could be, invented at the one
-		// place nobody was asked. The worker reads 0 as "does not expire" (`grants.expired`).
-		ExpiresAtUnix: 0,
-		// ACCESS ONLY (#439): the identities (digest, length, media kind) live in the
-		// spec's bindings, inside the invocation digest.
-		Inputs: []*pb.InputAccess{{InputId: "payload", Url: payloadURL(req.Payload)}},
-	}
-	g.Inputs = append(g.Inputs, modelAccess(req)...)
-	assets, problem := localAssetAccess(req)
-	if problem != nil {
-		return nil, problem
-	}
-	g.Inputs = append(g.Inputs, assets...)
-
-	for _, id := range splitList(req.Outputs) {
-		if e := FenceOutputID(id); e != nil {
-			return nil, e
-		}
-		g.Outputs = append(g.Outputs, &pb.OutputAccess{OutputId: id, Url: "file://" + dir + "/"})
-	}
-	return g, nil
-}
-
-func localAssetAccess(req records.Request) ([]*pb.InputAccess, *exit.Error) {
-	var inputs []*pb.InputAccess
-	for _, asset := range req.Assets {
-		if asset.Native != nil {
-			if req.ParentRequestID == "" {
-				return nil, exit.New(exit.Conflict, "native byte inputs require a private child grant")
-			}
-			if asset.LocalPath != "" || asset.Digest != asset.Native.Output.Digest || asset.Length != asset.Native.Output.Length || asset.MediaType != asset.Native.Output.MimeType {
-				return nil, exit.New(exit.Validation, "native input differs from recorded byte output")
-			}
-			inputs = append(inputs, &pb.InputAccess{InputId: asset.FieldPath, NativeTree: &pb.NativeByteRetentionRequest{Source: asset.Native.Output.NativeRef(), RetentionId: asset.Native.RetentionID}})
-			continue
-		}
-		limit := asset.MaxBytes
-		if limit <= 0 {
-			limit = asset.Length
-		}
-		if e := inputasset.Verify(asset, limit); e != nil {
-			return nil, e
-		}
-		inputs = append(inputs, &pb.InputAccess{
-			InputId: asset.FieldPath, Url: (&url.URL{Scheme: "file", Path: asset.LocalPath}).String(),
-		})
-	}
-	return inputs, nil
-}
-
-// payloadURL is the request document as a `data:` URL: the grant IS the bytes, so a
-// worker on this host reads the payload from the grant and nothing is written to disk
-// to hand it over. The worker still verifies them against the spec's digest and length.
-func payloadURL(payload []byte) string {
-	return "data:application/json;base64," + base64.StdEncoding.EncodeToString(payload)
-}
-
-// outputDirectory is where one serving request's result files live: the directory its
-// export row names (the caller's --out, else the package's store) — the same directory
-// the grant hands the worker and the terminal is verified against.
-func (c *Orchestrator) outputDirectory(req records.Request) (string, *exit.Error) {
-	export, e := c.opt.Store.OutputExportOf(req.ID)
-	if e != nil {
-		return "", e
-	}
-	if export != nil {
-		return export.Directory, nil
-	}
-	return c.opt.Layout.PackageOutputs(req.Package), nil
 }
 
 // Await blocks until the attempt is closed — the terminal accepted, its outputs visible,
@@ -1689,55 +820,3 @@ func (c *Orchestrator) AwaitAccepted(requestID string, attempt uint64, timeout t
 // ClientCancelGraceMS is the one cooperative attempt-cancellation policy. It is a
 // cancellation budget carried to Runtime, never a stall or caller deadline.
 const ClientCancelGraceMS uint64 = 5000
-
-// CancelClient is the client-reason cancel, for the callers that have no business
-// naming a protocol enum. The actor is journaled BEFORE the cancel frame goes out
-// (cl-108): the attempt's canceled terminal arrives later from the worker, and joining
-// it back to WHO asked must survive a daemon restart in between.
-func (c *Orchestrator) CancelClient(requestID string, attempt, graceMS uint64, actor string) *exit.Error {
-	if actor == "" {
-		actor = "an unnamed client"
-	}
-	if e := c.opt.Store.AppendEvent(requestID, "request.cancel_requested", int64(attempt),
-		map[string]any{"actor": actor, "grace_ms": graceMS}); e != nil {
-		return e
-	}
-	return c.Cancel(requestID, attempt, pb.CancelReason_CANCEL_REASON_CLIENT, graceMS)
-}
-
-// Cancel is the only way to supersede a live attempt: explicit, digest-fenced, and
-// followed by a journaled terminal. Silent supersession does not exist in this protocol,
-// and an attempt is never killed to improve queue latency.
-func (c *Orchestrator) Cancel(requestID string, attempt uint64, reason pb.CancelReason, graceMS uint64) *exit.Error {
-	row, e := c.opt.Store.AttemptRow(requestID, int64(attempt))
-	if e != nil {
-		return e
-	}
-	if row == nil {
-		return exit.New(exit.NotFound, "no attempt %s#%d to cancel", requestID, attempt)
-	}
-	raw, err := canonical.Raw(row.InvocationDigest)
-	if err != nil {
-		return exit.Internalf("the journaled spec digest is unreadable: %s", err)
-	}
-	c.mu.Lock()
-	sess := c.sessions[row.SessionID]
-	w := c.workers[row.InstanceID]
-	c.mu.Unlock()
-	if sess == nil || w == nil {
-		return exit.Unavailablef("the stream that holds %s#%d is gone", requestID, attempt)
-	}
-	cancel := &pb.CancelAttempt{
-		RequestId: requestID, AttemptOrdinal: attempt, Reason: reason,
-		GraceMs: graceMS, InvocationSpecDigest: raw,
-	}
-	cancel.RecordOwnerEpoch, cancel.ControlStreamEpoch, cancel.WorkerBootId =
-		recordOwnerEpoch, sess.epoch, sess.bootID
-	if !sess.trySend(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_CancelAttempt{CancelAttempt: cancel}}) {
-		return exit.Unavailablef("the control stream for %s#%d cannot accept cancellation now",
-			requestID, attempt)
-	}
-	c.logf("CancelAttempt %s#%d reason=%s", requestID, attempt,
-		pb.CancelReason_name[int32(reason)])
-	return nil
-}
