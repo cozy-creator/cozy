@@ -141,8 +141,8 @@ func TestDeclaredAssetsDecodedViewDescriptor(t *testing.T) {
 	if _, problem := launch.DecodePackageInterface([]byte(decodedFile)); problem != nil {
 		t.Fatalf("a decoded file Assets slot refused the interface: %v", problem)
 	}
-	if _, problem := launch.DecodePackageInterface([]byte(strings.Replace(declaredAssetsInterface,
-		`"parameter":"assets"`, `"parameter":"assets","view":true`, 1))); problem == nil {
+	if _, problem := callableOf(t, []byte(strings.Replace(declaredAssetsInterface,
+		`"parameter":"assets"`, `"parameter":"assets","view":true`, 1)), "run"); problem == nil {
 		t.Fatal("a mistyped Assets view was admitted")
 	}
 }
@@ -201,7 +201,7 @@ func TestDeclaredAssetsCountsAndFidelity(t *testing.T) {
 	}
 	for _, value := range []string{"true", "1.5"} {
 		raw := strings.Replace(declaredAssetsInterface, `"kind":"image"`, `"kind":"image","max_count":`+value, 1)
-		if _, problem := launch.DecodePackageInterface([]byte(raw)); problem == nil {
+		if _, problem := callableOf(t, []byte(raw), "run"); problem == nil {
 			t.Fatalf("mistyped max_count %s was admitted", value)
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -35,11 +36,25 @@ func TestInternalCallablesStayInExecutionInterface(t *testing.T) {
 		}
 	}
 	for _, value := range []string{"null", `"true"`, "1", "{}"} {
-		raw := strings.ReplaceAll(internalCallablesInterface, `"internal":true`, `"internal":`+value)
-		if _, problem := launch.DecodePackageInterface([]byte(raw)); problem == nil {
-			t.Fatal("accepted non-boolean visibility", value)
+		raw := []byte(strings.ReplaceAll(internalCallablesInterface, `"internal":true`, `"internal":`+value))
+		for _, name := range []string{"segment", "internal_job"} {
+			if _, problem := callableOf(t, raw, name); problem == nil {
+				t.Fatal("accepted non-boolean visibility", value)
+			}
+		}
+		if _, problem := callableOf(t, raw, "generate"); problem != nil {
+			t.Fatal("one unreadable callable refused its siblings", problem)
 		}
 	}
+}
+
+// callableOf decodes a package interface that loads and answers its callable `name`, or the
+// refusal of it alone.
+func callableOf(t *testing.T, raw []byte, name string) (*launch.Entrypoint, *exit.Error) {
+	t.Helper()
+	surface, problem := launch.DecodePackageInterface(raw)
+	fatal(t, problem)
+	return surface.Function(name)
 }
 
 func TestInternalCallablesAreAbsentFromCLIAndRefuseDirectRun(t *testing.T) {

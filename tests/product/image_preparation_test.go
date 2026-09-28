@@ -41,15 +41,13 @@ func TestImagePreparationDescriptorAppliesOnlyExactDecodedPolicies(t *testing.T)
 		{`{"profile":"image-fit/1","max_pixels":1.5}`, "refused"},
 	} {
 		raw := strings.Replace(decoded, `"kind":"image"`, `"kind":"image","prepare":`+test.policy, 1)
-		iface, problem := launch.DecodePackageInterface([]byte(raw))
+		ep, problem := callableOf(t, []byte(raw), "run")
 		if (problem != nil) != (test.outcome == "refused") {
 			t.Fatalf("policy %s admission: %v", test.policy, problem)
 		}
 		if problem != nil {
 			continue
 		}
-		ep, problem := iface.Function("run")
-		fatal(t, problem)
 		if prepared := ep.Assets.Kinds[0].Preparation != nil; prepared != (test.outcome == "prepared") {
 			t.Fatalf("policy %s: prepared=%v, want %s", test.policy, prepared, test.outcome)
 		}

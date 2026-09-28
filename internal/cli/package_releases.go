@@ -24,16 +24,22 @@ import (
 
 var immutablePackageVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 
-// installableInterface refuses a release its installers would refuse: publish reads the staged
-// interface through the same launch.DecodePackageInterface every install runs.
+// installableInterface refuses a release its installers would refuse, or one with a function
+// they could not call: publish reads the staged interface through the same
+// launch.DecodePackageInterface every install runs.
 func installableInterface(path string) *exit.Error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return exit.Internalf("cannot read the staged package interface: %s", err)
 	}
-	if _, problem := launch.DecodePackageInterface(raw); problem != nil {
+	surface, problem := launch.DecodePackageInterface(raw)
+	if problem != nil {
 		problem.Message = "this release would not install: " + problem.Message
 		return problem
+	}
+	for _, unusable := range surface.Unavailable {
+		unusable.Message = "installs could not call this function: " + unusable.Message
+		return unusable
 	}
 	return nil
 }

@@ -23,7 +23,6 @@ package launch
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -39,17 +38,19 @@ import (
 // PackageInterfaceFile is Runtime's derived document inside an immutable install. It is
 // never committed in package source.
 const PackageInterfaceFile = "package-interface.json"
-const packageInterfaceFormat = "cozy.package.interface/1"
+const packageInterfaceFormat = "cozy.package.interface/"
 
-// PackageInterface is the PackageInterface/1 subset this host consumes. Members it does not
-// read are ignored so documents from older and newer Runtimes keep loading; Raw is the whole
-// normalized canonical JSON for control-plane transport and semantic identity.
+// PackageInterface is the package-interface subset this host consumes. Members it does not
+// read are ignored so documents from older and newer Runtimes keep loading, and a callable it
+// cannot read is Unavailable alone, with why; Raw is the whole normalized canonical JSON for
+// control-plane transport and semantic identity.
 type PackageInterface struct {
-	Format      string          `json:"format"`
-	Application string          `json:"application"`
-	Entrypoints []Entrypoint    `json:"entrypoints"`
-	Jobs        []Entrypoint    `json:"jobs"`
-	Raw         json.RawMessage `json:"-"`
+	Format      string
+	Application string
+	Entrypoints []Entrypoint
+	Jobs        []Entrypoint
+	Unavailable map[string]*exit.Error
+	Raw         json.RawMessage
 }
 
 // Entrypoint is one callable surface: its request schema, its declared model slots, and
@@ -216,24 +217,6 @@ type FieldConstraints struct {
 	LE         *float64     `json:"le"`
 }
 
-// callableVisibility refuses a present non-boolean "internal": decoding null as false would
-// publish a callable its author hid.
-func callableVisibility(data []byte) error {
-	var root struct {
-		Entrypoints []map[string]json.RawMessage `json:"entrypoints"`
-		Jobs        []map[string]json.RawMessage `json:"jobs"`
-	}
-	if err := json.Unmarshal(data, &root); err != nil {
-		return err
-	}
-	for _, callable := range append(root.Entrypoints, root.Jobs...) {
-		if raw, present := callable["internal"]; present && string(raw) != "true" && string(raw) != "false" {
-			return fmt.Errorf("internal must be a boolean")
-		}
-	}
-	return nil
-}
-
 // MissingComponents returns the package-declared lower bound that a checkpoint
 // cannot supply. ComponentUse is intentionally conservative: it unions only
 // explicitly declared names, so an undeclared method can never cause a false
@@ -392,61 +375,76 @@ func DecodePackageInterface(data []byte) (*PackageInterface, *exit.Error) {
 	if err != nil {
 		return nil, exit.New(exit.Validation, "%s is not canonical JSON: %s", PackageInterfaceFile, err)
 	}
-	var d PackageInterface
-	if err := json.Unmarshal(normalized, &d); err != nil {
+	var doc struct {
+		Format      string            `json:"format"`
+		Application string            `json:"application"`
+		Entrypoints []json.RawMessage `json:"entrypoints"`
+		Jobs        []json.RawMessage `json:"jobs"`
+	}
+	if err := json.Unmarshal(normalized, &doc); err != nil {
 		return nil, exit.New(exit.Validation, "%s is not a package interface document: %s", PackageInterfaceFile, err)
 	}
-	if err := callableVisibility(normalized); err != nil {
-		return nil, exit.New(exit.Validation, "%s is not a package interface document: %s", PackageInterfaceFile, err)
-	}
-	if d.Format != packageInterfaceFormat || d.Application == "" {
+	if !strings.HasPrefix(doc.Format, packageInterfaceFormat) || doc.Application == "" {
 		return nil, exit.New(exit.Validation, "%s format/application is invalid", PackageInterfaceFile)
 	}
-	var raw struct {
-		Entrypoints []struct {
-			Assets json.RawMessage `json:"assets"`
-		} `json:"entrypoints"`
-		Jobs []json.RawMessage `json:"jobs"`
-	}
-	if err := json.Unmarshal(normalized, &raw); err != nil || len(raw.Jobs) != len(d.Jobs) {
-		return nil, exit.New(exit.Validation, "%s carries invalid job rows", PackageInterfaceFile)
-	}
-	for i := range d.Entrypoints {
-		d.Entrypoints[i].Kind = "entrypoint"
-		admitAssetsSlot(&d.Entrypoints[i], raw.Entrypoints[i].Assets)
-		if problem := validateEntrypoint(&d.Entrypoints[i]); problem != nil {
-			return nil, problem
-		}
-	}
-	for i := range d.Jobs {
-		d.Jobs[i].Kind = "job"
-		var job struct {
-			Assets         json.RawMessage              `json:"assets"`
-			WeightsOutputs []map[string]json.RawMessage `json:"weights_outputs"`
-		}
-		_ = json.Unmarshal(raw.Jobs[i], &job)
-		admitAssetsSlot(&d.Jobs[i], job.Assets)
-		// A new-byte budget has no safe default: zero would refuse the job's own output.
-		for _, output := range job.WeightsOutputs {
-			if budget, present := output["max_bytes"]; !present || string(budget) == "null" {
-				return nil, exit.New(exit.Validation, "%s weights outputs need an explicit max_bytes", d.Jobs[i].Name)
+	d := &PackageInterface{Format: doc.Format, Application: doc.Application, Unavailable: map[string]*exit.Error{}, Raw: normalized}
+	for kind, rows := range map[string][]json.RawMessage{"entrypoint": doc.Entrypoints, "job": doc.Jobs} {
+		for _, raw := range rows {
+			callable, problem := decodeCallable(kind, raw)
+			switch {
+			case problem != nil:
+				if problem.Remedy == "" {
+					problem.Remedy = "update cozy, or call another function of this package"
+				}
+				d.Unavailable[callable.Name] = problem
+			case kind == "job":
+				d.Jobs = append(d.Jobs, callable)
+			default:
+				d.Entrypoints = append(d.Entrypoints, callable)
 			}
 		}
-		digest := sha256.Sum256(append([]byte("cozy.runtime.job-descriptor\x00"), raw.Jobs[i]...))
-		d.Jobs[i].DescriptorID, err = canonical.Spell(digest[:])
-		if err != nil {
-			return nil, exit.Internalf("cannot spell job descriptor id: %s", err)
-		}
-		if problem := validateEntrypoint(&d.Jobs[i]); problem != nil {
-			return nil, problem
-		}
 	}
-	d.Raw = normalized
-	return &d, nil
+	return d, nil
+}
+
+// decodeCallable reads one entrypoint or job. One this host cannot read is refused alone: its
+// problem answers every call of it.
+func decodeCallable(kind string, raw json.RawMessage) (Entrypoint, *exit.Error) {
+	var extra struct {
+		Name           string                       `json:"name"`
+		Internal       json.RawMessage              `json:"internal"`
+		Assets         json.RawMessage              `json:"assets"`
+		WeightsOutputs []map[string]json.RawMessage `json:"weights_outputs"`
+	}
+	_ = json.Unmarshal(raw, &extra)
+	callable := Entrypoint{Name: extra.Name, Kind: kind}
+	if err := json.Unmarshal(raw, &callable); err != nil {
+		return Entrypoint{Name: extra.Name}, exit.New(exit.Validation, "%s is not readable here: %s", extra.Name, err)
+	}
+	// Decoding null as false would publish a callable its author hid.
+	if len(extra.Internal) > 0 && string(extra.Internal) != "true" && string(extra.Internal) != "false" {
+		return callable, exit.New(exit.Validation, "%s internal must be a boolean", callable.Name)
+	}
+	admitAssetsSlot(&callable, extra.Assets)
+	if kind == "job" {
+		// A new-byte budget has no safe default: zero would refuse the job's own output.
+		for _, output := range extra.WeightsOutputs {
+			if budget, present := output["max_bytes"]; !present || string(budget) == "null" {
+				return callable, exit.New(exit.Validation, "%s weights outputs need an explicit max_bytes", callable.Name)
+			}
+		}
+		digest := sha256.Sum256(append([]byte("cozy.runtime.job-descriptor\x00"), raw...))
+		callable.DescriptorID, _ = canonical.Spell(digest[:])
+	}
+	problem := validateEntrypoint(&callable)
+	return callable, problem
 }
 
 // Function finds one entrypoint or job by name.
 func (d *PackageInterface) Function(name string) (*Entrypoint, *exit.Error) {
+	if problem, unavailable := d.Unavailable[name]; unavailable {
+		return nil, problem
+	}
 	for i := range d.Entrypoints {
 		if d.Entrypoints[i].Name == name {
 			return &d.Entrypoints[i], nil

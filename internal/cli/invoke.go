@@ -2945,6 +2945,9 @@ func emitFunctions(ctx *Context, target Target, packageInterface *launch.Package
 }
 
 func unknownFunction(target Target, packageInterface *launch.PackageInterface) *exit.Error {
+	if unavailable := packageInterface.Unavailable[target.Function]; unavailable != nil {
+		return unavailable
+	}
 	names := packageInterface.PublicNames()
 	problem := exit.New(exit.NotFound, "%s registers no function %q", target.Package, target.Function)
 	if len(names) == 0 {
