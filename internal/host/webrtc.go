@@ -3,7 +3,6 @@ package host
 import (
 	"context"
 	"fmt"
-	"net"
 
 	"github.com/cozy-creator/cozy/internal/host/webrtc"
 )

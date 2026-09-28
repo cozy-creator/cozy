@@ -1,4 +1,4 @@
-package webrtc_test
+package producttest
 
 import (
 	"bufio"
@@ -17,12 +17,12 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/host/webrtc"
-	"github.com/cozy-creator/cozy/internal/host/webrtc/webrtctest"
+	"github.com/cozy-creator/cozy/tests/product/webrtctest"
 	"github.com/pion/stun/v4"
 )
 
-func TestHelloAdmitsOnlyAValidCapability(t *testing.T) {
-	h := newHarness(t)
+func TestWebRTCHelloAdmitsOnlyAValidCapability(t *testing.T) {
+	h := newMediaHarness(t)
 	_, stranger, _ := ed25519.GenerateKey(rand.Reader)
 	signed := func(key ed25519.PrivateKey, payload string) string { // any payload, signed as Mint signs
 		sig := ed25519.Sign(key, append([]byte("cozy-capability/1\x00"), payload...))
@@ -77,9 +77,9 @@ func TestHelloAdmitsOnlyAValidCapability(t *testing.T) {
 	}
 }
 
-func TestRequestsOutsideTheGrantAreRefused(t *testing.T) {
-	h := newHarness(t)
-	h.m.Append(7, "video", -1, segment(1000, 1), 1_000_000)
+func TestWebRTCRequestsOutsideTheGrantAreRefused(t *testing.T) {
+	h := newMediaHarness(t)
+	h.m.Append(7, "video", -1, mediaSegment(1000, 1), 1_000_000)
 	h.m.End(7, "completed")
 	c := h.dial()
 	h.send(c, map[string]any{"t": "hello", "v": 1, "cap": h.grant(func(g *capability.Grant) { g.Outputs = []string{"references/2"} })})
@@ -101,8 +101,8 @@ func TestRequestsOutsideTheGrantAreRefused(t *testing.T) {
 	}
 }
 
-func TestAMessageOver64KiBEndsTheSession(t *testing.T) {
-	h := newHarness(t)
+func TestWebRTCAMessageOver64KiBEndsTheSession(t *testing.T) {
+	h := newMediaHarness(t)
 	c, err := webrtctest.Dial(h.ctx, h.srv.Addr, h.srv.Fingerprint, webrtctest.Options{Oversend: true})
 	if err != nil {
 		t.Fatal(err)
@@ -118,12 +118,12 @@ func TestAMessageOver64KiBEndsTheSession(t *testing.T) {
 	}
 }
 
-func TestRevokingTheKeyEndsItsSessions(t *testing.T) {
-	h := newHarness(t)
+func TestWebRTCRevokingTheKeyEndsItsSessions(t *testing.T) {
+	h := newMediaHarness(t)
 	c := h.open(64 << 20)
 	h.follow(c, 0, 0)
-	var f follower
-	h.m.Append(7, "video", -1, segment(50_000, 1), 1_000_000)
+	var f mediaFollower
+	h.m.Append(7, "video", -1, mediaSegment(50_000, 1), 1_000_000)
 	h.until(c, &f, func() bool { return len(f.got) == 50_000 })
 	h.m.Revoke(h.key.Public().(ed25519.PublicKey))
 	if m := h.expect(c, "bye"); m.Code != "revoked" {
@@ -136,8 +136,8 @@ func TestRevokingTheKeyEndsItsSessions(t *testing.T) {
 	}
 }
 
-// stunConn speaks raw ICE-TCP: framed STUN, as a browser's first packet.
-func stunConn(t *testing.T, h *harness) net.Conn {
+// iceTCPConn speaks raw ICE-TCP: framed STUN, as a browser's first packet.
+func iceTCPConn(t *testing.T, h *mediaHarness) net.Conn {
 	conn, err := net.Dial("tcp", h.srv.Addr.String())
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +146,7 @@ func stunConn(t *testing.T, h *harness) net.Conn {
 	return conn
 }
 
-func binding(t *testing.T, conn net.Conn, username, pwd string) {
+func sendBinding(t *testing.T, conn net.Conn, username, pwd string) {
 	m, err := stun.Build(stun.TransactionID, stun.BindingRequest, stun.NewUsername(username),
 		stun.NewShortTermIntegrity(pwd), stun.Fingerprint)
 	if err != nil {
@@ -157,12 +157,12 @@ func binding(t *testing.T, conn net.Conn, username, pwd string) {
 	}
 }
 
-func TestSTUNAnswersOnlyTheClientChosenCredential(t *testing.T) {
-	h := newHarness(t)
+func TestWebRTCSTUNAnswersOnlyTheClientChosenCredential(t *testing.T) {
+	h := newMediaHarness(t)
 	ufrag := webrtctest.Ufrag()
 
-	good := stunConn(t, h)
-	binding(t, good, ufrag+":browser", ufrag)
+	good := iceTCPConn(t, h)
+	sendBinding(t, good, ufrag+":browser", ufrag)
 	r := bufio.NewReader(good)
 	var size [2]byte
 	if _, err := io.ReadFull(r, size[:]); err != nil {
@@ -182,28 +182,30 @@ func TestSTUNAnswersOnlyTheClientChosenCredential(t *testing.T) {
 		"signed with another password": {ufrag + ":browser", ufrag + "x"},
 		"a ufrag without the prefix":   {"published:browser", "published"},
 	} {
-		conn := stunConn(t, h)
-		binding(t, conn, pair[0], pair[1])
+		conn := iceTCPConn(t, h)
+		sendBinding(t, conn, pair[0], pair[1])
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		if n, err := conn.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !isReset(err) {
+		if n, err := conn.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !connReset(err) {
 			t.Fatalf("%s: read %d, %v", name, n, err)
 		}
 	}
 }
 
-func isReset(err error) bool { return err != nil && strings.Contains(err.Error(), "connection reset") }
+func connReset(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "connection reset")
+}
 
-func TestTheNinthConnectionFromOneIPEvictsTheOldestPending(t *testing.T) {
-	h := newHarness(t)
-	h.m.Append(7, "video", -1, segment(1000, 1), 1_000_000)
+func TestWebRTCTheNinthConnectionFromOneIPEvictsTheOldestPending(t *testing.T) {
+	h := newMediaHarness(t)
+	h.m.Append(7, "video", -1, mediaSegment(1000, 1), 1_000_000)
 	h.m.End(7, "completed")
 	c := h.open(1 << 20) // authenticated: never evicted for pending ones
 	var pending []net.Conn
 	for range 8 { // 1 + 7 fill the IP's 8; the 8th pending arrival is the 9th connection
-		pending = append(pending, stunConn(t, h))
+		pending = append(pending, iceTCPConn(t, h))
 	}
 	pending[0].SetReadDeadline(time.Now().Add(10 * time.Second))
-	if _, err := pending[0].Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !isReset(err) {
+	if _, err := pending[0].Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !connReset(err) {
 		t.Fatalf("the oldest pending connection was kept: %v", err)
 	}
 	for _, conn := range pending[1:] {

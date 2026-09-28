@@ -195,7 +195,7 @@ func Serve(t testing.TB, host string, m *Machine) Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0")) //cozy:allow the listener under test, on a test port
 	if err != nil {
 		t.Fatal(err)
 	}

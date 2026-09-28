@@ -1,4 +1,4 @@
-package webrtc_test
+package producttest
 
 import (
 	"bytes"
@@ -10,9 +10,9 @@ import (
 	"testing"
 )
 
-// fragments cuts a fragmented MP4 at its top-level boxes: the init (ftyp, moov), then one
+// fmp4Fragments cuts a fragmented MP4 at its top-level boxes: the init (ftyp, moov), then one
 // piece per moof+mdat.
-func fragments(film []byte) (header []byte, pieces [][]byte) {
+func fmp4Fragments(film []byte) (header []byte, pieces [][]byte) {
 	for at := 0; at < len(film); {
 		size, kind := int(binary.BigEndian.Uint32(film[at:])), string(film[at+4:at+8])
 		switch kind {
@@ -29,7 +29,7 @@ func fragments(film []byte) (header []byte, pieces [][]byte) {
 	return header, pieces
 }
 
-func frames(t *testing.T, media []byte) string {
+func countFrames(t *testing.T, media []byte) string {
 	path := filepath.Join(t.TempDir(), "piece.mp4")
 	if err := os.WriteFile(path, media, 0o600); err != nil {
 		t.Fatal(err)
@@ -44,8 +44,8 @@ func frames(t *testing.T, media []byte) string {
 
 // A 3-segment film published by appends plays as it lands, and a seek fetches the init and
 // one middle segment by the byte ranges its entries map.
-func TestAFilmStreamsLiveAndItsMiddleSegmentDecodes(t *testing.T) {
-	h := newHarness(t)
+func TestWebRTCAFilmStreamsLiveAndItsMiddleSegmentDecodes(t *testing.T) {
+	h := newMediaHarness(t)
 	path := filepath.Join(t.TempDir(), "film.mp4")
 	if out, err := exec.Command("ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=3:size=320x240:rate=24",
 		"-c:v", "libx264", "-preset", "ultrafast", "-g", "24", "-keyint_min", "24", "-sc_threshold", "0",
@@ -56,14 +56,14 @@ func TestAFilmStreamsLiveAndItsMiddleSegmentDecodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	header, pieces := fragments(film)
+	header, pieces := fmp4Fragments(film)
 	if len(pieces) != 3 {
 		t.Fatalf("%d fragments", len(pieces))
 	}
 
 	c := h.open(64 << 20)
 	h.follow(c, 0, 0)
-	var f follower
+	var f mediaFollower
 	var published []byte
 	for k, piece := range pieces {
 		if k == 0 {
@@ -72,13 +72,13 @@ func TestAFilmStreamsLiveAndItsMiddleSegmentDecodes(t *testing.T) {
 		published = append(published, piece...)
 		e := h.m.Append(7, "video", -1, piece, 1_000_000)
 		h.until(c, &f, func() bool { return len(f.got) == len(published) && f.seq == e.Seq })
-		if got := frames(t, f.got); got != []string{"24", "48", "72"}[k] {
-			t.Fatalf("after segment %d the follower's copy decodes %s frames", k+1, got)
+		if got := countFrames(t, f.got); got != []string{"24", "48", "72"}[k] {
+			t.Fatalf("after mediaSegment %d the follower's copy decodes %s frames", k+1, got)
 		}
 	}
 	h.m.End(7, "completed")
 	h.until(c, &f, func() bool { return f.end != nil })
-	if !bytes.Equal(f.got, film) || f.end.SHA256 != sha(film) {
+	if !bytes.Equal(f.got, film) || f.end.SHA256 != digestOf(film) {
 		t.Fatal("the followed film is not the film")
 	}
 
@@ -88,7 +88,7 @@ func TestAFilmStreamsLiveAndItsMiddleSegmentDecodes(t *testing.T) {
 	from, to := f.entries[0].Length, f.entries[1].Length // segment 2, by the map
 	h.send(seek, map[string]any{"t": "get", "id": "s2", "run": "7", "output": "video", "offset": from, "length": to - from})
 	middle, _ := h.body(seek)
-	if got := frames(t, append(head, middle...)); got != "24" {
-		t.Fatalf("init + segment 2 decodes %s frames", got)
+	if got := countFrames(t, append(head, middle...)); got != "24" {
+		t.Fatalf("init + mediaSegment 2 decodes %s frames", got)
 	}
 }
