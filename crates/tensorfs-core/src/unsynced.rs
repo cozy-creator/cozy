@@ -281,6 +281,16 @@ impl Epoch {
     /// fsync every object admitted since the last batch. A writer with its own durability
     /// points (a derived checkpoint) calls this there; a pull relies on [`SYNC_EVERY`].
     pub(crate) fn sync_now(&self) -> Result<()> {
+        self.sync_batch(false)
+    }
+
+    /// The same, plus the directories those objects were linked into: a derived checkpoint
+    /// names its objects, so their names must survive with it.
+    pub(crate) fn sync_now_named(&self) -> Result<()> {
+        self.sync_batch(true)
+    }
+
+    fn sync_batch(&self, names: bool) -> Result<()> {
         let batch = std::mem::take(
             &mut *self
                 .pending
@@ -289,6 +299,13 @@ impl Epoch {
         );
         let started = Instant::now();
         sync_files(&batch)?;
+        if names {
+            let directories: std::collections::BTreeSet<PathBuf> = batch
+                .iter()
+                .filter_map(|path| path.parent().map(Path::to_path_buf))
+                .collect();
+            sync_files(&directories.into_iter().collect::<Vec<_>>())?;
+        }
         let spent = started.elapsed();
         self.syncs.fetch_add(1, Ordering::Relaxed);
         self.sync_nanos.fetch_add(

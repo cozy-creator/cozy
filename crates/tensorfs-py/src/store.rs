@@ -2294,8 +2294,11 @@ impl PyStore {
                 )
             })
             .or_refuse(py)?;
+        let store = py
+            .detach(|| derived::writer_store(&self.store))
+            .or_refuse(py)?;
         Ok(PyDerivedWriter {
-            store: self.store.clone(),
+            store: Arc::new(store),
             meta: self.meta.clone(),
             transaction_id: transaction_id.to_string(),
             writer_session_id,
@@ -2890,12 +2893,14 @@ impl PyDerivedWriter {
                     detail: "derived writer holds were released".into(),
                 })?;
                 guards.writer_hold.still_registered(&self.meta)?;
-                derived::commit(
+                let facts = derived::commit(
                     &self.store,
                     &self.meta,
                     &self.transaction_id,
                     self.writer_session_id,
-                )
+                )?;
+                derived::finish_writer(&self.store)?;
+                Ok(facts)
             })
             .or_refuse(py)?;
         self.release_holds(py);
