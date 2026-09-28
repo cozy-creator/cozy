@@ -288,10 +288,10 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 	if prepares != 0 {
 		t.Fatalf("the client prepared the machine %d time(s) for a root it takes by release", prepares)
 	}
-	if _, show := runCozy(t, root, "run", "show", "2"); !strings.Contains(show, "ordinals [0 1 2 3]") {
+	if _, show := runCozy(t, root, "run", "show", "2"); !strings.Contains(show, "GPUs 0-3") {
 		t.Fatalf("run show does not name the GPUs Runtime granted:\n%s", show)
 	}
-	// Runtime's triage bundle is kept, so the run still reads as setup, inference and ranks.
+	// Runtime's triage bundle is kept, so the run still reads as setup, inference and GPUs.
 	_, show := runCozy(t, root, "run", "show", "2", "--json")
 	var report struct {
 		Stages []struct{ Name, Kind string } `json:"stages"`
@@ -299,9 +299,9 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 			Name  string `json:"name"`
 			Count int    `json:"count"`
 		} `json:"steps"`
-		Ranks []struct {
+		GPUs []struct {
 			PID int `json:"pid"`
-		} `json:"ranks"`
+		} `json:"gpus"`
 	}
 	must(t, json.Unmarshal([]byte(show), &report))
 	kinds := map[string]string{}
@@ -309,7 +309,7 @@ func TestRentedInferenceIsARuntimeExecution(t *testing.T) {
 		kinds[stage.Name] = stage.Kind
 	}
 	if kinds["executor boot"] != "setup" || kinds["condition"] != "inference" ||
-		len(report.Steps) != 1 || report.Steps[0].Count != 4 || len(report.Ranks) != 1 || report.Ranks[0].PID <= 0 {
+		len(report.Steps) != 1 || report.Steps[0].Count != 4 || len(report.GPUs) != 1 || report.GPUs[0].PID <= 0 {
 		t.Fatalf("run show lost Runtime's evidence: %s", show)
 	}
 	pod.mu.Lock()

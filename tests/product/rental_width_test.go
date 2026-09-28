@@ -45,7 +45,7 @@ func modelBearingPlacement(t *testing.T) func([]byte, string, string) *pb.Placem
 }
 
 // TestWideProductsAreOnlyBoughtForAPackageThatDeclaresTheDegree is the PRE-SPEND half.
-// Width is not capacity — every rank of a group holds the full weights — so the only thing
+// Width is not capacity — every GPU of a group holds the full weights — so the only thing
 // that uses a second card is a group of that degree, and only the package's author can say
 // the construction can be built at one. A wide product is therefore excluded from the
 // ladder unless the degree is declared, which keeps a typed worker refusal from costing an

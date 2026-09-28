@@ -20,7 +20,7 @@ import (
 )
 
 // runReport is one run's execution evidence: cold setup apart from inference, the per-step
-// series, which ranks ran it, and each child call it made. Every fact comes from the
+// series, which GPUs ran it, and each child call it made. Every fact comes from the
 // daemon's records (durable events and the kept triage bundle); JSON also carries both
 // sources whole.
 type runReport struct {
@@ -41,7 +41,7 @@ type runReport struct {
 	Stages   []reportStage   `json:"stages"`
 	Steps    []reportSteps   `json:"steps,omitempty"`
 	Degree   int             `json:"degree,omitempty"`
-	Ranks    []reportRank    `json:"ranks,omitempty"`
+	GPUs     []reportGPU     `json:"gpus,omitempty"`
 	Calls    []reportCall    `json:"calls,omitempty"`
 	// Resolved is what the machine installed and which checkpoint each Model slot ran: the
 	// run's reproducible identity, recorded by the machine that chose it.
@@ -106,24 +106,21 @@ type reportCall struct {
 	Label       string        `json:"label,omitempty"`
 	Status      string        `json:"status,omitempty"` // empty until Runtime records it settled
 	Error       string        `json:"error,omitempty"`
-	GPUs        []int         `json:"gpus,omitempty"`
+	GPUs        []reportGPU   `json:"gpus,omitempty"` // its grants' cards, then its release's records
 	StartUnixMS int64         `json:"start_unix_ms,omitempty"`
 	MS          float64       `json:"ms"`
 	Stages      []reportStage `json:"stages"`
 	Steps       []reportSteps `json:"steps,omitempty"`
-	// Ranks are the call's own ranks and attention kernels, from its GPU release: a child
-	// call's never reach the root's triage.
-	Ranks []reportRank `json:"ranks,omitempty"`
 
 	timed []reportStage // its latest record's attribution stages, beside Stages until sorted
 }
 
-// reportRank is Runtime's per-rank record, read tolerantly.
-type reportRank struct {
-	Rank      int    `json:"rank"`
-	PID       int    `json:"pid"`
-	Ordinal   int    `json:"ordinal"`
-	UUID      string `json:"uuid"`
+// reportGPU is Runtime's record of one GPU an execution ran on, read tolerantly: `gpu` is
+// the number nvidia-smi shows, -1 when unknown. A grant's row names only the card.
+type reportGPU struct {
+	GPU       int    `json:"gpu"`
+	PID       int    `json:"pid,omitempty"`
+	UUID      string `json:"uuid,omitempty"`
 	Arch      string `json:"arch,omitempty"`
 	StartUS   int64  `json:"start_us"`
 	EndUS     int64  `json:"end_us"`
@@ -135,7 +132,26 @@ type reportRank struct {
 	} `json:"attention"`
 }
 
-// reportKernel is one kernel of a rank's attention chains: whether it served, and if not
+// legacyRank is a Runtime's `ranks` row, all a Runtime before `gpus` sends: its `ordinal`
+// is the GPU's number. Drop once no deployed Runtime lacks `gpus`.
+type legacyRank struct {
+	reportGPU
+	Ordinal int `json:"ordinal"`
+}
+
+// gpuRecords prefers Runtime's `gpus` and falls back to an older one's `ranks`.
+func gpuRecords(gpus []reportGPU, ranks []legacyRank) []reportGPU {
+	if len(gpus) > 0 {
+		return gpus
+	}
+	for _, rank := range ranks {
+		rank.GPU = rank.Ordinal
+		gpus = append(gpus, rank.reportGPU)
+	}
+	return gpus
+}
+
+// reportKernel is one kernel of a GPU's attention chains: whether it served, and if not
 // why (compiling, failed, absent, unsupported), with what compiling it cost this machine.
 type reportKernel struct {
 	Kernel    string   `json:"kernel"`
@@ -175,7 +191,8 @@ type triageEvidence struct {
 		} `json:"attribution"`
 		Execution struct {
 			Degree       int          `json:"degree"`
-			Ranks        []reportRank `json:"ranks"`
+			GPUs         []reportGPU  `json:"gpus"`
+			Ranks        []legacyRank `json:"ranks"`
 			Executor     triageSetup  `json:"executor"`
 			Construction triageSetup  `json:"construction"`
 		} `json:"execution"`
@@ -185,11 +202,26 @@ type triageEvidence struct {
 // The evidence events run show reads, each decoded once into its own type. A payload
 // that does not decode is skipped: one odd record never hides the rest.
 
-// gpuEvent is Runtime's grant or release of one call attempt's devices (`request#attempt`).
+// gpuEvent is Runtime's grant or release of one call attempt's devices (`request#attempt`):
+// `gpus` names each card, and a release's rows are its execution records. A Runtime before
+// `gpus` sends only `ordinals` (the same numbers on a whole-pod worker) and `ranks`.
 type gpuEvent struct {
 	Key      string       `json:"key"`
 	Ordinals []int        `json:"ordinals"`
-	Ranks    []reportRank `json:"ranks"` // a release's per-rank execution evidence
+	GPUs     []reportGPU  `json:"gpus"`
+	Ranks    []legacyRank `json:"ranks"`
+}
+
+// cards are the GPUs the event names.
+func (e gpuEvent) cards() []reportGPU {
+	if len(e.GPUs) > 0 {
+		return e.GPUs
+	}
+	cards := make([]reportGPU, len(e.Ordinals))
+	for i, ordinal := range e.Ordinals {
+		cards[i] = reportGPU{GPU: ordinal}
+	}
+	return cards
 }
 
 type preparingEvent struct {
@@ -335,11 +367,11 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				continue
 			}
 			stage := reportStage{Name: "GPU", Kind: "gpu", StartUnixMS: at.UnixMilli(),
-				Detail: "ordinals " + fmt.Sprint(lease.Ordinals)}
+				Detail: gpuNames(lease.cards())}
 			stages := &report.Stages
 			if request, _, _ := strings.Cut(lease.Key, "#"); request != life.RequestID {
 				c := call(request)
-				c.GPUs, stages = union(c.GPUs, lease.Ordinals), &c.Stages
+				c.GPUs, stages = seat(c.GPUs, lease.cards(), false), &c.Stages
 			} else {
 				stage.Name += " " + lease.Key
 			}
@@ -354,8 +386,9 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 				stage := &(*open.stages)[open.index]
 				stage.MS = float64(at.UnixMilli() - stage.StartUnixMS)
 			}
-			if request, _, _ := strings.Cut(release.Key, "#"); request != life.RequestID && len(release.Ranks) > 0 {
-				call(request).Ranks = release.Ranks
+			if request, _, _ := strings.Cut(release.Key, "#"); request != life.RequestID {
+				c := call(request)
+				c.GPUs = seat(c.GPUs, gpuRecords(release.GPUs, release.Ranks), true)
 			}
 			delete(granted, release.Key)
 		case "machine.call":
@@ -435,7 +468,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	var triage triageEvidence
 	if len(evidence.Triage) > 0 && json.Unmarshal(evidence.Triage, &triage) == nil {
 		execution := triage.Measurements.Execution
-		report.Degree, report.Ranks = execution.Degree, execution.Ranks
+		report.Degree, report.GPUs = execution.Degree, gpuRecords(execution.GPUs, execution.Ranks)
 		if boot := execution.Executor; boot.StartedUnixMS > 0 {
 			report.Stages = append(report.Stages, setupStage("executor boot", boot.StartedUnixMS,
 				boot.MS, created, topLegs(boot.Legs)))
@@ -498,13 +531,18 @@ func sortStages(stages []reportStage) {
 	})
 }
 
-func union(held, more []int) []int {
-	for _, ordinal := range more {
-		if !slices.Contains(held, ordinal) {
-			held = append(held, ordinal)
+// seat puts rows into a call's GPUs by number, in number order: a grant's card is added
+// once, and a release's execution record replaces its card's row.
+func seat(held, rows []reportGPU, records bool) []reportGPU {
+	for _, row := range rows {
+		switch i := slices.IndexFunc(held, func(h reportGPU) bool { return h.GPU == row.GPU }); {
+		case i < 0:
+			held = append(held, row)
+		case records:
+			held[i] = row
 		}
 	}
-	slices.Sort(held)
+	slices.SortFunc(held, func(a, b reportGPU) int { return a.GPU - b.GPU })
 	return held
 }
 
@@ -751,7 +789,7 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		}
 	}
 	emitTimeline(w, table, r.Stages, r.Steps, offset, mode.Full)
-	emitRanks(w, table, r.Degree, r.Ranks, offset, mode.Full)
+	emitGPUs(w, table, r.GPUs, offset, mode.Full)
 	if len(r.Calls) == 0 {
 		return nil
 	}
@@ -760,11 +798,11 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 	for _, c := range r.Calls {
 		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.Number, clip(c.name(), 40), dash(c.Function),
 			dash(c.Status), dash(gpuList(c.GPUs)), offset(c.StartUnixMS), span(c.MS), dash(stepsCell(c.Steps)),
-			dash(clip(served(c.Ranks), 40)))
+			dash(clip(served(c.GPUs), 40)))
 	}
 	table.Flush()
 	if !mode.Full {
-		fmt.Fprintf(w, "\n`cozy run show %s --call <#>` shows one call's stages, steps, ranks and attention kernels; --full shows every call's.\n",
+		fmt.Fprintf(w, "\n`cozy run show %s --call <#>` shows one call's stages, steps, GPUs and attention kernels; --full shows every call's.\n",
 			runReference(r.Number, r.RequestID))
 		return nil
 	}
@@ -794,7 +832,7 @@ func (c callReport) Emit(w io.Writer, mode output.Mode) error {
 	return nil
 }
 
-// emit prints one call: what it ran, its timeline on the run's clock, its steps and ranks.
+// emit prints one call: what it ran, its timeline on the run's clock, its steps and GPUs.
 func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset func(int64) string, full bool) {
 	fmt.Fprintf(w, "call %d of %d  %s", c.Number, calls, c.name())
 	if c.Function != "" {
@@ -813,7 +851,7 @@ func (c reportCall) emit(w io.Writer, table *tabwriter.Writer, calls int, offset
 		fmt.Fprintf(w, "error: %s\n", c.Error)
 	}
 	emitTimeline(w, table, c.Stages, c.Steps, offset, full)
-	emitRanks(w, table, len(c.Ranks), c.Ranks, offset, full)
+	emitGPUs(w, table, c.GPUs, offset, full)
 }
 
 // name is the call's label, else its request id's first eight digits.
@@ -854,37 +892,47 @@ func emitTimeline(w io.Writer, table *tabwriter.Writer, stages []reportStage, st
 	}
 }
 
-func emitRanks(w io.Writer, table *tabwriter.Writer, degree int, ranks []reportRank, offset func(int64) string, full bool) {
-	if len(ranks) == 0 {
+// emitGPUs prints the GPUs an execution ran on, by the number nvidia-smi shows. A card held
+// with no process on it (a one-process call on a wider grant) and a CPU process are not.
+func emitGPUs(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, offset func(int64) string, full bool) {
+	gpus = slices.DeleteFunc(slices.Clone(gpus), func(g reportGPU) bool {
+		return g.PID <= 0 || g.GPU < 0 && g.UUID == ""
+	})
+	if len(gpus) == 0 {
 		return
 	}
-	fmt.Fprintf(w, "\nranks (degree %d)\n", degree)
-	fmt.Fprintln(table, "RANK\tGPU\tARCH\tUUID\tPID\tSTART\tTIME\tATTENTION")
-	for _, rank := range ranks {
-		gpu, start, took := "-", "-", "-"
-		if rank.Ordinal >= 0 {
-			gpu = fmt.Sprint(rank.Ordinal)
+	fmt.Fprintf(w, "\nGPUs (%d)\n", len(gpus))
+	fmt.Fprintln(table, "GPU\tARCH\tUUID\tPID\tSTART\tTIME\tATTENTION")
+	for _, gpu := range gpus {
+		start, took := "-", "-"
+		if gpu.StartUS > 0 {
+			start, took = offset(gpu.StartUS/1000), span(float64(gpu.EndUS-gpu.StartUS)/1000)
 		}
-		if rank.StartUS > 0 {
-			start, took = offset(rank.StartUS/1000), span(float64(rank.EndUS-rank.StartUS)/1000)
-		}
-		fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", rank.Rank, gpu, dash(rank.Arch),
-			output.Elide(dash(rank.UUID), 17, full), rank.PID, start, took, rankAttention(rank))
+		fmt.Fprintf(table, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n", gpu.number(), dash(gpu.Arch),
+			output.Elide(dash(gpu.UUID), 17, full), gpu.PID, start, took, gpuAttention(gpu))
 	}
 	table.Flush()
-	emitKernels(w, table, ranks, full)
+	emitKernels(w, table, gpus, full)
 }
 
-// emitKernels prints each rank's attention kernels: the one that served, and for every other
+// number is the GPU's number as nvidia-smi shows it, "-" when unknown.
+func (g reportGPU) number() string {
+	if g.GPU < 0 {
+		return "-"
+	}
+	return strconv.Itoa(g.GPU)
+}
+
+// emitKernels prints each GPU's attention kernels: the one that served, and for every other
 // kernel of its chains why it did not (still compiling, failed, absent, unsupported), with
 // its compile time on this machine.
-func emitKernels(w io.Writer, table *tabwriter.Writer, ranks []reportRank, full bool) {
+func emitKernels(w io.Writer, table *tabwriter.Writer, gpus []reportGPU, full bool) {
 	header := false
-	for _, rank := range ranks {
-		for _, kernel := range rank.Attention.Kernels {
+	for _, gpu := range gpus {
+		for _, kernel := range gpu.Attention.Kernels {
 			if !header {
 				fmt.Fprintln(w, "\nattention kernels")
-				fmt.Fprintln(table, "RANK\tKERNEL\tSTATE\tCOMPILE\tDETAIL")
+				fmt.Fprintln(table, "GPU\tKERNEL\tSTATE\tCOMPILE\tDETAIL")
 				header = true
 			}
 			state := kernel.State
@@ -897,7 +945,7 @@ func emitKernels(w io.Writer, table *tabwriter.Writer, ranks []reportRank, full 
 			if kernel.CompileMS > 0 {
 				compile = span(kernel.CompileMS)
 			}
-			fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\n", rank.Rank, kernel.Kernel, state, compile,
+			fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n", gpu.number(), kernel.Kernel, state, compile,
 				dash(output.Elide(kernel.Detail, 72, full)))
 		}
 	}
@@ -921,11 +969,11 @@ func stepsCell(steps []reportSteps) string {
 	return strings.Join(parts, ", ")
 }
 
-// served names the attention kernels that served a call's ranks, else what its ranks observed.
-func served(ranks []reportRank) string {
+// served names the attention kernels that served a call's GPUs, else what its GPUs observed.
+func served(gpus []reportGPU) string {
 	var names []string
-	for _, rank := range ranks {
-		for _, kernel := range rank.Attention.Kernels {
+	for _, gpu := range gpus {
+		for _, kernel := range gpu.Attention.Kernels {
 			if kernel.Served && !slices.Contains(names, kernel.Kernel) {
 				names = append(names, kernel.Kernel)
 			}
@@ -934,24 +982,37 @@ func served(ranks []reportRank) string {
 	if len(names) > 0 {
 		return strings.Join(names, ",")
 	}
-	for _, rank := range ranks {
-		if seen := rank.Attention.Observed; seen != "" && !slices.Contains(names, seen) {
+	for _, gpu := range gpus {
+		if seen := gpu.Attention.Observed; seen != "" && !slices.Contains(names, seen) {
 			names = append(names, seen)
 		}
 	}
 	return strings.Join(names, ",")
 }
 
-// gpuList spells ordinals, a contiguous run as its bounds: "0", "0-3", "0 2".
-func gpuList(ordinals []int) string {
-	if n := len(ordinals); n > 2 && ordinals[n-1]-ordinals[0] == n-1 {
-		return fmt.Sprintf("%d-%d", ordinals[0], ordinals[n-1])
+// gpuList spells GPU numbers in order, a contiguous run as its bounds: "0", "0-3", "0 2".
+func gpuList(gpus []reportGPU) string {
+	numbers := make([]int, len(gpus))
+	for i, gpu := range gpus {
+		numbers[i] = gpu.GPU
 	}
-	parts := make([]string, len(ordinals))
-	for i, ordinal := range ordinals {
-		parts[i] = strconv.Itoa(ordinal)
+	slices.Sort(numbers)
+	if n := len(numbers); n > 2 && numbers[n-1]-numbers[0] == n-1 && numbers[0] >= 0 {
+		return fmt.Sprintf("%d-%d", numbers[0], numbers[n-1])
+	}
+	parts := make([]string, len(gpus))
+	for i, number := range numbers {
+		parts[i] = reportGPU{GPU: number}.number()
 	}
 	return strings.Join(parts, " ")
+}
+
+// gpuNames is a grant's cards as a person reads them: "GPU 2", "GPUs 0-3".
+func gpuNames(gpus []reportGPU) string {
+	if len(gpus) == 1 {
+		return "GPU " + gpus[0].number()
+	}
+	return "GPUs " + gpuList(gpus)
 }
 
 func clip(value string, limit int) string {
@@ -968,16 +1029,16 @@ func dash(value string) string {
 	return value
 }
 
-func rankAttention(rank reportRank) string {
-	seen := rank.Attention.Observed
+func gpuAttention(gpu reportGPU) string {
+	seen := gpu.Attention.Observed
 	if seen == "" {
 		seen = "unobserved"
 	}
-	if rank.Attention.Impl != "" {
-		seen += " (" + rank.Attention.Impl + ")"
+	if gpu.Attention.Impl != "" {
+		seen += " (" + gpu.Attention.Impl + ")"
 	}
-	if rank.Attention.Requested != "" {
-		return rank.Attention.Requested + " → " + seen
+	if gpu.Attention.Requested != "" {
+		return gpu.Attention.Requested + " → " + seen
 	}
 	return seen
 }
