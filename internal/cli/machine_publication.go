@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
-	"encoding/pem"
 	"slices"
 	"time"
 
@@ -15,42 +14,48 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 )
 
+// publicationAuthorization binds a run's consented repositories to the machine it runs on:
+// a rental or this computer's machine, each by its pinned Host leaf and its hub identity.
 func (m *machineRuns) publicationAuthorization(ctx context.Context, request, machine string, connection *machineConnection) (string, *exit.Error) {
 	names, problem := m.store.RequestPublicationRepositories(request)
 	if problem != nil || len(names) == 0 {
 		return "", problem
 	}
-	if connection.RentalID() == "" || len(connection.CertificateDigest) != sha256.Size {
-		return "", exit.Named(exit.Structural, "publication.machine_identity_required", "publication authority requires the rented machine's pinned certificate identity")
+	machineID := connection.HubID()
+	if machineID == "" || len(connection.CertificateDER) == 0 || len(connection.CertificateDigest) != sha256.Size {
+		return "", exit.Named(exit.Structural, "publication.machine_identity_required", "publication authority requires the machine's pinned certificate identity")
+	}
+	account := connection.Account()
+	if account == nil {
+		return "", exit.Named(exit.Credential, "publication.account_unavailable", "publication authority requires a Tensorhub login for machine %s", machine)
 	}
 	raw, problem := m.store.MachinePublicationIntent(request)
 	if problem != nil {
 		return "", problem
 	}
 	var intent hub.MachinePublicationGrantIntent
-	account := client(m.fleet.atRental(machine))
 	if len(raw) == 0 {
-		selected, problem := account.Rental(ctx, machine)
-		if problem != nil {
-			return "", problem
+		if !connection.Owned() {
+			// A rental grants only while the Hub says it is this exact ready worker.
+			selected, problem := account.Rental(ctx, machineID)
+			if problem != nil {
+				return "", problem
+			}
+			if selected.ID != machineID || selected.State != hub.RentalReady ||
+				selected.WorkerID != connection.Claim.WorkerId || selected.WorkerBootID != connection.Claim.WorkerBootId {
+				return "", exit.New(exit.Conflict, "publication authority rental readback differs from the authenticated machine")
+			}
 		}
-		if selected.ID != machine || selected.WorkerID != connection.Claim.WorkerId || selected.WorkerBootID != connection.Claim.WorkerBootId {
-			return "", exit.New(exit.Conflict, "publication authority rental readback differs from the authenticated machine")
-		}
-		block, remaining := pem.Decode([]byte(selected.CertPEM))
-		if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(remaining)) != 0 {
-			return "", exit.New(exit.Conflict, "publication authority has no exact machine certificate")
-		}
-		certificate, err := x509.ParseCertificate(block.Bytes)
+		leaf, err := x509.ParseCertificate(connection.CertificateDER)
 		if err != nil {
 			return "", exit.New(exit.Conflict, "publication authority machine certificate is invalid")
 		}
 		now := time.Now()
 		expires := now.Add(7 * 24 * time.Hour)
-		if expires.After(certificate.NotAfter) {
-			expires = certificate.NotAfter
+		if leaf.NotAfter.Before(expires) {
+			expires = leaf.NotAfter
 		}
-		intent, problem = hub.PrepareMachinePublicationGrant(selected, names, now, expires)
+		intent, problem = hub.PrepareMachinePublicationGrant(machine, machineID, connection.CertificateDER, names, now, expires)
 		if problem != nil {
 			return "", problem
 		}
@@ -64,7 +69,7 @@ func (m *machineRuns) publicationAuthorization(ctx context.Context, request, mac
 	for _, repository := range intent.Repositories {
 		consented = append(consented, repository.Org+"/"+repository.Name)
 	}
-	if err != nil || intent.RentalID != machine || !bytes.Equal(digest[:], connection.CertificateDigest) ||
+	if err != nil || intent.Machine != machine || intent.MachineID != machineID || !bytes.Equal(digest[:], connection.CertificateDigest) ||
 		!slices.Equal(consented, names) || !slices.Equal(intent.Permissions, []string{"assessment", "checkpoint", "release"}) {
 		return "", exit.New(exit.Conflict, "publication authorization differs from recorded consent or the pinned machine certificate")
 	}

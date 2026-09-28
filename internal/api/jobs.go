@@ -263,8 +263,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
-		if !spec.Rental || (spec.LocalInstallationID == "" && !publishedMachineJob(spec)) || s.machineExecutions == nil {
-			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-upload requires a Runtime-owned rented transaction with its own certificate identity"))
+		if (spec.LocalInstallationID == "" && !publishedMachineJob(spec)) || s.machineExecutions == nil {
+			s.refuseTyped(w, r, exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-upload requires a Runtime-owned transaction on a machine with its own certificate identity"))
 			return
 		}
 	}
@@ -350,10 +350,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, status, handle)
 }
 
-// Every root uses Runtime submission. A rented job publishes its weights outputs to their
-// destination from the machine. Source acquisition has no machine-side staging path and
-// stays with its own coordinator, as does a destination on this computer, whose machine
-// has no hub-known certificate to publish with yet.
+// Every root uses Runtime submission. A job publishes its weights outputs to their
+// destination from the machine it runs on, rented or this computer's, under a grant bound
+// to that machine's Host leaf. Source acquisition has no machine-side staging path and
+// stays with its own coordinator.
 func publishedMachineJob(spec orchestrator.Submission) bool {
 	if spec.ModelTransfer != nil {
 		return machineDestination(spec) != ""
@@ -361,9 +361,9 @@ func publishedMachineJob(spec orchestrator.Submission) bool {
 	return true
 }
 
-// machineDestination is the repository a rented job's machine publishes its outputs to.
+// machineDestination is the repository a job's machine publishes its outputs to.
 func machineDestination(spec orchestrator.Submission) string {
-	if !spec.Rental || spec.ModelTransfer == nil || spec.ModelTransfer.HasAcquisition() {
+	if spec.ModelTransfer == nil || spec.ModelTransfer.HasAcquisition() {
 		return ""
 	}
 	return spec.ModelTransfer.Destination

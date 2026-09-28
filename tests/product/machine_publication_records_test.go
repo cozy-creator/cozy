@@ -42,7 +42,7 @@ func TestMachinePublicationIntentCannotChangeAcrossClientRestart(t *testing.T) {
 	fatal(t, problem)
 	request, _, problem := store.Submit(records.Request{ID: "job-publication-intent", IdemKey: "publication-intent", Package: "local/example", Entrypoint: "main", Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("1"), MachineExecutionObserver: true})
 	fatal(t, problem)
-	raw := []byte(`{"authorization_id":"9a4c3c53-564b-4497-8398-ac0f55bcc2cc","rental_id":"private-machine","repositories":[{"org":"alice","name":"model"}],"permissions":["assessment","checkpoint","release"],"expires_at_unix":1900000000,"certificate_der_b64url":"cHVibGljLW1ldGFkYXRh"}`)
+	raw := []byte(`{"authorization_id":"9a4c3c53-564b-4497-8398-ac0f55bcc2cc","machine":"private-machine","machine_id":"private-machine","repositories":[{"org":"alice","name":"model"}],"permissions":["assessment","checkpoint","release"],"expires_at_unix":1900000000,"certificate_der_b64url":"cHVibGljLW1ldGFkYXRh"}`)
 	if problem := store.RecordMachinePublicationIntent(request.ID, raw); problem == nil {
 		t.Fatal("publication authority was recorded before machine selection")
 	}

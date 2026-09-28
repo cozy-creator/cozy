@@ -42,9 +42,6 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		if problem != nil {
 			return problem
 		}
-		if !rentalRequested(ctx) {
-			return exit.Named(exit.Structural, "publication.machine_identity_required", "--allow-upload requires a rented transaction with its own certificate identity")
-		}
 		ctx.Inv.Values["--allow-upload"] = normalized
 	}
 	deadline, problem := runDeadline(ctx)

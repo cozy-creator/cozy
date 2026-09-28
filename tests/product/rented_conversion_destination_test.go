@@ -343,7 +343,8 @@ func (f *conversionFixture) published(t *testing.T, out string) *records.Request
 		t.Fatalf("the input model is not the Hub checkpoint the pod reuses: %v", models)
 	}
 	f.mu.Lock()
-	if len(f.grants) != 1 || !strings.Contains(mustJSON(t, f.grants[0]), `"repositories":[{"name":"output","org":"proof"}]`) {
+	if len(f.grants) != 1 || !strings.Contains(mustJSON(t, f.grants[0]), `"repositories":[{"name":"output","org":"proof"}]`) ||
+		!strings.Contains(mustJSON(t, f.grants[0]), `"machine_id":"`+podRental+`"`) || strings.Contains(mustJSON(t, f.grants[0]), `"rental_id"`) {
 		t.Fatalf("the destination is not the machine's only publication grant: %v", f.grants)
 	}
 	f.mu.Unlock()

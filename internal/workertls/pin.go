@@ -15,6 +15,9 @@ import (
 // certificate had SIGNED; a pin admits one thing.
 type Pin struct{ der []byte }
 
+// DER is the pinned leaf's exact bytes: the identity a publication grant binds.
+func (p *Pin) DER() []byte { return append([]byte(nil), p.der...) }
+
 func (p *Pin) Digest() []byte {
 	sum := sha256.Sum256(p.der)
 	return append([]byte(nil), sum[:]...)

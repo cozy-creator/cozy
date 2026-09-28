@@ -40,7 +40,9 @@ type Machine struct {
 	Claim     *pb.Claim
 	Protocol  *pb.ProtocolInfoResult
 	WireMinor uint32
-	// CertificateDigest is the pinned leaf's sha256, the identity publication authority binds.
+	// CertificateDER is the pinned leaf, the identity publication authority binds, and
+	// CertificateDigest its sha256.
+	CertificateDER    []byte
 	CertificateDigest []byte
 
 	claimAck *pb.ClaimAck
@@ -74,6 +76,15 @@ func (m *Machine) Close() error {
 	}
 	return err
 }
+
+// HubID is the hub's identity for this machine: a rental id, or an owned machine's id.
+func (m *Machine) HubID() string { return m.hubID }
+
+// Account is the signed-in owner's client at the hub this machine belongs to.
+func (m *Machine) Account() *hub.Client { return m.hub }
+
+// Owned says whether this is an owned machine, such as this computer's, not a rental.
+func (m *Machine) Owned() bool { return m.owned }
 
 // RentalID is the rental behind a rented machine, and "" for an owned one.
 func (m *Machine) RentalID() string {
@@ -272,7 +283,7 @@ func (m *Machine) dial(ctx context.Context, t target, controlClaim bool) *exit.E
 	if err != nil {
 		return Transport(err)
 	}
-	m.Conn, m.Host, m.CertificateDigest = connection, pb.NewPodHostClient(connection), t.pin.Digest()
+	m.Conn, m.Host, m.CertificateDER, m.CertificateDigest = connection, pb.NewPodHostClient(connection), t.pin.DER(), t.pin.Digest()
 	m.workspace = &atomic.Pointer[pb.MachineExecutionWorkspace]{}
 	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
 	info, err := m.Host.ProtocolInfo(probe, &pb.ProtocolInfoRequest{})

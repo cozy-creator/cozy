@@ -21,9 +21,10 @@ func (s *Store) RequestPublicationRepositories(id string) ([]string, *exit.Error
 	return names, nil
 }
 
-// A frozen authorization names one machine's certificate; a run released from a
-// lost machine is authorized again for the machine it is placed on next.
-const linkedPublication = `json_extract(CAST(payload AS TEXT),'$.rental_id')=(SELECT machine_id FROM machine_executions WHERE request_id=?)`
+// A frozen authorization names one machine (this host's name for it: a rental id or
+// "local") and its certificate; a run released from a lost machine is authorized again for
+// the machine it is placed on next.
+const linkedPublication = `json_extract(CAST(payload AS TEXT),'$.machine')=(SELECT machine_id FROM machine_executions WHERE request_id=?)`
 
 func (s *Store) MachinePublicationIntent(id string) ([]byte, *exit.Error) {
 	var raw []byte
@@ -60,9 +61,9 @@ func (s *Store) RecordMachinePublicationIntent(id string, raw []byte) *exit.Erro
 		return exit.Internalf("cannot inspect existing machine publication authorization: %s", err)
 	}
 	var allowed bool
-	err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND e.machine_id=json_extract(?,'$.rental_id') AND e.machine_id!='local' AND length(e.submission)=0 AND r.state!='canceled')`, id, string(raw)).Scan(&allowed)
+	err = tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM machine_executions e JOIN requests r ON r.id=e.request_id WHERE r.id=? AND e.machine_id=json_extract(?,'$.machine') AND length(e.submission)=0 AND r.state!='canceled')`, id, string(raw)).Scan(&allowed)
 	if err != nil || !allowed {
-		return exit.New(exit.Conflict, "publication authority has no pending rented machine submission")
+		return exit.New(exit.Conflict, "publication authority has no pending machine submission")
 	}
 	if _, err = tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,'machine.publication_authorization',0,?,?)`, id, raw, now()); err != nil {
 		return exit.Internalf("cannot freeze machine publication authorization: %s", err)

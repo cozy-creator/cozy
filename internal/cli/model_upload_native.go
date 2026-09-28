@@ -29,14 +29,11 @@ const (
 	ingestTensorFSFloor = "0.3.73"
 )
 
-// nativeModelUpload runs a rented provider ingest as an ordinary local script on the
-// rental: the pod downloads the source, converts it to CozyTensors with reviewed TensorFS
-// profiles and uploads the checkpoint. A Runtime recipe, where one exists, adds its
+// nativeModelUpload runs a provider ingest as an ordinary script on a machine, rented or
+// this computer's: the machine downloads the source, converts it to CozyTensors with
+// reviewed TensorFS profiles and uploads the checkpoint under its own publication grant. A Runtime recipe, where one exists, adds its
 // model-owned metadata; without one the profiles the source headers match are used.
 func nativeModelUpload(ctx *Context) (bool, *exit.Error) {
-	if !rentalRequested(ctx) {
-		return false, nil
-	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return true, exit.Internalf("cannot resolve working directory: %s", err)

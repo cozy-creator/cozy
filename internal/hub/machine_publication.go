@@ -1,11 +1,9 @@
 package hub
 
 import (
-	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/pem"
 	"net/http"
 	"slices"
 	"time"
@@ -21,27 +19,29 @@ type PublicationRepository struct {
 
 // MachinePublicationGrantIntent is frozen in the client submission record before
 // its first Hub authorization call. A retry reuses this exact value, including ID and expiry.
-// It contains public certificate/scope metadata, never a device key or token.
+// It contains public certificate/scope metadata, never a device key or token. MachineID is a
+// rental id (pr-…) or an owned machine's id (om-…); the certificate is its Host leaf.
 type MachinePublicationGrantIntent struct {
-	AuthorizationID string                  `json:"authorization_id"`
-	RentalID        string                  `json:"rental_id"`
-	Repositories    []PublicationRepository `json:"repositories"`
-	Permissions     []string                `json:"permissions"`
-	ExpiresAtUnix   int64                   `json:"expires_at_unix"`
-	CertificateDER  string                  `json:"certificate_der_b64url"`
+	AuthorizationID string `json:"authorization_id"`
+	// Machine is this host's name for the machine (a rental id or "local"); MachineID is the
+	// hub's identity for it (the rental id, or an owned machine's om-… id).
+	Machine        string                  `json:"machine"`
+	MachineID      string                  `json:"machine_id"`
+	Repositories   []PublicationRepository `json:"repositories"`
+	Permissions    []string                `json:"permissions"`
+	ExpiresAtUnix  int64                   `json:"expires_at_unix"`
+	CertificateDER string                  `json:"certificate_der_b64url"`
 }
 
-func PrepareMachinePublicationGrant(rental Rental, repositories []string, now, expires time.Time) (MachinePublicationGrantIntent, *exit.Error) {
-	if rental.State != RentalReady || rental.ID == "" || rental.WorkerID == "" {
-		return MachinePublicationGrantIntent{}, exit.New(exit.Conflict, "publication authority requires the current ready rental")
+// PrepareMachinePublicationGrant binds explicit repositories to one machine's exact Host
+// leaf for at most seven days and never past the leaf's own validity.
+func PrepareMachinePublicationGrant(machine, machineID string, leaf []byte, repositories []string, now, expires time.Time) (MachinePublicationGrantIntent, *exit.Error) {
+	if machine == "" || machineID == "" {
+		return MachinePublicationGrantIntent{}, exit.New(exit.Conflict, "publication authority requires one machine identity")
 	}
-	block, remaining := pem.Decode([]byte(rental.CertPEM))
-	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(remaining)) != 0 {
-		return MachinePublicationGrantIntent{}, exit.New(exit.Validation, "rental has no exact pinned certificate")
-	}
-	certificate, err := x509.ParseCertificate(block.Bytes)
+	certificate, err := x509.ParseCertificate(leaf)
 	if err != nil || now.Before(certificate.NotBefore) || !now.Before(certificate.NotAfter) {
-		return MachinePublicationGrantIntent{}, exit.New(exit.Validation, "rental certificate is not currently valid")
+		return MachinePublicationGrantIntent{}, exit.New(exit.Validation, "machine certificate is not currently valid")
 	}
 	expires = expires.UTC().Truncate(time.Second)
 	if !expires.After(now.Add(time.Second)) || expires.After(now.Add(7*24*time.Hour)) || expires.After(certificate.NotAfter) {
@@ -60,8 +60,8 @@ func PrepareMachinePublicationGrant(rental Rental, repositories []string, now, e
 	if err != nil {
 		return MachinePublicationGrantIntent{}, exit.Internalf("cannot create publication authorization identity")
 	}
-	return MachinePublicationGrantIntent{AuthorizationID: id.String(), RentalID: rental.ID, Repositories: wanted,
-		Permissions: []string{"assessment", "checkpoint", "release"}, ExpiresAtUnix: expires.Unix(), CertificateDER: base64.RawURLEncoding.EncodeToString(block.Bytes)}, nil
+	return MachinePublicationGrantIntent{AuthorizationID: id.String(), Machine: machine, MachineID: machineID, Repositories: wanted,
+		Permissions: []string{"assessment", "checkpoint", "release"}, ExpiresAtUnix: expires.Unix(), CertificateDER: base64.RawURLEncoding.EncodeToString(leaf)}, nil
 }
 
 // NormalizePublicationRepositories validates explicit consent before selecting or
@@ -90,7 +90,7 @@ func NormalizePublicationRepositories(repositories []string) ([]string, *exit.Er
 // initial short token is deliberately discarded here and never sent to Python.
 func (c *Client) AuthorizeMachinePublication(ctx context.Context, intent MachinePublicationGrantIntent) *exit.Error {
 	id, err := uuid.Parse(intent.AuthorizationID)
-	if err != nil || id == uuid.Nil || id.String() != intent.AuthorizationID || intent.RentalID == "" {
+	if err != nil || id == uuid.Nil || id.String() != intent.AuthorizationID || intent.MachineID == "" {
 		return exit.New(exit.Validation, "publication authorization intent is malformed")
 	}
 	ttl := min(int64(900), intent.ExpiresAtUnix-time.Now().Unix()-1)
@@ -103,7 +103,7 @@ func (c *Client) AuthorizeMachinePublication(ctx context.Context, intent Machine
 	}
 	problem := c.do(ctx, call{method: http.MethodPost, path: "/v1/machine-authorizations", auth: true,
 		body: map[string]any{"ttl_seconds": ttl, "delegate_certificate_der_b64url": intent.CertificateDER,
-			"requested_grant": map[string]any{"authorization_id": intent.AuthorizationID, "rental_id": intent.RentalID,
+			"requested_grant": map[string]any{"authorization_id": intent.AuthorizationID, "machine_id": intent.MachineID,
 				"repositories": intent.Repositories, "permissions": intent.Permissions, "expires_at_unix": intent.ExpiresAtUnix}},
 	}, &out)
 	if problem != nil {
