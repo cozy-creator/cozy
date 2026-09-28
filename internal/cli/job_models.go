@@ -61,13 +61,23 @@ func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 	if problem != nil {
 		return nil, problem
 	}
+	sources := map[string]bool{}
 	for _, spec := range selected {
-		if _, provider, problem := providerModelSource(spec.Ref); problem != nil {
+		canonical, provider, problem := providerModelSource(spec.Ref)
+		if problem != nil {
 			return nil, problem
-		} else if provider {
-			return nil, exit.Named(exit.Unavailable, "model_source.mixed_inputs_unsupported",
-				"a provider source must name every model slot of the job, and only one source")
 		}
+		if provider {
+			sources[canonical] = true
+		}
+	}
+	if len(sources) > 1 {
+		return nil, exit.Named(exit.Unavailable, "model_source.multiple_sources_unsupported",
+			"one run prepares one provider source; every model input must name the same source")
+	}
+	if len(sources) > 0 {
+		return nil, exit.Named(exit.Unavailable, "model_source.mixed_inputs_unsupported",
+			"a provider source must name every model slot of the job")
 	}
 	if len(profiles) > 0 {
 		return nil, exit.Usagef("--source-profile applies only to foreign model inputs")
