@@ -85,9 +85,6 @@ func InventoryPython(inventory *pb.ImageInventory, requiresPython, selected stri
 		return "", "the package reports invalid Requires-Python " + requiresPython
 	}
 	candidates := append([]*pb.PythonInterpreter(nil), inventory.Interpreters...)
-	if len(candidates) == 0 {
-		return "", "the rental image advertises no Python executor; use a current worker image"
-	}
 	for _, candidate := range candidates {
 		if candidate == nil {
 			return "", "the rental image reports an invalid Python executor"

@@ -391,7 +391,7 @@ func TestRentalInventoryRefusesAnUnreadablePython(t *testing.T) {
 	if _, why := launch.InventoryPython(inventory, ">=3.12", ""); why == "" {
 		t.Fatal("an unreadable Python version was accepted")
 	}
-	if _, why := launch.InventoryPython(&pb.ImageInventory{Python: "3.12.11"}, ">=3.12", ""); !strings.Contains(why, "no Python executor") {
+	if _, why := launch.InventoryPython(&pb.ImageInventory{Python: "3.12.11"}, ">=3.12", ""); !strings.Contains(why, "no available Python executor") {
 		t.Fatal(why)
 	}
 }
