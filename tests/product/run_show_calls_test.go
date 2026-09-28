@@ -32,8 +32,11 @@ type shownCall struct {
 	Function string `json:"function"`
 	Label    string `json:"label"`
 	Status   string `json:"status"`
-	GPUs     []int  `json:"gpus"`
-	Stages   []struct {
+	GPUs     []struct {
+		GPU int `json:"gpu"`
+		PID int `json:"pid"`
+	} `json:"gpus"`
+	Stages []struct {
 		Name string `json:"name"`
 		Kind string `json:"kind"`
 	} `json:"stages"`
@@ -42,15 +45,13 @@ type shownCall struct {
 		Count  int          `json:"count"`
 		Series [][2]float64 `json:"series"`
 	} `json:"steps"`
-	Ranks []struct {
-		Ordinal int `json:"ordinal"`
-	} `json:"ranks"`
 }
 
 // longForm journals what Runtime records for a long_form root: a prefetch narrating every
 // position of its download (4,065 such rows filled run 1510's 4,096-row record and hid its
 // nine segments), then each segment's input check, GPU grant and release, and the call
-// record Runtime journals when the segment settles.
+// record Runtime journals when the segment settles. Its worker was launched on cards 4-7, so
+// each grant's envelope ordinals 0-3 are GPUs 4-7, and its one process ran on GPU 4.
 func (m *runtimeMachine) longForm(segments, positions int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -67,11 +68,16 @@ func (m *runtimeMachine) longForm(segments, positions int) {
 		child := fmt.Sprintf("call-%040x", index)
 		m.record("log", log(map[string]any{"name": "Checking model inputs", "value": "info", "at_unix_ms": now,
 			"fields": map[string]any{"child_request": child, "phase": "Checking model inputs", "completed": true, "elapsed_ms": 101.5}}))
-		grant, _ := json.Marshal(map[string]any{"key": child + "#1", "ordinals": []int{0, 1, 2, 3}})
+		cards := []map[string]any{{"gpu": 4, "uuid": "GPU-4"}, {"gpu": 5, "uuid": "GPU-5"},
+			{"gpu": 6, "uuid": "GPU-6"}, {"gpu": 7, "uuid": "GPU-7"}}
+		grant, _ := json.Marshal(map[string]any{"key": child + "#1", "ordinals": []int{0, 1, 2, 3}, "gpus": cards})
 		m.record("gpu.grant", grant)
+		attention := map[string]any{"observed": "sageattention"}
 		release, _ := json.Marshal(map[string]any{"key": child + "#1", "ordinals": []int{0, 1, 2, 3}, "cause": "exited",
-			"ranks": []map[string]any{{"rank": 0, "ordinal": 0, "pid": 4000 + index, "arch": "sm_120",
-				"attention": map[string]any{"observed": "sageattention"}}}})
+			"ranks": []map[string]any{{"rank": 0, "ordinal": 4, "pid": 4000 + index, "uuid": "GPU-4", "arch": "sm_120",
+				"attention": attention}},
+			"gpus": []map[string]any{{"gpu": 4, "pid": 4000 + index, "uuid": "GPU-4", "arch": "sm_120",
+				"attention": attention}}})
 		m.record("gpu.release", release)
 		series := [][2]float64{}
 		for step := range 8 {
@@ -127,7 +133,7 @@ func TestRunShowKeepsEveryCallPastAProgressFlood(t *testing.T) {
 	code, human := runCozy(t, root, "run", "show", "1")
 	t.Logf("cozy run show 1:\n%s", human)
 	for index := range segments {
-		row := regexp.MustCompile(fmt.Sprintf(`(?m)^%d +Segment %d of %d +motion_segment_turbo +succeeded +0-3 .* denoise 8× 8.6s +sageattention$`,
+		row := regexp.MustCompile(fmt.Sprintf(`(?m)^%d +Segment %d of %d +motion_segment_turbo +succeeded +4-7 .* denoise 8× 8.6s +sageattention$`,
 			index+1, index+1, segments))
 		if code != 0 || !strings.Contains(human, "calls (9)") || !row.MatchString(human) {
 			t.Fatalf("run show [%d] lacks segment %d's call row:\n%s", code, index+1, human)
@@ -148,8 +154,8 @@ func TestRunShowKeepsEveryCallPastAProgressFlood(t *testing.T) {
 		t.Fatalf("the record holds %d prefetch samples, not its one latest: %.500v", len(narrated), narrated)
 	}
 	for _, call := range shown.Calls {
-		if call.Status != "succeeded" || fmt.Sprint(call.GPUs) != "[0 1 2 3]" || len(call.Steps) != 1 ||
-			call.Steps[0].Count != 8 || len(call.Steps[0].Series) != 8 || len(call.Ranks) != 1 || len(call.Stages) != 4 {
+		if call.Status != "succeeded" || fmt.Sprint(call.GPUs) != fmt.Sprintf("[{4 %d} {5 0} {6 0} {7 0}]", 4000+call.Number-1) ||
+			len(call.Steps) != 1 || call.Steps[0].Count != 8 || len(call.Steps[0].Series) != 8 || len(call.Stages) != 4 {
 			t.Fatalf("call %d lost its record: %+v", call.Number, call)
 		}
 	}
@@ -157,8 +163,8 @@ func TestRunShowKeepsEveryCallPastAProgressFlood(t *testing.T) {
 	code, one := runCozy(t, root, "run", "show", "1", "--call", "segment 3 of 9")
 	t.Logf("cozy run show 1 --call 'segment 3 of 9':\n%s", one)
 	for _, want := range []string{"call 3 of 9  Segment 3 of 9  motion_segment_turbo  succeeded",
-		"Checking model inputs  phase", "decode_video", "ordinals [0 1 2 3]",
-		"steps denoise: 8 in 1m8.8s; first 8.6s, then mean 8.6s", "ranks (degree 1)"} {
+		"Checking model inputs  phase", "decode_video", "GPUs 4-7", "GPU  ARCH",
+		"steps denoise: 8 in 1m8.8s; first 8.6s, then mean 8.6s", "GPUs (1)"} {
 		if code != 0 || !strings.Contains(one, want) {
 			t.Fatalf("run show --call [%d] lacks %q:\n%s", code, want, one)
 		}

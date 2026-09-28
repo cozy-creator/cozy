@@ -191,7 +191,7 @@ func takes(models []records.ModelRef, callable, accelerator string, width int) b
 //
 // ONE CARD, AT EVERY WIDTH, DELIBERATELY (cl-179). VRAMGB is the per-card figure for a
 // wide product as much as a narrow one, and that is the correct test: nothing here is
-// tensor- or pipeline-parallel, so under a sequence-parallel group every rank holds the
+// tensor- or pipeline-parallel, so under a sequence-parallel group every GPU holds the
 // WHOLE weights and a four-card pod fits exactly what one of its cards fits. Reading a
 // width as capacity — summing it, or dividing the need by it — would buy a pod that
 // cannot hold the model and only discover it after the hour was billed.
@@ -239,7 +239,7 @@ func gib(bytes int64) float64 { return float64(bytes) / (1 << 30) }
 // this request can use every card it would be billed for (cl-179). A reuse is not held to
 // it: the worker runs a paid wide pod at the best declared degree that fits.
 //
-// A wide machine is not more capacity: every rank of a sequence-parallel group holds the
+// A wide machine is not more capacity: every GPU of a sequence-parallel group holds the
 // FULL weights, so width buys latency and never fit. The only thing that uses the extra
 // cards is a group placement of exactly that degree, which needs two things this side
 // knows before spending: the package's author must have declared the degree, and the

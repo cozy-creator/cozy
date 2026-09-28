@@ -1,0 +1,10 @@
+attention kernels
+GPU  KERNEL         STATE            COMPILE  DETAIL
+2    flash-attn3    unsupported      -        flash-attn3 serves sm90 only; this executor holds sm100
+2    sageattention  served           3m5.3s   -
+2    sdpa           ready            -        -
+2    sol-attn       compiling (42%)  1m11.8s  -
+3    flash-attn3    unsupported      -        flash-attn3 serves sm90 only; this executor holds sm100
+3    sageattention  served           3m5.3s   -
+3    sdpa           ready            -        -
+3    sol-attn       compiling (42%)  1m11.8s  -

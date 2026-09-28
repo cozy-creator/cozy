@@ -839,7 +839,7 @@ type Residency struct {
 
 // Resident sizes the pinned selection against ONE accelerator, at every rental width
 // (cl-179): nothing here is tensor- or pipeline-parallel, so under a sequence-parallel
-// group every rank holds the whole selection and a K-card pod holds exactly what one of
+// group every GPU holds the whole selection and a K-card pod holds exactly what one of
 // its cards holds. A width is latency and activation headroom, never capacity.
 //
 // It sizes that one accelerator the way cozy-runtime loads it: per slot, the largest sum

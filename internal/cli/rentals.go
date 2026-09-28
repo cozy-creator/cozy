@@ -766,7 +766,7 @@ func oddGPUNote(gpus int) string {
 // product is sold at a WIDTH — how many of them one rental delivers. The width belongs
 // beside the card rather than in a column of its own: `4x NVIDIA H100 80GB HBM3` is one
 // machine with four cards, and the VRAM figure next to it stays the ONE-CARD figure,
-// which is the number that decides fit (every rank of a group holds the full weights).
+// which is the number that decides fit (every GPU of a group holds the full weights).
 // gpuCount is the rental's recorded GPU count; a CPU rental or an unreported count has none.
 func gpuCount(model string, count int) (int, bool) {
 	if count <= 0 || strings.EqualFold(strings.TrimSpace(model), "cpu") {

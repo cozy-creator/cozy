@@ -439,7 +439,7 @@ type RentalSKU struct {
 	AcceleratorModel string `json:"accelerator_model"`
 	// AcceleratorCount is the machine's GPU count. VRAMGB stays the ONE-CARD figure at
 	// every count, and that is the right fit test: under a sequence-parallel group every
-	// rank holds the FULL weights, so width buys latency, never capacity.
+	// GPU holds the FULL weights, so width buys latency, never capacity.
 	AcceleratorCount int `json:"accelerator_count"`
 	// BaseWorkerProfile is the hub's own label for the base image this product boots,
 	// e.g. `torch2.13.0-cu130-cp312-linux-x86`. It is read so a published release whose

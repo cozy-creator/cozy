@@ -27,55 +27,62 @@ func TestRunShowReadsAPreRecordBundleTolerantly(t *testing.T) {
 			t.Fatalf("run show [%d] lacks %q:\n%s", code, want, human)
 		}
 	}
-	if strings.Contains(human, "ranks") {
-		t.Fatalf("a bundle with no execution record showed ranks:\n%s", human)
+	if strings.Contains(human, "GPUs (") {
+		t.Fatalf("a bundle with no execution record showed GPUs:\n%s", human)
 	}
 }
 
-// Each rank's attention kernels are readable without a shell on the pod: the one that
+// Each GPU's attention kernels are readable without a shell on the pod: the one that
 // served, and for every other kernel of its chains why not (still compiling with its
-// progress, unsupported on this card) and what compiling it cost. The bundle is a
-// constructed two-rank Blackwell run in the shape Runtime's execution evidence carries.
-func TestRunShowPrintsEachRanksAttentionKernels(t *testing.T) {
-	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "kernel-ranks.json"))
+// progress, unsupported on this card) and what compiling it cost. Each bundle is a
+// constructed Blackwell run on GPUs 2 and 3: the current Runtime names them in `gpus`
+// (sealed by UUID, its `ranks` rows hold no number), and an older one only as the `ordinal`
+// of its `ranks` rows. Both read as the GPUs nvidia-smi shows, never as ranks.
+func TestRunShowPrintsEachGPUsAttentionKernels(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "kernel-gpus.golden"))
 	must(t, err)
-	o := hostOwner(t, "run-show-kernels")
-	id := succeededWithTriage(t, o, bundle)
-	defer publicationControlAPI(t, o)()
-	code, human := runCozy(t, o.root, "run", "show", id)
-	t.Logf("cozy run show:\n%s", human)
-	at := strings.Index(human, "attention kernels")
-	if code != 0 || at < 0 || !strings.Contains(human, "sm_100") {
-		t.Fatalf("run show [%d] lacks the ranks' arch or kernels:\n%s", code, human)
-	}
-	golden, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "kernel-ranks.golden"))
-	must(t, err)
-	if got := human[at:]; got != string(golden) {
-		t.Fatalf("attention kernels differ from the golden:\n%s\nwant:\n%s", got, golden)
-	}
+	for _, fixture := range []string{"kernel-gpus.json", "kernel-ranks.json"} {
+		bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", fixture))
+		must(t, err)
+		o := hostOwner(t, "run-show-"+strings.TrimSuffix(fixture, ".json"))
+		id := succeededWithTriage(t, o, bundle)
+		stop := publicationControlAPI(t, o)
+		code, human := runCozy(t, o.root, "run", "show", id)
+		t.Logf("cozy run show (%s):\n%s", fixture, human)
+		at := strings.Index(human, "attention kernels")
+		table := regexp.MustCompile(`(?m)^GPUs \(2\)\nGPU +ARCH +UUID +PID +START +TIME +ATTENTION\n2 +sm_100 +GPU-6f1c2a9e\S* +41021 .*\n3 +sm_100 +GPU-0a7e5d13\S* +41022 `)
+		if code != 0 || at < 0 || !table.MatchString(human) || strings.Contains(human, "rank") {
+			t.Fatalf("run show [%d] of %s lacks GPUs 2 and 3, or says rank:\n%s", code, fixture, human)
+		}
+		if got := human[at:]; got != string(golden) {
+			t.Fatalf("attention kernels of %s differ from the golden:\n%s\nwant:\n%s", fixture, got, golden)
+		}
 
-	code, out := runCozy(t, o.root, "run", "show", id, "--json")
-	var report struct {
-		Ranks []struct {
-			Arch      string `json:"arch"`
-			Attention struct {
-				Kernels []map[string]any `json:"kernels"`
-			} `json:"attention"`
-		} `json:"ranks"`
-	}
-	if code != 0 || json.Unmarshal([]byte(out), &report) != nil || len(report.Ranks) != 2 {
-		t.Fatalf("run show --json [%d]:\n%s", code, out)
-	}
-	for _, rank := range report.Ranks {
-		kernels := rank.Attention.Kernels
-		if rank.Arch != "sm_100" || len(kernels) != 4 || kernels[1]["served"] != true ||
-			kernels[3]["state"] != "compiling" || kernels[3]["progress"] != 0.42 {
-			t.Fatalf("run show --json lost a rank's kernel evidence: %+v", rank)
+		code, out := runCozy(t, o.root, "run", "show", id, "--json")
+		stop()
+		var report struct {
+			GPUs []struct {
+				GPU       int    `json:"gpu"`
+				Arch      string `json:"arch"`
+				Attention struct {
+					Kernels []map[string]any `json:"kernels"`
+				} `json:"attention"`
+			} `json:"gpus"`
+		}
+		if code != 0 || json.Unmarshal([]byte(out), &report) != nil || len(report.GPUs) != 2 {
+			t.Fatalf("run show --json [%d] of %s:\n%s", code, fixture, out)
+		}
+		for index, gpu := range report.GPUs {
+			kernels := gpu.Attention.Kernels
+			if gpu.GPU != 2+index || gpu.Arch != "sm_100" || len(kernels) != 4 || kernels[1]["served"] != true ||
+				kernels[3]["state"] != "compiling" || kernels[3]["progress"] != 0.42 {
+				t.Fatalf("run show --json lost a GPU's kernel evidence from %s: %+v", fixture, gpu)
+			}
 		}
 	}
 }
 
-// A GPU call's kernels are its own: a long_form run's H3 segments are child calls, whose ranks
+// A GPU call's kernels are its own: a long_form run's H3 segments are child calls, whose GPUs
 // reach Creator only in their GPU releases, never in the root's triage. Run 1525 served SDPA
 // there with nothing on screen saying why. Each call's row names the kernel that served it,
 // the call prints all its kernels, and the warm's phase prints what it started compiling.
@@ -85,7 +92,7 @@ func TestRunShowPrintsEachGPUCallsKernelsAndTheWarmsCompiles(t *testing.T) {
 	o := hostOwner(t, "run-show-call-kernels")
 	id := succeededWithTriage(t, o, bundle)
 	defer publicationControlAPI(t, o)()
-	warm := "rank 0: sol-attn compiling, sageattention compiling (3%), flash-attn3 unsupported, sdpa ready"
+	warm := "GPU 0: sol-attn compiling, sageattention compiling (3%), flash-attn3 unsupported, sdpa ready"
 	fatal(t, o.store.AppendEvent(id, "request.log", 1, map[string]any{"name": "Starting kernel compiles",
 		"value": "info", "fields": map[string]any{"phase": "Starting kernel compiles", "completed": true,
 			"started_unix_ms": 1790592484035, "elapsed_ms": 969.9, "detail": warm}}))
@@ -98,7 +105,7 @@ func TestRunShowPrintsEachGPUCallsKernelsAndTheWarmsCompiles(t *testing.T) {
 	}
 	fatal(t, o.store.AppendEvent(id, "machine.gpu.release", 1, map[string]any{"key": call,
 		"ordinals": []any{0}, "cause": "exited", "ranks": []any{map[string]any{"rank": 0,
-			"ordinal": 0, "arch": "sm_120", "attention": map[string]any{"observed": "sol-attn",
+			"ordinal": 0, "pid": 4100, "arch": "sm_120", "attention": map[string]any{"observed": "sol-attn",
 				"kernels": kernels}}}}))
 	code, human := runCozy(t, o.root, "run", "show", id)
 	t.Logf("cozy run show:\n%s", human)
