@@ -3,8 +3,19 @@ package host
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/host/outputs"
+	"github.com/cozy-creator/cozy/internal/runoutputs"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -41,15 +52,207 @@ func (m *Machine) request(ctx context.Context, run uint64) (string, error) {
 	return list.Executions[0].RequestId, nil
 }
 
-// Entries and Open read run outputs through the shared fold (internal/runoutputs); until it
-// lands they answer ErrUpdateRequired after resolving the run.
-func (m *Machine) Entries(ctx context.Context, run uint64, _ uint64) ([]outputs.Entry, error) {
-	if _, err := m.request(ctx, run); err != nil {
-		return nil, err
-	}
-	return nil, outputs.ErrUpdateRequired
+// runLog is a run's log read from its start, folded into items.
+type runLog struct {
+	fold     *runoutputs.Fold
+	entries  []outputs.Entry
+	terminal bool
+	next     uint64
 }
 
-func (m *Machine) Open(uint64, string, int) (outputs.Snapshot, error) {
-	return outputs.Snapshot{}, outputs.ErrUpdateRequired
+// read folds run's log; with wait and nothing after `after`, it holds one read open at the tail.
+func (m *Machine) read(ctx context.Context, run, after uint64, wait bool) (*runLog, error) {
+	request, err := m.request(ctx, run)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := m.runtime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := pb.NewWorkerControlClient(conn)
+	l := &runLog{fold: runoutputs.New(strconv.FormatUint(run, 10))}
+	page := func(wait bool) (*pb.MachineExecutionEventPage, error) {
+		answer, err := client.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{
+			Execution: &pb.MachineExecutionQuery{Claim: m.claims.claim, RequestId: request}, After: l.next, Wait: wait})
+		if status.Code(err) == codes.NotFound {
+			return nil, outputs.ErrNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range answer.Events {
+			l.add(event)
+		}
+		return answer, nil
+	}
+	for {
+		answer, err := page(false)
+		if err != nil {
+			return nil, err
+		}
+		if len(answer.Events) == 0 || l.next >= answer.HeadSequence {
+			break
+		}
+	}
+	if wait && !l.terminal && len(l.after(after)) == 0 {
+		if _, err := page(true); err != nil {
+			return nil, err
+		}
+	}
+	if l.terminal { // the terminal entry follows: each item's current revision is final
+		for i := range l.entries {
+			entry := &l.entries[i]
+			if item, ok := l.fold.Item(entry.Output, listIndex(entry.Index)); ok && entry.Status == "" && entry.Rev == uint64(item.Current.Rev) {
+				entry.SHA256 = item.Current.Digest
+			}
+		}
+	}
+	return l, nil
+}
+
+func listIndex(index int) uint32 {
+	if index < 0 {
+		return 0
+	}
+	return uint32(index)
+}
+
+func (l *runLog) add(event *pb.MachineExecutionEvent) {
+	l.next = max(l.next, event.Sequence)
+	switch {
+	case event.Product != nil:
+		item, _, err := l.fold.Add(event.Sequence, event.Product)
+		if err != nil {
+			return
+		}
+		rev, index := item.Current, -1
+		if item.List {
+			index = int(item.Index)
+		}
+		entry := outputs.Entry{Seq: event.Sequence, Output: item.Output, Index: index, Rev: uint64(rev.Rev), Length: rev.Length,
+			DurationUS: rev.DurationUs, MediaType: rev.MediaType, Label: rev.Label}
+		if rev.AppendedFrom != nil {
+			from := uint64(*rev.AppendedFrom)
+			entry.AppendedFrom = &from
+		}
+		l.entries = append(l.entries, entry)
+	case event.Outcome != nil:
+		l.terminal = true
+		l.entries = append(l.entries, outputs.Entry{Seq: event.Sequence, Index: -1, Status: outcomeStatus(event.Outcome)})
+	}
+}
+
+func (l *runLog) after(after uint64) []outputs.Entry {
+	at := sort.Search(len(l.entries), func(i int) bool { return l.entries[i].Seq > after })
+	return l.entries[at:]
+}
+
+// outcomeStatus reads the terminal status from the outcome document.
+func outcomeStatus(outcome *pb.AttemptOutcome) string {
+	body, err := canonical.Read(outcome.GetOutcomeCanonicalBytes(), &pb.AttemptOutcomeBody{})
+	if err != nil {
+		return "failed"
+	}
+	switch pb.OutcomeStatus(body.Int("status")) {
+	case pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED:
+		return "completed"
+	case pb.OutcomeStatus_OUTCOME_STATUS_CANCELED:
+		return "canceled"
+	}
+	return "failed"
+}
+
+// Entries answers run's log after `after`, waiting at the tail; at or past the terminal entry
+// it answers the terminal entry again.
+func (m *Machine) Entries(ctx context.Context, run, after uint64) ([]outputs.Entry, error) {
+	l, err := m.read(ctx, run, after, true)
+	if err != nil {
+		return nil, err
+	}
+	if entries := l.after(after); len(entries) > 0 {
+		return entries, nil
+	}
+	if l.terminal {
+		return l.entries[len(l.entries)-1:], nil
+	}
+	return nil, ctx.Err()
+}
+
+// Open answers an output's current bytes: its parts, in order, from the TensorFS store.
+func (m *Machine) Open(run uint64, output string, index int) (outputs.Snapshot, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	l, err := m.read(ctx, run, 0, false)
+	if err != nil {
+		return outputs.Snapshot{}, err
+	}
+	item, ok := l.fold.Item(output, listIndex(index))
+	if !ok {
+		return outputs.Snapshot{}, outputs.ErrNotFound
+	}
+	rev := item.Current
+	body := &parts{}
+	for _, part := range rev.Parts {
+		file, err := m.object(part.Digest)
+		if err != nil {
+			body.Close()
+			return outputs.Snapshot{}, err
+		}
+		body.files, body.lengths = append(body.files, file), append(body.lengths, part.Length)
+	}
+	snapshot := outputs.Snapshot{Body: body, Length: rev.Length, Rev: uint64(rev.Rev), Final: l.terminal}
+	if snapshot.Final {
+		snapshot.SHA256 = rev.Digest
+	}
+	return snapshot, nil
+}
+
+// object opens one object of the machine's TensorFS store, sha256:<hex>.
+func (m *Machine) object(digest string) (*os.File, error) {
+	hex, ok := strings.CutPrefix(digest, "sha256:")
+	if !ok || len(hex) != 64 {
+		return nil, outputs.ErrNotFound
+	}
+	file, err := os.OpenFile(filepath.Join(m.layout.Store, "blobs", hex[:2], hex[2:4], hex), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, outputs.ErrNotFound
+	}
+	return file, err
+}
+
+// parts is the concatenation of an output's part objects, read at any offset.
+type parts struct {
+	files   []*os.File
+	lengths []int64
+}
+
+func (p *parts) ReadAt(b []byte, off int64) (int, error) {
+	n := 0
+	for i, file := range p.files {
+		if off >= p.lengths[i] {
+			off -= p.lengths[i]
+			continue
+		}
+		for n < len(b) && off < p.lengths[i] {
+			want := min(int64(len(b)-n), p.lengths[i]-off)
+			got, err := file.ReadAt(b[n:n+int(want)], off)
+			n, off = n+got, off+int64(got)
+			if err != nil && !(errors.Is(err, io.EOF) && int64(got) == want) {
+				return n, err
+			}
+		}
+		if n == len(b) {
+			return n, nil
+		}
+		off = 0
+	}
+	return n, io.EOF
+}
+
+func (p *parts) Close() error {
+	for _, file := range p.files {
+		file.Close()
+	}
+	return nil
 }

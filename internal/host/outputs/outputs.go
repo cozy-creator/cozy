@@ -24,12 +24,12 @@ type Snapshot struct {
 type Entry struct {
 	Seq          uint64
 	Output       string
-	Index        int // -1: the output is not a list
+	Index        int // a list item's 1-based index; -1: the output is not a list
 	Rev          uint64
 	Length       int64
 	AppendedFrom *uint64 // the byte offset an append continued from
 	DurationUS   uint64
-	SHA256       string // final only
+	SHA256       string // sha256:<hex>, on the final revision only
 	MediaType    string
 	Label        string
 	Status       string // "" for a product; completed, failed or canceled on the terminal entry
@@ -48,4 +48,12 @@ type Source interface {
 	Entries(ctx context.Context, run uint64, after uint64) ([]Entry, error)
 	// Keys is the authorized key set now and a channel closed when it changes.
 	Keys() ([]ed25519.PublicKey, <-chan struct{})
+}
+
+// Close releases the descriptors a snapshot's body holds.
+func (s Snapshot) Close() error {
+	if closer, ok := s.Body.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
 }
