@@ -72,6 +72,7 @@ type fakeRentalHub struct {
 	spendCap int64
 	released map[string]int
 	server   *httptest.Server
+	mux      *http.ServeMux // the routes, however server's handler is wrapped
 	// publishes is whether this stand-in hub carries th-199's account listing.
 	publishes bool
 	// reads counts rental reads, so a test can plant a transition after the daemon's first look.
@@ -88,6 +89,7 @@ func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	t.Helper()
 	h := &fakeRentalHub{rentals: map[string]map[string]any{}, released: map[string]int{}, publishes: true}
 	mux := http.NewServeMux()
+	h.mux = mux
 	mux.HandleFunc("GET /v1/packages/{owner}/{name}/releases/{release}", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()

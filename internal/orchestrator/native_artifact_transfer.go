@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
+
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -11,7 +13,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/protobuf/proto"
-	"sort"
 )
 
 type pendingNativeArtifact struct {
@@ -156,15 +157,28 @@ func (c *Orchestrator) runNativeUpload(ctx context.Context, call records.NativeC
 	})
 }
 
+// ArtifactRoundtrip sends one NativeArtifactTransfer to the machine holding the artifact and
+// answers its status, a refusal already typed.
+type ArtifactRoundtrip func(context.Context, *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error)
+
 // HeldArtifactClosure pages the exact object closure of an artifact this host holds on a
-// rental ("" for the local workspace), as its native store names it, and returns it
-// sorted with its closure digest. operation names the upload the pages are read for.
+// rental ("" for the local workspace) over WorkerControl.
 func (c *Orchestrator) HeldArtifactClosure(ctx context.Context, worker, operation string, source *pb.DerivedRetentionRequest,
+	manifest *pb.Ref) ([]hub.Object, string, *exit.Error) {
+	return HeldClosure(ctx, func(ctx context.Context, command *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error) {
+		return c.artifactRoundtrip(ctx, worker, command)
+	}, operation, source, manifest)
+}
+
+// HeldClosure pages the exact object closure of a held artifact, as its machine's native
+// store names it, and returns it sorted with its closure digest. operation names the upload
+// the pages are read for.
+func HeldClosure(ctx context.Context, roundtrip ArtifactRoundtrip, operation string, source *pb.DerivedRetentionRequest,
 	manifest *pb.Ref) ([]hub.Object, string, *exit.Error) {
 	var objects []hub.Object
 	var closure []byte
 	for offset := uint32(0); ; {
-		page, problem := c.artifactRoundtrip(ctx, worker, &pb.NativeArtifactTransfer{EffectId: operation, Source: source, Manifest: manifest, Offset: offset, Limit: 128})
+		page, problem := roundtrip(ctx, &pb.NativeArtifactTransfer{EffectId: operation, Source: source, Manifest: manifest, Offset: offset, Limit: 128})
 		if problem != nil {
 			return nil, "", problem
 		}
@@ -210,16 +224,24 @@ func (c *Orchestrator) HeldArtifactClosure(ctx context.Context, worker, operatio
 	return objects, digest, nil
 }
 
-// PushHeldArtifactObject sends one granted closure object of a held artifact from the
-// machine holding it straight to the Hub.
+// PushHeldArtifactObject sends one granted closure object over WorkerControl.
 func (c *Orchestrator) PushHeldArtifactObject(ctx context.Context, worker, operation string, source *pb.DerivedRetentionRequest,
+	manifest *pb.Ref, grant hub.Grant, serverTime int64) *exit.Error {
+	return PushHeld(ctx, func(ctx context.Context, command *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error) {
+		return c.artifactRoundtrip(ctx, worker, command)
+	}, operation, source, manifest, grant, serverTime)
+}
+
+// PushHeld sends one granted closure object of a held artifact from the machine holding it
+// straight to the Hub.
+func PushHeld(ctx context.Context, roundtrip ArtifactRoundtrip, operation string, source *pb.DerivedRetentionRequest,
 	manifest *pb.Ref, grant hub.Grant, serverTime int64) *exit.Error {
 	headers := make([]*pb.WeightsUploadHeader, 0, len(grant.Headers))
 	for name, value := range grant.Headers {
 		headers = append(headers, &pb.WeightsUploadHeader{Name: name, Value: value})
 	}
 	sort.Slice(headers, func(i, j int) bool { return headers[i].Name < headers[j].Name })
-	uploaded, problem := c.artifactRoundtrip(ctx, worker, &pb.NativeArtifactTransfer{EffectId: operation, Source: source, Manifest: manifest,
+	uploaded, problem := roundtrip(ctx, &pb.NativeArtifactTransfer{EffectId: operation, Source: source, Manifest: manifest,
 		GrantRevision: 1, ServerTimeUnix: serverTime, Grant: &pb.WeightsUploadGrant{ObjectId: grant.ObjectID, Length: uint64(grant.Length),
 			Url: grant.URL, ExpiresAtUnix: uint64(grant.ExpiresAtUnix), RequiredHeaders: headers}})
 	if problem != nil {

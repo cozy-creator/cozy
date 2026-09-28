@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -30,7 +31,7 @@ type checkpointHub struct {
 
 func serveCheckpoints(t *testing.T, peer *fakeRentalHub) *checkpointHub {
 	h := &checkpointHub{lengths: map[string]int64{}, stored: map[string][]byte{}, accepted: map[string]bool{}, pushes: map[string]int{}, finalized: map[string]string{}}
-	mux := peer.server.Config.Handler.(*http.ServeMux)
+	mux := peer.mux
 	mux.HandleFunc("GET /v1/models/{org}/{name}/checkpoints/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -131,24 +132,20 @@ func servePodClosure(t *testing.T, f *retainedWeights, busyOnce string) {
 	inventory, problem := publication.Canonical(rows)
 	fatal(t, problem)
 	var busy sync.Once
-	f.pod.onFrame = func(frame *pb.RecordOwnerFrame, send func(*pb.WorkerFrame) error) (bool, error) {
-		ask, ok := frame.Msg.(*pb.RecordOwnerFrame_NativeArtifactTransfer)
-		if !ok {
-			return false, nil
+	// The pod answers each command on the machine connection; no WorkerControl session exists.
+	f.pod.artifactTransfer = func(_ context.Context, call *pb.NativeArtifactTransferCall) (*pb.NativeArtifactTransferStatus, error) {
+		if err := f.pod.verifyClaim(call.Claim, false); err != nil {
+			return nil, err
 		}
-		command := ask.NativeArtifactTransfer
-		status := &pb.NativeArtifactTransferStatus{RecordOwnerEpoch: command.RecordOwnerEpoch, ControlStreamEpoch: command.ControlStreamEpoch,
-			WorkerBootId: command.WorkerBootId, EffectId: command.EffectId, Source: command.Source, Manifest: command.Manifest,
+		command := call.Request
+		status := &pb.NativeArtifactTransferStatus{EffectId: command.EffectId, Source: command.Source, Manifest: command.Manifest,
 			CommandId: command.CommandId, GrantRevision: command.GrantRevision}
-		reply := func() error {
-			return send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_NativeArtifactTransferStatus{NativeArtifactTransferStatus: status}})
-		}
 		if command.Grant == nil {
 			status.ClosureDigest = canonical.Digest(inventory)
 			for _, id := range ids {
 				status.Objects = append(status.Objects, &pb.WeightsObjectRef{ObjectId: id, Length: uint64(len(f.objects[id]))})
 			}
-			return true, reply()
+			return status, nil
 		}
 		grant := command.Grant
 		status.ObjectId = grant.ObjectId
@@ -158,19 +155,20 @@ func servePodClosure(t *testing.T, f *retainedWeights, busyOnce string) {
 		}
 		if refused {
 			status.Outcome, status.SafeCode, status.SafeDetail = pb.WeightsUploadOutcome_WEIGHTS_UPLOAD_OUTCOME_REFUSED, "native_artifact_busy", "no free transfer slot"
-			return true, reply()
+			return status, nil
 		}
-		go func() {
-			raw := f.objects[grant.ObjectId]
-			put, err := http.NewRequest(http.MethodPut, grant.Url, bytes.NewReader(raw))
-			must(t, err)
-			answer, err := http.DefaultClient.Do(put)
-			must(t, err)
-			answer.Body.Close()
-			status.Outcome, status.ChecksumSha256, status.TransferredBytes = pb.WeightsUploadOutcome_WEIGHTS_UPLOAD_OUTCOME_UPLOADED, grant.ObjectId, uint64(len(raw))
-			_ = reply()
-		}()
-		return true, nil
+		raw := f.objects[grant.ObjectId]
+		put, err := http.NewRequest(http.MethodPut, grant.Url, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		answer, err := http.DefaultClient.Do(put)
+		if err != nil {
+			return nil, err
+		}
+		answer.Body.Close()
+		status.Outcome, status.ChecksumSha256, status.TransferredBytes = pb.WeightsUploadOutcome_WEIGHTS_UPLOAD_OUTCOME_UPLOADED, grant.ObjectId, uint64(len(raw))
+		return status, nil
 	}
 }
 

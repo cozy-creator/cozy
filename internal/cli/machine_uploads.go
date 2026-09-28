@@ -13,18 +13,20 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/machines"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// retainedOutput is one output a finished run holds on the rental it ran on: the custody
-// record, its artifact, and the rental.
+// retainedOutput is one output a finished run holds on the machine it ran on: the custody
+// record, its artifact, and the machine (this computer's, or a rental).
 type retainedOutput struct {
 	hold     records.MachineModelRetention
 	artifact records.ModelArtifact
-	rental   string
+	machine  string
 }
 
 // Upload sends a retained output of a finished run from the rental holding it to a private
@@ -101,16 +103,18 @@ func (m *machineRuns) retainedOutput(request records.Request, output string) (re
 	if problem != nil || link == nil {
 		return retainedOutput{}, firstProblem(problem, exit.New(exit.Conflict, "the run has no machine execution"))
 	}
-	rented, problem := m.store.RentalRow(link.MachineID)
-	if problem != nil {
-		return retainedOutput{}, problem
+	if !machines.IsLocal(link.MachineID) {
+		rented, problem := m.store.RentalRow(link.MachineID)
+		if problem != nil {
+			return retainedOutput{}, problem
+		}
+		if rented == nil || records.RentalTerminalState(rented.State) {
+			return retainedOutput{}, exit.Named(exit.Conflict, "upload.rental_ended",
+				"%s was retained on rental %s, which has ended; its bytes are gone", found[0].artifact.OutputSlot, link.MachineID).
+				WithRemedy("run the job again with --upload-to <org/model>")
+		}
 	}
-	if rented == nil || records.RentalTerminalState(rented.State) {
-		return retainedOutput{}, exit.Named(exit.Conflict, "upload.rental_ended",
-			"%s was retained on rental %s, which has ended; its bytes are gone", found[0].artifact.OutputSlot, link.MachineID).
-			WithRemedy("run the job again with --upload-to <org/model>")
-	}
-	found[0].rental = link.MachineID
+	found[0].machine = link.MachineID
 	return found[0], nil
 }
 
@@ -172,7 +176,12 @@ func (m *machineRuns) uploadOnce(requestID string, upload records.OutputUpload) 
 		TensorfsReceiptDigest: retained.hold.ReceiptDigest, RetentionId: retained.hold.RetentionID}
 	manifest := &pb.Ref{Digest: digest, Length: uint64(retained.artifact.Manifest.Length)}
 	ctx := m.ctx
-	objects, closure, problem := m.fleet.owner.HeldArtifactClosure(ctx, retained.rental, upload.Operation, source, manifest)
+	connection, problem := m.connect(ctx, retained.machine, m.runHolder(*request, "uploading its "+upload.Output))
+	if problem != nil {
+		return "", problem
+	}
+	defer connection.Close()
+	objects, closure, problem := orchestrator.HeldClosure(ctx, connection.artifactTransfer, upload.Operation, source, manifest)
 	if problem != nil {
 		return "", problem
 	}
@@ -184,7 +193,7 @@ func (m *machineRuns) uploadOnce(requestID string, upload records.OutputUpload) 
 	}
 	checkpoint, problem := publication.UploadCheckpoint(ctx, owner, upload.Operation, intent, held,
 		func(ctx context.Context, grant hub.Grant, serverTime int64) *exit.Error {
-			return m.fleet.owner.PushHeldArtifactObject(ctx, retained.rental, upload.Operation, source, manifest, grant, serverTime)
+			return orchestrator.PushHeld(ctx, connection.artifactTransfer, upload.Operation, source, manifest, grant, serverTime)
 		})
 	return checkpoint.Checkpoint, problem
 }

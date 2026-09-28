@@ -26,6 +26,13 @@ func (p *fakePod) RetainDerivedResult(ctx context.Context, call *pb.DerivedReten
 	return p.derivedRetain(ctx, call)
 }
 
+func (p *fakePod) NativeArtifactTransfer(ctx context.Context, call *pb.NativeArtifactTransferCall) (*pb.NativeArtifactTransferStatus, error) {
+	if p.artifactTransfer == nil {
+		return nil, status.Error(codes.Unimplemented, "artifact transfer not configured")
+	}
+	return p.artifactTransfer(ctx, call)
+}
+
 func (p *fakePod) ReleaseDerivedRetention(ctx context.Context, call *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error) {
 	if p.derivedRelease == nil {
 		return nil, status.Error(codes.Unimplemented, "derived release not configured")

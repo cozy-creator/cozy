@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
@@ -12,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/machines"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/publication"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 	"github.com/cozy-creator/cozy/internal/transfer"
@@ -37,6 +39,24 @@ func (m *machineRuns) connect(ctx context.Context, name, holder string) (*machin
 		return nil, problem
 	}
 	return &machineConnection{Machine: machine, runs: m, installed: map[string]*pb.InstalledPackage{}, placements: map[string]*pb.DesiredPlacementSet{}}, nil
+}
+
+// artifactCommands numbers this host's retained-artifact commands; the machine keys a
+// command's replay by it.
+var artifactCommands atomic.Uint64
+
+// artifactTransfer sends one retained-artifact command over the machine connection: a
+// closure page or one granted object upload, authorized by this connection's claim.
+func (c *machineConnection) artifactTransfer(ctx context.Context, command *pb.NativeArtifactTransfer) (*pb.NativeArtifactTransferStatus, *exit.Error) {
+	command.CommandId = artifactCommands.Add(1)
+	status, err := c.Host.NativeArtifactTransfer(ctx, &pb.NativeArtifactTransferCall{Claim: c.Claim, Request: command})
+	if err != nil {
+		return nil, machineTransport(err)
+	}
+	if problem := publication.ArtifactTransferRefusal(status.SafeCode, status.SafeDetail); problem != nil {
+		return nil, problem
+	}
+	return status, nil
 }
 
 func (c *machineConnection) retainModel(ctx context.Context, request *pb.DerivedRetentionRequest) (*pb.DerivedRetentionResult, error) {

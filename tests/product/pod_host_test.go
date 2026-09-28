@@ -76,8 +76,10 @@ type fakePod struct {
 	watchProgress   func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
 	recordOperation func(*pb.RecordOperationResultCall) (*pb.RecordOperationResultResult, error)
 	derivedRetain   func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
-	derivedRelease  func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
-	resultRelease   func(context.Context, *pb.DerivedResultReleaseCall) (*pb.DerivedResultReleaseResult, error)
+	// artifactTransfer answers `cozy run upload`'s retained-artifact commands.
+	artifactTransfer func(context.Context, *pb.NativeArtifactTransferCall) (*pb.NativeArtifactTransferStatus, error)
+	derivedRelease   func(context.Context, *pb.DerivedRetentionCall) (*pb.DerivedRetentionResult, error)
+	resultRelease    func(context.Context, *pb.DerivedResultReleaseCall) (*pb.DerivedResultReleaseResult, error)
 	controlDefaults
 	pb.UnimplementedPodHostServer
 	controlKey ed25519.PublicKey

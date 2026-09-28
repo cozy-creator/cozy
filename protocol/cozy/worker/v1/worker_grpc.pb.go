@@ -693,6 +693,7 @@ const (
 	RuntimePreparation_WorkspaceRetainByteTree_FullMethodName          = "/cozy.worker.v1.RuntimePreparation/WorkspaceRetainByteTree"
 	RuntimePreparation_WorkspaceReleaseByteTree_FullMethodName         = "/cozy.worker.v1.RuntimePreparation/WorkspaceReleaseByteTree"
 	RuntimePreparation_WorkspaceReadByteTreeObject_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceReadByteTreeObject"
+	RuntimePreparation_WorkspaceNativeArtifactTransfer_FullMethodName  = "/cozy.worker.v1.RuntimePreparation/WorkspaceNativeArtifactTransfer"
 	RuntimePreparation_ImportInputTree_FullMethodName                  = "/cozy.worker.v1.RuntimePreparation/ImportInputTree"
 	RuntimePreparation_WorkspaceWeightsIntentReady_FullMethodName      = "/cozy.worker.v1.RuntimePreparation/WorkspaceWeightsIntentReady"
 	RuntimePreparation_PreparePackageSet_FullMethodName                = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
@@ -735,6 +736,9 @@ type RuntimePreparationClient interface {
 	WorkspaceRetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	WorkspaceReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	WorkspaceReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error)
+	// A retained artifact's closure page or one granted object upload, for the machine
+	// connection: the same command WorkerControl carries, authorized by the call's claim.
+	WorkspaceNativeArtifactTransfer(ctx context.Context, in *NativeArtifactTransferCall, opts ...grpc.CallOption) (*NativeArtifactTransferStatus, error)
 	// Authenticated root input intake; native bytes commit before a receipt.
 	ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error)
 	WorkspaceWeightsIntentReady(ctx context.Context, in *WeightsIntentReadyCall, opts ...grpc.CallOption) (*WeightsHostAck, error)
@@ -878,6 +882,16 @@ func (c *runtimePreparationClient) WorkspaceReadByteTreeObject(ctx context.Conte
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RuntimePreparation_WorkspaceReadByteTreeObjectClient = grpc.ServerStreamingClient[NativeByteReadChunk]
+
+func (c *runtimePreparationClient) WorkspaceNativeArtifactTransfer(ctx context.Context, in *NativeArtifactTransferCall, opts ...grpc.CallOption) (*NativeArtifactTransferStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NativeArtifactTransferStatus)
+	err := c.cc.Invoke(ctx, RuntimePreparation_WorkspaceNativeArtifactTransfer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func (c *runtimePreparationClient) ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -1048,6 +1062,9 @@ type RuntimePreparationServer interface {
 	WorkspaceRetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	WorkspaceReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	WorkspaceReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error
+	// A retained artifact's closure page or one granted object upload, for the machine
+	// connection: the same command WorkerControl carries, authorized by the call's claim.
+	WorkspaceNativeArtifactTransfer(context.Context, *NativeArtifactTransferCall) (*NativeArtifactTransferStatus, error)
 	// Authenticated root input intake; native bytes commit before a receipt.
 	ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error
 	WorkspaceWeightsIntentReady(context.Context, *WeightsIntentReadyCall) (*WeightsHostAck, error)
@@ -1105,6 +1122,9 @@ func (UnimplementedRuntimePreparationServer) WorkspaceReleaseByteTree(context.Co
 }
 func (UnimplementedRuntimePreparationServer) WorkspaceReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error {
 	return status.Error(codes.Unimplemented, "method WorkspaceReadByteTreeObject not implemented")
+}
+func (UnimplementedRuntimePreparationServer) WorkspaceNativeArtifactTransfer(context.Context, *NativeArtifactTransferCall) (*NativeArtifactTransferStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method WorkspaceNativeArtifactTransfer not implemented")
 }
 func (UnimplementedRuntimePreparationServer) ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error {
 	return status.Error(codes.Unimplemented, "method ImportInputTree not implemented")
@@ -1359,6 +1379,24 @@ func _RuntimePreparation_WorkspaceReadByteTreeObject_Handler(srv interface{}, st
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type RuntimePreparation_WorkspaceReadByteTreeObjectServer = grpc.ServerStreamingServer[NativeByteReadChunk]
+
+func _RuntimePreparation_WorkspaceNativeArtifactTransfer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NativeArtifactTransferCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).WorkspaceNativeArtifactTransfer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_WorkspaceNativeArtifactTransfer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).WorkspaceNativeArtifactTransfer(ctx, req.(*NativeArtifactTransferCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _RuntimePreparation_ImportInputTree_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(RuntimePreparationServer).ImportInputTree(&grpc.GenericServerStream[InputTreeImportFrame, NativeByteRetentionResult]{ServerStream: stream})
@@ -1649,6 +1687,10 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RuntimePreparation_WorkspaceReleaseByteTree_Handler,
 		},
 		{
+			MethodName: "WorkspaceNativeArtifactTransfer",
+			Handler:    _RuntimePreparation_WorkspaceNativeArtifactTransfer_Handler,
+		},
+		{
 			MethodName: "WorkspaceWeightsIntentReady",
 			Handler:    _RuntimePreparation_WorkspaceWeightsIntentReady_Handler,
 		},
@@ -1853,6 +1895,7 @@ const (
 	PodHost_RetainByteTree_FullMethodName                        = "/cozy.worker.v1.PodHost/RetainByteTree"
 	PodHost_ReleaseByteTree_FullMethodName                       = "/cozy.worker.v1.PodHost/ReleaseByteTree"
 	PodHost_ReadByteTreeObject_FullMethodName                    = "/cozy.worker.v1.PodHost/ReadByteTreeObject"
+	PodHost_NativeArtifactTransfer_FullMethodName                = "/cozy.worker.v1.PodHost/NativeArtifactTransfer"
 	PodHost_ImportInputTree_FullMethodName                       = "/cozy.worker.v1.PodHost/ImportInputTree"
 	PodHost_RecordOperationResult_FullMethodName                 = "/cozy.worker.v1.PodHost/RecordOperationResult"
 	PodHost_LookupOperation_FullMethodName                       = "/cozy.worker.v1.PodHost/LookupOperation"
@@ -1925,6 +1968,8 @@ type PodHostClient interface {
 	RetainByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	ReleaseByteTree(ctx context.Context, in *NativeByteRetentionCall, opts ...grpc.CallOption) (*NativeByteRetentionResult, error)
 	ReadByteTreeObject(ctx context.Context, in *NativeByteReadCall, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NativeByteReadChunk], error)
+	// A retained output's closure and granted object uploads, as `cozy run upload` sends them.
+	NativeArtifactTransfer(ctx context.Context, in *NativeArtifactTransferCall, opts ...grpc.CallOption) (*NativeArtifactTransferStatus, error)
 	// Proxies the bounded stream to Runtime without owning its byte custody.
 	ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error)
 	RecordOperationResult(ctx context.Context, in *RecordOperationResultCall, opts ...grpc.CallOption) (*RecordOperationResultResult, error)
@@ -2232,6 +2277,16 @@ func (c *podHostClient) ReadByteTreeObject(ctx context.Context, in *NativeByteRe
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_ReadByteTreeObjectClient = grpc.ServerStreamingClient[NativeByteReadChunk]
 
+func (c *podHostClient) NativeArtifactTransfer(ctx context.Context, in *NativeArtifactTransferCall, opts ...grpc.CallOption) (*NativeArtifactTransferStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NativeArtifactTransferStatus)
+	err := c.cc.Invoke(ctx, PodHost_NativeArtifactTransfer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *podHostClient) ImportInputTree(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InputTreeImportFrame, NativeByteRetentionResult], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &PodHost_ServiceDesc.Streams[5], PodHost_ImportInputTree_FullMethodName, cOpts...)
@@ -2416,6 +2471,8 @@ type PodHostServer interface {
 	RetainByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	ReleaseByteTree(context.Context, *NativeByteRetentionCall) (*NativeByteRetentionResult, error)
 	ReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error
+	// A retained output's closure and granted object uploads, as `cozy run upload` sends them.
+	NativeArtifactTransfer(context.Context, *NativeArtifactTransferCall) (*NativeArtifactTransferStatus, error)
 	// Proxies the bounded stream to Runtime without owning its byte custody.
 	ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error
 	RecordOperationResult(context.Context, *RecordOperationResultCall) (*RecordOperationResultResult, error)
@@ -2509,6 +2566,9 @@ func (UnimplementedPodHostServer) ReleaseByteTree(context.Context, *NativeByteRe
 }
 func (UnimplementedPodHostServer) ReadByteTreeObject(*NativeByteReadCall, grpc.ServerStreamingServer[NativeByteReadChunk]) error {
 	return status.Error(codes.Unimplemented, "method ReadByteTreeObject not implemented")
+}
+func (UnimplementedPodHostServer) NativeArtifactTransfer(context.Context, *NativeArtifactTransferCall) (*NativeArtifactTransferStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method NativeArtifactTransfer not implemented")
 }
 func (UnimplementedPodHostServer) ImportInputTree(grpc.ClientStreamingServer[InputTreeImportFrame, NativeByteRetentionResult]) error {
 	return status.Error(codes.Unimplemented, "method ImportInputTree not implemented")
@@ -2961,6 +3021,24 @@ func _PodHost_ReadByteTreeObject_Handler(srv interface{}, stream grpc.ServerStre
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PodHost_ReadByteTreeObjectServer = grpc.ServerStreamingServer[NativeByteReadChunk]
 
+func _PodHost_NativeArtifactTransfer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NativeArtifactTransferCall)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PodHostServer).NativeArtifactTransfer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PodHost_NativeArtifactTransfer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PodHostServer).NativeArtifactTransfer(ctx, req.(*NativeArtifactTransferCall))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PodHost_ImportInputTree_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(PodHostServer).ImportInputTree(&grpc.GenericServerStream[InputTreeImportFrame, NativeByteRetentionResult]{ServerStream: stream})
 }
@@ -3212,6 +3290,10 @@ var PodHost_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseByteTree",
 			Handler:    _PodHost_ReleaseByteTree_Handler,
+		},
+		{
+			MethodName: "NativeArtifactTransfer",
+			Handler:    _PodHost_NativeArtifactTransfer_Handler,
 		},
 		{
 			MethodName: "RecordOperationResult",
