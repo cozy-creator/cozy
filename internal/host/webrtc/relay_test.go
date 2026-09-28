@@ -10,19 +10,27 @@ import (
 )
 
 // relay is a path between client and machine: it forwards each TCP connection with a
-// one-way delay each way (RTT = 2 × delay) and can kill every connection at once.
+// one-way delay each way (RTT = 2 × delay), optionally through a bottleneck of rate bytes/s
+// with an unbounded queue, and can kill every connection at once.
 type relay struct {
-	ln    net.Listener
-	mu    sync.Mutex
-	conns []*net.TCPConn
+	ln       net.Listener
+	delay    time.Duration
+	rate     float64
+	mu       sync.Mutex
+	conns    []*net.TCPConn
+	maxQueue time.Duration // the longest any byte waited at the bottleneck
 }
 
 func newRelay(t testing.TB, target netip.AddrPort, delay time.Duration) *relay {
+	return newLink(t, target, delay, 0)
+}
+
+func newLink(t testing.TB, target netip.AddrPort, delay time.Duration, rate float64) *relay {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &relay{ln: ln}
+	r := &relay{ln: ln, delay: delay, rate: rate}
 	t.Cleanup(func() { ln.Close(); r.kill() })
 	go func() {
 		for {
@@ -38,8 +46,8 @@ func newRelay(t testing.TB, target netip.AddrPort, delay time.Duration) *relay {
 			r.mu.Lock()
 			r.conns = append(r.conns, in.(*net.TCPConn), out.(*net.TCPConn))
 			r.mu.Unlock()
-			go forward(out, in, delay)
-			go forward(in, out, delay)
+			go r.forward(out, in)
+			go r.forward(in, out)
 		}
 	}()
 	return r
@@ -58,9 +66,9 @@ func (r *relay) kill() {
 	r.conns = nil
 }
 
-func forward(dst, src net.Conn, delay time.Duration) {
+func (r *relay) forward(dst, src net.Conn) {
 	defer dst.Close()
-	if delay == 0 {
+	if r.delay == 0 && r.rate == 0 {
 		io.Copy(dst, src)
 		return
 	}
@@ -71,13 +79,25 @@ func forward(dst, src net.Conn, delay time.Duration) {
 	line := make(chan chunk, 1<<16)
 	go func() {
 		defer close(line)
-		buf := make([]byte, 64<<10)
+		buf := make([]byte, 16<<10)
+		var free time.Time // when the bottleneck has sent everything queued
 		for {
 			n, err := src.Read(buf)
 			if err != nil {
 				return
 			}
-			line <- chunk{time.Now().Add(delay), append([]byte(nil), buf[:n]...)}
+			at := time.Now()
+			if r.rate > 0 {
+				if free.Before(at) {
+					free = at
+				}
+				free = free.Add(time.Duration(float64(n) / r.rate * float64(time.Second)))
+				r.mu.Lock()
+				r.maxQueue = max(r.maxQueue, free.Sub(at))
+				r.mu.Unlock()
+				at = free
+			}
+			line <- chunk{at.Add(r.delay), append([]byte(nil), buf[:n]...)}
 		}
 	}()
 	for c := range line {

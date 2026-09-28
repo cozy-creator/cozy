@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"slices"
 	"strings"
 	"sync"
@@ -201,10 +202,10 @@ func Serve(t testing.TB, host string, m *Machine) Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	s := Server{Addr: ln.Addr().(*net.TCPAddr).AddrPort(), Fingerprint: webrtc.Fingerprint(der), Machine: "wk-test"}
-	go func() {
+	go pprof.Do(ctx, pprof.Labels("side", "machine"), func(ctx context.Context) { // profiles tell the ends apart
 		done <- webrtc.Serve(ctx, ln, webrtc.Config{Machine: s.Machine, Source: m,
 			Leaf: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}})
-	}()
+	})
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
