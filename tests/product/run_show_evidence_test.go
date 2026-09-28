@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -76,8 +77,8 @@ func TestRunShowPrintsEachRanksAttentionKernels(t *testing.T) {
 
 // A GPU call's kernels are its own: a long_form run's H3 segments are child calls, whose ranks
 // reach Creator only in their GPU releases, never in the root's triage. Run 1525 served SDPA
-// there with nothing on screen saying why. Each call prints its kernels, and the warm's phase
-// prints what it started compiling.
+// there with nothing on screen saying why. Each call's row names the kernel that served it,
+// the call prints all its kernels, and the warm's phase prints what it started compiling.
 func TestRunShowPrintsEachGPUCallsKernelsAndTheWarmsCompiles(t *testing.T) {
 	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "h3-run-1183-attribution.json"))
 	must(t, err)
@@ -101,9 +102,15 @@ func TestRunShowPrintsEachGPUCallsKernelsAndTheWarmsCompiles(t *testing.T) {
 				"kernels": kernels}}}}))
 	code, human := runCozy(t, o.root, "run", "show", id)
 	t.Logf("cozy run show:\n%s", human)
-	at := strings.Index(human, "attention kernels, GPU "+call)
-	if code != 0 || at < 0 || !strings.Contains(human, warm) {
-		t.Fatalf("run show [%d] lacks the call's kernels or the warm's compiles:\n%s", code, human)
+	row := regexp.MustCompile(`(?m)^1 +call-748e50c5… .* sol-attn$`)
+	if code != 0 || !row.MatchString(human) || !strings.Contains(human, warm) {
+		t.Fatalf("run show [%d] lacks the call's served kernel or the warm's compiles:\n%s", code, human)
+	}
+	code, human = runCozy(t, o.root, "run", "show", id, "--call", "call-748e50c5")
+	t.Logf("cozy run show --call call-748e50c5:\n%s", human)
+	at := strings.Index(human, "attention kernels")
+	if code != 0 || at < 0 {
+		t.Fatalf("run show --call [%d] lacks the call's kernels:\n%s", code, human)
 	}
 	for _, want := range []string{"sol-attn       served", "11.6s", "sageattention  compiling (61%)"} {
 		if !strings.Contains(human[at:], want) {

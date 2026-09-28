@@ -5,8 +5,8 @@ import (
 	"net/http"
 )
 
-// maxEvidenceEvents bounds one run's durable history in a single read. Imported progress
-// samples are not evidence and do not count against it.
+// maxEvidenceEvents bounds one run's lifecycle history in a single read. Progress samples
+// read apart, the latest of each stream, and never count against it.
 const maxEvidenceEvents = 4096
 
 // Evidence is one run's execution record read from records alone: its durable events in
@@ -18,10 +18,10 @@ type Evidence struct {
 }
 
 type EvidenceEvent struct {
-	Type    string         `json:"type"`
-	Attempt int64          `json:"attempt,omitempty"`
-	At      string         `json:"at"`
-	Payload map[string]any `json:"payload"`
+	Type    string          `json:"type"`
+	Attempt int64           `json:"attempt,omitempty"`
+	At      string          `json:"at"`
+	Payload json.RawMessage `json:"payload"`
 }
 
 func (s *Server) requestEvidence(w http.ResponseWriter, r *http.Request) {
@@ -43,7 +43,7 @@ func (s *Server) requestEvidence(w http.ResponseWriter, r *http.Request) {
 	out := Evidence{RequestID: row.ID, Events: make([]EvidenceEvent, 0, len(events))}
 	for _, event := range events {
 		out.Events = append(out.Events, EvidenceEvent{Type: event.Type, Attempt: event.Attempt,
-			At: event.At, Payload: event.Payload})
+			At: event.At, Payload: event.Raw})
 	}
 	if attempts, problem := s.store.Attempts(row.ID); problem == nil && len(attempts) > 0 {
 		last := attempts[len(attempts)-1]

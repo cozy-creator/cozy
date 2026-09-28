@@ -432,7 +432,7 @@ type RunCmd struct {
 	Resume  RunResumeCmd  `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List    RunListCmd    `cmd:"" help:"List current and past runs."`
 	Watch   RunWatchCmd   `cmd:"" help:"Watch one recorded run until it settles."`
-	Show    RunShowCmd    `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, ranks, and each rank's attention kernels (served, or why not, and compile time)."`
+	Show    RunShowCmd    `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, ranks, each rank's attention kernels (served, or why not, and compile time), and each child call's function, label, GPUs, stages and steps."`
 }
 
 type RunExecuteCmd struct {
@@ -536,11 +536,12 @@ func (c *RunWatchCmd) Run(r *Runtime) error {
 }
 
 type RunShowCmd struct {
-	ID string `arg:"" name:"run" help:"Run number or id."`
+	ID   string `arg:"" name:"run" help:"Run number or id."`
+	Call string `help:"Show one of the run's calls: its number, label, function or call id."`
 }
 
 func (c *RunShowCmd) Run(r *Runtime) error {
-	return r.call(handleRunShow, []string{c.ID}, nil, nil, true)
+	return r.call(handleRunShow, []string{c.ID}, nil, values("--call", c.Call), true)
 }
 
 // RentalCmd has no default subcommand: bare `cozy rental` prints its verbs, the way

@@ -316,7 +316,7 @@ installed build. Records at an older schema are refused, never migrated.
 | route | scope | auth | notes |
 |---|---|---|---|
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | one attempt's kept triage bundle from its own row; 404 when none was kept |
-| `GET /v1/local/requests/{id}/evidence` | local | yes | one run's durable events and its last attempt's kept triage bundle; the `cozy run show` source |
+| `GET /v1/local/requests/{id}/evidence` | local | yes | one run's lifecycle events, the latest sample of each progress stream, and its last attempt's kept triage bundle; the `cozy run show` source |
 | `GET /v1/local/rentals` | local | yes | reconciled rental inventory, account spend, pending acquisitions, and activity; `?reconcile=false` reuses the last Hub census while refreshing local activity; no client SQLite access |
 | `POST /v1/local/rentals/{rental_id}/keepalive` | local | yes | explicit acknowledged fixed fifteen-minute reset; request ID only |
 | `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | drop the daemon's kept connection to one rented machine |
