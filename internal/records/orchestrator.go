@@ -48,7 +48,6 @@ CREATE TABLE IF NOT EXISTS requests (
   outputs      TEXT    NOT NULL DEFAULT '',
   state        TEXT    NOT NULL,
   ordinal      INTEGER NOT NULL DEFAULT 0,
-  requeues     INTEGER NOT NULL DEFAULT 0,
   created_at   TEXT    NOT NULL,
   kind         TEXT    NOT NULL DEFAULT 'serving',
   needs_accelerator INTEGER NOT NULL DEFAULT 0,
