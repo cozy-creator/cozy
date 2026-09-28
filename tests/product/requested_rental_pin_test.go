@@ -82,11 +82,6 @@ func TestRequestedRentalQueueKeepsRentalAlive(t *testing.T) {
 	if queued != 1 || running != 0 {
 		t.Fatalf("rental run counts miss requested-rental work: queued=%d running=%d", queued, running)
 	}
-	won, problem := store.ClaimRentalIdleRelease(row.ID, now)
-	fatal(t, problem)
-	if won {
-		t.Fatal("idle release took a rental with a queued requested-rental run")
-	}
 	pinned, problem := store.PinnedRentalWork(row.ID)
 	fatal(t, problem)
 	if len(pinned) != 1 || pinned[0].ID != request.ID {

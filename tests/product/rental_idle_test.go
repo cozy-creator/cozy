@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -18,53 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/records"
 )
-
-// The real daemon reaps an overdue owned rental through the Hub and leaves a
-// freshly ready one alive. Boundary timing is covered by the clock-driven tests.
-func TestRentalIdleRelease(t *testing.T) {
-	root := t.TempDir()
-	peer := newFakeRentalHub(t, 0)
-	peer.publishListing()
-	must(t, os.WriteFile(filepath.Join(root, config.FileName), []byte("tensorhub_url: "+peer.server.URL+"\ntensorhub_token: rental-idle-test\ndaemon:\n  idle_shutdown_s: 0\n"), 0600))
-	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
-	fatal(t, problem)
-	defer store.Close()
-	for _, item := range []struct {
-		id, machine string
-		ready       time.Time
-	}{{"rental-idle-old", "heron", time.Now().Add(-16 * time.Minute)}, {"rental-idle-new", "otter", time.Now()}, {"rental-idle-retained", "curlew", time.Now().Add(-time.Hour)}} {
-		peer.add(item.id, item.machine)
-		fatal(t, store.RecordRental(records.Rental{ID: item.id, MachineName: item.machine, SKU: "cpu", AcceleratorModel: "CPU", AcceleratorCount: 1, HourlyRateUSDMicros: 100000, State: "ready", Hub: peer.server.URL, Address: "127.0.0.1:1", CertPath: filepath.Join(root, item.id+".pem"), ReadyAt: item.ready.UTC().Format(time.RFC3339Nano)}))
-	}
-	retained := recordPrivateTransaction(t, store, "idle-expiry", "rental-idle-retained")
-	changed, problem := store.BlockRetainedWork(retained.ID, "fixture", "retained bytes are not active work")
-	fatal(t, problem)
-	if !changed {
-		t.Fatal("retained fixture did not settle")
-	}
-	db, err := sql.Open("sqlite", filepath.Join(root, "creator.sqlite"))
-	must(t, err)
-	_, err = db.Exec(`UPDATE request_events SET at=? WHERE request_id=? AND type='request.blocked'`, time.Now().Add(-16*time.Minute).UTC().Format(time.RFC3339Nano), retained.ID)
-	must(t, err)
-	must(t, db.Close())
-	startDaemonProcess(t, root)
-	awaitRentalGone(t, store, "rental-idle-retained", 20*time.Second, filepath.Join(root, "daemon.log"))
-	if peer.releases("rental-idle-retained") != 1 {
-		t.Fatal("retained custody vetoed idle expiry")
-	}
-	awaitRentalGone(t, store, "rental-idle-old", 20*time.Second, filepath.Join(root, "daemon.log"))
-	if peer.releases("rental-idle-old") != 1 || peer.releases("rental-idle-new") != 0 {
-		t.Fatal("fixed idle sweep released the wrong rental")
-	}
-	fresh, problem := store.RentalRow("rental-idle-new")
-	fatal(t, problem)
-	if fresh == nil {
-		t.Fatal("fresh rental disappeared")
-	}
-}
 
 func awaitRentalGone(t *testing.T, store *records.Store, id string, within time.Duration, logPath string) {
 	t.Helper()

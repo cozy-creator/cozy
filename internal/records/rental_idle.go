@@ -114,26 +114,6 @@ func (s *Store) RecordRentalWorkFinished(id string, at time.Time) *exit.Error {
 	return nil
 }
 
-// RentalKeepaliveDue is whether live work must renew the Host's own idle deadline now:
-// no receipt from this boot yet, or half of the window the Host last granted has passed.
-func (s *Store) RentalKeepaliveDue(row Rental, now time.Time) (bool, *exit.Error) {
-	var worker, boot, observed string
-	var ack, deadline int64
-	err := s.db.QueryRow(`SELECT worker_id,worker_boot_id,acknowledged_at_ms,idle_deadline_ms,receipt_observed_at FROM rental_idle WHERE rental_id=?`,
-		row.ID).Scan(&worker, &boot, &ack, &deadline, &observed)
-	if err == sql.ErrNoRows {
-		return true, nil
-	}
-	if err != nil {
-		return false, exit.Internalf("cannot read rental keepalive receipt: %s", err)
-	}
-	at, err := time.Parse(time.RFC3339Nano, observed)
-	if ack <= 0 || deadline <= ack || worker != row.ExpectedWorkerID || boot != row.ExpectedWorkerBootID || err != nil {
-		return true, nil
-	}
-	return !now.Before(at.Add(time.Duration(deadline-ack) * time.Millisecond / 2)), nil
-}
-
 func (s *Store) RentalIdleResetAt(row Rental) (time.Time, int, *exit.Error) {
 	return rentalIdleResetAt(s.db, row)
 }
@@ -225,44 +205,6 @@ func rentalIdleObservation(reader rentalIdleReader, row Rental) (RentalIdleState
 		idle.Since = at
 	}
 	return idle, nil
-}
-
-// ClaimRentalIdleRelease atomically chooses expiry against request admission.
-// The single records writer either sees new pinned work, or commits the release
-// fence before any new pin/submission can enter. No network call occurs here.
-func (s *Store) ClaimRentalIdleRelease(id string, at time.Time) (bool, *exit.Error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return false, exit.Internalf("cannot begin rental idle release: %s", err)
-	}
-	defer tx.Rollback()
-	row, err := scanRental(tx.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, id))
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	if err != nil {
-		return false, exit.Internalf("cannot read rental expiry candidate: %s", err)
-	}
-	if row.State == "release_requested" {
-		return true, nil
-	}
-	if row.State != "ready" {
-		return false, nil
-	}
-	idle, problem := rentalIdleObservation(tx, row)
-	if problem != nil {
-		return false, problem
-	}
-	if !idle.Due(at) {
-		return false, nil
-	}
-	if _, err := tx.Exec(`UPDATE rentals SET state='release_requested' WHERE id=?`, id); err != nil {
-		return false, exit.Internalf("cannot commit rental idle release: %s", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, exit.Internalf("cannot finish rental idle release: %s", err)
-	}
-	return true, nil
 }
 
 func refuseReleasedRental(reader rentalIdleReader, id string) *exit.Error {

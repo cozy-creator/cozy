@@ -134,11 +134,6 @@ func TestRentalInstallQueueSurvivesDisconnectAndReplaysExactSelection(t *testing
 	case <-time.After(3 * time.Second):
 		t.Fatal("ready rental was not dispatched")
 	}
-	claimed, problem := store.ClaimRentalIdleRelease(machine.ID, time.Now())
-	rentalInstallCheck(t, problem)
-	if claimed {
-		t.Fatal("active installation lost its rental to idle release")
-	}
 	stop()
 	waitRentalInstall(t, store, accepted.ID, "queued")
 	store.Close()

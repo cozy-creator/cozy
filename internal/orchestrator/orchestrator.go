@@ -401,14 +401,6 @@ const (
 	ExcludedDiskShort = "disk_short"
 )
 
-// RentalWorkerFailed is whether the rental's worker last reported WORKER_PHASE_FAILED.
-func (c *Orchestrator) RentalWorkerFailed(id string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	w := c.workers[rentalInstanceID(id)]
-	return w != nil && w.phase == pb.WorkerPhase_WORKER_PHASE_FAILED
-}
-
 // RentalStanding is what this owner knows live about one ready rental a placement could
 // go to: the reason its worker cannot take this request's MODE, or the attempts the
 // worker holds and has been offered — what a new request waits behind, with the
