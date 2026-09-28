@@ -72,7 +72,7 @@ type reportWarning struct {
 
 type reportStage struct {
 	Name        string  `json:"name"`
-	Kind        string  `json:"kind"` // setup, gpu, phase, inference or transfer
+	Kind        string  `json:"kind"` // setup, download, gpu, wait, phase, inference or transfer
 	StartUnixMS int64   `json:"start_unix_ms,omitempty"`
 	MS          float64 `json:"ms"`
 	Count       int     `json:"count,omitempty"`
@@ -205,7 +205,8 @@ type preparingEvent struct {
 // logEvent is one Runtime log record. A phase record (a source download, a conversion, a
 // call's input check) names its phase and elapsed time, and its call when it is one's.
 type logEvent struct {
-	AtUnixMS int64 `json:"at_unix_ms"`
+	Name     string `json:"name"`
+	AtUnixMS int64  `json:"at_unix_ms"`
 	Fields   struct {
 		Phase         string   `json:"phase"`
 		ChildRequest  string   `json:"child_request"`
@@ -217,6 +218,15 @@ type logEvent struct {
 		Rate          float64  `json:"rate_bytes_per_second"`
 		Completed     *bool    `json:"completed"`
 		Detail        string   `json:"detail"` // what it found: an executor start's legs, the kernels' compiles
+		// Runtime's `model fetch` and `model wait` records: one model's pull, and a call held
+		// for its callee's model preparation.
+		Event      string  `json:"event"`
+		Model      string  `json:"model"`
+		Entrypoint string  `json:"entrypoint"`
+		Prefetch   bool    `json:"prefetch"`
+		Step       string  `json:"step"`
+		Call       string  `json:"call"`
+		WaitedMS   float64 `json:"waited_ms"`
 	} `json:"fields"`
 }
 
@@ -314,6 +324,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 	}
 	granted := map[string]grant{}        // an open GPU grant's stage, by its key
 	phases := map[string][]reportStage{} // phase records naming a child request, by it
+	fetched := false                     // the Runtime recorded each model's pull itself
 	for _, event := range evidence.Events {
 		at, _ := time.Parse(time.RFC3339Nano, event.At)
 		switch event.Type {
@@ -380,8 +391,19 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 			if json.Unmarshal(event.Payload, &record) != nil {
 				continue
 			}
-			if stage, ok := phaseStage(record); ok {
-				phases[record.Fields.ChildRequest] = append(phases[record.Fields.ChildRequest], stage)
+			switch {
+			case record.Name == "model fetch" && record.Fields.Event == "end":
+				fetched = true
+				report.Stages = append(report.Stages, fetchStage(record))
+			case record.Name == "model wait" && record.Fields.Event == "end" && record.Fields.Call != "":
+				c := call(record.Fields.Call)
+				c.Stages = append(c.Stages, reportStage{Name: "waiting for model weights", Kind: "wait",
+					StartUnixMS: record.AtUnixMS - int64(record.Fields.WaitedMS), MS: record.Fields.WaitedMS,
+					Detail: strings.TrimSpace(record.Fields.Entrypoint + " weights, in " + record.Fields.Step)})
+			default:
+				if stage, ok := phaseStage(record); ok {
+					phases[record.Fields.ChildRequest] = append(phases[record.Fields.ChildRequest], stage)
+				}
 			}
 		case "request.outputs_fetched":
 			var fetched outputsEvent
@@ -398,8 +420,12 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		}
 	}
 	// A call's phases are its own; a shared preparation's (a model download several calls
-	// wait on) and the run's are the run's.
+	// wait on) and the run's are the run's. A Runtime that records each model's pull has
+	// its download phases as those rows, with their bytes and rates.
 	for child, stages := range phases {
+		if fetched {
+			stages = slices.DeleteFunc(stages, func(stage reportStage) bool { return stage.Name == "Downloading model weights" })
+		}
 		if c := calls[child]; c != nil && child != "" {
 			c.Stages = append(c.Stages, stages...)
 		} else {
@@ -456,7 +482,7 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 // sortStages orders setup, GPU wait, then execution phases and inference, then transfer;
 // within an order, by start (unknown last).
 func sortStages(stages []reportStage) {
-	order := map[string]int{"setup": 0, "gpu": 1, "phase": 2, "inference": 2, "transfer": 3}
+	order := map[string]int{"setup": 0, "download": 1, "gpu": 1, "phase": 2, "inference": 2, "transfer": 3}
 	sort.SliceStable(stages, func(i, j int) bool {
 		a, b := stages[i], stages[j]
 		if order[a.Kind] != order[b.Kind] {
@@ -574,6 +600,37 @@ func phaseStage(record logEvent) (reportStage, bool) {
 		row.Detail = strings.TrimPrefix(row.Detail+"; did not complete", "; ")
 	}
 	return row, true
+}
+
+// fetchStage is one model's pull (Runtime's `model fetch` end record): its bytes, time and
+// rate, and the step it held or that it was a prefetch.
+func fetchStage(record logEvent) reportStage {
+	fields := record.Fields
+	elapsed := 0.0
+	if fields.ElapsedMS != nil {
+		elapsed = *fields.ElapsedMS
+	}
+	row := reportStage{Name: "download " + fields.Model, Kind: "download", StartUnixMS: fields.StartedUnixMS,
+		MS: elapsed, Bytes: fields.Bytes}
+	parts := []string{}
+	if fields.Bytes > 0 {
+		moved := units.Bytes(fields.Bytes)
+		if fields.Rate > 0 {
+			moved += " at " + units.Bytes(int64(fields.Rate)) + "/s"
+		}
+		parts = append(parts, moved)
+	}
+	switch {
+	case fields.Prefetch:
+		parts = append(parts, "prefetch for "+fields.Entrypoint)
+	case fields.Step != "":
+		parts = append(parts, "for "+fields.Entrypoint+", held "+fields.Step)
+	}
+	if fields.Completed != nil && !*fields.Completed {
+		parts = append(parts, "did not complete")
+	}
+	row.Detail = strings.Join(parts, "; ")
+	return row
 }
 
 // setupStage marks setup that finished before the run was submitted as reused, not paid.

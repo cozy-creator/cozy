@@ -37,6 +37,8 @@ type liveView struct {
 	hasETA                       bool
 	held                         map[string][]any // this run's GPU grants: call key -> ordinals
 	waits                        []gpuWait
+	stalls                       map[string]*stall        // steps held for their callee's weights
+	stalled                      map[string]time.Duration // each step's closed holds, summed
 
 	shown   []string // rows on screen
 	cells   []int    // their widths, to erase them after a resize
@@ -51,6 +53,7 @@ type liveStage struct {
 	key, label, leaf string
 	scope            bool
 	announced        bool           // reported at the root, not only as a child's scope
+	whole            bool           // a child's own scope whose count completed: it is over
 	event            localapi.Event // a phase's latest observation
 	started, last    time.Time
 
@@ -71,6 +74,14 @@ type gpuWait struct {
 	width                int
 	ownRun, behindOthers bool
 	since                time.Time
+}
+
+// stall is a step held for its callee's model preparation: its clock stops while the
+// download it waits on runs on its own line.
+type stall struct {
+	count      int
+	since      time.Time
+	entrypoint string
 }
 
 type liveDone struct {
@@ -204,6 +215,20 @@ func (p *RunProgress) onLive(e localapi.Event) {
 		return
 	case "machine.gpu.grant", "machine.gpu.release", "machine.gpu.wait":
 		v.gpu(e, at)
+	case "log":
+		fields, _ := e.Payload["fields"].(map[string]any)
+		switch e.Payload["name"] {
+		case "model-prefetch":
+			// A prefetch narrates its download on the log; one that counts bytes is drawn.
+			if fields["unit"] != "bytes" {
+				return
+			}
+			p.liveProgress(fields, at)
+		case "model wait":
+			v.stall(fields, at)
+		default:
+			return
+		}
 	case "attempt_failed", "requeued":
 		v.retireAll(at, true)
 		v.executing, v.status = false, "retrying"
@@ -239,7 +264,7 @@ func (p *RunProgress) liveProgress(fields map[string]any, at time.Time) {
 		}
 		s = &liveStage{key: scope, label: stageLabel(scope), scope: true, started: at, position: -1}
 		v.scopes = append(v.scopes, s)
-	} else if s.announced {
+	} else if s.announced && !nested {
 		v.sequenced(s)
 	}
 	leaf := ""
@@ -253,8 +278,10 @@ func (p *RunProgress) liveProgress(fields map[string]any, at time.Time) {
 	}
 	s.measure(fields)
 	s.last = at
-	// A child's own scope (a weights download) has nothing left once its count is whole.
+	// A child's own scope (a weights download) has nothing left once its count is whole;
+	// a later count under its name is another download.
 	if !s.announced && s.counted && s.current == s.total {
+		s.whole = true
 		v.retire(s, at, false)
 	}
 }
@@ -294,7 +321,7 @@ func (v *liveView) open(key string) *liveStage {
 		}
 	}
 	for i := len(v.done) - 1; i >= 0; i-- {
-		if s := v.done[i].stage; s != nil && s.key == key && !v.done[i].failed {
+		if s := v.done[i].stage; s != nil && s.key == key && !v.done[i].failed && !s.whole {
 			v.done = slices.Delete(v.done, i, i+1)
 			v.scopes = append(v.scopes, s)
 			slices.SortStableFunc(v.scopes, func(a, b *liveStage) int { return a.started.Compare(b.started) })
@@ -305,13 +332,62 @@ func (v *liveView) open(key string) *liveStage {
 }
 
 // supersede closes the stages a new root stage follows. Stages a root starts within one
-// frame of each other may be a fan-out of concurrent calls and stay open until sequenced.
+// frame of each other may be a fan-out of concurrent calls and stay open until sequenced;
+// a child's own scope (a download) runs beside the root's stages until its count is whole.
 func (v *liveView) supersede(at time.Time) {
-	v.close(at, false, func(s *liveStage) bool { return at.Sub(s.started) <= liveFrame })
+	v.close(at, false, func(s *liveStage) bool { return at.Sub(s.started) <= liveFrame || !s.announced })
+}
+
+// stall follows a step held for its callee's weights (Runtime's `model wait` records).
+func (v *liveView) stall(fields map[string]any, at time.Time) {
+	step, _ := fields["step"].(string)
+	if step == "" {
+		return
+	}
+	if v.stalls == nil {
+		v.stalls, v.stalled = map[string]*stall{}, map[string]time.Duration{}
+	}
+	held := v.stalls[step]
+	switch fields["event"] {
+	case "start":
+		if held == nil {
+			held = &stall{since: at}
+			v.stalls[step] = held
+		}
+		held.count++
+		held.entrypoint, _ = fields["entrypoint"].(string)
+	case "end":
+		if held == nil {
+			return
+		}
+		if held.count--; held.count <= 0 {
+			v.stalled[step] += max(at.Sub(held.since), 0)
+			delete(v.stalls, step)
+		}
+	}
+}
+
+// ran is how long a stage has executed by at: its time open less its time held for weights.
+func (v *liveView) ran(s *liveStage, at time.Time) time.Duration {
+	held := v.stalled[s.key]
+	if open := v.stalls[s.key]; open != nil {
+		held += max(at.Sub(open.since), 0)
+	}
+	return max(at.Sub(s.started)-held, 0)
+}
+
+// download is a child's own scope downloading its weights, read as the download itself.
+func (s *liveStage) download() (string, bool) {
+	rest, ok := strings.CutPrefix(s.leaf, "Downloading ")
+	if s.announced || !s.bytes || !ok {
+		return "", false
+	}
+	return "Downloading " + s.label + " " + rest, true
 }
 
 // sequenced closes the stages that started just before s and have been silent since: s
-// reporting again shows they were a quick sequence, not a fan-out running beside it.
+// reporting again at the root shows they were a quick sequence. A report nested under s
+// makes it a parent step, which a fan-out's siblings run beside (run 1560's references).
 func (v *liveView) sequenced(s *liveStage) {
 	for _, other := range slices.Clone(v.scopes) {
 		if other.announced && other.started.Before(s.started) && s.started.Sub(other.started) <= liveFrame &&
@@ -353,7 +429,9 @@ func (v *liveView) retireAll(at time.Time, failed bool) {
 func (v *liveView) retire(s *liveStage, end time.Time, failed bool) {
 	v.scopes = slices.DeleteFunc(v.scopes, func(open *liveStage) bool { return open == s })
 	label := s.label
-	if (failed || !s.announced) && s.leaf != "" {
+	if download, ok := s.download(); ok {
+		label = download
+	} else if (failed || !s.announced) && s.leaf != "" {
 		label += " · " + s.leaf // where it failed, or all a child's own scope did
 	}
 	if s.bytes && s.total > 0 {
@@ -367,7 +445,7 @@ func (v *liveView) retire(s *liveStage, end time.Time, failed bool) {
 	if !s.scope {
 		stage = nil
 	}
-	v.done = append(v.done, liveDone{stage: stage, label: label, took: max(end.Sub(s.started), 0), failed: failed})
+	v.done = append(v.done, liveDone{stage: stage, label: label, took: v.ran(s, end), failed: failed})
 }
 
 // observed is a stage a producer measured, which a queue heartbeat never replaces.
@@ -464,7 +542,7 @@ func (p *RunProgress) frame(at time.Time, width, height int) []string {
 		active = append(active, v.phase.phaseRows(at, width)...)
 	}
 	for _, s := range v.scopes {
-		active = append(active, s.rows(at, width)...)
+		active = append(active, s.rows(v.ran(s, at), v.stalls[s.key], width)...)
 	}
 	for _, w := range v.waits {
 		if !v.ended.IsZero() {
@@ -548,12 +626,19 @@ func doneRows(done []liveDone, width int) []string {
 	return rows
 }
 
-func (s *liveStage) rows(at time.Time, width int) []string {
+// rows are an open stage's line and bar. A step held for weights shows what it waits for
+// and no clock: its time is the download's, on the download's own line.
+func (s *liveStage) rows(ran time.Duration, held *stall, width int) []string {
 	line := "  ▸ " + s.label
-	if s.leaf != "" {
+	if held != nil {
+		return []string{line + " · waiting for " + strings.TrimSpace(held.entrypoint+" weights")}
+	}
+	if download, ok := s.download(); ok {
+		line = "  ▸ " + download
+	} else if s.leaf != "" {
 		line += " · " + s.leaf
 	}
-	rows := []string{line + " · " + shortDuration(max(at.Sub(s.started), 0))}
+	rows := []string{line + " · " + shortDuration(ran)}
 	if !s.hasFraction {
 		return rows
 	}

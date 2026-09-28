@@ -200,7 +200,11 @@ func TestLiveRunViewGoldenFrames(t *testing.T) {
 // goldenFrames replays a recorded run and compares its frames at moments of the run.
 func goldenFrames(t *testing.T, run, machine string, frames []struct{ at, frame string }) {
 	t.Helper()
-	events := recordedRun(t, "run-"+run)
+	goldenStream(t, run, machine, recordedRun(t, "run-"+run), frames)
+}
+
+func goldenStream(t *testing.T, run, machine string, events []localapi.Event, frames []struct{ at, frame string }) {
+	t.Helper()
 	began := recordedAt(t, events[0])
 	sink := &renderBuffer{}
 	ctx := &cli.Context{Inv: &cli.Invocation{Mode: output.Mode{Human: true, Live: true}}, Out: sink, Err: sink}
@@ -337,4 +341,129 @@ func screen(output string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// Run 1560 (4×H100): five references behind a 33 GB download of the image model's weights,
+// then segment 1 behind the 100 GB motion_segment_turbo prefetch. Recorded on a Runtime from
+// before its fetch and wait records, the watch draws it as it always has.
+var liveFrames1560 = []struct{ at, frame string }{
+	{"19:50:00", `
+Run 1560 · paul/minimax-h3/long_form · jaguarman · running · 2m54s
+  ✓ starting  2s
+  ▸ Creating reference Subject-1 · 2m52s
+  ▸ Creating reference Subject-2 · 2m52s
+  ▸ Creating reference Subject-3 · 2m52s
+  ▸ Creating reference Subject-4 · 2m52s
+  ▸ Creating reference Background · Downloading model weights · 2m52s
+  ▸ generate_image · Downloading model weights · 2m31s
+    ████████████░░░░░░░░  61%  step 20234983479/33118370151`},
+}
+
+// Run 1560 as today's Runtime narrates it: its recorded download samples say they count
+// bytes, with the rate since the previous sample, and each call held for its callee's
+// weights says which step waits, from its call until its callee's preparation ended (the
+// recorded "Checking model compatibility").
+var liveFrames1560Narrated = []struct{ at, frame string }{
+	{"19:50:00", `
+Run 1560 · paul/minimax-h3/long_form · jaguarman · running · 2m54s
+  ✓ starting  2s
+  ▸ Creating reference Subject-1 · waiting for generate_image weights
+  ▸ Creating reference Subject-2 · waiting for generate_image weights
+  ▸ Creating reference Subject-3 · waiting for generate_image weights
+  ▸ Creating reference Subject-4 · waiting for generate_image weights
+  ▸ Creating reference Background · waiting for generate_image weights
+  ▸ Downloading motion_segment_turbo model weights · 2m49s
+    ████░░░░░░░░░░░░░░░░  20%  18.6GiB / 93.0GiB · 137.5MiB/s · ETA ~9m14s
+  ▸ Downloading generate_image model weights · 2m31s
+    ████████████░░░░░░░░  61%  18.8GiB / 30.8GiB · 149.5MiB/s · ETA ~1m22s`},
+	{"19:58:49", `
+Run 1560 · paul/minimax-h3/long_form · jaguarman · running · 11m43s
+  … 3 earlier
+  ✓ Creating reference Subject-2   28s
+  ✓ Creating reference Subject-3   15s
+  ✓ Creating reference Subject-4   28s
+  ✓ Creating reference Background  28s
+  ▸ Downloading motion_segment_turbo model weights · 11m38s
+    ████████████████░░░░  81%  75.4GiB / 93.0GiB · 106.6MiB/s · ETA ~2m49s
+  ▸ Segment 1 of 9 · waiting for motion_segment_turbo weights
+  overall ░░░░░░░░░░░░░░░░░░░░   1%`},
+	{"20:05:37", `
+Run 1560 · paul/minimax-h3/long_form · jaguarman · completed · 18m31s
+  ✓ starting                                                  2s
+  ✓ Downloading generate_image model weights · 30.8GiB        4m33s
+  ✓ Creating reference Subject-1                              21s
+  ✓ Creating reference Subject-2                              28s
+  ✓ Creating reference Subject-3                              15s
+  ✓ Creating reference Subject-4                              28s
+  ✓ Creating reference Background                             28s
+  ✓ Downloading motion_segment_turbo model weights · 93.0GiB  14m48s
+  ✓ Downloading motion_segment_turbo model weights · 1.5GiB   2m6s
+  ✓ Segment 1 of 9                                            1m5s
+  ✓ Segment 2 of 9                                            9s
+  ✓ Assembling video                                          1s`},
+}
+
+func TestADownloadIsItsOwnLineAndStepsAreTimedWithoutIt(t *testing.T) {
+	goldenFrames(t, "1560", "jaguarman", liveFrames1560)
+	events := narratedByTodaysRuntime(t, recordedRun(t, "run-1560"))
+	goldenStream(t, "1560", "jaguarman", events, liveFrames1560Narrated)
+}
+
+func narratedByTodaysRuntime(t *testing.T, recorded []localapi.Event) []localapi.Event {
+	t.Helper()
+	var out []localapi.Event
+	previous := map[string][2]float64{} // a download's last sample: bytes, unix seconds
+	counted := func(e localapi.Event, fields map[string]any, key string) {
+		position, ok := fields["position"].(float64)
+		if !ok {
+			return
+		}
+		at := float64(recordedAt(t, e).UnixNano()) / 1e9
+		fields["unit"] = "bytes"
+		if last, ok := previous[key]; ok && at > last[1] {
+			fields["rate"] = (position - last[0]) / (at - last[1])
+		}
+		previous[key] = [2]float64{position, at}
+	}
+	held := func(e localapi.Event, event, step, entrypoint string) localapi.Event {
+		return localapi.Event{Type: "request.log", RequestID: e.RequestID, Attempt: 1,
+			At: recordedAt(t, e).Add(time.Millisecond).Format(time.RFC3339Nano),
+			Payload: map[string]any{"name": "model wait", "value": "info", "fields": map[string]any{
+				"event": event, "step": step, "entrypoint": entrypoint}}}
+	}
+	var steps []string
+	compatibility := 0
+	for _, e := range recorded {
+		out = append(out, e)
+		switch e.Type {
+		case "machine.progress":
+			fields, _ := e.Payload["payload"].(map[string]any)
+			stage, _ := fields["stage"].(string)
+			if strings.HasSuffix(stage, " / Downloading model weights") {
+				counted(e, fields, stage)
+			}
+			if strings.HasPrefix(stage, "Creating reference ") && !strings.Contains(stage, " / ") ||
+				stage == "Segment 1 of 9" && len(steps) == 5 {
+				entrypoint := map[bool]string{true: "generate_image", false: "motion_segment_turbo"}[len(steps) < 5]
+				steps = append(steps, stage)
+				out = append(out, held(e, "start", stage, entrypoint))
+			}
+		case "request.log":
+			fields, _ := e.Payload["fields"].(map[string]any)
+			switch e.Payload["name"] {
+			case "model-prefetch":
+				stage, _ := fields["stage"].(string)
+				counted(e, fields, fmt.Sprint(stage, fields["total"]))
+			case "Checking model compatibility":
+				// The callee's preparation ended: every call held for it proceeds.
+				waiting := map[int][]string{0: steps[:min(5, len(steps))], 1: steps[min(5, len(steps)):]}[compatibility]
+				entrypoint := map[int]string{0: "generate_image", 1: "motion_segment_turbo"}[compatibility]
+				for _, step := range waiting {
+					out = append(out, held(e, "end", step, entrypoint))
+				}
+				compatibility++
+			}
+		}
+	}
+	return out
 }

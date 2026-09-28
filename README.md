@@ -480,6 +480,8 @@ the package reports `overall_fraction`; stage-local fractions are labeled as sta
 Human progress is automatic with `--await`; no separate progress flag is needed. On a terminal it
 redraws in place (the run, finished stages with their durations, each active stage's bar) and
 settles to one record; piped or with `TERM=dumb` it appends plain lines. `NO_COLOR` drops color.
+A model download is its own line with its bytes, rate and time, and a step held for weights is
+timed without the wait; `cozy run show` lists every download, prefetches included.
 Model overrides accept `--model.<param>=org/model@release/lane` after the target;
 the existing `model.<param>=...` payload spelling has the same meaning.
 Without an override, Cozy uses the owner's Tensorhub binding, then the selected function's

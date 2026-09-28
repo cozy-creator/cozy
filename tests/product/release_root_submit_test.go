@@ -58,6 +58,8 @@ type releaseMachine struct {
 	// downloading, while open, has each root answered as still downloading its Models (1 of
 	// 4 GiB landed), as a Runtime answers before acceptance.
 	downloading chan struct{}
+	// logs are the log records a running root narrates: Runtime's {"type":"log",...} bodies.
+	logs [][]byte
 }
 
 const resolvedBody = `{"installation_id":"inst-h3","models":[{"gpus":2,"lane":"fp8-adaln-pruned","manifest":{"digest":"sha256:` +
@@ -73,6 +75,10 @@ func (m *releaseMachine) events(request string) []*pb.MachineExecutionEvent {
 	out := []*pb.MachineExecutionEvent{{Sequence: 1, AttemptOrdinal: 1, AtMs: uint64(time.Now().UnixMilli()), Kind: "resolved", BodyCanonicalBytes: []byte(resolvedBody)}}
 	if _, ok := m.running.Load(request); ok {
 		out = append(out, &pb.MachineExecutionEvent{Sequence: 2, AttemptOrdinal: 1, AtMs: uint64(time.Now().UnixMilli()), Kind: "running", BodyCanonicalBytes: []byte(`{"generation":1}`)})
+		for _, body := range m.logs {
+			out = append(out, &pb.MachineExecutionEvent{Sequence: uint64(len(out) + 1), AttemptOrdinal: 1,
+				AtMs: uint64(time.Now().UnixMilli()), Kind: "log", BodyCanonicalBytes: body})
+		}
 	}
 	if _, ok := m.ended.Load(request); ok {
 		out = append(out, &pb.MachineExecutionEvent{Sequence: uint64(len(out) + 1), AttemptOrdinal: 1, AtMs: uint64(time.Now().UnixMilli()), Kind: "canceled", BodyCanonicalBytes: []byte(`{"generation":1}`)})
