@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/capability"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -194,6 +195,20 @@ func (m *Manager) Identity() string {
 		return ""
 	}
 	return "key:" + stored.DeviceKeyID
+}
+
+// MintCapability signs a grant with this origin's device key, the key every machine the
+// account rents holds among its authorized keys.
+func (m *Manager) MintCapability(g capability.Grant) (string, *exit.Error) {
+	_, private, problem := m.load()
+	if problem != nil {
+		return "", problem
+	}
+	token, err := capability.Mint(private, g)
+	if err != nil {
+		return "", exit.Internalf("cannot sign the capability: %s", err)
+	}
+	return token, nil
 }
 
 // CredentialPresent reports whether this Tensorhub origin has a local machine

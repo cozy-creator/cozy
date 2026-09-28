@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -18,7 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/capability"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"github.com/cozy-creator/cozy/tests/product/webrtctest"
 	"github.com/playwright-community/playwright-go"
 )
@@ -290,4 +295,100 @@ func playerEval(t *testing.T, page playwright.Page, expression string) any {
 	result, err := page.Evaluate("async () => { " + playerHelpers + " return await " + expression + "; }")
 	must(t, err)
 	return result
+}
+
+// `cozy run play` prints a link from the run's machine receipt, the Hub's rental view and this
+// home's device key; the link plays in a browser. Each view that cannot serve says why, and
+// no link is printed.
+func TestRunPlayPrintsALinkThatPlays(t *testing.T) {
+	ip := "127.0.0.1"
+	if *playerBrowsers != "" {
+		ip = playerLANAddress(t)
+	}
+	public, key, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	machine := webrtctest.NewMachine(t.TempDir(), public)
+	server := webrtctest.Serve(t, ip, machine)
+	var mu sync.Mutex
+	view := map[string]any{}
+	hub := httptest.NewServer(machineKeyLogin("dk-play", public, "play-test", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.URL.Path != "/v1/rentals/pr-play" || r.Header.Get("Authorization") != "Bearer play-test" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(view)
+	})))
+	defer hub.Close()
+	pages := httptest.NewServer(http.FileServer(http.Dir(filepath.Join("..", "..", "web", "player"))))
+	defer pages.Close()
+
+	o := hostOwner(t, fmt.Sprintf("run-play-%d", time.Now().UnixNano()))
+	must(t, os.WriteFile(filepath.Join(o.root, config.FileName), []byte("tensorhub_url: "+hub.URL+
+		"\nplayer_url: "+pages.URL+"/index.html\n"), 0o600))
+	plantMachineKey(t, o.root, hub.URL, "dk-play", key)
+
+	// A run the rental "jaguarman" accepted as its run 7.
+	request, _, problem := o.store.Submit(records.Request{ID: "job-play", IdemKey: "play", Package: "local/example", Entrypoint: "main",
+		Kind: "job", Payload: []byte(`{}`), BodyDigest: childDigest("play"), MachineExecutionObserver: true,
+		Hub: hub.URL, Rental: true, Worker: "pr-play", Machine: "jaguarman"})
+	fatal(t, problem)
+	fatal(t, o.store.LinkMachineExecution(request.ID, "pr-play"))
+	capture, spec := []byte(`{"capture":"play"}`), []byte(`{"invocation":"play"}`)
+	submission := &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "workspace", SubmissionId: request.IdemKey,
+		CaptureCanonicalBytes: capture, CaptureDigest: canonical.Digest(capture),
+		Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}
+	fatal(t, o.store.RecordMachineSubmission(request.ID, submission))
+	fatal(t, o.store.AcceptMachineExecution(request.ID, &pb.MachineExecutionReceipt{RequestId: request.ID, SubmissionId: request.IdemKey,
+		CaptureDigest: submission.CaptureDigest, InvocationSpecDigest: submission.Offer.InvocationSpecDigest, AcceptedAtMs: 1000,
+		WorkerId: server.Machine, WorkerBootId: "boot-1", ExecutionWorkspaceId: "workspace", Number: 7}))
+	defer publicationControlAPI(t, o)()
+
+	play := func(state string, webrtc map[string]any, media string) (int, string) {
+		mu.Lock()
+		view = map[string]any{"rental_id": "pr-play", "name": "jaguarman", "state": state, "media_address": media}
+		if webrtc != nil {
+			view["webrtc"] = webrtc
+		}
+		mu.Unlock()
+		return runCozy(t, o.root, "run", "play", request.ID, "--json")
+	}
+	served := map[string]any{"address": server.Addr.String(), "fingerprint": server.Fingerprint}
+	for _, arm := range []struct {
+		name, state, media, says string
+		webrtc                   map[string]any
+	}{
+		{"an ended rental", "released", "", "is released", served},
+		{"an image before machines", "ready", "10.0.0.9:8444", "image that predates browser playback", nil},
+		{"a Hub or daemon before WebRTC", "ready", "", "its Hub (" + hub.URL + ") or its machine's daemon predates it", nil},
+	} {
+		if code, out := play(arm.state, arm.webrtc, arm.media); code == 0 || !strings.Contains(out, arm.says) || strings.Contains(out, "#v=1") {
+			t.Fatalf("%s: [%d] %s", arm.name, code, out)
+		}
+	}
+	code, out := play("ready", served, "")
+	var printed struct{ Link string }
+	if code != 0 || json.Unmarshal([]byte(out), &printed) != nil || !strings.HasPrefix(printed.Link, pages.URL+"/index.html#v=1&a="+server.Addr.String()) {
+		t.Fatalf("cozy run play: [%d] %s", code, out)
+	}
+	if *playerBrowsers == "" {
+		return
+	}
+	for _, segment := range playerFilm(t) {
+		machine.Append(7, "video", -1, segment, 500_000)
+	}
+	machine.End(7, "completed")
+	pw, err := playwright.Run(&playwright.RunOptions{SkipInstallBrowsers: true})
+	must(t, err)
+	defer pw.Stop()
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{Channel: playwright.String("chrome")})
+	must(t, err)
+	defer browser.Close()
+	page, err := browser.NewPage()
+	must(t, err)
+	_, err = page.Goto(printed.Link)
+	must(t, err)
+	playerWait(t, page, "the printed link plays the film to its end", `video().ended && decoded(1.5, 36)`)
 }

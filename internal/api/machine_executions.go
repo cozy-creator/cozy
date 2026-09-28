@@ -98,6 +98,10 @@ type MachineExecutionView struct {
 	// owner acts (a destination that refuses the files, say); the machine keeps the result
 	// and a later observation collects it once the cause is fixed.
 	CollectionRefused string `json:"collection_refused,omitempty"`
+	// Worker and Number name the run on its machine, as the machine's receipt does; Number
+	// is 0 from a Runtime older than wire 66.
+	Worker string `json:"worker,omitempty"`
+	Number uint64 `json:"number,omitempty"`
 }
 
 // RetainedOutput is an output held on the machine that produced it, in this host's custody,
@@ -136,6 +140,10 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 		machine = link.MachineID
 	}
 	view := &MachineExecutionView{Accepted: len(link.Receipt) > 0, Machine: machine, Collected: link.Collected}
+	var receipt pb.MachineExecutionReceipt
+	if proto.Unmarshal(link.Receipt, &receipt) == nil {
+		view.Worker, view.Number = receipt.WorkerId, receipt.Number
+	}
 	retaining, retentionProblem := s.store.MachineExecutionOwesWork(row.ID)
 	if retentionProblem != nil {
 		retaining = true

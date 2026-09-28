@@ -493,6 +493,13 @@ and return that slot to its authored default.
 `cozy run watch <run-id>` attaches to that same progress stream later; interrupting a watcher
 detaches without canceling the durable run.
 
+`cozy run play <run> [--output video] [--expires 24h]` prints a link that plays a rented run's output
+in any browser, live as it grows, straight from the machine over WebRTC. The link carries the machine's
+address and certificate pin, and a capability for that output signed by this machine's key, in its
+fragment, which never leaves the browser. Anyone holding the link can watch that output until it
+expires. The page is [web/player](web/player), served at `player_url` (default
+`https://cozy-creator.github.io/cozy/play/`).
+
 If the package is missing, Cozy installs the newest compatible release from Tensorhub before
 starting; the download is visible progress, not an interactive prompt. Reusing an explicit
 `--idempotency-key` safely returns the same recorded work. Before submission, Cozy materializes an
@@ -664,6 +671,7 @@ huggingface_token: hf_replace-with-your-token
 civitai_token: replace-with-your-token
 tfs: /usr/local/bin/tfs
 port: 8818
+player_url: https://cozy-creator.github.io/cozy/play/   # the page `cozy run play` links open
 local_rate_micro_usd_per_hour: 250000
 daemon:
   idle_shutdown_s: 900
