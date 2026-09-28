@@ -106,14 +106,12 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		sub.TimeoutMS++
 	}
 	// On a known machine, a published job's explicit choices are the machine's to resolve.
-	var source string
-	var profiles map[string]string
 	models, chosen, e := jobModelChoices(ctx, target, job, overrides.Models, selectedRental)
 	if e != nil {
 		return e
 	}
 	if !chosen {
-		if source, profiles, models, e = resolveJobModelInputs(ctx, target, job, overrides.Models); e != nil {
+		if models, e = resolveJobModelInputs(ctx, target, job, overrides.Models); e != nil {
 			return e
 		}
 	}
@@ -122,14 +120,6 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		if sub.PlannedSourceBytes, e = sourceRentalBytes(ctx, models); e != nil {
 			return e
 		}
-	}
-	if source != "" {
-		if len(trees) > 0 {
-			return exit.Usagef("foreign model inputs cannot also use local input trees")
-		}
-		// A new rental, an older Runtime or an editable package: the model transfer lane.
-		return submitSourceTransfer(ctx, "model-upload", source, ctx.Inv.Value("--upload-to"),
-			&sourceInvocation{Target: target, Job: job, Profiles: profiles}, sub)
 	}
 	if e := jobOutputDestination(ctx, job, &sub); e != nil {
 		return e

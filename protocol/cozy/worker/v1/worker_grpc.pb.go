@@ -119,7 +119,7 @@
 // a frame in flight: `PodHost` (owner <-> host, a second service on the pod listener),
 // `RuntimeWeights` (host <-> Runtime, loopback), and a host-authored SECOND snapshot document
 // beside the worker's, which passes through BYTE-IDENTICAL. The owner's transfer lanes
-// (weights transfer, model source files and preparation, local package fetch and abort) still
+// (weights transfer, model source files and preparation, local package abort) still
 // ride RecordOwnerFrame / WorkerFrame slots on WorkerControl, which the Host routes itself.
 //
 // DEVICE LANES (proto-024). The serialized resource inside one worker is a DEVICE

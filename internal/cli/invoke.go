@@ -313,12 +313,6 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 	if problem != nil {
 		return nil, false, problem
 	}
-	if strings.HasPrefix(target.Package, "local/") || target.Snapshot {
-		if len(profiles) > 0 {
-			return nil, false, exit.Usagef("--source-profile applies only to a published call's provider-source model")
-		}
-		return nil, false, nil
-	}
 	var out []orchestrator.ModelRef
 	for _, slot := range ep.Models {
 		raw, chosen := overrides[slot.Path]
@@ -357,11 +351,29 @@ func modelChoices(ctx *Context, target Target, ep *launch.Entrypoint, overrides 
 	for parameter := range profiles {
 		return nil, false, exit.Usagef("--source-profile %s names no model parameter of %s", parameter, target.Function)
 	}
+	// Unpublished code resolves its own slots, unless every slot names one provider source:
+	// only the machine makes that, from a root naming the installation.
+	if (strings.HasPrefix(target.Package, "local/") || target.Snapshot) && !oneSource(ep, out) {
+		return nil, false, nil
+	}
 	return out, true, nil
 }
 
 func sourced(models []orchestrator.ModelRef) bool {
 	return slices.ContainsFunc(models, func(model orchestrator.ModelRef) bool { return model.Source != "" })
+}
+
+// oneSource answers whether every Model slot of ep names the same provider source.
+func oneSource(ep *launch.Entrypoint, models []orchestrator.ModelRef) bool {
+	if len(models) == 0 || len(models) != len(ep.Models) {
+		return false
+	}
+	for _, model := range models {
+		if model.Source == "" || model.Source != models[0].Source {
+			return false
+		}
+	}
+	return true
 }
 
 // pinnedProviderSource spells a Hugging Face or Civitai source at an immutable revision.

@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/localpackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -26,14 +27,38 @@ import (
 // its own Hub, resolves every open slot for its own devices, prepares and mints the offer;
 // nothing here reads the Hub, a ladder or a package.
 
-// releaseRoot answers whether a request is submitted by its release: every published root.
+// releaseRoot answers whether a request is submitted as one root: every published root, and
+// an unpublished installation's root with a provider-source Model, which only a root carries.
 func releaseRoot(request records.Request) bool {
-	return request.LocalInstallationID == "" && !strings.HasPrefix(request.Package, "local/")
+	if request.LocalInstallationID != "" {
+		return sourced(request.Models)
+	}
+	return !strings.HasPrefix(request.Package, "local/")
+}
+
+// capturedRevision is the unpublished installation a root names. A root carries that one
+// installation; one whose package calls other unpublished packages still goes by capture.
+func (m *machineRuns) capturedRevision(request records.Request) (localpackage.Installation, *exit.Error) {
+	capture, problem := m.resolver.CaptureMachineExecution(request)
+	if problem != nil {
+		return localpackage.Installation{}, problem
+	}
+	if len(capture.Installations) != 1 || capture.Installations[0].ID != request.LocalInstallationID {
+		return localpackage.Installation{}, exit.Named(exit.Structural, "machine_execution.captured_callees_unsupported",
+			"a provider-source Model on a package that calls other unpublished packages is not supported yet")
+	}
+	return capture.Installations[0], nil
 }
 
 func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records.Request, connection *machineConnection) (*pb.MachineExecutionSubmit, *exit.Error) {
 	root := &pb.ReleaseRoot{Package: request.Package, Release: request.Release, Entrypoint: request.Entrypoint,
 		DeadlineUnixMs: uint64(max(request.DeadlineUnixMS, 0)), AttentionKernel: request.AttentionKernel}
+	if request.LocalInstallationID != "" {
+		if _, problem := m.capturedRevision(request); problem != nil {
+			return nil, problem
+		}
+		root.Release, root.InstallationId = "", request.LocalInstallationID
+	}
 	if request.IsJob() {
 		root.Job, root.PublicationGrant = true, home.ScratchRepo(request.Org, request.ID)
 		if request.ModelTransfer != nil {
@@ -100,6 +125,10 @@ func (m *machineRuns) sendReleaseRoot(ctx context.Context, request records.Reque
 		}
 		codeOf := trailer.Get("cozy-error-code")
 		switch {
+		case slices.Contains(codeOf, "release_root_installation_absent"):
+			// The machine lost the installation it was given (a restart): not now. The
+			// next pass prepares it again and asks with the same submission.
+			return exit.Named(exit.Unavailable, "machine_execution.installation_absent", "%s", status.Convert(err).Message())
 		case slices.Contains(codeOf, "release_root_preparing"):
 			if message := status.Convert(err).Message(); message != progress {
 				progress = message

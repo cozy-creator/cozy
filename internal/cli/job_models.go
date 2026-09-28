@@ -15,7 +15,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelsource"
-	"github.com/cozy-creator/cozy/internal/modeltransfer"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -41,57 +40,43 @@ func providerModelSource(raw string) (string, bool, *exit.Error) {
 // A provider selection is acquired once, with an explicit reviewed profile for
 // each model slot. The existing durable source owner holds one source inventory;
 // it must never silently widen a selection or replace independently bound inputs.
+// resolveJobModelInputs resolves a job's Models on this host: choosing a machine to rent reads
+// the ladders, and so does unpublished code. A provider source goes as a choice only when it
+// names every slot (jobModelChoices); here it would be one input among resolved ones.
 func resolveJobModelInputs(ctx *Context, target Target, job *launch.Entrypoint,
 	overrides map[string]string,
-) (string, map[string]string, []orchestrator.ModelRef, *exit.Error) {
+) ([]orchestrator.ModelRef, *exit.Error) {
 	profiles, problem := parseSourceProfileFlags(ctx)
 	if problem != nil {
-		return "", nil, nil, problem
+		return nil, problem
 	}
 	if len(overrides) == 0 && len(profiles) == 0 {
 		models, problem := resolveInvocationModels(ctx, target, job, overrides)
 		if problem == nil {
 			models, problem = jobManifestInputs(ctx, job, models)
 		}
-		return "", nil, models, problem
+		return models, problem
 	}
 	selected, problem := invocationModelSpecs(ctx, target, job, overrides)
 	if problem != nil {
-		return "", nil, nil, problem
+		return nil, problem
 	}
-	source, foreign := "", 0
 	for _, spec := range selected {
-		canonical, provider, problem := providerModelSource(spec.Ref)
-		if problem != nil {
-			return "", nil, nil, problem
+		if _, provider, problem := providerModelSource(spec.Ref); problem != nil {
+			return nil, problem
+		} else if provider {
+			return nil, exit.Named(exit.Unavailable, "model_source.mixed_inputs_unsupported",
+				"a provider source must name every model slot of the job, and only one source")
 		}
-		if !provider {
-			continue
-		}
-		if source != "" && source != canonical {
-			return "", nil, nil, exit.Named(exit.Unavailable, "model_source.multiple_sources_unsupported",
-				"one invocation currently prepares one provider source; all foreign model inputs must name the same source")
-		}
-		source, foreign = canonical, foreign+1
 	}
-	if foreign == 0 {
-		if len(profiles) > 0 {
-			return "", nil, nil, exit.Usagef("--source-profile applies only to foreign model inputs")
-		}
-		models, problem := resolveSelectedInvocationModels(ctx, target, job, selected)
-		if problem == nil {
-			models, problem = jobManifestInputs(ctx, job, models)
-		}
-		return "", nil, models, problem
+	if len(profiles) > 0 {
+		return nil, exit.Usagef("--source-profile applies only to foreign model inputs")
 	}
-	if foreign != len(job.Models) {
-		return "", nil, nil, exit.Named(exit.Unavailable, "model_source.mixed_inputs_unsupported",
-			"foreign source preparation currently requires every model slot to name that source")
+	models, problem := resolveSelectedInvocationModels(ctx, target, job, selected)
+	if problem == nil {
+		models, problem = jobManifestInputs(ctx, job, models)
 	}
-	if problem := modeltransfer.ValidateProducer(target.Package+"/"+target.Function, job, profiles); problem != nil {
-		return "", nil, nil, problem
-	}
-	return source, profiles, nil, nil
+	return models, problem
 }
 
 // jobModelChoices are a published job's explicit Model choices, unresolved, for the machine
@@ -104,13 +89,8 @@ func jobModelChoices(ctx *Context, target Target, job *launch.Entrypoint, overri
 	if problem != nil || !chosen || rental != "" || !rentalRequested(ctx) {
 		return models, chosen, problem
 	}
-	if len(models) == 0 || len(models) != len(job.Models) {
+	if !oneSource(job, models) {
 		return nil, false, nil
-	}
-	for _, model := range models {
-		if model.Source == "" || model.Source != models[0].Source {
-			return nil, false, nil
-		}
 	}
 	return models, true, nil
 }

@@ -448,6 +448,15 @@ func (m *machineRuns) submit(request records.Request, link *records.MachineExecu
 	}
 	began = time.Now()
 	if submission.ReleaseRoot != nil {
+		if submission.ReleaseRoot.InstallationId != "" {
+			revision, problem := m.capturedRevision(request)
+			if problem == nil {
+				problem = connection.prepare(ctx, request.ID, revision)
+			}
+			if problem != nil {
+				return problem
+			}
+		}
 		if problem := m.sendReleaseRoot(ctx, request, connection, submission); problem != nil {
 			return problem
 		}

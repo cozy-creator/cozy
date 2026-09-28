@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -432,7 +433,23 @@ func installLocalPackage(t *testing.T, layout home.Layout, store *records.Store,
 func TestRentedConversionOfAnUnpublishedPackagePublishesFromTheMachine(t *testing.T) {
 	f := newConversionFixture(t)
 	surface := installConversionPackage(t, f.layout, f.store)
-	// The pod receives the captured wheels and source archive as it does any private code.
+	servePrivateCode(t, f, surface)
+	f.start(t)
+	code, out := runCozy(t, f.root, "run", "local/conversion-proof/quantize", "proof/source@1.0.0/bf16", "proof/output",
+		"steps=7", "--rental=tessa", "--await", "--json")
+	if code != 0 {
+		t.Fatalf("the unpublished conversion did not publish [exit %d]: %s\n%s", code, out, tail(filepath.Join(f.root, "daemon.log")))
+	}
+	if request := f.published(t, out); request.LocalInstallationID == "" {
+		t.Fatalf("the unpublished conversion did not run its captured code: %+v", request)
+	}
+}
+
+// servePrivateCode has the pod receive the captured wheels and source archive as it does any
+// private code, and answers how many times it was asked to prepare them.
+func servePrivateCode(t *testing.T, f *conversionFixture, surface []byte) *atomic.Int32 {
+	t.Helper()
+	prepared := &atomic.Int32{}
 	f.pod.localUpload = func(stream grpc.BidiStreamingServer[pb.LocalPackageUploadFrame, pb.LocalPackageFileStatus]) error {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -469,6 +486,7 @@ func TestRentedConversionOfAnUnpublishedPackagePublishesFromTheMachine(t *testin
 		if err := f.pod.verifyClaim(call.Claim, false); err != nil {
 			return err
 		}
+		prepared.Add(1)
 		selected := call.LocalPackageSet.Package
 		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED, InstalledPackage: &pb.InstalledPackage{
 			InstallationId: selected.InstallationId, Package: selected.Package, Release: selected.Release, PackageInterface: surface}})
@@ -484,14 +502,41 @@ func TestRentedConversionOfAnUnpublishedPackagePublishesFromTheMachine(t *testin
 		return stream.Send(&pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_PREPARED,
 			PlacementSet: &pb.DesiredPlacementSet{PlacementSetDigest: digest, PlacementSetCanonicalBytes: raw}})
 	}
+	return prepared
+}
+
+// An unpublished package's provider-source job is one root naming its installation: the pod
+// is given the captured code, and the machine makes the source for it; nothing takes the
+// classic transfer lane.
+func TestAnUnpublishedPackagesProviderSourceIsOneRootNamingItsInstallation(t *testing.T) {
+	f := newConversionFixture(t)
+	f.machine.jobRoots = true
+	prepared := servePrivateCode(t, f, installConversionPackage(t, f.layout, f.store))
 	f.start(t)
-	code, out := runCozy(t, f.root, "run", "local/conversion-proof/quantize", "proof/source@1.0.0/bf16", "proof/output",
-		"steps=7", "--rental=tessa", "--await", "--json")
+	source := "hf://example/weights@" + strings.Repeat("c", 40)
+	code, out := runCozy(t, f.root, "run", "local/conversion-proof/quantize", "model.source="+source, "steps=7",
+		"--rental=tessa", "--json", "--idempotency-key", "local-source")
 	if code != 0 {
-		t.Fatalf("the unpublished conversion did not publish [exit %d]: %s\n%s", code, out, tail(filepath.Join(f.root, "daemon.log")))
+		t.Fatalf("the unpublished source job was refused [exit %d]: %s\n%s", code, out, tail(filepath.Join(f.root, "daemon.log")))
 	}
-	if request := f.published(t, out); request.LocalInstallationID == "" {
-		t.Fatalf("the unpublished conversion did not run its captured code: %+v", request)
+	var root *pb.ReleaseRoot
+	waitFor(t, f.root, "the root naming the installation", func() bool {
+		f.machine.mu.Lock()
+		defer f.machine.mu.Unlock()
+		for _, submitted := range f.machine.submissions {
+			root = submitted.ReleaseRoot
+		}
+		return root != nil
+	})
+	store, problem := records.Open(f.layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	row, problem := store.RequestByIdempotencyKey("local-source")
+	fatal(t, problem)
+	if row.ModelTransfer != nil || row.LocalInstallationID == "" || root.InstallationId != row.LocalInstallationID ||
+		root.Release != "" || !root.Job || len(root.Models) != 1 || root.Models[0].Source != source || prepared.Load() == 0 {
+		t.Fatalf("the unpublished source job is not one root naming its installation: transfer %+v, installation %q, prepared %d, root %+v",
+			row.ModelTransfer, row.LocalInstallationID, prepared.Load(), root)
 	}
 }
 

@@ -119,7 +119,7 @@
 // a frame in flight: `PodHost` (owner <-> host, a second service on the pod listener),
 // `RuntimeWeights` (host <-> Runtime, loopback), and a host-authored SECOND snapshot document
 // beside the worker's, which passes through BYTE-IDENTICAL. The owner's transfer lanes
-// (weights transfer, model source files and preparation, local package fetch and abort) still
+// (weights transfer, model source files and preparation, local package abort) still
 // ride RecordOwnerFrame / WorkerFrame slots on WorkerControl, which the Host routes itself.
 //
 // DEVICE LANES (proto-024). The serialized resource inside one worker is a DEVICE
@@ -3410,16 +3410,17 @@ func (x *MachineExecutionSubmit) GetOwnerMemo() bool {
 }
 
 type ReleaseRoot struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Package         string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"`
-	Release         string                 `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
-	Entrypoint      string                 `protobuf:"bytes,3,opt,name=entrypoint,proto3" json:"entrypoint,omitempty"`
-	Models          []*ModelChoice         `protobuf:"bytes,6,rep,name=models,proto3" json:"models,omitempty"`                              // explicit Model choices only, sorted by parameter
-	Inputs          []*InputBinding        `protobuf:"bytes,7,rep,name=inputs,proto3" json:"inputs,omitempty"`                              // byte inputs other than payload, as InvocationSpec.inputs
-	InputAccess     []*InputAccess         `protobuf:"bytes,8,rep,name=input_access,json=inputAccess,proto3" json:"input_access,omitempty"` // their native trees, as DeliveryGrant.inputs
-	DeadlineUnixMs  uint64                 `protobuf:"varint,9,opt,name=deadline_unix_ms,json=deadlineUnixMs,proto3" json:"deadline_unix_ms,omitempty"`
-	AttentionKernel string                 `protobuf:"bytes,10,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
-	Capture         *ActivationCapture     `protobuf:"bytes,11,opt,name=capture,proto3" json:"capture,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Package string                 `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"`
+	// Exactly one of release and installation_id names the root's code.
+	Release         string             `protobuf:"bytes,2,opt,name=release,proto3" json:"release,omitempty"`
+	Entrypoint      string             `protobuf:"bytes,3,opt,name=entrypoint,proto3" json:"entrypoint,omitempty"`
+	Models          []*ModelChoice     `protobuf:"bytes,6,rep,name=models,proto3" json:"models,omitempty"`                              // explicit Model choices only, sorted by parameter
+	Inputs          []*InputBinding    `protobuf:"bytes,7,rep,name=inputs,proto3" json:"inputs,omitempty"`                              // byte inputs other than payload, as InvocationSpec.inputs
+	InputAccess     []*InputAccess     `protobuf:"bytes,8,rep,name=input_access,json=inputAccess,proto3" json:"input_access,omitempty"` // their native trees, as DeliveryGrant.inputs
+	DeadlineUnixMs  uint64             `protobuf:"varint,9,opt,name=deadline_unix_ms,json=deadlineUnixMs,proto3" json:"deadline_unix_ms,omitempty"`
+	AttentionKernel string             `protobuf:"bytes,10,opt,name=attention_kernel,json=attentionKernel,proto3" json:"attention_kernel,omitempty"`
+	Capture         *ActivationCapture `protobuf:"bytes,11,opt,name=capture,proto3" json:"capture,omitempty"`
 	// The entrypoint names a published job: Runtime mints its
 	// JobInvocationSpec and directive from the job's declaration, as it does for child jobs.
 	Job bool `protobuf:"varint,13,opt,name=job,proto3" json:"job,omitempty"`
@@ -3428,8 +3429,14 @@ type ReleaseRoot struct {
 	WeightsDestination string `protobuf:"bytes,14,opt,name=weights_destination,json=weightsDestination,proto3" json:"weights_destination,omitempty"`
 	// The owner's scratch publication grant for this job ("org/_job-<request>").
 	PublicationGrant string `protobuf:"bytes,15,opt,name=publication_grant,json=publicationGrant,proto3" json:"publication_grant,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// A captured installation this machine already holds (an unpublished package the
+	// controller prepared on it with PreparePackageSet) instead of a published release. The
+	// machine resolves its slots, installs its published callees and mints the offer exactly
+	// as for a release. Absent here: Submit refuses with cozy-error-code
+	// release_root_installation_absent, and the controller prepares it and asks again.
+	InstallationId string `protobuf:"bytes,16,opt,name=installation_id,json=installationId,proto3" json:"installation_id,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ReleaseRoot) Reset() {
@@ -3542,6 +3549,13 @@ func (x *ReleaseRoot) GetWeightsDestination() string {
 func (x *ReleaseRoot) GetPublicationGrant() string {
 	if x != nil {
 		return x.PublicationGrant
+	}
+	return ""
+}
+
+func (x *ReleaseRoot) GetInstallationId() string {
+	if x != nil {
+		return x.InstallationId
 	}
 	return ""
 }
@@ -22238,7 +22252,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x12source_credentials\x18\f \x03(\v2 .cozy.worker.v1.SourceCredentialR\x11sourceCredentials\x12>\n" +
 	"\frelease_root\x18\r \x01(\v2\x1b.cozy.worker.v1.ReleaseRootR\vreleaseRoot\x12\x1d\n" +
 	"\n" +
-	"owner_memo\x18\x0e \x01(\bR\townerMemoJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\xc8\x04\n" +
+	"owner_memo\x18\x0e \x01(\bR\townerMemoJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\fmax_attemptsR\x0eretry_delay_ms\"\xf1\x04\n" +
 	"\vReleaseRoot\x12\x18\n" +
 	"\apackage\x18\x01 \x01(\tR\apackage\x12\x18\n" +
 	"\arelease\x18\x02 \x01(\tR\arelease\x12\x1e\n" +
@@ -22254,7 +22268,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\acapture\x18\v \x01(\v2!.cozy.worker.v1.ActivationCaptureR\acapture\x12\x10\n" +
 	"\x03job\x18\r \x01(\bR\x03job\x12/\n" +
 	"\x13weights_destination\x18\x0e \x01(\tR\x12weightsDestination\x12+\n" +
-	"\x11publication_grant\x18\x0f \x01(\tR\x10publicationGrantJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\f\x10\rR\acalleesR\rinstallationsR\x0ecatalog_origin\"\xde\x01\n" +
+	"\x11publication_grant\x18\x0f \x01(\tR\x10publicationGrant\x12'\n" +
+	"\x0finstallation_id\x18\x10 \x01(\tR\x0einstallationIdJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\f\x10\rR\acalleesR\rinstallationsR\x0ecatalog_origin\"\xde\x01\n" +
 	"\vModelChoice\x12\x1c\n" +
 	"\tparameter\x18\x01 \x01(\tR\tparameter\x12\x1e\n" +
 	"\n" +

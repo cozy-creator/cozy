@@ -46,6 +46,11 @@ func (r *Resolver) capturedResultInterface(request records.Request) (*launch.Pac
 		// The machine installed the committed release: its interface as a machine described
 		// it here, else as the Hub read that chose a machine to rent kept it.
 		root := submission.ReleaseRoot
+		if root.InstallationId != "" {
+			// A root naming unpublished code: the interface is that code's own.
+			_, surface, problem := r.installPackageInterface(request.InstallID)
+			return surface, problem
+		}
 		if raw, err := os.ReadFile(releaseInterfacePath(home.Paths(r.cfg.Home).Root, root.Package, root.Release)); err == nil {
 			return launch.DecodePackageInterface(raw)
 		}
