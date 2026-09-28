@@ -58,6 +58,9 @@ type publishedRouteObserver struct{}
 func (publishedRouteObserver) Refresh(context.Context, records.Request) *exit.Error { return nil }
 func (publishedRouteObserver) Withdraw(string)                                      {}
 func (publishedRouteObserver) Forget(string)                                        {}
+func (publishedRouteObserver) ForgetPackage(_ context.Context, pkg string) api.ForgottenPackage {
+	return api.ForgottenPackage{Package: pkg}
+}
 func (publishedRouteObserver) PruneOperationCache(context.Context, string) (uint32, uint64, bool, *exit.Error) {
 	return 0, 0, false, exit.Unavailablef("no machine")
 }

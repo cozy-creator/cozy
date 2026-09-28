@@ -41,6 +41,7 @@ type machineHub struct {
 	*fakeRentalHub
 	worker   *httptest.Server
 	ca       []byte // the worker doors' private CA
+	provider string // the rental's machine root, as its provider booted it
 	mu       sync.Mutex
 	machines map[string]string
 }
@@ -267,7 +268,8 @@ func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.St
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	t.Cleanup(func() { store.Close() })
-	launch, identity, token, _ := providerHost(t, h, layout, source, uv)
+	launch, identity, token, provider := providerHost(t, h, layout, source, uv)
+	h.provider = provider
 	// The rental's paid hardware is what its worker's ClaimAck reads back: the inventory the
 	// Runtime schedules on, the same four virtual devices its workspace reports.
 	const model, count = "Virtual Accelerator", 4

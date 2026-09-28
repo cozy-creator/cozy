@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -224,6 +225,42 @@ func (m *machineRuns) Describe(ctx context.Context, machine, pkg, release string
 	}
 	keepReleaseInterface(m.layout.Root, pkg, described.Release, described.PackageInterface, nil)
 	return api.DescribedRelease{Package: described.Package, Release: described.Release, PackageInterface: described.PackageInterface}, nil
+}
+
+// ForgetPackage tells each machine this daemon knows (this computer's while it runs, every
+// ready rental) that a package's releases or owner bindings changed: each keeps what it read
+// of the package at its Hub, and reads it once more on its next run.
+func (m *machineRuns) ForgetPackage(ctx context.Context, pkg string) api.ForgottenPackage {
+	out := api.ForgottenPackage{Package: pkg, Machines: []string{}}
+	var names []string
+	if status, problem := m.machines.Host.Status(); problem == nil && status.Running {
+		names = append(names, machines.Local)
+	}
+	rentals, problem := m.store.Rentals()
+	if problem != nil {
+		out.Notes = append(out.Notes, "rentals were not told: "+problem.Message)
+	}
+	for _, row := range rentals {
+		if row.State == "ready" && row.Address != "" {
+			names = append(names, row.ID)
+		}
+	}
+	for _, name := range names {
+		connection, problem := m.connect(ctx, name, "forgetting "+pkg)
+		if problem == nil {
+			_, err := connection.Host.ForgetPackage(ctx, &pb.ForgetPackageCall{Claim: connection.Claim, Package: pkg})
+			connection.Close()
+			if err != nil {
+				problem = machineTransport(err)
+			}
+		}
+		if problem != nil {
+			out.Notes = append(out.Notes, fmt.Sprintf("%s keeps what it read of %s until it restarts: %s", name, pkg, problem.Message))
+			continue
+		}
+		out.Machines = append(out.Machines, name)
+	}
+	return out
 }
 
 // PruneOperationCache frees one machine's unused cached operation results through its Host.

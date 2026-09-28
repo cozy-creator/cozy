@@ -453,6 +453,13 @@ func (c *Client) JobContext(ctx context.Context, id string) (api.JobState, *exit
 
 // UploadJobOutput uploads a job's retained output from the rental holding it to a private
 // checkpoint in destination; the answer carries the upload's state.
+// ForgetPackage tells the machines the daemon knows that a package changed.
+func (c *Client) ForgetPackage(pkg string) (api.ForgottenPackage, *exit.Error) {
+	var out api.ForgottenPackage
+	e := c.call(http.MethodPost, "/v1/local/machines/forget-package", map[string]any{"package": pkg}, &out)
+	return out, e
+}
+
 func (c *Client) UploadJobOutput(id, output, destination string) (api.JobState, *exit.Error) {
 	var state api.JobState
 	problem := c.call("POST", "/v1/local/jobs/"+id+"/uploads", api.OutputUploadRequest{Output: output, Destination: destination}, &state)

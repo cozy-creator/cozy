@@ -30,7 +30,7 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 	if exec.Command(python, "-c", "import cozy_runtime.internal.worker.machine_release_catalog").Run() != nil {
 		t.Skip("the machine's Runtime predates releases the machine installs itself (0.18.67)")
 	}
-	publishParityRelease(t, h, root)
+	publishParityRelease(t, h, root, parityProject(t))
 	var mu sync.Mutex
 	var seen []string
 	served := h.server.Config.Handler
@@ -77,13 +77,12 @@ func TestPublishedRunOnAKnownMachineReadsNoHub(t *testing.T) {
 	}
 }
 
-// publishParityRelease publishes the parity project as proof/machine-parity@0.0.1 at the
+// publishParityRelease publishes a parity project as proof/machine-parity@0.0.1 at the
 // machines' own Hub: the interface the machine's Runtime describes from source, and the
 // locked closure every machine installs. The wheel is served beside it, not by a Hub.
-func publishParityRelease(t *testing.T, h *machineHub, root string) {
+func publishParityRelease(t *testing.T, h *machineHub, root, project string) {
 	t.Helper()
 	// A release pins the published closure: the machine's own Runtime wheel is no release.
-	project := parityProject(t)
 	pyproject := filepath.Join(project, "pyproject.toml")
 	raw, err := os.ReadFile(pyproject)
 	must(t, err)

@@ -6,7 +6,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/canonical"
+	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -169,13 +171,33 @@ func handlePackageBind(ctx *Context) *exit.Error {
 	if written.Binding.Slot != slot || written.Binding.Revision < 1 {
 		return exit.Internalf("Tensorhub returned a different binding row")
 	}
-	return emit(ctx, compactRecord([]output.Field{
+	record := compactRecord([]output.Field{
 		{K: "package", V: ref.String()}, {K: "slot", V: slot},
 		{K: "model", V: written.Binding.Model}, {K: "release", V: written.Binding.Release},
 		{K: "ladder", V: hub.LadderText(written.Binding.Ladder)},
 		{K: "revision", V: written.Binding.Revision}, {K: "status", V: "bound"},
 		{K: "changed", V: written.Changed},
-	}, "package", "slot", "model", "release", "ladder", "revision", "status", "changed"))
+	}, "package", "slot", "model", "release", "ladder", "revision", "status", "changed")
+	record.Notes = changed(ctx, ref)
+	return emit(ctx, record)
+}
+
+// changed tells the machines the daemon knows that this command changed ref's releases or
+// bindings: each read the package once and keeps it, so only this names the change. A
+// machine it cannot reach keeps what it read until it restarts, and the note says so.
+func changed(ctx *Context, ref hub.Ref) []string {
+	state, _, problem := ensureDaemon(ctx)
+	if problem == nil {
+		ctx.Daemon = state
+		var c *localapi.Client
+		if c, problem = dial(ctx); problem == nil {
+			var told api.ForgottenPackage
+			if told, problem = c.ForgetPackage(ref.String()); problem == nil {
+				return told.Notes
+			}
+		}
+	}
+	return []string{"no machine was told that " + ref.String() + " changed: " + problem.Message}
 }
 
 func handlePackageUnbind(ctx *Context) *exit.Error {
@@ -204,10 +226,12 @@ func handlePackageUnbind(ctx *Context) *exit.Error {
 	if result.Slot != slot {
 		return exit.Internalf("Tensorhub reset a different binding slot")
 	}
-	return emit(ctx, compactRecord([]output.Field{
+	record := compactRecord([]output.Field{
 		{K: "package", V: ref.String()}, {K: "slot", V: slot},
 		{K: "status", V: "unbound"}, {K: "changed", V: result.Changed},
-	}, "package", "slot", "status", "changed"))
+	}, "package", "slot", "status", "changed")
+	record.Notes = changed(ctx, ref)
+	return emit(ctx, record)
 }
 
 // packageBindingRevision reads the rows as written, so an unusable row can still be
