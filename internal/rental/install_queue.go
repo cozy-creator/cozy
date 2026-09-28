@@ -78,31 +78,36 @@ func (q *InstallQueue) Run(ctx context.Context) {
 				if ctx.Err() != nil {
 					break
 				}
-				machine, problem := q.store.RentalRow(row.RentalID)
-				if problem != nil {
-					q.report(problem)
-					continue
-				}
-				if machine == nil {
-					problem = exit.Named(exit.Unavailable, "rental.ended", "rental %s ended before installation completed", row.RentalID)
-				} else {
-					problem = records.RentalInstallStateProblem(machine.ID, machine.State)
-				}
-				if problem != nil {
-					q.report(q.store.SettleRentalInstall(row.ID, "failed", problem))
-					if held, ok := running[row.RentalID]; ok && held.id == row.ID {
-						held.cancel()
+				// This computer's machine is always present; a rental must still be ready.
+				boot, ready := "", true
+				if row.RentalID != records.LocalMachine {
+					machine, problem := q.store.RentalRow(row.RentalID)
+					if problem != nil {
+						q.report(problem)
+						continue
 					}
-					continue
+					if machine == nil {
+						problem = exit.Named(exit.Unavailable, "rental.ended", "rental %s ended before installation completed", row.RentalID)
+					} else {
+						problem = records.RentalInstallStateProblem(machine.ID, machine.State)
+					}
+					if problem != nil {
+						q.report(q.store.SettleRentalInstall(row.ID, "failed", problem))
+						if held, ok := running[row.RentalID]; ok && held.id == row.ID {
+							held.cancel()
+						}
+						continue
+					}
+					boot, ready = machine.ExpectedWorkerBootID, machine.State == "ready" && machine.ExpectedWorkerBootID != ""
 				}
 				if seen[row.RentalID] {
 					continue
 				}
 				seen[row.RentalID] = true
-				if _, busy := running[row.RentalID]; busy || machine.State != "ready" || machine.ExpectedWorkerBootID == "" {
+				if _, busy := running[row.RentalID]; busy || !ready {
 					continue
 				}
-				claimed, problem := q.store.StartRentalInstall(row.ID, machine.ExpectedWorkerBootID)
+				claimed, problem := q.store.StartRentalInstall(row.ID, boot)
 				if problem != nil {
 					q.report(problem)
 					continue

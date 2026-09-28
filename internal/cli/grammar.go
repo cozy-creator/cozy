@@ -327,7 +327,7 @@ func (c *ModelFamilyCmd) Run(r *Runtime) error {
 
 type ModelDownloadCmd struct {
 	Source         string `arg:"" name:"source" predictor:"file-or-ref" help:"Provider source, Tensorhub model (#lane or @release/lane), local alias, or explicit local file."`
-	Ref            string `arg:"" optional:"" name:"model" help:"Local destination (local/name)."`
+	Ref            string `arg:"" optional:"" name:"model" help:"Local destination (local/name); omit it to download into this computer's machine."`
 	Lane           string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental         string `help:"Download directly into this owned rental (no local destination)."`
 	RentalOnly     bool   `help:"Require a remote rental instead of local capacity."`

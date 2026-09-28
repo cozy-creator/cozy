@@ -71,11 +71,8 @@ func handleModelUpload(ctx *Context) *exit.Error {
 }
 
 func handleModelDownload(ctx *Context) *exit.Error {
-	if ctx.Inv.Value("--rental") != "" {
-		return handleRentalModelDownload(ctx)
-	}
-	if len(ctx.Inv.Args) < 2 || strings.TrimSpace(ctx.Inv.Args[1]) == "" {
-		return exit.Usagef("local model download requires a local/name destination; use --rental=NAME for a remote download")
+	if ctx.Inv.Value("--rental") != "" || len(ctx.Inv.Args) < 2 || strings.TrimSpace(ctx.Inv.Args[1]) == "" {
+		return handleMachineModelDownload(ctx)
 	}
 	return handleModelTransfer(ctx, "model-download")
 }

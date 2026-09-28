@@ -248,19 +248,26 @@ func removeModels(ctx *Context, tool *tfs.Tool, layout home.Layout, fence reclam
 	return emit(ctx, removed)
 }
 
-// handleRentalModelDownload freezes a catalog selection before durable acceptance.
-func handleRentalModelDownload(ctx *Context) *exit.Error {
-	adoptRentalHub(ctx, ctx.Inv.Value("--rental"))
+// handleMachineModelDownload freezes a catalog selection before durable acceptance and
+// downloads it into a machine's own store: the named rental's, or without --rental this
+// computer's machine, the one local runs read.
+func handleMachineModelDownload(ctx *Context) *exit.Error {
+	machine := strings.TrimSpace(ctx.Inv.Value("--rental"))
+	if machine != "" {
+		adoptRentalHub(ctx, machine)
+	} else {
+		machine = records.LocalMachine
+	}
 	if len(ctx.Inv.Args) > 1 && strings.TrimSpace(ctx.Inv.Args[1]) != "" {
 		return exit.Usagef("--rental downloads into the worker store and takes no local destination")
 	}
 	if ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--await") || ctx.Inv.Value("--idempotency-key") != "" {
-		return exit.Usagef("named-rental model download does not accept --rental-only, --await, or --idempotency-key")
+		return exit.Usagef("machine model download does not accept --rental-only, --await, or --idempotency-key")
 	}
 	model, problem := resolveRemoteModel(ctx, "", launch.Slot{}, ctx.Inv.Args[0], ctx.Inv.Value("--lane"), nil)
 	if problem != nil {
 		return problem
 	}
 	selection := records.RentalInstallSelection{Models: []records.ModelRef{model}}
-	return enqueueRentalInstall(ctx, ctx.Inv.Value("--rental"), selection)
+	return enqueueRentalInstall(ctx, machine, selection)
 }

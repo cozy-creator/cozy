@@ -16,7 +16,7 @@ func localMachineHost(ctx *Context) (*machines.Host, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
-	return machines.NewHost(layout.Machine, ctx.Cfg.Child()), nil
+	return machines.NewHost(layout.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child()), nil
 }
 
 func handleMachineInstall(ctx *Context) *exit.Error {

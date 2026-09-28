@@ -44,7 +44,7 @@ func machineTemplateDir(t *testing.T) string {
 			return
 		}
 		source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}
-		_, machineTemplate.problem = machines.NewHost(machineTemplate.dir, nil).Install(context.Background(), source, uv)
+		_, machineTemplate.problem = machines.NewHost(machineTemplate.dir, "", nil).Install(context.Background(), source, uv)
 	})
 	fatal(t, machineTemplate.problem)
 	return machineTemplate.dir

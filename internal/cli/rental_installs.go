@@ -20,19 +20,22 @@ func handleRentalPackageInstall(ctx *Context) *exit.Error {
 }
 
 func enqueueRentalInstall(ctx *Context, rentalName string, selection records.RentalInstallSelection) *exit.Error {
-	_, store, problem := rentalStores(ctx)
-	if problem != nil {
-		return problem
+	rentalID := records.LocalMachine
+	if rentalName != records.LocalMachine {
+		_, store, problem := rentalStores(ctx)
+		if problem != nil {
+			return problem
+		}
+		row, problem := store.RentalByMachine(strings.TrimSpace(rentalName))
+		store.Close()
+		if problem != nil {
+			return problem
+		}
+		if row == nil {
+			return exit.New(exit.NotFound, "no rental %q on this host", rentalName)
+		}
+		rentalID = row.ID
 	}
-	row, problem := store.RentalByMachine(strings.TrimSpace(rentalName))
-	store.Close()
-	if problem != nil {
-		return problem
-	}
-	if row == nil {
-		return exit.New(exit.NotFound, "no rental %q on this host", rentalName)
-	}
-	rentalID := row.ID
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return problem
@@ -49,6 +52,9 @@ func enqueueRentalInstall(ctx *Context, rentalName string, selection records.Ren
 	fields := []output.Field{{K: "id", V: result.ID}, {K: "rental", V: result.RentalID}, {K: "status", V: result.State}, {K: "target", V: rentalInstallTarget(result.Selection)}, {K: "package", V: result.Selection.Package}, {K: "release", V: result.Selection.Release}, {K: "models", V: result.Selection.Models}}
 	record := compactRecord(fields, "id", "rental", "status", "target")
 	record.Notes = []string{"installation accepted; Creator will deliver it when this rental is ready"}
+	if rentalID == records.LocalMachine {
+		record.Notes = []string{"installation accepted; Creator delivers it to this computer's machine"}
+	}
 	if len(selection.Models) == 0 {
 		record.Notes = append(record.Notes, "no model weights were requested")
 	}

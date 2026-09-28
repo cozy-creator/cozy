@@ -115,7 +115,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	found := &machineset.Resolver{
-		Host: machineset.NewHost(l.Machine, ctx.Cfg.Child()), HubOrigin: ctx.Cfg.HubURL,
+		Host: machineset.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child()), HubOrigin: ctx.Cfg.HubURL,
 		Hub:     func() *hub.Client { return client(ctx) },
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
 		UseRental:     func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
@@ -164,12 +164,14 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fleet.wakeQueue = c.WakeQueue
 	installContext, cancelInstalls := context.WithCancel(context.Background())
 	installs := rental.NewInstallQueue(st, func(ctx context.Context, row records.RentalInstall) *exit.Error {
-		machine, problem := st.RentalRow(row.RentalID)
-		if problem != nil {
-			return problem
-		}
-		if machine == nil {
-			return exit.Named(exit.Unavailable, "rental.ended", "installation rental no longer exists")
+		if row.RentalID != records.LocalMachine {
+			machine, problem := st.RentalRow(row.RentalID)
+			if problem != nil {
+				return problem
+			}
+			if machine == nil {
+				return exit.Named(exit.Unavailable, "rental.ended", "installation rental no longer exists")
+			}
 		}
 
 		models := orchestrator.DownloadModelRefs(row.Selection.Models)

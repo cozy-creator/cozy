@@ -22,6 +22,10 @@ const rentalInstallsDDL = `CREATE TABLE IF NOT EXISTS rental_installs (
 )`
 const rentalInstallsIndex = `CREATE INDEX IF NOT EXISTS rental_installs_pending ON rental_installs(rental_id,state,created_at)`
 
+// LocalMachine names this computer's machine. It installs through the same queue as a
+// rental; it has no rental row and is always present.
+const LocalMachine = "local"
+
 type RentalInstallSelection struct {
 	Package string     `json:"package,omitempty"`
 	Release string     `json:"release,omitempty"`
@@ -77,15 +81,17 @@ func (s *Store) BeginRentalInstall(rental string, selection RentalInstallSelecti
 		return nil, exit.Internalf("cannot begin rental installation: %s", err)
 	}
 	defer tx.Rollback()
-	var state string
-	if err := tx.QueryRow(`SELECT state FROM rentals WHERE id=?`, rental).Scan(&state); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, exit.New(exit.NotFound, "rental %s is not recorded on this host", rental)
+	if rental != LocalMachine {
+		var state string
+		if err := tx.QueryRow(`SELECT state FROM rentals WHERE id=?`, rental).Scan(&state); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, exit.New(exit.NotFound, "rental %s is not recorded on this host", rental)
+			}
+			return nil, exit.Internalf("cannot inspect installation rental: %s", err)
 		}
-		return nil, exit.Internalf("cannot inspect installation rental: %s", err)
-	}
-	if problem := RentalInstallStateProblem(rental, state); problem != nil {
-		return nil, problem
+		if problem := RentalInstallStateProblem(rental, state); problem != nil {
+			return nil, problem
+		}
 	}
 	prior, problem := scanRentalInstall(tx.QueryRow(`SELECT `+rentalInstallCols+` FROM rental_installs WHERE rental_id=? AND selection=? AND state IN ('queued','installing') ORDER BY created_at,id LIMIT 1`, rental, raw))
 	if problem != nil {
@@ -137,10 +143,10 @@ func (s *Store) PendingRentalInstalls() ([]RentalInstall, *exit.Error) {
 // StartRentalInstall claims the installation on the rental's current ready worker
 // boot. A restarted worker re-claims it, and the selection is prepared again there.
 func (s *Store) StartRentalInstall(id, boot string) (*RentalInstall, *exit.Error) {
-	if boot == "" {
-		return nil, exit.New(exit.Unavailable, "rental has not published its worker identity")
-	}
-	result, err := s.db.Exec(`UPDATE rental_installs SET state='installing',worker_boot_id=?,error_code='',error='',updated_at=? WHERE id=? AND state IN ('queued','installing') AND EXISTS(SELECT 1 FROM rentals r WHERE r.id=rental_installs.rental_id AND r.state='ready' AND r.expected_worker_boot_id=?)`, boot, now(), id, boot)
+	// This computer's machine has no rental row; the Host it dials is the one that exists.
+	result, err := s.db.Exec(`UPDATE rental_installs SET state='installing',worker_boot_id=?,error_code='',error='',updated_at=? WHERE id=? AND state IN ('queued','installing')
+		AND (rental_id=? AND ?='' OR ?<>'' AND EXISTS(SELECT 1 FROM rentals r WHERE r.id=rental_installs.rental_id AND r.state='ready' AND r.expected_worker_boot_id=?))`,
+		boot, now(), id, LocalMachine, boot, boot, boot)
 	if err != nil {
 		return nil, exit.Internalf("cannot start rental installation: %s", err)
 	}
