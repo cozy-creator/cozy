@@ -82,11 +82,9 @@ jobs:
       # The sdist carries sources only, never the staged binary; pyproject's `data`
       # option needs the directory to exist even for an sdist.
       - run: mkdir -p wheel-data/scripts
+      # The runner's system Python is externally managed (PEP 668); uv runs maturin in its own env.
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist
+        run: uv tool run --from 'maturin>=1.15,<2' maturin sdist --out dist
       - name: Wheels and sdist name the tree's version
         run: |
           ls -l dist
