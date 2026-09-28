@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"encoding/json"
+	"github.com/cozy-creator/cozy/internal/machines"
 	"net/http"
 	"os"
 	"os/exec"
@@ -45,7 +46,13 @@ print(json.dumps({"manifest_id": manifest, "manifest_length": len(raw)}))
 // default lane: a derive-only Manifest capability, so the job never loads it.
 func probeProject(t *testing.T, lane string) string {
 	t.Helper()
-	project := parityProject(t)
+	return probeProjectOn(t, machines.Source{RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}, lane)
+}
+
+// probeProjectOn is probeProject locked against source's wheels, or the published Runtime.
+func probeProjectOn(t *testing.T, source machines.Source, lane string) string {
+	t.Helper()
+	project := parityProjectOn(t, source)
 	must(t, os.WriteFile(filepath.Join(project, "machine_parity.py"), []byte(`import msgspec
 from cozy_runtime.author import App, Loader, Model
 
