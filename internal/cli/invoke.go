@@ -1434,6 +1434,12 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
+	lines := NewProgress(ctx, ctx.Mode().JSON, began)
+	if lines.liveMode() {
+		if life, e := c.Request(requestID); e == nil {
+			lines.describeRun(life)
+		}
+	}
 	stopped := make(chan string, 1)
 	cancelFailed := make(chan *exit.Error, 1)
 	done := make(chan struct{})
@@ -1446,9 +1452,9 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 			}
 			stopped <- "detached"
 			if !ctx.Mode().JSON {
-				fmt.Fprintf(ctx.Err,
+				lines.Detach(fmt.Sprintf(
 					"\ndetached — the run keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
-					requestID, requestID)
+					requestID, requestID))
 			}
 			stopWatch()
 			return
@@ -1459,9 +1465,9 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 			// has no wire field for it) — walking away instead would leave the card held.
 			stopped <- "deadline"
 			if !ctx.Mode().JSON {
-				fmt.Fprintf(ctx.Err,
+				lines.Say(fmt.Sprintf(
 					"\n--timeout %s expired; cancel requested — the attempt's own terminal still settles it\n",
-					deadline)
+					deadline))
 			}
 		case <-done:
 			return
@@ -1471,13 +1477,13 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 		select {
 		case <-interrupt:
 			if !ctx.Mode().JSON {
-				fmt.Fprintln(ctx.Err, "detached — the cancelled terminal still lands in `cozy run list`")
+				lines.Detach("detached — the cancelled terminal still lands in `cozy run list`\n")
 			}
 			stopWatch()
 		case problem := <-cancelResult:
 			if problem != nil {
 				if !ctx.Mode().JSON {
-					fmt.Fprintf(ctx.Err, "cancel: %s\n", problem.Message)
+					lines.Say(fmt.Sprintf("cancel: %s\n", problem.Message))
 				}
 				cancelFailed <- problem
 				stopWatch()
@@ -1489,14 +1495,13 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 		select {
 		case <-interrupt:
 			if !ctx.Mode().JSON {
-				fmt.Fprintln(ctx.Err, "detached — the cancelled terminal still lands in `cozy run list`")
+				lines.Detach("detached — the cancelled terminal still lands in `cozy run list`\n")
 			}
 			stopWatch()
 		case <-done:
 		}
 	}()
 
-	lines := NewProgress(ctx, ctx.Mode().JSON, began)
 	notice.lines = lines
 	var manualStop *localapi.Event
 	terminal, e := c.WatchContext(watchCtx, requestID, 0, func(event localapi.Event) bool {
@@ -1553,8 +1558,8 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 }
 
 // progress renders the live lane. Three shapes, and they are not the same surface:
-// Awaited `--json` writes NDJSON of the typed envelope on stderr, a terminal keeps
-// finished stages above a refreshed active block, and a redirected human command gets sparse
+// Awaited `--json` writes NDJSON of the typed envelope on stderr, a terminal redraws the
+// run in place (liveView), and a redirected human command gets sparse
 // append-only lines — a stage change, each new tenth of the work, one line per five
 // quiet seconds — never the full lossy tick stream. JSON results stay on stdout. Exported —
 // with HumanWaitLine — so the product suite (#661: verification's one
@@ -1573,7 +1578,7 @@ type RunProgress struct {
 	stepSamples     int
 	stepPosition    float64
 	progressAttempt uint64
-	terminal        liveProgress
+	view            liveView
 	overallSeen     bool
 	overallFraction float64
 	overallDelta    float64
@@ -1628,8 +1633,8 @@ func (p *RunProgress) On(e localapi.Event) bool {
 		e.Payload = map[string]any{"wait": orchestrator.WaitRental}
 	}
 	if strings.TrimPrefix(e.Type, "request.") == "progress" && p.progressAttempt != e.Attempt {
-		if p.progressAttempt != 0 && p.ctx.Mode().Color && !p.ctx.Mode().Full {
-			p.finishLive("retrying", eventTime(e))
+		if p.progressAttempt != 0 && p.liveMode() {
+			p.view.retireAll(eventTime(e), true)
 		}
 		p.progressAttempt = e.Attempt
 		p.stepStage, p.stepSeconds, p.stepSamples = "", 0, 0
@@ -1638,12 +1643,12 @@ func (p *RunProgress) On(e localapi.Event) bool {
 	}
 	// A redirected human command has no status line to rewrite: it gets the sparse
 	// append lane. --full deliberately restores the complete diagnostic stream.
-	if !p.ctx.Mode().Color && !p.ctx.Mode().Full {
+	if !p.ctx.Mode().Live && !p.ctx.Mode().Full {
 		p.sparse(e)
 		return true
 	}
-	if p.ctx.Mode().Color && !p.ctx.Mode().Full {
-		p.interactive(e)
+	if p.liveMode() {
+		p.onLive(e)
 	} else {
 		p.render(diagnosticProgressLine(e))
 	}
@@ -1927,12 +1932,8 @@ func (p *RunProgress) Done() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.closed = true
-	if p.terminal.timer != nil {
-		p.terminal.timer.Stop()
-	}
-	if p.ctx.Mode().Color && !p.ctx.Mode().Full {
-		p.finishLive("", p.now())
-		return
+	if p.liveMode() {
+		p.settle("", p.now())
 	}
 }
 

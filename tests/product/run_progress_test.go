@@ -202,8 +202,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 		t.Fatalf("piped lane leaked a diagnostic spelling\n%s", stderr)
 	}
 
-	// TTY: the active stage block refreshes in place; completed stages remain above it.
-	// Each row is clamped under the terminal's 80 columns.
+	// TTY: the run's region refreshes in place and settles to one record. Each row is
+	// clamped under the terminal's 80 columns.
 	code, tty := ptyRun(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=4", "delay_ms=2500", "--await")
 	if code != 0 {
@@ -215,10 +215,10 @@ func TestRunProgressSurfaces(t *testing.T) {
 	}
 	// The 80-column pty clamps the tail (that IS the resize safety); the bar, steps
 	// and percentage must always survive the clamp.
-	barred := regexp.MustCompile(`tile_steps \d+/100 \[[=.]{10}\] \d+% stage`)
+	barred := regexp.MustCompile(`[█░]{20} +\d+%  step \d+/100`)
 	seen := 0
 	for _, chunk := range rewrites[1:] {
-		line := chunk
+		line := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(chunk, "")
 		if cut := strings.IndexAny(line, "\r\n"); cut >= 0 {
 			line = line[:cut]
 		}
@@ -232,7 +232,8 @@ func TestRunProgressSurfaces(t *testing.T) {
 	if seen < 2 {
 		t.Fatalf("terminal rewrites never showed the step bar\n%q", tty)
 	}
-	if !strings.Contains(tty, "elapsed") || !strings.Contains(tty, "s/step avg") || !strings.Contains(tty, "ETA ~") {
+	if plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(tty, ""); !strings.Contains(plain, "▸ tile_steps · ") ||
+		!strings.Contains(plain, "s/step avg") || !strings.Contains(plain, "ETA ~") {
 		t.Fatalf("terminal run never showed elapsed, measured speed and stage ETA\n%q", tty)
 	}
 
@@ -400,7 +401,7 @@ func TestLiveProgressFitsResizedTerminal(t *testing.T) {
 	buf := &renderBuffer{}
 	readDone := make(chan struct{})
 	go func() { _, _ = io.Copy(buf, master); close(readDone) }()
-	p := cli.NewProgress(&cli.Context{Inv: &cli.Invocation{Mode: output.Mode{Human: true, Color: true}}, Err: slave}, false, time.Now())
+	p := cli.NewProgress(&cli.Context{Inv: &cli.Invocation{Mode: output.Mode{Human: true, Live: true}}, Err: slave}, false, time.Now())
 	t.Cleanup(p.Done)
 	models := make([]any, 12)
 	for i := range models {
@@ -429,7 +430,7 @@ func TestLiveProgressFitsResizedTerminal(t *testing.T) {
 			t.Fatalf("redraw wrapped a 32-column terminal: %q", line)
 		}
 	}
-	if !strings.Contains(narrow, "denoising 5/30") {
+	if !strings.Contains(narrow, "denoising") || !strings.Contains(narrow, "step 5/30") {
 		t.Fatalf("resize lost the stage and count: %q", narrow)
 	}
 }

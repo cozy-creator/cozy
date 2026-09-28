@@ -16,7 +16,7 @@ import (
 )
 
 func TestScopedProgressKeepsChildTimingSeparateFromOverallWork(t *testing.T) {
-	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	p, _ := progressSink(output.Mode{Human: true, Live: true}, false)
 	t.Cleanup(p.Done)
 	for _, position := range []int{2, 3} {
 		p.On(liveEvent("progress", map[string]any{
@@ -25,14 +25,15 @@ func TestScopedProgressKeepsChildTimingSeparateFromOverallWork(t *testing.T) {
 			"step_ms": 1000,
 		}))
 	}
+	child := liveFrame(p, time.Now())
 	p.On(liveEvent("progress", map[string]any{"stage": "Assembling video", "overall_fraction": .95}))
-	got := buf.String()
-	for _, want := range []string{"Shot 2 of 7 · Generating video · step 3/8", "1.00s/step avg", "overall 20%", "overall 95%"} {
+	got := child + "\n" + liveFrame(p, time.Now())
+	for _, want := range []string{"Shot 2 of 7 · Generating video", "step 3/8", "1.00s/step avg", " 20%", " 95%"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("scoped progress lacks %q: %q", want, got)
 		}
 	}
-	if strings.Contains(got, "overall 20% · ETA") || strings.Contains(got, "overall 95% · ETA") {
+	if strings.Contains(got, "20% · ETA") || strings.Contains(got, "95% · ETA") {
 		t.Fatalf("child duration became a prediction for later work: %q", got)
 	}
 }

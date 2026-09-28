@@ -481,7 +481,9 @@ position, then returns while the daemon continues. `--await` stays attached thro
 shows named pipeline stages, measured step speed, elapsed time, and a whole-run estimate only when
 the package reports `overall_fraction`; stage-local fractions are labeled as stage progress.
 `--await --json` writes typed JSONL progress events to stderr and one final JSON result to stdout.
-Human progress is automatic with `--await`; no separate progress flag is needed.
+Human progress is automatic with `--await`; no separate progress flag is needed. On a terminal it
+redraws in place (the run, finished stages with their durations, each active stage's bar) and
+settles to one record; piped or with `TERM=dumb` it appends plain lines. `NO_COLOR` drops color.
 Model overrides accept `--model.<param>=org/model@release/lane` after the target;
 the existing `model.<param>=...` payload spelling has the same meaning.
 Without an override, Cozy uses the owner's Tensorhub binding, then the selected function's

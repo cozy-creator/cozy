@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -51,7 +52,7 @@ func waitEnvelope(eventType string, at time.Time, payload map[string]any) locala
 }
 
 func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
-	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	p, buf := progressSink(output.Mode{Human: true, Live: true}, false)
 	frame := func(stageFraction, overallFraction float64, position int) localapi.Event {
 		return localapi.Event{Type: "request.progress", RequestID: "req-progress", Attempt: 1,
 			Payload: map[string]any{"value": map[string]any{
@@ -61,13 +62,13 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 			}}}
 	}
 	p.On(frame(0.50, 0.10, 50))
-	if got := buf.String(); !strings.Contains(got, "overall") ||
-		!strings.Contains(got, "tile_steps 50/100") || !strings.Contains(got, "50% stage") ||
-		strings.Contains(got, "overall 10% · ETA") {
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "▸ tile_steps") ||
+		!regexp.MustCompile(`█+░+  50%  step 50/100`).MatchString(got) ||
+		!regexp.MustCompile(`overall █+░+  10%$`).MatchString(got) {
 		t.Fatalf("first progress sample conflated stage and overall facts: %q", got)
 	}
 	p.On(frame(0.60, 0.20, 60))
-	if got := buf.String(); !strings.Contains(got, "20%") || !strings.Contains(got, "ETA ~") {
+	if got := liveFrame(p, time.Now()); !regexp.MustCompile(`overall █+░+  20% · ETA ~`).MatchString(got) {
 		t.Fatalf("forward overall progress did not produce a whole-job ETA: %q", got)
 	}
 	p.Done()
@@ -86,12 +87,12 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 	}
 	p.Done()
 
-	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
+	p, _ = progressSink(output.Mode{Human: true, Live: true}, false)
 	p.On(localapi.Event{Type: "request.progress", RequestID: "req-stage", Attempt: 1,
 		Payload: map[string]any{"value": map[string]any{
 			"stage": "encode", "stage_fraction": float64(0.7), "step_ms": float64(12),
 		}}})
-	if got := buf.String(); !strings.Contains(got, "70%") || !strings.Contains(got, "stage") ||
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "70%") ||
 		strings.Contains(got, "overall") || strings.Contains(got, "ETA") {
 		t.Fatalf("stage-only progress was presented as whole-job progress: %q", got)
 	}
@@ -99,7 +100,7 @@ func TestProgressKeepsStageAndOverallFractionsDistinct(t *testing.T) {
 }
 
 func TestProgressOverallETAAccountsForCoalescedSteps(t *testing.T) {
-	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	p, _ := progressSink(output.Mode{Human: true, Live: true}, false)
 	t.Cleanup(p.Done)
 	for _, position := range []float64{3, 6} {
 		p.On(localapi.Event{Type: "request.progress", RequestID: "coalesced-progress", Attempt: 1,
@@ -109,7 +110,7 @@ func TestProgressOverallETAAccountsForCoalescedSteps(t *testing.T) {
 				"step_ms": float64(42000),
 			}}})
 	}
-	if got := buf.String(); !strings.Contains(got, "overall 20% · ETA ~16m48s") {
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "20% · ETA ~16m48s") {
 		t.Fatalf("whole-job ETA charged one interval to three completed steps: %q", got)
 	}
 }
@@ -140,7 +141,7 @@ func TestWaitLinesAreStageHonest(t *testing.T) {
 	for _, c := range cases {
 		for _, eventType := range []string{"request.queued", "request.parked"} {
 			c.payload["reason"] = rawDiagnostic
-			p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+			p, buf := progressSink(output.Mode{Human: true, Live: true}, false)
 			p.On(waitEnvelope(eventType, time.Now(), c.payload))
 			p.Done()
 			got := buf.String()
@@ -162,7 +163,7 @@ func TestWaitDetailsStayInDiagnosticOutput(t *testing.T) {
 	payload := map[string]any{"wait": "slot_busy", "waiting_on": "shidehiko", "reason": rawDiagnostic}
 
 	// A fresh wait stays calm.
-	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	p, buf := progressSink(output.Mode{Human: true, Live: true}, false)
 	p.On(waitEnvelope("request.parked", time.Now(), payload))
 	if got := buf.String(); strings.Contains(got, "DISPATCHABLE") {
 		t.Errorf("the diagnostic surfaced before the wait threshold: %q", got)
@@ -171,9 +172,9 @@ func TestWaitDetailsStayInDiagnosticOutput(t *testing.T) {
 
 	// A long wait is ordinary while another inference owns the GPU. Reattaching
 	// must not turn that into a wall of internal dispatcher diagnostics.
-	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
+	p, buf = progressSink(output.Mode{Human: true, Live: true}, false)
 	p.On(waitEnvelope("request.parked", time.Now().Add(-10*time.Minute), payload))
-	got := buf.String()
+	got := buf.String() + liveFrame(p, time.Now())
 	if !strings.Contains(got, "waiting for a free slot on shidehiko") || strings.Contains(got, rawDiagnostic) {
 		t.Errorf("a long wait exposed the dispatcher diagnostic: %q", got)
 	}

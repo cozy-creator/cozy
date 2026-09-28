@@ -25,7 +25,7 @@ func TestRentalWaitProgressDeduplicatesAlternatingNotices(t *testing.T) {
 	const changedSpend = "rentals: 5 remote machines running · $9.97/hour"
 	for _, terminal := range []bool{false, true} {
 		t.Run(map[bool]string{false: "redirected", true: "terminal"}[terminal], func(t *testing.T) {
-			p, buf := progressSink(output.Mode{Human: true, Color: terminal}, false)
+			p, buf := progressSink(output.Mode{Human: true, Live: terminal}, false)
 			defer p.Done()
 			at := time.Now().Add(-55 * time.Second)
 			for i := 0; i < 20; i++ {
@@ -37,7 +37,11 @@ func TestRentalWaitProgressDeduplicatesAlternatingNotices(t *testing.T) {
 			if strings.Count(got, spend) != 1 || strings.Count(got, "placement: wait for misery") != 1 {
 				t.Fatalf("stable interleaved notices were appended repeatedly: %q", got)
 			}
-			if !strings.Contains(got, "waiting for a rental machine · elapsed 55s") {
+			if terminal {
+				got = liveFrame(p, time.Now())
+			}
+			if !strings.Contains(got, map[bool]string{false: "waiting for a rental machine · elapsed 55s",
+				true: "▸ waiting for a rental machine · 55s"}[terminal]) {
 				t.Fatalf("attaching did not become the elapsed rental wait: %q", got)
 			}
 			if !terminal && (strings.ContainsAny(got, "\r\033") ||
@@ -56,18 +60,18 @@ func TestRentalWaitProgressDeduplicatesAlternatingNotices(t *testing.T) {
 			if terminal {
 				// The clock advances even when the provider sends no new event.
 				deadline := time.Now().Add(2 * time.Second)
-				for !strings.Contains(buf.String(), "elapsed 56s") && time.Now().Before(deadline) {
+				for !strings.Contains(buf.String(), "machine · 56s") && time.Now().Before(deadline) {
 					time.Sleep(10 * time.Millisecond)
 				}
-				if !strings.Contains(buf.String(), "elapsed 56s") {
+				if !strings.Contains(buf.String(), "machine · 56s") {
 					t.Fatalf("quiet rental wait did not tick in place: %q", buf.String())
 				}
 				p.On(waitEnvelope("request.phase", time.Now(), map[string]any{
 					"value": map[string]any{"phase": "downloading", "machine": "isao"},
 				}))
 				p.On(waitEnvelope("request.completed", time.Now(), nil))
-				if got := buf.String(); strings.Count(got, " · done") != 2 ||
-					!strings.Contains(got, "downloading on isao") {
+				if got := liveFrame(p, time.Now()); strings.Count(got, "✓") != 2 ||
+					!strings.Contains(got, "✓ downloading on isao") {
 					t.Fatalf("transition discarded finished wait/download stages: %q", got)
 				}
 			}
@@ -95,7 +99,7 @@ func TestRentalWaitProgressPreservesJSONAndChosenPlacement(t *testing.T) {
 			t.Fatalf("JSON envelope changed: got %s, want %s", line, want)
 		}
 	}
-	p, buf = progressSink(output.Mode{Human: true, Color: true}, false)
+	p, buf = progressSink(output.Mode{Human: true, Live: true}, false)
 	defer p.Done()
 	chosen := events[1]
 	chosen.Payload["line"] = "placement: reuse darkrai (h100-nvl, fp8-adaln-pruned) — balanced"
@@ -103,7 +107,7 @@ func TestRentalWaitProgressPreservesJSONAndChosenPlacement(t *testing.T) {
 		"machine": "darkrai", "verdict": "chosen",
 	})
 	p.On(chosen)
-	if got := buf.String(); strings.Contains(got, "waiting") || !strings.Contains(got, "placement: reuse darkrai") {
+	if got := buf.String() + liveFrame(p, time.Now()); strings.Contains(got, "waiting") || !strings.Contains(got, "placement: reuse darkrai") {
 		t.Fatalf("an attaching alternative overrode the chosen placement: %q", got)
 	}
 }

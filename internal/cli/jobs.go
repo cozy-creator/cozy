@@ -420,6 +420,12 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	defer restoreInput()
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
+	lines := NewProgress(ctx, ctx.Mode().JSON, began)
+	if lines.liveMode() {
+		if state, e := c.Job(jobID); e == nil {
+			lines.describeJob(state)
+		}
+	}
 	detached := make(chan struct{}, 1)
 	done := make(chan struct{})
 	defer close(done)
@@ -433,9 +439,9 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 			// asking for cancellation. The daemon owns the accepted job; this client
 			// merely detaches, and only an explicit `cozy job cancel` cancels.
 			if !ctx.Mode().JSON {
-				fmt.Fprintf(ctx.Err,
+				lines.Detach(fmt.Sprintf(
 					"\ndetached — the job keeps running; `cozy run watch %s` reattaches, `cozy run cancel %s` cancels\n",
-					jobID, jobID)
+					jobID, jobID))
 			}
 			detached <- struct{}{}
 			stopWatch()
@@ -443,7 +449,6 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		}
 	}()
 
-	lines := NewProgress(ctx, ctx.Mode().JSON, began)
 	notice := &reattachNotice{ctx: ctx, lines: lines}
 	c = c.Following(notice.say)
 	var stopped *localapi.Event

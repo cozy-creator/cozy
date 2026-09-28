@@ -19,10 +19,13 @@ const maxNext = 2
 type Mode struct {
 	JSON  bool
 	Human bool
+	// Color allows SGR styling: a live terminal whose environment does not set NO_COLOR.
 	Color bool
 	// TTY records that the result writer is a terminal; it gates output only a
 	// terminal can render, such as OSC 8 hyperlinks.
-	TTY    bool
+	TTY bool
+	// Live says progress may redraw in place: a terminal that is not TERM=dumb.
+	Live   bool
 	Full   bool
 	Fields []string
 }

@@ -22,7 +22,7 @@ func liveSignals(ctx *Context, navigation chan<- listNavigation) (chan os.Signal
 	interrupts := make(chan os.Signal, 2)
 	signal.Notify(interrupts, syscall.SIGINT, syscall.SIGTERM)
 	stop := func() { signal.Stop(interrupts) }
-	if ctx.Mode().JSON || !ctx.Mode().Color {
+	if ctx.Mode().JSON || !ctx.Mode().Live {
 		return interrupts, stop, false, nil
 	}
 	fd := int(os.Stdin.Fd()) //cozy:stdin-value live terminal controls, never a prompt

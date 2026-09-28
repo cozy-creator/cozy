@@ -78,26 +78,25 @@ func TestQuietPreparationKeepsBytesButHidesOldSpeedAndETA(t *testing.T) {
 }
 
 func TestAttachedDownloadAgesItsLastSample(t *testing.T) {
-	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	p, _ := progressSink(output.Mode{Human: true, Live: true}, false)
 	t.Cleanup(p.Done)
 	e := liveEvent("phase", map[string]any{"phase": "downloading", "sample_age_ms": 0,
 		"moved_bytes": 45 << 30, "total_bytes": 100 << 30,
 		"rate_bytes_per_second": 55 << 20, "remaining_ms": 126735})
 	e.At = time.Now().Add(-90 * time.Second).UTC().Format(time.RFC3339Nano)
 	p.On(e)
-	if got := buf.String(); !strings.Contains(got, "last update") || strings.Contains(got, "/s") || strings.Contains(got, "ETA") {
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "last update") || strings.Contains(got, "/s") || strings.Contains(got, "ETA") {
 		t.Fatalf("quiet attached display kept the original frame's rate: %q", got)
 	}
-	before := len(buf.String())
 	p.On(liveEvent("phase", map[string]any{"phase": "downloading", "sample_age_ms": 0,
 		"moved_bytes": 46 << 30, "total_bytes": 100 << 30, "rate_bytes_per_second": 23 << 20}))
-	if got := buf.String()[before:]; !strings.Contains(got, "/s") || strings.Contains(got, "last update") {
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "/s") || strings.Contains(got, "last update") {
 		t.Fatalf("fresh sample did not replace stale display: %q", got)
 	}
 }
 
 func TestAttachedDownloadAgesModelsIndependently(t *testing.T) {
-	p, buf := progressSink(output.Mode{Human: true, Color: true}, false)
+	p, _ := progressSink(output.Mode{Human: true, Live: true}, false)
 	t.Cleanup(p.Done)
 	model := map[string]any{"model": "paul/minimax-h3", "sample_age_ms": 9000,
 		"moved_bytes": 45 << 30, "total_bytes": 100 << 30, "rate_bytes_per_second": 55 << 20}
@@ -105,17 +104,16 @@ func TestAttachedDownloadAgesModelsIndependently(t *testing.T) {
 		"models": []any{model}})
 	e.At = time.Now().Add(-2 * time.Second).UTC().Format(time.RFC3339Nano)
 	p.On(e)
-	if got := buf.String(); !strings.Contains(got, "last update") || strings.Contains(got, "/s") {
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "last update") || strings.Contains(got, "/s") {
 		t.Fatalf("model's nine-second sample failed to age beyond eleven seconds: %q", got)
 	}
 	if model["sample_age_ms"] != 9000 {
 		t.Fatalf("rendering mutated the original model observation: %+v", model)
 	}
-	before := len(buf.String())
 	model["sample_age_ms"] = 0
 	p.On(liveEvent("phase", map[string]any{"phase": "downloading", "sample_age_ms": 90000,
 		"models": []any{model}}))
-	if got := buf.String()[before:]; !strings.Contains(got, "/s") {
+	if got := liveFrame(p, time.Now()); !strings.Contains(got, "/s") {
 		t.Fatalf("old aggregate counters hid a freshly reported model rate: %q", got)
 	}
 }

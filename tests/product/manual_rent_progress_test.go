@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -120,7 +121,8 @@ func TestManualRentShowsSharedAcquisitionProgress(t *testing.T) {
 				t.Fatalf("boot acquired a fabricated estimate or percentage: %q", log)
 			}
 			if mode == "terminal" {
-				if !strings.Contains(log, "\r\033[K") || !strings.Contains(log, " · done") || !strings.Contains(log, " · failed") {
+				plain := regexp.MustCompile(`\x1b\[[0-9;]*m`).ReplaceAllString(log, "")
+				if !strings.Contains(log, "\r\033[K") || !strings.Contains(plain, "✓ acquiring") || !strings.Contains(plain, "✗ booting on") {
 					t.Fatalf("manual rent did not retain completed stages and final failure: %q", log)
 				}
 			} else if strings.ContainsAny(log, "\r\033") || strings.Count(log, "pulling image on") != 1 {

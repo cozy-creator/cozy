@@ -63,8 +63,7 @@ func watchInvocation(ctx *Context, client *localclient.Client, id string) *exit.
 	if problem != nil {
 		return problem
 	}
-	began := recordedRunStart(life.CreatedAt)
-	terminal, detached, problem := watchRunStream(ctx, client, id, began, notice)
+	terminal, detached, problem := watchRunStream(ctx, client, life, notice)
 	if problem != nil {
 		return problem
 	}
@@ -82,9 +81,9 @@ func watchInvocation(ctx *Context, client *localclient.Client, id string) *exit.
 	return renderRun(ctx, life, terminal, "", exportedOutputs(life), 0)
 }
 
-func watchRunStream(ctx *Context, client runEventObserver, id string,
-	began time.Time, notice *reattachNotice,
+func watchRunStream(ctx *Context, client runEventObserver, life api.Lifecycle, notice *reattachNotice,
 ) (*localclient.Event, bool, *exit.Error) {
+	id := life.RequestID
 	watchCtx, stop := context.WithCancel(context.Background())
 	defer stop()
 	interrupt, restoreInput, _, problem := liveSignals(ctx, nil)
@@ -92,6 +91,8 @@ func watchRunStream(ctx *Context, client runEventObserver, id string,
 		return nil, false, problem
 	}
 	defer restoreInput()
+	lines := NewProgress(ctx, ctx.Mode().JSON, recordedRunStart(life.CreatedAt))
+	lines.describeRun(life)
 	detached := make(chan struct{}, 1)
 	done := make(chan struct{})
 	defer close(done)
@@ -99,14 +100,13 @@ func watchRunStream(ctx *Context, client runEventObserver, id string,
 		select {
 		case <-interrupt:
 			if !ctx.Mode().JSON {
-				fmt.Fprintf(ctx.Err, "\ndetached from run %s; durable work continues\n", id)
+				lines.Detach(fmt.Sprintf("\ndetached from run %s; durable work continues\n", id))
 			}
 			detached <- struct{}{}
 			stop()
 		case <-done:
 		}
 	}()
-	lines := NewProgress(ctx, ctx.Mode().JSON, began)
 	notice.lines = lines
 	defer func() { notice.lines = nil }()
 	var manualStop *localclient.Event
