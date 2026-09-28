@@ -284,6 +284,17 @@ var processConfig struct {
 // snapshot; later calls return it.
 func Load() (Config, *exit.Error) { return LoadForTensorhub(nil) }
 
+// Terminal is what the environment says about the terminal, a cross-tool convention and not
+// a Cozy setting: TERM=dumb cannot move the cursor, and a non-empty NO_COLOR asks for none.
+type Terminal struct {
+	Dumb, NoColor bool
+}
+
+// ReadTerminal is the terminal's environment facts; the entrypoint reads them once.
+func ReadTerminal() Terminal {
+	return Terminal{Dumb: os.Getenv("TERM") == "dumb", NoColor: os.Getenv("NO_COLOR") != ""}
+}
+
 // LoadForTensorhub freezes the explicit CLI selection (a hub name or URL) after file
 // and environment resolution. Subsequent Load consumers see the same origin. The
 // static token stays bound to the configured origin, so selecting another hub never

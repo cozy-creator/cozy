@@ -115,6 +115,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 	args = helpArgs(args)
 	wantsJSON := jsonRequested(args)
+	terminal := config.ReadTerminal()
 	var grammar CLI
 	helpExit := -1
 	parser, err := kong.New(&grammar,
@@ -136,7 +137,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	if err == nil && len(args) > 0 && args[0] == completeVerb {
 		return complete(parser.Model, args[1:], stdout)
 	}
-	mode := presentationMode(stdout, wantsJSON)
+	mode := presentationMode(stdout, wantsJSON, terminal)
 	if err != nil {
 		problem := output.NewError(output.Operational, "cli.grammar", err.Error())
 		_ = output.EmitError(stdout, problem, mode)
@@ -145,7 +146,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 	args = normalizeRunArgs(args, parser.Model.Node)
 	parsed, err := parser.Parse(args)
-	mode = presentationMode(stdout, wantsJSON || grammar.JSON)
+	mode = presentationMode(stdout, wantsJSON || grammar.JSON, terminal)
 	mode.Full, mode.Fields = grammar.Full, grammar.Fields
 	if helpExit >= 0 {
 		return helpExit
@@ -180,12 +181,12 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	return runtime.exitCode
 }
 
-func presentationMode(w io.Writer, json bool) output.Mode {
+func presentationMode(w io.Writer, json bool, terminal config.Terminal) output.Mode {
 	mode := output.Mode{JSON: json, Human: !json}
 	if file, ok := w.(*os.File); ok && !json {
 		mode.TTY = isatty.IsTerminal(file.Fd()) || isatty.IsCygwinTerminal(file.Fd())
-		mode.Live = mode.TTY && os.Getenv("TERM") != "dumb"
-		mode.Color = mode.Live && os.Getenv("NO_COLOR") == ""
+		mode.Live = mode.TTY && !terminal.Dumb
+		mode.Color = mode.Live && !terminal.NoColor
 	}
 	return mode
 }
