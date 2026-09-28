@@ -21,8 +21,9 @@ import (
 
 // A run reports its work as it happens, over the real CLI, daemon, Host and Runtime. The
 // package publishes three revisions of one output and one list item per revision. Each lands
-// in the daemon's mirror and in the outputs folder while the run goes on: the CLI names it,
-// the `.partial` file is replaced whole each time, and the result is the fold of the log.
+// in its item's one stable file in the outputs folder while the run goes on: the CLI names
+// the file once and each revision after, an image is replaced whole, a video is appended in
+// place, and the result is the fold of the log.
 // Canceled after its second revision, a run keeps that revision as its result. The Hub is
 // asked nothing while the runs go on.
 func TestRunReportsProductsAsTheyArrive(t *testing.T) {
@@ -110,11 +111,11 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		})
 		return command, &stderr, request
 	}
-	// revision opens gate k and waits until revision k is the partial file, whole.
+	// revision opens gate k and waits until revision k is the image's one stable file, whole.
 	revision := func(request *records.Request, gate string, k int) records.Product {
 		t.Helper()
 		must(t, os.WriteFile(filepath.Join(gate, fmt.Sprintf("go-%d", k)), nil, 0o600))
-		partial := filepath.Join(directory, fmt.Sprintf("%d-image.partial.png", request.Number))
+		stable := filepath.Join(directory, fmt.Sprintf("%d-image.png", request.Number))
 		var shown records.Product
 		landed(t, fmt.Sprintf("revision %d", k), func() bool {
 			products, _ := store.Products(request.ID)
@@ -128,11 +129,12 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 				return false
 			}
 			shown = sets[k-1]
-			data, err := os.ReadFile(partial)
-			// The partial file is always some revision whole, and soon this one.
+			data, err := os.ReadFile(stable)
+			// The file is always some revision whole, and soon this one.
 			return err == nil && digestOf(data) == shown.Digest
 		})
-		if shown.Op != records.ProductSet || shown.Label != fmt.Sprintf("Revision %d of 3", k) || shown.Path != partial {
+		if shown.Op != records.ProductSet || shown.Label != fmt.Sprintf("Revision %d of 3", k) || shown.Path != stable ||
+			shown.Rev != uint32(k) || shown.AppendedFrom != nil || shown.Item != fmt.Sprintf("%d/image", request.Number) {
 			t.Fatalf("revision %d landed as %+v", k, shown)
 		}
 		return shown
@@ -152,8 +154,14 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	if err := command.Wait(); err != nil {
 		t.Fatalf("the completed run exited %v:\n%s", err, stderr)
 	}
+	// The CLI names each item's stable file once, then one line per revision.
+	image := filepath.Join(directory, fmt.Sprintf("%d-image.png", request.Number))
+	if strings.Count(stderr.String(), "  image  "+image+"\n") != 1 {
+		t.Fatalf("the CLI did not name the image's file exactly once:\n%s", stderr)
+	}
 	for k := 1; k <= 3; k++ {
-		for _, line := range []string{fmt.Sprintf("~ Revision %d of 3", k), fmt.Sprintf("+ Frame %d", k)} {
+		frame := filepath.Join(directory, fmt.Sprintf("%d-frames-%d.png", request.Number, k))
+		for _, line := range []string{fmt.Sprintf("  image r%d  ", k), fmt.Sprintf("Revision %d of 3", k), fmt.Sprintf("Frame %d", k), "  frames " + fmt.Sprint(k) + "  " + frame} {
 			if !strings.Contains(stderr.String(), line) {
 				t.Fatalf("the CLI never named %q as it landed:\n%s", line, stderr)
 			}
@@ -162,11 +170,12 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	products, problem := store.Products(request.ID)
 	fatal(t, problem)
 	fold := records.Fold(products)
-	if len(fold) != 4 || fold[3].Output != "image" || fold[3].Digest != last.Digest {
+	if len(fold) != 4 || fold[0].Output != "image" || fold[0].Digest != last.Digest || fold[0].Rev != 3 {
 		t.Fatalf("the completed run's fold is %+v", fold)
 	}
-	for index, product := range fold[:3] {
-		if product.Output != "frames" || product.Op != records.ProductAppend || product.Index != uint32(index) || product.Path == "" {
+	for index, product := range fold[1:] {
+		want := filepath.Join(directory, fmt.Sprintf("%d-frames-%d.png", request.Number, index+1))
+		if product.Output != "frames" || product.Op != records.ProductAppend || product.Index != uint32(index) || product.Path != want || product.Rev != 1 {
 			t.Fatalf("frame %d is %+v", index, product)
 		}
 	}
@@ -175,12 +184,9 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	if export == nil || export.State != "published" || len(export.PublishedPaths) != 4 {
 		t.Fatalf("the completed run's result was not written: %+v", export)
 	}
-	final, err := os.ReadFile(filepath.Join(directory, strings.TrimPrefix(last.Digest, "sha256:")+".png"))
+	final, err := os.ReadFile(image)
 	if err != nil || digestOf(final) != last.Digest {
 		t.Fatalf("the final image is not the last revision: %v", err)
-	}
-	if _, err := os.Stat(last.Path); !os.IsNotExist(err) {
-		t.Fatalf("the partial file outlived its run: %v", err)
 	}
 	// The machine itself serves the image, the current bytes of its third revision.
 	machineServesOutput(t, root, "image", last.Digest, 3)
@@ -204,15 +210,15 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	fatal(t, problem)
 	row, problem := store.RequestRow(request.ID)
 	fatal(t, problem)
-	kept, err := os.ReadFile(filepath.Join(directory, strings.TrimPrefix(second.Digest, "sha256:")+".png"))
+	kept, err := os.ReadFile(filepath.Join(directory, fmt.Sprintf("%d-image.png", request.Number)))
 	if row.State != "canceled" || len(export.PublishedPaths) != 3 || err != nil || digestOf(kept) != second.Digest {
 		t.Fatalf("the canceled run did not keep revision 2 as its result: state %s export %+v: %v", row.State, export, err)
 	}
 	if !strings.Contains(stderr.String(), "kept") {
 		t.Fatalf("the canceled run did not say what it kept:\n%s", stderr)
 	}
-	// A growing video plays in a standard player from the daemon while the run goes on, and
-	// its last revision is the final MP4 in the outputs folder.
+	// A growing video is one file a player reads while the run goes on, appended in place;
+	// its last revision is the final MP4.
 	gate = filepath.Join(t.TempDir(), "film")
 	must(t, os.MkdirAll(gate, 0o700))
 	command = cozy("run", "local/output-log-proof/film", "gate="+gate, "--await")
@@ -233,55 +239,65 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 		products, _ := store.Products(film.ID)
 		return products
 	}
-	for k := 1; k <= 2; k++ {
+	// The video is one file rewritten in place: each revision's bytes begin with the last
+	// one's, and the file is only ever appended to.
+	var takes [][]byte
+	take := func(k int) records.Product {
+		t.Helper()
 		must(t, os.WriteFile(filepath.Join(gate, fmt.Sprintf("go-%d", k)), nil, 0o600))
-		landed(t, fmt.Sprintf("film revision %d", k), func() bool { return len(revisions()) == k })
-	}
-	var stream string
-	landed(t, "the stream line", func() bool {
-		for _, line := range strings.Split(filmed.String(), "\n") {
-			if _, url, ok := strings.Cut(line, "play it as it grows: "); ok {
-				stream = strings.TrimSpace(url)
+		var shown records.Product
+		landed(t, fmt.Sprintf("film revision %d", k), func() bool {
+			if all := revisions(); len(all) == k {
+				shown = all[k-1]
+				info, err := os.Stat(shown.Path)
+				return err == nil && info.Size() == shown.Length
 			}
-		}
-		return stream != ""
-	})
-	frames := func() (int, string) {
-		out, err := exec.Command("ffprobe", "-v", "error", "-count_frames", "-select_streams", "v",
-			"-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", stream).CombinedOutput()
-		if err != nil {
-			t.Fatalf("ffprobe %s: %v %s", stream, err, out)
-		}
-		response, err := http.Get(stream)
+			return false
+		})
+		data, err := os.ReadFile(shown.Path)
 		must(t, err)
-		defer response.Body.Close()
-		var playlist bytes.Buffer
-		_, _ = playlist.ReadFrom(response.Body)
+		if shown.Path != filepath.Join(directory, fmt.Sprintf("%d-video.mp4", film.Number)) || shown.Rev != uint32(k) || digestOf(data) != shown.Digest {
+			t.Fatalf("film revision %d is not its stable file whole: %+v", k, shown)
+		}
+		if k > 1 && (shown.AppendedFrom == nil || *shown.AppendedFrom != int64(len(takes[k-2])) || !bytes.HasPrefix(data, takes[k-2])) {
+			t.Fatalf("film revision %d did not append in place to revision %d: %+v", k, k-1, shown)
+		}
+		takes = append(takes, data)
+		return shown
+	}
+	take(1)
+	take(2)
+	film1 := filepath.Join(directory, fmt.Sprintf("%d-video.mp4", film.Number))
+	frames := func() int {
+		out, err := exec.Command("ffprobe", "-v", "error", "-count_frames", "-select_streams", "v",
+			"-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", film1).CombinedOutput()
+		if err != nil {
+			t.Fatalf("ffprobe %s: %v %s", film1, err, out)
+		}
 		count := 0
 		fmt.Sscan(strings.TrimSpace(string(out)), &count)
-		return count, playlist.String()
+		return count
 	}
-	if count, playlist := frames(); count != 24 || strings.Contains(playlist, "#EXT-X-ENDLIST") {
-		t.Fatalf("mid-run the stream should play 2 segments, not ended: %d frames\n%s", count, playlist)
+	if count := frames(); count != 24 {
+		t.Fatalf("mid-run the video file should play 2 segments: %d frames", count)
 	}
-	must(t, os.WriteFile(filepath.Join(gate, "go-3"), nil, 0o600))
+	take(3)
 	if err := command.Wait(); err != nil {
 		t.Fatalf("the film run exited %v:\n%s", err, filmed.String())
 	}
-	if count, playlist := frames(); count != 36 || !strings.Contains(playlist, "#EXT-X-ENDLIST") {
-		t.Fatalf("the ended stream should play 3 segments: %d frames\n%s", count, playlist)
+	if count := frames(); count != 36 {
+		t.Fatalf("the finished video file should play 3 segments: %d frames", count)
 	}
 	last = revisions()[2]
 	if len(last.Parts) != 4 || last.Parts[0].DurationUs != 0 || last.Parts[1].DurationUs != 500000 {
 		t.Fatalf("the last revision is not init plus three half-second fragments: %+v", last.Parts)
 	}
-	movie, err := os.ReadFile(filepath.Join(directory, strings.TrimPrefix(last.Digest, "sha256:")+".mp4"))
-	if err != nil || digestOf(movie) != last.Digest {
+	movie, err := os.ReadFile(last.Path)
+	if err != nil || digestOf(movie) != last.Digest || !bytes.Equal(movie, takes[2]) {
 		t.Fatalf("the final MP4 is not the last revision: %v", err)
 	}
-	// The outputs folder holds only each run's final files: its single outputs' last revisions
-	// and its list items. No partial file outlives its run, and no superseded revision is
-	// ever written there; the daemon's product store keeps those.
+	// The outputs folder holds only each run's items, each one stable file at its last
+	// revision: no partial files, no superseded revisions, no content-hash names.
 	var finals []string
 	requests, problem := store.Requests("", "local/output-log-proof", 10)
 	fatal(t, problem)
@@ -298,9 +314,7 @@ func TestRunReportsProductsAsTheyArrive(t *testing.T) {
 	for _, entry := range entries {
 		present = append(present, filepath.Join(directory, entry.Name()))
 	}
-	// Runs that made the same bytes share one content-addressed file.
 	slices.Sort(finals)
-	finals = slices.Compact(finals)
 	slices.Sort(present)
 	if !slices.Equal(present, finals) {
 		t.Fatalf("the outputs folder is not exactly the runs' final files:\nhas  %v\nwant %v", present, finals)

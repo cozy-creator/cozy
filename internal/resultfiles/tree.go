@@ -100,7 +100,7 @@ func ParseTreeManifest(raw []byte, contentBytes int64) ([]TreeMember, *exit.Erro
 
 // MaterializeTree copies a complete verified closure into a separate directory.
 // Its staging directory is published only after all files and directories sync.
-func MaterializeTree(source, directory, digest string, length, contentBytes int64) (string, *exit.Error) {
+func MaterializeTree(source, directory, name, digest string, length, contentBytes int64) (string, *exit.Error) {
 	members, problem := ReadTreeManifest(source, digest, length, contentBytes)
 	if problem != nil {
 		return "", problem
@@ -108,16 +108,14 @@ func MaterializeTree(source, directory, digest string, length, contentBytes int6
 	if problem := Preflight(directory); problem != nil {
 		return "", problem
 	}
-	name, problem := Filename(digest, TreeMediaType)
-	if problem != nil {
-		return "", problem
-	}
 	destination := filepath.Join(directory, name)
+	replaced := ""
 	if _, err := os.Lstat(destination); err == nil {
-		if problem := verifyExportedTree(destination, members); problem != nil {
-			return "", problem
+		if verifyExportedTree(destination, members) == nil {
+			return destination, nil
 		}
-		return destination, nil
+		// Another revision of the tree: the new one takes its name whole.
+		replaced = filepath.Join(directory, ".cozy-tree-old-"+randomSuffix())
 	} else if !os.IsNotExist(err) {
 		return "", exportWriteFailure(directory, err)
 	}
@@ -180,6 +178,12 @@ func MaterializeTree(source, directory, digest string, length, contentBytes int6
 		if syncErr != nil {
 			return "", exportWriteFailure(directory, syncErr)
 		}
+	}
+	if replaced != "" {
+		if err := os.Rename(destination, replaced); err != nil {
+			return "", exportWriteFailure(directory, err)
+		}
+		defer os.RemoveAll(replaced)
 	}
 	if err := os.Rename(temporary, destination); err != nil {
 		return "", exportWriteFailure(directory, err)

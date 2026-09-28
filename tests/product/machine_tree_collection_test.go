@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -91,9 +90,9 @@ func TestTreeCollectionRejectsMalformedClosureAndExportsIndependentBytes(t *test
 	must(t, os.WriteFile(filepath.Join(source+".files", blob), data, 0600))
 	digestHash := sha256.Sum256(good)
 	digest := "sha256:" + hex.EncodeToString(digestHash[:])
-	destination, problem := resultfiles.MaterializeTree(source, filepath.Join(root, "exports"), digest, int64(len(good)), int64(2*len(data)))
+	destination, problem := resultfiles.MaterializeTree(source, filepath.Join(root, "exports"), "7-tree", digest, int64(len(good)), int64(2*len(data)))
 	fatal(t, problem)
-	again, problem := resultfiles.MaterializeTree(source, filepath.Join(root, "exports"), digest, int64(len(good)), int64(2*len(data)))
+	again, problem := resultfiles.MaterializeTree(source, filepath.Join(root, "exports"), "7-tree", digest, int64(len(good)), int64(2*len(data)))
 	fatal(t, problem)
 	if again != destination {
 		t.Fatal("tree replay changed its destination")
@@ -101,8 +100,8 @@ func TestTreeCollectionRejectsMalformedClosureAndExportsIndependentBytes(t *test
 	output := filepath.Join(destination, "nested/report.json")
 	out, err := os.ReadFile(output)
 	must(t, err)
-	if string(out) != string(data) || !strings.HasSuffix(destination, hex.EncodeToString(digestHash[:])) {
-		t.Fatal("tree export lost its exact member or identity")
+	if string(out) != string(data) || filepath.Base(destination) != "7-tree" {
+		t.Fatal("tree export lost its exact member or its stable name")
 	}
 	must(t, os.WriteFile(output, []byte("user edit"), 0600))
 	retained, err := os.ReadFile(filepath.Join(source+".files", blob))
@@ -110,11 +109,15 @@ func TestTreeCollectionRejectsMalformedClosureAndExportsIndependentBytes(t *test
 	if string(retained) != string(data) {
 		t.Fatal("user copy changed internal tree custody")
 	}
-	if _, problem := resultfiles.MaterializeTree(source, filepath.Join(root, "exports"), digest, int64(len(good)), int64(2*len(data))); problem == nil {
-		t.Fatal("edited tree destination was silently overwritten")
+	// The tree is rewritten in place: a changed copy is replaced whole by the verified one.
+	if _, problem := resultfiles.MaterializeTree(source, filepath.Join(root, "exports"), "7-tree", digest, int64(len(good)), int64(2*len(data))); problem != nil {
+		t.Fatalf("a changed tree was not rewritten: %v", problem)
+	}
+	if out, err := os.ReadFile(output); err != nil || string(out) != string(data) {
+		t.Fatal("the rewritten tree lost its exact member")
 	}
 	must(t, os.WriteFile(filepath.Join(source+".files", blob), []byte("changed custody"), 0600))
-	if _, problem := resultfiles.MaterializeTree(source, filepath.Join(root, "new-export"), digest, int64(len(good)), int64(2*len(data))); problem == nil {
+	if _, problem := resultfiles.MaterializeTree(source, filepath.Join(root, "new-export"), "7-tree", digest, int64(len(good)), int64(2*len(data))); problem == nil {
 		t.Fatal("changed member custody exported")
 	}
 }

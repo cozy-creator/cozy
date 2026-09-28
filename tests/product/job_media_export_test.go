@@ -11,7 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -120,7 +119,10 @@ def picture(payload:Request,out:Outputs)->Picture:
 		}
 		entry := saved[0].(map[string]any)
 		target := entry["path"].(string)
-		if filepath.Dir(target) != directory || !strings.HasSuffix(target, ".png") {
+		request, problem := store.RequestByReference(fmt.Sprint(result["job"]))
+		fatal(t, problem)
+		// The image is its item's one stable file, named by run and output, never by content.
+		if target != filepath.Join(directory, fmt.Sprintf("%d-image.png", request.Number)) {
 			t.Fatalf("wrong output path: %s", target)
 		}
 		data, err := os.ReadFile(target)
@@ -129,8 +131,6 @@ def picture(payload:Request,out:Outputs)->Picture:
 		if entry["digest"] != "sha256:"+hex.EncodeToString(digest[:]) {
 			t.Fatal("saved bytes differ from accepted digest")
 		}
-		request, problem := store.RequestByReference(fmt.Sprint(result["job"]))
-		fatal(t, problem)
 		export, problem := store.OutputExportOf(request.ID)
 		fatal(t, problem)
 		if export == nil || export.State != "published" || len(export.PublishedPaths) != 1 {
@@ -140,22 +140,13 @@ def picture(payload:Request,out:Outputs)->Picture:
 		fatal(t, problem)
 		products, problem := store.Products(request.ID)
 		fatal(t, problem)
-		if len(outputs) != 1 || len(products) != 1 || products[0].Digest != outputs[0].Digest {
-			t.Fatalf("the image did not arrive as the run's one product: %+v %+v", products, outputs)
+		if len(outputs) != 1 || len(products) != 1 || products[0].Digest != outputs[0].Digest || products[0].Path != target || products[0].Rev != 1 {
+			t.Fatalf("the image did not arrive as the run's one item: %+v %+v", products, outputs)
 		}
-		layout, problem := home.Open(root)
-		fatal(t, problem)
-		custody := filepath.Join(layout.Products(request.Org, request.ID), strings.TrimPrefix(products[0].Digest, "sha256:"))
 		attempts, problem := store.Attempts(request.ID)
 		fatal(t, problem)
 		if len(attempts) != 0 {
 			t.Fatal("file collection created a Creator execution attempt")
-		}
-		must(t, os.WriteFile(target, []byte("user edit"), 0600))
-		internal, err := os.ReadFile(custody)
-		must(t, err)
-		if string(internal) != string(data) {
-			t.Fatal("editing exported media changed internal custody")
 		}
 	}
 }

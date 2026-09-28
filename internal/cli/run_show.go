@@ -52,17 +52,18 @@ type runReport struct {
 	Result any `json:"result,omitempty"`
 	// Products are the run's output log: what it made, as it made it. A superseded one is
 	// an earlier revision of a single output.
-	Products []reportProduct `json:"products,omitempty"`
-	// Stream plays a growing video while the run goes on: append `<output>.m3u8`.
-	Stream string `json:"stream,omitempty"`
+	// Outputs are the run's items at their current revision.
+	Outputs []reportOutput `json:"outputs,omitempty"`
 	// CollectionPending names why a finished result still waits on its machine.
 	CollectionPending string `json:"collection_pending,omitempty"`
 	CollectionError   string `json:"collection_error,omitempty"`
 }
 
-type reportProduct struct {
+type reportOutput struct {
 	records.Product
-	Superseded bool `json:"superseded,omitempty"`
+	// Status is in_progress while the run goes on, then completed, or incomplete when the run
+	// failed or was canceled.
+	Status string `json:"status"`
 }
 
 type reportWarning struct {
@@ -329,15 +330,17 @@ func buildRunReport(life api.Lifecycle, evidence api.Evidence) runReport {
 		report.Waiting = "waiting: " + life.WaitReason
 	}
 	report.Result = life.Result
-	for index, product := range life.Products {
-		superseded := false
-		for _, later := range life.Products[index+1:] {
-			superseded = superseded || product.Op == records.ProductSet && later.Op == records.ProductSet && later.Output == product.Output
+	for _, product := range records.Fold(life.Products) {
+		status := "in_progress"
+		switch {
+		case life.Status == "completed":
+			status = "completed"
+		case life.Status == "failed" || life.Status == "canceled":
+			status = "incomplete"
+		case product.Op == records.ProductAppend:
+			status = "completed" // a list element never changes once added
 		}
-		report.Products = append(report.Products, reportProduct{Product: product, Superseded: superseded})
-	}
-	if len(life.Products) > 0 {
-		report.Stream = life.Stream
+		report.Outputs = append(report.Outputs, reportOutput{Product: product, Status: status})
 	}
 	if view := life.MachineExecution; view != nil && !view.Collected && view.CollectionRefused != "" {
 		report.CollectionPending, report.CollectionError = view.CollectionRefused, view.ObservationError
@@ -770,23 +773,17 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 		fmt.Fprintf(w, "collection pending: %s — %s\n", r.CollectionPending, r.CollectionError)
 	}
 	table := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if len(r.Products) > 0 {
+	if len(r.Outputs) > 0 {
 		fmt.Fprintln(w)
-		fmt.Fprintln(table, "PRODUCT\tLABEL\tSIZE\tFILE")
-		for _, product := range r.Products {
-			name := product.Output
-			if product.Op == records.ProductAppend {
-				name = fmt.Sprintf("%s[%d]", product.Output, product.Index)
+		fmt.Fprintln(table, "OUTPUT\tREV\tSIZE\tSTATUS\tFILE")
+		for _, item := range r.Outputs {
+			name := item.Output
+			if item.Op == records.ProductAppend {
+				name = fmt.Sprintf("%s %d", item.Output, item.Index+1)
 			}
-			if product.Superseded {
-				name += " (superseded)"
-			}
-			fmt.Fprintf(table, "%s\t%s\t%s\t%s\n", name, product.Label, output.Bytes(product.Length), product.Path)
+			fmt.Fprintf(table, "%s\tr%d\t%s\t%s\t%s\n", name, item.Rev, output.Bytes(item.Length), item.Status, item.Path)
 		}
 		_ = table.Flush()
-		if r.Stream != "" {
-			fmt.Fprintf(w, "stream %s<output>.m3u8\n", r.Stream)
-		}
 	}
 	emitTimeline(w, table, r.Stages, r.Steps, offset, mode.Full)
 	emitGPUs(w, table, r.GPUs, offset, mode.Full)

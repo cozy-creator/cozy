@@ -53,8 +53,6 @@ type JobSubmission struct {
 	RetainWork      bool                   `json:"retain_work,omitempty"`
 	RetryOf         string                 `json:"retry_of,omitempty"`
 	OutputDirectory string                 `json:"output_directory,omitempty"`
-	// NoPartials writes only the final files, never a `.partial` revision file.
-	NoPartials bool `json:"no_partials,omitempty"`
 	// Worker pins an internal production step to the already-attached rental that
 	// prepared its source Manifests. It is admitted only with the CLI credential.
 	Worker string `json:"worker,omitempty"`
@@ -221,7 +219,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 				if directory == "" {
 					directory = s.layout.PackageOutputs(spec.Package)
 				}
-				spec.OutputExport = &records.OutputExportIntent{Directory: directory, Outputs: export.Outputs, Partials: export.Partials}
+				spec.OutputExport = &records.OutputExportIntent{Directory: directory, Outputs: export.Outputs}
 			}
 		}
 	} else {
@@ -424,7 +422,7 @@ func replayJobSubmission(sub JobSubmission,
 		sort.Strings(params)
 	}
 	return orchestrator.Submission{Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: packageName,
-		ChildArtifacts: recorded.ChildArtifacts, OutputDirectory: sub.OutputDirectory, NoPartials: sub.NoPartials,
+		ChildArtifacts: recorded.ChildArtifacts, OutputDirectory: sub.OutputDirectory,
 		Entrypoint: function, Payload: payload, Org: org, Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
 		InstallID: recorded.InstallID, Release: recorded.Release,
 		LocalInstallationID: recorded.LocalInstallationID,
@@ -457,7 +455,7 @@ func (s *Server) resolveJob(ctx context.Context, hub string, sub JobSubmission, 
 	out := orchestrator.Submission{
 		Kind: "job", RetainWork: sub.RetainWork, RetryOf: sub.RetryOf, Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org), Assets: append([]records.AssetBinding(nil), sub.LocalAssets...),
-		Release: sub.Release, OutputDirectory: sub.OutputDirectory, NoPartials: sub.NoPartials,
+		Release: sub.Release, OutputDirectory: sub.OutputDirectory,
 		Rental: sub.Rental || sub.RentalRequired || sub.RentNew || sub.RequestedRental != "", RentalRequired: sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental: sub.RequestedRental, RentNew: sub.RentNew,
 		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
@@ -835,7 +833,6 @@ type JobState struct {
 	Result           any               `json:"result,omitempty"`
 	Outputs          []MediaRef        `json:"outputs"`
 	Products         []records.Product `json:"products,omitempty"`
-	Stream           string            `json:"stream,omitempty"`
 	OutputExport     *OutputExportRef  `json:"output_export,omitempty"`
 	Weights          []WeightsRef      `json:"weights,omitempty"`
 	Checkpoints      []JobCheckpoint   `json:"checkpoints,omitempty"`

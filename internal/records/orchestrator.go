@@ -2541,8 +2541,7 @@ func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
 			if product.Op == ProductAppend {
 				id = fmt.Sprintf("%s.%d", product.Output, product.Index)
 			}
-			// Its bytes are the run's product store, part by part: no one local file is the output.
-			out = append(out, Output{OutputID: id, Digest: product.Digest, Length: product.Length, MimeType: product.MediaType})
+			out = append(out, Output{OutputID: id, Path: product.Path, Digest: product.Digest, Length: product.Length, MimeType: product.MediaType})
 		}
 	}
 	return out, nil

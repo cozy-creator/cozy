@@ -106,7 +106,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		RetainWork:   strings.HasPrefix(target.Package, "local/"), RetryOf: ctx.Inv.Value("--retry"),
 		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 		Release: target.Release, Rental: rentalRequested(ctx),
-		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory, NoPartials: ctx.Inv.Bool("--no-partials"),
+		RentNew: ctx.Inv.Bool("--rent-new"), RentalRequired: ctx.Inv.Bool("--rental-only") || ctx.Inv.Bool("--rent-new") || selectedRental != "", RequestedRental: selectedRental, OutputDirectory: outputDirectory,
 		PlannedSourceBytes: ctx.ingestBytes, AttentionKernel: overrides.AttentionKernel}
 	if deadline%time.Millisecond != 0 {
 		sub.TimeoutMS++
@@ -428,7 +428,6 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	defer stopWatch()
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
 	if state, e := c.Job(jobID); e == nil {
-		lines.streamFrom(c, state.Stream)
 		if lines.liveMode() {
 			lines.describeJob(state)
 		}

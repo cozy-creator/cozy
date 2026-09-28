@@ -57,8 +57,6 @@ type Submission struct {
 	// OutputDirectory is the caller's --out. Empty means the package's own store under
 	// outputs/, which every run exports to.
 	OutputDirectory string `json:"output_directory,omitempty"`
-	// NoPartials writes only the final files, never a `.partial` revision file.
-	NoPartials bool `json:"no_partials,omitempty"`
 	// AttentionKernel is an optional developer execution-path pin.
 	AttentionKernel string `json:"attention_kernel,omitempty"`
 	AttemptKey      string `json:"-"`
@@ -298,7 +296,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		RentalRequired:      sub.RentalRequired || sub.RentNew || sub.RequestedRental != "",
 		RequestedRental:     sub.RequestedRental, RentNew: sub.RentNew,
 		Models: models, NeedsAccelerator: recorded.NeedsAccelerator,
-		OutputDirectory: sub.OutputDirectory, NoPartials: sub.NoPartials,
+		OutputDirectory: sub.OutputDirectory,
 		// Replays compare the caller's requested execution path with the original.
 		AttentionKernel: sub.AttentionKernel,
 	}
@@ -441,7 +439,6 @@ func (s *Server) resolvePlan(ctx context.Context, hub string, sub Submission, le
 		Models:          append([]orchestrator.ModelRef(nil), sub.Models...),
 		AttentionKernel: sub.AttentionKernel,
 		OutputDirectory: sub.OutputDirectory,
-		NoPartials:      sub.NoPartials,
 	}
 	if problem := s.validateRequestedRental(out.RequestedRental, hub); problem != nil {
 		return out, problem
@@ -528,7 +525,7 @@ func (s *Server) deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestr
 	if len(paths) == 0 && len(launch.AssetLists(entrypoint.Result)) == 0 && (out.Kind == "job" || len(out.Outputs) == 0) {
 		return nil
 	}
-	intent := &records.OutputExportIntent{Directory: out.OutputDirectory, Partials: !out.NoPartials}
+	intent := &records.OutputExportIntent{Directory: out.OutputDirectory}
 	if intent.Directory == "" {
 		intent.Directory = s.layout.PackageOutputs(out.Package)
 	}
@@ -807,10 +804,8 @@ type Lifecycle struct {
 	Outputs    []MediaRef `json:"outputs"`
 	// Products are the run's output log in order: what it has made so far, as it made it.
 	Products []records.Product `json:"products,omitempty"`
-	// Stream is the run's capability path for a standard player (append `<output>.m3u8`).
-	Stream string     `json:"stream,omitempty"`
-	Triage *TriageRef `json:"triage,omitempty"`
-	Rental bool       `json:"rental,omitempty"`
+	Triage   *TriageRef        `json:"triage,omitempty"`
+	Rental   bool              `json:"rental,omitempty"`
 	// Machine names the selected or executing venue. Queued status does not imply
 	// that the machine has accepted an attempt; it may still be preparing this request.
 	// After execution, the recorded machine survives rental cleanup.
@@ -859,6 +854,8 @@ type MediaRef struct {
 	MimeType string `json:"mime_type"`
 	Length   int64  `json:"length"`
 	Digest   string `json:"digest"`
+	// Path is the output's stable file in the run's outputs folder, when it has one.
+	Path string `json:"path,omitempty"`
 }
 
 // TriageRef is the handle onto a retained bundle. `attempt_key` is the orchestrator's own
@@ -928,7 +925,7 @@ func (s *Server) lifecycleFacts(row records.Request) Lifecycle {
 		life := Lifecycle{Number: row.Number, Kind: kind, RequestID: row.ID, Status: state.Status,
 			Package: row.Package, Function: row.Entrypoint, Attempt: state.Attempt, Attempts: state.Attempts,
 			ExecutionMS: state.ExecutionMS,
-			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Products: state.Products, Stream: state.Stream,
+			Result:      state.Result, Error: state.Error, ErrorType: state.ErrorType, ErrorCode: state.ErrorCode, Outputs: state.Outputs, Products: state.Products,
 			Rental: row.Rental, RentalID: row.Worker, Machine: machine, CreatedAt: row.CreatedAt,
 			ResponseURL: "/v1/requests/" + row.ID, MachineExecution: state.MachineExecution,
 			Retaining: state.Retaining, RetryAvailable: state.RetryAvailable, StoppedEventID: state.StoppedEventID}
