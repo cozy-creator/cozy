@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1109,16 +1108,6 @@ func readMachinePreparationEvent(stream grpc.ServerStreamingClient[pb.PrepareEve
 			return event, validateMachinePrepared(event.PlacementSet)
 		}
 	}
-}
-
-// Retain an ordinary JSON error summary in the observation API, not raw RPC
-// envelopes or sensitive capture contents.
-func machineObservationError(problem *exit.Error) json.RawMessage {
-	if problem == nil {
-		return nil
-	}
-	raw, _ := json.Marshal(map[string]string{"code": problem.ErrName(), "message": problem.Message})
-	return raw
 }
 
 // readMachineTriage reads one attempt's retained triage bundle through the Host, the same

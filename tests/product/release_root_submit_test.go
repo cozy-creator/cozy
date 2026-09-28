@@ -27,6 +27,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -54,6 +55,9 @@ type releaseMachine struct {
 	// predates that terminal (it was journaled between the observer's two reads).
 	ended sync.Map
 	stale sync.Map
+	// downloading, while open, has each root answered as still downloading its Models (1 of
+	// 4 GiB landed), as a Runtime answers before acceptance.
+	downloading chan struct{}
 }
 
 const resolvedBody = `{"installation_id":"inst-h3","models":[{"gpus":2,"lane":"fp8-adaln-pruned","manifest":{"digest":"sha256:` +
@@ -150,6 +154,15 @@ func (m *releaseMachine) SubmitMachineExecution(ctx context.Context, submit *pb.
 	m.installed[root.Package+"@"+root.Release] = true // installed from its own Hub
 	m.roots = append(m.roots, proto.Clone(root).(*pb.ReleaseRoot))
 	m.mu.Unlock()
+	if m.downloading != nil {
+		select {
+		case <-m.downloading:
+		case <-time.After(100 * time.Millisecond): // the Runtime holds a call until news
+			_ = grpc.SetTrailer(ctx, metadata.Pairs("cozy-error-code", "release_root_preparing",
+				"cozy-progress-bytes", fmt.Sprintf("%d %d", 1<<30, 4<<30)))
+			return nil, status.Error(codes.Unavailable, "downloading model weights")
+		}
+	}
 	receipt, err := m.acceptingMachines.SubmitMachineExecution(ctx, submit)
 	m.acceptedAt.Store(submit.Offer.RequestId, time.Now())
 	if receipt != nil {
@@ -597,6 +610,44 @@ func TestAnAutoRentedProviderSourceJobGoesByReleaseRoot(t *testing.T) {
 		t.Fatalf("the auto-rented source job did not go by release root: worker %q, transfer %+v, planned %d, root %+v",
 			row.Worker, row.ModelTransfer, planned, last)
 	}
+}
+
+// A root still downloading its Models shows the download as the run's live phase: the bytes
+// its machine says have landed, of their total, before the machine accepts the run.
+func TestAPreparingRootShowsItsDownload(t *testing.T) {
+	h := newLadderHub(t)
+	h.bind(goodLadder())
+	machine := newReleaseMachine()
+	machine.downloading = make(chan struct{})
+	root := startRentedPod(t, h, &fakePod{}, func(string) machineExecutionPeer { return machine },
+		"--extra-index-url https://public.example/v1/index/proof/simple/\n")
+	go runCozy(t, root, "run", ladderPackage+"/generate", "steps=1", "--rental=tessa", "--json", "--idempotency-key", "downloading")
+	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
+	fatal(t, problem)
+	defer store.Close()
+	shown := ""
+	waitFor(t, root, "the run showing its machine's download", func() bool {
+		row, problem := store.RequestByIdempotencyKey("downloading")
+		if problem != nil || row == nil {
+			return false
+		}
+		_, shown = runCozy(t, root, "run", "list", "--json", "--full")
+		return strings.Contains(shown, `"phase_moved_bytes":1073741824`) && strings.Contains(shown, `"phase_total_bytes":4294967296`)
+	})
+	close(machine.downloading)
+	var id string
+	waitFor(t, root, "the run's acceptance after its download", func() bool {
+		row, problem := store.RequestByIdempotencyKey("downloading")
+		if problem == nil && row != nil {
+			id = row.ID
+		}
+		return id != "" && machine.accepted(id)
+	})
+	// Once the download ends, `run show` keeps it as a stage with its bytes and rate.
+	waitFor(t, root, "the download kept for run show", func() bool {
+		_, shown = runCozy(t, root, "run", "show", id, "--json")
+		return strings.Contains(shown, `"name":"download"`) && strings.Contains(shown, `"bytes":1073741824`)
+	})
 }
 
 // A terminal the machine journals between the observer's state read and its event read is

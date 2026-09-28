@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/localpackage"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	"google.golang.org/grpc"
@@ -111,6 +112,16 @@ func (m *machineRuns) releaseRootSubmission(ctx context.Context, request records
 // it prepares, the machine answers with its progress.
 func (m *machineRuns) sendReleaseRoot(ctx context.Context, request records.Request, connection *machineConnection, frozen *pb.MachineExecutionSubmit) *exit.Error {
 	progress := ""
+	// The Models' download, kept for `cozy run show` once it ends: its bytes, time and rate.
+	var began time.Time
+	var downloaded *pb.PrepareEvent
+	recordDownload := func() {
+		if payload := orchestrator.PrepareStagePayload(request.Package, pb.PrepareStage_PREPARE_STAGE_DOWNLOADING, began, downloaded); payload != nil {
+			_ = m.store.AppendEvent(request.ID, "request.preparing", 0, payload)
+		}
+		downloaded = nil
+	}
+	defer recordDownload()
 	for {
 		submission := proto.Clone(frozen).(*pb.MachineExecutionSubmit)
 		submission.SourceCredentials, submission.Claim = m.resolver.SourceCredentials(), connection.Claim
@@ -134,6 +145,14 @@ func (m *machineRuns) sendReleaseRoot(ctx context.Context, request records.Reque
 				progress = message
 				_ = m.store.AppendEvent(request.ID, "request.preparing", 0, map[string]any{"stage": "machine", "detail": message})
 			}
+			if event := m.observeRootDownload(request.ID, trailer); event != nil {
+				if downloaded == nil {
+					began = time.Now()
+				}
+				downloaded = event
+			} else {
+				recordDownload()
+			}
 		case status.Code(err) == codes.DeadlineExceeded && ctx.Err() == nil:
 			// The Host bounds one admission; the machine keeps preparing: ask again.
 		default:
@@ -143,6 +162,24 @@ func (m *machineRuns) sendReleaseRoot(ctx context.Context, request records.Reque
 			return m.submissionRefused(request.ID, trailer, err)
 		}
 	}
+}
+
+// observeRootDownload shows a preparing root's Models download as the run's live download
+// phase: the machine answers the bytes landed of the total, and the phase lane measures rate.
+func (m *machineRuns) observeRootDownload(request string, trailer metadata.MD) *pb.PrepareEvent {
+	counts := trailer.Get("cozy-progress-bytes")
+	var moved, total uint64
+	if len(counts) != 1 {
+		return nil
+	}
+	if _, err := fmt.Sscanf(counts[0], "%d %d", &moved, &total); err != nil || total == 0 {
+		return nil
+	}
+	event := &pb.PrepareEvent{Stage: pb.PrepareStage_PREPARE_STAGE_DOWNLOADING, TransferredBytes: moved, TotalBytes: total}
+	if m.fleet != nil && m.fleet.owner != nil {
+		m.fleet.owner.ObservePrepareEvent(request, "", "", event)
+	}
+	return event
 }
 
 // submissionRefused names a failed release-root submission; a definitive refusal is recorded.
