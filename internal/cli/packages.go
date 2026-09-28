@@ -387,28 +387,8 @@ func handleRm(ctx *Context) *exit.Error {
 		removed.Aggregates = []output.Field{{K: "changed", V: false}}
 		return emit(ctx, removed)
 	}
-	// The pin is gone before residency changes. Accepted work keeps its exact install;
-	// the daemon retires only workers it can prove idle.
 	w.Unlock()
 	st.Close()
-	state, _, problem := ensureDaemon(ctx)
-	if problem != nil {
-		return problem
-	}
-	ctx.Daemon = state
-	client, problem := dial(ctx)
-	if problem == nil {
-		unloaded, unloadProblem := client.Unload()
-		if unloadProblem != nil {
-			removed.Notes = append(removed.Notes,
-				"idle worker cleanup was deferred: "+unloadProblem.Message)
-		} else if unloaded.Count > 0 {
-			removed.Notes = append(removed.Notes,
-				fmt.Sprintf("retired %d idle package worker(s)", unloaded.Count))
-		}
-	} else {
-		removed.Notes = append(removed.Notes, "idle worker cleanup was deferred: "+problem.Message)
-	}
 	removed.Aggregates = []output.Field{
 		{K: "changed", V: true},
 		{K: "reclaimed", V: output.Bytes(freed)},

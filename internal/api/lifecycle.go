@@ -23,11 +23,6 @@ type LifecycleIdentity struct {
 	State string `json:"state"`
 }
 
-type UnloadResult struct {
-	Stopped []orchestrator.WorkerFacts `json:"stopped"`
-	Count   int                        `json:"count"`
-}
-
 // DownResult is the daemon-side half of client disconnect or explicit teardown.
 // Normal/forced disconnect preserves requests, Runtime executions and rentals.
 // Under --all, a false result tells the caller exactly what cancellation was requested
@@ -41,15 +36,6 @@ type DownResult struct {
 	// returned as an error: a teardown that stops at the first problem is the failure this
 	// field exists to make visible.
 	Refused []string `json:"refused,omitempty"`
-}
-
-func (s *Server) unload(w http.ResponseWriter, r *http.Request) {
-	stopped, problem := s.orchestrator.UnloadIdleLocalWorkers()
-	if problem != nil {
-		s.refuseTyped(w, r, problem)
-		return
-	}
-	s.ok(w, r, http.StatusOK, UnloadResult{Stopped: stopped, Count: len(stopped)})
 }
 
 func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {

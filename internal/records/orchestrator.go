@@ -204,7 +204,7 @@ CREATE TABLE IF NOT EXISTS weights_finalizations (
 )`}
 
 // The ONE spelling of "still owes work or a terminal". Every lifecycle fence — the down
-// refusal, the idle exit, the unload safety check — reads these; a request in any other
+// refusal, the idle exit — reads these; a request in any other
 // state is settled and an attempt in any other state is closed.
 const (
 	activeRequestStates = `'submitted','queued','dispatching','requeue_pending','finalizing','pausing','paused','blocked','canceling','releasing'`

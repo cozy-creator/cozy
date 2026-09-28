@@ -1275,9 +1275,7 @@ func (c *Orchestrator) shutdownWorker(w *worker, grace time.Duration) bool {
 }
 
 // stopClaimedWorker completes teardown after the caller has atomically withdrawn the
-// worker from selection by setting stopping. Keeping the claim separate lets `unload`
-// stop only a worker it proved idle without reopening a dispatch race between proof and
-// teardown.
+// worker from selection by setting stopping.
 func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
 	c.mu.Lock()
 	cancelControl := w.cancelControl
@@ -1352,64 +1350,6 @@ func (c *Orchestrator) reclaimWorker(instanceID string) {
 	if freed > 0 {
 		c.logf("worker %s root reclaimed: %s", instanceID, units.Bytes(freed))
 	}
-}
-
-// UnloadIdleLocalWorkers stops every definitely-idle local serving worker. Remote
-// workers are paid resources owned by the rental lifecycle, job workers are run-once,
-// and any active request, outstanding offer, reservation, or unacked terminal keeps a
-// worker alive. Process exit is the reliable release of its GPU-resident model.
-func (c *Orchestrator) UnloadIdleLocalWorkers() ([]WorkerFacts, *exit.Error) {
-	return c.unloadIdleLocalWorkers("", "")
-}
-
-// UnloadIdleLocalPackage stops only stale idle workers for one refreshed package.
-// The current install stays warm; other warm packages and active work also stay alive.
-func (c *Orchestrator) UnloadIdleLocalPackage(pkg, keepInstallID string) ([]WorkerFacts, *exit.Error) {
-	return c.unloadIdleLocalWorkers(pkg, keepInstallID)
-}
-
-func (c *Orchestrator) unloadIdleLocalWorkers(pkg, keepInstallID string) ([]WorkerFacts, *exit.Error) {
-	active, e := c.opt.Store.ActiveRequests()
-	if e != nil {
-		return nil, e
-	}
-
-	c.mu.Lock()
-	candidates := make([]*worker, 0, len(c.workers))
-	for _, w := range c.workers {
-		if w.spec.Connection == nil && !w.spec.IsJob() &&
-			(pkg == "" || w.spec.Placement.Package == pkg) &&
-			(keepInstallID == "" || w.spec.Placement.InstallID != keepInstallID) {
-			candidates = append(candidates, w)
-		}
-	}
-	c.mu.Unlock()
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].instanceID < candidates[j].instanceID
-	})
-
-	stopped := make([]WorkerFacts, 0, len(candidates))
-	for _, w := range candidates {
-		c.mu.Lock()
-		if !c.idleLocalWorkerLocked(w, active) {
-			c.mu.Unlock()
-			continue
-		}
-		facts := factsOf(w)
-		w.stopping = true
-		c.mu.Unlock()
-		if c.stopClaimedWorker(w, StopGrace) {
-			stopped = append(stopped, facts)
-		}
-	}
-	if len(stopped) > 0 {
-		// Capacity changed, so the queue must be re-asked — but that wake is not part
-		// of reclamation. Its head may synchronously acquire a managed rental. Joining
-		// that unrelated network operation here kept `cozy unload` waiting after every
-		// selected process was reaped and its device grant was already released.
-		go c.reviveQueue()
-	}
-	return stopped, nil
 }
 
 func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request) bool {

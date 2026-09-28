@@ -46,7 +46,7 @@ run -v
 check "-v reports the release tag without loading config" "$([ "$CODE" = 0 ] && [ "$OUT" = "$WANT_TAG" ] && echo 1 || echo 0)" "$OUT"
 
 run
-for command in "package install" "model download" "auth login" "run cancel" "rental new" "up" "down" "unload"; do
+for command in "package install" "model download" "auth login" "run cancel" "rental new" "up" "down"; do
   check "root help exposes $command" "$(printf '%s' "$OUT" | grep -q "$command" && echo 1 || echo 0)" "$OUT"
 done
 run help run
@@ -71,9 +71,6 @@ check "down stops the explicit daemon" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" 
 run run list --json
 check "run list can auto-start the same daemon" "$([ "$CODE" = 0 ] && grep -q '^token=' "$COZY_HOME/daemon.lock" && echo 1 || echo 0)" "$OUT"
 check "JSON success is domain-shaped without renderer scaffolding" "$(printf '%s' "$OUT" | grep -q '"invocations":\[\]' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data|fields|rows|count|aggregates)"' && echo 1 || echo 0)" "$OUT"
-
-run unload
-check "unload preserves the daemon and returns idle residency" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'workers' && echo 1 || echo 0)" "$OUT"
 
 if [ -n "$PACKAGE_ARCHIVE" ] && [ -f "$PACKAGE_ARCHIVE" ]; then
   DIGEST="sha256:$(sha256sum "$PACKAGE_ARCHIVE" | cut -d' ' -f1)"

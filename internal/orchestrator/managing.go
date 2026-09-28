@@ -13,8 +13,7 @@ import (
 // that is busy or remote, an event stream a client is still reading.
 //
 // An idle local serving worker is deliberately absent. It is a warm cache, not an
-// obligation: Close stops it cleanly, `cozy unload` reclaims exactly that set, and `cozy
-// down` never refused on it. Counting it would keep the daemon up after every local run.
+// obligation: Close stops it cleanly and `cozy down` never refused on it. Counting it would keep the daemon up after every local run.
 func (c *Orchestrator) Managing() ([]string, *exit.Error) {
 	active, e := c.opt.Store.ActiveRequests()
 	if e != nil {

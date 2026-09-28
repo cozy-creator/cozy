@@ -157,8 +157,8 @@ func modelRemovalRefusal(layout home.Layout, names []string) *exit.Error {
 	for _, worker := range live {
 		if worker.WorkerID != "remote" {
 			return exit.New(exit.Conflict, "local worker %s may still hold model residency", worker.InstanceID).
-				WithRemedy("run `cozy unload`, then remove the model repository").
-				WithNext("cozy unload")
+				WithRemedy("run `cozy machine stop`, then remove the model repository").
+				WithNext("cozy machine stop")
 		}
 	}
 	for _, name := range names {

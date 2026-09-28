@@ -1,5 +1,5 @@
 // Package client is the CLI's client of the LOCAL CLIENT API (cl-010). It exists so
-// invoke, unload, and down commands are the API's FIRST
+// invoke and down commands are the API's FIRST
 // CLIENT rather than a parallel implementation the HTTP surface later wraps: every one of
 // them speaks the routes in `docs/client-contract.md` over a real socket, exactly as
 // cl-007's UI and cozy.art do.
@@ -406,14 +406,6 @@ func (c *Client) DetachRental(rentalID string) (bool, *exit.Error) {
 	e := c.call(http.MethodDelete,
 		"/v1/local/rentals/"+url.PathEscape(rentalID)+"/claim", nil, &out)
 	return out.Changed, e
-}
-
-// Unload asks the daemon to stop only definitely-idle local serving workers. It
-// never touches remote rentals, run-once jobs, active work, or installed disk bytes.
-func (c *Client) Unload() (api.UnloadResult, *exit.Error) {
-	var out api.UnloadResult
-	e := c.call(http.MethodPost, "/v1/local/daemon/unload", map[string]any{}, &out)
-	return out, e
 }
 
 // Down performs the daemon-side lifecycle fence. Normal disconnect refuses only

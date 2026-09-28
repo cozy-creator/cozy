@@ -585,7 +585,7 @@ def check_manifest() -> list[str]:
     fields = re.sub(r"\s+", " ", source)
     required = (
         "Package PackageCmd", "Model ModelCmd", "Run RunCmd", "Rental RentalCmd",
-        "Up UpCmd", "Down DownCmd", "Unload UnloadCmd",
+        "Up UpCmd", "Down DownCmd",
         "Search PackageSearchCmd", "Install PackageInstallCmd", "Remove PackageRemoveCmd",
         "List PackageListCmd", "Publish PackagePublishCmd", "UpdateAll PackageUpdateAllCmd",
         "Search ModelSearchCmd", "Download ModelDownloadCmd", "Remove ModelRemoveCmd",

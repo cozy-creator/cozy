@@ -205,7 +205,7 @@ database's. A pass never runs beside a local run still moving bytes in (a downlo
 unnamed until its commit): `remove` defers reclamation to `model gc`, `model gc` refuses naming
 the run, the cron logs `gc: deferred`. A paused or failed run that retains its work keeps only
 the ingest sessions its retry may resume. `remove` refuses only for a live worker holding a
-model (`cozy unload` first) or a queued or running local run that uses it.
+model (`cozy machine stop` first) or a queued or running local run that uses it.
 
 Upload an already canonical local alias, or ingest a provider source with `model download`.
 Run quantization and other weight-producing jobs through the ordinary package command.
@@ -601,7 +601,7 @@ and `cozy down --all` request termination; normal or forced client disconnect do
 These commands have deliberately different scopes:
 
 ```sh
-cozy unload       # stop idle local Runtime workers and release their GPU models
+cozy machine stop # stop this computer's machine and free its GPU; the next run relaunches it
 cozy down         # disconnect; guards work that still needs this daemon online
 cozy down --force # disconnect anyway; never cancel jobs or end rentals
 cozy down --all   # cancel all work, end all rentals, then stop the daemon

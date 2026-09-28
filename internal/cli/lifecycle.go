@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	localapi "github.com/cozy-creator/cozy/internal/client"
@@ -17,36 +16,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
 )
-
-func handleUnload(ctx *Context) *exit.Error {
-	state := daemon.Probe(ctx.Cfg)
-	if !state.Up {
-		return emit(ctx, output.Record{Fields: []output.Field{
-			{K: "stopped", V: 0}, {K: "released", V: "0B"}, {K: "changed", V: false},
-		}})
-	}
-	ctx.Daemon = state
-	client, problem := dial(ctx)
-	if problem != nil {
-		return problem
-	}
-	result, problem := client.Unload()
-	if problem != nil {
-		return problem
-	}
-	list := output.List{
-		Name: "workers", Fields: []string{"package", "devices"},
-		AllFields: []string{"instance", "package", "release", "devices"},
-	}
-	for _, worker := range result.Stopped {
-		list.Rows = append(list.Rows, map[string]string{
-			"instance": worker.InstanceID, "package": worker.Package,
-			"release": worker.Release, "devices": strings.Join(worker.Devices, ","),
-		})
-	}
-	list.Aggregates = []output.Field{{K: "changed", V: result.Count > 0}}
-	return emit(ctx, list)
-}
 
 func handleUp(ctx *Context) *exit.Error {
 	state, changed, problem := ensureDaemon(ctx)

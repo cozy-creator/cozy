@@ -21,7 +21,6 @@ type CLI struct {
 	Cache   CacheCmd   `cmd:"" group:"Lifecycle" help:"Manage cached operation results on this machine."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
-	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
 	Daemon  DaemonCmd  `cmd:"" group:"Lifecycle" help:"Read the cozy-daemon's own log."`
 
 	Completion CompletionCmd `cmd:"" group:"Lifecycle" help:"Print a bash, zsh or fish tab-completion script."`
@@ -630,12 +629,6 @@ type RentalListCmd struct {
 
 func (c *RentalListCmd) Run(r *Runtime) error {
 	return r.call(handleRentalList, nil, bools("--watch", c.Watch, "--no-watch", c.NoWatch, "--all-hubs", c.AllHubs), nil, false)
-}
-
-type UnloadCmd struct{}
-
-func (c *UnloadCmd) Run(r *Runtime) error {
-	return r.call(handleUnload, nil, nil, nil, false)
 }
 
 type UpCmd struct{}

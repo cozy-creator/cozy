@@ -250,7 +250,6 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/rentals/{rental_id}/runtime-update": s.startRuntimeUpdate,
 		"GET /v1/local/rentals/{rental_id}/runtime-update":  s.readRuntimeUpdate,
 		"POST /v1/local/cache/prune":                        s.pruneCache,
-		"POST /v1/local/daemon/unload":                      s.unload,
 		"POST /v1/local/daemon/down":                        s.downDaemon,
 		"POST /v1/local/jobs":                               s.submitJob,
 		"GET /v1/local/jobs/{id}":                           s.getJob,
