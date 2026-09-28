@@ -1616,7 +1616,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		}
 		listed, listing = true, len(remote)
 		for _, seen := range remote {
-			if seen.ID != subject && seen.Name != subject {
+			if seen.ID != subject && !strings.EqualFold(seen.Name, subject) {
 				continue
 			}
 			known.RentalID = seen.ID

@@ -188,6 +188,38 @@ func TestAuthLoginAccountNameIgnoresCase(t *testing.T) {
 	}
 }
 
+// A Hub may answer an account in the case it was first typed, when read or when registered:
+// it is the one lowercase account, and login goes on.
+func TestHubAccountNameIgnoresCase(t *testing.T) {
+	for _, route := range []string{"/v1/accounts/current", "/v1/accounts/fidika"} {
+		t.Run(route, func(t *testing.T) {
+			hub := newAccountHub(t)
+			served := hub.Config.Handler
+			hub.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != route {
+					served.ServeHTTP(w, r)
+					return
+				}
+				if r.Method == http.MethodGet {
+					_, _ = w.Write([]byte(`{"name":"Fidika"}`))
+					return
+				}
+				recorded := httptest.NewRecorder()
+				served.ServeHTTP(recorded, r)
+				w.WriteHeader(recorded.Code)
+				_, _ = w.Write(bytes.ReplaceAll(recorded.Body.Bytes(), []byte(`"fidika"`), []byte(`"Fidika"`)))
+			})
+			cmd := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "auth", "login", "paul@example.test", "--tensorhub="+hub.URL, "--json")
+			cmd.Env = childEnv(t, t.TempDir())
+			cmd.Stdin = strings.NewReader("123456\nfidika\n") //cozy:stdin-value test login code and account name
+			out, _ := cmd.CombinedOutput()
+			if cmd.ProcessState.ExitCode() != 0 || !strings.Contains(string(out), `"account":"fidika"`) {
+				t.Fatalf("a capitalized account from the Hub: exit %d\n%s", cmd.ProcessState.ExitCode(), out)
+			}
+		})
+	}
+}
+
 // A ref names its org and resource in any case: `Paul/SDXL` reads paul/sdxl.
 func TestModelRefIgnoresCase(t *testing.T) {
 	hub := newAccountHub(t)

@@ -722,10 +722,11 @@ func (s *Store) CompleteRentalAttachment(key string, row Rental, stage func() *e
 	return nil
 }
 
-// RentalByMachine resolves either a memorable machine name or the opaque Tensorhub id.
+// RentalByMachine resolves either a memorable machine name, in any case, or the opaque
+// Tensorhub id.
 func (s *Store) RentalByMachine(name string) (*Rental, *exit.Error) {
 	r, err := scanRental(s.db.QueryRow(
-		`SELECT `+rentalCols+` FROM rentals WHERE machine_name=? OR id=?`, name, name))
+		`SELECT `+rentalCols+` FROM rentals WHERE machine_name=? OR id=?`, strings.ToLower(name), name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
