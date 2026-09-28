@@ -118,12 +118,13 @@ def main():
                 # The reviewed key set classifies; conversion validates the actual dtypes.
                 assert result.returncode == 0, (arm, result.stderr)
                 continue
-            assert result.returncode != 0 and "UNREGISTERED_FINGERPRINT" in result.stderr, (
+            # Never the reviewed profile: an unrecognized carrier is stored as-is.
+            assert result.returncode == 0 and json.loads(result.stdout)["profile"] == "as-is/1", (
                 arm, result.stdout, result.stderr)
     print(json.dumps({"checked": 4, "changes": changes,
                       "profile": observed["profile"], "tensor_payload_bytes_read": 0,
                       "classifies": ["same-width-dtype"],
-                      "strict_refusals": ["missing-key", "provider-namespace"]}))
+                      "as_is": ["missing-key", "provider-namespace"]}))
 
 
 if __name__ == "__main__":

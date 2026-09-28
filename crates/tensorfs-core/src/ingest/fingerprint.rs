@@ -1,4 +1,6 @@
-//! Classification: what IS this carrier, and does a reviewed registry entry authorize it?
+//! Classification: what IS this carrier, and which reviewed converter and profile fit it?
+//! The registry is a HINT: a source it does not recognize is stored as it is
+//! (`source::AS_IS`), never refused for being unknown.
 //!
 //! Three separations this file exists to keep:
 //!
@@ -417,7 +419,8 @@ impl FingerprintRegistry {
                 Code::UNREGISTERED_FINGERPRINT,
                 format!(
                     "{what}: key set {} ({} logical keys) matches no reviewed registry entry. \
-                     A filename never authorizes; bank the fingerprint under review first.",
+                     A filename never authorizes: bank the fingerprint under review, or plan \
+                     the source as-is.",
                     fp.keyset_digest, fp.logical_keys
                 ),
             ),

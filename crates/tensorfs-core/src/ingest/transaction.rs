@@ -935,8 +935,11 @@ pub fn finalize(store: &Store, request: Finalize<'_>) -> Result<Outcome> {
 
     encodings.sort_by_key(EncodingSpec::object_id);
     encodings.dedup_by(|a, b| a.object_id() == b.object_id());
+    let mut configs = configs.to_vec();
+    configs.extend(super::convert::normalization_config(&plan.converter));
+    configs.sort();
     let header = Header {
-        configs: configs.to_vec(),
+        configs,
         assets: Vec::new(),
         encodings,
         components: comps,

@@ -394,13 +394,12 @@ fn source_plan_uses_the_compiled_product_registry_by_default() {
         .arg(&unknown)
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    // An unrecognized carrier is a hint miss, not a refusal: it is stored as it is.
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        error.contains("matches no reviewed source profile"),
-        "{error}"
-    );
-    assert!(!error.contains("no reviewed registry"), "{error}");
+    assert!(output.status.success(), "{error}");
+    let plan = String::from_utf8(output.stdout).unwrap();
+    assert!(plan.contains(r#""profile":"as-is/1""#), "{plan}");
+    assert!(plan.contains(r#""converter":"identity/1""#), "{plan}");
     let _ = fs::remove_dir_all(root);
 }
 
@@ -478,9 +477,9 @@ fn reviewed_members_resolve_identical_headers_and_missing_members_refuse() {
     assert!(body.contains(r#""source_member":"provider/fl2va""#));
     assert!(body.contains(r#""source_member":"provider/ref2va""#));
 
+    // Unbound or foreign members never match the member-bound profile: they are stored as-is.
     let missing = source_plan(&registry, &[&first, &second]);
-    assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("matches no reviewed source profile"));
+    assert!(String::from_utf8_lossy(&missing.stdout).contains(r#""profile":"as-is/1""#));
 
     let unreviewed = Command::new(env!("CARGO_BIN_EXE_tfs"))
         .args(["ingest", "source-plan", "--registry"])
@@ -492,10 +491,7 @@ fn reviewed_members_resolve_identical_headers_and_missing_members_refuse() {
         ])
         .output()
         .unwrap();
-    assert!(!unreviewed.status.success());
-    assert!(
-        String::from_utf8_lossy(&unreviewed.stderr).contains("matches no reviewed source profile")
-    );
+    assert!(String::from_utf8_lossy(&unreviewed.stdout).contains(r#""profile":"as-is/1""#));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -559,7 +555,6 @@ fn provider_bound_and_local_profiles_do_not_steal_each_others_candidates() {
         .args(["--carrier", &format!("other/decoder={}", second.display())])
         .output()
         .unwrap();
-    assert!(!foreign.status.success());
-    assert!(String::from_utf8_lossy(&foreign.stderr).contains("matches no reviewed source profile"));
+    assert!(String::from_utf8_lossy(&foreign.stdout).contains(r#""profile":"as-is/1""#));
     let _ = fs::remove_dir_all(root);
 }

@@ -239,9 +239,9 @@ fn profile_plan(plan: &SourcePlan) -> ProfilePlan {
     }
 }
 
-/// The one reviewed profile these member heads plan under, chosen from their headers alone:
-/// several matching profiles that plan identically are one answer; different plans refuse
-/// `AMBIGUOUS_CLASSIFICATION` naming them, and none refuses `UNREGISTERED_FINGERPRINT`.
+/// The one profile these member heads plan under, chosen from their headers alone: several
+/// matching reviewed profiles that plan identically are one answer; different plans refuse
+/// `AMBIGUOUS_CLASSIFICATION` naming them, and none selects [`source::AS_IS`].
 pub fn select_profile(
     registry_locator: &str,
     registry_bytes: &[u8],

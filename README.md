@@ -506,10 +506,19 @@ bound to a Store (`Store.bind_fingerprint_registry(bytes)`: a pinned file or the
 bytes a caller supplies to `prepare_model_source(registry=...)`. Newer entries replace older ones
 under the same key and keep their own provenance, so an older TensorFS can ingest models banked after
 it shipped. The CLI `--registry` flag remains for platform review and tests. A provider may present a
-superset of candidate headers. TensorFS selects one exact reviewed subset and refuses if zero or
-multiple profile assignments survive, so adapters never choose a variant by filename. A reviewed
+superset of candidate headers. TensorFS selects one exact reviewed subset and refuses if multiple
+profile assignments survive, so adapters never choose a variant by filename. A reviewed
 production may name its exact required source profile; this narrows only the registry profile, while
 the same header/member proof still has to match it exactly.
+
+**The registry is a hint, not a gate.** A source no reviewed profile matches, or one planned with
+`--source-profile as-is/1`, is stored as it is: converter `identity/1` makes every safetensors key one
+plain tensor, nothing folded, dropped or renamed. Its default selection keeps carriers in folders over
+loose root files and, per folder or root stem, the non-variant file, else the lowest precision; shards
+come with their index. One component is `model`; several are named by folder or stem. The header's
+`normalization` config records `{"converter","dialect","state":"raw"}`; a normalizing converter records
+`"state":"normalized"`, and reviewed converters that predate the record write none. Malformed
+carriers still refuse.
 
 The CLI and Python facade call the same `tensorfs-core::ingest::source` planner/executor. They do not
 trust or reinterpret asserted fields: the core re-reads carrier headers and the exact registry,

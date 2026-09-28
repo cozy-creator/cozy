@@ -28,6 +28,10 @@ use super::fingerprint::{
 use super::transaction::{self, SourceFile};
 
 pub const BUILTIN_REGISTRY: &str = "builtin:fingerprint-registry/1";
+/// The profile of a source no reviewed profile matches: its carriers, stored as they are
+/// ([`convert::IDENTITY`]). The registry is a hint that selects better; its absence is not
+/// a refusal.
+pub const AS_IS: &str = "as-is/1";
 pub const BUILTIN_REGISTRY_BYTES: &[u8] =
     include_bytes!("../../../../vectors/fingerprints/registry.json");
 
@@ -514,6 +518,17 @@ pub fn prepare_with_registry(
     registry: &FingerprintRegistry,
     spec_variant: Option<usize>,
 ) -> Result<Prepared> {
+    prepare(target, sources, set, Some(registry), spec_variant)
+}
+
+/// With no registry every source is stored as-is through [`convert::IDENTITY`].
+fn prepare(
+    target: &str,
+    sources: &[(String, CarrierInput)],
+    set: &CarrierSet,
+    registry: Option<&FingerprintRegistry>,
+    spec_variant: Option<usize>,
+) -> Result<Prepared> {
     let target = Target::parse(target)?;
     let seeds = specs_for(&target, spec_variant)?;
     let specs = plain_specs(&seeds);
@@ -522,6 +537,14 @@ pub fn prepare_with_registry(
     for (component, carrier) in sources {
         let path = &carrier.path;
         let (full, raw) = read_carrier(carrier, set)?;
+        let Some(registry) = registry else {
+            raws.push(raw);
+            files.push(SourceFile {
+                path: path.clone(),
+                header: full,
+            });
+            continue;
+        };
         let projected = convert::single_file_component(component, &full).ok();
         let mut selected = None;
         if let Some(view) = projected {
@@ -556,7 +579,7 @@ pub fn prepare_with_registry(
             format!("reviewed components name different converters {names:?}"),
         );
     }
-    let conv = convert::converter(names[0])?;
+    let conv = convert::converter(names.first().copied().unwrap_or(convert::IDENTITY))?;
     let views: Vec<Source<'_>> = files
         .iter()
         .enumerate()
@@ -663,7 +686,7 @@ fn plan_source_prepared(
         }
     }
     let registry = FingerprintRegistry::parse(registry_bytes)?;
-    if let Some(name) = requested_profile {
+    if let Some(name) = requested_profile.filter(|name| *name != AS_IS) {
         if !registry
             .source_profiles
             .iter()
@@ -693,9 +716,22 @@ fn plan_source_prepared(
         }
     }
     if matches.is_empty() {
-        return refuse(
-            Code::UNREGISTERED_FINGERPRINT,
-            "carrier set matches no reviewed source profile",
+        if requested_profile.is_some_and(|name| name != AS_IS) {
+            return refuse(
+                Code::UNREGISTERED_FINGERPRINT,
+                "carrier set does not match the requested reviewed source profile",
+            );
+        }
+        let (profile, assignments) = as_is_profile(carriers, &headers)?;
+        return plan_match(
+            &profile,
+            assignments,
+            carriers,
+            &set,
+            None,
+            registry_locator,
+            registry_bytes,
+            spec_variant,
         );
     }
     // Every match is planned. Matches whose plans are identical (the same sources, order,
@@ -709,7 +745,7 @@ fn plan_source_prepared(
             assignments,
             carriers,
             &set,
-            &registry,
+            Some(&registry),
             registry_locator,
             registry_bytes,
             spec_variant,
@@ -791,13 +827,116 @@ fn specificity(profile: &SourceProfile) -> (usize, usize) {
     (exact, prefixed)
 }
 
+/// The as-is recipe: one plain component per carrier a default narrowing keeps, in its own
+/// key order. Shards come with their index. Carriers in folders win over loose root files
+/// (alternative packagings); within a folder, or among root files of one stem, the
+/// non-variant file wins, else the lowest precision (`x.fp16.safetensors` over
+/// `x.fp32.safetensors`). A lone component is `model`; several are named by folder or stem.
+fn as_is_profile(
+    carriers: &[CarrierInput],
+    headers: &[SourceHeader],
+) -> Result<(SourceProfile, Vec<SourceAssignment>)> {
+    let shards: std::collections::BTreeSet<&Path> = headers
+        .iter()
+        .flat_map(|header| header.shards.iter().map(|shard| shard.path.as_path()))
+        .collect();
+    let named: Vec<(usize, String)> = carriers
+        .iter()
+        .enumerate()
+        .filter(|(_, carrier)| !shards.contains(carrier.path.as_path()))
+        .map(|(index, carrier)| {
+            let name = carrier.member.clone().unwrap_or_else(|| {
+                let name = carrier.path.file_name().unwrap_or_default();
+                name.to_string_lossy().into_owned()
+            });
+            (index, name)
+        })
+        .collect();
+    let foldered = named.iter().any(|(_, name)| name.contains('/'));
+    let mut ranked: Vec<_> = named
+        .into_iter()
+        .filter(|(_, name)| name.contains('/') == foldered)
+        .map(|(index, name)| {
+            let file = name.rsplit('/').next().unwrap_or(&name);
+            let base = [".safetensors.index.json", ".safetensors", ".json"]
+                .iter()
+                .find_map(|suffix| file.strip_suffix(suffix))
+                .unwrap_or(file);
+            let (stem, variant) = base.split_once('.').unwrap_or((base, ""));
+            let group = name.split_once('/').map_or(stem, |(folder, _)| folder);
+            let precision = ["8", "16", "32", "64"]
+                .iter()
+                .position(|bits| variant.contains(bits));
+            let rank = (
+                !variant.is_empty(),
+                precision.unwrap_or(4),
+                variant.to_string(),
+            );
+            (group.to_string(), rank, name.to_string(), index)
+        })
+        .collect();
+    // Sorted by group, then preference: the first of each group is its default.
+    ranked.sort();
+    ranked.dedup_by(|later, kept| later.0 == kept.0);
+    let lone = ranked.len() == 1;
+    let mut components: Vec<SourceProfileComponent> = Vec::new();
+    let mut assignments = Vec::new();
+    for (group, _, _, index) in ranked {
+        let mut component: String = if lone {
+            "model".into()
+        } else {
+            group
+                .chars()
+                .map(|c| match c {
+                    'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '-' | '.' => c,
+                    _ => '_',
+                })
+                .collect()
+        };
+        while components.iter().any(|c| c.component == component) {
+            component.push('_');
+        }
+        ascii_name("as-is component", &component, crate::limits::MAX_NAME_BYTES)?;
+        components.push(SourceProfileComponent {
+            component: component.clone(),
+            source_member: carriers[index].member.clone(),
+            source_member_prefix: None,
+            target_encoding: "plain/1".into(),
+            variants: vec![fingerprint::SourceProfileVariant {
+                keyset_digest: String::new(),
+                construction_order: headers[index]
+                    .tensors
+                    .iter()
+                    .map(|t| t.key.clone())
+                    .collect(),
+            }],
+        });
+        assignments.push(SourceAssignment {
+            component,
+            carrier: index,
+            projected: false,
+            variant: 0,
+        });
+    }
+    if components.is_empty() {
+        return refuse(Code::MISSING_FIELD, "the source has no tensor carrier");
+    }
+    Ok((
+        SourceProfile {
+            name: AS_IS.into(),
+            components,
+        },
+        assignments,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_match(
     profile: &SourceProfile,
     mut assignments: Vec<SourceAssignment>,
     carriers: &[CarrierInput],
     set: &CarrierSet,
-    registry: &FingerprintRegistry,
+    registry: Option<&FingerprintRegistry>,
     registry_locator: &str,
     registry_bytes: &[u8],
     spec_variant: Option<usize>,
@@ -832,7 +971,7 @@ fn plan_match(
                 .map(|key| (component.component.clone(), key.clone()))
         })
         .collect();
-    let mut prepared = prepare_with_registry(&target, &sources, set, registry, spec_variant)?;
+    let mut prepared = prepare(&target, &sources, set, registry, spec_variant)?;
     prepared.plan.apply_order(&order)?;
     prepared.plan.check_converts_something()?;
     let plan = SourcePlan {
@@ -1113,10 +1252,11 @@ fn validate_request(
     }
     for row in &request.profiles {
         ascii_name("source slot", &row.slot, crate::limits::MAX_NAME_BYTES)?;
-        if !registry
-            .source_profiles
-            .iter()
-            .any(|profile| profile.name == row.profile)
+        if row.profile != AS_IS
+            && !registry
+                .source_profiles
+                .iter()
+                .any(|profile| profile.name == row.profile)
         {
             return refuse(
                 Code::UNREGISTERED_FINGERPRINT,

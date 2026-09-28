@@ -51,9 +51,18 @@ pub struct Converter {
     /// Quarry-derived geometry that has NOT yet met the real bytes it describes (tfs-010).
     /// Stated in the type so a receipt cannot quietly claim more than the evidence supports.
     pub validated_on_real_bytes: bool,
+    /// `(state, dialect of the stored keys)` for the output's `normalization` config:
+    /// `raw` keys need a consumer that reads that dialect, `normalized` ones are canonical.
+    /// `None` records nothing (reviewed outputs that predate the record).
+    pub normalization: Option<(&'static str, &'static str)>,
 }
 
-pub const CONVERTERS: [Converter; 5] = [
+/// The header config an output's [`Converter::normalization`] is recorded under.
+pub const NORMALIZATION: &str = "normalization";
+/// The converter for a source no reviewed profile recognizes: its keys, stored as they are.
+pub const IDENTITY: &str = "identity/1";
+
+pub const CONVERTERS: [Converter; 6] = [
     Converter {
         name: "diffusers.identity/1",
         dialect: "safetensors.diffusers",
@@ -62,6 +71,7 @@ pub const CONVERTERS: [Converter; 5] = [
               becomes one logical tensor; `.weight_scale` siblings fold into their base as \
               encoding ROLES; marker tensors are dropped. Bytes stream through untouched.",
         validated_on_real_bytes: true,
+        normalization: None,
     },
     Converter {
         name: "single_file.identity/1",
@@ -70,6 +80,7 @@ pub const CONVERTERS: [Converter; 5] = [
         doc: "One file carrying several components, split on the reviewed component prefix \
               map. Same byte path as the diffusers converter — packaging is not identity.",
         validated_on_real_bytes: true,
+        normalization: None,
     },
     Converter {
         name: "cozytensors.inherit/1",
@@ -78,6 +89,7 @@ pub const CONVERTERS: [Converter; 5] = [
         doc: "An already-canonical source. Every untouched tensor carries by OBJECT \
               REFERENCE; nothing is re-hashed and nothing is re-uploaded.",
         validated_on_real_bytes: true,
+        normalization: None,
     },
     Converter {
         name: "h3.lora/1",
@@ -85,6 +97,7 @@ pub const CONVERTERS: [Converter; 5] = [
         class: Class::Permutation,
         doc: "Native H3 LoRA A/B and Kohya down/up factors: split head-interleaved QKV B rows, swap SwiGLU B halves, preserve A and alpha without arithmetic.",
         validated_on_real_bytes: false,
+        normalization: None,
     },
     Converter {
         name: "h3.native/2",
@@ -106,8 +119,33 @@ pub const CONVERTERS: [Converter; 5] = [
         // pinned official converter requires. The complete trained Ref2VA block0
         // fc1 (308281344 B) converted to e7cf97ae...3b19; fc2 stayed byte-identical.
         validated_on_real_bytes: true,
+        normalization: None,
+    },
+    Converter {
+        name: IDENTITY,
+        dialect: "safetensors",
+        class: Class::Identity,
+        doc: "An unrecognized source, stored as it is: every key becomes one plain tensor \
+              under its own name and dtype. Nothing is folded, dropped or renamed, so a \
+              consumer that needs another spelling normalizes it.",
+        validated_on_real_bytes: true,
+        normalization: Some(("raw", "safetensors")),
     },
 ];
+
+/// The `normalization` config the output of `converter` carries, if it records one.
+pub fn normalization_config(converter: &str) -> Option<(String, Vec<u8>)> {
+    let (state, dialect) = CONVERTERS
+        .iter()
+        .find(|c| c.name == converter)?
+        .normalization?;
+    let record = crate::canon::Value::obj(vec![
+        ("converter", crate::canon::Value::str(converter)),
+        ("dialect", crate::canon::Value::str(dialect)),
+        ("state", crate::canon::Value::str(state)),
+    ]);
+    Some((NORMALIZATION.to_string(), crate::canon::write(&record)))
+}
 
 pub fn converter(name: &str) -> Result<&'static Converter> {
     match CONVERTERS.iter().find(|c| c.name == name) {
@@ -968,6 +1006,9 @@ fn plan_carrier(
         }
         return super::h3_lora::plan(component, file, h, cands.plain, p);
     }
+    if conv.name == IDENTITY {
+        return plan_as_is(component, file, h, allowed, cands.plain, p);
+    }
     let alias = Allowed(allowed);
     p.header_bytes += h.header_bytes;
     let plain_map = role_map("plain/1")?;
@@ -1228,6 +1269,46 @@ fn plan_carrier(
                 h.tensors.len()
             ),
         );
+    }
+    Ok(())
+}
+
+/// Every key, its own plain tensor: no role folds, no marker drops, no rename.
+fn plan_as_is(
+    component: &str,
+    file: usize,
+    h: &SourceHeader,
+    allowed: &[&str],
+    plain: &EncodingSpec,
+    p: &mut Plan,
+) -> Result<()> {
+    if allowed != ["plain/1"] {
+        return refuse(
+            Code::UNKNOWN_ENCODING,
+            format!("{IDENTITY} stores an unrecognized source in plain/1 only"),
+        );
+    }
+    p.header_bytes += h.header_bytes;
+    let (data, id) = (role_map("plain/1")?.data, plain.object_id());
+    for t in &h.tensors {
+        p.ops.push(Op {
+            component: component.to_string(),
+            out_key: t.key.clone(),
+            encoding: "plain/1".into(),
+            encoding_id: id.clone(),
+            logical_dtype: t.dtype,
+            logical_shape: t.shape.clone(),
+            roles: vec![RolePlan {
+                role: data.into(),
+                dtype: t.dtype,
+                shape: t.shape.clone(),
+                bytes: Bytes::Stream {
+                    file,
+                    key: t.key.clone(),
+                },
+            }],
+            effect: Effect::Recontain,
+        });
     }
     Ok(())
 }
