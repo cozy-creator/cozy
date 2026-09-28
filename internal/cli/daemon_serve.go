@@ -114,8 +114,10 @@ func serveDaemon(ctx *Context) *exit.Error {
 	knownRentals := rental.Known(st)
 
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
+	localMachine := machineset.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child())
+	localMachine.GPUBudget = ctx.Cfg.MachineGPUBudget
 	found := &machineset.Resolver{
-		Host: machineset.NewHost(l.Machine, ctx.Cfg.TensorFSRoot, ctx.Cfg.Child()), HubOrigin: ctx.Cfg.HubURL,
+		Host: localMachine, HubOrigin: ctx.Cfg.HubURL,
 		Hub:     func(origin string) *hub.Client { return client(ctx.forHub(origin)) },
 		Rentals: rentals, RentalHub: func(id string) *hub.Client { return client(fleet.atRental(id)) },
 		UseRental:     func(id, holder string) (func(), *exit.Error) { return fleet.owner.UseRental(id, holder) },
