@@ -101,6 +101,9 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 		return err
 	}
 	defer listeners.close()
+	if err := m.serveWebRTC(ctx); err != nil {
+		return err
+	}
 	if m.conn, err = m.dialRuntime(); err != nil {
 		return err
 	}
@@ -222,7 +225,7 @@ func (m *Machine) claimRuntime(p *runtimeProcess) {
 	defer tick.Stop()
 	for {
 		if raw, err := os.ReadFile(payload); err == nil && len(raw) > 0 {
-			if err := m.receipt.seal(raw, m.grant.WorkerPort, m.grant.ObservedAuth); err != nil {
+			if err := m.receipt.seal(raw, m.grant.WorkerPort, m.grant.ObservedAuth, m.webrtcReceipt()); err != nil {
 				fmt.Fprintln(m.log, "cozy machine: the Runtime's readiness was refused:", err)
 				p.stop()
 				return

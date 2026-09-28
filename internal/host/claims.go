@@ -30,6 +30,7 @@ type claims struct {
 	mu               sync.Mutex
 	authorized       []ed25519.PublicKey
 	floor            map[string]uint64 // the highest epoch each key has presented
+	changed          chan struct{}     // closed when the authorized set changes
 	// own is the daemon's key for its Runtime; the Runtime is launched trusting only it.
 	own   ed25519.PrivateKey
 	claim *pb.Claim
@@ -41,7 +42,7 @@ func newClaims(workerID, bootID string, leafDigest []byte, authorized []ed25519.
 		return nil, err
 	}
 	c := &claims{workerID: workerID, bootID: bootID, leafDigest: leafDigest, authorized: authorized,
-		floor: map[string]uint64{}, own: own}
+		floor: map[string]uint64{}, own: own, changed: make(chan struct{})}
 	proof, err := c.transcript(runtimeOwnerEpoch)
 	if err != nil {
 		return nil, err

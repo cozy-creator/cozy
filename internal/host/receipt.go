@@ -70,8 +70,8 @@ func (r *receipt) Envelope() []byte {
 // Hub that froze an auth document, the observed auth repeats it. Everything else passes
 // through, including members this daemon does not know. A later Runtime of the same boot
 // must attest the same facts; the original envelope is kept byte for byte.
-func (r *receipt) seal(raw []byte, workerPort int, observed *OwnerAuth) error {
-	payload, err := rewritePayload(raw, workerPort, observed)
+func (r *receipt) seal(raw []byte, workerPort int, observed *OwnerAuth, webrtc map[string]any) error {
+	payload, err := rewritePayload(raw, workerPort, observed, webrtc)
 	if err != nil {
 		return err
 	}
@@ -100,7 +100,7 @@ func (r *receipt) seal(raw []byte, workerPort int, observed *OwnerAuth) error {
 	return nil
 }
 
-func rewritePayload(raw []byte, workerPort int, observed *OwnerAuth) ([]byte, error) {
+func rewritePayload(raw []byte, workerPort int, observed *OwnerAuth, webrtc map[string]any) ([]byte, error) {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return nil, fmt.Errorf("the Runtime readiness payload is not one object: %w", err)
@@ -113,6 +113,11 @@ func rewritePayload(raw []byte, workerPort int, observed *OwnerAuth) ([]byte, er
 		delete(members, "observed_record_owner_auth")
 	} else if members["observed_record_owner_auth"], err = json.Marshal(observed); err != nil {
 		return nil, err
+	}
+	if webrtc != nil {
+		if members["webrtc"], err = json.Marshal(webrtc); err != nil {
+			return nil, err
+		}
 	}
 	return json.Marshal(members)
 }
