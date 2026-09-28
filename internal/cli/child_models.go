@@ -5,15 +5,11 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/scratch"
-	"github.com/cozy-creator/cozy/internal/tfs"
-	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 // A captured child's model slot has ONE authority and it is not the calling package.
@@ -227,59 +223,4 @@ func (r *Resolver) UnpublishedChildModels(request records.Request) ([]records.Mo
 		}
 	}
 	return out, nil
-}
-
-// EnsureLocalModels runs after child admission, on the ordinary activation path.
-// The control-frame reader must not block on a model download before recording the child.
-func (r *Resolver) EnsureLocalModels(origin string, models []orchestrator.ModelRef) *exit.Error {
-	for _, model := range models {
-		if model.Downloadable() {
-			if problem := r.ensureLocalChildModel(origin, model); problem != nil {
-				return problem
-			}
-		}
-	}
-	return nil
-}
-
-// A local child skips the top-level CLI's model intake. Use that same acquisition
-// owner here; code publication cannot make cold model bytes appear in the store.
-func (r *Resolver) ensureLocalChildModel(origin string, model orchestrator.ModelRef) *exit.Error {
-	tool, problem := tfs.Open(r.cfg)
-	if problem != nil {
-		return problem
-	}
-	layout, problem := home.Open(r.cfg.Home)
-	if problem != nil {
-		return problem
-	}
-	work, problem := scratch.Temp(layout.Tmp, "child-model-")
-	if problem != nil {
-		return problem
-	}
-	defer work.Release()
-	spec := model.Model
-	if model.Release != "" {
-		spec += "@" + model.Release
-	}
-	spec += "@" + model.Manifest
-	fetch := transfer.Fetch{Tool: tool, Hub: r.catalog(origin), Spec: spec, Lane: model.Lane,
-		Scratch: work.Path, Locks: layout.AcquisitionLocks()}
-	ctx, cancel := hub.LongContext()
-	defer cancel()
-	resolved, problem := fetch.Resolve(ctx)
-	if problem != nil {
-		return problem
-	}
-	if fetch.Ref.String() != model.Model || resolved.ManifestID != model.Manifest || resolved.Release != model.Release || resolved.Lane != model.Lane {
-		return exit.Named(exit.Conflict, "child.model_manifest_changed", "local child acquisition differs from its exact model selection")
-	}
-	fetched, problem := fetch.Acquire(ctx, resolved)
-	if problem != nil {
-		return problem
-	}
-	if fetched.ManifestID != model.Manifest || fetched.ManifestLength != model.ManifestLength {
-		return exit.Named(exit.Conflict, "child.model_manifest_changed", "local child acquisition differs from its exact manifest")
-	}
-	return nil
 }

@@ -42,11 +42,6 @@ type Resolver struct {
 	selectionMu sync.Mutex
 	store       *records.Store
 	cfg         config.Config
-	// cache holds the specs already derived this launch. Deriving one reads a PackageInterface
-	// and asks the runtime for its artifact index; an install is IMMUTABLE, so doing it
-	// twice would answer the same thing twice.
-	cache    map[string]orchestrator.WorkerLaunchSpec
-	selected map[string]orchestrator.WorkerLaunchSpec
 	// placements contain only control-plane facts. Keeping this cache distinct is the
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement
@@ -54,9 +49,6 @@ type Resolver struct {
 	// its own hub's catalog.
 	catalogMu sync.Mutex
 	catalogs  map[string]*hub.Client
-	// Devices is the device envelope the daemon GRANTS a worker this host launches: what
-	// it may SEE, and the space the worker's reported lanes index into (proto-024).
-	Devices []string
 }
 
 // PrepareLocal freezes one editable install into exact wheels before rental attachment.
@@ -228,7 +220,6 @@ func (r *Resolver) RefreshSnapshot(snapshot *EditableSnapshot) (installID string
 		return current.ID, false, refreshFailure(pkg, current, problem)
 	}
 	r.mu.Lock()
-	delete(r.cache, pkg)
 	delete(r.placements, pkg)
 	r.mu.Unlock()
 	if result.Install.ID == "" {
@@ -263,16 +254,12 @@ func (r *Resolver) namespace() (packagepublish.Namespace, *exit.Error) {
 	return packagepublish.Namespace{Hub: c.Base(), Account: account.Name}, nil
 }
 
-// NewResolver builds the resolver over the lifecycle authority. `devices` is the envelope
-// the daemon grants every local worker it launches (orchestrator.LocalDeviceEnvelope).
-func NewResolver(store *records.Store, cfg config.Config, devices []string) *Resolver {
+// NewResolver builds the resolver over the lifecycle authority.
+func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	return &Resolver{
 		store: store, cfg: cfg,
-		cache:      map[string]orchestrator.WorkerLaunchSpec{},
-		selected:   map[string]orchestrator.WorkerLaunchSpec{},
 		placements: map[string]orchestrator.DesiredPlacement{},
 		catalogs:   map[string]*hub.Client{},
-		Devices:    append([]string(nil), devices...),
 	}
 }
 
@@ -322,33 +309,6 @@ func (r *Resolver) ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, 
 	return placement, nil
 }
 
-// Resolve answers with the spec for one package ref.
-func (r *Resolver) Resolve(pkg string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	pkg = strings.TrimSpace(pkg)
-	r.mu.Lock()
-	spec, ok := r.cache[pkg]
-	r.mu.Unlock()
-	if ok {
-		return spec, nil
-	}
-	inst, e := r.activeInstall(pkg)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	facts, e := launch.Read(*inst, r.cfg.Home, r.cfg.Tool())
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	spec, e = facts.Spec(r.Devices)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	r.mu.Lock()
-	r.cache[pkg] = spec
-	r.mu.Unlock()
-	return spec, nil
-}
-
 // ResolveInstall answers from the exact immutable row a durable request retained.
 func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelRef) (
 	orchestrator.WorkerLaunchSpec, *exit.Error,
@@ -358,14 +318,11 @@ func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelR
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	if facts.Install.PlacementSetDigest == "" || len(models) > 0 {
-		spec, problem := facts.PreparationSpec(r.Devices)
-		if problem != nil {
-			return spec, problem
-		}
+		spec := facts.PreparationSpec()
 		spec.Placement.Models = append([]orchestrator.ModelRef(nil), models...)
 		return spec, nil
 	}
-	return facts.Spec(r.Devices)
+	return facts.Spec()
 }
 
 func selectedInstallKey(installID string, models []orchestrator.ModelRef) string {
@@ -705,36 +662,6 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 	facts.CPUOrchestration = facts.CPUOrchestration || facts.PackageInterface.Application == packagepublish.ScriptApplication
 	facts.SelfCallable, problem = r.store.SelfCallableEntrypoints(installID)
 	return facts, problem
-}
-
-// ResolveJob answers with the spec that makes ONE job function's worker resident. It is
-// the same install, the same venv and the same device envelope as `Resolve` — what
-// differs is the plan record staged for it and the Directive mode it boots into.
-//
-// It is NOT cached: a job spec is per-function, and caching by package alone was exactly
-// the shape that would hand a serving spec to a job.
-func (r *Resolver) ResolveJob(pkg, function string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	inst, e := r.activeInstall(strings.TrimSpace(pkg))
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	facts, e := launch.Read(*inst, r.cfg.Home, r.cfg.Tool())
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	spec, _, e := facts.JobSpec(function, r.Devices)
-	return spec, e
-}
-
-// ResolveJobInstall starts a job from the exact immutable install selected before the
-// request entered the queue.
-func (r *Resolver) ResolveJobInstall(installID, function string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	facts, e := r.installFacts(installID)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	spec, _, e := facts.JobSpec(function, r.Devices)
-	return spec, e
 }
 
 // Jobs names the `@job` functions one installed package registers, with the PackageInterface

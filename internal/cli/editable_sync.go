@@ -6,9 +6,8 @@ package cli
 // locally." Before this, an edit reached a worker only at the next `cozy run`, which paid
 // the rebuild and the cold placement itself. Now the daemon watches every editable
 // install's source tree; a change is rebuilt on the path a run would have taken
-// (RefreshSnapshot: rebuild, Runtime accepts, the pin swaps) and every worker holding the
-// package — the local lane and each attached rental — is re-prepared the way the next run
-// would have, so that run is warm.
+// (RefreshSnapshot: rebuild, Runtime accepts, the pin swaps), so the next run on any
+// machine starts from the new install.
 //
 // Nothing here is timed. A filesystem event is the observed fact that wakes a tree; the
 // only "debounce" is the reading itself: a tree is read again while events keep arriving
@@ -34,7 +33,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -43,7 +41,6 @@ type editableSync struct {
 	layout   home.Layout
 	store    *records.Store
 	resolver *Resolver
-	owner    *orchestrator.Orchestrator
 	log      io.Writer
 	watcher  *fsnotify.Watcher
 	ctx      context.Context
@@ -65,7 +62,7 @@ type editableTree struct {
 // startEditableSync watches the records database for pin changes and every editable
 // install's source tree for edits, until quit closes.
 func startEditableSync(layout home.Layout, store *records.Store, resolver *Resolver,
-	owner *orchestrator.Orchestrator, log io.Writer, quit <-chan struct{},
+	log io.Writer, quit <-chan struct{},
 ) (*editableSync, *exit.Error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -76,7 +73,7 @@ func startEditableSync(layout home.Layout, store *records.Store, resolver *Resol
 		return nil, exit.Internalf("cannot watch %s for package pins: %s", filepath.Dir(layout.DB), err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &editableSync{layout: layout, store: store, resolver: resolver, owner: owner, log: log,
+	s := &editableSync{layout: layout, store: store, resolver: resolver, log: log,
 		watcher: watcher, ctx: ctx, quit: quit, rescan: make(chan struct{}, 1),
 		trees: map[string]*editableTree{}, said: map[string]string{}}
 	go func() {
@@ -350,7 +347,7 @@ func (s *editableSync) settle(tree *editableTree) uint64 {
 			return seen
 		}
 		if changed {
-			s.reprepare(tree.pkg, snapshot, installID)
+			s.recordRefresh(tree.pkg, snapshot, installID)
 		}
 		return seen
 	}
@@ -366,63 +363,12 @@ func (s *editableSync) refused(pkg, installID string, problem *exit.Error) {
 	}
 }
 
-// reprepare gives every worker that held the package its placement under the new install.
-func (s *editableSync) reprepare(pkg string, snapshot *EditableSnapshot, installID string) {
-	locals := s.owner.PackageHolders(pkg)
-	var workers []string
-	if len(locals) > 0 {
-		stopped, problem := s.owner.UnloadIdleLocalPackage(pkg, installID)
-		if problem != nil {
-			fmt.Fprintf(s.log, "editable %s: stale local workers stay: %s\n", pkg, problem.Message)
-		}
-		for _, w := range stopped {
-			fmt.Fprintf(s.log, "editable %s: stopped idle worker %s\n", pkg, w.InstanceID)
-		}
-		for _, models := range distinctSelections(locals) {
-			spec, problem := s.resolver.ResolveInstall(installID, models)
-			if problem != nil {
-				fmt.Fprintf(s.log, "editable %s: cannot resolve install %s: %s\n", pkg, short12(installID), problem.Message)
-				continue
-			}
-			instance, change, problem := s.owner.EnsureWorker(spec)
-			if problem == nil && len(spec.Placement.Entrypoints) > 0 {
-				problem = s.owner.EnsurePlacementReady(instance, spec.Placement.Entrypoints[0].Digest, "")
-			}
-			if problem != nil {
-				fmt.Fprintf(s.log, "editable %s: local worker not re-prepared (%s); the next run starts it\n",
-					pkg, problem.Message)
-				continue
-			}
-			fmt.Fprintf(s.log, "editable %s: local worker %s %s and dispatchable for install %s\n",
-				pkg, instance, change, short12(installID))
-			workers = append(workers, "local/"+instance)
-		}
-	}
+// recordRefresh journals the package's new active install.
+func (s *editableSync) recordRefresh(pkg string, snapshot *EditableSnapshot, installID string) {
 	if e := s.store.AppendPackageEvent(pkg, "package.refreshed", map[string]any{
-		"install": installID, "files": snapshot.Files,
-		"bytes": snapshot.Bytes, "workers": workers,
+		"install": installID, "files": snapshot.Files, "bytes": snapshot.Bytes,
 	}); e != nil {
 		fmt.Fprintf(s.log, "editable %s: cannot record the refresh: %s\n", pkg, e.Message)
 	}
-	fmt.Fprintf(s.log, "editable %s: install %s active; %d worker(s) re-prepared\n",
-		pkg, short12(installID), len(workers))
-}
-
-// distinctSelections answers each model selection the local holders were resolved with,
-// once, so one worker per selection comes back under the new install.
-func distinctSelections(locals []orchestrator.LocalHolder) [][]orchestrator.ModelRef {
-	var out [][]orchestrator.ModelRef
-	seen := map[string]bool{}
-	for _, holder := range locals {
-		key := selectedInstallKey("", holder.Models)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, holder.Models)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return selectedInstallKey("", out[i]) < selectedInstallKey("", out[j])
-	})
-	return out
+	fmt.Fprintf(s.log, "editable %s: install %s active\n", pkg, short12(installID))
 }

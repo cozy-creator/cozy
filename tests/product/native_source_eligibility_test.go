@@ -31,7 +31,7 @@ func TestNativeDownloadsCannotHideResolutionInsideMemoizedParents(t *testing.T) 
 		must(t, os.MkdirAll(filepath.Dir(launch.PackageInterfacePath(install.Dir)), 0o700))
 		must(t, os.WriteFile(launch.PackageInterfacePath(install.Dir), raw, 0o444))
 		fatal(t, store.RecordInstall(install))
-		resolver := cli.NewResolver(store, config.Config{Home: layout.Root}, nil)
+		resolver := cli.NewResolver(store, config.Config{Home: layout.Root})
 		parent := records.Request{InstallID: install.ID, Entrypoint: "compute"}
 		for _, operation := range []string{"download_huggingface", "download_civitai"} {
 			problem = resolver.NativeSourceEligible(parent, operation)

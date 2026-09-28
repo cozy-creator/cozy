@@ -17,14 +17,12 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 	cozyweb "github.com/cozy-creator/cozy/web"
 )
 
@@ -216,45 +214,6 @@ func awaitMachineReceipt(t *testing.T, store *records.Store, requestID string) *
 
 // close releases the root so a later `cozy run list` on the same root is the only owner of it.
 func (o *owner) close() { o.once.Do(o.closer) }
-
-// fakeSpec is a worker slot whose process is tests/support/fakeworker speaking raw protocol
-// bytes: a real process dialing the real socket over the committed contract. `device` is
-// the granted envelope, comma-separated for a multi-device one.
-func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec {
-	spelled := func(raw []byte) string { value, _ := canonical.Spell(raw); return value }
-	entrypointIdentity := map[string]canonical.Value{
-		"name": "fake", "slots": []canonical.Value{},
-	}
-	entrypointBytes, _ := canonical.Write(entrypointIdentity)
-	entrypointDigest := canonical.Digest(entrypointBytes)
-	entrypoints := []canonical.Value{map[string]canonical.Value{
-		"entrypoint_binding_digest": spelled(entrypointDigest),
-		"name":                      "fake", "slots": []canonical.Value{},
-	}}
-	bindingsBytes, _ := canonical.Write(map[string]canonical.Value{
-		"entrypoints": entrypoints, "models": []canonical.Value{},
-	})
-	setBytes, setDigest, _ := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
-		PlacementId: "plc-fake-" + name,
-		PackageMode: &pb.Placement_Package{Package: &pb.PackageSelection{
-			Package: "fake/" + name, Release: "1.0.0"}},
-		InstallationId:   "fake-" + name,
-		PackageInterface: []byte(`{"format":"cozy.package.interface/1","application":"fake:app","entrypoints":[],"jobs":[]}`), BindingsDigest: canonical.Digest(bindingsBytes),
-		Entrypoints: []*pb.Entrypoint{{Name: "fake", EntrypointBindingDigest: entrypointDigest}},
-	}}})
-	setID := spelled(setDigest)
-	placement, problem := orchestrator.PlacementFromExact("fake/"+name, "", setID,
-		setBytes, map[string][]string{"fake": []string{"image"}})
-	if problem != nil {
-		panic(problem.Message)
-	}
-	return orchestrator.WorkerLaunchSpec{
-		Python:    fakeWorkerBin,
-		Args:      args,
-		Devices:   strings.Split(device, ","),
-		Placement: placement,
-	}
-}
 
 func planIDOf(t *testing.T, spec orchestrator.WorkerLaunchSpec) string {
 	t.Helper()

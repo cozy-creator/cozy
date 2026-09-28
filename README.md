@@ -623,8 +623,7 @@ The daemon's own words — the orchestrator's frame-by-frame account — are in
 
 The daemon also leaves on its own once it has had nothing to manage for `daemon.idle_shutdown_s`
 (default 900): no rental it owns, no request or attempt it owes, no transfer, export, launch or
-teardown in flight, no event stream attached. User interaction is not the signal, and an idle
-warm local worker is not work — the exit drains it exactly as `down` does. A rental holds the
+teardown in flight, no event stream attached. User interaction is not the signal. A rental holds the
 daemon until its idle release, or `cozy rental end`, has confirmed the pod gone. Set
 `idle_shutdown_s: 0` to keep the daemon up until `cozy down`. The next command that needs the
 daemon starts it again.
@@ -644,7 +643,7 @@ The default local root is `~/.cozy`. The TensorFS store is its own independent h
 | `installs/` | one immutable environment per installed package, plus the writer's `.lock` |
 | `outputs/<org>-<package>/` | result files, named by their own content digest; never removed automatically |
 | `inputs/` | uploaded/streamed request bodies only, created on demand; a local CLI file input stays at its caller path |
-| `workers/<instance>/` | a local worker's `run/` state and `worker.log`; removed when it exits, the log stays |
+| `machine/` | this computer's machine: the same Host a rental runs, with its grant |
 | `tmp/<request-id>/` | bytes in flight for a model transfer; removed when the request settles |
 | `creator.sqlite`, `daemon.log` | the one local lifecycle database (mode 0600) and the daemon's own log |
 | `daemon.lock` | the daemon's lifetime ownership record: address, pid, and the per-launch CLI token (mode 0600) |

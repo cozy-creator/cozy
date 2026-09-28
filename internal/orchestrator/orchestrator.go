@@ -135,17 +135,6 @@ type ModelTransferMover func(context.Context, records.ModelTransferWeights,
 type Launcher interface {
 	ValidateExecutionCapture(records.Request) *exit.Error
 	ResolvePlacement(pkg string) (DesiredPlacement, *exit.Error)
-	Resolve(pkg string) (WorkerLaunchSpec, *exit.Error)
-	// ResolveInstall relaunches the immutable local install a durable request resolved
-	// before entering the queue, so a changed pin cannot change accepted work.
-	ResolveInstall(installID string, models []ModelRef) (WorkerLaunchSpec, *exit.Error)
-	// ResolveJob is the JOB lane's half: `org/name` plus a job function to the spec that
-	// makes THAT job's worker resident. It is a separate method rather than a flag
-	// because the two produce different Directives and different worker slots — the
-	// mode is a fact about the worker, and a resolver that returned "either" would push
-	// the choice into the orchestrator, which resolves nothing.
-	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
-	ResolveJobInstall(installID, function string) (WorkerLaunchSpec, *exit.Error)
 	LocalInstallation(installID, digest string) (localpackage.Installation, *exit.Error)
 }
 

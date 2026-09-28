@@ -315,7 +315,7 @@ func (m *managedRentals) acquire(req records.Request) (orchestrator.PlacementDec
 	}
 	// Everything this decision reads or buys belongs to the request's hub.
 	origin, scoped := m.origin(req.Hub), m.at(req.Hub)
-	resolver := NewResolver(m.store, m.ctx.Cfg, nil)
+	resolver := NewResolver(m.store, m.ctx.Cfg)
 	needsAccelerator, problem := resolver.PrivateRentalNeedsAccelerator(req)
 	if problem != nil {
 		return none, "", problem

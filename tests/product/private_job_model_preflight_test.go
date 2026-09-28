@@ -58,7 +58,7 @@ func TestPrivateModelPreflightDefersAbsentCapturedInputs(t *testing.T) {
 			fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: parent.ID,
 				ChildInstallID: child.ID,
 				Module:         "private_ops", Export: "compute", Entrypoint: "compute"}}))
-			resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.server.URL, HubToken: secret.New("ladder-test")}, nil)
+			resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.server.URL, HubToken: secret.New("ladder-test")})
 			models, problem := resolver.UnpublishedChildModels(records.Request{InstallID: parent.ID, Kind: "job"})
 			switch mode {
 			case "job-unbound", "entrypoint-unbound", "job-owner-unreadable":
@@ -104,7 +104,7 @@ func TestInvokedCapturedEntrypointStillRequiresItsActualModel(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(layout.LocalPackages, installed.ID, "installation.json"), []byte(`{"ID":"`+installed.ID+`"}`), 0o600))
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID, ChildInstallID: installed.ID,
 		Module: "captured", Export: "judge", Entrypoint: "judge"}}))
-	resolver := cli.NewResolver(store, config.Config{Home: layout.Root}, nil)
+	resolver := cli.NewResolver(store, config.Config{Home: layout.Root})
 	parent := records.Request{ID: "parent", InstallID: installed.ID, Entrypoint: "parent", Kind: "job"}
 	models, problem := resolver.UnpublishedChildModels(parent)
 	fatal(t, problem)

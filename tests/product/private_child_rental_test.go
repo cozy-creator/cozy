@@ -37,7 +37,7 @@ func TestPrivateRentalIncludesChildGPUWithoutGrantingItToParent(t *testing.T) {
 			fatal(t, store.RecordInstall(child))
 			fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: parent.ID, ChildInstallID: child.ID, Module: "private_ops", Export: "compute", Entrypoint: "compute"}}))
 			request := records.Request{InstallID: parent.ID, Kind: "job", NeedsAccelerator: false, RetainWork: true, Rental: true}
-			resolver := cli.NewResolver(store, config.Config{Home: layout.Root}, nil)
+			resolver := cli.NewResolver(store, config.Config{Home: layout.Root})
 			requiresGPU, problem := resolver.PrivateRentalNeedsAccelerator(request)
 			fatal(t, problem)
 			if requiresGPU != gpu || request.NeedsAccelerator {

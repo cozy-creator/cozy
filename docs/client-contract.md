@@ -138,11 +138,6 @@ acknowledged; locally mirrored output bytes remain addressable by their media id
 failed pod deletion remains a durable attempt-row obligation and is retried on subsequent
 worker reports; it is never converted into a successful cleanup claim.
 
-Local worker grants currently refuse on Windows as
-`local_file_grant_unsupported` (structural). Remote pod execution remains supported.
-This is an explicit boundary until cozy-runtime and Cozy share one Windows file-URL
-encoder/authorizer; Cozy does not emit malformed `file://C:\\…` capabilities.
-
 A pinned request crosses a REAL byte boundary, and the crossing is the pod's own media
 server: the payload and every input asset are uploaded as separate
 objects before the attempt is dispatched, the worker reads them off the pod's disk, and

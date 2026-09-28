@@ -1,12 +1,9 @@
 package launch
 
 import (
-	"path/filepath"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
@@ -48,75 +45,6 @@ type JobFacts struct {
 	// DECLARATION, never off the kind (cr-009).
 	Publishes        bool
 	NeedsAccelerator bool
-}
-
-// JobSpec builds the WorkerLaunchSpec that makes ONE job function's worker resident. It
-// is the job lane's `Facts.Spec`: same worker, same venv, same device envelope, a
-// JobDirective instead of a placement set.
-//
-// A JOB WORKER HOSTS NO PLACEMENT. Its DesiredPlacement carries `Jobs` and no bindings,
-// which is what puts the DesiredWorkerState's `mode` oneof on the job branch — a worker is
-// in exactly ONE mode until the next revision.
-//
-// ONE WORKER PER (package, install, job function), and it is RECLAIMED at its outcome
-// like every other job worker: one immutable build, one bounded attempt, outcome, reclaim
-// (worker-protocol, cr-009). Deep queueing is the ORCHESTRATOR's — the dispatch queue holds
-// the work and select-or-start makes the next worker resident — and it does not require
-// keeping a job worker warm after it finishes. Warm persistence is a serving concern and
-// stays one.
-func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerLaunchSpec, *JobFacts, *exit.Error) {
-	facts, e := f.Job(function)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, nil, e
-	}
-	if !facts.NeedsAccelerator {
-		devices = nil
-	}
-	runtimeBin, e := hostruntime.Path(f.RuntimeCLI.Env)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, nil, e
-	}
-	placement, installationID, e := f.JobInstallationID()
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, nil, e
-	}
-	cache := filepath.Join(f.Install.Dir, "artifact-cache")
-	environmentPython := f.environmentPython()
-	placement.Jobs = []*orchestrator.JobPlan{{
-		Function:       facts.Name,
-		DescriptorID:   facts.DescriptorID,
-		InstallationID: installationID,
-		Outputs:        facts.Outputs,
-		WeightsOutputs: facts.WeightsOutputs,
-		// The record's key set is CLOSED at both ends: `plan.py::JobBinding.read`
-		// refuses an unknown key, exactly as the binding record's reader does.
-		Record: map[string]any{
-			"job_descriptor_id":           facts.DescriptorID,
-			"installation_id":             installationID,
-			"application":                 f.PackageInterface.Application,
-			"package_interface":           PackageInterfacePath(f.Install.Dir),
-			"python":                      environmentPython,
-			"job":                         facts.Name,
-			"publishes":                   facts.Publishes,
-			"emits_media":                 false,
-			"gpu_rate_micro_usd_per_hour": int64(0),
-			"cap_micro_usd":               int64(0),
-			"reclaim_on_terminal":         true,
-		},
-		RSSCap: jobRSSBudget, NeedsAccelerator: facts.NeedsAccelerator,
-	}}
-	spec := orchestrator.WorkerLaunchSpec{
-		Placement: placement,
-		// The same entry the serving lane uses: the runtime's own public verb (spec.go).
-		Python:            runtimeBin,
-		Args:              []string{"serve"},
-		Dir:               f.Source,
-		Devices:           devices,
-		ArtifactCache:     cache,
-		EnvironmentPython: environmentPython,
-		TensorFSRoot:      config.Frozen().TensorFSRoot,
-	}
-	return spec, facts, nil
 }
 
 // Job resolves one declared `@job` and READS its descriptor id from the runtime that owns

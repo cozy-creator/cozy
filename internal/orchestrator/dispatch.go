@@ -1183,9 +1183,10 @@ func settledState(state string) bool {
 	return false
 }
 
-// resolveFor keeps local package execution separate from generic rented capacity.
-// A rented worker receives only Creator's logical package refs; the worker
-// resolves and reports the exact binding it made dispatchable.
+// resolveFor resolves rented capacity only. This computer runs work through its machine;
+// a request that reaches here without a rental belongs to the retired classic local worker.
+// A rented worker receives only Creator's logical package refs; the worker resolves and
+// reports the exact binding it made dispatchable.
 func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpec, planID string, problem *exit.Error) {
 	defer func() {
 		if problem == nil && resolved.IsJob() {
@@ -1201,46 +1202,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 		}
 	}
 	if req.Worker == "" {
-		if c.opt.Packages == nil {
-			return WorkerLaunchSpec{}, "", exit.Unavailablef("this host resolves no local packages")
-		}
-		if req.InstallID != "" {
-			if req.IsJob() && req.ParentRequestID != "" && len(downloadModelRefs(req.Models)) > 0 {
-				acquirer, ok := c.opt.Packages.(localModelAcquirer)
-				if !ok {
-					return WorkerLaunchSpec{}, "", exit.Unavailablef("local model acquisition owner is unavailable")
-				}
-				if problem := acquirer.EnsureLocalModels(req.Hub, req.Models); problem != nil {
-					return WorkerLaunchSpec{}, "", problem
-				}
-			}
-			if req.IsJob() {
-				spec, e := c.opt.Packages.ResolveJobInstall(req.InstallID, req.Entrypoint)
-				return c.exactLocalTransferProducer(req, spec, e)
-			}
-			spec, e := c.opt.Packages.ResolveInstall(req.InstallID, req.Models)
-			if e != nil {
-				return WorkerLaunchSpec{}, "", e
-			}
-			if spec.Preparation != nil {
-				return c.prepareLocalServing(req, spec)
-			}
-			if spec.Placement.Package != req.Package {
-				return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
-					"request_install_package_mismatch",
-					"install %s serves %s, not request package %s",
-					req.InstallID, spec.Placement.Package, req.Package)
-			}
-			return spec, req.PlanID, nil
-		}
-		spec, e := c.opt.Packages.Resolve(req.Package)
-		if req.IsJob() {
-			spec, e = c.opt.Packages.ResolveJob(req.Package, req.Entrypoint)
-			if req.ModelTransfer != nil {
-				return c.exactLocalTransferProducer(req, spec, e)
-			}
-		}
-		return spec, req.PlanID, e
+		return WorkerLaunchSpec{}, "", ClassicLocalRetired()
 	}
 	if !req.IsJob() {
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict, "rental.inference_runtime_owned",
@@ -1371,19 +1333,6 @@ func (c *Orchestrator) resolveFor(req records.Request) (resolved WorkerLaunchSpe
 	}
 	if e := c.ConvergeRemoteJob(instance, spec); e != nil {
 		return WorkerLaunchSpec{}, "", e
-	}
-	return spec, req.PlanID, nil
-}
-
-func (c *Orchestrator) exactLocalTransferProducer(req records.Request, spec WorkerLaunchSpec,
-	problem *exit.Error,
-) (WorkerLaunchSpec, string, *exit.Error) {
-	if problem != nil {
-		return spec, req.PlanID, problem
-	}
-	if req.Release != "" && spec.Placement.Release != req.Release {
-		return WorkerLaunchSpec{}, req.PlanID, exit.Unavailablef(
-			"local producer does not exactly match frozen %s@%s", req.Package, req.Release)
 	}
 	return spec, req.PlanID, nil
 }

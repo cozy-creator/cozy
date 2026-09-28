@@ -69,7 +69,7 @@ func TestH3ServingRentalIgnoresCapturedSiblingResidency(t *testing.T) {
 	fatal(t, store.RecordChildBindings([]records.ChildBinding{{ParentInstallID: installed.ID,
 		ChildInstallID: installed.ID,
 		Module:         "h3", Export: "segment", Entrypoint: "segment"}}))
-	resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.URL}, nil)
+	resolver := cli.NewResolver(store, config.Config{Home: layout.Root, HubURL: catalog.URL})
 	request := records.Request{InstallID: installed.ID, Package: installed.Package,
 		Entrypoint: "fl2va", Kind: "serving", NeedsAccelerator: true, Models: selected.Models}
 	children, problem := resolver.UnpublishedChildModels(request)

@@ -66,7 +66,7 @@ func TestRemoteReleaseSharesSlotsOfOneConstruction(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "creator.sqlite"))
 	fatal(t, problem)
 	defer store.Close()
-	resolver := cli.NewResolver(store, config.Config{HubURL: server.URL, Home: root}, nil)
+	resolver := cli.NewResolver(store, config.Config{HubURL: server.URL, Home: root})
 	manifest := "sha256:" + strings.Repeat("a", 64)
 	rungs := []records.ModelRung{{GPU: "H100", Lane: "fp8-adaln-pruned", Manifest: manifest},
 		{GPU: "*", Lane: "bf16-full", Manifest: "sha256:" + strings.Repeat("b", 64)}}

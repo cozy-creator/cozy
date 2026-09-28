@@ -29,9 +29,8 @@ func (c *Orchestrator) finishRequestedCancellation(id string) *exit.Error {
 	return nil
 }
 
-// runRetainedCancellation releases what the machine holds for the request, then cancels
-// it. A cancel never starts a worker: local custody that no connected worker can release
-// stays recorded, and the request is canceled the moment nothing of it executes.
+// runRetainedCancellation releases what the rental holds for the request, then cancels it.
+// A cancel never starts a worker; a request without a rental is canceled at once.
 func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 	request, problem := c.opt.Store.RequestRow(id)
 	if problem != nil || request == nil || (request.State != "canceling" && request.State != "releasing") {
@@ -45,8 +44,8 @@ func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 		c.retryRetainedCancellation(id)
 		return
 	}
-	local := request.Worker == ""
-	if local && c.localWorkspace() == nil {
+	if request.Worker == "" {
+		// Only the retired classic local worker held local custody; nothing can release it.
 		c.settleIdleCancellation(*request)
 		return
 	}
@@ -65,10 +64,6 @@ func (c *Orchestrator) runRetainedCancellation(ctx context.Context, id string) {
 	ready, problem = c.releaseAbandonedWork(ctx, *request, attempts, "")
 	if problem != nil || !ready {
 		_ = c.stopRetainedAttempt(id, pb.CancelReason_CANCEL_REASON_CLIENT)
-		if local && problem == nil {
-			c.settleIdleCancellation(*request)
-			return
-		}
 		c.retryRetainedCancellation(id)
 		return
 	}

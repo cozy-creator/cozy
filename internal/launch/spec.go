@@ -5,10 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hostruntime"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
@@ -109,30 +107,15 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 		f.Install.PlacementSetDigest, data, outputs)
 }
 
-// Spec adds this host's target-environment materialization to a placement. The trusted
-// host Runtime owns worker control; the install venv supplies the selected executor.
-// A connected worker never calls this method.
-func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+// Spec is the install's serving placement: the exact PlacementSet a published install
+// selected, or the preparation metadata an unprepared or local install carries.
+func (f *Facts) Spec() (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	if f.Install.SourceKind == "local" || f.Install.PlacementSetDigest == "" {
-		return f.PreparationSpec(devices)
+		return f.PreparationSpec(), nil
 	}
 	placement, e := f.Placement()
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
-	cache := filepath.Join(f.Install.Dir, "artifact-cache")
-
-	runtimeBin, e := hostruntime.Path(f.RuntimeCLI.Env)
-	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
-	}
-	return orchestrator.WorkerLaunchSpec{
-		Placement: placement,
-		Python:    runtimeBin, Args: []string{"serve"},
-		Dir:               f.Source,
-		Devices:           devices,
-		ArtifactCache:     cache,
-		EnvironmentPython: f.environmentPython(),
-		TensorFSRoot:      config.Frozen().TensorFSRoot,
-	}, nil
+	return orchestrator.WorkerLaunchSpec{Placement: placement}, nil
 }

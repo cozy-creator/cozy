@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -224,29 +223,18 @@ type RemoteTarget struct {
 	Devices []string
 }
 
-// WorkerLaunchSpec is everything this owner needs to make one worker exist and host one
-// placement. The caller (cl-010's `start`, or cl-001's live driver) resolves it from the
-// install; the orchestrator itself resolves nothing about Python.
+// WorkerLaunchSpec names one attached rental worker and the placement it hosts. The
+// orchestrator starts no process: this computer runs work through its machine's Host.
 type WorkerLaunchSpec struct {
-	Python  string   `json:"python"` // package-independent control Runtime
-	Args    []string `json:"args"`
-	Dir     string   `json:"dir"`
-	Imposed []string `json:"imposed"` // exact env values the launcher imposes, never inherited
-	// Devices is the device envelope this worker holds: for a spawned worker the names on
-	// its own `--devices` line, which this daemon GRANTS and arbitrates; for an attached
-	// rental the pod's paid width, which this daemon only reads. Lane ordinals are
+	// Devices is the rental's paid width, which this daemon only reads. Lane ordinals are
 	// positions in it, and its length is the placement's device-group degree.
-	Devices           []string `json:"devices"`
-	ArtifactCache     string   `json:"artifact_cache,omitempty"`
-	InstallRoot       string   `json:"install_root,omitempty"`
-	EnvironmentPython string   `json:"environment_python,omitempty"` // preinstalled package venv
-	TensorFSRoot      string   `json:"tensorfs_root,omitempty"`
+	Devices []string `json:"devices"`
 	// Placement is what this worker is launched to host. LAUNCH CLAMPS THE SET TO ONE
 	// (worker-protocol header): a longer set is a typed refusal at the worker, so this
 	// side names one placement rather than pretending to a generality it cannot deliver.
 	Placement DesiredPlacement `json:"placement"`
-	// Connection attaches an ALREADY-RUNNING worker instead of spawning one: the owner
-	// pins CACert and signs Claim with its per-rental key. Nil = the ordinary local spawn.
+	// Connection attaches the rental's ALREADY-RUNNING worker: the owner pins CACert and
+	// signs Claim with its per-rental key.
 	Connection  *WorkerConnection        `json:"connection,omitempty"`
 	Preparation *LocalServingPreparation `json:"preparation,omitempty"`
 }
@@ -681,13 +669,14 @@ func (w *worker) observeJobs(n int) {
 // to tell an idempotent no-op from a real convergence, and a boolean `resident` could only
 // tell them "it was there", which is true of both.
 func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange, *exit.Error) {
-	if spec.Connection != nil {
-		release, problem := c.UseRental(spec.Connection.RentalID, "attaching its worker")
-		if problem != nil {
-			return "", ChangeNone, problem
-		}
-		defer release()
+	if spec.Connection == nil {
+		return "", ChangeNone, ClassicLocalRetired()
 	}
+	release, problem := c.UseRental(spec.Connection.RentalID, "attaching its worker")
+	if problem != nil {
+		return "", ChangeNone, problem
+	}
+	defer release()
 	instanceID := spec.InstanceID()
 	var live *worker
 	var mine chan struct{}
@@ -780,93 +769,8 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		}
 		c.mu.Unlock()
 	}()
-	if spec.Connection != nil {
-		id, e := c.connectWorker(spec)
-		return id, ChangeWorkerStarted, e
-	}
-	id, e := c.spawnWorker(spec)
-	originalHolders := map[string]bool{}
-	expectedHolders := 0
-	if e != nil && e.ErrName() == "device_envelope_held" {
-		holders, problem := c.opt.Store.DeviceHolders(spec.Devices)
-		if problem != nil {
-			return "", ChangeNone, problem
-		}
-		for _, holder := range holders {
-			originalHolders[holder] = true
-		}
-		expectedHolders = len(holders)
-	}
-	// A multi-device envelope may be held by one idle serving worker per device. Each
-	// pass re-reads the ledger and may evict exactly one observed LRU holder; the bound is
-	// the requested envelope size, so concurrent/new evidence escapes instead of turning
-	// pressure handling into an unbounded machine drain.
-	for evictions := 0; e != nil && e.ErrName() == "device_envelope_held" &&
-		evictions < len(spec.Devices); evictions++ {
-		evicted, evictionProblem := c.evictLRUIdleDeviceHolder(
-			spec.Devices, originalHolders, expectedHolders)
-		if evictionProblem != nil {
-			return "", ChangeNone, evictionProblem
-		}
-		if !evicted {
-			break
-		}
-		expectedHolders--
-		id, e = c.spawnWorker(spec)
-	}
+	id, e := c.connectWorker(spec)
 	return id, ChangeWorkerStarted, e
-}
-
-// evictLRUIdleDeviceHolder releases one local device envelope under launch pressure.
-// Every holder conflicting with the requested envelope must be an idle local serving
-// worker or an acknowledged completed job; an active, remote, unknown, offered, reserved, or unacked holder makes the
-// conflict ineligible and preserves all workers. A changed holder set is concurrent/new
-// evidence and is never folded into the original pressure decision. The selected holder
-// is claimed under the orchestrator lock before teardown, so dispatch cannot race into it.
-func (c *Orchestrator) evictLRUIdleDeviceHolder(devices []string,
-	original map[string]bool, expected int) (bool, *exit.Error) {
-	holders, problem := c.opt.Store.DeviceHolders(devices)
-	if problem != nil || len(holders) == 0 {
-		return false, problem
-	}
-	if len(holders) != expected {
-		return false, nil
-	}
-	for _, holder := range holders {
-		if !original[holder] {
-			return false, nil
-		}
-	}
-	active, problem := c.opt.Store.ActiveRequests()
-	if problem != nil {
-		return false, problem
-	}
-
-	c.mu.Lock()
-	eligible := make([]*worker, 0, len(holders))
-	for _, instanceID := range holders {
-		w := c.workers[instanceID]
-		if !c.idleLocalDeviceHolderLocked(w, active) {
-			c.mu.Unlock()
-			return false, nil
-		}
-		eligible = append(eligible, w)
-	}
-	sort.Slice(eligible, func(i, j int) bool { return lessRecentlyUsed(eligible[i], eligible[j]) })
-	victim := eligible[0]
-	victim.stopping = true
-	instanceID, pkg := victim.instanceID, victim.spec.Placement.Package
-	lastUse, resident := victim.lastUseRevision, victim.residentRevision
-	c.mu.Unlock()
-
-	c.logf("device pressure: evicting LRU idle local worker %s (%s, last_use=%d, resident=%d)",
-		instanceID, pkg, lastUse, resident)
-	if !c.stopClaimedWorker(victim, StopGrace) {
-		return false, exit.New(exit.Conflict,
-			"idle device holder %s changed before it could be evicted", instanceID)
-	}
-	c.reviveQueue()
-	return true, nil
 }
 
 func lessRecentlyUsed(a, b *worker) bool {
@@ -1082,226 +986,6 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 		}
 	}
 	return true
-}
-
-// spawnWorker journals the device grant and spawns the worker for one exact
-// PlacementSet. The grant is journaled BEFORE the process exists: a process that was never
-// granted an envelope cannot appear, and two concurrent starts cannot both consume one.
-func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) {
-	instanceID := spec.InstanceID()
-	// The slot root is reused for logs and local paths only. Attempt authority stays in
-	// Creator's records store; Runtime owns no durable journal under this directory.
-	root := c.opt.Layout.WorkerDir(instanceID)
-	workerHome := filepath.Join(root, "home")
-	if err := os.MkdirAll(workerHome, 0o755); err != nil {
-		return "", exit.Internalf("cannot create the worker home %s: %s", workerHome, err)
-	}
-
-	var planIDs []string
-	for _, entrypoint := range spec.Placement.Entrypoints {
-		planIDs = append(planIDs, entrypoint.Digest)
-	}
-	sort.Strings(planIDs)
-	if spec.IsJob() {
-		if e := stageJobPlans(workerHome, spec.Placement.Jobs); e != nil {
-			return "", e
-		}
-		for _, p := range spec.Placement.Jobs {
-			planIDs = append(planIDs, p.DescriptorID)
-		}
-	}
-
-	logPath := filepath.Join(root, "worker.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return "", exit.Internalf("cannot open the worker log %s: %s", logPath, err)
-	}
-
-	// The GRANT IS JOURNALED FIRST, before any process exists. An admission that
-	// refuses here means nothing was started, which is why the refusal has no cleanup.
-	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
-		InstanceID: instanceID, Package: spec.Placement.Package,
-		InstallID: spec.Placement.InstallID, WorkerID: "local", Devices: spec.Devices, //cozy:venue classic worker for local model transfers until proto-062 PR 7
-	}); e != nil {
-		logFile.Close()
-		return "", e
-	}
-
-	// `cozy-runtime serve`'s CLOSED flag set — the launch facts nothing can discover for a
-	// orchestrator. It is the runtime's PUBLIC launch grammar, so this is the only spelling
-	// the orchestrator knows: `--socket`/`--out` are the path grants the verb translates
-	// into its worker loop.
-	// THE WORKER BINDS ITS OWN SOCKET (#436): a unix path under its run root (loopback
-	// `127.0.0.1:0` on Windows — proc shims pick it), published to run/control.addr for
-	// this owner to dial. `--socket` is the runtime serve verb's listen grant.
-	listen := filepath.Join(root, "run", "control.sock")
-	if bootstrapRequired {
-		// Windows has no unix socket worth having: the worker binds an ephemeral
-		// loopback port and publishes the real address (cr-020 item 4).
-		listen = "127.0.0.1:0"
-	}
-	if err := os.MkdirAll(filepath.Join(root, "run"), 0o755); err != nil {
-		return "", exit.Internalf("cannot create the worker run root: %s", err)
-	}
-	_ = os.Remove(filepath.Join(root, "run", "control.addr"))
-	_ = os.Remove(filepath.Join(root, "run", "control.sock"))
-	args := append([]string{}, spec.Args...)
-	args = append(args,
-		"--socket", listen,
-		"--out", filepath.Join(root, "run"),
-		"--release-id", spec.Placement.Release,
-		"--devices", strings.Join(spec.Devices, ","),
-	)
-	for _, option := range []struct{ flag, value string }{
-		{"--artifact-cache", spec.ArtifactCache},
-		{"--install-root", spec.InstallRoot},
-		{"--environment-python", spec.EnvironmentPython},
-		{"--tensorfs-root", spec.TensorFSRoot},
-	} {
-		if option.value != "" {
-			args = append(args, option.flag, option.value)
-		}
-	}
-	cmd := exec.Command(spec.Python, args...)
-	cmd.Dir = spec.Dir
-	// The child's whole environment: the allowlist plus the values THIS launcher
-	// imposes. COZY_HOME points the worker at its own staged records and nothing else.
-	imposed := append([]string{
-		"COZY_HOME=" + workerHome,
-		"COZY_DEPENDENCY_CACHE=" + c.opt.Layout.DependencyCache(),
-		"CUDA_VISIBLE_DEVICES=" + strings.Join(spec.Devices, ","),
-	}, spec.Imposed...)
-	// The launcher mints a PER-SPAWN bootstrap credential and hands it over through the
-	// environment — the one channel only this child inherits. The flip made it the
-	// controller-authority proof on EVERY platform (#463): this owner presents it as
-	// Claim.proof and the worker verifies constant-time; the unix socket's filesystem
-	// authority is belt, this is suspenders.
-	bootstrap := secret.Mint()
-	imposed = append(imposed, secret.EnvEntry("COZY_BOOTSTRAP_CREDENTIAL", bootstrap))
-	cmd.Env = c.opt.Cfg.Child(imposed...)
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	processtree.Prepare(cmd)
-
-	w := newWorker(instanceID, spec)
-	w.cmd, w.logPath, w.home = cmd, logPath, workerHome
-	w.planIDs, w.bootstrap = planIDs, bootstrap
-	w.processDone = make(chan struct{})
-	// Registered BEFORE the process can dial: a worker that registers faster than its
-	// launcher can record it would be refused as an instance nobody spawned.
-	c.mu.Lock()
-	c.residentRevision++
-	w.residentRevision = c.residentRevision
-	c.workers[instanceID] = w
-	c.mu.Unlock()
-
-	if err := cmd.Start(); err != nil {
-		c.mu.Lock()
-		delete(c.workers, instanceID)
-		c.mu.Unlock()
-		_ = c.opt.Store.CloseWorker(instanceID)
-		logFile.Close()
-		return "", exit.Internalf("cannot start the package worker: %s", err)
-	}
-	// The group is established at fork on Unix and must be ATTACHED after start on Windows,
-	// where the child is created suspended and the job adopts it before it runs. Adoption
-	// FAILS CLOSED (#449): a worker that cannot be contained is ended before it executes,
-	// and the spawn refuses exactly as if the process had never started.
-	if err := processtree.Adopt(cmd); err != nil {
-		_ = cmd.Process.Kill()
-		go func() { _ = cmd.Wait(); logFile.Close() }()
-		c.mu.Lock()
-		delete(c.workers, instanceID)
-		c.mu.Unlock()
-		_ = c.opt.Store.CloseWorker(instanceID)
-		return "", exit.Internalf("cannot contain the package worker: %s", err)
-	}
-	c.mu.Lock()
-	w.pid = cmd.Process.Pid
-	c.mu.Unlock()
-	if e := c.opt.Store.WorkerStarted(instanceID, cmd.Process.Pid, birthOf(cmd.Process.Pid)); e != nil {
-		_ = processtree.Kill(cmd.Process.Pid, syscall.SIGKILL)
-		_ = cmd.Wait()
-		logFile.Close()
-		processtree.Release(cmd.Process.Pid)
-		close(w.processDone)
-		close(w.attachDone)
-		c.mu.Lock()
-		if c.workers[instanceID] == w {
-			delete(c.workers, instanceID)
-		}
-		c.mu.Unlock()
-		_ = c.opt.Store.CloseWorker(instanceID)
-		return "", e
-	}
-	c.logf("worker %s spawned pid=%d devices=[%s] plans=%d",
-		instanceID, cmd.Process.Pid, strings.Join(spec.Devices, ","), len(planIDs))
-	// THE OWNER DIALS (#436): one goroutine owns this worker's claim conversation for
-	// the life of its process, re-claiming across stream drops.
-	go c.attach(w)
-
-	// A worker row outliving its process is exactly the sidecar bug this design refuses:
-	// the row holds a device grant, so it dies with the process that held it.
-	go func() {
-		defer close(w.processDone)
-		err := cmd.Wait()
-		logFile.Close()
-		// The process is reaped: retire its containment handle so a reused pid can
-		// never meet a stale job (Windows; a no-op where the group is a kernel fact).
-		processtree.Release(cmd.Process.Pid)
-		c.mu.Lock()
-		current, live := c.workers[instanceID]
-		mine := live && current == w
-		controlledStop := mine && w.stopping
-		if mine {
-			w.exitCode = cmd.ProcessState.ExitCode()
-			// The entry STAYS, marked exited: a caller waiting on readiness needs to
-			// learn the worker is gone and where its log is, and a row that vanishes
-			// silently is the same lie as a row that outlives its process.
-			w.exited = true
-			if !controlledStop {
-				w.stopping = true // spontaneous exit owns cleanup until its row is closed
-			}
-			if w.bootID != "" {
-				delete(c.sessions, w.bootID)
-			}
-		}
-		cancelControl := w.cancelControl
-		c.mu.Unlock()
-		if cancelControl != nil {
-			cancelControl()
-		}
-		if mine {
-			if controlledStop {
-				return // the teardown that set stopping owns the row and recovery decision
-			}
-			<-w.attachDone
-			// Reclaimed BEFORE the row closes: the row holds the slot's device grant, so
-			// no replacement for this instance id can be spawned into the same root
-			// until it does.
-			c.reclaimWorker(instanceID)
-			closeProblem := c.opt.Store.CloseWorker(instanceID)
-			c.mu.Lock()
-			if c.workers[instanceID] == w {
-				delete(c.workers, instanceID)
-			}
-			close(w.stopped)
-			closing := c.closing
-			c.mu.Unlock()
-			if closeProblem != nil {
-				c.logf("worker %s exited (%v) but its durable row could not close: %s",
-					instanceID, err, closeProblem.Message)
-				return
-			}
-			c.logf("worker %s exited (%v); its device grant is released — log %s",
-				instanceID, err, logPath)
-			// The queue's answer to "does capacity exist" just changed, and so has the
-			// fate of anything this worker was RUNNING.
-			if !closing {
-				go c.recoverWorker(w.spec)
-			}
-		}
-	}()
-	return instanceID, nil
 }
 
 // newWorker is the one place a worker's observed state starts, and it starts UNKNOWN:
@@ -1884,6 +1568,14 @@ func keysOf(m map[string]bool) []string {
 	return out
 }
 
+// ClassicLocalRetired names work that only the retired classic local Runtime worker could
+// run. This computer executes through its machine's Host; such work is never revived.
+func ClassicLocalRetired() *exit.Error {
+	return exit.Named(exit.Conflict, "request.classic_local_retired",
+		"this work needs the retired classic local Runtime worker; this computer now runs work through its machine").
+		WithRemedy("submit it again with the current cozy; it runs on this computer's machine")
+}
+
 // StopGrace is how long a worker has between SIGTERM and SIGKILL. It is a CANCELLATION
 // BUDGET, not a wait for work to finish: the supervisor's own cooperative-cancel budget
 // plus the terminal transaction that follows it, which is what a worker still needs to do
@@ -2161,21 +1853,7 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	if e != nil {
 		return 0, 0, e
 	}
-	// A local worker that may have started before its birth identity was journaled keeps
-	// its row, so its devices stay reserved and its attempts unsettled; the daemon still
-	// starts for every other device and rental.
-	unresolved := map[string]bool{}
 	for _, row := range rows {
-		if row.WorkerID == "local" && row.State == "spawned_without_birth" { //cozy:venue classic worker for local model transfers until proto-062 PR 7
-			unresolved[row.InstanceID] = true
-			c.logf("worker %s may have started before its OS birth identity was journaled; devices [%s] stay reserved "+
-				"until the orphan is stopped and its row closed", row.InstanceID, strings.Join(row.Devices, ","))
-		}
-	}
-	for _, row := range rows {
-		if unresolved[row.InstanceID] {
-			continue
-		}
 		if row.PID > 0 && birthOf(row.PID) == row.Birth && row.Birth != "" {
 			_ = processtree.Kill(row.PID, syscall.SIGKILL)
 			killed++
@@ -2189,6 +1867,18 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		if e := c.opt.Store.CloseWorker(row.InstanceID); e != nil {
 			return killed, forgotten, e
 		}
+	}
+	// Work that only the retired classic local Runtime worker could run ends here, named,
+	// and custody no store can release any more (classic local, ended rentals) is forgotten.
+	retired, e := c.opt.Store.RetireClassicLocalWork()
+	if e != nil {
+		return killed, forgotten, e
+	}
+	for _, id := range retired {
+		c.logf("%s needed the retired classic local Runtime worker; ended as %s", id, records.ClassicLocalRetiredCode)
+	}
+	if e := c.opt.Store.ForgetEndedRentalCustody(); e != nil {
+		return killed, forgotten, e
 	}
 	// THE DISPATCH QUEUE IS MEMORY, AND THE AUTHORITY IS NOT. A request recorded as owed
 	// work before the crash has no attempt and no queue entry after it — it simply stopped
@@ -2209,46 +1899,25 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		go c.reviveQueue()
 	}
 	// AND THE ATTEMPTS THAT OWE A TERMINAL. Remote rentals reconnect to pod-supervisor,
-	// whose worker-local ledger replays their exact state. Local Runtime is stateless, so
-	// Creator settles its own persisted assignment as ABANDONED; restarting
-	// an execution child to ask it what happened would recreate the duplicate journal this
-	// boundary removes.
+	// whose worker-local ledger replays their exact state.
 	unsettled, e := c.opt.Store.Unsettled()
 	if e != nil {
 		return killed, forgotten, e
 	}
 	for _, req := range unsettled {
-		if req.Worker != "" {
-			// RECONNECTING ONLY WORKS IF THERE IS SOMETHING TO RECONNECT TO. pod-supervisor's
-			// ledger is what replays a remote attempt, and it lives on the pod: once the
-			// rental is gone or terminally failed, that ledger was destroyed with it and no
-			// amount of reconnecting will ever produce the terminal this attempt owes.
-			// Before this check the daemon said "reconnecting to its supervisor ledger" at
-			// every boot for a pod that had not existed for hours, and the request behind it
-			// could never settle (observed live: req-b2df33d17e663a8a1e047246, 2590 s and
-			// climbing on a destroyed container).
-			if !c.rentalCanServe(req.Worker) {
-				c.recoverPinned(req, req.Worker, c.lostRentalCause(req.Worker))
-				continue
-			}
-			c.logf("%s holds a remote attempt with no terminal; reconnecting to its supervisor ledger",
-				req.ID)
-			c.selectOrStart(req)
+		if req.Worker == "" {
 			continue
 		}
-		attempts, problem := c.opt.Store.Attempts(req.ID)
-		if problem != nil {
-			return killed, forgotten, problem
+		// RECONNECTING ONLY WORKS IF THERE IS SOMETHING TO RECONNECT TO. pod-supervisor's
+		// ledger is what replays a remote attempt, and it lives on the pod: once the rental
+		// is gone or terminally failed, that ledger was destroyed with it and no amount of
+		// reconnecting will ever produce the terminal this attempt owes.
+		if !c.rentalCanServe(req.Worker) {
+			c.recoverPinned(req, req.Worker, c.lostRentalCause(req.Worker))
+			continue
 		}
-		for _, attempt := range attempts {
-			if unresolved[attempt.InstanceID] {
-				continue
-			}
-			switch attempt.State {
-			case "preparing", "offered", "accepted", "recovered_open", "terminal":
-				c.settleLocalProcessDeath(attempt)
-			}
-		}
+		c.logf("%s holds a remote attempt with no terminal; reconnecting to its supervisor ledger", req.ID)
+		c.selectOrStart(req)
 	}
 	ready, e := c.opt.Store.ReadyRequeues()
 	if e != nil {

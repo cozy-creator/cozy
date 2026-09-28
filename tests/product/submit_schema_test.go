@@ -285,7 +285,7 @@ func ownerAtRoot(t *testing.T, root string) *owner {
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
 		MaxOutputMiB: 8,
 	}
-	options.Packages = cli.NewResolver(st, cfg, orchestrator.LocalDeviceEnvelope())
+	options.Packages = cli.NewResolver(st, cfg)
 	c, e := orchestrator.Open(options)
 	fatal(t, e)
 	go func() { _ = c.Serve() }()

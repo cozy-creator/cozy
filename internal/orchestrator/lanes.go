@@ -19,14 +19,6 @@ import (
 // keeps a seat ledger per lane beside the worker-level one and reserves against both. A worker that
 // reports no lanes — a minor-21 runtime, a job worker — is exactly the worker-level ledger,
 // which is byte for byte the behaviour before lanes were on the wire.
-//
-// LocalDeviceEnvelope is what this daemon GRANTS a local worker: the device names on its
-// `--devices` line, and the space a reported lane's ordinals index into. Lane ordinals are
-// positions in this envelope (`lane-0` over ordinal 0 is device "0"), so a lane is the
-// worker's own account of which granted device it serves. One device, until case B (cl-016
-// "Multi-GPU local": K independent placements on K lanes) has an owner — a wider envelope
-// with no pin refuses typed at the worker rather than idling cards (group-lanes ruling 3).
-func LocalDeviceEnvelope() []string { return []string{"0"} }
 
 // RentalDeviceEnvelope is the envelope a RENTED pod's worker holds: its width, spelled as
 // the ordinals its lanes index into. This daemon grants a rental nothing — the pod's cards

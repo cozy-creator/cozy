@@ -106,7 +106,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// advertises makes one rather than queueing for capacity nothing would create.
 	// The device envelope every local worker is granted; its reported lanes are ordinals
 	// into it, and dispatch draws a seat from the placement's lane (proto-024).
-	resolver := NewResolver(st, ctx.Cfg, orchestrator.LocalDeviceEnvelope())
+	resolver := NewResolver(st, ctx.Cfg)
 	// Two questions, deliberately not one object: the API resolves the persisted,
 	// non-secret attempt control (so a bad pin refuses before a request row), and the
 	// orchestrator resolves the dial triple at dial time. Only the second reads the token.
@@ -281,7 +281,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// (cl-097): an edit is rebuilt and every worker holding the package re-prepared before
 	// the next run asks. A watch that cannot be set up is reported, not fatal — runs still
 	// refresh at submission.
-	if _, e := startEditableSync(l, st, resolver, c, ctx.Out, quit); e != nil {
+	if _, e := startEditableSync(l, st, resolver, ctx.Out, quit); e != nil {
 		fmt.Fprintf(ctx.Out, "editable watch unavailable: %s\n", e.Message)
 	}
 	idle := idleWatch{debounce: ctx.Cfg.DaemonIdleShutdown, store: st, owner: c,

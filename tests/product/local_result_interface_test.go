@@ -34,7 +34,7 @@ func TestLocalResultInterfaceSurvivesInstallRemoval(t *testing.T) {
 	fatal(t, store.RecordMachineSubmission(request.ID, &pb.MachineExecutionSubmit{ExpectedExecutionWorkspaceId: "persistent-workspace", SubmissionId: request.IdemKey, CaptureCanonicalBytes: capture, CaptureDigest: captureDigest, Offer: &pb.AttemptOffer{RequestId: request.ID, AttemptOrdinal: 1, InvocationSpecCanonicalBytes: spec, InvocationSpecDigest: canonical.Digest(spec)}}))
 	// The accepted graph retains the schema itself, so no install or source files
 	// are needed and mutable replacement pins cannot alter the output contract.
-	resolver := cli.NewResolver(store, config.Config{Home: root, HubURL: "http://127.0.0.1:1"}, nil)
+	resolver := cli.NewResolver(store, config.Config{Home: root, HubURL: "http://127.0.0.1:1"})
 	bound, problem := resolver.CapturedByteOutputBound(request, "clip", "video/mp4")
 	fatal(t, problem)
 	if bound != 200000 {
