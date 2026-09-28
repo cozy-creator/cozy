@@ -20,8 +20,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// ToolFloor is the first released Runtime with everything this Cozy drives. Installers
-// upgrade this tool before replacing Cozy; the tool's worker wire minor is checked apart.
+// ToolFloor is the first released Runtime with everything this Cozy drives: a lower bound.
 // Distribution is the Runtime's Python distribution and executable name.
 const Distribution = "cozy-runtime"
 
@@ -40,9 +39,8 @@ var InstallCommand = fmt.Sprintf(
 	ToolFloor)
 
 // hostRuntimeInstall is the one remedy for a host tool this Cozy cannot drive.
-var hostRuntimeInstall = fmt.Sprintf(
-	"install cozy-runtime %s or newer supporting %s+minor.%d or newer: %s — then retry",
-	ToolFloor, wirePackage(), pb.MinCompatibleWireMinor, InstallCommand)
+var hostRuntimeInstall = fmt.Sprintf("install cozy-runtime %s or newer: %s — then retry",
+	ToolFloor, InstallCommand)
 
 func wirePackage() string { return string(pb.File_cozy_worker_v1_worker_proto.Package()) }
 
@@ -55,14 +53,10 @@ var hostRuntimeVerdicts = struct {
 	admitted map[string]bool
 }{admitted: map[string]bool{}}
 
-// Path is the admitted tool. A cozy-runtime on PATH is not yet a tool this daemon can drive. It must vendor this daemon's
-// wire package at MinCompatibleWireMinor or newer — the minor is additive, so a newer tool serves
-// an older daemon and an older tool cannot (cl-086's live run: a 0.0.29 tool (minor 16) under
-// a minor-22 daemon launched, never came READY, and the request sat `queued` with nothing
-// said). ToolFloor also requires the static script and managed-operation metadata contract.
-// It also requires Runtime-owned temporary image preparation (0.9.0).
-// Source-authored model default metadata requires 0.10.0.
-// The tool's own `version` verb is the fact, asked here.
+// Path is the admitted tool: a cozy-runtime on PATH of this daemon's wire package, at
+// ToolFloor or newer. The tool answers typed CLI verbs (describe, image preparation, builtin
+// metadata) and never speaks the worker wire, so its wire minor is not compared: an older or
+// newer tool serves this daemon. The tool's own `version` verb is the fact, asked here.
 func Path(env []string) (string, *exit.Error) {
 	path, err := exec.LookPath(Distribution)
 	if err != nil {
@@ -114,15 +108,15 @@ func admitHostRuntime(path string, env []string) *exit.Error {
 			"this host cannot read: %s", err)
 	}
 	spoken, minorText, ok := strings.Cut(answer.WireProtocol, "+minor.")
-	minor, err := strconv.ParseUint(minorText, 10, 32)
+	_, err = strconv.ParseUint(minorText, 10, 32)
 	if !ok || err != nil {
 		return unreadableHostRuntime(path, "`cozy-runtime --json version` names wire_protocol %q, "+
 			"not <package>+minor.<n>", answer.WireProtocol)
 	}
-	if spoken != wirePackage() || uint32(minor) < pb.MinCompatibleWireMinor {
+	if spoken != wirePackage() {
 		return exit.Named(exit.Structural, "host_runtime_wire_mismatch",
-			"cozy-runtime %s is release %s and speaks %s; this Cozy needs %s+minor.%d or newer",
-			path, answer.Distribution, answer.WireProtocol, wirePackage(), pb.MinCompatibleWireMinor).
+			"cozy-runtime %s is release %s and speaks %s; this Cozy speaks %s",
+			path, answer.Distribution, answer.WireProtocol, wirePackage()).
 			WithRemedy("%s", hostRuntimeInstall)
 	}
 	release, err := pep440.Parse(answer.Distribution)
