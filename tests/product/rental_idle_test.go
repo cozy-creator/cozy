@@ -65,12 +65,6 @@ type fakeRentalHub struct {
 	reads int
 }
 
-func (h *fakeRentalHub) rentalReads() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.reads
-}
-
 func newFakeRentalHub(t *testing.T, port int) *fakeRentalHub {
 	t.Helper()
 	h := &fakeRentalHub{rentals: map[string]map[string]any{}, released: map[string]int{}, publishes: true}

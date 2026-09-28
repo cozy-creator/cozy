@@ -67,8 +67,6 @@ type fakePod struct {
 	mediaRequest     func(http.ResponseWriter, *http.Request) bool
 	// sourceRuntime delegates checkpoint metadata/bytes to an actual installed Runtime.
 	sourceRuntime pb.RuntimePreparationClient
-	sourceRelease func(context.Context, *pb.ModelSourceReleaseCall) (*pb.ReleaseModelSourceResult, error)
-	sourceControl func(*pb.ModelSourceControlCall) (*pb.ModelSourceControlResult, error)
 	weightsReady  func(*pb.WeightsIntentReadyRequest) (*pb.WeightsHostAck, error)
 	protocolInfo  func(context.Context, *pb.ProtocolInfoRequest) (*pb.ProtocolInfoResult, error)
 	watchProgress func(*pb.ProgressOpen, pb.WorkerControl_WatchProgressServer) error
