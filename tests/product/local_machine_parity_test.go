@@ -217,6 +217,12 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 		if kind == "request.rentals" || kind == "request.placement" || kind == "machine.collected" {
 			continue
 		}
+		// Progress is lossy by design: the machine records it only while the run lives, so a
+		// frame that reaches it after the terminal is dropped on one venue and not the other.
+		fields, _ := event.Payload["fields"].(map[string]any)
+		if kind == "machine.progress" || kind == "request.progress" || kind == "request.log" && fields["position"] != nil {
+			continue
+		}
 		if kind == "request.preparing" {
 			kind += ":" + fmt.Sprint(event.Payload["stage"])
 		}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -349,6 +350,32 @@ def grow(ctx: Context, payload: Request, out: Outputs) -> Grown:
 	movie, err := os.ReadFile(filepath.Join(directory, strings.TrimPrefix(last.Digest, "sha256:")+".mp4"))
 	if err != nil || digestOf(movie) != last.Digest {
 		t.Fatalf("the final MP4 is not the last revision: %v", err)
+	}
+	// The outputs folder holds only each run's final files: its single outputs' last revisions
+	// and its list items. No partial file outlives its run, and no superseded revision is
+	// ever written there; the daemon's product store keeps those.
+	var finals []string
+	requests, problem := store.Requests("", "local/output-log-proof", 10)
+	fatal(t, problem)
+	for _, row := range requests {
+		export, problem := store.OutputExportOf(row.ID)
+		fatal(t, problem)
+		if export != nil {
+			finals = append(finals, export.PublishedPaths...)
+		}
+	}
+	entries, err := os.ReadDir(directory)
+	must(t, err)
+	var present []string
+	for _, entry := range entries {
+		present = append(present, filepath.Join(directory, entry.Name()))
+	}
+	// Runs that made the same bytes share one content-addressed file.
+	slices.Sort(finals)
+	finals = slices.Compact(finals)
+	slices.Sort(present)
+	if !slices.Equal(present, finals) {
+		t.Fatalf("the outputs folder is not exactly the runs' final files:\nhas  %v\nwant %v", present, finals)
 	}
 	t.Logf("the film as the CLI showed it:\n%s", filmed.String())
 	if asked := hubCalls()[before:]; len(asked) != 0 {
