@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,8 +18,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/host/outputs"
 	"github.com/cozy-creator/cozy/internal/runoutputs"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 var _ outputs.Source = (*Machine)(nil)
@@ -30,15 +33,73 @@ func (m *Machine) Keys() ([]ed25519.PublicKey, <-chan struct{}) {
 	return append([]ed25519.PublicKey(nil), m.claims.authorized...), m.claims.changed
 }
 
-// request is the query that names run n's execution, asking the Runtime by number.
-func (m *Machine) request(ctx context.Context, run uint64) (*pb.MachineExecutionQuery, error) {
-	if run == 0 {
-		return nil, outputs.ErrNotFound
+// A finished run's log is immutable, so the machine keeps it: the product and terminal entries,
+// under the machine's state, one file per run and journal. Media of a finished run is read
+// from that record and the TensorFS store alone; it never starts a stopped Runtime, and no read
+// renews idle. Only a live run's log comes from its Runtime, which a live run keeps up.
+
+func (m *Machine) runsDir(workspace string) string {
+	return filepath.Join(m.layout.State, "runs", workspace)
+}
+
+// journal is the Runtime journal whose run numbers the machine last saw.
+func (m *Machine) journal() string {
+	raw, _ := os.ReadFile(filepath.Join(m.layout.State, "runs", "journal"))
+	return strings.TrimSpace(string(raw))
+}
+
+func (m *Machine) sawJournal(workspace string) {
+	if workspace != "" && workspace != m.journal() && filepath.Base(workspace) == workspace {
+		_ = writeAtomic(filepath.Join(m.layout.State, "runs", "journal"), []byte(workspace+"\n"), 0o600)
 	}
-	conn, err := m.runtime(ctx)
+}
+
+func (m *Machine) archived(run uint64) ([]*pb.MachineExecutionEvent, bool) {
+	workspace := m.journal()
+	if workspace == "" {
+		return nil, false
+	}
+	raw, err := os.ReadFile(filepath.Join(m.runsDir(workspace), strconv.FormatUint(run, 10)+".pb"))
+	page := &pb.MachineExecutionEventPage{}
+	if err != nil || proto.Unmarshal(raw, page) != nil {
+		return nil, false
+	}
+	return page.Events, true
+}
+
+func (m *Machine) archive(workspace string, run uint64, events []*pb.MachineExecutionEvent) {
+	if workspace == "" || filepath.Base(workspace) != workspace {
+		return
+	}
+	raw, err := proto.Marshal(&pb.MachineExecutionEventPage{Events: events})
+	if err == nil {
+		err = writeAtomic(filepath.Join(m.runsDir(workspace), strconv.FormatUint(run, 10)+".pb"), raw, 0o600)
+	}
 	if err != nil {
-		return nil, err
+		fmt.Fprintf(m.log, "cozy machine: run %d's finished log was not kept: %v\n", run, err)
 	}
+}
+
+// liveRuntime is the running Runtime, waiting while it boots. It never launches one.
+func (m *Machine) liveRuntime(ctx context.Context) (*grpc.ClientConn, error) {
+	m.mu.Lock()
+	p, ready := m.proc, m.ready
+	m.mu.Unlock()
+	if p == nil || p.exited() {
+		return nil, outputs.ErrUnavailable
+	}
+	select {
+	case <-ready:
+		return m.conn, nil
+	case <-p.done:
+		return nil, outputs.ErrUnavailable
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// request is the query that names run n's execution, asking the Runtime by number.
+func (m *Machine) request(ctx context.Context, conn *grpc.ClientConn, run uint64) (*pb.MachineExecutionQuery, error) {
 	list, err := pb.NewWorkerControlClient(conn).ListMachineExecutions(ctx, &pb.MachineExecutionListQuery{
 		Claim: m.claims.claim, AfterNumber: run - 1, Limit: 1})
 	switch {
@@ -50,30 +111,45 @@ func (m *Machine) request(ctx context.Context, run uint64) (*pb.MachineExecution
 		return nil, outputs.ErrNotFound
 	}
 	state := list.Executions[0]
-	return &pb.MachineExecutionQuery{Claim: m.claims.claim, RequestId: state.RequestId,
-		ExpectedExecutionWorkspaceId: cmpOr(state.ExecutionWorkspaceId, list.ExecutionWorkspaceId)}, nil
+	workspace := cmpOr(state.ExecutionWorkspaceId, list.ExecutionWorkspaceId)
+	m.sawJournal(workspace)
+	return &pb.MachineExecutionQuery{Claim: m.claims.claim, RequestId: state.RequestId, ExpectedExecutionWorkspaceId: workspace}, nil
 }
 
 // runLog is a run's log read from its start, folded into items.
 type runLog struct {
 	fold     *runoutputs.Fold
 	entries  []outputs.Entry
+	kept     []*pb.MachineExecutionEvent // the product and terminal entries
 	terminal bool
 	next     uint64
 }
 
-// read folds run's log; with wait and nothing after `after`, it holds one read open at the tail.
+func newRunLog(run uint64) *runLog { return &runLog{fold: runoutputs.New(strconv.FormatUint(run, 10))} }
+
+// read folds run's log: a finished run from its record, a live one from the Runtime, where with
+// wait and nothing after `after` it holds one read open at the tail.
 func (m *Machine) read(ctx context.Context, run, after uint64, wait bool) (*runLog, error) {
-	request, err := m.request(ctx, run)
+	if run == 0 {
+		return nil, outputs.ErrNotFound
+	}
+	if events, ok := m.archived(run); ok {
+		l := newRunLog(run)
+		for _, event := range events {
+			l.add(event)
+		}
+		return l.final(), nil
+	}
+	conn, err := m.liveRuntime(ctx)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := m.runtime(ctx)
+	request, err := m.request(ctx, conn, run)
 	if err != nil {
 		return nil, err
 	}
 	client := pb.NewWorkerControlClient(conn)
-	l := &runLog{fold: runoutputs.New(strconv.FormatUint(run, 10))}
+	l := newRunLog(run)
 	page := func(wait bool) (*pb.MachineExecutionEventPage, error) {
 		answer, err := client.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{
 			Execution: request, After: l.next, Wait: wait})
@@ -102,15 +178,50 @@ func (m *Machine) read(ctx context.Context, run, after uint64, wait bool) (*runL
 			return nil, err
 		}
 	}
-	if l.terminal { // the terminal entry follows: each item's current revision is final
-		for i := range l.entries {
-			entry := &l.entries[i]
-			if item, ok := l.fold.Item(entry.Output, listIndex(entry.Index)); ok && entry.Status == "" && entry.Rev == uint64(item.Current.Rev) {
-				entry.SHA256 = item.Current.Digest
+	if l.terminal {
+		m.archive(request.ExpectedExecutionWorkspaceId, run, l.kept)
+	}
+	return l.final(), nil
+}
+
+// final names the digest of every item's current revision once the terminal entry follows.
+func (l *runLog) final() *runLog {
+	if !l.terminal {
+		return l
+	}
+	for i := range l.entries {
+		entry := &l.entries[i]
+		if item, ok := l.fold.Item(entry.Output, listIndex(entry.Index)); ok && entry.Status == "" && entry.Rev == uint64(item.Current.Rev) {
+			entry.SHA256 = item.Current.Digest
+		}
+	}
+	return l
+}
+
+// keepFinished records every finished run the Runtime has not yet had recorded, so its media
+// outlives the Runtime: before the machine stops its Runtime, and whenever its work settles.
+func (m *Machine) keepFinished(ctx context.Context) {
+	conn, err := m.liveRuntime(ctx)
+	if err != nil {
+		return
+	}
+	for after := uint64(0); ; {
+		list, err := pb.NewWorkerControlClient(conn).ListMachineExecutions(ctx, &pb.MachineExecutionListQuery{
+			Claim: m.claims.claim, AfterNumber: after, Limit: 256})
+		if err != nil || len(list.Executions) == 0 {
+			return
+		}
+		m.sawJournal(list.ExecutionWorkspaceId)
+		for _, state := range list.Executions {
+			after = max(after, state.Number)
+			if _, kept := m.archived(state.Number); state.Number == 0 || state.FinishedAtMs == 0 || kept {
+				continue
+			}
+			if _, err := m.read(ctx, state.Number, 0, false); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(m.log, "cozy machine: run %d's finished log was not kept: %v\n", state.Number, err)
 			}
 		}
 	}
-	return l, nil
 }
 
 func listIndex(index int) uint32 {
@@ -122,6 +233,9 @@ func listIndex(index int) uint32 {
 
 func (l *runLog) add(event *pb.MachineExecutionEvent) {
 	l.next = max(l.next, event.Sequence)
+	if event.Product != nil || event.Outcome != nil {
+		l.kept = append(l.kept, event)
+	}
 	switch {
 	case event.Product != nil:
 		item, _, err := l.fold.Add(event.Sequence, event.Product)

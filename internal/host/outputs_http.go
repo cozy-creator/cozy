@@ -46,6 +46,9 @@ func (m *Machine) serveOutput(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, outputs.ErrNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
+	case errors.Is(err, outputs.ErrUnavailable):
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
 	case errors.Is(err, outputs.ErrUpdateRequired):
 		http.Error(w, "capability_unavailable: "+err.Error(), http.StatusNotImplemented)
 		return

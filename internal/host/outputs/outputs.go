@@ -39,6 +39,7 @@ type Entry struct {
 var (
 	ErrNotFound       = errors.New("this machine has no such run or output")
 	ErrUpdateRequired = errors.New("this machine's Runtime predates run outputs; update the machine's Runtime")
+	ErrUnavailable    = errors.New("this run is live or unrecorded and the machine's Runtime is stopped")
 )
 
 // Source is a machine's outputs and the keys that may read them.

@@ -46,7 +46,8 @@ type Machine struct {
 	ready      chan struct{} // closed once the current Runtime is claimed
 	runtimeAck *pb.ClaimAck
 	releasing  bool
-	control    uint64 // Control streams answered
+	control    uint64     // Control streams answered
+	keeping    sync.Mutex // one pass of keepFinished at a time
 	wake       chan struct{}
 	preparing  sync.WaitGroup
 	active     int
@@ -122,10 +123,10 @@ func Run(ctx context.Context, g *Grant, log io.Writer) error {
 	go func() { errs <- m.supervise(ctx) }()
 	select {
 	case err := <-errs:
-		m.stopRuntime()
+		m.keepAndStop()
 		return err
 	case err := <-listeners.failed:
-		m.stopRuntime()
+		m.keepAndStop()
 		return err
 	}
 }
@@ -359,6 +360,7 @@ func (m *Machine) observeCache(o cacheObservation) {
 // supervise is the machine's one loop: Runtime exits, activity, and the idle release.
 func (m *Machine) supervise(ctx context.Context) error {
 	work := &activity{path: m.layout.boot("worker-activity"), log: m.log}
+	wasBusy := false
 	var nextAsk time.Time
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
@@ -376,6 +378,10 @@ func (m *Machine) supervise(ctx context.Context) error {
 		if m.running() {
 			busy, err = work.observe(now)
 		}
+		if wasBusy && !busy && err == nil {
+			go m.keepSettled()
+		}
+		wasBusy = busy && err == nil
 		if err := m.restarts.observe(busy, err); err != nil {
 			return err
 		}
@@ -461,7 +467,7 @@ func (m *Machine) release(ctx context.Context) (bool, error) {
 	m.mu.Lock()
 	m.releasing = true
 	m.mu.Unlock()
-	m.stopRuntime()
+	m.keepAndStop()
 	call, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	err := m.hub.release(call)
@@ -543,4 +549,23 @@ func (m *Machine) heldClaim() *pb.ClaimAck {
 		return nil
 	}
 	return ack
+}
+
+// keepAndStop records finished runs, then stops the Runtime.
+func (m *Machine) keepAndStop() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	m.keepFinished(ctx)
+	cancel()
+	m.stopRuntime()
+}
+
+// keepSettled records finished runs once work settles; one pass at a time.
+func (m *Machine) keepSettled() {
+	if !m.keeping.TryLock() {
+		return
+	}
+	defer m.keeping.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	m.keepFinished(ctx)
 }
