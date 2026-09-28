@@ -13,6 +13,8 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 )
 
 // handleRentalLogs is `cozy rental logs <rental>`: every line the provider logged while the
@@ -27,25 +29,10 @@ func handleRentalLogs(ctx *Context) *exit.Error {
 		}
 		attempt = n
 	}
-	daemon, problem := dial(ctx)
-	if problem != nil {
-		return problem
-	}
-	inventory, problem := daemon.RentalInventory(context.Background(), true, true)
-	if problem != nil {
-		return problem
-	}
 	subject := strings.TrimSpace(ctx.Inv.Args[0])
-	id, origin := "", ""
-	for _, row := range append(append(inventory.Rentals, inventory.Unrecorded...), inventory.Pending...) {
-		if row.ID != "" && (row.ID == subject || row.MachineName == subject) {
-			id, origin = row.ID, row.Hub
-			break
-		}
-	}
-	if id == "" {
-		return exit.Named(exit.NotFound, "rental.unknown", "no listed rental is named %q", subject).
-			WithNext("cozy rental list --all-hubs")
+	id, origin, problem := rentalLogSubject(ctx, subject)
+	if problem != nil {
+		return problem
 	}
 	hubClient := client(ctx.forHub(origin))
 	interrupt := make(chan os.Signal, 1)
@@ -103,4 +90,36 @@ func handleRentalLogs(ctx *Context) *exit.Error {
 		case <-time.After(pollCadence):
 		}
 	}
+}
+
+// rentalLogSubject names a rental and its Hub: this host's record of it, ended ones included,
+// else the Hubs' listings, else the id as typed on the command's Hub.
+func rentalLogSubject(ctx *Context, typed string) (id, origin string, problem *exit.Error) {
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return "", "", problem
+	}
+	recorded, problem := rental.Resolve(store, typed)
+	store.Close()
+	if problem != nil || recorded.RentalID != "" {
+		return recorded.RentalID, recorded.Hub, problem
+	}
+	daemon, problem := dial(ctx)
+	if problem != nil {
+		return "", "", problem
+	}
+	inventory, problem := daemon.RentalInventory(context.Background(), true, true)
+	if problem != nil {
+		return "", "", problem
+	}
+	for _, row := range append(append(inventory.Rentals, inventory.Unrecorded...), inventory.Pending...) {
+		if row.ID != "" && (row.ID == typed || row.MachineName == typed) {
+			return row.ID, row.Hub, nil
+		}
+	}
+	if rentalid.Valid(typed) {
+		return typed, "", nil
+	}
+	return "", "", exit.Named(exit.NotFound, "rental.unknown", "no rental is named %q", typed).
+		WithNext("cozy rental list --all-hubs")
 }

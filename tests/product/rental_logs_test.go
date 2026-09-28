@@ -16,8 +16,8 @@ import (
 
 // `cozy rental logs` reads a rental's provider boot log from its Hub through the daemon: an
 // older Hub that keeps none says so; a newer one's pages print in order with each line's time
-// and step, --json is one document, and -f follows onto a replanned attempt and waits for new
-// lines until the rental is no longer booting.
+// and step, --json is one document, -f follows onto a replanned attempt and waits for new
+// lines until the rental is no longer booting, and the log still reads once the rental ended.
 func TestRentalLogsPrintsTheProviderBootLog(t *testing.T) {
 	root := filepath.Join(scratchBase, "rental-logs")
 	must(t, os.RemoveAll(root))
@@ -96,5 +96,13 @@ func TestRentalLogsPrintsTheProviderBootLog(t *testing.T) {
 	if code != 0 || !strings.Contains(out, want+"attempt 2 of 2\n") || !strings.HasSuffix(out,
 		"2026-09-25T20:50:43Z  starting_container  start container for index.docker.io/tensorhub/worker: begin\n") {
 		t.Fatalf("-f did not follow onto the replanned attempt and its new line [exit %d]:\n%s", code, out)
+	}
+	// The log outlives the pod: an ended rental no Hub lists any more still reads by name.
+	hub.setState("pr-bootlog", "released", "")
+	if code, out := runCozy(t, root, "rental", "list", "--no-watch"); code != 0 || strings.Contains(out, "otter") {
+		t.Fatalf("the ended rental is still listed [exit %d]:\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "rental", "logs", "otter", "--attempt", "1"); code != 0 || !strings.Contains(out, want) {
+		t.Fatalf("an ended rental's log did not read by name [exit %d]:\n%s", code, out)
 	}
 }
