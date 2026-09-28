@@ -8,10 +8,10 @@
 //!    `{"lane":"..","ref":"org/name[@release]","after":hex?,"limit":N?}`
 //!    → `{"complete":bool,"lane":..,"manifest":{"length":N,"sha256":hex},"model":"org/name",
 //!       "objects":[{"length":N,"sha256":hex},...],"presign_max_digests":N,"release":..,
-//!       "scope":"runtime","stamps":{key:[values]}}` — NO URLs. `objects` is sorted
-//!    unique by digest and EXCLUDES the manifest row, which travels in `manifest` on
-//!    EVERY page. `scope` names the walk the closure covers (`runtime` today); `stamps`
-//!    is the resolved lane's stamped-fact set (#567d) and may be absent.
+//!       "scope":"runtime"}` — NO URLs. `objects` is sorted unique by digest and EXCLUDES
+//!    the manifest row, which travels in `manifest` on EVERY page. `scope` names the walk
+//!    the closure covers (`runtime` today). Every field is required: a hub that omits one
+//!    predates this protocol and is refused by name.
 //! 2. `POST {base}/v1/tensorfs/presign`, body `{"digests":[hex,...]}` (sorted unique, at
 //!    most the `presign_max_digests` the closure declared) →
 //!    `{"expires_at_unix":N,"server_time_unix":N,"urls":{hex:"https://...",...}}` — URLs
@@ -144,13 +144,10 @@ pub struct Closure {
     pub manifest: ObjectRef,
     /// Sorted unique by digest; EXCLUDES the manifest row.
     pub objects: Vec<ObjectRef>,
-    pub stamps: Vec<(String, Vec<String>)>,
     /// False when more object rows follow this page.
     pub complete: bool,
-    /// The largest presign ask the HUB will read, as the hub itself stated it. `None` when
-    /// it declared nothing — there is then no bound this side may invent, so the caller
-    /// falls back to something derived from a fact it owns.
-    pub presign_max_digests: Option<usize>,
+    /// The largest presign ask the HUB will read, as the hub itself stated it.
+    pub presign_max_digests: usize,
 }
 
 /// ONE PAGE of a closure. `after` is the last digest of the page before it, exclusive;
@@ -169,8 +166,7 @@ pub fn closure(
     ledger: &Ledger,
 ) -> Result<Closure> {
     // No `limit`: a page size is the hub's to choose, and a client that named one would be
-    // guessing at a bound it does not own. `after` is omitted entirely on the first page so
-    // the request is the one an unpaginated hub already understands.
+    // guessing at a bound it does not own. `after` is omitted on the first page.
     let mut fields = vec![("lane", Value::str(lane)), ("ref", Value::str(refspec))];
     if !after.is_empty() {
         fields.insert(0, ("after", Value::str(after)));
@@ -193,7 +189,7 @@ pub fn closure(
             .map(|(_, v)| v)
             .ok_or_else(|| Refusal {
                 code: Code::HUB_REFUSED,
-                detail: format!("the closure response carries no {name:?} field"),
+                detail: format!("the closure response carries no {name:?} field; update Tensorhub"),
             })
     };
     let manifest = object_row("closure.manifest", field("manifest")?)?;
@@ -205,53 +201,33 @@ pub fn closure(
         }
     }
     objects = sorted_unique(objects)?;
-    let scope = match obj.iter().find(|(k, _)| k == "scope") {
-        Some((_, v)) => as_str("closure", "scope", v)?.to_string(),
-        None => "runtime".to_string(),
-    };
+    let scope = as_str("closure", "scope", field("scope")?)?.to_string();
     if scope != "runtime" {
         return refuse(
             Code::HUB_REFUSED,
             format!("closure scope {scope:?} is not one this build proves; runtime only"),
         );
     }
-    let mut stamps = Vec::new();
-    if let Some((_, raw)) = obj.iter().find(|(k, _)| k == "stamps") {
-        for (key, values) in as_obj("closure", "stamps", raw)? {
-            let mut out = Vec::new();
-            for v in as_arr("closure.stamps", key, values)? {
-                out.push(as_str("closure.stamps", key, v)?.to_string());
-            }
-            if !out.is_empty() {
-                stamps.push((key.clone(), out));
-            }
-        }
-    }
-    // An absent `complete` is a hub that does not paginate, and everything it sent IS the
-    // closure. A hub that paginates says so on every page.
-    let complete = match obj.iter().find(|(k, _)| k == "complete") {
-        Some((_, Value::Bool(done))) => *done,
-        Some((_, other)) => {
+    let complete = match field("complete")? {
+        Value::Bool(done) => *done,
+        other => {
             return refuse(
                 Code::HUB_REFUSED,
                 format!("closure.complete is {other:?}, not a boolean"),
             )
         }
-        None => true,
     };
-    let presign_max_digests = match obj.iter().find(|(k, _)| k == "presign_max_digests") {
-        Some((_, raw)) => {
-            let declared = as_uint("closure", "presign_max_digests", raw)?;
-            if declared == 0 {
-                return refuse(
-                    Code::HUB_REFUSED,
-                    "the hub declared presign_max_digests = 0, which authorizes no ask at all",
-                );
-            }
-            Some(declared as usize)
-        }
-        None => None,
-    };
+    let presign_max_digests = as_uint(
+        "closure",
+        "presign_max_digests",
+        field("presign_max_digests")?,
+    )? as usize;
+    if presign_max_digests == 0 {
+        return refuse(
+            Code::HUB_REFUSED,
+            "the hub declared presign_max_digests = 0, which authorizes no ask at all",
+        );
+    }
     Ok(Closure {
         model: as_str("closure", "model", field("model")?)?.to_string(),
         release: as_str("closure", "release", field("release")?)?.to_string(),
@@ -259,7 +235,6 @@ pub fn closure(
         scope,
         manifest,
         objects,
-        stamps,
         complete,
         presign_max_digests,
     })
@@ -376,12 +351,11 @@ fn sorted_unique(mut objects: Vec<ObjectRef>) -> Result<Vec<ObjectRef>> {
 ///
 /// The lifetime is read from the hub's OWN clock — `expires_at_unix - server_time_unix` —
 /// never from this machine's, so a skewed local clock cannot make a live URL look dead or a
-/// dead one look live. `None` when the hub declared neither field: there is then nothing to
-/// judge a URL's age against, and the caller's mint window is the only bound on it.
+/// dead one look live.
 #[derive(Debug, Clone, Default)]
 pub struct Presigned {
     pub urls: Vec<(String, String)>,
-    pub lifetime: Option<std::time::Duration>,
+    pub lifetime: std::time::Duration,
 }
 
 /// Mint URLs for exactly `digests` — sorted unique bare hex, which is what the hub accepts
@@ -412,26 +386,19 @@ pub fn presign(
         ledger,
     )?;
     let obj = as_obj("presign", "response", &value)?;
-    let urls = obj
-        .iter()
-        .find(|(k, _)| k == "urls")
-        .map(|(_, v)| v)
-        .ok_or_else(|| Refusal {
-            code: Code::HUB_REFUSED,
-            detail: "the presign response carries no \"urls\" field".into(),
-        })?;
-    let rows = as_obj("presign", "urls", urls)?;
-    let field = |name: &str| obj.iter().find(|(k, _)| k == name).map(|(_, v)| v);
-    let lifetime = match (field("expires_at_unix"), field("server_time_unix")) {
-        (Some(expires), Some(server_now)) => {
-            let expires = as_uint("presign", "expires_at_unix", expires)?;
-            let server_now = as_uint("presign", "server_time_unix", server_now)?;
-            Some(std::time::Duration::from_secs(
-                expires.saturating_sub(server_now),
-            ))
-        }
-        _ => None,
+    let field = |name: &str| {
+        obj.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+            .ok_or_else(|| Refusal {
+                code: Code::HUB_REFUSED,
+                detail: format!("the presign response carries no {name:?} field; update Tensorhub"),
+            })
     };
+    let rows = as_obj("presign", "urls", field("urls")?)?;
+    let expires = as_uint("presign", "expires_at_unix", field("expires_at_unix")?)?;
+    let server_now = as_uint("presign", "server_time_unix", field("server_time_unix")?)?;
+    let lifetime = std::time::Duration::from_secs(expires.saturating_sub(server_now));
     let mut out = Vec::new();
     for digest in digests {
         match rows.iter().find(|(k, _)| k == digest) {

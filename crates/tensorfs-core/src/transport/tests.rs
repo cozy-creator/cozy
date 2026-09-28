@@ -389,10 +389,8 @@ fn closure_value(checkpoint: &Checkpoint, base: &str) -> Value {
         ),
         ("release", Value::str("r1")),
         ("scope", Value::str("runtime")),
-        (
-            "stamps",
-            Value::obj(vec![("family", Value::arr(vec![Value::str("dit")]))]),
-        ),
+        ("complete", Value::Bool(true)),
+        ("presign_max_digests", Value::uint(1956)),
     ])
 }
 
@@ -410,7 +408,15 @@ fn presign_value(request_body: &[u8], base: &str) -> Value {
             (hex, Value::str(url))
         })
         .collect();
-    Value::obj(vec![("urls", Value::map(urls))])
+    let server_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    Value::obj(vec![
+        ("expires_at_unix", Value::uint(server_now + 3600)),
+        ("server_time_unix", Value::uint(server_now)),
+        ("urls", Value::map(urls)),
+    ])
 }
 
 /// The standard hub emulation: closure + presign + object GETs, with per-object override.
@@ -597,10 +603,6 @@ fn cold_pull_lands_and_warm_pull_moves_nothing() {
     );
     assert_eq!(report.model, "acme/model");
     assert_eq!(report.release, "r1");
-    assert_eq!(
-        report.stamps,
-        vec![("family".to_string(), vec!["dit".to_string()])]
-    );
     // Cold acquisition may retry a delayed response under concurrent CI load.
     // Warm reuse must add exactly the closure request, regardless of those retries.
     let calls_after_cold = origin.total_hits();
@@ -665,7 +667,8 @@ fn a_go_hubs_ordinary_json_pulls() {
         let body = format!(
             "{{\n  \"model\": \"acme/model\",\n  \"release\": \"r1\",\n  \"lane\": \"public\",\n  \
              \"scope\": \"runtime\",\n  \"note\": \"weights \\u0026 configs \u{2014} ready\",\n  \
-             \"ratio\": 0.5,\n  \"stamps\": null,\n  \"presign_max_digests\": null,\n  \
+             \"ratio\": 0.5,\n  \"retired\": null,\n  \"complete\": true,\n  \
+             \"presign_max_digests\": 1956,\n  \
              \"manifest\": {},\n  \"objects\": [\n    {}\n  ]\n}}",
             go_row(&c.manifest),
             rows.join(",\n    ")
@@ -680,7 +683,6 @@ fn a_go_hubs_ordinary_json_pulls() {
     let report = pull(&request_for(&store, &origin.base, &policy)).unwrap();
     assert_eq!(report.declared, checkpoint.objects.len() as u64 + 1);
     assert_eq!(report.fetched, checkpoint.objects.len() as u64 + 1);
-    assert!(report.stamps.is_empty());
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1518,11 +1520,11 @@ fn minting_hub(
                 let Value::Obj(mut fields) = closure_value(&checkpoint, &base) else {
                     panic!("the closure emulation is an object")
                 };
-                fields.push((
-                    "presign_max_digests".to_string(),
-                    Value::uint(window as u64),
-                ));
-                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                for (key, value) in &mut fields {
+                    if key == "presign_max_digests" {
+                        *value = Value::uint(window as u64);
+                    }
+                }
                 ok_json(&Value::Obj(fields))
             }
             ("POST", "/v1/tensorfs/presign") => {
@@ -1941,9 +1943,9 @@ fn retryable_status_buys_a_reask_and_authorization_answers_do_not() {
     assert_eq!(origin.hits(&format!("/obj/{flaky}")), 2);
 
     // A 403 against a URL minted moments ago: one ask, a typed refusal, no retry. The
-    // reason is the LEASE, not the status — this hub declares no lifetime, so there is
-    // nothing to argue that time was the cause, and re-minting would ask the same
-    // question. A 403 against a lease the hub's own declared life says is spent is
+    // reason is the LEASE, not the status — the lease holds nearly all of its declared
+    // life, so there is nothing to argue that time was the cause, and re-minting would ask
+    // the same question. A 403 against a lease the hub's own declared life says is spent is
     // re-minted instead; that half is
     // `a_403_is_judged_by_the_leases_age_and_not_by_a_count`.
     let store2root = temporary("retry-expired");
@@ -3079,8 +3081,7 @@ struct Wire {
 /// ceiling it derived from its own body cap, and REFUSES an oversized body rather than
 /// truncating it.
 ///
-/// `ceiling` of `None` is a hub that declares nothing, which is the skew a client must also
-/// survive.
+/// `ceiling` of `None` is a hub from before the ceiling was declared, which a client refuses.
 fn wire_hub_origin(
     checkpoint: Arc<Checkpoint>,
     request_cap: usize,
@@ -3262,29 +3263,27 @@ fn a_closure_is_paginated_and_every_page_names_one_tree() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// **A hub that declares no ceiling gets a window derived from a fact this side owns.**
-///
-/// The fallback is `streams`: mint exactly what is in flight. It is a degradation and not a
-/// guess — a few hundred bytes per call, safe under any body cap a hub could have — and it
-/// is deliberately not a number picked to be "probably under" whatever the hub's cap is.
+/// **A hub that declares no ceiling predates the protocol and is refused by name.**
 #[test]
-fn a_hub_that_declares_no_ceiling_mints_one_wave_at_a_time() {
+fn a_hub_that_declares_no_ceiling_is_refused() {
     let root = temporary("wire-noceiling");
     let store = Store::init(&root).unwrap();
     let checkpoint = Arc::new(checkpoint(30, 1024));
     let hub = wire_hub_origin(Arc::clone(&checkpoint), 128 << 10, usize::MAX, None);
     let policy = SourcePolicy::default();
-    let mut request = request_for(&store, &hub.origin.base, &policy);
-    request.streams = 4;
-    let report = pull(&request).unwrap();
-    assert_eq!(report.fetched, checkpoint.objects.len() as u64 + 1);
-    // A window of 4 over 32 objects is many calls, and each one is tiny.
-    let largest = hub.largest_presign.load(Ordering::Relaxed);
+    let refusal = pull(&request_for(&store, &hub.origin.base, &policy)).unwrap_err();
+    assert_eq!(refusal.code, Code::HUB_REFUSED);
     assert!(
-        largest <= 13 + 67 * 4,
-        "a fallback window sent a {largest} B body"
+        refusal.detail.contains("presign_max_digests"),
+        "{}",
+        refusal.detail
     );
-    assert!(hub.mints.load(Ordering::Relaxed) >= 8);
+    assert!(
+        refusal.detail.contains("update Tensorhub"),
+        "{}",
+        refusal.detail
+    );
+    assert_eq!(hub.mints.load(Ordering::Relaxed), 0);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3334,7 +3333,7 @@ fn a_403_is_judged_by_the_leases_age_and_not_by_a_count() {
         super::pull::Lease {
             url: "http://127.0.0.1:1/stale".into(),
             minted: Instant::now() - declared,
-            lifetime: Some(declared),
+            lifetime: declared,
         },
     );
     let minted = super::pull::ObjectUrls::url_for(&leases, 0, &object, true)
@@ -3352,7 +3351,7 @@ fn a_403_is_judged_by_the_leases_age_and_not_by_a_count() {
         super::pull::Lease {
             url: "http://127.0.0.1:1/fresh".into(),
             minted: Instant::now(),
-            lifetime: Some(declared),
+            lifetime: declared,
         },
     );
     let refusal = super::pull::ObjectUrls::url_for(&leases, 0, &object, true)
@@ -3415,9 +3414,13 @@ fn a_slow_mint_does_not_poison_the_urls_it_returns() {
                 let Value::Obj(mut fields) = presign_value(&request.body, &base) else {
                     panic!()
                 };
-                fields.push(("expires_at_unix".into(), Value::uint(now + DECLARED)));
-                fields.push(("server_time_unix".into(), Value::uint(now)));
-                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                for (key, value) in &mut fields {
+                    match key.as_str() {
+                        "expires_at_unix" => *value = Value::uint(now + DECLARED),
+                        "server_time_unix" => *value = Value::uint(now),
+                        _ => {}
+                    }
+                }
                 ok_json(&Value::Obj(fields))
             }
             ("GET", path) if path.starts_with("/obj/") => {

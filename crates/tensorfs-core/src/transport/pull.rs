@@ -657,18 +657,6 @@ impl ObjectUrls for BTreeMap<String, String> {
     }
 }
 
-/// How wide a mint window is when the hub declared no ceiling: exactly what the streams
-/// have in flight.
-///
-/// This is a DEGRADATION, derived from a fact this side owns, not a copy of a fact the hub
-/// owns. A window of `streams` digests is a few hundred bytes and is safe under any body cap
-/// a hub could plausibly have; it costs one presign call per wave of objects, which is a
-/// round trip and never a transfer. There is deliberately no constant here that guesses at
-/// the hub's cap — guessing at it is the defect this module is being repaired for.
-fn window_without_a_declared_ceiling(streams: usize) -> usize {
-    streams.max(1)
-}
-
 /// One minted URL and the life the hub declared for it.
 ///
 /// `pub(super)` for one reason: the rule that decides whether a 403 is re-mintable is the
@@ -678,8 +666,8 @@ fn window_without_a_declared_ceiling(streams: usize) -> usize {
 pub(super) struct Lease {
     pub(super) url: String,
     pub(super) minted: Instant,
-    /// What the HUB said this URL is good for, or `None` when it said nothing.
-    pub(super) lifetime: Option<Duration>,
+    /// What the HUB said this URL is good for.
+    pub(super) lifetime: Duration,
 }
 
 impl Lease {
@@ -688,11 +676,9 @@ impl Lease {
     /// Half of the hub's OWN number is not a magic duration: it carries no opinion about how
     /// many seconds anything should take, it moves when the hub moves, and what it buys is a
     /// stated guarantee — every object begins its transfer holding at least half a URL's
-    /// life, whatever that life happens to be. A hub that declares nothing leaves nothing to
-    /// judge, and then the mint window's own advance is the only bound on a URL's age.
+    /// life, whatever that life happens to be.
     fn spent(&self) -> bool {
-        self.lifetime
-            .is_some_and(|life| self.minted.elapsed() * 2 >= life)
+        self.minted.elapsed() * 2 >= self.lifetime
     }
 }
 
@@ -712,8 +698,7 @@ pub(super) struct Leases<'a> {
     pub(super) ledger: &'a Ledger,
     pub(super) wanted: &'a [ObjectRef],
     /// How many digests one mint asks for — the ceiling the hub declared on this pull's
-    /// own closure, or `window_without_a_declared_ceiling` when it declared none. Never a
-    /// constant compiled in here.
+    /// own closure. Never a constant compiled in here.
     pub(super) window: usize,
     pub(super) held: Mutex<BTreeMap<String, Lease>>,
     pub(super) minting: Minting,
@@ -814,7 +799,7 @@ impl Leases<'_> {
     /// What the hub said this digest's URL was good for, for a refusal to quote.
     fn declared_lifetime(&self, digest: &str) -> Option<Duration> {
         let held = self.held.lock().unwrap();
-        held.get(digest).and_then(|lease| lease.lifetime)
+        held.get(digest).map(|lease| lease.lifetime)
     }
 
     fn fresh(&self, digest: &str) -> Option<String> {
@@ -832,10 +817,6 @@ impl Leases<'_> {
     /// agree on a fast link and diverge exactly where a slow one lives. An object holding
     /// half a URL's life that takes longer than that to move is slow, not broken, and its
     /// second expiry is as honest as its first.
-    ///
-    /// A hub that declared no lifetime leaves nothing to judge, and then a refusal is taken
-    /// at face value: the window's own advance is the only bound on a URL's age, so a
-    /// re-mint could not be argued for.
     fn retire(&self, digest: &str) -> Result<bool> {
         let mut held = self.held.lock().unwrap();
         let Some(lease) = held.remove(digest) else {
@@ -1334,7 +1315,6 @@ pub struct PullReport {
     pub bytes_held: u64,
     pub bytes_total: u64,
     pub presence: Vec<(String, &'static str)>,
-    pub stamps: Vec<(String, Vec<String>)>,
     /// The disk the Store lives on and what making this pull durable cost.
     pub durability: crate::unsynced::SyncCost,
 }
@@ -1447,9 +1427,7 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
             deadline: request.deadline,
             ledger: &ledger,
             wanted: &plan.wanted,
-            window: closure
-                .presign_max_digests
-                .unwrap_or_else(|| window_without_a_declared_ceiling(request.streams)),
+            window: closure.presign_max_digests,
             held: Mutex::new(BTreeMap::new()),
             minting: Minting::default(),
         };
@@ -1524,7 +1502,6 @@ fn plan_against_store(
             .iter()
             .map(|(object, presence)| (object.id(), presence.as_str()))
             .collect(),
-        stamps: closure.stamps.clone(),
         durability: crate::unsynced::SyncCost {
             class: request.store.disk_class(),
             filesystem: request.store.disk().kind,
@@ -1581,9 +1558,9 @@ fn pinned_local_closure(request: &PullRequest<'_>) -> Option<hub::Closure> {
         scope: "runtime".to_string(),
         manifest,
         objects,
-        stamps: Vec::new(),
         complete: true,
-        presign_max_digests: None,
+        // Served only when nothing is wanted, so it authorizes no presign.
+        presign_max_digests: 0,
     })
 }
 

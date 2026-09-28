@@ -3736,10 +3736,5 @@ pub fn pull<'p>(
         presence.set_item(id, why)?;
     }
     result.set_item("presence", presence)?;
-    let stamps = PyDict::new(py);
-    for (key, values) in &report.stamps {
-        stamps.set_item(key, values.clone())?;
-    }
-    result.set_item("stamps", stamps)?;
     Ok(result)
 }
