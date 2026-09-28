@@ -165,7 +165,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		if len(models) != len(row.Selection.Models) {
 			return exit.New(exit.Validation, "rental installation contains non-downloadable model selections")
 		}
-		return machines.Prewarm(ctx, row.RentalID, row.WorkerBootID, row.Selection.Package, row.Selection.Release, models)
+		return machines.Prewarm(ctx, row.RentalID, row.Selection.Hub, row.WorkerBootID, row.Selection.Package, row.Selection.Release, models)
 	}, ctx.Out)
 	fleet.installs = installs
 	installsStopped := make(chan struct{})

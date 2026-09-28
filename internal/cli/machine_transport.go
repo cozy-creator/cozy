@@ -52,6 +52,17 @@ func (m *machineRuns) connectFor(ctx context.Context, request records.Request, n
 	return m.connectAt(ctx, name, request.Hub, m.runHolder(request, doing))
 }
 
+// connectAtHub opens a machine for work read at hub: this computer's machine moves there once
+// the work it holds for another hub has ended.
+func (m *machineRuns) connectAtHub(ctx context.Context, name, hub, holder string) (*machineConnection, *exit.Error) {
+	if machines.IsLocal(name) {
+		if problem := m.localHubFree(records.Request{Hub: hub}); problem != nil {
+			return nil, problem
+		}
+	}
+	return m.connectAt(ctx, name, hub, holder)
+}
+
 // localHubFree keeps this computer's machine at its hub while it holds another hub's work:
 // moving its Host ends everything it holds. The run waits for that work to end.
 func (m *machineRuns) localHubFree(request records.Request) *exit.Error {
@@ -211,8 +222,8 @@ func (c *machineConnection) prepareModels(ctx context.Context, request records.R
 // Prewarm prepares a published package, its selected models, or models alone on a machine
 // without running anything: `cozy package install` and `cozy model download` for any
 // machine. bootID, when set, is the worker lifetime the selection was queued for.
-func (m *machineRuns) Prewarm(ctx context.Context, machine, bootID, pkg, release string, models []*pb.DownloadModelRef) *exit.Error {
-	connection, problem := m.connect(ctx, machine, "installing "+either(pkg, "models"))
+func (m *machineRuns) Prewarm(ctx context.Context, machine, hub, bootID, pkg, release string, models []*pb.DownloadModelRef) *exit.Error {
+	connection, problem := m.connectAtHub(ctx, machine, hub, "installing "+either(pkg, "models"))
 	if problem != nil {
 		return problem
 	}
@@ -245,8 +256,8 @@ func (m *machineRuns) Prewarm(ctx context.Context, machine, bootID, pkg, release
 func (m *machineRuns) Forget(machine string) { m.machines.Forget(machine) }
 
 // Describe asks the machine for a published release's interface, as it reads it at its own Hub.
-func (m *machineRuns) Describe(ctx context.Context, machine, pkg, release string) (api.DescribedRelease, *exit.Error) {
-	connection, problem := m.connect(ctx, machine, "describing "+pkg)
+func (m *machineRuns) Describe(ctx context.Context, machine, hub, pkg, release string) (api.DescribedRelease, *exit.Error) {
+	connection, problem := m.connectAtHub(ctx, machine, hub, "describing "+pkg)
 	if problem != nil {
 		return api.DescribedRelease{}, problem
 	}

@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -15,6 +16,9 @@ type OwnedMachine struct {
 	ID          string            `json:"id"`
 	WorkerToken string            `json:"worker_token"`
 	Environment map[string]string `json:"environment"`
+	// Ignored names environment settings this CLI does not pass to its machine: a newer hub's
+	// facts, which never make registration fail.
+	Ignored []string `json:"-"`
 }
 
 // ownedMachinePrefix is the hub's spelling for an owned machine's worker id; no rental id
@@ -46,8 +50,13 @@ func (c *Client) RegisterMachine(ctx context.Context) (OwnedMachine, *exit.Error
 	}
 	for name := range out.Environment {
 		if !strings.HasPrefix(name, "TENSORHUB_") {
-			return OwnedMachine{}, exit.Named(exit.Conflict, "hub.machine_environment_invalid", "the hub's machine environment names %s, which is not a hub fact", name)
+			delete(out.Environment, name)
+			out.Ignored = append(out.Ignored, name)
 		}
+	}
+	slices.Sort(out.Ignored)
+	if len(out.Environment) == 0 {
+		return OwnedMachine{}, exit.Named(exit.Conflict, "hub.machine_environment_invalid", "the hub returned no hub facts for the registered machine")
 	}
 	return out, nil
 }

@@ -2,6 +2,7 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,8 +24,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 // hubWitness is everything one stand-in Tensorhub was sent: which bearers reached it
@@ -549,8 +552,14 @@ func TestLocalRunOfAnInstallUsesItsHub(t *testing.T) {
 	// The machine resolves the call's Models; the release it runs is read from the hub the
 	// install came from, never from the current one.
 	code, out := runCozy(t, root, "run", "proof/alpha/generate", "--json")
-	if _, asked := askedA.Load("proof/alpha/releases/1.0.0"); !asked {
-		t.Fatalf("the install's hub was not asked for its release: %d %s", code, out)
+	// A queued run reaches its machine after the command returns.
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(50 * time.Millisecond) {
+		if _, asked := askedA.Load("proof/alpha/releases/1.0.0"); asked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the install's hub was not asked for its release: %d %s", code, out)
+		}
 	}
 	crossed := false
 	askedB.Range(func(key, _ any) bool {
@@ -604,5 +613,105 @@ func TestRunsWithoutAHubStayListed(t *testing.T) {
 	}
 	if all := runs("--all-hubs"); len(all) != 2 || all["req-hubless-local"] != hubA || all["req-hubless-rented"] != hubB {
 		t.Fatalf("every hub's listing lost a run: %+v", all)
+	}
+}
+
+// A package published only at a second hub runs on this computer's machine through
+// `cozy run --tensorhub <second>`. The machine is registered with both hubs; it reads the
+// release at the hub the command names and never asks the first hub for it.
+func TestLocalRunReadsTheCommandsHub(t *testing.T) {
+	if *machineHostBinary == "" {
+		t.Skip("requires -machine-host: this computer's machine reads the release")
+	}
+	iface := json.RawMessage(`{"format":"cozy.package.interface/1","application":"beta:app","entrypoints":[{"name":"generate",` +
+		`"models":[],"request":{"fields":[]},"result":{"fields":[]}}],"jobs":[]}`)
+	var askedA, askedB, machineA, machineB sync.Map
+	catalog := func(asked *sync.Map, publishes bool) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			asked.Store(r.URL.Path, true)
+			if !publishes || !strings.HasPrefix(r.URL.Path, "/v1/packages/proof/beta") {
+				http.NotFound(w, r)
+				return
+			}
+			switch strings.TrimPrefix(r.URL.Path, "/v1/packages/proof/beta") {
+			case "":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"package":  map[string]any{"org": "proof", "name": "beta", "latest_release": "1.0.0"},
+					"releases": []any{map[string]any{"release": "1.0.0", "cut_at": "2026-09-01T00:00:00Z"}}})
+			case "/releases/1.0.0":
+				_ = json.NewEncoder(w).Encode(map[string]any{"release": map[string]any{"release": "1.0.0"},
+					"package_interface": iface, "requires_python": ">=3.12", "python_version": "3.12"})
+			case "/releases/1.0.0/locked-requirements":
+				_, _ = w.Write([]byte("msgspec==0.19.0\n"))
+			case "/bindings":
+				_ = json.NewEncoder(w).Encode(map[string]any{"bindings": []any{}})
+			default:
+				http.NotFound(w, r)
+			}
+		})
+	}
+	hubA, hubB := httptest.NewServer(catalog(&askedA, false)), httptest.NewServer(catalog(&askedB, true))
+	t.Cleanup(hubA.Close)
+	t.Cleanup(hubB.Close)
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, config.FileName),
+		[]byte("tensorhub_url: a\nport: 0\ntensorhub_token: two-hubs\nhubs:\n  a: "+hubA.URL+"\n  b: "+hubB.URL+"\n"), 0o600))
+	provisionMachine(t, root)
+	for _, hub := range []struct {
+		origin  string
+		handler http.Handler
+	}{{hubA.URL, catalog(&machineA, false)}, {hubB.URL, catalog(&machineB, true)}} {
+		doors, ca := hubTLSServer(t, hub.handler)
+		t.Cleanup(doors.Close)
+		registerMachineAt(t, root, hub.origin, map[string]string{"TENSORHUB_ORIGIN": doors.URL, "TENSORHUB_PUBLIC_ORIGIN": doors.URL,
+			"TENSORHUB_CA_DER_B64URL": base64.RawURLEncoding.EncodeToString(ca)})
+	}
+	code, out := runCozy(t, root, "run", "proof/beta/generate", "--tensorhub", "b", "--json")
+	if strings.Contains(out, "not a published release") || strings.Contains(out, "not a published package") {
+		t.Fatalf("the machine read the release at another hub than the command's: %d %s", code, out)
+	}
+	// The machine, at the command's hub's doors, read the release's install facts.
+	if _, asked := machineB.Load("/v1/packages/proof/beta/releases/1.0.0/locked-requirements"); !asked {
+		t.Fatalf("the machine did not read the release at the command's hub: %d %s", code, out)
+	}
+	for _, other := range []*sync.Map{&askedA, &machineA} {
+		other.Range(func(key, _ any) bool {
+			if strings.HasPrefix(key.(string), "/v1/packages/proof/beta") {
+				t.Fatalf("the other hub was asked %s for the command's package", key)
+			}
+			return true
+		})
+	}
+	var registered map[string]json.RawMessage
+	raw, err := os.ReadFile(filepath.Join(root, "machine", "registrations.json"))
+	must(t, err)
+	must(t, json.Unmarshal(raw, &registered))
+	if len(registered) != 2 {
+		t.Fatalf("the machine holds %d registrations, not one per hub: %s", len(registered), raw)
+	}
+}
+
+// A newer hub may hand a registered machine settings this CLI does not know. Registration
+// still succeeds: the hub's facts are kept and anything else is ignored, never refused.
+func TestMachineRegistrationToleratesNewHubSettings(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/machines" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "om-" + randomToken(t)[:22], "worker_token": randomToken(t),
+			"environment": map[string]string{"TENSORHUB_ORIGIN": "https://hub.example", "TENSORHUB_FUTURE_FACT": "1",
+				"COZY_WEBRTC_INTERNAL_PORT": "8445", "SOME_NEW_SETTING": "x"}})
+	}))
+	t.Cleanup(server.Close)
+	machine, problem := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("fixture")}, "").RegisterMachine(context.Background())
+	fatal(t, problem)
+	if machine.Environment["TENSORHUB_ORIGIN"] != "https://hub.example" || machine.Environment["TENSORHUB_FUTURE_FACT"] != "1" {
+		t.Fatalf("the hub's facts were not kept: %v", machine.Environment)
+	}
+	if _, passed := machine.Environment["COZY_WEBRTC_INTERNAL_PORT"]; passed || strings.Join(machine.Ignored, ",") != "COZY_WEBRTC_INTERNAL_PORT,SOME_NEW_SETTING" {
+		t.Fatalf("settings the machine does not read reached it or went unnamed: %v ignored %v", machine.Environment, machine.Ignored)
 	}
 }
