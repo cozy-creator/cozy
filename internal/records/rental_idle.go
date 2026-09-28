@@ -28,9 +28,13 @@ func (s *Store) RentalIdleRunCounts(id, buyer string) (int, int, *exit.Error) {
 
 func rentalIdleRunCounts(reader rentalIdleReader, id, buyer string) (queued, running int, problem *exit.Error) {
 	pinned, args := pinnedToRental("r.", id)
+	// A machine's acceptance receipt is live work from that moment, before any observation
+	// projects the request out of the queue.
+	const accepted = `EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=r.id AND length(e.receipt)>0)`
 	err := reader.QueryRow(`SELECT
- COALESCE(SUM(CASE WHEN r.state IN ('submitted','queued','requeue_pending') THEN 1 ELSE 0 END),0),
+ COALESCE(SUM(CASE WHEN r.state IN ('submitted','queued','requeue_pending') AND NOT `+accepted+` THEN 1 ELSE 0 END),0),
  COALESCE(SUM(CASE WHEN r.state IN ('dispatching','finalizing','pausing','canceling') OR
+ r.state IN ('submitted','queued','requeue_pending') AND `+accepted+` OR
  EXISTS(SELECT 1 FROM attempts a WHERE a.request_id=r.id AND a.state IN ('preparing','offered','accepted','recovered_open')) THEN 1 ELSE 0 END),0)
  FROM requests r WHERE `+pinned+` OR
  (r.id=? AND r.worker='') OR EXISTS(SELECT 1 FROM machine_executions e WHERE e.request_id=r.id AND e.machine_id=?)`, append(args, buyer, id)...).Scan(&queued, &running)
@@ -108,6 +112,26 @@ func (s *Store) RecordRentalWorkFinished(id string, at time.Time) *exit.Error {
 		return exit.Internalf("cannot record rental work completion: %s", err)
 	}
 	return nil
+}
+
+// RentalKeepaliveDue is whether live work must renew the Host's own idle deadline now:
+// no receipt from this boot yet, or half of the window the Host last granted has passed.
+func (s *Store) RentalKeepaliveDue(row Rental, now time.Time) (bool, *exit.Error) {
+	var worker, boot, observed string
+	var ack, deadline int64
+	err := s.db.QueryRow(`SELECT worker_id,worker_boot_id,acknowledged_at_ms,idle_deadline_ms,receipt_observed_at FROM rental_idle WHERE rental_id=?`,
+		row.ID).Scan(&worker, &boot, &ack, &deadline, &observed)
+	if err == sql.ErrNoRows {
+		return true, nil
+	}
+	if err != nil {
+		return false, exit.Internalf("cannot read rental keepalive receipt: %s", err)
+	}
+	at, err := time.Parse(time.RFC3339Nano, observed)
+	if ack <= 0 || deadline <= ack || worker != row.ExpectedWorkerID || boot != row.ExpectedWorkerBootID || err != nil {
+		return true, nil
+	}
+	return !now.Before(at.Add(time.Duration(deadline-ack) * time.Millisecond / 2)), nil
 }
 
 func (s *Store) RentalIdleResetAt(row Rental) (time.Time, int, *exit.Error) {

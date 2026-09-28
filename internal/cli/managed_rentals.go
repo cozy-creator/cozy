@@ -965,8 +965,7 @@ func (m *managedRentals) sweepLocked() []*pendingRelease {
 // said once. A rental whose release or keepalive is in flight is left to it.
 func (m *managedRentals) observeLocked(row records.Rental) (string, *pendingRelease, *exit.Error) {
 	if m.closed || time.Now().Before(m.retryAt[row.ID]) || m.settling[row.ID] || m.keeping[row.ID] > 0 {
-		line, problem := m.lineLocked(row.Hub)
-		return line, nil, problem
+		return m.fleetLineLocked(row.Hub), nil, nil
 	}
 	idle, problem := m.observeIdle(row)
 	if problem != nil {
@@ -975,14 +974,15 @@ func (m *managedRentals) observeLocked(row records.Rental) (string, *pendingRele
 	due, eligible := idle.ReleaseAt()
 	if !eligible {
 		delete(m.said, row.ID)
-		line, problem := m.lineLocked(row.Hub)
-		return line, nil, problem
+		if idle.Running > 0 {
+			m.holdLocked(row)
+		}
+		return m.fleetLineLocked(row.Hub), nil, nil
 	}
 	if now := time.Now(); now.Before(due) {
 		m.sayLocked(row.ID, fmt.Sprintf("rental %s (%s) idle since %s; released at %s unless work arrives",
 			row.ID, row.MachineName, idle.Since.UTC().Format("15:04:05"), due.UTC().Format("15:04:05")))
-		line, problem := m.lineLocked(row.Hub)
-		return line, nil, problem
+		return m.fleetLineLocked(row.Hub), nil, nil
 	}
 	release, problem := m.releaseIdleLocked(row.ID)
 	if problem != nil {
@@ -990,8 +990,7 @@ func (m *managedRentals) observeLocked(row records.Rental) (string, *pendingRele
 		return "", nil, problem
 	}
 	if release == nil {
-		line, problem := m.lineLocked(row.Hub)
-		return line, nil, problem
+		return m.fleetLineLocked(row.Hub), nil, nil
 	}
 	release.idleSince = idle.Since
 	return "", release, nil
@@ -1590,6 +1589,13 @@ func (m *managedRentals) letGo(released, failed []string) *exit.Error {
 		}
 	}
 	return nil
+}
+
+// fleetLineLocked is the fleet line where one is known. A Hub without an account
+// listing has none, and that is no reason to defer anything about a rental.
+func (m *managedRentals) fleetLineLocked(origin string) string {
+	line, _ := m.lineLocked(origin)
+	return line
 }
 
 // lineLocked is one hub's fleet line: that account's machines and burn.

@@ -2,13 +2,16 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func handleRentalKeepalive(ctx *Context) *exit.Error {
@@ -57,23 +60,61 @@ func (m *managedRentals) keepalive(ctx context.Context, id, requestID string) (a
 		m.mu.Unlock()
 		return out, problem
 	}
+	m.keepingLocked(id)
+	m.mu.Unlock()
+	receipt, problem := m.renew(ctx, id, requestID)
+	if problem != nil {
+		return out, problem
+	}
+	return api.RentalKeepaliveResult{Rental: id, RequestID: receipt.RequestId, WorkerID: receipt.WorkerId, WorkerBootID: receipt.WorkerBootId, AcknowledgedAtUnixMS: receipt.AcknowledgedAtUnixMs, IdleDeadlineUnixMS: receipt.IdleDeadlineUnixMs}, nil
+}
+
+func (m *managedRentals) keepingLocked(id string) {
 	if m.keeping == nil {
 		m.keeping = map[string]int{}
 	}
 	m.keeping[id]++
-	m.mu.Unlock()
+}
+
+// renew asks the Host for one keepalive and records its receipt; the caller counted it
+// in keeping, which this ends.
+func (m *managedRentals) renew(ctx context.Context, id, requestID string) (*pb.KeepRentalAliveResult, *exit.Error) {
 	receipt, problem := m.owner.KeepRentalAlive(ctx, id, requestID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.keeping[id]--; m.keeping[id] == 0 {
 		delete(m.keeping, id)
 	}
-	if problem != nil {
-		return out, problem
+	if problem == nil {
+		problem = m.store.RecordRentalKeepalive(id, receipt, time.Now())
 	}
-	if problem = m.store.RecordRentalKeepalive(id, receipt, time.Now()); problem != nil {
-		return out, problem
+	if problem != nil {
+		return nil, problem
 	}
 	m.forgetIdleLocked(id)
-	return api.RentalKeepaliveResult{Rental: id, RequestID: receipt.RequestId, WorkerID: receipt.WorkerId, WorkerBootID: receipt.WorkerBootId, AcknowledgedAtUnixMS: receipt.AcknowledgedAtUnixMs, IdleDeadlineUnixMS: receipt.IdleDeadlineUnixMs}, nil
+	return receipt, nil
+}
+
+// holdLocked keeps the Host from releasing a rental while this host holds accepted work
+// executing on it. The Host releases on its own clock, from what its Runtime reports;
+// that report can lapse (a Runtime restarted by maintenance), and this host's accepted
+// executions are then the only evidence of live work. Renewal follows the Host's own
+// granted window.
+func (m *managedRentals) holdLocked(row records.Rental) {
+	if m.owner == nil || m.keeping[row.ID] > 0 {
+		return
+	}
+	due, problem := m.store.RentalKeepaliveDue(row, time.Now())
+	if problem != nil || !due {
+		return
+	}
+	m.keepingLocked(row.ID)
+	go func() {
+		if _, problem := m.renew(context.Background(), row.ID, requestKey("")); problem != nil {
+			m.mu.Lock()
+			m.sayLocked("hold:"+row.ID, fmt.Sprintf("rental %s (%s) runs accepted work but could not renew its Host idle deadline: %s",
+				row.ID, row.MachineName, problem.Message))
+			m.mu.Unlock()
+		}
+	}()
 }
