@@ -14,8 +14,8 @@ func TestPublishedDependenciesCaptureDirectWheelAndExactVersionPins(t *testing.T
 [[package]]
 name = "reference-image"
 version = "0.1.1"
-source = { registry = "http://127.0.0.1:8819/v1/index/paul/simple/" }
-wheels = [{url = "http://127.0.0.1:8819/v1/index/paul/files/` + digest + `/reference_image-0.1.1-py3-none-any.whl", hash = "sha256:` + digest + `"}]
+source = { registry = "http://127.0.0.1:1/v1/index/paul/simple/" }
+wheels = [{url = "http://127.0.0.1:1/v1/index/paul/files/` + digest + `/reference_image-0.1.1-py3-none-any.whl", hash = "sha256:` + digest + `"}]
 `)
 	direct := "reference-image @ " + wheelURL + " --hash=sha256:" + digest + "\n"
 	version := "reference-image==0.1.1 --hash=sha256:" + digest + "\n"
@@ -36,7 +36,7 @@ wheels = [{url = "http://127.0.0.1:8819/v1/index/paul/files/` + digest + `/refer
 		}
 	}
 	for name, source := range map[string][]byte{
-		"PyPI homonym": []byte(strings.ReplaceAll(string(lock), "http://127.0.0.1:8819/v1/index/paul/simple/", "https://pypi.org/simple")),
+		"PyPI homonym": []byte(strings.ReplaceAll(string(lock), "http://127.0.0.1:1/v1/index/paul/simple/", "https://pypi.org/simple")),
 		"foreign org":  []byte(strings.ReplaceAll(string(lock), "/index/paul/simple/", "/index/other/simple/")),
 	} {
 		selected, problem := install.PublishedDependencies("paul/minimax-h3", source, []byte(direct))

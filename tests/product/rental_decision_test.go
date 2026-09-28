@@ -229,7 +229,7 @@ func TestRentalProvenanceSurvivesToTheRecord(t *testing.T) {
 			return body, "sha256:" + strings.Repeat("a", 64), nil
 		}
 		_, _, problem := store.BeginRentalOperation(records.RentalOperation{
-			Key: key, Hub: "http://127.0.0.1:8819", Reason: reason,
+			Key: key, Hub: "http://127.0.0.1:1", Reason: reason,
 			HourlyRateUSDMicros: 740_000, State: "pending",
 		}, author)
 

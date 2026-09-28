@@ -273,7 +273,7 @@ func TestHubContextsSelectTheCurrentHub(t *testing.T) {
 		!strings.Contains(out, `"url":"`+config.DefaultHubURL+`"`) {
 		t.Fatalf("a fresh install does not list the default hub: %d %s", code, out)
 	}
-	if code, out := runCozy(t, root, "hub", "add", "local", "http://127.0.0.1:8819/", "--json"); code != 0 {
+	if code, out := runCozy(t, root, "hub", "add", "local", "http://127.0.0.1:1/", "--json"); code != 0 {
 		t.Fatalf("hub add: %d %s", code, out)
 	}
 	if code, out := runCozy(t, root, "hub", "add", "Bad Name", "http://127.0.0.1:1", "--json"); code == 0 {
@@ -284,7 +284,7 @@ func TestHubContextsSelectTheCurrentHub(t *testing.T) {
 	}
 	raw, err := os.ReadFile(filepath.Join(root, config.FileName))
 	must(t, err)
-	if !strings.Contains(string(raw), "tensorhub_url: local") || !strings.Contains(string(raw), "local: http://127.0.0.1:8819\n") {
+	if !strings.Contains(string(raw), "tensorhub_url: local") || !strings.Contains(string(raw), "local: http://127.0.0.1:1\n") {
 		t.Fatalf("hub selection was not recorded in config.yaml:\n%s", raw)
 	}
 	code, out := runCozy(t, root, "hub", "list", "--json")
@@ -319,13 +319,13 @@ func TestHubContextsSelectTheCurrentHub(t *testing.T) {
 	raw, err = os.ReadFile(path)
 	must(t, err)
 	must(t, os.WriteFile(path, append(raw, []byte("tensorhub_token: operator-token\n")...), 0o600))
-	code, out = runCozy(t, root, "hub", "use", "http://127.0.0.1:8819", "--json")
+	code, out = runCozy(t, root, "hub", "use", "http://127.0.0.1:1", "--json")
 	if code == 0 || !strings.Contains(out, "hub.static_token_bound") ||
-		!strings.Contains(out, "the tensorhub_token line in "+path) || !strings.Contains(out, "--tensorhub=http://127.0.0.1:8819") {
+		!strings.Contains(out, "the tensorhub_token line in "+path) || !strings.Contains(out, "--tensorhub=http://127.0.0.1:1") {
 		t.Fatalf("hub use did not say which token setting to remove: %d %s", code, out)
 	}
 	must(t, os.WriteFile(path, raw, 0o600))
-	command := exec.Command(cozyBin, "hub", "use", "http://127.0.0.1:8819", "--json")
+	command := exec.Command(cozyBin, "hub", "use", "http://127.0.0.1:1", "--json")
 	command.Env = childEnv(t, root, "TENSORHUB_TOKEN=operator-token")
 	env, _ := command.CombinedOutput()
 	if command.ProcessState.ExitCode() == 0 || !strings.Contains(string(env), "the TENSORHUB_TOKEN environment variable") ||

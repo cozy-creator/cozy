@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -93,6 +94,10 @@ func TestMain(m *testing.M) {
 	// (childEnv) default to the same unanswered loopback hub.
 	if err := os.Setenv("TENSORHUB_URL", testDefaultHub); err != nil {
 		panic(err)
+	}
+	if conn, err := net.Dial("tcp", strings.TrimPrefix(testDefaultHub, "http://")); err == nil {
+		conn.Close()
+		panic("the suite's unanswered Tensorhub " + testDefaultHub + " answers on this box")
 	}
 	cozyBin = filepath.Join(dir, "cozy")
 	build := exec.Command("go", "build", "-o", cozyBin, ".")
@@ -406,8 +411,9 @@ func runCozyStreams(t *testing.T, root string, args ...string) (int, string, str
 // can only ever be started by a process that got its COZY_HOME from here. Registering the
 // root here is therefore the same thing as registering every daemon that can exist, and a
 // test cannot forget to do it. See reap_test.go for what the registration arms.
-// testDefaultHub is the suite's default Tensorhub: loopback, and never production.
-const testDefaultHub = "http://127.0.0.1:8819"
+// testDefaultHub is the suite's default Tensorhub: loopback port 1, which only root can bind,
+// so it always refuses. It is never production and never the owner's local Hub on 8819.
+const testDefaultHub = "http://127.0.0.1:1"
 
 func childEnv(t *testing.T, root string, imposed ...string) []string {
 	t.Helper()

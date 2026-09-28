@@ -168,10 +168,10 @@ sha256 = "b09a2fe63e5e2249a4d0b5c086acc4372e1d44de2b76a4c72cebbdbef7231e67"
 [[packages]]
 name = "sdxl"
 version = "2.0.16"
-index = "http://127.0.0.1:8819/v1/index/paul/simple/"
+index = "http://127.0.0.1:1/v1/index/paul/simple/"
 
 [[packages.wheels]]
-url = "http://127.0.0.1:8819/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/sdxl-2.0.16-py3-none-any.whl"
+url = "http://127.0.0.1:1/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/sdxl-2.0.16-py3-none-any.whl"
 
 [packages.wheels.hashes]
 sha256 = "f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7"
@@ -188,7 +188,7 @@ func TestSameOrgIndexRowsAreDeclaredForCustodyShare(t *testing.T) {
 	sdxl := rows[1]
 	if sdxl.Version != "2.0.16" || sdxl.Size != 0 ||
 		sdxl.SHA256 != "f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7" ||
-		sdxl.URL != "http://127.0.0.1:8819/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/sdxl-2.0.16-py3-none-any.whl" {
+		sdxl.URL != "http://127.0.0.1:1/v1/index/paul/files/f2926e8dd87777ed74e041fe2dfba89731df8af9ed1b2e47d80fc90694fadfe7/sdxl-2.0.16-py3-none-any.whl" {
 		t.Fatalf("org row = %+v, want the exact lock facts with size 0", sdxl)
 	}
 
@@ -213,7 +213,7 @@ func TestSameOrgIndexRowsAreDeclaredForCustodyShare(t *testing.T) {
 	}
 	// The namespace is read from the one hub index shape, never a lookalike path.
 	lookalike := strings.Replace(orgIndexPylock,
-		"http://127.0.0.1:8819/v1/index/paul/simple/", "http://127.0.0.1:8819/paul/simple/", 1)
+		"http://127.0.0.1:1/v1/index/paul/simple/", "http://127.0.0.1:1/paul/simple/", 1)
 	if _, problem := packagepublish.RegistryRowsFromLock([]byte(lookalike), nil, "paul"); problem == nil ||
 		problem.Name != "registry_dependency_index_refused" {
 		t.Fatalf("lookalike index path answered %v", problem)
