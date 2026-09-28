@@ -39,6 +39,7 @@ type Message struct {
 	Offset       uint64          `json:"offset"`
 	Length       uint64          `json:"length"`
 	AppendedFrom *uint64         `json:"appended_from"`
+	DurationUS   uint64          `json:"duration_us"`
 	SHA256       string          `json:"sha256"`
 	ETag         string          `json:"etag"`
 	Status       string          `json:"status"`
@@ -50,6 +51,7 @@ type Message struct {
 // Options tune the client's side of the path.
 type Options struct {
 	ReceiveBuffer uint32 // the SCTP receive window; 0 keeps pion's
+	Oversend      bool   // ignore the machine's max-message-size, as a misbehaving client
 }
 
 // Dial connects to a machine's listener at addr, pinning its leaf fingerprint.
@@ -80,7 +82,7 @@ func Dial(ctx context.Context, addr netip.AddrPort, fingerprint string, opts Opt
 		return nil, err
 	}
 	c := &Client{pc: pc, in: make(chan Message, 64), Cert: "sha-256 " + strings.ToUpper(fingerprints[0].Value)}
-	if err := c.connect(ctx, addr, fingerprint); err != nil {
+	if err := c.connect(ctx, addr, fingerprint, opts.Oversend); err != nil {
 		pc.Close()
 		return nil, err
 	}
@@ -88,7 +90,7 @@ func Dial(ctx context.Context, addr netip.AddrPort, fingerprint string, opts Opt
 	return c, nil
 }
 
-func (c *Client) connect(ctx context.Context, addr netip.AddrPort, fingerprint string) error {
+func (c *Client) connect(ctx context.Context, addr netip.AddrPort, fingerprint string, oversend bool) error {
 	protocol := "cozy/1"
 	dc, err := c.pc.CreateDataChannel("cozy", &pion.DataChannelInit{Protocol: &protocol})
 	if err != nil {
@@ -110,6 +112,9 @@ func (c *Client) connect(ctx context.Context, addr netip.AddrPort, fingerprint s
 	}
 	<-gathered
 	answer := Answer(offer.SDP, addr, fingerprint, Ufrag())
+	if oversend {
+		answer = strings.Replace(answer, "max-message-size:65536", "max-message-size:1048576", 1)
+	}
 	if err := c.pc.SetRemoteDescription(pion.SessionDescription{Type: pion.SDPTypeAnswer, SDP: answer}); err != nil {
 		return err
 	}

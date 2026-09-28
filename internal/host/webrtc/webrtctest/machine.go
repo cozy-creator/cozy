@@ -52,8 +52,9 @@ func (m *Machine) path(run, output string, index int) string {
 	return filepath.Join(m.dir, run+"-"+output)
 }
 
-// Append adds data to an output in place; final makes it the output's last revision.
-func (m *Machine) Append(run, output string, index int, data []byte, final bool) outputs.Entry {
+// Append adds data, which plays for durationUS, to an output in place; final makes it the
+// output's last revision.
+func (m *Machine) Append(run, output string, index int, data []byte, durationUS uint64, final bool) outputs.Entry {
 	path := m.path(run, output, index)
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
 	if err == nil {
@@ -64,13 +65,14 @@ func (m *Machine) Append(run, output string, index int, data []byte, final bool)
 		panic(err)
 	}
 	m.mu.Lock()
-	previous := m.current[path].Length
+	previous := m.current[path]
 	m.mu.Unlock()
-	return m.journal(run, output, index, path, previous+uint64(len(data)), &previous, final)
+	return m.journal(run, output, index, path, previous.Length+uint64(len(data)), &previous.Length,
+		previous.DurationUS+durationUS, final)
 }
 
 // Replace rewrites an output's bytes by rename, so readers of the old revision keep them.
-func (m *Machine) Replace(run, output string, index int, data []byte, final bool) outputs.Entry {
+func (m *Machine) Replace(run, output string, index int, data []byte, durationUS uint64, final bool) outputs.Entry {
 	path := m.path(run, output, index)
 	if err := os.WriteFile(path+".new", data, 0o600); err != nil {
 		panic(err)
@@ -78,14 +80,15 @@ func (m *Machine) Replace(run, output string, index int, data []byte, final bool
 	if err := os.Rename(path+".new", path); err != nil {
 		panic(err)
 	}
-	return m.journal(run, output, index, path, uint64(len(data)), nil, final)
+	return m.journal(run, output, index, path, uint64(len(data)), nil, durationUS, final)
 }
 
-func (m *Machine) journal(run, output string, index int, path string, length uint64, appended *uint64, final bool) outputs.Entry {
+// journal records a revision; durationUS is the output's whole duration, as the fold's.
+func (m *Machine) journal(run, output string, index int, path string, length uint64, appended *uint64, durationUS uint64, final bool) outputs.Entry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e := outputs.Entry{Seq: uint64(len(m.logs[run]) + 1), Output: output, Index: index, Rev: m.current[path].Rev + 1,
-		Length: length, AppendedFrom: appended, MediaType: "video/mp4", Label: output}
+		Length: length, AppendedFrom: appended, DurationUS: durationUS, MediaType: "video/mp4", Label: output}
 	if final {
 		raw, err := os.ReadFile(path)
 		if err != nil {

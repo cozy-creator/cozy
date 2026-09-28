@@ -17,7 +17,7 @@ type relay struct {
 	conns []*net.TCPConn
 }
 
-func newRelay(t *testing.T, target netip.AddrPort, delay time.Duration) *relay {
+func newRelay(t testing.TB, target netip.AddrPort, delay time.Duration) *relay {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

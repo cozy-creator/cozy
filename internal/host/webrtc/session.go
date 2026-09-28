@@ -196,6 +196,7 @@ func (c *session) read() {
 	for {
 		n, text, err := c.ch.dc.ReadDataChannel(buf)
 		if err != nil {
+			c.ch.assoc.Abort(err.Error()) // an SCTP ABORT tells a live peer at once
 			return
 		}
 		c.mu.Lock()
