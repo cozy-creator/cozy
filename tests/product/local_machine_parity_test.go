@@ -143,12 +143,18 @@ func providerHost(t *testing.T, h *machineHub, layout home.Layout, source machin
 
 func parityProject(t *testing.T) string {
 	t.Helper()
+	return parityProjectOn(t, machines.Source{RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel})
+}
+
+// parityProjectOn locks the parity package against source's wheels, or the published Runtime.
+func parityProjectOn(t *testing.T, source machines.Source) string {
+	t.Helper()
 	project := filepath.Join(t.TempDir(), "machine-parity")
 	must(t, os.MkdirAll(project, 0o700))
 	runtime := "cozy-runtime>=" + machines.RuntimeFloor
 	sources := ""
-	if *machineRuntimeWheel != "" {
-		sources = fmt.Sprintf("[tool.uv.sources]\ncozy-runtime={path=%q}\ntensorfs={path=%q}\n", *machineRuntimeWheel, *machineTensorFSWheel)
+	if source.RuntimeWheel != "" {
+		sources = fmt.Sprintf("[tool.uv.sources]\ncozy-runtime={path=%q}\ntensorfs={path=%q}\n", source.RuntimeWheel, source.TensorFSWheel)
 	}
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[project]
 name="machine-parity"
@@ -231,7 +237,13 @@ func journal(t *testing.T, store *records.Store, id string) []string {
 // virtual four-device inventory.
 func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.Store) {
 	t.Helper()
-	if *machineHostBinary == "" {
+	return parityMachinesOn(t, machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel})
+}
+
+// parityMachinesOn is parityMachines with both machines running source's Host and Runtime.
+func parityMachinesOn(t *testing.T, source machines.Source) (*machineHub, string, home.Layout, *records.Store) {
+	t.Helper()
+	if source.Host == "" {
 		t.Skip("requires -machine-host: the pod-supervisor both machines run")
 	}
 	uv, err := exec.LookPath("uv")
@@ -253,7 +265,6 @@ func parityMachines(t *testing.T) (*machineHub, string, home.Layout, *records.St
 			_ = removeAllForce(root)
 		}
 	})
-	source := machines.Source{Host: *machineHostBinary, RuntimeWheel: *machineRuntimeWheel, TensorFSWheel: *machineTensorFSWheel}
 	install := []string{"machine", "install", "--host", source.Host}
 	if source.RuntimeWheel != "" {
 		install = append(install, "--runtime-wheel", source.RuntimeWheel, "--tensorfs-wheel", source.TensorFSWheel)
