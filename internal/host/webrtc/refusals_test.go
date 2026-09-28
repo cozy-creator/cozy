@@ -179,7 +179,7 @@ func TestSTUNAnswersOnlyTheClientChosenCredential(t *testing.T) {
 
 	for name, pair := range map[string][2]string{
 		"signed with another password": {ufrag + ":browser", ufrag + "x"},
-		"a ufrag without the prefix":    {"published:browser", "published"},
+		"a ufrag without the prefix":   {"published:browser", "published"},
 	} {
 		conn := stunConn(t, h)
 		binding(t, conn, pair[0], pair[1])
