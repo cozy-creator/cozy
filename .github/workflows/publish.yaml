@@ -90,7 +90,12 @@ jobs:
           ls -l dist
           VER="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
           for f in dist/*; do case "$(basename "$f")" in tensorfs-"$VER"[-.]*) ;; *) echo "$f is not $VER"; exit 1;; esac; done
+      # Trusted publishing is unchanged. This box cannot reach fulcio.sigstore.dev (TLS
+      # "wrong version number" from the host and from docker; pypi.org works), so the
+      # optional PEP 740 attestations are off while releases run here.
       - name: Publish (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: false
       - if: always()
         run: docker run --rm -v "$GITHUB_WORKSPACE:/w" alpine:3.20 chown -R "$(id -u):$(id -g)" /w
