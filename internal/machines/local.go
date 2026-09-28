@@ -378,8 +378,7 @@ func (h *Host) start(ctx context.Context, base []string, key []byte, hubOrigin, 
 	command := exec.Command(h.binary())
 	command.Env, command.Dir = env, h.Root()
 	command.Stdout, command.Stderr = log, log
-	// Its own session: the Host survives this daemon as a pod survives its controller.
-	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	detach(command)
 	if err := command.Start(); err != nil {
 		return nil, exit.Internalf("cannot start the machine Host: %s", err)
 	}
@@ -424,7 +423,7 @@ func (h *Host) stopLocked(ctx context.Context) *exit.Error {
 		return problem
 	}
 	if h.alive(record.PID) {
-		if err := syscall.Kill(record.PID, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := terminate(record.PID); err != nil {
 			return exit.Internalf("cannot stop the machine Host: %s", err)
 		}
 		for h.alive(record.PID) {
