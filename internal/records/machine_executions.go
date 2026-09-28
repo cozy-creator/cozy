@@ -391,9 +391,9 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 	if page.NextAfter < cursor {
 		page = &pb.MachineExecutionEventPage{NextAfter: cursor, HeadSequence: max(cursor, page.HeadSequence)}
 	}
-	if page.CompactedThrough > cursor {
-		cursor = page.CompactedThrough
-	}
+	// Only live progress is compacted on the machine: progress at or below CompactedThrough
+	// may be gone, and every other event a page carries is retained history, recorded
+	// whatever its sequence. A gap nothing explains is recorded and read past, never a stall.
 	for _, event := range page.Events {
 		if event == nil || event.Sequence <= cursor {
 			continue
@@ -401,6 +401,13 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 		if event.Sequence > page.NextAfter || event.AtMs > math.MaxInt64 || event.AttemptOrdinal > math.MaxInt64 ||
 			event.Kind == "" || len(event.Kind) > 128 || len(event.BodyCanonicalBytes) > 64<<10 || !json.Valid(event.BodyCanonicalBytes) {
 			return exit.New(exit.Conflict, "machine returned an invalid execution event")
+		}
+		if event.Sequence-1 > max(cursor, page.CompactedThrough) {
+			gap, _ := json.Marshal(map[string]uint64{"after": cursor, "before": event.Sequence})
+			if _, err := tx.Exec(`INSERT INTO request_events(request_id,type,attempt,payload,at) VALUES(?,'machine.events_missing',?,?,?)`,
+				id, event.AttemptOrdinal, string(gap), time.UnixMilli(int64(event.AtMs)).UTC().Format(time.RFC3339Nano)); err != nil {
+				return exit.Internalf("cannot record missing machine events: %s", err)
+			}
 		}
 		kind, payload := "machine."+event.Kind, event.BodyCanonicalBytes
 		if event.Kind == "retention_released" {
@@ -423,9 +430,6 @@ func (s *Store) ObserveMachineExecution(id string, state *pb.MachineExecutionSta
 			return exit.Internalf("cannot cache machine event: %s", err)
 		}
 		cursor = event.Sequence
-	}
-	if page.NextAfter < cursor || page.NextAfter > cursor && page.NextAfter > page.CompactedThrough {
-		return exit.New(exit.Conflict, "machine event page skips unaccounted history")
 	}
 	raw, err := proto.MarshalOptions{Deterministic: true}.Marshal(state)
 	if err != nil {
