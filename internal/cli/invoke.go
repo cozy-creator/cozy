@@ -250,7 +250,6 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		RequestedRental: selectedRental,
 		Models:          models,
 		OutputDirectory: outputDirectory,
-		NoPartials:      ctx.Inv.Bool("--no-partials"),
 		AttentionKernel: overrides.AttentionKernel,
 	}, key)
 	releaseSnapshotReader(target)
@@ -1429,21 +1428,20 @@ type savedFile struct {
 	Digest string `json:"digest"`
 }
 
-// exportedOutputs joins the published paths to the outputs they carry. A file is named
-// by its content digest, so the join is exact rather than positional.
+// exportedOutputs joins the published paths to the outputs they carry: each output names its
+// stable file, so the join is exact rather than positional.
 func exportedOutputs(life api.Lifecycle) []savedFile {
 	if life.OutputExport == nil || life.OutputExport.State != "published" {
 		return nil
 	}
-	byDigest := make(map[string]api.MediaRef, len(life.Outputs))
+	byPath := make(map[string]api.MediaRef, len(life.Outputs))
 	for _, o := range life.Outputs {
-		byDigest[strings.TrimPrefix(o.Digest, "sha256:")] = o
+		byPath[o.Path] = o
 	}
 	result := make([]savedFile, 0, len(life.OutputExport.Paths))
 	for _, path := range life.OutputExport.Paths {
-		stem := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 		row := savedFile{Path: path}
-		if o, ok := byDigest[stem]; ok {
+		if o, ok := byPath[path]; ok && path != "" {
 			row.Output, row.Bytes, row.Mime, row.Digest = o.OutputID, o.Length, o.MimeType, o.Digest
 		}
 		result = append(result, row)
@@ -1488,11 +1486,8 @@ func watch(ctx *Context, c invocationEventObserver, cancel func(string, string) 
 	watchCtx, stopWatch := context.WithCancel(context.Background())
 	defer stopWatch()
 	lines := NewProgress(ctx, ctx.Mode().JSON, began)
-	if life, e := c.Request(requestID); e == nil {
-		lines.streamFrom(c, life.Stream)
-		if lines.liveMode() {
-			lines.describeRun(life)
-		}
+	if life, e := c.Request(requestID); e == nil && lines.liveMode() {
+		lines.describeRun(life)
 	}
 	stopped := make(chan string, 1)
 	cancelFailed := make(chan *exit.Error, 1)
@@ -1645,50 +1640,57 @@ type RunProgress struct {
 	sparseAt      time.Time
 	sparseStarted time.Time
 
-	// stream is where a player reads the run's growing videos; streamed names those told.
-	stream   string
-	streamed map[string]bool
+	// named are the output items whose file this run's lines already named.
+	named map[string]bool
 
 	// Injected clock and measure, so tests drive the REAL renderer deterministically.
 	now   func() time.Time
 	width func() int
 }
 
-// streamFrom points the product lines at the daemon serving this run's products.
-func (p *RunProgress) streamFrom(client any, path string) {
-	if daemon, ok := client.(interface{ Addr() string }); ok && path != "" {
-		p.stream = "http://" + daemon.Addr() + path
-	}
-}
-
-// productLines are one product as it lands: `+` a list output's new item, `~` a single
-// output's new revision, and once per growing video where a player can follow it.
+// productLines are one output revision as it lands (progressive-outputs.md §3). A list
+// element never changes: one line names it and its file. A single output's file is named once,
+// then each revision is a line with its size, media time and what it added.
 func (p *RunProgress) productLines(payload map[string]any) []string {
 	var product records.Product
 	raw, _ := json.Marshal(payload)
 	if json.Unmarshal(raw, &product) != nil {
 		return nil
 	}
-	mark, name := "~", product.Output
+	name := product.Output
 	if product.Op == records.ProductAppend {
-		mark, name = "+", fmt.Sprintf("%s[%d]", product.Output, product.Index)
+		name = fmt.Sprintf("%s %d", product.Output, product.Index+1)
+	}
+	var lines []string
+	if !p.named[product.Item] {
+		if p.named == nil {
+			p.named = map[string]bool{}
+		}
+		p.named[product.Item] = true
+		if product.Path != "" {
+			lines = append(lines, "  "+name+"  "+p.ctx.Mode().Hyperlink(product.Path))
+		}
+		if product.Op == records.ProductAppend {
+			return append(lines, "  "+name+"  "+strings.TrimSpace(output.Bytes(product.Length)+"  "+product.Label))
+		}
+	}
+	line := fmt.Sprintf("  %s r%d  %s", name, product.Rev, output.Bytes(product.Length))
+	if product.DurationUs > 0 {
+		line += "  " + mediaTime(product.DurationUs)
+	}
+	if product.AppendedFrom != nil {
+		line += "  +" + output.Bytes(product.Length-*product.AppendedFrom)
 	}
 	if product.Label != "" {
-		name = product.Label
+		line += "  " + product.Label
 	}
-	line := fmt.Sprintf("  %s %s  %s", mark, name, output.Bytes(product.Length))
-	if product.Path != "" {
-		line += "  " + p.ctx.Mode().Hyperlink(product.Path)
-	}
-	lines := []string{line}
-	if len(product.Parts) > 1 && p.stream != "" && !p.streamed[product.Output] {
-		if p.streamed == nil {
-			p.streamed = map[string]bool{}
-		}
-		p.streamed[product.Output] = true
-		lines = append(lines, "    play it as it grows: "+p.stream+product.Output+".m3u8")
-	}
-	return lines
+	return append(lines, line)
+}
+
+// mediaTime is a media duration as m:ss.
+func mediaTime(us uint64) string {
+	seconds := us / 1_000_000
+	return fmt.Sprintf("%d:%02d", seconds/60, seconds%60)
 }
 
 func NewProgress(ctx *Context, rawJSON bool, began time.Time) *RunProgress {

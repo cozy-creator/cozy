@@ -175,10 +175,9 @@ func (s *Server) machineJobState(row records.Request, link *records.MachineExecu
 	}
 	// The run's output log as this client holds it; its result is the fold once collected.
 	state.Products, _ = s.store.Products(row.ID)
-	state.Stream = StreamPath(row)
 	if outputs, problem := s.store.VisibleOutputs(row.ID); problem == nil {
 		for _, output := range outputs {
-			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest})
+			state.Outputs = append(state.Outputs, MediaRef{OutputID: output.OutputID, MimeType: output.MimeType, Length: output.Length, Digest: output.Digest, Path: output.Path})
 		}
 	}
 	if row.ModelTransfer != nil {

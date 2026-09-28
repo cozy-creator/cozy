@@ -122,7 +122,7 @@ func TestProductPath(t *testing.T) {
 	files, err := os.ReadDir(storeDir)
 	must(t, err)
 	if len(files) != 1 || !requestOutputName(files[0].Name(), ".webp") {
-		t.Fatalf("default location does not hold one content-digest file: %v", files)
+		t.Fatalf("default location does not hold the run's one stable file: %v", files)
 	}
 	firstOutput := files[0].Name()
 	if !strings.Contains(stdout, filepath.Join(storeDir, firstOutput)) {
@@ -131,7 +131,7 @@ func TestProductPath(t *testing.T) {
 	assertOnlyResultFiles(t, filepath.Join(root, "outputs"))
 	assertNoAttemptRoot(t, root)
 
-	// An unseeded run draws fresh entropy, so its bytes — and its name — differ.
+	// Every run writes its own stable file, named by its run.
 	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32", "--await")
 	if code != 0 {
 		t.Fatalf("second human invocation failed [exit %d]\n%s", code, stderr)
@@ -140,24 +140,24 @@ func TestProductPath(t *testing.T) {
 	must(t, err)
 	if len(files) != 2 || files[0].Name() == files[1].Name() ||
 		!requestOutputName(files[0].Name(), ".webp") || !requestOutputName(files[1].Name(), ".webp") {
-		t.Fatalf("distinct results did not retain two content-digest files: %v", files)
+		t.Fatalf("two runs did not retain two stable files: %v", files)
 	}
-	// The same bytes again land on the same name: one file, no second copy.
+	// The same bytes from another run are that run's own file: outputs are named by run and
+	// output, never by content.
 	var stable string
 	for attempt := 0; attempt < 2; attempt++ {
 		code, stdout, _ = runCozyStreams(t, root, "run", localWeightlessRef+"/tile", "size=32", "seed=7", "--await")
 		if code != 0 || !strings.Contains(stdout, storeDir+"/") {
 			t.Fatalf("seeded invocation %d did not report its store path [exit %d]\n%s", attempt+1, code, stdout)
 		}
-		if files, err = os.ReadDir(storeDir); err != nil || len(files) != 3 {
-			t.Fatalf("seeded invocation %d did not land on one stable file: %v, %v", attempt+1, files, err)
+		if files, err = os.ReadDir(storeDir); err != nil || len(files) != 3+attempt {
+			t.Fatalf("seeded invocation %d did not land on its own stable file: %v, %v", attempt+1, files, err)
 		}
 		reported := savedLine(stdout)
-		if stable == "" {
-			stable = reported
-		} else if stable != reported {
-			t.Fatalf("regenerating the same bytes reported a different path:\n%s\n%s", stable, reported)
+		if reported == stable {
+			t.Fatalf("a second run reported the first run's file:\n%s", reported)
 		}
+		stable = reported
 	}
 	assertOnlyResultFiles(t, filepath.Join(root, "outputs"))
 
@@ -170,8 +170,8 @@ func TestProductPath(t *testing.T) {
 			code, stdout, stderr)
 	}
 	if outFiles, err := os.ReadDir(outputDir); err != nil || len(outFiles) != 1 ||
-		!strings.Contains(stable, outFiles[0].Name()) {
-		t.Fatalf("--out did not keep the content-digest name: %v, %v", outFiles, err)
+		!requestOutputName(outFiles[0].Name(), ".webp") || !strings.Contains(savedLine(stdout), outFiles[0].Name()) {
+		t.Fatalf("--out did not keep the run's stable name: %v, %v", outFiles, err)
 	}
 	if !strings.Contains(stderr, "Saving outputs to "+outputDir) {
 		t.Fatalf("--out invocation did not announce its directory\n%s", stderr)
@@ -186,8 +186,8 @@ func TestProductPath(t *testing.T) {
 	}
 	fixed, err := os.ReadDir(fixedDir)
 	must(t, err)
-	if len(fixed) != 1 || !requestOutputName(fixed[0].Name(), ".webp") {
-		t.Fatalf("the same explicit payload did not resolve to one stable filename: %v", fixed)
+	if len(fixed) != 2 || !requestOutputName(fixed[0].Name(), ".webp") || !requestOutputName(fixed[1].Name(), ".webp") {
+		t.Fatalf("two runs of one payload did not write two stable files: %v", fixed)
 	}
 	assertOnlyResultFiles(t, outputDir)
 	assertOnlyResultFiles(t, fixedDir)
@@ -450,7 +450,7 @@ func savedLine(stdout string) string {
 }
 
 // assertOnlyResultFiles is the owner's rule for the user-facing store: nothing but
-// result files — `<content digest>.<ext>`, regular files — ever lands under outputs/ or
+// result files — `<run>-<output>[-<i>].<ext>`, regular files — ever lands under outputs/ or
 // a --out directory. No payload, no manifest, no sidecar, no attempt directory.
 func assertOnlyResultFiles(t *testing.T, dir string) {
 	t.Helper()
@@ -472,7 +472,7 @@ func assertOnlyResultFiles(t *testing.T, dir string) {
 		}
 		if !entry.Type().IsRegular() || !requestOutputName(entry.Name(), filepath.Ext(entry.Name())) ||
 			filepath.Ext(entry.Name()) == "" {
-			t.Errorf("%s holds %s, which is not a <content digest>.<ext> result file", dir, rel)
+			t.Errorf("%s holds %s, which is not a <run>-<output>.<ext> result file", dir, rel)
 		}
 		return nil
 	})
@@ -488,20 +488,9 @@ func assertNoAttemptRoot(t *testing.T, root string) {
 	}
 }
 
+// requestOutputName is a result file's stable name: `<run>-<output>[-<i>]<extension>`.
 func requestOutputName(name, extension string) bool {
-	if !strings.HasSuffix(name, extension) {
-		return false
-	}
-	digest := strings.TrimSuffix(name, extension)
-	if len(digest) != 64 {
-		return false
-	}
-	for _, char := range digest {
-		if !strings.ContainsRune("0123456789abcdef", char) {
-			return false
-		}
-	}
-	return true
+	return regexp.MustCompile(`^[0-9]+-[A-Za-z0-9_.-]+` + regexp.QuoteMeta(extension) + `$`).MatchString(name)
 }
 
 func activePackageInstall(t *testing.T, root string) records.PackageInstall {

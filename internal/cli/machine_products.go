@@ -4,224 +4,306 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
+	"github.com/cozy-creator/cozy/internal/runoutputs"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// A run reports its work as it happens. The machine journals each product the function
-// publishes (worker-protocol RunProduct); this client, the owner's one durable mirror, holds
-// the product's bytes before the entry becomes a request.product event. A list product lands
-// in the run's outputs folder when it arrives, a single output's current revision as
-// `<n>-<output>.partial.<ext>`, and the terminal writes the fold: the run's result, whether it
-// completed, failed or was canceled. Nothing here reaches the Hub.
+// A run's outputs are items rewritten in place (progressive-outputs.md). The machine journals
+// each revision as a `product` entry; the shared fold names its item, rev and how it changed;
+// this follower writes it into the item's one stable file, `<n>-<output>[-<i>].<ext>` in the
+// run's outputs folder: an append by writing only the new tail in place, a replace whole under
+// a temporary name then renamed over. The file is the output from its first revision to its
+// last. Nothing here reaches the Hub.
 
 type machineByteStream interface {
 	Recv() (*pb.NativeByteReadChunk, error)
 }
 
-// productBlob is one byte string a product needs: the whole product, or one of its parts.
-type productBlob struct {
-	digest string
-	length int64
-	source *pb.NativeByteRetentionRequest
-}
-
-// holdProducts receives the bytes of every product a page names after `cursor`, and the
-// Product each becomes.
+// holdProducts writes every revision a page names after `cursor` into its item's file, and
+// answers the Product each becomes.
 func (m *machineRuns) holdProducts(ctx context.Context, request records.Request, connection *machineConnection, page *pb.MachineExecutionEventPage, cursor uint64) (map[uint64]records.Product, *exit.Error) {
 	held := map[uint64]records.Product{}
-	if request.Number == 0 {
-		// Observers carry the durable row; its short number names the run's partial files.
-		if numbered, problem := m.store.RequestByReference(request.ID); problem == nil && numbered != nil {
-			request.Number = numbered.Number
-		}
-	}
+	var fold *runoutputs.Fold
+	var directory string
 	for _, event := range page.GetEvents() {
 		if event.GetSequence() <= cursor || event.GetKind() != "product" {
 			continue
 		}
-		product, blobs, problem := productOf(event)
-		if problem != nil {
+		if fold == nil {
+			var problem *exit.Error
+			if fold, directory, request, problem = m.outputFold(request); problem != nil {
+				return nil, problem
+			}
+		}
+		if problem := checkProduct(event.GetProduct()); problem != nil {
 			return nil, problem
 		}
-		store := m.productStore(request)
-		for _, blob := range blobs {
-			if problem := receiveProductBlob(ctx, connection, store, blob); problem != nil {
-				return nil, problem
-			}
+		item, _, err := fold.Add(event.Sequence, event.Product)
+		if err != nil {
+			return nil, exit.New(exit.Conflict, "the machine journaled an unusable output revision: %s", err)
 		}
-		if product.MediaType == resultfiles.TreeMediaType {
-			if problem := receiveProductTree(ctx, connection, store, blobs[0], product.ContentBytes); problem != nil {
-				return nil, problem
-			}
+		product := productOf(item, event.Product)
+		if directory != "" {
+			// The file is where people look while the run goes on. A folder that refuses it never
+			// stops the log: the run's end brings every item's file to its final revision, and a
+			// refusal there waits on the owner as a pending collection, never a silent hang.
+			product.Path = filepath.Join(directory, itemFile(strconv.FormatInt(request.Number, 10), item, product.MediaType))
+			_ = writeItem(ctx, connection, directory, product.Path, item, product)
 		}
-		// The bytes are held here now; the outputs folder is only where people look. A folder
-		// that refuses the file never stops the log: the run's end writes its result, and a
-		// refusal there waits on the owner as a pending collection (never a silent hang).
-		product.Path, _ = m.showProduct(request, product)
 		held[event.Sequence] = product
 	}
 	return held, nil
 }
 
-// productOf decodes one RunProduct once, at this boundary.
-func productOf(event *pb.MachineExecutionEvent) (records.Product, []productBlob, *exit.Error) {
-	source := event.GetProduct()
-	refuse := func(why string) (records.Product, []productBlob, *exit.Error) {
-		return records.Product{}, nil, exit.New(exit.Conflict, "the machine journaled an unusable product: %s", why)
+// outputFold is the run's items as its recorded revisions left them, and the folder they are
+// written in ("" for a run whose outputs are not written, a child's say).
+func (m *machineRuns) outputFold(request records.Request) (*runoutputs.Fold, string, records.Request, *exit.Error) {
+	if request.Number == 0 {
+		// Observers carry the durable row; its short number names the run's files.
+		if numbered, problem := m.store.RequestByReference(request.ID); problem == nil && numbered != nil {
+			request.Number = numbered.Number
+		}
 	}
-	if source == nil {
-		return refuse("the entry carries none")
+	products, problem := m.store.Products(request.ID)
+	if problem != nil {
+		return nil, "", request, problem
 	}
-	op := map[pb.RunProductOp]string{pb.RunProductOp_RUN_PRODUCT_OP_SET: records.ProductSet, pb.RunProductOp_RUN_PRODUCT_OP_APPEND: records.ProductAppend}[source.Op]
-	digest, err := canonical.Spell(source.GetContent().GetDigest())
-	if op == "" || err != nil || source.Content.Length > math.MaxInt64 || !printable(source.Output, 1024) || source.Output == "" ||
+	fold := runoutputs.New(strconv.FormatInt(request.Number, 10))
+	for _, product := range products {
+		if _, _, err := fold.Add(product.Sequence, recordedProduct(product)); err != nil {
+			return nil, "", request, exit.Internalf("a recorded output revision is unreadable: %s", err)
+		}
+	}
+	export, problem := m.store.OutputExportOf(request.ID)
+	if problem != nil || export == nil {
+		return fold, "", request, problem
+	}
+	return fold, export.Directory, request, nil
+}
+
+// checkProduct refuses an entry this client cannot hold, before it reaches the fold.
+func checkProduct(source *pb.RunProduct) *exit.Error {
+	refuse := func(why string) *exit.Error {
+		return exit.New(exit.Conflict, "the machine journaled an unusable output revision: %s", why)
+	}
+	if source == nil || source.GetContent().GetLength() > math.MaxInt64 || !printable(source.Output, 1024) ||
 		!printable(source.Label, 256) || !printable(source.MediaType, 256) {
 		return refuse("its output, content or label is malformed")
 	}
-	product := records.Product{Sequence: event.Sequence, Output: source.Output, Op: op, Index: source.Index, Digest: digest,
-		Length: int64(source.Content.Length), MediaType: source.MediaType, Label: source.Label}
 	if (source.Source == nil) == (len(source.Parts) == 0) || len(source.Parts) > 128 {
 		return refuse("it needs exactly one byte source or its parts")
 	}
-	if source.Source != nil {
-		if records.ValidateByteRef(source.Source.GetSource()) != nil {
-			return refuse("its byte source is malformed")
-		}
-		if product.MediaType == resultfiles.TreeMediaType {
-			product.ContentBytes = int64(source.Source.Source.ContentBytes)
-		}
-		return product, []productBlob{{digest: digest, length: product.Length, source: source.Source}}, nil
+	if source.Source != nil && records.ValidateByteRef(source.Source.GetSource()) != nil {
+		return refuse("its byte source is malformed")
 	}
-	var blobs []productBlob
-	var total uint64
 	for _, part := range source.Parts {
-		spelled, err := canonical.Spell(part.GetContent().GetDigest())
-		if err != nil || records.ValidateByteRef(part.GetSource().GetSource()) != nil || part.Content.Length > math.MaxInt64 {
+		if records.ValidateByteRef(part.GetSource().GetSource()) != nil {
 			return refuse("a part is malformed")
 		}
-		total += part.Content.Length
-		blobs = append(blobs, productBlob{digest: spelled, length: int64(part.Content.Length), source: part.Source})
-		product.Parts = append(product.Parts, records.ProductPart{Digest: spelled, Length: int64(part.Content.Length), DurationUs: part.DurationUs})
 	}
-	if total != source.Content.Length {
-		return refuse("its parts do not add up to its length")
-	}
-	return product, blobs, nil
+	return nil
 }
 
 func printable(value string, bound int) bool {
 	return len(value) <= bound && strings.IndexFunc(value, func(r rune) bool { return r < 0x20 || r > 0x7e }) < 0
 }
 
-// productStore is the run's own content-addressed copy of its products.
-func (m *machineRuns) productStore(request records.Request) string {
-	return m.layout.Products(request.Org, request.ID)
+// productOf is the revision the fold made of one entry, as this client records it.
+func productOf(item runoutputs.Item, source *pb.RunProduct) records.Product {
+	current := item.Current
+	product := records.Product{Sequence: current.Sequence, Item: item.ID, Output: item.Output, Op: records.ProductSet,
+		Index: source.Index, Rev: current.Rev, Digest: current.Digest, Length: current.Length, AppendedFrom: current.AppendedFrom,
+		DurationUs: current.DurationUs, MediaType: current.MediaType, Label: current.Label}
+	if item.List {
+		product.Op = records.ProductAppend
+	}
+	if source.Source != nil && current.MediaType == resultfiles.TreeMediaType {
+		product.ContentBytes = int64(source.Source.Source.ContentBytes)
+	}
+	if len(source.Parts) > 0 {
+		for _, part := range current.Parts {
+			product.Parts = append(product.Parts, records.ProductPart{Digest: part.Digest, Length: part.Length, DurationUs: part.DurationUs})
+		}
+	}
+	return product
 }
 
-func productBlobPath(store, digest string) string {
-	return filepath.Join(store, strings.TrimPrefix(digest, "sha256:"))
+// recordedProduct is a recorded revision as the fold reads it again; its bytes are here.
+func recordedProduct(product records.Product) *pb.RunProduct {
+	ref := func(digest string, length int64) *pb.Ref {
+		raw, _ := canonical.Raw(digest)
+		return &pb.Ref{Digest: raw, Length: uint64(length)}
+	}
+	op := pb.RunProductOp_RUN_PRODUCT_OP_SET
+	if product.Op == records.ProductAppend {
+		op = pb.RunProductOp_RUN_PRODUCT_OP_APPEND
+	}
+	source := &pb.RunProduct{Output: product.Output, Op: op, Index: product.Index, Content: ref(product.Digest, product.Length),
+		MediaType: product.MediaType, Label: product.Label}
+	for _, part := range product.Parts {
+		source.Parts = append(source.Parts, &pb.RunProductPart{Content: ref(part.Digest, part.Length), DurationUs: part.DurationUs})
+	}
+	return source
 }
 
-// productSources are the files whose concatenation is the product's bytes.
-func productSources(store string, product records.Product) []string {
-	if len(product.Parts) == 0 {
-		return []string{productBlobPath(store, product.Digest)}
+// itemFile is the item's stable file name in its run's outputs folder.
+func itemFile(run string, item runoutputs.Item, mediaType string) string {
+	name := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
+			return r
+		}
+		return '_'
+	}, item.Name(run))
+	if mediaType == resultfiles.TreeMediaType {
+		return name
 	}
-	sources := make([]string, len(product.Parts))
-	for index, part := range product.Parts {
-		sources[index] = productBlobPath(store, part.Digest)
-	}
-	return sources
+	return name + resultfiles.Extension(mediaType)
 }
 
-// receiveProductBlob holds one byte string here: a verified file named by its digest. An
-// interrupted receive resumes at the offset its staged file reached.
-func receiveProductBlob(ctx context.Context, connection *machineConnection, store string, blob productBlob) *exit.Error {
-	final := productBlobPath(store, blob.digest)
-	if info, err := os.Lstat(final); err == nil && info.Mode().IsRegular() && info.Size() == blob.length {
-		return nil
+// writeItem brings the item's file at `path` to its current revision: when the file holds an
+// earlier revision this one extends, only the missing tail is appended in place; otherwise the
+// revision is written whole and renamed over it.
+func writeItem(ctx context.Context, connection *machineConnection, directory, path string, item runoutputs.Item, product records.Product) *exit.Error {
+	if problem := resultfiles.Preflight(directory); problem != nil {
+		return problem
 	}
-	if err := os.MkdirAll(store, 0o700); err != nil {
-		return exit.Internalf("cannot create the run's product store: %s", err)
+	current := item.Current
+	if product.MediaType == resultfiles.TreeMediaType {
+		return writeTree(ctx, connection, directory, path, current, product.ContentBytes)
 	}
-	staged := final + ".receiving"
-	output, err := os.OpenFile(staged, os.O_CREATE|os.O_RDWR, 0o600)
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+		for _, earlier := range item.History {
+			if earlier.Rev < current.Rev && earlier.Length == info.Size() && earlier.PrefixOf(current) {
+				return appendTail(ctx, connection, path, info.Size(), current)
+			}
+		}
+	}
+	return replaceWhole(ctx, connection, directory, path, current)
+}
+
+// appendTail writes bytes [have, length) of the revision onto the file in place: an open
+// reader keeps reading, and sees the new bytes once written.
+func appendTail(ctx context.Context, connection *machineConnection, path string, have int64, current runoutputs.Revision) *exit.Error {
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
-		return exit.Internalf("cannot stage a product: %s", err)
+		return exit.Internalf("cannot open %s: %s", path, err)
 	}
-	defer output.Close()
+	defer file.Close()
+	if _, err := file.Seek(have, io.SeekStart); err != nil {
+		return exit.Internalf("cannot append to %s: %s", path, err)
+	}
+	if problem := receiveParts(ctx, connection, file, nil, current.Parts, have); problem != nil {
+		return problem
+	}
+	if err := file.Sync(); err != nil {
+		return exit.Internalf("cannot sync %s: %s", path, err)
+	}
+	return nil
+}
+
+// replaceWhole writes the revision whole beside the file, verifies it, and renames it over.
+func replaceWhole(ctx context.Context, connection *machineConnection, directory, path string, current runoutputs.Revision) *exit.Error {
+	staged, err := os.CreateTemp(directory, ".cozy-output-")
+	if err != nil {
+		return exit.Internalf("cannot stage an output in %s: %s", directory, err)
+	}
+	defer func() { staged.Close(); _ = os.Remove(staged.Name()) }()
+	if err := staged.Chmod(0o644); err != nil {
+		return exit.Internalf("cannot stage an output: %s", err)
+	}
 	hash := sha256.New()
-	offset, err := io.Copy(hash, output)
-	if err != nil || offset > blob.length {
-		offset = 0
-		hash.Reset()
-		if err := output.Truncate(0); err != nil {
-			return exit.Internalf("cannot restage a product: %s", err)
-		}
-		if _, err := output.Seek(0, io.SeekStart); err != nil {
-			return exit.Internalf("cannot restage a product: %s", err)
-		}
+	if problem := receiveParts(ctx, connection, staged, hash, current.Parts, 0); problem != nil {
+		return problem
 	}
-	raw, _ := canonical.Raw(blob.digest)
-	stream, err := connection.readBytes(ctx, blob.source, &pb.Ref{Digest: raw, Length: uint64(blob.length)}, uint64(offset))
-	if err != nil {
-		return machineTransport(err)
+	if "sha256:"+hex.EncodeToString(hash.Sum(nil)) != current.Digest {
+		return exit.New(exit.Conflict, "a received output differs from its digest")
 	}
-	for offset < blob.length {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			break
+	if err := staged.Sync(); err != nil {
+		return exit.Internalf("cannot sync an output: %s", err)
+	}
+	if err := os.Rename(staged.Name(), path); err != nil {
+		return exit.Internalf("cannot write %s: %s", path, err)
+	}
+	return syncDirectory(directory)
+}
+
+// receiveParts writes the parts' bytes from offset `from` of their concatenation onward.
+func receiveParts(ctx context.Context, connection *machineConnection, output io.Writer, hash io.Writer, parts []runoutputs.Part, from int64) *exit.Error {
+	if hash != nil {
+		output = io.MultiWriter(output, hash)
+	}
+	var start int64
+	for _, part := range parts {
+		end := start + part.Length
+		if end <= from {
+			start = end
+			continue
 		}
+		offset := max(from-start, 0)
+		raw, _ := canonical.Raw(part.Digest)
+		stream, err := connection.readBytes(ctx, part.Source, &pb.Ref{Digest: raw, Length: uint64(part.Length)}, uint64(offset))
 		if err != nil {
 			return machineTransport(err)
 		}
-		if chunk == nil || chunk.Offset != uint64(offset) || len(chunk.Data) == 0 || len(chunk.Data) > pb.MaxNativeByteReadChunkBytes || int64(len(chunk.Data)) > blob.length-offset {
-			return exit.New(exit.Conflict, "a product's byte stream left its exact bounds")
+		for offset < part.Length {
+			chunk, err := stream.Recv()
+			if err != nil {
+				return machineTransport(err)
+			}
+			if chunk == nil || chunk.Offset != uint64(offset) || len(chunk.Data) == 0 || len(chunk.Data) > pb.MaxNativeByteReadChunkBytes || int64(len(chunk.Data)) > part.Length-offset {
+				return exit.New(exit.Conflict, "an output's byte stream left its exact bounds")
+			}
+			if _, err := output.Write(chunk.Data); err != nil {
+				return exit.Internalf("cannot write an output: %s", err)
+			}
+			connection.progress.Advance(int64(len(chunk.Data)))
+			offset += int64(len(chunk.Data))
 		}
-		if _, err := io.MultiWriter(output, hash).Write(chunk.Data); err != nil {
-			return exit.Internalf("cannot write a product: %s", err)
-		}
-		connection.progress.Advance(int64(len(chunk.Data)))
-		offset += int64(len(chunk.Data))
+		start = end
 	}
-	if offset != blob.length || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != blob.digest {
-		_ = os.Remove(staged)
-		return exit.New(exit.Conflict, "a received product differs from its digest")
-	}
-	if err := output.Sync(); err != nil {
-		return exit.Internalf("cannot sync a product: %s", err)
-	}
-	if err := os.Rename(staged, final); err != nil {
-		return exit.Internalf("cannot commit a product: %s", err)
-	}
-	return syncDirectory(store)
+	return nil
 }
 
-// receiveProductTree holds a tree product's members beside its manifest, where
-// resultfiles.MaterializeTree reads them.
-func receiveProductTree(ctx context.Context, connection *machineConnection, store string, manifest productBlob, contentBytes int64) *exit.Error {
-	path := productBlobPath(store, manifest.digest)
-	members, problem := resultfiles.ReadTreeManifest(path, manifest.digest, manifest.length, contentBytes)
+// writeTree receives a tree item's manifest and members, then puts the tree at its stable
+// name, replacing another revision whole.
+func writeTree(ctx context.Context, connection *machineConnection, directory, path string, current runoutputs.Revision, contentBytes int64) *exit.Error {
+	staging, err := os.MkdirTemp(directory, ".cozy-tree-receiving-")
+	if err != nil {
+		return exit.Internalf("cannot stage a tree in %s: %s", directory, err)
+	}
+	defer os.RemoveAll(staging)
+	manifest := filepath.Join(staging, "manifest")
+	if problem := replaceWhole(ctx, connection, staging, manifest, current); problem != nil {
+		return problem
+	}
+	members, problem := resultfiles.ReadTreeManifest(manifest, current.Digest, current.Length, contentBytes)
 	if problem != nil {
 		return problem
 	}
+	if err := os.MkdirAll(manifest+".files", 0o700); err != nil {
+		return exit.Internalf("cannot stage a tree: %s", err)
+	}
+	source := current.Parts[0].Source
 	for _, member := range members {
-		if problem := receiveProductBlob(ctx, connection, path+".files", productBlob{digest: member.Digest, length: member.Length, source: manifest.source}); problem != nil {
+		part := runoutputs.Revision{Digest: member.Digest, Length: member.Length,
+			Parts: []runoutputs.Part{{Digest: member.Digest, Length: member.Length, Source: source}}}
+		if problem := replaceWhole(ctx, connection, manifest+".files", filepath.Join(manifest+".files", strings.TrimPrefix(member.Digest, "sha256:")), part); problem != nil {
 			return problem
 		}
 	}
-	return nil
+	_, problem = resultfiles.MaterializeTree(manifest, directory, filepath.Base(path), current.Digest, current.Length, contentBytes)
+	return problem
 }
 
 func syncDirectory(path string) *exit.Error {
@@ -236,41 +318,10 @@ func syncDirectory(path string) *exit.Error {
 	return nil
 }
 
-// showProduct writes a product where people look while the run goes on: a list product's
-// own file, or its single output's `.partial` file, replaced atomically for each revision.
-func (m *machineRuns) showProduct(request records.Request, product records.Product) (string, *exit.Error) {
-	export, problem := m.store.OutputExportOf(request.ID)
-	if problem != nil || export == nil || product.MediaType == resultfiles.TreeMediaType {
-		return "", problem
-	}
-	sources := productSources(m.productStore(request), product)
-	if product.Op == records.ProductAppend {
-		name, problem := resultfiles.Filename(product.Digest, product.MediaType)
-		if problem != nil {
-			return "", problem
-		}
-		return resultfiles.MaterializeParts(sources, export.Directory, name, product.Digest, product.Length)
-	}
-	if !export.Partials {
-		return "", nil
-	}
-	return resultfiles.MaterializeParts(sources, export.Directory, partialName(request, product), product.Digest, product.Length)
-}
-
-// partialName is a single output's revision file while its run goes on.
-func partialName(request records.Request, product records.Product) string {
-	output := strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
-			return r
-		}
-		return '_'
-	}, product.Output)
-	return fmt.Sprintf("%d-%s.partial%s", request.Number, output, resultfiles.Extension(product.MediaType))
-}
-
-// exportProducts writes the run's result, the fold of its products, into its outputs folder
-// under each file's digest name, removes the partial files, and settles the export.
-func (m *machineRuns) exportProducts(request records.Request) *exit.Error {
+// exportProducts settles the run's result, whatever its terminal: each item's file at its
+// final revision, checked against that revision's sha256. A file a refused write left behind is
+// written now from the machine's log, which holds every item's current bytes until the ack.
+func (m *machineRuns) exportProducts(ctx context.Context, connection *machineConnection, query *pb.MachineExecutionQuery, request records.Request) *exit.Error {
 	export, problem := m.store.OutputExportOf(request.ID)
 	if problem != nil || export == nil || export.State == "published" {
 		return problem
@@ -279,28 +330,81 @@ func (m *machineRuns) exportProducts(request records.Request) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	store := m.productStore(request)
+	var live *runoutputs.Fold
 	var paths []string
 	for _, product := range records.Fold(products) {
-		var path string
-		if product.MediaType == resultfiles.TreeMediaType {
-			path, problem = resultfiles.MaterializeTree(productBlobPath(store, product.Digest), export.Directory, product.Digest, product.Length, product.ContentBytes)
-		} else {
-			name, filenameProblem := resultfiles.Filename(product.Digest, product.MediaType)
-			if problem = filenameProblem; problem == nil {
-				path, problem = resultfiles.MaterializeParts(productSources(store, product), export.Directory, name, product.Digest, product.Length)
+		if product.Path == "" {
+			continue
+		}
+		if verifyFinal(product) != nil {
+			if live == nil {
+				if live, problem = m.logFold(ctx, connection, query, request); problem != nil {
+					return problem
+				}
+			}
+			index := uint32(0)
+			if product.Op == records.ProductAppend {
+				index = product.Index + 1
+			}
+			item, ok := live.Item(product.Output, index)
+			if !ok {
+				return exit.New(exit.Conflict, "the machine's log no longer names output %s", product.Item)
+			}
+			problem = writeItem(ctx, connection, export.Directory, product.Path, item, product)
+			if problem == nil {
+				problem = verifyFinal(product)
+			}
+			if problem != nil {
+				_ = m.store.FailOutputExport(request.ID, problem.ErrName(), problem.Message)
+				return problem
 			}
 		}
-		if problem != nil {
-			_ = m.store.FailOutputExport(request.ID, problem.ErrName(), problem.Message)
-			return problem
-		}
-		paths = append(paths, path)
-	}
-	for _, product := range products {
-		if product.Op == records.ProductSet && product.Path != "" && strings.HasSuffix(strings.TrimSuffix(product.Path, filepath.Ext(product.Path)), ".partial") {
-			_ = os.Remove(product.Path)
-		}
+		paths = append(paths, product.Path)
 	}
 	return m.store.CompleteOutputExport(request.ID, paths)
+}
+
+// logFold reads the run's product entries from its machine again, with the byte sources the
+// recorded revisions do not keep.
+func (m *machineRuns) logFold(ctx context.Context, connection *machineConnection, query *pb.MachineExecutionQuery, request records.Request) (*runoutputs.Fold, *exit.Error) {
+	fold := runoutputs.New(strconv.FormatInt(request.Number, 10))
+	for after := uint64(0); ; {
+		page, err := connection.Host.ListMachineExecutionEvents(ctx, &pb.MachineExecutionEventsQuery{Execution: query, After: after, Limit: 128})
+		if err != nil {
+			return nil, machineTransport(err)
+		}
+		for _, event := range page.GetEvents() {
+			if event.GetKind() == "product" && event.GetProduct() != nil {
+				if _, _, err := fold.Add(event.Sequence, event.Product); err != nil {
+					return nil, exit.New(exit.Conflict, "the machine journaled an unusable output revision: %s", err)
+				}
+			}
+		}
+		if page.NextAfter >= page.HeadSequence || page.NextAfter <= after {
+			return fold, nil
+		}
+		after = page.NextAfter
+	}
+}
+
+// verifyFinal checks an item's finished file against its final revision's sha256. A tree is
+// checked when it is written.
+func verifyFinal(product records.Product) *exit.Error {
+	if product.MediaType == resultfiles.TreeMediaType {
+		if info, err := os.Lstat(product.Path); err != nil || !info.IsDir() {
+			return exit.Named(exit.Conflict, "output_final_changed", "%s is not its tree", product.Path)
+		}
+		return nil
+	}
+	file, err := os.Open(product.Path)
+	if err != nil {
+		return exit.Named(exit.Conflict, "output_final_changed", "%s is gone: %s", product.Path, err)
+	}
+	defer file.Close()
+	hash := sha256.New()
+	written, err := io.Copy(hash, io.LimitReader(file, product.Length+1))
+	if err != nil || written != product.Length || "sha256:"+hex.EncodeToString(hash.Sum(nil)) != product.Digest {
+		return exit.Named(exit.Conflict, "output_final_changed", "%s differs from its final revision", product.Path)
+	}
+	return nil
 }

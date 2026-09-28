@@ -887,7 +887,7 @@ func (m *machineRuns) observeOn(ctx context.Context, progress *transfer.Progress
 		models, problem = m.collectMachineModels(ctx, request, connection, outcome, modelPlan, written)
 	}
 	if problem == nil {
-		problem = m.exportProducts(request)
+		problem = m.exportProducts(ctx, connection, query, request)
 	}
 	triage.Wait()
 	if body.TriageBundle != nil && triageProblem != nil {

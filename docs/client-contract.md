@@ -334,7 +334,6 @@ installed build. Records at an older schema are refused, never migrated.
 | `POST /v1/local/jobs/{id}/resume` | local | yes | queue the same paused request with its captured execution inputs |
 | `POST /v1/local/jobs/{id}/uploads` | local | yes | upload a run's retained output from the rental holding it as a private checkpoint; never rerun the producer |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
-| `GET /v1/local/runs/{number}/{token}/{file}` | local | capability | a run's products for a standard player: `<output>.m3u8` (HLS EVENT of a growing video), `<output>.<ext>` (current bytes), `<sha256 hex>` (a part); one `Range` |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
 | `GET /app.css` | local | no | embedded localhost web UI stylesheet |
 | `GET /app.js` | local | no | embedded localhost web UI script |
