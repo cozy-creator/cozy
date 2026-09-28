@@ -304,6 +304,15 @@ fn remove(root: &Path, row: &GcDelete) -> Result<()> {
 /// entire selection/removal/collection transition, including new readers and downloads.
 /// Old roots without transport provenance are deliberately not migrated or inferred.
 pub fn collect_cached(root: &Path, protected_manifests: &[String]) -> Result<Report> {
+    collect_cached_for(root, protected_manifests, 1)
+}
+
+/// The same pass, dropping the cache roots whose marginal bytes cover `need` together.
+pub fn collect_cached_for(
+    root: &Path,
+    protected_manifests: &[String],
+    need: u64,
+) -> Result<Report> {
     let protected_manifests = protected_manifests
         .iter()
         .map(|digest| {
@@ -316,9 +325,10 @@ pub fn collect_cached(root: &Path, protected_manifests: &[String]) -> Result<Rep
     let store = Store::open(root)?;
     let exclusive = WriterGuard::lock_rebuild(root)?;
     let collected = collect_locked(&store, false, &exclusive)?;
-    if collected.reclaimed_bytes > 0 {
+    if collected.reclaimed_bytes >= need.max(1) {
         return Ok(collected);
     }
+    let need = need.max(1) - collected.reclaimed_bytes;
     let (holds, _) = session_holds(&store)?;
     let mut protected: BTreeSet<&str> = protected_manifests.iter().map(String::as_str).collect();
     protected.extend(
@@ -339,7 +349,7 @@ pub fn collect_cached(root: &Path, protected_manifests: &[String]) -> Result<Rep
             keep.push(repository.repo.clone());
         }
     }
-    let plan = match crate::reclaim::plan_managed(&store, 1, &keep, &holds) {
+    let plan = match crate::reclaim::plan_managed(&store, need, &keep, &holds) {
         Ok(plan) => plan,
         Err(error) if error.code == Code::RECLAIM_INSUFFICIENT => return Ok(collected),
         Err(error) => return Err(error),
@@ -357,5 +367,10 @@ pub fn collect_cached(root: &Path, protected_manifests: &[String]) -> Result<Rep
             .expect("planner only names census repositories");
         store.remove_cached_repository(body, &repository.repo, &exclusive)?;
     }
-    collect_locked(&store, false, &exclusive)
+    let mut dropped = collect_locked(&store, false, &exclusive)?;
+    dropped.reclaimed_bytes += collected.reclaimed_bytes;
+    dropped.reclaimed_blobs += collected.reclaimed_blobs;
+    dropped.reclaimed_manifests += collected.reclaimed_manifests;
+    dropped.scratch_reaped += collected.scratch_reaped;
+    Ok(dropped)
 }

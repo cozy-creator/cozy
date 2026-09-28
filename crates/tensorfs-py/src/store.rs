@@ -833,6 +833,13 @@ impl PyStore {
         .or_refuse(py)
     }
 
+    /// Mark a retained product tree delivered: disk pressure may now evict it, oldest
+    /// delivery first. Undelivered trees are never evicted.
+    fn deliver_tree_root(&self, py: Python<'_>, owner: &str) -> PyResult<()> {
+        py.detach(|| tensorfs_core::source_artifact::deliver(&self.store, owner))
+            .or_refuse(py)
+    }
+
     fn release_tree_root(&self, py: Python<'_>, owner: &str) -> PyResult<()> {
         py.detach(|| tensorfs_core::source_artifact::release(&self.store, owner))
             .or_refuse(py)
@@ -3532,7 +3539,7 @@ pub fn fetch_complete_cozytensors(py: Python<'_>, store: &PyStore, plan: &[u8]) 
 /// A thread-safe native stop signal; cancel never waits for a Python callback.
 #[pyclass(name = "PullCancellation", module = "tensorfs._ext")]
 pub struct PyPullCancellation {
-    token: tensorfs_core::transport::PullCancellation,
+    pub(crate) token: tensorfs_core::transport::PullCancellation,
 }
 
 #[pymethods]

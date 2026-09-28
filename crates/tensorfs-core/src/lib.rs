@@ -23,6 +23,7 @@ pub mod descriptors;
 pub mod disk;
 pub mod dtype;
 pub mod durability;
+pub mod ensure;
 pub mod err;
 pub mod fetch;
 pub mod fill;
@@ -59,6 +60,10 @@ pub mod vectors;
 
 /// This TensorFS's release version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What callers may feature-detect by name instead of by version: `ensure`, ranged `get`
+/// under a lease, delivered-product marks, and the pressure pass.
+pub const CAPABILITIES: &[&str] = &["deliver/1", "ensure/1", "get-range/1", "pressure/1"];
 
 /// Conservative identity of the actual native converter build, not its version label.
 pub const IMPLEMENTATION_SHA256: &str = env!("TENSORFS_IMPLEMENTATION_SHA256");

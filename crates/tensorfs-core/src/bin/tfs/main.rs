@@ -31,7 +31,8 @@
 //!                                   [--session <s>] [--tenant <t>] [--no-journal]
 //!   tfs repo-cache chain <cache> <chain-id> <length>       the links, root to head
 //!   tfs put <root> <file>        stream one object in (any shape)
-//!   tfs get <root> <hex>         verified read, whole or ranged
+//!   tfs get <root> <hex>         verified read, whole or ranged; with --out - the bytes
+//!                                go to stdout under a read lease (--range <off>:<len>|<off>:)
 //!   tfs contains <root> <hex>    the presence HINT, and what it is worth
 //!   tfs verify <root> <hex>      verification record or rehash; remove corrupt bytes
 //!   tfs scrub <root>             one rate knob over the whole store
@@ -48,6 +49,15 @@
 //! `tfs fetch` reads and backfills the Store's bound repo cache between the local Store
 //! and the origin. It is bound by `tfs store ensure --repo-cache` and never by a flag here.
 //!
+//!   tfs capabilities             one feature name per line (ensure/1, get-range/1, ...)
+//!   tfs ensure <root> <ref> --hub <base> [--lane L] [--step S] [--keep sha256:<m>]...
+//!                               make one model resident: closure, one flight per manifest per
+//!                               Store, disk admission + GC policy, paced resumable fetch, retry
+//!                               only after measured progress. STDOUT is JSON lines:
+//!                               ensure.progress samples, then ensure.result (exit 0) or
+//!                               ensure.refused {code, resumable, detail} (exit 1)
+//!   tfs pressure <root> [--keep sha256:<m>]...   one pressure pass: at <= 1/10 free, run
+//!                               the GC policy until > 1/5 is free; one JSON line
 //!   tfs fetch <root> <ref>       closure -> plan -> N-way walk (presign at use) -> proof
 //!   tfs fetch bounded <root> <ref> --max-download-bytes N --max-download-objects N
 //!                               same pull, refused before body transfer if new objects exceed bounds
@@ -203,7 +213,9 @@ fn accept_printed_ids(args: Vec<String>) -> Vec<String> {
 
 fn main() -> ExitCode {
     let (args, flags) = split_flags(std::env::args().skip(1).collect());
-    if let Some(path) = flag(&flags, "ca-file") {
+    // `ensure` names its CA itself so a bad file is a refusal on its own channel.
+    let ensure = args.first().is_some_and(|verb| verb == "ensure");
+    if let (Some(path), false) = (flag(&flags, "ca-file"), ensure) {
         let trusted = fs::read(path)
             .map_err(|e| format!("IO_FAILED: read {path}: {e}"))
             .and_then(|pem| {
@@ -218,6 +230,14 @@ fn main() -> ExitCode {
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match a.as_slice() {
         ["version"] => cmd_version(),
+        ["capabilities"] => {
+            tensorfs_core::CAPABILITIES
+                .iter()
+                .for_each(|c| println!("{c}"));
+            ExitCode::SUCCESS
+        }
+        ["ensure", r, refspec] => ensure::cmd_ensure(Path::new(r), refspec, &flags),
+        ["pressure", r] => ensure::cmd_pressure(Path::new(r), &flags),
         ["home"] => cmd_home(None),
         ["home", r] => cmd_home(Some(Path::new(r))),
         ["store", "init"] => cmd_store_default("init", &flags),
@@ -815,6 +835,7 @@ macro_rules! ok {
 
 mod ckpt;
 mod conform;
+mod ensure;
 mod fetch;
 mod ingest;
 mod rd;
@@ -936,6 +957,67 @@ fn fault_of(f: &Flags) -> Fault {
     }
 }
 
+/// `<off>:<len>` or `<off>:` (to the end) inside an object of `length` bytes.
+fn byte_range(range: &str, length: u64) -> TfsResult<(u64, u64)> {
+    let bad = || Refusal {
+        code: tensorfs_core::err::Code::RANGE_BOUNDS,
+        detail: format!("--range {range:?} is not <off>:<len> or <off>: inside {length} B"),
+    };
+    let (off, len) = range.split_once(':').ok_or_else(bad)?;
+    let off: u64 = off.parse().map_err(|_| bad())?;
+    let len: u64 = match len {
+        "" => length.checked_sub(off).ok_or_else(bad)?,
+        len => len.parse().map_err(|_| bad())?,
+    };
+    match off.checked_add(len) {
+        Some(end) if end <= length => Ok((off, len)),
+        _ => Err(bad()),
+    }
+}
+
+/// Stream a range of one verified object to stdout under a read lease, so a GC pass cannot
+/// take the object mid-read.
+fn get_leased(store: &Store, hex: &str, range: Option<&str>) -> TfsResult<()> {
+    use std::io::Write;
+    use tensorfs_core::read::{self, ObjectRange};
+    let length = store.open_verified(hex)?.len();
+    let (mut off, mut left) = match range {
+        Some(range) => byte_range(range, length)?,
+        None => (0, length),
+    };
+    let meta = tensorfs_core::meta::Meta::open(store)?;
+    let obj = ObjectRef {
+        sha256: hex.to_string(),
+        length,
+    };
+    let (lease, _) = read::acquire(store, &meta, "", vec![obj.clone()])?;
+    let mut out = std::io::stdout().lock();
+    let mut buf = vec![0u8; 1 << 20];
+    let streamed = (|| {
+        while left > 0 {
+            let n = left.min(buf.len() as u64);
+            let chunk = &mut buf[..n as usize];
+            let range = ObjectRange {
+                obj: obj.clone(),
+                off,
+                len: n,
+            };
+            read::read_into(&lease, &range, chunk)?;
+            out.write_all(chunk).map_err(|e| Refusal {
+                code: tensorfs_core::err::Code::IO_FAILED,
+                detail: format!("write stdout: {e}"),
+            })?;
+            (off, left) = (off + n, left - n);
+        }
+        out.flush().map_err(|e| Refusal {
+            code: tensorfs_core::err::Code::IO_FAILED,
+            detail: format!("write stdout: {e}"),
+        })
+    })();
+    lease.release(&meta)?;
+    streamed
+}
+
 fn cmd_put(root: &Path, src: &Path, f: &Flags) -> ExitCode {
     let s = ok!(Store::open(root));
     let expect = match (flag(f, "expect"), flag(f, "expect-length")) {
@@ -1016,6 +1098,10 @@ fn cmd_verify_object(root: &Path, hex: &str, f: &Flags) -> ExitCode {
 
 fn cmd_get(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let s = ok!(Store::open(root));
+    if flag(f, "out") == Some("-") {
+        ok!(get_leased(&s, hex, flag(f, "range")));
+        return ExitCode::SUCCESS;
+    }
     let t = Instant::now();
     if let Some(r) = flag(f, "range") {
         let (o, l) = r.split_once(':').unwrap_or((r, "1"));

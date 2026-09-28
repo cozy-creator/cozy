@@ -34,7 +34,8 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const HEAD_MAX_BYTES: usize = 64 * 1024;
@@ -160,8 +161,16 @@ impl Judge {
 }
 
 pub struct Client {
-    tls: Arc<rustls::ClientConfig>,
+    tls: Mutex<Tls>,
+    /// Trusts exactly the roots it was built with, never the process's later additions.
+    fixed: bool,
     idle: IdlePool,
+}
+
+/// A client's TLS configuration and the process trust generation it was built from.
+struct Tls {
+    generation: u64,
+    config: Arc<rustls::ClientConfig>,
 }
 
 type IdlePool = Arc<Mutex<Vec<Idle>>>;
@@ -213,10 +222,12 @@ struct Idle {
 }
 
 /// Authorities this process trusts beside the webpki set: a private hub's CA, named by its
-/// caller as a location (`tfs --ca-file`). Set once, before the first exchange.
-static EXTRA_ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
+/// caller as a location (`tfs --ca-file`, `ensure(ca_file=)`). Additive: a root once
+/// trusted stays trusted, and every shared client picks up an addition on its next exchange.
+static EXTRA_ROOTS: Mutex<Vec<CertificateDer<'static>>> = Mutex::new(Vec::new());
+static TRUST_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Trust the PEM certificates in `pem` for every client this process builds.
+/// Trust the PEM certificates in `pem` for every client this process uses.
 pub fn trust_roots(pem: &[u8]) -> Result<usize> {
     let roots: Vec<_> = CertificateDer::pem_slice_iter(pem)
         .collect::<std::result::Result<_, _>>()
@@ -228,36 +239,70 @@ pub fn trust_roots(pem: &[u8]) -> Result<usize> {
     if roots.is_empty() || usable != roots.len() {
         return refuse(Code::UNKNOWN_FORMAT, "holds no usable CA certificate");
     }
-    EXTRA_ROOTS.set(roots).map_err(|_| Refusal {
-        code: Code::UNKNOWN_FORMAT,
-        detail: "this process already chose its trust roots".into(),
-    })?;
+    let mut extra = EXTRA_ROOTS.lock().unwrap();
+    let before = extra.len();
+    for root in roots {
+        if !extra.contains(&root) {
+            extra.push(root);
+        }
+    }
+    if extra.len() != before {
+        TRUST_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
     Ok(usable)
 }
 
-impl Client {
-    pub fn new() -> Client {
-        Client::with_extra_roots(EXTRA_ROOTS.get().map_or(&[], Vec::as_slice))
+fn tls_config(extra_roots: &[CertificateDer<'static>]) -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for root in extra_roots {
+        let _ = roots.add(root.clone());
     }
-
-    /// Trusts the webpki set plus `extra_roots`.
-    pub fn with_extra_roots(extra_roots: &[CertificateDer<'static>]) -> Client {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        for root in extra_roots {
-            let _ = roots.add(root.clone());
-        }
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .expect("rustls ships its own default protocol versions")
         .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_no_client_auth(),
+    )
+}
+
+impl Client {
+    /// Trusts the webpki set plus every root this process trusts, now or later.
+    pub fn new() -> Client {
+        let generation = TRUST_GENERATION.load(Ordering::Acquire);
+        let config = tls_config(&EXTRA_ROOTS.lock().unwrap());
         Client {
-            tls: Arc::new(config),
+            tls: Mutex::new(Tls { generation, config }),
+            fixed: false,
             idle: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Trusts the webpki set plus `extra_roots`, and nothing the process adds later.
+    pub fn with_extra_roots(extra_roots: &[CertificateDer<'static>]) -> Client {
+        Client {
+            tls: Mutex::new(Tls {
+                generation: 0,
+                config: tls_config(extra_roots),
+            }),
+            fixed: true,
+            idle: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn tls(&self) -> Arc<rustls::ClientConfig> {
+        let mut tls = self.tls.lock().unwrap();
+        let generation = TRUST_GENERATION.load(Ordering::Acquire);
+        if !self.fixed && tls.generation != generation {
+            *tls = Tls {
+                generation,
+                config: tls_config(&EXTRA_ROOTS.lock().unwrap()),
+            };
+        }
+        Arc::clone(&tls.config)
     }
 
     fn take(&self, scope: &Scope, checked: &CheckedUrl) -> Option<Wire> {
@@ -1065,13 +1110,10 @@ pub fn send<'l>(
                 code: Code::SOURCE_NOT_ALLOWED,
                 detail: format!("{}: not a valid TLS server name", checked.host),
             })?;
-            let conn =
-                rustls::ClientConnection::new(Arc::clone(&client.tls), name).map_err(|e| {
-                    Refusal {
-                        code: fail,
-                        detail: format!("TLS setup: {e}"),
-                    }
-                })?;
+            let conn = rustls::ClientConnection::new(client.tls(), name).map_err(|e| Refusal {
+                code: fail,
+                detail: format!("TLS setup: {e}"),
+            })?;
             let mut sock = sock;
             let mut conn = Box::new(conn);
             tls_handshake(

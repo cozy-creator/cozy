@@ -401,7 +401,53 @@ pub fn release(store: &Store, owner: &str) -> Result<()> {
     root.released = true;
     root.objects.clear();
     write(store, &root)?;
+    match fs::remove_file(path(store, owner)?.with_extension("delivered")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io(e)),
+        _ => {}
+    }
     crate::transport::prefix::discard_owner(store, owner)
+}
+
+/// Mark a retained tree delivered: its bytes may now be evicted under disk pressure, oldest
+/// delivery first, after unreferenced bytes and before cached model lanes. Idempotent; the
+/// first delivery's time is kept.
+pub fn deliver(store: &Store, owner: &str) -> Result<()> {
+    let _lock = lock(store)?;
+    match read(store, owner)? {
+        Some(root) if !root.released => {}
+        _ => return refuse(Code::ROOT_ABSENT, "tree owner is absent or released"),
+    }
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path(store, owner)?.with_extension("delivered"))
+    {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(io(e)),
+        _ => Ok(()),
+    }
+}
+
+/// Delivered, unreleased trees, oldest delivery first.
+pub fn delivered(store: &Store) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(directory(store)) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(io(e)),
+    };
+    let mut marks = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(io)?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("delivered") {
+            continue;
+        }
+        let owner = format!("sha256:{}", path.file_stem().unwrap().to_string_lossy());
+        let at = fs::metadata(&path).and_then(|m| m.modified()).map_err(io)?;
+        if matches!(read(store, &owner)?, Some(root) if !root.released) {
+            marks.push((at, owner));
+        }
+    }
+    marks.sort();
+    Ok(marks.into_iter().map(|(_, owner)| owner).collect())
 }
 pub(crate) fn held_objects(store: &Store) -> Result<Vec<HeldKey>> {
     let entries = match fs::read_dir(directory(store)) {

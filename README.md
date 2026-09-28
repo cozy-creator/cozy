@@ -185,14 +185,42 @@ already holds is never bought twice — on a content-addressed store a second mo
 an encoder with the first may add almost nothing.
 
 The budget is measured against the Store's own occupancy — the blobs and manifests
-TensorFS installed — and **never against the filesystem**. TensorFS does not stat a
-filesystem for policy: free space is a caller input, because only the caller can see the
-image layers, install roots, media quotas and compile caches sharing the disk. Choosing
-the number is the caller's job; refusing against it is TensorFS's.
+TensorFS installed — and never against the filesystem. Filesystem headroom is `ensure`'s
+admission (below), which the machine's one Store now owns (proto-063).
 
 `CAPACITY_EXHAUSTED` is also what a genuinely full filesystem raises. It is a VERDICT and
 never weather: retrying it fails at the same byte forever, which is exactly what the
 generic `IO_FAILED` an out-of-space write used to raise bought on rented hardware.
+
+## Ensure: model download
+
+`ensure` is the one entry for making a model resident, used by the machine daemon
+(`tfs ensure`) and the Runtime (`tensorfs.ensure`); `tfs fetch` and `tensorfs.pull` stay.
+
+```bash
+tfs capabilities                      # ensure/1, get-range/1, deliver/1, pressure/1
+tfs ensure <root> org/name@1.0.0 --hub https://hub --lane fp8 --step "load" \
+    [--ca-file hub-ca.pem] [--allow-hosts objects.example] [--keep sha256:<manifest>]...
+tfs get <root> sha256:<blob> --range 0:1048576 --out -   # bytes to stdout, under a read lease
+tfs pressure <root> [--keep sha256:<manifest>]...
+```
+
+- **Stdout is JSON lines**: `ensure.progress` samples (`model`, `step`, `phase`,
+  `bytes_done`, `bytes_total`, `rate`, `attempt`), then one `ensure.result` (exit 0) or
+  `ensure.refused` with `code` and `resumable` (exit 1). The result's fetched, cached and
+  cache-written bytes are the Hub's cache observation.
+- **One flight per manifest per Store**, across processes: a second `ensure` of the same
+  manifest waits (`phase: waiting`, the leader's bytes) and moves nothing (`joined: true`).
+- **Retries are earned**: an attempt that failed on the link is retried only when it landed
+  an object; one that landed none is `STALLED`. Stalled streams are judged by the
+  transport's measured ledger; nothing is a timer.
+- **Admission is disk only**: wanted bytes plus 16 + 3 inodes per object must fit under a
+  reserve of max(1 GiB, 1/50 of the filesystem) and 32 inodes, after what other live
+  flights still owe. Short, the GC policy runs: unreferenced bytes, then delivered products
+  (`Store.deliver_tree_root`, oldest first), then cached lanes; then `CAPACITY_EXHAUSTED`.
+  `tfs pressure` / `tensorfs.relieve` runs the same policy at 1/10 free until 1/5 is free.
+- **The Hub CA** (`--ca-file`, `ca_file=`) is added to process trust; an untrusted hub is
+  `TLS_UNTRUSTED`, never retried.
 
 ## Durability
 

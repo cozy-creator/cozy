@@ -9,6 +9,7 @@
 //! `torch.frombuffer` itself. The dtype table crosses exactly once, from `dtypes()`.
 
 mod docs;
+mod ensure;
 mod errors;
 mod ingest;
 mod store;
@@ -134,6 +135,9 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(store::fetch_complete_cozytensors, m)?)?;
     m.add_class::<store::PyPullCancellation>()?;
     m.add_function(wrap_pyfunction!(store::pull, m)?)?;
+    m.add_function(wrap_pyfunction!(ensure::ensure, m)?)?;
+    m.add_function(wrap_pyfunction!(ensure::relieve, m)?)?;
+    m.add("CAPABILITIES", tensorfs_core::CAPABILITIES.to_vec())?;
     m.add_function(wrap_pyfunction!(store::transfer_streams, m)?)?;
     m.add("STREAM_MEMORY", tensorfs_core::transport::STREAM_MEMORY)?;
     m.add("AS_IS_PROFILE", tensorfs_core::ingest::source::AS_IS)?;

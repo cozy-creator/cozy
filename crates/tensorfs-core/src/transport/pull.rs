@@ -1257,6 +1257,9 @@ pub struct PullRequest<'a> {
     /// report the exact declared and already-held bytes without resolving a second plan.
     pub on_plan: Option<&'a (dyn Fn(&FetchPlan) + Sync)>,
     pub on_object: Option<ObjectObserver<'a>>,
+    /// A closure the caller already resolved with [`resolve_closure`]; the pull asks the
+    /// hub nothing more about it.
+    pub closure: Option<&'a hub::Closure>,
 }
 
 impl<'a> PullRequest<'a> {
@@ -1283,8 +1286,59 @@ impl<'a> PullRequest<'a> {
             download_budget: None,
             on_plan: None,
             on_object: None,
+            closure: None,
         }
     }
+}
+
+/// The pull's egress policy: the caller's, plus the hub it named.
+fn pull_policy(request: &PullRequest<'_>) -> SourcePolicy {
+    let mut policy = request.policy.clone();
+    // One resolution per host for this pull, however many objects it asks for.
+    policy.resolved = Default::default();
+    // Naming a hub base IS declaring it, and a loopback hub declares a local deployment.
+    if let Ok(host) = policy::base_host(request.base) {
+        if !policy.allows_host(&host) {
+            policy.allowed_hosts.push(host);
+        }
+    }
+    if policy::is_loopback_origin(request.base) {
+        policy.allow_local = true;
+    }
+    policy
+}
+
+fn pull_ledger(request: &PullRequest<'_>) -> Ledger {
+    let ledger = Ledger::with_resolution(std::time::Duration::from_secs_f64(
+        request.sample_seconds.clamp(0.001, 3600.0),
+    ));
+    match &request.cancellation {
+        Some(cancellation) => ledger.with_cancellation(cancellation.clone()),
+        None => ledger,
+    }
+}
+
+/// What `request` names, exactly: the Store's own answer when the ref is digest-pinned to a
+/// release lane it already holds whole, else the hub's closure.
+pub fn resolve_closure(request: &PullRequest<'_>) -> Result<hub::Closure> {
+    let ledger = pull_ledger(request);
+    ledger.check_running()?;
+    if let Some(closure) = pinned_local_closure(request) {
+        if matches!(plan_against_store(request, &closure), Ok((plan, _)) if plan.wanted.is_empty())
+        {
+            return Ok(closure);
+        }
+    }
+    hub::closure_all(
+        shared_client(),
+        request.base,
+        request.refspec,
+        request.lane,
+        request.credential,
+        &pull_policy(request),
+        request.deadline,
+        &ledger,
+    )
 }
 
 /// What a pull actually did — counted, never estimated.
@@ -1330,30 +1384,17 @@ pub struct PullReport {
 pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     // Keep the presence proof, transfer and retained repository in one GC-safe span.
     // The shared native writer fence permits concurrent pulls; GC refuses STORE_BUSY.
-    let mut ledger = Ledger::with_resolution(std::time::Duration::from_secs_f64(
-        request.sample_seconds.clamp(0.001, 3600.0),
-    ));
-    if let Some(cancellation) = &request.cancellation {
-        ledger = ledger.with_cancellation(cancellation.clone());
-    }
+    let ledger = pull_ledger(request);
     ledger.check_running()?;
     let _retention = crate::catalog::WriterGuard::acquire(request.store.root())?;
-    // Naming a hub base IS declaring it, and a loopback hub declares a local deployment —
-    // the port of pull.py's `local_hub` carve-out. The policy itself stays the caller's.
-    let mut policy = request.policy.clone();
-    // One resolution per host for this pull, however many objects it asks for.
-    policy.resolved = Default::default();
-    if let Ok(host) = policy::base_host(request.base) {
-        if !policy.allows_host(&host) {
-            policy.allowed_hosts.push(host);
-        }
-    }
-    if policy::is_loopback_origin(request.base) {
-        policy.allow_local = true;
-    }
+    let policy = pull_policy(request);
     // A digest-pinned ask for a release lane this Store already records, over a closure
     // it already trusts, has nothing to learn from the hub (proto-061 A).
-    if let Some(closure) = pinned_local_closure(request) {
+    if let Some(closure) = request
+        .closure
+        .cloned()
+        .or_else(|| pinned_local_closure(request))
+    {
         if let Ok((plan, report)) = plan_against_store(request, &closure) {
             if plan.wanted.is_empty() {
                 if let Some(observer) = request.on_plan {
@@ -1368,16 +1409,20 @@ pub fn pull(request: &PullRequest<'_>) -> Result<PullReport> {
     // The WHOLE closure, however many pages the hub takes to say it. A closure that fits
     // one page is one call, which is every model we own today; nothing about the walk
     // changes when one day it is not.
-    let closure = hub::closure_all(
-        client,
-        request.base,
-        request.refspec,
-        request.lane,
-        request.credential,
-        &policy,
-        request.deadline,
-        &ledger,
-    )?;
+    // A Store-answered closure authorizes no presign; if its objects went since, ask.
+    let closure = match request.closure {
+        Some(closure) if closure.presign_max_digests > 0 => closure.clone(),
+        _ => hub::closure_all(
+            client,
+            request.base,
+            request.refspec,
+            request.lane,
+            request.credential,
+            &policy,
+            request.deadline,
+            &ledger,
+        )?,
+    };
     let (plan, mut report) = plan_against_store(request, &closure)?;
     if let Some((bytes, objects)) = request.download_budget {
         let wanted_bytes = plan.wanted_bytes();

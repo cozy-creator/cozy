@@ -31,8 +31,9 @@ reason it exists (tfs-005 measured the drain at ~10%).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from os import PathLike
 from typing import Literal, TypedDict, cast
 
 from . import errors
@@ -52,6 +53,9 @@ from ._tensors import (
     tensors,
 )
 from ._ext import (
+    CAPABILITIES as _CAPABILITIES,
+    ensure as _ensure,
+    relieve as _relieve,
     _fit,
     Batch,
     Closure,
@@ -209,12 +213,123 @@ def fit(
     )
 
 
+class EnsureEvent(TypedDict):
+    """One :func:`ensure` progress sample."""
+
+    model: str
+    step: str
+    phase: Literal["resolving", "waiting", "collecting", "fetching"]
+    bytes_done: int
+    bytes_total: int
+    #: Bytes per second over the last sample.
+    rate: float
+    attempt: int
+
+
+class EnsureResult(TypedDict):
+    """What :func:`ensure` did. ``bytes_fetched``, ``bytes_cached`` and
+    ``cache_written_bytes`` over ``bytes_total`` are the cache observation."""
+
+    model: str
+    release: str
+    lane: str
+    scope: str
+    manifest: str
+    manifest_length: int
+    bytes_total: int
+    bytes_held: int
+    bytes_fetched: int
+    bytes_cached: int
+    cache_written_bytes: int
+    collected_bytes: int
+    attempts: int
+    joined: bool
+    seconds: float
+
+
+def ensure(
+    store: Store,
+    ref: str,
+    *,
+    hub: str,
+    lane: str = "",
+    step: str = "",
+    credential: str = "",
+    ca_file: str | PathLike[str] | None = None,
+    allowed_hosts: Sequence[str] = (),
+    allow_local: bool = False,
+    keep: Sequence[str] = (),
+    streams: int = 128,
+    streams_start: int = 16,
+    sample_seconds: float | None = None,
+    cancellation: PullCancellation | None = None,
+    progress: Callable[[EnsureEvent], object] | None = None,
+) -> EnsureResult:
+    """Make one model resident in ``store``: resolve ``ref`` (``org/name[@release][@sha256:<hex>]``)
+    at ``hub``, share one flight per manifest with every process on this Store, admit it
+    against the disk (running the GC policy when short; ``keep`` names manifests it must not
+    evict), and pull, retrying only after measured progress. ``ca_file`` adds the hub's CA to
+    this process's trust. Refusals raise typed ``errors.*`` (``TlsUntrusted``, ``RefNotFound``,
+    ``CredentialRequired``, ``CapacityExhausted``, ``Stalled``, ``HubRefused``, ...); a raising
+    ``progress`` cancels and its exception is re-raised."""
+
+    return cast(
+        EnsureResult,
+        _ensure(
+            store,
+            ref,
+            hub=hub,
+            lane=lane,
+            step=step,
+            credential=credential,
+            ca_file=ca_file,
+            allowed_hosts=allowed_hosts,
+            allow_local=allow_local,
+            keep=keep,
+            streams=streams,
+            streams_start=streams_start,
+            sample_seconds=sample_seconds,
+            cancellation=cancellation,
+            progress=None if progress is None else lambda event: progress(cast(EnsureEvent, event)),
+        ),
+    )
+
+
+class Relief(TypedDict):
+    """One :func:`relieve` pass."""
+
+    pressure: bool
+    collected_bytes: int
+    capacity_bytes: int
+    available_bytes: int
+    #: Why a GC tier could not run (e.g. a live reader), when one could not.
+    unable: str | None
+
+
+def relieve(store: Store, *, keep: Sequence[str] = ()) -> Relief:
+    """One pressure pass: when at most 1/10 of the Store's filesystem is free (or it is under
+    its reserve), run the GC policy (unreferenced, delivered products, cached lanes) until
+    more than 1/5 is free. Manifests in ``keep`` and in live downloads are never evicted."""
+
+    return cast(Relief, _relieve(store, keep=keep))
+
+
+#: Feature names a caller detects instead of versions: ``"ensure/1"``, ``"get-range/1"``,
+#: ``"deliver/1"``, ``"pressure/1"``.
+CAPABILITIES: frozenset[str] = frozenset(_CAPABILITIES)
+
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
 #: knowledge: a consumer sizing a `torch.frombuffer` reads it from here, never from a
 #: table of its own.
 DTYPES: dict[str, int] = dtypes()
 
 __all__ = [
+    "CAPABILITIES",
+    "EnsureEvent",
+    "EnsureResult",
+    "Relief",
+    "ensure",
+    "relieve",
     "TensorAccessError",
     "TensorAllocation",
     "TensorReader",

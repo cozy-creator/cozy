@@ -62,8 +62,8 @@ pub use memory::{memory_available, streams_within, transfer_streams, STREAM_MEMO
 pub use pace::{Level, GAIN, PULL_STREAMS};
 pub use policy::{base_host, blocked, is_loopback_origin, resolve, CheckedUrl, SourcePolicy};
 pub use pull::{
-    fetch_authorized, fetch_url, fetch_wanted, pull, FetchObserver, Fetched, ObjectSource,
-    ObjectUrls, PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
+    fetch_authorized, fetch_url, fetch_wanted, pull, resolve_closure, FetchObserver, Fetched,
+    ObjectSource, ObjectUrls, PullReport, PullRequest, WalkOutcome, RETRYABLE_STATUS,
 };
 pub use push::{push_object, Pushed, UploadGrant, MAX_GRANT_BYTES, PUT_ATTEMPTS};
 pub use ranged::{fetch_ranged, Ranged, PART_BYTES, RANGED_MIN_BYTES, SOURCE_STREAMS};

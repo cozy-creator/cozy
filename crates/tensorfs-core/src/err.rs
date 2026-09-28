@@ -194,6 +194,9 @@ codes![
     CREDENTIAL_REQUIRED,
     TRANSFER_FAILED,
     DEADLINE_EXCEEDED,
+    // ensure: an attempt that landed nothing. Retrying an attempt that made progress is
+    // resumption; retrying one that made none is a loop.
+    STALLED,
     // repository graph
     REPOSITORY_FULL,
     REPOSITORY_CONFLICT,

@@ -168,7 +168,7 @@ use tensorfs_core::transport::{
     self, credential_from_spec, Anonymous, Deadline, PullRequest, SourcePolicy,
 };
 
-fn policy_of(flags: &Flags) -> SourcePolicy {
+pub(crate) fn policy_of(flags: &Flags) -> SourcePolicy {
     SourcePolicy {
         allowed_hosts: crate::flag(flags, "allow-hosts")
             .map(|hosts| {
