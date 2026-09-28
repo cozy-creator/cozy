@@ -434,7 +434,7 @@ type RunCmd struct {
 	Resume      RunResumeCmd      `cmd:"" help:"Resume a paused transaction from its captured code and retained work."`
 	List        RunListCmd        `cmd:"" help:"List current and past runs."`
 	Watch       RunWatchCmd       `cmd:"" help:"Watch one recorded run until it settles."`
-	Show        RunShowCmd        `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, ranks, attention and its numeric probes."`
+	Show        RunShowCmd        `cmd:"" help:"Show one run's execution evidence: setup and inference stages, per-step times, ranks, and each rank's attention kernels (served, or why not, and compile time)."`
 }
 
 type RunExecuteCmd struct {

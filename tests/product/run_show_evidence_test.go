@@ -31,26 +31,26 @@ func TestRunShowReadsAPreRecordBundleTolerantly(t *testing.T) {
 	}
 }
 
-// Each rank's attention probe is readable without a shell on the pod: the served kernel's
-// worst row group against its budget, flagged when that budget is uncalibrated on this
-// architecture, and the kernels its probe refused with their numbers. The bundle is a
-// constructed two-rank Blackwell pin in the shape Runtime's execution evidence carries.
-func TestRunShowPrintsEachRanksAttentionProbe(t *testing.T) {
-	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "probe-ranks.json"))
+// Each rank's attention kernels are readable without a shell on the pod: the one that
+// served, and for every other kernel of its chains why not (still compiling with its
+// progress, unsupported on this card) and what compiling it cost. The bundle is a
+// constructed two-rank Blackwell run in the shape Runtime's execution evidence carries.
+func TestRunShowPrintsEachRanksAttentionKernels(t *testing.T) {
+	bundle, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "kernel-ranks.json"))
 	must(t, err)
-	o := hostOwner(t, "run-show-probes")
+	o := hostOwner(t, "run-show-kernels")
 	id := succeededWithTriage(t, o, bundle)
 	defer publicationControlAPI(t, o)()
 	code, human := runCozy(t, o.root, "run", "show", id)
 	t.Logf("cozy run show:\n%s", human)
-	at := strings.Index(human, "attention probes")
+	at := strings.Index(human, "attention kernels")
 	if code != 0 || at < 0 || !strings.Contains(human, "sm_100") {
-		t.Fatalf("run show [%d] lacks the ranks' arch or probes:\n%s", code, human)
+		t.Fatalf("run show [%d] lacks the ranks' arch or kernels:\n%s", code, human)
 	}
-	golden, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "probe-ranks.golden"))
+	golden, err := os.ReadFile(filepath.Join("testdata", "execution_evidence", "kernel-ranks.golden"))
 	must(t, err)
 	if got := human[at:]; got != string(golden) {
-		t.Fatalf("attention probes differ from the golden:\n%s\nwant:\n%s", got, golden)
+		t.Fatalf("attention kernels differ from the golden:\n%s\nwant:\n%s", got, golden)
 	}
 
 	code, out := runCozy(t, o.root, "run", "show", id, "--json")
@@ -58,8 +58,7 @@ func TestRunShowPrintsEachRanksAttentionProbe(t *testing.T) {
 		Ranks []struct {
 			Arch      string `json:"arch"`
 			Attention struct {
-				Probes  []map[string]any `json:"probes"`
-				Skipped []map[string]any `json:"skipped"`
+				Kernels []map[string]any `json:"kernels"`
 			} `json:"attention"`
 		} `json:"ranks"`
 	}
@@ -67,12 +66,10 @@ func TestRunShowPrintsEachRanksAttentionProbe(t *testing.T) {
 		t.Fatalf("run show --json [%d]:\n%s", code, out)
 	}
 	for _, rank := range report.Ranks {
-		probe, skipped := rank.Attention.Probes, rank.Attention.Skipped
-		if rank.Arch != "sm_100" || len(probe) != 1 || len(skipped) != 1 ||
-			probe[0]["budget_state"] != "uncalibrated" || probe[0]["source"] != "warm" ||
-			len(probe[0]["rel_l2_by_rows"].(map[string]any)) != 4 ||
-			skipped[0]["status"] != "attention_kernel_out_of_budget" {
-			t.Fatalf("run show --json lost a rank's probe evidence: %+v", rank)
+		kernels := rank.Attention.Kernels
+		if rank.Arch != "sm_100" || len(kernels) != 4 || kernels[1]["served"] != true ||
+			kernels[3]["state"] != "compiling" || kernels[3]["progress"] != 0.42 {
+			t.Fatalf("run show --json lost a rank's kernel evidence: %+v", rank)
 		}
 	}
 }

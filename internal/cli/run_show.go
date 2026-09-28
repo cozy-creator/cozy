@@ -80,23 +80,22 @@ type reportRank struct {
 	StartUS   int64  `json:"start_us"`
 	EndUS     int64  `json:"end_us"`
 	Attention struct {
-		Requested string        `json:"requested"`
-		Observed  string        `json:"observed"`
-		Impl      string        `json:"impl"`
-		Probes    []reportProbe `json:"probes,omitempty"`  // kernels the rank served
-		Skipped   []reportProbe `json:"skipped,omitempty"` // kernels its probe refused
+		Requested string         `json:"requested"`
+		Observed  string         `json:"observed"`
+		Impl      string         `json:"impl"`
+		Kernels   []reportKernel `json:"kernels,omitempty"` // every kernel of its chains
 	} `json:"attention"`
 }
 
-// reportProbe is one rank's numeric probe of an attention kernel against exact attention.
-type reportProbe struct {
-	Kernel      string             `json:"kernel"`
-	Status      string             `json:"status"`
-	Source      string             `json:"source,omitempty"` // warm, prepare or request
-	Shape       []int              `json:"shape,omitempty"`
-	RelL2ByRows map[string]float64 `json:"rel_l2_by_rows,omitempty"`
-	Budget      float64            `json:"budget"`
-	BudgetState string             `json:"budget_state,omitempty"` // calibrated or uncalibrated
+// reportKernel is one kernel of a rank's attention chains: whether it served, and if not
+// why (compiling, failed, absent, unsupported), with what compiling it cost this machine.
+type reportKernel struct {
+	Kernel    string   `json:"kernel"`
+	State     string   `json:"state"`
+	Served    bool     `json:"served"`
+	Progress  *float64 `json:"progress,omitempty"`
+	CompileMS float64  `json:"compile_ms,omitempty"`
+	Detail    string   `json:"detail,omitempty"`
 }
 
 type triageTrack struct {
@@ -430,44 +429,35 @@ func (r runReport) Emit(w io.Writer, mode output.Mode) error {
 				output.Elide(dash(rank.UUID), 17, mode.Full), rank.PID, start, took, rankAttention(rank))
 		}
 		table.Flush()
-		emitProbes(w, table, r.Ranks)
+		emitKernels(w, table, r.Ranks, mode.Full)
 	}
 	return nil
 }
 
-// emitProbes prints each rank's attention probes: the worst row group's rel L2 against
-// exact attention beside the kernel's budget, and whether the kernel served or was refused.
-func emitProbes(w io.Writer, table *tabwriter.Writer, ranks []reportRank) {
+// emitKernels prints each rank's attention kernels: the one that served, and for every other
+// kernel of its chains why it did not (still compiling, failed, absent, unsupported), with
+// its compile time on this machine.
+func emitKernels(w io.Writer, table *tabwriter.Writer, ranks []reportRank, full bool) {
 	header := false
 	for _, rank := range ranks {
-		rows := append(append([]reportProbe{}, rank.Attention.Probes...), rank.Attention.Skipped...)
-		for index, probe := range rows {
+		for _, kernel := range rank.Attention.Kernels {
 			if !header {
-				fmt.Fprintln(w, "\nattention probes")
-				fmt.Fprintln(table, "RANK\tKERNEL\tMAX REL L2\tBUDGET\tVERDICT\tMEASURED")
+				fmt.Fprintln(w, "\nattention kernels")
+				fmt.Fprintln(table, "RANK\tKERNEL\tSTATE\tCOMPILE\tDETAIL")
 				header = true
 			}
-			worst, group := "-", ""
-			for name, value := range probe.RelL2ByRows {
-				if group == "" || value > probe.RelL2ByRows[group] || (value == probe.RelL2ByRows[group] && name < group) {
-					group = name
-				}
+			state := kernel.State
+			if kernel.Served {
+				state = "served"
+			} else if kernel.Progress != nil {
+				state = fmt.Sprintf("%s (%.0f%%)", state, *kernel.Progress*100)
 			}
-			if group != "" {
-				worst = fmt.Sprintf("%.4g (%s)", probe.RelL2ByRows[group], group)
+			compile := "-"
+			if kernel.CompileMS > 0 {
+				compile = span(kernel.CompileMS)
 			}
-			budget := fmt.Sprintf("%.4g", probe.Budget)
-			if probe.BudgetState == "uncalibrated" {
-				budget += " UNCALIBRATED"
-			}
-			verdict := "served"
-			if index >= len(rank.Attention.Probes) {
-				verdict = "refused: " + strings.TrimPrefix(probe.Status, "attention_kernel_")
-			} else if probe.Status != "ready" {
-				verdict += " (" + probe.Status + ")"
-			}
-			fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\t%s\n", rank.Rank, probe.Kernel, worst, budget,
-				verdict, dash(probe.Source))
+			fmt.Fprintf(table, "%d\t%s\t%s\t%s\t%s\n", rank.Rank, kernel.Kernel, state, compile,
+				dash(output.Elide(kernel.Detail, 72, full)))
 		}
 	}
 	table.Flush()

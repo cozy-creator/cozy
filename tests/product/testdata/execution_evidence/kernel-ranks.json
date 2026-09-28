@@ -1,0 +1,133 @@
+{
+ "measurements": {
+  "attribution": {
+   "stages": {},
+   "steps": {
+    "denoise": {
+     "count": 2,
+     "total_ms": 3000.0,
+     "min_ms": 1400.0,
+     "max_ms": 1600.0,
+     "first_ms": 1600.0,
+     "started_unix_ms": 1790480090000,
+     "series": [
+      [
+       1790480091600,
+       1600.0
+      ],
+      [
+       1790480093000,
+       1400.0
+      ]
+     ],
+     "series_dropped": 0
+    }
+   }
+  },
+  "execution": {
+   "degree": 2,
+   "ranks": [
+    {
+     "rank": 0,
+     "pid": 41021,
+     "ordinal": 0,
+     "uuid": "GPU-6f1c2a9e-0b8d-4c55-9a51-3f0d2e7c1b44",
+     "arch": "sm_100",
+     "start_us": 1790480087578987,
+     "end_us": 1790480143600401,
+     "attention": {
+      "requested": "",
+      "observed": "sageattention",
+      "impl": "sageattn_qk_int8_pv_fp8_cuda(per_thread, fp32+fp16, smooth_k)",
+      "kernels": [
+       {
+        "kernel": "flash-attn3",
+        "state": "unsupported",
+        "line": "unsupported: flash-attn3 serves sm90 only; this executor holds sm100",
+        "served": false,
+        "detail": "flash-attn3 serves sm90 only; this executor holds sm100"
+       },
+       {
+        "kernel": "sageattention",
+        "state": "ready",
+        "line": "ready (compiled in 185.3 s)",
+        "served": true,
+        "compile_ms": 185312.4
+       },
+       {
+        "kernel": "sdpa",
+        "state": "ready",
+        "line": "ready",
+        "served": false
+       },
+       {
+        "kernel": "sol-attn",
+        "state": "compiling",
+        "line": "compiling (42%)",
+        "served": false,
+        "progress": 0.42,
+        "compile_ms": 71840.0
+       }
+      ]
+     }
+    },
+    {
+     "rank": 1,
+     "pid": 41022,
+     "ordinal": 1,
+     "uuid": "GPU-0a7e5d13-9c2f-4e81-b6d0-58a9c4f2e310",
+     "arch": "sm_100",
+     "start_us": 1790480087579887,
+     "end_us": 1790480143600401,
+     "attention": {
+      "requested": "",
+      "observed": "sageattention",
+      "impl": "sageattn_qk_int8_pv_fp8_cuda(per_thread, fp32+fp16, smooth_k)",
+      "kernels": [
+       {
+        "kernel": "flash-attn3",
+        "state": "unsupported",
+        "line": "unsupported: flash-attn3 serves sm90 only; this executor holds sm100",
+        "served": false,
+        "detail": "flash-attn3 serves sm90 only; this executor holds sm100"
+       },
+       {
+        "kernel": "sageattention",
+        "state": "ready",
+        "line": "ready (compiled in 185.3 s)",
+        "served": true,
+        "compile_ms": 185312.4
+       },
+       {
+        "kernel": "sdpa",
+        "state": "ready",
+        "line": "ready",
+        "served": false
+       },
+       {
+        "kernel": "sol-attn",
+        "state": "compiling",
+        "line": "compiling (42%)",
+        "served": false,
+        "progress": 0.42,
+        "compile_ms": 71840.0
+       }
+      ]
+     }
+    }
+   ],
+   "executor": {
+    "started_unix_ms": 0,
+    "ms": 0,
+    "legs_ms": {}
+   },
+   "construction": {
+    "prepared_unix_ms": 0,
+    "prepare_ms": 0,
+    "fill_ms": 0,
+    "warm_ms": 0,
+    "legs_ms": {}
+   }
+  }
+ }
+}
