@@ -1690,22 +1690,21 @@ fn require_payload_record(store: &Store, object: &ObjectRef, what: &str) -> Resu
 }
 
 fn require_source_roots(store: &Store, declaration: &Declaration) -> Result<()> {
-    if declaration.sources.is_empty() {
-        return Ok(());
+    let wanted: Vec<ObjectRef> = declaration
+        .sources
+        .iter()
+        .map(|source| source.manifest.clone())
+        .collect();
+    match crate::gc::unretained_manifests(store, &wanted)?.first() {
+        Some(missing) => refuse(
+            Code::ROOT_ABSENT,
+            format!(
+                "source {} has no exact retained filesystem root",
+                missing.id()
+            ),
+        ),
+        None => Ok(()),
     }
-    let retained = crate::gc::retained_manifests(store)?;
-    for declared in &declaration.sources {
-        if !retained.contains(&declared.manifest) {
-            return refuse(
-                Code::ROOT_ABSENT,
-                format!(
-                    "source {} has no exact retained filesystem root",
-                    declared.manifest.id()
-                ),
-            );
-        }
-    }
-    Ok(())
 }
 
 fn load_sources(store: &Store, declaration: &Declaration) -> Result<Vec<SourceData>> {
@@ -3124,6 +3123,22 @@ pub(crate) fn retain_restore(
             .sort_by(|left, right| left.sha256.cmp(&right.sha256));
     }
     roots::write(store, &root)
+}
+
+/// The manifests private roots name themselves, without walking their checkpoint chains.
+pub(crate) fn rooted_manifests(store: &Store) -> Result<Vec<ObjectRef>> {
+    let mut named: Vec<ObjectRef> = retention::held_objects(store)?
+        .into_iter()
+        .map(|hold| ObjectRef {
+            sha256: hold.sha256,
+            length: hold.length,
+        })
+        .collect();
+    for root in roots::all(store)? {
+        named.extend(root.sources);
+        named.extend(root.manifest);
+    }
+    Ok(named)
 }
 
 pub(crate) fn retained_objects(store: &Store) -> Result<Vec<crate::storage::HeldKey>> {
@@ -4666,3 +4681,6 @@ mod part_rows_tests;
 
 #[cfg(test)]
 mod group_commit_tests;
+
+#[cfg(test)]
+mod history_cost_tests;

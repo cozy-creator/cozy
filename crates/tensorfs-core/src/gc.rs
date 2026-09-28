@@ -29,6 +29,7 @@ use std::path::Path;
 
 use crate::catalog::{Catalog, WriterGuard};
 use crate::err::{Code, Refusal, Result};
+use crate::ids::ObjectRef;
 use crate::ingest::transaction as tx;
 use crate::storage::{self, Census, GcDelete, HeldKey};
 use crate::store::Store;
@@ -158,30 +159,48 @@ pub fn session_holds(store: &Store) -> Result<(Vec<HeldKey>, Vec<String>)> {
     Ok((holds, sessions))
 }
 
-/// The same exact manifest roots used by reclamation, without a payload census.
-/// Membership is retention, not caller authorization. A consumer must acquire its
-/// live hold before checking roots so GC cannot remove bytes during admission.
-pub(crate) fn retained_manifests(store: &Store) -> Result<Vec<crate::ids::ObjectRef>> {
-    let mut roots = Vec::new();
-    for (repository, _) in storage::read_repositories(store.root())? {
-        roots.extend(
-            repository
-                .checkpoints
-                .into_iter()
-                .map(|checkpoint| checkpoint.manifest),
-        );
-    }
-    let (holds, _) = session_holds(store)?;
-    roots.extend(
+/// The `wanted` manifests that no root reclamation keeps names. Roots are read cheapest
+/// first and the search stops once every wanted manifest is found, so a rooted source costs
+/// the roots that name it rather than every checkpoint chain and parts journal the Store
+/// has retained, which grow with its history (finding 50). Membership is retention, not
+/// caller authorization. A consumer must acquire its live hold before checking roots so
+/// GC cannot remove bytes during admission.
+pub(crate) fn unretained_manifests(store: &Store, wanted: &[ObjectRef]) -> Result<Vec<ObjectRef>> {
+    let manifests = |holds: Vec<HeldKey>| {
         holds
             .into_iter()
-            .filter(|hold| hold.is_manifest())
-            .map(|hold| crate::ids::ObjectRef {
+            .filter(HeldKey::is_manifest)
+            .map(|hold| ObjectRef {
                 sha256: hold.sha256,
                 length: hold.length,
-            }),
-    );
-    Ok(roots)
+            })
+    };
+    let repositories = || -> Result<Vec<ObjectRef>> {
+        Ok(storage::read_repositories(store.root())?
+            .into_iter()
+            .flat_map(|(repository, _)| repository.checkpoints)
+            .map(|checkpoint| checkpoint.manifest)
+            .collect())
+    };
+    let named_roots = || -> Result<Vec<ObjectRef>> {
+        let mut named = crate::derived::rooted_manifests(store)?;
+        named.extend(manifests(crate::source_artifact::held_objects(store)?));
+        named.extend(manifests(crate::checkpoint_root::held_objects(store)?));
+        Ok(named)
+    };
+    let everything =
+        || -> Result<Vec<ObjectRef>> { Ok(manifests(session_holds(store)?.0).collect()) };
+    let passes: [&dyn Fn() -> Result<Vec<ObjectRef>>; 3] =
+        [&repositories, &named_roots, &everything];
+    let mut missing = wanted.to_vec();
+    for pass in passes {
+        if missing.is_empty() {
+            break;
+        }
+        let named = pass()?;
+        missing.retain(|manifest| !named.contains(manifest));
+    }
+    Ok(missing)
 }
 
 /// One complete pass: exclusivity, orphan temps, census, plan, delete, catalog repair.
